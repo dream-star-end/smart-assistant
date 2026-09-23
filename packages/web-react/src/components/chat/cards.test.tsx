@@ -271,8 +271,25 @@ describe("UserCard 状态标签(M-09)", () => {
     expect(screen.getByText("已送达")).toBeInTheDocument();
     rerender(<UserCard msg={userMsg({ status: "sending" })} cb={{}} />);
     expect(screen.getByText("发送中")).toBeInTheDocument();
-    rerender(<UserCard msg={userMsg({ status: "queued" })} cb={{}} />);
-    expect(screen.getByText("排队中")).toBeInTheDocument();
+    rerender(<UserCard msg={userMsg({ status: "queued", text: "等一下再发" })} cb={{}} />);
+    expect(screen.getByText("还在等上一项")).toBeInTheDocument();
+    expect(screen.getByText("等一下再发")).toBeInTheDocument();
+  });
+
+  test("排队中的消息在对话里，并提供修改和立即发送", () => {
+    const onEditQueued = vi.fn();
+    const onSendQueuedNow = vi.fn();
+    render(
+      <UserCard
+        msg={userMsg({ status: "queued", text: "先记下来" })}
+        cb={{ onEditQueued, onSendQueuedNow }}
+      />,
+    );
+    expect(screen.getByText("先记下来")).toBeInTheDocument();
+    screen.getByRole("button", { name: "修改" }).click();
+    screen.getByRole("button", { name: "立即发送" }).click();
+    expect(onEditQueued).toHaveBeenCalledTimes(1);
+    expect(onSendQueuedNow).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -660,19 +677,32 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("计划内重启不再出错误卡，也不提供从断点继续按钮", () => {
-    const error = errMsg({
+  test("计划内重启本身不出错误卡；自动续跑被拒时要说明这句没发出去", () => {
+    renderErr(errMsg({
       _errorCode: "SERVICE_RESTART",
       _clientMessageId: "u1",
       usage: { waived: true },
-      _recoverySkippedNotice: "没法从保存的进度继续。任务内容还在，请刷新后再试。",
-    });
-    renderErr(error, {
+    }), {
       onContinueInterrupted: vi.fn(),
       resolveInterruptedContinuation: () => retryableUser,
     });
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.queryByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeNull();
+    expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
+
+    renderErr(errMsg({
+      _errorCode: "SERVICE_RESTART",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+      _recoverySkippedNotice: "没法从保存的进度继续。任务内容还在，请刷新后再试。",
+    }), {
+      onContinueInterrupted: vi.fn(),
+      onRegenerate: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText("这句没有发出去")).toBeInTheDocument();
+    expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 
@@ -782,9 +812,11 @@ describe("AssistantCard 失败轮部分正文(Codex 审计 R6)", () => {
         cb={{ onRegenerate: vi.fn() }}
       />,
     );
-    expect(screen.getByText("本轮已自动免单")).toBeInTheDocument();
-    // 免单红卡:精确「重试」不显(waived → 非可重试)。
+    expect(screen.getByText("这轮没有回复")).toBeInTheDocument();
+    expect(screen.getByText("模型没有生成内容，本轮未扣费。点重试再发一次。")).toBeInTheDocument();
+    // 免单卡不走精确「重试」(那会按原 payload 重发)。末轮给「重新尝试」。
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
   });
 });
 

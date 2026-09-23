@@ -124,6 +124,10 @@ export type CardCallbacks = {
   onQuote?: (msg: ChatMessage) => void;
   /** 把用户原文放回输入框，改完发送即新 turn（不删原消息、不原地替换）。 */
   onEditResend?: (msg: ChatMessage) => void;
+  /** 排队中的消息：收回输入框，并从队列里拿掉，避免稍后又自动发出。 */
+  onEditQueued?: (msg: ChatMessage) => void;
+  /** 排队中的消息：停掉当前这轮，马上发这一条。 */
+  onSendQueuedNow?: (msg: ChatMessage) => void;
   /** 打开顶栏模型选择器（红卡「切换模型」）。 */
   onOpenModelPicker?: () => void;
   /** 按需读取并验证一条超大 immutable record；可能展开为多个 runtime events。 */
@@ -511,6 +515,24 @@ export function UserCard({
           )}
         >
           <span>{statusLabel}</span>
+          {status === "queued" && cb?.onEditQueued && (
+            <button
+              type="button"
+              onClick={() => cb.onEditQueued?.(msg)}
+              className="inline-flex items-center rounded-full bg-card px-2 py-0.5 font-medium text-fg transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11"
+            >
+              修改
+            </button>
+          )}
+          {status === "queued" && cb?.onSendQueuedNow && (
+            <button
+              type="button"
+              onClick={() => cb.onSendQueuedNow?.(msg)}
+              className="inline-flex items-center rounded-full bg-card px-2 py-0.5 font-medium text-fg transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11"
+            >
+              立即发送
+            </button>
+          )}
           {/* 发送失败 → 「重试」：复用原消息 payload（含附件引用）走既有发送入口原地重发。 */}
           {status === "error" && cb?.onRetrySend && (
             <button

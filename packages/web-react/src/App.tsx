@@ -2565,6 +2565,16 @@ export function App() {
           },
       onRetrySend: demo ? undefined : retrySend,
       onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
+      onEditQueued: (m) => {
+        const text = activeId
+          ? (sockRef.current?.editQueuedMessage(activeId, m.id) ?? m.text ?? "")
+          : (m.text || "");
+        setComposerPrefill({ text, nonce: Date.now() });
+      },
+      onSendQueuedNow: (m) => {
+        if (!activeId) return;
+        sockRef.current?.sendQueuedNow(activeId, m.id);
+      },
       onOpenModelPicker: () => setModelPickerOpen(true),
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,

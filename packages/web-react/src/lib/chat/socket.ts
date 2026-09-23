@@ -5942,6 +5942,44 @@ export class ChatSocket {
     this.deps.persistSession?.(sess.id);
   }
 
+  /** Pull a not-yet-sent message back into the composer and drop it from the queue. */
+  editQueuedMessage(sessId: string, msgId: string): string | undefined {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return undefined;
+    const user = sess.messages.find((message) => message.role === "user" && message.id === msgId);
+    if (!user || user.status !== "queued") return undefined;
+    const text = user._modelText || user.text || "";
+    this.clearPendingDispatch(sessId, msgId);
+    sess.messages = sess.messages.filter((message) => message.id !== msgId);
+    const stillQueued = this.offlineQueue.some(
+      (item) => item.sessId === sessId && item.state === "queued",
+    );
+    if (!stillQueued) sess._dispatchPaused = false;
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+    return text;
+  }
+
+  /**
+   * Send one queued message now. If a turn is still running, stop it first.
+   * Stop normally holds later messages; this click is the explicit send.
+   */
+  sendQueuedNow(sessId: string, msgId: string): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const queued = this.offlineQueue.some(
+      (item) => item.sessId === sessId && item.msgId === msgId && item.state === "queued",
+    );
+    const user = sess.messages.find((message) => message.role === "user" && message.id === msgId);
+    if (!queued || !user || user.status !== "queued") return;
+    if (sess._sendingInFlight && sess._activeClientMessageId !== msgId) {
+      this.stopTurn(sessId);
+    }
+    sess._dispatchPaused = false;
+    this.scheduleNotify();
+    this.kickDispatchPump();
+  }
+
   stopTurn(sessId: string): void {
     const sess = this.sessions.get(sessId);
     if (!sess) return;
