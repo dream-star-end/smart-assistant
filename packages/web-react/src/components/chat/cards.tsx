@@ -440,7 +440,7 @@ function MessageActions({
 // 只剩噪音;「已读」同理。「已送达」保留 —— 它只在当前在飞轮出现,告诉用户服务端已受理。
 const USER_STATUS_LABEL: Record<string, string> = {
   sending: "发送中",
-  queued: "排队中",
+  queued: "还在等上一项",
   sent: "已送达",
   error: "发送失败",
 };
@@ -659,10 +659,14 @@ export function AssistantCard({
   const presentedError = hasError
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
     : null;
+  const isSyntheticEmptyNotice =
+    !hasError && (msg.text ?? "").trim() === "本轮未能产出可见回复，已结束，可重试或继续";
 
   // ── 红卡重试 CTA 硬门(任务④)────────────────────────────────────────────────────
   // 语义(retryable/cta)从 protocol taxonomy 派生,不在组件里手写码判断。
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
+  const isEmptyNoReply =
+    normalizedCode === "no_response" || normalizedCode === "phantom_turn";
   const sem = turnErrorSemantics(normalizedCode);
   const expectedError = sem.expected === true;
   const frozenCard = msg._errorCardSnapshot?.disposition === "card" ? msg._errorCardSnapshot : undefined;
@@ -684,8 +688,12 @@ export function AssistantCard({
   const showUnpublishedProcessPending =
     msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
-  const shownTitle = frozenCard?.title ?? presentedError?.title;
-  const shownMessage = frozenCard?.message ?? presentedError?.message;
+  const shownTitle = isEmptyNoReply
+    ? "这轮没有回复"
+    : (frozenCard?.title ?? presentedError?.title);
+  const shownMessage = isEmptyNoReply
+    ? "模型没有生成内容，本轮未扣费。点重试再发一次。"
+    : (frozenCard?.message ?? presentedError?.message);
   const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
   const creditsCopy = insufficientCreditsCopy(
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
@@ -788,7 +796,7 @@ export function AssistantCard({
             - 用户主动停止同样走 bodyText：已经产生的部分回答必须可见，不能因为
               stopped/user_cancelled 就整段藏掉（费用和过程都是真实发生过的）。
             - 流式已起但正文尚空 → 本轮活动指示取代裸三点。 */}
-        {msg.text && !hasError ? (
+        {msg.text && !hasError && !isSyntheticEmptyNotice ? (
           <OptionsGroupProvider live={live}>
             {/* 流式光标由 Markdown(caret)内联注入到最后一个文本块末尾,不再落在正文下一行。 */}
             <ProgressiveMarkdown text={msg.text} live={live} caret={live} />
@@ -802,6 +810,27 @@ export function AssistantCard({
         ) : live && !hasError && !ctx.activityInFooter ? (
           ctx.turnActivity ? <TurnActivity info={ctx.turnActivity} /> : <TypingDots />
         ) : null}
+
+        {isSyntheticEmptyNotice && !live && (
+          <Alert
+            tone="warning"
+            density="compact"
+            className="mt-2.5"
+            icon={<AlertTriangle size={17} />}
+            title="这轮没有回复"
+          >
+            <div className="min-w-0">
+              <p className="text-[13px] leading-5 text-fg/90">模型没有生成内容。可以重试。</p>
+              {isLastTurn && cb.onRegenerate && (
+                <div className="mt-2.5">
+                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
+                    <RotateCcw size={14} /> 重试
+                  </Button>
+                </div>
+              )}
+            </div>
+          </Alert>
+        )}
 
         {/* 截断续写 banner */}
         {msg._truncated && !live && (
@@ -841,12 +870,33 @@ export function AssistantCard({
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
           </output>
+        ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
+          <Alert
+            tone="warning"
+            density="compact"
+            className="mt-2.5 max-w-full overflow-hidden"
+            icon={<AlertTriangle size={17} />}
+            title="这句没有发出去"
+          >
+            <div className="min-w-0">
+              <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
+                {msg._recoverySkippedNotice}
+              </p>
+              {isLastTurn && cb.onRegenerate && (
+                <div className="mt-2.5">
+                  <Button size="sm" variant="secondary" shape="pill" onClick={cb.onRegenerate}>
+                    <RotateCcw size={14} /> 重试
+                  </Button>
+                </div>
+              )}
+            </div>
+          </Alert>
         ) : !suppressErrorAlert && presentedError && (
           <Alert
             tone={errorTone}
-            density={expectedError && !presentedError.waived && !frozenCard ? "compact" : "comfortable"}
+            density={isEmptyNoReply || (expectedError && !presentedError.waived && !frozenCard) ? "compact" : "comfortable"}
             className="mt-2.5 max-w-full overflow-hidden"
-            icon={presentedError.waived && !frozenCard ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
+            icon={isEmptyNoReply || !(presentedError.waived && !frozenCard) ? <AlertTriangle size={17} /> : <ShieldCheck size={17} />}
             title={isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
           >
             <div className="min-w-0">
@@ -949,7 +999,7 @@ export function AssistantCard({
         )}
 
         {/* 动作条 + meta（流式中不显示动作条，避免抖动）。流式阶段不单挂 token。 */}
-        {!live && !hasError && msg.text && (
+        {!live && !hasError && msg.text && !isSyntheticEmptyNotice && (
           <MessageActions
             msg={msg}
             cb={cb}
@@ -977,7 +1027,7 @@ export function AssistantCard({
             一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
             其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
             未登录/demo 由卡内 Context 兜底隐藏。 */}
-        {!live && !hasError && !!msg.text && ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn) && (
+        {!live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply && ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn) && (
           <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
         )}
       </div>

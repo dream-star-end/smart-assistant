@@ -9,6 +9,7 @@ import {
   emptyCompletedTurnAssistantText,
   hasPlatedAssistantOutput,
   shouldAnnounceEmptyCompletedTurn,
+  shouldFailClosedEmptyModelTurn,
 } from '../emptyCompletedTurn.js'
 
 describe('shouldAnnounceEmptyCompletedTurn', () => {
@@ -44,6 +45,62 @@ describe('shouldAnnounceEmptyCompletedTurn', () => {
     )
     assert.equal(
       shouldAnnounceEmptyCompletedTurn({ status: 'completed', errorCode: 'USER_CANCELLED' }),
+      false,
+    )
+  })
+})
+
+describe('shouldFailClosedEmptyModelTurn', () => {
+  it('token 全 0 且没有任何产出 → 不能记成完成', () => {
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({
+        status: 'completed',
+        assistantText: '',
+        outputTokens: 0,
+        inputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        toolCallCount: 0,
+        blockCount: 0,
+        structuredBlockCount: 0,
+        apiState: 'called',
+      }),
+      true,
+    )
+  })
+
+  it('有正文、有工具、有 token、斜杠命令、已跳过的 API → 不改判', () => {
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({ status: 'completed', assistantText: '在的', outputTokens: 0 }),
+      false,
+    )
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({ status: 'completed', assistantText: '', toolCallCount: 1 }),
+      false,
+    )
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({
+        status: 'completed',
+        assistantText: '',
+        outputTokens: 0,
+        inputTokens: 3,
+      }),
+      false,
+    )
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({ status: 'completed', assistantText: '', isSlashCommand: true }),
+      false,
+    )
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({ status: 'completed', assistantText: '', apiState: 'skipped' }),
+      false,
+    )
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({ status: 'completed', assistantText: '', structuredBlockCount: 1 }),
+      false,
+    )
+    assert.equal(
+      shouldFailClosedEmptyModelTurn({ status: 'crashed', assistantText: '' }),
       false,
     )
   })

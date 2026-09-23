@@ -372,9 +372,9 @@ export function recoverySkippedNotice(reason?: string): string {
     case "source_tape_malformed":
       return "没法从保存的进度继续。任务内容还在，请刷新后再试。";
     case "recovery_mode_mismatch":
-      return "没法从保存的进度继续。任务内容还在，请再点一次「从断点继续」。";
+      return "没法从断点继续。这句没有发出去，点重试再发一次。";
     case "automatic_checkpoint_unsafe":
-      return "自动续跑已跳过。任务内容还在，你可以手动从进度继续。";
+      return "自动续跑已跳过。这句没有发出去，请手动从进度继续，或点重试再发一次。";
     case "automatic_retry_exhausted":
       return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
     case "capability_unavailable":

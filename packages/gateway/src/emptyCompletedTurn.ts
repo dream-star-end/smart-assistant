@@ -44,3 +44,39 @@ export function emptyCompletedTurnAssistantText(args: {
     ? EMPTY_COMPLETED_TURN_NOTICE
     : text
 }
+
+/**
+ * 模型完全没产出（token 全是 0，也没有工具、正文或结构化块）时，
+ * 这轮不能记成 completed。斜杠命令、已跳过的 API、以及已经是错误的结果除外。
+ */
+export function shouldFailClosedEmptyModelTurn(args: {
+  status?: string | null
+  errorCode?: string | null
+  assistantText?: string | null
+  outputTokens?: number | null
+  inputTokens?: number | null
+  cacheReadTokens?: number | null
+  cacheCreationTokens?: number | null
+  toolCallCount?: number | null
+  blockCount?: number | null
+  structuredBlockCount?: number | null
+  apiState?: 'skipped' | 'called' | 'unknown' | null
+  isSlashCommand?: boolean
+  isError?: boolean
+}): boolean {
+  if (args.isSlashCommand) return false
+  if (args.apiState === 'skipped') return false
+  if (args.isError) return false
+  if (args.status && args.status !== 'completed') return false
+  if (args.errorCode) return false
+  if ((args.toolCallCount ?? 0) > 0) return false
+  if ((args.blockCount ?? 0) > 0) return false
+  if ((args.structuredBlockCount ?? 0) > 0) return false
+  if (String(args.assistantText ?? '').trim()) return false
+  const tokens =
+    (args.outputTokens ?? 0) +
+    (args.inputTokens ?? 0) +
+    (args.cacheReadTokens ?? 0) +
+    (args.cacheCreationTokens ?? 0)
+  return tokens === 0
+}

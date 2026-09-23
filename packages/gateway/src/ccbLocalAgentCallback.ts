@@ -18,6 +18,8 @@ export { parseOriginWebchatSessionKey }
 
 const SUMMARY_MAX = 800
 const PENDING_MAX = 1024
+/** Same status+summary inside one session is one notice, not a second turn. */
+const DUPLICATE_NOTICE_WINDOW_MS = 2 * 60_000
 
 /** Max finalize-time 12-retry windows before a pending inject is abandoned. */
 export const CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS = 5
@@ -190,6 +192,31 @@ export function noteCcbLocalAgentFinalizeRoundExhausted(
  * model answer) and CCB will never ack it. Record pending and wait for ack
  * or parent-turn finalize.
  */
+function noticeIdentity(notification: CcbLocalAgentNotification): string {
+  return `${notification.status.trim()}\n${notification.summary.trim()}`
+}
+
+/** A second bookend with the same status and summary is the same notice. */
+export function isDuplicateRecentLocalAgentNotice(
+  sessionKey: string,
+  notification: CcbLocalAgentNotification,
+  now = Date.now(),
+): boolean {
+  const summary = notification.summary.trim()
+  if (!summary) return false
+  const identity = noticeIdentity(notification)
+  const taskId = notification.taskId.trim()
+  for (const entry of store.values()) {
+    if (entry.sessionKey !== sessionKey) continue
+    if (entry.taskId === taskId) continue
+    if (!entry.payload.summary.trim()) continue
+    if (noticeIdentity(entry.payload) !== identity) continue
+    if (now - entry.firstSeenAt > DUPLICATE_NOTICE_WINDOW_MS) continue
+    return true
+  }
+  return false
+}
+
 export function noteCcbTaskNotification(opts: {
   sessionKey: string
   notification: CcbLocalAgentNotification
@@ -198,6 +225,9 @@ export function noteCcbTaskNotification(opts: {
 }): CcbLocalAgentCallbackDecision {
   const taskId = opts.notification.taskId.trim()
   if (!taskId) return 'noop'
+  if (isDuplicateRecentLocalAgentNotice(opts.sessionKey, { ...opts.notification, taskId })) {
+    return 'noop'
+  }
   const key = ccbLocalAgentPendingKey(opts.sessionKey, taskId)
   const existing = store.get(key)
   if (existing?.state === 'delivered') return 'noop'

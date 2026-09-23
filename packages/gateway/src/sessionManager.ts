@@ -81,7 +81,7 @@ import {
   mapTurnTerminalStatus,
   type TurnTerminalStatus,
 } from './turnUsage.js'
-import { emptyCompletedTurnAssistantText } from './emptyCompletedTurn.js'
+import { emptyCompletedTurnAssistantText, shouldFailClosedEmptyModelTurn } from './emptyCompletedTurn.js'
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
@@ -7282,6 +7282,42 @@ export class SessionManager {
           (result.usage.inputTokens > 0 ||
             result.usage.cacheReadTokens > 0 ||
             result.usage.cacheCreationTokens > 0)
+        ) {
+          terminalOverride = {
+            status: 'crashed',
+            reason: '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
+            errorCode: 'NO_RESPONSE',
+            waiveReason: 'no_response',
+          }
+          retainTerminalError(
+            terminalOverride.status,
+            terminalOverride.reason,
+            terminalOverride.errorCode,
+          )
+        }
+
+        // 连一次模型调用的 token 都没有、也没有任何可见产出时，不能记成 completed
+        // 再补「本轮未能产出可见回复」。那句话会变成假正文，评价和操作栏都会贴上去。
+        const retryAssistantPreview = retryAssistantSegments
+          .map((segment) => segment.text)
+          .join('')
+        if (
+          !terminalOverride &&
+          result &&
+          shouldFailClosedEmptyModelTurn({
+            status: 'completed',
+            assistantText: `${retryAssistantPreview}${result.assistantText ?? ''}`,
+            outputTokens: result.usage.outputTokens,
+            inputTokens: result.usage.inputTokens,
+            cacheReadTokens: result.usage.cacheReadTokens,
+            cacheCreationTokens: result.usage.cacheCreationTokens,
+            toolCallCount: turnToolCallCount,
+            blockCount: turnBlockCount,
+            structuredBlockCount: structuredBlocks.length,
+            apiState: signals.apiState,
+            isSlashCommand,
+            isError: result.isError === true,
+          })
         ) {
           terminalOverride = {
             status: 'crashed',
