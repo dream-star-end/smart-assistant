@@ -53,8 +53,7 @@ type GuardRuntime = {
   enabled: boolean;
 };
 
-// One hour. The JP egress TLS handshake to ipinfo.io often exceeds the
-// 4s abort, and a 60s cache made the next call probe again.
+// One hour. The JP egress TLS handshake to ipinfo.io often takes several seconds, and a 60s cache made the next call probe again.
 const PROBE_TTL_MS = 3_600_000;
 const PINNED_USER_ID_RE = /^[0-9a-f]{64}$/;
 
@@ -118,7 +117,7 @@ function extractDeviceId(metadataUserId: unknown): string | null {
 
 async function defaultProbeExit(dispatcher: unknown): Promise<IpObservation> {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), 4_000);
+  const timer = setTimeout(() => ac.abort(), 15_000);
   try {
     const init: RequestInit & { dispatcher?: unknown } = {
       method: "GET",
