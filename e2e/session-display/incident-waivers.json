@@ -254,6 +254,138 @@
       "reason": "oc-task ticket list stdout was cut at the 64KiB pipe buffer because main() called process.exit() before the async pipe flush; adds --ndjson/--full/slim default. In-container CLI tooling only; no user-visible production incident, no turn/billing/data semantics change.",
       "approvedBy": "user 2026-09-07 授权「a,b,c都搞,派opus5去搞,交由你全权负责」(OCV5-163 审计整改;OCV5-165)",
       "expiresAt": "2026-10-07"
+    },
+    {
+      "commit": "c2d0923c3f0d875ee187a412b1ceb50f3253fb1b",
+      "reason": "0283 first apply failed because active catalog execution fields are immutable; follow-up only switches grok-build onto grok-4.7 via fn_model_switch_version before the first deploy. No production incident; migration had not been applied.",
+      "approvedBy": "user 2026-09-22 要求把 Grok 4.7 对接到当前 V5 自用环境 (OCV5-256)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "c531f8ea9a859e1993889c9f60f181562e8a3a29",
+      "reason": "First Grok 4.7 Fast turn on a fresh home applies --model before the CLI catalog fetch has credentials, so the id is unknown. Seeds the already fetched model list. No data loss or billing change.",
+      "approvedBy": "user 2026-09-22 截图追问 Fast 仍然任务执行失败",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "1a22942e5f04ce2a7e34c89f00c2736442bdbe70",
+      "reason": "Grok 4.7 Fast turns failed with CLI unknown model id because they joined the standard grok-build leader before its catalog refresh. Isolates GROK_HOME for grok-build-fast. No data loss or billing change.",
+      "approvedBy": "user 2026-09-22 追问为什么用不了 Fast 模式 (OCV5-258)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "c7c99f1ec9e3f14643efef56bbaf9e31a3ae798a",
+      "reason": "OCV5-260 error-card freeze. Display only: one committed card, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "6a42f1768c236a2959a6d1e12dce608d2560005c",
+      "reason": "OCV5-260 keep the first error card across tape ids. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "960a1fa3f214ce79d08ff5b8f783e3bda614b154",
+      "reason": "OCV5-260 do not paint while recovery is pending. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "59ed125fff3dcc0471db97633d1273a0cac433b1",
+      "reason": "OCV5-260 keep a stopped recovery from painting later. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "09a9662545a9e0bd276d3fe03cf35d1c6f14ede0",
+      "reason": "OCV5-260 keep an undecided refresh and a late error after stop from painting. Display only, no billing or stored-data migration.",
+      "approvedBy": "agent:main 2026-09-22 train gate (OCV5-260 display-only, no data migration)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "09b40bf2dcbe721ef7a2906752d206af26ef58a6",
+      "reason": "Advisor consult token wiring for Grok/Cursor. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "3ec0821e4080ea1bf55d55e9a39876bd78a44dfa",
+      "reason": "Per-launch Grok consult token file. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "811993846bad026ad8548c59fb76546e7168f8a3",
+      "reason": "Per-launch Grok MCP config. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "7789592fc54c9f0c34d075fe5aa18b4b3a1c7630",
+      "reason": "Fast Grok session symlink stays on the fast home. Not a production incident; no data loss or billing change.",
+      "approvedBy": "agent:main OCV5-266",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "c3304a9e7aee46ef552df7df24365ad87451f62c",
+      "reason": "Grok Fast routes are stored as grok-build-fast. The relay treated every other model id as expired, so Fast turns returned 404 grok route expired. Allow only grok-build and grok-build-fast and forward that route model. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-22 要求改掉 Fast 中继拒绝 (OCV5-267)",
+      "expiresAt": "2026-10-22"
+    },
+    {
+      "commit": "5bdaffa03255c2fc3d3febfaad20586b2a90e30f",
+      "reason": "Shown stage text stays mounted while a turn is running so the chat no longer snaps when the next tool arrives. Display only; no billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 要求根治已显示正文抖动 (OCV5-269)",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "6b7b778df6c9659e2683ef429de598582984e9cd",
+      "reason": "Intermediate assistant notes stay fully visible inside the process area instead of collapsing to a one-line stage. Display only; no billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 要求中间响应直接显示不折叠 (OCV5-271)",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "e2d2d23af579b676c08969304edc69ef3ec8ca21",
+      "reason": "Grok Fast transcripts live under grok-build/fast/sessions. The resume probe only scanned the standard root, so same-tier follow-ups replayed history and still --resume. The probe now sees the Fast root, restores a mis-tagged id, and a real miss clears the live head instead of saving it as implicit ccb. No billing change.",
+      "approvedBy": "user 2026-09-23 说有问题就改下 (OCV5-270)",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "cc7fc4bcd44329fdbd7ffc69196138d882a93985",
+      "reason": "Finished turns were opening a second work-process shell when a plan row arrived after the final answer. The view now keeps that plan in the shell above the answer. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 批准开工 OCV5-274",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "5b08f6d573ac968f8da506ab677cb7588f61b76b",
+      "reason": "A refresh treated an open turn as a finished tape and changed the process fold. In-flight reloads now keep the live rows and skip terminal reordering. No billing or stored-data change.",
+      "approvedBy": "user:default approved OCV5-272",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "696660100903d4311293b8425c6368dadb198c7e",
+      "reason": "A refresh kept only the open subtask card and dropped the parent turn steps. The first live-unit pack now shrinks that card before evicting parent tools, and a non-empty pack no longer deletes local steps it did not replace. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 要求根治过程区刷新 OCV5-275",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "30ec3a245946e79b75a87e9fdc1e9ca862f526dd",
+      "reason": "The older-history button no longer appears above the first message when only the current turn has unloaded live steps. Those steps load from the process shell. Display only; no billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 批准开工 OCV5-277",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "21b8c740f54f07b71bc02ce992dd00647e8db1ac",
+      "reason": "Picker tests still passed retired GPT-5.6 family literals into the GPT-6 context picker, so the selfhost web build failed tsc before cutover. Tests now use the GPT-6 Sol and Luna specs. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 批准开工 OCV5-277; build break on the same ride",
+      "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43",
+      "reason": "Cutover smoke C2 needs one collapsed Codex model. GPT-6 Luna is folded and the contract default moves off disabled GPT-5.6 Luna. Trailer was written as OCV5-276 before the format check; the shared branch cannot rewrite it. No billing or stored-data change.",
+      "approvedBy": "user 2026-09-23 选择现在就切流 OCV5-276",
+      "expiresAt": "2026-10-23"
     }
   ]
 }

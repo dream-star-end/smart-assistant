@@ -1,3 +1,5 @@
+import { setContentReviewAlerter } from '../../gateway/src/jevContentReview.js'
+import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
  *
@@ -584,6 +586,11 @@ import {
   makeMiniMaxWebSearchHandler,
   type MiniMaxWebSearchHandler,
 } from "./minimax/webSearchProxy.js";
+import {
+  GROK_WEB_SEARCH_PATH,
+  makeGrokWebSearchHandler,
+  type GrokWebSearchHandler,
+} from "./grok/webSearchProxy.js";
 import { MediaGenerationService } from "./media-generation/service.js";
 import {
   MEDIA_GENERATION_INTERNAL_PREFIX,
@@ -2347,6 +2354,10 @@ export async function registerCommercial(
         identityRepo,
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
       });
+      // MiniMax 失败时 CCB 再打这条。Grok 订阅 token 只留在 master。
+      const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
+        identityRepo,
+      });
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -2848,6 +2859,9 @@ export async function registerCommercial(
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
           return minimaxWebSearchHandler(req, res, ctx);
+        }
+        if (path === GROK_WEB_SEARCH_PATH) {
+          return grokWebSearchHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);
@@ -6880,6 +6894,8 @@ export async function registerCommercial(
     await leaderBundle.start();
     await seedPlatformAgentsForLeadership();
   }
+
+  setContentReviewAlerter((event) => { void alertContentReview(event) })
 
   return {
     handle: async (req, res) => {

@@ -114,6 +114,11 @@ export function detectServerTerminalTurns(
       else errored.add(cmid);
     } else if (
       isServerAuthoredRow(m) &&
+      // An in-flight timeline unit is not the finalized tape. Only a sealed
+      // tape (handled above) or a pre-timeline srv-* row proves the turn ended.
+      // Otherwise a refresh mid-reply treats the open turn as finished and the
+      // process fold changes. OCV5-272
+      m._timelineRecord !== true &&
       (m.role === "assistant" || m.role === "thinking" || m.role === "tool")
     ) {
       completed.add(cmid);
@@ -172,6 +177,16 @@ export type StoredSession = {
    *  `outbound.permission_request` for them must not open a new card. */
   _settledPermissionRequestIds?: Record<string, true>;
   _automaticRecoveryDecisions?: Record<string, true>;
+  /** 刷新后仍未裁决的源轮。历史失败 tape 不能把它当成终态否决。 */
+  _deferredTerminalErrorClientMessageId?: string;
+  _deferredTerminalErrorPaint?: {
+    normalized: string;
+    text: string;
+    detail?: string;
+    displayMessage?: string;
+    clientMessageId?: string;
+    traceId?: string;
+  };
   _turnStartedAt?: number;
   _lastFrameAt?: number;
   _maxSeq?: number;
@@ -1082,6 +1097,60 @@ function isCoveredStaleLocalRow(
 }
 
 
+/** 实时 m-* 行和 tape 的 srv-* 行不是同一个 id。已提交的错误卡按 clientMessageId 迁到权威行上。 */
+function transplantCommittedErrorCards(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
+  const snaps = new Map<string, NonNullable<ChatMessage["_errorCardSnapshot"]>>();
+  for (const row of local) {
+    if (
+      row?.role === "assistant" &&
+      row._errorCardSnapshot &&
+      typeof row._clientMessageId === "string" &&
+      row._clientMessageId.length > 0
+    ) {
+      snaps.set(row._clientMessageId, row._errorCardSnapshot);
+    }
+  }
+  if (snaps.size === 0) return server;
+  return server.map((row) => {
+    if (!row || row._errorCardSnapshot || row.role !== "assistant") return row;
+    if (typeof row._errorCode !== "string" || row._errorCode.length === 0) return row;
+    if (typeof row._clientMessageId !== "string") return row;
+    const snap = snaps.get(row._clientMessageId);
+    return snap ? { ...row, _errorCardSnapshot: snap } : row;
+  });
+}
+
+/** Live substitute still on screen. Exact timeline/tape rows are the other projection. */
+function isLiveOwnedProcessRow(message: ChatMessage, ownerId: string): boolean {
+  if (message._timelineRecord === true) return false;
+  if (!isTapeBackedAgentProcessRole(message.role)) return false;
+  if (turnOwnerId(message) !== ownerId) return false;
+  if (message._source === "server" && message._turnTapeComplete === true) return false;
+  return true;
+}
+
+function isExactProcessRowForOwner(message: ChatMessage, ownerId: string): boolean {
+  if (turnOwnerId(message) !== ownerId) return false;
+  if (!isTapeBackedAgentProcessRole(message.role)) return false;
+  return message._timelineRecord === true ||
+    (message._source === "server" && message._turnTapeComplete === true);
+}
+
+/**
+ * While a turn is still in flight, keep the rows the open tab already painted.
+ * Exact tape rows for that owner are a second count and must wait until the
+ * turn is no longer active. OCV5-272
+ */
+function holdLiveProcessRows(
+  server: ChatMessage[],
+  local: ChatMessage[],
+  activeClientMessageId: string | undefined,
+): ChatMessage[] {
+  if (!activeClientMessageId) return server;
+  if (!local.some((message) => isLiveOwnedProcessRow(message, activeClientMessageId))) return server;
+  return server.filter((message) => !isExactProcessRowForOwner(message, activeClientMessageId));
+}
+
 export function mergeFullServerWins(
   server: ChatMessage[],
   local: ChatMessage[],
@@ -1105,6 +1174,9 @@ export function mergeFullServerWins(
     adoptUnifiedTimeline?: boolean;
   },
 ): ChatMessage[] {
+  server = transplantCommittedErrorCards(server, local);
+  const activeOwner = opts?.activeClientMessageId;
+  server = holdLiveProcessRows(server, local, activeOwner);
   const shadowInput = [...server, ...local];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
@@ -1113,7 +1185,12 @@ export function mergeFullServerWins(
     observeTimelineShadow({ entry: "full", input: shadowInput, oldOutput: visible, oldMs });
     return visible;
   };
-  local = repairPostFinalProcessOrder(local);
+  // In-flight order is the live order. Repair would pull process cards in
+  // front of a partial assistant and the refresh would not match the open tab.
+  const settle = (rows: ChatMessage[]) => finishShadow(
+    activeOwner ? rows : coalesceProcessIdentities(repairPostFinalProcessOrder(rows)),
+  );
+  local = activeOwner ? local : repairPostFinalProcessOrder(local);
   const legacyActiveRows = new Set<ChatMessage>();
   if (opts?.adoptUnifiedTimeline === true && opts.activeClientMessageId) {
     let insideActiveTurn = false;
@@ -1266,9 +1343,7 @@ export function mergeFullServerWins(
           isUnpublishedProcessRow(m)),
     );
   if (!tail.length && !preservedMid.length) {
-    return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
-      stableSortByTs(serverChanged ? serverMerged : server),
-    )));
+    return settle(stableSortByTs(serverChanged ? serverMerged : server));
   }
   const safeByOriginal = new Map<ChatMessage, ChatMessage>();
   for (const m of [...preservedMid, ...tail]) safeByOriginal.set(m, sanitizePreservedLocalRow(m));
@@ -1279,9 +1354,7 @@ export function mergeFullServerWins(
   );
   if (!hasDurableOrderAxis) {
     // 兼容尚无 `_orderSeq` 的旧 server 快照：沿用 server→mid→tail 插入序，再按 ts 排列。
-    return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
-      stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]),
-    )));
+    return settle(stableSortByTs([...serverMerged, ...safePreservedMid, ...safeTail]));
   }
   // 中段 client-owned 行若在拼接时离开本地原槽，会错误继承 server 尾行的排序锚点。
   // 一方面按原 local 插入序重建槽位；另一方面保留一次性 anchor override，明确冻结其
@@ -1326,9 +1399,9 @@ export function mergeFullServerWins(
       if (m?.id) emittedServerIds.add(m.id);
     }
   }
-  return finishShadow(coalesceProcessIdentities(repairPostFinalProcessOrder(
-    stableSortByTs(inLocalOrder, anchorOverrides),
-  )));
+  return settle(
+    activeOwner ? inLocalOrder : stableSortByTs(inLocalOrder, anchorOverrides),
+  );
 }
 
 /**
@@ -1346,6 +1419,9 @@ export function applyServerIncremental(
     activeClientMessageId?: string;
   },
 ): ChatMessage[] {
+  incoming = transplantCommittedErrorCards(incoming, local);
+  const activeOwner = opts?.activeClientMessageId;
+  incoming = holdLiveProcessRows(incoming, local, activeOwner);
   const shadowInput = [...local, ...incoming];
   const shadowStarted = typeof performance !== "undefined" ? performance.now() : Date.now();
   const finishShadow = (result: ChatMessage[]): ChatMessage[] => {
@@ -1354,7 +1430,7 @@ export function applyServerIncremental(
     observeTimelineShadow({ entry: "incremental", input: shadowInput, oldOutput: visible, oldMs });
     return visible;
   };
-  local = repairPostFinalProcessOrder(local);
+  local = activeOwner ? local : repairPostFinalProcessOrder(local);
   if (!incoming.length) return finishShadow(local);
   if (
     completedClientMessageId &&
@@ -1395,7 +1471,7 @@ export function applyServerIncremental(
   const seen = new Set<string>();
   for (const m of local) if (m?.id) seen.add(m.id);
   for (const m of incoming) if (m?.id && !seen.has(m.id)) merged.push(m);
-  return finishShadow(repairPostFinalProcessOrder(stableSortByTs(merged)));
+  return finishShadow(activeOwner ? merged : repairPostFinalProcessOrder(stableSortByTs(merged)));
 }
 
 /**
@@ -1810,6 +1886,10 @@ function mergeLocalClientFields(
   preserveTapeProcessExpansion = true,
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  // 已提交的错误卡快照单调保留。后到的 tape / 免单 / 重分类不得改已经看见的颜色和文案。
+  if (localMsg._errorCardSnapshot && !serverMsg._errorCardSnapshot) {
+    serverMsg = { ...serverMsg, _errorCardSnapshot: localMsg._errorCardSnapshot };
+  }
   // INC-20260903-TURNEND-LAST-SEGMENT-FLASH: the Phase-A fallback is stamped
   // with visible_head.messageId = the LAST assistant segment id, so server-wins
   // by id swallows the live row that streamed that segment. Carry the segment

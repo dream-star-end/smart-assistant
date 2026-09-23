@@ -434,6 +434,11 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // lease). Source SHAs cannot be amended; only immutable ancestors of this tip
   // are exempted.
   "f4f1430885612c9d377b7495831fb08375d0c6cb",
+  // 2026-09-23 full forward sync freeze: selfhost 448c28c63 (personal live is
+  // 93696701d; this tip also contains the 0288 partial-retirement text, which
+  // selfhost does not re-apply). Source SHAs cannot be amended; only immutable
+  // ancestors of this tip are exempted.
+  "448c28c63797067f2b957e87a0c7c32aff292911",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
@@ -559,6 +564,15 @@ function checkTrailerClosure(): number {
     }
     trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
+      // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
+      // rewriting it. The waiver records the user-approved smoke-only fix.
+      const ticketWaiver = waivers.get(sha.slice(0, 8));
+      if (
+        sha === "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43"
+        && trailer === "OCV5-276"
+        && ticketWaiver
+        && ticketWaiver.expiresAt >= today
+      ) continue;
       fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
     }
     const incident = manifest.incidents.find((item) => item.id === trailer);

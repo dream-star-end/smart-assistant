@@ -109,6 +109,63 @@ if (!mediaEncoder.includes('JSON.stringify([timestamp, id])') || mediaEncoder.in
 }
 console.log('[media-cursor-rootfix] PASS — INC-20260907-MEDIA-CURSOR-PRECISION source contracts locked')
 
+// INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.
+const sandLifecycleSrc = readFileSync(join(root, 'packages/commercial/src/account-pool/cursorSandLifecycle.ts'), 'utf8')
+if (sandLifecycleSrc.includes('if (this.now() - op.startedAt > 15 * 60_000) throw new SandProvisionError("UNKNOWN_OPERATION_RESULT")')) {
+  throw new Error('[sand-uor-loop] stale in-flight still throws UNKNOWN_OPERATION_RESULT without resetting the operation')
+}
+if (!sandLifecycleSrc.includes('Stale in-flight must not loop on UNKNOWN_OPERATION_RESULT')) {
+  throw new Error('[sand-uor-loop] missing stale in-flight reset contract')
+}
+if (!/if \(op\.agentId\) \{\s*op\.nonce = nonce\(\);\s*op\.phase = "created";/.test(sandLifecycleSrc)) {
+  throw new Error('[sand-uor-loop] stale submitted must rotate nonce then retry sendPrompt on the owned agent')
+}
+console.log('[sand-uor-loop] PASS — INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.')
+
+// INC-20260921-SAND-INSTALL-RETRY: Box sendPrompt is idempotent on nonce+"-install";
+// the maintenance bot must exec the heredoc, not invent INSTALLER_B64_MISSING.
+const sandInstallerSrc = readFileSync(join(root, 'packages/commercial/src/account-pool/cursorSandInstaller.ts'), 'utf8')
+if (!sandInstallerSrc.includes('Do not spawn a subagent')) {
+  throw new Error('[sand-install-retry] installer prompt must forbid spawning a subagent')
+}
+if (!sandInstallerSrc.includes('INSTALLER_B64_MISSING')) {
+  throw new Error('[sand-install-retry] installer prompt must forbid invented INSTALLER_B64_MISSING')
+}
+if (!sandInstallerSrc.includes('execute the exact python3 heredoc below once in THIS Bot')) {
+  throw new Error('[sand-install-retry] installer prompt must require executing the heredoc in this Bot')
+}
+console.log('[sand-install-retry] PASS — INC-20260921-SAND-INSTALL-RETRY: source regression guard, not end-to-end proof.')
+
+// INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.
+const sessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+if (!sessionManagerSrc.includes('export function isNativeEngineTransientContinuationSafe(')) {
+  throw new Error('[ccb-transient-continue] missing native continuation predicate')
+}
+if (!sessionManagerSrc.includes('turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)')) {
+  throw new Error('[ccb-transient-continue] transient continuation must OR native session resume with read-only checkpoint')
+}
+if (!sessionManagerSrc.includes('TRANSIENT_RETRY_INPUT resumes')) {
+  throw new Error('[ccb-transient-continue] missing native-continuation-is-not-replay contract')
+}
+console.log('[ccb-transient-continue] PASS — INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.')
+
+// INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.
+const identityGuardSrc = readFileSync(
+  join(root, 'packages/commercial/src/http/proxy/claudeIdentityGuard.ts'),
+  'utf8',
+)
+const identityCoreSrc = readFileSync(join(root, 'packages/commercial/src/http/proxy/core.ts'), 'utf8')
+if (!identityGuardSrc.includes('export async function assertClaudeOAuthIdentity(')) {
+  throw new Error('[claude-identity-guard] missing assertClaudeOAuthIdentity')
+}
+if (!identityCoreSrc.includes('await assertClaudeOAuthIdentity({')) {
+  throw new Error('[claude-identity-guard] core.ts must call assertClaudeOAuthIdentity before fetch')
+}
+if (!identityCoreSrc.includes('EGRESS_IDENTITY_MISMATCH')) {
+  throw new Error('[claude-identity-guard] mismatch must fail-closed with EGRESS_IDENTITY_MISMATCH')
+}
+console.log('[claude-identity-guard] PASS — INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.')
+
 // INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
 // The delegateDurable unit suite separately exercises real SQLite retire/prune and
 // a real-interval cron heartbeat; this gate only stops the contracts regressing.

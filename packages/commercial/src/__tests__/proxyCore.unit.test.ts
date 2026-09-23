@@ -27,7 +27,7 @@
  * anthropicProxy.integ.test.ts;那里的 mock 更重。
  */
 
-import { afterEach, describe, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -38,6 +38,10 @@ import type { ProxyBody, UsageObservation } from "../http/proxy/shared.js";
 import type { FinalizerHandle, FinalizeOutcome } from "../billing/proxyBilling.js";
 import { rootLogger } from "../logging/logger.js";
 import { _setProviderQuotaRunnerForTest } from "../admin/providerQuotaCircuit.js";
+import {
+  resetClaudeIdentityGuardForTest,
+  setClaudeIdentityGuardRuntimeForTest,
+} from "../http/proxy/claudeIdentityGuard.js";
 
 const log = rootLogger.child({ subsys: "proxyCore.unit.test" });
 
@@ -335,7 +339,13 @@ function buildCtx(opts: BuildCtxOpts) {
   return { ctx, req, res, session, finalize };
 }
 
-afterEach(() => _setProviderQuotaRunnerForTest(undefined));
+beforeEach(() => {
+  setClaudeIdentityGuardRuntimeForTest({ enabled: false });
+});
+afterEach(() => {
+  _setProviderQuotaRunnerForTest(undefined);
+  resetClaudeIdentityGuardForTest();
+});
 
 describe("runUpstreamRoundTrip — platform model / upstream model 分离", () => {
   test("平台 kimi-k3-ark 只在发往上游的 JSON 改写为 kimi-k3", async () => {

@@ -46,6 +46,10 @@ import {
   errSummary,
 } from "./shared.js";
 import type { PreparedUpstreamSession } from "./upstream.js";
+import {
+  assertClaudeOAuthIdentity,
+  ClaudeIdentityGuardError,
+} from "./claudeIdentityGuard.js";
 import type { FinalizerHandle, FinalizeOutcome } from "../../billing/proxyBilling.js";
 import { maybeUpdateAccountQuota } from "../../account-pool/quota.js";
 import {
@@ -198,7 +202,32 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // Authorization + anthropic-beta + (OAuth)device_id pin → session.applyUpstreamAuth
     // body sanitize(OAuth strip malformed thinking;DeepSeek noop)→ session.sanitizeMessages
     // 详见 proxy/upstream.ts 中两个实现的注释。
-    session.applyUpstreamAuth(safeHeaders, body, userLog);
+    try {
+      session.applyUpstreamAuth(safeHeaders, body, userLog);
+      if (session.accountId != null) {
+        await assertClaudeOAuthIdentity({
+          accountId: session.accountId,
+          pinnedUserId: session.pinnedUserId,
+          personaTimezone: session.personaTimezone,
+          userAgent: safeHeaders["user-agent"] ?? safeHeaders["User-Agent"],
+          xApp: safeHeaders["x-app"],
+          metadataUserId: body.metadata?.user_id,
+          dispatcher: session.dispatcher,
+        });
+      }
+    } catch (err) {
+      if (err instanceof ClaudeIdentityGuardError) {
+        incrAnthropicProxyReject("bad_headers");
+        userLog.warn("proxy_egress_identity_blocked", {
+          code: err.code,
+          detail: err.cause,
+        });
+        await finalize.failClient(observed, err, "INVALID_REQUEST");
+        sendJsonError(res, 503, "EGRESS_IDENTITY_MISMATCH", err.publicMessage, requestId);
+        return;
+      }
+      throw err;
+    }
     const upstreamMessages = session.sanitizeMessages(body.messages, body.model, userLog);
     const serializeUpstreamBody = (messages: unknown[]): string => JSON.stringify({
         ...body,

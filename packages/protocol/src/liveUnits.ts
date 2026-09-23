@@ -1061,6 +1061,24 @@ function enforceBudget(pack: LiveUnit[], opts: {
       return sliced
     })
   }
+  // A still-open subtask can carry a multi-megabyte child transcript. Shrink
+  // that card to its title before evicting the parent turn's own steps. The
+  // children stay addressable through the nested cursor. Dropping parent tools
+  // first left a refresh showing only the subtask (OCV5-275).
+  if (over() && opts.keepOpenChrome) {
+    current = current.map((u) => {
+      if (!(u.open && u.kind === 'agent_group')) return u
+      const chrome = cloneUnit(u)
+      const hadChildren = (u.children?.length ?? 0) > 0
+      chrome.children = []
+      chrome.nestedHasMoreBefore = hadChildren || u.nestedHasMoreBefore === true
+      chrome.nestedBeforeCursor = hadChildren
+        ? (u.nestedBeforeCursor ?? 'c:0')
+        : (u.nestedBeforeCursor ?? null)
+      applyPreviewToUnit(chrome, opts.previewMax)
+      return chrome
+    })
+  }
   if (over()) {
     const open = current.filter((u) => u.open && u.kind === 'agent_group')
     const rest = current.filter((u) => !(u.open && u.kind === 'agent_group'))
@@ -1073,7 +1091,7 @@ function enforceBudget(pack: LiveUnit[], opts: {
       current = open.map((u) => {
         const chrome = cloneUnit(u)
         chrome.children = []
-        chrome.nestedHasMoreBefore = (u.children?.length ?? 0) > 0
+        chrome.nestedHasMoreBefore = (u.children?.length ?? 0) > 0 || u.nestedHasMoreBefore === true
         chrome.nestedBeforeCursor = u.nestedBeforeCursor ?? (chrome.nestedHasMoreBefore ? 'c:0' : null)
         applyPreviewToUnit(chrome, opts.previewMax)
         return chrome

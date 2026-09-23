@@ -47,12 +47,13 @@ export const AGENT_MODEL_AUTO = 'auto'
 
 /**
  * Codex engine 模型号 + 模型自身默认思考深度的单一权威。
- * 顺序有产品语义:第一项同时是 codex seed / 团队模式队长默认型号(仍为 Sol;
- * GPT-6-Astra 在选择器里置顶靠 model_pricing.sort_order,不靠本表顺序)。
+ * 第一项仍是历史 Sol id,避免把数组下标当默认值。队长默认是
+ * `DEFAULT_CODEX_ENGINE_MODEL`(gpt-6-astra),不靠本表顺序。
  *
- * GPT-6-Astra(2026-09-05,Codex 0.153.3 内嵌目录 slug `gpt-6-astra`,
- * minimal_client_version 0.153.0,`visibility: hide` 但 supported_in_api)。定价 = Sol
- * 标准档 ×2(迁移 0263),1M 孪生沿用 0238 的 1.5× 长上下文契约。
+ * GPT-6 Sol / Luna(2026-09-22,Codex CLI 0.155.1 `debug models` 可见,
+ * slug `gpt-6-sol` / `gpt-6-luna`,supported_in_api)。1M 孪生沿用 0238 的
+ * 1.5× 长上下文契约,cliModel 指标准 id。GPT-5.6 仍留在本表里供在途会话
+ * 解析,选择器家族已摘掉(迁移 0288 下线 catalog)。
  */
 export const CODEX_ENGINE_MODELS = [
   { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh', longContext: false },
@@ -87,6 +88,22 @@ export const CODEX_ENGINE_MODELS = [
     cliModel: 'gpt-6-astra',
     longContext: true,
   },
+  { id: 'gpt-6-sol', displayName: 'GPT-6-Sol', defaultReasoningEffort: 'medium', longContext: false },
+  {
+    id: 'gpt-6-sol-1m',
+    displayName: 'GPT-6-Sol',
+    defaultReasoningEffort: 'medium',
+    cliModel: 'gpt-6-sol',
+    longContext: true,
+  },
+  { id: 'gpt-6-luna', displayName: 'GPT-6-Luna', defaultReasoningEffort: 'medium', longContext: false },
+  {
+    id: 'gpt-6-luna-1m',
+    displayName: 'GPT-6-Luna',
+    defaultReasoningEffort: 'medium',
+    cliModel: 'gpt-6-luna',
+    longContext: true,
+  },
 ] as const satisfies readonly {
   id: string
   displayName: string
@@ -103,8 +120,9 @@ export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 
 /**
  * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
- * 收进「更多 GPT 模型」折叠组(2026-09-05 产品决定:GPT-5.6 Terra/Luna 折叠,给 GPT-6-Astra
- * 与 Sol 腾位;当前选中模型落在折叠组时该组自动展开)。不影响准入、计费与路由。
+ * 收进「更多 GPT 模型」折叠组。2026-09-23 起 GPT-5.6 退出选择器(catalog 由 0288 下线);
+ * GPT-6 Astra / Sol / Luna 都直接展示,Luna 不进「更多」。切流冒烟 C2 选可见模型,
+ * 不再依赖折叠组。当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
  */
 export const CONTEXT_TIER_FAMILIES = [
   {
@@ -115,25 +133,18 @@ export const CONTEXT_TIER_FAMILIES = [
     collapsedByDefault: false,
   },
   {
-    family: 'gpt-5.6-sol',
-    familyLabel: 'GPT-5.6-Sol',
-    standardId: 'gpt-5.6-sol',
-    longId: 'gpt-5.6-sol-1m',
+    family: 'gpt-6-sol',
+    familyLabel: 'GPT-6-Sol',
+    standardId: 'gpt-6-sol',
+    longId: 'gpt-6-sol-1m',
     collapsedByDefault: false,
   },
   {
-    family: 'gpt-5.6-terra',
-    familyLabel: 'GPT-5.6-Terra',
-    standardId: 'gpt-5.6-terra',
-    longId: 'gpt-5.6-terra-1m',
-    collapsedByDefault: true,
-  },
-  {
-    family: 'gpt-5.6-luna',
-    familyLabel: 'GPT-5.6-Luna',
-    standardId: 'gpt-5.6-luna',
-    longId: 'gpt-5.6-luna-1m',
-    collapsedByDefault: true,
+    family: 'gpt-6-luna',
+    familyLabel: 'GPT-6-Luna',
+    standardId: 'gpt-6-luna',
+    longId: 'gpt-6-luna-1m',
+    collapsedByDefault: false,
   },
   {
     family: 'kimi-k3',
@@ -184,7 +195,8 @@ export function codexTransportModelId(modelId: string | undefined): string | und
 
 /** xAI 官方 Grok CLI 的编码产品型号。 */
 export const GROK_ENGINE_MODELS = [
-  { id: 'grok-build', displayName: 'Grok Build', upstreamModel: 'grok-4.6' },
+  { id: 'grok-build', displayName: 'Grok 4.7', upstreamModel: 'grok-4.7' },
+  { id: 'grok-build-fast', displayName: 'Grok 4.7 Fast', upstreamModel: 'grok-4.7-build-fast' },
 ] as const
 
 export const GROK_ENGINE_MODEL_IDS = GROK_ENGINE_MODELS.map((m) => m.id)
@@ -261,6 +273,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  */
 export type CursorEngineFamilyId =
   | 'auto'
+  | 'grok-4.7'
   | 'grok-4.6'
   | 'composer-2.5'
   | 'opus-5'
@@ -283,6 +296,78 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Cursor Auto',
     effort: null,
     fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-low',
+    displayName: 'Grok 4.7 Low',
+    upstreamModel: 'grok-4.7-low',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'low',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-low-fast',
+    displayName: 'Grok 4.7 Low Fast',
+    upstreamModel: 'grok-4.7-low-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'low',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.7-medium',
+    displayName: 'Grok 4.7 Medium',
+    upstreamModel: 'grok-4.7-medium',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'medium',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-medium-fast',
+    displayName: 'Grok 4.7 Medium Fast',
+    upstreamModel: 'grok-4.7-medium-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'medium',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.7-high',
+    displayName: 'Grok 4.7 High',
+    upstreamModel: 'grok-4.7-high',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'high',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-high-fast',
+    displayName: 'Grok 4.7 High Fast',
+    upstreamModel: 'grok-4.7-high-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'high',
+    fast: true,
+  },
+  {
+    id: 'cursor-grok-4.7-xhigh',
+    displayName: 'Grok 4.7 Extra High',
+    upstreamModel: 'grok-4.7-xhigh',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'xhigh',
+    fast: false,
+  },
+  {
+    id: 'cursor-grok-4.7-xhigh-fast',
+    displayName: 'Grok 4.7 Extra High Fast',
+    upstreamModel: 'grok-4.7-xhigh-fast',
+    family: 'grok-4.7',
+    familyLabel: 'Grok 4.7',
+    effort: 'xhigh',
+    fast: true,
   },
   {
     id: 'cursor-grok-4.6-low',
@@ -1194,7 +1279,7 @@ export function cursorCredentialModelFamily(
   const known = cursorModelById(raw)
   const upstream = known ? known.upstreamModel ?? 'auto' : raw
   if (!upstream || upstream === 'auto') return 'cursor_models'
-  return /^(?:cursor-grok-4\.[56]|composer-2\.5)(?:-|$)/.test(upstream)
+  return /^(?:cursor-grok-4\.[56]|grok-4\.7|composer-2\.5)(?:-|$)/.test(upstream)
     ? 'cursor_models'
     : 'other_models'
 }

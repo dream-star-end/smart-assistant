@@ -311,7 +311,7 @@ describe("AssistantCard 部分回答的精简动作行(M-18)", () => {
 });
 
 describe("token 用量并入 MetaRow(M-08)", () => {
-  test("终态助手行:token 徽章带单位且与时间/积分/请求ID 同一行,不再单独悬在正文下方", () => {
+  test("终态助手行底部不显示 token，时间和积分、请求ID仍在同一行", () => {
     render(
       <AssistantCard
         msg={{
@@ -323,27 +323,28 @@ describe("token 用量并入 MetaRow(M-08)", () => {
         } as ChatMessage}
         ctx={{ isLast: true, sending: false, inActiveTurn: false }}
         cb={{}}
-        tokenUsage={{ totalTokens: 5_980 }}
+        tokenUsage={{ totalTokens: 5_980, estimated: true }}
       />,
     );
-    const badge = screen.getByLabelText("本轮 5,980 token");
-    expect(badge).toHaveTextContent("5.98k token");
-    const metaRow = badge.parentElement!;
+    const metaRow = screen.getByTestId("assistant-meta");
+    expect(metaRow).not.toHaveTextContent(/token/i);
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
     expect(metaRow.querySelector("time")).not.toBeNull();
     expect(metaRow).toContainElement(screen.getByLabelText("消耗 1280 积分"));
     expect(metaRow).toContainElement(screen.getByRole("button", { name: "复制请求ID trace-tok" }));
   });
 
-  test("流式中 MetaRow 尚未出现,token 用量仍单独实时显示", () => {
+  test("流式中不另起孤立 token 行，终态时间行也不出现", () => {
     render(
       <AssistantCard
         msg={{ id: "a-live", role: "assistant", text: "生成中的正文", ts: 1 } as ChatMessage}
         ctx={{ isLast: true, sending: true, inActiveTurn: true }}
         cb={{}}
-        tokenUsage={{ totalTokens: 256 }}
+        tokenUsage={{ totalTokens: 27_500 }}
       />,
     );
-    expect(screen.getByLabelText("本轮 256 token")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/token/i)).not.toBeInTheDocument();
     expect(document.querySelector("time")).toBeNull();
   });
 });
@@ -467,7 +468,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
       expect(screen.getByRole("button", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
       expect(screen.getByLabelText("消耗 4096 积分")).toBeInTheDocument();
-      expect(screen.getByLabelText("本轮 42 token")).toBeInTheDocument();
+      expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
     },
   );
 
@@ -659,7 +660,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("续跑被拒后错误卡改写说明并隐藏「从断点继续」", () => {
+  test("计划内重启不再出错误卡，也不提供从断点继续按钮", () => {
     const error = errMsg({
       _errorCode: "SERVICE_RESTART",
       _clientMessageId: "u1",
@@ -670,7 +671,8 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       onContinueInterrupted: vi.fn(),
       resolveInterruptedContinuation: () => retryableUser,
     });
-    expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeNull();
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 
@@ -1055,5 +1057,31 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     const row = screen.getByTestId("assistant-row");
     expect(row.querySelector("[data-testid=message-text]")).toBeNull();
     expect(pending.closest("[data-testid=assistant-row]")).toBe(row);
+  });
+});
+
+describe("普通回答不再占头像列", () => {
+  test("最终回答没有头像占位；别的 agent 只用名称", () => {
+    const { rerender } = render(
+      <AssistantCard
+        msg={{ id: "a", role: "assistant", text: "这是最终回答", ts: 1 } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    const row = screen.getByTestId("assistant-row");
+    expect(row).toHaveTextContent("这是最终回答");
+    expect(row.querySelector(".bg-grad-cta")).toBeNull();
+    expect(row.className).not.toMatch(/gap-4/);
+    expect(screen.queryByTestId("assistant-speaker")).not.toBeInTheDocument();
+    rerender(
+      <AssistantCard
+        msg={{ id: "a", role: "assistant", text: "队员回复", ts: 1, agentId: "coding-assistant" } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("coding-assistant");
+    expect(screen.getByTestId("assistant-row").querySelector(".bg-grad-cta")).toBeNull();
   });
 });

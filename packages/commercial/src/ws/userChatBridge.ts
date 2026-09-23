@@ -1,3 +1,4 @@
+import { inboundSessionKey, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -5728,6 +5729,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               teamModeRequested &&
               (frameAgentId === "main" || frameAgentId === null || teamModeNonMainAgentDemotesToMain);
             const effectiveFrameAgentId = teamModeMain ? "main" : frameAgentId;
+            try {
+              const reviewFrame = parsed as {
+                channel?: unknown
+                peer?: { kind?: unknown; id?: unknown }
+                content?: { text?: unknown }
+              }
+              const reviewSessionKey = inboundSessionKey({
+                ...reviewFrame,
+                agentId: effectiveFrameAgentId ?? "main",
+              })
+              const reviewUserId = uid.toString()
+              const reviewText = reviewFrame.content?.text
+              if (typeof reviewText === "string" && reviewText.trim()) {
+                observeUserContentReview({
+                  text: reviewText,
+                  userId: reviewUserId,
+                  sessionKey: reviewSessionKey,
+                })
+              }
+            } catch {
+              // Recording must not block delivery of this message.
+            }
             const agentImpliedModel =
               effectiveFrameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[effectiveFrameAgentId] : undefined;
             // P0 计费旁路封堵 —— master agent 权威推导:帧无 model 时容器 gateway

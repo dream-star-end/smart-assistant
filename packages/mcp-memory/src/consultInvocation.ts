@@ -36,8 +36,9 @@ export function resolveConsultInvocationId(input: {
     input.mcpMeta && typeof input.mcpMeta === 'object' && !Array.isArray(input.mcpMeta)
       ? (input.mcpMeta as Record<string, unknown>)
       : null
-  const fromMeta = typeof meta?.[CCB_TOOL_USE_META_KEY] === 'string' ? meta[CCB_TOOL_USE_META_KEY] : ''
-  if (fromMeta) {
+  for (const key of [CCB_TOOL_USE_META_KEY, 'toolUseId', 'toolCallId', 'tool_use_id']) {
+    const fromMeta = typeof meta?.[key] === 'string' ? meta[key] : ''
+    if (!fromMeta) continue
     const id = validId(fromMeta)
     if (!id) return { ok: false, error: 'mcp tool_use id invalid' }
     return { ok: true, invocationId: id, source: 'mcp-meta' }

@@ -3773,6 +3773,7 @@ export function App() {
                   </div>
                 )}
                 <MessageList
+                  processDisclosure
                   key={activeId}
                   messages={wsMessages}
                   sending={wsSending}

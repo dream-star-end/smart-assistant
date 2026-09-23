@@ -378,6 +378,19 @@ describe("detectServerTerminalTurns (persist)", () => {
     const m = detectServerTerminalTurns([srvRow({ id: "srv-a-t1-s0", text: "答复", _clientMessageId: "cm1" })]);
     expect(m.get("cm1")).toBe("completed");
   });
+  test("未封口的 timeline 记录不算整轮收尾 (OCV5-272)", () => {
+    const m = detectServerTerminalTurns([
+      srvRow({
+        id: "unit-tool",
+        role: "tool",
+        text: "正在读取文件",
+        _clientMessageId: "cm-open",
+        _timelineRecord: true,
+        toolName: "Read",
+      }),
+    ]);
+    expect(m.has("cm-open")).toBe(false);
+  });
   test("只有 plan/runtime-event 的 finalized tape 也能收敛丢失的 final WS", () => {
     const m = detectServerTerminalTurns([
       srvRow({
@@ -528,6 +541,58 @@ describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
     expect(s._sendingInFlight).toBe(false);
     const userRow = s.messages.find((m) => m.role === "user" && m.id === cmid)!;
     expect(userRow.status).toBe("replied");
+    sock.stop();
+  });
+
+  test("进行中的 timeline 记录不把直播过程收成已结束 (OCV5-272)", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "还在看文件" });
+    const s = sock.sessions.get("s1")!;
+    const cmid = s.messages.find((m) => m.role === "user")!.id;
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: "s1", kind: "dm" },
+      clientMessageId: cmid,
+    }) });
+    s.messages.push({
+      id: "live-read",
+      role: "tool",
+      text: "读取",
+      ts: Date.now(),
+      toolName: "Read",
+      _clientMessageId: cmid,
+      _completed: false,
+    });
+
+    sock.applyServerMessages(
+      "s1",
+      "main",
+      [
+        srvRow({ id: cmid, role: "user", text: "还在看文件", _seq: 1 }),
+        srvRow({
+          id: "unit-read",
+          role: "tool",
+          text: "磁带读取",
+          _seq: 2,
+          _clientMessageId: cmid,
+          _timelineRecord: true,
+          toolName: "Read",
+        }),
+      ],
+      true,
+      2,
+      { serverUpdatedAt: 100 },
+    );
+
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe(cmid);
+    expect(s.messages.some((message) => message.id === "live-read")).toBe(true);
+    expect(s.messages.some((message) => message.id === "unit-read")).toBe(false);
     sock.stop();
   });
 

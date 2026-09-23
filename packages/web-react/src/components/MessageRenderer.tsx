@@ -8,7 +8,8 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -19,9 +20,10 @@ import {
   useRef,
   useState,
 } from "react";
-import type {
-  ChatMessage,
-  LiveTurnTokenUsageSnapshot,
+import {
+  isRetryingTurnStatus,
+  type ChatMessage,
+  type LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
@@ -32,7 +34,7 @@ import {
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
-import { isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
@@ -91,7 +93,7 @@ import {
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
-import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
+import { Alert, IconButton, Input, Spinner } from "./ui";
 import { cn } from "../lib/utils";
 import {
   findMatches,
@@ -318,6 +320,10 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "goal":
+        if (isClearedGoalRecord(message)) return null;
+        if (isHistoricalGoalRecord(message)) {
+          return <HistoricalGoalDiagnostic message={message} />;
+        }
         return (
           <TapeBackedCard>
             <GoalCard msg={message} />
@@ -385,6 +391,59 @@ const RUNTIME_TEXT_STEP = 32 * 1024;
 
 function TapeBackedCard({ children }: { children: ReactNode }) {
   return <div className="space-y-1">{children}</div>;
+}
+
+function historicalGoalLine(message: ChatMessage): string {
+  const status = (message.goalStatus ?? "").trim().toLowerCase();
+  const cleared = message.cleared === true || status === "cleared";
+  const label = cleared ? "目标已清除" : status === "completed" ? "目标已完成" : "目标记录";
+  const objective = (message.text ?? "").replace(/\s+/g, " ").trim();
+  if (!objective || objective === "会话目标") return label;
+  return `${label} · ${objective}`;
+}
+
+/** Cleared/completed goals are a one-line diagnostic. The raw record is the next click. */
+function HistoricalGoalDiagnostic({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(false);
+  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
+  const line = historicalGoalLine(message);
+  const hasTape = !!message._turnTapeId;
+  const raw = message._eventHistory ?? message;
+  const serialized = open && hasTape ? JSON.stringify(raw, null, 2) ?? String(raw) : "";
+  return (
+    <div data-testid="process-goal-line" className="min-w-0">
+      {hasTape ? (
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label="查看原始目标记录"
+          className="flex min-h-10 w-full items-center gap-2 rounded-md py-1 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11"
+          onClick={() => setOpen((value) => !value)}
+        >
+          <ChevronRight size={13} aria-hidden className={open ? "shrink-0 rotate-90" : "shrink-0"} />
+          <span className="min-w-0 truncate">{line}</span>
+        </button>
+      ) : (
+        <p className="py-1 text-sm text-muted">{line}</p>
+      )}
+      {open && hasTape ? (
+        <div className="mt-1 px-1" data-testid="process-goal-record">
+          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
+            {serialized.slice(0, visibleChars)}
+          </pre>
+          {visibleChars < serialized.length ? (
+            <button
+              type="button"
+              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
+              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            >
+              继续显示原始记录
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 /** Readable cards retain their pre-direct-timeline UX, while the immutable
@@ -740,7 +799,7 @@ function rowHeightBucket(sessionId: string | undefined): Map<string, number> {
   return created;
 }
 
-type RenderItem =
+type LeafRenderItem =
   | {
       kind: "single";
       m: ChatMessage;
@@ -758,6 +817,153 @@ type RenderItem =
       idx: number;
       tokenUsage?: DisplayTokenUsage;
     };
+
+type RenderItem = LeafRenderItem | {
+  kind: "process"; key: string; members: ChatMessage[]; items: LeafRenderItem[]; active: boolean;
+};
+function itemMessages(item: LeafRenderItem): ChatMessage[] {
+  return item.kind === "single" ? [item.m] : item.members;
+}
+
+/**
+ * Visible answer ids for disclosure. While a turn is still sending, no
+ * assistant is promoted to the final answer — a later tool must not split the
+ * one process shell, and the live body stays inside that shell as Markdown.
+ * After the turn stops, the last assistant of the turn is the only top-level
+ * answer. A deferred empty locator for a finished turn stays outside too.
+ * Deliverable rows are excluded separately by isProcessMessage.
+ */
+function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
+  const ids = new Set<string>();
+  const activeStart = currentTurnStartIndex(messages);
+  const live = (index: number) => sending && index >= activeStart;
+  for (let i = 0; i < messages.length; i++) {
+    if (!finals[i] || live(i)) continue;
+    const id = messages[i]?.id;
+    if (id) ids.add(id);
+  }
+  const lastAssistant = new Map<string, number>();
+  let segment = "head";
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!message) continue;
+    if (message.role === "user") {
+      segment = message.id;
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    lastAssistant.set(message._clientMessageId || segment, i);
+  }
+  for (const index of lastAssistant.values()) {
+    if (live(index)) continue;
+    const message = messages[index];
+    if (!message?._payloadDeferred || !message.id) continue;
+    ids.add(message.id);
+  }
+  return ids;
+}
+
+function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner: string; boundary: string } {
+  const nextOwner = rows[0]?.role === "user" ? rows[0].id : owner;
+  return {
+    owner: nextOwner,
+    boundary: `${rows[0]?._clientMessageId || nextOwner}:${tapeRenderPageKey(rows[0])}`,
+  };
+}
+
+/** Contiguous, owner/page-bounded display groups; never move an actionable row. */
+function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
+  const out: RenderItem[] = [];
+  const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const activeStart = currentTurnStartIndex(messages);
+  const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
+  const assistantArtifactKeys = new Map<string, Set<string>>();
+  let scanOwner = "head";
+  for (const item of items) {
+    const rows = itemMessages(item);
+    const advanced = advanceDisclosureBoundary(rows, scanOwner);
+    scanOwner = advanced.owner;
+    for (const message of rows) {
+      if (message.role !== "assistant" || message._hideUnpublishedFallback === true) continue;
+      const keys = artifactEvidenceKeys(message.text ?? "");
+      if (keys.length === 0) continue;
+      let owned = assistantArtifactKeys.get(advanced.boundary);
+      if (!owned) {
+        owned = new Set();
+        assistantArtifactKeys.set(advanced.boundary, owned);
+      }
+      for (const key of keys) owned.add(key);
+    }
+  }
+  let owner = "head";
+  type ProcessGroup = Extract<RenderItem, { kind: "process" }>;
+  let group: ProcessGroup | undefined;
+  let boundary = "";
+  // A static plan that arrives after the final answer is still this turn's
+  // work. Keep it in the shell above the answer. Do not open a second shell
+  // underneath, and do not move a question, approval, failure, or artifact.
+  let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
+  const seal = (current: ProcessGroup | undefined, keyBoundary: string) => {
+    if (!current) return;
+    const work = current.members.find((message) =>
+      !isClearedGoalRecord(message) && (isFoldableWorkRole(message) || isHistoricalGoalRecord(message)));
+    current.key = `process:${keyBoundary}:${work?.id ?? current.members[0]?.id ?? "row"}`;
+    if (!work) {
+      const index = out.indexOf(current);
+      if (index >= 0) out.splice(index, 1, ...current.items);
+    }
+  };
+  const planOnly = (rows: ChatMessage[]) => rows.length > 0 && rows.every((message) => message.role === "plan");
+  for (const item of items) {
+    const rows = itemMessages(item);
+    // A cleared goal is not a row, a count, or a shell. Skipping it must not
+    // seal the current process or move the owner/page boundary.
+    if (rows.length > 0 && rows.every(isClearedGoalRecord)) continue;
+    const advanced = advanceDisclosureBoundary(rows, owner);
+    owner = advanced.owner;
+    const nextBoundary = advanced.boundary;
+    const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
+    const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id), ownedArtifacts));
+    if (!fold) {
+      seal(group, boundary);
+      const crossedAnswer = rows.some((message) => answerIds.has(message.id));
+      if (crossedAnswer) {
+        const kept = group ?? (carry?.boundary === nextBoundary ? carry.group : undefined);
+        carry = { boundary: nextBoundary, group: kept, answerIndex: out.length };
+      } else {
+        carry = undefined;
+      }
+      group = undefined;
+      out.push(item);
+      continue;
+    }
+    if (carry && carry.boundary === nextBoundary && !group && planOnly(rows)) {
+      if (!carry.group || out.indexOf(carry.group) < 0) {
+        const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
+        carry.group = created;
+        out.splice(carry.answerIndex, 0, created);
+        carry.answerIndex += 1;
+      }
+      carry.group.items.push(item);
+      carry.group.members.push(...rows);
+      if (rows.some((message) => activeIds.has(message.id))) carry.group.active = true;
+      continue;
+    }
+    if (carry && !planOnly(rows)) carry = undefined;
+    if (!group || boundary !== nextBoundary) {
+      seal(group, boundary);
+      group = { kind: "process", key: "", members: [], items: [], active: false };
+      boundary = nextBoundary;
+      out.push(group);
+    }
+    group.items.push(item);
+    group.members.push(...rows);
+    if (rows.some((message) => activeIds.has(message.id))) group.active = true;
+  }
+  seal(group, boundary);
+  if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+  return out;
+}
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
   if (!message) return "";
@@ -803,7 +1009,7 @@ function coalesceTeam(
   start: number,
   sending: boolean,
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot },
-): RenderItem[] {
+): LeafRenderItem[] {
   const total = messages.length;
   const slice = messages.slice(start);
   // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1;
@@ -888,7 +1094,7 @@ function coalesceTeam(
       teamCount.set(k, (teamCount.get(k) ?? 0) + 1);
     }
   }
-  const items: RenderItem[] = [];
+  const items: LeafRenderItem[] = [];
   const emittedTeam = new Set<string>();
   // 连续 thinking 行合并:被吸收进某组的 thinking 行(首条除外)记入此集,外层循环跳过它们。
   const consumedThinking = new Set<number>();
@@ -1032,6 +1238,7 @@ function defaultTailStart(length: number): number {
 
 function renderItemKey(item: RenderItem): string {
   try {
+    if (item.kind === "process") return item.key;
     if (item.kind === "single") {
       return timelineMessageKey(item.m);
     }
@@ -1105,7 +1312,18 @@ type FindPinState = {
   gen: number;
   renderIndex: number;
   renderKey: string;
+  /** Timeline key of the matched message. Equals renderKey for a single row. */
+  memberKey?: string;
 };
+
+function pinnedFindElement(scroller: HTMLElement, pin: FindPinState): HTMLElement | null {
+  if (pin.memberKey) {
+    const member = scroller.querySelector(`[data-find-member="${escapeFindSelector(pin.memberKey)}"]`);
+    if (member instanceof HTMLElement) return member;
+  }
+  const row = scroller.querySelector(`[data-chat-virtual-key="${escapeFindSelector(pin.renderKey)}"]`);
+  return row instanceof HTMLElement ? row : null;
+}
 
 function lastUserItemIndex(items: RenderItem[]): number {
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -1140,7 +1358,34 @@ export type MessageListArchive = {
   onLoadOlderLiveUnits?: () => void | Promise<void>;
 };
 
+function turnHasVisibleWork(
+  processDisclosure: boolean,
+  items: RenderItem[],
+  messages: ChatMessage[],
+  turnStart: number,
+): boolean {
+  if (processDisclosure && items.some((item) => item.kind === "process" && item.active)) return true;
+  for (let i = Math.max(0, turnStart); i < messages.length; i += 1) {
+    const message = messages[i];
+    if (message && isPlatedAssistantMessage(message)) return true;
+  }
+  return false;
+}
+
+/** Retry, stop, and engine status stay. A second 「思考中」 under live steps or body does not. */
+function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
+  if (!info) return false;
+  if (info.recoveryStatus?.kind === "stopping") return true;
+  if (isRetryingTurnStatus(info.turnStatus)) return true;
+  const status = info.turnStatus;
+  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
+    return true;
+  }
+  return !!info.leaderStep;
+}
+
 export function MessageList({
+  processDisclosure = false,
   messages,
   sending,
   liveTurnUsage,
@@ -1159,6 +1404,8 @@ export function MessageList({
   followBottomRef,
   find,
 }: {
+  /** Main chat uses result-first presentation; diagnostics may retain raw rows. */
+  processDisclosure?: boolean;
   messages: ChatMessage[];
   sending: boolean;
   /** Active browser turn's live token display; estimates are explicitly marked. */
@@ -1203,6 +1450,12 @@ export function MessageList({
   /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
   find?: { onClose: () => void };
 }) {
+  // MessageList owns expansion so virtual unmounts and live→history updates cannot reset user intent.
+  const [disclosureState, setDisclosureState] = useState<{ session?: string; values: Record<string, boolean> }>({ values: {} });
+  const disclosureValues = disclosureState.session === sessionId ? disclosureState.values : {};
+  const setDisclosure = (key: string, open: boolean) => setDisclosureState(previous => ({
+    session: sessionId, values: { ...(previous.session === sessionId ? previous.values : {}), [key]: open },
+  }));
   const pagingOwnerRef = useRef<{
     generation: string;
     controller: UserUpwardPagingController;
@@ -1288,7 +1541,7 @@ export function MessageList({
   useEffect(() => {
     const pin = findPinRef.current;
     if (!pin) return;
-    const stillHit = findMatchesList.some((match) => match.key === pin.renderKey);
+    const stillHit = findMatchesList.some((match) => match.key === (pin.memberKey ?? pin.renderKey));
     if (!stillHit) bumpFindGeneration();
   }, [findMatchesList, bumpFindGeneration]);
   useEffect(() => {
@@ -1335,8 +1588,7 @@ export function MessageList({
     const tick = () => {
       frame = 0;
       if (findGenRef.current !== gen || findPinRef.current?.gen !== gen) return;
-      const esc = escapeFindSelector(pin.renderKey);
-      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      const el = pinnedFindElement(scroller, pin);
       if (el instanceof HTMLElement) {
         const row = el.getBoundingClientRect();
         follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
@@ -1352,7 +1604,7 @@ export function MessageList({
                 if (left <= 0 || findGenRef.current !== gen) return;
                 requestAnimationFrame(() => {
                   if (findGenRef.current !== gen) return;
-                  const node = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+                  const node = pinnedFindElement(scroller, pin);
                   if (node instanceof HTMLElement) {
                     const next = node.getBoundingClientRect();
                     follow.correctTo?.(scroller, scroller.scrollTop + (next.top - findViewTop(scroller)));
@@ -1751,8 +2003,11 @@ export function MessageList({
         m.role === "assistant" &&
         !!m._errorCode &&
         typeof m._clientMessageId === "string" &&
-        recoveredSourceIds.has(m._clientMessageId)
+        recoveredSourceIds.has(m._clientMessageId) &&
+        // 已经提交的卡不许因恢复子轮再被藏掉。没提交的中间态仍隐藏。
+        m._errorCardSnapshot?.disposition !== "card"
       ) &&
+      !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
   );
@@ -1931,6 +2186,7 @@ export function MessageList({
       idx: absIdx,
     }));
   }
+  if (processDisclosure) renderItems = discloseProcess(renderItems as LeafRenderItem[], renderableMessages, ratingFinal, sending);
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -1949,9 +2205,14 @@ export function MessageList({
   visibleCountRef.current = visibleItems.length;
   visibleKeysRef.current = visibleItems.map(itemKey);
   if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
-    eagerPayloadKeysRef.current = new Set(
-      visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey),
-    );
+    const eager = new Set(visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey));
+    for (const item of visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS)) {
+      if (item.kind !== "process") continue;
+      for (const message of item.members) {
+        if (message._payloadDeferred) eager.add(message._timelineUnitKey ?? message.id);
+      }
+    }
+    eagerPayloadKeysRef.current = eager;
     eagerMediaKeysRef.current = new Set(
       visibleItems.slice(-EAGER_MEDIA_TAIL_ITEMS).map(itemKey),
     );
@@ -2051,11 +2312,77 @@ export function MessageList({
     }
     lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
   }, [paintStart, paintEnd, scrollParent, windowVersion, sessionId, visibleItems.length]);
-  const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
+  const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
+  // Live-unit backlog is earlier steps of the loaded turn, not an older
+  // conversation. Keep it on the latest process shell so it cannot sit
+  // above the opening message as "查看更早历史记录".
+  const olderLiveStepsKey = (() => {
+    if (!liveHasMore) return null;
+    let key: string | null = null;
+    for (const item of visibleItems) {
+      if (item.kind === "process") key = itemKey(item);
+    }
+    return key;
+  })();
+  const olderLiveStepsBusy = Boolean(archive?.loading) || archiveQueued;
+  const olderLiveStepsControl = liveHasMore ? (
+    <div className="flex justify-center pb-2" data-testid="older-live-steps-loader">
+      <button
+        type="button"
+        onClick={requestOlderLiveUnits}
+        disabled={olderLiveStepsBusy}
+        aria-busy={olderLiveStepsBusy}
+        className="inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+      >
+        {olderLiveStepsBusy
+          ? <><Spinner size={12} /> 加载中…</>
+          : archive?.error
+            ? <span className="text-danger">加载失败，点击重试</span>
+            : "加载更早的处理步骤"}
+      </button>
+    </div>
+  ) : null;
 
-  const renderItem = (it: RenderItem) => {
+  const renderItem = (it: RenderItem): ReactNode => {
+    if (it.kind === "process") {
+      const sections = processSections(it.items, itemMessages, renderItemKey);
+      const needle = findQuery.trim().toLowerCase();
+      const sectionHit = (section: { messages: ChatMessage[]; narrative: boolean }) =>
+        !!needle && section.messages.some((message) =>
+          (message.role === "assistant" || message.role === "user") &&
+          (message.text ?? "").toLowerCase().includes(needle)
+        );
+      const eager = eagerPayloadKeysRef.current?.has(it.key) === true
+        || it.members.some((message) => message._payloadDeferred && eagerPayloadKeysRef.current?.has(timelineMessageKey(message)));
+      const explicit = disclosureValues[it.key];
+      // Absent means the default: open while this turn is still running,
+      // closed once it has finished. A click stores true or false and is not
+      // reset when tokens arrive or the turn completes.
+      const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
+      return (
+        <>
+          {olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
+          <ProcessDisclosure
+          sections={sections}
+          active={it.active}
+          open={open}
+          setOpen={(next) => setDisclosure(it.key, next)}
+          detailOpen={(key) => {
+            if (disclosureValues[`detail:${key}`] === true) return true;
+            const section = sections.find((candidate) => candidate.key === key);
+            return !!section && sectionHit(section);
+          }}
+          setDetailOpen={(key, open) => setDisclosure(`detail:${key}`, open)}
+          renderItem={renderItem}
+          keyOf={renderItemKey}
+          messagesOf={itemMessages}
+          eagerDeferred={eager}
+        />
+        </>
+      );
+    }
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
       const placeholderSig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
@@ -2139,7 +2466,7 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const canRevealOlder = windowStart > 0 || hasOlderHistory || liveHasMore;
+  const canRevealOlder = windowStart > 0 || hasOlderHistory;
   const historyControl = showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
@@ -2147,7 +2474,7 @@ export function MessageList({
     >
       <button
         type="button"
-        onClick={windowStart > 0 ? expandLocalWindow : liveHasMore ? requestOlderLiveUnits : hasOlderHistory ? requestOlderArchive : undefined}
+        onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
         disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
         aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
@@ -2167,21 +2494,17 @@ export function MessageList({
     </div>
   ) : null;
   // footer 不再自带 px-5:它嵌在列表根(px-5)内,双份内边距会让本轮活动指示 / 软提示 / 尾部骨架比
-  // 时间线内容多缩进 20px(footer 头像与助手头像不对齐)。空列表早返回分支由外层容器补 px-5。
+  // 时间线内容多缩进 20px。空列表早返回分支由外层容器补 px-5。
+  const workVisible = turnHasVisibleWork(processDisclosure, renderItems, renderableMessages, turnStart);
+  const showTurnActivity = sending && (!workVisible || keepDistinctActivity(turnActivity));
   const footer = (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 pb-8 pt-4" data-testid="timeline-footer">
       <div data-testid="turn-activity-footer">
-        {sending && (
-          <div className="flex gap-4">
-            {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
-            <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-              <Sparkles size={16} />
-            </Avatar>
-            <div className="min-w-0 flex-1">
-              <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
-            </div>
+        {showTurnActivity ? (
+          <div className="min-w-0">
+            <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
           </div>
-        )}
+        ) : null}
       </div>
       {/* 会话级 transient 软提示（超时软提示等，非消息卡片、不落库；刷新即消失，不与真内容矛盾）。 */}
       {transientNotice && (
@@ -2237,7 +2560,8 @@ export function MessageList({
     findMatchesList.length === 0
       ? -1
       : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
-  const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const findLookup = findLookupItems(renderItems);
+  const findCurrentTarget = findCurrent >= 0 ? locateFindMatch(findLookup, findMatchesList[findCurrent]) : null;
   const jumpTo = (match: FindMatch) => {
     const follow = followBottomRef;
     const scroller = scrollParent;
@@ -2257,11 +2581,10 @@ export function MessageList({
       startOverrideRef.current = target.renderIndex;
       setWindowVersion((value) => value + 1);
     }
-    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey };
+    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey, memberKey: target.memberKey };
     findPinRef.current = pin;
     setFindPin(pin);
-    const esc = escapeFindSelector(target.renderKey);
-    const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+    const el = pinnedFindElement(scroller, pin);
     if (el instanceof HTMLElement) {
       const row = el.getBoundingClientRect();
       follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
@@ -2399,6 +2722,8 @@ export function MessageList({
       ) : null}
       {paintedItems.map((item, paintedIndex) => {
         const key = itemKey(item);
+        const findCurrentHere = findCurrentTarget?.renderKey === key;
+        const findRowHit = findLookup.some((entry) => entry.key === key && entry.memberKeys.some((member) => findHitKeys.has(member)));
         const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
         const visibleIndex = paintStart + paintedIndex;
         const liveRow =
@@ -2421,11 +2746,11 @@ export function MessageList({
                 liveRow
                   ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
                   : "chat-virtual-item chat-timeline-row",
-                find && findCurrentKey === key && "ring-1 ring-accent/60",
-                find && findCurrentKey !== key && findHitKeys.has(key) && "bg-accent-soft/30",
+                find && findCurrentHere && "ring-1 ring-accent/60",
+                find && !findCurrentHere && findRowHit && "bg-accent-soft/30",
               )}
               data-chat-virtual-key={key}
-              data-find-current={find && findCurrentKey === key ? "" : undefined}
+              data-find-current={find && findCurrentHere ? "" : undefined}
               style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}
@@ -2440,6 +2765,7 @@ export function MessageList({
           style={{ height: bottomSpacerPx }}
         />
       ) : null}
+      {olderLiveStepsKey === null ? olderLiveStepsControl : null}
       {footer}
       {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
           **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following

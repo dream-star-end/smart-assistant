@@ -166,6 +166,17 @@ while IFS=$'\x1f' read -r -d $'\x1e' sha subject body committed_at || [[ -n "${s
     continue
   fi
 
+  # fbb9020fd pushed Incident: OCV5-276. Shared branch forbids rewriting it.
+  if [[ "$sha" == "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43" && "$trailer" == "OCV5-276" ]]; then
+    w="$(waiver_for "$sha8")"
+    if [[ -z "$w" ]]; then
+      bad "$sha8 声明 OCV5-276,但 $WAIVERS 里没有对应 waiver"; violations=$((violations + 1)); continue
+    fi
+    exp="$(jq -r '.expiresAt' <<<"$w")"
+    if [[ "$exp" < "$today" ]]; then bad "$sha8 的 waiver 已于 $exp 过期"; violations=$((violations + 1)); fi
+    continue
+  fi
+
   if ! [[ "$trailer" =~ $INC_RE ]]; then
     bad "$sha8 \"$subject\" 的 Incident trailer 格式非法:$trailer(应为 INC-YYYYMMDD-SLUG,或 none (<理由>) + waiver)"
     violations=$((violations + 1)); continue

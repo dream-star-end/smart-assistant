@@ -1985,6 +1985,46 @@ describe("sync authority propagation", () => {
     expect(merged.some((m) => m.text === "流式中…")).toBe(true);
   });
 
+  test("活跃轮刷新保留直播过程，不并入精确磁带改计数 (OCV5-272)", () => {
+    const owner = "cm-open";
+    const user: ChatMessage = { id: owner, role: "user", text: "继续", ts: 1, status: "sent" };
+    const liveTool: ChatMessage = {
+      id: "live-read",
+      role: "tool",
+      text: "读取",
+      ts: 2,
+      toolName: "Read",
+      _clientMessageId: owner,
+      _completed: false,
+    };
+    const liveStage: ChatMessage = {
+      id: "live-stage",
+      role: "assistant",
+      text: "我先看一下",
+      ts: 3,
+      _clientMessageId: owner,
+    };
+    const exactTool: ChatMessage = {
+      id: "tape-read",
+      role: "tool",
+      text: "另一份读取",
+      ts: 4,
+      _source: "server",
+      _timelineRecord: true,
+      _clientMessageId: owner,
+      toolName: "Read",
+    };
+    const local = [user, liveTool, liveStage];
+    const merged = mergeFullServerWins([user, exactTool], local, 0, undefined, {
+      activeClientMessageId: owner,
+    });
+    expect(merged.map((message) => message.id)).toEqual(["cm-open", "live-read", "live-stage"]);
+    const incremental = applyServerIncremental(local, [exactTool], undefined, {
+      activeClientMessageId: owner,
+    });
+    expect(incremental.map((message) => message.id)).toEqual(["cm-open", "live-read", "live-stage"]);
+  });
+
   test("未覆盖 turn 的 live 行保留(活跃/降级保存安全):server 只回 t1,本地 t2 行原样存活;t1 前缀不误伤 t12", () => {
     const otherRows: ChatMessage[] = [
       { id: "srv-peer-main-t2", role: "assistant", text: "好,正在改…", ts: 510 },

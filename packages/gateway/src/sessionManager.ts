@@ -1243,6 +1243,26 @@ export {
  *  继续完成同一任务。导出供引擎回放测试引用同一权威串。 */
 export const TRANSIENT_RETRY_INPUT = '上一条消息因上游瞬时错误中断，请继续完成该任务。'
 
+/**
+ * CCB/Codex 轮内瞬时重试走 TRANSIENT_RETRY_INPUT,接同一 native session,
+ * 不是重放原用户口令。已完成的 Bash/MCP 因此不会再跑一遍。
+ *
+ * checkpointSafe 仍只给 Read/Glob/Grep 盖章;本谓词补上「会话还在 + 工具已
+ * 完成 + 无挂起权限」的续跑。没有 native session 时拒绝,避免变成重放。
+ */
+export function isNativeEngineTransientContinuationSafe(input: {
+  providerTag: string | undefined
+  nativeSessionId: string | null | undefined
+  ccbSessionId: string | null | undefined
+  permissionCount: number
+  tools: readonly { completed?: boolean }[]
+}): boolean {
+  if (input.providerTag !== 'ccb' && input.providerTag !== 'codex') return false
+  if (!input.nativeSessionId && !input.ccbSessionId) return false
+  if (input.permissionCount !== 0) return false
+  return input.tools.every((tool) => tool.completed !== false)
+}
+
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
 
@@ -3295,7 +3315,19 @@ export class SessionManager {
   ): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
-    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    let tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    // A false "no transcript" drop used to delete the provider and let the
+    // live-session overlay save the same id back as implicit ccb. The Fast
+    // transcript is still on disk; a positive Grok artifact puts the tag back.
+    // An unknown probe has no path and must not retag a real ccb id.
+    if (tag !== wantProvider && wantProvider === 'grok' && tag === SessionManager.CCB_PROVIDER_TAG) {
+      const recovered = probeResumeArtifact('grok', id)
+      if (recovered.exists && recovered.path) {
+        this._resumeMapProvider.set(sessionKey, 'grok')
+        tag = 'grok'
+        this._saveResumeMap()
+      }
+    }
     if (tag !== wantProvider) return undefined
 
     if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
@@ -3363,10 +3395,26 @@ export class SessionManager {
       provider: tag,
       resumeId: id,
     })
+    if (tag === 'grok') this._releaseGrokResumeHead(sessionKey)
     this._forgetResumeEntry(sessionKey)
     this._saveResumeMap()
     return undefined
   }
+
+  /** A Grok id with no on-disk transcript must not stay --resume-able.
+   *  Clearing the live head before `_saveResumeMap` also stops the overlay
+   *  from writing that dead id back. */
+  private _releaseGrokResumeHead(sessionKey: string): void {
+    const live = this.sessions.get(sessionKey)
+    if (!live || live.providerTag !== 'grok') return
+    live.ccbSessionId = null
+    live.runner.clearSessionId()
+    live._historicalContextInjected = false
+    live._historicalContextInjectedKey = undefined
+    live._forceHistoricalContextOnFirstTurn = true
+    live._contextRebuildNotice = 'native-resume-loss'
+  }
+
 
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
    *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
@@ -3573,7 +3621,12 @@ export class SessionManager {
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
         if (sess.costImprecise === true) entry.costImprecise = true
-        const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
+        // Provider map wins when set. When a drop just cleared it, fall back
+        // to the live engine so a Grok id is not rewritten as implicit ccb
+        // (historyContextVersion only) and then refused on the next lookup.
+        const prov = SessionManager.normalizeEngineTag(
+          this._resumeMapProvider.get(key) ?? sess.providerTag,
+        )
         if (prov === SessionManager.CCB_PROVIDER_TAG) {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
         }
@@ -6971,17 +7024,26 @@ export class SessionManager {
           result.thinkingSegments.length === 0 &&
           result.tools.length === 0 &&
           !contextOverflowHasUsage
+        const checkpointSafe = assessTurnRecoveryTape(
+          freezeTools(result?.tools ?? []).map((tool) => ({
+            role: 'tool',
+            ...tool,
+            // TurnToolEntry omits completed for a matched result; the
+            // durable recovery contract requires an explicit terminal bit.
+            _completed: tool.completed !== false,
+          })),
+        ).checkpointSafe
+        const nativeContinuationSafe = isNativeEngineTransientContinuationSafe({
+          providerTag: session.providerTag,
+          nativeSessionId: session.runner.nativeSessionId,
+          ccbSessionId: session.ccbSessionId,
+          permissionCount: turnPermissionCount,
+          tools: result?.tools ?? [],
+        })
+        // Native continuation is not a replay: TRANSIENT_RETRY_INPUT resumes
+        // the same engine session. Completed Bash is therefore safe here.
         const transientContinuationIsSafe =
-          turnPermissionCount === 0 &&
-          assessTurnRecoveryTape(
-            freezeTools(result?.tools ?? []).map((tool) => ({
-              role: 'tool',
-              ...tool,
-              // TurnToolEntry omits completed for a matched result; the
-              // durable recovery contract requires an explicit terminal bit.
-              _completed: tool.completed !== false,
-            })),
-          ).checkpointSafe
+          turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)
         if (
           result?.isError &&
           retryTransientErrors &&
@@ -7635,18 +7697,35 @@ export class SessionManager {
         settle(() => resolve())
       }
 
+      let runnerExitInfo: { signal: string | null; crashed?: boolean } | undefined
       const handleError = (err: Error) => {
         // All unexpected runner failures share one recovery-facing code.  The
         // immutable detail still preserves the concrete transport/process
         // error, while the Master can make one deterministic retry decision.
-        const planned = this.shouldClassifyExitAsServiceRestart(session)
-        const persistence =
-          requestTerminalPersistence?.(
+        // Wait past handleExit's 150ms drain so a planned SIGTERM is classified
+        // once. Emitting RUNNER_CRASHED first and SERVICE_RESTART second is what
+        // repainted the same turn from red to yellow. The diagnostic event is
+        // recorded immediately; only the client-visible terminal waits.
+        const plannedAtError = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+        retainTerminalError(
+          plannedAtError ? 'interrupted' : 'crashed',
+          err.message,
+          plannedAtError ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+        )
+        const persistence = (async () => {
+          await new Promise<void>((resolveWait) => {
+            const timer = setTimeout(resolveWait, 200)
+            timer.unref?.()
+          })
+          if (terminalPersistenceClaim !== 'none' || turn?.finalized) return
+          const planned = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+          await (requestTerminalPersistence?.(
             planned ? 'interrupted' : 'crashed',
             err.message,
             planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
             planned ? 'no_response' : undefined,
-          ) ?? Promise.resolve()
+          ) ?? Promise.resolve())
+        })()
         this._trackPersistence(persistence)
       }
 
@@ -7657,6 +7736,7 @@ export class SessionManager {
         signal: string | null
         crashed: boolean
       }) => {
+        runnerExitInfo = { signal: info.signal, crashed: info.crashed }
         // Normal lifecycle restarts (model/effort/toolset swaps and Codex
         // app-server route-token respawns) emit a clean `exit` before the turn
         // continues on the replacement process. Do not finalize/detach the
