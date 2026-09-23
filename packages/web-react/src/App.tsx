@@ -36,6 +36,7 @@ import {
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import { QueuedSendList } from "./components/chat/QueuedSendList";
 import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
@@ -2647,12 +2648,19 @@ export function App() {
     }
   } else {
     for (let i = wsMessages.length - 1; i >= 0; i--) {
-      if (wsMessages[i].role === "user" && wsMessages[i].text) {
-        lastUserText = wsMessages[i].text;
+      const message = wsMessages[i];
+      if (message.role === "user" && message.status !== "queued" && message.text) {
+        lastUserText = message.text;
         break;
       }
     }
   }
+  const timelineMessages = wsMessages.filter(
+    (message) => message.role !== "user" || message.status !== "queued",
+  );
+  const queuedOutgoing = wsMessages.filter(
+    (message) => message.role === "user" && message.status === "queued",
+  );
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -3814,9 +3822,9 @@ export function App() {
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
             <PinnedTaskTracker
-              todos={extractLatestTodos(wsMessages)}
+              todos={extractLatestTodos(timelineMessages)}
               active={wsSending}
-              settled={currentTurnSettled(wsMessages)}
+              settled={currentTurnSettled(timelineMessages)}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}
@@ -3907,6 +3915,13 @@ export function App() {
                 </div>
               </Alert>
             </div>
+          )}
+          {!demo && !gated && queuedOutgoing.length > 0 && (
+            <QueuedSendList
+              messages={queuedOutgoing}
+              onEdit={(message) => cardCallbacks.onEditQueued?.(message)}
+              onSendNow={(message) => cardCallbacks.onSendQueuedNow?.(message)}
+            />
           )}
           <Composer
             onSend={(text, media, replyTo) =>

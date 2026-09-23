@@ -276,7 +276,7 @@ describe("UserCard 状态标签(M-09)", () => {
     expect(screen.getByText("等一下再发")).toBeInTheDocument();
   });
 
-  test("排队中的消息在对话里，并提供修改和立即发送", () => {
+  test("直接渲染排队用户卡时仍提供修改和立即发送", () => {
     const onEditQueued = vi.fn();
     const onSendQueuedNow = vi.fn();
     render(

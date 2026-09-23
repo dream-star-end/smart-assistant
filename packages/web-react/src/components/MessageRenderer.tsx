@@ -1473,6 +1473,8 @@ export function MessageList({
   /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
   find?: { onClose: () => void };
 }) {
+  // 还没开始发送的用户消息不进对话流，改由输入框上方的待发送列表呈现。
+  messages = messages.filter((message) => message.role !== "user" || message.status !== "queued");
   // MessageList owns expansion so virtual unmounts and live→history updates cannot reset user intent.
   const [disclosureState, setDisclosureState] = useState<{ session?: string; values: Record<string, boolean> }>({ values: {} });
   const disclosureValues = disclosureState.session === sessionId ? disclosureState.values : {};
