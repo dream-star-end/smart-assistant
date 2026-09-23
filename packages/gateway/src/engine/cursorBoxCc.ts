@@ -27,6 +27,7 @@ export {
   BOX_CC_WRITE_SCRIPT,
   boxCcControlSummary,
   boxCcLaunchExec,
+  boxCcSpawnFifo,
   boxCcWriteExec,
   boxOfficialClaudeModel,
   encodeExecRequest,

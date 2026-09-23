@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto'
 import {
   boxCcControlSummary,
   boxCcLaunchExec,
+  boxCcSpawnFifo,
   boxCcWriteExec,
   cursorBoxCcEnabled,
   cursorBoxCcSelectionEligible,
@@ -162,6 +163,10 @@ test('exec frames survive a split chunk and the user line stays out of argv', ()
   const launch = boxCcLaunchExec(control, remoteClaudeArgs(['--model', 'claude-opus-4-8']))
   assert.equal(launch.environment.ANTHROPIC_API_KEY, undefined)
   assert.equal(launch.args.includes('/home/box/.local/bin/claude'), true)
+  assert.match(String(launch.args[1]), /exec 3<>"\$fifo"/)
+  assert.doesNotMatch(String(launch.args[1]), /exec "\$claude"/)
+  assert.equal(boxCcSpawnFifo(control.fifo, '0123abcd'), '/tmp/oc-box-cc-abcdef.0123abcd.fifo')
+  assert.throws(() => boxCcSpawnFifo(control.fifo, '../x'), /BOX_CC_FIFO_INVALID/)
   assert.equal(boxCcControlSummary(control).execHost, 'box.cursorvm.com')
 })
 

@@ -125,6 +125,17 @@ export function _isExpectedOfficialClaudeAbortExit(args: {
     && args.abortResultObserved
 }
 
+/** Box-resident official Claude is one-shot print mode: a finished answer
+ * exits 0. That must not feed the crash-loop gate. The session layer still
+ * sees the exit so a turn with no result can finalize. */
+export function _boxCcOneShotExitSkipsCrashLoop(args: {
+  boxResidentCc: boolean
+  code: number | null
+  signal: NodeJS.Signals | null
+}): boolean {
+  return args.boxResidentCc && args.code === 0 && args.signal == null
+}
+
 /**
  * 构造容器侧 OC_REMOTE_* env。
  *
@@ -1974,8 +1985,13 @@ export class SubprocessRunner extends EventEmitter {
         signal,
         abortResultObserved: this.officialAbortResultObserved,
       })
+      const skipCrashLoop = _boxCcOneShotExitSkipsCrashLoop({
+        boxResidentCc: this.opts.boxResidentCc === true,
+        code,
+        signal,
+      })
       const crashed = !this.shuttingDown && !expectedOfficialAbortExit
-      if (crashed) {
+      if (crashed && !skipCrashLoop) {
         this._recordCrash()
       } else {
         // Keep `shuttingDown` true until the stdout-drained `close` boundary.

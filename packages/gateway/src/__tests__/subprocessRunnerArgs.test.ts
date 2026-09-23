@@ -23,6 +23,7 @@ import {
   buildOfficialClaudeCliArgs,
   CCB_PLATFORM_DISALLOWED_TOOLS,
   OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS,
+  _boxCcOneShotExitSkipsCrashLoop,
   _isExpectedOfficialClaudeAbortExit,
   _isOfficialClaudeAbortResult,
 } from '../subprocessRunner.js'
@@ -331,6 +332,16 @@ describe('official Claude Code cooperative Stop exit', () => {
     assert.equal(_isExpectedOfficialClaudeAbortExit({
       harness: 'official-cc', code: 1, signal: null, abortResultObserved: false,
     }), false)
+  })
+})
+
+describe('box resident claude one-shot exit', () => {
+  it('does not count a clean exit 0 toward the crash loop', () => {
+    assert.equal(_boxCcOneShotExitSkipsCrashLoop({ boxResidentCc: true, code: 0, signal: null }), true)
+    assert.equal(_boxCcOneShotExitSkipsCrashLoop({ boxResidentCc: true, code: 1, signal: null }), false)
+    assert.equal(_boxCcOneShotExitSkipsCrashLoop({ boxResidentCc: true, code: 0, signal: 'SIGTERM' }), false)
+    assert.equal(_boxCcOneShotExitSkipsCrashLoop({ boxResidentCc: false, code: 0, signal: null }), false)
+    assert.equal(_boxCcOneShotExitSkipsCrashLoop({ boxResidentCc: true, code: null, signal: null }), false)
   })
 })
 

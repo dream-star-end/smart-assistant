@@ -1,11 +1,13 @@
 /** Local stdio bridge. The gateway speaks stream-json to this process.
  * This process runs official `claude` inside the selected account's Grok Bot
  * box and copies stdout back. It does not call the model itself. */
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   boxCcLaunchExec,
+  boxCcSpawnFifo,
   boxCcWriteExec,
   encodeExecRequest,
   parseExecFrames,
@@ -64,22 +66,39 @@ export async function runBoxCcBridge(opts: {
   const abort = new AbortController()
   const onAbort = (): void => abort.abort()
   opts.signal?.addEventListener('abort', onAbort)
-  const launch = boxCcLaunchExec(opts.control, remoteClaudeArgs(opts.args))
+  const control: BoxCcControl = {
+    ...opts.control,
+    fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')),
+  }
+  const launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
   let exitCode = 1
   let sawExit = false
+  const deliverLine = async (line: string): Promise<void> => {
+    let last: unknown
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (abort.signal.aborted) return
+      const writer = new AbortController()
+      const timer = setTimeout(() => writer.abort(), 20_000)
+      try {
+        const response = await postExec(control, boxCcWriteExec(control, line), fetchImpl, writer.signal)
+        await response.arrayBuffer()
+        return
+      } catch (err) {
+        last = err
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    const message = last instanceof Error ? last.message : 'BOX_CC_WRITE_FAILED'
+    opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
+    abort.abort()
+  }
   const pending = bufferLines(opts.stdin, async (line) => {
     if (abort.signal.aborted) return
-    const writer = new AbortController()
-    const timer = setTimeout(() => writer.abort(), 20_000)
-    try {
-      const response = await postExec(opts.control, boxCcWriteExec(opts.control, line), fetchImpl, writer.signal)
-      await response.arrayBuffer()
-    } finally {
-      clearTimeout(timer)
-    }
+    await deliverLine(line)
   })
   try {
-    const response = await postExec(opts.control, launch, fetchImpl, abort.signal)
+    const response = await postExec(control, launch, fetchImpl, abort.signal)
     const reader = response.body!.getReader()
     let pendingBytes = Buffer.alloc(0)
     for (;;) {

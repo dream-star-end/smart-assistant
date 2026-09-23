@@ -64,8 +64,25 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'shift 2',
   'rm -f "$fifo"',
   'mkfifo -m 600 "$fifo"',
-  'exec "$claude" "$@" < "$fifo"',
+  // Hold both ends for the life of claude. A later writer then cannot block
+  // in open(), and closing that writer does not deliver EOF mid-turn.
+  'exec 3<>"$fifo"',
+  '"$claude" "$@" <"$fifo"',
+  'status=$?',
+  'exec 3>&-',
+  'exit "$status"',
 ].join('\n')
+
+const SPAWN_FIFO_NONCE = /^[a-f0-9]{8,32}$/
+
+/** One fifo name per bridge process. A writer blocked on the previous
+ * process's fifo must not be able to miss the new inode after rm. */
+export function boxCcSpawnFifo(base: string, nonce: string): string {
+  if (!base.startsWith('/tmp/oc-box-cc-') || !base.endsWith('.fifo') || !SPAWN_FIFO_NONCE.test(nonce)) {
+    throw new Error('BOX_CC_FIFO_INVALID')
+  }
+  return `${base.slice(0, -'.fifo'.length)}.${nonce}.fifo`
+}
 
 export interface BoxCcExecRequest {
   command: string
