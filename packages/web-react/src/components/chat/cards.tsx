@@ -33,6 +33,7 @@ import type { ChatMessage } from "../../lib/chat/model";
 import {
   formatDurationSeconds,
   insufficientCreditsCopy,
+  isSilentTurnErrorCode,
   problemCardPresentation,
   speechLangFor,
 } from "../../lib/chat/pure";
@@ -52,7 +53,8 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Avatar, Badge, Button, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
+import { Alert, Badge, Button, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
+import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
@@ -228,22 +230,22 @@ function ReqIdChip({ traceId }: { traceId: string }) {
   );
 }
 
-/** 时间 · 积分 · token · 请求ID 同一行:token 用量不再孤零零悬在正文下方一个无单位的数字。 */
-function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
+/** 时间 · 积分 · 请求ID 同一行。时间用 caption:超过 30 天的绝对日期不能继承正文 16px。
+ *  token 计数留在消息上给定价和上下文，最终回答底部不再打印。 */
+function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
   const traceId = msg.usage?.traceId;
   const credits = msg.usage?.costCredits;
   const waived = msg.usage?.waived === true;
   // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
   const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
   const showTime = Boolean(msg.ts);
-  const showTokens = Boolean(tokenUsage && tokenUsage.totalTokens > 0);
-  if (!traceId && !showCredits && !waived && !showTime && !showTokens) return null;
+  if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-faint">
+    <div data-testid="assistant-meta" className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-faint">
       {showTime && (
-        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap">
+        <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap text-caption">
           <TooltipProvider>
-            <TimeAgo value={msg.ts} format="relative" tooltip className="text-faint" />
+            <TimeAgo value={msg.ts} format="relative" tooltip className="text-caption text-faint" />
           </TooltipProvider>
         </time>
       )}
@@ -257,7 +259,6 @@ function MetaRow({ msg, tokenUsage }: { msg: ChatMessage; tokenUsage?: DisplayTo
           <Wallet size={11} /> {groupDigits(credits!)} 积分
         </Badge>
       )}
-      {showTokens && <TokenUsageBadge usage={tokenUsage} />}
       {traceId && <ReqIdChip traceId={traceId} />}
     </div>
   );
@@ -597,7 +598,7 @@ const LIVE_MARKDOWN_TAIL = 64 * 1024;
 
 /** caret=流式光标内联在**正文最后一个文本块末尾**(Markdown 的 rehype 注入),不再作为块级容器之后
  *  的兄弟节点单独占一行。分段(hasLiveGap)时只有尾段带光标。 */
-function ProgressiveMarkdown({
+export function ProgressiveMarkdown({
   text,
   live = false,
   caret = false,
@@ -653,6 +654,7 @@ export function AssistantCard({
 }) {
   const live = isLive(msg, ctx);
   if (msg._hideUnpublishedFallback === true) return null;
+  if (msg._errorHeldForRecovery === true && msg._errorCardSnapshot?.disposition !== "card") return null;
   const hasError = !!msg._errorCode;
   const presentedError = hasError
     ? errorPresentation(msg._errorCode, msg.text, msg._errorDetail, msg.usage?.waived === true)
@@ -663,10 +665,17 @@ export function AssistantCard({
   const normalizedCode = normalizeTurnErrorCode(msg._errorCode);
   const sem = turnErrorSemantics(normalizedCode);
   const expectedError = sem.expected === true;
-  const errorTone = problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
-    ? "warning"
-    : "danger";
+  const frozenCard = msg._errorCardSnapshot?.disposition === "card" ? msg._errorCardSnapshot : undefined;
+  const errorTone = frozenCard
+    ? (frozenCard.tone === "yellow" ? "warning" : "danger")
+    : (problemCardPresentation(normalizedCode, presentedError?.waived === true) === "yellow"
+      ? "warning"
+      : "danger");
   const isUserCancelled = normalizedCode === "stopped" || normalizedCode === "user_cancelled";
+  const suppressErrorAlert =
+    !isUserCancelled &&
+    (msg._errorCardSnapshot?.disposition === "silent" ||
+      (!frozenCard && isSilentTurnErrorCode(normalizedCode)));
   const hasDisplayableBody = Boolean(
     (msg.text && !hasError) || (hasError && presentedError?.bodyText),
   );
@@ -675,6 +684,9 @@ export function AssistantCard({
   const showUnpublishedProcessPending =
     msg._displayDegradeReason === "records_unpublished" && !hasDisplayableBody && !live;
   const isInsufficient = normalizedCode === "insufficient_credits";
+  const shownTitle = frozenCard?.title ?? presentedError?.title;
+  const shownMessage = frozenCard?.message ?? presentedError?.message;
+  const shownDetail = frozenCard ? frozenCard.detail : presentedError?.detail;
   const creditsCopy = insufficientCreditsCopy(
     cb.subscriptionPaid ?? lastKnownSubscriptionPaid() ?? false,
   );
@@ -751,14 +763,15 @@ export function AssistantCard({
   const showRegenerate = isLastTurn && (ctx.turnFinalAssistant ?? ctx.isLast);
   // MetaRow(时间 · 积分 · token · 请求ID)只在终态帧到达后出现(见 RenderCtx.inActiveTurn 注释)。
   const metaVisible = !live && !(ctx.sending && ctx.inActiveTurn);
+  const speakerId = (msg.agentId || msg._delegateAgentId || "").trim();
+  const speaker = speakerId && speakerId !== "main" ? agentDisplayName(speakerId) : "";
 
   return (
-    <div className="group flex gap-4 animate-in" data-testid="assistant-row">
-      {/* 移动端隐藏助手头像:窄屏下头像+间距挤占正文宽度(boss 反馈),≥sm 才显示。 */}
-      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-        <Sparkles size={16} />
-      </Avatar>
-      <div className="min-w-0 flex-1">
+    <div className="group min-w-0 animate-in" data-testid="assistant-row">
+      <div className="min-w-0">
+        {speaker ? (
+          <p className="mb-1 text-xs text-muted" data-testid="assistant-speaker">{speaker}</p>
+        ) : null}
         {msg.cronPush && (
           <div className="mb-1.5">
             <Badge tone="accent">
@@ -828,26 +841,28 @@ export function AssistantCard({
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
           </output>
-        ) : presentedError && (
+        ) : !suppressErrorAlert && presentedError && (
           <Alert
             tone={errorTone}
-            density={expectedError && !presentedError.waived ? "compact" : "comfortable"}
+            density={expectedError && !presentedError.waived && !frozenCard ? "compact" : "comfortable"}
             className="mt-2.5 max-w-full overflow-hidden"
-            icon={presentedError.waived ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
-            title={isInsufficient ? creditsCopy.title : presentedError.title}
+            icon={presentedError.waived && !frozenCard ? <ShieldCheck size={17} /> : <AlertTriangle size={17} />}
+            title={isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
           >
             <div className="min-w-0">
               <p className="text-[13px] leading-5 text-fg/90 [overflow-wrap:anywhere]">
-                {msg._recoverySkippedNotice ??
-                  (isInsufficient ? creditsCopy.message : presentedError.message)}
+                {frozenCard
+                  ? frozenCard.message
+                  : (msg._recoverySkippedNotice ??
+                    (isInsufficient ? creditsCopy.message : shownMessage))}
               </p>
-              {presentedError.detail && (
+              {shownDetail && (
                 <details className="mt-1.5 max-w-full">
                   <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg [@media(hover:none)]:py-3.5">
                     查看请求信息
                   </summary>
                   <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
-                    {presentedError.detail}
+                    {shownDetail}
                   </pre>
                 </details>
               )}
@@ -933,14 +948,7 @@ export function AssistantCard({
           </output>
         )}
 
-        {/* MetaRow 尚未出现(流式中 / 团队编排未终态)时 token 用量单独一行实时跳动;终态后并入
-            MetaRow 与时间·积分·请求ID 同一行,不再孤零零悬着一个无单位的数字。 */}
-        {!metaVisible && tokenUsage && tokenUsage.totalTokens > 0 && (
-          <div className="mt-2">
-            <TokenUsageBadge usage={tokenUsage} />
-          </div>
-        )}
-        {/* 动作条 + meta（流式中不显示动作条，避免抖动） */}
+        {/* 动作条 + meta（流式中不显示动作条，避免抖动）。流式阶段不单挂 token。 */}
         {!live && !hasError && msg.text && (
           <MessageActions
             msg={msg}

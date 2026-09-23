@@ -18,6 +18,17 @@ describe('resolveConsultInvocationId', () => {
     assert.equal(got.source, 'mcp-meta')
   })
 
+  it('accepts a non-CCB tool call id in MCP meta and still ignores the JSON-RPC id', () => {
+    const got = resolveConsultInvocationId({
+      mcpMeta: { toolCallId: 'call_grok_consult_1' },
+      jsonRpcId: 44,
+    })
+    assert.equal(got.ok, true)
+    if (!got.ok) return
+    assert.equal(got.invocationId, 'call_grok_consult_1')
+    assert.equal(got.source, 'mcp-meta')
+  })
+
   it('does not treat JSON-RPC id as a retry identity when _meta is missing', () => {
     const got = resolveConsultInvocationId({ jsonRpcId: 'rpc-99' })
     assert.equal(got.ok, false)

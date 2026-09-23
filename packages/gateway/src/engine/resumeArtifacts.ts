@@ -148,23 +148,37 @@ export function codexRolloutArtifact(
   return null
 }
 
-/** `<OPENCLAUDE_HOME>/grok-build/sessions/<urlencoded-cwd>/<sessionId>/` non-empty. */
+/** Non-empty `<cwd-key>/<sessionId>/` under either Grok home.
+ *
+ * Standard transcripts live in `grok-build/sessions`. Fast (`grok-build-fast`)
+ * uses a separate GROK_HOME and writes the same layout under
+ * `grok-build/fast/sessions`. Scanning only the standard root makes every
+ * Fast follow-up look like a missing transcript. */
 export function grokSessionArtifact(
   sessionId: string,
   openclaudeHome: string,
 ): ResumeArtifactProbe | 'unknown' | null {
   if (!UUID_RE.test(sessionId)) return 'unknown'
-  const root = join(openclaudeHome, 'grok-build', 'sessions')
-  if (!existsSync(root)) return 'unknown'
-  try {
-    for (const group of readdirSync(root, { withFileTypes: true })) {
-      if (!group.isDirectory()) continue
-      const hit = dirWithContent(join(root, group.name, sessionId))
-      if (hit) return hit
+  const roots = [
+    join(openclaudeHome, 'grok-build', 'sessions'),
+    join(openclaudeHome, 'grok-build', 'fast', 'sessions'),
+  ]
+  const present = roots.filter((root) => existsSync(root))
+  if (present.length === 0) return 'unknown'
+  let sawUnreadable = false
+  for (const root of present) {
+    try {
+      for (const group of readdirSync(root, { withFileTypes: true })) {
+        if (!group.isDirectory()) continue
+        const hit = dirWithContent(join(root, group.name, sessionId))
+        if (hit) return hit
+      }
+    } catch {
+      sawUnreadable = true
     }
-  } catch {
-    return 'unknown'
   }
+  // A root we could not list is not evidence the transcript is gone.
+  if (sawUnreadable) return 'unknown'
   return null
 }
 

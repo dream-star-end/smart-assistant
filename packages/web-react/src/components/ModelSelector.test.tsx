@@ -249,6 +249,43 @@ describe('ModelSelector Cursor 家族 + 思考档 + Fast', () => {
   })
 })
 
+describe('ModelSelector 官方 Grok 4.7 Fast 是速度开关', () => {
+  const GROK_MODELS: PublicModel[] = [
+    { id: 'grok-build', display_name: 'Grok 4.7', cost_x: 3.4 },
+    { id: 'grok-build-fast', display_name: 'Grok 4.7 Fast', cost_x: 6.8 },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('触发器保持 Grok 4.7，Fast 只出现在档位里', () => {
+    render(
+      <ModelSelector
+        models={GROK_MODELS}
+        selectedId="grok-build-fast"
+        onSelect={() => {}}
+        effortSupported={['high']}
+        effortActive="high"
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger.textContent).toContain('Grok 4.7')
+    expect(trigger.textContent).not.toContain('Grok 4.7 Fast')
+    expect(screen.getByTestId('model-trigger-tier').textContent).toContain('Fast')
+  })
+
+  it('菜单只有一行 Grok 4.7，Fast 开关改写 catalog id', async () => {
+    const onSelect = vi.fn()
+    render(<ModelSelector models={GROK_MODELS} selectedId="grok-build" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-grok-family="grok-build"]')).toBeTruthy()
+    expect(screen.queryByText('Grok 4.7 Fast')).toBeNull()
+    const fast = document.querySelector('[data-fast="true"]')
+    expect(fast).toBeTruthy()
+    if (fast) fireEvent.click(fast)
+    expect(onSelect).toHaveBeenCalledWith('grok-build-fast')
+  })
+})
+
 // C-08:当前模型被后端标 degraded 时 trigger 无任何标识,只有点开菜单才看到。
 describe('ModelSelector 降级模型 trigger 标识', () => {
   const DEG_MODELS: PublicModel[] = [
@@ -636,37 +673,21 @@ describe('ModelSelector 「更多 GPT 模型」折叠组(2026-09-05 Terra/Luna)'
   })
 })
 
-const SEARCH_MODELS: PublicModel[] = Array.from({ length: 8 }, (_, i) => ({
-  id: `plain-search-${i}`,
+const MANY_MODELS: PublicModel[] = Array.from({ length: 9 }, (_, i) => ({
+  id: `plain-many-${i}`,
   display_name: i === 3 ? 'Zebra Unique' : `Alpha ${i}`,
 }))
 
-describe('ModelSelector 搜索', () => {
-  it('≥8 模型时渲染搜索框，输入后只剩匹配项', async () => {
-    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
+describe('ModelSelector 无搜索框', () => {
+  it('模型再多也不渲染搜索框，列表仍可见', async () => {
+    render(<ModelSelector models={MANY_MODELS} selectedId="plain-many-0" onSelect={() => {}} />)
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    const input = await screen.findByLabelText('搜索模型')
-    fireEvent.change(input, { target: { value: 'Zebra' } })
-    const items = screen.getAllByRole('menuitem')
-    expect(items).toHaveLength(1)
-    expect(items[0]).toHaveTextContent('Zebra Unique')
-    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(false)
-  })
-
-  it('无匹配时显示「无匹配模型」', async () => {
-    render(<ModelSelector models={SEARCH_MODELS} selectedId="plain-search-0" onSelect={() => {}} />)
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    const input = await screen.findByLabelText('搜索模型')
-    fireEvent.change(input, { target: { value: 'no-such-model-zzz' } })
-    expect(screen.getByText('无匹配模型')).toBeInTheDocument()
-    expect(screen.queryAllByRole('menuitem')).toHaveLength(0)
-  })
-
-  it('<8 模型不渲染搜索框', async () => {
-    render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    await screen.findAllByRole('menuitem')
+    const items = await screen.findAllByRole('menuitem')
     expect(screen.queryByLabelText('搜索模型')).toBeNull()
+    expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
+    expect(screen.queryByText('无匹配模型')).toBeNull()
+    expect(items.some((i) => i.textContent?.includes('Zebra Unique'))).toBe(true)
+    expect(items.some((i) => i.textContent?.includes('Alpha 0'))).toBe(true)
   })
 })
 
@@ -704,21 +725,8 @@ describe('ModelSelector 切换中态', () => {
   })
 })
 
-// C-29:菜单打开后焦点落在首项,搜索框(≥8 模型才出现)不自动聚焦,键盘用户要多按一次。
-describe('ModelSelector 搜索框自动聚焦', () => {
-  const MANY: PublicModel[] = Array.from({ length: 9 }, (_, i) => ({
-    id: `model-${i}`,
-    display_name: `Model ${i}`,
-  }))
-
-  it('≥8 模型时打开菜单焦点直接落在搜索框', async () => {
-    render(<ModelSelector models={MANY} selectedId="model-0" onSelect={() => {}} />)
-    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
-    const search = await screen.findByRole('textbox', { name: '搜索模型' })
-    await waitFor(() => expect(document.activeElement).toBe(search))
-  })
-
-  it('<8 模型无搜索框,焦点仍按 Radix 默认落在菜单内', async () => {
+describe('ModelSelector 打开后焦点', () => {
+  it('无搜索框时焦点仍按 Radix 默认落在菜单内', async () => {
     render(<ModelSelector models={MODELS} selectedId="glm-5.2" onSelect={() => {}} />)
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
@@ -776,5 +784,94 @@ describe('ModelSelector 最近使用', () => {
       ?.querySelector('[data-model-id="deepseek-v4"]')
     expect(recentItem).toBeTruthy()
     expect(recentItem?.textContent).toContain('DeepSeek-V4')
+  })
+})
+
+function stubNarrowViewport(narrow: boolean) {
+  const original = window.matchMedia
+  window.matchMedia = ((query: string) =>
+    ({
+      matches: query === '(max-width: 639px)' ? narrow : false,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    }) as MediaQueryList) as typeof window.matchMedia
+  return () => {
+    window.matchMedia = original
+  }
+}
+
+describe('ModelSelector 窄屏贴底 sheet', () => {
+  const CURSOR_MODELS: PublicModel[] = [
+    { id: 'cursor-grok-4.6-high', display_name: 'Grok 4.6 High' },
+    { id: 'cursor-grok-4.6-low', display_name: 'Grok 4.6 Low' },
+    { id: 'cursor-grok-4.6-medium', display_name: 'Grok 4.6 Medium' },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('宽屏仍走下拉菜单,不渲染 dialog sheet', async () => {
+    const restore = stubNarrowViewport(false)
+    try {
+      render(
+        <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high" onSelect={() => {}} />,
+      )
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findAllByRole('menuitem')
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(screen.queryByTestId('model-picker-sheet')).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('窄屏打开为贴底 sheet:遮罩 dialog + 单一滚动容器容纳模型与思考档', async () => {
+    const restore = stubNarrowViewport(true)
+    try {
+      render(
+        <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high" onSelect={() => {}} />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      const dialog = await screen.findByRole('dialog')
+      expect(dialog.className).toContain('model-picker-sheet')
+      expect(dialog.className).toContain('overflow-hidden')
+      expect(screen.getByTestId('model-picker-sheet')).toBeInTheDocument()
+      const scroll = screen.getByTestId('model-picker-sheet-scroll')
+      expect(scroll).toHaveAttribute('role', 'menu')
+      expect(scroll.className).toContain('overflow-y-auto')
+      expect(scroll.className).toContain('overscroll-contain')
+      expect(scroll.querySelector('.overflow-y-auto')).toBeNull()
+      expect(screen.getAllByText('选择对话模型').length).toBeGreaterThan(0)
+      expect(screen.getByTestId('model-picker-sheet').textContent).toMatch(/选择对话模型/)
+      expect(screen.getAllByText(/Grok 4\.6/).length).toBeGreaterThan(0)
+      expect(screen.getByText('思考档位')).toBeInTheDocument()
+      const summary = screen.getByText('思考档位').parentElement
+      expect(summary?.textContent).toMatch(/高/)
+      expect(screen.getByRole('menuitem', { name: '高' })).toBeInTheDocument()
+      expect(screen.queryByRole('textbox', { name: '搜索模型' })).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('窄屏点选模型后关闭 sheet', async () => {
+    const restore = stubNarrowViewport(true)
+    try {
+      const onSelect = vi.fn()
+      render(
+        <ModelSelector models={CURSOR_MODELS} selectedId="cursor-grok-4.6-high" onSelect={onSelect} />,
+      )
+      fireEvent.click(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findByRole('dialog')
+      fireEvent.click(screen.getByRole('menuitem', { name: /GLM-5\.2/ }))
+      expect(onSelect).toHaveBeenCalledWith('glm-5.2')
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    } finally {
+      restore()
+    }
   })
 })

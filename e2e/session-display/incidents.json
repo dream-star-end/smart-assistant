@@ -4515,6 +4515,165 @@
           "assertion": "SERVICE_RESTART leftover with live progress refuses automatic recovery"
         }
       ]
+    },
+    {
+      "id": "INC-20260921-SAND-UOR-LOOP",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "唯一 active Cursor Sand 账号 20 的 Box install 卡在 submitted 后，UNKNOWN_OPERATION_RESULT 死循环，空池导致整条 Cursor 引擎 DISPATCH_NOT_ACCEPTED。",
+      "rootFixCommit": "9bfa706c7",
+      "coverageCommits": [
+        "9bfa706c7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-SAND-INSTALL-RETRY",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "Cursor Sand Box sendPrompt 对 clientNonce=nonce-install 幂等，同 nonce 重试 accepted 但不执行；维护 bot 自造 INSTALLER_B64_MISSING 而不跑官方 python heredoc，空池无法恢复。",
+      "rootFixCommit": "66dc86caa",
+      "coverageCommits": [
+        "66dc86caa"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandActor.test.ts",
+          "assertion": "installer prompt contains exact reviewed source and module bytes, not credentials"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-CCB-TRANSIENT-CONTINUE",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "官方 CC 终端工具已完成后，瞬时 Anthropic 5xx 被 checkpointSafe 拦住不自动续跑，直接红卡收轮。",
+      "rootFixCommit": "6781147ea",
+      "coverageCommits": [
+        "6781147ea",
+        "d3cb01ae9"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "API Error 500 after completed Bash retries TRANSIENT_RETRY_INPUT"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "capacity failure after a completed tool with unknown external outcome never auto-continues"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-OFFICIAL-CC-UA-PIN",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "官方 CC 开着时 OAuth 池 persona UA 仍发 CCB fork claude-cli/2.8.4，活体容器是官方 Claude Code 2.1.278；出口日本但 persona 随机美东。",
+      "rootFixCommit": "231f30c1f",
+      "coverageCommits": [
+        "231f30c1f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/persona.unit.test.ts",
+          "assertion": "OC_CCB_OFFICIAL_CC=1 → UA 钉官方 Claude Code 版本"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/persona.unit.test.ts",
+          "assertion": "OFFICIAL_CC_CLI_VERSION 与 runtime-build.env 钉一致"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-CLAUDE-IDENTITY-GUARD",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "Claude OAuth 出站不核对出口 IP/时区/设备一致性，persona 与日本出口错配或 device_id 未钉仍打到 Anthropic。",
+      "rootFixCommit": "0c37e008f",
+      "coverageCommits": [
+        "0c37e008f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/claudeIdentityGuard.unit.test.ts",
+          "assertion": "persona 时区与出口时区不一致 → tz_mismatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/claudeIdentityGuard.unit.test.ts",
+          "assertion": "出口 IP 相对 env 钉漂移 → ip_drift"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyUpstream.unit.test.ts",
+          "assertion": "pinned schema breach → fail-closed,不重写 device_id"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-CLAUDE-EGRESS-PRECHECK-ACTIVE",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "管理台新建 Claude 账号绑同一 egress 失败：预检把 disabled Claude 也算占用，与只约束 active 的唯一索引不一致。",
+      "rootFixCommit": "b0c1c07a",
+      "coverageCommits": [
+        "b0c1c07a",
+        "1d7f79c7a"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/adminAccounts.egressPrecheck.unit.test.ts",
+          "assertion": "只统计 active Claude，与 idx_claude_accounts_egress_proxy_uniq 一致"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败"
+        }
+      ]
     }
   ]
 }

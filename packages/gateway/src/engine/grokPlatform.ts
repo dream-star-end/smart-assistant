@@ -4,11 +4,12 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
  * Grok CLI. Grok does not inherit CCB/Cursor wiring; this module is the
  * explicit projection (see v5-official-cli-subscription-integration).
  */
+import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { paths } from '@openclaude/storage'
-import { issueDelegateContextToken } from '../delegateContext.js'
+import { issueParentCallerToken } from '../delegateContext.js'
 import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
 
 export const GROK_MEMORY_MCP_TOOLS = [
@@ -89,6 +90,8 @@ exclude = ["XAI_*", "GROK_*"]
 
 export interface GrokPlatformProjection {
   grokHome: string
+  /** Per-launch home. config.toml here is not shared with other Grok turns. */
+  launchHome: string
   advertisedMcpTools: string[]
   delegateContextFile: string | null
 }
@@ -101,6 +104,7 @@ export interface GrokPlatformInput {
   gatewayPort: number
   gatewayToken: string
   delegationDepth: number
+  consultTurn?: { turnKey: string; turnIndex: number; configVersion: string } | null
   claudeCodePath?: string
   skillEvalMode?: boolean
   skillEvalExclude?: string
@@ -129,18 +133,23 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
   const advertisedMcpTools: string[] = []
   let delegateContextFile: string | null = null
   let mcpToml = ''
+  // config.toml and the token live here, not in the shared GROK_HOME. A later
+  // turn must not retarget an earlier process that has not spawned yet.
+  const callerDir = join(grokHome, 'caller', randomBytes(8).toString('hex'))
+  mkdirSync(callerDir, { recursive: true, mode: 0o700 })
 
   const mcpLaunch = resolveMcpMemoryLaunch(input.claudeCodePath, { fallback: 'node-tsx' })
   if (mcpLaunch && input.gatewayToken) {
-    const tokenFile = join(grokHome, 'gateway-token')
-    delegateContextFile = join(grokHome, 'delegate-context')
+    const tokenFile = join(callerDir, 'gateway-token')
+    delegateContextFile = join(callerDir, 'delegate-context')
     writePrivate(tokenFile, input.gatewayToken)
     writePrivate(
       delegateContextFile,
-      `${issueDelegateContextToken({
+      `${issueParentCallerToken({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
         depth: input.delegationDepth,
+        consultTurn: input.consultTurn,
       })}\n`,
     )
     const env: Record<string, string> = {
@@ -185,8 +194,8 @@ ${envLines}
     advertisedMcpTools.push(...GROK_MEMORY_MCP_TOOLS)
   }
 
-  writePrivate(join(grokHome, 'config.toml'), `${MANAGED_GROK_HEAD}${mcpToml}`)
-  return { grokHome, advertisedMcpTools, delegateContextFile }
+  writePrivate(join(callerDir, 'config.toml'), `${MANAGED_GROK_HEAD}${mcpToml}`)
+  return { grokHome, launchHome: callerDir, advertisedMcpTools, delegateContextFile }
 }
 
 export const _grokPlatformInternals = {

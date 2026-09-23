@@ -16,7 +16,12 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { SessionManager, TRANSIENT_RETRY_INPUT, type AgentSession } from "../sessionManager.js";
+import {
+  SessionManager,
+  TRANSIENT_RETRY_INPUT,
+  isNativeEngineTransientContinuationSafe,
+  type AgentSession,
+} from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
@@ -281,7 +286,7 @@ test("an aborted logical-turn signal fences both pre-submit and retry backoff wi
   try {
     (sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => {
       attempts += 1;
-      throw new Error("Selected model is at capacity. Please try a different model.");
+      throw new Error("model is overloaded");
     };
     (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 30_000;
 
@@ -807,6 +812,42 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("native continuation allows completed tools only when the engine session still exists", () => {
+    const base = {
+      providerTag: "ccb" as const,
+      nativeSessionId: null as string | null,
+      ccbSessionId: "ccb-sess-1" as string | null,
+      permissionCount: 0,
+      tools: [{ completed: true }],
+    };
+    assert.equal(isNativeEngineTransientContinuationSafe(base), true);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      ccbSessionId: null,
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      ccbSessionId: null,
+      nativeSessionId: "native-1",
+    }), true);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      tools: [{ completed: false }],
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      permissionCount: 1,
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      providerTag: "cursor",
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      tools: [],
+    }), true);
+  });
+
   test("capacity failure after an unresolved tool boundary never auto-continues", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
@@ -854,7 +895,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("capacity failure after a completed tool with unknown external outcome never auto-continues", async () => {
+  test("capacity failure after a completed Bash continues the same native session", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -866,29 +907,34 @@ describe("crash/interrupt partial persistence", () => {
       const runner = new FakeCcbRunner((r) => {
         submits++;
         setImmediate(() => {
-          r.msg({
-            type: "assistant",
-            message: {
-              content: [{ type: "tool_use", id: "tool-unknown", name: "Bash", input: { k: 1 } }],
-            },
-          });
-          r.msg({
-            type: "user",
-            message: {
-              content: [{
-                type: "tool_result",
-                tool_use_id: "tool-unknown",
-                content: JSON.stringify({ outcome: "unknown" }),
-                is_error: false,
-              }],
-            },
-          });
-          r.result({
-            is_error: true,
-            subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please try a different model.",
-            errorClass: "model_capacity",
-          });
+          if (submits === 1) {
+            r.msg({
+              type: "assistant",
+              message: {
+                content: [{ type: "tool_use", id: "tool-unknown", name: "Bash", input: { k: 1 } }],
+              },
+            });
+            r.msg({
+              type: "user",
+              message: {
+                content: [{
+                  type: "tool_result",
+                  tool_use_id: "tool-unknown",
+                  content: JSON.stringify({ outcome: "unknown" }),
+                  is_error: false,
+                }],
+              },
+            });
+            r.result({
+              is_error: true,
+              subtype: "error_during_execution",
+              result: "Selected model is at capacity. Please try a different model.",
+              errorClass: "model_capacity",
+            });
+            return;
+          }
+          r.text("retry succeeded");
+          r.result({ stop_reason: "end_turn" });
         });
       });
       const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
@@ -902,15 +948,103 @@ describe("crash/interrupt partial persistence", () => {
         "a".repeat(32),
       );
 
+      assert.equal(submits, 2);
+      assert.deepEqual(runner.submittedInputs, ["run once", TRANSIENT_RETRY_INPUT]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.ok(captured.payloads[0]!.text?.includes("retry succeeded"));
+      assert.notEqual(captured.payloads[0]!.tools?.[0]?.completed, false);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("capacity failure after a completed tool with unknown external outcome never auto-continues", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          r.toolPair("tool-bash", "Bash", "pong");
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Selected model is at capacity. Please try a different model.",
+            errorClass: "model_capacity",
+          });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        ccbSessionId: null,
+      });
+
+      await sm.submit(
+        session,
+        "run once",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "b".repeat(32),
+      );
+
       assert.equal(submits, 1);
       assert.equal(events.some((event) => event.kind === "turn_status"), false);
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0]!.errorCode, "model_capacity");
-      assert.notEqual(captured.payloads[0]!.tools?.[0]?.completed, false);
-      assert.match(
-        JSON.stringify(captured.payloads[0]!.tools?.[0]?.outputJson),
-        /unknown/,
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("API Error 500 after completed Bash retries TRANSIENT_RETRY_INPUT", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.toolPair("tool-bash", "Bash", "pong");
+            r.result({
+              is_error: true,
+              subtype: "success",
+              result: "API Error: 500 internal error. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (172.31.0.1:18892).",
+              terminal_reason: "api_error",
+            });
+            return;
+          }
+          r.text("retry succeeded");
+          r.result({ stop_reason: "end_turn" });
+        });
+      });
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+
+      await sm.submit(
+        session,
+        "run once",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "c".repeat(32),
       );
+
+      assert.equal(submits, 2, "completed Bash + 500 must auto-retry");
+      assert.deepEqual(runner.submittedInputs, ["run once", TRANSIENT_RETRY_INPUT]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
     } finally {
       setV3MasterSinkSingleton(null);
     }

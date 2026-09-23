@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
 
+import { inspectConsultTurnToken } from '../delegateContext.js'
 import { GROK_PREAMBLE, projectGrokPlatform } from '../engine/grokPlatform.js'
 
 function restore(name: string, value: string | undefined): void {
@@ -33,18 +34,63 @@ describe('grok platform projection', () => {
       assert.ok(projected.advertisedMcpTools.includes('skill_search'))
       assert.ok(projected.advertisedMcpTools.includes('present_task_approval'))
       assert.ok(projected.delegateContextFile)
-      const raw = readFileSync(path.join(projected.grokHome, 'config.toml'), 'utf8')
+      const raw = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
       assert.match(raw, /\[shell_environment_policy\]/)
       assert.match(raw, /\[mcp_servers\."openclaude-memory"\]/)
       assert.equal(raw.includes('bearer-must-not-enter-config'), false)
-      const tokenFile = path.join(projected.grokHome, 'gateway-token')
+      const tokenFile = path.join(path.dirname(projected.delegateContextFile!), 'gateway-token')
       assert.equal(readFileSync(tokenFile, 'utf8'), 'bearer-must-not-enter-config')
+      assert.notEqual(tokenFile, path.join(projected.grokHome, 'gateway-token'))
       assert.equal(lstatSync(tokenFile).mode & 0o777, 0o600)
       assert.match(raw, /OPENCLAUDE_ENGINE = "grok"/)
       assert.match(raw, /tool_timeout_sec = 600/)
       assert.ok(GROK_PREAMBLE.includes('Grok adapter'))
       assert.ok(GROK_PREAMBLE.includes('options'))
       assert.ok(GROK_PREAMBLE.includes('present_task_approval'))
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      restore('OPENCLAUDE_HOME', oldHome)
+    }
+  })
+
+  test('advisor turn writes a v2 consult token, not a v1 delegate token', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'oc-grok-platform-consult-'))
+    const oldHome = process.env.OPENCLAUDE_HOME
+    process.env.OPENCLAUDE_HOME = home
+    try {
+      const projected = projectGrokPlatform({
+        agentId: 'main',
+        sessionKey: 'agent:main:webchat:dm:grok-advisor',
+        gatewayPort: 18790,
+        gatewayToken: 'bearer-stays-in-token-file',
+        delegationDepth: 0,
+        consultTurn: {
+          turnKey: 'a'.repeat(64),
+          turnIndex: 2,
+          configVersion: 'v1:advisor:gpt-6-astra',
+        },
+      })
+      const token = readFileSync(projected.delegateContextFile!, 'utf8').trim()
+      const inspected = inspectConsultTurnToken(token)
+      assert.ok(inspected?.hmacOk)
+      assert.equal(inspected?.claims.collabMode, 'advisor')
+      assert.equal(inspected?.claims.turnIndex, 2)
+      const firstPath = projected.delegateContextFile!
+      const firstToken = token
+      const other = projectGrokPlatform({
+        agentId: 'main',
+        sessionKey: 'agent:main:webchat:dm:grok-other',
+        gatewayPort: 18790,
+        gatewayToken: 'bearer-stays-in-token-file',
+        delegationDepth: 0,
+      })
+      assert.notEqual(other.delegateContextFile, firstPath)
+      assert.equal(readFileSync(firstPath, 'utf8').trim(), firstToken)
+      assert.equal(inspectConsultTurnToken(readFileSync(firstPath, 'utf8').trim())?.claims.sessionKey, 'agent:main:webchat:dm:grok-advisor')
+      const firstConfig = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
+      assert.match(firstConfig, /grok-advisor/)
+      assert.equal(firstConfig.includes(other.delegateContextFile!), false)
+      assert.equal(readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8'), firstConfig)
     } finally {
       rmSync(home, { recursive: true, force: true })
       restore('OPENCLAUDE_HOME', oldHome)
@@ -63,7 +109,7 @@ describe('grok platform projection', () => {
         gatewayToken: '',
         delegationDepth: 0,
       })
-      const raw = readFileSync(path.join(projected.grokHome, 'config.toml'), 'utf8')
+      const raw = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
       assert.equal(projected.advertisedMcpTools.length, 0)
       assert.equal(projected.delegateContextFile, null)
       assert.equal(raw.includes('mcp_servers'), false)

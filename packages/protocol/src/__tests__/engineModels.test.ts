@@ -42,12 +42,13 @@ import {
   modelReasoningPolicy,
   codexTransportModelId,
   zcodeTransportModelId,
+  GROK_ENGINE_MODELS,
   ZCODE_ENGINE_MODEL_IDS,
   ZCODE_HOSTED_PERMISSION_MODE,
 } from '../engineModels.js'
 
 describe('GPT-5.6 / GPT-6 engine model authority', () => {
-  test('exactly the GPT-5.6 series plus GPT-6-Astra are Codex models; GPT-5.5 is retired', () => {
+  test('exactly the GPT-5.6 series plus GPT-6 Astra/Sol/Luna are Codex models; GPT-5.5 is retired', () => {
     assert.deepEqual(CODEX_ENGINE_MODEL_IDS, [
       'gpt-5.6-sol',
       'gpt-5.6-terra',
@@ -57,6 +58,10 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
       'gpt-5.6-luna-1m',
       'gpt-6-astra',
       'gpt-6-astra-1m',
+      'gpt-6-sol',
+      'gpt-6-sol-1m',
+      'gpt-6-luna',
+      'gpt-6-luna-1m',
     ])
     assert.equal(DEFAULT_CODEX_ENGINE_MODEL, 'gpt-6-astra')
     assert.equal(isCodexLongContextModel('gpt-6-astra'), false)
@@ -64,6 +69,12 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     assert.equal(codexTransportModelId('gpt-6-astra-1m'), 'gpt-6-astra')
     assert.equal(modelReasoningPolicy('gpt-6-astra').codexModelDefault, 'xhigh')
     assert.equal(modelReasoningPolicy('gpt-6-astra-1m').codexModelDefault, 'xhigh')
+    assert.equal(modelReasoningPolicy('gpt-6-sol').codexModelDefault, 'medium')
+    assert.equal(modelReasoningPolicy('gpt-6-luna').codexModelDefault, 'medium')
+    assert.equal(codexTransportModelId('gpt-6-sol-1m'), 'gpt-6-sol')
+    assert.equal(codexTransportModelId('gpt-6-luna-1m'), 'gpt-6-luna')
+    assert.equal(isCodexLongContextModel('gpt-6-sol-1m'), true)
+    assert.equal(isCodexLongContextModel('gpt-6-luna'), false)
     assert.equal(isCodexEngineModel('gpt-6'), false)
     for (const id of CODEX_ENGINE_MODEL_IDS) assert.equal(isCodexEngineModel(id), true)
     assert.equal(isCodexEngineModel('gpt-5.5'), false)
@@ -89,21 +100,23 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     assert.equal(modelReasoningPolicy('gpt-5.6-sol').supported.includes('ultra' as never), false)
   })
 
-  test('context-tier families: Astra first, Terra/Luna collapsed by default', () => {
+  test('context-tier families: GPT-6 Astra/Sol/Luna expanded, GPT-5.6 not selectable', () => {
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.map((f) => f.family),
-      ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'kimi-k3'],
+      ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'kimi-k3'],
     )
     assert.deepEqual(
       CONTEXT_TIER_FAMILIES.filter((f) => f.collapsedByDefault).map((f) => f.family),
-      ['gpt-5.6-terra', 'gpt-5.6-luna'],
+      [],
     )
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-astra'), false)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-sol'), false)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-terra'), true)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-5.6-luna'), true)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6-sol'), false)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6-luna'), false)
+    assert.equal(contextFamilyByModelId('gpt-5.6-sol'), undefined)
     assert.equal(contextFamilyCollapsedByDefault('kimi-k3'), false)
     assert.equal(contextFamilyByModelId('gpt-6-astra-1m')?.family, 'gpt-6-astra')
+    assert.equal(contextFamilyByModelId('gpt-6-sol-1m')?.family, 'gpt-6-sol')
+    assert.equal(contextFamilyByModelId('gpt-6-luna-1m')?.family, 'gpt-6-luna')
     assert.equal(COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL, '更多 GPT 模型')
     for (const family of CONTEXT_TIER_FAMILIES) {
       if (family.family === 'kimi-k3') continue
@@ -119,10 +132,19 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
   })
 })
 
+describe('Grok Build engine model authority', () => {
+  test('pins grok-build onto grok-4.7', () => {
+    assert.deepEqual(GROK_ENGINE_MODELS, [
+      { id: 'grok-build', displayName: 'Grok 4.7', upstreamModel: 'grok-4.7' },
+      { id: 'grok-build-fast', displayName: 'Grok 4.7 Fast', upstreamModel: 'grok-4.7-build-fast' },
+    ])
+  })
+})
+
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    // 61 + 10 luna Sand + 1 gemini-3.1-pro (2026-09-17)
-    assert.equal(CURSOR_ENGINE_MODELS.length, 72)
+    // 72 + 8 grok-4.7 (2026-09-22)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 80)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -172,6 +194,16 @@ describe('Cursor engine model authority', () => {
     assert.deepEqual(cursorFamilyEfforts('opus-4.8'), ['low', 'medium', 'high', 'xhigh', 'max'])
     assert.equal(cursorFamilySupportsFast('opus-4.8'), true)
     assert.equal(findCursorEngineModel('composer-2.5', null, false)?.upstreamModel, 'composer-2.5')
+    assert.deepEqual(cursorFamilyEfforts('grok-4.7'), ['low', 'medium', 'high', 'xhigh'])
+    assert.equal(cursorFamilySupportsFast('grok-4.7'), true)
+    assert.equal(
+      findCursorEngineModel('grok-4.7', 'high', false)?.upstreamModel,
+      'grok-4.7-high',
+    )
+    assert.equal(
+      findCursorEngineModel('grok-4.7', 'xhigh', true)?.upstreamModel,
+      'grok-4.7-xhigh-fast',
+    )
     assert.deepEqual(cursorFamilyEfforts('grok-4.6'), ['low', 'medium', 'high', 'xhigh'])
     assert.equal(cursorFamilySupportsFast('fable-5'), false)
     assert.equal(cursorFamilySupportsFast('fable-5.1'), false)
@@ -203,6 +235,8 @@ describe('Cursor engine model authority', () => {
     assert.equal(isCursorEngineModel('cursor-auto --force'), false)
     assert.equal(cursorCredentialModelFamily('cursor-auto'), 'cursor_models')
     assert.equal(cursorCredentialModelFamily('cursor-grok-4.6-high'), 'cursor_models')
+    assert.equal(cursorCredentialModelFamily('cursor-grok-4.7-high'), 'cursor_models')
+    assert.equal(cursorCredentialModelFamily('grok-4.7-high-fast'), 'cursor_models')
     assert.equal(cursorCredentialModelFamily('composer-2.5-fast'), 'cursor_models')
     assert.equal(cursorCredentialModelFamily('cursor-opus-5-high'), 'other_models')
     assert.equal(cursorCredentialModelFamily('claude-fable-5-thinking-high'), 'other_models')
@@ -254,7 +288,7 @@ describe('Cursor engine model authority', () => {
   test('family-level public ids drop the effort suffix but keep the fast axis', () => {
     // Every family that carries an effort axis is family-addressable; auto / composer are not.
     assert.deepEqual([...CURSOR_EFFORT_FAMILIES].sort(), [
-      'fable-5', 'fable-5.1', 'gemini-3.8-flash', 'gpt-5.6-luna-sand', 'grok-4.5', 'grok-4.6', 'opus-4.8', 'opus-5', 'sonnet-5',
+      'fable-5', 'fable-5.1', 'gemini-3.8-flash', 'gpt-5.6-luna-sand', 'grok-4.5', 'grok-4.6', 'grok-4.7', 'opus-4.8', 'opus-5', 'sonnet-5',
     ])
     assert.equal(cursorFamilyHasEffortAxis('fable-5.1'), true)
     assert.equal(cursorFamilyHasEffortAxis('auto'), false)
@@ -273,6 +307,8 @@ describe('Cursor engine model authority', () => {
     assert.equal(publicCursorFamilyModelId('cursor-fable-5.1-low'), 'fable-5.1')
     assert.equal(publicCursorFamilyModelId('cursor-grok-4.6-xhigh-fast'), 'grok-4.6-fast')
     assert.equal(publicCursorFamilyModelId('cursor-grok-4.6-low'), 'grok-4.6')
+    assert.equal(publicCursorFamilyModelId('cursor-grok-4.7-high-fast'), 'grok-4.7-fast')
+    assert.equal(publicCursorFamilyModelId('cursor-grok-4.7-low'), 'grok-4.7')
     assert.equal(publicCursorFamilyModelId('cursor-gemini-3.8-flash-medium'), 'gemini-3.8-flash')
     // Families without an effort axis keep their single public id.
     assert.equal(publicCursorFamilyModelId('cursor-auto'), 'auto')
@@ -346,6 +382,11 @@ describe('Cursor engine model authority', () => {
     assert.deepEqual(resolveCursorPublicModel('grok-4.6-fast', 'xhigh'), {
       internalId: 'cursor-grok-4.6-xhigh-fast', family: 'grok-4.6', effort: 'xhigh', fast: true, effortSource: 'request',
     })
+    assert.deepEqual(resolveCursorPublicModel('grok-4.7-fast', 'high'), {
+      internalId: 'cursor-grok-4.7-high-fast', family: 'grok-4.7', effort: 'high', fast: true, effortSource: 'request',
+    })
+    assert.equal(resolveCursorPublicModel('grok-4.7', 'max')?.internalId, 'cursor-grok-4.7-xhigh')
+    assert.equal(resolveCursorPublicModel('grok-4.7', 'max')?.effortSource, 'clamped')
     // No client effort → family default (high).
     assert.deepEqual(resolveCursorPublicModel('sonnet-5', undefined), {
       internalId: 'cursor-sonnet-5-high', family: 'sonnet-5', effort: 'high', fast: false, effortSource: 'default',

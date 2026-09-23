@@ -118,3 +118,10 @@ export { setLiteratureSkillProvider, type LiteratureSkillProvider } from './prom
 // 注入平台静态 key 表(供 host 平台 agent 合成首帧解析到静态模型后 CCB 子进程直连上游)。
 // Personal 不调即恒 null = 整块 no-op(settings.json 继续掌权,零行为变化)。见 hostStaticProviders。
 export { setHostStaticProviderKeys } from './hostStaticProviders.js'
+
+export {
+  inboundSessionKey,
+  isContentReviewSessionBanned,
+  observeUserContentReview,
+  setContentReviewAlerter,
+} from './jevContentReview.js'

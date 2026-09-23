@@ -152,3 +152,34 @@ test('pickResumableId: head wins when durable; otherwise newest history id with 
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('probeResumeArtifact: grok fast transcripts live beside the standard root', () => {
+  const { dir, ctx } = scaffold()
+  try {
+    const fastGroup = join(ctx.openclaudeHome, 'grok-build', 'fast', 'sessions', '%2Fws')
+    mkdirSync(join(fastGroup, A), { recursive: true })
+    writeFileSync(join(fastGroup, A, 'chat_history.jsonl'), '{}\n')
+    const hit = probeResumeArtifact('grok', A, ctx)
+    assert.equal(hit.exists, true)
+    assert.match(hit.path ?? '', /\/fast\/sessions\//)
+    // Standard root from scaffold exists and does not contain C, and neither does fast.
+    assert.equal(probeResumeArtifact('grok', C, ctx).exists, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('probeResumeArtifact: missing both grok homes stays unknown instead of evicting', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-resume-grok-absent-'))
+  try {
+    const ctx = {
+      openclaudeHome: join(dir, 'empty-home'),
+      env: {} as NodeJS.ProcessEnv,
+    }
+    mkdirSync(ctx.openclaudeHome, { recursive: true })
+    assert.equal(probeResumeArtifact('grok', A, ctx).exists, true)
+    assert.equal(probeResumeArtifact('grok', A, ctx).path, undefined)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -291,7 +291,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
-      npm install -g @openai/codex@0.153.3 --no-audit --no-fund \
+      npm install -g @openai/codex@0.155.1 --no-audit --no-fund \
       && npm cache clean --force \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
@@ -301,7 +301,7 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 # pinned and verified at build time; gateway additionally gates every spawn to
 # a credential-bound loopback Cursor relay.
 ARG OC_INCLUDE_OFFICIAL_CLAUDE=0
-ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.278
+ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.280
 RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
       npm install -g "@anthropic-ai/claude-code@${OC_OFFICIAL_CLAUDE_VERSION}" --no-audit --no-fund; \
       test "$(claude --version | awk '{print $1}')" = "$OC_OFFICIAL_CLAUDE_VERSION"; \
@@ -374,7 +374,7 @@ RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
 # First `hsqs` offset in this AppImage is a false positive; use the embedded
 # --appimage-extract runtime instead of unsquashfs -o $first_offset.
 ARG OC_ZCODE_APPIMAGE_VERSION=3.8.1
-ARG OC_ZCODE_APPIMAGE_SHA256=b420dea50961b77d5c75b08b924da41ab529c720a7ec32eacbe95a6d843199e0
+ARG OC_ZCODE_APPIMAGE_SHA256=ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61
 ARG OC_ZCODE_CLI_VERSION=0.16.3
 ARG OC_INCLUDE_ZCODE=0
 RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \

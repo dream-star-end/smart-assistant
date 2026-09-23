@@ -18,11 +18,14 @@
  * 契约测试(turnErrorTaxonomyContract)锁 1↔2↔3 的 code 集合同源。
  */
 
+import { observeUnknownRunError } from './errorClassifyJevShadow.js'
+
 export type ClassifiedErrorCode =
   | 'insufficient_credits'
   | 'rate_limited'
   | 'model_capacity'
   | 'model_config_changed_retry_turn'
+  | 'model_not_available'
   | 'upstream_failed'
   | 'context_too_long'
   | 'bad_request'
@@ -128,6 +131,28 @@ const PATTERNS: Array<{
     code: 'bad_request',
     message: '这条请求无法被模型处理，请调整内容后重试',
   },
+  // Deterministic config/route failures: retrying the same target never
+  // succeeds. Must beat both the capacity lexicon below (`try a different
+  // model` used to land on retryable model_capacity) and the generic
+  // 5xx/upstream rule (503 MOONSHOT_NOT_CONFIGURED; `grok route expired`
+  // can also contain incidental `\b5\d{2}\b` hits from token counts).
+  // Reuse taxonomy model_not_available (retryable:false, cta:switch_model)
+  // rather than inventing a new class.
+  {
+    re: /try a different model/i,
+    code: 'model_not_available',
+    message: '当前模型不可用，请切换模型后再试',
+  },
+  {
+    re: /grok route expired/i,
+    code: 'model_not_available',
+    message: '当前模型不可用，请切换模型后再试',
+  },
+  {
+    re: /\bMOONSHOT_NOT_CONFIGURED\b/,
+    code: 'model_not_available',
+    message: '当前模型不可用，请切换模型后再试',
+  },
   // 模型容量满载 —— 上游"at capacity"/overloaded/model busy 词族。与 upstream_failed
   // 的区别是语义可行动:同模型稍后可用、换模型立即可用(taxonomy cta=retry_or_switch)。
   // 必须排在 upstream_failed 之前:"overloaded" 常与 5xx/upstream 措辞同现,先命中
@@ -137,8 +162,10 @@ const PATTERNS: Array<{
   // 审计 R1:裸 `529` 归容量档(Anthropic 529 = overloaded,是容量语义而非泛上游
   // 故障)。它必须在此(upstream 之前)显式命中,否则会被下面的通用 `\b5\d{2}\b`
   // 吞成 upstream_failed。词族之外单列 `\b529\b`,与词族 OR 平级。
+  // `try a different model` is NOT in this lexicon: that branch is a
+  // same-target-never-succeeds failure handled above.
   {
-    re: /at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|try a different model|\b529\b/i,
+    re: /at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|\b529\b/i,
     code: 'model_capacity',
     message: '模型繁忙，请稍后重试或切换模型',
   },
@@ -171,6 +198,11 @@ export function classifyRunError(raw: string | undefined | null): ClassifiedErro
   if (!s) return { code: 'unknown', message: '' }
   for (const p of PATTERNS) {
     if (p.re.test(s)) return { code: p.code, message: p.message }
+  }
+  try {
+    observeUnknownRunError(s)
+  } catch {
+    // OCV5-253: shadow must never change classification or throw into the turn.
   }
   return { code: 'unknown', message: '' }
 }

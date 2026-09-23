@@ -1,5 +1,4 @@
-import { Sparkles } from "lucide-react";
-import { Avatar, Skeleton } from "../ui";
+import { Skeleton } from "../ui";
 
 /**
  * 冷会话加载骨架屏。
@@ -45,7 +44,7 @@ export function shouldShowHistorySkeleton(p: {
   return !p.graceExpired; // meta 未知（深链/列表未落定）→ 800ms 兜底窗
 }
 
-/** 单条骨架气泡：左（助手，带头像）/右（用户）交替形态。 */
+/** 单条骨架气泡：左（助手正文）/右（用户）交替形态，不再留头像列。 */
 function SkeletonBubble({ side }: { side: "left" | "right" }) {
   if (side === "right") {
     // 用户消息：右对齐，单块圆角气泡。
@@ -55,13 +54,9 @@ function SkeletonBubble({ side }: { side: "left" | "right" }) {
       </div>
     );
   }
-  // 助手消息：左侧头像 + 两三行文本条。
   return (
-    <div className="flex gap-4">
-      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-        <Sparkles size={16} />
-      </Avatar>
-      <div className="min-w-0 flex-1 space-y-2">
+    <div className="min-w-0">
+      <div className="min-w-0 space-y-2">
         <Skeleton className="h-4 w-4/5" />
         <Skeleton className="h-4 w-full" />
         <Skeleton className="h-4 w-2/3" />
@@ -92,15 +87,12 @@ export function MessageListSkeleton() {
 export function PartialHistorySkeleton() {
   return (
     <output
-      className="flex gap-4 py-1 text-muted"
+      className="py-1 text-muted"
       aria-label="正在加载会话内容"
       aria-live="polite"
       aria-busy="true"
       data-testid="partial-history-skeleton"
     >
-      <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-        <Sparkles size={16} />
-      </Avatar>
       <div className="min-w-0 flex-1 space-y-2">
         <span className="block text-xs">正在加载会话内容…</span>
         <Skeleton className="h-4 w-4/5" />

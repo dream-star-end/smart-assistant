@@ -867,6 +867,21 @@ export function problemCardPresentation(code: string, waived: boolean): "red" | 
   return "red";
 }
 
+/**
+ * 这些终态不是故障卡。点停、计划内重启、容器回收一律不出错误卡。
+ * 已恢复成功和旧错误重放由调用方丢弃，不在这里画第二张。
+ */
+export const SILENT_TURN_ERROR_CODES: ReadonlySet<string> = new Set([
+  "stopped",
+  "user_cancelled",
+  "service_restart",
+  "codex_container_recycled",
+]);
+
+export function isSilentTurnErrorCode(code: unknown): boolean {
+  return SILENT_TURN_ERROR_CODES.has(normalizeTurnErrorCode(code));
+}
+
 // ═══════════════ 流式行身份（server canonical id upsert，websocket.js:606）═══════════════
 
 /**

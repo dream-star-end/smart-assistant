@@ -855,6 +855,17 @@ body {
    墨迹留余量,避免被 overflow-y:hidden 裁掉。 */
 .prose .katex-display { overflow-x: auto; overflow-y: hidden; padding-block: 0.08em; }
 
+/* 模型选择器窄屏 sheet(OCV5-245):未分层普通规则,才能盖过 Sheet 原语的 max-h-[85dvh]
+   工具类,并保留不支持 dvh 的 WebView 的 vh 回退。overflow 交给内部单一滚动容器,
+   避免原语 overflow-y-auto 与列表再叠一层滚动。 */
+.model-picker-sheet {
+  max-height: 85vh;
+  max-height: min(85dvh, calc(100% - env(safe-area-inset-bottom, 0px)));
+}
+.model-picker-sheet-scroll {
+  overscroll-behavior: contain;
+}
+
 /* Center dialogs share one visual-viewport/safe-area positioning contract. Keep the existing
    translateY(-50%) on each Radix content node. Declaration order is deliberate: vh is the old
    WebView fallback, dvh handles modern browser chrome, and App's measured visualViewport px vars

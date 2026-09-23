@@ -311,6 +311,21 @@ export type ChatMessage = {
   /** error 红卡：归一化 code + 折叠区原始 detail。*/
   _errorCode?: string;
   _errorDetail?: string;
+  /**
+   * 错误卡第一次提交时写死的展示。之后错误码、免单、历史同步都不得改颜色、标题或正文。
+   * `silent` = 这一轮不出现错误卡（点停 / 计划内重启 / 容器回收）。
+   */
+  _errorCardSnapshot?:
+    | { disposition: "silent" }
+    | {
+        disposition: "card";
+        tone: "red" | "yellow";
+        title: string;
+        message: string;
+        detail?: string;
+      };
+  /** 恢复裁决还没到。历史里的源错误行先不展示，避免抢先画卡。 */
+  _errorHeldForRecovery?: true;
   /** Browser-only: last recovery skip copy, attached to the source error card. */
   _recoverySkippedNotice?: string;
   /** Highest gateway-local retry consumed before this terminal error. */
@@ -711,9 +726,9 @@ export type ChatSession = {
   // ── 双帧 error 抑制（§11）──
   _suppressErrorBubbleAtSeq?: number;
   /**
-   * Master 拥有自动恢复时被**延后**的终态错误所属 cmid(浏览器内存态,不持久化)。存在期间本轮
-   * 保持 `_sendingInFlight` + retrying 软状态,兼容 [error] final 不得收尾;由 socket 在
-   * `sys.recovery_decision` / `outbound.ack{recovery}` 领养 / 宽限超时时清除。
+   * Master 拥有自动恢复时被延后的终态错误所属 cmid。存在期间本轮保持
+   * `_sendingInFlight` + retrying 软状态,历史失败 tape 不得把它收成错误卡。
+   * 随会话快照持久化,刷新后继续等真正的 declined / skipped / adopted / stop。
    */
   _deferredTerminalErrorClientMessageId?: string;
 

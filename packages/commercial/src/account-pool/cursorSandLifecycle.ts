@@ -153,9 +153,27 @@ export class CursorSandLifecycleCoordinator {
         if (op.phase !== "created") {
           // Missing acceptance records do not prove a mutation was never accepted.
           // Only an exact installed capability probe can finish an unknown install.
-          op.nextAttemptAt = this.now() + 60_000;
-          if (this.now() - op.startedAt > 15 * 60_000) throw new SandProvisionError("UNKNOWN_OPERATION_RESULT");
-          this.save(state); return;
+          if (this.now() - op.startedAt <= 15 * 60_000) {
+            op.nextAttemptAt = this.now() + 60_000;
+            this.save(state); return;
+          }
+          // Stale in-flight must not loop on UNKNOWN_OPERATION_RESULT: keep the
+          // owned agent and retry sendPrompt, or start a new create if none.
+          // Box sendPrompt is idempotent on clientNonce=nonce+"-install"; reuse
+          // accepts without executing. Rotate nonce, keep agentId/agentMarker.
+          if (op.agentId) {
+            op.nonce = nonce();
+            op.phase = "created";
+            op.startedAt = this.now();
+            op.nextAttemptAt = 0;
+            this.save(state);
+          } else {
+            op = state.operations[principal.subjectHash] = {
+              nonce: nonce(), moduleHash: this.deps.moduleHash, phase: "idle",
+              startedAt: this.now(), nextAttemptAt: 0,
+            };
+            this.save(state);
+          }
         }
       }
       if (op.phase === "error") throw new SandProvisionError(op.errorCode ?? "INSTALL_REJECTED");

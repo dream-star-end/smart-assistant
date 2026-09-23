@@ -160,6 +160,79 @@ test("GET capability probe upgrades a real legacy relay without any empty infere
   } finally { await coordinator.stop(); server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sand-stale-submitted-"));
+  const token = "x." + Buffer.from(JSON.stringify({ type: "session", sub: "stale-principal", exp: 2_000_000_000 })).toString("base64url") + ".y";
+  const moduleHash = "d".repeat(64), machine = "a".repeat(32);
+  let now = Date.now(), creates = 0, sends = 0, acceptSend = false;
+  const sendNonces: string[] = [];
+  const agents: any[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []; req.on("data", (x) => chunks.push(x));
+    req.on("end", () => {
+      const path = req.url!, body = Buffer.concat(chunks).toString();
+      const reply = (value: unknown, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); };
+      if (path.endsWith("GetSandBoxRunState")) return reply({ state: "SAND_BOX_RUN_STATE_RUNNING" });
+      if (path.endsWith("EnsureSandBox")) return reply({ gatewayUrl: base + "/box", gatewayToken: "GATE", networkToken: "NET" });
+      if (path.endsWith("/health")) return reply({ ok: true, pid: 321, isBusy: false });
+      if (path.endsWith("InferenceService/Stream")) return reply({}, 404);
+      if (path.endsWith("/listAgents")) return reply(agents);
+      if (path.endsWith("/createAgent")) {
+        creates++;
+        const data = JSON.parse(body);
+        agents.push({ id: "owned-maintenance-bot", description: data.description, isRunning: false });
+        return reply({ agent: { id: "owned-maintenance-bot" }, transcript: [] });
+      }
+      if (path.endsWith("/sendPrompt")) {
+        sends++;
+        sendNonces.push(JSON.parse(body).clientNonce);
+        if (!acceptSend) { req.socket.destroy(); return; }
+        return reply({ accepted: true });
+      }
+      return reply({}, 404);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = "http://127.0.0.1:" + (server.address() as { port: number }).port;
+  const row: any = { id: 1n, provider: "cursor", status: "active", cursor_sand_enabled: true, runtime_channel: "v5" };
+  const coordinator = new CursorSandLifecycleCoordinator({
+    authDir: dir, moduleHash, listAccounts: async () => [row], getAccount: async () => row,
+    getTokenSnapshot: async () => ({ id: 1n, token: Buffer.from(token), refresh: null, credential_kind: "session" as const, machine_id: machine, expires_at: null }),
+    clientFor: async () => ({ client: new CursorSandProvisionClient({ fetchImpl: fetch, apiBase: base, allowTestLoopback: true }) }),
+    installerPrompt: () => "synthetic deterministic installer", onChange: () => {}, now: () => now,
+  });
+  try {
+    await coordinator.tick();
+    assert.deepEqual({ creates, sends }, { creates: 1, sends: 1 });
+    const original = Object.values(readSandLifecycleState(dir).operations)[0];
+    assert.equal(original.phase, "install-intent");
+    now += 15 * 60_000 + 1;
+    acceptSend = true;
+    await coordinator.tick();
+    assert.deepEqual({ creates, sends }, { creates: 1, sends: 2 }, "must retry sendPrompt without a second createAgent");
+    const after = readSandLifecycleState(dir);
+    const op = Object.values(after.operations)[0];
+    assert.notEqual(op.nonce, original.nonce);
+    assert.equal(op.agentId, original.agentId);
+    assert.equal(op.agentMarker, original.agentMarker);
+    assert.equal(op.phase, "submitted");
+    assert.equal(sendNonces.length, 2);
+    assert.notEqual(sendNonces[0], sendNonces[1]);
+    assert.notEqual(after.accounts["1"].phase, "error");
+    assert.notEqual(after.accounts["1"].errorCode, "UNKNOWN_OPERATION_RESULT");
+    now += 60_000;
+    await coordinator.tick();
+    const looped = readSandLifecycleState(dir);
+    assert.notEqual(looped.accounts["1"].errorCode, "UNKNOWN_OPERATION_RESULT");
+    assert.equal(creates, 1);
+  } finally {
+    await coordinator.stop();
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("API-key exchange transient failures retain exact ready expiry; expiry and explicit rejection still withdraw", async () => {
   const dir = mkdtempSync(join(tmpdir(), "sand-exchange-recheck-"));
   const key = "crsr_" + "a".repeat(64), machine = "b".repeat(32), subject = sandHash("api-principal"), moduleHash = "c".repeat(64);
