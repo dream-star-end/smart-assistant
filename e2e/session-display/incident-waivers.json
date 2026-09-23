@@ -392,6 +392,12 @@
       "reason": "One turn was drawn as several process blocks, with the load-earlier-steps button between them. The fold is display-only. The published commit cannot be rewritten.",
       "approvedBy": "user 2026-09-23 发布上线 OCV5-280",
       "expiresAt": "2026-10-23"
+    },
+    {
+      "commit": "ba14faab3549dc5af29031faf799112a5f3a0a96",
+      "reason": "One visible user turn was still drawn as several process shells because each step kept its own client id. Grouping now follows the user turn. Display only.",
+      "approvedBy": "user 2026-09-23 根治 OCV5-280",
+      "expiresAt": "2026-10-23"
     }
   ]
 }
