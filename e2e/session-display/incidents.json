@@ -4710,6 +4710,28 @@
           "assertion": "本轮还有更早步骤时按游标自动补齐，不显示加载按钮；失败才出现重试；历史按钮仍只翻对话"
         }
       ]
+    },
+    {
+      "id": "INC-20260924-LIVE-UNITS-VIEWPORT-JUMP",
+      "occurredAt": "2026-09-24",
+      "severity": "P1",
+      "symptom": "流式回复时自动补更早过程步骤，已经渲染出来的文字整块上下跳。",
+      "rootFixCommit": "d203d9bf",
+      "coverageCommits": [
+        "d203d9bf"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "贴底自动补更早过程步骤时，已渲染锚点不因前插位移"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "离底补更早过程步骤时按前插后的真实位置保持锚点"
+        }
+      ]
     }
   ]
 }
