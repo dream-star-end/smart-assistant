@@ -51,6 +51,29 @@ export interface BoxCallFingerprint {
   readonly replayFingerprint: string;
 }
 
+/** Privacy-safe binding for the CLI's effective invocation context. A resume
+ * request adds the assistant tool_use and user tool_result pair to the
+ * already-running CLI; neither message was part of its previous context. */
+export function deriveBoxContextHash(body: ProxyBody,
+  completedToolTail = false): string {
+  if (!Array.isArray(body.messages)
+    || (completedToolTail && body.messages.length < 2)) {
+    throw new BoxCallFingerprintError("BOX_CALL_CONTEXT_INVALID");
+  }
+  const { metadata: _tracking, ...modelBody } = body;
+  const messages = completedToolTail ? body.messages.slice(0, -2) : body.messages;
+  const hasher = createHash("sha256").update("ocv5-box-context-v1\0");
+  let bytes = 0;
+  updateStableJson({ ...modelBody, messages }, (part) => {
+    bytes += Buffer.byteLength(part);
+    if (bytes > 16 * 1024 * 1024) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    hasher.update(part);
+  });
+  return hasher.digest("hex");
+}
+
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
   if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");

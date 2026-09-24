@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProxyBody } from "./shared.js";
-import { BoxCallFingerprintError, deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
+import { BoxCallFingerprintError, deriveBoxCallFingerprint,
+  deriveBoxContextHash } from "./boxCallFingerprint.js";
 
 function body(turnKey = "a".repeat(64)): ProxyBody {
   return { model: "claude-opus-5-5", max_tokens: 128, stream: true,
@@ -48,6 +49,24 @@ test("same-turn identical independent call remains deliberately ambiguous", () =
   const b = deriveBoxCallFingerprint(3n, body());
   assert.equal(a.replayFingerprint, b.replayFingerprint,
     "this must not be advertised as a unique logical-call ID");
+});
+
+test("tool continuation binds the complete prior CLI context without storing text", () => {
+  const first = body();
+  const prior = deriveBoxContextHash(first);
+  const resumed = body("b".repeat(64));
+  resumed.messages.push({ role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_1", name: "Bash", input: { command: "echo synthetic" } }] });
+  resumed.messages.push({ role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_1", content: "local-result" }] });
+  assert.equal(deriveBoxContextHash(resumed, true), prior);
+  assert.notEqual(deriveBoxContextHash(resumed), prior);
+  const changed = { ...resumed, system: "changed-system" } as ProxyBody;
+  assert.notEqual(deriveBoxContextHash(changed, true), prior);
+  const changedHistory = { ...resumed, messages: [
+    { role: "user", content: "changed-history" }, ...resumed.messages.slice(1)] } as ProxyBody;
+  assert.notEqual(deriveBoxContextHash(changedHistory, true), prior);
+  assert.notEqual(deriveBoxContextHash({ ...resumed, max_tokens: 256 }, true), prior);
 });
 
 test("real official CC inner session ID is accepted; conflicting outer ID fails", () => {

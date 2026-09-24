@@ -8,7 +8,7 @@ import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
-import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
+import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { matchBoxToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
@@ -46,6 +46,8 @@ export interface BoxJournalAdmission {
   runNonce: string;
   leaseEpoch: string;
   invocationMode?: "text" | "detached_tool";
+  /** Hash of model-affecting context actually launched in the detached CLI. */
+  contextHash?: string;
 }
 export interface BoxToolResumeClaim {
   readonly ownerRequestId: string;
@@ -101,6 +103,8 @@ function goodId(input: BoxJournalAdmission): void {
     || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.fingerprint.sessionId)
     || (input.invocationMode !== undefined && input.invocationMode !== "text"
       && input.invocationMode !== "detached_tool")
+    || (input.invocationMode === "detached_tool"
+      && !/^[a-f0-9]{64}$/.test(input.contextHash ?? ""))
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -143,6 +147,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxRequestHash: input.fingerprint.requestHash,
         boxTurnKey: input.fingerprint.turnKey,
         boxSessionId: input.fingerprint.sessionId,
+        ...(input.invocationMode === "detached_tool"
+          ? { boxContextHash: input.contextHash } : {}),
         boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
@@ -328,7 +334,13 @@ export class BoxDurableJournal implements BoxJournalPort {
       throw new BoxDurableJournalError("BOX_TOOL_RESUME_IDENTITY_INVALID");
     }
     let fingerprint: BoxCallFingerprint;
-    try { fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody); }
+    let priorContextHash: string;
+    let nextContextHash: string;
+    try {
+      fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody);
+      priorContextHash = deriveBoxContextHash(input.canonicalBody, true);
+      nextContextHash = deriveBoxContextHash(input.canonicalBody);
+    }
     catch { throw new BoxDurableJournalError("BOX_TOOL_RESUME_IDENTITY_INVALID"); }
     const client = await this.pool.connect();
     let committed = false;
@@ -353,6 +365,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
         || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
         || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
+        || typeof ctx.boxContextHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(ctx.boxContextHash)
         || typeof ctx.boxHandoffRevision !== "string" || ctx.boxHandoffRevision.length > 128
         || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
         || Array.isArray(ctx.boxToolHandoff)) {
@@ -377,6 +391,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       } catch (error) {
         if (error instanceof BoxDurableJournalError) throw error;
         throw new BoxDurableJournalError("BOX_TOOL_CATALOG_CHANGED");
+      }
+      if (ctx.boxContextHash !== priorContextHash) {
+        throw new BoxDurableJournalError("BOX_TOOL_CONTEXT_CHANGED");
       }
       const digests = handoff.toolUses;
       let results: readonly BoxMatchedToolResult[];
@@ -417,8 +434,9 @@ export class BoxDurableJournal implements BoxJournalPort {
             boxCatalogHash: handoff.catalogHash,
             boxSessionId: fingerprint.sessionId,
             boxReplayFingerprint: fingerprint.replayFingerprint,
-            boxRequestHash: fingerprint.requestHash,
-            boxParentResumeRevision: durableRevision })]);
+             boxRequestHash: fingerprint.requestHash,
+             boxContextHash: nextContextHash,
+             boxParentResumeRevision: durableRevision })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey

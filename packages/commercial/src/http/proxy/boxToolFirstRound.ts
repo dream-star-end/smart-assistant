@@ -2,7 +2,7 @@
  * Off-route until the complete cross-HTTP resume/terminal coordinator passes
  * real Box acceptance. The remote CLI never executes OpenClaude tools. */
 import { isDeepStrictEqual } from "node:util";
-import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
+import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { makeBoxDetachedToolPlan, type BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
 import { BoxCliToolHandoffDecoder, type BoxToolHandoffCandidate } from "./boxCliToolHandoff.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
@@ -82,8 +82,22 @@ export async function runBoxToolFirstRound(input: {
   const cap = deps.maxOutputTokensForModel(input.canonicalModel);
   if (cap === null) throw new BoxToolFirstRoundError("BOX_TOOL_MODEL_NOT_CONFIGURED");
   let fingerprint: ReturnType<typeof deriveBoxCallFingerprint>;
-  try { fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody); }
+  let contextHash: string;
+  try {
+    fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody);
+    contextHash = deriveBoxContextHash(input.canonicalBody);
+  }
   catch { throw new BoxToolFirstRoundError("BOX_TOOL_IDENTITY_MISSING"); }
+  // The durable digest must describe the request actually passed to the
+  // remote CLI, not merely the handler snapshot used for identity checks.
+  try {
+    if (deriveBoxContextHash({ ...body, model: input.canonicalModel }) !== contextHash) {
+      throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
+    }
+  } catch (error) {
+    if (error instanceof BoxToolFirstRoundError) throw error;
+    throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
+  }
   const plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
@@ -208,7 +222,7 @@ export async function runBoxToolFirstRound(input: {
     const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
       accountId: target.accountId, model: input.canonicalModel, fingerprint,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
-      invocationMode: "detached_tool" });
+      invocationMode: "detached_tool", contextHash });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
