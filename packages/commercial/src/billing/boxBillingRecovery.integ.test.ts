@@ -18,6 +18,13 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_usage_id_seq'::regclass)");
     await client.query("CREATE TEMP TABLE pending_usage_patches (LIKE public.pending_usage_patches INCLUDING ALL)");
     await client.query("CREATE TEMP TABLE users (LIKE public.users INCLUDING ALL)");
+    // Every spend/organization relation is shadowed on the pinned connection.
+    // A coincidentally existing real subscription or org membership for this
+    // uid must never be read and, especially, never be UPDATEd by this test.
+    await client.query("CREATE TEMP TABLE user_subscriptions (LIKE public.user_subscriptions INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE org_memberships (LIKE public.org_memberships INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE orgs (LIKE public.orgs INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE org_subscriptions (LIKE public.org_subscriptions INCLUDING ALL)");
     await client.query("CREATE TEMP SEQUENCE box_recovery_ledger_id_seq");
     await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
     await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
@@ -28,6 +35,18 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     await client.query(`INSERT INTO users(id,email,password_hash,credits)
       VALUES ($1,$2,'test-only-hash',1000)`,
     [userId.toString(), `${requestId}@example.invalid`]);
+    const shadow = await client.query<{ only_temp: boolean }>(
+      `SELECT 'user_subscriptions'::regclass = 'pg_temp.user_subscriptions'::regclass
+        AND 'org_memberships'::regclass = 'pg_temp.org_memberships'::regclass
+        AND 'orgs'::regclass = 'pg_temp.orgs'::regclass
+        AND 'org_subscriptions'::regclass = 'pg_temp.org_subscriptions'::regclass
+        AS only_temp`);
+    assert.equal(shadow.rows[0]?.only_temp, true);
+    // Same uid has an active subscription. The real spend path must debit only
+    // this TEMP row, not a coincidentally matching persistent subscription.
+    await client.query(`INSERT INTO user_subscriptions
+      (id,user_id,plan_code,period_end,period_credits)
+      VALUES (1,$1,'plus',NOW()+INTERVAL '1 day',1000)`, [userId.toString()]);
     const nonce = "b".repeat(24), epoch = "c".repeat(32);
     const ctx = { model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
       boxState: "terminal", boxAccountId: "20", boxReplayFingerprint: "d".repeat(64),
@@ -56,11 +75,15 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     const debited = await client.query<{ credits: string }>(
       "SELECT credits::text FROM users WHERE id=$1", [userId.toString()]);
     const balance = BigInt(debited.rows[0]?.credits ?? "0");
-    assert.ok(balance < 1000n && balance >= 0n);
+    assert.equal(balance, 1000n, "active TEMP period bucket is spent before wallet");
+    const period = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM user_subscriptions WHERE user_id=$1", [userId.toString()]);
+    const periodAfter = BigInt(period.rows[0]?.period_credits ?? "0");
+    assert.ok(periodAfter < 1000n && periodAfter >= 0n);
     const ledger = await client.query<{ delta: string }>(
       "SELECT delta::text FROM credit_ledger WHERE user_id=$1", [userId.toString()]);
     assert.equal(ledger.rows.length, 1);
-    assert.equal(BigInt(ledger.rows[0]!.delta), balance - 1000n);
+    assert.equal(BigInt(ledger.rows[0]!.delta), periodAfter - 1000n);
     const locator = await client.query(
       "SELECT request_id FROM pending_usage_patches WHERE request_id=$1", [requestId]);
     assert.equal(locator.rows.length, 1);
@@ -81,6 +104,43 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
       "SELECT credits::text FROM users WHERE id=$1", [userId.toString()]);
     assert.equal(BigInt(afterBalance.rows[0]!.credits), balance,
       "retry must not debit twice");
+    const afterPeriod = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM user_subscriptions WHERE user_id=$1", [userId.toString()]);
+    assert.equal(BigInt(afterPeriod.rows[0]!.period_credits), periodAfter);
+
+    // Same-UID org membership negative control: an active org subscription
+    // may exist outside this test, but all reads and debits resolve to TEMP.
+    const orgUser = 900_000_001n, orgRequest = `${requestId}-org`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`, [orgUser.toString(), `${orgRequest}@example.invalid`]);
+    await client.query("INSERT INTO orgs(id,name,credits) VALUES (1,'temp-only-org',1000)");
+    await client.query(`INSERT INTO org_memberships(org_id,user_id,billing_enabled)
+      VALUES (1,$1,true)`, [orgUser.toString()]);
+    await client.query(`INSERT INTO org_subscriptions
+      (id,org_id,plan_code,seats,period_end,period_credits)
+      VALUES (1,1,'team',1,NOW()+INTERVAL '1 day',1000)`);
+    const orgTurnKey = "e".repeat(64);
+    const orgCtx = { ...ctx, boxReplayFingerprint: "f".repeat(64),
+      boxTurnKey: orgTurnKey,
+      boxBillingContext: { ...ctx.boxBillingContext, sessionId: "web-org-recovery",
+        turnKey: orgTurnKey } };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [orgRequest, orgUser.toString(), JSON.stringify(orgCtx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, orgRequest, orgUser), "settled");
+    const orgPeriod = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM org_subscriptions WHERE org_id=1");
+    const orgAfter = BigInt(orgPeriod.rows[0]?.period_credits ?? "0");
+    assert.ok(orgAfter < 1000n && orgAfter >= 0n);
+    const orgWallet = await client.query<{ credits: string }>(
+      "SELECT credits::text FROM orgs WHERE id=1");
+    assert.equal(orgWallet.rows[0]?.credits, "1000");
+    assert.equal(await recoverBoxBillingRequest(sameConnection, orgRequest, orgUser),
+      "already_committed");
+    const orgPeriodAgain = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM org_subscriptions WHERE org_id=1");
+    assert.equal(BigInt(orgPeriodAgain.rows[0]!.period_credits), orgAfter);
   } finally {
     client.release();
     await pool.end(); // TEMP tables and sequence vanish with this connection.
