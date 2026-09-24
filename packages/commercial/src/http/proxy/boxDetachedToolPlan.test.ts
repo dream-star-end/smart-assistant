@@ -21,12 +21,12 @@ test("detached tool launch reuses private staged plan without putting user conte
     detachedRunnerAsset: read("box_detached_runner.py"),
     runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) });
   assert.ok(plan.stageDetachedRunner.args[2]?.startsWith("/tmp/ocv5-289-detached-runner-"));
-  assert.equal(plan.launch.args[4], plan.cwd);
-  assert.deepEqual(plan.launch.args.slice(5), plan.run.args);
+  assert.equal(plan.launch.args[5], plan.cwd);
+  assert.deepEqual(plan.launch.args.slice(6), plan.run.args);
   assert.ok(!plan.launch.args.join(" ").includes("private tool prompt"));
   assert.ok(!plan.launch.args.join(" ").includes("local-only tool"));
   const reader = plan.readSpool(42, 4096);
-  assert.deepEqual(reader.args.slice(4), ["--read", plan.cwd, "42", "4096"]);
+  assert.deepEqual(reader.args.slice(5), ["--read", plan.cwd, "42", "4096"]);
   assert.throws(() => plan.readSpool(-1), /BOX_SPOOL_READ_INVALID/);
   assert.throws(() => plan.readSpool(0, 65537), /BOX_SPOOL_READ_INVALID/);
 });

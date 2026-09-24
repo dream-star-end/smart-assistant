@@ -44,7 +44,7 @@ export function makeBoxPinnedRunnerRequest(input: {
     || !input.runnerPath.endsWith(`${input.detachedRunnerHash.slice(0, 16)}.py`)) {
     throw new BoxDetachedRunAccessError("BOX_DETACHED_RUN_IDENTITY_INVALID");
   }
-  return { command: PYTHON, args: ["-c", PINNED_RUNNER, input.runnerPath,
+  return { command: PYTHON, args: ["-I", "-c", PINNED_RUNNER, input.runnerPath,
     input.detachedRunnerHash, ...input.args], cwd: input.cwd,
     environment: input.environment };
 }
