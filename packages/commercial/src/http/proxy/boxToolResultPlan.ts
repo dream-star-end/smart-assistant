@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
+import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { makeBoxStageFiles } from "./boxStageFiles.js";
 
@@ -48,7 +49,8 @@ export function makeBoxPendingRead(cwd: string, toolId: string): BoxCcExecReques
     cwd: "/tmp", environment: ENV };
 }
 
-export function parseBoxPendingCall(raw: string, expected: BoxToolUse): BoxPendingToolCall {
+export function parseBoxPendingCall(raw: string,
+  expected: BoxToolUse | BoxToolUseDigest): BoxPendingToolCall {
   if (Buffer.byteLength(raw) > 1_048_576) {
     throw new BoxToolResultPlanError("BOX_PENDING_INVALID");
   }
@@ -58,11 +60,16 @@ export function parseBoxPendingCall(raw: string, expected: BoxToolUse): BoxPendi
     throw new BoxToolResultPlanError("BOX_PENDING_INVALID");
   }
   const x = value as Record<string, unknown>;
+  let sameArguments = false;
+  try { sameArguments = "inputHash" in expected
+    ? hashBoxToolInput(x.arguments) === expected.inputHash
+    : isDeepStrictEqual(x.arguments, expected.input); }
+  catch { sameArguments = false; }
   if (Object.keys(x).sort().join(",") !== "arguments,mcpRequestId,modelToolUseId,name,version"
     || x.version !== 1 || x.modelToolUseId !== expected.id
     || !TOOL_ID.test(expected.id)
     || x.name !== expected.boxName.replace(/^mcp__ocbridge__/, "")
-    || !isDeepStrictEqual(x.arguments, expected.input)
+    || !sameArguments
     || (typeof x.mcpRequestId !== "string" && !Number.isSafeInteger(x.mcpRequestId))
     || (typeof x.mcpRequestId === "string" && x.mcpRequestId.length > 128)) {
     throw new BoxToolResultPlanError("BOX_PENDING_INVALID");
@@ -72,7 +79,7 @@ export function parseBoxPendingCall(raw: string, expected: BoxToolUse): BoxPendi
 
 export function makeBoxToolResultPlan(input: {
   cwd: string;
-  expected: BoxToolUse;
+  expected: BoxToolUse | BoxToolUseDigest;
   pending: BoxPendingToolCall;
   matched: BoxMatchedToolResult;
 }): { requests: readonly BoxCcExecRequest[]; resultHash: string; path: string } {

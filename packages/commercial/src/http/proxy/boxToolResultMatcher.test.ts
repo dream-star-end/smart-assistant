@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { matchBoxToolResults } from "./boxToolResultMatcher.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
+import { hashBoxToolInput } from "./boxToolInputHash.js";
 
 const uses: BoxToolUse[] = [
   { id: "toolu_same_A", boxName: "mcp__ocbridge__t0",
@@ -27,6 +28,10 @@ test("same-name same-input tool results bind by model ID, not arrival order", ()
     ["toolu_same_A", "first"], ["toolu_same_B", "second"],
   ]);
   assert.notEqual(matched[0]?.contentHash, matched[1]?.contentHash);
+  const digests = uses.map(({ id, boxName, clientName, input }) => ({
+    id, boxName, clientName, inputHash: hashBoxToolInput(input) }));
+  assert.deepEqual(matchBoxToolResults(body(), digests), matched,
+    "cross-request resume must validate only persisted hashes, not PG raw arguments");
 });
 
 test("missing, duplicate or rewritten tool history fails before result publication", () => {

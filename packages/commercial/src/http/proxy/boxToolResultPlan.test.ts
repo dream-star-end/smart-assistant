@@ -10,6 +10,7 @@ import { makeBoxPendingRead, makeBoxToolResultPlan,
 import { makeBoxStageFiles } from "./boxStageFiles.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
 import type { ProxyBody } from "./shared.js";
+import { hashBoxToolInput } from "./boxToolInputHash.js";
 
 const use: BoxToolUse = { id: "toolu_same_A", boxName: "mcp__ocbridge__t0",
   clientName: "local_echo", input: { value: "ping" } };
@@ -59,6 +60,11 @@ test("pending identity and mutated local result cannot publish", () => {
     modelToolUseId: "toolu_other" }), use), /BOX_PENDING_INVALID/);
   assert.throws(() => parseBoxPendingCall(JSON.stringify({ ...pending,
     name: "t1" }), use), /BOX_PENDING_INVALID/);
+  const digest = { id: use.id, boxName: use.boxName,
+    clientName: use.clientName, inputHash: hashBoxToolInput(use.input) };
+  assert.equal(parseBoxPendingCall(JSON.stringify(pending), digest).modelToolUseId, use.id);
+  assert.throws(() => parseBoxPendingCall(JSON.stringify({ ...pending,
+    arguments: { value: "different" } }), digest), /BOX_PENDING_INVALID/);
   const matched = matchBoxToolResults(body, [use])[0]!;
   const altered = { ...matched, content: [{ type: "text" as const,
     text: "changed after validation" }] };

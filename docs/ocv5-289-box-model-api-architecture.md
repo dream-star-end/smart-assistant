@@ -218,7 +218,14 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   do **not** publish tools in production or grant Box execution permission.
   A first-round journal CAS can now persist the full model tool-use set, exact
   usage and verified pending subset and return a durable handoff revision;
-  no HTTP stream calls it yet, and arbitrary later rounds remain unimplemented.
+  the next HTTP row can atomically claim that invocation with a complete,
+  ID-bound tool_result set before any sidecar result is published. PG stores
+  only canonical input/result hashes, never raw tool arguments or results;
+  the resumed request and sidecar pending file are rehashed against those
+  digests. Recovery can
+  settle the first completed model-message usage without treating a live CLI as
+  terminated. No HTTP stream calls these methods yet, and arbitrary later
+  rounds remain unimplemented.
 - Before **each** round's terminal SSE (tool-use or final text), persist exact
   observed usage and the frozen pricing basis bound to its stable billing ID.
   The existing per-HTTP `request_finalize_journal` must carry a Box durable

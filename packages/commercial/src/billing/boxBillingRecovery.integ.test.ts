@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { recoverBoxBillingRequest } from "./boxBillingRecovery.js";
+import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
 
 test("terminal Box evidence settles once, with durable usage and turn locator",
   { skip: !process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL }, async () => {
@@ -141,6 +142,44 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     const orgPeriodAgain = await client.query<{ period_credits: string }>(
       "SELECT period_credits::text FROM org_subscriptions WHERE org_id=1");
     assert.equal(BigInt(orgPeriodAgain.rows[0]!.period_credits), orgAfter);
+
+    // A completed model tool message is billable even while the remote CLI
+    // remains alive for OpenClaude-local tool results. It must use this round's
+    // usage, never a later cumulative CLI terminal snapshot.
+    const toolUser = 900_000_002n, toolRequest = `${requestId}-tool`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [toolUser.toString(), `${toolRequest}@example.invalid`]);
+    const toolTurnKey = "5".repeat(64);
+    const toolCtx = { ...ctx, boxState: "handoff",
+      boxReplayFingerprint: "6".repeat(64), boxTurnKey: toolTurnKey,
+      boxTerminalProof: undefined, boxUsage: undefined,
+      boxHandoffRevision: "123e4567-e89b-42d3-a456-426614174000",
+      boxToolHandoff: { version: 1, roundNo: 1, messageId: "msg_tool",
+        toolUses: [{ id: "toolu_one", boxName: "mcp__ocbridge__t0",
+          clientName: "local_echo", inputHash: hashBoxToolInput({ value: "ping" }) }],
+        verifiedPendingToolUseIds: ["toolu_one"],
+        usage: { inputTokens: 2, outputTokens: 3,
+          cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      boxBillingContext: { ...ctx.boxBillingContext, sessionId: "web-tool-recovery",
+        turnKey: toolTurnKey } };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [toolRequest, toolUser.toString(), JSON.stringify(toolCtx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, toolRequest, toolUser), "settled");
+    const toolUsage = await client.query<{ cost_credits: string }>(
+      "SELECT cost_credits::text FROM usage_records WHERE request_id=$1", [toolRequest]);
+    assert.equal(toolUsage.rows.length, 1);
+    assert.ok(BigInt(toolUsage.rows[0]!.cost_credits) > 0n);
+    const toolBalance = await client.query<{ credits: string }>(
+      "SELECT credits::text FROM users WHERE id=$1", [toolUser.toString()]);
+    assert.ok(BigInt(toolBalance.rows[0]!.credits) < 1000n);
+    const toolState = await client.query<{ box_state: string }>(
+      "SELECT ctx->>'boxState' AS box_state FROM request_finalize_journal WHERE request_id=$1",
+      [toolRequest]);
+    assert.equal(toolState.rows[0]?.box_state, "handoff",
+      "billing settlement must not release the live Box process/account fence");
   } finally {
     client.release();
     await pool.end(); // TEMP tables and sequence vanish with this connection.

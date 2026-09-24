@@ -1,4 +1,4 @@
-/** Recover only already-proven Box text rounds from the existing journal.
+/** Recover only already-proven Box model rounds from the existing journal.
  * This never invokes Box, restarts Claude, replays a tool, or guesses usage. */
 import type { Pool } from "pg";
 import { parseBillingPricing } from "./persistedBillingPricing.js";
@@ -23,23 +23,57 @@ function evidence(row: JournalRow): { usage: TokenUsage;
   pricing: NonNullable<ReturnType<typeof parseBillingPricing>>;
   context: NonNullable<ReturnType<typeof parseBoxBillingContext>> } | null {
   const ctx = row.ctx;
-  if (ctx.boxInvocationRecovery !== "v1" || ctx.boxState !== "terminal"
+  if (ctx.boxInvocationRecovery !== "v1"
     || typeof ctx.model !== "string" || typeof ctx.boxRunNonce !== "string"
-    || typeof ctx.boxLeaseEpoch !== "string" || !ctx.boxTerminalProof
+    || typeof ctx.boxLeaseEpoch !== "string"
     || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
     || typeof ctx.boxReplayFingerprint !== "string"
     || !/^[a-f0-9]{64}$/.test(ctx.boxReplayFingerprint)
-    || typeof ctx.boxTurnKey !== "string" || !/^[a-f0-9]{64}$/.test(ctx.boxTurnKey)
-    || !ctx.boxUsage || typeof ctx.boxUsage !== "object" || Array.isArray(ctx.boxUsage)) return null;
+    || typeof ctx.boxTurnKey !== "string" || !/^[a-f0-9]{64}$/.test(ctx.boxTurnKey)) return null;
   const pricing = parseBillingPricing(ctx.billingPricing, ctx.model);
   const context = parseBoxBillingContext(ctx.boxBillingContext);
-  let proof: ReturnType<typeof parseBoxTerminalProof>;
-  try { proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
-    { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch }); }
-  catch { return null; }
-  if (!pricing || !context || context.turnKey !== ctx.boxTurnKey
-    || proof.reason !== "worker_complete") return null;
-  const u = ctx.boxUsage as Record<string, unknown>;
+  if (!pricing || !context || context.turnKey !== ctx.boxTurnKey) return null;
+  let source: unknown;
+  if (ctx.boxToolHandoff !== undefined) {
+    if (!["handoff", "resuming", "unknown", "terminal"].includes(String(ctx.boxState))
+      || typeof ctx.boxHandoffRevision !== "string"
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(ctx.boxHandoffRevision)
+      || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
+      || Array.isArray(ctx.boxToolHandoff)) return null;
+    const h = ctx.boxToolHandoff as Record<string, unknown>;
+    const toolUses = h.toolUses, pendingIds = h.verifiedPendingToolUseIds;
+    if (h.version !== 1 || h.roundNo !== 1
+      || typeof h.messageId !== "string" || h.messageId.length < 1
+      || !Array.isArray(toolUses) || toolUses.length < 1 || toolUses.length > 32
+      || !Array.isArray(pendingIds) || pendingIds.length < 1
+      || Array.from({ length: toolUses.length }, (_, index) => index)
+        .some((index) => !Object.hasOwn(toolUses, index))
+      || Array.from({ length: pendingIds.length }, (_, index) => index)
+        .some((index) => !Object.hasOwn(pendingIds, index))
+      || toolUses.some((use: unknown) => {
+        if (!use || typeof use !== "object" || Array.isArray(use)) return true;
+        const item = use as Record<string, unknown>;
+        return Object.keys(item).sort().join(",") !== "boxName,clientName,id,inputHash"
+          || typeof item.id !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.id)
+          || typeof item.boxName !== "string" || !/^mcp__ocbridge__t[0-9]{1,3}$/.test(item.boxName)
+          || typeof item.clientName !== "string" || item.clientName.length < 1
+          || typeof item.inputHash !== "string" || !/^[a-f0-9]{64}$/.test(item.inputHash);
+      })
+      || pendingIds.some((id: unknown) =>
+        !toolUses.some((use: unknown) =>
+          !!use && typeof use === "object" && (use as { id?: unknown }).id === id))) return null;
+    source = h.usage;
+  } else {
+    if (ctx.boxState !== "terminal" || !ctx.boxTerminalProof) return null;
+    let proof: ReturnType<typeof parseBoxTerminalProof>;
+    try { proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
+      { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch }); }
+    catch { return null; }
+    if (proof.reason !== "worker_complete") return null;
+    source = ctx.boxUsage;
+  }
+  if (!source || typeof source !== "object" || Array.isArray(source)) return null;
+  const u = source as Record<string, unknown>;
   const counts = [u.inputTokens, u.outputTokens, u.cacheReadTokens, u.cacheWriteTokens];
   if (Object.keys(u).sort().join(",") !==
       "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens"
@@ -93,7 +127,9 @@ export async function recoverBoxBillingRequest(pool: Pool, requestId: string,
               error_msg=NULL, failure_code=NULL, final_credits=NULL, updated_at=NOW()
         WHERE rfj.request_id=$1 AND rfj.user_id=$2
           AND rfj.state='finalizing' AND rfj.ctx->>'boxInvocationRecovery'='v1'
-          AND rfj.ctx->>'boxState'='terminal'
+          AND (rfj.ctx->>'boxState'='terminal'
+            OR (rfj.ctx->>'boxState' IN ('handoff','resuming','unknown')
+              AND rfj.ctx ? 'boxToolHandoff'))
           AND rfj.updated_at < NOW() - ($3::bigint * INTERVAL '1 millisecond')
           AND NOT EXISTS (SELECT 1 FROM usage_records ur
             WHERE ur.request_id=rfj.request_id AND ur.user_id=rfj.user_id)`,
@@ -123,7 +159,10 @@ export async function reconcileBoxBillingBatch(pool: Pool, limit = 20): Promise<
   settled: number; pending: number; manual: number }> {
   const rows = await pool.query<{ request_id: string; user_id: string }>(
     `SELECT request_id,user_id::text FROM request_finalize_journal
-      WHERE ctx->>'boxInvocationRecovery'='v1' AND ctx->>'boxState'='terminal'
+      WHERE ctx->>'boxInvocationRecovery'='v1'
+        AND (ctx->>'boxState'='terminal'
+          OR (ctx->>'boxState' IN ('handoff','resuming','unknown')
+            AND ctx ? 'boxToolHandoff'))
         AND state IN ('inflight','finalizing')
         AND updated_at < NOW() - ($2::bigint * INTERVAL '1 millisecond')
       ORDER BY updated_at ASC LIMIT $1`,

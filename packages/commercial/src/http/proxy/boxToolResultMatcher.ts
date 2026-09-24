@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { ProxyBody } from "./shared.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
+import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 
 const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 // Leave room for the sidecar result envelope under its 8 MiB frame bound.
@@ -59,7 +60,7 @@ function content(value: unknown): McpContent[] {
 }
 
 export function matchBoxToolResults(body: ProxyBody,
-  expected: readonly BoxToolUse[]): readonly BoxMatchedToolResult[] {
+  expected: readonly (BoxToolUse | BoxToolUseDigest)[]): readonly BoxMatchedToolResult[] {
   if (!Array.isArray(expected) || expected.length < 1 || expected.length > 32
     || !Array.isArray(body.messages) || body.messages.length < 2) {
     throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
@@ -77,9 +78,16 @@ export function matchBoxToolResults(body: ProxyBody,
   for (let i = 0; i < expected.length; i++) {
     const use = uses[i];
     const prior = expected[i]!;
+    let sameInput = false;
+    if (record(use)) {
+      try { sameInput = "inputHash" in prior
+        ? hashBoxToolInput(use.input) === prior.inputHash
+        : isDeepStrictEqual(use.input, prior.input); }
+      catch { sameInput = false; }
+    }
     if (!record(use) || typeof prior.id !== "string" || !TOOL_ID.test(prior.id)
       || use.id !== prior.id || use.name !== prior.clientName
-      || !isDeepStrictEqual(use.input, prior.input)) {
+      || !sameInput) {
       throw new BoxToolResultMatchError("BOX_TOOL_RESULT_HISTORY_MISMATCH");
     }
   }

@@ -19,9 +19,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       error_msg text, failure_code text, final_credits bigint)`);
     // Pin all journal operations to this one connection, whose temp table
     // shadows the real table. No shared schema or persistent row is touched.
+    const privateMarker = "synthetic-private-marker";
+    const guardedQuery = async (sql: string, params: unknown[] = []) => {
+      assert.ok(!JSON.stringify(params).includes(privateMarker),
+        "raw tool arguments must never enter a PostgreSQL query parameter");
+      return client.query(sql, params);
+    };
     const sameConnection = { connect: async () => ({
-      query: client.query.bind(client), release: () => {} }),
-      query: client.query.bind(client) } as never;
+      query: guardedQuery, release: () => {} }), query: guardedQuery } as never;
     const journal = new BoxDurableJournal(sameConnection);
     const suffix = randomBytes(6).toString("hex");
     const fingerprint = { turnKey: "a".repeat(64), sessionId: `session-${suffix}`,
@@ -103,9 +108,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await journal.markRunning(toolCall);
     const candidate = { messageId: "msg_box_tool_1", toolUses: [
       { id: "toolu_A", boxName: "mcp__ocbridge__t0",
-        clientName: "local_echo", input: { value: "same" } },
+        clientName: "local_echo", input: { value: privateMarker } },
       { id: "toolu_B", boxName: "mcp__ocbridge__t0",
-        clientName: "local_echo", input: { value: "same" } },
+        clientName: "local_echo", input: { value: privateMarker } },
     ], inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
       verifiedPendingToolUseIds: ["toolu_A"] });
@@ -114,6 +119,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const handoff = await client.query<{ ctx: Record<string, unknown> }>(
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
     assert.equal(handoff.rows[0]?.ctx.boxState, "handoff");
+    assert.ok(!JSON.stringify(handoff.rows[0]?.ctx).includes(privateMarker));
+    const persistedUses = (handoff.rows[0]?.ctx.boxToolHandoff as {
+      toolUses: Array<Record<string, unknown>> }).toolUses;
+    assert.ok(persistedUses.every((use) => /^[a-f0-9]{64}$/.test(String(use.inputHash))
+      && !Object.hasOwn(use, "input")));
     assert.deepEqual((handoff.rows[0]?.ctx.boxToolHandoff as Record<string, unknown>).usage,
       { inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 });
     await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
@@ -124,6 +134,43 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       verifiedPendingToolUseIds: ["toolu_A"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
+
+    await put(`box-d-${suffix}`);
+    const resumeBody = { model: basis.model, max_tokens: 128,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: "a".repeat(64),
+        session_id: `session-${suffix}` }) },
+      messages: [
+        { role: "assistant", content: candidate.toolUses.map((use) => ({
+          type: "tool_use", id: use.id, name: use.clientName, input: use.input })) },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
+          { type: "tool_result", tool_use_id: "toolu_A", content: "first" },
+        ] },
+      ] };
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model,
+      canonicalBody: { ...resumeBody, messages: [resumeBody.messages[0]!,
+        { role: "user", content: [resumeBody.messages[1]!.content[0]!] }] } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_RESULT_MISMATCH");
+    const resumed = await journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
+    assert.equal(resumed.ownerRequestId, toolCall.requestId);
+    assert.equal(resumed.accountId, 20n);
+    assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
+      ["toolu_A", "toolu_B"]);
+    const linked = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE request_id IN ($1,$2) ORDER BY request_id`,
+      [toolCall.requestId, `box-d-${suffix}`]);
+    assert.equal(linked.rows.find((row) => row.request_id === toolCall.requestId)?.ctx.boxState,
+      "resuming");
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
+      "linked");
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_CALL_AMBIGUOUS");
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();
