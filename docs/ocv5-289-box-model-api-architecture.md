@@ -180,6 +180,24 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   it for that call's network retries, and sends it to the existing master
   proxy without moving prompt construction, memory or tools to Box. Until
   that exact behavior is proven, keep the catalog route disabled.
+  Reuse the **existing user-container GatewayServer** for this private
+  loopback-only shim; do not create another user-facing API or an agent process.
+  For a Box-authorized CCB turn, `SubprocessRunner` points only that turn's
+  `ANTHROPIC_BASE_URL` at the local shim; it forwards to the same authenticated
+  master `/v1/messages` endpoint with original container credentials and
+  signed model-authority headers intact. The shim buffers only the already
+  bounded request body, assigns a random per-call ID before forwarding,
+  and adds `x-oc-box-call-id`. It keeps `(turn_key, request_hash) → call ID`
+  while a response is in flight/unknown, reusing the ID on a transport retry.
+  A fully delivered terminal response retires that mapping; a subsequent
+  independent call gets a fresh ID even for identical content. On ambiguous
+  delivery the mapping stays fenced, and master rejects or serves verified
+  cached output for the same ID—never starts a second paid CLI. Master still
+  binds that ID to authenticated uid/session/turn/model/body hash in PG;
+  neither a forged header nor a new ID can bypass its open-invocation conflict
+  gate. Transparent SSE forwarding, cancel/backpressure, bounded buffering,
+  redirect prohibition and no credential logging need same-entry tests before
+  replacing any live `ANTHROPIC_BASE_URL`.
 - Use monotonic revision/lease epoch on every state change. State path:
   `reserved → starting → streaming → handoff → resuming → streaming → ...`
   then `terminal`; each new model message increments `round_no`. Any
