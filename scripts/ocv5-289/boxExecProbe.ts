@@ -10,7 +10,7 @@ import { getAccount, getCursorTokenSnapshot, getTokenForUse } from '../../packag
 import { resolveAccountEgressDispatcher } from '../../packages/commercial/src/account-pool/egressDispatcher.js'
 import { CursorSandProvisionClient } from '../../packages/commercial/src/account-pool/cursorSandProvision.js'
 import { getRuntimeChannel } from '../../packages/commercial/src/runtimeChannel.js'
-import { encodeExecRequest, parseExecFrames } from '../../packages/gateway/src/engine/cursorBoxCcExec.js'
+import { encodeExecRequest, parseExecFramesStrict } from '../../packages/gateway/src/engine/cursorBoxCcExec.js'
 import { boxExecEgressBasis } from './boxExecBasis.js'
 import { withPinnedBoxHistoryVersion } from './boxHistoryVersionGate.js'
 import { compileBoxCliSyntheticTurn } from '../../packages/commercial/src/http/proxy/boxMessagesMapper.js'
@@ -137,7 +137,7 @@ try {
           total += chunk.value.byteLength
           if (total > 256 * 1024) throw new Error('BOX_EXEC_RESPONSE_TOO_LARGE')
           pending = Buffer.concat([pending, Buffer.from(chunk.value)])
-          const parsed = parseExecFrames(pending)
+          const parsed = parseExecFramesStrict(pending)
           pending = Buffer.from(parsed.rest)
           for (const event of parsed.events) {
             if (event.kind === 'stdout') output += event.data ?? ''
