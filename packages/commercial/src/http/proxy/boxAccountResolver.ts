@@ -10,7 +10,7 @@ import { getAccount, getCursorTokenSnapshot, getTokenForUse, listAccounts,
   type AccountRow, type AccountToken, type CursorTokenSnapshot } from "../../account-pool/store.js";
 import { resolveAccountEgressDispatcher, type EgressResolution } from "../../account-pool/egressDispatcher.js";
 import { CursorSandProvisionClient, sandPrincipal } from "../../account-pool/cursorSandProvision.js";
-import { selectCursorAccount } from "./cursorExternal.js";
+import { selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
 import { BoxExecTransport } from "./boxExecTransport.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
