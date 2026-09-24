@@ -2,7 +2,7 @@
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
-import type { BoxDurableJournal } from "./boxDurableJournal.js";
+import type { BoxDurableJournal, BoxRemoteCleanupCandidate } from "./boxDurableJournal.js";
 import { runBoxToolFirstRound, type BoxToolFirstHandoff,
   type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
@@ -30,8 +30,10 @@ function resumeShape(body: ProxyBody): boolean {
 
 export class BoxToolFetch {
   private readonly targets = new Map<string, Set<BoxResolvedTarget>>();
-  private readonly terminalCleanup = new Map<string, BoxResolvedTarget>();
+  private readonly terminalCleanup = new Map<string, { target: BoxResolvedTarget;
+    candidate: BoxRemoteCleanupCandidate }>();
   private readonly terminalInFlight = new Map<string, Promise<void>>();
+  private readonly reconcileInFlight = new Set<string>();
   private readonly cleanup = new Set<{ target: BoxResolvedTarget;
     pending: Promise<void>; failed: boolean }>();
   constructor(private readonly deps: {
@@ -88,15 +90,45 @@ export class BoxToolFetch {
   /** Terminal proof and journal evidence already exist for these runs.
    * The remote cleanup is idempotent; this never relaunches the paid CLI. */
   async retryTerminalCleanup(): Promise<number> {
-    await Promise.allSettled([...this.terminalCleanup].map(([nonce, target]) =>
-      this.cleanKnownTerminal(nonce, target)));
+    await Promise.allSettled([...this.terminalCleanup].map(([nonce, held]) =>
+      this.cleanKnownTerminal(nonce, held.target, held.candidate)));
     return this.terminalCleanup.size;
   }
 
-  private cleanKnownTerminal(runNonce: string, target: BoxResolvedTarget): Promise<void> {
+  /** Restart-safe takeover: a new egress process can find already-proven
+   * terminal runs in the existing journal and clean them on the pinned Box.
+   * This never resumes, replays or pays for a CLI invocation. */
+  async reconcileRemoteCleanup(limit = 10): Promise<number> {
+    const candidates = await this.deps.journal.listRemoteCleanupCandidates(limit);
+    await Promise.allSettled(candidates.map(async (candidate) => {
+      if (this.reconcileInFlight.has(candidate.runNonce)) return;
+      this.reconcileInFlight.add(candidate.runNonce);
+      try {
+        let held = this.terminalCleanup.get(candidate.runNonce);
+        if (!held) {
+          const target = await this.deps.resolveTarget({ uid: candidate.uid,
+            sessionId: null, requestId: candidate.requestId,
+            upstreamModel: "claude-opus-5-5",
+            requiredAccountId: candidate.accountId,
+            signal: new AbortController().signal });
+          if (target.accountId !== candidate.accountId) {
+            throw new Error("BOX_CLEANUP_ACCOUNT_MISMATCH");
+          }
+          held = { target, candidate };
+          this.terminalCleanup.set(candidate.runNonce, held);
+          this.own(candidate.runNonce, target);
+        }
+        await this.cleanKnownTerminal(candidate.runNonce, held.target, candidate);
+      } finally { this.reconcileInFlight.delete(candidate.runNonce); }
+    }));
+    return this.terminalCleanup.size;
+  }
+
+  private cleanKnownTerminal(runNonce: string, target: BoxResolvedTarget,
+    candidate: BoxRemoteCleanupCandidate): Promise<void> {
     const existing = this.terminalInFlight.get(runNonce);
     if (existing) return existing;
-    const pending = this.performTerminalCleanup(runNonce, target).finally(() => {
+    const pending = this.performTerminalCleanup(runNonce, target, candidate).finally(() => {
       this.terminalInFlight.delete(runNonce);
     });
     this.terminalInFlight.set(runNonce, pending);
@@ -104,7 +136,7 @@ export class BoxToolFetch {
   }
 
   private async performTerminalCleanup(runNonce: string,
-    target: BoxResolvedTarget): Promise<void> {
+    target: BoxResolvedTarget, candidate: BoxRemoteCleanupCandidate): Promise<void> {
     const remote = target.exec.run(makeBoxRunCleanup(runNonce), {
       timeoutMs: 20_000, maxResponseBytes: 4096 });
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -114,6 +146,7 @@ export class BoxToolFetch {
     })]); }
     finally { if (timeout) clearTimeout(timeout); }
     if (result.stdout.trim() !== "clean") throw new Error("BOX_RUN_CLEANUP_UNPROVEN");
+    await this.deps.journal.markRemoteCleaned(candidate);
     this.terminalCleanup.delete(runNonce);
     const group = this.targets.get(runNonce);
     if (!group) return;
@@ -130,12 +163,13 @@ export class BoxToolFetch {
     }));
   }
 
-  private async releaseAfterProof(runNonce: string): Promise<void> {
+  private async releaseAfterProof(candidate: BoxRemoteCleanupCandidate): Promise<void> {
+    const runNonce = candidate.runNonce;
     const group = this.targets.get(runNonce);
     if (!group) return;
     const target = [...group].at(-1)!;
-    this.terminalCleanup.set(runNonce, target);
-    try { await this.cleanKnownTerminal(runNonce, target); }
+    this.terminalCleanup.set(runNonce, { target, candidate });
+    try { await this.cleanKnownTerminal(runNonce, target, candidate); }
     catch { /* retain pinned target and private files for bounded retry */ }
   }
 
@@ -169,7 +203,10 @@ export class BoxToolFetch {
                 this.own(held.claim.runNonce, held.target),
               onUnknown: this.deps.onUnknown });
             if (result.kind === "final") {
-              await this.releaseAfterProof(published.claim.runNonce);
+              await this.releaseAfterProof({ requestId: args.requestId,
+                uid: args.uid, accountId: published.claim.accountId,
+                runNonce: published.claim.runNonce,
+                leaseEpoch: published.claim.leaseEpoch });
             }
           } else {
             const outcome: BoxToolFirstHandoff | BoxToolFirstFinal = await (this.deps.runFirst
@@ -187,7 +224,10 @@ export class BoxToolFetch {
             });
             this.own(outcome.plan.runNonce, outcome.target);
             if (outcome.kind === "final") {
-              await this.releaseAfterProof(outcome.plan.runNonce);
+              await this.releaseAfterProof({ requestId: args.requestId,
+                uid: args.uid, accountId: outcome.target.accountId,
+                runNonce: outcome.plan.runNonce,
+                leaseEpoch: outcome.plan.leaseEpoch });
             }
           }
           controller.close();

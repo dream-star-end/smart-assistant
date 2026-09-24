@@ -20,6 +20,8 @@ const call = (canonicalBody: ProxyBody) => ({ uid: 3n, sessionId: "session",
   upstreamModel: "claude-opus-5-5", url: BOX_INTERNAL_ENDPOINT,
   init: { method: "POST", body: JSON.stringify({ ...canonicalBody,
     model: "claude-opus-5-5" }) } });
+const journal = () => ({ markRemoteCleaned: async () => {},
+  listRemoteCleanupCandidates: async () => [] }) as never;
 
 test("same internal model fetch streams first handoff then next final without tool execution", async () => {
   const calls: string[] = [];
@@ -27,11 +29,11 @@ test("same internal model fetch streams first handoff then next final without to
   const target = { accountId: 20n,
     exec: { run: async () => ({ stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const }) },
     dispose: async () => { disposed = true; } };
-  const claim = { runNonce: "a".repeat(24), accountId: 20n,
+  const claim = { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), accountId: 20n,
     spoolOffset: 1234, roundNo: 2 };
   const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
     keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
-    detachedRunnerAsset: Buffer.from("d"), journal: {} as never,
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: async () => target as never,
     onUnknown: async () => {},
@@ -68,13 +70,14 @@ test("failed local close retry is bounded and never starts concurrent dispose", 
   } };
   const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
     keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
-    detachedRunnerAsset: Buffer.from("d"), journal: {} as never,
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: async () => target as never,
     onUnknown: async () => {},
     runFirst: (async (input: { emit: (sse: string) => void }) => {
       input.emit("event: message_stop\ndata: {}\n\n");
-      return { kind: "final", plan: { runNonce: "a".repeat(24) }, target,
+      return { kind: "final", plan: { runNonce: "a".repeat(24),
+        leaseEpoch: "b".repeat(32) }, target,
         proof: { reason: "worker_complete" } };
     }) as never,
   });
@@ -99,13 +102,14 @@ test("terminal cleanup failure retains the pinned Box target for idempotent retr
   } }, dispose: async () => { disposed = true; } };
   const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
     keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
-    detachedRunnerAsset: Buffer.from("d"), journal: {} as never,
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: async () => target as never,
     onUnknown: async () => {},
     runFirst: (async (input: { emit: (sse: string) => void }) => {
       input.emit("event: message_stop\ndata: {}\n\n");
-      return { kind: "final", plan: { runNonce: "b".repeat(24) }, target,
+      return { kind: "final", plan: { runNonce: "b".repeat(24),
+        leaseEpoch: "c".repeat(32) }, target,
         proof: { reason: "worker_complete" } };
     }) as never,
   });
@@ -115,4 +119,34 @@ test("terminal cleanup failure retains the pinned Box target for idempotent retr
   assert.equal(await service.retryTerminalCleanup(), 0);
   assert.equal(attempts, 2);
   assert.equal(disposed, true);
+});
+
+test("fresh egress instance recovers proven remote cleanup from durable journal", async () => {
+  const candidate = { requestId: "box-proven", uid: 3n, accountId: 20n,
+    runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32) };
+  let marked = false, disposed = false, cleans = 0;
+  const target = { accountId: 20n, exec: { run: async () => {
+    cleans++;
+    return { stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const };
+  } }, dispose: async () => { disposed = true; } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { listRemoteCleanupCandidates: async () => marked ? [] : [candidate],
+      markRemoteCleaned: async (value: typeof candidate) => {
+        assert.deepEqual(value, candidate); marked = true;
+      } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async (args) => {
+      assert.equal(args.requiredAccountId, 20n);
+      return target as never;
+    },
+    onUnknown: async () => {},
+  });
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  assert.equal(cleans, 1);
+  assert.equal(marked, true);
+  assert.equal(disposed, true);
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  assert.equal(cleans, 1, "already-cleaned remote run is not touched again");
 });
