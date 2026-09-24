@@ -1,12 +1,15 @@
 /** Offline real Claude Code 2.1.280 -> synthetic Messages API. Verifies that
  * the *actual* built-in tool declarations fit our Box virtual-MCP catalog
  * compiler without storing user prompts, descriptions or schema bodies. */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { compileBoxToolCatalog, mapBoxCliEffort } from
   "../../packages/commercial/src/http/proxy/boxToolCatalog.js";
 
+const version = execFileSync("/usr/local/bin/claude", ["--version"],
+  { encoding: "utf8", timeout: 5000 }).trim();
+if (version !== "2.1.280 (Claude Code)") throw new Error("DIRECT_CC_VERSION_UNEXPECTED");
 const home = mkdtempSync("/tmp/ocv5-289-cc-catalog-");
 let seen = 0;
 let summary: Record<string, unknown> | null = null;
@@ -73,5 +76,5 @@ if (exit !== 0 || seen !== 1 || summary?.count !== 20
   || summary.effort !== "medium" || summary.aliasesUnique !== true) {
   throw new Error("DIRECT_CC_TOOL_CATALOG_CONTRACT_FAILED");
 }
-process.stdout.write(JSON.stringify({ version: "2.1.280", synthetic: true,
+process.stdout.write(JSON.stringify({ version, synthetic: true,
   requests: seen, ...summary }) + "\n");
