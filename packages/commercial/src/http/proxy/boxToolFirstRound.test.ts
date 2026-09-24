@@ -41,7 +41,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   const sequence: string[] = [];
   const emitted: string[] = [];
   let disposed = false, launches = 0, recordedOffset = -1;
-  let retained = false;
+  let retained = false, cleanupRetained = false;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
     exec: { run: async (request: { args: string[] }) => {
       const args = request.args;
@@ -91,7 +91,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     journal: journal as never, maxOutputTokensForModel: () => 128_000,
     resolveTarget: async () => target as never,
     onUnknown: async () => { sequence.push("notify-unknown"); },
-    retainUnknownTarget: () => { retained = true; sequence.push("retain-unknown"); } };
+    retainUnknownTarget: () => { retained = true; sequence.push("retain-unknown"); },
+    retainCleanupTarget: () => { cleanupRetained = true; sequence.push("retain-cleanup"); } };
   const input = { uid: 3n, sessionId: "session-synthetic", requestId: "box-synthetic",
     canonicalModel: canonicalBody.model, canonicalBody, upstreamModel: model,
     url: BOX_INTERNAL_ENDPOINT, init: { method: "POST", body: JSON.stringify(upstreamBody) },
@@ -99,7 +100,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   return { input, deps, target, sequence, emitted,
     get disposed() { return disposed; }, get launches() { return launches; },
     get recordedOffset() { return recordedOffset; },
-    get retained() { return retained; } };
+    get retained() { return retained; },
+    get cleanupRetained() { return cleanupRetained; } };
 }
 
 test("first tool round admits before one launch and emits terminal only after durable handoff", async () => {
@@ -145,10 +147,25 @@ test("late resolver after caller cancellation closes only the unused target", as
   const task = runBoxToolFirstRound({ ...f.input,
     init: { ...f.input.init, signal: abort.signal } }, f.deps);
   abort.abort();
+  deliver(f.target); // same event-loop turn as cancellation
   await assert.rejects(() => task, /BOX_TOOL_ABORTED/);
-  deliver(f.target);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(f.disposed, true);
+  assert.equal(f.launches, 0);
+});
+
+test("synchronous late dispose failure is observed and retained for retry", async () => {
+  const f = fixture();
+  const abort = new AbortController();
+  let deliver!: (target: typeof f.target) => void;
+  f.deps.resolveTarget = (() => new Promise((resolve) => { deliver = resolve; })) as never;
+  f.target.dispose = (() => { throw new Error("synthetic dispose failure"); }) as never;
+  const task = runBoxToolFirstRound({ ...f.input,
+    init: { ...f.input.init, signal: abort.signal } }, f.deps);
+  abort.abort(); deliver(f.target);
+  await assert.rejects(() => task, /BOX_TOOL_ABORTED/);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(f.cleanupRetained, true);
   assert.equal(f.launches, 0);
 });
 
@@ -179,6 +196,21 @@ test("proven prestart asset failure releases only local resources", async () => 
   assert.equal(f.launches, 0);
   assert.equal(f.disposed, true);
   assert.ok(f.sequence.indexOf("admit") < f.sequence.indexOf("prestart-stopped"));
+});
+
+test("stalled prestart journal cleanup is bounded and retains target ownership", async () => {
+  const f = fixture();
+  f.target.exec.run = async () => ({ stdout: "wrong-hash\n", stderrBytes: 0,
+    exitCode: 0 as const });
+  (f.deps.journal as unknown as { markPrestartStopped: () => Promise<void> })
+    .markPrestartStopped = () => new Promise<void>(() => {});
+  const began = Date.now();
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
+    /BOX_TOOL_ASSET_STAGE_INVALID/);
+  assert.ok(Date.now() - began < 3000);
+  assert.equal(f.retained, true);
+  assert.equal(f.disposed, false);
+  assert.equal(f.launches, 0);
 });
 
 test("downstream SSE failure after paid launch retains unknown without replay", async () => {

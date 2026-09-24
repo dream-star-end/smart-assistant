@@ -50,6 +50,9 @@ export async function runBoxToolFirstRound(input: {
   /** Retain the local target until remote proof or explicit operator recovery. */
   retainUnknownTarget: (handle: { target: BoxResolvedTarget;
     plan: BoxDetachedToolPlan; uid: bigint; requestId: string }) => void;
+  /** Failed local-agent close remains explicitly owned for bounded retry. */
+  retainCleanupTarget: (handle: { target: BoxResolvedTarget;
+    uid: bigint; requestId: string; phase: string }) => void;
   budgetMs?: number;
 }): Promise<BoxToolFirstHandoff> {
   if (input.url !== BOX_INTERNAL_ENDPOINT || input.init.method !== "POST"
@@ -98,6 +101,28 @@ export async function runBoxToolFirstRound(input: {
   let admitted = false, launchAttempted = false, inputStageStarted = false;
   let prestartClosed = false;
   let unknownNotified = false;
+  const disposals = new WeakMap<BoxResolvedTarget, Promise<void>>();
+  const disposeOnce = (owned: BoxResolvedTarget, phase: string): Promise<void> => {
+    const existing = disposals.get(owned);
+    if (existing) return existing;
+    const pending = Promise.resolve().then(() => owned.dispose?.()).then(() => {},
+      (error: unknown) => {
+        disposals.delete(owned);
+        deps.retainCleanupTarget({ target: owned, uid: input.uid,
+          requestId: input.requestId, phase });
+        throw error;
+      });
+    disposals.set(owned, pending);
+    return pending;
+  };
+  const bounded = async <T>(pending: Promise<T>, ms: number): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { return await Promise.race([pending, new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new BoxToolFirstRoundError(
+        "BOX_TOOL_CLEANUP_TIMEOUT")), ms);
+    })]); }
+    finally { if (timer) clearTimeout(timer); }
+  };
   const unknown = async (phase: string): Promise<void> => {
     if (!admitted || !target || unknownNotified) return;
     unknownNotified = true;
@@ -127,13 +152,13 @@ export async function runBoxToolFirstRound(input: {
     if (!target || !admitted) return;
     if (inputStageStarted) {
       try {
-        const cleaned = await target.exec.run(plan.cleanup, { timeoutMs: 20_000,
-          maxResponseBytes: 4096 });
+        const cleaned = await bounded(target.exec.run(plan.cleanup, {
+          timeoutMs: 20_000, maxResponseBytes: 4096 }), 20_500);
         if (cleaned.stdout.trim() !== "clean") throw new Error("cleanup mismatch");
       } catch { await unknown("prestart_cleanup_unknown"); return; }
     }
-    try { await deps.journal.markPrestartStopped({ requestId: input.requestId,
-      uid: input.uid, leaseEpoch: plan.leaseEpoch }); prestartClosed = true; }
+    try { await bounded(deps.journal.markPrestartStopped({ requestId: input.requestId,
+      uid: input.uid, leaseEpoch: plan.leaseEpoch }), 2_000); prestartClosed = true; }
     catch { await unknown("prestart_journal_unknown"); }
   };
   try {
@@ -141,13 +166,17 @@ export async function runBoxToolFirstRound(input: {
     const pendingTarget = deps.resolveTarget({ uid: input.uid, sessionId: input.sessionId,
       requestId: input.requestId, upstreamModel: input.upstreamModel, signal });
     let resolutionAbandoned = false;
+    let completedTarget: BoxResolvedTarget | null = null;
     void pendingTarget.then((late) => {
-      if (resolutionAbandoned && late !== target) {
-        void Promise.resolve(late.dispose?.()).catch(() => {});
-      }
+      completedTarget = late;
+      if (resolutionAbandoned) void disposeOnce(late, "late_resolver").catch(() => {});
     }, () => {});
     try { target = await race(pendingTarget); }
-    finally { resolutionAbandoned = true; }
+    catch (error) {
+      resolutionAbandoned = true;
+      if (completedTarget) void disposeOnce(completedTarget, "late_resolver").catch(() => {});
+      throw error;
+    }
     const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
       accountId: target.accountId, model: input.canonicalModel, fingerprint,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch });
@@ -223,7 +252,7 @@ export async function runBoxToolFirstRound(input: {
   } catch (error) {
     if (launchAttempted) await unknown("first_round_unknown");
     if ((!admitted || prestartClosed) && target) {
-      await Promise.resolve(target.dispose?.()).catch(() => {});
+      await disposeOnce(target, "prestart_dispose").catch(() => {});
     }
     throw error;
   } finally {
