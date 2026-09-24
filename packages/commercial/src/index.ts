@@ -53,6 +53,9 @@ import {
 } from "./billing/cursorExternalApiOutbox.js";
 import { closePool, createPool, getPool } from "./db/index.js";
 import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
+import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
+import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
+import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
 import {
   assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool,
@@ -6157,6 +6160,10 @@ export async function registerCommercial(
       name: "finalizeReconciler",
       domain: "shared",
       start: () => {
+        const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+          journal: new BoxDurableJournal(getPool()),
+          resolver: createProductionBoxAccountResolver(),
+        });
         const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
         const intervalMs =
           Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
@@ -6175,7 +6182,15 @@ export async function registerCommercial(
           intervalMs,
           thresholdMs,
           durableWaiverAgeMs,
-          boxRecoveryFn: () => reconcileBoxBillingBatch(getPool()),
+          boxRecoveryFn: async () => {
+            const results = await Promise.allSettled([
+              reconcileBoxBillingBatch(getPool()),
+              boxRemoteCleanup.reconcileBatch(10),
+            ]);
+            if (results.some((result) => result.status === "rejected")) {
+              throw new Error("BOX_RECOVERY_PARTIAL_FAILURE");
+            }
+          },
         }));
         return { stop: () => h.stop() };
       },
