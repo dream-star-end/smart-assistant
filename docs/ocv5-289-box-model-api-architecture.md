@@ -169,7 +169,17 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   CLI; a completed duplicate returns cached verified output or a loud
   already-executed result, not a fresh paid call. This needs a real
   container→master ID transport; gateway-generated per-HTTP request IDs are
-  not a substitute.
+  not a substitute. An offline real official CC 2.1.280 two-model-call probe
+  found the same `x-claude-code-session-id` and `oc_turn_key` on both requests,
+  **no per-model-call ID header**, while request bodies differed after tool
+  results. Thus `turn_key + body_hash` is useful as a retransmission hint but
+  cannot be the full logical identity: an intentional identical request in
+  the same turn is indistinguishable. The Box route needs an OpenClaude-side
+  model-transport boundary (e.g. an authenticated user-container loopback
+  forwarding shim) that mints and persists one ID per actual API call, reuses
+  it for that call's network retries, and sends it to the existing master
+  proxy without moving prompt construction, memory or tools to Box. Until
+  that exact behavior is proven, keep the catalog route disabled.
 - Use monotonic revision/lease epoch on every state change. State path:
   `reserved → starting → streaming → handoff → resuming → streaming → ...`
   then `terminal`; each new model message increments `round_no`. Any
