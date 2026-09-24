@@ -4718,7 +4718,8 @@
       "symptom": "流式回复时自动补更早过程步骤，已经渲染出来的文字整块上下跳。",
       "rootFixCommit": "d203d9bf",
       "coverageCommits": [
-        "d203d9bf"
+        "d203d9bf",
+        "2d37d709"
       ],
       "regressions": [
         {
