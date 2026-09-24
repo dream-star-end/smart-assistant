@@ -112,7 +112,7 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
-import { validateBoxTextRequest } from "./boxRequestGate.js";
+import { validateBoxRequest } from "./boxRequestGate.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
@@ -814,7 +814,8 @@ export function makeAnthropicProxyHandler(
           sendJsonError(res, 403, "NOT_AUTHORIZED", "model not authorized", requestId);
           return;
         }
-        const unsupported = validateBoxTextRequest(body);
+        const unsupported = validateBoxRequest(body,
+          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true);
         if (unsupported) {
           userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
           incrAnthropicProxyReject("bad_body");

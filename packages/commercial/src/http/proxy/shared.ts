@@ -1513,6 +1513,7 @@ export interface AnthropicProxyDeps {
    * identity/authority/precheck/finalizer; this component owns only the Box
    * invocation and its independent cross-HTTP account-capacity lease. */
   boxModel?: {
+    toolBridgeReady?: boolean;
     fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
       canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
       url: string; init: RequestInit }): Promise<Response>;
