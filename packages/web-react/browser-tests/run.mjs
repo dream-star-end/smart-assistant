@@ -38,6 +38,7 @@
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -84,6 +85,41 @@ await esbuild.build({
   },
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
+});
+
+// T69 only. OC_CHAT_BASELINE swaps MessageRenderer for the pre-fix tree so the
+// same fixture can fail on ed8c283f9 and pass on d203d9bf6. The main harness
+// stays on the current sources; other cases must not inherit that swap.
+const liveUnitsBundlePath = join(outDir, "live-units-viewport.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "live-units-viewport-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: liveUnitsBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+  plugins: process.env.OC_CHAT_BASELINE
+    ? [{
+        name: "oc-chat-baseline",
+        setup(build) {
+          build.onLoad({ filter: /src\/components\/MessageRenderer\.tsx$/ }, (args) => {
+            const rel = args.path.slice(args.path.indexOf("packages/web-react/"));
+            const contents = execFileSync(
+              "git",
+              ["show", `${process.env.OC_CHAT_BASELINE}:${rel}`],
+              { cwd: join(HERE, "../../.."), encoding: "utf8" },
+            );
+            return { contents, loader: "tsx" };
+          });
+        },
+      }]
+    : [],
 });
 
 const previewBundlePath = join(outDir, "preview-harness.js");
@@ -170,6 +206,11 @@ if (!previewCssFile) throw new Error("browser-tests: 预览 production CSS 构�
 // / .min-h-11)被删掉后门依然全绿(2026-07-26 审计实锤:删 styles.css 的
 // .chat-scroll-area 规则,T8 照过)。现在 T4/T8/T13 断言的就是线上那份 CSS。
 const productionCss = readFileSync(join(previewCssDir, previewCssFile), "utf8");
+const liveUnitsHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${productionCss}</style><style>
+  html,body{margin:0;overflow:auto;height:auto}
+  .timeline-scroll-probe{height:240px;width:720px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
+  .live-units-case{margin:8px 0}
+</style></head><body><div id="live-units-viewport-root"></div><script>${readFileSync(liveUnitsBundlePath, "utf8")}</script></body></html>`;
 const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
 // 移动整页(T25):与线上 index.html 同构 —— 同一份 production CSS、同一条 viewport meta、
 // 单一 #root 挂载点,**零测试脚手架样式**(加一条覆盖就等于把被测的布局改掉了)。
@@ -3684,6 +3725,167 @@ await check("T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且
     state: "visible",
     timeout: 3000,
   });
+});
+
+
+await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底保持锚点，上滑后不恢复跟随", async () => {
+  const liveUrl = "http://127.0.0.1/__openclaude_live_units_viewport__";
+  const livePage = await browser.newPage();
+  watchRuntimeErrors(livePage, "live-units");
+  const previousShot = screenshotPage;
+  screenshotPage = livePage;
+  try {
+    await livePage.route("**/*", serveBuiltAsset);
+    await livePage.route(liveUrl, (route) => route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: liveUnitsHtml,
+    }));
+    await livePage.goto(liveUrl);
+    try {
+      await livePage.waitForFunction(() => (
+        window.__liveUnits.follow.started
+        && window.__liveUnits.away.started
+        && window.__liveUnits.gesture.started
+      ), null, { timeout: 4000 });
+    } catch (err) {
+      const diag = await livePage.evaluate(() => ({
+        hasApi: typeof window.__liveUnits,
+        started: window.__liveUnits
+          ? Object.fromEntries(Object.entries(window.__liveUnits).map(([k, v]) => [k, Boolean(v?.started)]))
+          : null,
+        roots: document.querySelectorAll("[data-testid^=\"live-units\"]").length,
+        text: (document.body?.innerText || "").slice(0, 400),
+      }));
+      throw new Error(`${err.message} diag=${JSON.stringify(diag)}`);
+    }
+
+    async function geometry(mode) {
+      return livePage.evaluate((which) => {
+        const scroller = document.querySelector(`[data-testid="live-units-${which}"]`);
+        const anchor = scroller?.querySelector(`[data-find-member="jump-anchor-${which}"]`);
+        if (!(scroller instanceof HTMLElement) || !(anchor instanceof HTMLElement)) {
+          return { missing: true, mode: which };
+        }
+        const top = anchor.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+        return {
+          missing: false,
+          top,
+          scrollTop: scroller.scrollTop,
+          scrollHeight: scroller.scrollHeight,
+          clientHeight: scroller.clientHeight,
+          distance: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight,
+          following: window.__liveUnits[which].following(),
+          button: Boolean(scroller.querySelector("button")?.textContent?.includes("加载更早的处理步骤")),
+        };
+      }, mode);
+    }
+    async function frames() {
+      await livePage.evaluate(() => new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve(undefined)));
+      }));
+    }
+    async function growThenPrepend(mode) {
+      const beforeHeight = (await geometry(mode)).scrollHeight;
+      await livePage.evaluate((which) => window.__liveUnits[which].grow(), mode);
+      try {
+        await livePage.waitForFunction(({ which, prev }) => {
+          const scroller = document.querySelector(`[data-testid="live-units-${which}"]`);
+          return scroller instanceof HTMLElement && scroller.scrollHeight > prev + 8;
+        }, { which: mode, prev: beforeHeight }, { timeout: 4000 });
+      } catch (err) {
+        const snap = await geometry(mode);
+        const text = await livePage.locator(`[data-testid="live-units-${mode}"]`).innerText();
+        throw new Error(`T69 ${mode} 流式增高未反映到 scrollHeight prev=${beforeHeight} now=${JSON.stringify(snap)} text=${text.slice(0, 240)}`);
+      }
+      await frames();
+      const before = await geometry(mode);
+      await livePage.evaluate((which) => window.__liveUnits[which].prepend(), mode);
+      try {
+        await livePage.waitForFunction((which) => {
+          const scroller = document.querySelector(`[data-testid="live-units-${which}"]`);
+          return Boolean(scroller?.querySelector(`[data-find-member="older-${which}"]`));
+        }, mode, { timeout: 4000 });
+      } catch (err) {
+        const text = await livePage.locator(`[data-testid="live-units-${mode}"]`).innerText();
+        throw new Error(`T69 ${mode} 前插未进 DOM text=${text.slice(0, 300)}`);
+      }
+      await frames();
+      const after = await geometry(mode);
+      return { before, after };
+    }
+
+    const follow = await growThenPrepend("follow");
+    const followDelta = follow.after.top - follow.before.top;
+    console.log(`[T69 follow] ${JSON.stringify({ before: follow.before, after: follow.after, delta: followDelta })}`);
+    if (follow.before.missing || follow.after.missing) {
+      throw new Error(`T69 贴底锚点没有真实几何: ${JSON.stringify(follow)}`);
+    }
+    // Chromium lays the prepended block on a fractional pixel. The fixed build
+    // stays pinned (distance 0) and the anchor moves by a fraction of a pixel;
+    // the pre-fix build moves it by the whole prepend (~190px). 1px still
+    // separates those and matches the subpixel slack already used by TOUCH_MIN.
+    if (Math.abs(followDelta) > 1) {
+      throw new Error(`T69 贴底前插位移 ${followDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify(follow)}`);
+    }
+    if (follow.after.following !== true) {
+      throw new Error(`T69 贴底补页后跟随被清掉: ${JSON.stringify(follow.after)}`);
+    }
+    if (!(follow.after.distance < 2)) {
+      throw new Error(`T69 贴底补页后离开了底部: ${JSON.stringify(follow.after)}`);
+    }
+    if (!(follow.after.scrollHeight > follow.before.scrollHeight + 20)) {
+      throw new Error(`T69 贴底 scrollHeight 没有随前插变高: ${JSON.stringify(follow)}`);
+    }
+    if (follow.after.button) throw new Error("T69 贴底仍出现手动加载更早按钮");
+
+    const away = await growThenPrepend("away");
+    const awayDelta = away.after.top - away.before.top;
+    console.log(`[T69 away] ${JSON.stringify({ before: away.before, after: away.after, delta: awayDelta })}`);
+    if (away.before.missing || away.after.missing) {
+      throw new Error(`T69 离底锚点没有真实几何: ${JSON.stringify(away)}`);
+    }
+    if (Math.abs(awayDelta) > 1) {
+      throw new Error(`T69 离底前插位移 ${awayDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify(away)}`);
+    }
+    if (away.after.following !== false) {
+      throw new Error(`T69 离底补页后被拉回跟随: ${JSON.stringify(away.after)}`);
+    }
+    if (!(away.after.scrollHeight > away.before.scrollHeight + 20)) {
+      throw new Error(`T69 离底 scrollHeight 没有随前插变高: ${JSON.stringify(away)}`);
+    }
+
+    await livePage.evaluate(() => window.__liveUnits.gesture.grow());
+    await frames();
+    const gestureScroller = livePage.getByTestId("live-units-gesture");
+    await gestureScroller.hover();
+    await gestureScroller.evaluate((node) => {
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -140, bubbles: true, cancelable: true }));
+      if (!(node instanceof HTMLElement)) return;
+      node.scrollTop = Math.max(0, node.scrollTop - 120);
+      node.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await livePage.waitForTimeout(280);
+    const gestured = await geometry("gesture");
+    if (gestured.following !== false) {
+      throw new Error(`T69 上滑后仍在跟随: ${JSON.stringify(gestured)}`);
+    }
+    await livePage.evaluate(() => window.__liveUnits.gesture.prepend());
+    await livePage.waitForFunction(() => Boolean(
+      document.querySelector('[data-testid="live-units-gesture"] [data-find-member="older-gesture"]'),
+    ), null, { timeout: 4000 });
+    await frames();
+    await livePage.waitForTimeout(280);
+    const gestureAfter = await geometry("gesture");
+    console.log(`[T69 gesture] ${JSON.stringify({ before: gestured, after: gestureAfter })}`);
+    if (gestureAfter.following !== false) {
+      throw new Error(`T69 上滑手势后补页结束又恢复了跟随: ${JSON.stringify(gestureAfter)}`);
+    }
+    if (gestureAfter.button) throw new Error("T69 手势场景出现手动加载更早按钮");
+  } finally {
+    screenshotPage = previousShot;
+    await livePage.close();
+  }
 });
 
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
