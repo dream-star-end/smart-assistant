@@ -23,10 +23,33 @@ HASH = re.compile(r"^[a-f0-9]{64}$")
 MAX_CATALOG = 1_048_576
 MAX_TOOL_FRAME = 8 * 1024 * 1024
 MAX_CALLS = 32
+MAX_JSON_DEPTH = 64
 _stdout_lock = threading.Lock()
 
 
 def strict_json(raw: bytes | str) -> object:
+    text = raw.decode("utf-8", "strict") if isinstance(raw, bytes) else raw
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "{[":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("BOX_MCP_JSON_TOO_DEEP")
+        elif char in "}]":
+            depth -= 1
+    if depth != 0 or quoted:
+        raise ValueError("BOX_MCP_JSON_INVALID")
+
     def invalid_constant(_value: str) -> object:
         raise ValueError("BOX_MCP_JSON_INVALID")
 
@@ -38,8 +61,11 @@ def strict_json(raw: bytes | str) -> object:
             result[key] = value
         return result
 
-    return json.loads(raw, parse_constant=invalid_constant,
-                      object_pairs_hook=unique_object)
+    try:
+        return json.loads(text, parse_constant=invalid_constant,
+                          object_pairs_hook=unique_object)
+    except RecursionError as error:
+        raise ValueError("BOX_MCP_JSON_TOO_DEEP") from error
 
 
 def emit(value: dict) -> None:
@@ -75,9 +101,14 @@ def read_file(dir_fd: int, name: str, limit: int) -> bytes | None:
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
                 or info.st_size < 1 or info.st_size > limit):
             raise ValueError("BOX_MCP_FILE_INVALID")
+        # Atomic hardlink publication briefly has nlink=2 until the producer
+        # removes its temp name. Wait rather than classifying that window as
+        # a corrupt result; persistent extra links remain pending to timeout.
+        if info.st_nlink != 1:
+            return None
         raw = os.read(fd, limit + 1)
         if len(raw) != info.st_size:
             raise ValueError("BOX_MCP_FILE_INVALID")
@@ -167,13 +198,17 @@ def serve_call(dir_fd: int, ident: str | int, params: dict, model_id: str,
             time.sleep(.02)
         if (not isinstance(result, dict) or set(result) != {
                 "version", "modelToolUseId", "mcpRequestId", "content", "isError"}
-                or result["version"] != 1 or result["modelToolUseId"] != model_id
-                or result["mcpRequestId"] != ident or not isinstance(result["isError"], bool)
+                or type(result["version"]) is not int or result["version"] != 1
+                or type(result["modelToolUseId"]) is not str
+                or result["modelToolUseId"] != model_id
+                or type(result["mcpRequestId"]) is not type(ident)
+                or result["mcpRequestId"] != ident
+                or type(result["isError"]) is not bool
                 or not valid_content(result["content"])):
             raise ValueError("BOX_MCP_RESULT_INVALID")
         emit({"jsonrpc": "2.0", "id": ident, "result": {
             "content": result["content"], "isError": result["isError"]}})
-    except (OSError, ValueError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError, RecursionError):
         fail(ident, -32000, "Tool result unavailable")
     finally:
         on_done(model_id)
@@ -193,6 +228,7 @@ def main() -> int:
         return 126
     aliases = {tool["name"] for tool in tools}
     active: set[str] = set()
+    seen_rpc_ids: set[tuple[type, str | int]] = set()
     active_lock = threading.Lock()
 
     def done(model_id: str) -> None:
@@ -200,12 +236,17 @@ def main() -> int:
             active.discard(model_id)
 
     try:
-        for line in sys.stdin:
+        while line := sys.stdin.buffer.readline(MAX_TOOL_FRAME + 1):
+            if len(line) > MAX_TOOL_FRAME:
+                while line and not line.endswith(b"\n"):
+                    line = sys.stdin.buffer.readline(MAX_TOOL_FRAME + 1)
+                fail(None, -32700, "Parse error")
+                continue
             try:
                 request = strict_json(line)
                 if not isinstance(request, dict):
                     raise ValueError()
-            except (ValueError, json.JSONDecodeError):
+            except (UnicodeDecodeError, ValueError, json.JSONDecodeError, RecursionError):
                 fail(None, -32700, "Parse error")
                 continue
             method, ident = request.get("method"), request.get("id")
@@ -214,9 +255,17 @@ def main() -> int:
                 continue
             if ident is None:
                 continue
-            if isinstance(ident, bool) or not isinstance(ident, (str, int)):
+            if (request.get("jsonrpc") != "2.0" or not isinstance(method, str)
+                    or isinstance(ident, bool) or not isinstance(ident, (str, int))
+                    or (isinstance(ident, str) and len(ident) > 128)
+                    or (isinstance(ident, int) and abs(ident) > 2**53)):
                 fail(None, -32600, "Invalid request")
                 continue
+            rpc_key = (type(ident), ident)
+            if rpc_key in seen_rpc_ids or len(seen_rpc_ids) >= 10_000:
+                fail(ident, -32600, "Invalid request")
+                continue
+            seen_rpc_ids.add(rpc_key)
             if method == "initialize":
                 params = request.get("params")
                 version = params.get("protocolVersion", "2025-06-18") if isinstance(params, dict) else "2025-06-18"

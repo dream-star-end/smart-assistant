@@ -3,8 +3,8 @@
  * No Box account, user data, or paid model is involved. */
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync,
-  writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, rmSync,
+  unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,8 +123,15 @@ try {
     const raw = JSON.stringify({ version: 1, modelToolUseId: id,
       mcpRequestId: item.mcpRequestId, content: [{ type: "text", text: results[index] }],
       isError: false });
-    const fd = openSync(join(directory, `result.${id}.json`), "wx", 0o600);
+    const dest = join(directory, `result.${id}.json`);
+    const temp = `${dest}.tmp`;
+    const fd = openSync(temp, "wx", 0o600);
     try { writeFileSync(fd, raw); fsyncSync(fd); } finally { closeSync(fd); }
+    try {
+      linkSync(temp, dest);
+      const dirFd = openSync(directory, "r");
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    } finally { unlinkSync(temp); }
   };
   if (concurrentObserved) { publish(1); publish(0); }
   else {

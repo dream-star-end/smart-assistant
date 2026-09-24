@@ -76,11 +76,24 @@ class VirtualMcpTest(unittest.TestCase):
         raw = compact({"version": 1, "modelToolUseId": model_id,
                        "mcpRequestId": request_id,
                        "content": [{"type": "text", "text": text}], "isError": False})
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self.publish_raw(path, raw)
+
+    def publish_raw(self, path: Path, raw: bytes) -> None:
+        temp = path.with_name(path.name + ".tmp")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             os.write(fd, raw); os.fsync(fd)
         finally:
             os.close(fd)
+        try:
+            os.link(temp, path)
+            directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temp.unlink()
 
     def call(self, request_id: int, model_id: str) -> None:
         self.send(request_id, "tools/call", {"name": "t0", "arguments": {"value": "same"},
@@ -134,7 +147,7 @@ class VirtualMcpTest(unittest.TestCase):
                        "content": [{"type": "image", "data": image,
                                     "mimeType": "image/png"}], "isError": False})
         path = self.directory / f"result.{ident}.json"
-        path.write_bytes(raw); path.chmod(0o600)
+        self.publish_raw(path, raw)
         response = self.read()
         self.assertEqual(response["id"], 20)
         self.assertEqual(response["result"]["content"][0]["data"], image)
@@ -158,6 +171,57 @@ class VirtualMcpTest(unittest.TestCase):
                 else:
                     os.mkfifo(path, 0o600)
                 self.assertEqual(self.read(timeout=1)["error"]["code"], -32000)
+
+    def test_deep_request_does_not_kill_active_calls(self) -> None:
+        self.start()
+        ident = "toolu_survivor_abc"
+        self.call(40, ident)
+        self.await_file(f"pending.{ident}.json")
+        deep = '[' * 1100 + '0' + ']' * 1100
+        raw = ('{"jsonrpc":"2.0","id":41,"method":"tools/call","params":'
+               '{"name":"t0","arguments":{"value":' + deep + '},'
+               '"_meta":{"claudecode/toolUseId":"toolu_deep_abc"}}}\n')
+        self.child.stdin.write(raw); self.child.stdin.flush()
+        self.assertEqual(self.read()["error"]["code"], -32700)
+        self.assertIsNone(self.child.poll())
+        self.result(ident, 40, "survived")
+        self.assertEqual(self.read()["result"]["content"][0]["text"], "survived")
+        self.send(42, "ping")
+        self.assertEqual(self.read()["id"], 42)
+
+    def test_deep_result_and_bool_identity_return_fixed_errors(self) -> None:
+        self.start()
+        first = "toolu_deep_result"
+        self.call(50, first)
+        self.await_file(f"pending.{first}.json")
+        deep = '[' * 1100 + '0' + ']' * 1100
+        raw = ('{"version":1,"modelToolUseId":"' + first + '",'
+               '"mcpRequestId":50,"content":' + deep + ',"isError":false}').encode()
+        self.publish_raw(self.directory / f"result.{first}.json", raw)
+        self.assertEqual(self.read()["error"]["code"], -32000)
+        second = "toolu_bool_result"
+        self.call(51, second)
+        self.await_file(f"pending.{second}.json")
+        raw = compact({"version": True, "modelToolUseId": second,
+                       "mcpRequestId": True, "content": [], "isError": False})
+        self.publish_raw(self.directory / f"result.{second}.json", raw)
+        self.assertEqual(self.read()["error"]["code"], -32000)
+        self.send(52, "ping")
+        self.assertEqual(self.read()["id"], 52)
+
+    def test_invalid_envelope_and_duplicate_rpc_id_never_publish_second_pending(self) -> None:
+        self.start()
+        self.child.stdin.write('{"id":60,"method":"tools/call","params":{}}\n')
+        self.child.stdin.flush()
+        self.assertEqual(self.read()["error"]["code"], -32600)
+        first, second = "toolu_rpc_first", "toolu_rpc_second"
+        self.call(61, first)
+        self.await_file(f"pending.{first}.json")
+        self.call(61, second)
+        self.assertEqual(self.read()["error"]["code"], -32600)
+        self.assertFalse((self.directory / f"pending.{second}.json").exists())
+        self.result(first, 61, "first")
+        self.assertEqual(self.read()["result"]["content"][0]["text"], "first")
 
 
 if __name__ == "__main__":
