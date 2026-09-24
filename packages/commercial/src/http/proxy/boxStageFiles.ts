@@ -41,18 +41,23 @@ for part in parts:
  decoded.append(raw)
 size=sum(len(raw) for raw in decoded)
 if start+size>want:raise SystemExit(1)
-fd=os.open(path+'.part',os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
+dfd=os.open(os.path.dirname(path),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 try:
- st=os.fstat(fd)
- if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_size!=start:raise SystemExit(1)
- os.lseek(fd,start,os.SEEK_SET)
- for raw in decoded:
-  done=0
-  while done<len(raw):done+=os.write(fd,raw[done:])
- os.fsync(fd)
- if os.fstat(fd).st_size!=start+size:raise SystemExit(1)
- print(start+size)
-finally:os.close(fd)`;
+ owner=os.fstat(dfd)
+ if not stat.S_ISDIR(owner.st_mode) or owner.st_uid!=os.getuid() or stat.S_IMODE(owner.st_mode)!=0o700:raise SystemExit(1)
+ fd=os.open(os.path.basename(path)+'.part',os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=dfd)
+ try:
+  st=os.fstat(fd)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_size!=start:raise SystemExit(1)
+  os.lseek(fd,start,os.SEEK_SET)
+  for raw in decoded:
+   done=0
+   while done<len(raw):done+=os.write(fd,raw[done:])
+  os.fsync(fd)
+  if os.fstat(fd).st_size!=start+size:raise SystemExit(1)
+  print(start+size)
+ finally:os.close(fd)
+finally:os.close(dfd)`;
 
 const FINISH = String.raw`import hashlib,os,re,stat,sys
 cwd,project,path,size,want=sys.argv[1:]
@@ -61,21 +66,25 @@ if project and project!='/home/box/.claude/projects/'+cwd.replace('/','-'):raise
 if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not re.fullmatch(re.escape(cwd)+r'/result\.toolu_[A-Za-z0-9_-]{1,120}\.json',path) and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
 expected=int(size)
 if expected<0 or expected>8*1024*1024 or not re.fullmatch(r'[0-9a-f]{64}',want):raise SystemExit(1)
-fd=os.open(path+'.part',os.O_RDONLY|os.O_NOFOLLOW)
-try:
- st=os.fstat(fd)
- if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_size!=expected:raise SystemExit(1)
- digest=hashlib.sha256();read=0
- while read<=expected:
-  chunk=os.read(fd,min(65536,expected+1-read))
-  if not chunk:break
-  digest.update(chunk);read+=len(chunk)
- if read!=expected or digest.hexdigest()!=want:raise SystemExit(1)
-finally:os.close(fd)
-os.link(path+'.part',path,follow_symlinks=False)
-os.unlink(path+'.part')
 directory=os.open(os.path.dirname(path),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
-try:os.fsync(directory)
+try:
+ owner=os.fstat(directory)
+ if not stat.S_ISDIR(owner.st_mode) or owner.st_uid!=os.getuid() or stat.S_IMODE(owner.st_mode)!=0o700:raise SystemExit(1)
+ name=os.path.basename(path)
+ fd=os.open(name+'.part',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=directory)
+ try:
+  st=os.fstat(fd)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_size!=expected:raise SystemExit(1)
+  digest=hashlib.sha256();read=0
+  while read<=expected:
+   chunk=os.read(fd,min(65536,expected+1-read))
+   if not chunk:break
+   digest.update(chunk);read+=len(chunk)
+  if read!=expected or digest.hexdigest()!=want:raise SystemExit(1)
+ finally:os.close(fd)
+ os.link(name+'.part',name,src_dir_fd=directory,dst_dir_fd=directory,follow_symlinks=False)
+ os.unlink(name+'.part',dir_fd=directory)
+ os.fsync(directory)
 finally:os.close(directory)
 print(want)`;
 
@@ -83,17 +92,28 @@ const CLEANUP = String.raw`import os,re,stat,sys
 cwd,project,*paths=sys.argv[1:]
 if not re.fullmatch(r'/tmp/ocv5-289-run-[0-9a-f]{24}',cwd):raise SystemExit(1)
 if project and project!='/home/box/.claude/projects/'+cwd.replace('/','-'):raise SystemExit(1)
-for d in (cwd,project):
- if not d:continue
- st=os.lstat(d)
- if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
-for path in paths:
- if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not re.fullmatch(re.escape(cwd)+r'/result\.toolu_[A-Za-z0-9_-]{1,120}\.json',path) and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
- for target in (path,path+'.part'):
-  try:os.unlink(target)
-  except FileNotFoundError:pass
-if project:os.rmdir(project)
-os.rmdir(cwd)
+fds={}
+try:
+ for d in (cwd,project):
+  if not d:continue
+  fd=os.open(d,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+  fds[d]=fd
+  st=os.fstat(fd)
+  if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
+ for path in paths:
+  if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not re.fullmatch(re.escape(cwd)+r'/result\.toolu_[A-Za-z0-9_-]{1,120}\.json',path) and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
+  parent,name=os.path.split(path)
+  if parent not in fds:raise SystemExit(1)
+  for target in (name,name+'.part'):
+   try:os.unlink(target,dir_fd=fds[parent])
+   except FileNotFoundError:pass
+ for d in (project,cwd):
+  if not d:continue
+  held=os.fstat(fds[d]);current=os.lstat(d)
+  if held.st_dev!=current.st_dev or held.st_ino!=current.st_ino:raise SystemExit(1)
+  os.rmdir(d)
+finally:
+ for fd in fds.values():os.close(fd)
 print('clean')`;
 
 export function makeBoxStageFiles(input: {

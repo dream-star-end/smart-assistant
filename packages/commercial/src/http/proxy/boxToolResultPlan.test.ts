@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync,
+  symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { matchBoxToolResults } from "./boxToolResultMatcher.js";
 import { makeBoxPendingRead, makeBoxToolResultPlan,
   parseBoxPendingCall } from "./boxToolResultPlan.js";
+import { makeBoxStageFiles } from "./boxStageFiles.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -63,4 +65,42 @@ test("pending identity and mutated local result cannot publish", () => {
   assert.throws(() => makeBoxToolResultPlan({
     cwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
     expected: use, pending, matched: altered }), /BOX_RESULT_CONTENT_CHANGED/);
+});
+
+test("replacing the run-directory parent with a symlink cannot redirect WRITE or FINISH", () => {
+  const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const backup = `${cwd}.backup`, decoy = `${cwd}.decoy`;
+  mkdirSync(cwd, { mode: 0o700 });
+  mkdirSync(decoy, { mode: 0o700 });
+  const matched = matchBoxToolResults(body, [use])[0]!;
+  const plan = makeBoxToolResultPlan({ cwd, expected: use, pending, matched });
+  const run = (request: typeof plan.requests[number]) => spawnSync(request.command,
+    request.args, { cwd: request.cwd, env: { ...process.env, ...request.environment },
+      encoding: "utf8", timeout: 5000 });
+  try {
+    renameSync(cwd, backup);
+    symlinkSync(decoy, cwd);
+    assert.notEqual(run(plan.requests[0]!).status, 0);
+    assert.equal(existsSync(`${decoy}/result.${use.id}.json.part`), false);
+    rmSync(cwd);
+    renameSync(backup, cwd);
+    for (const write of plan.requests.slice(0, -1)) {
+      assert.equal(run(write).status, 0);
+    }
+    const raw = readFileSync(`${cwd}/result.${use.id}.json.part`);
+    const cleanup = makeBoxStageFiles({ cwd, project: "", initialize: false,
+      files: [{ path: plan.path, raw, hash: plan.resultHash }] }).cleanup;
+    renameSync(cwd, backup);
+    symlinkSync(decoy, cwd);
+    assert.notEqual(run(plan.requests.at(-1)!).status, 0);
+    assert.notEqual(run(cleanup).status, 0);
+    assert.equal(existsSync(`${decoy}/result.${use.id}.json`), false);
+    rmSync(cwd);
+    renameSync(backup, cwd);
+    assert.equal(run(cleanup).status, 0);
+  } finally {
+    if (existsSync(cwd)) rmSync(cwd, { recursive: true, force: true });
+    if (existsSync(backup)) rmSync(backup, { recursive: true, force: true });
+    rmSync(decoy, { recursive: true, force: true });
+  }
 });
