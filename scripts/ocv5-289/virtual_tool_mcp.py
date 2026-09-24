@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """OCV5-289 experimental Box-side MCP tool rendezvous; never executes tools."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -61,6 +62,14 @@ def read_result(dir_fd: int) -> dict | None:
     return value
 
 
+def meta_hashes(value: object) -> dict:
+    if not isinstance(value, dict) or len(value) > 64:
+        return {}
+    return {str(key): hashlib.sha256(json.dumps(item, sort_keys=True,
+                                           separators=(",", ":")).encode()).hexdigest()
+            for key, item in value.items() if isinstance(key, str) and len(key) <= 128}
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         return 126
@@ -111,7 +120,11 @@ def main() -> int:
                 called = True
                 try:
                     write_once(dir_fd, "pending.json", {"mcpRequestId": ident,
-                                                        "name": "local_echo", "arguments": params["arguments"]})
+                                                        "name": "local_echo", "arguments": params["arguments"],
+                                                        "requestKeys": sorted(request.keys()),
+                                                        "paramKeys": sorted(params.keys()),
+                                                        "requestMetaHashes": meta_hashes(request.get("_meta")),
+                                                        "paramsMetaHashes": meta_hashes(params.get("_meta"))})
                     deadline = time.monotonic() + 30
                     result = None
                     while time.monotonic() < deadline:

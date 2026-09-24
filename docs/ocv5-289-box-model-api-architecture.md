@@ -87,7 +87,8 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   matrix and resulting behavior pass; preserve and test user-visible system
   text order within the supported subset.
 - Start supervised Box `claude -p` with fixed model/flags, empty setting
-  sources, only fixed virtual MCP tools. The first complete `tool_use` event is
+  sources, only bounded virtual MCP tools compiled from the OpenClaude-side
+  Claude Code request. The first complete `tool_use` event is
   exported before remote CLI waits for MCP. The internal API emits Anthropic
   SSE `message_start`, block start/delta/stop, `message_delta(tool_use)` and
   `message_stop`, then settles *observed* usage and persists resumable state.
@@ -95,7 +96,12 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   `tool_result` ID and complete the **held** MCP rendezvous in the same
   supervised CLI process. The snapshot-and-new-CLI alternative was rejected
   by the pending-tool replay test above. MCP JSON-RPC request ID and model
-  tool_use ID are distinct. No local OpenClaude tool command executes in Box.
+  tool_use ID are distinct. Offline real Claude Code 2.1.280 exposed the
+  exact model tool ID in `tools/call.params._meta["claudecode/toolUseId"]`
+  (synthetic one-tool replay green); this is the correlation key for parallel
+  same-name/same-argument calls, not positional matching. The Box version of
+  this metadata and multi-tool concurrency still need real and red/green
+  verification before use. No local OpenClaude tool command executes in Box.
 - The held CLI is owned by a **cross-HTTP Box invocation lease**, not by the
   first request's abort signal or finalizer. Normal `message_stop`/`res.end`
   after exporting tool_use must leave the supervised CLI and account-capacity

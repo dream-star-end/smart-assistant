@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { closeSync, copyFileSync, existsSync, fsyncSync, linkSync, mkdirSync, mkdtempSync,
   openSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 const root = mkdtempSync('/tmp/ocv5-289-tool-')
@@ -204,11 +204,21 @@ try {
       type: part.block.type, id: part.block.id ?? part.block.tool_use_id })),
     modelId: event?.modelToolUseId ?? null, mcpRequestId: pending?.mcpRequestId ?? null,
     distinctIds: event?.modelToolUseId !== pending?.mcpRequestId,
+    mcpRequestKeys: pending?.requestKeys ?? null,
+    mcpParamKeys: pending?.paramKeys ?? null,
+    mcpRequestMetaKeys: Object.keys(pending?.requestMetaHashes ?? {}),
+    mcpParamMetaKeys: Object.keys(pending?.paramsMetaHashes ?? {}),
+    modelIdPresentInMcpMeta: pending?.paramsMetaHashes?.['claudecode/toolUseId']
+      === createHash('sha256').update(JSON.stringify(event?.modelToolUseId)).digest('hex'),
     finalSuccess: final?.is_error === false, textExact: assistant.includes(nonce), stderrBytes }))
   if (exit.code !== 0 || requests !== 3 || !advertised || !delivered
       || !assistant.includes(nonce) || final?.is_error !== false
       || resume?.exit !== 0 || !resume.sameSession || !resume.finalSuccess
-      || !resume.textExact || !resume.historyToolPair) process.exitCode = 1
+      || !resume.textExact || !resume.historyToolPair
+      || pending?.paramsMetaHashes?.['claudecode/toolUseId']
+        !== createHash('sha256').update(JSON.stringify(event?.modelToolUseId)).digest('hex')) {
+    process.exitCode = 1
+  }
 } finally {
   if (!closed) child.kill('SIGTERM')
   await Promise.race([done.catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 2000))])
