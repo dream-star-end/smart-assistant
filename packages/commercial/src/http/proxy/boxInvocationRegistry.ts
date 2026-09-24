@@ -45,7 +45,7 @@ export class BoxInvocationRegistry {
     if (!Number.isSafeInteger(limits.maxPerUser) || limits.maxPerUser < 1
       || !Number.isSafeInteger(limits.maxPerAccount) || limits.maxPerAccount < 1
       || !Number.isSafeInteger(limits.leaseMs) || limits.leaseMs < 1000
-      || limits.leaseMs > 120_000) {
+      || limits.leaseMs > 900_000) {
       throw new BoxInvocationConflict("BOX_LEASE_LIMIT_INVALID");
     }
   }
@@ -57,7 +57,9 @@ export class BoxInvocationRegistry {
     return `${uid}:${sessionId}`;
   }
 
-  open(input: { uid: bigint; sessionId: string; accountId: bigint }): BoxInvocationLease {
+  open(input: { uid: bigint; sessionId: string; accountId: bigint;
+    /** Remaining shared request budget; never exceeds the registry ceiling. */
+    leaseMs?: number }): BoxInvocationLease {
     const key = this.key(input.uid, input.sessionId);
     if (input.accountId <= 0n) throw new BoxInvocationConflict("BOX_ACCOUNT_ID_INVALID");
     if (this.active.has(key)) throw new BoxInvocationConflict("BOX_SESSION_BUSY");
@@ -67,14 +69,18 @@ export class BoxInvocationRegistry {
     if ((this.accountCounts.get(input.accountId) ?? 0) >= this.limits.maxPerAccount) {
       throw new BoxInvocationConflict("BOX_ACCOUNT_CAPACITY_FULL");
     }
+    const leaseMs = input.leaseMs ?? this.limits.leaseMs;
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > this.limits.leaseMs) {
+      throw new BoxInvocationConflict("BOX_LEASE_LIMIT_INVALID");
+    }
     const controller = new AbortController();
     const openedAt = this.now();
     const lease: PrivateLease = {
       uid: input.uid, sessionId: input.sessionId, accountId: input.accountId,
       signal: controller.signal, controller, openedAt,
-      deadlineAt: openedAt + this.limits.leaseMs,
+      deadlineAt: openedAt + leaseMs,
       state: "running", toolUseId: null, mcpRequestId: null,
-      timer: setTimeout(() => this.markUnknown(lease), this.limits.leaseMs),
+      timer: setTimeout(() => this.markUnknown(lease), leaseMs),
     };
     this.active.set(key, lease);
     this.userCounts.set(input.uid, (this.userCounts.get(input.uid) ?? 0) + 1);

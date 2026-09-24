@@ -84,4 +84,19 @@ describe("Box cross-HTTP invocation ownership", () => {
     assert.equal(second.signal.aborted, true);
     registry.confirmRemoteStopped(second);
   });
+
+  it("per-open remaining budget fences a long registry ceiling", () => {
+    let now = 10_000;
+    const registry = new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
+      leaseMs: 600_000 }, () => now);
+    const lease = registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n,
+      leaseMs: 120_000 });
+    assert.equal(lease.deadlineAt, 130_000);
+    now = 130_000;
+    rejected(() => registry.handoff(lease, "toolu_289", 2), "BOX_LEASE_EXPIRED");
+    assert.deepEqual(registry.counts(3n, 20n), { user: 1, account: 1 });
+    registry.confirmRemoteStopped(lease);
+    rejected(() => registry.open({ uid: 3n, sessionId: "session-b", accountId: 20n,
+      leaseMs: 600_001 }), "BOX_LEASE_LIMIT_INVALID");
+  });
 });
