@@ -41,6 +41,7 @@ import {
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
 import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
+import { serializeBoxBillingContext } from "./boxBillingContext.js";
 import {
   resolveAuthorityTurnDispatchSponsorship,
   admitVerificationSponsorship,
@@ -1379,6 +1380,21 @@ export function makeAnthropicProxyHandler(
           }), ...(route.kind === "box" ? {
             boxInvocationRecovery: "v1",
             billingPricing: serializeBillingPricing(pricing),
+            boxBillingContext: serializeBoxBillingContext({
+              sessionId, mode: attribution.mode,
+              parentSessionId: attribution.parentSessionId,
+              delegateAgentId: attribution.delegateAgentId,
+              turnKey: attribution.turnKey,
+              parentTurnKey: attribution.parentTurnKey,
+              authority: gate ? { kind: gate.authorityKind,
+                executionRevision: gate.executionRevision,
+                projectionRevision: gate.projectionRevision,
+                securityEpoch: gate.securityEpoch } : null,
+              dispatchId: dispatchIdentity?.dispatchId ?? null,
+              attemptNo: dispatchIdentity?.attemptNo ?? null,
+              verificationSponsorship,
+              apiKeyId: identity.apiKey?.id ?? null,
+            }),
           } : {}) },
         });
         if (!admitted) {

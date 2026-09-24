@@ -29,7 +29,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const basis = { model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
       billingPricing: { v: 1, modelId: "box-api-claude-opus-5-5",
         displayName: "Opus", inputPerMtok: "1", outputPerMtok: "1",
-        cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" } };
+        cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" },
+      boxBillingContext: { v: 1, sessionId: `session-${suffix}`, mode: "chat",
+        parentSessionId: null, delegateAgentId: null, turnKey: "a".repeat(64),
+        parentTurnKey: null, authority: null, dispatchId: null, attemptNo: null,
+        verificationSponsorship: null, apiKeyId: null } };
     const put = async (id: string) => client.query(
       `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
        VALUES ($1,3,'inflight',$2::jsonb)`, [id, JSON.stringify(basis)]);
@@ -38,12 +42,20 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
       VALUES ($1,3,'inflight',$2::jsonb)`, [`box-no-price-${suffix}`,
       JSON.stringify({ model: basis.model, boxInvocationRecovery: "v1" })]);
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [`box-wrong-turn-${suffix}`,
+      JSON.stringify({ ...basis, boxBillingContext: {
+        ...basis.boxBillingContext, turnKey: "b".repeat(64) } })]);
     const input = { requestId: `box-a-${suffix}`, uid: 3n, accountId: 20n,
       model: basis.model, fingerprint, runNonce: "d".repeat(24), leaseEpoch: "e".repeat(32) };
     await assert.rejects(() => journal.admit({ ...input,
       requestId: `box-no-price-${suffix}` }),
       (error: unknown) => error instanceof BoxDurableJournalError
         && error.code === "BOX_JOURNAL_NOT_INFLIGHT");
+    await assert.rejects(() => journal.admit({ ...input,
+      requestId: `box-wrong-turn-${suffix}` }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_JOURNAL_BASIS_INVALID");
     await journal.admit(input);
     assert.equal(await abortInflightJournal(sameConnection, input.requestId,
       "client disconnected"), false, "reserved Box call cannot be legacy-aborted");

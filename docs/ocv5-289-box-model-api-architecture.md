@@ -282,7 +282,11 @@ replay fingerprint, frozen pricing and final usage in the existing
 `request_finalize_journal.ctx` JSONB; it does not execute or require a new
 database migration. The keeper now writes a nonce/epoch-bound marker after
 its reaping fence, and a later request can read it only through the pinned
-account. This is **not** a complete takeover reconciler or a live tool bridge:
+account. A Box-specific billing recovery routine now consumes only validated
+terminal marker, exact usage, frozen pricing and attribution after a live
+finalizer grace period; a real PostgreSQL test uses TEMP-shadow financial
+tables to prove one debit, one usage row and crash-window repair. This is
+**not** a complete remote-process takeover reconciler or a live tool bridge:
 the catalog entry remains off until those paths and real Box acceptance pass.
 Any later schema migration still requires a separate approval before execution.
 

@@ -4,6 +4,8 @@
 import type { Pool, PoolClient } from "pg";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import type { BoxTerminalProof } from "./boxTerminalProof.js";
+import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
+import { parseBoxBillingContext } from "./boxBillingContext.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming"];
 
@@ -89,14 +91,22 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxTurnKey: input.fingerprint.turnKey,
         boxSessionId: input.fingerprint.sessionId,
         boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch };
-      const updated = await client.query(
+      const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
           WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
             AND ctx->>'model' = $3 AND ctx->>'boxInvocationRecovery' = 'v1'
-            AND ctx ? 'billingPricing' AND NOT (ctx ? 'boxState')`,
+            AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'
+            AND NOT (ctx ? 'boxState')
+          RETURNING ctx`,
         [input.requestId, input.uid.toString(), input.model, JSON.stringify(identity)]);
       if (updated.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_NOT_INFLIGHT");
+      const ctx = updated.rows[0]?.ctx;
+      const billingContext = parseBoxBillingContext(ctx?.boxBillingContext);
+      if (!parseBillingPricing(ctx?.billingPricing, input.model)
+        || !billingContext || billingContext.turnKey !== input.fingerprint.turnKey) {
+        throw new BoxDurableJournalError("BOX_JOURNAL_BASIS_INVALID");
+      }
       await client.query("COMMIT");
       committed = true;
     } finally {

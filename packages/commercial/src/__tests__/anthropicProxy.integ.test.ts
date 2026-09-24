@@ -227,6 +227,9 @@ function buildFakePool(override: FakePoolOverride = {}) {
     }
     // SET LOCAL ... (statement_timeout 等 — 不实际生效,允许通过)
     if (head.startsWith("SET LOCAL")) return { rows: [], rowCount: 0 };
+    // Box 的真实 turn key 让结算锁同 turn 并检查免单栅栏；测试默认无 waiver。
+    if (head.startsWith("SELECT PG_ADVISORY_XACT_LOCK(")) return { rows: [], rowCount: 1 };
+    if (head.startsWith("SELECT 1 FROM TURN_WAIVERS")) return { rows: [], rowCount: 0 };
 
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) {
       if (override.failJournalInsert) throw override.failJournalInsert;
@@ -903,18 +906,42 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
         assert.equal(JSON.parse(String(init.body)).model, "claude-opus-5-5");
         return sseResponse(200, makeFullSseChunks());
       } };
-      const res = await h.run(minBody(BOX_API_MODEL), headers);
+      const res = await h.run({ ...minBody(BOX_API_MODEL), metadata: {
+        user_id: JSON.stringify({ session_id: "web-box-normal",
+          oc_turn_key: "a".repeat(64) }) } }, headers);
       assert.equal(res.statusCode, 200, res.bodyText());
       assert.equal(calls, 1);
       assert.equal(h.preCheckSpy.reserveCalls.length, 1);
       assert.equal(h.schedulerSpy.pickCalls.length, 0);
       assert.equal(h.schedulerSpy.releaseCalls.length, 0);
-      assert.equal(h.pool.queries.filter((query) =>
-        query.sql.trim().toUpperCase().startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")).length, 1);
+      const inserted = h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL"));
+      assert.equal(inserted.length, 1);
+      const journalCtx = JSON.parse(String(inserted[0]?.params[3])) as Record<string, unknown>;
+      assert.equal(journalCtx.boxInvocationRecovery, "v1");
+      assert.equal((journalCtx.boxBillingContext as { turnKey?: unknown }).turnKey, "a".repeat(64));
       assert.equal(h.pool.queries.filter((query) =>
         query.sql.trim().toUpperCase().startsWith("INSERT INTO USAGE_RECORDS")).length, 1,
       "the shared finalizer must settle the Box request exactly once");
       assert.ok(res.bodyText().includes("event: message_start"));
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("Box request without a turn key fails before paid transport", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      let calls = 0;
+      h.deps.boxModel = { async fetch() { calls++; throw new Error("SHOULD_NOT_CALL"); } };
+      const res = await h.run(minBody(BOX_API_MODEL), headers);
+      assert.notEqual(res.statusCode, 200);
+      assert.equal(calls, 0);
+      assert.equal(h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")).length, 0);
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
