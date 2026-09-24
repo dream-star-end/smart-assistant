@@ -42,11 +42,12 @@ class SpyRegistry extends BoxInvocationRegistry {
   }
 }
 type Runner = Pick<BoxExecTransport, "run">;
-function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "cleanup";
+function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "proof" | "cleanup";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
+  let proofDir = "", leaseEpoch = "";
   const stages: string[] = [], unknowns: string[] = [];
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
   const runner: Runner = { async run(request: BoxCcExecRequest,
@@ -57,8 +58,9 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
     const isSupervisor = request.args[2]?.startsWith("/tmp/ocv5-289-supervisor-");
     const isKeeper = request.args[2]?.startsWith("/tmp/ocv5-289-keeper-");
     const isCleanup = request.args[1]?.includes("print('clean')");
+    const isProof = request.args[1]?.includes("terminal.json");
     const phase = isModel ? "model" : isSupervisor ? "supervisor"
-      : isKeeper ? "keeper" : isCleanup ? "cleanup" : "stage";
+      : isKeeper ? "keeper" : isCleanup ? "cleanup" : isProof ? "proof" : "stage";
     stages.push(phase);
     active--;
     if (phase === "stage") opts.advanceAtStage?.();
@@ -70,6 +72,8 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
       throw new TypeError("getReader locked before terminal frame");
     }
     if (isModel) {
+      proofDir = request.args[request.args.indexOf("--proof-dir") + 1] ?? "";
+      leaseEpoch = request.args[request.args.indexOf("--lease-epoch") + 1] ?? "";
       assert.equal(request.environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "256");
       const output = opts.badCli
         ? cliOutput.replace('"content":[{"type":"text","text":"answer"}]',
@@ -89,6 +93,8 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
       return ok(output);
     }
     if (isSupervisor || isKeeper) return ok(request.args[4]);
+    if (isProof) return ok(JSON.stringify({ runNonce: proofDir.slice(-24), leaseEpoch,
+      keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 }) + "\n");
     if (isCleanup) return ok("clean\n");
     return ok();
   } };
@@ -128,6 +134,21 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
   assert.equal(f.getMaxActive(), 1, "stage steps may not overlap");
   assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
   assert.deepEqual(f.unknowns, []);
+});
+
+test("missing remote stop proof withholds final usage and fences capacity", async () => {
+  const f = fixture({ failPhase: "proof" });
+  const response = await f.service.fetch(input);
+  await assert.rejects(() => response.text(),
+    (error: unknown) => error instanceof BoxTextFetchError
+      && error.code === "BOX_MODEL_OUTCOME_UNKNOWN");
+  assert.ok(f.stages.includes("model"));
+  assert.ok(f.stages.includes("proof"));
+  assert.ok(!f.stages.includes("cleanup"));
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 1, account: 1 });
+  assert.ok(f.unknowns.includes("model_outcome_unknown"));
+  // Test teardown only: the fake transport cannot produce later reconciliation.
+  f.registry.confirmRemoteStopped(f.registry.last!);
 });
 
 test("BoxTextFetch delivers first model text delta before remote model exit", async () => {

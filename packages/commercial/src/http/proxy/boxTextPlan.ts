@@ -16,6 +16,9 @@ export class BoxTextPlanError extends Error {
 }
 export interface BoxTextPlan {
   readonly cwd: string;
+  readonly proofDir: string;
+  readonly runNonce: string;
+  readonly leaseEpoch: string;
   readonly sessionId: string;
   readonly expectedModel: string;
   readonly stageSupervisor: BoxCcExecRequest;
@@ -60,6 +63,7 @@ export function makeBoxTextPlan(input: {
   supervisorAsset: Buffer;
   keeperAsset: Buffer;
   runNonce?: string;
+  leaseEpoch?: string;
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body);
   if (unsupported) throw new BoxTextPlanError(unsupported);
@@ -74,8 +78,11 @@ export function makeBoxTextPlan(input: {
     throw new BoxTextPlanError("BOX_MAX_TOKENS_UNSUPPORTED");
   }
   const runNonce = input.runNonce ?? randomBytes(12).toString("hex");
+  const leaseEpoch = input.leaseEpoch ?? randomBytes(16).toString("hex");
   if (!/^[0-9a-f]{24}$/.test(runNonce)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
+  if (!/^[0-9a-f]{32}$/.test(leaseEpoch)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  const proofDir = `/tmp/ocv5-289-proof-${runNonce}`;
   const mapped = compileBoxCliSyntheticTurn({ ...input.body, model: input.upstreamModel },
     { cwd, cliVersion: "2.1.280" });
   const supervisorHash = sha(input.supervisorAsset);
@@ -108,7 +115,8 @@ export function makeBoxTextPlan(input: {
     ] });
   const run: BoxCcExecRequest = {
     command: PYTHON,
-    args: [keeperPath, supervisorPath, "--deadline", "110", "--kill-after", "2",
+    args: [keeperPath, supervisorPath, "--proof-dir", proofDir,
+      "--lease-epoch", leaseEpoch, "--deadline", "110", "--kill-after", "2",
       "--max-output", "1048576", "--stdin-file", stdinPath,
       "--stdin-sha256", stdinHash, "--", MODEL, "-p", "--model", input.upstreamModel,
       "--input-format", "stream-json", "--output-format", "stream-json",
@@ -125,7 +133,8 @@ export function makeBoxTextPlan(input: {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" },
   };
   const cleanup = staged.cleanup;
-  return { cwd, sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
+  return { cwd, proofDir, runNonce, leaseEpoch,
+    sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
     stageSupervisor, stageKeeper, stageInputs: staged.requests, run, cleanup,
     supervisorHash, keeperHash,
     snapshotHash, stdinHash, systemHash };

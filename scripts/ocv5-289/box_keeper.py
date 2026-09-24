@@ -8,6 +8,7 @@ numeric process group. No terminal proof is published by this prototype.
 import ctypes
 import errno
 import hashlib
+import json
 import math
 import os
 import re
@@ -21,6 +22,59 @@ import time
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_PATH = re.compile(r"^/tmp/ocv5-289-supervisor-([a-f0-9]{16})\.py$")
+PROOF_DIR = re.compile(r"^/tmp/ocv5-289-proof-([a-f0-9]{24})$")
+EPOCH = re.compile(r"^[a-f0-9]{32}$")
+
+
+def extract_proof_args(argv: list[str]) -> tuple[list[str], str | None, str | None]:
+    """Keep proof options out of the worker's strict supervisor argv."""
+    args = list(argv)
+    separator = args.index("--") if "--" in args else len(args)
+    proof_dir = epoch = None
+    for option in ("--proof-dir", "--lease-epoch"):
+        found = [i for i in range(separator) if args[i] == option]
+        if len(found) > 1 or (found and found[0] + 1 >= separator):
+            raise ValueError("PROOF_ARGS_INVALID")
+        if found:
+            index = found[0]
+            value = args[index + 1]
+            if option == "--proof-dir": proof_dir = value
+            else: epoch = value
+            del args[index:index + 2]
+            separator -= 2
+    if (proof_dir is None) != (epoch is None):
+        raise ValueError("PROOF_ARGS_INVALID")
+    if proof_dir is not None and (not PROOF_DIR.fullmatch(proof_dir)
+            or not EPOCH.fullmatch(epoch or "")):
+        raise ValueError("PROOF_ARGS_INVALID")
+    return args, proof_dir, epoch
+
+
+def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str) -> None:
+    """Publish only after the keeper has reaped every adopted descendant."""
+    info = os.lstat(proof_dir)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise ValueError("PROOF_DIR_INVALID")
+    name = "terminal.json"
+    directory = os.open(proof_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        content = (json.dumps({"runNonce": PROOF_DIR.fullmatch(proof_dir)[1],
+            "leaseEpoch": epoch, "keeperPid": os.getpid(), "cliPid": cli_pid,
+            "reason": reason, "revision": 1}, sort_keys=True,
+            separators=(",", ":")) + "\n").encode("ascii")
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=directory)
+        try:
+            written = 0
+            while written < len(content):
+                written += os.write(fd, content[written:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def verify_supervisor(path: str) -> bool:
@@ -138,6 +192,12 @@ def main() -> int:
     keeper_started = time.monotonic()
     if len(sys.argv) < 3 or not verify_supervisor(sys.argv[1]):
         return 126
+    try:
+        worker_args, proof_dir, epoch = extract_proof_args(sys.argv[2:])
+        if proof_dir is not None:
+            os.mkdir(proof_dir, 0o700)
+    except (OSError, ValueError):
+        return 126
     # WEXITED/WAITER identity requires zombies to remain waitable; never ignore
     # SIGCHLD or allow an asynchronous handler to reap children under us.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -149,7 +209,7 @@ def main() -> int:
     env = { **os.environ, "OCV5_KEEPER_REPORT_FD": str(report_write),
         "OCV5_KEEPER_ACK_FD": str(ack_read) }
     try:
-        worker = subprocess.Popen([sys.executable, sys.argv[1], *sys.argv[2:]],
+        worker = subprocess.Popen([sys.executable, sys.argv[1], *worker_args],
             env=env, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
             pass_fds=(report_write, ack_read), close_fds=True,
             preexec_fn=lambda: worker_setup(keeper_pid))
@@ -176,7 +236,7 @@ def main() -> int:
     cli_pid = None
     pidfd = None
     try:
-        startup_until = keeper_started + startup_budget(sys.argv[2:])
+        startup_until = keeper_started + startup_budget(worker_args)
         cli_pid = read_report(report_read, worker, startup_until)
         if cli_pid is None or stopping:
             try: worker.terminate()
@@ -201,15 +261,26 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 worker.kill(); worker.wait(timeout=5)
         code = worker.returncode
+        adopted_stopped = False
         if cli_pid is not None and adopted_unreaped(cli_pid):
             # W exited without reaping C. P is now its unique subreaper owner;
             # keep C unreaped until the final group signal has completed.
             stopped = stop_adopted_group(cli_pid)
+            adopted_stopped = stopped
             code = 125 if not stopped or code == 0 else code
-        if not reap_adopted_after_last_signal():
+        all_reaped = reap_adopted_after_last_signal()
+        if not all_reaped:
             code = 125
         if cli_pid is None or pidfd is None:
             return 124 if time.monotonic() >= startup_until else 126
+        if proof_dir is not None and all_reaped and (worker.returncode == 0 or adopted_stopped):
+            try:
+                publish_terminal(proof_dir, epoch, cli_pid,
+                    "worker_complete" if worker.returncode == 0 else "keeper_stopped")
+            except (OSError, ValueError):
+                # The marker is mandatory once requested: no success without
+                # durable terminal evidence, even though the CLI may be gone.
+                return 125
         return (128 - code) if code is not None and code < 0 else (code or 0)
     finally:
         os.close(report_read)

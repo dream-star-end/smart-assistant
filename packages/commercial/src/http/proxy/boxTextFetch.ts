@@ -8,6 +8,7 @@ import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationR
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
+import { readBoxTerminalProof } from "./boxTerminalProof.js";
 import type { ProxyBody } from "./shared.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -256,6 +257,10 @@ export class BoxTextFetch {
             try {
               try {
                 await exec(plan.run, 120_000, true, (chunk) => emit(decoder.push(chunk)));
+                await readBoxTerminalProof({ target: resolved!,
+                  expectedAccountId: resolved!.accountId,
+                  runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+                  signal: currentLease.signal });
                 remoteTerminalKnown = true;
               } catch {
                 // A failed Connect Exec or failed stream consumer does not prove

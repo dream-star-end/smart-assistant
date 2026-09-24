@@ -1,6 +1,7 @@
 """Offline keeper/worker/CLI lifecycle tests; only kill own test processes."""
 import hashlib
 import ctypes
+import json
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ class KeeperTest(unittest.TestCase):
         self.staged.write_bytes(raw)
         self.staged.chmod(0o600)
         self.processes = []
+        self.proofs = []
 
     def tearDown(self) -> None:
         for proc in self.processes:
@@ -40,6 +42,14 @@ class KeeperTest(unittest.TestCase):
         shutil.rmtree(self.tmp)
         # Content-addressed stage is reused by tests; remove only our hash.
         self.staged.unlink(missing_ok=True)
+        for proof in self.proofs:
+            shutil.rmtree(proof, ignore_errors=True)
+
+    def proof_args(self) -> tuple[list[str], Path, str]:
+        nonce, epoch = secrets.token_hex(12), secrets.token_hex(16)
+        proof = Path('/tmp') / f'ocv5-289-proof-{nonce}'
+        self.proofs.append(proof)
+        return ['--proof-dir', str(proof), '--lease-epoch', epoch], proof, epoch
 
     def command(self, code: str) -> list[str]:
         return [sys.executable, str(KEEPER), str(self.staged), "--deadline", "8",
@@ -74,19 +84,72 @@ class KeeperTest(unittest.TestCase):
         out, _ = bad.communicate(timeout=12)
         self.assertEqual((bad.returncode, out), (7, b""))
 
+    def test_terminal_marker_only_after_full_keeper_reap(self) -> None:
+        options, proof, epoch = self.proof_args()
+        command = self.command('print("done")')
+        command[3:3] = options
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.processes.append(proc)
+        out, err = proc.communicate(timeout=12)
+        self.assertEqual((proc.returncode, out, err), (0, b'done\n', b''))
+        marker = proof / 'terminal.json'
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(proof.stat().st_mode & 0o777, 0o700)
+        result = json.loads(marker.read_text())
+        self.assertEqual((result['runNonce'], result['leaseEpoch'], result['reason'],
+                          result['revision']), (proof.name[-24:], epoch, 'worker_complete', 1))
+        self.assertEqual(result['keeperPid'], proc.pid)
+
+    def test_failed_cli_has_no_terminal_marker_without_worker_proof(self) -> None:
+        options, proof, _ = self.proof_args()
+        command = self.command('import sys;sys.exit(7)')
+        command[3:3] = options
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.processes.append(proc)
+        proc.communicate(timeout=12)
+        self.assertEqual(proc.returncode, 7)
+        self.assertFalse((proof / 'terminal.json').exists())
+
+    def test_escaped_descendant_blocks_terminal_proof(self) -> None:
+        options, proof, _ = self.proof_args()
+        escaped_file = self.tmp / 'escaped'
+        code = ('import os,subprocess;'
+                'p=subprocess.Popen(["/usr/bin/sleep","30"],start_new_session=True,'
+                'stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);'
+                'open(os.environ["KEEPER_ESCAPED_FILE"],"w").write(str(p.pid))')
+        command = self.command(code)
+        command[3:3] = options
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, 'KEEPER_ESCAPED_FILE': str(escaped_file)})
+        self.processes.append(proc)
+        try:
+            self.await_file(escaped_file)
+            proc.communicate(timeout=12)
+            self.assertEqual(proc.returncode, 125)
+            self.assertFalse((proof / 'terminal.json').exists())
+        finally:
+            if escaped_file.exists():
+                try: os.kill(int(escaped_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError: pass
+
     def test_worker_sigkill_adopts_and_stops_cli_without_recycled_pgid(self) -> None:
         libc = ctypes.CDLL(None, use_errno=True)
         self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0,
                          "test process must be subreaper to observe orphan zombies")
         ready = self.tmp / "ready"
         descendant = self.tmp / "descendant"
+        options, proof, epoch = self.proof_args()
         code = ('import os,subprocess,time;'
                 'p=subprocess.Popen(["/usr/bin/sleep","30"]);'
                 'open(os.environ["KEEPER_TEST_DESCENDANT"],"w").write(str(p.pid));'
                 'time.sleep(30)')
         try:
-            proc = self.start(code, {"OCV5_SUPERVISOR_READY_FILE": str(ready),
-                                     "KEEPER_TEST_DESCENDANT": str(descendant)})
+            command = self.command(code)
+            command[3:3] = options
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={**os.environ, "OCV5_SUPERVISOR_READY_FILE": str(ready),
+                     "KEEPER_TEST_DESCENDANT": str(descendant)})
+            self.processes.append(proc)
             self.await_file(ready)
             self.await_file(descendant)
             cli_pid, watcher_pid = map(int, ready.read_text().split())
@@ -97,6 +160,9 @@ class KeeperTest(unittest.TestCase):
             os.kill(workers[0], signal.SIGKILL)
             proc.communicate(timeout=12)
             self.assertEqual(proc.returncode, 137)
+            marker = json.loads((proof / 'terminal.json').read_text())
+            self.assertEqual((marker['runNonce'], marker['leaseEpoch'], marker['reason']),
+                             (proof.name[-24:], epoch, 'keeper_stopped'))
             # As the nearest living subreaper, T would inherit any C/watcher/
             # descendant left unreaped by P. ECHILD is the actual outcome;
             # merely allowing Z state would miss an ownership leak.
