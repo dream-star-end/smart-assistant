@@ -82,6 +82,8 @@ export function makeBoxTextPlan(input: {
   extraStageFiles?: readonly BoxStageFile[];
   runNonce?: string;
   leaseEpoch?: string;
+  /** Detached tool bridge only; text path keeps its existing 110s default. */
+  supervisorDeadlineSeconds?: number;
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body);
   if (unsupported) throw new BoxTextPlanError(unsupported);
@@ -94,6 +96,11 @@ export function makeBoxTextPlan(input: {
   }
   if (input.body.max_tokens > input.maxOutputTokensLimit) {
     throw new BoxTextPlanError("BOX_MAX_TOKENS_UNSUPPORTED");
+  }
+  const supervisorDeadlineSeconds = input.supervisorDeadlineSeconds ?? 110;
+  if (!Number.isSafeInteger(supervisorDeadlineSeconds)
+    || supervisorDeadlineSeconds < 1 || supervisorDeadlineSeconds > 900) {
+    throw new BoxTextPlanError("BOX_SUPERVISOR_DEADLINE_INVALID");
   }
   const runNonce = input.runNonce ?? randomBytes(12).toString("hex");
   const leaseEpoch = input.leaseEpoch ?? randomBytes(16).toString("hex");
@@ -134,7 +141,7 @@ export function makeBoxTextPlan(input: {
   const run: BoxCcExecRequest = {
     command: PYTHON,
     args: [keeperPath, supervisorPath, "--proof-dir", proofDir,
-      "--lease-epoch", leaseEpoch, "--deadline", "110", "--kill-after", "2",
+      "--lease-epoch", leaseEpoch, "--deadline", String(supervisorDeadlineSeconds), "--kill-after", "2",
       "--max-output", "1048576", "--stdin-file", stdinPath,
       "--stdin-sha256", stdinHash, "--", MODEL, "-p", "--model", input.upstreamModel,
       "--input-format", "stream-json", "--output-format", "stream-json",

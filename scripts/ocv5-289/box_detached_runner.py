@@ -68,7 +68,7 @@ def launch(argv: list[str]) -> int:
         duration = float(options[options.index("--deadline") + 1])
         if (not PROOF.fullmatch(proof) or PROOF.fullmatch(proof)[1] != nonce[1]
                 or not re.fullmatch(r"[a-f0-9]{32}", epoch)
-                or not 1 <= duration <= 120):
+                or not 1 <= duration <= 900):
             return 126
         directory_fd = verified_dir(directory)
     except (OSError, ValueError, IndexError):

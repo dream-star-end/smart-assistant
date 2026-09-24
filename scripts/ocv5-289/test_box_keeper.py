@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import select
 import secrets
 import shutil
@@ -21,6 +22,11 @@ SUPERVISOR = HERE / "box_supervisor.py"
 
 
 class KeeperTest(unittest.TestCase):
+    def test_detached_worker_budget_uses_verified_deadline_not_old_140s(self) -> None:
+        budget = runpy.run_path(str(KEEPER))["worker_budget"]
+        self.assertEqual(budget(["--deadline", "900", "--", "echo"]), 930)
+        self.assertEqual(budget(["--deadline", "901", "--", "echo"]), 140)
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ocv5-289-keeper-"))
         raw = SUPERVISOR.read_bytes() + f"\n# keeper-test-{secrets.token_hex(8)}\n".encode()

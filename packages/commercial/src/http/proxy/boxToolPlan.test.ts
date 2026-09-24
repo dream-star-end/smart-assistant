@@ -31,10 +31,12 @@ test("first tool round stages private MCP catalog and permits only virtual tools
   assert.equal(args[args.indexOf("--allowedTools") + 1], "mcp__ocbridge__t0");
   assert.ok(!args.includes("--disallowedTools"));
   assert.equal(args[args.indexOf("--effort") + 1], "medium");
+  assert.equal(args[args.indexOf("--deadline") + 1], "900");
   const config = JSON.parse(args[args.indexOf("--mcp-config") + 1]!) as {
     mcpServers: { ocbridge: { args: string[] } } };
   assert.equal(config.mcpServers.ocbridge.args[1], plan.cwd);
   assert.equal(config.mcpServers.ocbridge.args[2], plan.catalog.sha256);
+  assert.equal(config.mcpServers.ocbridge.args[3], "900");
   assert.ok(!args.join(" ").includes("Use local_echo on ping"));
   assert.ok(!args.join(" ").includes("OpenClaude local-only echo"));
   for (const stage of [plan.stageVirtualMcp, ...plan.stageInputs, plan.cleanup]) {

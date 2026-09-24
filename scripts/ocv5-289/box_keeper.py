@@ -181,11 +181,28 @@ def startup_budget(argv: list[str]) -> float:
             raw = token.split("=", 1)[1]
     try:
         value = float(raw)
-        if math.isfinite(value) and 0 < value <= 120:
+        if math.isfinite(value) and 0 < value <= 900:
             return min(5.0, value)
     except (TypeError, ValueError):
         pass
     return 5.0
+
+
+def worker_budget(argv: list[str]) -> float:
+    options = argv[:argv.index("--")] if "--" in argv else argv
+    raw = None
+    for index, token in enumerate(options):
+        if token == "--deadline":
+            raw = options[index + 1] if index + 1 < len(options) else None
+        elif token.startswith("--deadline="):
+            raw = token.split("=", 1)[1]
+    try:
+        value = float(raw)
+        if math.isfinite(value) and 0 < value <= 900:
+            return value + 30
+    except (TypeError, ValueError):
+        pass
+    return 140
 
 
 def main() -> int:
@@ -254,7 +271,7 @@ def main() -> int:
         os.close(ack_write)
         ack_write = -1
         try:
-            worker.wait(timeout=140)
+            worker.wait(timeout=worker_budget(worker_args))
         except subprocess.TimeoutExpired:
             worker.terminate()
             try: worker.wait(timeout=5)

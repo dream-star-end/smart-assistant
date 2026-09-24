@@ -21,6 +21,7 @@ test("first text request stages only files and carries no prompt/system on Claud
   assert.equal(plan.proofDir, `/tmp/ocv5-289-proof-${"a".repeat(24)}`);
   assert.deepEqual(plan.run.args.slice(2, 6),
     ["--proof-dir", plan.proofDir, "--lease-epoch", "b".repeat(32)]);
+  assert.equal(plan.run.args[plan.run.args.indexOf("--deadline") + 1], "110");
   assert.ok(plan.run.args.includes("--session-id"));
   assert.ok(!plan.run.args.includes("--resume"));
   assert.ok(plan.run.args.includes("--system-prompt-file"));

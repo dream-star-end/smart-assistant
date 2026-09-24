@@ -41,15 +41,15 @@ export function makeBoxToolPlan(input: {
   const { tools: _tools, tool_choice: _choice, thinking: _thinking,
     output_config: _output, ...textBody } = input.body;
   const base = makeBoxTextPlan({ body: textBody, upstreamModel: input.upstreamModel,
-    maxOutputTokensLimit: input.maxOutputTokensLimit,
-    supervisorAsset: input.supervisorAsset, keeperAsset: input.keeperAsset,
-    extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
-    runNonce, leaseEpoch: input.leaseEpoch });
+      maxOutputTokensLimit: input.maxOutputTokensLimit,
+      supervisorAsset: input.supervisorAsset, keeperAsset: input.keeperAsset,
+      extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
+      runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900 });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
-    command: "/usr/bin/python3", args: [virtualMcpPath, base.cwd, catalog.sha256, "110"] } } });
+    command: "/usr/bin/python3", args: [virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });
   const args = [...base.run.args];
   const deny = args.indexOf("--disallowedTools");
   if (deny < 0 || args[deny + 1] !== "mcp__*") throw new BoxTextPlanError("BOX_TOOL_PLAN_INVALID");

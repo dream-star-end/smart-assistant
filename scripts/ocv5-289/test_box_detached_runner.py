@@ -43,7 +43,7 @@ class DetachedRunnerTest(unittest.TestCase):
         code = ('import sys,time;sys.stdout.write("first\\n");sys.stdout.flush();'
                 'time.sleep(1);sys.stdout.write("second\\n");sys.stdout.flush()')
         options = ["--proof-dir", str(self.proof_dir), "--lease-epoch", "a" * 32,
-                   "--deadline", "8", "--kill-after", ".1", "--max-output", "262144",
+                   "--deadline", "900", "--kill-after", ".1", "--max-output", "262144",
                    "--", sys.executable, "-c", code]
         args = [str(self.run_dir), str(self.assets[0]), str(self.assets[1]), *options]
         launch = self.run_fixed(*args)
@@ -104,6 +104,15 @@ class DetachedRunnerTest(unittest.TestCase):
             self.run_dir.unlink()
             backup.rename(self.run_dir)
             decoy.rmdir()
+
+    def test_deadline_above_detached_cap_fails_before_launch(self) -> None:
+        rejected = self.run_fixed(str(self.run_dir), str(self.assets[0]),
+            str(self.assets[1]), "--proof-dir", str(self.proof_dir),
+            "--lease-epoch", "a" * 32, "--deadline", "901",
+            "--kill-after", ".1", "--max-output", "262144",
+            "--", sys.executable, "-c", "print('must-not-run')")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertFalse((self.run_dir / "stdout.jsonl").exists())
 
 
 if __name__ == "__main__":

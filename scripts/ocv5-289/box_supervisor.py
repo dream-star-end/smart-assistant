@@ -310,7 +310,7 @@ def main() -> int:
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if (not command or not (0 < args.deadline <= 120) or not (0 < args.kill_after <= 10)
+    if (not command or not (0 < args.deadline <= 900) or not (0 < args.kill_after <= 10)
             or not (0 < args.max_output <= 1048576)
             or (args.stdin_file is None) != (args.stdin_sha256 is None)
             or (args.stdin_file is not None and (not args.stdin_file or not args.stdin_sha256))):
