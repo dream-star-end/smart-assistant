@@ -13,8 +13,8 @@ test("read-only poll frames partial UTF-8 by exact byte offset and never re-laun
   const parts = [raw.subarray(0, 27), raw.subarray(27)];
   const seen: string[] = [];
   const exec = { run: async (req: { args: string[] }) => {
-    seen.push(req.args[1]!);
-    const offset = Number(req.args[3]);
+    seen.push(req.args[4]!);
+    const offset = Number(req.args[6]);
     const bytes = parts.shift() ?? Buffer.alloc(0);
     return { stdout: encoded(bytes, offset), stderrBytes: 0, exitCode: 0 as const };
   } };
@@ -32,8 +32,8 @@ test("empty spool times out without starting or replaying model", async () => {
   let calls = 0;
   const exec = { run: async (req: { args: string[] }) => {
     calls++;
-    assert.equal(req.args[1], "--read");
-    const offset = Number(req.args[3]);
+    assert.equal(req.args[4], "--read");
+    const offset = Number(req.args[6]);
     return { stdout: encoded(Buffer.alloc(0), offset), stderrBytes: 0,
       exitCode: 0 as const };
   } };

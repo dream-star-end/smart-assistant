@@ -6,9 +6,8 @@ import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
 import { makeBoxAssetStage } from "./boxTextPlan.js";
 import { makeBoxToolPlan, type BoxToolPlan } from "./boxToolPlan.js";
-import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
+import { makeBoxDetachedRunAccess, makeBoxPinnedRunnerRequest } from "./boxDetachedRunAccess.js";
 
-const PYTHON = "/usr/bin/python3";
 export interface BoxDetachedToolPlan extends BoxToolPlan {
   readonly stageDetachedRunner: BoxCcExecRequest;
   readonly detachedRunnerHash: string;
@@ -33,10 +32,9 @@ export function makeBoxDetachedToolPlan(input: {
   const access = makeBoxDetachedRunAccess({ runNonce: base.runNonce, detachedRunnerHash });
   const runnerPath = access.runnerPath;
   const stageDetachedRunner = makeBoxAssetStage(detachedRunnerAsset, runnerPath).request;
-  const launch: BoxCcExecRequest = { command: PYTHON,
-    args: [runnerPath, base.cwd, base.run.args[0]!, base.run.args[1]!,
-      ...base.run.args.slice(2)], cwd: base.cwd,
-    environment: base.run.environment };
+  const launch: BoxCcExecRequest = makeBoxPinnedRunnerRequest({ runnerPath,
+    detachedRunnerHash, args: [base.cwd, ...base.run.args], cwd: base.cwd,
+    environment: base.run.environment });
   // Only after nonce/epoch-bound remote terminal proof: stdout/stderr contain
   // model output and must be removed with the private input/catalog files.
   const cleanup: BoxCcExecRequest = { ...base.cleanup,

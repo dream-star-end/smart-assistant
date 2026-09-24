@@ -262,6 +262,9 @@ terminal proof; unknown outcomes retain files for reconciliation.
 The durable tool handoff also pins the detached runner's full SHA-256 digest.
 A later HTTP request reconstructs only the nonce-scoped read plan from this
 digest and run nonce; it never rebuilds the original prompt or relaunches CLI.
+Initial launch and later reads use the same fixed Python loader: no-follow fd,
+owner/mode/size and full digest are checked before executing those exact fd
+bytes, rather than re-opening a mutable script path after a precheck.
 
 The supervised CLI must publish a bounded, no-content `terminal.json` in its
 owner-0700 per-run directory only after a **real stop fence**. Bind the marker
