@@ -259,6 +259,9 @@ canonical base64 and size but does not auto-ACK SSE delivery or replay an
 ambiguous model/tool-result write. The detached cleanup plan includes both
 stdout and stderr spools, but may run only after nonce/epoch-bound remote
 terminal proof; unknown outcomes retain files for reconciliation.
+The durable tool handoff also pins the detached runner's full SHA-256 digest.
+A later HTTP request reconstructs only the nonce-scoped read plan from this
+digest and run nonce; it never rebuilds the original prompt or relaunches CLI.
 
 The supervised CLI must publish a bounded, no-content `terminal.json` in its
 owner-0700 per-run directory only after a **real stop fence**. Bind the marker

@@ -1,7 +1,7 @@
 /** Bounded read-only Box stdout spool cursor. Reads may be repeated safely,
  * but a model/tool-result write or an ambiguous SSE delivery is never replayed. */
 import type { BoxExecTransport } from "./boxExecTransport.js";
-import type { BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
+import type { BoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 
 export class BoxSpoolReadError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxSpoolReadError"; }
@@ -35,7 +35,7 @@ export function parseBoxSpoolChunk(raw: string, offset: number,
 
 export async function readBoxSpoolChunk(input: {
   exec: Pick<BoxExecTransport, "run">;
-  plan: Pick<BoxDetachedToolPlan, "readSpool">;
+  plan: Pick<BoxDetachedRunAccess, "readSpool">;
   offset: number;
   limit?: number;
   signal?: AbortSignal;
