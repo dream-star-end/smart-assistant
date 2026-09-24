@@ -30,9 +30,10 @@ export interface BoxUsageEvidence {
 function validUsageEvidence(value: unknown): value is BoxUsageEvidence {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const usage = value as Record<string, unknown>;
-  return Object.keys(usage).sort().join(",") ===
-      "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens"
-    && Object.values(usage).every((n) => Number.isSafeInteger(n) && Number(n) >= 0);
+  const keys = ["cacheReadTokens", "cacheWriteTokens", "inputTokens", "outputTokens"];
+  return Object.keys(usage).length === keys.length
+    && keys.every((key) => Object.hasOwn(usage, key)
+      && Number.isSafeInteger(usage[key]) && Number(usage[key]) >= 0);
 }
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 

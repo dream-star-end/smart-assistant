@@ -79,6 +79,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const usage = { inputTokens: 51, outputTokens: 7,
       cacheReadTokens: 9, cacheWriteTokens: 3 };
     await journal.complete({ ...input, proof, usage });
+    await assert.rejects(() => journal.complete({ ...input, proof,
+      usage: { "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens": 1 } as never }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_EVIDENCE_INVALID");
     assert.equal(await abortInflightJournal(sameConnection, input.requestId,
       "late client disconnect"), false);
     const row = await client.query<{ ctx: Record<string, unknown> }>(
@@ -285,7 +289,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const finalUsage = { inputTokens: 9, outputTokens: 13,
       cacheReadTokens: 1, cacheWriteTokens: 0 };
     for (const invalid of [{}, [], { inputTokens: 9, outputTokens: 13,
-      cacheReadTokens: 1 }, { ...finalUsage, extra: 1 }]) {
+      cacheReadTokens: 1 }, { ...finalUsage, extra: 1 },
+      { "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens": 1 }]) {
       await assert.rejects(() => journal.completeToolChain({
         requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
         proof: chainProof, usage: invalid as never }),
