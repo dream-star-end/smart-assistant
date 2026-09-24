@@ -14,9 +14,10 @@ d=sys.argv[1];end=time.monotonic()+30;seq=0
 try:
  while time.monotonic()<end and not os.path.exists(d+'/stop'):
   seq+=1
-  fd=os.open(d+'/alive',os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+  fd=os.open(d+'/alive.tmp',os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
   try:os.write(fd,str(seq).encode('ascii'));os.fsync(fd)
   finally:os.close(fd)
+  os.replace(d+'/alive.tmp',d+'/alive')
   time.sleep(.1)
 finally:
  fd=os.open(d+'/done',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
@@ -69,7 +70,9 @@ try:
    os.close(fd);break
   except FileNotFoundError:time.sleep(.05)
  else:raise SystemExit(4)
- for name in ('alive','stop','done'):os.unlink(name,dir_fd=dfd)
+ for name in ('alive','stop','done','alive.tmp'):
+  try:os.unlink(name,dir_fd=dfd)
+  except FileNotFoundError:pass
 finally:os.close(dfd)
 os.rmdir(d);print('stopped')`;
 

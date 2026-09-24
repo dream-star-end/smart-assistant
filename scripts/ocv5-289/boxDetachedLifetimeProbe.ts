@@ -16,7 +16,7 @@ async function main(): Promise<void> {
   const requestId = `ocv5-289-detached-${randomBytes(12).toString("hex")}`;
   const target = await createProductionBoxAccountResolver().resolve({ uid: UID,
     sessionId: requestId, requestId, upstreamModel: "claude-opus-5-5",
-    signal: new AbortController().signal });
+    signal: new AbortController().signal, requiredAccountId: ACCOUNT_ID });
   try {
     if (target.accountId !== ACCOUNT_ID) throw new Error("BOX_DETACHED_ACCOUNT_MISMATCH");
     const plan = makeBoxDetachedProbePlan(randomBytes(12).toString("hex"));

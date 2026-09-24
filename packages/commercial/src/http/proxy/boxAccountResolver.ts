@@ -140,10 +140,13 @@ export class BoxAccountResolver {
   }
 
   async resolve(args: { uid: bigint; sessionId: string | null; requestId: string;
-    upstreamModel: string; signal: AbortSignal }): Promise<BoxResolvedTarget> {
+    upstreamModel: string; signal: AbortSignal;
+    /** Operator-only exact account fence, checked before the first Box control request. */
+    requiredAccountId?: bigint }): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
-    const rows = (await this.deps.list()).filter((row) => eligible(row, now()));
+    const rows = (await this.deps.list()).filter((row) => eligible(row, now())
+      && (args.requiredAccountId === undefined || row.id === args.requiredAccountId));
     const picked = selectCursorAccount({ accounts: rows, model: args.upstreamModel,
       now: new Date(now()), cooled: new Set(), sticky: null, random: this.deps.random });
     if (!picked) throw new BoxAccountResolverError("BOX_ACCOUNT_UNAVAILABLE");

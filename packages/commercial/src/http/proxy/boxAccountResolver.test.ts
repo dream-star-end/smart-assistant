@@ -135,6 +135,21 @@ test("ineligible account and unresolved bound egress never call Box control", as
   assert.equal(egress.getClosed(), 0);
 });
 
+test("operator account pin rejects another eligible account before GetState", async () => {
+  const f = fixture();
+  const row20 = (await f.deps.list())[0]!;
+  const row21 = { ...row20, id: 21n };
+  const resolver = new BoxAccountResolver({ ...f.deps, list: async () => [row21] });
+  await assert.rejects(resolver.resolve({ ...f.args, requiredAccountId: 20n }),
+    (error: unknown) => error instanceof BoxAccountResolverError
+      && error.code === "BOX_ACCOUNT_UNAVAILABLE");
+  assert.deepEqual(f.calls, [], "no wrong-account Box control request is allowed");
+  const pinned = new BoxAccountResolver({ ...f.deps, list: async () => [row21, row20] });
+  const target = await pinned.resolve({ ...f.args, requiredAccountId: 20n });
+  assert.equal(target.accountId, 20n);
+  await target.dispose?.();
+});
+
 test("failed pre-handoff private-proxy close remains owned for explicit retry", async () => {
   const f = fixture();
   let closes = 0;
