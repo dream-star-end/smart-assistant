@@ -1,5 +1,6 @@
 """Offline keeper/worker/CLI lifecycle tests; only kill own test processes."""
 import hashlib
+import ctypes
 import os
 from pathlib import Path
 import re
@@ -73,32 +74,45 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual((bad.returncode, out), (7, b""))
 
     def test_worker_sigkill_adopts_and_stops_cli_without_recycled_pgid(self) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0,
+                         "test process must be subreaper to observe orphan zombies")
         ready = self.tmp / "ready"
         descendant = self.tmp / "descendant"
         code = ('import os,subprocess,time;'
                 'p=subprocess.Popen(["/usr/bin/sleep","30"]);'
                 'open(os.environ["KEEPER_TEST_DESCENDANT"],"w").write(str(p.pid));'
                 'time.sleep(30)')
-        proc = self.start(code, {"OCV5_SUPERVISOR_READY_FILE": str(ready),
-                                 "KEEPER_TEST_DESCENDANT": str(descendant)})
-        self.await_file(ready)
-        self.await_file(descendant)
-        cli_pid, _watchdog_pid = map(int, ready.read_text().split())
-        descendant_pid = int(descendant.read_text())
-        children_file = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
-        workers = [int(x) for x in children_file.read_text().split()]
-        self.assertEqual(len(workers), 1)
-        os.kill(workers[0], signal.SIGKILL)
-        proc.communicate(timeout=12)
-        self.assertEqual(proc.returncode, 137)
-        # CLI leader may briefly be a zombie until keeper reaps it; after
-        # keeper exits it must not remain a runnable process.
-        for pid in (cli_pid, descendant_pid):
-            try:
-                status = Path(f"/proc/{pid}/stat").read_text()
-                self.assertIn(status.split(") ", 1)[1][0], "ZX")
-            except FileNotFoundError:
-                pass
+        try:
+            proc = self.start(code, {"OCV5_SUPERVISOR_READY_FILE": str(ready),
+                                     "KEEPER_TEST_DESCENDANT": str(descendant)})
+            self.await_file(ready)
+            self.await_file(descendant)
+            cli_pid, watcher_pid = map(int, ready.read_text().split())
+            descendant_pid = int(descendant.read_text())
+            children_file = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
+            workers = [int(x) for x in children_file.read_text().split()]
+            self.assertEqual(len(workers), 1)
+            os.kill(workers[0], signal.SIGKILL)
+            proc.communicate(timeout=12)
+            self.assertEqual(proc.returncode, 137)
+            # As the nearest living subreaper, T would inherit any C/watcher/
+            # descendant left unreaped by P. ECHILD is the actual outcome;
+            # merely allowing Z state would miss an ownership leak.
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(-1, os.WNOHANG)
+            for pid in (cli_pid, watcher_pid, descendant_pid):
+                self.assertFalse(Path(f"/proc/{pid}").exists(),
+                                 f"keeper left its own PID {pid} behind")
+        finally:
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                except ChildProcessError:
+                    break
+            libc.prctl(36, 0, 0, 0, 0)
 
     def test_report_missing_before_gate_fails_closed(self) -> None:
         child_file = self.tmp / "child"
