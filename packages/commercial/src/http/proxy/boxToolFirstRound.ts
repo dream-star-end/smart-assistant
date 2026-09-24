@@ -9,6 +9,8 @@ import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
 import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { readBoxSpoolChunk } from "./boxSpoolRead.js";
+import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
@@ -17,14 +19,21 @@ export class BoxToolFirstRoundError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolFirstRoundError"; }
 }
 export interface BoxToolFirstHandoff {
+  readonly kind: "tool_handoff";
   readonly plan: BoxDetachedToolPlan;
   /** Must remain owned until nonce/epoch-bound remote terminal proof. */
   readonly target: BoxResolvedTarget;
   readonly candidate: BoxToolHandoffCandidate;
   readonly spoolOffset: number;
 }
+export interface BoxToolFirstFinal {
+  readonly kind: "final";
+  readonly plan: BoxDetachedToolPlan;
+  readonly target: BoxResolvedTarget;
+  readonly proof: BoxTerminalProof;
+}
 type Journal = Pick<BoxDurableJournal, "admit" | "markRunning" |
-  "markPrestartStopped" | "markUnknown" | "recordToolHandoff">;
+  "markPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">;
 
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
@@ -54,7 +63,7 @@ export async function runBoxToolFirstRound(input: {
   retainCleanupTarget: (handle: { target: BoxResolvedTarget;
     pending: Promise<void>; uid: bigint; requestId: string; phase: string }) => void;
   budgetMs?: number;
-}): Promise<BoxToolFirstHandoff> {
+}): Promise<BoxToolFirstHandoff | BoxToolFirstFinal> {
   if (input.url !== BOX_INTERNAL_ENDPOINT || input.init.method !== "POST"
     || typeof input.init.body !== "string") {
     throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_REQUEST_INVALID");
@@ -237,11 +246,43 @@ export async function runBoxToolFirstRound(input: {
     if (launch.stdout.trim() !== "launched") {
       throw new BoxToolFirstRoundError("BOX_TOOL_LAUNCH_UNKNOWN");
     }
-    const decoder = new BoxCliToolHandoffDecoder(plan.expectedModel, plan.catalog);
+    const decoder = new BoxCliToolHandoffDecoder(plan.expectedModel, plan.catalog,
+      { allowFinal: true });
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access: plan,
       startOffset: 0, deadlineMs: Math.max(1, remaining()), signal })) {
       const decoded = decoder.push(line.text);
       if (decoded.sse) input.emit(decoded.sse);
+      if (decoded.finalCandidate) {
+        const final = decoded.finalCandidate;
+        let proof: BoxTerminalProof | null = null;
+        const until = Date.now() + 20_000;
+        while (!proof && Date.now() < until && !signal.aborted) {
+          try { proof = await race(readBoxTerminalProof({ target,
+            expectedAccountId: target.accountId, runNonce: plan.runNonce,
+            leaseEpoch: plan.leaseEpoch, signal })); }
+          catch (error) {
+            if (!(error instanceof BoxExecTransportError && error.terminalKnown)) throw error;
+            await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        if (!proof || proof.reason !== "worker_complete") {
+          throw new BoxToolFirstRoundError("BOX_TOOL_TERMINAL_UNPROVEN");
+        }
+        const trailing = await race(readBoxSpoolChunk({ exec: target.exec,
+          plan, offset: line.endOffset, signal }));
+        if (trailing.bytes.length !== 0) {
+          throw new BoxToolFirstRoundError("BOX_TOOL_FINAL_TRAILING_BYTES");
+        }
+        decoder.finishFinal();
+        const usage = { inputTokens: final.inputTokens,
+          outputTokens: final.outputTokens, cacheReadTokens: final.cacheReadTokens,
+          cacheWriteTokens: final.cacheWriteTokens };
+        await race(deps.journal.complete({ requestId: input.requestId,
+          uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage }));
+        input.emit(decoder.commitFinal({ terminalReason: proof.reason,
+          journaledUsage: usage }));
+        return { kind: "final", plan, target, proof };
+      }
       if (!decoded.candidate) continue;
       const candidate = decoded.candidate;
       const pending = new Set<string>();
@@ -265,7 +306,8 @@ export async function runBoxToolFirstRound(input: {
         catalogHash: plan.catalog.bindingSha256,
         verifiedPendingToolUseIds: [...pending] }));
       input.emit(decoder.commitHandoff(proof));
-      return { plan, target, candidate, spoolOffset: line.endOffset };
+      return { kind: "tool_handoff", plan, target, candidate,
+        spoolOffset: line.endOffset };
     }
     throw new BoxToolFirstRoundError("BOX_TOOL_STREAM_INCOMPLETE");
   } catch (error) {

@@ -3,7 +3,8 @@
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
-import { runBoxToolFirstRound, type BoxToolFirstHandoff } from "./boxToolFirstRound.js";
+import { runBoxToolFirstRound, type BoxToolFirstHandoff,
+  type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -128,7 +129,7 @@ export class BoxToolFetch {
               await this.releaseAfterProof(published.claim.runNonce);
             }
           } else {
-            const handoff: BoxToolFirstHandoff = await (this.deps.runFirst
+            const outcome: BoxToolFirstHandoff | BoxToolFirstFinal = await (this.deps.runFirst
               ?? runBoxToolFirstRound)({ ...args, init, emit }, {
               supervisorAsset: this.deps.supervisorAsset,
               keeperAsset: this.deps.keeperAsset,
@@ -141,7 +142,10 @@ export class BoxToolFetch {
               retainUnknownTarget: ({ target, plan }) => this.own(plan.runNonce, target),
               retainCleanupTarget: (handle) => this.retainCleanup(handle),
             });
-            this.own(handoff.plan.runNonce, handoff.target);
+            this.own(outcome.plan.runNonce, outcome.target);
+            if (outcome.kind === "final") {
+              await this.releaseAfterProof(outcome.plan.runNonce);
+            }
           }
           controller.close();
         })().catch((error: unknown) => {

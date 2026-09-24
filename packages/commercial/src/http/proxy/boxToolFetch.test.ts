@@ -35,7 +35,7 @@ test("same internal model fetch streams first handoff then next final without to
     onUnknown: async () => {},
     runFirst: (async (input: { emit: (sse: string) => void }) => {
       calls.push("first"); input.emit("event: message_stop\ndata: {}\n\n");
-      return { plan: { runNonce: claim.runNonce }, target };
+      return { kind: "tool_handoff", plan: { runNonce: claim.runNonce }, target };
     }) as never,
     publishResume: (async () => { calls.push("claim-and-publish");
       return { claim, target, access: {} }; }) as never,
