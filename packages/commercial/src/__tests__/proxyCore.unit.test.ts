@@ -463,6 +463,38 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     assert.equal(finalize.failClientCalls.length, 0);
   });
 
+  test("Box 非重放策略:签名 400 不删除历史、不发第二次模型调用", async () => {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    const signatureError = JSON.stringify({
+      type: "error",
+      error: { type: "invalid_request_error", message: "thinking signature invalid" },
+    });
+    const { ctx, res, finalize } = buildCtx({
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return sentBodies.length === 1
+          ? new Response(signatureError, { status: 400 })
+          : sseFullResponse(); // 若误重试会假绿,下方调用数/终态断言会抓住。
+      },
+    });
+    const messages = [{ role: "assistant", content: [
+      { type: "thinking", thinking: "signed", signature: "q".repeat(64) },
+      { type: "text", text: "visible" },
+    ] }];
+    const before = structuredClone(messages);
+    ctx.body.messages = messages as ProxyBody["messages"];
+    ctx.noHistoryRewriteRetry = true;
+
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(sentBodies.length, 1, "Box request must never be silently replayed");
+    assert.deepEqual(sentBodies[0]!.messages, before);
+    assert.deepEqual(messages, before, "the canonical history must remain unchanged");
+    assert.equal(finalize.commitCalls.length, 0);
+    assert.equal(finalize.failClientCalls.length, 1);
+    assert.notEqual(res.statusCode, 200);
+  });
+
   test("上游 500 → finalize.fail(非 failClient)+ 502 UPSTREAM_ERROR", async () => {
     const { ctx, res, session, finalize } = buildCtx({
       fetchImpl: async () => new Response("internal error", { status: 500 }),
