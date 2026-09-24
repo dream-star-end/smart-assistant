@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 
-const evidence = () => ({ version: 1, roundNo: 1, messageId: "msg_tool",
+const evidence = () => ({ version: 1, roundNo: 1, messageId: "msg_tool", spoolOffset: 1234,
   toolUses: [
     { id: "toolu_A", boxName: "mcp__ocbridge__t0",
       clientName: "local_echo", inputHash: "a".repeat(64) },
@@ -28,4 +28,6 @@ test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed",
   assert.equal(parseBoxStoredToolHandoff(sparse), null);
   const wrongUsage = evidence(); wrongUsage.usage.outputTokens = -1;
   assert.equal(parseBoxStoredToolHandoff(wrongUsage), null);
+  const wrongOffset = evidence(); wrongOffset.spoolOffset = 0;
+  assert.equal(parseBoxStoredToolHandoff(wrongOffset), null);
 });

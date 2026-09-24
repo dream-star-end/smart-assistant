@@ -217,7 +217,8 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   also exist; neither is connected to a live durable resume CAS yet, so they
   do **not** publish tools in production or grant Box execution permission.
   A first-round journal CAS can now persist the full model tool-use set, exact
-  usage and verified pending subset and return a durable handoff revision;
+  usage, verified pending subset and the exact JSONL `message_stop` **byte**
+  offset (not the enclosing read chunk's end), then return a durable handoff revision;
   the next HTTP row can atomically claim that invocation with a complete,
   ID-bound tool_result set before any sidecar result is published. PG stores
   only canonical input/result hashes, never raw tool arguments or results;

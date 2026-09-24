@@ -113,12 +113,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         clientName: "local_echo", input: { value: privateMarker } },
     ], inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
+      spoolOffset: 1234,
       verifiedPendingToolUseIds: ["toolu_A"] });
     assert.deepEqual(receipt.journaledToolUseIds, ["toolu_A", "toolu_B"]);
     assert.deepEqual(receipt.verifiedPendingToolUseIds, ["toolu_A"]);
     const handoff = await client.query<{ ctx: Record<string, unknown> }>(
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
     assert.equal(handoff.rows[0]?.ctx.boxState, "handoff");
+    assert.equal((handoff.rows[0]?.ctx.boxToolHandoff as { spoolOffset: number }).spoolOffset, 1234);
     assert.ok(!JSON.stringify(handoff.rows[0]?.ctx).includes(privateMarker));
     const persistedUses = (handoff.rows[0]?.ctx.boxToolHandoff as {
       toolUses: Array<Record<string, unknown>> }).toolUses;
@@ -127,10 +129,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.deepEqual((handoff.rows[0]?.ctx.boxToolHandoff as Record<string, unknown>).usage,
       { inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 });
     await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
+      spoolOffset: 1234,
       verifiedPendingToolUseIds: ["toolu_not_in_model"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
     await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
+      spoolOffset: 1234,
       verifiedPendingToolUseIds: ["toolu_A"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
@@ -177,6 +181,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
     assert.equal(resumed.ownerRequestId, toolCall.requestId);
     assert.equal(resumed.accountId, 20n);
+    assert.equal(resumed.spoolOffset, 1234);
     assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
       ["toolu_A", "toolu_B"]);
     const linked = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(

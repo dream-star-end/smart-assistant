@@ -41,6 +41,7 @@ export interface BoxToolResumeClaim {
   readonly accountId: bigint;
   readonly runNonce: string;
   readonly leaseEpoch: string;
+  readonly spoolOffset: number;
   readonly durableRevision: string;
   readonly results: readonly BoxMatchedToolResult[];
   readonly toolUses: readonly BoxToolUseDigest[];
@@ -56,6 +57,7 @@ export interface BoxJournalPort {
     { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
   recordToolHandoff?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { candidate: BoxToolHandoffCandidate;
+      spoolOffset: number;
       verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof>;
   claimToolResume?(input: { requestId: string; uid: bigint;
     canonicalModel: string; canonicalBody: ProxyBody }): Promise<BoxToolResumeClaim>;
@@ -198,6 +200,7 @@ export class BoxDurableJournal implements BoxJournalPort {
    * later sidecar calls may appear only after earlier tool results. */
   async recordToolHandoff(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { candidate: BoxToolHandoffCandidate;
+      spoolOffset: number;
       verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof> {
     const candidate = input.candidate;
     const toolUses = candidate && Array.isArray(candidate.toolUses) ? candidate.toolUses : [];
@@ -221,6 +224,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         || !use.input || typeof use.input !== "object" || Array.isArray(use.input))
       || !Array.isArray(pending) || pending.length < 1
       || pending.length > ids.length || new Set(pending).size !== pending.length
+      || !Number.isSafeInteger(input.spoolOffset) || input.spoolOffset < 1
+      || input.spoolOffset > 8 * 1024 * 1024
       || Array.from({ length: pending.length }, (_, index) => index)
         .some((index) => !Object.hasOwn(pending, index)
           || typeof pending[index] !== "string" || !ids.includes(pending[index]!))
@@ -234,6 +239,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       inputHash: hashBoxToolInput(use.input) })); }
     catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
     const frozen = { version: 1, roundNo: 1, messageId: candidate.messageId,
+      spoolOffset: input.spoolOffset,
       toolUses: digests, verifiedPendingToolUseIds: pendingIds, usage };
     if (!parseBoxStoredToolHandoff(frozen)) {
       throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
@@ -331,6 +337,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           JSON.stringify({ boxState: "linked", boxOwnerRequestId: owner.request_id,
             boxAccountId: ctx.boxAccountId, boxRunNonce: ctx.boxRunNonce,
             boxLeaseEpoch: ctx.boxLeaseEpoch, boxTurnKey: fingerprint.turnKey,
+            boxResumeSpoolOffset: handoff.spoolOffset,
             boxSessionId: fingerprint.sessionId,
             boxReplayFingerprint: fingerprint.replayFingerprint,
             boxRequestHash: fingerprint.requestHash, boxResumeRevision: durableRevision })]);
@@ -344,7 +351,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       committed = true;
       return { ownerRequestId: owner.request_id, accountId: BigInt(ctx.boxAccountId),
         runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch,
-        durableRevision, results,
+        spoolOffset: handoff.spoolOffset, durableRevision, results,
         toolUses: digests };
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
