@@ -9,6 +9,8 @@ export class SandProvisionError extends Error {
 }
 export interface SandGatewayConnection { gatewayUrl: string; gatewayToken: string; networkToken: string }
 export interface SandRelayProbe { moduleHash: string; active: number; maxConcurrent: number }
+/** Box Exec is an account capability, independent of the installed Sand relay. */
+export interface SandBoxExecTarget { execUrl: string; execToken: string; networkToken: string }
 type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
 const RELAY_PATH = "/sand-stream-relay/aiserver.v1.InferenceService/Stream";
 const BOX_METHODS = new Set(["listAgents", "getHostStatus", "createAgent", "sendPrompt", "promptAcceptanceStatus", "getAgentTranscript"]);
@@ -124,6 +126,34 @@ export class CursorSandProvisionClient {
       || !((u.protocol === "https:" && u.hostname.endsWith(".cursorvm.com"))
         || (this.options.allowTestLoopback && u.protocol === "http:" && u.hostname === "127.0.0.1"))) throw new SandProvisionError("DESCRIPTOR_INVALID");
     return { gatewayUrl: u.href.replace(/\/+$/, ""), gatewayToken: bearer(value.gatewayToken), networkToken: bearer(value.networkToken) };
+  }
+
+  /** Resolve the official Exec daemon without requiring an OpenClaude Sand
+   * relay probe. Only call after the account has been authorized and its
+   * session credential and machine ID were read from the same trusted store.
+   * An ambiguous Ensure response is never retried in this method. */
+  async resolveBoxExec(token: string, machine: string, signal: AbortSignal): Promise<SandBoxExecTarget> {
+    sandPrincipal(token, "session", this.options.now?.());
+    const state = await this.control("GetSandBoxRunState", token, machine, signal);
+    if (state.state !== "SAND_BOX_RUN_STATE_RUNNING") throw new SandProvisionError("BOX_NOT_RUNNING");
+    const value = await this.control("EnsureSandBox", token, machine, signal);
+    if (typeof value.execDaemonUrl !== "string" || value.execDaemonUrl.length === 0 || value.execDaemonUrl.length > 2048) {
+      throw new SandProvisionError("EXEC_DESCRIPTOR_INVALID");
+    }
+    let url: URL;
+    try {
+      url = new URL(value.execDaemonUrl);
+      if (url.username || url.password || url.search || url.hash
+        || !((url.protocol === "https:" && url.hostname.endsWith(".cursorvm.com"))
+          || (this.options.allowTestLoopback && url.protocol === "http:" && url.hostname === "127.0.0.1"))) {
+        throw new Error("invalid exec descriptor");
+      }
+    } catch { throw new SandProvisionError("EXEC_DESCRIPTOR_INVALID"); }
+    const prefix = url.pathname.replace(/\/+$/, "");
+    if (!prefix.endsWith("/agent.v1.ControlService/Exec")) {
+      url.pathname = `${prefix}/agent.v1.ControlService/Exec`;
+    }
+    return { execUrl: url.href, execToken: bearer(value.execDaemonAuthToken), networkToken: bearer(value.networkToken) };
   }
 
   private headers(c: SandGatewayConnection): Record<string, string> {
