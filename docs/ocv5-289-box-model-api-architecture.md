@@ -211,6 +211,9 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   model response requests C, persist a new round and hand off again. A
   timeout or crash after any publish is `unknown`, not a reason to republish
   any result or restart `claude -p`.
+  The offline `boxToolResultMatcher` now binds all client results to the
+  completed model's exact tool IDs, names and inputs, independent of result
+  order; it does **not** publish to Box or grant execution permission.
 - Before **each** round's terminal SSE (tool-use or final text), persist exact
   observed usage and the frozen pricing basis bound to its stable billing ID.
   The existing per-HTTP `request_finalize_journal` must carry a Box durable
