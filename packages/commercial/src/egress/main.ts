@@ -24,6 +24,8 @@
 
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import IORedis from "ioredis";
 
 import { loadConfig } from "../config.js";
@@ -51,6 +53,10 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_UID,
 } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
+import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
+import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
+import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
@@ -226,6 +232,23 @@ export async function startEgress(): Promise<void> {
     DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
     Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
   );
+  // Off by default. Keep the same authenticated /v1/messages handler and
+  // OpenClaude user-container agent; Box owns only the supervised model call.
+  // Missing staged assets make egress refuse startup when explicitly enabled.
+  const boxModel = process.env.OC_BOX_MODEL_API === "1" ? new BoxTextFetch({
+    supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
+    keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
+    registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
+      leaseMs: 900_000 }),
+    journal: new BoxDurableJournal(getPool()),
+    maxOutputTokensForModel: (model) =>
+      model === "box-api-claude-opus-5-5" ? 128_000 : null,
+    resolveTarget: (args) => createProductionBoxAccountResolver().resolve(args),
+    onUnknown: async ({ uid, accountId, requestId, phase }) => {
+      log.error("box_model_outcome_unknown", { uid: uid.toString(),
+        accountId: accountId.toString(), requestId, phase });
+    },
+  }) : undefined;
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -236,6 +259,7 @@ export async function startEgress(): Promise<void> {
     rateLimitRedis,
     concurrencyLimiter: sharedProxyConcurrency,
     fallbackLimiter: sharedProxyFallback,
+    boxModel,
     modelCatalog,
     modelAuthorityEnforce,
     // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。
