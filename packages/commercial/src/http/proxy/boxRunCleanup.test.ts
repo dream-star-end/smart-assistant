@@ -31,11 +31,13 @@ test("known-terminal cleanup removes private files but keeps empty replay-fence 
     put("pending.toolu_A.json", "private arguments");
     put("result.toolu_A.json", "private result");
     put("result.toolu_B.json.part", "partial result");
+    put("pending.toolu_C.json.12345.987654321.tmp", "interrupted private MCP write");
     const first = f.run();
     assert.equal(first.status, 0, first.stderr);
     assert.equal(first.stdout.trim(), "clean");
     for (const name of ["stdin.jsonl", "system.txt", "tool-catalog.json",
-      "pending.toolu_A.json", "result.toolu_A.json", "result.toolu_B.json.part"]) {
+      "pending.toolu_A.json", "result.toolu_A.json", "result.toolu_B.json.part",
+      "pending.toolu_C.json.12345.987654321.tmp"]) {
       assert.equal(existsSync(`${f.cwd}/${name}`), false);
     }
     assert.equal(readFileSync(`${f.cwd}/stdout.jsonl`).length, 0);

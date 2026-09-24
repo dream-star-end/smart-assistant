@@ -32,7 +32,7 @@ try:
     raise SystemExit(126)
    os.ftruncate(fd,0);os.fsync(fd)
   finally:os.close(fd)
- allowed=re.compile(r'(?:stdin\.jsonl|system\.txt|tool-catalog\.json|pending\.toolu_[A-Za-z0-9_-]{1,120}\.json|result\.toolu_[A-Za-z0-9_-]{1,120}\.json)(?:\.part)?')
+ allowed=re.compile(r'(?:(?:stdin\.jsonl|system\.txt|tool-catalog\.json|pending\.toolu_[A-Za-z0-9_-]{1,120}\.json|result\.toolu_[A-Za-z0-9_-]{1,120}\.json)(?:\.part)?|pending\.toolu_[A-Za-z0-9_-]{1,120}\.json\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,19}\.tmp)')
  for name in sorted(os.listdir(run)):
   if name in ('stdout.jsonl','stderr.log'):continue
   if not allowed.fullmatch(name):raise SystemExit(126)
