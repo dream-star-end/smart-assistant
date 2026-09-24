@@ -62,7 +62,6 @@ import {
   AssistantCard,
   type CardCallbacks,
   DelegateProgressCard,
-  GoalCard,
   PlanCard,
   SystemCard,
   ThinkingCard,
@@ -320,16 +319,9 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "goal":
-        if (isClearedGoalRecord(message)) return null;
-        if (isHistoricalGoalRecord(message)) {
-          return <HistoricalGoalDiagnostic message={message} />;
-        }
-        return (
-          <TapeBackedCard>
-            <GoalCard msg={message} />
-            <ExactTapeRecordDisclosure messages={[message]} label="目标" />
-          </TapeBackedCard>
-        );
+        // Current objective is the one-line composer dock. Repeated active
+        // echoes must not keep stacking cards in the transcript.
+        return null;
       case "permission": {
         // INC-20260904-STOP-LEAVES-PERMISSION-PENDING (fix C):
         // A permission card owned by a master automatic-recovery turn
@@ -391,59 +383,6 @@ const RUNTIME_TEXT_STEP = 32 * 1024;
 
 function TapeBackedCard({ children }: { children: ReactNode }) {
   return <div className="space-y-1">{children}</div>;
-}
-
-function historicalGoalLine(message: ChatMessage): string {
-  const status = (message.goalStatus ?? "").trim().toLowerCase();
-  const cleared = message.cleared === true || status === "cleared";
-  const label = cleared ? "目标已清除" : status === "completed" ? "目标已完成" : "目标记录";
-  const objective = (message.text ?? "").replace(/\s+/g, " ").trim();
-  if (!objective || objective === "会话目标") return label;
-  return `${label} · ${objective}`;
-}
-
-/** Cleared/completed goals are a one-line diagnostic. The raw record is the next click. */
-function HistoricalGoalDiagnostic({ message }: { message: ChatMessage }) {
-  const [open, setOpen] = useState(false);
-  const [visibleChars, setVisibleChars] = useState(RUNTIME_TEXT_STEP);
-  const line = historicalGoalLine(message);
-  const hasTape = !!message._turnTapeId;
-  const raw = message._eventHistory ?? message;
-  const serialized = open && hasTape ? JSON.stringify(raw, null, 2) ?? String(raw) : "";
-  return (
-    <div data-testid="process-goal-line" className="min-w-0">
-      {hasTape ? (
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-label="查看原始目标记录"
-          className="flex min-h-10 w-full items-center gap-2 rounded-md py-1 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11"
-          onClick={() => setOpen((value) => !value)}
-        >
-          <ChevronRight size={13} aria-hidden className={open ? "shrink-0 rotate-90" : "shrink-0"} />
-          <span className="min-w-0 truncate">{line}</span>
-        </button>
-      ) : (
-        <p className="py-1 text-sm text-muted">{line}</p>
-      )}
-      {open && hasTape ? (
-        <div className="mt-1 px-1" data-testid="process-goal-record">
-          <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-muted">
-            {serialized.slice(0, visibleChars)}
-          </pre>
-          {visibleChars < serialized.length ? (
-            <button
-              type="button"
-              onClick={() => setVisibleChars((value) => value + RUNTIME_TEXT_STEP)}
-              className="mt-2 rounded-full bg-hover px-2.5 py-1 text-caption text-muted hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
-            >
-              继续显示原始记录
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
 }
 
 /** Readable cards retain their pre-direct-timeline UX, while the immutable

@@ -38,6 +38,7 @@ import {
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
 import { QueuedSendList } from "./components/chat/QueuedSendList";
 import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
+import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
@@ -3820,6 +3821,9 @@ export function App() {
           {/* 任务列表 HUD:钉在输入框上方,始终可见(取代会滚走的 inline TodoWrite 卡)。
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务或本轮已收口时组件自渲染
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
+          {!demo && !gated && (
+            <PinnedGoalBar messages={timelineMessages} />
+          )}
           {!demo && !gated && (
             <PinnedTaskTracker
               todos={extractLatestTodos(timelineMessages)}

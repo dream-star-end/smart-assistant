@@ -2273,7 +2273,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
     expect(screen.queryByText(/已思考/)).toBeNull();
   });
 
-  test("中间夹可见 goal 行 → 打断 thinking 连续性并渲染目标卡", () => {
+  test("中间夹 goal 行 → 打断 thinking，目标不进消息流", () => {
     renderList([
       mk("user", { id: "u1", text: "q", status: "sent" }),
       think("th1", "**Alpha**"),
@@ -2281,7 +2281,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
       think("th2", "**Beta**"),
     ]);
     expect(screen.getAllByText(/已思考/)).toHaveLength(2);
-    expect(screen.getByText("目标")).toBeInTheDocument();
+    expect(screen.queryByText("目标")).toBeNull();
   });
 
   test("被会渲染的 assistant 叙事行打断 → 分成两张思考卡", () => {
