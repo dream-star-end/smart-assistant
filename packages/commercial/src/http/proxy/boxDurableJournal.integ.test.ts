@@ -284,6 +284,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       revision: 1 as const };
     const finalUsage = { inputTokens: 9, outputTokens: 13,
       cacheReadTokens: 1, cacheWriteTokens: 0 };
+    for (const invalid of [{}, [], { inputTokens: 9, outputTokens: 13,
+      cacheReadTokens: 1 }, { ...finalUsage, extra: 1 }]) {
+      await assert.rejects(() => journal.completeToolChain({
+        requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+        proof: chainProof, usage: invalid as never }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_TOOL_CHAIN_EVIDENCE_INVALID");
+    }
     await assert.rejects(() => journal.completeToolChain({
       requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
       proof: { ...chainProof, reason: "keeper_stopped" }, usage: finalUsage }),
@@ -300,6 +308,25 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await client.query(`UPDATE request_finalize_journal
       SET ctx=jsonb_set(ctx,'{boxResumeRequestId}',to_jsonb($2::text))
       WHERE request_id=$1`, [`box-d-${suffix}`, `box-e-${suffix}`]);
+    const revisionRow = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-${suffix}`]);
+    const secondRevision = revisionRow.rows[0]?.ctx.boxResumeRevision;
+    assert.match(String(secondRevision), /^[0-9a-f-]{36}$/);
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx-'boxResumeRevision'
+      WHERE request_id=$1`, [`box-d-${suffix}`]);
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx-'boxParentResumeRevision'
+      WHERE request_id=$1`, [`box-e-${suffix}`]);
+    await assert.rejects(() => journal.completeToolChain({
+      requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+      proof: chainProof, usage: finalUsage }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_CHAIN_INVALID");
+    for (const [id, key] of [[`box-d-${suffix}`, "boxResumeRevision"],
+      [`box-e-${suffix}`, "boxParentResumeRevision"]]) {
+      await client.query(`UPDATE request_finalize_journal
+        SET ctx=jsonb_set(ctx,ARRAY[$2::text],to_jsonb($3::text)) WHERE request_id=$1`,
+      [id, key, secondRevision]);
+    }
     await journal.completeToolChain({ requestId: `box-e-${suffix}`,
       uid: 3n, leaseEpoch: toolCall.leaseEpoch, proof: chainProof, usage: finalUsage });
     const closed = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(

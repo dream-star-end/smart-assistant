@@ -27,6 +27,14 @@ export interface BoxUsageEvidence {
   cacheReadTokens: number;
   cacheWriteTokens: number;
 }
+function validUsageEvidence(value: unknown): value is BoxUsageEvidence {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const usage = value as Record<string, unknown>;
+  return Object.keys(usage).sort().join(",") ===
+      "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens"
+    && Object.values(usage).every((n) => Number.isSafeInteger(n) && Number(n) >= 0);
+}
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface BoxJournalAdmission {
   requestId: string;
@@ -188,7 +196,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     const u = input.usage;
     if (input.proof.leaseEpoch !== input.leaseEpoch
       || input.proof.reason !== "worker_complete"
-      || Object.values(u).some((n) => !Number.isSafeInteger(n) || n < 0)) {
+      || !validUsageEvidence(u)) {
       throw new BoxDurableJournalError("BOX_JOURNAL_EVIDENCE_INVALID");
     }
     const changed = await this.pool.query(
@@ -425,7 +433,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     const usage = input.usage;
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
-      || Object.values(usage).some((n) => !Number.isSafeInteger(n) || n < 0)) {
+      || !validUsageEvidence(usage)) {
       throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID");
     }
     try {
@@ -490,6 +498,10 @@ export class BoxDurableJournal implements BoxJournalPort {
           || !["inflight", "finalizing", "committed"].includes(parent.state)
           || !["resuming", "unknown"].includes(String(ctx.boxState))
           || ctx.boxResumeRequestId !== child.request_id
+          || typeof ctx.boxResumeRevision !== "string"
+          || !UUID_V4.test(ctx.boxResumeRevision)
+          || typeof child.ctx.boxParentResumeRevision !== "string"
+          || !UUID_V4.test(child.ctx.boxParentResumeRevision)
           || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
           || ctx.boxAccountId !== basis.boxAccountId
           || ctx.boxSessionId !== basis.boxSessionId
