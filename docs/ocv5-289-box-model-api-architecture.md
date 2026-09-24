@@ -150,6 +150,39 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
 
 ## Mandatory gates before enabling any catalog model
 
+**Direct-CC experience parity is a release gate, not a post-launch goal.**
+Use the same OpenClaude user container, Claude Code version, synthetic prompt,
+platform memory/Skill fixtures and local tool fixture for paired runs: current
+direct CCB route versus CCB through the internal Box model API. Assert the
+business outcome and event chronology, not just a mock invocation:
+
+- The OpenClaude-side agent still receives memory and Skills; Box receives
+  only the model request. A random local-only tool value is executed once in
+  the user container and appears in the final answer; no Box-native tool may
+  execute it.
+- Text and tool events stream progressively. First visible delta must arrive
+  before the Box CLI reaches terminal status; ordinary deltas, tool_use and
+  terminal SSE must remain ordered. The current **buffered text-only prototype
+  fails this gate** until a bounded live stream/journal replaces it.
+- A tool_use response ends normally, the next request's matching tool_result
+  resumes the same held CLI, and two user turns preserve conversation context.
+  Switch to another eligible Bot only at a completed-turn boundary, without
+  replaying a side-effecting local tool or charging the same model call twice.
+- Stop, client disconnect, upstream 429/503, tool error and restart/unknown
+  paths show the same understandable UI lifecycle and never silently retry a
+  paid or side-effecting operation. Compare usage/credits with real ledger
+  rows, not only the synthetic UsageObserver.
+- Compare image, thinking/effort, context-window and max-output behavior that
+  direct CCB exposes. Unsupported shapes must remain disabled; do not call a
+  text-only pass "experience parity" or silently flatten/strip content.
+- The returned model ID must match the advertised version. A Box response
+  labelled `claude-opus-5` cannot be sold or displayed as Opus 5.5.
+
+Record direct-route and Box-route first-delta latency, inter-delta gaps,
+tool-roundtrip latency and failure rate under the same synthetic workload.
+Any material regression is a release blocker to investigate, not something
+to hide by buffering and sending a completed response all at once.
+
 1. Offline CCB → internal API → Box-adapter → fake model red/green matrix for
    all captured real request fields, role order, tool IDs, multiple tool calls,
    history, image handling or explicit rejection, SSE order, usage and cancel.
