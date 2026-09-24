@@ -39,6 +39,14 @@ export interface BoxToolHandoffCandidate {
   readonly cacheReadTokens: number;
   readonly cacheWriteTokens: number;
 }
+export interface BoxToolFinalCandidate {
+  readonly messageId: string;
+  readonly stopReason: "end_turn" | "max_tokens" | "stop_sequence";
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+}
 export interface BoxToolHandoffProof {
   /** Receipt from a successful durable journal write, not a local counter. */
   readonly durableRevision: string;
@@ -82,18 +90,22 @@ export class BoxCliToolHandoffDecoder {
   private snapshot: Obj | null = null;
   private heldTerminal: string[] = [];
   private candidate: BoxToolHandoffCandidate | null = null;
+  private finalCandidate: BoxToolFinalCandidate | null = null;
   private expectedToolIds: readonly string[] = [];
   private remainder = "";
 
   constructor(private readonly expectedModel: string,
-    private readonly catalog: BoxToolCatalog) {
+    private readonly catalog: BoxToolCatalog,
+    private readonly options: { alreadyInitialized?: boolean; allowFinal?: boolean } = {}) {
     if (!/^claude-[a-z0-9-]{3,64}$/.test(expectedModel)
       || catalog.tools.length < 1) {
       throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_INVALID");
     }
+    this.initSeen = options.alreadyInitialized === true;
   }
 
-  push(chunk: string): { sse: string; candidate: BoxToolHandoffCandidate | null } {
+  push(chunk: string): { sse: string; candidate: BoxToolHandoffCandidate | null;
+    finalCandidate: BoxToolFinalCandidate | null } {
     if (this.failed || this.committed || typeof chunk !== "string") {
       throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_CLOSED");
     }
@@ -111,19 +123,20 @@ export class BoxCliToolHandoffDecoder {
       if (this.bytes > 1_048_576) throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_TOO_LARGE");
       this.pending += chunk;
       let emitted = "";
-      while (this.candidate === null) {
+      while (this.candidate === null && this.finalCandidate === null) {
         const index = this.pending.indexOf("\n");
         if (index < 0) break;
         const line = this.pending.slice(0, index).replace(/\r$/, "");
         this.pending = this.pending.slice(index + 1);
         if (line) emitted += this.record(obj(JSON.parse(line)));
       }
-      if (this.candidate !== null && this.pending) {
+      if ((this.candidate !== null || this.finalCandidate !== null) && this.pending) {
         this.remainder += this.pending;
         this.pending = "";
       }
       return { sse: emitted, candidate: this.candidate
-        ? structuredClone(this.candidate) : null };
+        ? structuredClone(this.candidate) : null,
+      finalCandidate: this.finalCandidate ? structuredClone(this.finalCandidate) : null };
     } catch (error) {
       this.failed = true;
       throw error instanceof BoxCliToolHandoffError ? error
@@ -156,6 +169,24 @@ export class BoxCliToolHandoffDecoder {
     return this.heldTerminal.join("");
   }
 
+  /** Caller invokes only after remote terminal proof and journal completion. */
+  commitFinal(proof: { terminalReason: "worker_complete";
+    journaledUsage: { inputTokens: number; outputTokens: number;
+      cacheReadTokens: number; cacheWriteTokens: number } }): string {
+    const final = this.finalCandidate;
+    if (this.failed || this.committed || !final || this.heldTerminal.length !== 2
+      || proof?.terminalReason !== "worker_complete"
+      || !proof.journaledUsage
+      || proof.journaledUsage.inputTokens !== final.inputTokens
+      || proof.journaledUsage.outputTokens !== final.outputTokens
+      || proof.journaledUsage.cacheReadTokens !== final.cacheReadTokens
+      || proof.journaledUsage.cacheWriteTokens !== final.cacheWriteTokens) {
+      throw new BoxCliToolHandoffError("BOX_TOOL_FINAL_PROOF_INVALID");
+    }
+    this.committed = true;
+    return this.heldTerminal.join("");
+  }
+
   takeRemainder(): string {
     const raw = this.remainder;
     this.remainder = "";
@@ -163,7 +194,9 @@ export class BoxCliToolHandoffDecoder {
   }
 
   private record(record: Obj): string {
-    if (this.candidate) throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
+    if (this.candidate || this.finalCandidate) {
+      throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
+    }
     if (record.type === "system" && record.subtype === "init") {
       if (this.initSeen || this.started || !Array.isArray(record.tools)
         || record.tools.length !== this.catalog.tools.length
@@ -185,6 +218,24 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_INVALID");
       }
       this.snapshot = snapshot;
+      return "";
+    }
+    if (record.type === "result") {
+      if (!this.options.allowFinal || !this.sawStop || this.stopReason === "tool_use"
+        || record.subtype !== "success" || record.is_error !== false) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_FINAL_RESULT_INVALID");
+      }
+      const usage = obj(record.usage);
+      if (count(usage.input_tokens) < this.inputTokens
+        || count(usage.output_tokens) < this.outputTokens
+        || count(usage.cache_read_input_tokens ?? 0) < this.cacheRead
+        || count(usage.cache_creation_input_tokens ?? 0) < this.cacheWrite) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_FINAL_USAGE_INVALID");
+      }
+      this.finalCandidate = { messageId: this.messageId!,
+        stopReason: this.stopReason as BoxToolFinalCandidate["stopReason"],
+        inputTokens: this.inputTokens, outputTokens: this.outputTokens,
+        cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };
       return "";
     }
     if (record.type !== "stream_event") {
@@ -289,7 +340,9 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_ORDER_INVALID");
       }
       const reason = obj(event.delta).stop_reason;
-      if (reason !== "tool_use" || this.stopReason !== null) {
+      if (this.stopReason !== null || (reason !== "tool_use"
+        && !(this.options.allowFinal && (reason === "end_turn"
+          || reason === "max_tokens" || reason === "stop_sequence")))) {
         throw new BoxCliToolHandoffError("BOX_TOOL_STOP_REASON_INVALID");
       }
       const usage = obj(event.usage);
@@ -303,19 +356,23 @@ export class BoxCliToolHandoffDecoder {
       const nextOutput = count(usage.output_tokens);
       if (nextOutput < this.outputTokens) throw new BoxCliToolHandoffError("BOX_TOOL_USAGE_REGRESSION");
       this.outputTokens = nextOutput;
-      this.stopReason = "tool_use";
+      this.stopReason = reason as string;
     } else if (kind === "message_stop") {
-      if (!this.started || this.active || this.sawStop || this.stopReason !== "tool_use") {
+      if (!this.started || this.active || this.sawStop || this.stopReason === null) {
         throw new BoxCliToolHandoffError("BOX_TOOL_ORDER_INVALID");
       }
       this.sawStop = true;
       this.verifySnapshot();
       const uses = this.blocks.flatMap((block) => block.use ? [block.use] : []);
-      if (uses.length < 1) throw new BoxCliToolHandoffError("BOX_TOOL_USE_REQUIRED");
-      this.candidate = { messageId: this.messageId!, toolUses: uses,
-        inputTokens: this.inputTokens, outputTokens: this.outputTokens,
-        cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };
-      this.expectedToolIds = uses.map((use) => use.id);
+      if (this.stopReason === "tool_use") {
+        if (uses.length < 1) throw new BoxCliToolHandoffError("BOX_TOOL_USE_REQUIRED");
+        this.candidate = { messageId: this.messageId!, toolUses: uses,
+          inputTokens: this.inputTokens, outputTokens: this.outputTokens,
+          cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };
+        this.expectedToolIds = uses.map((use) => use.id);
+      } else if (uses.length > 0 || !this.options.allowFinal) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_STOP_REASON_INVALID");
+      }
     } else if (kind !== "ping") {
       throw new BoxCliToolHandoffError("BOX_TOOL_EVENT_UNSUPPORTED");
     }

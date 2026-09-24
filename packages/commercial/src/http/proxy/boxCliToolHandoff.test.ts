@@ -139,3 +139,55 @@ test("post-handoff bytes are not misparsed as the first HTTP response", () => {
   assert.equal(decoder.takeRemainder(), suffix);
   assert.equal(decoder.takeRemainder(), "");
 });
+
+test("a resumed tool round accepts no second init and still fences terminal SSE", () => {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog,
+    { alreadyInitialized: true, allowFinal: true });
+  let streamed = "";
+  for (const line of lines(records().slice(1))) streamed += decoder.push(line).sse;
+  const candidate = decoder.push("").candidate;
+  assert.equal(candidate?.messageId, "msg_tool_1");
+  assert.equal(candidate?.toolUses.length, 2);
+  assert.ok(!streamed.includes("event: message_stop"));
+  assert.ok(decoder.commitHandoff({ durableRevision: "synthetic-revision",
+    journaledToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"],
+    verifiedPendingToolUseIds: ["toolu_parallel_a"] }).includes("event: message_stop"));
+});
+
+test("a resumed final round streams blocks but withholds terminal until result and durable proof", () => {
+  const finalRecords = [
+    event({ type: "message_start", message: { id: "msg_final", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    event({ type: "content_block_start", index: 0,
+      content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "done" } }),
+    { type: "assistant", message: { id: "msg_final", model,
+      role: "assistant", content: [{ type: "text", text: "done" }] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 2, output_tokens: 4 } }),
+    event({ type: "message_stop" }),
+    { type: "result", subtype: "success", is_error: false,
+      usage: { input_tokens: 10, output_tokens: 12 } },
+  ];
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog,
+    { alreadyInitialized: true, allowFinal: true });
+  let streamed = "";
+  for (const line of lines(finalRecords.slice(0, -1))) streamed += decoder.push(line).sse;
+  assert.ok(streamed.includes("done"));
+  assert.ok(!streamed.includes("event: message_stop"));
+  assert.equal(decoder.push("").finalCandidate, null);
+  const final = decoder.push(lines(finalRecords.slice(-1))[0]!).finalCandidate;
+  assert.equal(final?.stopReason, "end_turn");
+  assert.equal(final?.outputTokens, 4, "bill only this HTTP model round, not CLI cumulative total");
+  assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
+    journaledUsage: { inputTokens: 2, outputTokens: 999,
+      cacheReadTokens: 0, cacheWriteTokens: 0 } }), /BOX_TOOL_FINAL_PROOF_INVALID/);
+  const terminal = decoder.commitFinal({ terminalReason: "worker_complete",
+    journaledUsage: { inputTokens: 2, outputTokens: 4,
+      cacheReadTokens: 0, cacheWriteTokens: 0 } });
+  assert.ok(terminal.includes('"stop_reason":"end_turn"'));
+  assert.ok(terminal.includes("event: message_stop"));
+  assert.throws(() => decoder.push(""), /BOX_TOOL_DECODER_CLOSED/);
+});
