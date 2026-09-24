@@ -27,6 +27,13 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   the CLI replaced the pending block with `No response requested.` and dropped
   the result from the downstream request. The adapter therefore cannot switch
   Bots mid-tool by simply staging a transcript and resuming a new CLI.
+- A real Box (account 20, Claude Code 2.1.280) received an isolated synthetic
+  JSONL containing a completed `tool_use → tool_result → assistant` history.
+  With no nonce in the new prompt and no available tools, `claude -p --resume`
+  returned the exact random text from the prior tool result (success, observed
+  usage 2 input / 20 output). This proves text retrieval from completed tool
+  history on one Box, **not** full role/order fidelity of its paid upstream or
+  switching between two independent Bot accounts.
 
 ## Trust and ownership
 
@@ -35,22 +42,35 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
    rate/concurrency limits, precheck, usage journal and finalizer. A new Box
    route must be inserted **after** those gates; an operator probe must never
    be exposed as a model entry or public endpoint.
-2. OpenClaude owns a `(uid, session_id)` session record with revision, selected
-   account, current turn state and encrypted Claude session snapshot. A Box
-   keeps only a bounded transient copy. Every request pins uid/session/model,
-   account authorization, credential fingerprint and egress basis. Session
-   switch is a revision-checked transfer, not an implicit Box fallback.
-3. Never copy Box auth/config, arbitrary files or plugins. The only movable
-   asset is the explicitly named session JSONL after strict path, owner/mode,
-   size, line framing and schema checks. It contains user/model content and
-   must be encrypted at rest, keyed and authorized per uid; it is never logged.
-   Unique per-run Box directories, restrictive permissions, no arbitrary
-   built-in tools, empty settings sources, strict MCP config and fixed argv
-   keep one user's data from another user's model invocation.
-4. Account/session pinning is durable; stale revision, wrong uid or concurrent
+2. For a **completed** turn, the authenticated OpenClaude Messages request is
+   the history authority. Generate a fresh, bounded session JSONL from that
+   request, stage it into an isolated per-run Box directory, and delete it
+   after known terminal completion. This removes the need to copy a prior
+   Box's session file or persist a second complete-history authority merely
+   to switch Bot accounts. The mapper is version-pinned to Claude Code 2.1.280
+   and rejects current `tool_result`, pending tool history, unsupported blocks
+   and mismatched IDs instead of flattening them. Any real CCB field outside
+   the tested subset remains a gate, not a silently ignored option.
+3. OpenClaude owns a durable `(uid, session_id)` **in-flight** invocation
+   record with revision, selected account, tool ID, deadline and unknown
+   status. Every request pins uid/session/model, account authorization,
+   credential fingerprint and egress basis. Session switch is allowed at a
+   completed turn boundary; it is not an implicit mid-tool fallback.
+4. Never copy Box auth/config, arbitrary files or plugins. The only staged
+   asset is the server-generated, explicitly named synthetic session JSONL
+   after strict path, owner/mode, size, line framing and schema checks. It
+   contains user/model content and is never logged. After known remote
+   termination it is deleted; an unknown completion is retained only under a
+   fenced, bounded recovery/GC policy, never deleted on the mere loss of a
+   transport response. Unique per-run Box directories, restrictive
+   permissions, no arbitrary built-in tools, empty settings sources, strict
+   MCP config and fixed argv reduce cross-invocation exposure, but are **not**
+   a same-UID security boundary; cross-user negative tests remain mandatory.
+5. Account/session pinning is durable; stale revision, wrong uid or concurrent
    turn returns a conflict before Box invocation. On Bot failure, a new Bot may
-   receive the last committed snapshot only. An ambiguous in-flight paid call
-   is never automatically replayed; reconcile/explicit retry is required.
+   receive only a freshly compiled snapshot from an authenticated request's
+   **completed** history. An ambiguous in-flight paid call is never
+   automatically replayed; reconcile/explicit retry is required.
 
 ## Request and response state machine
 
@@ -61,6 +81,11 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   prompt as a compatibility shortcut. Phase gate: prove exact downstream
   request-shape mapping for real CCB traffic or explicitly reject unsupported
   shapes before any charge.
+- The same-version CLI still prepends its own billing/agent system blocks to
+  `--system-prompt`; OpenClaude's system text appears after those blocks. Do
+  not claim byte-for-byte Anthropic API equivalence until the full CCB request
+  matrix and resulting behavior pass; preserve and test user-visible system
+  text order within the supported subset.
 - Start supervised Box `claude -p` with fixed model/flags, empty setting
   sources, only fixed virtual MCP tools. The first complete `tool_use` event is
   exported before remote CLI waits for MCP. The internal API emits Anthropic
@@ -83,8 +108,8 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   Box invocation if this lease is pending; it must consume the matching one.
   Egress/master restart loses the live handle: durable state must fence the
   lease and report unknown, never auto-replay a paid call or local tool.
-- A Bot switch may hydrate a verified session snapshot only at a **completed
-  turn boundary**. An in-flight tool call cannot be transparently migrated;
+- A Bot switch may compile and stage fresh history only at a **completed turn
+  boundary**. An in-flight tool call cannot be transparently migrated;
   on loss, record an unknown outcome and require explicit recovery/retry from
   the last committed state rather than claiming seamless mid-call failover.
 - Final text/structured blocks must be emitted as real SSE with exact model,
@@ -133,8 +158,8 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
    supervised CLI and prove exactly one local tool execution and no duplicate
    Box model invocation. Separate tests cover premature disconnect, explicit
    cancel, lease expiry and restart/unknown outcome.
-2. Real Box with no user data: two distinct Box identities; portable session
-   snapshot with tool history; forced Bot switch; per-user cross-read negative;
+2. Real Box with no user data: two distinct eligible Box identities; generated
+   completed history with tool pair; forced Bot switch; per-user cross-read negative;
    disconnect/429/503/timeouts and non-retry proof. The Sand installer remains
    paused and is not a dependency of this route.
 3. Code review to PASS; full T2 test/train; shared-branch fast-forward merge
