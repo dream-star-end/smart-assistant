@@ -389,12 +389,26 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(await journal.claimRemoteCleanup({ ...finalCleanup!,
       proof: { ...finalCleanup!.proof, keeperPid: 999 } }), false,
     "proof changed after selection cannot authorize remote cleanup");
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '6 minutes' WHERE request_id=$1`,
+    [`box-e-${suffix}`]);
+    const beforeCleanup = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [`box-e-${suffix}`]);
     assert.equal(await journal.claimRemoteCleanup(finalCleanup!), true);
+    const afterClaim = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [`box-e-${suffix}`]);
+    assert.equal(afterClaim.rows[0]?.updated_at.getTime(),
+      beforeCleanup.rows[0]?.updated_at.getTime(),
+    "remote cleanup retries must never reset billing recovery grace");
     assert.equal(await journal.claimRemoteCleanup(finalCleanup!), false);
     assert.ok(!(await journal.listRemoteCleanupCandidates()).some((item) =>
       item.requestId === `box-e-${suffix}`), "claimed failure is briefly backed off");
     await client.query(`UPDATE request_finalize_journal
-      SET updated_at=NOW()-INTERVAL '3 minutes' WHERE request_id=$1`,
+      SET ctx=jsonb_set(ctx,'{boxRemoteCleanupRetryAfterMs}',
+        to_jsonb((EXTRACT(EPOCH FROM NOW()-INTERVAL '1 minute')*1000)::bigint))
+      WHERE request_id=$1`,
     [`box-e-${suffix}`]);
     assert.ok((await journal.listRemoteCleanupCandidates()).some((item) =>
       item.requestId === `box-e-${suffix}`));
@@ -405,6 +419,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       && error.code === "BOX_CLEANUP_FENCE_LOST");
     await journal.markRemoteCleaned(finalCleanup!);
     await journal.markRemoteCleaned(finalCleanup!);
+    const afterDone = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [`box-e-${suffix}`]);
+    assert.equal(afterDone.rows[0]?.updated_at.getTime(),
+      beforeCleanup.rows[0]?.updated_at.getTime());
     assert.equal(await journal.remoteCleanupStatus(finalCleanup!), "done");
     assert.ok(!(await journal.listRemoteCleanupCandidates()).some((item) =>
       item.requestId === `box-e-${suffix}`));

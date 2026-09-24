@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { recoverBoxBillingRequest } from "./boxBillingRecovery.js";
+import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
 
 test("terminal Box evidence settles once, with durable usage and turn locator",
@@ -182,6 +183,44 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
       [toolRequest]);
     assert.equal(toolState.rows[0]?.box_state, "handoff",
       "billing settlement must not release the live Box process/account fence");
+
+    // Remote cleanup may keep failing while PG and financial settlement are
+    // healthy. Its private retry clock must not refresh billing updated_at.
+    const delayedUser = 900_000_003n, delayedRequest = `${requestId}-cleanup-clock`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [delayedUser.toString(), `${delayedRequest}@example.invalid`]);
+    await client.query(`INSERT INTO user_subscriptions
+      (id,user_id,plan_code,period_end,period_credits)
+      VALUES (2,$1,'plus',NOW()+INTERVAL '1 day',1000)`, [delayedUser.toString()]);
+    const delayedCtx = { ...ctx, boxInvocationMode: "detached_tool",
+      boxReplayFingerprint: "7".repeat(64) };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [delayedRequest, delayedUser.toString(), JSON.stringify(delayedCtx)]);
+    const journalPort = new BoxDurableJournal(sameConnection);
+    const cleanup = { requestId: delayedRequest, uid: delayedUser,
+      accountId: 20n, runNonce: nonce, leaseEpoch: epoch,
+      proof: { ...ctx.boxTerminalProof, reason: "worker_complete" as const,
+        revision: 1 as const } };
+    const before = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1", [delayedRequest]);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      assert.equal(await journalPort.claimRemoteCleanup(cleanup), true);
+      await client.query(`UPDATE request_finalize_journal
+        SET ctx=jsonb_set(ctx,'{boxRemoteCleanupRetryAfterMs}',
+          to_jsonb((EXTRACT(EPOCH FROM NOW()-INTERVAL '1 minute')*1000)::bigint))
+        WHERE request_id=$1`, [delayedRequest]);
+    }
+    const afterClaims = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1", [delayedRequest]);
+    assert.equal(afterClaims.rows[0]?.updated_at.getTime(), before.rows[0]?.updated_at.getTime());
+    assert.equal(await recoverBoxBillingRequest(sameConnection, delayedRequest, delayedUser),
+      "settled", "repeated failed remote cleanup must not starve billable proof");
+    const delayedUsage = await client.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM usage_records WHERE request_id=$1", [delayedRequest]);
+    assert.equal(delayedUsage.rows[0]?.n, "1");
   } finally {
     client.release();
     await pool.end(); // TEMP tables and sequence vanish with this connection.
