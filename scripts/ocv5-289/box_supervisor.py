@@ -315,6 +315,7 @@ def main() -> int:
             or (args.stdin_file is None) != (args.stdin_sha256 is None)
             or (args.stdin_file is not None and (not args.stdin_file or not args.stdin_sha256))):
         return 126
+    deadline = time.monotonic() + args.deadline
 
     publisher = None
     if event_path := os.environ.get("OCV5_SUPERVISOR_TOOL_EVENT_FILE"):
@@ -440,8 +441,7 @@ def main() -> int:
     assert child.stdout is not None and child.stderr is not None
     selector.register(child.stdout, selectors.EVENT_READ, "stdout")
     selector.register(child.stderr, selectors.EVENT_READ, "stderr")
-    deadline = time.monotonic() + args.deadline
-    stdout = bytearray()
+    stdout_bytes = 0
     stderr_bytes = 0
     reason = None
     try:
@@ -458,14 +458,21 @@ def main() -> int:
                     selector.unregister(key.fileobj)
                     continue
                 if key.data == "stdout":
-                    stdout.extend(chunk)
+                    if stdout_bytes + len(chunk) + stderr_bytes > args.max_output:
+                        reason = 125
+                        break
+                    stdout_bytes += len(chunk)
                     if publisher is not None:
                         publisher.feed(chunk)
+                    delivery = write_before_deadline(chunk, deadline, lambda: stopped)
+                    if delivery != "written":
+                        reason = 143 if delivery == "cancelled" else 124
+                        break
                 else:
                     stderr_bytes += len(chunk)
-                if len(stdout) + stderr_bytes > args.max_output:
-                    reason = 125
-                    break
+                    if stdout_bytes + stderr_bytes > args.max_output:
+                        reason = 125
+                        break
             if reason is not None:
                 break
         if reason is None and publisher is not None:
@@ -497,12 +504,6 @@ def main() -> int:
             publisher.close()
     if reason is not None:
         return reason
-    if child.returncode == 0:
-        output = write_before_deadline(stdout, deadline, lambda: stopped)
-        if output == "cancelled":
-            return 143
-        if output != "written":
-            return 124
     return child.returncode or 0
 
 

@@ -4,6 +4,7 @@ import ctypes
 import os
 from pathlib import Path
 import re
+import select
 import secrets
 import shutil
 import signal
@@ -135,6 +136,26 @@ class KeeperTest(unittest.TestCase):
         proc.wait(timeout=3)
         self.assertEqual(proc.returncode, 143)
         self.assertLess(time.monotonic() - began, 1.5)
+
+    def test_first_stdout_is_visible_while_cli_is_still_running(self) -> None:
+        release = self.tmp / "release"
+        code = ('import os,sys,time;'
+                'sys.stdout.write("first\\n");sys.stdout.flush();'
+                'p=os.environ["KEEPER_TEST_RELEASE"];'
+                '\nwhile not os.path.exists(p):time.sleep(.01)\n'
+                'sys.stdout.write("second\\n");sys.stdout.flush()')
+        proc = self.start(code, {"KEEPER_TEST_RELEASE": str(release)})
+        try:
+            ready, _, _ = select.select([proc.stdout], [], [], 2)
+            self.assertTrue(ready, "supervisor buffered first delta until CLI exit")
+            first = os.read(proc.stdout.fileno(), 256)
+            self.assertEqual(first, b"first\n")
+            self.assertIsNone(proc.poll(), "CLI/keeper must still be live")
+        finally:
+            release.write_text("go")
+        rest, err = proc.communicate(timeout=10)
+        self.assertEqual((proc.returncode, first + rest, err),
+                         (0, b"first\nsecond\n", b""))
 
 
 if __name__ == "__main__":
