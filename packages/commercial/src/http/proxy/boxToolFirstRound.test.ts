@@ -169,6 +169,17 @@ test("synchronous late dispose failure is observed and retained for retry", asyn
   assert.equal(f.launches, 0);
 });
 
+test("never-settling prestart target close is bounded and retained", async () => {
+  const f = fixture({ rejectAdmission: true });
+  f.target.dispose = (() => new Promise<void>(() => {})) as never;
+  const began = Date.now();
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
+    /synthetic admission denied/);
+  assert.ok(Date.now() - began < 800);
+  assert.equal(f.cleanupRetained, true);
+  assert.equal(f.launches, 0);
+});
+
 test("late admission commit after cancellation is prestart-closed without launch", async () => {
   const f = fixture();
   const abort = new AbortController();

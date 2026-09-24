@@ -52,7 +52,7 @@ export async function runBoxToolFirstRound(input: {
     plan: BoxDetachedToolPlan; uid: bigint; requestId: string }) => void;
   /** Failed local-agent close remains explicitly owned for bounded retry. */
   retainCleanupTarget: (handle: { target: BoxResolvedTarget;
-    uid: bigint; requestId: string; phase: string }) => void;
+    pending: Promise<void>; uid: bigint; requestId: string; phase: string }) => void;
   budgetMs?: number;
 }): Promise<BoxToolFirstHandoff> {
   if (input.url !== BOX_INTERNAL_ENDPOINT || input.init.method !== "POST"
@@ -101,19 +101,27 @@ export async function runBoxToolFirstRound(input: {
   let admitted = false, launchAttempted = false, inputStageStarted = false;
   let prestartClosed = false;
   let unknownNotified = false;
-  const disposals = new WeakMap<BoxResolvedTarget, Promise<void>>();
-  const disposeOnce = (owned: BoxResolvedTarget, phase: string): Promise<void> => {
+  type Disposal = { pending: Promise<void>; retained: boolean };
+  const disposals = new WeakMap<BoxResolvedTarget, Disposal>();
+  const retainCleanup = (owned: BoxResolvedTarget, state: Disposal,
+    phase: string): void => {
+    if (state.retained) return;
+    state.retained = true;
+    deps.retainCleanupTarget({ target: owned, pending: state.pending,
+      uid: input.uid, requestId: input.requestId, phase });
+  };
+  const disposeOnce = (owned: BoxResolvedTarget, phase: string): Disposal => {
     const existing = disposals.get(owned);
     if (existing) return existing;
+    const state: Disposal = { pending: Promise.resolve(), retained: false };
     const pending = Promise.resolve().then(() => owned.dispose?.()).then(() => {},
       (error: unknown) => {
-        disposals.delete(owned);
-        deps.retainCleanupTarget({ target: owned, uid: input.uid,
-          requestId: input.requestId, phase });
+        retainCleanup(owned, state, phase);
         throw error;
       });
-    disposals.set(owned, pending);
-    return pending;
+    state.pending = pending;
+    disposals.set(owned, state);
+    return state;
   };
   const bounded = async <T>(pending: Promise<T>, ms: number): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -122,6 +130,17 @@ export async function runBoxToolFirstRound(input: {
         "BOX_TOOL_CLEANUP_TIMEOUT")), ms);
     })]); }
     finally { if (timer) clearTimeout(timer); }
+  };
+  const closeBounded = async (owned: BoxResolvedTarget, phase: string): Promise<void> => {
+    const state = disposeOnce(owned, phase);
+    try { await bounded(state.pending, 200); }
+    catch (error) {
+      if (error instanceof BoxToolFirstRoundError
+        && error.code === "BOX_TOOL_CLEANUP_TIMEOUT") {
+        retainCleanup(owned, state, phase);
+      }
+      throw error;
+    }
   };
   const unknown = async (phase: string): Promise<void> => {
     if (!admitted || !target || unknownNotified) return;
@@ -169,12 +188,12 @@ export async function runBoxToolFirstRound(input: {
     let completedTarget: BoxResolvedTarget | null = null;
     void pendingTarget.then((late) => {
       completedTarget = late;
-      if (resolutionAbandoned) void disposeOnce(late, "late_resolver").catch(() => {});
+      if (resolutionAbandoned) void closeBounded(late, "late_resolver").catch(() => {});
     }, () => {});
     try { target = await race(pendingTarget); }
     catch (error) {
       resolutionAbandoned = true;
-      if (completedTarget) void disposeOnce(completedTarget, "late_resolver").catch(() => {});
+      if (completedTarget) void closeBounded(completedTarget, "late_resolver").catch(() => {});
       throw error;
     }
     const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
@@ -252,7 +271,7 @@ export async function runBoxToolFirstRound(input: {
   } catch (error) {
     if (launchAttempted) await unknown("first_round_unknown");
     if ((!admitted || prestartClosed) && target) {
-      await disposeOnce(target, "prestart_dispose").catch(() => {});
+      await closeBounded(target, "prestart_dispose").catch(() => {});
     }
     throw error;
   } finally {
