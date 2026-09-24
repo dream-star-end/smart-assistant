@@ -565,13 +565,18 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
-          AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
-            OR (jsonb_typeof(ctx->'boxRemoteCleanupRetryAfterMs')='number'
-              AND (ctx->>'boxRemoteCleanupRetryAfterMs') ~ '^[0-9]{13}$'
-              AND (ctx->>'boxRemoteCleanupRetryAfterMs')::bigint
-                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
-          AND state IN ('inflight','finalizing','committed')
-        ORDER BY updated_at ASC LIMIT $1`,
+           AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
+             OR (jsonb_typeof(ctx->'boxRemoteCleanupRetryAfterMs')='number'
+               AND (ctx->>'boxRemoteCleanupRetryAfterMs') ~ '^[0-9]{13}$'
+               AND (ctx->>'boxRemoteCleanupRetryAfterMs')::bigint
+                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
+             OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
+               AND updated_at <= NOW()-INTERVAL '2 minutes'))
+           AND state IN ('inflight','finalizing','committed')
+         ORDER BY CASE WHEN jsonb_typeof(ctx->'boxRemoteCleanupLastAttemptMs')='number'
+             AND (ctx->>'boxRemoteCleanupLastAttemptMs') ~ '^[0-9]{13}$'
+           THEN (ctx->>'boxRemoteCleanupLastAttemptMs')::bigint ELSE 0 END ASC,
+           updated_at ASC LIMIT $1`,
       [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
     const candidates: BoxRemoteCleanupCandidate[] = [];
     for (const row of found.rows) {
@@ -627,8 +632,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || jsonb_build_object(
-            'boxRemoteCleanupClaimed',true,
-            'boxRemoteCleanupRetryAfterMs',
+             'boxRemoteCleanupClaimed',true,
+             'boxRemoteCleanupLastAttemptMs',
+               (EXTRACT(EPOCH FROM NOW())*1000)::bigint,
+             'boxRemoteCleanupRetryAfterMs',
               (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
@@ -640,11 +647,13 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->'boxTerminalProof'=$6::jsonb
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
-          AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
-            OR (jsonb_typeof(ctx->'boxRemoteCleanupRetryAfterMs')='number'
-              AND (ctx->>'boxRemoteCleanupRetryAfterMs') ~ '^[0-9]{13}$'
-              AND (ctx->>'boxRemoteCleanupRetryAfterMs')::bigint
-                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))`,
+           AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
+             OR (jsonb_typeof(ctx->'boxRemoteCleanupRetryAfterMs')='number'
+               AND (ctx->>'boxRemoteCleanupRetryAfterMs') ~ '^[0-9]{13}$'
+               AND (ctx->>'boxRemoteCleanupRetryAfterMs')::bigint
+                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
+             OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
+               AND updated_at <= NOW()-INTERVAL '2 minutes'))`,
       [input.requestId, input.uid.toString(), input.accountId.toString(),
         input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
     return changed.rowCount === 1;

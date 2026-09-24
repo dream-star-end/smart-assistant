@@ -377,6 +377,28 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const finalCleanup = cleanupCandidates.find((item) =>
       item.requestId === `box-e-${suffix}`);
     assert.ok(finalCleanup);
+    // Retry fairness must not depend on updated_at: that is the billing age.
+    // Ten older failing runs become eligible again, but a never-attempted
+    // eleventh run must still get a cleanup slot on the next tick.
+    for (let i = 0; i < 10; i++) {
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
+        SELECT $1,user_id,'committed',ctx,NOW()-INTERVAL '1 day'
+          FROM request_finalize_journal WHERE request_id=$2`,
+      [`box-retry-${i}-${suffix}`, `box-e-${suffix}`]);
+    }
+    const oldRetries = await journal.listRemoteCleanupCandidates(10);
+    assert.equal(oldRetries.length, 10);
+    for (const old of oldRetries) {
+      assert.equal(await journal.claimRemoteCleanup(old), true);
+      await client.query(`UPDATE request_finalize_journal
+        SET ctx=jsonb_set(ctx,'{boxRemoteCleanupRetryAfterMs}',
+          to_jsonb((EXTRACT(EPOCH FROM NOW()-INTERVAL '1 minute')*1000)::bigint))
+        WHERE request_id=$1`, [old.requestId]);
+    }
+    assert.ok((await journal.listRemoteCleanupCandidates(10)).some((item) =>
+      item.requestId === `box-e-${suffix}`),
+    "previously failed runs must not starve a fresh terminal cleanup");
     assert.equal(await journal.remoteCleanupStatus(finalCleanup!), "pending");
     assert.equal(await journal.remoteCleanupStatus({ ...finalCleanup!, accountId: 21n }),
       "invalid");
@@ -410,7 +432,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         to_jsonb((EXTRACT(EPOCH FROM NOW()-INTERVAL '1 minute')*1000)::bigint))
       WHERE request_id=$1`,
     [`box-e-${suffix}`]);
-    assert.ok((await journal.listRemoteCleanupCandidates()).some((item) =>
+    assert.ok((await journal.listRemoteCleanupCandidates(20)).some((item) =>
       item.requestId === `box-e-${suffix}`));
     assert.equal(await journal.claimRemoteCleanup(finalCleanup!), true);
     await assert.rejects(() => journal.markRemoteCleaned({ ...finalCleanup!,
