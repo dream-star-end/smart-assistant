@@ -115,7 +115,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     ], inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const toolDeclarations = [{ name: "local_echo", description: "local-only",
       input_schema: { type: "object", properties: { value: { type: "string" } } } }];
-    const catalogHash = compileBoxToolCatalog(toolDeclarations).sha256;
+    const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234,
       detachedRunnerHash: "f".repeat(64),
@@ -176,6 +176,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         description: "changed after Box launch" }] } }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_CATALOG_CHANGED");
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model,
+      canonicalBody: { ...resumeBody, tools: [{ ...toolDeclarations[0]!,
+        name: "renamed_echo" }] } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_CATALOG_CHANGED");
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,toolUses,1,id}','"toolu_A"'::jsonb)
       WHERE request_id=$1`, [toolCall.requestId]);
@@ -215,6 +221,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "linked");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxRoundNo,
       2);
+    assert.deepEqual(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)
+      ?.ctx.boxPriorMessageIds, [candidate.messageId]);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
     (error: unknown) => error instanceof BoxDurableJournalError
@@ -230,6 +238,20 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       verifiedPendingToolUseIds: ["toolu_C"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
+    for (const mutation of [
+      { candidate: secondCandidate, spoolOffset: 1234, detachedRunnerHash: "f".repeat(64) },
+      { candidate: { ...secondCandidate, messageId: candidate.messageId },
+        spoolOffset: 2345, detachedRunnerHash: "f".repeat(64) },
+      { candidate: secondCandidate, spoolOffset: 2345,
+        detachedRunnerHash: "e".repeat(64) },
+    ]) {
+      await assert.rejects(() => journal.recordToolHandoff({
+        requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+        roundNo: 2, catalogHash, verifiedPendingToolUseIds: ["toolu_C"],
+        ...mutation }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
+    }
     await journal.recordToolHandoff({ requestId: `box-d-${suffix}`, uid: 3n,
       leaseEpoch: toolCall.leaseEpoch, candidate: secondCandidate, roundNo: 2,
       spoolOffset: 2345, detachedRunnerHash: "f".repeat(64),
@@ -250,6 +272,58 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const third = await client.query<{ ctx: Record<string, unknown> }>(
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-e-${suffix}`]);
     assert.equal(third.rows[0]?.ctx.boxRoundNo, 3);
+    assert.deepEqual(third.rows[0]?.ctx.boxPriorMessageIds,
+      [candidate.messageId, secondCandidate.messageId]);
+    await journal.markUnknown({ requestId: `box-e-${suffix}`, uid: 3n,
+      leaseEpoch: toolCall.leaseEpoch, phase: "resume_stream_aborted" });
+    const unknownLinked = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-e-${suffix}`]);
+    assert.equal(unknownLinked.rows[0]?.ctx.boxState, "unknown");
+    const chainProof = { runNonce: toolCall.runNonce, leaseEpoch: toolCall.leaseEpoch,
+      keeperPid: 101, cliPid: 102, reason: "worker_complete" as const,
+      revision: 1 as const };
+    const finalUsage = { inputTokens: 9, outputTokens: 13,
+      cacheReadTokens: 1, cacheWriteTokens: 0 };
+    await assert.rejects(() => journal.completeToolChain({
+      requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+      proof: { ...chainProof, reason: "keeper_stopped" }, usage: finalUsage }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_CHAIN_EVIDENCE_INVALID");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxResumeRequestId}','"wrong-child"'::jsonb)
+      WHERE request_id=$1`, [`box-d-${suffix}`]);
+    await assert.rejects(() => journal.completeToolChain({
+      requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+      proof: chainProof, usage: finalUsage }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_CHAIN_INVALID");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxResumeRequestId}',to_jsonb($2::text))
+      WHERE request_id=$1`, [`box-d-${suffix}`, `box-e-${suffix}`]);
+    await journal.completeToolChain({ requestId: `box-e-${suffix}`,
+      uid: 3n, leaseEpoch: toolCall.leaseEpoch, proof: chainProof, usage: finalUsage });
+    const closed = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE request_id IN ($1,$2,$3) ORDER BY request_id`,
+      [toolCall.requestId, `box-d-${suffix}`, `box-e-${suffix}`]);
+    assert.deepEqual(closed.rows.map((row) => row.ctx.boxState),
+      ["terminal", "terminal", "terminal"]);
+    assert.deepEqual(closed.rows.find((row) => row.request_id === toolCall.requestId)
+      ?.ctx.boxToolHandoff && (closed.rows.find((row) => row.request_id === toolCall.requestId)
+        ?.ctx.boxToolHandoff as { usage: unknown }).usage, candidate && {
+      inputTokens: candidate.inputTokens, outputTokens: candidate.outputTokens,
+      cacheReadTokens: candidate.cacheReadTokens, cacheWriteTokens: candidate.cacheWriteTokens });
+    assert.deepEqual(closed.rows.find((row) => row.request_id === `box-e-${suffix}`)?.ctx.boxUsage,
+      finalUsage);
+    await assert.rejects(() => journal.completeToolChain({
+      requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+      proof: chainProof, usage: { ...finalUsage, outputTokens: 999 } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_CHAIN_INVALID");
+    await put(`box-f-${suffix}`);
+    await journal.admit({ ...input, requestId: `box-f-${suffix}`,
+      fingerprint: { ...fingerprint, replayFingerprint: "8".repeat(64) },
+      runNonce: "5".repeat(24), leaseEpoch: "6".repeat(32) });
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();

@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
-import type { BoxTerminalProof } from "./boxTerminalProof.js";
+import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
@@ -15,7 +15,7 @@ import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 
-const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming"];
+const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
 export class BoxDurableJournalError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxDurableJournalError"; }
@@ -68,6 +68,8 @@ export interface BoxJournalPort {
       verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof>;
   claimToolResume?(input: { requestId: string; uid: bigint;
     canonicalModel: string; canonicalBody: ProxyBody }): Promise<BoxToolResumeClaim>;
+  completeToolChain?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
+    { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
 }
 
 function goodId(input: BoxJournalAdmission): void {
@@ -277,11 +279,18 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ((($5::int = 1) AND ctx->>'boxState' = 'running')
             OR (($5::int > 1) AND ctx->>'boxState' = 'linked'
               AND ctx->>'boxRoundNo' = $5::text
-              AND ctx->>'boxCatalogHash' = $6))
+              AND ctx->>'boxCatalogHash' = $6
+              AND ctx->>'boxDetachedRunnerHash' = $7
+              AND jsonb_typeof(ctx->'boxResumeSpoolOffset') = 'number'
+              AND (ctx->>'boxResumeSpoolOffset')::bigint < $9::bigint
+              AND jsonb_typeof(ctx->'boxPriorMessageIds') = 'array'
+              AND jsonb_array_length(ctx->'boxPriorMessageIds') = $5::int - 1
+              AND NOT (ctx->'boxPriorMessageIds' ? $8)))
           AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'`,
       [input.requestId, input.uid.toString(), input.leaseEpoch,
         JSON.stringify({ boxState: "handoff", boxHandoffRevision: durableRevision,
-          boxToolHandoff: frozen }), roundNo, input.catalogHash]);
+          boxToolHandoff: frozen }), roundNo, input.catalogHash,
+        input.detachedRunnerHash, candidate.messageId, input.spoolOffset]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_FENCE_LOST");
     return { durableRevision, journaledToolUseIds: ids,
       verifiedPendingToolUseIds: pendingIds };
@@ -329,8 +338,17 @@ export class BoxDurableJournal implements BoxJournalPort {
       const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
       if (!handoff) throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
       if (handoff.roundNo >= 32) throw new BoxDurableJournalError("BOX_TOOL_ROUND_LIMIT");
+      const priorIds = ctx.boxPriorMessageIds === undefined ? [] : ctx.boxPriorMessageIds;
+      if (!Array.isArray(priorIds) || priorIds.length !== handoff.roundNo - 1
+        || new Set(priorIds).size !== priorIds.length
+        || priorIds.some((id) => typeof id !== "string" || id.length < 1 || id.length > 128)
+        || Array.from({ length: priorIds.length }, (_, i) => i)
+          .some((i) => !Object.hasOwn(priorIds, i))
+        || priorIds.includes(handoff.messageId)) {
+        throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
+      }
       try {
-        if (compileBoxToolCatalog(input.canonicalBody.tools).sha256 !== handoff.catalogHash) {
+        if (compileBoxToolCatalog(input.canonicalBody.tools).bindingSha256 !== handoff.catalogHash) {
           throw new BoxDurableJournalError("BOX_TOOL_CATALOG_CHANGED");
         }
       } catch (error) {
@@ -370,11 +388,13 @@ export class BoxDurableJournal implements BoxJournalPort {
             boxLeaseEpoch: ctx.boxLeaseEpoch, boxTurnKey: fingerprint.turnKey,
             boxResumeSpoolOffset: handoff.spoolOffset,
             boxRoundNo: handoff.roundNo + 1,
+            boxPriorMessageIds: [...priorIds, handoff.messageId],
             boxDetachedRunnerHash: handoff.detachedRunnerHash,
             boxCatalogHash: handoff.catalogHash,
             boxSessionId: fingerprint.sessionId,
             boxReplayFingerprint: fingerprint.replayFingerprint,
-            boxRequestHash: fingerprint.requestHash, boxResumeRevision: durableRevision })]);
+            boxRequestHash: fingerprint.requestHash,
+            boxParentResumeRevision: durableRevision })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
@@ -390,6 +410,115 @@ export class BoxDurableJournal implements BoxJournalPort {
         detachedRunnerHash: handoff.detachedRunnerHash,
         catalogHash: handoff.catalogHash,
         toolUses: digests };
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
+  /** A final model message closes every row in its one remote invocation.
+   * Earlier HTTP rows retain their own handoff usage for per-round settlement;
+   * only the final linked row receives final-message usage and terminal proof.
+   * Until this transaction commits, the original owner keeps account capacity. */
+  async completeToolChain(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
+    { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void> {
+    const usage = input.usage;
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
+      || Object.values(usage).some((n) => !Number.isSafeInteger(n) || n < 0)) {
+      throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID");
+    }
+    try {
+      parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
+        runNonce: input.proof.runNonce, leaseEpoch: input.leaseEpoch });
+    } catch { throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID"); }
+    if (input.proof.reason !== "worker_complete") {
+      throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID");
+    }
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
+      const rows: Row[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = input.requestId;
+      while (cursor !== null) {
+        if (rows.length >= 32 || seen.has(cursor)) {
+          throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+        }
+        seen.add(cursor);
+        const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
+          `SELECT request_id,state,ctx FROM request_finalize_journal
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [cursor, input.uid.toString()]);
+        const row: Row | undefined = found.rows[0];
+        if (found.rowCount !== 1 || !row || !row.ctx
+          || row.ctx.boxInvocationRecovery !== "v1"
+          || row.ctx.boxRunNonce !== input.proof.runNonce
+          || row.ctx.boxLeaseEpoch !== input.leaseEpoch) {
+          throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+        }
+        rows.push(row);
+        const parent: unknown = row.ctx.boxOwnerRequestId;
+        if (parent === undefined) cursor = null;
+        else if (typeof parent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parent)) {
+          cursor = parent;
+        } else throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+      }
+      const current = rows[0]!;
+      const basis = current.ctx;
+      const roundNo = basis.boxRoundNo;
+      if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
+        || Number(roundNo) > 32 || rows.length !== roundNo
+        || current.state !== "inflight"
+        || !["linked", "unknown"].includes(String(basis.boxState))
+        || basis.boxToolHandoff !== undefined
+        || typeof basis.boxCatalogHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
+        || typeof basis.boxDetachedRunnerHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)) {
+        throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+      }
+      for (let i = 1; i < rows.length; i++) {
+        const child = rows[i - 1]!, parent = rows[i]!;
+        const ctx = parent.ctx;
+        const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+        if (!handoff || handoff.roundNo !== Number(roundNo) - i
+          || handoff.catalogHash !== basis.boxCatalogHash
+          || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash
+          || !["inflight", "finalizing", "committed"].includes(parent.state)
+          || !["resuming", "unknown"].includes(String(ctx.boxState))
+          || ctx.boxResumeRequestId !== child.request_id
+          || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
+          || ctx.boxAccountId !== basis.boxAccountId
+          || ctx.boxSessionId !== basis.boxSessionId
+          || ctx.boxTurnKey !== basis.boxTurnKey
+          || ctx.model !== basis.model) {
+          throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+        }
+      }
+      const final = await client.query(
+        `UPDATE request_finalize_journal
+            SET ctx=ctx || $4::jsonb, updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+            AND ctx->>'boxLeaseEpoch'=$3
+            AND ctx->>'boxState' IN ('linked','unknown')`,
+        [current.request_id, input.uid.toString(), input.leaseEpoch,
+          JSON.stringify({ boxState: "terminal", boxTerminalProof: input.proof,
+            boxUsage: usage })]);
+      if (final.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_CHAIN_FENCE_LOST");
+      for (const ancestor of rows.slice(1)) {
+        const changed = await client.query(
+          `UPDATE request_finalize_journal
+              SET ctx=jsonb_set(ctx,'{boxState}','"terminal"'::jsonb), updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
+              AND ctx->>'boxState' IN ('resuming','unknown')`,
+          [ancestor.request_id, input.uid.toString(), input.leaseEpoch]);
+        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_CHAIN_FENCE_LOST");
+      }
+      await client.query("COMMIT");
+      committed = true;
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();

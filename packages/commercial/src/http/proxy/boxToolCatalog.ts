@@ -20,6 +20,8 @@ export interface BoxToolCatalog {
   readonly clientNameByBoxName: ReadonlyMap<string, string>;
   readonly boxNameByClientName: ReadonlyMap<string, string>;
   readonly sha256: string;
+  /** Binds original client tool names as well as remote alias/schema bytes. */
+  readonly bindingSha256: string;
   readonly json: string;
 }
 
@@ -82,8 +84,11 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
   if (Buffer.byteLength(json) > 1_048_576) {
     throw new BoxToolCatalogError("BOX_TOOL_CATALOG_TOO_LARGE");
   }
+  const bindingJson = JSON.stringify({ catalog: json,
+    clientNames: rawTools.map((tool) => (tool as Record<string, unknown>).name) });
   return { tools, clientNameByBoxName, boxNameByClientName,
-    sha256: createHash("sha256").update(json).digest("hex"), json };
+    sha256: createHash("sha256").update(json).digest("hex"),
+    bindingSha256: createHash("sha256").update(bindingJson).digest("hex"), json };
 }
 
 /** Current real Claude Code 2.1.280 default is adaptive/omitted + medium.

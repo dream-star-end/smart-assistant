@@ -33,6 +33,10 @@ test("real CC built-in tool names get unique Box MCP aliases and exact reverse n
   }
   assert.match(compiled.sha256, /^[a-f0-9]{64}$/);
   assert.equal(compileBoxToolCatalog(source).sha256, compiled.sha256);
+  const renamed = source.map((item, i) => i === 0 ? { ...item, name: "RenamedAgent" } : item);
+  assert.equal(compileBoxToolCatalog(renamed).sha256, compiled.sha256,
+    "remote catalog aliases alone cannot bind the original client tool name");
+  assert.notEqual(compileBoxToolCatalog(renamed).bindingSha256, compiled.bindingSha256);
 });
 
 test("duplicate, malformed, oversized and dangerous tool declarations fail closed", () => {
