@@ -637,6 +637,26 @@ describe("UsageObserver — SSE 解析 + usage 提取", () => {
     }
   });
 
+  test("Anthropic delta only updates output; start input/cache survive to final billing", () => {
+    const o = new _UsageObserver();
+    feedEvents(o, ["event: message_start", `data: ${JSON.stringify({
+      type: "message_start", message: { usage: { input_tokens: 2, output_tokens: 0,
+        cache_read_input_tokens: 100, cache_creation_input_tokens: 20 } },
+    })}`]);
+    feedEvents(o, ["event: message_delta", `data: ${JSON.stringify({
+      type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 7 },
+    })}`]);
+    const r = o.result();
+    assert.equal(r.kind, "final");
+    if (r.kind === "final") {
+      assert.equal(r.usage.input_tokens, 2n);
+      assert.equal(r.usage.output_tokens, 7n);
+      assert.equal(r.usage.cache_read_tokens, 100n);
+      assert.equal(r.usage.cache_write_tokens, 20n);
+    }
+  });
+
   test("非 message_start/delta 事件忽略", () => {
     const o = new _UsageObserver();
     feedEvents(o, [

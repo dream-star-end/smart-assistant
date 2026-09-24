@@ -928,15 +928,20 @@ class UsageObserver {
     }
     // message_start: { type, message: { ..., usage: {...}}}
     // message_delta: { type, delta:{...}, usage: {...}}
-    const usage =
-      ev.event === "message_start"
-        ? extractUsageFromMessageStart(parsed)
-        : extractUsageFromMessageDelta(parsed);
-    if (!usage) return;
+    const startUsage = ev.event === "message_start" ? extractUsageFromMessageStart(parsed) : null;
+    const deltaUsage = ev.event === "message_delta" ? extractUsageFromMessageDelta(parsed) : null;
+    if (!startUsage && !deltaUsage) return;
     // message_delta 携 stop_reason 时视为 final
     const isFinal =
       ev.event === "message_delta" && hasStopReason(parsed);
-    this.latest = { kind: isFinal ? "final" : "partial", usage };
+    // Anthropic message_delta normally carries cumulative output_tokens but
+    // omits input/cache fields already sent in message_start. Absence means
+    // "unchanged", not zero; replacing the entire object underbills caching.
+    const prior: TokenUsage = this.latest.kind === "none"
+      ? { input_tokens: 0n, output_tokens: 0n, cache_read_tokens: 0n, cache_write_tokens: 0n }
+      : this.latest.usage;
+    this.latest = { kind: isFinal ? "final" : "partial",
+      usage: startUsage ?? { ...prior, ...(deltaUsage ?? {}) } };
   }
 }
 
@@ -977,15 +982,17 @@ function extractUsageFromMessageStart(parsed: unknown): TokenUsage | null {
   };
 }
 
-function extractUsageFromMessageDelta(parsed: unknown): TokenUsage | null {
+function extractUsageFromMessageDelta(parsed: unknown): Partial<TokenUsage> | null {
   if (!isObj(parsed)) return null;
   const u = parsed.usage;
   if (!isObj(u)) return null;
   return {
-    input_tokens: readNonNegInt(u.input_tokens),
-    output_tokens: readNonNegInt(u.output_tokens),
-    cache_read_tokens: readNonNegInt(u.cache_read_input_tokens),
-    cache_write_tokens: readNonNegInt(u.cache_creation_input_tokens),
+    ...(u.input_tokens === undefined ? {} : { input_tokens: readNonNegInt(u.input_tokens) }),
+    ...(u.output_tokens === undefined ? {} : { output_tokens: readNonNegInt(u.output_tokens) }),
+    ...(u.cache_read_input_tokens === undefined ? {}
+      : { cache_read_tokens: readNonNegInt(u.cache_read_input_tokens) }),
+    ...(u.cache_creation_input_tokens === undefined ? {}
+      : { cache_write_tokens: readNonNegInt(u.cache_creation_input_tokens) }),
   };
 }
 

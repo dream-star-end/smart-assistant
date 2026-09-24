@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { completedBoxCliToSse, BoxCliSseError } from "./boxCliSse.js";
+import { _UsageObserver } from "./shared.js";
 
 const model = "claude-opus-5-5";
 const event = (value: unknown) => ({ type: "stream_event", event: value });
@@ -117,4 +118,27 @@ test("delta input/cache usage cannot contradict start and result", () => {
     usage: { output_tokens: 7, cache_read_input_tokens: 100,
       cache_creation_input_tokens: 20 } });
   rejected(cacheMismatch, "BOX_CLI_USAGE_MISMATCH");
+});
+
+test("converter SSE drives existing billing observer with input/cache intact", () => {
+  const source = records();
+  const start = (source[1] as { event: { message: { usage: Record<string, number> } } }).event.message.usage;
+  start.cache_read_input_tokens = 100;
+  start.cache_creation_input_tokens = 20;
+  const finalUsage = (source[8] as { usage: Record<string, number> }).usage;
+  finalUsage.cache_read_input_tokens = 100;
+  finalUsage.cache_creation_input_tokens = 20;
+  const converted = completedBoxCliToSse(jsonl(source), model);
+  const observer = new _UsageObserver();
+  observer.push(converted.sse.slice(0, 121));
+  observer.push(converted.sse.slice(121));
+  observer.flush();
+  const observation = observer.result();
+  assert.equal(observation.kind, "final");
+  if (observation.kind === "final") {
+    assert.deepEqual(observation.usage, {
+      input_tokens: 2n, output_tokens: 7n,
+      cache_read_tokens: 100n, cache_write_tokens: 20n,
+    });
+  }
 });
