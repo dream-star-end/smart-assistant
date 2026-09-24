@@ -101,7 +101,7 @@ try:
   st=os.fstat(fd)
   if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
  for path in paths:
-  if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not re.fullmatch(re.escape(cwd)+r'/result\.toolu_[A-Za-z0-9_-]{1,120}\.json',path) and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
+  if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json',cwd+'/stdout.jsonl',cwd+'/stderr.log') and not re.fullmatch(re.escape(cwd)+r'/result\.toolu_[A-Za-z0-9_-]{1,120}\.json',path) and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
   parent,name=os.path.split(path)
   if parent not in fds:raise SystemExit(1)
   for target in (name,name+'.part'):

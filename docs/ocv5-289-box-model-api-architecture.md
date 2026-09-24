@@ -255,7 +255,9 @@ with owner-private stdout/stderr spool files and read bounded offsets through
 separate Exec calls; this still has no production HTTP caller or verified Box
 cgroup-lifetime evidence. The TypeScript reader validates exact byte offsets,
 canonical base64 and size but does not auto-ACK SSE delivery or replay an
-ambiguous model/tool-result write.
+ambiguous model/tool-result write. The detached cleanup plan includes both
+stdout and stderr spools, but may run only after nonce/epoch-bound remote
+terminal proof; unknown outcomes retain files for reconciliation.
 
 The supervised CLI must publish a bounded, no-content `terminal.json` in its
 owner-0700 per-run directory only after a **real stop fence**. Bind the marker

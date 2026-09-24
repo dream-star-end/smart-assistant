@@ -44,5 +44,9 @@ export function makeBoxDetachedToolPlan(input: {
     return { command: PYTHON, args: [runnerPath, "--read", base.cwd,
       String(offset), String(limit)], cwd: "/tmp", environment: ENV };
   };
-  return { ...base, stageDetachedRunner, detachedRunnerHash, launch, readSpool };
+  // Only after nonce/epoch-bound remote terminal proof: stdout/stderr contain
+  // model output and must be removed with the private input/catalog files.
+  const cleanup: BoxCcExecRequest = { ...base.cleanup,
+    args: [...base.cleanup.args, `${base.cwd}/stdout.jsonl`, `${base.cwd}/stderr.log`] };
+  return { ...base, cleanup, stageDetachedRunner, detachedRunnerHash, launch, readSpool };
 }
