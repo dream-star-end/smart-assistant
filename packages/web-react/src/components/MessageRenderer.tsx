@@ -1319,6 +1319,53 @@ function findTargetVisible(el: HTMLElement, scroller: HTMLElement): boolean {
   return row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1;
 }
 
+type LiveUnitsViewportAnchor = {
+  top: number;
+  member: string;
+};
+
+type LiveUnitsViewportHold = {
+  following: boolean;
+  epoch: number;
+  anchor: LiveUnitsViewportAnchor | null;
+};
+
+/** Topmost on-screen step. A process shell's own top does not move when an
+ * older page is inserted inside it, so the anchor has to be that step. */
+function captureLiveUnitsAnchor(scroller: HTMLElement): LiveUnitsViewportAnchor | null {
+  const viewport = scroller.getBoundingClientRect();
+  const rows = scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]");
+  for (const row of rows) {
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.bottom <= viewport.top + 0.5 || rowRect.top >= viewport.bottom - 0.5) continue;
+    for (const candidate of row.querySelectorAll<HTMLElement>("[data-find-member]")) {
+      const rect = candidate.getBoundingClientRect();
+      const member = candidate.getAttribute("data-find-member");
+      if (!member || rect.height <= 0) continue;
+      if (rect.bottom <= viewport.top + 0.5 || rect.top >= viewport.bottom - 0.5) continue;
+      return { top: rect.top - viewport.top, member };
+    }
+  }
+  return null;
+}
+
+/** Move by the anchor's position after this commit, not by a height taken
+ * before the request. Bottom streaming between those two moments must not
+ * be treated as a prepend. */
+function restoreLiveUnitsAnchor(
+  scroller: HTMLElement,
+  anchor: LiveUnitsViewportAnchor,
+  writeTop: (el: HTMLElement, nextTop: number) => void,
+): void {
+  const el = scroller.querySelector<HTMLElement>(
+    `[data-find-member="${escapeFindSelector(anchor.member)}"]`,
+  );
+  if (!el) return;
+  const current = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  const delta = current - anchor.top;
+  if (Math.abs(delta) > 0.5) writeTop(scroller, scroller.scrollTop + delta);
+}
+
 function eventInFindToolbar(scroller: HTMLElement, target: EventTarget | null): boolean {
   const bar = findToolbarEl(scroller);
   return !!(bar && target instanceof Node && bar.contains(target));
@@ -1520,6 +1567,8 @@ export function MessageList({
   const startOverrideRef = useRef<number | null>(null);
   const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
   const viewportPreserveLockRef = useRef(false);
+  const liveUnitsHoldRef = useRef<LiveUnitsViewportHold | null>(null);
+  const liveUnitsSettleRef = useRef<LiveUnitsViewportHold | null>(null);
   const listRootRef = useRef<HTMLDivElement | null>(null);
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
@@ -1740,6 +1789,8 @@ export function MessageList({
     startOverrideRef.current = null;
     didSnapToBottomRef.current = false;
     viewportPreserveLockRef.current = false;
+    liveUnitsHoldRef.current = null;
+    liveUnitsSettleRef.current = null;
     rowHeightCacheRef.current = rowHeightBucket(sessionId);
     visibleKeysRef.current = [];
     eagerPayloadKeysRef.current = null;
@@ -2134,21 +2185,36 @@ export function MessageList({
     setLiveUnitsBusy(true);
     const token = ++archiveQueueTokenRef.current;
     const el = scrollParent;
-    beginViewportPreserve();
-    if (el) {
-      pendingExpandCorrectionRef.current = {
-        height: el.scrollHeight,
-        top: el.scrollTop,
+    const follow = followBottomRefBox.current;
+    const following = follow?.current === true;
+    // beginViewportPreserve is for manual history and window expansion: it
+    // drops following and never restores it. A live-unit page must not use
+    // that, and must not snapshot height before the rows exist.
+    if (following) {
+      liveUnitsHoldRef.current = {
+        following: true,
+        epoch: processPaging.interactionVersion(),
+        anchor: null,
+      };
+    } else {
+      viewportPreserveLockRef.current = true;
+      liveUnitsHoldRef.current = {
+        following: false,
+        epoch: processPaging.interactionVersion(),
+        anchor: el ? captureLiveUnitsAnchor(el) : null,
       };
     }
     const pending = Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
       if (archiveQueueTokenRef.current !== token) return;
+      const hold = liveUnitsHoldRef.current;
+      liveUnitsHoldRef.current = null;
+      liveUnitsSettleRef.current = hold;
       liveQueuedRef.current = false;
       setLiveUnitsBusy(false);
       setWindowVersion((value) => value + 1);
     });
     return pending;
-  }, [archive, liveHasMore, scrollParent, beginViewportPreserve]);
+  }, [archive, liveHasMore, scrollParent, processPaging]);
   // Earlier steps of this turn load themselves. History stays a manual button,
   // and scrolling never starts either request.
   useEffect(() => {
@@ -2202,15 +2268,36 @@ export function MessageList({
     setWindowVersion((value) => value + 1);
   }, [scrollParent]);
   useLayoutEffect(() => {
-    const pending = pendingExpandCorrectionRef.current;
     const el = scrollParent;
-    if (!pending || !el) return;
-    pendingExpandCorrectionRef.current = null;
-    if (typeof followBottomRef?.correctTo === "function") {
-      followBottomRef.correctTo(el, correctedScrollTop(pending.height, el.scrollHeight, pending.top));
+    const pending = pendingExpandCorrectionRef.current;
+    if (pending && el) {
+      pendingExpandCorrectionRef.current = null;
+      if (typeof followBottomRef?.correctTo === "function") {
+        followBottomRef.correctTo(el, correctedScrollTop(pending.height, el.scrollHeight, pending.top));
+      }
+      endViewportPreserve();
+    }
+    const settled = liveUnitsSettleRef.current;
+    if (!settled) return;
+    liveUnitsSettleRef.current = null;
+    const follow = followBottomRefBox.current;
+    if (!el || !follow) {
+      if (!settled.following) endViewportPreserve();
+      return;
+    }
+    const gestured = processPaging.interactionVersion() !== settled.epoch;
+    if (settled.following) {
+      if (!gestured) {
+        follow.current = true;
+        follow.scrollToBottom?.(el);
+      }
+      return;
+    }
+    if (settled.anchor && typeof follow.correctTo === "function") {
+      restoreLiveUnitsAnchor(el, settled.anchor, follow.correctTo);
     }
     endViewportPreserve();
-  }, [windowVersion, scrollParent]);
+  }, [windowVersion, scrollParent, processPaging]);
   useLayoutEffect(() => {
     const scroller = scrollParent;
     const root = listRootRef.current;
@@ -2370,6 +2457,22 @@ export function MessageList({
       estimatePx,
     )
     : 0;
+  useLayoutEffect(() => {
+    const el = scrollParent;
+    const hold = liveUnitsHoldRef.current;
+    if (!el || !hold) return;
+    const follow = followBottomRefBox.current;
+    if (!follow) return;
+    if (hold.following) {
+      if (follow.current && processPaging.interactionVersion() === hold.epoch) {
+        follow.scrollToBottom?.(el);
+      }
+      return;
+    }
+    if (hold.anchor && typeof follow.correctTo === "function") {
+      restoreLiveUnitsAnchor(el, hold.anchor, follow.correctTo);
+    }
+  });
   useLayoutEffect(() => {
     const root = listRootRef.current;
     if (root) {
@@ -2894,6 +2997,8 @@ export function MessageList({
               if (!scrollParent || !followBottomRef?.jumpToBottom) return;
               pendingExpandCorrectionRef.current = null;
               viewportPreserveLockRef.current = false;
+              liveUnitsHoldRef.current = null;
+              liveUnitsSettleRef.current = null;
               lastViewportAnchorRef.current = null;
               followBottomRef.jumpToBottom(scrollParent);
               setShowScrollToBottom(shouldShowScrollToBottom(
