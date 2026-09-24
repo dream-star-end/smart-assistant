@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateBoxTextRequest } from "./boxRequestGate.js";
+import { validateBoxTextRequest, validateBoxRequest,
+  validateBoxToolRequest } from "./boxRequestGate.js";
 import type { ProxyBody } from "./shared.js";
 import { applyModelDefaultEffort } from "./shared.js";
 
@@ -27,4 +28,27 @@ test("pricing default effort injection is rejected, not silently dropped", () =>
   const input = structuredClone(base);
   applyModelDefaultEffort(input, "high");
   assert.equal(validateBoxTextRequest(input), "BOX_EFFORT_UNMAPPED");
+});
+
+test("tool bridge gate is explicit and validates first and next HTTP rounds", () => {
+  const tools = [{ name: "local_echo", description: "synthetic local tool",
+    input_schema: { type: "object", properties: { value: { type: "string" } } } }];
+  const first = { ...base, tools, tool_choice: { type: "auto" },
+    thinking: { type: "adaptive", display: "omitted" },
+    output_config: { effort: "medium" } } as ProxyBody;
+  assert.equal(validateBoxRequest(first, false), "BOX_TOOLS_REQUIRE_LIVE_BRIDGE");
+  assert.equal(validateBoxRequest(first, true), null);
+  const next = { ...first, messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_A",
+      name: "local_echo", input: { value: "x" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_A",
+      content: "OpenClaude user-container result" }] },
+  ] } as ProxyBody;
+  assert.equal(validateBoxToolRequest(next), null);
+  assert.equal(validateBoxToolRequest({ ...first, tool_choice: {
+    type: "tool", name: "local_echo" } }), "BOX_TOOL_CHOICE_UNMAPPED");
+  assert.equal(validateBoxToolRequest({ ...first,
+    output_config: { effort: "invalid" } }), "BOX_EFFORT_UNMAPPED");
+  assert.equal(validateBoxRequest({ ...first, tools: {} as never }, true),
+    "BOX_TOOL_COUNT_INVALID");
 });
