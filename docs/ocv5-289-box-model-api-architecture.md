@@ -89,10 +89,11 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   text order within the supported subset.
 - Start supervised Box `claude -p` with fixed model/flags, empty setting
   sources, only bounded virtual MCP tools compiled from the OpenClaude-side
-  Claude Code request. The first complete `tool_use` event is
-  exported before remote CLI waits for MCP. The internal API emits Anthropic
-  SSE `message_start`, block start/delta/stop, `message_delta(tool_use)` and
-  `message_stop`, then settles *observed* usage and persists resumable state.
+  Claude Code request. The internal API may progressively emit Anthropic SSE
+  `message_start` and content blocks, but before `message_delta(tool_use)` /
+  `message_stop` it must validate the whole model message and persist that
+  round's observed usage/pricing and resumable tool set. Settlement follows
+  from that durable evidence; it is never inferred from terminal SSE alone.
 - A subsequent same-session Messages call must carry an exactly matching
   `tool_result` ID and complete the **held** MCP rendezvous in the same
   supervised CLI process. The snapshot-and-new-CLI alternative was rejected
@@ -114,8 +115,11 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   interleaved with `content_block_delta`/`content_block_stop`, then one
   `message_delta(tool_use)` and `message_stop` **before** the two MCP results
   appeared. The first HTTP response may expose progressive blocks, but must
-  withhold terminal SSE until the complete model message, the exact per-ID
-  sidecar pending records and the durable handoff journal all agree. The CLI
+  withhold terminal SSE until the complete model tool-ID set is journaled,
+  at least one currently dispatched owner-scoped sidecar pending record is
+  verified, and the durable handoff/usage revision is committed. Remaining
+  pending records are verified by ID as Claude Code dispatches them later;
+  waiting for all of them here would deadlock this observed serial schedule. The CLI
   then produced a second `message_start` in the same process after both local
   results. In this observed run CC dispatched the two MCP calls sequentially;
   the sidecar's reverse-order parallel unit test is a capability test, not an
