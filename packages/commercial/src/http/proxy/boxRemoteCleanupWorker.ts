@@ -8,7 +8,8 @@ import type { BoxResolvedTarget } from "./boxTextFetch.js";
 
 type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned">;
-type Resolver = Pick<BoxAccountResolver, "resolve">;
+type Resolver = Pick<BoxAccountResolver, "resolve"> &
+  Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 
 export class BoxRemoteCleanupWorker {
   private readonly orphaned = new Map<BoxResolvedTarget,
@@ -61,6 +62,7 @@ export class BoxRemoteCleanupWorker {
 
   async reconcileBatch(limit = 10): Promise<{ cleaned: number; pending: number;
     orphaned: number }> {
+    await this.deps.resolver.retryFailedAgentCleanup?.().catch(() => {});
     for (const [target, state] of this.orphaned) {
       if (state.failed && !state.pending) {
         state.failed = false;

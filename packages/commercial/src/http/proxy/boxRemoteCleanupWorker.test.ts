@@ -43,13 +43,18 @@ test("lost CAS claim never resolves a Box target or touches remote files", async
 });
 
 test("flag-independent idle recovery performs only an empty journal read", async () => {
+  let resolverCleanupRetries = 0;
   const worker = new BoxRemoteCleanupWorker({
     journal: { listRemoteCleanupCandidates: async () => [],
       claimRemoteCleanup: async () => { throw new Error("must not claim"); },
       markRemoteCleaned: async () => { throw new Error("must not mark"); } } as never,
-    resolver: { resolve: async () => { throw new Error("must not contact Box"); } } as never,
+    resolver: { resolve: async () => { throw new Error("must not contact Box"); },
+      retryFailedAgentCleanup: async () => { resolverCleanupRetries++; return 0; } } as never,
   });
   assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.equal(resolverCleanupRetries, 2,
+    "failed resolver-owned ProxyAgents are retried even without Box candidates");
 });
 
 test("remote cleanup failure never marks done and keeps durable retry eligible", async () => {
