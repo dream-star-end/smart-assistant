@@ -91,6 +91,7 @@ export class BoxCliToolHandoffDecoder {
   private heldTerminal: string[] = [];
   private candidate: BoxToolHandoffCandidate | null = null;
   private finalCandidate: BoxToolFinalCandidate | null = null;
+  private finalStreamChecked = false;
   private expectedToolIds: readonly string[] = [];
   private remainder = "";
 
@@ -174,7 +175,8 @@ export class BoxCliToolHandoffDecoder {
     journaledUsage: { inputTokens: number; outputTokens: number;
       cacheReadTokens: number; cacheWriteTokens: number } }): string {
     const final = this.finalCandidate;
-    if (this.failed || this.committed || !final || this.heldTerminal.length !== 2
+    if (this.failed || this.committed || !this.finalStreamChecked
+      || !final || this.heldTerminal.length !== 2
       || proof?.terminalReason !== "worker_complete"
       || !proof.journaledUsage
       || proof.journaledUsage.inputTokens !== final.inputTokens
@@ -185,6 +187,16 @@ export class BoxCliToolHandoffDecoder {
     }
     this.committed = true;
     return this.heldTerminal.join("");
+  }
+
+  /** Call only after nonce/epoch-bound remote stop AND an exact spool EOF read. */
+  finishFinal(): void {
+    if (this.failed || this.committed || !this.finalCandidate
+      || this.pending.length !== 0 || this.remainder.length !== 0
+      || this.splitHighSurrogate.length !== 0) {
+      throw new BoxCliToolHandoffError("BOX_TOOL_FINAL_TRAILING_BYTES");
+    }
+    this.finalStreamChecked = true;
   }
 
   takeRemainder(): string {

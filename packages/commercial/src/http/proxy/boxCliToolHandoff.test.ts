@@ -182,6 +182,10 @@ test("a resumed final round streams blocks but withholds terminal until result a
   assert.equal(final?.stopReason, "end_turn");
   assert.equal(final?.outputTokens, 4, "bill only this HTTP model round, not CLI cumulative total");
   assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
+    journaledUsage: { inputTokens: 2, outputTokens: 4,
+      cacheReadTokens: 0, cacheWriteTokens: 0 } }), /BOX_TOOL_FINAL_PROOF_INVALID/);
+  decoder.finishFinal();
+  assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
     journaledUsage: { inputTokens: 2, outputTokens: 999,
       cacheReadTokens: 0, cacheWriteTokens: 0 } }), /BOX_TOOL_FINAL_PROOF_INVALID/);
   const terminal = decoder.commitFinal({ terminalReason: "worker_complete",
@@ -190,4 +194,39 @@ test("a resumed final round streams blocks but withholds terminal until result a
   assert.ok(terminal.includes('"stop_reason":"end_turn"'));
   assert.ok(terminal.includes("event: message_stop"));
   assert.throws(() => decoder.push(""), /BOX_TOOL_DECODER_CLOSED/);
+});
+
+test("success result followed by same-chunk or later bytes cannot release final SSE", () => {
+  const prelude = [
+    event({ type: "message_start", message: { id: "msg_final_trailing", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    event({ type: "content_block_start", index: 0,
+      content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "done" } }),
+    { type: "assistant", message: { id: "msg_final_trailing", model,
+      role: "assistant", content: [{ type: "text", text: "done" }] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 2, output_tokens: 4 } }),
+    event({ type: "message_stop" }),
+    { type: "result", subtype: "success", is_error: false,
+      usage: { input_tokens: 10, output_tokens: 12 } },
+  ];
+  for (const suffix of [
+    JSON.stringify({ type: "result", subtype: "error", is_error: true }) + "\n",
+    "not-json\n", "{\"type\":\"result\"",
+  ]) {
+    for (const sameChunk of [true, false]) {
+      const decoder = new BoxCliToolHandoffDecoder(model, catalog,
+        { alreadyInitialized: true, allowFinal: true });
+      const full = lines(prelude).join("");
+      if (sameChunk) decoder.push(full + suffix);
+      else { decoder.push(full); decoder.push(suffix); }
+      assert.throws(() => decoder.finishFinal(), /BOX_TOOL_FINAL_TRAILING_BYTES/);
+      assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
+        journaledUsage: { inputTokens: 2, outputTokens: 4,
+          cacheReadTokens: 0, cacheWriteTokens: 0 } }), /BOX_TOOL_FINAL_PROOF_INVALID/);
+    }
+  }
 });
