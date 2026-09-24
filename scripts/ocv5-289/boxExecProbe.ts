@@ -1,8 +1,9 @@
-/** OCV5-289 operator-only Box Exec capability probe.
- * This does NOT install Sand relay, issue inference, publish credentials, or
- * change the user container. It may call upstream EnsureSandBox once.
+/** OCV5-289 operator-only Box Exec capability and synthetic inference probe.
+ * This does NOT install Sand relay, publish credentials, or change the user
+ * container. An explicit second ACK permits one small synthetic inference.
+ * EnsureSandBox may change upstream Box state; no call is retried on ambiguity.
  */
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { ProxyAgent, fetch as fetchUndici } from 'undici'
 import { getAccount, getCursorTokenSnapshot, getTokenForUse } from '../../packages/commercial/src/account-pool/store.js'
@@ -101,18 +102,14 @@ try {
   client.setAccountGuard(assertCurrent)
   const controlAbort = new AbortController()
   const target = await client.resolveBoxExec(snap.token.toString('utf8').trim(), snap.machine_id, controlAbort.signal)
-  const summaries: Array<Record<string, unknown>> = []
-  for (const argv of COMMANDS) {
+  const runFixed = async (input: { command: string; args: string[]; cwd: string;
+    environment: Record<string, string>; timeoutMs?: number }): Promise<string> => {
     await assertCurrent()
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 20_000)
+    const timer = setTimeout(() => controller.abort(), input.timeoutMs ?? 20_000)
     try {
-      const request = encodeExecRequest({
-        command: MODEL,
-        args: [...argv],
-        cwd: '/workspace',
-        environment: { HOME: '/home/box', PATH: '/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' },
-      })
+      const request = encodeExecRequest({ command: input.command, args: input.args,
+        cwd: input.cwd, environment: input.environment })
       const response = await fetchImpl(target.execUrl, {
         method: 'POST', redirect: 'error', signal: controller.signal,
         headers: {
@@ -142,17 +139,97 @@ try {
         }
       } finally { await reader.cancel().catch(() => {}); reader.releaseLock() }
       if (exitCode !== 0 || pending.length !== 0) throw new Error('BOX_EXEC_INCOMPLETE')
+      return output
+    } finally { clearTimeout(timer) }
+  }
+  const summaries: Array<Record<string, unknown>> = []
+  for (const argv of COMMANDS) {
+    const output = await runFixed({ command: MODEL, args: [...argv], cwd: '/workspace',
+      environment: { HOME: '/home/box', PATH: '/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin', LANG: 'C.UTF-8' } })
       const flags = argv[0] === '--help'
         ? ['--input-format', '--output-format', '--mcp-config', '--no-session-persistence', '--tools']
             .filter((flag) => output.includes(flag))
         : []
       const version = output.trim().split(/\r?\n/, 1)[0] ?? ''
-      summaries.push({ command: argv[0], exitCode, outputBytes: Buffer.byteLength(output),
+      summaries.push({ command: argv[0], exitCode: 0, outputBytes: Buffer.byteLength(output),
         outputHash: createHash('sha256').update(output).digest('hex').slice(0, 16), flags,
         ...(argv[0] === '--version' && /^\d+\.\d+\.\d+ \(Claude Code\)$/.test(version) ? { version } : {}) })
-    } finally { clearTimeout(timer) }
   }
-  process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, route: 'box-exec-direct', summaries }) + '\n')
+  let inference: Record<string, unknown> | undefined
+  if (process.env.OCV5_289_INFERENCE_ACK === '1') {
+    const asset = readFileSync(new URL('./box_supervisor.py', import.meta.url))
+    const digest = createHash('sha256').update(asset).digest('hex')
+    // Keep this non-secret, content-addressed asset after the probe: it
+    // re-execs itself as the gate/watcher while the supervised CLI is live.
+    // A later GC may remove it only after no process uses this digest.
+    const remotePath = `/tmp/ocv5-289-supervisor-${digest.slice(0, 16)}.py`
+    const stagePython = String.raw`import base64,hashlib,os,stat,sys
+p,encoded,want=sys.argv[1:]
+raw=base64.b64decode(encoded,validate=True)
+if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want: raise SystemExit(1)
+try:
+ fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+except FileExistsError:
+ pass
+else:
+ try: os.write(fd,raw);os.fsync(fd)
+ finally: os.close(fd)
+st=os.lstat(p)
+if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit(1)
+if hashlib.sha256(open(p,'rb').read()).hexdigest()!=want: raise SystemExit(1)
+print(want)`
+    const stageOutput = await runFixed({ command: '/usr/bin/python3',
+      args: ['-c', stagePython, remotePath, asset.toString('base64'), digest], cwd: '/tmp',
+      environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+    if (stageOutput.trim() !== digest) throw new Error('BOX_SUPERVISOR_STAGE_FAILED')
+    const verifyPython = String.raw`import hashlib,os,stat,sys
+p=sys.argv[1];st=os.lstat(p)
+if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600: raise SystemExit(1)
+print(hashlib.sha256(open(p,'rb').read()).hexdigest())`
+    const remoteDigest = await runFixed({ command: '/usr/bin/python3',
+      args: ['-c', verifyPython, remotePath], cwd: '/tmp',
+      environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+    if (remoteDigest.trim() !== digest) throw new Error('BOX_SUPERVISOR_VERIFY_FAILED')
+
+    const nonce = `ocv5-289-${randomBytes(12).toString('hex')}`
+    const prompt = `Return exactly this token, with no spaces or punctuation: ${nonce}`
+    const output = await runFixed({
+      command: '/usr/bin/python3', cwd: '/tmp', timeoutMs: 40_000,
+      args: [remotePath, '--deadline', '30', '--kill-after', '2', '--max-output', '262144', '--',
+        MODEL, '-p', prompt, '--model', 'claude-opus-5-5',
+        '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
+        '--tools', '', '--disallowedTools', 'mcp__*', '--strict-mcp-config',
+        '--mcp-config', '{"mcpServers":{}}', '--no-session-persistence', '--safe-mode'],
+      environment: { HOME: '/home/box', PATH: '/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin',
+        LANG: 'C.UTF-8', CLAUDE_CODE_MAX_RETRIES: '0', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' },
+    })
+    let records: Array<Record<string, unknown>>
+    try { records = output.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) }
+    catch { throw new Error('BOX_INFERENCE_STREAM_INVALID') }
+    const init = records.find((record) => record.type === 'system' && record.subtype === 'init') as {
+      tools?: unknown; mcp_servers?: unknown
+    } | undefined
+    const final = records.findLast((record) => record.type === 'result') as {
+      subtype?: unknown; is_error?: unknown; usage?: { input_tokens?: unknown; output_tokens?: unknown }
+    } | undefined
+    const text = records.filter((record) => record.type === 'assistant').flatMap((record) => {
+      const content = (record.message as { content?: unknown } | undefined)?.content
+      return Array.isArray(content) ? content.filter((block) => block?.type === 'text').map((block) => block.text) : []
+    }).join('')
+    if (!init || !Array.isArray(init.tools) || init.tools.length !== 0
+      || !Array.isArray(init.mcp_servers) || init.mcp_servers.length !== 0
+      || final?.subtype !== 'success' || final.is_error !== false || text !== nonce
+      || !Number.isSafeInteger(final.usage?.input_tokens) || Number(final.usage?.input_tokens) < 0
+      || !Number.isSafeInteger(final.usage?.output_tokens) || Number(final.usage?.output_tokens) < 0) {
+      throw new Error('BOX_INFERENCE_CONTRACT_FAILED')
+    }
+    inference = { exact: true, eventTypes: [...new Set(records.map((record) => record.type))],
+      outputBytes: Buffer.byteLength(output), outputHash: createHash('sha256').update(output).digest('hex').slice(0, 16),
+      inputTokens: final.usage.input_tokens, outputTokens: final.usage.output_tokens,
+      remoteSupervisorHash: digest.slice(0, 16) }
+  }
+  process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, route: 'box-exec-direct', summaries,
+    ...(inference ? { inference } : {}) }) + '\n')
 } finally {
   secret?.token.fill(0); secret?.refresh?.fill(0)
   snap?.token.fill(0); snap?.refresh?.fill(0)
