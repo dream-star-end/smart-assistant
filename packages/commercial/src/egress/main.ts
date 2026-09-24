@@ -235,7 +235,9 @@ export async function startEgress(): Promise<void> {
   // Off by default. Keep the same authenticated /v1/messages handler and
   // OpenClaude user-container agent; Box owns only the supervised model call.
   // Missing staged assets make egress refuse startup when explicitly enabled.
-  const boxModel = process.env.OC_BOX_MODEL_API === "1" ? new BoxTextFetch({
+  const boxResolver = process.env.OC_BOX_MODEL_API === "1"
+    ? createProductionBoxAccountResolver() : null;
+  const boxModel = boxResolver ? new BoxTextFetch({
     supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
     keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
     registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
@@ -243,12 +245,21 @@ export async function startEgress(): Promise<void> {
     journal: new BoxDurableJournal(getPool()),
     maxOutputTokensForModel: (model) =>
       model === "box-api-claude-opus-5-5" ? 128_000 : null,
-    resolveTarget: (args) => createProductionBoxAccountResolver().resolve(args),
+    resolveTarget: (args) => boxResolver.resolve(args),
     onUnknown: async ({ uid, accountId, requestId, phase }) => {
       log.error("box_model_outcome_unknown", { uid: uid.toString(),
         accountId: accountId.toString(), requestId, phase });
     },
   }) : undefined;
+  // The resolver retains failed private ProxyAgent closes across requests;
+  // retry only these proven pre-invocation orphans, never a remote unknown CLI.
+  const boxCleanupTimer = boxResolver && boxModel ? setInterval(() => {
+    void boxResolver.retryFailedAgentCleanup().catch(() =>
+      log.error("box_resolver_orphan_cleanup_failed"));
+    void boxModel.retryFailedOrphanCleanup().catch(() =>
+      log.error("box_target_orphan_cleanup_failed"));
+  }, 60_000) : null;
+  boxCleanupTimer?.unref();
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -624,6 +635,7 @@ export async function startEgress(): Promise<void> {
     shuttingDown = true;
     latencyProber?.stop();
     recoveryProber?.stop();
+    if (boxCleanupTimer) clearInterval(boxCleanupTimer);
     void desktopTlsClose?.().catch(() => {});
     // eslint-disable-next-line no-console
     console.log(
