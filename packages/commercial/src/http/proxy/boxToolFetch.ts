@@ -7,6 +7,7 @@ import { runBoxToolFirstRound, type BoxToolFirstHandoff,
   type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
+import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -29,6 +30,8 @@ function resumeShape(body: ProxyBody): boolean {
 
 export class BoxToolFetch {
   private readonly targets = new Map<string, Set<BoxResolvedTarget>>();
+  private readonly terminalCleanup = new Map<string, BoxResolvedTarget>();
+  private readonly terminalInFlight = new Map<string, Promise<void>>();
   private readonly cleanup = new Set<{ target: BoxResolvedTarget;
     pending: Promise<void>; failed: boolean }>();
   constructor(private readonly deps: {
@@ -82,23 +85,58 @@ export class BoxToolFetch {
     return this.cleanup.size;
   }
 
-  private async releaseAfterProof(runNonce: string): Promise<void> {
+  /** Terminal proof and journal evidence already exist for these runs.
+   * The remote cleanup is idempotent; this never relaunches the paid CLI. */
+  async retryTerminalCleanup(): Promise<number> {
+    await Promise.allSettled([...this.terminalCleanup].map(([nonce, target]) =>
+      this.cleanKnownTerminal(nonce, target)));
+    return this.terminalCleanup.size;
+  }
+
+  private cleanKnownTerminal(runNonce: string, target: BoxResolvedTarget): Promise<void> {
+    const existing = this.terminalInFlight.get(runNonce);
+    if (existing) return existing;
+    const pending = this.performTerminalCleanup(runNonce, target).finally(() => {
+      this.terminalInFlight.delete(runNonce);
+    });
+    this.terminalInFlight.set(runNonce, pending);
+    return pending;
+  }
+
+  private async performTerminalCleanup(runNonce: string,
+    target: BoxResolvedTarget): Promise<void> {
+    const remote = target.exec.run(makeBoxRunCleanup(runNonce), {
+      timeoutMs: 20_000, maxResponseBytes: 4096 });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let result: Awaited<typeof remote>;
+    try { result = await Promise.race([remote, new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error("BOX_RUN_CLEANUP_TIMEOUT")), 20_500);
+    })]); }
+    finally { if (timeout) clearTimeout(timeout); }
+    if (result.stdout.trim() !== "clean") throw new Error("BOX_RUN_CLEANUP_UNPROVEN");
+    this.terminalCleanup.delete(runNonce);
     const group = this.targets.get(runNonce);
     if (!group) return;
     this.targets.delete(runNonce);
-    await Promise.allSettled([...group].map(async (target) => {
-      const pending = Promise.resolve().then(() => target.dispose?.());
+    await Promise.allSettled([...group].map(async (owned) => {
+      const pending = Promise.resolve().then(() => owned.dispose?.());
       let timer: ReturnType<typeof setTimeout> | undefined;
       const observed = pending.then(() => {}, () => {});
-      try {
-        await Promise.race([observed, new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, 200);
-        })]);
-      } finally { if (timer) clearTimeout(timer); }
-      // A pending or rejected close remains owned. The service timer may retry
-      // only after that specific promise settles, never concurrently.
-      this.retainCleanup({ target, pending });
+      try { await Promise.race([observed, new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 200);
+      })]); }
+      finally { if (timer) clearTimeout(timer); }
+      this.retainCleanup({ target: owned, pending });
     }));
+  }
+
+  private async releaseAfterProof(runNonce: string): Promise<void> {
+    const group = this.targets.get(runNonce);
+    if (!group) return;
+    const target = [...group].at(-1)!;
+    this.terminalCleanup.set(runNonce, target);
+    try { await this.cleanKnownTerminal(runNonce, target); }
+    catch { /* retain pinned target and private files for bounded retry */ }
   }
 
   async fetch(args: FetchArgs): Promise<Response> {

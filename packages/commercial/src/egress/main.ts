@@ -285,6 +285,8 @@ export async function startEgress(): Promise<void> {
       log.error("box_target_orphan_cleanup_failed"));
     void boxToolModel?.retryFailedCleanup().catch(() =>
       log.error("box_tool_target_cleanup_failed"));
+    void boxToolModel?.retryTerminalCleanup().catch(() =>
+      log.error("box_tool_remote_cleanup_failed"));
   }, 60_000) : null;
   boxCleanupTimer?.unref();
   const proxyHandler = makeAnthropicProxyHandler({
