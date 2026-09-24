@@ -261,14 +261,22 @@ and automated parent-loss cleanup is needed. The proposed portable fallback
 uses the initial Exec process as a **subreaper keeper**: it sets
 `PR_SET_CHILD_SUBREAPER` before forking the stdout-producing supervisor worker;
 the worker reports the CLI leader PID immediately after spawn. If that worker
-dies, the still-living keeper adopts the orphaned CLI and must confirm via
-`waitid(..., WNOWAIT)` that the *same leader is its unreaped child* before any
+dies, the keeper must first observe **worker exit** (not merely a report-pipe
+EOF), then adopts the orphaned CLI and confirms via
+`waitid(P_PID, pid, WEXITED|WNOHANG|WNOWAIT)` that the *same leader is its
+unreaped child* before any
 numeric process-group signal. It then signals and reaps without a PID-reuse
 window; `ECHILD`, missing report, inaccessible descendants, or keeper death
 means **no numeric group signal and no terminal marker**, only unknown/manual.
 Normal worker exit still uses its existing unreaped-leader group fence. The
-keeper must forward stop signals, bound waits and close its copy of stdout so
-it cannot fake stream completion. This hierarchy needs private-PID1 red/green
+keeper must leave `SIGCHLD` at a waitable disposition (no `SIG_IGN`/
+`SA_NOCLDWAIT`) and prevent other handlers/threads from reaping the leader;
+`WNOWAIT` alone is not a permanent identity lock. It must receive and ACK the
+child PID **before** the worker opens its existing execution gate, forward
+stop signals, bound startup/waits, close only its own stdout/stderr copies,
+and propagate the worker's real exit status rather than converting cleanup
+success into a zero exit. Control reports never enter model stdout. This
+hierarchy needs private-PID1 red/green
 tests before any real Box call or marker publication. A sent signal, closed stdout,
 disappeared HTTP handle, timeout or
 `MainPID=0` is not proof. If the Box runtime cannot inspect/fence descendants
