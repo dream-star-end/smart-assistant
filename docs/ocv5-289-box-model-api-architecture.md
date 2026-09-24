@@ -240,6 +240,29 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   resolution. With proof, close resources and settle only from durable round
   usage evidence. No automatic paid-call or local-tool replay on takeover.
 
+### Box terminal marker and reconciliation proof (design; not implemented)
+
+The supervised CLI must publish a bounded, no-content `terminal.json` in its
+owner-0700 per-run directory only after a **real stop fence**. Bind the marker
+to the journal's run nonce and lease epoch; include supervisor/CLI process
+identity, termination reason and a monotonic revision. The parent normally
+signals TERM/KILL and confirms the CLI leader and same-group descendants are
+not runnable **while the leader PID is still unreaped** (so the PGID cannot be
+reused), then fsync-publishes the marker atomically before acknowledging its
+watchdog. On parent loss, the independent watchdog may publish a distinct
+`parent_lost` marker only after its own kill and the same no-runnable-process
+check. A sent signal, closed stdout, disappeared HTTP handle, timeout or
+`MainPID=0` is not proof. If the Box runtime cannot inspect/fence descendants
+that escaped the original process group, it must **not** publish a safe-stop
+marker; reconciliation remains unknown/manual rather than assuming death.
+
+The master reads the marker only via the pinned eligible account and egress,
+checks file owner/mode/no symlink, exact run nonce/epoch and expected state,
+and cross-checks durable per-round billing evidence. A marker proves at most
+remote process termination; it does **not** prove the user received SSE or
+that credits settled. Missing, corrupt or stale markers leave account
+capacity fenced. GC of staged user content requires the same terminal fence.
+
 This schema/state design is not approval to apply a data migration. The next
 free migration number and shared-branch tip must be rechecked at merge, and
 the user must approve migration execution before release.
