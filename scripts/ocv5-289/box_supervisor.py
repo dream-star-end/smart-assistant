@@ -359,6 +359,30 @@ def main() -> int:
         time.sleep(min(float(prewatch_delay), 2.0))
     watcher = None
     try:
+        keeper_report = os.environ.get("OCV5_KEEPER_REPORT_FD")
+        keeper_ack = os.environ.get("OCV5_KEEPER_ACK_FD")
+        if (keeper_report is None) != (keeper_ack is None):
+            raise RuntimeError("KEEPER_FDS_INCOMPLETE")
+        if keeper_report is not None and keeper_ack is not None:
+            report_fd = None
+            keeper_ack_fd = None
+            try:
+                report_fd, keeper_ack_fd = int(keeper_report), int(keeper_ack)
+                if report_fd < 3 or keeper_ack_fd < 3 or report_fd == keeper_ack_fd:
+                    raise ValueError("KEEPER_FDS_INVALID")
+                os.write(report_fd, f"{child.pid}\n".encode("ascii"))
+                # Keeper owns the bounded startup timer. W keeps C gated and
+                # unreaped until ACK/pipe EOF, so its PID cannot be recycled
+                # between numeric report and keeper.pidfd_open().
+                if os.read(keeper_ack_fd, 1) != b"K":
+                    raise RuntimeError("KEEPER_NOT_READY")
+            except (OSError, ValueError) as error:
+                raise RuntimeError("KEEPER_NOT_READY") from error
+            finally:
+                for owned_fd in (report_fd, keeper_ack_fd):
+                    if owned_fd is not None:
+                        try: os.close(owned_fd)
+                        except OSError: pass
         watcher = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--watchdog", str(watch_read), str(ack_write), str(child.pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
