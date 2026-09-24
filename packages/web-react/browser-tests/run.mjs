@@ -3877,9 +3877,16 @@ await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底
     await frames();
     await livePage.waitForTimeout(280);
     const gestureAfter = await geometry("gesture");
-    console.log(`[T69 gesture] ${JSON.stringify({ before: gestured, after: gestureAfter })}`);
+    const gestureDelta = gestureAfter.top - gestured.top;
+    console.log(`[T69 gesture] ${JSON.stringify({ before: gestured, after: gestureAfter, delta: gestureDelta })}`);
     if (gestureAfter.following !== false) {
       throw new Error(`T69 上滑手势后补页结束又恢复了跟随: ${JSON.stringify(gestureAfter)}`);
+    }
+    if (gestureAfter.missing || gestured.missing) {
+      throw new Error(`T69 手势锚点没有真实几何: ${JSON.stringify({ before: gestured, after: gestureAfter })}`);
+    }
+    if (Math.abs(gestureDelta) > 1) {
+      throw new Error(`T69 上滑后前插位移 ${gestureDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify({ before: gestured, after: gestureAfter })}`);
     }
     if (gestureAfter.button) throw new Error("T69 手势场景出现手动加载更早按钮");
   } finally {

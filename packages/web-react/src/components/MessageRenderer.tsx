@@ -1875,6 +1875,20 @@ export function MessageList({
     };
     const onWindowBlur = () => endPointer();
     const onScroll = () => {
+      // A following live-unit fetch has not inserted its page yet. If the
+      // reader already left the bottom, remember the step now — writing
+      // scrollTop here would fight the gesture, and writing it after the
+      // fence drops would be a second jump. The prepend commit corrects
+      // once, and correctTo itself no-ops while a fence is up.
+      const hold = liveUnitsHoldRef.current;
+      if (
+        hold?.following &&
+        processPaging.interactionVersion() !== hold.epoch
+      ) {
+        hold.following = false;
+        hold.anchor = captureLiveUnitsAnchor(scroller);
+        viewportPreserveLockRef.current = true;
+      }
       if (scrollbarPointerId !== null) {
         processPaging.signalUserInteraction();
       } else if (touchMomentum) {
