@@ -93,6 +93,37 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(prestart.rows[0]?.ctx.boxState, "prestart_stopped");
     assert.equal(await abortInflightJournal(sameConnection, `box-b-${suffix}`,
       "no model started"), true, "proven prestart failure may release generic journal");
+
+    // First completed model tool message is durable before terminal SSE.
+    await put(`box-c-${suffix}`);
+    const toolCall = { ...input, requestId: `box-c-${suffix}`,
+      fingerprint: { ...fingerprint, replayFingerprint: "9".repeat(64) },
+      runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32) };
+    await journal.admit(toolCall);
+    await journal.markRunning(toolCall);
+    const candidate = { messageId: "msg_box_tool_1", toolUses: [
+      { id: "toolu_A", boxName: "mcp__ocbridge__t0",
+        clientName: "local_echo", input: { value: "same" } },
+      { id: "toolu_B", boxName: "mcp__ocbridge__t0",
+        clientName: "local_echo", input: { value: "same" } },
+    ], inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
+    const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
+      verifiedPendingToolUseIds: ["toolu_A"] });
+    assert.deepEqual(receipt.journaledToolUseIds, ["toolu_A", "toolu_B"]);
+    assert.deepEqual(receipt.verifiedPendingToolUseIds, ["toolu_A"]);
+    const handoff = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
+    assert.equal(handoff.rows[0]?.ctx.boxState, "handoff");
+    assert.deepEqual((handoff.rows[0]?.ctx.boxToolHandoff as Record<string, unknown>).usage,
+      { inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 });
+    await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
+      verifiedPendingToolUseIds: ["toolu_not_in_model"] }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
+    await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
+      verifiedPendingToolUseIds: ["toolu_A"] }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();

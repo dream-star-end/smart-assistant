@@ -216,6 +216,9 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   order. A fixed pending-file reader and no-clobber result-file staging plan
   also exist; neither is connected to a live durable resume CAS yet, so they
   do **not** publish tools in production or grant Box execution permission.
+  A first-round journal CAS can now persist the full model tool-use set, exact
+  usage and verified pending subset and return a durable handoff revision;
+  no HTTP stream calls it yet, and arbitrary later rounds remain unimplemented.
 - Before **each** round's terminal SSE (tool-use or final text), persist exact
   observed usage and the frozen pricing basis bound to its stable billing ID.
   The existing per-HTTP `request_finalize_journal` must carry a Box durable

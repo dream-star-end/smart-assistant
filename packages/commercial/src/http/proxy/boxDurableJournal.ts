@@ -1,11 +1,13 @@
 /** Box invocation fence on the existing request_finalize_journal.ctx JSONB.
  * No schema change. This is deliberately stricter than HTTP idempotency: an
  * identical body in one signed turn remains ambiguous and is never re-run. */
+import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import type { BoxTerminalProof } from "./boxTerminalProof.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
+import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming"];
 
@@ -38,6 +40,9 @@ export interface BoxJournalPort {
     { phase: string }): Promise<void>;
   complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
+  recordToolHandoff?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
+    { candidate: BoxToolHandoffCandidate;
+      verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof>;
 }
 
 function goodId(input: BoxJournalAdmission): void {
@@ -170,5 +175,57 @@ export class BoxDurableJournal implements BoxJournalPort {
         JSON.stringify({ boxState: "terminal", boxUsage: u, boxTerminalProof: input.proof }),
         input.proof.runNonce]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_COMPLETE_FENCE_LOST");
+  }
+
+  /** The full model set and exact round usage must commit before the first
+   * tool-use terminal SSE. A pending subset proves the CLI began dispatch;
+   * later sidecar calls may appear only after earlier tool results. */
+  async recordToolHandoff(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
+    { candidate: BoxToolHandoffCandidate;
+      verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof> {
+    const candidate = input.candidate;
+    const toolUses = candidate && Array.isArray(candidate.toolUses) ? candidate.toolUses : [];
+    const ids = toolUses.map((use) => use?.id ?? "");
+    const pending = input.verifiedPendingToolUseIds;
+    const usage = { inputTokens: candidate?.inputTokens,
+      outputTokens: candidate?.outputTokens,
+      cacheReadTokens: candidate?.cacheReadTokens,
+      cacheWriteTokens: candidate?.cacheWriteTokens };
+    if (!candidate || typeof candidate.messageId !== "string"
+      || candidate.messageId.length < 1 || candidate.messageId.length > 128
+      || ids.length < 1 || ids.length > 32 || new Set(ids).size !== ids.length
+      || ids.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))
+      || toolUses.some((use) => !use
+        || !/^mcp__ocbridge__t[0-9]{1,3}$/.test(use.boxName)
+        || typeof use.clientName !== "string" || use.clientName.length < 1
+        || !use.input || typeof use.input !== "object" || Array.isArray(use.input))
+      || !Array.isArray(pending) || pending.length < 1
+      || pending.length > ids.length || new Set(pending).size !== pending.length
+      || pending.some((id) => !ids.includes(id))
+      || Object.values(usage).some((n) => !Number.isSafeInteger(n) || Number(n) < 0)) {
+      throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
+    }
+    const pendingIds = [...pending];
+    const frozen = { version: 1, roundNo: 1, messageId: candidate.messageId,
+      toolUses, verifiedPendingToolUseIds: pendingIds, usage };
+    let encoded: string;
+    try { encoded = JSON.stringify(frozen); }
+    catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
+    if (Buffer.byteLength(encoded) > 8 * 1024 * 1024) {
+      throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_TOO_LARGE");
+    }
+    const durableRevision = randomUUID();
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx = ctx || $4::jsonb, updated_at = NOW()
+        WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
+          AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxState' = 'running'
+          AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'`,
+      [input.requestId, input.uid.toString(), input.leaseEpoch,
+        JSON.stringify({ boxState: "handoff", boxHandoffRevision: durableRevision,
+          boxToolHandoff: frozen })]);
+    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_FENCE_LOST");
+    return { durableRevision, journaledToolUseIds: ids,
+      verifiedPendingToolUseIds: pendingIds };
   }
 }
