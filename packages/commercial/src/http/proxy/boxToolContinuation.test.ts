@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
@@ -45,16 +46,27 @@ const finalRecords = [
     usage: { input_tokens: 10, output_tokens: 12 } },
 ];
 const raw = (records: unknown[]) => Buffer.from(records.map((x) => JSON.stringify(x) + "\n").join(""));
+const localResult = "OpenClaude user-container result";
+const echoRecord = { type: "user", message: { role: "user", content: [
+  { type: "tool_result", tool_use_id: "toolu_prior_a", content: localResult },
+] } };
+const echoHash = createHash("sha256").update(JSON.stringify({
+  content: [{ type: "text", text: localResult }], isError: false })).digest("hex");
 
-function fixture(kind: "tool" | "final", failComplete = false, trailing = false) {
+function fixture(kind: "tool" | "final", failComplete = false,
+  trailing = false, omitEcho = false) {
   const sequence: string[] = [], emitted: string[] = [];
   let retained = false;
   const claim = { ownerRequestId: "box-owner", accountId: 20n,
     runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
     spoolOffset: 1234, roundNo: 2, detachedRunnerHash: "c".repeat(64),
     catalogHash: catalog.bindingSha256, durableRevision: "synthetic-revision",
-    toolUses: [], results: [] };
-  const bytes = Buffer.concat([raw(kind === "tool" ? toolRecords : finalRecords),
+    toolUses: [{ id: "toolu_prior_a", boxName, clientName: "local_echo",
+      inputHash: "f".repeat(64) }],
+    results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: localResult }],
+      isError: false, contentHash: echoHash }] };
+  const bytes = Buffer.concat([raw([...(omitEcho ? [] : [echoRecord]),
+    ...(kind === "tool" ? toolRecords : finalRecords)]),
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
   const proof = { runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch,
     keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 };
@@ -144,4 +156,16 @@ test("post-success spool bytes block terminal journal and final SSE", async () =
   assert.ok(!f.sequence.includes("terminal-journal"));
   assert.ok(!f.emitted.join("").includes("event: message_stop"));
   assert.equal(f.retained, true);
+});
+
+test("missing tool-result echo blocks both next tool and final model rounds", async () => {
+  for (const kind of ["tool", "final"] as const) {
+    const f = fixture(kind, false, false, true);
+    await assert.rejects(() => runBoxToolContinuation(f.input, f.deps),
+      /BOX_TOOL_ECHO_INCOMPLETE/);
+    assert.ok(f.sequence.includes("unknown"));
+    assert.ok(!f.sequence.includes("durable-handoff"));
+    assert.ok(!f.sequence.includes("terminal-journal"));
+    assert.equal(f.retained, true);
+  }
 });

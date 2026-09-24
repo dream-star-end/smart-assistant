@@ -6,6 +6,7 @@ import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
+import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
@@ -82,8 +83,25 @@ export async function runBoxToolContinuation(input: {
     }
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
       { alreadyInitialized: true, allowFinal: true });
+    const echo = new BoxToolResultEcho(claim.results);
+    let modelStarted = false;
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access,
       startOffset: claim.spoolOffset, deadlineMs: budget, signal })) {
+      let record: unknown;
+      try { record = JSON.parse(line.text); }
+      catch { throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_RECORD_INVALID"); }
+      if (record && typeof record === "object" && !Array.isArray(record)
+        && (record as { type?: unknown }).type === "user") {
+        if (modelStarted) throw new BoxToolContinuationError("BOX_TOOL_ECHO_AFTER_MODEL");
+        echo.accept(record);
+        continue;
+      }
+      if (record && typeof record === "object" && !Array.isArray(record)
+        && (record as { type?: unknown }).type === "stream_event"
+        && (record as { event?: { type?: unknown } }).event?.type === "message_start") {
+        echo.assertComplete();
+        modelStarted = true;
+      }
       const decoded = decoder.push(line.text);
       if (decoded.sse) input.emit(decoded.sse);
       if (decoded.candidate) {
