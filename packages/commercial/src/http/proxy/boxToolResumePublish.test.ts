@@ -110,3 +110,35 @@ test("same-turn cancellation and late pinned resolver completion retain the targ
   assert.equal(f.writes, 0);
   assert.ok(f.sequence.includes("unknown"));
 });
+
+test("out-of-order pending B is published before dependent A without replay", async () => {
+  const f = fixture();
+  const b = "toolu_synthetic_b";
+  f.claim.toolUses.push({ ...f.claim.toolUses[0]!, id: b });
+  f.claim.results.push({ ...f.claim.results[0]!, modelToolUseId: b });
+  let bPublished = false;
+  const published: string[] = [];
+  f.target.exec.run = async (request: { args: string[] }) => {
+    const args = request.args;
+    if (args[1]?.includes("pending.")) {
+      const pendingId = args[3];
+      if (pendingId === id && !bPublished) {
+        throw new BoxExecTransportError("synthetic missing pending", true, 1);
+      }
+      return { stdout: JSON.stringify({ version: 1, modelToolUseId: pendingId,
+        mcpRequestId: pendingId === b ? 8 : 7, name: "t0", arguments: toolInput }),
+      stderrBytes: 0, exitCode: 0 as const };
+    }
+    const path = args[4] ?? "";
+    if (args.length === 7 && path.includes("/result.")) {
+      const resultId = path.includes(b) ? b : id;
+      published.push(resultId);
+      if (resultId === b) bPublished = true;
+    }
+    return { stdout: `${args.at(-1) ?? "written"}\n`, stderrBytes: 0,
+      exitCode: 0 as const };
+  };
+  await publishBoxToolResume(f.input, f.deps);
+  assert.deepEqual(published, [b, id]);
+  assert.equal(f.retained, false);
+});

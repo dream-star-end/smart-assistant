@@ -132,33 +132,46 @@ export async function publishBoxToolResume(input: {
       return race(target.exec.run(request, { timeoutMs, maxResponseBytes: 1_048_576,
         signal }));
     };
-    for (let i = 0; i < claim.toolUses.length; i++) {
-      const expected = claim.toolUses[i]!, matched = claim.results[i]!;
-      if (matched.modelToolUseId !== expected.id) {
-        throw new BoxToolResumePublishError("BOX_TOOL_RESUME_RESULT_ORDER_INVALID");
-      }
-      // MCP may dispatch later calls only after an earlier result arrives.
-      // Pending reads are side-effect free; result writes are never repeated.
-      const pendingUntil = Date.now() + Math.min(30_000, budget);
-      let pending: ReturnType<typeof parseBoxPendingCall> | null = null;
-      while (!pending && Date.now() < pendingUntil && !signal.aborted) {
+    const remaining = new Map(claim.toolUses.map((expected, i) =>
+      [expected.id, { expected, matched: claim!.results[i]! }] as const));
+    if (remaining.size !== claim.toolUses.length) {
+      throw new BoxToolResumePublishError("BOX_TOOL_RESUME_RESULT_ORDER_INVALID");
+    }
+    let idleUntil = Date.now() + Math.min(30_000, budget);
+    while (remaining.size > 0) {
+      let progressed = false;
+      for (const [id, { expected, matched }] of remaining) {
+        if (matched.modelToolUseId !== expected.id) {
+          throw new BoxToolResumePublishError("BOX_TOOL_RESUME_RESULT_ORDER_INVALID");
+        }
+        // The CLI may dispatch any subset first. Scan every remaining ID; a
+        // pending read is side-effect free, but a result file is published once.
+        let pending: ReturnType<typeof parseBoxPendingCall>;
         try {
           const read = await run(makeBoxPendingRead(access.cwd, expected.id));
           pending = parseBoxPendingCall(read.stdout, expected);
         } catch (error) {
-          if (!(error instanceof BoxExecTransportError && error.terminalKnown)) throw error;
-          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          if (error instanceof BoxExecTransportError && error.terminalKnown) continue;
+          throw error;
         }
+        const staged = makeBoxToolResultPlan({ cwd: access.cwd, expected,
+          pending, matched });
+        for (let j = 0; j < staged.requests.length; j++) {
+          const published = await run(staged.requests[j]!);
+          if (j === staged.requests.length - 1
+            && published.stdout.trim() !== staged.resultHash) {
+            throw new BoxToolResumePublishError("BOX_TOOL_RESULT_PUBLISH_UNPROVEN");
+          }
+        }
+        remaining.delete(id);
+        progressed = true;
+        idleUntil = Date.now() + Math.min(30_000, budget);
       }
-      if (!pending) throw new BoxToolResumePublishError("BOX_TOOL_RESUME_PENDING_UNPROVEN");
-      const staged = makeBoxToolResultPlan({ cwd: access.cwd, expected,
-        pending, matched });
-      for (let j = 0; j < staged.requests.length; j++) {
-        const published = await run(staged.requests[j]!);
-        if (j === staged.requests.length - 1
-          && published.stdout.trim() !== staged.resultHash) {
-          throw new BoxToolResumePublishError("BOX_TOOL_RESULT_PUBLISH_UNPROVEN");
+      if (!progressed) {
+        if (signal.aborted || Date.now() >= idleUntil) {
+          throw new BoxToolResumePublishError("BOX_TOOL_RESUME_PENDING_UNPROVEN");
         }
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
       }
     }
     return { claim, access, target };
