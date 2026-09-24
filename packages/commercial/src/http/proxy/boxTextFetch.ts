@@ -30,6 +30,7 @@ export class BoxTextFetch {
     { done: boolean; pending: Promise<void> | null }>();
   constructor(private readonly deps: {
     supervisorAsset: Buffer;
+    keeperAsset: Buffer;
     registry: BoxInvocationRegistry;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
@@ -101,7 +102,8 @@ export class BoxTextFetch {
     const cap = this.deps.maxOutputTokensForModel(body.model);
     if (cap === null) throw new BoxTextFetchError("BOX_MODEL_NOT_CONFIGURED");
     const plan = makeBoxTextPlan({ body, upstreamModel: body.model,
-      maxOutputTokensLimit: cap, supervisorAsset: this.deps.supervisorAsset });
+      maxOutputTokensLimit: cap, supervisorAsset: this.deps.supervisorAsset,
+      keeperAsset: this.deps.keeperAsset });
     const now = this.deps.now ?? Date.now;
     const budgetMs = this.deps.budgetMs ?? 600_000;
     if (!Number.isSafeInteger(budgetMs) || budgetMs < MIN_RUN_BUDGET_MS || budgetMs > 900_000) {
@@ -213,15 +215,20 @@ export class BoxTextFetch {
         if (supervisor.stdout.trim() !== plan.supervisorHash) {
           throw new BoxTextFetchError("BOX_SUPERVISOR_STAGE_INVALID");
         }
+        const keeper = await exec(plan.stageKeeper, 20_000);
+        if (keeper.stdout.trim() !== plan.keeperHash) {
+          throw new BoxTextFetchError("BOX_KEEPER_STAGE_INVALID");
+        }
         inputStageStarted = true;
         for (const step of plan.stageInputs) await exec(step, 20_000);
       } catch (error) {
         const provenStageTerminal = (error instanceof BoxExecTransportError && error.terminalKnown)
-          || (error instanceof BoxTextFetchError && error.code === "BOX_SUPERVISOR_STAGE_INVALID");
+          || (error instanceof BoxTextFetchError && (error.code === "BOX_SUPERVISOR_STAGE_INVALID"
+            || error.code === "BOX_KEEPER_STAGE_INVALID"));
         if (!provenStageTerminal) {
           await markUnknown("staging_unknown");
         } else if (!inputStageStarted) {
-          // Only the global content-addressed supervisor asset was touched;
+          // Only global content-addressed supervisor/keeper assets were touched;
           // no private cwd or model process exists to clean up.
           this.deps.registry.confirmRemoteStopped(lease);
         } else if (await cleanupKnown()) {

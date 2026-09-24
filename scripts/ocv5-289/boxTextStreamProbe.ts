@@ -26,6 +26,7 @@ function requireAck(): void {
 async function main(): Promise<void> {
   requireAck();
   const supervisorAsset = readFileSync(new URL("./box_supervisor.py", import.meta.url));
+  const keeperAsset = readFileSync(new URL("./box_keeper.py", import.meta.url));
   const resolver: BoxAccountResolver = createProductionBoxAccountResolver();
   const registry = new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
     leaseMs: 900_000 });
@@ -34,7 +35,7 @@ async function main(): Promise<void> {
   const startedAt = process.hrtime.bigint();
   let modelTerminalAt: bigint | null = null;
   let unknown: string | null = null;
-  const service = new BoxTextFetch({ supervisorAsset, registry, budgetMs: 600_000,
+  const service = new BoxTextFetch({ supervisorAsset, keeperAsset, registry, budgetMs: 600_000,
     maxOutputTokensForModel: (model) => model === MODEL ? 128_000 : null,
     resolveTarget: async (args) => {
       const target = await resolver.resolve(args);
@@ -43,7 +44,7 @@ async function main(): Promise<void> {
         throw new Error("BOX_PROBE_ACCOUNT_MISMATCH");
       }
       return { ...target, exec: { run: async (request, opts) => {
-        const modelRun = request.args[0]?.startsWith("/tmp/ocv5-289-supervisor-");
+        const modelRun = request.args[0]?.startsWith("/tmp/ocv5-289-keeper-");
         const result = await target.exec.run(request, opts);
         if (modelRun) modelTerminalAt = process.hrtime.bigint();
         return result;

@@ -42,7 +42,7 @@ class SpyRegistry extends BoxInvocationRegistry {
   }
 }
 type Runner = Pick<BoxExecTransport, "run">;
-function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cleanup";
+function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "cleanup";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
@@ -53,13 +53,18 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cl
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
     active++; maxActive = Math.max(maxActive, active);
     await new Promise((resolve) => setTimeout(resolve, 1));
-    const isModel = request.args[0]?.startsWith("/tmp/ocv5-289-supervisor-");
+    const isModel = request.args[0]?.startsWith("/tmp/ocv5-289-keeper-");
     const isSupervisor = request.args[2]?.startsWith("/tmp/ocv5-289-supervisor-");
+    const isKeeper = request.args[2]?.startsWith("/tmp/ocv5-289-keeper-");
     const isCleanup = request.args[1]?.includes("print('clean')");
-    const phase = isModel ? "model" : isSupervisor ? "supervisor" : isCleanup ? "cleanup" : "stage";
+    const phase = isModel ? "model" : isSupervisor ? "supervisor"
+      : isKeeper ? "keeper" : isCleanup ? "cleanup" : "stage";
     stages.push(phase);
     active--;
     if (phase === "stage") opts.advanceAtStage?.();
+    if (phase === "keeper" && opts.failPhase === "keeper_known") {
+      throw new BoxExecTransportError("BOX_EXEC_REMOTE_EXIT", true, 1);
+    }
     if (opts.failPhase === phase) throw new BoxExecTransportError("BOX_EXEC_TRANSPORT_UNKNOWN", false);
     if (phase === "stage" && opts.failPhase === "stage_typeerror") {
       throw new TypeError("getReader locked before terminal frame");
@@ -83,11 +88,12 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cl
       } else options.onStdout?.(output);
       return ok(output);
     }
-    if (isSupervisor) return ok(request.args[4]);
+    if (isSupervisor || isKeeper) return ok(request.args[4]);
     if (isCleanup) return ok("clean\n");
     return ok();
   } };
   const service = new BoxTextFetch({ supervisorAsset: Buffer.from("#!/usr/bin/python3\nprint('fixture')\n"),
+    keeperAsset: Buffer.from("#!/usr/bin/python3\nprint('keeper fixture')\n"),
     registry, maxOutputTokensForModel: (value) => value === model ? 128_000 : null,
     resolveTarget: async () => {
       if (opts.resolverThrow) throw new Error("raw credential detail must not leak");
@@ -203,6 +209,25 @@ test("unknown stage never starts model or cleans, and holds account capacity", a
   f.registry.confirmRemoteStopped(f.registry.last!); // test-only authoritative fence
 });
 
+test("unknown keeper stage holds capacity; known remote keeper failure releases before model", async () => {
+  const unknown = fixture({ failPhase: "keeper" });
+  await assert.rejects(unknown.service.fetch(input),
+    (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_STAGING_FAILED");
+  assert.ok(unknown.stages.includes("keeper") && !unknown.stages.includes("model"));
+  assert.ok(!unknown.stages.includes("cleanup"));
+  assert.deepEqual(unknown.unknowns, ["staging_unknown"]);
+  assert.deepEqual(unknown.registry.counts(3n, 20n), { user: 1, account: 1 });
+  unknown.registry.confirmRemoteStopped(unknown.registry.last!);
+
+  const known = fixture({ failPhase: "keeper_known" });
+  await assert.rejects(known.service.fetch(input),
+    (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_STAGING_FAILED");
+  assert.ok(known.stages.includes("keeper") && !known.stages.includes("model"));
+  assert.deepEqual(known.unknowns, []);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(known.registry.counts(3n, 20n), { user: 0, account: 0 });
+});
+
 test("unclassified stage reader error defaults to unknown, never cleanup/release", async () => {
   const f = fixture({ failPhase: "stage_typeerror" });
   await assert.rejects(f.service.fetch(input),
@@ -299,7 +324,7 @@ test("a resolver that completes after abort releases its private target without 
   let closed = 0;
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 });
   const service = new BoxTextFetch({
-    supervisorAsset: Buffer.from("fixture"), registry,
+    supervisorAsset: Buffer.from("fixture"), keeperAsset: Buffer.from("keeper"), registry,
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: () => new Promise((resolve) => { finish = resolve; }),
     onUnknown: async () => {},
@@ -320,7 +345,7 @@ test("failed orphan close retains ownership for explicit retry", async () => {
   let finish!: (target: { accountId: bigint; exec: Runner; dispose: () => void }) => void;
   let calls = 0;
   const service = new BoxTextFetch({
-    supervisorAsset: Buffer.from("fixture"),
+    supervisorAsset: Buffer.from("fixture"), keeperAsset: Buffer.from("keeper"),
     registry: new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }),
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: () => new Promise((resolve) => { finish = resolve; }),

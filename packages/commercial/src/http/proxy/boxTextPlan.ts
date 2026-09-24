@@ -19,11 +19,13 @@ export interface BoxTextPlan {
   readonly sessionId: string;
   readonly expectedModel: string;
   readonly stageSupervisor: BoxCcExecRequest;
+  readonly stageKeeper: BoxCcExecRequest;
   /** Execute in order; never retry an ambiguous partial write. */
   readonly stageInputs: readonly BoxCcExecRequest[];
   readonly run: BoxCcExecRequest;
   readonly cleanup: BoxCcExecRequest;
   readonly supervisorHash: string;
+  readonly keeperHash: string;
   readonly snapshotHash: string | null;
   readonly stdinHash: string;
   readonly systemHash: string;
@@ -56,12 +58,14 @@ export function makeBoxTextPlan(input: {
   /** Model-specific verified output cap, supplied by the catalog route. */
   maxOutputTokensLimit: number;
   supervisorAsset: Buffer;
+  keeperAsset: Buffer;
   runNonce?: string;
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body);
   if (unsupported) throw new BoxTextPlanError(unsupported);
   if (!/^claude-[a-z0-9-]{3,64}$/.test(input.upstreamModel)
     || input.supervisorAsset.length === 0 || input.supervisorAsset.length > 32768
+    || input.keeperAsset.length === 0 || input.keeperAsset.length > 32768
     || !Number.isSafeInteger(input.maxOutputTokensLimit) || input.maxOutputTokensLimit < 1
     || !Number.isSafeInteger(input.body.max_tokens) || input.body.max_tokens < 1) {
     throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
@@ -76,6 +80,8 @@ export function makeBoxTextPlan(input: {
     { cwd, cliVersion: "2.1.280" });
   const supervisorHash = sha(input.supervisorAsset);
   const supervisorPath = `/tmp/ocv5-289-supervisor-${supervisorHash.slice(0, 16)}.py`;
+  const keeperHash = sha(input.keeperAsset);
+  const keeperPath = `/tmp/ocv5-289-keeper-${keeperHash.slice(0, 16)}.py`;
   const hasHistory = mapped.snapshotJsonl.length > 0;
   const project = hasHistory ? `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}` : "";
   const snapshotPath = hasHistory ? `${project}/${mapped.sessionId}.jsonl` : "";
@@ -90,6 +96,10 @@ export function makeBoxTextPlan(input: {
     command: PYTHON, args: ["-c", STAGE_SUPERVISOR, supervisorPath,
       input.supervisorAsset.toString("base64"), supervisorHash], cwd: "/tmp", environment: BASE_ENV,
   };
+  const stageKeeper: BoxCcExecRequest = {
+    command: PYTHON, args: ["-c", STAGE_SUPERVISOR, keeperPath,
+      input.keeperAsset.toString("base64"), keeperHash], cwd: "/tmp", environment: BASE_ENV,
+  };
   const staged = makeBoxStageFiles({ cwd, project,
     files: [
       ...(hasHistory ? [{ path: snapshotPath, raw: snapshot, hash: snapshotHash! }] : []),
@@ -98,7 +108,7 @@ export function makeBoxTextPlan(input: {
     ] });
   const run: BoxCcExecRequest = {
     command: PYTHON,
-    args: [supervisorPath, "--deadline", "110", "--kill-after", "2",
+    args: [keeperPath, supervisorPath, "--deadline", "110", "--kill-after", "2",
       "--max-output", "1048576", "--stdin-file", stdinPath,
       "--stdin-sha256", stdinHash, "--", MODEL, "-p", "--model", input.upstreamModel,
       "--input-format", "stream-json", "--output-format", "stream-json",
@@ -116,6 +126,7 @@ export function makeBoxTextPlan(input: {
   };
   const cleanup = staged.cleanup;
   return { cwd, sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
-    stageSupervisor, stageInputs: staged.requests, run, cleanup, supervisorHash,
+    stageSupervisor, stageKeeper, stageInputs: staged.requests, run, cleanup,
+    supervisorHash, keeperHash,
     snapshotHash, stdinHash, systemHash };
 }
