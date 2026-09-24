@@ -59,6 +59,13 @@ export interface BoxToolResumeClaim {
   readonly results: readonly BoxMatchedToolResult[];
   readonly toolUses: readonly BoxToolUseDigest[];
 }
+export interface BoxRemoteCleanupCandidate {
+  readonly requestId: string;
+  readonly uid: bigint;
+  readonly accountId: bigint;
+  readonly runNonce: string;
+  readonly leaseEpoch: string;
+}
 
 export interface BoxJournalPort {
   admit(input: BoxJournalAdmission): Promise<void>;
@@ -536,5 +543,71 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
     }
+  }
+
+  /** Read-only candidate selection for restart-safe privacy cleanup. Terminal
+   * proof is revalidated before any caller may touch Box remote files. */
+  async listRemoteCleanupCandidates(limit = 10): Promise<BoxRemoteCleanupCandidate[]> {
+    const found = await this.pool.query<{ request_id: string; user_id: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
+        WHERE ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
+          AND state IN ('inflight','finalizing','committed')
+        ORDER BY updated_at ASC LIMIT $1`,
+      [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
+    const candidates: BoxRemoteCleanupCandidate[] = [];
+    for (const row of found.rows) {
+      const ctx = row.ctx;
+      if (!ctx || typeof ctx.boxRunNonce !== "string"
+        || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+        || typeof ctx.boxLeaseEpoch !== "string"
+        || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
+        || typeof ctx.boxAccountId !== "string"
+        || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+        || !/^[1-9][0-9]{0,19}$/.test(row.user_id)) continue;
+      try {
+        const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
+          { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
+        if (proof.reason !== "worker_complete") continue;
+        candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
+          accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
+          leaseEpoch: ctx.boxLeaseEpoch });
+      } catch { /* Corrupt proof is manual, never automatic cleanup. */ }
+    }
+    return candidates;
+  }
+
+  async markRemoteCleaned(input: BoxRemoteCleanupCandidate): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
+      || input.uid <= 0n || input.accountId <= 0n
+      || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
+    }
+    const params = [input.requestId, input.uid.toString(), input.accountId.toString(),
+      input.runNonce, input.leaseEpoch];
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb, updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
+          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ctx->'boxTerminalProof'->>'runNonce'=$4
+          AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
+          AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
+          AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'`, params);
+    if (changed.rowCount === 1) return;
+    const already = await this.pool.query(
+      `SELECT 1 FROM request_finalize_journal
+        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
+          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ctx->'boxTerminalProof'->>'runNonce'=$4
+          AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
+          AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
+          AND ctx->>'boxRemoteCleanup'='done'`, params);
+    if (already.rowCount !== 1) throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");
   }
 }

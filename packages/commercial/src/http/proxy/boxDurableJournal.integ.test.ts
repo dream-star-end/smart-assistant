@@ -347,6 +347,21 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       cacheReadTokens: candidate.cacheReadTokens, cacheWriteTokens: candidate.cacheWriteTokens });
     assert.deepEqual(closed.rows.find((row) => row.request_id === `box-e-${suffix}`)?.ctx.boxUsage,
       finalUsage);
+    const cleanupCandidates = await journal.listRemoteCleanupCandidates();
+    assert.ok(cleanupCandidates.some((item) => item.requestId === input.requestId));
+    const finalCleanup = cleanupCandidates.find((item) =>
+      item.requestId === `box-e-${suffix}`);
+    assert.ok(finalCleanup);
+    assert.ok(!cleanupCandidates.some((item) => item.requestId === toolCall.requestId),
+      "handoff ancestors have no independent terminal proof");
+    await assert.rejects(() => journal.markRemoteCleaned({ ...finalCleanup!,
+      accountId: 21n }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_CLEANUP_FENCE_LOST");
+    await journal.markRemoteCleaned(finalCleanup!);
+    await journal.markRemoteCleaned(finalCleanup!);
+    assert.ok(!(await journal.listRemoteCleanupCandidates()).some((item) =>
+      item.requestId === `box-e-${suffix}`));
     await assert.rejects(() => journal.completeToolChain({
       requestId: `box-e-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
       proof: chainProof, usage: { ...finalUsage, outputTokens: 999 } }),
