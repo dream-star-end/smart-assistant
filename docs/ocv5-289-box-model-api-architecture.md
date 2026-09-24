@@ -109,6 +109,16 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   matched the pending MCP call, the locally chosen result was returned exactly,
   and the supervised invocation exited successfully. This is protocol evidence,
   **not** a claim that multi-tool or cross-HTTP production handoff is complete.
+  An offline real CC 2.1.280 two-tool stream showed `assistant` snapshots
+  interleaved with `content_block_delta`/`content_block_stop`, then one
+  `message_delta(tool_use)` and `message_stop` **before** the two MCP results
+  appeared. The first HTTP response may expose progressive blocks, but must
+  withhold terminal SSE until the complete model message, the exact per-ID
+  sidecar pending records and the durable handoff journal all agree. The CLI
+  then produced a second `message_start` in the same process after both local
+  results. In this observed run CC dispatched the two MCP calls sequentially;
+  the sidecar's reverse-order parallel unit test is a capability test, not an
+  assertion about that run's scheduling.
 - The held CLI is owned by a **cross-HTTP Box invocation lease**, not by the
   first request's abort signal or finalizer. Normal `message_stop`/`res.end`
   after exporting tool_use must leave the supervised CLI and account-capacity
