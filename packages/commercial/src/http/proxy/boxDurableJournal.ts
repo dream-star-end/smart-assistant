@@ -12,6 +12,7 @@ import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { matchBoxToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
+import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming"];
 
@@ -234,6 +235,9 @@ export class BoxDurableJournal implements BoxJournalPort {
     catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
     const frozen = { version: 1, roundNo: 1, messageId: candidate.messageId,
       toolUses: digests, verifiedPendingToolUseIds: pendingIds, usage };
+    if (!parseBoxStoredToolHandoff(frozen)) {
+      throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
+    }
     let encoded: string;
     try { encoded = JSON.stringify(frozen); }
     catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
@@ -294,18 +298,9 @@ export class BoxDurableJournal implements BoxJournalPort {
         || Array.isArray(ctx.boxToolHandoff)) {
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
       }
-      const handoff = ctx.boxToolHandoff as Record<string, unknown>;
-      if (handoff.version !== 1 || handoff.roundNo !== 1
-        || !Array.isArray(handoff.toolUses) || handoff.toolUses.length < 1
-        || handoff.toolUses.length > 32) {
-        throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
-      }
-      const digests = handoff.toolUses as BoxToolUseDigest[];
-      if (digests.some((use) => !use || typeof use.inputHash !== "string"
-        || !/^[a-f0-9]{64}$/.test(use.inputHash)
-        || Object.hasOwn(use, "input"))) {
-        throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
-      }
+      const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+      if (!handoff) throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
+      const digests = handoff.toolUses;
       let results: readonly BoxMatchedToolResult[];
       try { results = matchBoxToolResults(input.canonicalBody,
         digests); }

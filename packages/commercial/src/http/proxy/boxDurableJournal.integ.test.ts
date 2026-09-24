@@ -153,6 +153,26 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         { role: "user", content: [resumeBody.messages[1]!.content[0]!] }] } }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_RESULT_MISMATCH");
+    await client.query(`UPDATE request_finalize_journal SET
+      ctx=jsonb_set(ctx,'{boxToolHandoff,toolUses,1,id}','"toolu_A"'::jsonb)
+      WHERE request_id=$1`, [toolCall.requestId]);
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_OWNER_INVALID");
+    await client.query(`UPDATE request_finalize_journal SET
+      ctx=jsonb_set(ctx,'{boxToolHandoff,toolUses,1,id}','"toolu_B"'::jsonb)
+      WHERE request_id=$1`, [toolCall.requestId]);
+    await client.query(`UPDATE request_finalize_journal SET
+      ctx=jsonb_set(ctx,'{boxToolHandoff,verifiedPendingToolUseIds}',
+        '["toolu_A","toolu_A"]'::jsonb) WHERE request_id=$1`, [toolCall.requestId]);
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_OWNER_INVALID");
+    await client.query(`UPDATE request_finalize_journal SET
+      ctx=jsonb_set(ctx,'{boxToolHandoff,verifiedPendingToolUseIds}',
+        '["toolu_A"]'::jsonb) WHERE request_id=$1`, [toolCall.requestId]);
     const resumed = await journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody });
     assert.equal(resumed.ownerRequestId, toolCall.requestId);

@@ -7,6 +7,7 @@ import { claimInflightJournalForSettlement, finalizeInflightJournal,
   settleUsageAndLedger } from "./proxyBilling.js";
 import { parseBoxBillingContext } from "../http/proxy/boxBillingContext.js";
 import { parseBoxTerminalProof } from "../http/proxy/boxTerminalProof.js";
+import { parseBoxStoredToolHandoff } from "../http/proxy/boxStoredToolHandoff.js";
 
 const STALE_CLAIM_MS = 5 * 60_000;
 const LIVE_FINALIZER_GRACE_MS = 5 * 60_000;
@@ -40,29 +41,9 @@ function evidence(row: JournalRow): { usage: TokenUsage;
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(ctx.boxHandoffRevision)
       || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
       || Array.isArray(ctx.boxToolHandoff)) return null;
-    const h = ctx.boxToolHandoff as Record<string, unknown>;
-    const toolUses = h.toolUses, pendingIds = h.verifiedPendingToolUseIds;
-    if (h.version !== 1 || h.roundNo !== 1
-      || typeof h.messageId !== "string" || h.messageId.length < 1
-      || !Array.isArray(toolUses) || toolUses.length < 1 || toolUses.length > 32
-      || !Array.isArray(pendingIds) || pendingIds.length < 1
-      || Array.from({ length: toolUses.length }, (_, index) => index)
-        .some((index) => !Object.hasOwn(toolUses, index))
-      || Array.from({ length: pendingIds.length }, (_, index) => index)
-        .some((index) => !Object.hasOwn(pendingIds, index))
-      || toolUses.some((use: unknown) => {
-        if (!use || typeof use !== "object" || Array.isArray(use)) return true;
-        const item = use as Record<string, unknown>;
-        return Object.keys(item).sort().join(",") !== "boxName,clientName,id,inputHash"
-          || typeof item.id !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.id)
-          || typeof item.boxName !== "string" || !/^mcp__ocbridge__t[0-9]{1,3}$/.test(item.boxName)
-          || typeof item.clientName !== "string" || item.clientName.length < 1
-          || typeof item.inputHash !== "string" || !/^[a-f0-9]{64}$/.test(item.inputHash);
-      })
-      || pendingIds.some((id: unknown) =>
-        !toolUses.some((use: unknown) =>
-          !!use && typeof use === "object" && (use as { id?: unknown }).id === id))) return null;
-    source = h.usage;
+    const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+    if (!handoff) return null;
+    source = handoff.usage;
   } else {
     if (ctx.boxState !== "terminal" || !ctx.boxTerminalProof) return null;
     let proof: ReturnType<typeof parseBoxTerminalProof>;
