@@ -45,6 +45,7 @@ export interface BoxJournalAdmission {
   fingerprint: BoxCallFingerprint;
   runNonce: string;
   leaseEpoch: string;
+  invocationMode?: "text" | "detached_tool";
 }
 export interface BoxToolResumeClaim {
   readonly ownerRequestId: string;
@@ -65,6 +66,7 @@ export interface BoxRemoteCleanupCandidate {
   readonly accountId: bigint;
   readonly runNonce: string;
   readonly leaseEpoch: string;
+  readonly proof: BoxTerminalProof;
 }
 
 export interface BoxJournalPort {
@@ -97,6 +99,8 @@ function goodId(input: BoxJournalAdmission): void {
     || !/^[a-f0-9]{64}$/.test(input.fingerprint.requestHash)
     || !/^[a-f0-9]{64}$/.test(input.fingerprint.turnKey)
     || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.fingerprint.sessionId)
+    || (input.invocationMode !== undefined && input.invocationMode !== "text"
+      && input.invocationMode !== "detached_tool")
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -133,6 +137,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         [ACTIVE, input.accountId.toString(), input.uid.toString(), input.fingerprint.sessionId]);
       if (occupied.rowCount) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       const identity = { boxInvocationRecovery: "v1", boxState: "reserved",
+        boxInvocationMode: input.invocationMode ?? "text",
         boxAccountId: input.accountId.toString(),
         boxReplayFingerprint: input.fingerprint.replayFingerprint,
         boxRequestHash: input.fingerprint.requestHash,
@@ -292,6 +297,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           SET ctx = ctx || $4::jsonb, updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
           AND ctx->>'boxLeaseEpoch' = $3
+          AND ctx->>'boxInvocationMode' = 'detached_tool'
           AND ((($5::int = 1) AND ctx->>'boxState' = 'running')
             OR (($5::int > 1) AND ctx->>'boxState' = 'linked'
               AND ctx->>'boxRoundNo' = $5::text
@@ -343,6 +349,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (owners.rows.length !== 1) throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
       const owner = owners.rows[0]!, ctx = owner.ctx;
       if (ctx.model !== input.canonicalModel
+        || ctx.boxInvocationMode !== "detached_tool"
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
         || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
         || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
@@ -400,6 +407,7 @@ export class BoxDurableJournal implements BoxJournalPort {
             AND NOT (ctx ? 'boxState') RETURNING ctx`,
         [input.requestId, input.uid.toString(), input.canonicalModel,
           JSON.stringify({ boxState: "linked", boxOwnerRequestId: owner.request_id,
+            boxInvocationMode: "detached_tool",
             boxAccountId: ctx.boxAccountId, boxRunNonce: ctx.boxRunNonce,
             boxLeaseEpoch: ctx.boxLeaseEpoch, boxTurnKey: fingerprint.turnKey,
             boxResumeSpoolOffset: handoff.spoolOffset,
@@ -471,6 +479,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         const row: Row | undefined = found.rows[0];
         if (found.rowCount !== 1 || !row || !row.ctx
           || row.ctx.boxInvocationRecovery !== "v1"
+          || row.ctx.boxInvocationMode !== "detached_tool"
           || row.ctx.boxRunNonce !== input.proof.runNonce
           || row.ctx.boxLeaseEpoch !== input.leaseEpoch) {
           throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
@@ -545,38 +554,92 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
-  /** Read-only candidate selection for restart-safe privacy cleanup. Terminal
-   * proof is revalidated before any caller may touch Box remote files. */
+  /** Restart-safe privacy cleanup selection. Corrupt terminal evidence is
+   * durably quarantined (no remote touch) so it cannot starve newer runs. */
   async listRemoteCleanupCandidates(limit = 10): Promise<BoxRemoteCleanupCandidate[]> {
     const found = await this.pool.query<{ request_id: string; user_id: string;
       ctx: Record<string, unknown> }>(
       `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
         WHERE ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
           AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
+          AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
+          AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
+            OR updated_at < NOW() - INTERVAL '2 minutes')
           AND state IN ('inflight','finalizing','committed')
         ORDER BY updated_at ASC LIMIT $1`,
       [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
     const candidates: BoxRemoteCleanupCandidate[] = [];
     for (const row of found.rows) {
       const ctx = row.ctx;
+      const quarantine = async (): Promise<void> => {
+        await this.pool.query(
+          `UPDATE request_finalize_journal
+              SET ctx=ctx || '{"boxRemoteCleanupQuarantine":"invalid_evidence"}'::jsonb,
+                  updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2
+              AND ctx->'boxTerminalProof'=$3::jsonb
+              AND ctx->>'boxInvocationRecovery'='v1'
+              AND ctx->>'boxInvocationMode'='detached_tool'
+              AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+              AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
+              AND NOT (ctx ? 'boxRemoteCleanupQuarantine')`,
+          [row.request_id, row.user_id, JSON.stringify(ctx?.boxTerminalProof)]);
+      };
       if (!ctx || typeof ctx.boxRunNonce !== "string"
         || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
         || typeof ctx.boxLeaseEpoch !== "string"
         || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
         || typeof ctx.boxAccountId !== "string"
         || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
-        || !/^[1-9][0-9]{0,19}$/.test(row.user_id)) continue;
+        || !/^[1-9][0-9]{0,19}$/.test(row.user_id)) {
+        await quarantine();
+        continue;
+      }
       try {
         const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
           { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
-        if (proof.reason !== "worker_complete") continue;
+        if (proof.reason !== "worker_complete") { await quarantine(); continue; }
         candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
           accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
-          leaseEpoch: ctx.boxLeaseEpoch });
-      } catch { /* Corrupt proof is manual, never automatic cleanup. */ }
+          leaseEpoch: ctx.boxLeaseEpoch, proof });
+      } catch { await quarantine(); /* Corrupt proof is manual, never automatic cleanup. */ }
     }
     return candidates;
+  }
+
+  /** Move a proven detached run to the back of the queue before a network
+   * attempt. A crashed worker becomes eligible again after two minutes. */
+  async claimRemoteCleanup(input: BoxRemoteCleanupCandidate): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
+      || input.uid <= 0n || input.accountId <= 0n
+      || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
+    }
+    try {
+      if (parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input).reason
+        !== "worker_complete") throw new Error("non-success proof");
+    } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || '{"boxRemoteCleanupClaimed":true}'::jsonb, updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
+          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ctx->'boxTerminalProof'->>'runNonce'=$4
+          AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
+          AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
+          AND ctx->'boxTerminalProof'=$6::jsonb
+          AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
+          AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
+          AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
+            OR updated_at < NOW() - INTERVAL '2 minutes')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
+    return changed.rowCount === 1;
   }
 
   async markRemoteCleaned(input: BoxRemoteCleanupCandidate): Promise<void> {
@@ -586,17 +649,25 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
       throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
     }
+    try {
+      if (parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input).reason
+        !== "worker_complete") throw new Error("non-success proof");
+    } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
     const params = [input.requestId, input.uid.toString(), input.accountId.toString(),
-      input.runNonce, input.leaseEpoch];
+      input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)];
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb, updated_at=NOW()
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ctx->>'boxInvocationMode'='detached_tool'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
+          AND ctx->'boxTerminalProof'=$6::jsonb
+          AND ctx->>'boxRemoteCleanupClaimed'='true'
+          AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'`, params);
     if (changed.rowCount === 1) return;
     const already = await this.pool.query(
@@ -604,9 +675,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ctx->>'boxInvocationMode'='detached_tool'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
+          AND ctx->'boxTerminalProof'=$6::jsonb
           AND ctx->>'boxRemoteCleanup'='done'`, params);
     if (already.rowCount !== 1) throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");
   }

@@ -207,7 +207,8 @@ export async function runBoxToolFirstRound(input: {
     }
     const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
       accountId: target.accountId, model: input.canonicalModel, fingerprint,
-      runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch });
+      runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+      invocationMode: "detached_tool" });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {

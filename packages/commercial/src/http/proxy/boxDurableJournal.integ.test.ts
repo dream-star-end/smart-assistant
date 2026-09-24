@@ -107,6 +107,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     // First completed model tool message is durable before terminal SSE.
     await put(`box-c-${suffix}`);
     const toolCall = { ...input, requestId: `box-c-${suffix}`,
+      invocationMode: "detached_tool" as const,
       fingerprint: { ...fingerprint, replayFingerprint: "9".repeat(64) },
       runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32) };
     await journal.admit(toolCall);
@@ -347,8 +348,32 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       cacheReadTokens: candidate.cacheReadTokens, cacheWriteTokens: candidate.cacheWriteTokens });
     assert.deepEqual(closed.rows.find((row) => row.request_id === `box-e-${suffix}`)?.ctx.boxUsage,
       finalUsage);
-    const cleanupCandidates = await journal.listRemoteCleanupCandidates();
-    assert.ok(cleanupCandidates.some((item) => item.requestId === input.requestId));
+    for (let i = 0; i < 10; i++) {
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
+        SELECT $1,user_id,'committed',ctx,NOW()-INTERVAL '1 day'
+          FROM request_finalize_journal WHERE request_id=$2`,
+      [`box-old-text-${i}-${suffix}`, input.requestId]);
+    }
+    for (let i = 0; i < 10; i++) {
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
+        SELECT $1,user_id,'committed',
+          jsonb_set(ctx,'{boxTerminalProof,keeperPid}','"invalid"'::jsonb),
+          NOW()-INTERVAL '1 day'
+          FROM request_finalize_journal WHERE request_id=$2`,
+      [`box-corrupt-tool-${i}-${suffix}`, `box-e-${suffix}`]);
+    }
+    assert.equal((await journal.listRemoteCleanupCandidates(10)).length, 0,
+      "invalid oldest batch is quarantined rather than retried forever");
+    const quarantined = await client.query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM request_finalize_journal
+        WHERE request_id LIKE $1 AND ctx->>'boxRemoteCleanupQuarantine'='invalid_evidence'`,
+      [`box-corrupt-tool-%-${suffix}`]);
+    assert.equal(quarantined.rows[0]?.n, "10");
+    const cleanupCandidates = await journal.listRemoteCleanupCandidates(10);
+    assert.ok(!cleanupCandidates.some((item) => item.requestId === input.requestId),
+      "text rows were already cleaned by their own path");
     const finalCleanup = cleanupCandidates.find((item) =>
       item.requestId === `box-e-${suffix}`);
     assert.ok(finalCleanup);
@@ -356,6 +381,23 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "handoff ancestors have no independent terminal proof");
     await assert.rejects(() => journal.markRemoteCleaned({ ...finalCleanup!,
       accountId: 21n }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_CLEANUP_FENCE_LOST");
+    assert.equal(await journal.claimRemoteCleanup({ ...finalCleanup!,
+      proof: { ...finalCleanup!.proof, keeperPid: 999 } }), false,
+    "proof changed after selection cannot authorize remote cleanup");
+    assert.equal(await journal.claimRemoteCleanup(finalCleanup!), true);
+    assert.equal(await journal.claimRemoteCleanup(finalCleanup!), false);
+    assert.ok(!(await journal.listRemoteCleanupCandidates()).some((item) =>
+      item.requestId === `box-e-${suffix}`), "claimed failure is briefly backed off");
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '3 minutes' WHERE request_id=$1`,
+    [`box-e-${suffix}`]);
+    assert.ok((await journal.listRemoteCleanupCandidates()).some((item) =>
+      item.requestId === `box-e-${suffix}`));
+    assert.equal(await journal.claimRemoteCleanup(finalCleanup!), true);
+    await assert.rejects(() => journal.markRemoteCleaned({ ...finalCleanup!,
+      proof: { ...finalCleanup!.proof, keeperPid: 999 } }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_CLEANUP_FENCE_LOST");
     await journal.markRemoteCleaned(finalCleanup!);
