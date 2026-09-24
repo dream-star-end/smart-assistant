@@ -5,10 +5,11 @@ import type { BoxUsageEvidence } from "./boxDurableJournal.js";
 
 export interface BoxStoredToolHandoff {
   version: 1;
-  roundNo: 1;
+  roundNo: number;
   messageId: string;
   spoolOffset: number;
   detachedRunnerHash: string;
+  catalogHash: string;
   toolUses: BoxToolUseDigest[];
   verifiedPendingToolUseIds: string[];
   usage: BoxUsageEvidence;
@@ -23,14 +24,17 @@ function dense(x: unknown[], max: number): boolean {
 export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | null {
   if (!record(raw)
     || Object.keys(raw).sort().join(",") !==
-      "detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version"
-    || raw.version !== 1 || raw.roundNo !== 1
+      "catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version"
+    || raw.version !== 1 || !Number.isSafeInteger(raw.roundNo)
+    || Number(raw.roundNo) < 1 || Number(raw.roundNo) > 32
     || typeof raw.messageId !== "string" || raw.messageId.length < 1
     || raw.messageId.length > 128
     || !Number.isSafeInteger(raw.spoolOffset) || Number(raw.spoolOffset) < 1
     || Number(raw.spoolOffset) > 8 * 1024 * 1024
     || typeof raw.detachedRunnerHash !== "string"
     || !/^[a-f0-9]{64}$/.test(raw.detachedRunnerHash)
+    || typeof raw.catalogHash !== "string"
+    || !/^[a-f0-9]{64}$/.test(raw.catalogHash)
     || !Array.isArray(raw.toolUses) || !dense(raw.toolUses, 32)
     || !Array.isArray(raw.verifiedPendingToolUseIds)
     || !dense(raw.verifiedPendingToolUseIds, raw.toolUses.length)

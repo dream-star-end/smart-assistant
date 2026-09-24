@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
+import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 
 test("Box journal fences replay/account capacity and persists proof plus exact usage",
@@ -112,9 +113,13 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       { id: "toolu_B", boxName: "mcp__ocbridge__t0",
         clientName: "local_echo", input: { value: privateMarker } },
     ], inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
+    const toolDeclarations = [{ name: "local_echo", description: "local-only",
+      input_schema: { type: "object", properties: { value: { type: "string" } } } }];
+    const catalogHash = compileBoxToolCatalog(toolDeclarations).sha256;
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234,
       detachedRunnerHash: "f".repeat(64),
+      catalogHash,
       verifiedPendingToolUseIds: ["toolu_A"] });
     assert.deepEqual(receipt.journaledToolUseIds, ["toolu_A", "toolu_B"]);
     assert.deepEqual(receipt.verifiedPendingToolUseIds, ["toolu_A"]);
@@ -134,18 +139,21 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234,
       detachedRunnerHash: "f".repeat(64),
+      catalogHash,
       verifiedPendingToolUseIds: ["toolu_not_in_model"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
     await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234,
       detachedRunnerHash: "f".repeat(64),
+      catalogHash,
       verifiedPendingToolUseIds: ["toolu_A"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
 
     await put(`box-d-${suffix}`);
     const resumeBody = { model: basis.model, max_tokens: 128,
+      tools: toolDeclarations,
       metadata: { user_id: JSON.stringify({ oc_turn_key: "a".repeat(64),
         session_id: `session-${suffix}` }) },
       messages: [
@@ -162,6 +170,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         { role: "user", content: [resumeBody.messages[1]!.content[0]!] }] } }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_RESULT_MISMATCH");
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model,
+      canonicalBody: { ...resumeBody, tools: [{ ...toolDeclarations[0]!,
+        description: "changed after Box launch" }] } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_CATALOG_CHANGED");
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,toolUses,1,id}','"toolu_A"'::jsonb)
       WHERE request_id=$1`, [toolCall.requestId]);
@@ -187,6 +201,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(resumed.ownerRequestId, toolCall.requestId);
     assert.equal(resumed.accountId, 20n);
     assert.equal(resumed.spoolOffset, 1234);
+    assert.equal(resumed.roundNo, 2);
     assert.equal(resumed.detachedRunnerHash, "f".repeat(64));
     assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
       ["toolu_A", "toolu_B"]);
@@ -198,10 +213,43 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "resuming");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
       "linked");
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxRoundNo,
+      2);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_CALL_AMBIGUOUS");
+    const secondCandidate = { messageId: "msg_box_tool_2", toolUses: [
+      { id: "toolu_C", boxName: "mcp__ocbridge__t0",
+        clientName: "local_echo", input: { value: privateMarker } },
+    ], inputTokens: 8, outputTokens: 12, cacheReadTokens: 0, cacheWriteTokens: 1 };
+    await assert.rejects(() => journal.recordToolHandoff({
+      requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+      candidate: secondCandidate, roundNo: 1, spoolOffset: 2345,
+      detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_C"] }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
+    await journal.recordToolHandoff({ requestId: `box-d-${suffix}`, uid: 3n,
+      leaseEpoch: toolCall.leaseEpoch, candidate: secondCandidate, roundNo: 2,
+      spoolOffset: 2345, detachedRunnerHash: "f".repeat(64),
+      catalogHash,
+      verifiedPendingToolUseIds: ["toolu_C"] });
+    await put(`box-e-${suffix}`);
+    const secondResumeBody = { ...resumeBody, messages: [
+      { role: "assistant", content: secondCandidate.toolUses.map((use) => ({
+        type: "tool_use", id: use.id, name: use.clientName, input: use.input })) },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
+        content: "third" }] },
+    ] };
+    const secondResume = await journal.claimToolResume({ requestId: `box-e-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: secondResumeBody });
+    assert.equal(secondResume.ownerRequestId, `box-d-${suffix}`);
+    assert.equal(secondResume.spoolOffset, 2345);
+    assert.equal(secondResume.roundNo, 3);
+    const third = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-e-${suffix}`]);
+    assert.equal(third.rows[0]?.ctx.boxRoundNo, 3);
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();

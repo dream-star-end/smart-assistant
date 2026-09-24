@@ -4,6 +4,7 @@ import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 
 const evidence = () => ({ version: 1, roundNo: 1, messageId: "msg_tool", spoolOffset: 1234,
   detachedRunnerHash: "f".repeat(64),
+  catalogHash: "e".repeat(64),
   toolUses: [
     { id: "toolu_A", boxName: "mcp__ocbridge__t0",
       clientName: "local_echo", inputHash: "a".repeat(64) },
@@ -15,6 +16,8 @@ const evidence = () => ({ version: 1, roundNo: 1, messageId: "msg_tool", spoolOf
 
 test("valid handoff stores only unique model IDs and argument hashes", () => {
   assert.deepEqual(parseBoxStoredToolHandoff(evidence()), evidence());
+  const later = evidence(); later.roundNo = 2;
+  assert.deepEqual(parseBoxStoredToolHandoff(later), later);
 });
 
 test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed", () => {
@@ -33,4 +36,8 @@ test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed",
   assert.equal(parseBoxStoredToolHandoff(wrongOffset), null);
   const wrongRunner = evidence(); wrongRunner.detachedRunnerHash = "x".repeat(64);
   assert.equal(parseBoxStoredToolHandoff(wrongRunner), null);
+  const wrongCatalog = evidence(); wrongCatalog.catalogHash = "x".repeat(64);
+  assert.equal(parseBoxStoredToolHandoff(wrongCatalog), null);
+  const beyondCap = evidence(); beyondCap.roundNo = 33;
+  assert.equal(parseBoxStoredToolHandoff(beyondCap), null);
 });
