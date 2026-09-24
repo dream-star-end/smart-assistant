@@ -229,6 +229,13 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
 
 ### Box terminal marker and reconciliation proof (text-path prototype; not production-enabled)
 
+Long-lived tool handoff has an additional Box-runtime gate: the current
+Connect Exec transport and supervisor each cap a foreground call at 120s.
+`scripts/ocv5-289/boxDetachedLifetimeProbe.ts` is a **non-model** operator
+probe for whether a detached, self-expiring child survives its launch Exec and
+can be observed from a distinct Exec. A local Linux test is not Box evidence;
+no detached production path may be assumed until the actual pinned Box passes.
+
 The supervised CLI must publish a bounded, no-content `terminal.json` in its
 owner-0700 per-run directory only after a **real stop fence**. Bind the marker
 to the journal's run nonce and lease epoch; include supervisor/CLI process
