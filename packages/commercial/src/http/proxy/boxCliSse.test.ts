@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { completedBoxCliToSse, BoxCliSseError } from "./boxCliSse.js";
+import { completedBoxCliToSse, createBoxCliSseDecoder, BoxCliSseError } from "./boxCliSse.js";
 import { _UsageObserver } from "./shared.js";
+import { BoxExecTransport } from "./boxExecTransport.js";
 
 const model = "claude-opus-5-5";
 const event = (value: unknown) => ({ type: "stream_event", event: value });
@@ -38,6 +39,87 @@ test("completed Box CLI events become unmodified Anthropic SSE with observed usa
     "content_block_stop", "message_delta", "message_stop"]);
   assert.ok(output.sse.includes(JSON.stringify((source[3] as { event: unknown }).event)));
   assert.ok(!output.sse.includes('"type":"result"'), "CLI result is not a second model event");
+});
+
+test("fragmented live JSONL emits text before CLI terminal and withholds message_stop", () => {
+  const source = records();
+  const decoder = createBoxCliSseDecoder(model);
+  let early = "";
+  for (const record of source.slice(0, 4)) {
+    const line = JSON.stringify(record) + "\n";
+    const midpoint = Math.floor(line.length / 2);
+    assert.equal(decoder.push(line.slice(0, midpoint)), "");
+    early += decoder.push(line.slice(midpoint));
+  }
+  assert.ok(early.includes("event: content_block_delta"));
+  assert.ok(!early.includes("event: message_stop"));
+  let later = "";
+  for (const record of source.slice(4)) later += decoder.push(JSON.stringify(record) + "\n");
+  assert.ok(!later.includes("event: message_stop"), "terminal is held until final integrity proof");
+  const final = decoder.finish();
+  assert.equal(final.tailSse.includes("event: message_stop"), true);
+  assert.equal(early + later + final.tailSse, completedBoxCliToSse(jsonl(source), model).sse);
+  assert.equal(final.inputTokens, 2);
+  assert.equal(final.outputTokens, 7);
+});
+
+test("live decoder never emits terminal success if final snapshot contradicts earlier text", () => {
+  const source = records();
+  (source[7] as { message: { content: Array<{ text: string }> } }).message.content[0]!.text =
+    "different";
+  const decoder = createBoxCliSseDecoder(model);
+  let streamed = "";
+  for (const record of source) streamed += decoder.push(JSON.stringify(record) + "\n");
+  assert.ok(streamed.includes("event: content_block_delta"));
+  assert.ok(!streamed.includes("event: message_stop"));
+  assert.throws(() => decoder.finish(),
+    (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_TEXT_MISMATCH");
+});
+
+test("real Connect transport callback delivers first model delta before remote exit", async () => {
+  const source = records();
+  const part1 = jsonl(source.slice(0, 4));
+  const part2 = jsonl(source.slice(4));
+  const frame = (value: unknown, flag = 0): Buffer => {
+    const raw = Buffer.from(JSON.stringify(value));
+    const out = Buffer.alloc(5 + raw.length);
+    out[0] = flag; out.writeUInt32BE(raw.length, 1); raw.copy(out, 5);
+    return out;
+  };
+  let release!: () => void;
+  const response = new Response(new ReadableStream<Uint8Array>({ start(controller) {
+    controller.enqueue(frame({ stdoutEvent: { data: part1 } }));
+    release = () => {
+      controller.enqueue(frame({ stdoutEvent: { data: part2 } }));
+      controller.enqueue(frame({ exitEvent: {} }));
+      controller.enqueue(frame({}, 2));
+      controller.close();
+    };
+  } }), { status: 200 });
+  const decoder = createBoxCliSseDecoder(model);
+  let streamed = "", terminal = false;
+  let seenDelta!: () => void;
+  const firstDelta = new Promise<void>((resolve) => { seenDelta = resolve; });
+  const transport = new BoxExecTransport({ execUrl: "https://box.example.cursorvm.com/agent.v1.ControlService/Exec",
+    execToken: "synthetic-exec", networkToken: "synthetic-network" }, async () => response,
+  async () => {});
+  const pending = transport.run({ command: "/usr/bin/python3", args: ["--version"],
+    cwd: "/tmp", environment: {} }, { timeoutMs: 2000,
+    onStdout: (chunk) => {
+      streamed += decoder.push(chunk);
+      if (streamed.includes("event: content_block_delta")) seenDelta();
+    } }).then((result) => { terminal = true; return result; });
+  try {
+    await Promise.race([firstDelta, new Promise<never>((_, reject) => setTimeout(() =>
+      reject(new Error("FIRST_DELTA_NOT_PROGRESSIVE")), 500))]);
+    assert.equal(terminal, false, "the Box process has not exited yet");
+    assert.ok(streamed.includes("event: content_block_delta"));
+    assert.ok(!streamed.includes("event: message_stop"));
+  } finally { release(); }
+  const result = await pending;
+  assert.equal(result.exitCode, 0);
+  const final = decoder.finish();
+  assert.equal(streamed + final.tailSse, completedBoxCliToSse(part1 + part2, model).sse);
 });
 
 test("tool_use is never silently consumed by the complete-call path", () => {

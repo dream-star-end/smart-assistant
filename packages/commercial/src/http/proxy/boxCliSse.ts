@@ -39,8 +39,16 @@ export interface BoxCliSseResult {
   outputTokens: number;
 }
 
-export function completedBoxCliToSse(stdout: string, expectedModel: string): BoxCliSseResult {
-  if (!stdout || Buffer.byteLength(stdout) > 1_048_576 || !expectedModel) {
+/** Incremental decoder for supervised CLI JSONL. `message_stop` is withheld
+ * until the final CLI result validates, so the proxy usage observer cannot
+ * mistake a partial/failed CLI invocation for a completed billable response.
+ * Each push returns only newly validated SSE frames; it never replays a prefix.
+ */
+export function createBoxCliSseDecoder(expectedModel: string): {
+  push: (chunk: string) => string;
+  finish: () => BoxCliSseResult & { tailSse: string };
+} {
+  if (!expectedModel) {
     throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
   }
   let started = false, stopped = false, resultSeen = false, initSeen = false;
@@ -53,7 +61,9 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
   let activeBlock: { originalIndex: number; visibleIndex: number; type: string; text: string } | null = null;
   const visibleTextParts: string[] = [];
   const frames: string[] = [];
-  for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
+  let pending = "", bytes = 0, finished = false, heldStop: string | null = null;
+  const processLine = (line: string): string => {
+    let emitted = "";
     let record: ObjectValue;
     try { record = object(JSON.parse(line)); }
     catch { throw new BoxCliSseError("BOX_CLI_STREAM_INVALID"); }
@@ -153,7 +163,9 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
       } else if (eventType !== "ping") {
         throw new BoxCliSseError("BOX_CLI_EVENT_UNSUPPORTED");
       }
-      frames.push(`event: ${eventType}\ndata: ${JSON.stringify(forwardedEvent)}\n\n`);
+      const frame = `event: ${eventType}\ndata: ${JSON.stringify(forwardedEvent)}\n\n`;
+      if (eventType === "message_stop") heldStop = frame;
+      else { frames.push(frame); emitted += frame; }
     } else if (kind === "result") {
       if (!stopped || resultSeen || record.subtype !== "success" || record.is_error !== false) {
         throw new BoxCliSseError("BOX_CLI_RESULT_INVALID");
@@ -196,13 +208,50 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
     } else if (kind !== "rate_limit_event") {
       throw new BoxCliSseError("BOX_CLI_RECORD_UNSUPPORTED");
     }
+    return emitted;
+  };
+  const push = (chunk: string): string => {
+    if (finished || typeof chunk !== "string") throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    pending += chunk;
+    let emitted = "";
+    for (;;) {
+      const index = pending.indexOf("\n");
+      if (index < 0) break;
+      const line = pending.slice(0, index).replace(/\r$/, "");
+      pending = pending.slice(index + 1);
+      if (line) emitted += processLine(line);
+    }
+    return emitted;
+  };
+  const finish = (): BoxCliSseResult & { tailSse: string } => {
+    if (finished) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    finished = true;
+    let tailSse = pending ? processLine(pending) : "";
+    pending = "";
+    if (!started || !stopped || !resultSeen || inputTokens === null || outputTokens === null) {
+      throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
+    }
+    if (!assistantSeen || visibleTextParts.join("") !== lastAssistantText
+      || assistantTexts.some((text) => !lastAssistantText.startsWith(text))) {
+      throw new BoxCliSseError("BOX_CLI_TEXT_MISMATCH");
+    }
+    if (!heldStop) throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
+    frames.push(heldStop);
+    tailSse += heldStop;
+    heldStop = null;
+    return { sse: frames.join(""), inputTokens, outputTokens, tailSse };
+  };
+  return { push, finish };
+}
+
+export function completedBoxCliToSse(stdout: string, expectedModel: string): BoxCliSseResult {
+  if (!stdout || Buffer.byteLength(stdout) > 1_048_576) {
+    throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
   }
-  if (!started || !stopped || !resultSeen || inputTokens === null || outputTokens === null) {
-    throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
-  }
-  if (!assistantSeen || visibleTextParts.join("") !== lastAssistantText
-    || assistantTexts.some((text) => !lastAssistantText.startsWith(text))) {
-    throw new BoxCliSseError("BOX_CLI_TEXT_MISMATCH");
-  }
-  return { sse: frames.join(""), inputTokens, outputTokens };
+  const decoder = createBoxCliSseDecoder(expectedModel);
+  decoder.push(stdout);
+  const { sse, inputTokens, outputTokens } = decoder.finish();
+  return { sse, inputTokens, outputTokens };
 }
