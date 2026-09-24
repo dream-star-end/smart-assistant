@@ -98,10 +98,12 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   by the pending-tool replay test above. MCP JSON-RPC request ID and model
   tool_use ID are distinct. Offline real Claude Code 2.1.280 exposed the
   exact model tool ID in `tools/call.params._meta["claudecode/toolUseId"]`
-  (synthetic one-tool replay green); this is the correlation key for parallel
-  same-name/same-argument calls, not positional matching. The Box version of
-  this metadata and multi-tool concurrency still need real and red/green
-  verification before use. No local OpenClaude tool command executes in Box.
+  (synthetic one-tool replay green). A real account-20 Box `claude -p` one-tool
+  probe also verified that metadata against the streamed model tool ID and
+  returned the local synthetic result exactly. This is the correlation key
+  for parallel same-name/same-argument calls, not positional matching. Actual
+  multi-tool concurrency and cross-HTTP handoff still need red/green proof
+  before use. No local OpenClaude tool command executes in Box.
 - The held CLI is owned by a **cross-HTTP Box invocation lease**, not by the
   first request's abort signal or finalizer. Normal `message_stop`/`res.end`
   after exporting tool_use must leave the supervised CLI and account-capacity
