@@ -31,7 +31,7 @@ function resumeShape(body: ProxyBody): boolean {
 export class BoxToolFetch {
   private readonly targets = new Map<string, Set<BoxResolvedTarget>>();
   private readonly terminalCleanup = new Map<string, { target: BoxResolvedTarget;
-    candidate: BoxRemoteCleanupCandidate }>();
+    candidate: BoxRemoteCleanupCandidate; claimed: boolean }>();
   private readonly terminalInFlight = new Map<string, Promise<void>>();
   private readonly reconcileInFlight = new Set<string>();
   private readonly cleanup = new Set<{ target: BoxResolvedTarget;
@@ -90,8 +90,12 @@ export class BoxToolFetch {
   /** Terminal proof and journal evidence already exist for these runs.
    * The remote cleanup is idempotent; this never relaunches the paid CLI. */
   async retryTerminalCleanup(): Promise<number> {
-    await Promise.allSettled([...this.terminalCleanup].map(([nonce, held]) =>
-      this.cleanKnownTerminal(nonce, held.target, held.candidate)));
+    await Promise.allSettled([...this.terminalCleanup].map(async ([nonce, held]) => {
+      if (!held.claimed) {
+        held.claimed = await this.deps.journal.claimRemoteCleanup(held.candidate);
+      }
+      if (held.claimed) await this.cleanKnownTerminal(nonce, held.target, held.candidate);
+    }));
     return this.terminalCleanup.size;
   }
 
@@ -104,6 +108,7 @@ export class BoxToolFetch {
       if (this.reconcileInFlight.has(candidate.runNonce)) return;
       this.reconcileInFlight.add(candidate.runNonce);
       try {
+        if (!await this.deps.journal.claimRemoteCleanup(candidate)) return;
         let held = this.terminalCleanup.get(candidate.runNonce);
         if (!held) {
           const target = await this.deps.resolveTarget({ uid: candidate.uid,
@@ -114,10 +119,11 @@ export class BoxToolFetch {
           if (target.accountId !== candidate.accountId) {
             throw new Error("BOX_CLEANUP_ACCOUNT_MISMATCH");
           }
-          held = { target, candidate };
+          held = { target, candidate, claimed: true };
           this.terminalCleanup.set(candidate.runNonce, held);
           this.own(candidate.runNonce, target);
         }
+        held.claimed = true;
         await this.cleanKnownTerminal(candidate.runNonce, held.target, candidate);
       } finally { this.reconcileInFlight.delete(candidate.runNonce); }
     }));
@@ -168,7 +174,16 @@ export class BoxToolFetch {
     const group = this.targets.get(runNonce);
     if (!group) return;
     const target = [...group].at(-1)!;
-    this.terminalCleanup.set(runNonce, { target, candidate });
+    const held = { target, candidate, claimed: false };
+    this.terminalCleanup.set(runNonce, held);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { held.claimed = await Promise.race([
+      this.deps.journal.claimRemoteCleanup(candidate),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 2000); }),
+    ]); }
+    catch { held.claimed = false; }
+    finally { if (timer) clearTimeout(timer); }
+    if (!held.claimed) return;
     try { await this.cleanKnownTerminal(runNonce, target, candidate); }
     catch { /* retain pinned target and private files for bounded retry */ }
   }
@@ -206,7 +221,7 @@ export class BoxToolFetch {
               await this.releaseAfterProof({ requestId: args.requestId,
                 uid: args.uid, accountId: published.claim.accountId,
                 runNonce: published.claim.runNonce,
-                leaseEpoch: published.claim.leaseEpoch });
+                leaseEpoch: published.claim.leaseEpoch, proof: result.proof });
             }
           } else {
             const outcome: BoxToolFirstHandoff | BoxToolFirstFinal = await (this.deps.runFirst
@@ -227,7 +242,7 @@ export class BoxToolFetch {
               await this.releaseAfterProof({ requestId: args.requestId,
                 uid: args.uid, accountId: outcome.target.accountId,
                 runNonce: outcome.plan.runNonce,
-                leaseEpoch: outcome.plan.leaseEpoch });
+                leaseEpoch: outcome.plan.leaseEpoch, proof: outcome.proof });
             }
           }
           controller.close();

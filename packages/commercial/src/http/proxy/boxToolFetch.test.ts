@@ -20,7 +20,8 @@ const call = (canonicalBody: ProxyBody) => ({ uid: 3n, sessionId: "session",
   upstreamModel: "claude-opus-5-5", url: BOX_INTERNAL_ENDPOINT,
   init: { method: "POST", body: JSON.stringify({ ...canonicalBody,
     model: "claude-opus-5-5" }) } });
-const journal = () => ({ markRemoteCleaned: async () => {},
+const journal = () => ({ claimRemoteCleanup: async () => true,
+  markRemoteCleaned: async () => {},
   listRemoteCleanupCandidates: async () => [] }) as never;
 
 test("same internal model fetch streams first handoff then next final without tool execution", async () => {
@@ -46,7 +47,9 @@ test("same internal model fetch streams first handoff then next final without to
     runContinuation: (async (input: { emit: (sse: string) => void }) => {
       calls.push("continued-final");
       input.emit("event: message_stop\ndata: {}\n\n");
-      return { kind: "final", proof: { reason: "worker_complete" } };
+      return { kind: "final", proof: { runNonce: claim.runNonce,
+        leaseEpoch: claim.leaseEpoch, keeperPid: 101, cliPid: 102,
+        reason: "worker_complete", revision: 1 } };
     }) as never,
   });
   const first = await service.fetch(call(firstBody));
@@ -78,7 +81,8 @@ test("failed local close retry is bounded and never starts concurrent dispose", 
       input.emit("event: message_stop\ndata: {}\n\n");
       return { kind: "final", plan: { runNonce: "a".repeat(24),
         leaseEpoch: "b".repeat(32) }, target,
-        proof: { reason: "worker_complete" } };
+        proof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+          keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 } };
     }) as never,
   });
   const response = await service.fetch(call(firstBody));
@@ -110,7 +114,8 @@ test("terminal cleanup failure retains the pinned Box target for idempotent retr
       input.emit("event: message_stop\ndata: {}\n\n");
       return { kind: "final", plan: { runNonce: "b".repeat(24),
         leaseEpoch: "c".repeat(32) }, target,
-        proof: { reason: "worker_complete" } };
+        proof: { runNonce: "b".repeat(24), leaseEpoch: "c".repeat(32),
+          keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 } };
     }) as never,
   });
   const response = await service.fetch(call(firstBody));
@@ -123,7 +128,10 @@ test("terminal cleanup failure retains the pinned Box target for idempotent retr
 
 test("fresh egress instance recovers proven remote cleanup from durable journal", async () => {
   const candidate = { requestId: "box-proven", uid: 3n, accountId: 20n,
-    runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32) };
+    runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32),
+    proof: { runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32),
+      keeperPid: 101, cliPid: 102, reason: "worker_complete" as const,
+      revision: 1 as const } };
   let marked = false, disposed = false, cleans = 0;
   const target = { accountId: 20n, exec: { run: async () => {
     cleans++;
@@ -133,6 +141,7 @@ test("fresh egress instance recovers proven remote cleanup from durable journal"
     keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
     detachedRunnerAsset: Buffer.from("d"),
     journal: { listRemoteCleanupCandidates: async () => marked ? [] : [candidate],
+      claimRemoteCleanup: async () => true,
       markRemoteCleaned: async (value: typeof candidate) => {
         assert.deepEqual(value, candidate); marked = true;
       } } as never,
