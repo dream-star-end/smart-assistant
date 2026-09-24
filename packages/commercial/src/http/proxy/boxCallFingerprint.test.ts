@@ -50,6 +50,25 @@ test("same-turn identical independent call remains deliberately ambiguous", () =
     "this must not be advertised as a unique logical-call ID");
 });
 
+test("real official CC inner session ID is accepted; conflicting outer ID fails", () => {
+  const innerOnly = body();
+  delete innerOnly.metadata!.session_id;
+  innerOnly.metadata!.user_id = JSON.stringify({ oc_turn_key: "a".repeat(64),
+    session_id: "official-cc-session-289" });
+  assert.equal(deriveBoxCallFingerprint(3n, innerOnly).sessionId,
+    "official-cc-session-289");
+  const conflict = body();
+  conflict.metadata!.user_id = JSON.stringify({ oc_turn_key: "a".repeat(64),
+    session_id: "different-session" });
+  rejects(conflict, "BOX_CALL_SESSION_CONFLICT");
+});
+
+test("streaming canonical hash accepts model body above old 8MiB cutoff", () => {
+  const large = body();
+  large.messages = [{ role: "user", content: "x".repeat(8_400_000) }];
+  assert.match(deriveBoxCallFingerprint(3n, large).requestHash, /^[a-f0-9]{64}$/);
+});
+
 test("missing identity, malformed metadata and excessive nesting fail closed", () => {
   const missing = body(); delete missing.metadata!.session_id;
   rejects(missing, "BOX_CALL_IDENTITY_MISSING");

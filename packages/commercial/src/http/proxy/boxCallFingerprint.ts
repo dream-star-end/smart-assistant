@@ -11,21 +11,36 @@ export class BoxCallFingerprintError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxCallFingerprintError"; }
 }
 
-function stableJson(value: unknown, depth = 0): string {
+function updateStableJson(value: unknown, emit: (part: string) => void,
+  depth = 0): void {
   if (depth > 64) throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_DEEP");
   if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return JSON.stringify(value);
+    emit(JSON.stringify(value)); return;
   }
-  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item, depth + 1)).join(",")}]`;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    emit(JSON.stringify(value)); return;
+  }
+  if (Array.isArray(value)) {
+    emit("[");
+    value.forEach((item, index) => {
+      if (index) emit(",");
+      updateStableJson(item, emit, depth + 1);
+    });
+    emit("]"); return;
+  }
   if (!value || typeof value !== "object") {
     throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");
   }
   const object = value as Record<string, unknown>;
   const keys = Object.keys(object).sort();
   if (keys.length > 4096) throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
-  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJson(object[key], depth + 1)}`)
-    .join(",")}}`;
+  emit("{");
+  keys.forEach((key, index) => {
+    if (index) emit(",");
+    emit(JSON.stringify(key)); emit(":");
+    updateStableJson(object[key], emit, depth + 1);
+  });
+  emit("}");
 }
 
 export interface BoxCallFingerprint {
@@ -37,9 +52,7 @@ export interface BoxCallFingerprint {
 }
 
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
-  if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string"
-    || typeof body.metadata.session_id !== "string"
-    || !/^[A-Za-z0-9._:-]{1,256}$/.test(body.metadata.session_id)) {
+  if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
   }
   let userMeta: Record<string, unknown>;
@@ -52,17 +65,38 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
   if (typeof turnKey !== "string" || !/^[a-f0-9]{64}$/.test(turnKey)) {
     throw new BoxCallFingerprintError("BOX_CALL_TURN_KEY_MISSING");
   }
+  const outer = body.metadata.session_id;
+  const inner = userMeta.session_id;
+  if (outer !== undefined && typeof outer !== "string") {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_INVALID");
+  }
+  if (inner !== undefined && typeof inner !== "string") {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_INVALID");
+  }
+  if (outer && inner && outer !== inner) {
+    throw new BoxCallFingerprintError("BOX_CALL_SESSION_CONFLICT");
+  }
+  const sessionId = outer ?? inner;
+  if (typeof sessionId !== "string"
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
+  }
   // Tracking metadata can change independently of the model request. Identity
   // is separately bound by authenticated uid, session and the signed turn key.
   const { metadata: _tracking, ...modelBody } = body;
-  const canonical = stableJson(modelBody);
-  if (Buffer.byteLength(canonical) > 8 * 1024 * 1024) {
-    throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
-  }
-  const requestHash = createHash("sha256").update(canonical).digest("hex");
+  const hasher = createHash("sha256");
+  let bytes = 0;
+  updateStableJson(modelBody, (part) => {
+    bytes += Buffer.byteLength(part);
+    if (bytes > 16 * 1024 * 1024) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    hasher.update(part);
+  });
+  const requestHash = hasher.digest("hex");
   const replayFingerprint = createHash("sha256")
     .update("ocv5-box-replay-v1\0").update(uid.toString()).update("\0")
-    .update(body.metadata.session_id).update("\0").update(turnKey).update("\0")
+    .update(sessionId).update("\0").update(turnKey).update("\0")
     .update(requestHash).digest("hex");
-  return { turnKey, sessionId: body.metadata.session_id, requestHash, replayFingerprint };
+  return { turnKey, sessionId, requestHash, replayFingerprint };
 }

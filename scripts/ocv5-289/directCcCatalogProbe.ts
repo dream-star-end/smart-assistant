@@ -28,12 +28,17 @@ const server = createServer(async (req, res) => {
   try {
     const catalog = compileBoxToolCatalog(body.tools);
     const effort = mapBoxCliEffort(body.thinking, body.output_config);
-    const meta = body.metadata as { user_id?: unknown } | undefined;
+    const meta = body.metadata as { user_id?: unknown; session_id?: unknown } | undefined;
     const userMeta = typeof meta?.user_id === "string"
       ? JSON.parse(meta.user_id) as Record<string, unknown> : {};
     summary = { count: catalog.tools.length, hash: catalog.sha256,
       effort, aliasesUnique: catalog.clientNameByBoxName.size === catalog.tools.length,
       turnKeyPropagated: userMeta.oc_turn_key === syntheticTurnKey,
+      outerSessionPresent: typeof meta?.session_id === "string",
+      innerSessionPresent: typeof userMeta.session_id === "string",
+      sessionIdsAgree: typeof meta?.session_id === "string"
+        && typeof userMeta.session_id === "string"
+        && meta.session_id === userMeta.session_id,
       topLevelKeys: [...new Set((body.tools as Array<Record<string, unknown>>)
         .flatMap((item) => Object.keys(item)))].sort() };
   } catch (error) {
