@@ -42,8 +42,11 @@ export interface BoxToolHandoffCandidate {
 export interface BoxToolHandoffProof {
   /** Receipt from a successful durable journal write, not a local counter. */
   readonly durableRevision: string;
-  /** IDs checked against owner-scoped Box MCP pending files. */
-  readonly verifiedToolUseIds: readonly string[];
+  /** All IDs committed from the completed model message, in model order. */
+  readonly journaledToolUseIds: readonly string[];
+  /** Nonempty subset whose owner-scoped MCP pending files already exist.
+   * Claude Code may dispatch later IDs only after the first result arrives. */
+  readonly verifiedPendingToolUseIds: readonly string[];
 }
 interface ActiveBlock {
   original: number;
@@ -134,12 +137,19 @@ export class BoxCliToolHandoffDecoder {
       throw new BoxCliToolHandoffError("BOX_TOOL_HANDOFF_NOT_READY");
     }
     if (!proof || typeof proof.durableRevision !== "string"
-      || !Array.isArray(proof.verifiedToolUseIds)
+      || !Array.isArray(proof.journaledToolUseIds)
+      || !Array.isArray(proof.verifiedPendingToolUseIds)
       || !/^[A-Za-z0-9._:-]{1,128}$/.test(proof.durableRevision)
-      || proof.verifiedToolUseIds.length !== this.expectedToolIds.length
+      || proof.journaledToolUseIds.length !== this.expectedToolIds.length
       || this.expectedToolIds.some((id, index) =>
-        !Object.hasOwn(proof.verifiedToolUseIds, index)
-        || proof.verifiedToolUseIds[index] !== id)) {
+        !Object.hasOwn(proof.journaledToolUseIds, index)
+        || proof.journaledToolUseIds[index] !== id)
+      || proof.verifiedPendingToolUseIds.length < 1
+      || proof.verifiedPendingToolUseIds.length > this.expectedToolIds.length
+      || new Set(proof.verifiedPendingToolUseIds).size !== proof.verifiedPendingToolUseIds.length
+      || Array.from({ length: proof.verifiedPendingToolUseIds.length }, (_, index) => index)
+        .some((index) => !Object.hasOwn(proof.verifiedPendingToolUseIds, index)
+          || !this.expectedToolIds.includes(proof.verifiedPendingToolUseIds[index]!))) {
       throw new BoxCliToolHandoffError("BOX_TOOL_HANDOFF_PROOF_INVALID");
     }
     this.committed = true;

@@ -145,43 +145,68 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
 
 ### Durable invocation journal (design freeze; no migration applied yet)
 
-Use a **new selfhost-only PG table** for the lifetime of one Box CLI process.
+Use new selfhost-only PG invocation **and per-model-message round** records.
 Do not overload `request_finalize_journal` (one billing HTTP request) or
-`turn_dispatches` (one user-container agent turn): one held CLI may span two
-Messages HTTP requests and two usage settlements. The row carries only
-`invocation_id`, uid, OpenClaude session ID, immutable first-request hash,
-first billing request ID, account ID, Box run nonce, catalog/model IDs,
-owner ID/lease epoch/deadline, state/revision, per-tool ID/name/input hashes,
-second billing request ID when claimed, and terminal/unknown evidence. No
+`turn_dispatches` (one user-container agent turn): a held CLI can span an
+arbitrary positive number of tool cycles and Messages HTTP requests. The
+invocation row carries `invocation_id`, uid, OpenClaude session ID, stable
+**logical model-call ID**, immutable request hash, selected account, Box run
+nonce, catalog/model IDs, owner ID/lease epoch/deadline, state/revision and
+terminal/unknown evidence. A round row keyed by `(invocation_id, round_no)`
+carries that HTTP request's stable billing ID, tool ID/name/input hashes,
+observed usage, immutable pricing basis/hash, and settlement evidence. No
 credential, prompt, tool arguments/results or Box session snapshot in PG.
 
-- Reserve by `(uid, session_id, first_request_hash)` **before** any potentially
-  paid model start, using a uniqueness/CAS fence. A duplicate never starts a
-  second CLI. A completed duplicate may return an explicit already-executed
-  error unless a verified response cache is available; it must not silently
-  replay or be treated as a fresh request.
-- Use monotonic revision and lease epoch on every state change. State path:
-  `reserved → starting → streaming → handoff → resuming → terminal`; any
+- The OpenClaude-side model-call boundary mints a stable logical ID **once**.
+  Its transport retries reuse that ID; a deliberate new call (even with
+  identical body) gets a new ID. Reserve by `(uid, logical_call_id)` before
+  potentially paid work. The request hash only proves immutable content for
+  that ID, never defines identity by itself. A duplicate cannot start another
+  CLI; a completed duplicate returns cached verified output or a loud
+  already-executed result, not a fresh paid call. This needs a real
+  container→master ID transport; gateway-generated per-HTTP request IDs are
+  not a substitute.
+- Use monotonic revision/lease epoch on every state change. State path:
+  `reserved → starting → streaming → handoff → resuming → streaming → ...`
+  then `terminal`; each new model message increments `round_no`. Any
   ambiguous transport, owner loss or mismatched proof goes to `unknown` (or
   explicit `manual_reconcile`), never back to `reserved`. Per-uid/session and
-  per-account active capacity is held across HTTP boundaries.
-- Before emitting first-response `message_delta(tool_use)` / `message_stop`,
-  verify **every** model tool ID/name/input against the owner-scoped Box MCP
-  `pending.<tool_id>.json` files, then commit all IDs/hashes and a journal
-  revision in one PG transaction. Only that committed revision can be passed
-  to the handoff decoder. Merely seeing a streamed `tool_use` is not a durable
-  handoff.
-- The second authenticated Messages request must match uid, session, model,
-  the exact pending tool-ID set and one `tool_result` per ID (including error
-  flags/content hashes). Claim `handoff → resuming` under CAS; publish each
-  result to its Box file **once**, atomically. A timeout after publish is
-  `unknown`, not a reason to republish or restart `claude -p`.
+  per-account capacity remains held across all rounds and HTTP boundaries.
+- The first model message may request A and B while Claude Code dispatches
+  their MCP calls **serially** (observed in real CLI2.1.280): B's pending file
+  can appear only after A's result. Therefore do **not** wait for every Box
+  `pending.<tool_id>.json` before closing the first HTTP response. Instead,
+  validate the complete streamed model message and final assistant snapshot,
+  persist the **full** model tool ID/name/input-hash set plus per-round usage
+  and pricing evidence in one transaction, and require any *currently
+  dispatched* pending files to match. A nonempty owner-scoped pending subset
+  proves the CLI entered tool dispatch; remaining IDs are checked only when
+  their pending files appear. The transaction returns a durable revision;
+  only then emit first-response `message_delta(tool_use)`/`message_stop`.
+- The next authenticated Messages request must match uid, session, model,
+  prior round number and the **full model tool-ID set**, with exactly one
+  `tool_result` per ID (including error flags/content hashes). Claim
+  `handoff → resuming` under CAS. Publish A's result once, wait for B's
+  owner-scoped pending record, validate its ID/name/input, then publish B
+  once; never publish by order or before its pending record exists. If another
+  model response requests C, persist a new round and hand off again. A
+  timeout or crash after any publish is `unknown`, not a reason to republish
+  any result or restart `claude -p`.
+- Before **each** round's terminal SSE (tool-use or final text), persist exact
+  observed usage and the frozen pricing basis bound to its stable billing ID.
+  The existing per-HTTP `request_finalize_journal` must carry a Box durable
+  recovery marker: its legacy timeout-abort/GC path must exclude these rows.
+  A Box-specific reconciler settles from round evidence idempotently against
+  `usage_records`/ledger and emits the cost frame when recoverable. Without
+  durable usage/pricing evidence, neither terminal SSE nor a claim of
+  billable success may be emitted; mere transport closure is not evidence.
 - A restart may lose the live Connect response. The reconciler must never
   infer remote termination from elapsed time or a vanished local handle;
-  it needs a Box-side terminal/watchdog marker read through the pinned account
-  and egress. Without proof, keep `unknown`, capacity fenced, alert for manual
-  resolution. With proof, close resources and settle only from durable usage
-  evidence. No automatic paid-call or local-tool replay on takeover.
+  it needs a Box-side run-nonce/epoch-bound terminal/watchdog marker read
+  through the pinned account and egress. A kill request alone is not proof.
+  Without proof, keep `unknown`, capacity fenced and alert for manual
+  resolution. With proof, close resources and settle only from durable round
+  usage evidence. No automatic paid-call or local-tool replay on takeover.
 
 This schema/state design is not approval to apply a data migration. The next
 free migration number and shared-branch tip must be rechecked at merge, and

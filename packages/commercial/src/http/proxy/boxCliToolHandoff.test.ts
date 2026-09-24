@@ -59,22 +59,32 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
     ["toolu_parallel_a", boxName, "Bash", "same"],
     ["toolu_parallel_b", boxName, "Bash", "same"],
   ]);
-  assert.throws(() => decoder.commitHandoff({ durableRevision: "", verifiedToolUseIds: [] }),
+  assert.throws(() => decoder.commitHandoff({ durableRevision: "",
+    journaledToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"],
+    verifiedPendingToolUseIds: ["toolu_parallel_a"] }),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
   assert.throws(() => decoder.commitHandoff({ durableRevision: "synthetic-journal-rev-1",
-    verifiedToolUseIds: new Array<string>(2) }),
+    journaledToolUseIds: new Array<string>(2),
+    verifiedPendingToolUseIds: ["toolu_parallel_a"] }),
   (error: unknown) => error instanceof BoxCliToolHandoffError
     && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
   (candidate!.toolUses as unknown as Array<unknown>).splice(0, 2);
   assert.equal(decoder.push("").candidate?.toolUses.length, 2,
     "published candidate is not the internal authorization baseline");
   assert.throws(() => decoder.commitHandoff({ durableRevision: "synthetic-journal-rev-1",
-    verifiedToolUseIds: [] }),
+    journaledToolUseIds: [], verifiedPendingToolUseIds: ["toolu_parallel_a"] }),
   (error: unknown) => error instanceof BoxCliToolHandoffError
     && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
   const proof = { durableRevision: "synthetic-journal-rev-1",
-    verifiedToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"] };
+    journaledToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"],
+    verifiedPendingToolUseIds: ["toolu_parallel_a"] };
+  for (const pending of [[], ["toolu_wrong"], new Array<string>(1)]) {
+    assert.throws(() => decoder.commitHandoff({ ...proof,
+      verifiedPendingToolUseIds: pending }),
+    (error: unknown) => error instanceof BoxCliToolHandoffError
+      && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
+  }
   const terminal = decoder.commitHandoff(proof);
   assert.ok(terminal.includes('"stop_reason":"tool_use"'));
   assert.ok(terminal.includes("event: message_stop"));
@@ -114,7 +124,8 @@ test("snapshot mismatch, duplicate ID and unsupported tool name fail before term
       for (const line of lines(source)) decoder.push(line);
     }, BoxCliToolHandoffError);
     assert.throws(() => decoder.commitHandoff({ durableRevision: "synthetic-journal-rev-1",
-      verifiedToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"] }),
+      journaledToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"],
+      verifiedPendingToolUseIds: ["toolu_parallel_a"] }),
       (error: unknown) => error instanceof BoxCliToolHandoffError
         && error.code === "BOX_TOOL_HANDOFF_NOT_READY");
   }
