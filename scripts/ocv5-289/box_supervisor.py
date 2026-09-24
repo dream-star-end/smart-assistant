@@ -301,7 +301,7 @@ class ToolEventPublisher:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument("--deadline", type=float, required=True)
     parser.add_argument("--kill-after", type=float, default=1.0)
     parser.add_argument("--max-output", type=int, default=262144)

@@ -47,6 +47,15 @@ def extract_proof_args(argv: list[str]) -> tuple[list[str], str | None, str | No
     if proof_dir is not None and (not PROOF_DIR.fullmatch(proof_dir)
             or not EPOCH.fullmatch(epoch or "")):
         raise ValueError("PROOF_ARGS_INVALID")
+    supervisor_options = args[:separator]
+    allowed = {"--deadline", "--kill-after", "--max-output",
+               "--stdin-file", "--stdin-sha256"}
+    if (len(supervisor_options) % 2 or
+            any(supervisor_options[i] not in allowed
+                for i in range(0, len(supervisor_options), 2)) or
+            len(set(supervisor_options[::2])) != len(supervisor_options[::2]) or
+            supervisor_options[::2].count("--deadline") != 1):
+        raise ValueError("SUPERVISOR_ARGS_INVALID")
     return args, proof_dir, epoch
 
 

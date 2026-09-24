@@ -114,6 +114,18 @@ class DetachedRunnerTest(unittest.TestCase):
         self.assertNotEqual(rejected.returncode, 0)
         self.assertFalse((self.run_dir / "stdout.jsonl").exists())
 
+    def test_abbreviated_or_duplicate_deadline_fails_before_launch(self) -> None:
+        for deadline_args in (["--deadline", "110", "--dead", "900"],
+                              ["--deadline", "110", "--deadline", "900"]):
+            with self.subTest(deadline_args=deadline_args):
+                rejected = self.run_fixed(str(self.run_dir), str(self.assets[0]),
+                    str(self.assets[1]), "--proof-dir", str(self.proof_dir),
+                    "--lease-epoch", "a" * 32, *deadline_args,
+                    "--kill-after", ".1", "--max-output", "262144",
+                    "--", sys.executable, "-c", "print('must-not-run')")
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse((self.run_dir / "stdout.jsonl").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,14 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(budget(["--deadline", "900", "--", "echo"]), 930)
         self.assertEqual(budget(["--deadline", "901", "--", "echo"]), 140)
 
+    def test_abbreviated_or_duplicate_deadline_is_rejected_before_worker(self) -> None:
+        extract = runpy.run_path(str(KEEPER))["extract_proof_args"]
+        for args in (["--deadline", "110", "--dead", "900", "--", "echo"],
+                     ["--deadline", "110", "--deadline", "900", "--", "echo"],
+                     ["--deadline=900", "--", "echo"]):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                extract(args)
+
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ocv5-289-keeper-"))
         raw = SUPERVISOR.read_bytes() + f"\n# keeper-test-{secrets.token_hex(8)}\n".encode()
@@ -245,7 +253,8 @@ class KeeperTest(unittest.TestCase):
                                             "KEEPER_TEST_EXEC_MARKER": str(marker)})
                 self.processes.append(proc)
                 proc.communicate(timeout=4)
-                self.assertEqual(proc.returncode, 124)
+                self.assertEqual(proc.returncode,
+                    124 if deadline_args == ["--deadline", ".2"] else 126)
                 self.assertLess(time.monotonic() - began, 1.5)
                 self.assertFalse(marker.exists(), "CLI must not run after startup budget")
 

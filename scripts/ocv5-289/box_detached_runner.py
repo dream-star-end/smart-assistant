@@ -57,7 +57,15 @@ def launch(argv: list[str]) -> int:
         verified_asset(supervisor, "supervisor")
         if "--" not in options or options.index("--") == len(options) - 1:
             return 126
-        command = options[options.index("--") + 1]
+        separator = options.index("--")
+        prefix = options[:separator]
+        allowed = {"--proof-dir", "--lease-epoch", "--deadline",
+                   "--kill-after", "--max-output", "--stdin-file", "--stdin-sha256"}
+        if (len(prefix) % 2 or
+                any(prefix[i] not in allowed for i in range(0, len(prefix), 2)) or
+                len(set(prefix[::2])) != len(prefix[::2])):
+            return 126
+        command = options[separator + 1]
         if not os.path.isabs(command):
             return 126
         if ("--proof-dir" not in options or "--lease-epoch" not in options
