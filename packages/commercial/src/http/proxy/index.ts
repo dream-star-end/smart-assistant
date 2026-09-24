@@ -110,6 +110,8 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
+import { validateBoxTextRequest } from "./boxRequestGate.js";
+import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -776,11 +778,17 @@ export function makeAnthropicProxyHandler(
         ? gate.descriptor.capabilityProfile.supportsVision
         : route.kind === "static"
           ? route.provider.supportsVision === true
-          : true;
+          : route.kind !== "box";
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
+        boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
       });
       if (cfgErr) {
+        if (cfgErr.kind === "box_not_configured") {
+          incrAnthropicProxyReject("model_config_invalid");
+          sendJsonError(res, 503, "MODEL_NOT_AVAILABLE", "model not available", requestId);
+          return;
+        }
         // cfgErr.kind === "static_not_configured" —— 由 provider 的 commercial 语义映射决定
         // 503 错误码 + reject metric(deepseek/minimax/ark 各自一套，新增 provider 零改本处)。
         const meta = STATIC_PROVIDER_META[cfgErr.providerId];
@@ -797,6 +805,20 @@ export function makeAnthropicProxyHandler(
           requestId,
         );
         return;
+      }
+      if (route.kind === "box") {
+        if (containerIdBig === null) {
+          incrAnthropicProxyReject("unauthorized_model");
+          sendJsonError(res, 403, "NOT_AUTHORIZED", "model not authorized", requestId);
+          return;
+        }
+        const unsupported = validateBoxTextRequest(body);
+        if (unsupported) {
+          userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
+          incrAnthropicProxyReject("bad_body");
+          sendJsonError(res, 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported", requestId);
+          return;
+        }
       }
 
       // 5d) Phase 5 platform envelope rewriter(2026-05-21,外接 ApiKey 路径
@@ -1462,7 +1484,14 @@ export function makeAnthropicProxyHandler(
       // SSE 透传 + finalize + post-commit 广播 + zeroize。release 责任已在 finalize。
       await runUpstreamRoundTrip({
         pgPool: deps.pgPool,
-        fetchFn,
+        fetchFn: route.kind === "box"
+          ? ((url: string, init: RequestInit) => {
+              if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel) {
+                throw new Error("BOX_FETCH_NOT_CONFIGURED");
+              }
+              return deps.boxModel.fetch({ uid, sessionId, requestId, url, init });
+            }) as typeof fetch
+          : fetchFn,
         appendCostCredits: deps.appendCostCredits,
         broadcastToUser: deps.broadcastToUser,
         req,
@@ -1471,6 +1500,7 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        noHistoryRewriteRetry: route.kind === "box",
         quotaProbeProviderId,
         finalize,
         sessionId,

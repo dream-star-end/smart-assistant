@@ -85,7 +85,12 @@ import { ClaudeIdentityGuardError } from "./claudeIdentityGuard.js";
 
 export type UpstreamRoute =
   | { kind: "oauth"; upstreamModel?: string }
-  | { kind: "static"; provider: StaticKeyProviderSpec; upstreamModel?: string };
+  | { kind: "static"; provider: StaticKeyProviderSpec; upstreamModel?: string }
+  | { kind: "box"; upstreamModel: string };
+
+/** Never hand this sentinel to a network fetch. The injected Box transport
+ * checks it and uses authenticated Connect Exec instead. */
+export const BOX_INTERNAL_ENDPOINT = "box-cli://messages";
 
 /**
  * catalog 行给出的路由事实(模型权威批次 · 方案 §1.3 / R1-B4)。
@@ -144,6 +149,9 @@ export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): Ups
     if (pid === null || pid === OAUTH_PROVIDER_ID) {
       return { kind: "oauth", upstreamModel: hint.upstreamModelId };
     }
+    if (pid === "box_cli") {
+      return { kind: "box", upstreamModel: hint.upstreamModelId };
+    }
     if (!STATIC_PROVIDER_IDS.has(pid)) {
       throw new UnroutableProviderError(pid);
     }
@@ -153,6 +161,9 @@ export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): Ups
       upstreamModel: hint.upstreamModelId,
     };
   }
+  // Without an enforced catalog, a known Box API model must not fall through
+  // to the Anthropic OAuth pool merely because it is not a static-key model.
+  if (model.startsWith("box-api-")) throw new UnroutableProviderError("box_cli_authority_required");
   const provider = findRouteProviderForModel(model);
   if (!provider) return { kind: "oauth" };
   const upstreamModel = provider.upstreamModelForRequest?.(model);
@@ -182,6 +193,7 @@ export interface ProviderCapabilityCeiling {
 }
 
 export function providerCapabilityCeiling(route: UpstreamRoute): ProviderCapabilityCeiling {
+  if (route.kind === "box") return { supportsVision: false, efforts: [] };
   if (route.kind === "oauth") {
     // OAuth(Anthropic 官方)端点:原生多模态,无 output_config 白名单机制。
     return { supportsVision: true, efforts: null };
@@ -270,7 +282,9 @@ export function checkSnapshotCapabilities(snapshot: {
  * handler 拿到后映射:503(STATIC_PROVIDER_META[providerId].notConfiguredHttpCode)
  * + 对应结构化 log + reject metric。
  */
-export type ConfigError = { kind: "static_not_configured"; providerId: StaticProviderId };
+export type ConfigError =
+  | { kind: "static_not_configured"; providerId: StaticProviderId }
+  | { kind: "box_not_configured" };
 
 /**
  * preCheck **前**调:路由级早拒绝。返回 null 表示该路由当前部署可走。
@@ -280,8 +294,9 @@ export type ConfigError = { kind: "static_not_configured"; providerId: StaticPro
  */
 export function validateUpstreamConfig(
   route: UpstreamRoute,
-  deps: { staticProviderKeys?: StaticProviderKeys },
+  deps: { staticProviderKeys?: StaticProviderKeys; boxConfigured?: boolean },
 ): ConfigError | null {
+  if (route.kind === "box" && deps.boxConfigured !== true) return { kind: "box_not_configured" };
   if (route.kind === "static" && !deps.staticProviderKeys?.[route.provider.id]) {
     return { kind: "static_not_configured", providerId: route.provider.id };
   }
@@ -874,6 +889,16 @@ export async function pickUpstream(
   | { ok: true; session: PreparedUpstreamSession }
   | { ok: false; error: PickError }
 > {
+  if (route.kind === "box") {
+    return { ok: true, session: {
+      accountId: null, slotId: null, pinnedUserId: null, personaTimezone: null,
+      endpoint: BOX_INTERNAL_ENDPOINT, upstreamModel: route.upstreamModel,
+      dispatcher: undefined, shouldUpdateQuotaFromResponse: false,
+      applyUpstreamAuth() { /* identity and Box account auth stay in the injected transport */ },
+      sanitizeMessages(messages) { return messages; },
+      zeroizeSecrets() { /* no credential is held by this synthetic proxy session */ },
+    } };
+  }
   if (route.kind === "static") {
     // validateUpstreamConfig 已保证该 provider 的 key 非空(handler preCheck 前 gate)。
     // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。

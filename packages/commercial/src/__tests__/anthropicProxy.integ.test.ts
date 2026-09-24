@@ -60,6 +60,9 @@ import { generatePersona } from "../account-pool/persona.js";
 import type { PreCheckRedis } from "../billing/preCheck.js";
 import type { RateLimitRedis } from "../middleware/rateLimit.js";
 import { PricingCache, type ModelPricing } from "../billing/pricing.js";
+import { ModelCatalogSnapshot, type ModelCatalogEntry,
+  type ModelCatalogPricing } from "../billing/modelCatalog.js";
+import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "../http/proxy/modelAuthorityGate.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import {
@@ -773,6 +776,149 @@ function buildHarness(opts: HarnessOpts = {}) {
 afterEach(async () => {
   _resetGateForTest();
   await resetPool();
+});
+
+// OCV5-289: Box API routing must reuse this handler's identity, authority,
+// precheck and finalizer rather than opening a second public auth stack.
+const BOX_API_MODEL = "box-api-claude-opus-5-5";
+const BOX_API_PRICING: ModelPricing = {
+  ...FIXED_PRICING, model_id: BOX_API_MODEL, display_name: "Box Claude API",
+  default_effort: null,
+};
+function boxCatalogSnapshot(): ModelCatalogSnapshot {
+  const entry: ModelCatalogEntry = {
+    entryId: 289, modelId: BOX_API_MODEL, engine: "ccb", providerId: "box_cli",
+    upstreamModelId: "claude-opus-5-5", contextWindow: 200_000,
+    capabilityProfile: { supportsVision: false,
+      reasoning: { supported: [], codexModelDefault: null },
+      ccb: { capabilityZero: true, supportsThinking: false } },
+    capabilitySchemaVersion: 1, state: "active", lockVersion: 0,
+  };
+  const pricing: ModelCatalogPricing = {
+    modelId: BOX_API_MODEL, displayName: BOX_API_PRICING.display_name,
+    inputPerMtok: BOX_API_PRICING.input_per_mtok,
+    outputPerMtok: BOX_API_PRICING.output_per_mtok,
+    cacheReadPerMtok: BOX_API_PRICING.cache_read_per_mtok,
+    cacheWritePerMtok: BOX_API_PRICING.cache_write_per_mtok,
+    multiplier: BOX_API_PRICING.multiplier, visibility: "public", sortOrder: 289,
+    defaultEffort: null,
+  };
+  return new ModelCatalogSnapshot({ entries: [entry], aliases: new Map(),
+    pricing: new Map([[BOX_API_MODEL, pricing]]), securityEpoch: 7n });
+}
+function boxRouteHarness() {
+  const h = buildHarness({ pricings: [FIXED_PRICING, DEEPSEEK_PRICING, BOX_API_PRICING] });
+  const snapshot = boxCatalogSnapshot();
+  const catalogStub = {
+    async assertFresh() { return snapshot; },
+    peek() { return snapshot; },
+  };
+  h.deps.modelCatalog = catalogStub as unknown as NonNullable<AnthropicProxyDeps["modelCatalog"]>;
+  h.deps.modelAuthorityEnforce = true;
+  const token = encodeLocalCatalogToken({ v: 1, kind: "local_catalog",
+    projectionRevision: snapshot.projectionRevisionFor({ uid: String(FIXED_USER_ID),
+      role: "user", grantedModelIds: new Set() }),
+    securityEpoch: snapshot.securityEpoch.toString() });
+  return { h, headers: { [LOCAL_CATALOG_HEADER]: token } };
+}
+
+describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
+  test("authority absent never falls through to OAuth account pool", async () => {
+    const h = buildHarness({ pricings: [FIXED_PRICING, DEEPSEEK_PRICING, BOX_API_PRICING] });
+    const res = await h.run(minBody(BOX_API_MODEL));
+    assert.equal(res.statusCode, 503);
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.schedulerSpy.pickCalls.length, 0);
+  });
+
+  test("off flag or missing injected Box transport rejects before precheck", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      const { h, headers } = boxRouteHarness();
+      let calls = 0;
+      h.deps.boxModel = { async fetch() { calls++; throw new Error("SHOULD_NOT_CALL"); } };
+      delete process.env.OC_BOX_MODEL_API;
+      const off = await h.run(minBody(BOX_API_MODEL), headers);
+      assert.equal(off.statusCode, 503);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      process.env.OC_BOX_MODEL_API = "1";
+      h.deps.boxModel = undefined;
+      const missing = await h.run(minBody(BOX_API_MODEL), headers);
+      assert.equal(missing.statusCode, 503);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(calls, 0);
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("unsupported tools reject before reservation or Box call", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      let calls = 0;
+      h.deps.boxModel = { async fetch() { calls++; throw new Error("SHOULD_NOT_CALL"); } };
+      const tools = await h.run({ ...minBody(BOX_API_MODEL), tools: [{ name: "Bash" }] }, headers);
+      assert.equal(tools.statusCode, 400);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(calls, 0);
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("fenced authorization denial makes zero Box calls and zero reservations", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      let calls = 0;
+      h.deps.boxModel = { async fetch() { calls++; throw new Error("SHOULD_NOT_CALL"); } };
+      h.setAuthz(async () => ({ role: "user", grantedModelIds: new Set(),
+        deniedModelIds: new Set([BOX_API_MODEL]) }));
+      const denied = await h.run(minBody(BOX_API_MODEL), headers);
+      assert.notEqual(denied.statusCode, 200);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(calls, 0);
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("authorized text request passes one Box fetch and the existing journal/finalizer", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      let calls = 0;
+      h.deps.boxModel = { async fetch({ uid, url, init }) {
+        calls++;
+        assert.equal(uid, BigInt(FIXED_USER_ID));
+        assert.equal(url, "box-cli://messages");
+        assert.equal(JSON.parse(String(init.body)).model, "claude-opus-5-5");
+        return sseResponse(200, makeFullSseChunks());
+      } };
+      const res = await h.run(minBody(BOX_API_MODEL), headers);
+      assert.equal(res.statusCode, 200, res.bodyText());
+      assert.equal(calls, 1);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 1);
+      assert.equal(h.schedulerSpy.pickCalls.length, 0);
+      assert.equal(h.schedulerSpy.releaseCalls.length, 0);
+      assert.equal(h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")).length, 1);
+      assert.equal(h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO USAGE_RECORDS")).length, 1,
+      "the shared finalizer must settle the Box request exactly once");
+      assert.ok(res.bodyText().includes("event: message_start"));
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
 });
 
 /** sendJsonError 输出 `{error: {code, message}}` —— body.error.code 才是 code。 */

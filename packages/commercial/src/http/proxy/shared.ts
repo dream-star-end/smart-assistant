@@ -1509,6 +1509,13 @@ export interface AnthropicProxyDeps {
   rateLimitRedis: RateLimitRedis;
   /** 注入 fetch(测试用)。 */
   fetchImpl?: typeof fetch;
+  /** Optional, off-by-default Box CLI model transport. The proxy retains
+   * identity/authority/precheck/finalizer; this component owns only the Box
+   * invocation and its independent cross-HTTP account-capacity lease. */
+  boxModel?: {
+    fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
+      url: string; init: RequestInit }): Promise<Response>;
+  };
   /** 上游 endpoint;默认 api.anthropic.com */
   upstreamEndpoint?: string;
   /** 限流配置覆盖 */
