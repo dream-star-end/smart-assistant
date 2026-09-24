@@ -642,6 +642,26 @@ export class BoxDurableJournal implements BoxJournalPort {
     return changed.rowCount === 1;
   }
 
+  /** A losing worker may close only its local ProxyAgent after another worker
+   * has durably marked the exact same proven remote run cleaned. */
+  async remoteCleanupStatus(input: BoxRemoteCleanupCandidate): Promise<"done" | "pending" | "invalid"> {
+    try {
+      if (parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input).reason
+        !== "worker_complete") return "invalid";
+    } catch { return "invalid"; }
+    const found = await this.pool.query<{ status: string | null }>(
+      `SELECT ctx->>'boxRemoteCleanup' AS status FROM request_finalize_journal
+        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
+          AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState'='terminal' AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
+          AND ctx->'boxTerminalProof'=$6::jsonb`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
+    if (found.rowCount !== 1) return "invalid";
+    return found.rows[0]?.status === "done" ? "done" : "pending";
+  }
+
   async markRemoteCleaned(input: BoxRemoteCleanupCandidate): Promise<void> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
       || input.uid <= 0n || input.accountId <= 0n

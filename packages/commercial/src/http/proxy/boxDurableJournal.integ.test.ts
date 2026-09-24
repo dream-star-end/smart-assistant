@@ -377,6 +377,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const finalCleanup = cleanupCandidates.find((item) =>
       item.requestId === `box-e-${suffix}`);
     assert.ok(finalCleanup);
+    assert.equal(await journal.remoteCleanupStatus(finalCleanup!), "pending");
+    assert.equal(await journal.remoteCleanupStatus({ ...finalCleanup!, accountId: 21n }),
+      "invalid");
     assert.ok(!cleanupCandidates.some((item) => item.requestId === toolCall.requestId),
       "handoff ancestors have no independent terminal proof");
     await assert.rejects(() => journal.markRemoteCleaned({ ...finalCleanup!,
@@ -402,6 +405,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       && error.code === "BOX_CLEANUP_FENCE_LOST");
     await journal.markRemoteCleaned(finalCleanup!);
     await journal.markRemoteCleaned(finalCleanup!);
+    assert.equal(await journal.remoteCleanupStatus(finalCleanup!), "done");
     assert.ok(!(await journal.listRemoteCleanupCandidates()).some((item) =>
       item.requestId === `box-e-${suffix}`));
     await assert.rejects(() => journal.completeToolChain({
