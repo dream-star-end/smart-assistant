@@ -86,6 +86,7 @@ const address = server.address();
 if (!address || typeof address === "string") throw new Error("LOOPBACK_INVALID");
 const child = spawn("/usr/local/bin/claude", ["-p", "Call local_echo twice with value same, then answer.",
   "--model", "claude-opus-5-5", "--output-format", "stream-json", "--verbose",
+  "--include-partial-messages",
   "--tools", "", "--strict-mcp-config", "--mcp-config", mcpConfig,
   "--allowedTools", toolName, "--setting-sources", "", "--disable-slash-commands",
   "--no-session-persistence"], { cwd: directory,
@@ -152,7 +153,11 @@ try {
   }
   process.stdout.write(JSON.stringify({ version, synthetic: true,
     requests, advertised, twoResultsExact: responseExact, concurrentObserved,
-    finalSuccess: true, stderrBytes }) + "\n");
+    finalSuccess: true, stderrBytes,
+    recordTypes: records.slice(0, 48).map((record) => record.type),
+    streamEventTypes: records.filter((record) => record.type === "stream_event")
+      .slice(0, 48).map((record) => (record.event as { type?: string } | undefined)?.type),
+  }) + "\n");
 } finally {
   clearTimeout(timer);
   if (child.exitCode === null) child.kill("SIGTERM");
