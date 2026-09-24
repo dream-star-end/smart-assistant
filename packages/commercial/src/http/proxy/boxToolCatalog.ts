@@ -27,8 +27,9 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Reject cycles, excessive nesting and dangerous keys before any schema is
- * staged as a Box file. JSON.stringify alone does not enforce depth. */
+/** Reject cycles and excessive nesting before a schema is staged as a Box
+ * file. Property names are inert JSON data here: no object merge or dynamic
+ * assignment ever interprets `__proto__`, `constructor`, etc. */
 function validateJson(value: unknown, depth = 0): void {
   if (depth > 32) throw new BoxToolCatalogError("BOX_TOOL_SCHEMA_TOO_DEEP");
   if (value === null || typeof value === "string" || typeof value === "boolean") return;
@@ -40,8 +41,7 @@ function validateJson(value: unknown, depth = 0): void {
   }
   if (!record(value)) throw new BoxToolCatalogError("BOX_TOOL_SCHEMA_INVALID");
   const keys = Object.keys(value);
-  if (keys.length > 4096 || keys.some((key) => key === "__proto__"
-    || key === "constructor" || key === "prototype")) {
+  if (keys.length > 4096) {
     throw new BoxToolCatalogError("BOX_TOOL_SCHEMA_INVALID");
   }
   for (const key of keys) validateJson(value[key], depth + 1);
@@ -56,7 +56,9 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
   const boxNameByClientName = new Map<string, string>();
   for (let i = 0; i < rawTools.length; i++) {
     const source = rawTools[i];
-    if (!record(source) || typeof source.name !== "string"
+    if (!record(source) || Object.keys(source).some((key) =>
+      key !== "name" && key !== "description" && key !== "input_schema")
+      || typeof source.name !== "string"
       || !/^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/.test(source.name)
       || boxNameByClientName.has(source.name)
       || typeof source.description !== "string"

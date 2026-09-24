@@ -44,8 +44,17 @@ test("duplicate, malformed, oversized and dangerous tool declarations fail close
     "BOX_TOOL_DECLARATION_INVALID");
   rejects([{ ...tool("Bash"), description: "x".repeat(16_385) }],
     "BOX_TOOL_DECLARATION_INVALID");
-  const malicious = JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string"}}}');
-  rejects([{ ...tool("Bash"), input_schema: malicious }], "BOX_TOOL_SCHEMA_INVALID");
+  for (const unsupported of [
+    { strict: true },
+    { allowed_callers: ["code_execution_20260120"] },
+    { type: "custom" },
+    { cache_control: { type: "ephemeral" } },
+  ]) {
+    rejects([{ ...tool("Bash"), ...unsupported }], "BOX_TOOL_DECLARATION_INVALID");
+  }
+  const dataKeys = JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string"},"constructor":{"type":"string"},"prototype":{"type":"string"}},"default":{"__proto__":"data"}}');
+  assert.deepEqual(JSON.parse(compileBoxToolCatalog([{ ...tool("Bash"),
+    input_schema: dataKeys }]).json).tools[0].inputSchema, dataKeys);
   const deep: Record<string, unknown> = { type: "object" };
   let cursor = deep;
   for (let i = 0; i < 34; i++) {
