@@ -60,4 +60,11 @@ test("error and image content map exactly to virtual MCP, unsupported blocks fai
     { type: "tool_result", tool_use_id: "toolu_same_B", content: "ok" },
   ];
   assert.throws(() => matchBoxToolResults(request, uses), /BOX_TOOL_RESULT_CONTENT_INVALID/);
+  (request.messages[1] as { content: unknown[] }).content = [
+    { type: "tool_result", tool_use_id: "toolu_same_A",
+      content: [{ type: "text", text: "quoted", citations: [{ type: "web_search_result_location" }] }] },
+    { type: "tool_result", tool_use_id: "toolu_same_B", content: "ok" },
+  ];
+  assert.throws(() => matchBoxToolResults(request, uses), /BOX_TOOL_RESULT_CONTENT_INVALID/,
+    "semantic citations must never be silently stripped or omitted from the hash");
 });

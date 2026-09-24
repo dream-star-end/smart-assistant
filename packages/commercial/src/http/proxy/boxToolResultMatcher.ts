@@ -31,11 +31,14 @@ function content(value: unknown): McpContent[] {
   const out: McpContent[] = [];
   for (const block of blocks) {
     if (!record(block)) throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTENT_INVALID");
-    if (block.type === "text" && typeof block.text === "string") {
+    if (block.type === "text" && typeof block.text === "string"
+      && Object.keys(block).sort().join(",") === "text,type") {
       out.push({ type: "text", text: block.text });
       continue;
     }
-    if (block.type === "image" && record(block.source)
+    if (block.type === "image" && Object.keys(block).sort().join(",") === "source,type"
+      && record(block.source)
+      && Object.keys(block.source).sort().join(",") === "data,media_type,type"
       && block.source.type === "base64" && typeof block.source.data === "string"
       && typeof block.source.media_type === "string"
       && ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(block.source.media_type)) {
@@ -84,6 +87,8 @@ export function matchBoxToolResults(body: ProxyBody,
   for (const block of user.content) {
     if (!record(block) || block.type !== "tool_result"
       || typeof block.tool_use_id !== "string" || !TOOL_ID.test(block.tool_use_id)
+      || Object.keys(block).some((key) =>
+        key !== "type" && key !== "tool_use_id" && key !== "content" && key !== "is_error")
       || (block.is_error !== undefined && typeof block.is_error !== "boolean")
       || byId.has(block.tool_use_id)) {
       throw new BoxToolResultMatchError("BOX_TOOL_RESULT_SET_MISMATCH");
