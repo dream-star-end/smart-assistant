@@ -52,6 +52,7 @@ import {
   type CursorExternalApiOutbox,
 } from "./billing/cursorExternalApiOutbox.js";
 import { closePool, createPool, getPool } from "./db/index.js";
+import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
 import {
   assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool,
@@ -6174,6 +6175,7 @@ export async function registerCommercial(
           intervalMs,
           thresholdMs,
           durableWaiverAgeMs,
+          boxRecoveryFn: () => reconcileBoxBillingBatch(getPool()),
         }));
         return { stop: () => h.stop() };
       },

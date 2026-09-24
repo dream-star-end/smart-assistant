@@ -82,6 +82,26 @@ describe('resolveDurableWaiverAgeMs', () => {
 describe('startFinalizeJournalReconciler', () => {
   const noGc = async () => 0
 
+  test('Box billing recovery shares the existing tick without blocking legacy reconcile/GC', async () => {
+    let boxCalls = 0, gcCalls = 0, errors = 0
+    const h = startFinalizeJournalReconciler({
+      runOnStart: false,
+      reconcileFn: async () => ({ committed: 1, aborted: 0, durableWaived: 0 }),
+      boxRecoveryFn: async () => { boxCalls++; throw new Error('synthetic Box DB failure') },
+      alertStuckFinalizingFn: async () => 0,
+      gcFn: async () => { gcCalls++; return 2 },
+      onError: () => { errors++ },
+    })
+    try {
+      const result = await h.runNow()
+      assert.equal(boxCalls, 1)
+      assert.equal(errors, 1)
+      assert.equal(gcCalls, 1)
+      assert.equal(result.committed, 1)
+      assert.equal(result.gc, 2)
+    } finally { h.stop() }
+  })
+
   test('runOnStart 默认 true,boot 立即 reconcile 一次', async () => {
     let n = 0
     const h = startFinalizeJournalReconciler({

@@ -524,6 +524,8 @@ export interface ReconcilerOptions {
   onError?: (err: unknown) => void
   /** 测试注入:覆盖默认 DB 调用。 */
   reconcileFn?: () => Promise<ReconcileCounts>
+  /** Box 终态证据单独恢复；未接线时不改变现有 reconciler 行为。 */
+  boxRecoveryFn?: () => Promise<unknown>
   gcFn?: () => Promise<number>
   /** 测试注入:覆盖 durable finalizing 老化告警(返回命中行数)。 */
   alertStuckFinalizingFn?: () => Promise<number>
@@ -586,6 +588,12 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
         durableWaived = r.durableWaived
       } catch (err) {
         onError(err)
+      }
+      // 独立于 legacy timeout-abort。Box 只从已持久化的终止/用量/定价
+      // 证据结算，失败保留原行并在下一 tick 重试，绝不重放模型调用。
+      if (opts.boxRecoveryFn) {
+        try { await opts.boxRecoveryFn() }
+        catch (err) { onError(err) }
       }
       // durable finalizing 老化告警(二级检测):独立 try —— 告警扫描失败不拖累 reconcile/GC。
       // 纯只读 + safeEnqueueAlert(fire-and-forget),不改任何行状态;dedupe 按行 id+天。
