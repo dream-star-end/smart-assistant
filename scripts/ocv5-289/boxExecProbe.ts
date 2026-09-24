@@ -14,12 +14,67 @@ import { encodeExecRequest, parseExecFramesStrict } from '../../packages/gateway
 import { boxExecEgressBasis } from './boxExecBasis.js'
 import { withPinnedBoxHistoryVersion } from './boxHistoryVersionGate.js'
 import { compileBoxCliSyntheticTurn } from '../../packages/commercial/src/http/proxy/boxMessagesMapper.js'
+import { BoxCliSseError, completedBoxCliToSse } from '../../packages/commercial/src/http/proxy/boxCliSse.js'
 import type { ProxyBody } from '../../packages/commercial/src/http/proxy/shared.js'
 
 const ACCOUNT_ID = '20'
 const AUTH_DIR = '/etc/openclaude/cursor-v5-u3'
 const MODEL = '/home/box/.local/bin/claude'
 const COMMANDS = [['--version'], ['--help']] as const
+/** Contract-only evidence; never include prompt, text, token or Exec ticket. */
+function safeCliStreamShape(records: Array<Record<string, unknown>>): Record<string, unknown> {
+  const events = records.filter((record) => record.type === 'stream_event')
+    .map((record) => record.event as Record<string, unknown> | undefined)
+    .filter((event): event is Record<string, unknown> => !!event && typeof event === 'object')
+  const typed = (value: unknown, allowed: readonly string[]): string =>
+    typeof value === 'string' && allowed.includes(value) ? value : 'other'
+  const index = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 128
+      ? value : null
+  const usage = (value: unknown): Record<string, number | null> => {
+    const source = value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown> : {}
+    const out: Record<string, number | null> = {}
+    for (const key of ['input_tokens', 'output_tokens', 'cache_read_input_tokens',
+      'cache_creation_input_tokens']) {
+      out[key] = typeof source[key] === 'number' && Number.isSafeInteger(source[key])
+        ? source[key] as number : null
+    }
+    return out
+  }
+  const starts = events.filter((event) => event.type === 'message_start').slice(0, 3)
+  const deltas = events.filter((event) => event.type === 'message_delta').slice(0, 5)
+  const final = records.findLast((record) => record.type === 'result')
+  const init = records.find((record) => record.type === 'system' && record.subtype === 'init')
+  return { recordsTruncated: records.length > 40, eventsTruncated: events.length > 40,
+    recordTypes: records.slice(0, 40).map((record) => typed(record.type,
+      ['system', 'stream_event', 'assistant', 'user', 'rate_limit_event', 'result'])),
+    eventTypes: events.slice(0, 40).map((event) => typed(event.type,
+      ['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop',
+        'message_delta', 'message_stop', 'ping'])),
+    startModelMatches: starts.map((event) =>
+      (event.message as { model?: unknown } | undefined)?.model === 'claude-opus-5-5'),
+    starts: starts.map((event) => usage((event.message as { usage?: unknown } | undefined)?.usage)),
+    deltas: deltas.map((event) => ({ usage: usage(event.usage),
+      stop: typed((event.delta as { stop_reason?: unknown } | undefined)?.stop_reason,
+        ['end_turn', 'tool_use', 'max_tokens', 'stop_sequence']) })),
+    blocks: events.filter((event) => event.type === 'content_block_start').slice(0, 8)
+      .map((event) => ({ index: index(event.index), type: typed(
+        (event.content_block as { type?: unknown } | undefined)?.type,
+        ['text', 'thinking', 'redacted_thinking', 'tool_use']) })),
+    contentDeltas: events.filter((event) => event.type === 'content_block_delta').slice(0, 12)
+      .map((event) => {
+        const delta = event.delta && typeof event.delta === 'object' && !Array.isArray(event.delta)
+          ? event.delta as Record<string, unknown> : {}
+        return { index: index(event.index), type: typed(delta.type,
+          ['text_delta', 'thinking_delta', 'signature_delta', 'input_json_delta', 'citations_delta']),
+          text: typeof delta.text === 'string', thinking: typeof delta.thinking === 'string',
+          signature: typeof delta.signature === 'string', json: typeof delta.partial_json === 'string' }
+      }),
+    finalUsage: usage(final?.usage), finalIsError: final?.is_error === true,
+    initToolCount: Array.isArray(init?.tools) ? init.tools.length : null,
+    initMcpCount: Array.isArray(init?.mcp_servers) ? init.mcp_servers.length : null }
+}
 async function main(): Promise<void> {
 if (process.env.OCV5_289_ACK_ACCOUNT_ID !== ACCOUNT_ID || process.env.OCV5_289_ACK_USER_ID !== '3') {
   throw new Error('OCV5_289_OPERATOR_ACK_REQUIRED')
@@ -451,7 +506,7 @@ os.rmdir(d);print('clean')`
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_hist_289',
           content: [{ type: 'text', text: nonce }] }] },
         { role: 'assistant', content: [{ type: 'text', text: 'Tool result received.' }] },
-        { role: 'user', content: currentPrompt },
+        { role: 'user', content: [{ type: 'text', text: currentPrompt }] },
       ],
     } as ProxyBody, { cwd: directory, cliVersion: '2.1.280' })
     const supervisorAsset = readFileSync(new URL('./box_supervisor.py', import.meta.url))
@@ -476,31 +531,40 @@ print(want)`
     if (stagedSupervisor.trim() !== supervisorHash) throw new Error('BOX_HISTORY_SUPERVISOR_STAGE_FAILED')
     const snapshot = Buffer.from(synthetic.snapshotJsonl)
     const snapshotHash = createHash('sha256').update(snapshot).digest('hex')
+    const stdin = Buffer.from(synthetic.stdinJsonl)
+    const stdinHash = createHash('sha256').update(stdin).digest('hex')
     const projectDir = `/home/box/.claude/projects/${directory.replaceAll('/', '-')}`
     const remoteSnapshot = `${projectDir}/${synthetic.sessionId}.jsonl`
+    const remoteStdin = `${directory}/stdin.jsonl`
     const stageSnapshot = String.raw`import base64,hashlib,os,stat,sys
-cwd,project,path,encoded,want=sys.argv[1:]
-if not cwd.startswith('/tmp/ocv5-289-run-') or not project.startswith('/home/box/.claude/projects/-tmp-ocv5-289-run-'):raise SystemExit(1)
-raw=base64.b64decode(encoded,validate=True)
-if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want:raise SystemExit(1)
+cwd,project,path,encoded,want,stdinpath,stdinencoded,stdinwant=sys.argv[1:]
+if not cwd.startswith('/tmp/ocv5-289-run-') or not project.startswith('/home/box/.claude/projects/-tmp-ocv5-289-run-') or stdinpath!=cwd+'/stdin.jsonl':raise SystemExit(1)
+raw=base64.b64decode(encoded,validate=True);stdinraw=base64.b64decode(stdinencoded,validate=True)
+if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want or len(stdinraw)>32768 or hashlib.sha256(stdinraw).hexdigest()!=stdinwant:raise SystemExit(1)
 os.mkdir(cwd,0o700);os.mkdir(project,0o700)
 fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
 try:os.write(fd,raw);os.fsync(fd)
 finally:os.close(fd)
-st=os.lstat(path)
-if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600:raise SystemExit(1)
-print(hashlib.sha256(open(path,'rb').read()).hexdigest())`
+fd=os.open(stdinpath,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+try:os.write(fd,stdinraw);os.fsync(fd)
+finally:os.close(fd)
+for p,w in ((path,want),(stdinpath,stdinwant)):
+ st=os.lstat(p)
+ if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or hashlib.sha256(open(p,'rb').read()).hexdigest()!=w:raise SystemExit(1)
+print(want+' '+stdinwant)`
     const staged = await runFixed({ command: '/usr/bin/python3',
       args: ['-c', stageSnapshot, directory, projectDir, remoteSnapshot,
-        snapshot.toString('base64'), snapshotHash], cwd: '/tmp',
+        snapshot.toString('base64'), snapshotHash, remoteStdin, stdin.toString('base64'), stdinHash], cwd: '/tmp',
       environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
-    if (staged.trim() !== snapshotHash) throw new Error('BOX_HISTORY_SNAPSHOT_STAGE_FAILED')
+    if (staged.trim() !== `${snapshotHash} ${stdinHash}`) throw new Error('BOX_HISTORY_SNAPSHOT_STAGE_FAILED')
     let remoteCompleted = false
     try {
       const output = await runFixed({ command: '/usr/bin/python3', cwd: directory, timeoutMs: 45_000,
-        args: [supervisorPath, '--deadline', '35', '--kill-after', '2', '--max-output', '262144', '--',
-          MODEL, '-p', currentPrompt, '--resume', synthetic.sessionId, '--model', 'claude-opus-5-5',
-          '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
+        args: [supervisorPath, '--deadline', '35', '--kill-after', '2', '--max-output', '262144',
+          '--stdin-file', remoteStdin, '--stdin-sha256', stdinHash, '--',
+          MODEL, '-p', '--resume', synthetic.sessionId, '--model', 'claude-opus-5-5',
+          '--input-format', 'stream-json', '--output-format', 'stream-json',
+          '--include-partial-messages', '--verbose',
           '--tools', '', '--disallowedTools', 'mcp__*', '--strict-mcp-config',
           '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '',
           '--disable-slash-commands', '--no-session-persistence',
@@ -521,27 +585,36 @@ print(hashlib.sha256(open(path,'rb').read()).hexdigest())`
         const content = (record.message as { content?: unknown } | undefined)?.content
         return Array.isArray(content) ? content.filter((block) => block?.type === 'text').map((block) => block.text) : []
       }).join('')
+      let sseBytes = 0
+      try { sseBytes = completedBoxCliToSse(output, 'claude-opus-5-5').sse.length }
+      catch (error) {
+        const code = error instanceof BoxCliSseError ? error.code : 'BOX_CLI_SSE_UNKNOWN'
+        process.stderr.write(`BOX_HISTORY_SSE_DIAG ${JSON.stringify({ code,
+          ...safeCliStreamShape(records) })}\n`)
+        throw new Error('BOX_HISTORY_SSE_INVALID')
+      }
       if (!init || !Array.isArray(init.tools) || init.tools.length !== 0
         || !Array.isArray(init.mcp_servers) || init.mcp_servers.length !== 0
-        || final?.subtype !== 'success' || final.is_error !== false || text !== nonce
+        || final?.subtype !== 'success' || final.is_error !== false || text !== nonce || sseBytes === 0
         || !Number.isSafeInteger(final.usage?.input_tokens) || Number(final.usage?.input_tokens) < 0
         || !Number.isSafeInteger(final.usage?.output_tokens) || Number(final.usage?.output_tokens) < 0) {
         throw new Error('BOX_HISTORY_CONTRACT_FAILED')
       }
-      historyReplay = { exact: true, completedToolHistory: true, inputTokens: final.usage.input_tokens,
+      historyReplay = { exact: true, completedToolHistory: true, structuredStdin: true,
+        sseBytes, stdinHash: stdinHash.slice(0, 16), inputTokens: final.usage.input_tokens,
         outputTokens: final.usage.output_tokens, snapshotHash: snapshotHash.slice(0, 16),
         supervisorHash: supervisorHash.slice(0, 16) }
     } finally {
       if (!remoteCompleted) process.stderr.write('BOX_HISTORY_REMOTE_UNKNOWN_RETAINED\n')
       else {
         const cleanup = String.raw`import os,stat,sys
-cwd,project,path=sys.argv[1:]
+cwd,project,path,stdinpath=sys.argv[1:]
 for d in (cwd,project):
  st=os.lstat(d)
  if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
-os.unlink(path);os.rmdir(project);os.rmdir(cwd);print('clean')`
+os.unlink(path);os.unlink(stdinpath);os.rmdir(project);os.rmdir(cwd);print('clean')`
         const cleaned = await runFixed({ command: '/usr/bin/python3',
-          args: ['-c', cleanup, directory, projectDir, remoteSnapshot], cwd: '/tmp',
+          args: ['-c', cleanup, directory, projectDir, remoteSnapshot, remoteStdin], cwd: '/tmp',
           environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
         if (cleaned.trim() !== 'clean') throw new Error('BOX_HISTORY_CLEANUP_FAILED')
       }
