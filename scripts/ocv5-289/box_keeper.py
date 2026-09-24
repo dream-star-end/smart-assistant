@@ -84,6 +84,19 @@ def stop_adopted_group(pid: int) -> bool:
     return False
 
 
+def reap_adopted_after_last_signal() -> bool:
+    """Bounded cleanup only *after* the CLI leader can no longer be signalled."""
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        try:
+            child_pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if child_pid == 0:
+            time.sleep(.02)
+    return False
+
+
 def read_report(fd: int, worker: subprocess.Popen, deadline: float) -> int | None:
     raw = b""
     while time.monotonic() < deadline and len(raw) <= 32:
@@ -172,6 +185,8 @@ def main() -> int:
             # keep C unreaped until the final group signal has completed.
             stopped = stop_adopted_group(cli_pid)
             code = 125 if not stopped or code == 0 else code
+        if not reap_adopted_after_last_signal():
+            code = 125
         if cli_pid is None or pidfd is None:
             return 126
         return (128 - code) if code is not None and code < 0 else (code or 0)

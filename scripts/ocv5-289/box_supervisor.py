@@ -145,7 +145,7 @@ def gated_exec(fd: int, command: list[str]) -> int:
     return 126
 
 
-def write_before_deadline(data: bytearray, deadline: float) -> bool:
+def write_before_deadline(data: bytearray, deadline: float, stop_requested) -> str:
     """Never let a disconnected Exec reader stall the supervisor indefinitely."""
     fd = sys.stdout.fileno()
     original = os.get_blocking(fd)
@@ -153,15 +153,17 @@ def write_before_deadline(data: bytearray, deadline: float) -> bool:
     offset = 0
     try:
         while offset < len(data):
+            if stop_requested():
+                return "cancelled"
             if time.monotonic() >= deadline:
-                return False
+                return "deadline"
             try:
                 offset += os.write(fd, data[offset:])
             except BlockingIOError:
                 select.select([], [fd], [], min(0.1, max(0, deadline - time.monotonic())))
             except BrokenPipeError:
-                return False
-        return True
+                return "closed"
+        return "written"
     finally:
         try:
             os.set_blocking(fd, original)
@@ -495,8 +497,12 @@ def main() -> int:
             publisher.close()
     if reason is not None:
         return reason
-    if child.returncode == 0 and not write_before_deadline(stdout, deadline):
-        return 124
+    if child.returncode == 0:
+        output = write_before_deadline(stdout, deadline, lambda: stopped)
+        if output == "cancelled":
+            return 143
+        if output != "written":
+            return 124
     return child.returncode or 0
 
 

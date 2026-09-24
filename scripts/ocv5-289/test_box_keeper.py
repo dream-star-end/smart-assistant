@@ -2,6 +2,7 @@
 import hashlib
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import signal
@@ -51,9 +52,17 @@ class KeeperTest(unittest.TestCase):
 
     def await_file(self, file: Path) -> None:
         until = time.monotonic() + 4
-        while time.monotonic() < until and not file.exists():
+        while time.monotonic() < until:
+            try:
+                raw = file.read_bytes()
+                pattern = rb"^[1-9][0-9]* [1-9][0-9]*\n$" if file.name == "ready" \
+                    else rb"^[1-9][0-9]*$"
+                if re.fullmatch(pattern, raw):
+                    return
+            except FileNotFoundError:
+                pass
             time.sleep(.01)
-        self.assertTrue(file.exists(), f"{file.name} absent")
+        self.fail(f"{file.name} complete PID frame absent")
 
     def test_normal_stdout_and_nonzero_status_are_preserved(self) -> None:
         ok = self.start('print("keeper-ok")')
@@ -65,10 +74,17 @@ class KeeperTest(unittest.TestCase):
 
     def test_worker_sigkill_adopts_and_stops_cli_without_recycled_pgid(self) -> None:
         ready = self.tmp / "ready"
-        proc = self.start('import time;time.sleep(30)',
-                          {"OCV5_SUPERVISOR_READY_FILE": str(ready)})
+        descendant = self.tmp / "descendant"
+        code = ('import os,subprocess,time;'
+                'p=subprocess.Popen(["/usr/bin/sleep","30"]);'
+                'open(os.environ["KEEPER_TEST_DESCENDANT"],"w").write(str(p.pid));'
+                'time.sleep(30)')
+        proc = self.start(code, {"OCV5_SUPERVISOR_READY_FILE": str(ready),
+                                 "KEEPER_TEST_DESCENDANT": str(descendant)})
         self.await_file(ready)
+        self.await_file(descendant)
         cli_pid, _watchdog_pid = map(int, ready.read_text().split())
+        descendant_pid = int(descendant.read_text())
         children_file = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
         workers = [int(x) for x in children_file.read_text().split()]
         self.assertEqual(len(workers), 1)
@@ -77,11 +93,12 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 137)
         # CLI leader may briefly be a zombie until keeper reaps it; after
         # keeper exits it must not remain a runnable process.
-        try:
-            status = Path(f"/proc/{cli_pid}/stat").read_text()
-            self.assertIn(status.split(") ", 1)[1][0], "ZX")
-        except FileNotFoundError:
-            pass
+        for pid in (cli_pid, descendant_pid):
+            try:
+                status = Path(f"/proc/{pid}/stat").read_text()
+                self.assertIn(status.split(") ", 1)[1][0], "ZX")
+            except FileNotFoundError:
+                pass
 
     def test_report_missing_before_gate_fails_closed(self) -> None:
         child_file = self.tmp / "child"
@@ -95,6 +112,15 @@ class KeeperTest(unittest.TestCase):
         os.kill(workers[0], signal.SIGKILL)
         proc.communicate(timeout=12)
         self.assertEqual(proc.returncode, 126)
+
+    def test_output_backpressure_cancel_is_prompt(self) -> None:
+        proc = self.start('import os;os.write(1,b"x"*200000)')
+        time.sleep(.5)  # leave parent stdout PIPE unread so W blocks in writer
+        began = time.monotonic()
+        proc.terminate()
+        proc.wait(timeout=3)
+        self.assertEqual(proc.returncode, 143)
+        self.assertLess(time.monotonic() - began, 1.5)
 
 
 if __name__ == "__main__":
