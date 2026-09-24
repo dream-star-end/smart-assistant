@@ -253,3 +253,25 @@ test("failed orphan close retains ownership for explicit retry", async () => {
   assert.equal(await service.retryFailedOrphanCleanup(), 0);
   assert.equal(calls, 2);
 });
+
+test("real fetch close failure stays owned and recovers through public identity retry", async () => {
+  let calls = 0;
+  const f = fixture({ onDispose: () => {
+    calls++;
+    if (calls === 1) throw new Error("simulated private egress close failure");
+  } });
+  const response = await f.service.fetch(input);
+  assert.equal(response.status, 200);
+  assert.ok((await response.text()).includes("event: message_stop"));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 1, account: 1 });
+  assert.equal(await f.service.retryFailedOrphanCleanup(), 0,
+    "a leased target is not an orphan");
+  assert.throws(() => f.service.retryFailedCleanup({ uid: 3n,
+    sessionId: "session-289", accountId: 21n }));
+  await f.service.retryFailedCleanup({ uid: 3n,
+    sessionId: "session-289", accountId: 20n });
+  assert.equal(calls, 2);
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
+});

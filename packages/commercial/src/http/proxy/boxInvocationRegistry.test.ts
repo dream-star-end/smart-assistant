@@ -129,8 +129,9 @@ describe("Box cross-HTTP invocation ownership", () => {
     assert.deepEqual(registry.counts(3n, 20n), { user: 1, account: 1 });
     rejected(() => registry.confirmRemoteStopped(lease), "BOX_CLEANUP_ALREADY_OWNED");
     assert.equal(calls, 1);
-    registry.retryFailedCleanup(lease);
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    rejected(() => registry.retryFailedCleanupByIdentity({ uid: 3n,
+      sessionId: "session-fail-close", accountId: 21n }), "BOX_CLEANUP_IDENTITY_MISMATCH");
+    await registry.retryFailedCleanup(lease);
     assert.equal(calls, 2);
     assert.deepEqual(registry.counts(3n, 20n), { user: 0, account: 0 });
   });

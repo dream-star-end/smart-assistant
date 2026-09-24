@@ -172,27 +172,40 @@ export class BoxInvocationRegistry {
       this.release(lease);
       return;
     }
-    this.startCleanup(lease);
+    void this.startCleanup(lease).catch(() => {});
   }
 
   /** Operator/reconciler action only, after a settled failed dispose. Never
    * blindly retry a pending close whose outcome is still unknown. */
-  retryFailedCleanup(handle: BoxInvocationLease): void {
+  retryFailedCleanup(handle: BoxInvocationLease): Promise<void> {
     const lease = this.requireActive(handle);
     if (lease.state !== "stopped_cleanup_failed") {
       throw new BoxInvocationConflict("BOX_CLEANUP_NOT_FAILED");
     }
-    this.startCleanup(lease);
+    return this.startCleanup(lease);
   }
 
-  private startCleanup(lease: PrivateLease): void {
+  /** A caller holding only durable identity can recover a failed close after
+   * the original HTTP request has returned; no reconstructed handle accepted. */
+  retryFailedCleanupByIdentity(input: {
+    uid: bigint; sessionId: string; accountId: bigint;
+  }): Promise<void> {
+    const lease = this.active.get(this.key(input.uid, input.sessionId));
+    if (!lease || lease.accountId !== input.accountId) {
+      throw new BoxInvocationConflict("BOX_CLEANUP_IDENTITY_MISMATCH");
+    }
+    return this.retryFailedCleanup(lease);
+  }
+
+  private startCleanup(lease: PrivateLease): Promise<void> {
     lease.state = "stopped_cleanup_pending";
-    void Promise.resolve().then(() => lease.onRemoteStopped!()).then(() => {
+    return Promise.resolve().then(() => lease.onRemoteStopped!()).then(() => {
       if (lease.state === "stopped_cleanup_pending") this.release(lease);
     }, () => {
       lease.state = "stopped_cleanup_failed";
       log.error("BOX_EGRESS_DISPOSE_FAILED", { uid: lease.uid.toString(),
         accountId: lease.accountId.toString(), sessionId: lease.sessionId });
+      throw new BoxInvocationConflict("BOX_EGRESS_DISPOSE_FAILED");
     });
   }
 

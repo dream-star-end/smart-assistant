@@ -43,10 +43,25 @@ export class BoxTextFetch {
   /** Manual, bounded-reconcile hook for targets acquired after cancellation or
    * before a lease. Failed closes remain owned here; never silently discarded. */
   async retryFailedOrphanCleanup(): Promise<number> {
-    await Promise.allSettled([...this.orphanedTargets].map((target) => this.disposeTarget(target).then(() => {
+    const retryable = [...this.orphanedTargets].filter((target) =>
+      this.disposal.get(target)?.pending === null);
+    const attempts = Promise.allSettled(retryable.map((target) => this.disposeTarget(target).then(() => {
       this.orphanedTargets.delete(target);
     })));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([attempts, new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 200);
+      })]);
+    } finally { if (timer) clearTimeout(timer); }
     return this.orphanedTargets.size;
+  }
+
+  /** Internal reconciliation entry; identity must come from a trusted journal,
+   * never an untrusted HTTP payload. */
+  retryFailedCleanup(input: { uid: bigint; sessionId: string;
+    accountId: bigint }): Promise<void> {
+    return this.deps.registry.retryFailedCleanupByIdentity(input);
   }
 
   private disposeTarget(target: BoxResolvedTarget): Promise<void> {
