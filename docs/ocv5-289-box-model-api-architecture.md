@@ -250,6 +250,10 @@ Connect Exec transport and supervisor each cap a foreground call at 120s.
 probe for whether a detached, self-expiring child survives its launch Exec and
 can be observed from a distinct Exec. A local Linux test is not Box evidence;
 no detached production path may be assumed until the actual pinned Box passes.
+An offline `box_detached_runner.py` prototype can start the existing keeper
+with owner-private stdout/stderr spool files and read bounded offsets through
+separate Exec calls; this still has no production HTTP caller or verified Box
+cgroup-lifetime evidence.
 
 The supervised CLI must publish a bounded, no-content `terminal.json` in its
 owner-0700 per-run directory only after a **real stop fence**. Bind the marker

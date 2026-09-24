@@ -62,7 +62,7 @@ export function makeBoxAssetStage(asset: Buffer, path: string): {
     throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
   }
   const hash = sha(asset);
-  const match = /^\/tmp\/ocv5-289-(?:supervisor|keeper|box-virtual-mcp)-([a-f0-9]{16})\.py$/.exec(path);
+  const match = /^\/tmp\/ocv5-289-(?:supervisor|keeper|box-virtual-mcp|detached-runner)-([a-f0-9]{16})\.py$/.exec(path);
   if (!match || match[1] !== hash.slice(0, 16)) {
     throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
   }
