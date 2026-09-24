@@ -104,6 +104,11 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   for parallel same-name/same-argument calls, not positional matching. Actual
   multi-tool concurrency and cross-HTTP handoff still need red/green proof
   before use. No local OpenClaude tool command executes in Box.
+  The new catalog-driven `box_virtual_mcp.py` has an offline two-identical-call
+  reverse-result test and a real account-20 Box **one-tool** probe: model ID
+  matched the pending MCP call, the locally chosen result was returned exactly,
+  and the supervised invocation exited successfully. This is protocol evidence,
+  **not** a claim that multi-tool or cross-HTTP production handoff is complete.
 - The held CLI is owned by a **cross-HTTP Box invocation lease**, not by the
   first request's abort signal or finalizer. Normal `message_stop`/`res.end`
   after exporting tool_use must leave the supervised CLI and account-capacity
