@@ -190,6 +190,19 @@ Record direct-route and Box-route first-delta latency, inter-delta gaps,
 tool-roundtrip latency and failure rate under the same synthetic workload.
 Any material regression is a release blocker to investigate, not something
 to hide by buffering and sending a completed response all at once.
+Freeze the following quantitative bar **before paired tests** (one exploratory
+Box-only nonce run was already observed; it is not a paired result): at least
+10 alternating direct-CC/Box pairs on the same user container, CLI 2.1.280,
+Opus 5.5, prompt/tool fixture and effort, with warm and cold cases recorded
+separately. End-to-end first-visible-delta overhead must be ≤3s at p50 and
+≤6s at p95; p95 inter-delta gap ≤max(2s, 2× direct); p95 local-tool roundtrip
+overhead ≤6s. For a long-output fixture whose direct-CC first-to-last visible
+delta span is ≥2s, Box must produce ≥3 distinct visible delivery times and a
+span ≥50% of direct, not a terminal burst. Any failed business result,
+duplicate local tool, missing cost frame/ledger row, wrong model ID, or
+unsupported direct-CC request shape is a hard fail regardless of latency.
+Do not loosen these thresholds after seeing paired results without an explicit
+user decision and a documented UX tradeoff.
 
 1. Offline CCB → internal API → Box-adapter → fake model red/green matrix for
    all captured real request fields, role order, tool IDs, multiple tool calls,
