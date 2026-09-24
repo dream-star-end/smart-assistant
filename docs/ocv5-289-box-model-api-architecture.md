@@ -286,7 +286,8 @@ account. A Box-specific billing recovery routine now consumes only validated
 terminal marker, exact usage, frozen pricing and attribution after a live
 finalizer grace period. It joins the existing shared finalize-journal tick,
 including with the Box model flag off, so rollback does not strand a proven
-billable row. A real PostgreSQL test uses TEMP-shadow financial
+billable row. Leader handoff waits for any in-flight recovery tick and prevents
+the old leader from entering a new Box phase after stop. A real PostgreSQL test uses TEMP-shadow financial
 tables to prove one debit, one usage row and crash-window repair. This is
 **not** a complete remote-process takeover reconciler or a live tool bridge:
 the catalog entry remains off until those paths and real Box acceptance pass.

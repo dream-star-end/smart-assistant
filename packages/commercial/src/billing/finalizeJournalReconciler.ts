@@ -496,7 +496,8 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
 }
 
 export interface ReconcilerHandle {
-  stop(): void
+  /** Stops new ticks and waits for an already running tick before lease handoff. */
+  stop(): Promise<void>
   /** 测试/运维:立即跑一轮(reconcile + durable finalizing 老化告警 + 视 cadence 决定是否 GC)。与 interval tick 共用 running 守卫。 */
   runNow(): Promise<{
     committed: number
@@ -563,6 +564,8 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
 
   let stopped = false
   let running = false
+  let tickDone: Promise<void> | null = null
+  let resolveTickDone: (() => void) | null = null
   let lastGcAt = 0 // 0 → 首轮即 GC(部署后立即清历史终态行)
 
   async function runOneTick(): Promise<{
@@ -573,8 +576,9 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
     gc: number
   }> {
     // DB 卡时跳过重叠 tick
-    if (running) return { committed: 0, aborted: 0, durableWaived: 0, finalizingAlerted: 0, gc: 0 }
+    if (stopped || running) return { committed: 0, aborted: 0, durableWaived: 0, finalizingAlerted: 0, gc: 0 }
     running = true
+    tickDone = new Promise<void>((resolve) => { resolveTickDone = resolve })
     try {
       let committed = 0
       let aborted = 0
@@ -591,7 +595,7 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
       }
       // 独立于 legacy timeout-abort。Box 只从已持久化的终止/用量/定价
       // 证据结算，失败保留原行并在下一 tick 重试，绝不重放模型调用。
-      if (opts.boxRecoveryFn) {
+      if (!stopped && opts.boxRecoveryFn) {
         try { await opts.boxRecoveryFn() }
         catch (err) { onError(err) }
       }
@@ -614,6 +618,9 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
       return { committed, aborted, durableWaived, finalizingAlerted, gc }
     } finally {
       running = false
+      resolveTickDone?.()
+      resolveTickDone = null
+      tickDone = null
     }
   }
 
@@ -628,6 +635,7 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
     stop() {
       stopped = true
       clearInterval(timer)
+      return tickDone ?? Promise.resolve()
     },
     runNow: runOneTick,
   }
