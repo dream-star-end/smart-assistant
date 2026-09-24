@@ -33,7 +33,7 @@ const body = {
 } as ProxyBody
 const compiled = compileBoxCliSyntheticTurn(body, { cwd, cliVersion: '2.1.280' })
 const expected = `answer-${nonce}`
-let requests = 0, exactHistory = false, exactSystem = false
+let requests = 0, exactHistory = false, exactSystem = false, exactMaxTokens = false
 const server = createServer(async (req, res) => {
   const chunks: Buffer[] = []
   for await (const chunk of req) chunks.push(Buffer.from(chunk))
@@ -42,6 +42,7 @@ const server = createServer(async (req, res) => {
   }
   requests++
   const sent = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  exactMaxTokens = sent.max_tokens === body.max_tokens
   const nonSystem = sent.messages.filter((m: { role: string }) => m.role !== 'system')
   const expectedHistory = (body.messages as Array<{ role: string; content: unknown }>)
     .filter((message) => message.role !== 'system')
@@ -105,6 +106,8 @@ try {
   writeFileSync(snapshot, snapshotText, { mode: 0o600, flag: 'wx' })
   const stdinPath = join(cwd, 'stdin.jsonl')
   writeFileSync(stdinPath, stdinJsonl, { mode: 0o600, flag: 'wx' })
+  const systemPath = join(cwd, 'system.txt')
+  writeFileSync(systemPath, systemPrompt, { mode: 0o600, flag: 'wx' })
   const stdinHash = createHash('sha256').update(stdinJsonl).digest('hex')
   const child = spawn('/usr/bin/python3', [
     fileURLToPath(new URL('./box_supervisor.py', import.meta.url)),
@@ -115,10 +118,11 @@ try {
     '--include-partial-messages', '--verbose', '--no-session-persistence',
     '--model', 'claude-opus-5-5', '--tools', '', '--strict-mcp-config',
     '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--disable-slash-commands',
-    '--system-prompt', systemPrompt], {
+    '--system-prompt-file', systemPath], {
     cwd, env: { HOME: cwd, CLAUDE_CONFIG_DIR: config, PATH: '/usr/local/bin:/usr/bin:/bin',
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
       ANTHROPIC_AUTH_TOKEN: 'fixture-only', CLAUDE_CODE_MAX_RETRIES: '0',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(body.max_tokens),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', NO_PROXY: '127.0.0.1,localhost' },
     stdio: ['ignore', 'pipe', 'pipe'] })
   let stdout = '', stderrBytes = 0
@@ -132,10 +136,10 @@ try {
   })
   const final = records.findLast((record) => record.type === 'result')
   const converted = exit === 0 ? completedBoxCliToSse(stdout, 'claude-opus-5-5') : null
-  const good = exit === 0 && requests === 1 && exactHistory && exactSystem
+  const good = exit === 0 && requests === 1 && exactHistory && exactSystem && exactMaxTokens
     && final?.is_error === false && final?.result === expected
     && converted?.sse.includes('event: message_stop') === true
-  process.stdout.write(JSON.stringify({ exit, requests, exactHistory, exactSystem,
+  process.stdout.write(JSON.stringify({ exit, requests, exactHistory, exactSystem, exactMaxTokens,
     finalSuccess: final?.is_error === false, textExact: final?.result === expected,
     sseBytes: converted?.sse.length ?? 0, stderrBytes }) + '\n')
   if (!good) process.exitCode = 1
