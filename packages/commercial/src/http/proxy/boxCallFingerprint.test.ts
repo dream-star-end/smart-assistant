@@ -61,6 +61,10 @@ test("real official CC inner session ID is accepted; conflicting outer ID fails"
   conflict.metadata!.user_id = JSON.stringify({ oc_turn_key: "a".repeat(64),
     session_id: "different-session" });
   rejects(conflict, "BOX_CALL_SESSION_CONFLICT");
+  const emptyConflict = body();
+  emptyConflict.metadata!.user_id = JSON.stringify({ oc_turn_key: "a".repeat(64),
+    session_id: "" });
+  rejects(emptyConflict, "BOX_CALL_SESSION_CONFLICT");
 });
 
 test("streaming canonical hash accepts model body above old 8MiB cutoff", () => {

@@ -73,7 +73,7 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
   if (inner !== undefined && typeof inner !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_INVALID");
   }
-  if (outer && inner && outer !== inner) {
+  if (outer !== undefined && inner !== undefined && outer !== inner) {
     throw new BoxCallFingerprintError("BOX_CALL_SESSION_CONFLICT");
   }
   const sessionId = outer ?? inner;
