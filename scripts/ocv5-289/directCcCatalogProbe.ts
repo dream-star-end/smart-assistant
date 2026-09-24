@@ -10,6 +10,7 @@ import { compileBoxToolCatalog, mapBoxCliEffort } from
 const version = execFileSync("/usr/local/bin/claude", ["--version"],
   { encoding: "utf8", timeout: 5000 }).trim();
 if (version !== "2.1.280 (Claude Code)") throw new Error("DIRECT_CC_VERSION_UNEXPECTED");
+const syntheticTurnKey = "a".repeat(64);
 const home = mkdtempSync("/tmp/ocv5-289-cc-catalog-");
 let seen = 0;
 let summary: Record<string, unknown> | null = null;
@@ -27,8 +28,12 @@ const server = createServer(async (req, res) => {
   try {
     const catalog = compileBoxToolCatalog(body.tools);
     const effort = mapBoxCliEffort(body.thinking, body.output_config);
+    const meta = body.metadata as { user_id?: unknown } | undefined;
+    const userMeta = typeof meta?.user_id === "string"
+      ? JSON.parse(meta.user_id) as Record<string, unknown> : {};
     summary = { count: catalog.tools.length, hash: catalog.sha256,
       effort, aliasesUnique: catalog.clientNameByBoxName.size === catalog.tools.length,
+      turnKeyPropagated: userMeta.oc_turn_key === syntheticTurnKey,
       topLevelKeys: [...new Set((body.tools as Array<Record<string, unknown>>)
         .flatMap((item) => Object.keys(item)))].sort() };
   } catch (error) {
@@ -61,6 +66,7 @@ const child = spawn("/usr/local/bin/claude", ["-p", "Reply exactly ok.", "--mode
 { env: { HOME: home, CLAUDE_CONFIG_DIR: home, PATH: "/usr/local/bin:/usr/bin:/bin",
   ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
   ANTHROPIC_AUTH_TOKEN: "synthetic-only", CLAUDE_CODE_MAX_RETRIES: "0",
+  CLAUDE_CODE_EXTRA_METADATA: JSON.stringify({ oc_turn_key: syntheticTurnKey }),
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" },
   stdio: ["ignore", "pipe", "pipe"] });
 child.stdout.resume(); child.stderr.resume();
@@ -73,7 +79,8 @@ finally {
   rmSync(home, { recursive: true, force: true });
 }
 if (exit !== 0 || seen !== 1 || summary?.count !== 20
-  || summary.effort !== "medium" || summary.aliasesUnique !== true) {
+  || summary.effort !== "medium" || summary.aliasesUnique !== true
+  || summary.turnKeyPropagated !== true) {
   throw new Error("DIRECT_CC_TOOL_CATALOG_CONTRACT_FAILED");
 }
 process.stdout.write(JSON.stringify({ version, synthetic: true,

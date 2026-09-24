@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, rmSync,
   unlinkSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileBoxToolCatalog } from "../../packages/commercial/src/http/proxy/boxToolCatalog.js";
@@ -13,6 +13,7 @@ import { compileBoxToolCatalog } from "../../packages/commercial/src/http/proxy/
 const version = execFileSync("/usr/local/bin/claude", ["--version"],
   { encoding: "utf8", timeout: 5000 }).trim();
 if (version !== "2.1.280 (Claude Code)") throw new Error("CC_VERSION_UNEXPECTED");
+const syntheticTurnKey = "b".repeat(64);
 const directory = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
 mkdirSync(directory, { mode: 0o700 });
 const catalog = compileBoxToolCatalog([{ name: "local_echo",
@@ -28,6 +29,9 @@ const ids = ["toolu_multi_a", "toolu_multi_b"];
 const results = [`local-${randomBytes(8).toString("hex")}`,
   `local-${randomBytes(8).toString("hex")}`];
 let requests = 0, responseExact = false, advertised = false;
+const headerShapes: Array<Record<string, string>> = [];
+const bodyHashes: string[] = [];
+const turnKeyMatches: boolean[] = [];
 const server = createServer(async (req, res) => {
   let raw = "";
   for await (const chunk of req) raw += chunk;
@@ -35,7 +39,18 @@ const server = createServer(async (req, res) => {
     res.writeHead(404).end(); return;
   }
   requests++;
+  bodyHashes.push(createHash("sha256").update(raw).digest("hex"));
+  headerShapes.push(Object.fromEntries(Object.entries(req.headers)
+    .filter(([key]) => /request|session|trace|stainless|id/i.test(key)
+      && !/authorization|cookie|token|key/i.test(key))
+    .map(([key, value]) => [key, createHash("sha256")
+      .update(JSON.stringify(value)).digest("hex").slice(0, 12)])));
   const body = JSON.parse(raw) as Record<string, unknown>;
+  const userMeta = (body.metadata as { user_id?: unknown } | undefined)?.user_id;
+  let parsedMeta: Record<string, unknown> = {};
+  try { if (typeof userMeta === "string") parsedMeta = JSON.parse(userMeta); }
+  catch { /* fail summary below */ }
+  turnKeyMatches.push(parsedMeta.oc_turn_key === syntheticTurnKey);
   const toolDefs = body.tools as Array<{ name?: string }> | undefined;
   advertised ||= toolDefs?.some((tool) => tool.name === toolName) === true;
   if (requests === 2) {
@@ -94,6 +109,7 @@ const child = spawn("/usr/local/bin/claude", ["-p", "Call local_echo twice with 
     PATH: "/usr/local/bin:/usr/bin:/bin",
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}`,
     ANTHROPIC_AUTH_TOKEN: "synthetic-only", CLAUDE_CODE_MAX_RETRIES: "0",
+    CLAUDE_CODE_EXTRA_METADATA: JSON.stringify({ oc_turn_key: syntheticTurnKey }),
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" },
   stdio: ["ignore", "pipe", "pipe"] });
 let stdout = "", stderrBytes = 0;
@@ -148,7 +164,8 @@ try {
   const final = records.findLast((record) => record.type === "result") as {
     is_error?: unknown; result?: unknown } | undefined;
   if (exit !== 0 || requests !== 2 || !advertised || !responseExact
-    || final?.is_error !== false || final.result !== "done") {
+    || final?.is_error !== false || final.result !== "done"
+    || !turnKeyMatches.every(Boolean) || bodyHashes[0] === bodyHashes[1]) {
     throw new Error("GENERIC_MCP_REAL_CC_CONTRACT_FAILED");
   }
   process.stdout.write(JSON.stringify({ version, synthetic: true,
@@ -157,6 +174,9 @@ try {
     recordTypes: records.slice(0, 48).map((record) => record.type),
     streamEventTypes: records.filter((record) => record.type === "stream_event")
       .slice(0, 48).map((record) => (record.event as { type?: string } | undefined)?.type),
+    headerShapes,
+    sameTurnKeyAcrossModelCalls: turnKeyMatches.every(Boolean),
+    modelRequestBodiesDistinct: bodyHashes[0] !== bodyHashes[1],
   }) + "\n");
 } finally {
   clearTimeout(timer);
