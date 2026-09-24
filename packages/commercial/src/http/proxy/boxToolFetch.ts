@@ -68,6 +68,19 @@ export class BoxToolFetch {
     });
   }
 
+  private async cleanedElsewhere(candidate: BoxRemoteCleanupCandidate): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const status = await Promise.race([
+        this.deps.journal.remoteCleanupStatus(candidate),
+        new Promise<"pending">((resolve) => {
+          timer = setTimeout(() => resolve("pending"), 2000);
+        }),
+      ]);
+      return status === "done";
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
   /** Only local ProxyAgents whose remote invocation is already proven stopped,
    * or whose paid invocation never started, are eligible for this retry. */
   async retryFailedCleanup(): Promise<number> {
@@ -95,6 +108,9 @@ export class BoxToolFetch {
         held.claimed = await this.deps.journal.claimRemoteCleanup(held.candidate);
       }
       if (held.claimed) await this.cleanKnownTerminal(nonce, held.target, held.candidate);
+      else if (await this.cleanedElsewhere(held.candidate)) {
+        await this.releaseLocalTargets(nonce);
+      }
     }));
     return this.terminalCleanup.size;
   }
@@ -108,7 +124,13 @@ export class BoxToolFetch {
       if (this.reconcileInFlight.has(candidate.runNonce)) return;
       this.reconcileInFlight.add(candidate.runNonce);
       try {
-        if (!await this.deps.journal.claimRemoteCleanup(candidate)) return;
+        if (!await this.deps.journal.claimRemoteCleanup(candidate)) {
+          if (this.terminalCleanup.has(candidate.runNonce)
+            && await this.cleanedElsewhere(candidate)) {
+            await this.releaseLocalTargets(candidate.runNonce);
+          }
+          return;
+        }
         let held = this.terminalCleanup.get(candidate.runNonce);
         if (!held) {
           const target = await this.deps.resolveTarget({ uid: candidate.uid,
@@ -153,6 +175,10 @@ export class BoxToolFetch {
     finally { if (timeout) clearTimeout(timeout); }
     if (result.stdout.trim() !== "clean") throw new Error("BOX_RUN_CLEANUP_UNPROVEN");
     await this.deps.journal.markRemoteCleaned(candidate);
+    await this.releaseLocalTargets(runNonce);
+  }
+
+  private async releaseLocalTargets(runNonce: string): Promise<void> {
     this.terminalCleanup.delete(runNonce);
     const group = this.targets.get(runNonce);
     if (!group) return;
@@ -183,7 +209,12 @@ export class BoxToolFetch {
     ]); }
     catch { held.claimed = false; }
     finally { if (timer) clearTimeout(timer); }
-    if (!held.claimed) return;
+    if (!held.claimed) {
+      if (await this.cleanedElsewhere(candidate)) {
+        await this.releaseLocalTargets(runNonce);
+      }
+      return;
+    }
     try { await this.cleanKnownTerminal(runNonce, target, candidate); }
     catch { /* retain pinned target and private files for bounded retry */ }
   }

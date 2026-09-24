@@ -21,6 +21,7 @@ const call = (canonicalBody: ProxyBody) => ({ uid: 3n, sessionId: "session",
   init: { method: "POST", body: JSON.stringify({ ...canonicalBody,
     model: "claude-opus-5-5" }) } });
 const journal = () => ({ claimRemoteCleanup: async () => true,
+  remoteCleanupStatus: async () => "pending",
   markRemoteCleaned: async () => {},
   listRemoteCleanupCandidates: async () => [] }) as never;
 
@@ -142,6 +143,7 @@ test("fresh egress instance recovers proven remote cleanup from durable journal"
     detachedRunnerAsset: Buffer.from("d"),
     journal: { listRemoteCleanupCandidates: async () => marked ? [] : [candidate],
       claimRemoteCleanup: async () => true,
+      remoteCleanupStatus: async () => marked ? "done" : "pending",
       markRemoteCleaned: async (value: typeof candidate) => {
         assert.deepEqual(value, candidate); marked = true;
       } } as never,
@@ -158,4 +160,31 @@ test("fresh egress instance recovers proven remote cleanup from durable journal"
   assert.equal(disposed, true);
   assert.equal(await service.reconcileRemoteCleanup(), 0);
   assert.equal(cleans, 1, "already-cleaned remote run is not touched again");
+});
+
+test("worker that lost cleanup claim releases local target once peer marked exact proof done", async () => {
+  let disposed = false, remoteCalls = 0;
+  const target = { accountId: 20n,
+    exec: { run: async () => { remoteCalls++; throw new Error("must not clean twice"); } },
+    dispose: async () => { disposed = true; } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { claimRemoteCleanup: async () => false,
+      remoteCleanupStatus: async () => "done" } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never,
+    onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void }) => {
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "final", plan: { runNonce: "e".repeat(24),
+        leaseEpoch: "f".repeat(32) }, target,
+        proof: { runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32),
+          keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 } };
+    }) as never,
+  });
+  const response = await service.fetch(call(firstBody));
+  assert.match(await response.text(), /message_stop/);
+  assert.equal(remoteCalls, 0);
+  assert.equal(disposed, true);
 });
