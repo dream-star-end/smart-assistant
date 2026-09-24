@@ -96,7 +96,7 @@ export function readBoxUidProxy(uid: bigint): string {
   const path = join(dir, ".https-proxy");
   let fd: number | undefined;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const st = fstatSync(fd);
     if (!st.isFile() || st.uid !== 0 || (st.mode & 0o777) !== 0o600
       || st.nlink !== 1 || st.size < 1 || st.size > 2048) {

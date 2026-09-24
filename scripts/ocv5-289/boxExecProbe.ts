@@ -337,7 +337,7 @@ print(hashlib.sha256(open(p,'rb').read()).hexdigest())`
     inference = { exact: true, eventTypes: [...new Set(records.map((record) => record.type))],
       outputBytes: Buffer.byteLength(output), outputHash: createHash('sha256').update(output).digest('hex').slice(0, 16),
       inputTokens: final.usage.input_tokens, outputTokens: final.usage.output_tokens,
-      remoteSupervisorHash: digest.slice(0, 16) }
+      remoteSupervisorHash: digest.slice(0, 16), ...safeCliStreamShape(records) }
   }
   let toolRoundtrip: Record<string, unknown> | undefined
   if (process.env.OCV5_289_TOOL_ACK === '1') {
