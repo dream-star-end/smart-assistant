@@ -118,12 +118,18 @@ def read_report(fd: int, worker: subprocess.Popen, deadline: float) -> int | Non
 
 
 def startup_budget(argv: list[str]) -> float:
+    options = argv[:argv.index("--")] if "--" in argv else argv
+    raw = None
+    for index, token in enumerate(options):
+        if token == "--deadline":
+            raw = options[index + 1] if index + 1 < len(options) else None
+        elif token.startswith("--deadline="):
+            raw = token.split("=", 1)[1]
     try:
-        index = argv.index("--deadline")
-        value = float(argv[index + 1])
+        value = float(raw)
         if math.isfinite(value) and 0 < value <= 120:
             return min(5.0, value)
-    except (ValueError, IndexError):
+    except (TypeError, ValueError):
         pass
     return 5.0
 
