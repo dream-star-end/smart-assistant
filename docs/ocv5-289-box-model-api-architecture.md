@@ -174,30 +174,17 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   **no per-model-call ID header**, while request bodies differed after tool
   results. Thus `turn_key + body_hash` is useful as a retransmission hint but
   cannot be the full logical identity: an intentional identical request in
-  the same turn is indistinguishable. The Box route needs an OpenClaude-side
-  model-transport boundary (e.g. an authenticated user-container loopback
-  forwarding shim) that mints and persists one ID per actual API call, reuses
-  it for that call's network retries, and sends it to the existing master
-  proxy without moving prompt construction, memory or tools to Box. Until
-  that exact behavior is proven, keep the catalog route disabled.
-  Reuse the **existing user-container GatewayServer** for this private
-  loopback-only shim; do not create another user-facing API or an agent process.
-  For a Box-authorized CCB turn, `SubprocessRunner` points only that turn's
-  `ANTHROPIC_BASE_URL` at the local shim; it forwards to the same authenticated
-  master `/v1/messages` endpoint with original container credentials and
-  signed model-authority headers intact. The shim buffers only the already
-  bounded request body, assigns a random per-call ID before forwarding,
-  and adds `x-oc-box-call-id`. It keeps `(turn_key, request_hash) → call ID`
-  while a response is in flight/unknown, reusing the ID on a transport retry.
-  A fully delivered terminal response retires that mapping; a subsequent
-  independent call gets a fresh ID even for identical content. On ambiguous
-  delivery the mapping stays fenced, and master rejects or serves verified
-  cached output for the same ID—never starts a second paid CLI. Master still
-  binds that ID to authenticated uid/session/turn/model/body hash in PG;
-  neither a forged header nor a new ID can bypass its open-invocation conflict
-  gate. Transparent SSE forwarding, cancel/backpressure, bounded buffering,
-  redirect prohibition and no credential logging need same-entry tests before
-  replacing any live `ANTHROPIC_BASE_URL`.
+  the same turn is indistinguishable. The user selected the conservative
+  fail-closed policy rather than a new user-container forwarding mechanism:
+  the existing authenticated `/v1/messages` path persists the server-derived
+  `(uid, session, turn_key, canonical_body_hash)` fingerprint in PG before
+  any paid Box call. A second identical body in the same turn is rejected,
+  **even when it might be a genuinely new call**. There is no automatic replay,
+  cached synthetic answer or new billing call on ambiguous delivery. This
+  preserves the existing OpenClaude agent/tool/memory execution location; the
+  Box receives only model invocation files. If an official per-call ID becomes
+  available later, it can replace this deliberately restrictive fence, but
+  the present launch does not depend on a second local HTTP shim.
 - Use monotonic revision/lease epoch on every state change. State path:
   `reserved → starting → streaming → handoff → resuming → streaming → ...`
   then `terminal`; each new model message increments `round_no`. Any
@@ -240,7 +227,7 @@ credential, prompt, tool arguments/results or Box session snapshot in PG.
   resolution. With proof, close resources and settle only from durable round
   usage evidence. No automatic paid-call or local-tool replay on takeover.
 
-### Box terminal marker and reconciliation proof (design; not implemented)
+### Box terminal marker and reconciliation proof (text-path prototype; not production-enabled)
 
 The supervised CLI must publish a bounded, no-content `terminal.json` in its
 owner-0700 per-run directory only after a **real stop fence**. Bind the marker
@@ -290,9 +277,14 @@ remote process termination; it does **not** prove the user received SSE or
 that credits settled. Missing, corrupt or stale markers leave account
 capacity fenced. GC of staged user content requires the same terminal fence.
 
-This schema/state design is not approval to apply a data migration. The next
-free migration number and shared-branch tip must be rechecked at merge, and
-the user must approve migration execution before release.
+The current text-path prototype stores the invocation identity, conservative
+replay fingerprint, frozen pricing and final usage in the existing
+`request_finalize_journal.ctx` JSONB; it does not execute or require a new
+database migration. The keeper now writes a nonce/epoch-bound marker after
+its reaping fence, and a later request can read it only through the pinned
+account. This is **not** a complete takeover reconciler or a live tool bridge:
+the catalog entry remains off until those paths and real Box acceptance pass.
+Any later schema migration still requires a separate approval before execution.
 
 - Extend the current internal proxy upstream selection with an injectable Box
   route rather than creating a second public auth stack. The route's transport

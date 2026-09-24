@@ -1514,6 +1514,7 @@ export interface AnthropicProxyDeps {
    * invocation and its independent cross-HTTP account-capacity lease. */
   boxModel?: {
     fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
+      canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
       url: string; init: RequestInit }): Promise<Response>;
   };
   /** 上游 endpoint;默认 api.anthropic.com */

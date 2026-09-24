@@ -40,6 +40,7 @@ import {
   makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
+import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
 import {
   resolveAuthorityTurnDispatchSponsorship,
   admitVerificationSponsorship,
@@ -1370,12 +1371,15 @@ export function makeAnthropicProxyHandler(
           ...(dispatchIdentity
             ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
             : {}),
-          ctxJson: buildProxyJournalCtxJson({
+          ctxJson: { ...buildProxyJournalCtxJson({
             runtimeKind: deps.runtimeKind,
             gate,
             dispatchIdentity,
             turnKey: attribution.turnKey ?? undefined,
-          }),
+          }), ...(route.kind === "box" ? {
+            boxInvocationRecovery: "v1",
+            billingPricing: serializeBillingPricing(pricing),
+          } : {}) },
         });
         if (!admitted) {
           await releaseUpstreamSession(
@@ -1489,7 +1493,9 @@ export function makeAnthropicProxyHandler(
               if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel) {
                 throw new Error("BOX_FETCH_NOT_CONFIGURED");
               }
-              return deps.boxModel.fetch({ uid, sessionId, requestId, url, init });
+              return deps.boxModel.fetch({ uid, sessionId, requestId,
+                canonicalModel: body.model, canonicalBody: body,
+                upstreamModel: session.upstreamModel, url, init });
             }) as typeof fetch
           : fetchFn,
         appendCostCredits: deps.appendCostCredits,

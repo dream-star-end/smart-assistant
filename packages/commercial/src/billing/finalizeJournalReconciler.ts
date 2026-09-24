@@ -365,6 +365,7 @@ export async function reconcileStuckFinalizeJournal(
             updated_at = NOW()
       WHERE rfj.state IN ('inflight', 'finalizing')
         AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') <> $2
+        AND COALESCE(rfj.ctx->>'boxInvocationRecovery', '') <> 'v1'
         AND NOT EXISTS (
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
@@ -449,6 +450,7 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
          WHERE state IN ('committed', 'aborted')
            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
            AND COALESCE(ctx->>'durableBillingRecovery', '') <> $3
+           AND COALESCE(ctx->>'boxInvocationRecovery', '') <> 'v1'
          ORDER BY updated_at ASC
          LIMIT $2
       )

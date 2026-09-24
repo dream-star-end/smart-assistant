@@ -4,14 +4,17 @@ import { BoxTextFetch, BoxTextFetchError } from "./boxTextFetch.js";
 import { BoxExecTransportError, type BoxExecResult,
   type BoxExecTransport } from "./boxExecTransport.js";
 import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationRegistry.js";
-import { _UsageObserver } from "./shared.js";
+import { _UsageObserver, type ProxyBody } from "./shared.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 
 const model = "claude-opus-5";
-const body = { model, max_tokens: 256, stream: true,
+const canonicalAlias = "box-api-claude-opus-5";
+const body: ProxyBody = { model, max_tokens: 256, stream: true,
+  metadata: { user_id: JSON.stringify({ oc_turn_key: "a".repeat(64), session_id: "session-289" }) },
   messages: [{ role: "user", content: "synthetic text only" }] };
 const input = { uid: 3n, sessionId: "session-289", requestId: "req-289",
+  canonicalModel: model, canonicalBody: body, upstreamModel: model,
   url: BOX_INTERNAL_ENDPOINT, init: { method: "POST", body: JSON.stringify(body) } };
 const line = (value: unknown) => JSON.stringify(value) + "\n";
 const cliOutput = [
@@ -33,6 +36,9 @@ const cliOutput = [
     usage: { input_tokens: 2, output_tokens: 7, cache_read_input_tokens: 20 } },
 ].map(line).join("");
 const ok = (stdout = ""): BoxExecResult => ({ stdout, stderrBytes: 0, exitCode: 0 });
+const noopJournal = { admit: async () => {}, markRunning: async () => {},
+  markPrestartStopped: async () => {}, markUnknown: async () => {},
+  complete: async () => {} };
 
 class SpyRegistry extends BoxInvocationRegistry {
   last: BoxInvocationLease | null = null;
@@ -43,12 +49,14 @@ class SpyRegistry extends BoxInvocationRegistry {
 }
 type Runner = Pick<BoxExecTransport, "run">;
 function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "proof" | "cleanup";
+  journalFailPhase?: "admit" | "running" | "complete";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
-  const stages: string[] = [], unknowns: string[] = [];
+  const stages: string[] = [], unknowns: string[] = [], journalCalls: string[] = [];
+  let journalUsage: unknown = null;
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
   const runner: Runner = { async run(request: BoxCcExecRequest,
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
@@ -100,7 +108,17 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
   } };
   const service = new BoxTextFetch({ supervisorAsset: Buffer.from("#!/usr/bin/python3\nprint('fixture')\n"),
     keeperAsset: Buffer.from("#!/usr/bin/python3\nprint('keeper fixture')\n"),
-    registry, maxOutputTokensForModel: (value) => value === model ? 128_000 : null,
+    registry,
+    journal: { admit: async () => { journalCalls.push("admit");
+        if (opts.journalFailPhase === "admit") throw new Error("db down"); },
+      markRunning: async () => { journalCalls.push("running");
+        if (opts.journalFailPhase === "running") throw new Error("db down"); },
+      markPrestartStopped: async () => { journalCalls.push("prestart_stopped"); },
+      markUnknown: async () => { journalCalls.push("unknown"); },
+      complete: async (evidence) => { journalCalls.push("complete");
+        journalUsage = evidence.usage;
+        if (opts.journalFailPhase === "complete") throw new Error("db down"); } },
+    maxOutputTokensForModel: (value) => value === model || value === canonicalAlias ? 128_000 : null,
     resolveTarget: async () => {
       if (opts.resolverThrow) throw new Error("raw credential detail must not leak");
       return { accountId: 20n, exec: runner, dispose: opts.onDispose };
@@ -110,7 +128,8 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
       if (opts.hangUnknown) await new Promise<void>(() => {});
     },
     now: () => now, budgetMs: 600_000 });
-  return { service, registry, stages, unknowns, getMaxActive: () => maxActive,
+  return { service, registry, stages, unknowns, journalCalls,
+    getJournalUsage: () => journalUsage, getMaxActive: () => maxActive,
     advance: (ms: number) => { now += ms; }, releaseModel: () => releaseModel() };
 }
 
@@ -134,6 +153,18 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
   assert.equal(f.getMaxActive(), 1, "stage steps may not overlap");
   assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
   assert.deepEqual(f.unknowns, []);
+  assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
+  assert.deepEqual(f.getJournalUsage(), { inputTokens: 2, outputTokens: 7,
+    cacheReadTokens: 20, cacheWriteTokens: 0 });
+});
+
+test("canonical billing identity stays distinct from the Box upstream model", async () => {
+  const f = fixture();
+  const response = await f.service.fetch({ ...input, canonicalModel: canonicalAlias,
+    canonicalBody: { ...body, model: canonicalAlias } });
+  assert.ok((await response.text()).includes("event: message_stop"));
+  assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
+  assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
 });
 
 test("missing remote stop proof withholds final usage and fences capacity", async () => {
@@ -149,6 +180,34 @@ test("missing remote stop proof withholds final usage and fences capacity", asyn
   assert.ok(f.unknowns.includes("model_outcome_unknown"));
   // Test teardown only: the fake transport cannot produce later reconciliation.
   f.registry.confirmRemoteStopped(f.registry.last!);
+});
+
+test("journal admission or start failure cannot issue a paid Box model call", async () => {
+  for (const phase of ["admit", "running"] as const) {
+    const f = fixture({ journalFailPhase: phase });
+    await assert.rejects(() => f.service.fetch(input),
+      (error: unknown) => error instanceof BoxTextFetchError
+        && error.code === (phase === "admit"
+          ? "BOX_JOURNAL_ADMISSION_FAILED" : "BOX_JOURNAL_START_FAILED"));
+    assert.ok(!f.stages.includes("model"));
+    for (let i = 0; i < 50 && f.registry.counts(3n, 20n).account !== 0; i++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
+    if (phase === "running") assert.ok(f.journalCalls.includes("prestart_stopped"));
+  }
+});
+
+test("durable usage write failure withholds terminal SSE and keeps recovery fence", async () => {
+  const f = fixture({ journalFailPhase: "complete" });
+  const response = await f.service.fetch(input);
+  await assert.rejects(() => response.text(),
+    (error: unknown) => error instanceof BoxTextFetchError
+      && error.code === "BOX_BILLING_EVIDENCE_UNAVAILABLE");
+  assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
+  assert.ok(f.journalCalls.includes("complete"));
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 1, account: 1 });
+  f.registry.confirmRemoteStopped(f.registry.last!); // teardown after fence assertion
 });
 
 test("BoxTextFetch delivers first model text delta before remote model exit", async () => {
@@ -346,6 +405,7 @@ test("a resolver that completes after abort releases its private target without 
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 });
   const service = new BoxTextFetch({
     supervisorAsset: Buffer.from("fixture"), keeperAsset: Buffer.from("keeper"), registry,
+    journal: noopJournal,
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: () => new Promise((resolve) => { finish = resolve; }),
     onUnknown: async () => {},
@@ -368,6 +428,7 @@ test("failed orphan close retains ownership for explicit retry", async () => {
   const service = new BoxTextFetch({
     supervisorAsset: Buffer.from("fixture"), keeperAsset: Buffer.from("keeper"),
     registry: new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }),
+    journal: noopJournal,
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: () => new Promise((resolve) => { finish = resolve; }),
     onUnknown: async () => {},

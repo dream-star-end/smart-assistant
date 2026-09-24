@@ -381,6 +381,8 @@ export async function abortInflightJournal(
             ctx=ctx - 'settlementClaimId',
             updated_at=NOW()
       WHERE request_id=$1
+        AND (COALESCE(ctx->>'boxInvocationRecovery', '') <> 'v1'
+          OR COALESCE(ctx->>'boxState', '') IN ('', 'prestart_stopped'))
         AND (${settlementClaimId === undefined
           ? "state='inflight'"
           : "state='finalizing' AND ctx->>'settlementClaimId'=$4"})`,

@@ -37,6 +37,8 @@ export interface BoxCliSseResult {
   sse: string;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
 }
 
 /** Incremental decoder for supervised CLI JSONL. `message_stop` is withheld
@@ -268,7 +270,8 @@ export function createBoxCliSseDecoder(expectedModel: string): {
     }
     frames.push(...heldTerminalFrames);
     tailSse += heldTerminalFrames.join("");
-    return { sse: frames.join(""), inputTokens, outputTokens, tailSse };
+    return { sse: frames.join(""), inputTokens, outputTokens,
+      cacheReadTokens: cacheRead, cacheWriteTokens: cacheCreation, tailSse };
   };
   return { push, finish };
 }
@@ -279,6 +282,6 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
   }
   const decoder = createBoxCliSseDecoder(expectedModel);
   decoder.push(stdout);
-  const { sse, inputTokens, outputTokens } = decoder.finish();
-  return { sse, inputTokens, outputTokens };
+  const { sse, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = decoder.finish();
+  return { sse, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
 }

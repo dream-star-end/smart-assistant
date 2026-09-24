@@ -11,7 +11,7 @@ import { BoxTextFetch } from "../../packages/commercial/src/http/proxy/boxTextFe
 import { BoxInvocationRegistry } from "../../packages/commercial/src/http/proxy/boxInvocationRegistry.js";
 import { readBoxTerminalProof } from "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "../../packages/commercial/src/http/proxy/upstream.js";
-import { _UsageObserver } from "../../packages/commercial/src/http/proxy/shared.js";
+import { _UsageObserver, type ProxyBody } from "../../packages/commercial/src/http/proxy/shared.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 
 const ACCOUNT_ID = 20n;
@@ -38,6 +38,11 @@ async function main(): Promise<void> {
   let proofIdentity: { runNonce: string; leaseEpoch: string } | null = null;
   let unknown: string | null = null;
   const service = new BoxTextFetch({ supervisorAsset, keeperAsset, registry, budgetMs: 600_000,
+    // Synthetic operator probe is not a catalog request. The real route must
+    // inject BoxDurableJournal; this stub cannot be used to enable traffic.
+    journal: { admit: async () => {}, markRunning: async () => {},
+      markPrestartStopped: async () => {},
+      markUnknown: async () => {}, complete: async () => {} },
     maxOutputTokensForModel: (model) => model === MODEL ? 128_000 : null,
     resolveTarget: async (args) => {
       const target = await resolver.resolve(args);
@@ -62,11 +67,14 @@ async function main(): Promise<void> {
     },
     onUnknown: async ({ phase }) => { unknown ??= phase; },
   });
-  const body = { model: MODEL, max_tokens: 128, stream: true,
+  const body: ProxyBody = { model: MODEL, max_tokens: 128, stream: true,
+    metadata: { user_id: JSON.stringify({ oc_turn_key: randomBytes(32).toString("hex"),
+      session_id: requestId }) },
     system: "Synthetic OpenClaude Box model transport verification. No tools.",
     messages: [{ role: "user", content:
       `Return exactly this token, with no other words: ${expected}` }] };
   const response = await service.fetch({ uid: UID, sessionId: requestId, requestId,
+    canonicalModel: MODEL, canonicalBody: body, upstreamModel: MODEL,
     url: BOX_INTERNAL_ENDPOINT,
     init: { method: "POST", body: JSON.stringify(body) } });
   if (response.status !== 200 || !response.body) throw new Error("BOX_STREAM_HTTP_INVALID");

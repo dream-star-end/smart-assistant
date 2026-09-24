@@ -8,7 +8,9 @@ import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationR
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
-import { readBoxTerminalProof } from "./boxTerminalProof.js";
+import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
+import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
+import type { BoxJournalPort } from "./boxDurableJournal.js";
 import type { ProxyBody } from "./shared.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -20,7 +22,7 @@ export interface BoxResolvedTarget {
   /** Only close after authoritative remote terminal evidence, or before open. */
   dispose?: () => void | Promise<void>;
 }
-const MIN_RUN_BUDGET_MS = 140_000; // 120s Exec + 20s bounded cleanup
+const MIN_RUN_BUDGET_MS = 160_000; // 120s Exec + 10s proof + 20s cleanup + margin
 export class BoxTextFetchError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxTextFetchError"; }
 }
@@ -33,6 +35,7 @@ export class BoxTextFetch {
     supervisorAsset: Buffer;
     keeperAsset: Buffer;
     registry: BoxInvocationRegistry;
+    journal: BoxJournalPort;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
       upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
@@ -92,6 +95,7 @@ export class BoxTextFetch {
   }
 
   async fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
+    canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
     url: string; init: RequestInit }): Promise<Response> {
     if (args.url !== BOX_INTERNAL_ENDPOINT || args.init.method !== "POST"
       || typeof args.init.body !== "string") {
@@ -100,9 +104,17 @@ export class BoxTextFetch {
     let body: ProxyBody;
     try { body = JSON.parse(args.init.body) as ProxyBody; }
     catch { throw new BoxTextFetchError("BOX_FETCH_REQUEST_INVALID"); }
-    const cap = this.deps.maxOutputTokensForModel(body.model);
+    if (args.canonicalBody.model !== args.canonicalModel
+      || body.model !== args.upstreamModel
+      || body.max_tokens !== args.canonicalBody.max_tokens) {
+      throw new BoxTextFetchError("BOX_MODEL_BINDING_INVALID");
+    }
+    const cap = this.deps.maxOutputTokensForModel(args.canonicalModel);
     if (cap === null) throw new BoxTextFetchError("BOX_MODEL_NOT_CONFIGURED");
-    const plan = makeBoxTextPlan({ body, upstreamModel: body.model,
+    let fingerprint: ReturnType<typeof deriveBoxCallFingerprint>;
+    try { fingerprint = deriveBoxCallFingerprint(args.uid, args.canonicalBody); }
+    catch { throw new BoxTextFetchError("BOX_CALL_IDENTITY_MISSING"); }
+    const plan = makeBoxTextPlan({ body, upstreamModel: args.upstreamModel,
       maxOutputTokensLimit: cap, supervisorAsset: this.deps.supervisorAsset,
       keeperAsset: this.deps.keeperAsset });
     const now = this.deps.now ?? Date.now;
@@ -129,6 +141,7 @@ export class BoxTextFetch {
     let completedTarget: BoxResolvedTarget | null = null;
     let clientLeaseListener: (() => void) | null = null;
     let streamHandedOff = false, unknownNotified = false, localCleaned = false;
+    let journalAdmitted = false;
     const cleanupLocal = (): void => {
       if (localCleaned) return;
       localCleaned = true;
@@ -147,6 +160,12 @@ export class BoxTextFetch {
       try { this.deps.registry.markUnknown(held); } catch { /* already stopped */ }
       if (unknownNotified) return;
       unknownNotified = true;
+      if (journalAdmitted) {
+        const persisted = Promise.resolve().then(() => this.deps.journal.markUnknown({
+          requestId: args.requestId, uid: args.uid,
+          leaseEpoch: plan.leaseEpoch, phase })).catch(() => {});
+        void persisted;
+      }
       // Durable notification must be initiated, but an unhealthy journal may
       // not hold a *verified successful* SSE hostage after its model finished.
       const notification = Promise.resolve().then(() => this.deps.onUnknown({ uid: args.uid,
@@ -178,12 +197,20 @@ export class BoxTextFetch {
         return result.stdout.trim() === "clean";
       } catch { return false; }
     };
+    const closePrestart = async (): Promise<void> => {
+      if (!lease) return;
+      try {
+        await this.deps.journal.markPrestartStopped({ requestId: args.requestId,
+          uid: args.uid, leaseEpoch: plan.leaseEpoch });
+        this.deps.registry.confirmRemoteStopped(lease);
+      } catch { await markUnknown("prestart_journal_unknown"); }
+    };
     try {
       if (abort.signal.aborted) throw new BoxTextFetchError("BOX_FETCH_ABORTED");
       try {
         const pendingTarget = this.deps.resolveTarget({ uid: args.uid,
           sessionId: args.sessionId, requestId: args.requestId,
-          upstreamModel: body.model, signal: abort.signal });
+          upstreamModel: args.upstreamModel, signal: abort.signal });
         // A resolver may ignore cancellation and finish after the HTTP budget.
         // Observe and release that target rather than leaking a ProxyAgent.
         void pendingTarget.then((target) => {
@@ -208,6 +235,17 @@ export class BoxTextFetch {
       };
       abort.signal.addEventListener("abort", clientLeaseListener, { once: true });
 
+      try {
+        await race(this.deps.journal.admit({ requestId: args.requestId,
+          uid: args.uid, accountId: resolved.accountId, model: args.canonicalModel,
+          fingerprint, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
+        journalAdmitted = true;
+      } catch {
+        // No Box command has started, so the acquired target is safe to close.
+        this.deps.registry.confirmRemoteStopped(lease);
+        throw new BoxTextFetchError("BOX_JOURNAL_ADMISSION_FAILED");
+      }
+
       // No model process exists during staging. Unknown Exec transport still
       // forbids cleanup/retry because a write may remain in flight.
       let inputStageStarted = false;
@@ -231,9 +269,9 @@ export class BoxTextFetch {
         } else if (!inputStageStarted) {
           // Only global content-addressed supervisor/keeper assets were touched;
           // no private cwd or model process exists to clean up.
-          this.deps.registry.confirmRemoteStopped(lease);
+          await closePrestart();
         } else if (await cleanupKnown()) {
-          this.deps.registry.confirmRemoteStopped(lease);
+          await closePrestart();
         } else {
           await markUnknown("staging_cleanup_unknown");
         }
@@ -242,14 +280,22 @@ export class BoxTextFetch {
       // The shared absolute budget includes all prior stage calls. Do not
       // start a paid model if it cannot finish its own bounded supervisor.
       if (remaining() < MIN_RUN_BUDGET_MS || abort.signal.aborted) {
-        if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(lease);
+        if (await cleanupKnown()) await closePrestart();
         else await markUnknown("pre_run_cleanup_unknown");
         throw new BoxTextFetchError("BOX_BUDGET_EXHAUSTED");
+      }
+      try { await race(this.deps.journal.markRunning({ requestId: args.requestId,
+        uid: args.uid, leaseEpoch: plan.leaseEpoch })); }
+      catch {
+        if (await cleanupKnown()) await closePrestart();
+        else await markUnknown("pre_run_cleanup_unknown");
+        throw new BoxTextFetchError("BOX_JOURNAL_START_FAILED");
       }
       const stream = new ReadableStream<Uint8Array>({
         start: (controller) => {
           const decoder = createBoxCliSseDecoder(plan.expectedModel);
           let remoteTerminalKnown = false;
+          let terminalProof: BoxTerminalProof | null = null;
           const emit = (sse: string): void => {
             if (sse) controller.enqueue(Buffer.from(sse, "utf8"));
           };
@@ -257,11 +303,14 @@ export class BoxTextFetch {
             try {
               try {
                 await exec(plan.run, 120_000, true, (chunk) => emit(decoder.push(chunk)));
-                await readBoxTerminalProof({ target: resolved!,
+                const proof = await readBoxTerminalProof({ target: resolved!,
                   expectedAccountId: resolved!.accountId,
                   runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
                   signal: currentLease.signal });
                 remoteTerminalKnown = true;
+                // The proof is retained until the decoder validates exact
+                // usage; no terminal SSE may leave before durable evidence.
+                terminalProof = proof;
               } catch {
                 // A failed Connect Exec or failed stream consumer does not prove
                 // the remote supervisor and descendants stopped. Never retry.
@@ -277,6 +326,17 @@ export class BoxTextFetch {
                 if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(currentLease);
                 else await markUnknown("protocol_cleanup_unknown");
                 throw new BoxTextFetchError("BOX_MODEL_PROTOCOL_INVALID");
+              }
+              try {
+                await race(this.deps.journal.complete({ requestId: args.requestId,
+                  uid: args.uid, leaseEpoch: plan.leaseEpoch, proof: terminalProof!,
+                  usage: { inputTokens: converted.inputTokens,
+                    outputTokens: converted.outputTokens,
+                    cacheReadTokens: converted.cacheReadTokens,
+                    cacheWriteTokens: converted.cacheWriteTokens } }));
+              } catch {
+                await markUnknown("billing_evidence_unknown");
+                throw new BoxTextFetchError("BOX_BILLING_EVIDENCE_UNAVAILABLE");
               }
               // A verified model result is billable even if post-run GC is
               // uncertain; record unknown but do not erase final usage.
