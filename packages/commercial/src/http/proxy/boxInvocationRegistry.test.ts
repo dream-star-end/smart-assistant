@@ -99,4 +99,19 @@ describe("Box cross-HTTP invocation ownership", () => {
     rejected(() => registry.open({ uid: 3n, sessionId: "session-b", accountId: 20n,
       leaseMs: 600_001 }), "BOX_LEASE_LIMIT_INVALID");
   });
+
+  it("retains an owned egress resource through unknown until remote stop proof", async () => {
+    const registry = new BoxInvocationRegistry(limits);
+    let closed = 0;
+    const lease = registry.open({ uid: 3n, sessionId: "session-resource", accountId: 20n,
+      onRemoteStopped: async () => { closed++; } });
+    registry.markUnknown(lease);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(closed, 0);
+    registry.confirmRemoteStopped(lease);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(closed, 1);
+    rejected(() => registry.confirmRemoteStopped(lease), "BOX_LEASE_STALE");
+    assert.equal(closed, 1);
+  });
 });

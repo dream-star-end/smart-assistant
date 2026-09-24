@@ -23,6 +23,7 @@ export interface BoxInvocationLease {
 interface PrivateLease extends BoxInvocationLease {
   readonly controller: AbortController;
   readonly timer: ReturnType<typeof setTimeout>;
+  readonly onRemoteStopped?: () => void | Promise<void>;
 }
 
 export class BoxInvocationConflict extends Error {
@@ -59,7 +60,9 @@ export class BoxInvocationRegistry {
 
   open(input: { uid: bigint; sessionId: string; accountId: bigint;
     /** Remaining shared request budget; never exceeds the registry ceiling. */
-    leaseMs?: number }): BoxInvocationLease {
+    leaseMs?: number;
+    /** Owns per-invocation egress resources until remote termination is proven. */
+    onRemoteStopped?: () => void | Promise<void> }): BoxInvocationLease {
     const key = this.key(input.uid, input.sessionId);
     if (input.accountId <= 0n) throw new BoxInvocationConflict("BOX_ACCOUNT_ID_INVALID");
     if (this.active.has(key)) throw new BoxInvocationConflict("BOX_SESSION_BUSY");
@@ -81,6 +84,7 @@ export class BoxInvocationRegistry {
       deadlineAt: openedAt + leaseMs,
       state: "running", toolUseId: null, mcpRequestId: null,
       timer: setTimeout(() => this.markUnknown(lease), leaseMs),
+      onRemoteStopped: input.onRemoteStopped,
     };
     this.active.set(key, lease);
     this.userCounts.set(input.uid, (this.userCounts.get(input.uid) ?? 0) + 1);
@@ -164,6 +168,11 @@ export class BoxInvocationRegistry {
     else this.userCounts.delete(lease.uid);
     if (accountCount > 0) this.accountCounts.set(lease.accountId, accountCount);
     else this.accountCounts.delete(lease.accountId);
+    // Resource cleanup is best-effort and observed, never a second unbounded
+    // phase of the request. Unknown leases do not reach this point.
+    if (lease.onRemoteStopped) {
+      void Promise.resolve().then(() => lease.onRemoteStopped!()).catch(() => {});
+    }
   }
 
   counts(uid: bigint, accountId: bigint): { user: number; account: number } {

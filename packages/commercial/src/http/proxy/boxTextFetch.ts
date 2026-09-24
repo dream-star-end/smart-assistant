@@ -11,6 +11,12 @@ import { makeBoxTextPlan } from "./boxTextPlan.js";
 import type { ProxyBody } from "./shared.js";
 
 type ExecRunner = Pick<BoxExecTransport, "run">;
+export interface BoxResolvedTarget {
+  accountId: bigint;
+  exec: ExecRunner;
+  /** Only close after authoritative remote terminal evidence, or before open. */
+  dispose?: () => void | Promise<void>;
+}
 const MIN_RUN_BUDGET_MS = 140_000; // 120s Exec + 20s bounded cleanup
 export class BoxTextFetchError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxTextFetchError"; }
@@ -22,7 +28,7 @@ export class BoxTextFetch {
     registry: BoxInvocationRegistry;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
-      upstreamModel: string; signal: AbortSignal }) => Promise<{ accountId: bigint; exec: ExecRunner }>;
+      upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
     onUnknown: (args: { uid: bigint; sessionId: string; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
     now?: () => number;
@@ -61,7 +67,15 @@ export class BoxTextFetch {
     void aborted.catch(() => {});
     const race = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, aborted]);
     let lease: BoxInvocationLease | null = null;
-    let resolved: { accountId: bigint; exec: ExecRunner } | null = null;
+    let resolved: BoxResolvedTarget | null = null;
+    let resolutionAbandoned = false;
+    let completedTarget: BoxResolvedTarget | null = null;
+    const disposed = new WeakSet<BoxResolvedTarget>();
+    const disposeTarget = (target: BoxResolvedTarget): void => {
+      if (disposed.has(target)) return;
+      disposed.add(target);
+      if (target.dispose) void Promise.resolve().then(() => target.dispose!()).catch(() => {});
+    };
     let clientLeaseListener: (() => void) | null = null;
     const markUnknown = async (phase: string): Promise<void> => {
       if (!lease || !resolved) return;
@@ -99,9 +113,16 @@ export class BoxTextFetch {
     try {
       if (abort.signal.aborted) throw new BoxTextFetchError("BOX_FETCH_ABORTED");
       try {
-        resolved = await race(this.deps.resolveTarget({ uid: args.uid,
+        const pendingTarget = this.deps.resolveTarget({ uid: args.uid,
           sessionId: args.sessionId, requestId: args.requestId,
-          upstreamModel: body.model, signal: abort.signal }));
+          upstreamModel: body.model, signal: abort.signal });
+        // A resolver may ignore cancellation and finish after the HTTP budget.
+        // Observe and release that target rather than leaking a ProxyAgent.
+        void pendingTarget.then((target) => {
+          completedTarget = target;
+          if (resolutionAbandoned) disposeTarget(target);
+        }, () => {});
+        resolved = await race(pendingTarget);
       } catch (error) {
         if (error instanceof BoxTextFetchError) throw error;
         throw new BoxTextFetchError("BOX_TARGET_UNAVAILABLE");
@@ -111,7 +132,8 @@ export class BoxTextFetch {
       }
       const leaseSessionId = args.sessionId ?? args.requestId;
       lease = this.deps.registry.open({ uid: args.uid, sessionId: leaseSessionId,
-        accountId: resolved.accountId, leaseMs: remaining() });
+        accountId: resolved.accountId, leaseMs: remaining(),
+        onRemoteStopped: () => disposeTarget(resolved!) });
       const currentLease = lease;
       clientLeaseListener = () => {
         try { this.deps.registry.markUnknown(currentLease); } catch { /* already stopped */ }
@@ -176,6 +198,9 @@ export class BoxTextFetch {
       return new Response(converted.sse, { status: 200,
         headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
     } finally {
+      resolutionAbandoned = true;
+      if (completedTarget && completedTarget !== resolved) disposeTarget(completedTarget);
+      if (resolved && !lease) disposeTarget(resolved);
       clearTimeout(timer);
       args.init.signal?.removeEventListener("abort", onClientAbort);
       if (clientLeaseListener) abort.signal.removeEventListener("abort", clientLeaseListener);

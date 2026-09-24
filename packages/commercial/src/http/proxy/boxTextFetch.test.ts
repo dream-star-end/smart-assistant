@@ -44,7 +44,7 @@ class SpyRegistry extends BoxInvocationRegistry {
 type Runner = Pick<BoxExecTransport, "run">;
 function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cleanup";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
-  resolverThrow?: boolean } = {}) {
+  resolverThrow?: boolean; onDispose?: () => void } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   const stages: string[] = [], unknowns: string[] = [];
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
@@ -74,7 +74,7 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cl
     registry, maxOutputTokensForModel: (value) => value === model ? 128_000 : null,
     resolveTarget: async () => {
       if (opts.resolverThrow) throw new Error("raw credential detail must not leak");
-      return { accountId: 20n, exec: runner };
+      return { accountId: 20n, exec: runner, dispose: opts.onDispose };
     },
     onUnknown: async ({ phase }) => {
       unknowns.push(phase);
@@ -185,4 +185,44 @@ test("resolver errors are fixed-code and cannot leak raw credential details", as
       && error.code === "BOX_TARGET_UNAVAILABLE"
       && !error.message.includes("credential detail"));
   assert.deepEqual(f.stages, []);
+});
+
+test("known terminal closes private egress, unknown retains it for reconciliation", async () => {
+  let knownClosed = 0;
+  const known = fixture({ onDispose: () => { knownClosed++; } });
+  await known.service.fetch(input);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(knownClosed, 1);
+
+  let unknownClosed = 0;
+  const unknown = fixture({ failPhase: "model", onDispose: () => { unknownClosed++; } });
+  await assert.rejects(unknown.service.fetch(input),
+    (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_MODEL_OUTCOME_UNKNOWN");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(unknownClosed, 0);
+  unknown.registry.confirmRemoteStopped(unknown.registry.last!);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(unknownClosed, 1);
+});
+
+test("a resolver that completes after abort releases its private target without opening a lease", async () => {
+  let finish!: (target: { accountId: bigint; exec: Runner; dispose: () => void }) => void;
+  let closed = 0;
+  const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 });
+  const service = new BoxTextFetch({
+    supervisorAsset: Buffer.from("fixture"), registry,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: () => new Promise((resolve) => { finish = resolve; }),
+    onUnknown: async () => {},
+  });
+  const controller = new AbortController();
+  const pending = service.fetch({ ...input, init: { ...input.init, signal: controller.signal } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(pending,
+    (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_FETCH_ABORTED");
+  finish({ accountId: 20n, exec: { run: async () => ok() }, dispose: () => { closed++; } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(closed, 1);
+  assert.equal(registry.last, null);
 });
