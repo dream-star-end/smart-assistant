@@ -76,6 +76,50 @@ test("live decoder never emits terminal success if final snapshot contradicts ea
     (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_TEXT_MISMATCH");
 });
 
+test("live UsageObserver stays partial until terminal result and text proof pass", () => {
+  for (const invalid of [false, true]) {
+    const source = records();
+    if (invalid) {
+      (source[7] as { message: { content: Array<{ text: string }> } })
+        .message.content[0]!.text = "contradiction";
+    }
+    const decoder = createBoxCliSseDecoder(model);
+    const observer = new _UsageObserver();
+    for (const record of source) observer.push(decoder.push(JSON.stringify(record) + "\n"));
+    observer.flush();
+    assert.equal(observer.result().kind, "partial", "stop_reason must not escape early");
+    if (invalid) {
+      assert.throws(() => decoder.finish(),
+        (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_TEXT_MISMATCH");
+      observer.flush();
+      assert.equal(observer.result().kind, "partial");
+    } else {
+      observer.push(decoder.finish().tailSse); observer.flush();
+      assert.equal(observer.result().kind, "final");
+    }
+  }
+});
+
+test("a failed push permanently poisons decoder and cannot later expose final usage", () => {
+  const decoder = createBoxCliSseDecoder(model);
+  decoder.push(jsonl(records()));
+  assert.throws(() => decoder.push('{"type":"unknown"}\n'),
+    (error: unknown) => error instanceof BoxCliSseError
+      && error.code === "BOX_CLI_RECORD_AFTER_RESULT");
+  assert.throws(() => decoder.finish(),
+    (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_STREAM_INVALID");
+});
+
+test("1MiB byte cap is invariant to an emoji split between chunks", () => {
+  const decoder = createBoxCliSseDecoder(model);
+  const emoji = "😀";
+  decoder.push("x".repeat(1_048_572));
+  decoder.push(emoji[0]!);
+  decoder.push(emoji[1]!);
+  assert.throws(() => decoder.push("x"),
+    (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_STREAM_INVALID");
+});
+
 test("real Connect transport callback delivers first model delta before remote exit", async () => {
   const source = records();
   const part1 = jsonl(source.slice(0, 4));

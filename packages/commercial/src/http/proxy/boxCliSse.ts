@@ -61,7 +61,9 @@ export function createBoxCliSseDecoder(expectedModel: string): {
   let activeBlock: { originalIndex: number; visibleIndex: number; type: string; text: string } | null = null;
   const visibleTextParts: string[] = [];
   const frames: string[] = [];
-  let pending = "", bytes = 0, finished = false, heldStop: string | null = null;
+  let pending = "", bytes = 0, finished = false, failed = false;
+  let splitHighSurrogate = "";
+  const heldTerminalFrames: string[] = [];
   const processLine = (line: string): string => {
     let emitted = "";
     let record: ObjectValue;
@@ -164,7 +166,13 @@ export function createBoxCliSseDecoder(expectedModel: string): {
         throw new BoxCliSseError("BOX_CLI_EVENT_UNSUPPORTED");
       }
       const frame = `event: ${eventType}\ndata: ${JSON.stringify(forwardedEvent)}\n\n`;
-      if (eventType === "message_stop") heldStop = frame;
+      // UsageObserver treats any message_delta with a stop_reason as final.
+      // Withhold it and message_stop until result, snapshot and text all prove
+      // successful, or a failed CLI could be charged as a completed response.
+      if (eventType === "message_stop"
+        || (eventType === "message_delta" && stopReason !== null)) {
+        heldTerminalFrames.push(frame);
+      }
       else { frames.push(frame); emitted += frame; }
     } else if (kind === "result") {
       if (!stopped || resultSeen || record.subtype !== "success" || record.is_error !== false) {
@@ -211,23 +219,41 @@ export function createBoxCliSseDecoder(expectedModel: string): {
     return emitted;
   };
   const push = (chunk: string): string => {
-    if (finished || typeof chunk !== "string") throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
-    bytes += Buffer.byteLength(chunk);
-    if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
-    pending += chunk;
-    let emitted = "";
-    for (;;) {
-      const index = pending.indexOf("\n");
-      if (index < 0) break;
-      const line = pending.slice(0, index).replace(/\r$/, "");
-      pending = pending.slice(index + 1);
-      if (line) emitted += processLine(line);
+    if (finished || failed || typeof chunk !== "string") {
+      throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
     }
-    return emitted;
+    try {
+      let measured = splitHighSurrogate + chunk;
+      splitHighSurrogate = "";
+      if (measured.length > 0) {
+        const last = measured.charCodeAt(measured.length - 1);
+        if (last >= 0xd800 && last <= 0xdbff) {
+          splitHighSurrogate = measured.slice(-1);
+          measured = measured.slice(0, -1);
+        }
+      }
+      bytes += Buffer.byteLength(measured);
+      if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+      pending += chunk;
+      let emitted = "";
+      for (;;) {
+        const index = pending.indexOf("\n");
+        if (index < 0) break;
+        const line = pending.slice(0, index).replace(/\r$/, "");
+        pending = pending.slice(index + 1);
+        if (line) emitted += processLine(line);
+      }
+      return emitted;
+    } catch (error) {
+      failed = true;
+      throw error;
+    }
   };
   const finish = (): BoxCliSseResult & { tailSse: string } => {
-    if (finished) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    if (finished || failed) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
     finished = true;
+    bytes += Buffer.byteLength(splitHighSurrogate);
+    if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
     let tailSse = pending ? processLine(pending) : "";
     pending = "";
     if (!started || !stopped || !resultSeen || inputTokens === null || outputTokens === null) {
@@ -237,10 +263,11 @@ export function createBoxCliSseDecoder(expectedModel: string): {
       || assistantTexts.some((text) => !lastAssistantText.startsWith(text))) {
       throw new BoxCliSseError("BOX_CLI_TEXT_MISMATCH");
     }
-    if (!heldStop) throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
-    frames.push(heldStop);
-    tailSse += heldStop;
-    heldStop = null;
+    if (!heldTerminalFrames.some((frame) => frame.startsWith("event: message_stop\n"))) {
+      throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
+    }
+    frames.push(...heldTerminalFrames);
+    tailSse += heldTerminalFrames.join("");
     return { sse: frames.join(""), inputTokens, outputTokens, tailSse };
   };
   return { push, finish };
