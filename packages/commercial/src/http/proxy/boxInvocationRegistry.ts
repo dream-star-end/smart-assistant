@@ -5,8 +5,12 @@
  * A request's close event is deliberately not the lifetime of a handed-off
  * remote CLI. No user content or account credential is held here.
  */
+import { rootLogger } from "../../logging/logger.js";
+
+const log = rootLogger.child({ subsys: "box-invocation" });
 export type BoxInvocationState =
-  | "running" | "waiting_tool_result" | "resuming" | "unknown" | "completed";
+  | "running" | "waiting_tool_result" | "resuming" | "unknown"
+  | "stopped_cleanup_pending" | "stopped_cleanup_failed" | "completed";
 
 export interface BoxInvocationLease {
   readonly uid: bigint;
@@ -151,7 +155,8 @@ export class BoxInvocationRegistry {
   /** Transport ambiguity is not proof of remote termination. Keep capacity. */
   markUnknown(handle: BoxInvocationLease): void {
     const lease = this.requireActive(handle);
-    if (lease.state === "completed" || lease.state === "unknown") return;
+    if (lease.state === "completed" || lease.state === "unknown"
+      || lease.state === "stopped_cleanup_pending" || lease.state === "stopped_cleanup_failed") return;
     lease.state = "unknown";
     lease.controller.abort();
   }
@@ -160,6 +165,38 @@ export class BoxInvocationRegistry {
   confirmRemoteStopped(handle: BoxInvocationLease): void {
     const lease = this.requireActive(handle);
     clearTimeout(lease.timer);
+    if (lease.state === "stopped_cleanup_pending" || lease.state === "stopped_cleanup_failed") {
+      throw new BoxInvocationConflict("BOX_CLEANUP_ALREADY_OWNED");
+    }
+    if (!lease.onRemoteStopped) {
+      this.release(lease);
+      return;
+    }
+    this.startCleanup(lease);
+  }
+
+  /** Operator/reconciler action only, after a settled failed dispose. Never
+   * blindly retry a pending close whose outcome is still unknown. */
+  retryFailedCleanup(handle: BoxInvocationLease): void {
+    const lease = this.requireActive(handle);
+    if (lease.state !== "stopped_cleanup_failed") {
+      throw new BoxInvocationConflict("BOX_CLEANUP_NOT_FAILED");
+    }
+    this.startCleanup(lease);
+  }
+
+  private startCleanup(lease: PrivateLease): void {
+    lease.state = "stopped_cleanup_pending";
+    void Promise.resolve().then(() => lease.onRemoteStopped!()).then(() => {
+      if (lease.state === "stopped_cleanup_pending") this.release(lease);
+    }, () => {
+      lease.state = "stopped_cleanup_failed";
+      log.error("BOX_EGRESS_DISPOSE_FAILED", { uid: lease.uid.toString(),
+        accountId: lease.accountId.toString(), sessionId: lease.sessionId });
+    });
+  }
+
+  private release(lease: PrivateLease): void {
     lease.state = "completed";
     this.active.delete(this.key(lease.uid, lease.sessionId));
     const userCount = (this.userCounts.get(lease.uid) ?? 0) - 1;
@@ -168,11 +205,6 @@ export class BoxInvocationRegistry {
     else this.userCounts.delete(lease.uid);
     if (accountCount > 0) this.accountCounts.set(lease.accountId, accountCount);
     else this.accountCounts.delete(lease.accountId);
-    // Resource cleanup is best-effort and observed, never a second unbounded
-    // phase of the request. Unknown leases do not reach this point.
-    if (lease.onRemoteStopped) {
-      void Promise.resolve().then(() => lease.onRemoteStopped!()).catch(() => {});
-    }
   }
 
   counts(uid: bigint, accountId: bigint): { user: number; account: number } {

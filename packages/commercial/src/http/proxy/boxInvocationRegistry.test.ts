@@ -114,4 +114,24 @@ describe("Box cross-HTTP invocation ownership", () => {
     rejected(() => registry.confirmRemoteStopped(lease), "BOX_LEASE_STALE");
     assert.equal(closed, 1);
   });
+
+  it("failed close keeps capacity and responsibility until explicit successful retry", async () => {
+    const registry = new BoxInvocationRegistry(limits);
+    let calls = 0;
+    const lease = registry.open({ uid: 3n, sessionId: "session-fail-close", accountId: 20n,
+      onRemoteStopped: () => {
+        calls++;
+        if (calls === 1) throw new Error("simulated close failure");
+      } });
+    registry.confirmRemoteStopped(lease);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(lease.state, "stopped_cleanup_failed");
+    assert.deepEqual(registry.counts(3n, 20n), { user: 1, account: 1 });
+    rejected(() => registry.confirmRemoteStopped(lease), "BOX_CLEANUP_ALREADY_OWNED");
+    assert.equal(calls, 1);
+    registry.retryFailedCleanup(lease);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(calls, 2);
+    assert.deepEqual(registry.counts(3n, 20n), { user: 0, account: 0 });
+  });
 });

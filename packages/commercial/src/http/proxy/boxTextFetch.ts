@@ -9,8 +9,10 @@ import { completedBoxCliToSse } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
 import type { ProxyBody } from "./shared.js";
+import { rootLogger } from "../../logging/logger.js";
 
 type ExecRunner = Pick<BoxExecTransport, "run">;
+const log = rootLogger.child({ subsys: "box-text-fetch" });
 export interface BoxResolvedTarget {
   accountId: bigint;
   exec: ExecRunner;
@@ -23,6 +25,9 @@ export class BoxTextFetchError extends Error {
 }
 
 export class BoxTextFetch {
+  private readonly orphanedTargets = new Set<BoxResolvedTarget>();
+  private readonly disposal = new WeakMap<BoxResolvedTarget,
+    { done: boolean; pending: Promise<void> | null }>();
   constructor(private readonly deps: {
     supervisorAsset: Buffer;
     registry: BoxInvocationRegistry;
@@ -34,6 +39,40 @@ export class BoxTextFetch {
     now?: () => number;
     budgetMs?: number;
   }) {}
+
+  /** Manual, bounded-reconcile hook for targets acquired after cancellation or
+   * before a lease. Failed closes remain owned here; never silently discarded. */
+  async retryFailedOrphanCleanup(): Promise<number> {
+    await Promise.allSettled([...this.orphanedTargets].map((target) => this.disposeTarget(target).then(() => {
+      this.orphanedTargets.delete(target);
+    })));
+    return this.orphanedTargets.size;
+  }
+
+  private disposeTarget(target: BoxResolvedTarget): Promise<void> {
+    let state = this.disposal.get(target);
+    if (!state) { state = { done: false, pending: null }; this.disposal.set(target, state); }
+    if (state.done) return Promise.resolve();
+    if (state.pending) return state.pending;
+    const current = state;
+    current.pending = Promise.resolve().then(() => target.dispose?.()).then(() => {
+      current.done = true;
+      current.pending = null;
+    }, (error: unknown) => {
+      current.pending = null;
+      throw error;
+    });
+    return current.pending;
+  }
+
+  private closeOrphan(target: BoxResolvedTarget): void {
+    this.orphanedTargets.add(target);
+    void this.disposeTarget(target).then(() => {
+      this.orphanedTargets.delete(target);
+    }, () => {
+      log.error("BOX_EGRESS_ORPHAN_DISPOSE_FAILED");
+    });
+  }
 
   async fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
     url: string; init: RequestInit }): Promise<Response> {
@@ -70,12 +109,6 @@ export class BoxTextFetch {
     let resolved: BoxResolvedTarget | null = null;
     let resolutionAbandoned = false;
     let completedTarget: BoxResolvedTarget | null = null;
-    const disposed = new WeakSet<BoxResolvedTarget>();
-    const disposeTarget = (target: BoxResolvedTarget): void => {
-      if (disposed.has(target)) return;
-      disposed.add(target);
-      if (target.dispose) void Promise.resolve().then(() => target.dispose!()).catch(() => {});
-    };
     let clientLeaseListener: (() => void) | null = null;
     const markUnknown = async (phase: string): Promise<void> => {
       if (!lease || !resolved) return;
@@ -120,7 +153,7 @@ export class BoxTextFetch {
         // Observe and release that target rather than leaking a ProxyAgent.
         void pendingTarget.then((target) => {
           completedTarget = target;
-          if (resolutionAbandoned) disposeTarget(target);
+          if (resolutionAbandoned) this.closeOrphan(target);
         }, () => {});
         resolved = await race(pendingTarget);
       } catch (error) {
@@ -133,7 +166,7 @@ export class BoxTextFetch {
       const leaseSessionId = args.sessionId ?? args.requestId;
       lease = this.deps.registry.open({ uid: args.uid, sessionId: leaseSessionId,
         accountId: resolved.accountId, leaseMs: remaining(),
-        onRemoteStopped: () => disposeTarget(resolved!) });
+        onRemoteStopped: () => this.disposeTarget(resolved!) });
       const currentLease = lease;
       clientLeaseListener = () => {
         try { this.deps.registry.markUnknown(currentLease); } catch { /* already stopped */ }
@@ -199,8 +232,8 @@ export class BoxTextFetch {
         headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
     } finally {
       resolutionAbandoned = true;
-      if (completedTarget && completedTarget !== resolved) disposeTarget(completedTarget);
-      if (resolved && !lease) disposeTarget(resolved);
+      if (completedTarget && completedTarget !== resolved) this.closeOrphan(completedTarget);
+      if (resolved && !lease) this.closeOrphan(resolved);
       clearTimeout(timer);
       args.init.signal?.removeEventListener("abort", onClientAbort);
       if (clientLeaseListener) abort.signal.removeEventListener("abort", clientLeaseListener);

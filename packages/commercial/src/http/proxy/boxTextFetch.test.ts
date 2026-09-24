@@ -135,6 +135,7 @@ test("late stage budget exhaustion rejects before any paid model start", async (
   } });
   await assert.rejects(f.service.fetch(input),
     (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_BUDGET_EXHAUSTED");
+  await new Promise<void>((resolve) => setImmediate(resolve));
   assert.ok(!f.stages.includes("model"));
   assert.equal(f.stages.at(-1), "cleanup");
   assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
@@ -174,6 +175,7 @@ test("protocol failure after known supervisor exit cleans and releases without i
   const f = fixture({ badCli: true });
   await assert.rejects(f.service.fetch(input),
     (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_MODEL_PROTOCOL_INVALID");
+  await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(f.stages.at(-1), "cleanup");
   assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
 });
@@ -225,4 +227,29 @@ test("a resolver that completes after abort releases its private target without 
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(closed, 1);
   assert.equal(registry.last, null);
+});
+
+test("failed orphan close retains ownership for explicit retry", async () => {
+  let finish!: (target: { accountId: bigint; exec: Runner; dispose: () => void }) => void;
+  let calls = 0;
+  const service = new BoxTextFetch({
+    supervisorAsset: Buffer.from("fixture"),
+    registry: new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }),
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: () => new Promise((resolve) => { finish = resolve; }),
+    onUnknown: async () => {},
+  });
+  const controller = new AbortController();
+  const pending = service.fetch({ ...input, init: { ...input.init, signal: controller.signal } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(pending);
+  finish({ accountId: 20n, exec: { run: async () => ok() }, dispose: () => {
+    calls++;
+    if (calls === 1) throw new Error("simulated close failure");
+  } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(await service.retryFailedOrphanCleanup(), 0);
+  assert.equal(calls, 2);
 });
