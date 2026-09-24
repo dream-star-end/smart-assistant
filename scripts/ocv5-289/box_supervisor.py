@@ -6,6 +6,7 @@ the upstream process group bounded even if the Exec stream is abandoned.
 """
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -20,6 +21,9 @@ import sys
 import time
 
 PR_SET_PDEATHSIG = 1
+# Linux uapi/linux/pidfd.h, available for pidfd_send_signal since Linux 6.9.
+# A pinned pidfd prevents sending to a recycled numeric PGID on parent loss.
+PIDFD_SIGNAL_PROCESS_GROUP = 1 << 2
 TOOL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 RUN_DIR = re.compile(r"^ocv5-289-run-[0-9a-f]{24}$")
 MAX_STDIN_BYTES = 8 * 1024 * 1024
@@ -74,17 +78,50 @@ def kill_group(pgid: int, sig: int) -> None:
         pass
 
 
+def signal_group_by_pidfd(pidfd: int) -> bool:
+    """Signal only the original process group; old kernels fail closed.
+
+    If group-scoped pidfd signalling is unavailable, signal the original
+    leader only. Never fall back to killpg(numeric PGID) after its parent died:
+    the leader can have been reaped and the number reused by then.
+    """
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL, None,
+                                 PIDFD_SIGNAL_PROCESS_GROUP)
+        return True
+    except OSError as error:
+        if error.errno not in (errno.EINVAL, errno.ENOSYS, errno.ESRCH):
+            raise
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        except OSError as leader_error:
+            if leader_error.errno not in (errno.EINVAL, errno.ENOSYS, errno.ESRCH):
+                raise
+        return False
+
+
 def watch_parent(fd: int, ack_fd: int, pgid: int) -> int:
     # A normal parent writes D. Parent SIGKILL closes the pipe: watcher kills
     # the whole CLI group, including same-group grandchildren.
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        os.close(fd)
+        os.close(ack_fd)
+        return 126
+    try:
+        pidfd = os.pidfd_open(pgid, 0)
+    except OSError:
+        os.close(fd)
+        os.close(ack_fd)
+        return 126
     try:
         os.write(ack_fd, b"R")
         os.close(ack_fd)
         data = os.read(fd, 1)
         if data != b"D":
-            kill_group(pgid, signal.SIGKILL)
+            return 0 if signal_group_by_pidfd(pidfd) else 125
         return 0
     finally:
+        os.close(pidfd)
         os.close(fd)
 
 
