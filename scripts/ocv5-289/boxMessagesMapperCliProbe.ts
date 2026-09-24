@@ -3,10 +3,12 @@
  */
 import { createServer } from 'node:http'
 import { execFileSync, spawn } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { compileBoxCliSyntheticTurn } from '../../packages/commercial/src/http/proxy/boxMessagesMapper.js'
+import { completedBoxCliToSse } from '../../packages/commercial/src/http/proxy/boxCliSse.js'
 import type { ProxyBody } from '../../packages/commercial/src/http/proxy/shared.js'
 
 const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString('hex')}`
@@ -101,8 +103,16 @@ try {
       && systemPrompt === compiled.systemPrompt) throw new Error('NEGATIVE_FIXTURE_NOT_APPLIED')
   }
   writeFileSync(snapshot, snapshotText, { mode: 0o600, flag: 'wx' })
-  const child = spawn('/usr/local/bin/claude', ['-p', '--resume', compiled.sessionId,
-    '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
+  const stdinPath = join(cwd, 'stdin.jsonl')
+  writeFileSync(stdinPath, stdinJsonl, { mode: 0o600, flag: 'wx' })
+  const stdinHash = createHash('sha256').update(stdinJsonl).digest('hex')
+  const child = spawn('/usr/bin/python3', [
+    fileURLToPath(new URL('./box_supervisor.py', import.meta.url)),
+    '--deadline', '15', '--kill-after', '1', '--max-output', '262144',
+    '--stdin-file', stdinPath, '--stdin-sha256', stdinHash, '--',
+    '/usr/local/bin/claude', '-p', '--resume', compiled.sessionId,
+    '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--include-partial-messages', '--verbose', '--no-session-persistence',
     '--model', 'claude-opus-5-5', '--tools', '', '--strict-mcp-config',
     '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '', '--disable-slash-commands',
     '--system-prompt', systemPrompt], {
@@ -110,23 +120,24 @@ try {
       ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
       ANTHROPIC_AUTH_TOKEN: 'fixture-only', CLAUDE_CODE_MAX_RETRIES: '0',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1', NO_PROXY: '127.0.0.1,localhost' },
-    stdio: ['pipe', 'pipe', 'pipe'] })
+    stdio: ['ignore', 'pipe', 'pipe'] })
   let stdout = '', stderrBytes = 0
   child.stdout.on('data', (chunk) => { stdout += chunk.toString('utf8') })
   child.stderr.on('data', (chunk) => { stderrBytes += chunk.length })
-  child.stdin.end(stdinJsonl)
-  const timer = setTimeout(() => child.kill('SIGKILL'), 12000)
+  const timer = setTimeout(() => child.kill('SIGKILL'), 20000)
   const exit = await new Promise<number | null>((resolve) => child.once('close', (code) => resolve(code)))
   clearTimeout(timer)
   const records = stdout.split(/\r?\n/).flatMap((line) => {
     try { return line ? [JSON.parse(line)] : [] } catch { return [] }
   })
   const final = records.findLast((record) => record.type === 'result')
+  const converted = exit === 0 ? completedBoxCliToSse(stdout, 'claude-opus-5-5') : null
   const good = exit === 0 && requests === 1 && exactHistory && exactSystem
     && final?.is_error === false && final?.result === expected
+    && converted?.sse.includes('event: message_stop') === true
   process.stdout.write(JSON.stringify({ exit, requests, exactHistory, exactSystem,
     finalSuccess: final?.is_error === false, textExact: final?.result === expected,
-    stderrBytes }) + '\n')
+    sseBytes: converted?.sse.length ?? 0, stderrBytes }) + '\n')
   if (!good) process.exitCode = 1
 } finally {
   server.closeAllConnections?.()

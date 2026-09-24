@@ -6,6 +6,7 @@ the upstream process group bounded even if the Exec stream is abandoned.
 """
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,50 @@ import time
 
 PR_SET_PDEATHSIG = 1
 TOOL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+RUN_DIR = re.compile(r"^ocv5-289-run-[0-9a-f]{24}$")
+MAX_STDIN_BYTES = 8 * 1024 * 1024
+
+
+def verified_stdin_fd(path: str, wanted_sha256: str) -> int:
+    parent, name = os.path.split(path)
+    directory = Path(parent)
+    if (name != "stdin.jsonl" or directory.parent != Path("/tmp")
+            or not RUN_DIR.fullmatch(directory.name)
+            or os.path.realpath(parent) != parent
+            or not re.fullmatch(r"[0-9a-f]{64}", wanted_sha256)):
+        raise ValueError("STDIN_PATH_INVALID")
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory_fd)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError("STDIN_DIR_INVALID")
+        # O_NONBLOCK is essential: an attacker-supplied FIFO in an otherwise
+        # valid 0700 directory must not park us before the fstat type check.
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or not (0 < info.st_size <= MAX_STDIN_BYTES)):
+            raise ValueError("STDIN_FILE_INVALID")
+        data = bytearray()
+        while len(data) <= MAX_STDIN_BYTES:
+            chunk = os.read(fd, min(65536, MAX_STDIN_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if (len(data) != info.st_size or not data.endswith(b"\n")
+                or hashlib.sha256(data).hexdigest() != wanted_sha256):
+            raise ValueError("STDIN_CONTENT_INVALID")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.set_blocking(fd, True)
+        return fd
+    except (OSError, ValueError):
+        os.close(fd)
+        raise
 
 
 def kill_group(pgid: int, sig: int) -> None:
@@ -221,11 +266,15 @@ def main() -> int:
     parser.add_argument("--deadline", type=float, required=True)
     parser.add_argument("--kill-after", type=float, default=1.0)
     parser.add_argument("--max-output", type=int, default=262144)
+    parser.add_argument("--stdin-file")
+    parser.add_argument("--stdin-sha256")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if (not command or not (0 < args.deadline <= 120) or not (0 < args.kill_after <= 10)
-            or not (0 < args.max_output <= 1048576)):
+            or not (0 < args.max_output <= 1048576)
+            or (args.stdin_file is None) != (args.stdin_sha256 is None)
+            or (args.stdin_file is not None and (not args.stdin_file or not args.stdin_sha256))):
         return 126
 
     publisher = None
@@ -235,6 +284,15 @@ def main() -> int:
         except (OSError, ValueError):
             return 126
 
+    stdin_fd = None
+    if args.stdin_file is not None:
+        try:
+            stdin_fd = verified_stdin_fd(args.stdin_file, args.stdin_sha256)
+        except (OSError, ValueError):
+            if publisher is not None:
+                publisher.close()
+            return 126
+
     parent_pid = os.getpid()
     gate_read, gate_write = os.pipe()
     watch_read, watch_write = os.pipe()
@@ -242,16 +300,20 @@ def main() -> int:
     try:
         child = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--gated", str(gate_read), *command],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stdin=stdin_fd if stdin_fd is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True,
             preexec_fn=lambda: child_setup(parent_pid), close_fds=True, pass_fds=(gate_read,),
         )
     except (OSError, subprocess.SubprocessError):
+        if stdin_fd is not None:
+            os.close(stdin_fd)
         for fd in (gate_read, gate_write, watch_read, watch_write, ack_read, ack_write):
             os.close(fd)
         if publisher is not None:
             publisher.close()
         return 126
+    if stdin_fd is not None:
+        os.close(stdin_fd)
     os.close(gate_read)
     if child_path := os.environ.get("OCV5_SUPERVISOR_TEST_CHILD_PID_FILE"):
         with open(child_path, "w", encoding="ascii") as child_file:
