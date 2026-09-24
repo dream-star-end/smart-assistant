@@ -9,6 +9,7 @@ import { BoxAccountResolver, createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { BoxTextFetch } from "../../packages/commercial/src/http/proxy/boxTextFetch.js";
 import { BoxInvocationRegistry } from "../../packages/commercial/src/http/proxy/boxInvocationRegistry.js";
+import { readBoxTerminalProof } from "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "../../packages/commercial/src/http/proxy/upstream.js";
 import { _UsageObserver } from "../../packages/commercial/src/http/proxy/shared.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
@@ -34,6 +35,7 @@ async function main(): Promise<void> {
   const expected = `ocv5-289-${randomBytes(12).toString("hex")}`;
   const startedAt = process.hrtime.bigint();
   let modelTerminalAt: bigint | null = null;
+  let proofIdentity: { runNonce: string; leaseEpoch: string } | null = null;
   let unknown: string | null = null;
   const service = new BoxTextFetch({ supervisorAsset, keeperAsset, registry, budgetMs: 600_000,
     maxOutputTokensForModel: (model) => model === MODEL ? 128_000 : null,
@@ -45,6 +47,14 @@ async function main(): Promise<void> {
       }
       return { ...target, exec: { run: async (request, opts) => {
         const modelRun = request.args[0]?.startsWith("/tmp/ocv5-289-keeper-");
+        if (modelRun) {
+          const proofDir = request.args[request.args.indexOf("--proof-dir") + 1];
+          const leaseEpoch = request.args[request.args.indexOf("--lease-epoch") + 1];
+          if (!proofDir?.startsWith("/tmp/ocv5-289-proof-") || !leaseEpoch) {
+            throw new Error("BOX_PROBE_PROOF_IDENTITY_MISSING");
+          }
+          proofIdentity = { runNonce: proofDir.slice(-24), leaseEpoch };
+        }
         const result = await target.exec.run(request, opts);
         if (modelRun) modelTerminalAt = process.hrtime.bigint();
         return result;
@@ -98,8 +108,18 @@ async function main(): Promise<void> {
     || unknown !== null || registry.counts(UID, ACCOUNT_ID).account !== 0) {
     throw new Error("BOX_STREAM_CONTRACT_FAILED");
   }
+  if (!proofIdentity) throw new Error("BOX_PROBE_PROOF_IDENTITY_MISSING");
+  const recovered = await resolver.resolve({ uid: UID, sessionId: requestId,
+    requestId: `${requestId}-recovery`, upstreamModel: MODEL,
+    signal: new AbortController().signal });
+  try {
+    const proof = await readBoxTerminalProof({ target: recovered,
+      expectedAccountId: ACCOUNT_ID, ...proofIdentity });
+    if (proof.reason !== "worker_complete") throw new Error("BOX_PROBE_RECOVERY_INVALID");
+  } finally { await recovered.dispose?.(); }
   process.stdout.write(JSON.stringify({ route: "box-text-fetch-live", accountId: String(ACCOUNT_ID),
     modelId, exact: true, firstDeltaBeforeModelTerminal: true,
+    crossRequestProof: true,
     firstDeltaMs: Number((firstDeltaAt - startedAt) / 1_000_000n),
     modelTerminalMs: Number((modelTerminalAt - startedAt) / 1_000_000n),
     totalMs: Number((process.hrtime.bigint() - startedAt) / 1_000_000n),
