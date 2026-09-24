@@ -56,13 +56,14 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
    status. Every request pins uid/session/model, account authorization,
    credential fingerprint and egress basis. Session switch is allowed at a
    completed turn boundary; it is not an implicit mid-tool fallback.
-4. Never copy Box auth/config, arbitrary files or plugins. The only staged
-   asset is the server-generated, explicitly named synthetic session JSONL
-   after strict path, owner/mode, size, line framing and schema checks. It
-   contains user/model content and is never logged. After known remote
-   termination it is deleted; an unknown completion is retained only under a
-   fenced, bounded recovery/GC policy, never deleted on the mere loss of a
-   transport response. Unique per-run Box directories, restrictive
+4. Never copy Box auth/config, arbitrary files or plugins. Stage only pinned
+   supervisor/virtual-MCP assets and server-generated, explicitly named
+   system/stdin/catalog/session files after strict path, owner/mode, size,
+   hash, framing and schema checks. The system/stdin/session files contain
+   user/model content and are never logged. After known remote termination
+   they are deleted; an unknown completion is retained only under a fenced,
+   bounded recovery/GC policy, never deleted on the mere loss of a transport
+   response. Unique per-run Box directories, restrictive
    permissions, no arbitrary built-in tools, empty settings sources, strict
    MCP config and fixed argv reduce cross-invocation exposure, but are **not**
    a same-UID security boundary; cross-user negative tests remain mandatory.
@@ -141,6 +142,50 @@ the actual agent, memory/skills/prompt construction, tool execution and UI.
   duplicate billing. Supervisor kills the process group at hard deadline.
 
 ## Integration and accounting
+
+### Durable invocation journal (design freeze; no migration applied yet)
+
+Use a **new selfhost-only PG table** for the lifetime of one Box CLI process.
+Do not overload `request_finalize_journal` (one billing HTTP request) or
+`turn_dispatches` (one user-container agent turn): one held CLI may span two
+Messages HTTP requests and two usage settlements. The row carries only
+`invocation_id`, uid, OpenClaude session ID, immutable first-request hash,
+first billing request ID, account ID, Box run nonce, catalog/model IDs,
+owner ID/lease epoch/deadline, state/revision, per-tool ID/name/input hashes,
+second billing request ID when claimed, and terminal/unknown evidence. No
+credential, prompt, tool arguments/results or Box session snapshot in PG.
+
+- Reserve by `(uid, session_id, first_request_hash)` **before** any potentially
+  paid model start, using a uniqueness/CAS fence. A duplicate never starts a
+  second CLI. A completed duplicate may return an explicit already-executed
+  error unless a verified response cache is available; it must not silently
+  replay or be treated as a fresh request.
+- Use monotonic revision and lease epoch on every state change. State path:
+  `reserved → starting → streaming → handoff → resuming → terminal`; any
+  ambiguous transport, owner loss or mismatched proof goes to `unknown` (or
+  explicit `manual_reconcile`), never back to `reserved`. Per-uid/session and
+  per-account active capacity is held across HTTP boundaries.
+- Before emitting first-response `message_delta(tool_use)` / `message_stop`,
+  verify **every** model tool ID/name/input against the owner-scoped Box MCP
+  `pending.<tool_id>.json` files, then commit all IDs/hashes and a journal
+  revision in one PG transaction. Only that committed revision can be passed
+  to the handoff decoder. Merely seeing a streamed `tool_use` is not a durable
+  handoff.
+- The second authenticated Messages request must match uid, session, model,
+  the exact pending tool-ID set and one `tool_result` per ID (including error
+  flags/content hashes). Claim `handoff → resuming` under CAS; publish each
+  result to its Box file **once**, atomically. A timeout after publish is
+  `unknown`, not a reason to republish or restart `claude -p`.
+- A restart may lose the live Connect response. The reconciler must never
+  infer remote termination from elapsed time or a vanished local handle;
+  it needs a Box-side terminal/watchdog marker read through the pinned account
+  and egress. Without proof, keep `unknown`, capacity fenced, alert for manual
+  resolution. With proof, close resources and settle only from durable usage
+  evidence. No automatic paid-call or local-tool replay on takeover.
+
+This schema/state design is not approval to apply a data migration. The next
+free migration number and shared-branch tip must be rechecked at merge, and
+the user must approve migration execution before release.
 
 - Extend the current internal proxy upstream selection with an injectable Box
   route rather than creating a second public auth stack. The route's transport
