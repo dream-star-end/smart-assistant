@@ -21,6 +21,9 @@ async function main(): Promise<void> {
 if (process.env.OCV5_289_ACK_ACCOUNT_ID !== ACCOUNT_ID || process.env.OCV5_289_ACK_USER_ID !== '3') {
   throw new Error('OCV5_289_OPERATOR_ACK_REQUIRED')
 }
+if (process.env.OCV5_289_PARALLEL_ACK === '1' && process.env.OCV5_289_INFERENCE_ACK === '1') {
+  throw new Error('BOX_PROBE_MODES_CONFLICT')
+}
 if (getRuntimeChannel() !== 'v5') throw new Error('WRONG_RUNTIME_CHANNEL')
 
 const account = await getAccount(ACCOUNT_ID)
@@ -155,6 +158,49 @@ try {
         outputHash: createHash('sha256').update(output).digest('hex').slice(0, 16), flags,
         ...(argv[0] === '--version' && /^\d+\.\d+\.\d+ \(Claude Code\)$/.test(version) ? { version } : {}) })
   }
+  let parallelExec: Record<string, unknown> | undefined
+  if (process.env.OCV5_289_PARALLEL_ACK === '1') {
+    const nonce = randomBytes(12).toString('hex')
+    const directory = `/tmp/ocv5-289-parallel-${nonce}`
+    const firstPython = String.raw`import os,sys,time
+directory,nonce=sys.argv[1:]
+os.mkdir(directory,0o700)
+with open(directory+'/pending.tmp','x',encoding='ascii') as f: f.write(nonce);f.flush();os.fsync(f.fileno())
+os.replace(directory+'/pending.tmp',directory+'/pending')
+end=time.time()+10
+while time.time()<end and not os.path.exists(directory+'/result'):time.sleep(.02)
+if not os.path.exists(directory+'/result'):raise SystemExit(2)
+if open(directory+'/result',encoding='ascii').read()!=nonce:raise SystemExit(3)
+print('first-ok')`
+    const secondPython = String.raw`import os,sys,time
+directory,nonce=sys.argv[1:]
+end=time.time()+3
+while time.time()<end and not os.path.exists(directory+'/pending'):time.sleep(.02)
+if not os.path.exists(directory+'/pending') or open(directory+'/pending',encoding='ascii').read()!=nonce:raise SystemExit(2)
+with open(directory+'/result.tmp','x',encoding='ascii') as f: f.write(nonce);f.flush();os.fsync(f.fileno())
+os.replace(directory+'/result.tmp',directory+'/result')
+print('second-ok')`
+    const first = runFixed({ command: '/usr/bin/python3', args: ['-c', firstPython, directory, nonce],
+      cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' }, timeoutMs: 15_000 })
+    const second = runFixed({ command: '/usr/bin/python3', args: ['-c', secondPython, directory, nonce],
+      cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' }, timeoutMs: 5_000 })
+    const [firstResult, secondResult] = await Promise.allSettled([first, second])
+    if (firstResult.status !== 'fulfilled' || secondResult.status !== 'fulfilled'
+      || firstResult.value.trim() !== 'first-ok' || secondResult.value.trim() !== 'second-ok') {
+      throw new Error('BOX_PARALLEL_EXEC_FAILED')
+    }
+    const cleanupPython = String.raw`import os,stat,sys
+directory=sys.argv[1]
+st=os.lstat(directory)
+if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
+for name in ('pending','result'):os.unlink(directory+'/'+name)
+os.rmdir(directory)
+print('clean')`
+    const cleaned = await runFixed({ command: '/usr/bin/python3', args: ['-c', cleanupPython, directory],
+      cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+    if (cleaned.trim() !== 'clean') throw new Error('BOX_PARALLEL_CLEANUP_FAILED')
+    parallelExec = { causalResultHandoff: true, firstExit: 0, secondExit: 0, cleanup: true }
+  }
   let inference: Record<string, unknown> | undefined
   if (process.env.OCV5_289_INFERENCE_ACK === '1') {
     const asset = readFileSync(new URL('./box_supervisor.py', import.meta.url))
@@ -229,7 +275,7 @@ print(hashlib.sha256(open(p,'rb').read()).hexdigest())`
       remoteSupervisorHash: digest.slice(0, 16) }
   }
   process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, route: 'box-exec-direct', summaries,
-    ...(inference ? { inference } : {}) }) + '\n')
+    ...(parallelExec ? { parallelExec } : {}), ...(inference ? { inference } : {}) }) + '\n')
 } finally {
   secret?.token.fill(0); secret?.refresh?.fill(0)
   snap?.token.fill(0); snap?.refresh?.fill(0)
