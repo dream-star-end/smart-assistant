@@ -414,17 +414,23 @@ finally:os.close(fd)`
         args: ['-c', rendezvousPython, directory], cwd: '/tmp', timeoutMs: 40_000,
         environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })) as {
           event?: { modelToolUseId?: unknown; name?: unknown; input?: unknown };
-          pending?: { mcpRequestId?: unknown; name?: unknown; arguments?: unknown }
+           pending?: { mcpRequestId?: unknown; name?: unknown; arguments?: unknown;
+             paramsMetaHashes?: Record<string, unknown> }
         }
       const modelId = metadata.event?.modelToolUseId
       const requestId = metadata.pending?.mcpRequestId
+      const modelIdMetaHash = typeof modelId === 'string'
+        ? createHash('sha256').update(JSON.stringify(modelId)).digest('hex') : null
       if (typeof modelId !== 'string' || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(modelId)
         || metadata.event?.name !== 'mcp__fixture__local_echo'
         || JSON.stringify(metadata.event.input) !== '{"value":"ping"}'
         || metadata.pending?.name !== 'local_echo'
         || JSON.stringify(metadata.pending.arguments) !== '{"value":"ping"}'
         || (typeof requestId !== 'number' && typeof requestId !== 'string')
-        || requestId === modelId) throw new Error('BOX_TOOL_METADATA_INVALID')
+        || requestId === modelId
+        || metadata.pending?.paramsMetaHashes?.['claudecode/toolUseId'] !== modelIdMetaHash) {
+        throw new Error('BOX_TOOL_METADATA_INVALID')
+      }
       // Fixed synthetic local action; no user data or arbitrary Box commands.
       const localResult = `local-${randomBytes(12).toString('hex')}`
       const resultWriter = String.raw`import json,os,stat,sys
@@ -471,7 +477,8 @@ finally:os.close(fd)`
         || !Number.isSafeInteger(final.usage?.output_tokens) || Number(final.usage?.output_tokens) < 0) {
         throw new Error('BOX_TOOL_CONTRACT_FAILED')
       }
-      toolRoundtrip = { exact: true, localResultReturned: true, soleTool: true,
+       toolRoundtrip = { exact: true, localResultReturned: true, soleTool: true,
+         modelIdInMcpMetadata: true,
         inputTokens: final.usage.input_tokens, outputTokens: final.usage.output_tokens,
         supervisorHash: supervisor.hash.slice(0, 16), mcpHash: mcp.hash.slice(0, 16) }
     } finally {
