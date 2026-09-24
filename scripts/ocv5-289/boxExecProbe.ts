@@ -12,6 +12,9 @@ import { CursorSandProvisionClient } from '../../packages/commercial/src/account
 import { getRuntimeChannel } from '../../packages/commercial/src/runtimeChannel.js'
 import { encodeExecRequest, parseExecFrames } from '../../packages/gateway/src/engine/cursorBoxCcExec.js'
 import { boxExecEgressBasis } from './boxExecBasis.js'
+import { withPinnedBoxHistoryVersion } from './boxHistoryVersionGate.js'
+import { compileBoxCliSyntheticTurn } from '../../packages/commercial/src/http/proxy/boxMessagesMapper.js'
+import type { ProxyBody } from '../../packages/commercial/src/http/proxy/shared.js'
 
 const ACCOUNT_ID = '20'
 const AUTH_DIR = '/etc/openclaude/cursor-v5-u3'
@@ -21,7 +24,7 @@ async function main(): Promise<void> {
 if (process.env.OCV5_289_ACK_ACCOUNT_ID !== ACCOUNT_ID || process.env.OCV5_289_ACK_USER_ID !== '3') {
   throw new Error('OCV5_289_OPERATOR_ACK_REQUIRED')
 }
-if (['OCV5_289_PARALLEL_ACK', 'OCV5_289_INFERENCE_ACK', 'OCV5_289_TOOL_ACK']
+if (['OCV5_289_PARALLEL_ACK', 'OCV5_289_INFERENCE_ACK', 'OCV5_289_TOOL_ACK', 'OCV5_289_HISTORY_ACK']
   .filter((key) => process.env[key] === '1').length > 1) {
   throw new Error('BOX_PROBE_MODES_CONFLICT')
 }
@@ -431,9 +434,123 @@ os.rmdir(d);print('clean')`
       }
     }
   }
+  let historyReplay: Record<string, unknown> | undefined
+  if (process.env.OCV5_289_HISTORY_ACK === '1') {
+    const observedVersion = summaries.find((item) => item.command === '--version')?.version
+    await withPinnedBoxHistoryVersion(observedVersion, async () => {
+    const nonce = `local-${randomBytes(12).toString('hex')}`
+    const directory = `/tmp/ocv5-289-run-${randomBytes(12).toString('hex')}`
+    const currentPrompt = 'Return exactly the text of the earlier tool result, with no spaces or other words.'
+    const synthetic = compileBoxCliSyntheticTurn({
+      model: 'claude-opus-5-5', max_tokens: 128, stream: true,
+      system: 'Synthetic OCV5-289 protocol test. Prior tool result is authoritative.',
+      messages: [
+        { role: 'user', content: 'Earlier synthetic fixture turn.' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_hist_289',
+          name: 'mcp__fixture__local_echo', input: { value: 'ping' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_hist_289',
+          content: [{ type: 'text', text: nonce }] }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'Tool result received.' }] },
+        { role: 'user', content: currentPrompt },
+      ],
+    } as ProxyBody, { cwd: directory, cliVersion: '2.1.280' })
+    const supervisorAsset = readFileSync(new URL('./box_supervisor.py', import.meta.url))
+    const supervisorHash = createHash('sha256').update(supervisorAsset).digest('hex')
+    const supervisorPath = `/tmp/ocv5-289-supervisor-${supervisorHash.slice(0, 16)}.py`
+    const stageSupervisor = String.raw`import base64,hashlib,os,stat,sys
+p,encoded,want=sys.argv[1:]
+raw=base64.b64decode(encoded,validate=True)
+if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want:raise SystemExit(1)
+try:fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+except FileExistsError:pass
+else:
+ try:os.write(fd,raw);os.fsync(fd)
+ finally:os.close(fd)
+st=os.lstat(p)
+if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600:raise SystemExit(1)
+if hashlib.sha256(open(p,'rb').read()).hexdigest()!=want:raise SystemExit(1)
+print(want)`
+    const stagedSupervisor = await runFixed({ command: '/usr/bin/python3',
+      args: ['-c', stageSupervisor, supervisorPath, supervisorAsset.toString('base64'), supervisorHash],
+      cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+    if (stagedSupervisor.trim() !== supervisorHash) throw new Error('BOX_HISTORY_SUPERVISOR_STAGE_FAILED')
+    const snapshot = Buffer.from(synthetic.snapshotJsonl)
+    const snapshotHash = createHash('sha256').update(snapshot).digest('hex')
+    const projectDir = `/home/box/.claude/projects/${directory.replaceAll('/', '-')}`
+    const remoteSnapshot = `${projectDir}/${synthetic.sessionId}.jsonl`
+    const stageSnapshot = String.raw`import base64,hashlib,os,stat,sys
+cwd,project,path,encoded,want=sys.argv[1:]
+if not cwd.startswith('/tmp/ocv5-289-run-') or not project.startswith('/home/box/.claude/projects/-tmp-ocv5-289-run-'):raise SystemExit(1)
+raw=base64.b64decode(encoded,validate=True)
+if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want:raise SystemExit(1)
+os.mkdir(cwd,0o700);os.mkdir(project,0o700)
+fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+try:os.write(fd,raw);os.fsync(fd)
+finally:os.close(fd)
+st=os.lstat(path)
+if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600:raise SystemExit(1)
+print(hashlib.sha256(open(path,'rb').read()).hexdigest())`
+    const staged = await runFixed({ command: '/usr/bin/python3',
+      args: ['-c', stageSnapshot, directory, projectDir, remoteSnapshot,
+        snapshot.toString('base64'), snapshotHash], cwd: '/tmp',
+      environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+    if (staged.trim() !== snapshotHash) throw new Error('BOX_HISTORY_SNAPSHOT_STAGE_FAILED')
+    let remoteCompleted = false
+    try {
+      const output = await runFixed({ command: '/usr/bin/python3', cwd: directory, timeoutMs: 45_000,
+        args: [supervisorPath, '--deadline', '35', '--kill-after', '2', '--max-output', '262144', '--',
+          MODEL, '-p', currentPrompt, '--resume', synthetic.sessionId, '--model', 'claude-opus-5-5',
+          '--output-format', 'stream-json', '--include-partial-messages', '--verbose',
+          '--tools', '', '--disallowedTools', 'mcp__*', '--strict-mcp-config',
+          '--mcp-config', '{"mcpServers":{}}', '--setting-sources', '',
+          '--disable-slash-commands', '--no-session-persistence',
+          '--system-prompt', synthetic.systemPrompt],
+        environment: { HOME: '/home/box', PATH: '/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin',
+          LANG: 'C.UTF-8', CLAUDE_CODE_MAX_RETRIES: '0', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' } })
+      remoteCompleted = true
+      let records: Array<Record<string, unknown>>
+      try { records = output.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>) }
+      catch { throw new Error('BOX_HISTORY_STREAM_INVALID') }
+      const init = records.find((record) => record.type === 'system' && record.subtype === 'init') as {
+        tools?: unknown; mcp_servers?: unknown
+      } | undefined
+      const final = records.findLast((record) => record.type === 'result') as {
+        subtype?: unknown; is_error?: unknown; usage?: { input_tokens?: unknown; output_tokens?: unknown }
+      } | undefined
+      const text = records.filter((record) => record.type === 'assistant').flatMap((record) => {
+        const content = (record.message as { content?: unknown } | undefined)?.content
+        return Array.isArray(content) ? content.filter((block) => block?.type === 'text').map((block) => block.text) : []
+      }).join('')
+      if (!init || !Array.isArray(init.tools) || init.tools.length !== 0
+        || !Array.isArray(init.mcp_servers) || init.mcp_servers.length !== 0
+        || final?.subtype !== 'success' || final.is_error !== false || text !== nonce
+        || !Number.isSafeInteger(final.usage?.input_tokens) || Number(final.usage?.input_tokens) < 0
+        || !Number.isSafeInteger(final.usage?.output_tokens) || Number(final.usage?.output_tokens) < 0) {
+        throw new Error('BOX_HISTORY_CONTRACT_FAILED')
+      }
+      historyReplay = { exact: true, completedToolHistory: true, inputTokens: final.usage.input_tokens,
+        outputTokens: final.usage.output_tokens, snapshotHash: snapshotHash.slice(0, 16),
+        supervisorHash: supervisorHash.slice(0, 16) }
+    } finally {
+      if (!remoteCompleted) process.stderr.write('BOX_HISTORY_REMOTE_UNKNOWN_RETAINED\n')
+      else {
+        const cleanup = String.raw`import os,stat,sys
+cwd,project,path=sys.argv[1:]
+for d in (cwd,project):
+ st=os.lstat(d)
+ if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
+os.unlink(path);os.rmdir(project);os.rmdir(cwd);print('clean')`
+        const cleaned = await runFixed({ command: '/usr/bin/python3',
+          args: ['-c', cleanup, directory, projectDir, remoteSnapshot], cwd: '/tmp',
+          environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+        if (cleaned.trim() !== 'clean') throw new Error('BOX_HISTORY_CLEANUP_FAILED')
+      }
+    }
+    })
+  }
   process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, route: 'box-exec-direct', summaries,
     ...(parallelExec ? { parallelExec } : {}), ...(inference ? { inference } : {}),
-    ...(toolRoundtrip ? { toolRoundtrip } : {}) }) + '\n')
+    ...(toolRoundtrip ? { toolRoundtrip } : {}), ...(historyReplay ? { historyReplay } : {}) }) + '\n')
 } finally {
   secret?.token.fill(0); secret?.refresh?.fill(0)
   snap?.token.fill(0); snap?.refresh?.fill(0)
