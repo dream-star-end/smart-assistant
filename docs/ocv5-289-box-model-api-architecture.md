@@ -257,7 +257,19 @@ through pidfd, never a recycled numeric PGID; it must emit **no** group-stop
 marker and leave reconciliation unknown/manual. This safe fallback is now
 prototyped, not proof that the Box kernel supports group-scoped pidfd signals.
 A cgroup/ancestor-subreaper design is required if that capability is absent
-and automated parent-loss cleanup is needed. A sent signal, closed stdout,
+and automated parent-loss cleanup is needed. The proposed portable fallback
+uses the initial Exec process as a **subreaper keeper**: it sets
+`PR_SET_CHILD_SUBREAPER` before forking the stdout-producing supervisor worker;
+the worker reports the CLI leader PID immediately after spawn. If that worker
+dies, the still-living keeper adopts the orphaned CLI and must confirm via
+`waitid(..., WNOWAIT)` that the *same leader is its unreaped child* before any
+numeric process-group signal. It then signals and reaps without a PID-reuse
+window; `ECHILD`, missing report, inaccessible descendants, or keeper death
+means **no numeric group signal and no terminal marker**, only unknown/manual.
+Normal worker exit still uses its existing unreaped-leader group fence. The
+keeper must forward stop signals, bound waits and close its copy of stdout so
+it cannot fake stream completion. This hierarchy needs private-PID1 red/green
+tests before any real Box call or marker publication. A sent signal, closed stdout,
 disappeared HTTP handle, timeout or
 `MainPID=0` is not proof. If the Box runtime cannot inspect/fence descendants
 that escaped the original process group, it must **not** publish a safe-stop
