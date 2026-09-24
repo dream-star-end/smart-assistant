@@ -44,11 +44,13 @@ class SpyRegistry extends BoxInvocationRegistry {
 type Runner = Pick<BoxExecTransport, "run">;
 function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cleanup";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
-  resolverThrow?: boolean; onDispose?: () => void } = {}) {
+  resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
+  let releaseModel = (): void => {};
   const stages: string[] = [], unknowns: string[] = [];
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
-  const runner: Runner = { async run(request: BoxCcExecRequest): Promise<BoxExecResult> {
+  const runner: Runner = { async run(request: BoxCcExecRequest,
+    options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
     active++; maxActive = Math.max(maxActive, active);
     await new Promise((resolve) => setTimeout(resolve, 1));
     const isModel = request.args[0]?.startsWith("/tmp/ocv5-289-supervisor-");
@@ -64,7 +66,22 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cl
     }
     if (isModel) {
       assert.equal(request.environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "256");
-      return ok(opts.badCli ? "not-json\n" : cliOutput);
+      const output = opts.badCli
+        ? cliOutput.replace('"content":[{"type":"text","text":"answer"}]',
+          '"content":[{"type":"text","text":"contradiction"}]')
+        : cliOutput;
+      if (opts.holdModel) {
+        const lines = output.split("\n");
+        options.onStdout?.(lines.slice(0, 4).join("\n") + "\n");
+        await Promise.race([new Promise<void>((resolve) => { releaseModel = resolve; }),
+          new Promise<never>((_, reject) => {
+            const cancelled = () => reject(new BoxExecTransportError("BOX_EXEC_ABORTED", false));
+            if (options.signal?.aborted) cancelled();
+            else options.signal?.addEventListener("abort", cancelled, { once: true });
+          })]);
+        options.onStdout?.(lines.slice(4).join("\n"));
+      } else options.onStdout?.(output);
+      return ok(output);
     }
     if (isSupervisor) return ok(request.args[4]);
     if (isCleanup) return ok("clean\n");
@@ -82,7 +99,7 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "model" | "cl
     },
     now: () => now, budgetMs: 600_000 });
   return { service, registry, stages, unknowns, getMaxActive: () => maxActive,
-    advance: (ms: number) => { now += ms; } };
+    advance: (ms: number) => { now += ms; }, releaseModel: () => releaseModel() };
 }
 
 test("one authenticated proxy fetch stages serially, returns billable SSE, then releases capacity", async () => {
@@ -105,6 +122,74 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
   assert.equal(f.getMaxActive(), 1, "stage steps may not overlap");
   assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
   assert.deepEqual(f.unknowns, []);
+});
+
+test("BoxTextFetch delivers first model text delta before remote model exit", async () => {
+  const f = fixture({ holdModel: true });
+  const response = await f.service.fetch(input);
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let received = "";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    while (!received.includes("event: content_block_delta")) {
+      const chunk = await Promise.race([reader.read(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("FIRST_DELTA_BUFFERED_UNTIL_EXIT")), 800);
+      })]);
+      if (timer) { clearTimeout(timer); timer = undefined; }
+      assert.equal(chunk.done, false);
+      received += decoder.decode(chunk.value, { stream: true });
+    }
+    assert.ok(f.stages.includes("model"));
+    assert.ok(!f.stages.includes("cleanup"), "remote CLI remains held before exit");
+    assert.ok(!received.includes("event: message_delta"), "final usage cannot escape early");
+  } finally {
+    if (timer) clearTimeout(timer);
+    f.releaseModel();
+  }
+  for (;;) {
+    const part = await reader.read();
+    if (part.done) break;
+    received += decoder.decode(part.value, { stream: true });
+  }
+  received += decoder.decode();
+  assert.ok(received.includes("event: message_stop"));
+  const observer = new _UsageObserver(); observer.push(received); observer.flush();
+  assert.equal(observer.result().kind, "final");
+  assert.equal(f.stages.at(-1), "cleanup");
+});
+
+test("client cancels a live Box response without cleanup or duplicate unknown notice", async () => {
+  const f = fixture({ holdModel: true });
+  const response = await f.service.fetch(input);
+  const reader = response.body!.getReader();
+  await reader.read();
+  await reader.cancel();
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(f.unknowns, ["request_abort"]);
+  assert.ok(!f.stages.includes("cleanup"));
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 1, account: 1 });
+  f.registry.confirmRemoteStopped(f.registry.last!);
+});
+
+test("invalid final Box snapshot cannot emit final usage on live response", async () => {
+  const f = fixture({ badCli: true });
+  const reader = (await f.service.fetch(input)).body!.getReader();
+  const observer = new _UsageObserver();
+  let sawStreamError = false;
+  try {
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      observer.push(new TextDecoder().decode(part.value));
+    }
+  } catch (error) {
+    sawStreamError = error instanceof BoxTextFetchError
+      && error.code === "BOX_MODEL_PROTOCOL_INVALID";
+  }
+  observer.flush();
+  assert.equal(sawStreamError, true);
+  assert.equal(observer.result().kind, "partial");
 });
 
 test("unknown stage never starts model or cleans, and holds account capacity", async () => {
@@ -173,7 +258,8 @@ test("a hung durable unknown notifier cannot hold successful SSE past cleanup bo
 
 test("protocol failure after known supervisor exit cleans and releases without inventing SSE", async () => {
   const f = fixture({ badCli: true });
-  await assert.rejects(f.service.fetch(input),
+  const response = await f.service.fetch(input);
+  await assert.rejects(response.text(),
     (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_MODEL_PROTOCOL_INVALID");
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(f.stages.at(-1), "cleanup");
@@ -192,13 +278,14 @@ test("resolver errors are fixed-code and cannot leak raw credential details", as
 test("known terminal closes private egress, unknown retains it for reconciliation", async () => {
   let knownClosed = 0;
   const known = fixture({ onDispose: () => { knownClosed++; } });
-  await known.service.fetch(input);
+  await (await known.service.fetch(input)).text();
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(knownClosed, 1);
 
   let unknownClosed = 0;
   const unknown = fixture({ failPhase: "model", onDispose: () => { unknownClosed++; } });
-  await assert.rejects(unknown.service.fetch(input),
+  const response = await unknown.service.fetch(input);
+  await assert.rejects(response.text(),
     (error: unknown) => error instanceof BoxTextFetchError && error.code === "BOX_MODEL_OUTCOME_UNKNOWN");
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(unknownClosed, 0);

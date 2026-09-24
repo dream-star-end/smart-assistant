@@ -5,7 +5,7 @@
 import type { BoxExecTransport, BoxExecResult } from "./boxExecTransport.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationRegistry.js";
-import { completedBoxCliToSse } from "./boxCliSse.js";
+import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
 import type { ProxyBody } from "./shared.js";
@@ -125,10 +125,25 @@ export class BoxTextFetch {
     let resolutionAbandoned = false;
     let completedTarget: BoxResolvedTarget | null = null;
     let clientLeaseListener: (() => void) | null = null;
+    let streamHandedOff = false, unknownNotified = false, localCleaned = false;
+    const cleanupLocal = (): void => {
+      if (localCleaned) return;
+      localCleaned = true;
+      resolutionAbandoned = true;
+      if (completedTarget && completedTarget !== resolved) this.closeOrphan(completedTarget);
+      if (resolved && !lease) this.closeOrphan(resolved);
+      clearTimeout(timer);
+      args.init.signal?.removeEventListener("abort", onClientAbort);
+      if (clientLeaseListener) abort.signal.removeEventListener("abort", clientLeaseListener);
+    };
     const markUnknown = async (phase: string): Promise<void> => {
       if (!lease || !resolved) return;
       const held = lease, target = resolved;
+      if (held.state === "completed" || held.state === "stopped_cleanup_pending"
+        || held.state === "stopped_cleanup_failed") return;
       try { this.deps.registry.markUnknown(held); } catch { /* already stopped */ }
+      if (unknownNotified) return;
+      unknownNotified = true;
       // Durable notification must be initiated, but an unhealthy journal may
       // not hold a *verified successful* SSE hostage after its model finished.
       const notification = Promise.resolve().then(() => this.deps.onUnknown({ uid: args.uid,
@@ -145,11 +160,13 @@ export class BoxTextFetch {
       } finally { if (waitTimer) clearTimeout(waitTimer); }
     };
     const exec = async (request: Parameters<ExecRunner["run"]>[0],
-      timeoutMs: number, useLeaseSignal = true): Promise<BoxExecResult> => {
+      timeoutMs: number, useLeaseSignal = true,
+      onStdout?: (chunk: string) => void): Promise<BoxExecResult> => {
       const left = remaining();
       if (left < 1000) throw new BoxTextFetchError("BOX_BUDGET_EXHAUSTED");
       return resolved!.exec.run(request, { timeoutMs: Math.max(1000, Math.min(timeoutMs, left)),
         maxResponseBytes: 1_048_576,
+        ...(onStdout ? { onStdout } : {}),
         ...(useLeaseSignal && lease ? { signal: lease.signal } : {}) });
     };
     const cleanupKnown = async (): Promise<boolean> => {
@@ -184,7 +201,7 @@ export class BoxTextFetch {
         onRemoteStopped: () => this.disposeTarget(resolved!) });
       const currentLease = lease;
       clientLeaseListener = () => {
-        try { this.deps.registry.markUnknown(currentLease); } catch { /* already stopped */ }
+        if (currentLease.state !== "completed") void markUnknown("request_abort");
       };
       abort.signal.addEventListener("abort", clientLeaseListener, { once: true });
 
@@ -221,37 +238,55 @@ export class BoxTextFetch {
         else await markUnknown("pre_run_cleanup_unknown");
         throw new BoxTextFetchError("BOX_BUDGET_EXHAUSTED");
       }
-      let cli: BoxExecResult;
-      try { cli = await exec(plan.run, 120_000); }
-      catch {
-        // Even a Connect Exec nonzero exit does not prove the supervisor's
-        // watcher has killed all descendants. No cleanup or capacity release.
-        await markUnknown("model_outcome_unknown");
-        throw new BoxTextFetchError("BOX_MODEL_OUTCOME_UNKNOWN");
-      }
-      let converted: ReturnType<typeof completedBoxCliToSse>;
-      try { converted = completedBoxCliToSse(cli.stdout, plan.expectedModel); }
-      catch {
-        // A full Connect exit0 from the supervisor proves its watcher/finally
-        // completed even if the model protocol body is invalid. GC is safe;
-        // the protocol error is separately not a billable success response.
-        if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(lease);
-        else await markUnknown("protocol_cleanup_unknown");
-        throw new BoxTextFetchError("BOX_MODEL_PROTOCOL_INVALID");
-      }
-      // The model already finished successfully. GC must not erase its usage
-      // evidence or turn a complete response into a free failed request.
-      if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(lease);
-      else await markUnknown("completed_gc_unknown");
-      return new Response(converted.sse, { status: 200,
+      const stream = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          const decoder = createBoxCliSseDecoder(plan.expectedModel);
+          let remoteTerminalKnown = false;
+          const emit = (sse: string): void => {
+            if (sse) controller.enqueue(Buffer.from(sse, "utf8"));
+          };
+          void (async () => {
+            try {
+              try {
+                await exec(plan.run, 120_000, true, (chunk) => emit(decoder.push(chunk)));
+                remoteTerminalKnown = true;
+              } catch {
+                // A failed Connect Exec or failed stream consumer does not prove
+                // the remote supervisor and descendants stopped. Never retry.
+                await markUnknown(abort.signal.aborted ? "request_abort" : "model_outcome_unknown");
+                throw new BoxTextFetchError(abort.signal.aborted
+                  ? "BOX_FETCH_ABORTED" : "BOX_MODEL_OUTCOME_UNKNOWN");
+              }
+              let converted: ReturnType<typeof decoder.finish>;
+              try { converted = decoder.finish(); }
+              catch {
+                // Full Connect exit0 proves watcher completion even if the CLI
+                // protocol body is invalid. No terminal SSE or final usage.
+                if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(currentLease);
+                else await markUnknown("protocol_cleanup_unknown");
+                throw new BoxTextFetchError("BOX_MODEL_PROTOCOL_INVALID");
+              }
+              // A verified model result is billable even if post-run GC is
+              // uncertain; record unknown but do not erase final usage.
+              if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(currentLease);
+              else await markUnknown("completed_gc_unknown");
+              emit(converted.tailSse);
+              controller.close();
+            } catch (error) {
+              if (!remoteTerminalKnown) await markUnknown("model_stream_unknown");
+              try { controller.error(error instanceof BoxTextFetchError ? error
+                : new BoxTextFetchError("BOX_MODEL_STREAM_FAILED")); }
+              catch { /* downstream already cancelled */ }
+            } finally { cleanupLocal(); }
+          })();
+        },
+        cancel: () => { abort.abort(); },
+      });
+      streamHandedOff = true;
+      return new Response(stream, { status: 200,
         headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
     } finally {
-      resolutionAbandoned = true;
-      if (completedTarget && completedTarget !== resolved) this.closeOrphan(completedTarget);
-      if (resolved && !lease) this.closeOrphan(resolved);
-      clearTimeout(timer);
-      args.init.signal?.removeEventListener("abort", onClientAbort);
-      if (clientLeaseListener) abort.signal.removeEventListener("abort", clientLeaseListener);
+      if (!streamHandedOff) cleanupLocal();
     }
   }
 }
