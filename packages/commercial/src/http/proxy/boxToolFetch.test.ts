@@ -188,3 +188,35 @@ test("worker that lost cleanup claim releases local target once peer marked exac
   assert.equal(remoteCalls, 0);
   assert.equal(disposed, true);
 });
+
+test("cleanup status query failure never poisons an already-final SSE response", async () => {
+  let disposed = false, statusFails = true;
+  const target = { accountId: 20n,
+    exec: { run: async () => { throw new Error("must not touch remote"); } },
+    dispose: async () => { disposed = true; } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { claimRemoteCleanup: async () => false,
+      remoteCleanupStatus: async () => {
+        if (statusFails) throw new Error("synthetic PG failure");
+        return "done";
+      } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never,
+    onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void }) => {
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "final", plan: { runNonce: "e".repeat(24),
+        leaseEpoch: "f".repeat(32) }, target,
+        proof: { runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32),
+          keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 } };
+    }) as never,
+  });
+  const response = await service.fetch(call(firstBody));
+  assert.match(await response.text(), /message_stop/);
+  assert.equal(disposed, false);
+  statusFails = false;
+  assert.equal(await service.retryTerminalCleanup(), 0);
+  assert.equal(disposed, true);
+});

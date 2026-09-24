@@ -78,7 +78,8 @@ export class BoxToolFetch {
         }),
       ]);
       return status === "done";
-    } finally { if (timer) clearTimeout(timer); }
+    } catch { return false; /* Cleanup status is pending, never response-fatal. */ }
+    finally { if (timer) clearTimeout(timer); }
   }
 
   /** Only local ProxyAgents whose remote invocation is already proven stopped,
