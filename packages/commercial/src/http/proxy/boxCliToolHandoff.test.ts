@@ -62,6 +62,17 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
   assert.throws(() => decoder.commitHandoff({ durableRevision: "", verifiedToolUseIds: [] }),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
+  assert.throws(() => decoder.commitHandoff({ durableRevision: "synthetic-journal-rev-1",
+    verifiedToolUseIds: new Array<string>(2) }),
+  (error: unknown) => error instanceof BoxCliToolHandoffError
+    && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
+  (candidate!.toolUses as unknown as Array<unknown>).splice(0, 2);
+  assert.equal(decoder.push("").candidate?.toolUses.length, 2,
+    "published candidate is not the internal authorization baseline");
+  assert.throws(() => decoder.commitHandoff({ durableRevision: "synthetic-journal-rev-1",
+    verifiedToolUseIds: [] }),
+  (error: unknown) => error instanceof BoxCliToolHandoffError
+    && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
   const proof = { durableRevision: "synthetic-journal-rev-1",
     verifiedToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"] };
   const terminal = decoder.commitHandoff(proof);
@@ -72,6 +83,17 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
   assert.throws(() => decoder.commitHandoff(proof),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_TOOL_HANDOFF_NOT_READY");
+});
+
+test("UTF-8 byte cap does not depend on a split surrogate pair", () => {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  decoder.push("x".repeat(1_048_572));
+  const emoji = "😀";
+  decoder.push(emoji[0]!);
+  decoder.push(emoji[1]!);
+  assert.throws(() => decoder.push("x"),
+    (error: unknown) => error instanceof BoxCliToolHandoffError
+      && error.code === "BOX_TOOL_STREAM_TOO_LARGE");
 });
 
 test("snapshot mismatch, duplicate ID and unsupported tool name fail before terminal", () => {

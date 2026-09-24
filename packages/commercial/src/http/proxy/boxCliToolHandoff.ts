@@ -60,6 +60,7 @@ interface ActiveBlock {
 export class BoxCliToolHandoffDecoder {
   private pending = "";
   private bytes = 0;
+  private splitHighSurrogate = "";
   private failed = false;
   private committed = false;
   private initSeen = false;
@@ -78,6 +79,7 @@ export class BoxCliToolHandoffDecoder {
   private snapshot: Obj | null = null;
   private heldTerminal: string[] = [];
   private candidate: BoxToolHandoffCandidate | null = null;
+  private expectedToolIds: readonly string[] = [];
   private remainder = "";
 
   constructor(private readonly expectedModel: string,
@@ -93,7 +95,16 @@ export class BoxCliToolHandoffDecoder {
       throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_CLOSED");
     }
     try {
-      this.bytes += Buffer.byteLength(chunk);
+      let measured = this.splitHighSurrogate + chunk;
+      this.splitHighSurrogate = "";
+      if (measured.length > 0) {
+        const last = measured.charCodeAt(measured.length - 1);
+        if (last >= 0xd800 && last <= 0xdbff) {
+          this.splitHighSurrogate = measured.slice(-1);
+          measured = measured.slice(0, -1);
+        }
+      }
+      this.bytes += Buffer.byteLength(measured);
       if (this.bytes > 1_048_576) throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_TOO_LARGE");
       this.pending += chunk;
       let emitted = "";
@@ -108,7 +119,8 @@ export class BoxCliToolHandoffDecoder {
         this.remainder += this.pending;
         this.pending = "";
       }
-      return { sse: emitted, candidate: this.candidate };
+      return { sse: emitted, candidate: this.candidate
+        ? structuredClone(this.candidate) : null };
     } catch (error) {
       this.failed = true;
       throw error instanceof BoxCliToolHandoffError ? error
@@ -124,8 +136,10 @@ export class BoxCliToolHandoffDecoder {
     if (!proof || typeof proof.durableRevision !== "string"
       || !Array.isArray(proof.verifiedToolUseIds)
       || !/^[A-Za-z0-9._:-]{1,128}$/.test(proof.durableRevision)
-      || proof.verifiedToolUseIds.length !== this.candidate.toolUses.length
-      || proof.verifiedToolUseIds.some((id, index) => id !== this.candidate!.toolUses[index]!.id)) {
+      || proof.verifiedToolUseIds.length !== this.expectedToolIds.length
+      || this.expectedToolIds.some((id, index) =>
+        !Object.hasOwn(proof.verifiedToolUseIds, index)
+        || proof.verifiedToolUseIds[index] !== id)) {
       throw new BoxCliToolHandoffError("BOX_TOOL_HANDOFF_PROOF_INVALID");
     }
     this.committed = true;
@@ -291,6 +305,7 @@ export class BoxCliToolHandoffDecoder {
       this.candidate = { messageId: this.messageId!, toolUses: uses,
         inputTokens: this.inputTokens, outputTokens: this.outputTokens,
         cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };
+      this.expectedToolIds = uses.map((use) => use.id);
     } else if (kind !== "ping") {
       throw new BoxCliToolHandoffError("BOX_TOOL_EVENT_UNSUPPORTED");
     }
