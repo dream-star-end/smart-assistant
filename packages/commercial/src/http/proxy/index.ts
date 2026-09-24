@@ -1431,6 +1431,9 @@ export function makeAnthropicProxyHandler(
       // 广播与 finalize ledger 提取出不同结果(Codex plan v3 修订 J 锁定)。
       // 归因键已提取完毕 → 从 user_id JSON 剥掉 oc_ 内部键再转发上游
       // (内部会话拓扑不出代理;普通 chat 请求无 oc_ 键,原串零改写)。
+      // Box 的服务端 replay fingerprint 必须绑定清洗前的 canonical 请求。
+      // 仅内部 transport 消费这份深拷贝；实际上游 body 仍照常清洗。
+      const boxCanonicalBody = route.kind === "box" ? structuredClone(body) : null;
       if (body.metadata?.user_id !== undefined) {
         body.metadata.user_id = stripUsageAttributionKeys(body.metadata.user_id);
       }
@@ -1490,11 +1493,11 @@ export function makeAnthropicProxyHandler(
         pgPool: deps.pgPool,
         fetchFn: route.kind === "box"
           ? ((url: string, init: RequestInit) => {
-              if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel) {
+              if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel || !boxCanonicalBody) {
                 throw new Error("BOX_FETCH_NOT_CONFIGURED");
               }
               return deps.boxModel.fetch({ uid, sessionId, requestId,
-                canonicalModel: body.model, canonicalBody: body,
+                canonicalModel: boxCanonicalBody.model, canonicalBody: boxCanonicalBody,
                 upstreamModel: session.upstreamModel, url, init });
             }) as typeof fetch
           : fetchFn,

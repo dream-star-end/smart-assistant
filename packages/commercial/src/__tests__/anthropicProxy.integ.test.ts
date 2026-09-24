@@ -63,6 +63,7 @@ import { PricingCache, type ModelPricing } from "../billing/pricing.js";
 import { ModelCatalogSnapshot, type ModelCatalogEntry,
   type ModelCatalogPricing } from "../billing/modelCatalog.js";
 import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "../http/proxy/modelAuthorityGate.js";
+import { deriveBoxCallFingerprint } from "../http/proxy/boxCallFingerprint.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import {
@@ -914,6 +915,40 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
         query.sql.trim().toUpperCase().startsWith("INSERT INTO USAGE_RECORDS")).length, 1,
       "the shared finalizer must settle the Box request exactly once");
       assert.ok(res.bodyText().includes("event: message_start"));
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("handler preserves Box turn identity internally while stripping it upstream; duplicate fails closed", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      const turnKey = "a".repeat(64);
+      const request = { ...minBody(BOX_API_MODEL), metadata: {
+        user_id: JSON.stringify({ session_id: "web-box-identity", oc_turn_key: turnKey }) } };
+      const seen = new Set<string>();
+      let paidCalls = 0;
+      h.deps.boxModel = { async fetch({ uid, canonicalModel, canonicalBody, upstreamModel, init }) {
+        assert.equal(canonicalModel, BOX_API_MODEL);
+        assert.equal(upstreamModel, "claude-opus-5-5");
+        const identity = deriveBoxCallFingerprint(uid, canonicalBody);
+        assert.equal(identity.turnKey, turnKey);
+        const forwarded = JSON.parse(String(init.body)) as { metadata?: { user_id?: string } };
+        assert.ok(!forwarded.metadata?.user_id?.includes("oc_turn_key"),
+          "only the internal snapshot may carry the platform turn key");
+        if (seen.has(identity.replayFingerprint)) throw new Error("BOX_CALL_AMBIGUOUS");
+        seen.add(identity.replayFingerprint);
+        paidCalls++;
+        return sseResponse(200, makeFullSseChunks());
+      } };
+      const first = await h.run(request, headers);
+      assert.equal(first.statusCode, 200, first.bodyText());
+      const second = await h.run(request, headers);
+      assert.notEqual(second.statusCode, 200, second.bodyText());
+      assert.equal(paidCalls, 1, "same-turn identical request must not start a second model call");
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
