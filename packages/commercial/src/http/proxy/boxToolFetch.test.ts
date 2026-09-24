@@ -54,3 +54,34 @@ test("same internal model fetch streams first handoff then next final without to
   assert.equal(disposed, true, "local target closes only after terminal proof");
   assert.equal(await service.retryFailedCleanup(), 0);
 });
+
+test("failed local close retry is bounded and never starts concurrent dispose", async () => {
+  let attempts = 0;
+  const target = { accountId: 20n, dispose: () => {
+    attempts++;
+    if (attempts === 1) throw new Error("first close failed");
+    return new Promise<void>(() => {});
+  } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), journal: {} as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never,
+    onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void }) => {
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "final", plan: { runNonce: "a".repeat(24) }, target,
+        proof: { reason: "worker_complete" } };
+    }) as never,
+  });
+  const response = await service.fetch(call(firstBody));
+  await response.text();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(attempts, 1);
+  const started = Date.now();
+  assert.equal(await service.retryFailedCleanup(), 1);
+  assert.ok(Date.now() - started < 800);
+  assert.equal(attempts, 2);
+  assert.equal(await service.retryFailedCleanup(), 1);
+  assert.equal(attempts, 2, "unsettled close attempt is not duplicated");
+});

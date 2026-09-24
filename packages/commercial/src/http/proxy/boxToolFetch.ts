@@ -71,8 +71,13 @@ export class BoxToolFetch {
       item.failed = false;
       const pending = Promise.resolve().then(() => item.target.dispose?.());
       item.pending = pending;
-      try { await pending; this.cleanup.delete(item); }
-      catch { item.failed = true; }
+      const observed = pending.then(() => { this.cleanup.delete(item); },
+        () => { item.failed = true; });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { await Promise.race([observed, new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 200);
+      })]); }
+      finally { if (timer) clearTimeout(timer); }
     }));
     return this.cleanup.size;
   }
