@@ -16,7 +16,8 @@ function records(blockType = "text"): Array<Record<string, unknown>> {
     event({ type: "content_block_stop", index: 0 }),
     event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 7 } }),
     event({ type: "message_stop" }),
-    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "fixture" }] } },
+    { type: "assistant", message: { id: "msg_1", model, role: "assistant",
+      content: [{ type: "text", text: "fixture" }] } },
     { type: "result", subtype: "success", is_error: false,
       usage: { input_tokens: 2, output_tokens: 7 } },
   ];
@@ -68,7 +69,8 @@ test("rejects hidden tool evidence outside content_block_start", () => {
     [{ type: "tool_use", id: "toolu_1" }];
   rejected(toolAtStart, "BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
   const toolInAssistant = records();
-  toolInAssistant[7] = { type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_1" }] } };
+  toolInAssistant[7] = { type: "assistant", message: { id: "msg_1", model,
+    role: "assistant", content: [{ type: "tool_use", id: "toolu_1" }] } };
   rejected(toolInAssistant, "BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
 });
 
@@ -118,6 +120,77 @@ test("delta input/cache usage cannot contradict start and result", () => {
     usage: { output_tokens: 7, cache_read_input_tokens: 100,
       cache_creation_input_tokens: 20 } });
   rejected(cacheMismatch, "BOX_CLI_USAGE_MISMATCH");
+});
+
+test("renumbers a verified visible index gap without inventing hidden content", () => {
+  const source = records();
+  for (const i of [2, 3, 4]) {
+    (source[i] as { event: { index: number } }).event.index = 1;
+  }
+  const output = completedBoxCliToSse(jsonl(source), model);
+  const indexes = output.sse.split("\n").filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)) as { index?: number })
+    .filter((entry) => entry.index !== undefined).map((entry) => entry.index);
+  assert.deepEqual(indexes, [0, 0, 0]);
+  assert.ok(output.sse.includes('"text":"fixture"'));
+});
+
+test("a hidden text prefix cannot be erased by index normalization", () => {
+  const source = records();
+  for (const i of [2, 3, 4]) {
+    (source[i] as { event: { index: number } }).event.index = 1;
+  }
+  (source[7] as { message: { content: Array<{ text: string }> } }).message.content[0]!.text =
+    "prefix-fixture";
+  rejected(source, "BOX_CLI_TEXT_MISMATCH");
+});
+
+test("nonempty block start and multiple deltas are included in the text proof", () => {
+  const source = records();
+  (source[2] as { event: { content_block: { text: string } } }).event.content_block.text = "pre";
+  (source[3] as { event: { delta: { text: string } } }).event.delta.text = "fix";
+  source.splice(4, 0, event({ type: "content_block_delta", index: 0,
+    delta: { type: "text_delta", text: "-suffix" } }));
+  (source[8] as { message: { content: Array<{ text: string }> } }).message.content[0]!.text =
+    "prefix-suffix";
+  const output = completedBoxCliToSse(jsonl(source), model);
+  assert.ok(output.sse.includes('"text":"-suffix"'));
+});
+
+test("missing final assistant snapshot and backwards original indexes fail closed", () => {
+  rejected(records().filter((item) => item.type !== "assistant"), "BOX_CLI_TEXT_MISMATCH");
+  const reversed = records();
+  reversed.splice(5, 0,
+    event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_stop", index: 0 }));
+  (reversed[2] as { event: { index: number } }).event.index = 1;
+  (reversed[3] as { event: { index: number } }).event.index = 1;
+  (reversed[4] as { event: { index: number } }).event.index = 1;
+  rejected(reversed, "BOX_CLI_EVENT_ORDER_INVALID");
+});
+
+test("Opus 5 response cannot pass as Opus 5.5", () => {
+  const source = records();
+  (source[1] as { event: { message: { model: string } } }).event.message.model = "claude-opus-5";
+  rejected(source, "BOX_CLI_MODEL_MISMATCH");
+});
+
+test("another assistant message cannot overwrite the current text proof", () => {
+  const source = records();
+  (source[3] as { event: { delta: { text: string } } }).event.delta.text = "suffix";
+  (source[7] as { message: { content: Array<{ text: string }> } }).message.content[0]!.text =
+    "prefix-suffix";
+  const other = { type: "assistant", message: { id: "msg_other", model,
+    role: "assistant", content: [{ type: "text", text: "suffix" }] } };
+  const beforeResult = source.slice();
+  beforeResult.splice(8, 0, other);
+  rejected(beforeResult, "BOX_CLI_ASSISTANT_MISMATCH");
+  const afterResult = source.concat([other]);
+  rejected(afterResult, "BOX_CLI_RECORD_AFTER_RESULT");
+  const sameMessageShrink = source.slice();
+  sameMessageShrink.splice(8, 0, { ...other,
+    message: { ...other.message, id: "msg_1" } });
+  rejected(sameMessageShrink, "BOX_CLI_TEXT_MISMATCH");
 });
 
 test("converter SSE drives existing billing observer with input/cache intact", () => {

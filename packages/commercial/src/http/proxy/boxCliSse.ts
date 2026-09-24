@@ -1,5 +1,6 @@
 /** Convert a completed, supervised Claude CLI stream-json call back to
- * Anthropic Messages SSE without rewriting model events or trusting prose.
+ * Anthropic Messages SSE. Visible block indexes are renumbered only after
+ * the reconstructed visible text matches the final CLI assistant snapshot.
  * Tool handoffs need a separate live-path; this complete-call path forbids
  * tool_use so it can never swallow a pending OpenClaude-local tool execution.
  */
@@ -44,23 +45,33 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
   }
   let started = false, stopped = false, resultSeen = false, initSeen = false;
   let inputTokens: number | null = null, outputTokens: number | null = null;
-  let cacheRead = 0, cacheCreation = 0, nextIndex = 0, deltaPhase = false;
+  let cacheRead = 0, cacheCreation = 0, nextVisibleIndex = 0, lastOriginalIndex = -1;
+  let deltaPhase = false, assistantSeen = false, lastAssistantText = "";
+  let currentMessageId: string | null = null;
+  const assistantTexts: string[] = [];
   let stopReason: string | null = null;
-  let activeBlock: { index: number; type: string } | null = null;
+  let activeBlock: { originalIndex: number; visibleIndex: number; type: string; text: string } | null = null;
+  const visibleTextParts: string[] = [];
   const frames: string[] = [];
   for (const line of stdout.split(/\r?\n/).filter(Boolean)) {
     let record: ObjectValue;
     try { record = object(JSON.parse(line)); }
     catch { throw new BoxCliSseError("BOX_CLI_STREAM_INVALID"); }
+    if (resultSeen) throw new BoxCliSseError("BOX_CLI_RECORD_AFTER_RESULT");
     const kind = record.type;
     if (kind === "stream_event") {
       const event = object(record.event);
+      let forwardedEvent: ObjectValue = event;
       const eventType = event.type;
       if (typeof eventType !== "string") throw new BoxCliSseError("BOX_CLI_EVENT_INVALID");
       if (eventType === "message_start") {
         if (started || !initSeen) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
         const message = object(event.message);
         if (message.model !== expectedModel) throw new BoxCliSseError("BOX_CLI_MODEL_MISMATCH");
+        if (message.role !== "assistant" || typeof message.id !== "string" || !message.id) {
+          throw new BoxCliSseError("BOX_CLI_MESSAGE_ID_INVALID");
+        }
+        currentMessageId = message.id;
         if (!Array.isArray(message.content) || message.content.length !== 0) {
           throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
         }
@@ -72,22 +83,30 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
         started = true;
       } else if (eventType === "content_block_start") {
         const index = event.index;
-        if (!started || stopped || deltaPhase || !Number.isSafeInteger(index) || index !== nextIndex
+        if (!started || stopped || deltaPhase || !Number.isSafeInteger(index)
+          || Number(index) < 0 || Number(index) <= lastOriginalIndex
           || activeBlock !== null) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
         const block = object(event.content_block);
         if (block.type === "tool_use") throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
         if (block.type !== "text" && block.type !== "thinking" && block.type !== "redacted_thinking") {
           throw new BoxCliSseError("BOX_CLI_BLOCK_UNSUPPORTED");
         }
-        activeBlock = { index: index as number, type: block.type as string };
+        if (block.type === "text" && typeof block.text !== "string") {
+          throw new BoxCliSseError("BOX_CLI_BLOCK_UNSUPPORTED");
+        }
+        activeBlock = { originalIndex: index as number, visibleIndex: nextVisibleIndex++,
+          type: block.type as string, text: block.type === "text" ? block.text as string : "" };
+        lastOriginalIndex = index as number;
+        forwardedEvent = { ...event, index: activeBlock.visibleIndex };
       } else if (eventType === "content_block_delta" || eventType === "content_block_stop") {
         const index = event.index;
-        if (!started || stopped || deltaPhase || activeBlock === null || activeBlock.index !== index) {
+        if (!started || stopped || deltaPhase || activeBlock === null || activeBlock.originalIndex !== index) {
           throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
         }
+        forwardedEvent = { ...event, index: activeBlock.visibleIndex };
         if (eventType === "content_block_stop") {
+          if (activeBlock.type === "text") visibleTextParts.push(activeBlock.text);
           activeBlock = null;
-          nextIndex++;
         } else {
           const delta = object(event.delta);
           if (!((activeBlock.type === "text" && delta.type === "text_delta" && typeof delta.text === "string")
@@ -97,6 +116,7 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
               && typeof delta.signature === "string"))) {
             throw new BoxCliSseError("BOX_CLI_DELTA_INVALID");
           }
+          if (activeBlock.type === "text") activeBlock.text += delta.text as string;
         }
       } else if (eventType === "message_delta") {
         if (!started || stopped || activeBlock !== null) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
@@ -133,7 +153,7 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
       } else if (eventType !== "ping") {
         throw new BoxCliSseError("BOX_CLI_EVENT_UNSUPPORTED");
       }
-      frames.push(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+      frames.push(`event: ${eventType}\ndata: ${JSON.stringify(forwardedEvent)}\n\n`);
     } else if (kind === "result") {
       if (!stopped || resultSeen || record.subtype !== "success" || record.is_error !== false) {
         throw new BoxCliSseError("BOX_CLI_RESULT_INVALID");
@@ -155,18 +175,34 @@ export function completedBoxCliToSse(stdout: string, expectedModel: string): Box
         initSeen = true;
       }
     } else if (kind === "assistant") {
-      const content = object(record.message).content;
+      const snapshot = object(record.message);
+      if (!started || snapshot.id !== currentMessageId || snapshot.model !== expectedModel
+        || snapshot.role !== "assistant") {
+        throw new BoxCliSseError("BOX_CLI_ASSISTANT_MISMATCH");
+      }
+      const content = snapshot.content;
       if (!Array.isArray(content) || content.some((block) => {
         if (!block || typeof block !== "object" || Array.isArray(block)) return true;
         const type = (block as { type?: unknown }).type;
         return type !== "text" && type !== "thinking" && type !== "redacted_thinking";
       })) throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
+      assistantSeen = true;
+      lastAssistantText = content.filter((block) => block.type === "text")
+        .map((block) => {
+          if (typeof block.text !== "string") throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+          return block.text;
+        }).join("");
+      assistantTexts.push(lastAssistantText);
     } else if (kind !== "rate_limit_event") {
       throw new BoxCliSseError("BOX_CLI_RECORD_UNSUPPORTED");
     }
   }
   if (!started || !stopped || !resultSeen || inputTokens === null || outputTokens === null) {
     throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
+  }
+  if (!assistantSeen || visibleTextParts.join("") !== lastAssistantText
+    || assistantTexts.some((text) => !lastAssistantText.startsWith(text))) {
+    throw new BoxCliSseError("BOX_CLI_TEXT_MISMATCH");
   }
   return { sse: frames.join(""), inputTokens, outputTokens };
 }

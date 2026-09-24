@@ -31,6 +31,11 @@ function safeCliStreamShape(records: Array<Record<string, unknown>>): Record<str
   const index = (value: unknown): number | null =>
     typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 128
       ? value : null
+  const modelId = (value: unknown): string => {
+    if (typeof value !== 'string') return 'not-a-string'
+    if (/^(?:claude-|anthropic\.|box-|cursor-|grok-)[A-Za-z0-9._:/-]{1,120}$/.test(value)) return value
+    return `redacted-sha256-${createHash('sha256').update(value).digest('hex').slice(0, 12)}`
+  }
   const usage = (value: unknown): Record<string, number | null> => {
     const source = value && typeof value === 'object' && !Array.isArray(value)
       ? value as Record<string, unknown> : {}
@@ -54,6 +59,7 @@ function safeCliStreamShape(records: Array<Record<string, unknown>>): Record<str
         'message_delta', 'message_stop', 'ping'])),
     startModelMatches: starts.map((event) =>
       (event.message as { model?: unknown } | undefined)?.model === 'claude-opus-5-5'),
+    startModels: starts.map((event) => modelId((event.message as { model?: unknown } | undefined)?.model)),
     starts: starts.map((event) => usage((event.message as { usage?: unknown } | undefined)?.usage)),
     deltas: deltas.map((event) => ({ usage: usage(event.usage),
       stop: typed((event.delta as { stop_reason?: unknown } | undefined)?.stop_reason,
