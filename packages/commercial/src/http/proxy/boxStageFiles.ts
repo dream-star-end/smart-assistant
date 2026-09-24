@@ -30,7 +30,7 @@ const WRITE = String.raw`import base64,os,re,stat,sys
 cwd,project,path,offset,total,*parts=sys.argv[1:]
 if not re.fullmatch(r'/tmp/ocv5-289-run-[0-9a-f]{24}',cwd):raise SystemExit(1)
 if project and project!='/home/box/.claude/projects/'+cwd.replace('/','-'):raise SystemExit(1)
-if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt') and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
+if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
 start=int(offset);want=int(total)
 if start<0 or want<0 or want>8*1024*1024 or start>want or not 1<=len(parts)<=4:raise SystemExit(1)
 decoded=[]
@@ -58,7 +58,7 @@ const FINISH = String.raw`import hashlib,os,re,stat,sys
 cwd,project,path,size,want=sys.argv[1:]
 if not re.fullmatch(r'/tmp/ocv5-289-run-[0-9a-f]{24}',cwd):raise SystemExit(1)
 if project and project!='/home/box/.claude/projects/'+cwd.replace('/','-'):raise SystemExit(1)
-if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt') and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
+if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
 expected=int(size)
 if expected<0 or expected>8*1024*1024 or not re.fullmatch(r'[0-9a-f]{64}',want):raise SystemExit(1)
 fd=os.open(path+'.part',os.O_RDONLY|os.O_NOFOLLOW)
@@ -88,7 +88,7 @@ for d in (cwd,project):
  st=os.lstat(d)
  if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
 for path in paths:
- if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt') and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
+ if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json') and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
  for target in (path,path+'.part'):
   try:os.unlink(target)
   except FileNotFoundError:pass
@@ -108,6 +108,7 @@ export function makeBoxStageFiles(input: {
   for (const file of input.files) {
     const allowedPath = file.path === `${input.cwd}/stdin.jsonl`
       || file.path === `${input.cwd}/system.txt`
+      || file.path === `${input.cwd}/tool-catalog.json`
       || (input.project !== "" && new RegExp(`^${input.project.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[0-9a-f-]{36}\\.jsonl$`).test(file.path));
     if (!allowedPath || paths.has(file.path) || !Buffer.isBuffer(file.raw)
       || file.raw.length > MAX_FILE_BYTES || !/^[0-9a-f]{64}$/.test(file.hash)

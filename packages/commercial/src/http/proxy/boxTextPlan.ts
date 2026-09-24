@@ -9,7 +9,7 @@ import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
 import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { validateBoxTextRequest } from "./boxRequestGate.js";
-import { makeBoxStageFiles } from "./boxStageFiles.js";
+import { makeBoxStageFiles, type BoxStageFile } from "./boxStageFiles.js";
 
 export class BoxTextPlanError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxTextPlanError"; }
@@ -55,6 +55,22 @@ st=os.lstat(p)
 if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or hashlib.sha256(open(p,'rb').read()).hexdigest()!=want:raise SystemExit(1)
 print(want)`;
 
+export function makeBoxAssetStage(asset: Buffer, path: string): {
+  hash: string; request: BoxCcExecRequest;
+} {
+  if (!Buffer.isBuffer(asset) || asset.length < 1 || asset.length > 32768) {
+    throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
+  }
+  const hash = sha(asset);
+  const match = /^\/tmp\/ocv5-289-(?:supervisor|keeper|box-virtual-mcp)-([a-f0-9]{16})\.py$/.exec(path);
+  if (!match || match[1] !== hash.slice(0, 16)) {
+    throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
+  }
+  return { hash, request: { command: PYTHON,
+    args: ["-c", STAGE_SUPERVISOR, path, asset.toString("base64"), hash],
+    cwd: "/tmp", environment: BASE_ENV } };
+}
+
 export function makeBoxTextPlan(input: {
   body: ProxyBody;
   upstreamModel: string;
@@ -62,6 +78,8 @@ export function makeBoxTextPlan(input: {
   maxOutputTokensLimit: number;
   supervisorAsset: Buffer;
   keeperAsset: Buffer;
+  /** Private virtual MCP catalog only. Other extra paths are forbidden. */
+  extraStageFiles?: readonly BoxStageFile[];
   runNonce?: string;
   leaseEpoch?: string;
 }): BoxTextPlan {
@@ -82,6 +100,11 @@ export function makeBoxTextPlan(input: {
   if (!/^[0-9a-f]{24}$/.test(runNonce)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   if (!/^[0-9a-f]{32}$/.test(leaseEpoch)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  if (input.extraStageFiles?.length
+    && (input.extraStageFiles.length !== 1
+      || input.extraStageFiles[0]?.path !== `${cwd}/tool-catalog.json`)) {
+    throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
+  }
   const proofDir = `/tmp/ocv5-289-proof-${runNonce}`;
   const mapped = compileBoxCliSyntheticTurn({ ...input.body, model: input.upstreamModel },
     { cwd, cliVersion: "2.1.280" });
@@ -99,19 +122,14 @@ export function makeBoxTextPlan(input: {
     || system.length > 8 * 1024 * 1024) throw new BoxTextPlanError("BOX_TEXT_INPUT_TOO_LARGE");
   const snapshotHash = hasHistory ? sha(snapshot) : null;
   const stdinHash = sha(stdin), systemHash = sha(system);
-  const stageSupervisor: BoxCcExecRequest = {
-    command: PYTHON, args: ["-c", STAGE_SUPERVISOR, supervisorPath,
-      input.supervisorAsset.toString("base64"), supervisorHash], cwd: "/tmp", environment: BASE_ENV,
-  };
-  const stageKeeper: BoxCcExecRequest = {
-    command: PYTHON, args: ["-c", STAGE_SUPERVISOR, keeperPath,
-      input.keeperAsset.toString("base64"), keeperHash], cwd: "/tmp", environment: BASE_ENV,
-  };
+  const stageSupervisor = makeBoxAssetStage(input.supervisorAsset, supervisorPath).request;
+  const stageKeeper = makeBoxAssetStage(input.keeperAsset, keeperPath).request;
   const staged = makeBoxStageFiles({ cwd, project,
     files: [
       ...(hasHistory ? [{ path: snapshotPath, raw: snapshot, hash: snapshotHash! }] : []),
       { path: stdinPath, raw: stdin, hash: stdinHash },
       { path: systemPath, raw: system, hash: systemHash },
+      ...(input.extraStageFiles ?? []),
     ] });
   const run: BoxCcExecRequest = {
     command: PYTHON,
