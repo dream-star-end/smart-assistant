@@ -38,7 +38,7 @@ test("empty spool times out without starting or replaying model", async () => {
       exitCode: 0 as const };
   } };
   const iter = pollBoxSpoolLines({ exec: exec as never, access, startOffset: 42,
-    deadlineMs: 30, pollIntervalMs: 5 });
-  await assert.rejects(() => iter.next(), /BOX_SPOOL_POLL_(TIMEOUT|ABORTED)/);
+    deadlineMs: 30, pollIntervalMs: 1000 });
+  await assert.rejects(() => iter.next(), /BOX_SPOOL_POLL_TIMEOUT/);
   assert.ok(calls >= 1);
 });

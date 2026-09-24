@@ -62,7 +62,14 @@ export async function* pollBoxSpoolLines(input: {
           ? "BOX_SPOOL_POLL_TIMEOUT" : "BOX_SPOOL_POLL_ABORTED");
         yield line;
       }
-      if (chunk.bytes.length === 0) await pause(interval, abort.signal);
+      if (chunk.bytes.length === 0) {
+        try { await pause(interval, abort.signal); }
+        catch (error) {
+          if (abort.signal.aborted) throw new BoxSpoolPollError(expired
+            ? "BOX_SPOOL_POLL_TIMEOUT" : "BOX_SPOOL_POLL_ABORTED");
+          throw error;
+        }
+      }
     }
   } finally {
     clearTimeout(timer);
