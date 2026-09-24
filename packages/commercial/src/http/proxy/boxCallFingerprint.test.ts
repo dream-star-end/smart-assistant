@@ -1,0 +1,65 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import type { ProxyBody } from "./shared.js";
+import { BoxCallFingerprintError, deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
+
+function body(turnKey = "a".repeat(64)): ProxyBody {
+  return { model: "claude-opus-5-5", max_tokens: 128, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "synthetic" }] }],
+    tools: [{ name: "Bash", description: "Synthetic", input_schema: {
+      type: "object", properties: { command: { type: "string" } } } }],
+    metadata: { session_id: "synthetic-session-289", user_id:
+      JSON.stringify({ device_id: "device-a", oc_turn_key: turnKey }) } };
+}
+function rejects(value: ProxyBody, code: string): void {
+  assert.throws(() => deriveBoxCallFingerprint(3n, value),
+    (error: unknown) => error instanceof BoxCallFingerprintError && error.code === code);
+}
+
+test("canonical body and per-turn metadata yield stable secondary replay fence", () => {
+  const first = body();
+  const a = deriveBoxCallFingerprint(3n, first);
+  const reordered = body();
+  reordered.messages = [{ content: [{ text: "synthetic", type: "text" }], role: "user" }];
+  reordered.metadata!.user_id = JSON.stringify({ oc_turn_key: "a".repeat(64),
+    device_id: "rotated-tracking-only" });
+  const b = deriveBoxCallFingerprint(3n, reordered);
+  assert.equal(a.requestHash, b.requestHash);
+  assert.equal(a.replayFingerprint, b.replayFingerprint);
+  assert.match(a.requestHash, /^[a-f0-9]{64}$/);
+  assert.equal(a.sessionId, "synthetic-session-289");
+});
+
+test("new user turn, uid or changed tool result makes a distinct fingerprint", () => {
+  const original = deriveBoxCallFingerprint(3n, body());
+  assert.notEqual(original.replayFingerprint,
+    deriveBoxCallFingerprint(3n, body("b".repeat(64))).replayFingerprint);
+  assert.notEqual(original.replayFingerprint,
+    deriveBoxCallFingerprint(4n, body()).replayFingerprint);
+  const next = body();
+  next.messages.push({ role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_synthetic", content: "local-result" }] });
+  assert.notEqual(original.replayFingerprint,
+    deriveBoxCallFingerprint(3n, next).replayFingerprint);
+});
+
+test("same-turn identical independent call remains deliberately ambiguous", () => {
+  const a = deriveBoxCallFingerprint(3n, body());
+  const b = deriveBoxCallFingerprint(3n, body());
+  assert.equal(a.replayFingerprint, b.replayFingerprint,
+    "this must not be advertised as a unique logical-call ID");
+});
+
+test("missing identity, malformed metadata and excessive nesting fail closed", () => {
+  const missing = body(); delete missing.metadata!.session_id;
+  rejects(missing, "BOX_CALL_IDENTITY_MISSING");
+  const malformed = body(); malformed.metadata!.user_id = "not-json";
+  rejects(malformed, "BOX_CALL_IDENTITY_INVALID");
+  const absent = body(); absent.metadata!.user_id = JSON.stringify({ device_id: "x" });
+  rejects(absent, "BOX_CALL_TURN_KEY_MISSING");
+  const deep = body();
+  let value: unknown = "leaf";
+  for (let i = 0; i < 70; i++) value = [value];
+  deep.messages = [{ role: "user", content: value }];
+  rejects(deep, "BOX_CALL_BODY_TOO_DEEP");
+});
