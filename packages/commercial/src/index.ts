@@ -6156,14 +6156,16 @@ export async function registerCommercial(
   // 阈值向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min)；durable Codex 另用 ≥24h
   // evidence SLA，且只豁免无 usage 的 inflight，绝不抢 finalizing owner。
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
+    // Local ProxyAgent cleanup state must outlive a temporary loss of shared
+    // leadership. Only the scheduler starts/stops on each leader term.
+    const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+      journal: new BoxDurableJournal(getPool()),
+      resolver: createProductionBoxAccountResolver(),
+    });
     leaderBundle.add({
       name: "finalizeReconciler",
       domain: "shared",
       start: () => {
-        const boxRemoteCleanup = new BoxRemoteCleanupWorker({
-          journal: new BoxDurableJournal(getPool()),
-          resolver: createProductionBoxAccountResolver(),
-        });
         const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
         const intervalMs =
           Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
