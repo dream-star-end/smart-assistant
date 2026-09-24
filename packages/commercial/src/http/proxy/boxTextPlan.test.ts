@@ -16,8 +16,11 @@ test("first text request stages only files and carries no prompt/system on Claud
     { type: "text", text: "private current user marker" },
   ] }]), upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
     maxOutputTokensLimit: 128_000,
-    runNonce: "a".repeat(24) });
+    runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) });
   assert.equal(plan.expectedModel, "claude-opus-5");
+  assert.equal(plan.proofDir, `/tmp/ocv5-289-proof-${"a".repeat(24)}`);
+  assert.deepEqual(plan.run.args.slice(2, 6),
+    ["--proof-dir", plan.proofDir, "--lease-epoch", "b".repeat(32)]);
   assert.ok(plan.run.args.includes("--session-id"));
   assert.ok(!plan.run.args.includes("--resume"));
   assert.ok(plan.run.args.includes("--system-prompt-file"));
