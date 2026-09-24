@@ -874,6 +874,45 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
     }
   });
 
+  test("tool bridge requires its own flag and reuses the authenticated proxy finalizer", async () => {
+    const oldModel = process.env.OC_BOX_MODEL_API;
+    const oldTools = process.env.OC_BOX_TOOL_BRIDGE;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      process.env.OC_BOX_TOOL_BRIDGE = "1";
+      const { h, headers } = boxRouteHarness();
+      let calls = 0;
+      const request = { ...minBody(BOX_API_MODEL),
+        tools: [{ name: "local_echo", description: "OpenClaude local tool",
+          input_schema: { type: "object", properties: {} } }],
+        tool_choice: { type: "auto" }, metadata: { user_id: JSON.stringify({
+          session_id: "web-box-tools", oc_turn_key: "a".repeat(64) }) } };
+      h.deps.boxModel = { toolBridgeReady: false, async fetch() {
+        calls++; throw new Error("TOOL_BRIDGE_NOT_READY"); } };
+      const off = await h.run(request, headers);
+      assert.equal(off.statusCode, 400);
+      assert.equal(calls, 0);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      h.deps.boxModel = { toolBridgeReady: true, async fetch({ canonicalBody, init }) {
+        calls++;
+        assert.equal((canonicalBody.tools as Array<{ name: string }>)[0]?.name, "local_echo");
+        assert.ok(!String(init.body).includes("oc_turn_key"));
+        return sseResponse(200, makeFullSseChunks());
+      } };
+      const accepted = await h.run(request, headers);
+      assert.equal(accepted.statusCode, 200, accepted.bodyText());
+      assert.equal(calls, 1);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 1);
+      assert.equal(h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO USAGE_RECORDS")).length, 1);
+    } finally {
+      if (oldModel === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = oldModel;
+      if (oldTools === undefined) delete process.env.OC_BOX_TOOL_BRIDGE;
+      else process.env.OC_BOX_TOOL_BRIDGE = oldTools;
+    }
+  });
+
   test("fenced authorization denial makes zero Box calls and zero reservations", async () => {
     const old = process.env.OC_BOX_MODEL_API;
     try {
