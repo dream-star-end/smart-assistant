@@ -361,6 +361,7 @@ def main() -> int:
     if prewatch_delay := os.environ.get("OCV5_SUPERVISOR_TEST_PRE_WATCH_DELAY"):
         time.sleep(min(float(prewatch_delay), 2.0))
     watcher = None
+    startup_expired = False
     try:
         keeper_report = os.environ.get("OCV5_KEEPER_REPORT_FD")
         keeper_ack = os.environ.get("OCV5_KEEPER_ACK_FD")
@@ -386,6 +387,9 @@ def main() -> int:
                     if owned_fd is not None:
                         try: os.close(owned_fd)
                         except OSError: pass
+        if time.monotonic() >= deadline:
+            startup_expired = True
+            raise RuntimeError("START_DEADLINE")
         watcher = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--watchdog", str(watch_read), str(ack_write), str(child.pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -393,10 +397,15 @@ def main() -> int:
         )
         os.close(watch_read)
         os.close(ack_write)
-        ready, _, _ = select.select([ack_read], [], [], 2.0)
+        remaining = max(0, deadline - time.monotonic())
+        ready, _, _ = select.select([ack_read], [], [], min(2.0, remaining))
         if not ready or os.read(ack_read, 1) != b"R":
+            startup_expired = time.monotonic() >= deadline
             raise RuntimeError("WATCHER_NOT_READY")
         os.close(ack_read)
+        if time.monotonic() >= deadline:
+            startup_expired = True
+            raise RuntimeError("START_DEADLINE")
         os.write(gate_write, b"G")
         os.close(gate_write)
     except (OSError, subprocess.SubprocessError):
@@ -424,7 +433,7 @@ def main() -> int:
             except subprocess.TimeoutExpired: watcher.kill(); watcher.wait()
         if publisher is not None:
             publisher.close()
-        return 126
+        return 124 if startup_expired else 126
     if ready_path := os.environ.get("OCV5_SUPERVISOR_READY_FILE"):
         with open(ready_path, "w", encoding="ascii") as ready:
             ready.write(f"{child.pid} {watcher.pid}\n")

@@ -8,6 +8,7 @@ numeric process group. No terminal proof is published by this prototype.
 import ctypes
 import errno
 import hashlib
+import math
 import os
 import re
 import select
@@ -116,7 +117,19 @@ def read_report(fd: int, worker: subprocess.Popen, deadline: float) -> int | Non
     return None
 
 
+def startup_budget(argv: list[str]) -> float:
+    try:
+        index = argv.index("--deadline")
+        value = float(argv[index + 1])
+        if math.isfinite(value) and 0 < value <= 120:
+            return min(5.0, value)
+    except (ValueError, IndexError):
+        pass
+    return 5.0
+
+
 def main() -> int:
+    keeper_started = time.monotonic()
     if len(sys.argv) < 3 or not verify_supervisor(sys.argv[1]):
         return 126
     # WEXITED/WAITER identity requires zombies to remain waitable; never ignore
@@ -157,9 +170,11 @@ def main() -> int:
     cli_pid = None
     pidfd = None
     try:
-        cli_pid = read_report(report_read, worker, time.monotonic() + 5)
+        startup_until = keeper_started + startup_budget(sys.argv[2:])
+        cli_pid = read_report(report_read, worker, startup_until)
         if cli_pid is None or stopping:
-            worker.terminate()
+            try: worker.terminate()
+            except ProcessLookupError: pass
         else:
             # W still owns unreaped C and waits for this ACK before opening its
             # existing execution gate. Opening pidfd here binds report identity.
@@ -188,7 +203,7 @@ def main() -> int:
         if not reap_adopted_after_last_signal():
             code = 125
         if cli_pid is None or pidfd is None:
-            return 126
+            return 124 if time.monotonic() >= startup_until else 126
         return (128 - code) if code is not None and code < 0 else (code or 0)
     finally:
         os.close(report_read)

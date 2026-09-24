@@ -157,6 +157,23 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual((proc.returncode, first + rest, err),
                          (0, b"first\nsecond\n", b""))
 
+    def test_startup_deadline_fences_cli_before_execution_gate(self) -> None:
+        marker = self.tmp / "would-have-executed"
+        code = ('import os;open(os.environ["KEEPER_TEST_EXEC_MARKER"],"w").write("paid")')
+        command = [sys.executable, str(KEEPER), str(self.staged), "--deadline", ".2",
+                   "--kill-after", ".1", "--max-output", "262144", "--",
+                   sys.executable, "-c", code]
+        began = time.monotonic()
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env={**os.environ,
+                                    "OCV5_SUPERVISOR_TEST_PRE_WATCH_DELAY": "1",
+                                    "KEEPER_TEST_EXEC_MARKER": str(marker)})
+        self.processes.append(proc)
+        proc.communicate(timeout=4)
+        self.assertEqual(proc.returncode, 124)
+        self.assertLess(time.monotonic() - began, 1.5)
+        self.assertFalse(marker.exists(), "CLI must not run after startup budget")
+
 
 if __name__ == "__main__":
     unittest.main()
