@@ -15,6 +15,7 @@ import { boxExecEgressBasis } from './boxExecBasis.js'
 import { withPinnedBoxHistoryVersion } from './boxHistoryVersionGate.js'
 import { compileBoxCliSyntheticTurn } from '../../packages/commercial/src/http/proxy/boxMessagesMapper.js'
 import { BoxCliSseError, completedBoxCliToSse } from '../../packages/commercial/src/http/proxy/boxCliSse.js'
+import { compileBoxToolCatalog } from '../../packages/commercial/src/http/proxy/boxToolCatalog.js'
 import type { ProxyBody } from '../../packages/commercial/src/http/proxy/shared.js'
 
 const ACCOUNT_ID = '20'
@@ -85,7 +86,8 @@ async function main(): Promise<void> {
 if (process.env.OCV5_289_ACK_ACCOUNT_ID !== ACCOUNT_ID || process.env.OCV5_289_ACK_USER_ID !== '3') {
   throw new Error('OCV5_289_OPERATOR_ACK_REQUIRED')
 }
-if (['OCV5_289_PARALLEL_ACK', 'OCV5_289_INFERENCE_ACK', 'OCV5_289_TOOL_ACK', 'OCV5_289_HISTORY_ACK']
+if (['OCV5_289_PARALLEL_ACK', 'OCV5_289_INFERENCE_ACK', 'OCV5_289_TOOL_ACK',
+  'OCV5_289_GENERIC_TOOL_ACK', 'OCV5_289_HISTORY_ACK']
   .filter((key) => process.env[key] === '1').length > 1) {
   throw new Error('BOX_PROBE_MODES_CONFLICT')
 }
@@ -502,6 +504,150 @@ os.rmdir(d);print('clean')`
       }
     }
   }
+  let genericToolRoundtrip: Record<string, unknown> | undefined
+  if (process.env.OCV5_289_GENERIC_TOOL_ACK === '1') {
+    const supervisorAsset = readFileSync(new URL('./box_supervisor.py', import.meta.url))
+    const mcpAsset = readFileSync(new URL('./box_virtual_mcp.py', import.meta.url))
+    const catalog = compileBoxToolCatalog([{ name: 'local_echo',
+      description: 'Synthetic OpenClaude-local echo. Box must not execute it.',
+      input_schema: { type: 'object', properties: { value: { type: 'string' } },
+        required: ['value'] } }])
+    const directory = `/tmp/ocv5-289-run-${randomBytes(12).toString('hex')}`
+    const stageRaw = String.raw`import base64,hashlib,os,stat,sys
+p,encoded,want=sys.argv[1:];raw=base64.b64decode(encoded,validate=True)
+if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want:raise SystemExit(1)
+try:fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+except FileExistsError:pass
+else:
+ try:
+  n=0
+  while n<len(raw):n+=os.write(fd,raw[n:])
+  os.fsync(fd)
+ finally:os.close(fd)
+st=os.lstat(p)
+if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or hashlib.sha256(open(p,'rb').read()).hexdigest()!=want:raise SystemExit(1)
+print(want)`
+    const stage = async (path: string, raw: Buffer): Promise<string> => {
+      const hash = createHash('sha256').update(raw).digest('hex')
+      const observed = await runFixed({ command: '/usr/bin/python3',
+        args: ['-c', stageRaw, path, raw.toString('base64'), hash], cwd: '/tmp',
+        environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+      if (observed.trim() !== hash) throw new Error('BOX_GENERIC_ASSET_STAGE_FAILED')
+      return hash
+    }
+    const supervisorHash = createHash('sha256').update(supervisorAsset).digest('hex')
+    const supervisorPath = `/tmp/ocv5-289-supervisor-${supervisorHash.slice(0,16)}.py`
+    const mcpHash = createHash('sha256').update(mcpAsset).digest('hex')
+    const mcpPath = `/tmp/ocv5-289-box-virtual-mcp-${mcpHash.slice(0,16)}.py`
+    await stage(supervisorPath, supervisorAsset)
+    await stage(mcpPath, mcpAsset)
+    const created = await runFixed({ command: '/usr/bin/python3',
+      args: ['-c', 'import os,sys;os.mkdir(sys.argv[1],0o700);print("created")', directory],
+      cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+    if (created.trim() !== 'created') throw new Error('BOX_GENERIC_DIR_CREATE_FAILED')
+    let first: Promise<string> | undefined
+    try {
+      await stage(`${directory}/tool-catalog.json`, Buffer.from(catalog.json))
+      const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: 'stdio',
+        command: '/usr/bin/python3', args: [mcpPath, directory, catalog.sha256, '45'] } } })
+      const prompt = 'Call the ocbridge local_echo tool exactly once with value ping. Then reply with exactly the tool text, no other words.'
+      first = runFixed({ command: '/usr/bin/python3', cwd: directory, timeoutMs: 70_000,
+        args: [supervisorPath, '--deadline', '55', '--kill-after', '2', '--max-output', '262144', '--',
+          MODEL, '-p', prompt, '--model', 'claude-opus-5-5', '--output-format', 'stream-json',
+          '--include-partial-messages', '--verbose', '--tools', '', '--strict-mcp-config',
+          '--mcp-config', mcpConfig, '--allowedTools', 'mcp__ocbridge__t0',
+          '--setting-sources', '', '--disable-slash-commands', '--no-session-persistence'],
+        environment: { HOME: '/home/box', PATH: '/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin',
+          LANG: 'C.UTF-8', CLAUDE_CODE_MAX_RETRIES: '0',
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' } })
+      void first.catch(() => {})
+      const readPending = String.raw`import json,os,re,stat,sys,time
+d=sys.argv[1];fd=os.open(d,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ st=os.fstat(fd)
+ if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(2)
+ end=time.monotonic()+30
+ while time.monotonic()<end:
+  names=[n for n in os.listdir(d) if re.fullmatch(r'pending\.toolu_[A-Za-z0-9_-]{1,120}\.json',n)]
+  if len(names)==1:break
+  if len(names)>1:raise SystemExit(3)
+  time.sleep(.02)
+ if len(names)!=1:raise SystemExit(4)
+ f=os.open(names[0],os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=fd)
+ try:
+  info=os.fstat(f)
+  if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600 or info.st_size>262144:raise SystemExit(5)
+  print(json.dumps(json.loads(os.read(f,262145)),separators=(',',':')))
+ finally:os.close(f)
+finally:os.close(fd)`
+      const pending = JSON.parse(await runFixed({ command: '/usr/bin/python3',
+        args: ['-c', readPending, directory], cwd: '/tmp', timeoutMs: 40_000,
+        environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })) as {
+          version?: unknown; modelToolUseId?: unknown; mcpRequestId?: unknown;
+          name?: unknown; arguments?: unknown }
+      const id = pending.modelToolUseId
+      if (pending.version !== 1 || typeof id !== 'string'
+        || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id)
+        || pending.name !== 't0' || JSON.stringify(pending.arguments) !== '{"value":"ping"}'
+        || (typeof pending.mcpRequestId !== 'number' && typeof pending.mcpRequestId !== 'string')) {
+        throw new Error('BOX_GENERIC_PENDING_INVALID')
+      }
+      const localResult = `local-${randomBytes(12).toString('hex')}`
+      const result = { version: 1, modelToolUseId: id, mcpRequestId: pending.mcpRequestId,
+        content: [{ type: 'text', text: localResult }], isError: false }
+      const publish = String.raw`import base64,json,os,stat,sys
+d,encoded=sys.argv[1:];raw=base64.b64decode(encoded,validate=True)
+v=json.loads(raw);id=v['modelToolUseId']
+fd=os.open(d,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+try:
+ st=os.fstat(fd)
+ if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(2)
+ name='result.'+id+'.json';tmp=name+'.'+str(os.getpid())+'.tmp'
+ f=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
+ try:os.write(f,raw);os.fsync(f)
+ finally:os.close(f)
+ try:os.link(tmp,name,src_dir_fd=fd,dst_dir_fd=fd,follow_symlinks=False);os.fsync(fd)
+ finally:os.unlink(tmp,dir_fd=fd)
+ print('published')
+finally:os.close(fd)`
+      const published = await runFixed({ command: '/usr/bin/python3',
+        args: ['-c', publish, directory, Buffer.from(JSON.stringify(result)).toString('base64')],
+        cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+      if (published.trim() !== 'published') throw new Error('BOX_GENERIC_RESULT_PUBLISH_FAILED')
+      const output = await first
+      const records = output.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>)
+      const streamedUse = records.filter((record) => record.type === 'stream_event')
+        .map((record) => record.event as { type?: string; content_block?: {
+          type?: string; id?: string; name?: string } } | undefined)
+        .find((event) => event?.type === 'content_block_start' && event.content_block?.type === 'tool_use')
+      const final = records.findLast((record) => record.type === 'result') as {
+        is_error?: unknown; usage?: { input_tokens?: unknown; output_tokens?: unknown } } | undefined
+      const text = records.filter((record) => record.type === 'assistant').flatMap((record) => {
+        const content = (record.message as { content?: unknown } | undefined)?.content
+        return Array.isArray(content) ? content.filter((block) => block?.type === 'text').map((block) => block.text) : []
+      }).join('')
+      if (streamedUse?.content_block?.id !== id || streamedUse.content_block.name !== 'mcp__ocbridge__t0'
+        || final?.is_error !== false || text !== localResult) throw new Error('BOX_GENERIC_TOOL_CONTRACT_FAILED')
+      genericToolRoundtrip = { exact: true, modelIdMatched: true, localResultReturned: true,
+        inputTokens: final.usage?.input_tokens, outputTokens: final.usage?.output_tokens,
+        supervisorHash: supervisorHash.slice(0,16), mcpHash: mcpHash.slice(0,16) }
+    } finally {
+      const remoteTerminated = first ? await first.then(() => true, () => false) : true
+      if (!remoteTerminated) {
+        process.stderr.write('BOX_GENERIC_REMOTE_UNKNOWN_RETAINED\n')
+      } else {
+        const cleanup = String.raw`import os,stat,sys
+d=sys.argv[1];st=os.lstat(d)
+if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(1)
+for n in os.listdir(d):
+ if n=='tool-catalog.json' or n.startswith(('pending.toolu_','result.toolu_')):os.unlink(d+'/'+n)
+os.rmdir(d);print('clean')`
+        const cleaned = await runFixed({ command: '/usr/bin/python3', args: ['-c', cleanup, directory],
+          cwd: '/tmp', environment: { PATH: '/usr/bin:/bin', LANG: 'C.UTF-8' } })
+        if (cleaned.trim() !== 'clean') throw new Error('BOX_GENERIC_CLEANUP_FAILED')
+      }
+    }
+  }
   let historyReplay: Record<string, unknown> | undefined
   if (process.env.OCV5_289_HISTORY_ACK === '1') {
     const observedVersion = summaries.find((item) => item.command === '--version')?.version
@@ -636,7 +782,9 @@ os.unlink(path);os.unlink(stdinpath);os.rmdir(project);os.rmdir(cwd);print('clea
   }
   process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, route: 'box-exec-direct', summaries,
     ...(parallelExec ? { parallelExec } : {}), ...(inference ? { inference } : {}),
-    ...(toolRoundtrip ? { toolRoundtrip } : {}), ...(historyReplay ? { historyReplay } : {}) }) + '\n')
+    ...(toolRoundtrip ? { toolRoundtrip } : {}),
+    ...(genericToolRoundtrip ? { genericToolRoundtrip } : {}),
+    ...(historyReplay ? { historyReplay } : {}) }) + '\n')
 } finally {
   secret?.token.fill(0); secret?.refresh?.fill(0)
   snap?.token.fill(0); snap?.refresh?.fill(0)
