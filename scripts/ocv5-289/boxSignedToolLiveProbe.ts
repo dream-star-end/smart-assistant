@@ -193,6 +193,8 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   const inFlight = new Map<string, Promise<void>>();
   const shapes: Array<{ requestId: string; model: unknown; keys: string[];
     toolNames: string[]; hasTurnKey: boolean; hasSessionId: boolean;
+    contextManagement: unknown; thinking: unknown; outputConfig: unknown;
+    messageRoles: string[];
     unsupported: string | null }> = [];
   let assigned = 0;
   const server = createServer((req, res) => {
@@ -241,6 +243,14 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
           toolNames: Array.isArray(body.tools) ? body.tools.map((tool) =>
             tool !== null && typeof tool === "object" && "name" in tool
               && typeof tool.name === "string" ? tool.name : "<invalid>") : [],
+          // These control-plane options contain no prompt/tool-result content;
+          // cap the serialized shape to prevent accidental overcollection.
+          contextManagement: JSON.stringify(body.context_management ?? null).slice(0, 2048),
+          thinking: JSON.stringify(body.thinking ?? null).slice(0, 512),
+          outputConfig: JSON.stringify(body.output_config ?? null).slice(0, 512),
+          messageRoles: Array.isArray(body.messages) ? body.messages.map((msg) =>
+            msg && typeof msg === "object" && "role" in msg
+              && typeof msg.role === "string" ? msg.role : "<invalid>") : [],
           hasTurnKey: typeof identity.oc_turn_key === "string"
             && /^[a-f0-9]{64}$/.test(identity.oc_turn_key),
           hasSessionId: typeof identity.session_id === "string" && !!identity.session_id,
