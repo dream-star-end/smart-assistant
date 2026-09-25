@@ -7912,18 +7912,20 @@ export class SessionManager {
     })
   }
 
-  interrupt(sessionKey: string): boolean {
+  interrupt(sessionKey: string, reason: 'user' | 'system' = 'system'): boolean {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
     const external = s._externalTurnAbort
     if (external && !external.signal.aborted) external.abort()
     const persistActiveTurn = s._persistActiveTurn
     if (persistActiveTurn) {
-      const persistence = persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
+      const persistence = reason === 'user'
+        ? persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
+        : persistActiveTurn('interrupted', '本轮因系统调度中断。', 'SYSTEM_INTERRUPT')
       this._trackPersistence(persistence)
       return true
     }
-    const runnerInterrupted = s.runner.interrupt('user')
+    const runnerInterrupted = s.runner.interrupt(reason)
     return !!external || runnerInterrupted
   }
 
@@ -7940,7 +7942,7 @@ export class SessionManager {
   interruptClientTurn(sessionKey: string, clientMessageId: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._runningClientMessageId !== clientMessageId) return false
-    return this.interrupt(sessionKey)
+    return this.interrupt(sessionKey, 'user')
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {

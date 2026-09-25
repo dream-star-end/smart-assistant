@@ -12056,7 +12056,7 @@ export class Gateway {
         interrupted = descendantInterrupted || interrupted
         continue
       }
-      interrupted = this.sessions.interrupt(childSessionKey) || descendantInterrupted || interrupted
+      interrupted = this.sessions.interrupt(childSessionKey, 'user') || descendantInterrupted || interrupted
     }
     if (childSessionKeys.size === 0) this._activeDelegationsByParent.delete(parentSessionKey)
     this.log.info('interrupt_delegations', {
@@ -18377,7 +18377,7 @@ export class Gateway {
         let interrupted = false
         for (const live of this.sessions.list()) {
           if (!live.sessionKey.endsWith(suffix)) continue
-          const selfInterrupted = this.sessions.interrupt(live.sessionKey)
+          const selfInterrupted = this.sessions.interrupt(live.sessionKey, 'user')
           const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
           if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
           interrupted = selfInterrupted || delegateInterrupted || interrupted
@@ -18397,7 +18397,7 @@ export class Gateway {
         sessionKey = routed.sessionKey
       }
     }
-    const selfInterrupted = this.sessions.interrupt(sessionKey)
+    const selfInterrupted = this.sessions.interrupt(sessionKey, 'user')
     const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
     if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
     let ok = selfInterrupted || delegateInterrupted
@@ -18407,7 +18407,7 @@ export class Gateway {
     if (!ok && frame.agentId) {
       for (const live of this.sessions.list()) {
         if (!live.sessionKey.endsWith(suffix)) continue
-        const fallbackSelf = this.sessions.interrupt(live.sessionKey)
+        const fallbackSelf = this.sessions.interrupt(live.sessionKey, 'user')
         const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
         if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
         ok = fallbackSelf || fallbackDelegates || ok
