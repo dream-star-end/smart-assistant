@@ -407,6 +407,15 @@ unsupported direct-CC request shape is a hard fail regardless of latency.
 Do not loosen these thresholds after seeing paired results without an explicit
 user decision and a documented UX tradeoff.
 
+**2026-09-25 initial selfhost launch exception (user decision):** the user
+explicitly deferred the 10 direct-CC/Box experience pairs to ship sooner.
+The current selfhost Claude OAuth pool has zero active `provider=claude` rows,
+so the direct Opus 5.5 control returns `503 no_active`. This is **not** a parity
+PASS: do not claim direct-route latency or experience equivalence. Re-run the
+frozen comparison when a legitimate direct Claude account is available. This
+exception does not waive the real Box functional, financial, cancel/restart,
+audit, or release safety gates.
+
 1. Offline CCB → internal API → Box-adapter → fake model red/green matrix for
    all captured real request fields, role order, tool IDs, multiple tool calls,
    history, image handling or explicit rejection, SSE order, usage and cancel.
