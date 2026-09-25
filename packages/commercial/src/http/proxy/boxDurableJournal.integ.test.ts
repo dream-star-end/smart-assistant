@@ -19,7 +19,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
       ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
-      error_msg text, failure_code text, final_credits bigint)`);
+      error_msg text, failure_code text CHECK (failure_code IN (
+        'UNKNOWN','INVALID_REQUEST','RATE_LIMITED','UPSTREAM_UNAVAILABLE',
+        'UPSTREAM_REJECTED','CLIENT_ABORT','STREAM_FAILED','BILLING_FAILED',
+        'INTERNAL_ERROR','USER_CANCELLED')), final_credits bigint)`);
     await client.query(`CREATE TEMP TABLE usage_records (
       request_id text NOT NULL, user_id bigint NOT NULL)`);
     // Pin all journal operations to this one connection, whose temp table
@@ -533,17 +536,23 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.markFirstRoundStoppedFailure({ ...failedCall,
       proof: { ...failedProof, workerExitCode: 0 } }),
     /BOX_FAILED_STOP_EVIDENCE_INVALID/);
+    await assert.rejects(() => client.query(
+      `UPDATE request_finalize_journal SET failure_code='BOX_REMOTE_STOPPED_FAILED'
+        WHERE request_id=$1`, [failedCall.requestId]),
+    (error: unknown) => (error as { code?: string }).code === "23514",
+    "the former failure code must be red under the real migration constraint");
     await journal.markFirstRoundStoppedFailure({ ...failedCall, proof: failedProof });
     await journal.markFirstRoundStoppedFailure({ ...failedCall, proof: failedProof });
     const failedRow = await client.query<{ state: string; ctx: Record<string, unknown>;
-      final_credits: string }>(
-      `SELECT state,ctx,final_credits::text FROM request_finalize_journal
+      final_credits: string; failure_code: string }>(
+      `SELECT state,ctx,final_credits::text,failure_code FROM request_finalize_journal
         WHERE request_id=$1`, [failedCall.requestId]);
     assert.equal(failedRow.rows[0]?.state, "aborted");
     assert.equal(failedRow.rows[0]?.ctx.boxState, "failed_stopped");
     assert.deepEqual(failedRow.rows[0]?.ctx.boxTerminalProof, failedProof);
     assert.equal(failedRow.rows[0]?.ctx.boxUsage, undefined);
     assert.equal(failedRow.rows[0]?.final_credits, "0");
+    assert.equal(failedRow.rows[0]?.failure_code, "STREAM_FAILED");
     await put(`box-g-${suffix}`);
     await journal.admit({ ...failedCall, requestId: `box-g-${suffix}`,
       fingerprint: { ...fingerprint, replayFingerprint: "7".repeat(64) },

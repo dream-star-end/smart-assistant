@@ -259,7 +259,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
       const changed = await client.query(
         `UPDATE request_finalize_journal
-            SET state='aborted', failure_code='BOX_REMOTE_STOPPED_FAILED',
+            SET state='aborted', failure_code='STREAM_FAILED',
                 final_credits=0,
                 ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
