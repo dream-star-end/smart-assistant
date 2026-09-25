@@ -12,3 +12,12 @@ export function sameSelfhostCatalogEndpoint(appRaw: string,
     return fixed(app) && fixed(admin) && app.username !== admin.username;
   } catch { return false; }
 }
+
+/** The catalog state is authoritative; pricing.enabled is its trigger mirror.
+ * Never flip pricing first, because that trigger would activate the model. */
+export function boxCatalogActivationAction(state: string, pricingEnabled: boolean):
+  "activate" | "already_active" {
+  if (state === "staged" && !pricingEnabled) return "activate";
+  if (state === "active" && pricingEnabled) return "already_active";
+  throw new Error("BOX_CATALOG_STATE_MIRROR_INVALID");
+}

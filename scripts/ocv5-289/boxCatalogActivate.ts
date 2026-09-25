@@ -5,16 +5,17 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { hostname } from "node:os";
 import { isDeepStrictEqual } from "node:util";
-import { getAccount } from "../../packages/commercial/src/account-pool/store.js";
+import { getAccount, getCursorTokenSnapshot } from
+  "../../packages/commercial/src/account-pool/store.js";
 import { activateEntry } from "../../packages/commercial/src/admin/modelCatalogOps.js";
-import { patchPricing } from "../../packages/commercial/src/admin/pricing.js";
 import { loadConfig } from "../../packages/commercial/src/config.js";
 import { getPool, closePool } from "../../packages/commercial/src/db/index.js";
 import { assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool, getModelCatalogAdminPool } from
   "../../packages/commercial/src/db/modelCatalogAdmin.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
-import { sameSelfhostCatalogEndpoint } from "./boxCatalogBoundary.js";
+import { boxCatalogActivationAction, sameSelfhostCatalogEndpoint } from
+  "./boxCatalogBoundary.js";
 
 const MODEL = "box-api-claude-opus-5-5";
 const SOURCE = "claude-opus-5-5";
@@ -116,6 +117,7 @@ async function main(): Promise<void> {
         "cache_write_per_mtok", "multiplier"].every((key) =>
         String(cost[key as keyof Price]) === String(baseline[key as keyof Price])),
     "BOX_CATALOG_STAGE_EVIDENCE_INVALID");
+    const action = boxCatalogActivationAction(row.state, cost.enabled);
     let live: { slot: string; sourceCommit: string } | null = null;
     if (mode === "activate") {
       live = liveEgressReady(expectedSha);
@@ -126,12 +128,20 @@ async function main(): Promise<void> {
         && account.cursor_sand_access_state === "SAND_ACCESS_STATE_GRANTED"
         && (!account.cooldown_until || account.cooldown_until.getTime() <= Date.now()),
       "BOX_CATALOG_ACCOUNT_INELIGIBLE");
-      if (!cost.enabled) {
-        assertion(row.state === "staged", "BOX_CATALOG_ACTIVE_PRICE_DISABLED");
-        await patchPricing(MODEL, { enabled: true },
-          { adminId: 3, userAgent: "ocv5-289-box-catalog-activate" });
+      const snapshot = await getCursorTokenSnapshot("20");
+      try {
+        assertion(snapshot?.credential_kind === "session"
+          && typeof snapshot.machine_id === "string" && snapshot.machine_id.length > 0
+          && snapshot.expires_at instanceof Date
+          && snapshot.expires_at.getTime() > Date.now() + 60_000
+          && snapshot.token.length > 0,
+        "BOX_CATALOG_ACCOUNT_CREDENTIAL_STALE");
+      } finally {
+        snapshot?.token.fill(0); snapshot?.refresh?.fill(0);
       }
-      if (row.state === "staged") {
+      if (action === "activate") {
+        // fn_model_activate_entry is the single activation authority. Its
+        // catalog→pricing trigger mirrors enabled=true in the same tx.
         await activateEntry(row.entry_id, row.lock_version,
           { adminId: 3, userAgent: "ocv5-289-box-catalog-activate" });
       }
