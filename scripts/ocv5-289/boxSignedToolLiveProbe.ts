@@ -3,6 +3,7 @@
  * never commercial production; all prompts/results are synthetic. Ambiguous
  * paid or side-effecting work is never replayed. */
 import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { hostname } from "node:os";
 import { constants, closeSync, fsyncSync, lstatSync, mkdirSync, openSync,
@@ -15,7 +16,7 @@ import type { BoxJournalAdmission } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
 import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
-import { validateBoxToolRequest } from
+import { validateBoxRequest, validateBoxToolRequest } from
   "../../packages/commercial/src/http/proxy/boxRequestGate.js";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
@@ -119,7 +120,8 @@ function assistantContent(events: Event[]): Array<Record<string, unknown>> {
 
 async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   boxModel: AnthropicProxyDeps["boxModel"]; price: ModelPricing;
-  containerId: number }) {
+  containerId: number; bindHost?: string; containerInboundIp?: string;
+  assignedRequestIds?: readonly string[]; shapeOnly?: boolean }) {
   const diagnostics: Array<{ msg: string; code?: string; detail?: string }> = [];
   const pricing = new PricingCache();
   pricing._setForTests([args.price]);
@@ -188,10 +190,62 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
     appendCostCredits: async () => {}, broadcastToUser: () => {},
   });
   const inFlight = new Map<string, Promise<void>>();
+  const shapes: Array<{ requestId: string; model: unknown; keys: string[];
+    toolNames: string[]; hasTurnKey: boolean; hasSessionId: boolean;
+    unsupported: string | null }> = [];
+  let assigned = 0;
   const server = createServer((req, res) => {
-    const requestId = req.headers["x-request-id"];
+    if (args.containerInboundIp && req.socket.remoteAddress !== args.containerInboundIp) {
+      diagnostics.push({ msg: "ccb_source_ip_mismatch" });
+      res.writeHead(403); res.end(); return;
+    }
+    if (req.url !== "/v1/messages" || req.method !== "POST") {
+      res.writeHead(404); res.end(); return;
+    }
+    const requestId = args.assignedRequestIds
+      ? args.assignedRequestIds[assigned++] : req.headers["x-request-id"];
     if (typeof requestId !== "string" || inFlight.has(requestId)) {
       res.writeHead(409); res.end(); return;
+    }
+    req.headers["x-request-id"] = requestId;
+    if (args.shapeOnly) {
+      void (async () => {
+        if (req.headers.authorization !== `Bearer oc-v3.${containerId}.${secretHex}`
+          || req.headers[LOCAL_CATALOG_HEADER] !== token) {
+          diagnostics.push({ msg: "ccb_shape_auth_failed" });
+          res.writeHead(401); res.end(); return;
+        }
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        for await (const chunk of req) {
+          const part = Buffer.from(chunk);
+          bytes += part.length;
+          if (bytes > 2_000_000) throw new Error("BOX_CCB_SHAPE_TOO_LARGE");
+          chunks.push(part);
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as ProxyBody;
+        let identity: Record<string, unknown> = {};
+        try {
+          if (typeof body.metadata?.user_id === "string") {
+            identity = JSON.parse(body.metadata.user_id) as Record<string, unknown>;
+          }
+        } catch { /* Preserve a malformed metadata negative as shape evidence. */ }
+        let unsupported: string | null;
+        try { unsupported = validateBoxRequest(body, true); }
+        catch { unsupported = "BOX_SHAPE_PARSE_FAILED"; }
+        shapes.push({ requestId, model: body.model, keys: Object.keys(body).sort(),
+          toolNames: Array.isArray(body.tools) ? body.tools.map((tool) =>
+            tool !== null && typeof tool === "object" && "name" in tool
+              && typeof tool.name === "string" ? tool.name : "<invalid>") : [],
+          hasTurnKey: typeof identity.oc_turn_key === "string"
+            && /^[a-f0-9]{64}$/.test(identity.oc_turn_key),
+          hasSessionId: typeof identity.session_id === "string" && !!identity.session_id,
+          unsupported });
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "BOX_CCB_SHAPE_PREFLIGHT",
+          message: "intentional no-paid shape probe" } }));
+      })().catch(() => { if (!res.headersSent) res.writeHead(400); res.end(); });
+      return;
     }
     const done = handler(req, res, { hostUuid, boundIp }).catch((error: unknown) => {
       diagnostics.push({ msg: "handler_exception", code: error instanceof Error
@@ -203,14 +257,23 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+    server.listen(0, args.bindHost ?? "127.0.0.1", () => {
+      server.off("error", reject); resolve();
+    });
   });
   const address = server.address();
   assertion(address && typeof address !== "string", "BOX_SIGNED_LISTENER_INVALID");
   return {
     diagnostics,
+    shapes,
+    observedRequestIds(): string[] {
+      return args.shapeOnly ? shapes.map((item) => item.requestId) : [...inFlight.keys()];
+    },
+    baseUrl: `http://${args.bindHost ?? "127.0.0.1"}:${address.port}`,
+    authToken: `oc-v3.${containerId}.${secretHex}`,
+    catalogToken: token,
     async call(body: ProxyBody, requestId: string): Promise<Response> {
-      return fetch(`http://127.0.0.1:${address.port}/v1/messages`, {
+      return fetch(`http://${args.bindHost ?? "127.0.0.1"}:${address.port}/v1/messages`, {
         method: "POST", headers: { authorization: `Bearer oc-v3.${containerId}.${secretHex}`,
           "content-type": "application/json", "anthropic-version": "2023-06-01",
           "x-request-id": requestId, [LOCAL_CATALOG_HEADER]: token },
@@ -238,6 +301,52 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
       secret.fill(0);
     },
   };
+}
+
+/** No adapter or remote execution layer: run the installed Claude Code CLI in
+ * the existing uid3 container. Credentials travel over docker-exec stdin and
+ * are never printed, put in argv, or written to a persistent file. */
+async function runContainerCcbPreflight(input: { baseUrl: string;
+  authToken: string; catalogToken: string; turnKey: string }): Promise<{
+  exitCode: number; stdoutBytes: number; stderrBytes: number }> {
+  const python = `import json,os,sys
+cfg=json.load(sys.stdin)
+env=os.environ.copy()
+env["ANTHROPIC_BASE_URL"]=cfg["baseUrl"]
+env["ANTHROPIC_AUTH_TOKEN"]=cfg["authToken"]
+env["ANTHROPIC_CUSTOM_HEADERS"]="x-oc-local-catalog: "+cfg["catalogToken"]
+env["CLAUDE_CODE_EXTRA_METADATA"]=json.dumps({"oc_turn_key":cfg["turnKey"]})
+env["NO_PROXY"]="172.31.0.1,"+env.get("NO_PROXY","")
+env.pop("ANTHROPIC_API_KEY",None)
+env.pop("CLAUDE_CODE_OAUTH_TOKEN",None)
+os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools.",
+  "--model","box-api-claude-opus-5-5","--tools","Read",
+  "--allowedTools","Read","--output-format","stream-json","--verbose",
+  "--no-session-persistence"],env)
+`;
+  const child = spawn("docker", ["exec", "-i", "--user", "1000:1000",
+    "--workdir", "/home/agent/.openclaude/workspace/ocv5-289-box-api",
+    "oc-v5-u3", "python3", "-c", python],
+  { stdio: ["pipe", "pipe", "pipe"] });
+  const cfg = JSON.stringify(input);
+  child.stdin.end(cfg);
+  let stdoutBytes = 0, stderrBytes = 0;
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdoutBytes += chunk.length;
+    if (stdoutBytes > 2_000_000) child.kill("SIGTERM");
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderrBytes += chunk.length;
+    if (stderrBytes > 500_000) child.kill("SIGTERM");
+  });
+  const timeout = setTimeout(() => child.kill("SIGTERM"), 120_000);
+  try {
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => resolve(code ?? 1));
+    });
+    return { exitCode, stdoutBytes, stderrBytes };
+  } finally { clearTimeout(timeout); }
 }
 
 async function main(): Promise<void> {
@@ -351,8 +460,8 @@ async function main(): Promise<void> {
       }
       syncDirectory(); lockHeld = true;
     });
-    const owners = await client.query<{ id: string }>(
-      `SELECT id::text FROM agent_containers
+    const owners = await client.query<{ id: string; bound_ip: string }>(
+      `SELECT id::text,host(bound_ip) AS bound_ip FROM agent_containers
        WHERE user_id=$1 AND state='active' AND runtime_channel='v5'
          AND runtime_kind='docker' AND secret_hash IS NOT NULL`, [UID.toString()]);
     assertion(owners.rows.length === 1 && owners.rows[0]?.id === expectedContainerId,
@@ -402,15 +511,40 @@ async function main(): Promise<void> {
       onUnknown: async ({ phase }) => { unknownPhase ??= phase; },
     });
     const preflightOnly = process.env.OCV5_289_SIGNED_PREFLIGHT_ONLY === "1";
+    const ccbPreflight = process.env.OCV5_289_CCB_PREFLIGHT_ONLY === "1";
     let transportCalls = 0;
+    let paidCalls = 0;
     process.env.OC_BOX_MODEL_API = "1";
     process.env.OC_BOX_TOOL_BRIDGE = "1";
     loopback = await startSignedLoopback({ pool, redis, containerId,
+      ...(ccbPreflight ? { bindHost: "172.31.0.1",
+        containerInboundIp: owners.rows[0]!.bound_ip,
+        assignedRequestIds: [firstId, secondId], shapeOnly: true } : {}),
       boxModel: { toolBridgeReady: true, fetch: (args) => {
         transportCalls++;
-        if (preflightOnly) throw new Error("BOX_PREFLIGHT_TRANSPORT_CALLED");
+        if (preflightOnly || ccbPreflight) throw new Error("BOX_PREFLIGHT_TRANSPORT_CALLED");
+        paidCalls++;
         return service.fetch(args);
       } }, price });
+    if (ccbPreflight) {
+      const result = await runContainerCcbPreflight({ baseUrl: loopback.baseUrl,
+        authToken: loopback.authToken, catalogToken: loopback.catalogToken, turnKey });
+      const observed = loopback.observedRequestIds();
+      const usage = await client.query("SELECT 1 FROM usage_records WHERE request_id=ANY($1::text[])",
+        [observed]);
+      assertion(observed.length >= 1 && observed.length <= 2
+        && transportCalls === 0 && paidCalls === 0
+        && !identityPersisted && usage.rowCount === 0,
+      "BOX_CCB_PREFLIGHT_INVALID");
+      withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
+      process.stdout.write(JSON.stringify({ ccbUserContainer: true, preflightOnly: true,
+        requestIds: observed, transportCalls, paidCalls,
+        exitCode: result.exitCode, stdoutBytes: result.stdoutBytes,
+        stderrBytes: result.stderrBytes,
+        shapes: loopback.shapes,
+        diagnostics: loopback.diagnostics.slice(-12) }) + "\n");
+      return;
+    }
     if (preflightOnly) {
       const invalid: ProxyBody = { model: MODEL, max_tokens: 128, stream: true,
         messages: [{ role: "user", content: "synthetic preflight" }],
