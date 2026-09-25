@@ -1,0 +1,223 @@
+/** Operator-only synthetic two-HTTP Box tool probe. Uses a pinned PostgreSQL
+ * TEMP journal: no migration, no live billing row, no user content. A paid or
+ * side-effecting operation is never replayed on an ambiguous result. */
+import { randomBytes } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { Pool } from "pg";
+import { BoxDurableJournal } from
+  "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
+import { BoxToolFetch } from
+  "../../packages/commercial/src/http/proxy/boxToolFetch.js";
+import { createProductionBoxAccountResolver } from
+  "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
+import { BOX_INTERNAL_ENDPOINT } from
+  "../../packages/commercial/src/http/proxy/upstream.js";
+import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import type { ProxyBody } from
+  "../../packages/commercial/src/http/proxy/shared.js";
+
+const UID = 3n, ACCOUNT_ID = 20n;
+const MODEL = "box-api-claude-opus-5-5", UPSTREAM = "claude-opus-5-5";
+type Event = { event: string; data: Record<string, unknown> };
+function assertion(ok: unknown, code: string): asserts ok {
+  if (!ok) throw new Error(code);
+}
+async function readEvents(response: Response): Promise<Event[]> {
+  assertion(response.status === 200 && response.body, "BOX_TOOL_PROBE_HTTP_INVALID");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let raw = "", ended = false;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) { ended = true; break; }
+      raw += decoder.decode(next.value, { stream: true });
+      assertion(Buffer.byteLength(raw) <= 2 * 1024 * 1024, "BOX_TOOL_PROBE_SSE_TOO_LARGE");
+    }
+  } finally { if (!ended) await reader.cancel().catch(() => {}); }
+  raw += decoder.decode();
+  const events = [...raw.matchAll(/^event: ([a-z_]+)\ndata: ([^\n]+)$/gm)]
+    .map((match) => ({ event: match[1]!,
+      data: JSON.parse(match[2]!) as Record<string, unknown> }));
+  assertion(events.length > 0 && events.some((item) => item.event === "message_stop"),
+    "BOX_TOOL_PROBE_SSE_INCOMPLETE");
+  return events;
+}
+function assistantContent(events: Event[]): Array<Record<string, unknown>> {
+  const blocks: Array<Record<string, unknown>> = [];
+  const partial = new Map<number, string>();
+  for (const { event, data } of events) {
+    if (event === "content_block_start") {
+      const index = data.index;
+      const block = data.content_block;
+      assertion(Number.isSafeInteger(index) && Number(index) >= 0
+        && block && typeof block === "object" && !Array.isArray(block),
+      "BOX_TOOL_PROBE_BLOCK_INVALID");
+      blocks[index as number] = { ...block as Record<string, unknown> };
+    } else if (event === "content_block_delta") {
+      const index = data.index;
+      const delta = data.delta as Record<string, unknown> | undefined;
+      assertion(Number.isSafeInteger(index) && !!blocks[index as number] && !!delta,
+        "BOX_TOOL_PROBE_DELTA_INVALID");
+      const block = blocks[index as number]!;
+      if (delta.type === "text_delta" && typeof delta.text === "string") {
+        block.text = String(block.text ?? "") + delta.text;
+      } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+        block.thinking = String(block.thinking ?? "") + delta.thinking;
+      } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
+        block.signature = delta.signature;
+      } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+        partial.set(index as number, (partial.get(index as number) ?? "") + delta.partial_json);
+      } else throw new Error("BOX_TOOL_PROBE_DELTA_UNSUPPORTED");
+    } else if (event === "content_block_stop") {
+      const index = data.index;
+      assertion(Number.isSafeInteger(index) && !!blocks[index as number],
+        "BOX_TOOL_PROBE_BLOCK_STOP_INVALID");
+      const input = partial.get(index as number);
+      if (input !== undefined) blocks[index as number]!.input = JSON.parse(input);
+    }
+  }
+  assertion(blocks.length > 0 && blocks.every((block) => !!block),
+    "BOX_TOOL_PROBE_CONTENT_INVALID");
+  return blocks;
+}
+
+async function main(): Promise<void> {
+  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== String(ACCOUNT_ID)
+    || process.env.OCV5_289_ACK_USER_ID !== String(UID)
+    || process.env.OCV5_289_TOOL_FETCH_ACK !== "1"
+    || getRuntimeChannel() !== "v5") throw new Error("BOX_TOOL_FETCH_ACK_REQUIRED");
+  const databaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL;
+  assertion(!!databaseUrl, "BOX_TOOL_TEMP_DB_REQUIRED");
+  const pool = new Pool({ connectionString: databaseUrl, max: 1 });
+  const client = await pool.connect();
+  const nonce = randomBytes(12).toString("hex");
+  const sessionId = `ocv5-289-live-${nonce}`;
+  const turnKey = randomBytes(32).toString("hex");
+  const firstId = `box-live-a-${nonce}`, secondId = `box-live-b-${nonce}`;
+  const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
+  let localExecutions = 0, unknownPhase: string | null = null;
+  let terminal = false;
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (
+      request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
+      ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      error_msg text, failure_code text, final_credits bigint)`);
+    const query = async (sql: string, params: unknown[] = []) => {
+      assertion(!JSON.stringify(params).includes(localResult), "BOX_TOOL_PRIVATE_SQL_LEAK");
+      return client.query(sql, params);
+    };
+    const sameConnection = { connect: async () => ({ query, release: () => {} }),
+      query } as never;
+    const journal = new BoxDurableJournal(sameConnection);
+    const basis = { model: MODEL, boxInvocationRecovery: "v1",
+      billingPricing: { v: 1, modelId: MODEL, displayName: "Opus synthetic",
+        inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1",
+        cacheWritePerMtok: "1", multiplier: "1" },
+      boxBillingContext: { v: 1, sessionId, mode: "chat", parentSessionId: null,
+        delegateAgentId: null, turnKey, parentTurnKey: null, authority: null,
+        dispatchId: null, attemptNo: null, verificationSponsorship: null,
+        apiKeyId: null } };
+    const seed = async (requestId: string) => client.query(
+      `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+       VALUES ($1,$2,'inflight',$3::jsonb)`,
+      [requestId, UID.toString(), JSON.stringify(basis)]);
+    const resolver = createProductionBoxAccountResolver();
+    const service = new BoxToolFetch({
+      supervisorAsset: readFileSync(new URL("./box_supervisor.py", import.meta.url)),
+      keeperAsset: readFileSync(new URL("./box_keeper.py", import.meta.url)),
+      virtualMcpAsset: readFileSync(new URL("./box_virtual_mcp.py", import.meta.url)),
+      detachedRunnerAsset: readFileSync(new URL("./box_detached_runner.py", import.meta.url)),
+      journal, maxOutputTokensForModel: (model) => model === MODEL ? 128_000 : null,
+      resolveTarget: (args) => resolver.resolve({ ...args, requiredAccountId: ACCOUNT_ID }),
+      onUnknown: async ({ phase }) => { unknownPhase ??= phase; },
+    });
+    const tools = [{ name: "local_echo", description: "Synthetic OpenClaude-local tool",
+      input_schema: { type: "object", properties: { value: { type: "string" } },
+        required: ["value"] } }];
+    const first: ProxyBody = { model: MODEL, max_tokens: 128, stream: true,
+      system: "Synthetic OpenClaude tool verification. No real user content.",
+      metadata: { user_id: JSON.stringify({ oc_turn_key: turnKey, session_id: sessionId }) },
+      messages: [{ role: "user", content:
+        "Call local_echo exactly once with value ping. Then answer with exactly its result text." }],
+      tools, tool_choice: { type: "auto" } };
+    await seed(firstId);
+    const firstResponse = await service.fetch({ uid: UID, sessionId, requestId: firstId,
+      canonicalModel: MODEL, canonicalBody: first, upstreamModel: UPSTREAM,
+      url: BOX_INTERNAL_ENDPOINT,
+      init: { method: "POST", body: JSON.stringify({ ...first, model: UPSTREAM }) } });
+    const firstEvents = await readEvents(firstResponse);
+    const content = assistantContent(firstEvents);
+    const toolUse = content.filter((block) => block.type === "tool_use");
+    assertion(toolUse.length === 1 && toolUse[0]?.name === "local_echo"
+      && typeof toolUse[0]?.id === "string"
+      && JSON.stringify(toolUse[0]?.input) === '{"value":"ping"}',
+    "BOX_TOOL_PROBE_TOOL_USE_INVALID");
+    assertion(firstEvents.some((item) => item.event === "message_delta"
+      && (item.data.delta as { stop_reason?: unknown } | undefined)?.stop_reason === "tool_use"),
+    "BOX_TOOL_PROBE_HANDOFF_INVALID");
+    // The only tool implementation is here in OpenClaude's operator process;
+    // Box receives only schema/pending/result via the virtual MCP.
+    localExecutions++;
+    const second: ProxyBody = { ...first, messages: [
+      ...first.messages, { role: "assistant", content },
+      { role: "user", content: [{ type: "tool_result",
+        tool_use_id: toolUse[0]!.id, content: localResult }] },
+    ] };
+    await seed(secondId);
+    const secondResponse = await service.fetch({ uid: UID, sessionId, requestId: secondId,
+      canonicalModel: MODEL, canonicalBody: second, upstreamModel: UPSTREAM,
+      url: BOX_INTERNAL_ENDPOINT,
+      init: { method: "POST", body: JSON.stringify({ ...second, model: UPSTREAM }) } });
+    const secondEvents = await readEvents(secondResponse);
+    const answer = assistantContent(secondEvents)
+      .filter((block) => block.type === "text").map((block) => block.text).join("");
+    assertion(answer.trim() === localResult && localExecutions === 1
+      && unknownPhase === null, "BOX_TOOL_PROBE_FINAL_INVALID");
+    const rows = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+       WHERE request_id IN ($1,$2) ORDER BY request_id`, [firstId, secondId]);
+    assertion(rows.rows.length === 2 && rows.rows.every((row) => row.ctx.boxState === "terminal")
+      && rows.rows.every((row) => !!row.ctx.boxTerminalProof),
+    "BOX_TOOL_PROBE_JOURNAL_NOT_TERMINAL");
+    terminal = true;
+    await service.retryTerminalCleanup();
+    process.stdout.write(JSON.stringify({ accountId: String(ACCOUNT_ID),
+      modelId: UPSTREAM, detachedAcrossHttp: true,
+      localToolExecutions: localExecutions,
+      exactFinal: true, terminalRows: rows.rows.length,
+      firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
+      unknown: false, tempOnly: true }) + "\n");
+  } catch (error) {
+    const observed = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+       WHERE request_id IN ($1,$2)`, [firstId, secondId]).catch(() => ({ rows: [] }));
+    const evidence = observed.rows.map((row) => ({ requestId: row.request_id,
+      state: row.ctx.boxState, runNonce: row.ctx.boxRunNonce,
+      leaseEpoch: row.ctx.boxLeaseEpoch }));
+    let evidencePath: string | undefined;
+    if (evidence.some((row) => row.state !== undefined && row.state !== "terminal"
+      && row.state !== "prestart_stopped")) {
+      evidencePath = join(process.cwd(), "scripts/ocv5-289",
+        `.box-tool-unknown-${nonce}.json`);
+      try {
+        writeFileSync(evidencePath, JSON.stringify({ accountId: String(ACCOUNT_ID),
+          observedAt: new Date().toISOString(), unknownPhase, evidence }) + "\n",
+        { mode: 0o600, flag: "wx" });
+      } catch { evidencePath = "EVIDENCE_FILE_WRITE_FAILED"; }
+    }
+    process.stderr.write(JSON.stringify({ code: error instanceof Error
+      && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "BOX_TOOL_PROBE_FAILED",
+      terminal, unknownPhase, evidencePath, evidence }) + "\n");
+    throw error;
+  } finally {
+    await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal").catch(() => {});
+    client.release(); await pool.end();
+  }
+}
+void main().then(() => process.exit(0), (error: unknown) => {
+  const code = error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message)
+    ? error.message : "BOX_TOOL_PROBE_FAILED";
+  process.stderr.write(code + "\n"); process.exit(1);
+});
