@@ -47,7 +47,9 @@ async function postExec(
       'connect-protocol-version': '1',
       'x-anyrun-network-token': control.networkToken,
     },
-    body: encodeExecRequest(body),
+    // Node fetch accepts Uint8Array; Buffer's generic type currently differs
+    // from the DOM BodyInit declaration even though the wire bytes are same.
+    body: Uint8Array.from(encodeExecRequest(body)),
   })
   if (!response.ok || !response.body) throw new Error(`BOX_CC_EXEC_FAILED_${response.status}`)
   return response
@@ -119,7 +121,9 @@ export async function runBoxCcBridge(opts: {
   } finally {
     abort.abort()
     opts.signal?.removeEventListener('abort', onAbort)
-    opts.stdin.destroy?.()
+    if ('destroy' in opts.stdin && typeof opts.stdin.destroy === 'function') {
+      opts.stdin.destroy()
+    }
     await pending.catch(() => undefined)
   }
   return sawExit ? exitCode : 1

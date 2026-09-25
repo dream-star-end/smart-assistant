@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { CURSOR_ENGINE_MODELS } from '../../../protocol/src/engineModels.ts'
+import { CURSOR_ENGINE_MODELS } from '../../../protocol/src/engineModels.js'
 import { uniqueCursorAccountIdFromSlotResults } from '../account-pool/cursorQuota.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
