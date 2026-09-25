@@ -29,4 +29,7 @@ test("runtime convergence requires immutable image, release, bundle, boot and mo
   assert.equal(runtimeMatches(status, oldBundle, desired, "rel-new", identity), false);
   const oldMount = inspect(); oldMount.Mounts[0]!.Source = "/runtime/old";
   assert.equal(runtimeMatches(status, oldMount, desired, "rel-new", identity), false);
+  assert.equal(runtimeMatches(status, inspect(), { ...desired,
+    platformRoot: "/platform/" }, "rel-new",
+  (path) => path.replace(/\/+$/, "")), true);
 });

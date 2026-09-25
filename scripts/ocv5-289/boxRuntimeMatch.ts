@@ -29,7 +29,7 @@ export function runtimeMatches(status: Status, info: Inspect,
       && labels[RUNTIME_BUNDLE_REV_LABEL_KEY] === desired.bundleRev
       && labels[RUNTIME_BOOT_HASH_LABEL_KEY] === desired.bootHash
       && !!runtime?.Source && !!platform?.Source
-      && resolve(runtime.Source) === desired.releaseResolvedPath
-      && resolve(platform.Source) === desired.platformRoot;
+      && resolve(runtime.Source) === resolve(desired.releaseResolvedPath)
+      && resolve(platform.Source) === resolve(desired.platformRoot);
   } catch { return false; }
 }
