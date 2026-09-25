@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 
@@ -122,12 +122,20 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32) };
     await journal.admit(toolCall);
     await journal.markRunning(toolCall);
-    const candidate = { messageId: "msg_box_tool_1", toolUses: [
+    const firstToolUses = [
       { id: "toolu_A", boxName: "mcp__ocbridge__t0",
         clientName: "local_echo", input: { value: privateMarker } },
       { id: "toolu_B", boxName: "mcp__ocbridge__t0",
         clientName: "local_echo", input: { value: privateMarker } },
-    ], inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
+    ];
+    const firstAssistantContent = [
+      { type: "text", text: "Box said A before calling tools" },
+      ...firstToolUses.map((use) => ({ type: "tool_use", id: use.id,
+        name: use.clientName, input: use.input })),
+    ];
+    const candidate = { messageId: "msg_box_tool_1", toolUses: firstToolUses,
+      assistantContentHash: hashBoxAssistantContent(firstAssistantContent),
+      inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234,
@@ -167,8 +175,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await put(`box-d-${suffix}`);
     const resumeBody = { ...firstBody, messages: [
         ...firstBody.messages,
-        { role: "assistant", content: candidate.toolUses.map((use) => ({
-          type: "tool_use", id: use.id, name: use.clientName, input: use.input })) },
+        { role: "assistant", content: firstAssistantContent },
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
           { type: "tool_result", tool_use_id: "toolu_A", content: "first" },
@@ -213,6 +220,21 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,verifiedPendingToolUseIds}',
         '["toolu_A"]'::jsonb) WHERE request_id=$1`, [toolCall.requestId]);
+    for (const alteredContent of [
+      [{ type: "text", text: "Box said B before calling tools" },
+        ...firstAssistantContent.slice(1)],
+      firstAssistantContent.slice(1),
+      [{ type: "thinking", thinking: "inserted", signature: "sig" },
+        ...firstAssistantContent],
+    ]) {
+      await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+        uid: 3n, canonicalModel: basis.model,
+        canonicalBody: { ...resumeBody, messages: [
+          ...resumeBody.messages.slice(0, -2),
+          { role: "assistant", content: alteredContent }, resumeBody.messages.at(-1)!] } }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_TOOL_ASSISTANT_CHANGED");
+    }
     for (const changedContext of [
       { ...resumeBody, system: "changed system" },
       { ...resumeBody, max_tokens: 256 },
@@ -256,10 +278,15 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_CALL_AMBIGUOUS");
-    const secondCandidate = { messageId: "msg_box_tool_2", toolUses: [
+    const secondToolUses = [
       { id: "toolu_C", boxName: "mcp__ocbridge__t0",
         clientName: "local_echo", input: { value: privateMarker } },
-    ], inputTokens: 8, outputTokens: 12, cacheReadTokens: 0, cacheWriteTokens: 1 };
+    ];
+    const secondAssistantContent = secondToolUses.map((use) => ({ type: "tool_use",
+      id: use.id, name: use.clientName, input: use.input }));
+    const secondCandidate = { messageId: "msg_box_tool_2", toolUses: secondToolUses,
+      assistantContentHash: hashBoxAssistantContent(secondAssistantContent),
+      inputTokens: 8, outputTokens: 12, cacheReadTokens: 0, cacheWriteTokens: 1 };
     await assert.rejects(() => journal.recordToolHandoff({
       requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
       candidate: secondCandidate, roundNo: 1, spoolOffset: 2345,
@@ -289,8 +316,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await put(`box-e-${suffix}`);
     const secondResumeBody = { ...resumeBody, messages: [
       ...resumeBody.messages,
-      { role: "assistant", content: secondCandidate.toolUses.map((use) => ({
-        type: "tool_use", id: use.id, name: use.clientName, input: use.input })) },
+      { role: "assistant", content: secondAssistantContent },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
         content: "third" }] },
     ] };

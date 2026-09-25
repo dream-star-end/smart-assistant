@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
+import { hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import { _UsageObserver } from "./shared.js";
 
 const model = "claude-opus-5-5";
@@ -54,6 +55,10 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
   assert.ok(streamed.includes('"name":"Bash"'));
   assert.ok(!streamed.includes("event: message_delta"));
   const candidate = decoder.push("").candidate;
+  assert.equal(candidate?.assistantContentHash, hashBoxAssistantContent([
+    { ...use("toolu_parallel_a"), name: "Bash" },
+    { ...use("toolu_parallel_b"), name: "Bash" },
+  ]));
   assert.deepEqual(candidate?.toolUses.map((item) => [item.id, item.boxName,
     item.clientName, item.input.value]), [
     ["toolu_parallel_a", boxName, "Bash", "same"],
@@ -93,6 +98,39 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
   assert.throws(() => decoder.commitHandoff(proof),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_TOOL_HANDOFF_NOT_READY");
+});
+
+test("handoff digest binds the full visible assistant text before tool_use", () => {
+  const tool = use("toolu_text_then_tool");
+  const source = [
+    { type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] },
+    event({ type: "message_start", message: { id: "msg_text_tool", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    event({ type: "content_block_start", index: 0,
+      content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "A" } }),
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "content_block_start", index: 1,
+      content_block: { type: "tool_use", id: tool.id, name: boxName, input: {} } }),
+    event({ type: "content_block_delta", index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"value":"same"}' } }),
+    { type: "assistant", message: { id: "msg_text_tool", model,
+      role: "assistant", content: [{ type: "text", text: "A" }, tool] } },
+    event({ type: "content_block_stop", index: 1 }),
+    event({ type: "message_delta", delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 8, input_tokens: 2 } }),
+    event({ type: "message_stop" }),
+  ];
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  for (const line of lines(source)) decoder.push(line);
+  const hash = decoder.push("").candidate?.assistantContentHash;
+  assert.equal(hash, hashBoxAssistantContent([
+    { type: "text", text: "A" }, { ...tool, name: "Bash" },
+  ]));
+  assert.notEqual(hash, hashBoxAssistantContent([
+    { type: "text", text: "B" }, { ...tool, name: "Bash" },
+  ]));
 });
 
 test("UTF-8 byte cap does not depend on a split surrogate pair", () => {

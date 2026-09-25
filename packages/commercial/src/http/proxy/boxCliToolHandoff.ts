@@ -4,6 +4,7 @@
  * This is a protocol primitive, not the production bridge by itself.
  */
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
+import { hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import { isDeepStrictEqual } from "node:util";
 
 export class BoxCliToolHandoffError extends Error {
@@ -33,6 +34,8 @@ export interface BoxToolUse {
 }
 export interface BoxToolHandoffCandidate {
   readonly messageId: string;
+  /** Full client-visible assistant content, including text/thinking/order. */
+  readonly assistantContentHash: string;
   readonly toolUses: readonly BoxToolUse[];
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -378,7 +381,8 @@ export class BoxCliToolHandoffDecoder {
       const uses = this.blocks.flatMap((block) => block.use ? [block.use] : []);
       if (this.stopReason === "tool_use") {
         if (uses.length < 1) throw new BoxCliToolHandoffError("BOX_TOOL_USE_REQUIRED");
-        this.candidate = { messageId: this.messageId!, toolUses: uses,
+        this.candidate = { messageId: this.messageId!,
+          assistantContentHash: this.visibleAssistantContentHash(), toolUses: uses,
           inputTokens: this.inputTokens, outputTokens: this.outputTokens,
           cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };
         this.expectedToolIds = uses.map((use) => use.id);
@@ -415,6 +419,22 @@ export class BoxCliToolHandoffDecoder {
       } else if (block.type === "text" && observed.text !== block.text) {
         throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
       }
+    }
+  }
+
+  private visibleAssistantContentHash(): string {
+    const content = this.snapshot?.content;
+    if (!Array.isArray(content) || content.length !== this.blocks.length) {
+      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
+    }
+    try {
+      return hashBoxAssistantContent(content.map((raw, index) => {
+        const block = obj(raw);
+        const use = this.blocks[index]?.use;
+        return use ? { ...block, name: use.clientName } : block;
+      }));
+    } catch {
+      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }
   }
 }

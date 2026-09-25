@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProxyBody } from "./shared.js";
 import { BoxCallFingerprintError, deriveBoxCallFingerprint,
-  deriveBoxContextHash } from "./boxCallFingerprint.js";
+  deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerprint.js";
 
 function body(turnKey = "a".repeat(64)): ProxyBody {
   return { model: "claude-opus-5-5", max_tokens: 128, stream: true,
@@ -67,6 +67,15 @@ test("tool continuation binds the complete prior CLI context without storing tex
     { role: "user", content: "changed-history" }, ...resumed.messages.slice(1)] } as ProxyBody;
   assert.notEqual(deriveBoxContextHash(changedHistory, true), prior);
   assert.notEqual(deriveBoxContextHash({ ...resumed, max_tokens: 256 }, true), prior);
+});
+
+test("assistant and context hashes reject sparse arrays", () => {
+  const sparse = [{ type: "text", text: "visible" }] as Array<unknown>;
+  sparse.length = 2;
+  assert.throws(() => hashBoxAssistantContent(sparse), BoxCallFingerprintError);
+  const value = body();
+  value.messages = sparse as ProxyBody["messages"];
+  assert.throws(() => deriveBoxContextHash(value), BoxCallFingerprintError);
 });
 
 test("real official CC inner session ID is accepted; conflicting outer ID fails", () => {

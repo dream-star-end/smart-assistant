@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 
 const evidence = () => ({ version: 1, roundNo: 1, messageId: "msg_tool", spoolOffset: 1234,
+  assistantContentHash: "d".repeat(64),
   detachedRunnerHash: "f".repeat(64),
   catalogHash: "e".repeat(64),
   toolUses: [
@@ -38,6 +39,8 @@ test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed",
   assert.equal(parseBoxStoredToolHandoff(wrongRunner), null);
   const wrongCatalog = evidence(); wrongCatalog.catalogHash = "x".repeat(64);
   assert.equal(parseBoxStoredToolHandoff(wrongCatalog), null);
+  const wrongAssistant = evidence(); wrongAssistant.assistantContentHash = "x".repeat(64);
+  assert.equal(parseBoxStoredToolHandoff(wrongAssistant), null);
   const beyondCap = evidence(); beyondCap.roundNo = 33;
   assert.equal(parseBoxStoredToolHandoff(beyondCap), null);
 });

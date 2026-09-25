@@ -8,7 +8,8 @@ import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
-import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { deriveBoxCallFingerprint, deriveBoxContextHash,
+  hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import { matchBoxToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
@@ -253,6 +254,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (!Number.isSafeInteger(roundNo) || roundNo < 1 || roundNo > 32
       || !candidate || typeof candidate.messageId !== "string"
       || candidate.messageId.length < 1 || candidate.messageId.length > 128
+      || typeof candidate.assistantContentHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(candidate.assistantContentHash)
       || ids.length < 1 || ids.length > 32 || new Set(ids).size !== ids.length
       || ids.some((id) => typeof id !== "string"
         || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))
@@ -284,6 +287,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       inputHash: hashBoxToolInput(use.input) })); }
     catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
     const frozen = { version: 1, roundNo, messageId: candidate.messageId,
+      assistantContentHash: candidate.assistantContentHash,
       spoolOffset: input.spoolOffset,
       detachedRunnerHash: input.detachedRunnerHash,
       catalogHash: input.catalogHash,
@@ -400,6 +404,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       try { results = matchBoxToolResults(input.canonicalBody,
         digests); }
       catch { throw new BoxDurableJournalError("BOX_TOOL_RESULT_MISMATCH"); }
+      try {
+        const assistant = input.canonicalBody.messages.at(-2) as
+          { content?: unknown } | undefined;
+        if (!assistant || hashBoxAssistantContent(assistant.content)
+          !== handoff.assistantContentHash) {
+          throw new Error("assistant message changed");
+        }
+      } catch {
+        throw new BoxDurableJournalError("BOX_TOOL_ASSISTANT_CHANGED");
+      }
       const durableRevision = randomUUID();
       const resultHashes = results.map((result) => ({
         modelToolUseId: result.modelToolUseId, contentHash: result.contentHash,

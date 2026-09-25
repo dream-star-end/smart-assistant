@@ -21,11 +21,17 @@ function updateStableJson(value: unknown, emit: (part: string) => void,
     emit(JSON.stringify(value)); return;
   }
   if (Array.isArray(value)) {
+    if (value.length > 1_000_000) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
     emit("[");
-    value.forEach((item, index) => {
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) {
+        throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");
+      }
       if (index) emit(",");
-      updateStableJson(item, emit, depth + 1);
-    });
+      updateStableJson(value[index], emit, depth + 1);
+    }
     emit("]"); return;
   }
   if (!value || typeof value !== "object") {
@@ -65,6 +71,24 @@ export function deriveBoxContextHash(body: ProxyBody,
   const hasher = createHash("sha256").update("ocv5-box-context-v1\0");
   let bytes = 0;
   updateStableJson({ ...modelBody, messages }, (part) => {
+    bytes += Buffer.byteLength(part);
+    if (bytes > 16 * 1024 * 1024) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    hasher.update(part);
+  });
+  return hasher.digest("hex");
+}
+
+/** Hash the complete client-visible assistant message content at handoff.
+ * The journal stores only this digest, never raw text, thinking or tool input. */
+export function hashBoxAssistantContent(content: unknown): string {
+  if (!Array.isArray(content) || content.length < 1 || content.length > 64) {
+    throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+  }
+  const hasher = createHash("sha256").update("ocv5-box-assistant-content-v1\0");
+  let bytes = 0;
+  updateStableJson(content, (part) => {
     bytes += Buffer.byteLength(part);
     if (bytes > 16 * 1024 * 1024) {
       throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
