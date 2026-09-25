@@ -73,6 +73,14 @@ export interface BoxRemoteCleanupCandidate {
   readonly leaseEpoch: string;
   readonly proof: BoxTerminalProof;
 }
+export interface BoxStoppedFailureProbeCandidate {
+  readonly requestId: string;
+  readonly uid: bigint;
+  readonly accountId: bigint;
+  readonly runNonce: string;
+  readonly leaseEpoch: string;
+  readonly linked: boolean;
+}
 
 /** Cleanup never promotes a stopped failure to a successful model result. */
 function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): boolean {
@@ -797,6 +805,82 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
     }
+  }
+
+  /** Bounded, shared-leader discovery only. These rows are unknown until a
+   * pinned Box read returns a valid terminal marker; no paid call is retried. */
+  async listStoppedFailureProbeCandidates(limit = 10): Promise<BoxStoppedFailureProbeCandidate[]> {
+    const found = await this.pool.query<{ request_id: string; user_id: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
+        WHERE state='inflight' AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
+          AND ctx->>'boxAccountId' ~ '^[1-9][0-9]{0,19}$'
+          AND ctx->>'boxRunNonce' ~ '^[a-f0-9]{24}$'
+          AND ctx->>'boxLeaseEpoch' ~ '^[a-f0-9]{32}$'
+          AND ctx->>'boxState' IN ('running','unknown','linked')
+          AND NOT (ctx ? 'boxToolHandoff')
+          AND NOT (ctx ? 'boxResumeRequestId')
+          AND NOT (ctx ? 'boxTerminalProof')
+          AND (NOT (ctx ? 'boxStopProbeAfterMs')
+            OR (jsonb_typeof(ctx->'boxStopProbeAfterMs')='number'
+              AND (ctx->>'boxStopProbeAfterMs') ~ '^[0-9]{13}$'
+              AND (ctx->>'boxStopProbeAfterMs')::bigint
+                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
+        ORDER BY updated_at ASC LIMIT $1`,
+      [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
+    const candidates: BoxStoppedFailureProbeCandidate[] = [];
+    for (const row of found.rows) {
+      const ctx = row.ctx;
+      if (!ctx || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+        || !/^[1-9][0-9]{0,19}$/.test(row.user_id)
+        || typeof ctx.boxAccountId !== "string"
+        || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+        || typeof ctx.boxRunNonce !== "string"
+        || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+        || typeof ctx.boxLeaseEpoch !== "string"
+        || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
+        || (ctx.boxOwnerRequestId !== undefined
+          && (typeof ctx.boxOwnerRequestId !== "string"
+            || !/^[A-Za-z0-9_-]{1,64}$/.test(ctx.boxOwnerRequestId)))) continue;
+      candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
+        accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
+        leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined });
+    }
+    return candidates;
+  }
+
+  /** Cross-worker CAS with a durable retry clock; never changes billing age. */
+  async claimStoppedFailureProbe(input: BoxStoppedFailureProbeCandidate): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
+      throw new BoxDurableJournalError("BOX_STOP_PROBE_IDENTITY_INVALID");
+    }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || jsonb_build_object('boxStopProbeAfterMs',
+            (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxState' IN ('running','unknown','linked')
+          AND NOT (ctx ? 'boxToolHandoff')
+          AND NOT (ctx ? 'boxResumeRequestId')
+          AND NOT (ctx ? 'boxTerminalProof')
+          AND (($6::boolean AND ctx->>'boxOwnerRequestId' IS NOT NULL)
+            OR (NOT $6::boolean AND NOT (ctx ? 'boxOwnerRequestId')))
+          AND (NOT (ctx ? 'boxStopProbeAfterMs')
+            OR (jsonb_typeof(ctx->'boxStopProbeAfterMs')='number'
+              AND (ctx->>'boxStopProbeAfterMs') ~ '^[0-9]{13}$'
+              AND (ctx->>'boxStopProbeAfterMs')::bigint
+                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, input.linked]);
+    return changed.rowCount === 1;
   }
 
   /** Restart-safe privacy cleanup selection. Corrupt terminal evidence is

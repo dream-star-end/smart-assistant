@@ -529,6 +529,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await journal.admit(failedCall);
     await journal.markRunning(failedCall);
     await journal.markUnknown({ ...failedCall, phase: "synthetic_failed_model" });
+    const firstProbe = (await journal.listStoppedFailureProbeCandidates(20))
+      .find((item) => item.requestId === failedCall.requestId);
+    assert.ok(firstProbe);
+    assert.equal(firstProbe.linked, false);
+    assert.equal(await journal.claimStoppedFailureProbe(firstProbe), true);
+    assert.equal(await journal.claimStoppedFailureProbe(firstProbe), false);
     const failedProof = { runNonce: failedCall.runNonce,
       leaseEpoch: failedCall.leaseEpoch, keeperPid: 111, cliPid: 112,
       reason: "worker_failed" as const, revision: 2 as const, workerExitCode: 7 };
@@ -595,6 +601,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       verifiedPendingToolUseIds: ["toolu_A"] });
     await journal.claimToolResume({ requestId: `box-h-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: failedResumeBody });
+    const linkedProbe = (await journal.listStoppedFailureProbeCandidates(20))
+      .find((item) => item.requestId === `box-h-${suffix}`);
+    assert.ok(linkedProbe);
+    assert.equal(linkedProbe.linked, true);
+    assert.equal(await journal.claimStoppedFailureProbe(linkedProbe), true);
     const failedChainProof = { ...failedProof, runNonce: failedChainRoot.runNonce,
       leaseEpoch: failedChainRoot.leaseEpoch };
     await assert.rejects(() => journal.markToolChainStoppedFailure({

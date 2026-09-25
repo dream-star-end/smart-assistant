@@ -71,3 +71,57 @@ test("remote cleanup failure never marks done and keeps durable retry eligible",
   assert.equal(marked, 0);
   assert.equal(disposed, 1);
 });
+
+test("restart worker proves a stopped linked failure before cleaning private files", async () => {
+  const sequence: string[] = [];
+  const probe = { requestId: "box-linked", uid: 3n, accountId: 20n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: true };
+  const failedProof = { ...candidate.proof, reason: "worker_failed" as const,
+    revision: 2 as const, workerExitCode: 7 };
+  let stopped = false;
+  const worker = new BoxRemoteCleanupWorker({
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => { sequence.push("probe-claim"); return true; },
+      markFirstRoundStoppedFailure: async () => { throw new Error("wrong round"); },
+      markToolChainStoppedFailure: async ({ proof }: { proof: unknown }) => {
+        assert.deepEqual(proof, failedProof); sequence.push("stopped-CAS"); stopped = true;
+      },
+      listRemoteCleanupCandidates: async () => stopped ? [{ ...candidate,
+        requestId: probe.requestId, proof: failedProof }] : [],
+      claimRemoteCleanup: async () => { sequence.push("clean-claim"); return true; },
+      markRemoteCleaned: async () => { sequence.push("clean-done"); } } as never,
+    resolver: { resolve: async () => ({ accountId: 20n,
+      exec: { run: async (request: { args: string[] }) => {
+        if (request.args.at(-1)?.startsWith("/tmp/ocv5-289-proof-")) {
+          sequence.push("proof-read");
+          return { stdout: JSON.stringify(failedProof) + "\n", stderrBytes: 0, exitCode: 0 };
+        }
+        sequence.push("remote-clean");
+        return { stdout: "clean\n", stderrBytes: 0, exitCode: 0 };
+      } }, dispose: async () => { sequence.push("dispose"); } }) as never } as never,
+  });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 1, pending: 0, orphaned: 0 });
+  assert.deepEqual(sequence, ["probe-claim", "proof-read", "stopped-CAS", "dispose",
+    "clean-claim", "remote-clean", "clean-done", "dispose"]);
+});
+
+test("missing terminal marker leaves unknown Box run fenced and never cleans", async () => {
+  let stopped = 0, cleaned = 0;
+  const probe = { requestId: "box-unknown", uid: 3n, accountId: 20n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: false };
+  const worker = new BoxRemoteCleanupWorker({
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      markFirstRoundStoppedFailure: async () => { stopped++; },
+      markToolChainStoppedFailure: async () => { stopped++; },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => { cleaned++; return true; },
+      markRemoteCleaned: async () => { cleaned++; } } as never,
+    resolver: { resolve: async () => ({ accountId: 20n,
+      exec: { run: async () => { throw new Error("terminal.json absent"); } },
+      dispose: async () => {} }) as never } as never,
+  });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.equal(stopped, 0);
+  assert.equal(cleaned, 0);
+});

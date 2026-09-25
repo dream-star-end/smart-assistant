@@ -4,10 +4,13 @@
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate } from "./boxDurableJournal.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
+import { readBoxTerminalProof } from "./boxTerminalProof.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 
 type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
-  "claimRemoteCleanup" | "markRemoteCleaned">;
+  "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
+    "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
+    "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 
@@ -16,7 +19,8 @@ export class BoxRemoteCleanupWorker {
     { pending: Promise<void> | null; failed: boolean }>();
   constructor(private readonly deps: { journal: Journal; resolver: Resolver }) {}
 
-  private async resolvePinned(candidate: BoxRemoteCleanupCandidate): Promise<BoxResolvedTarget> {
+  private async resolvePinned(candidate: Pick<BoxRemoteCleanupCandidate,
+    "uid" | "requestId" | "accountId">): Promise<BoxResolvedTarget> {
     const abort = new AbortController();
     const pending = this.deps.resolver.resolve({ uid: candidate.uid,
       sessionId: null, requestId: candidate.requestId,
@@ -60,6 +64,48 @@ export class BoxRemoteCleanupWorker {
     finally { if (timer) clearTimeout(timer); }
   }
 
+  /** A read-only probe can close only a failure that the keeper proved
+   * stopped. Missing/ambiguous proof is left unknown, never paid-replayed. */
+  async reconcileStoppedFailures(limit = 10): Promise<{ recovered: number; pending: number }> {
+    const journal = this.deps.journal;
+    if (!journal.listStoppedFailureProbeCandidates || !journal.claimStoppedFailureProbe
+      || !journal.markFirstRoundStoppedFailure || !journal.markToolChainStoppedFailure) {
+      return { recovered: 0, pending: 0 };
+    }
+    const candidates = await journal.listStoppedFailureProbeCandidates(limit);
+    let recovered = 0, pending = 0;
+    for (const candidate of candidates) {
+      let target: BoxResolvedTarget | null = null;
+      try {
+        if (!await journal.claimStoppedFailureProbe(candidate)) continue;
+        target = await this.resolvePinned(candidate);
+        if (target.accountId !== candidate.accountId) throw new Error("BOX_STOP_PROBE_ACCOUNT_MISMATCH");
+        const abort = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let proof: Awaited<ReturnType<typeof readBoxTerminalProof>>;
+        try {
+          proof = await Promise.race([
+            readBoxTerminalProof({ target, expectedAccountId: candidate.accountId,
+              runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch,
+              signal: abort.signal }),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => { abort.abort();
+                reject(new Error("BOX_STOP_PROBE_TIMEOUT")); }, 11_000);
+            }),
+          ]);
+        } finally { if (timer) clearTimeout(timer); }
+        if (proof.reason === "worker_complete") { pending++; continue; }
+        const stop = { requestId: candidate.requestId, uid: candidate.uid,
+          leaseEpoch: candidate.leaseEpoch, proof };
+        if (candidate.linked) await journal.markToolChainStoppedFailure(stop);
+        else await journal.markFirstRoundStoppedFailure(stop);
+        recovered++;
+      } catch { pending++; }
+      finally { if (target) await this.closeLocal(target); }
+    }
+    return { recovered, pending };
+  }
+
   async reconcileBatch(limit = 10): Promise<{ cleaned: number; pending: number;
     orphaned: number }> {
     await this.deps.resolver.retryFailedAgentCleanup?.().catch(() => {});
@@ -69,6 +115,7 @@ export class BoxRemoteCleanupWorker {
         await this.closeLocal(target);
       }
     }
+    await this.reconcileStoppedFailures(limit);
     const candidates = await this.deps.journal.listRemoteCleanupCandidates(limit);
     let cleaned = 0, pending = 0;
     for (const candidate of candidates) {
