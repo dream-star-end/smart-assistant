@@ -104,6 +104,7 @@ async function main(): Promise<void> {
   const sessionId = `ocv5-289-live-${nonce}`;
   const turnKey = randomBytes(32).toString("hex");
   const firstId = `box-live-a-${nonce}`, secondId = `box-live-b-${nonce}`;
+  const challenge = `probe-${randomBytes(8).toString("hex")}`;
   const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
   let localExecutions = 0, unknownPhase: string | null = null;
   let terminal = false;
@@ -239,7 +240,7 @@ async function main(): Promise<void> {
       system: "Synthetic OpenClaude tool verification. No real user content.",
       metadata: { user_id: JSON.stringify({ oc_turn_key: turnKey, session_id: sessionId }) },
       messages: [{ role: "user", content:
-        "Call local_echo exactly once with value ping. Then answer with exactly its result text." }],
+        `Call local_echo exactly once with value ${challenge}. Then answer with exactly its result text.` }],
       tools, tool_choice: { type: "auto" } };
     await seed(firstId);
     const firstResponse = await service.fetch({ uid: UID, sessionId, requestId: firstId,
@@ -251,7 +252,7 @@ async function main(): Promise<void> {
     const toolUse = content.filter((block) => block.type === "tool_use");
     assertion(toolUse.length === 1 && toolUse[0]?.name === "local_echo"
       && typeof toolUse[0]?.id === "string"
-      && JSON.stringify(toolUse[0]?.input) === '{"value":"ping"}',
+      && JSON.stringify(toolUse[0]?.input) === JSON.stringify({ value: challenge }),
     "BOX_TOOL_PROBE_TOOL_USE_INVALID");
     assertion(firstEvents.some((item) => item.event === "message_delta"
       && (item.data.delta as { stop_reason?: unknown } | undefined)?.stop_reason === "tool_use"),
