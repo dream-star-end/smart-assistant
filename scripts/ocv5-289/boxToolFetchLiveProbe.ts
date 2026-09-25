@@ -278,8 +278,12 @@ async function main(): Promise<void> {
     const rows = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal
        WHERE request_id IN ($1,$2) ORDER BY request_id`, [firstId, secondId]);
+    const ownerRow = rows.rows.find((row) => row.request_id === firstId);
+    const finalRow = rows.rows.find((row) => row.request_id === secondId);
     assertion(rows.rows.length === 2 && rows.rows.every((row) => row.ctx.boxState === "terminal")
-      && rows.rows.every((row) => !!row.ctx.boxTerminalProof),
+      && !!ownerRow?.ctx.boxToolHandoff && !ownerRow.ctx.boxTerminalProof
+      && (finalRow?.ctx.boxTerminalProof as { reason?: unknown } | undefined)?.reason
+        === "worker_complete",
     "BOX_TOOL_PROBE_JOURNAL_NOT_TERMINAL");
     terminal = true;
     const pendingCleanup = await service.retryTerminalCleanup();
