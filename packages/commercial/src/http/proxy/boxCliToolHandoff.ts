@@ -445,23 +445,31 @@ export class BoxCliToolHandoffDecoder {
     if (this.snapshots.length === 0) {
       throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }
-    let covered = 0;
+    // An identical next block can look like either a repeated cumulative
+    // prefix or a new segment. Keep every bounded valid coverage position;
+    // choosing one greedily would reject [A,A,T] with snapshots [A],[A],[T].
+    let covered = new Set<number>([0]);
     for (const content of this.snapshots) {
       if (content.length === 0) continue;
-      const cumulative = content.length >= covered
-        && content.length <= this.blocks.length
-        && content.every((observed, i) =>
-          isDeepStrictEqual(observed, this.blocks[i]?.upstream));
-      const segment = covered + content.length <= this.blocks.length
-        && content.every((observed, i) =>
-          isDeepStrictEqual(observed, this.blocks[covered + i]?.upstream));
-      if (cumulative) covered = content.length;
-      else if (segment) covered += content.length;
-      else {
+      const next = new Set<number>();
+      for (const position of covered) {
+        if (content.length >= position && content.length <= this.blocks.length
+          && content.every((observed, i) =>
+            isDeepStrictEqual(observed, this.blocks[i]?.upstream))) {
+          next.add(content.length);
+        }
+        if (position + content.length <= this.blocks.length
+          && content.every((observed, i) =>
+            isDeepStrictEqual(observed, this.blocks[position + i]?.upstream))) {
+          next.add(position + content.length);
+        }
+      }
+      if (next.size === 0) {
         throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
       }
+      covered = next;
     }
-    if (covered !== this.blocks.length) {
+    if (!covered.has(this.blocks.length)) {
       throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }
   }

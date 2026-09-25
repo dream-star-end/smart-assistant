@@ -148,6 +148,42 @@ test("Opus 5.5 segmented assistant snapshots preserve thinking then local tool_u
   }
 });
 
+test("identical text blocks do not make segmented snapshot coverage ambiguous", () => {
+  const textBlock = { type: "text", text: "same" };
+  const tool = use("toolu_repeated_text");
+  const source = [
+    { type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] },
+    event({ type: "message_start", message: { id: "msg_repeat", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    ...[0, 1].flatMap((index) => [
+      event({ type: "content_block_start", index,
+        content_block: { type: "text", text: "" } }),
+      event({ type: "content_block_delta", index,
+        delta: { type: "text_delta", text: "same" } }),
+      { type: "assistant", message: { id: "msg_repeat", model,
+        role: "assistant", content: [textBlock] } },
+      event({ type: "content_block_stop", index }),
+    ]),
+    event({ type: "content_block_start", index: 2,
+      content_block: { type: "tool_use", id: tool.id, name: boxName, input: {} } }),
+    event({ type: "content_block_delta", index: 2,
+      delta: { type: "input_json_delta", partial_json: '{"value":"same"}' } }),
+    { type: "assistant", message: { id: "msg_repeat", model,
+      role: "assistant", content: [tool] } },
+    event({ type: "content_block_stop", index: 2 }),
+    event({ type: "message_delta", delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 8, input_tokens: 2 } }),
+    event({ type: "message_stop" }),
+  ];
+  const valid = new BoxCliToolHandoffDecoder(model, catalog);
+  for (const line of lines(source)) valid.push(line);
+  assert.equal(valid.push("").candidate?.toolUses.length, 1);
+  const missingSecond = source.filter((item, index) => index !== 8);
+  const invalid = new BoxCliToolHandoffDecoder(model, catalog);
+  assert.throws(() => { for (const line of lines(missingSecond)) invalid.push(line); },
+    /BOX_TOOL_SNAPSHOT_MISMATCH/);
+});
+
 test("handoff digest binds the full visible assistant text before tool_use", () => {
   const tool = use("toolu_text_then_tool");
   const source = [
