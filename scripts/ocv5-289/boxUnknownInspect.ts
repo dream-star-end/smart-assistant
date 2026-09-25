@@ -45,19 +45,46 @@ def stream_shape(path):
   allowed={'system','assistant','user','result','rate_limit_event','stream_event','tool_progress','tool_use_summary','auth_status'}
   events={'message_start','content_block_start','content_block_delta','content_block_stop','message_delta','message_stop','ping'}
   all_lines=data.split(b'\n')[:-1]
-  result_count=0;tool_use_count=0;tool_result_count=0;last_type=None;last_result_error=None
+  result_count=0;tool_use_count=0;tool_result_count=0
+  invalid_count=0;unrecognized_count=0
+  last_type=None;last_result_error=None;last_result_subtype=None
   for line in all_lines:
    try:whole=json.loads(line)
-   except (UnicodeDecodeError,ValueError):continue
-   if not isinstance(whole,dict):continue
+   except (UnicodeDecodeError,ValueError):
+    invalid_count+=1;last_type='invalid_json';continue
+   if not isinstance(whole,dict):
+    invalid_count+=1;last_type='non_object';continue
    last_type=whole.get('type') if whole.get('type') in allowed else 'other'
+   if last_type=='other':unrecognized_count+=1
    if whole.get('type')=='result':
     result_count+=1;last_result_error=whole.get('is_error') is True
+    last_result_subtype=whole.get('subtype') if isinstance(whole.get('subtype'),str) else None
+   if whole.get('type') in ('tool_progress','tool_use_summary'):tool_use_count+=1
+   if whole.get('type')=='stream_event':
+    event=whole.get('event')
+    if not isinstance(event,dict) or event.get('type') not in events:
+     unrecognized_count+=1
+    elif event.get('type')=='content_block_start':
+     block=event.get('content_block')
+     kind=block.get('type') if isinstance(block,dict) else None
+     if kind=='tool_use':tool_use_count+=1
+     elif kind not in ('text','thinking','redacted_thinking'):unrecognized_count+=1
+    elif event.get('type')=='content_block_delta':
+     delta=event.get('delta')
+     if isinstance(delta,dict) and delta.get('type')=='input_json_delta':tool_use_count+=1
+    elif event.get('type')=='message_delta':
+     delta=event.get('delta')
+     if isinstance(delta,dict) and delta.get('stop_reason')=='tool_use':tool_use_count+=1
    msg=whole.get('message')
    blocks=msg.get('content') if isinstance(msg,dict) else None
+   if whole.get('type') in ('assistant','user') and not isinstance(blocks,list):
+    unrecognized_count+=1
    if isinstance(blocks,list):
     tool_use_count+=sum(isinstance(b,dict) and b.get('type')=='tool_use' for b in blocks)
     tool_result_count+=sum(isinstance(b,dict) and b.get('type')=='tool_result' for b in blocks)
+    if any(not isinstance(b,dict) or b.get('type') not in
+      ('text','thinking','redacted_thinking','tool_use','tool_result','image') for b in blocks):
+     unrecognized_count+=1
   records=[];used=0;budget_exceeded=False
   for line in all_lines[:64]:
    try:record=json.loads(line)
@@ -102,6 +129,8 @@ def stream_shape(path):
     'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64 or partial or budget_exceeded,
     'resultCount':result_count,'lastType':last_type,
     'lastResultIsError':last_result_error,
+    'lastResultSubtype':last_result_subtype,
+    'invalidCount':invalid_count,'unrecognizedCount':unrecognized_count,
     'toolUseCount':tool_use_count,'toolResultCount':tool_result_count,
     'records':records}
  finally:os.close(dfd)
@@ -361,10 +390,41 @@ async function main(): Promise<void> {
         awaitingSecondObservation = true;
       } else {
         const archive = `${DIR}/account-20.quarantined-${record.runNonce}.json`;
-        writeOnce(archive, JSON.stringify({ kind: "synthetic_unknown_cli_error",
+        const archiveRecord = { kind: "synthetic_unknown_cli_error",
           terminalProof: false, settledUsage: false, replayAllowed: false,
           originalLock: record, first: previous, second: assessed.snapshot,
-          quarantinedAt: new Date().toISOString() }));
+          quarantinedAt: new Date().toISOString() };
+        try {
+          const priorArchive = lstatSync(archive);
+          if (!priorArchive.isFile() || priorArchive.isSymbolicLink()
+            || priorArchive.uid !== process.getuid()
+            || (priorArchive.mode & 0o777) !== 0o600
+            || priorArchive.size < 1 || priorArchive.size > 8192) {
+            throw new Error("BOX_UNKNOWN_ARCHIVE_INVALID");
+          }
+          const saved = JSON.parse(readFileSync(archive, "utf8")) as Record<string, unknown>;
+          const first = saved.first as Record<string, unknown> | undefined;
+          const second = saved.second as Record<string, unknown> | undefined;
+          if (saved.kind !== "synthetic_unknown_cli_error"
+            || saved.terminalProof !== false || saved.settledUsage !== false
+            || saved.replayAllowed !== false
+            || JSON.stringify(saved.originalLock) !== JSON.stringify(record)
+            || !first || first.lockSha256 !== lockSha256
+            || first.runNonce !== record.runNonce
+            || first.stdoutSha256 !== assessed.snapshot.stdoutSha256
+            || !second || second.stdoutSha256 !== assessed.snapshot.stdoutSha256
+            || second.stdoutBytes !== assessed.snapshot.stdoutBytes
+            || second.lockSha256 !== lockSha256
+            || second.runNonce !== record.runNonce
+            || typeof first.observedAtMs !== "number"
+            || typeof second.observedAtMs !== "number"
+            || second.observedAtMs - first.observedAtMs < 60_000) {
+            throw new Error("BOX_UNKNOWN_ARCHIVE_CONFLICT");
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          writeOnce(archive, JSON.stringify(archiveRecord));
+        }
         const latest = lstatSync(LOCK);
         if (latest.dev !== st.dev || latest.ino !== st.ino
           || readFileSync(LOCK, "utf8") !== rawLock) {
@@ -372,8 +432,9 @@ async function main(): Promise<void> {
         }
         // This releases ONLY the synthetic operator mutex. It does not alter
         // the live billing journal, claim keeper proof, or delete Box files.
-        unlinkSync(LOCK);
         unlinkSync(SNAPSHOT);
+        syncDirectory();
+        unlinkSync(LOCK);
         syncDirectory();
         quarantinedLock = true;
       }

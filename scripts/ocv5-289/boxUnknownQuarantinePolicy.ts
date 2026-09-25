@@ -47,7 +47,9 @@ export function assessUnknownProbeQuarantine(input: {
     || !/^[a-f0-9]{64}$/.test(stream.stdoutSha256)
     || stream.partialLine !== false || stream.truncated !== false
     || stream.resultCount !== 1 || stream.lastType !== "result"
+    || stream.lastResultSubtype !== "success"
     || stream.lastResultIsError !== true
+    || stream.invalidCount !== 0 || stream.unrecognizedCount !== 0
     || stream.toolUseCount !== 0 || stream.toolResultCount !== 0
     || !Array.isArray(processes.matches) || processes.matches.length !== 0
     || !Array.isArray(processes.claudeLike)
