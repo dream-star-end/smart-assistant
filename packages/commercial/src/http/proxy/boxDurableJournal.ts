@@ -38,6 +38,16 @@ function validUsageEvidence(value: unknown): value is BoxUsageEvidence {
     && keys.every((key) => Object.hasOwn(usage, key)
       && Number.isSafeInteger(usage[key]) && Number(usage[key]) >= 0);
 }
+function validCancelIntent(value: unknown): value is {
+  v: 1; reason: "user_cancel"; requestId: string; atMs: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const intent = value as Record<string, unknown>;
+  return Object.keys(intent).sort().join(",") === "atMs,reason,requestId,v"
+    && intent.v === 1 && intent.reason === "user_cancel"
+    && typeof intent.requestId === "string"
+    && /^[A-Za-z0-9_-]{1,64}$/.test(intent.requestId)
+    && Number.isSafeInteger(intent.atMs) && Number(intent.atMs) > 0;
+}
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface BoxJournalAdmission {
@@ -255,6 +265,17 @@ export class BoxDurableJournal implements BoxJournalPort {
     let committed = false;
     try {
       await client.query("BEGIN");
+      // claimToolResume acquires this same advisory lock before row locks. A
+      // pre-lock read only finds its key; all identity is rechecked below.
+      const peek = await client.query<{ ctx: Record<string, unknown> }>(
+        `SELECT ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2`,
+        [input.requestId, input.uid.toString()]);
+      const sessionId = peek.rows[0]?.ctx?.boxSessionId;
+      if (peek.rowCount !== 1 || typeof sessionId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) {
+        throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+      }
+      await lock(client, [`box:session:${input.uid}:${sessionId}`]);
       const found = await client.query<{ state: string; ctx: Record<string, unknown> }>(
         `SELECT state,ctx FROM request_finalize_journal
           WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
@@ -265,34 +286,61 @@ export class BoxDurableJournal implements BoxJournalPort {
         || ctx.boxInvocationMode !== "detached_tool"
         || ctx.boxAccountId !== input.accountId.toString()
         || ctx.boxRunNonce !== input.runNonce
-        || ctx.boxLeaseEpoch !== input.leaseEpoch) {
+        || ctx.boxLeaseEpoch !== input.leaseEpoch
+        || ctx.boxSessionId !== sessionId
+        || typeof ctx.boxTurnKey !== "string"
+        || !/^[a-f0-9]{64}$/.test(ctx.boxTurnKey)
+        || typeof ctx.model !== "string") {
         throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
       }
-      const existing = ctx.boxCancelIntent;
-      if (existing !== undefined) {
-        if (!existing || typeof existing !== "object" || Array.isArray(existing)
-          || (existing as Record<string, unknown>).v !== 1
-          || (existing as Record<string, unknown>).reason !== "user_cancel"
-          || (existing as Record<string, unknown>).requestId !== input.requestId) {
-          throw new BoxDurableJournalError("BOX_CANCEL_CONFLICT");
-        }
-        await client.query("COMMIT"); committed = true; return;
+      const prior = ctx.boxCancelIntent;
+      if (prior !== undefined && !validCancelIntent(prior)) {
+        throw new BoxDurableJournalError("BOX_CANCEL_CONFLICT");
       }
-      if (!["inflight", "finalizing", "committed"].includes(row.state)
+      if (prior === undefined && (!["inflight", "finalizing", "committed"].includes(row.state)
         || !ACTIVE.includes(String(ctx.boxState))
-        || ctx.boxTerminalProof !== undefined) {
+        || ctx.boxTerminalProof !== undefined)) {
         throw new BoxDurableJournalError("BOX_CANCEL_NOT_ACTIVE");
       }
-      const changed = await client.query(
-        `UPDATE request_finalize_journal
-            SET ctx=ctx || $4::jsonb
-          WHERE request_id=$1 AND user_id=$2
-            AND ctx->>'boxLeaseEpoch'=$3 AND NOT (ctx ? 'boxCancelIntent')
-            AND ctx->>'boxState'=ANY($5::text[])`,
-        [input.requestId, input.uid.toString(), input.leaseEpoch,
-          JSON.stringify({ boxCancelIntent: { v: 1, reason: "user_cancel",
-            requestId: input.requestId, atMs: Date.now() } }), ACTIVE]);
-      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
+      const active = await client.query<{ request_id: string; state: string;
+        ctx: Record<string, unknown> }>(
+        `SELECT request_id,state,ctx FROM request_finalize_journal
+          WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
+            AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
+            AND ctx->>'boxState'=ANY($5::text[])
+          ORDER BY request_id FOR UPDATE`,
+        [input.uid.toString(), input.accountId.toString(), input.runNonce,
+          input.leaseEpoch, ACTIVE]);
+      const intent = prior ?? { v: 1, reason: "user_cancel",
+        requestId: input.requestId, atMs: Date.now() };
+      for (const current of active.rows) {
+        const linked = current.ctx;
+        if (linked.boxInvocationRecovery !== "v1"
+          || linked.boxInvocationMode !== "detached_tool"
+          || linked.boxSessionId !== sessionId
+          || linked.boxTurnKey !== ctx.boxTurnKey
+          || linked.model !== ctx.model
+          || !["inflight", "finalizing", "committed"].includes(current.state)
+          || linked.boxTerminalProof !== undefined
+          || (linked.boxCancelIntent !== undefined
+            && (!validCancelIntent(linked.boxCancelIntent)
+              || !isDeepStrictEqual(linked.boxCancelIntent, intent)))) {
+          throw new BoxDurableJournalError("BOX_CANCEL_CHAIN_INVALID");
+        }
+        if (linked.boxCancelIntent !== undefined) continue;
+        const changed = await client.query(
+          `UPDATE request_finalize_journal SET ctx=ctx || $5::jsonb
+            WHERE request_id=$1 AND user_id=$2
+              AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
+              AND ctx->>'boxState'=ANY($6::text[])
+              AND NOT (ctx ? 'boxCancelIntent')`,
+          [current.request_id, input.uid.toString(), input.runNonce,
+            input.leaseEpoch, JSON.stringify({ boxCancelIntent: intent }), ACTIVE]);
+        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
+      }
+      if (active.rowCount === 0 && prior === undefined) {
+        throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
+      }
       await client.query("COMMIT"); committed = true;
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});

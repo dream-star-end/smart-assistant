@@ -601,6 +601,32 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       verifiedPendingToolUseIds: ["toolu_A"] });
     await journal.claimToolResume({ requestId: `box-h-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: failedResumeBody });
+    await journal.recordUserCancelIntent(failedChainRoot);
+    await journal.recordUserCancelIntent(failedChainRoot);
+    const canceledChain = await client.query<{ request_id: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE request_id IN ($1,$2) ORDER BY request_id`,
+      [failedChainRoot.requestId, `box-h-${suffix}`]);
+    assert.deepEqual(canceledChain.rows.map((row) => row.ctx.boxCancelIntent),
+      [canceledChain.rows[0]?.ctx.boxCancelIntent,
+        canceledChain.rows[0]?.ctx.boxCancelIntent]);
+    await assert.rejects(() => journal.recordToolHandoff({
+      requestId: `box-h-${suffix}`, uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch,
+      candidate: secondCandidate, roundNo: 2, spoolOffset: 2345,
+      detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_C"] }), /BOX_TOOL_HANDOFF_FENCE_LOST/);
+    await putFailed(`box-cancel-child-${suffix}`);
+    const afterCancelBody: ProxyBody = { ...failedResumeBody, messages: [
+      ...failedResumeBody.messages,
+      { role: "assistant", content: secondAssistantContent },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
+        content: "third" }] },
+    ] };
+    await assert.rejects(() => journal.claimToolResume({
+      requestId: `box-cancel-child-${suffix}`, uid: 3n,
+      canonicalModel: basis.model, canonicalBody: afterCancelBody }),
+    /BOX_TOOL_OWNER_UNKNOWN/);
     const linkedProbe = (await journal.listStoppedFailureProbeCandidates(20))
       .find((item) => item.requestId === `box-h-${suffix}`);
     assert.ok(linkedProbe);
