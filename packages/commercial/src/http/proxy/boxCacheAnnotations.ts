@@ -86,6 +86,17 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
     const { context_management: _hint, ...rest } = body;
     semanticBody = rest as ProxyBody;
   }
+  // Opus 5.5 defaults adaptive display to "omitted". The actual Box CLI plan
+  // maps both request forms to the same effort and response behavior; normalize
+  // only this verified equivalence so a retry/continuation cannot evade its
+  // paid replay fence by adding the redundant display key.
+  const thinking = semanticBody.thinking;
+  if ((semanticBody.model === "box-api-claude-opus-5-5"
+      || semanticBody.model === "claude-opus-5-5")
+    && object(thinking) && Object.keys(thinking).sort().join(",") === "display,type"
+    && thinking.type === "adaptive" && thinking.display === "omitted") {
+    semanticBody = { ...semanticBody, thinking: { type: "adaptive" } } as ProxyBody;
+  }
   const collapse = options.collapseSingleText !== false;
   const messages = semanticBody.messages.map((raw) => {
     if (!object(raw)) return raw;

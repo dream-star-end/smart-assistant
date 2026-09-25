@@ -75,3 +75,20 @@ test("Opus 5.5 keep-all thinking edit is a semantic no-op for replay and resume"
     edits: [{ type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 1 } }] } };
   assert.notEqual(deriveBoxContextHash(plain), deriveBoxContextHash(edit));
 });
+
+test("Opus 5.5 optional omitted display does not split one paid call across HTTP", () => {
+  const base = { ...first, thinking: { type: "adaptive" },
+    output_config: { effort: "medium" } } as ProxyBody;
+  const redundant = { ...base, thinking: { type: "adaptive", display: "omitted" } } as ProxyBody;
+  assert.equal(deriveBoxContextHash(base), deriveBoxContextHash(redundant));
+  assert.equal(deriveBoxCallFingerprint(3n, base).replayFingerprint,
+    deriveBoxCallFingerprint(3n, redundant).replayFingerprint);
+  const resume = { ...redundant, messages: [...redundant.messages,
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_display",
+      name: "local_echo", input: { value: "ping" } }] },
+    { role: "user", content: [{ type: "tool_result",
+      tool_use_id: "toolu_display", content: "pong" }] }] } as ProxyBody;
+  assert.equal(deriveBoxContextHash(resume, true), deriveBoxContextHash(base));
+  assert.notEqual(deriveBoxContextHash({ ...base,
+    thinking: { type: "adaptive", display: "summarized" } }), deriveBoxContextHash(base));
+});
