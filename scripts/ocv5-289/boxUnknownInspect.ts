@@ -40,7 +40,7 @@ def stream_shape(path):
    return 'other-'+hashlib.sha256(str(value).encode()).hexdigest()[:8]
   allowed={'system','assistant','user','result','rate_limit_event','stream_event','tool_progress','tool_use_summary','auth_status'}
   events={'message_start','content_block_start','content_block_delta','content_block_stop','message_delta','message_stop','ping'}
-  records=[]
+  records=[];used=0;budget_exceeded=False
   for line in data.split(b'\n')[:-1][:64]:
    try:record=json.loads(line)
    except (UnicodeDecodeError,ValueError):records.append({'type':'invalid_json'});continue
@@ -72,13 +72,15 @@ def stream_shape(path):
    if item['type']=='result':
     item['subtype']=safe_type(record.get('subtype'),{'success','error','error_during_execution','error_max_turns'})
     item['isError']=record.get('is_error') is True
-   records.append(item)
+   item_bytes=len(json.dumps(item,separators=(',',':')).encode())+1
+   if used+item_bytes>5000:budget_exceeded=True;break
+   records.append(item);used+=item_bytes
   try:err=os.stat('stderr.log',dir_fd=dfd,follow_symlinks=False).st_size
   except FileNotFoundError:err=None
   partial=bool(data and not data.endswith(b'\n'))
   return {'present':True,'stdoutBytes':st.st_size,'stderrBytes':err,
    'partialLine':partial,
-   'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64 or partial,
+   'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64 or partial or budget_exceeded,
    'records':records}
  finally:os.close(dfd)
 def terminal_shape(path):
