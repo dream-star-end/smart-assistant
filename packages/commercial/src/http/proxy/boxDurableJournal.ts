@@ -916,6 +916,8 @@ export class BoxDurableJournal implements BoxJournalPort {
           ? (!["inflight", "finalizing", "committed"].includes(current.state)
             || !["handoff", "unknown"].includes(String(basis.boxState))
             || handoff.roundNo !== roundNo
+            || typeof basis.boxHandoffRevision !== "string"
+            || !UUID_V4.test(basis.boxHandoffRevision)
             || handoff.catalogHash !== basis.boxCatalogHash
             || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash)
           : (current.state !== "inflight"

@@ -807,6 +807,18 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(await journal.claimStoppedFailureProbe(linkedHandoffProbe), true);
     const linkedStopProof = { ...failedProof, runNonce: linkedRoot.runNonce,
       leaseEpoch: linkedRoot.leaseEpoch };
+    const linkedRevisionRow = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [linkedChildId]);
+    const linkedRevision = linkedRevisionRow.rows[0]?.ctx.boxHandoffRevision;
+    assert.match(String(linkedRevision), /^[0-9a-f-]{36}$/);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx-'boxHandoffRevision' WHERE request_id=$1`, [linkedChildId]);
+    await assert.rejects(() => journal.markToolChainStoppedFailure({
+      requestId: linkedChildId, uid: 3n, leaseEpoch: linkedRoot.leaseEpoch,
+      proof: linkedStopProof }), /BOX_FAILED_STOP_CHAIN_INVALID/);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxHandoffRevision}',to_jsonb($2::text))
+      WHERE request_id=$1`, [linkedChildId, linkedRevision]);
     await journal.markToolChainStoppedFailure({ requestId: linkedChildId,
       uid: 3n, leaseEpoch: linkedRoot.leaseEpoch, proof: linkedStopProof });
     await journal.markToolChainStoppedFailure({ requestId: linkedChildId,
