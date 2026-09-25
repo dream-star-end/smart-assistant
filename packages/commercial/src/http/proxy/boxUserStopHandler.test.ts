@@ -71,3 +71,35 @@ test("bad auth, API key, malformed turn and wrong container fail before remote s
     } } as never, coordinator })).status, 404);
   assert.equal(remote, 0);
 });
+
+test("same signed turn coalesces concurrent stop requests without duplicate remote signal", async () => {
+  let lookups = 0, stops = 0;
+  const handler = makeBoxUserStopHandler({
+    identity: { resolve: async () => ({ uid: 3n, containerId: 7n }) } as never,
+    journal: { findCancelableRun: async () => { lookups++; return run; } } as never,
+    coordinator: { requestStop: async () => {
+      stops++;
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      return "stopped_proven";
+    } } as never,
+  });
+  const server = createServer((req, res) => {
+    void handler(req, res, { hostUuid: "selfhost-test", boundIp: "127.0.0.1" });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const port = (server.address() as AddressInfo).port;
+    const send = () => fetch(`http://127.0.0.1:${port}/internal/box/stop`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(turn),
+    });
+    const [a, b] = await Promise.all([send(), send()]);
+    assert.equal(a.status, 200); assert.equal(b.status, 200);
+    assert.equal((await a.json()).status, "stopped");
+    assert.equal((await b.json()).status, "stopped");
+    assert.equal(lookups, 1);
+    assert.equal(stops, 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
