@@ -1124,6 +1124,45 @@ export class BoxDurableJournal implements BoxJournalPort {
       leaseEpoch: input.leaseEpoch, linked: ctx.boxOwnerRequestId !== undefined };
   }
 
+  /** Resolve a stop only from the currently authenticated user container's
+   * active turn. No client-supplied account, nonce, epoch or request ID is
+   * trusted; a different user's or stale container's row cannot be stopped. */
+  async findCancelableRun(input: { uid: bigint; containerId: bigint;
+    sessionId: string; turnKey: string }): Promise<Pick<BoxJournalAdmission,
+      "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">> {
+    if (input.uid <= 0n || input.containerId <= 0n
+      || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[a-f0-9]{64}$/.test(input.turnKey)) {
+      throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+    }
+    const found = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND container_id=$2
+          AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
+          AND ctx->>'model'='box-api-claude-opus-5-5'
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${STOP_PROBE_STATE_FENCE}
+          AND NOT (ctx ? 'boxResumeRequestId')
+          AND NOT (ctx ? 'boxTerminalProof')`,
+      [input.uid.toString(), input.containerId.toString(),
+        input.sessionId, input.turnKey]);
+    const row = found.rows[0], ctx = row?.ctx;
+    if (found.rowCount !== 1 || !row || !ctx
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+      || typeof ctx.boxAccountId !== "string"
+      || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+      || typeof ctx.boxRunNonce !== "string"
+      || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+      || typeof ctx.boxLeaseEpoch !== "string"
+      || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)) {
+      throw new BoxDurableJournalError("BOX_CANCEL_RUN_UNKNOWN");
+    }
+    return { requestId: row.request_id, uid: input.uid,
+      accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
+      leaseEpoch: ctx.boxLeaseEpoch };
+  }
+
   /** Restart-safe privacy cleanup selection. Corrupt terminal evidence is
    * durably quarantined (no remote touch) so it cannot starve newer runs. */
   async listRemoteCleanupCandidates(limit = 10): Promise<BoxRemoteCleanupCandidate[]> {

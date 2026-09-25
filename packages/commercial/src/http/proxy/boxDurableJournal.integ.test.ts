@@ -18,7 +18,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
   const client = await pool.connect();
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
-      request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
+      request_id text PRIMARY KEY, user_id bigint NOT NULL,
+      container_id bigint, state text NOT NULL,
       ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text CHECK (failure_code IN (
         'UNKNOWN','INVALID_REQUEST','RATE_LIMITED','UPSTREAM_UNAVAILABLE',
@@ -613,6 +614,18 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       verifiedPendingToolUseIds: ["toolu_A"] });
     await journal.claimToolResume({ requestId: `box-h-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: failedResumeBody });
+    await client.query(`UPDATE request_finalize_journal SET container_id=123
+      WHERE request_id=$1`, [`box-h-${suffix}`]);
+    const selectedStop = await journal.findCancelableRun({ uid: 3n,
+      containerId: 123n, sessionId: failedSession, turnKey: failedTurn });
+    assert.equal(selectedStop.requestId, `box-h-${suffix}`);
+    assert.equal(selectedStop.accountId, 20n);
+    await assert.rejects(() => journal.findCancelableRun({ uid: 3n,
+      containerId: 124n, sessionId: failedSession, turnKey: failedTurn }),
+    /BOX_CANCEL_RUN_UNKNOWN/);
+    await assert.rejects(() => journal.findCancelableRun({ uid: 4n,
+      containerId: 123n, sessionId: failedSession, turnKey: failedTurn }),
+    /BOX_CANCEL_RUN_UNKNOWN/);
     enforceChainLockOrder = true; sawSessionAdvisoryLock = false;
     await journal.recordUserCancelIntent(failedChainRoot);
     assert.equal(sawSessionAdvisoryLock, true);
