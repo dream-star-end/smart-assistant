@@ -233,7 +233,9 @@ async function main(): Promise<void> {
     const tools = [{ name: "local_echo", description: "Synthetic OpenClaude-local tool",
       input_schema: { type: "object", properties: { value: { type: "string" } },
         required: ["value"] } }];
-    const first: ProxyBody = { model: MODEL, max_tokens: 128, stream: true,
+    // Opus 5.5 adaptive thinking can consume a 128-token ceiling before it
+    // reaches tool_use; use the actual CCB-scale request budget for this probe.
+    const first: ProxyBody = { model: MODEL, max_tokens: 8192, stream: true,
       system: "Synthetic OpenClaude tool verification. No real user content.",
       metadata: { user_id: JSON.stringify({ oc_turn_key: turnKey, session_id: sessionId }) },
       messages: [{ role: "user", content:
