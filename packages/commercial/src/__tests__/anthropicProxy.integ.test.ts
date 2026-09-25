@@ -70,7 +70,7 @@ import {
   _resetGateForTest,
   getDegradedProviders,
 } from "../admin/providerHealthGate.js";
-import type { Pool, QueryResult } from "pg";
+import { Pool as PgPool, type Pool, type QueryResult } from "pg";
 import { matchObservabilitySql } from "./helpers/fakePoolSql.js";
 
 // ─── 通用构件 ─────────────────────────────────────────────────────────────
@@ -966,6 +966,85 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("signed Box route settles a real TEMP wallet and ledger, without persistent writes",
+    { skip: !process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL }, async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    const pg = new PgPool({ connectionString: process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL,
+      max: 1 });
+    const client = await pg.connect();
+    try {
+      await client.query("CREATE TEMP TABLE request_finalize_journal (LIKE public.request_finalize_journal INCLUDING ALL)");
+      await client.query("CREATE TEMP SEQUENCE box_signed_usage_id_seq");
+      await client.query("CREATE TEMP TABLE usage_records (LIKE public.usage_records INCLUDING ALL)");
+      await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_signed_usage_id_seq'::regclass)");
+      await client.query("CREATE TEMP TABLE pending_usage_patches (LIKE public.pending_usage_patches INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE users (LIKE public.users INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE user_subscriptions (LIKE public.user_subscriptions INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE org_memberships (LIKE public.org_memberships INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE orgs (LIKE public.orgs INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE org_subscriptions (LIKE public.org_subscriptions INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE turn_waivers (LIKE public.turn_waivers INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE chat_projects (LIKE public.chat_projects INCLUDING ALL)");
+      await client.query("CREATE TEMP SEQUENCE box_signed_ledger_id_seq");
+      await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
+      await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_signed_ledger_id_seq'::regclass)");
+      const shadow = await client.query<{ only_temp: boolean }>(`SELECT
+        'request_finalize_journal'::regclass='pg_temp.request_finalize_journal'::regclass
+        AND 'usage_records'::regclass='pg_temp.usage_records'::regclass
+        AND 'pending_usage_patches'::regclass='pg_temp.pending_usage_patches'::regclass
+        AND 'users'::regclass='pg_temp.users'::regclass
+        AND 'user_subscriptions'::regclass='pg_temp.user_subscriptions'::regclass
+        AND 'org_memberships'::regclass='pg_temp.org_memberships'::regclass
+        AND 'orgs'::regclass='pg_temp.orgs'::regclass
+        AND 'org_subscriptions'::regclass='pg_temp.org_subscriptions'::regclass
+        AND 'turn_waivers'::regclass='pg_temp.turn_waivers'::regclass
+        AND 'client_sessions'::regclass='pg_temp.client_sessions'::regclass
+        AND 'chat_projects'::regclass='pg_temp.chat_projects'::regclass
+        AND 'credit_ledger'::regclass='pg_temp.credit_ledger'::regclass AS only_temp`);
+      assert.equal(shadow.rows[0]?.only_temp, true);
+      const initialCredits = 1000n;
+      await client.query(`INSERT INTO users(id,email,password_hash,credits)
+        VALUES ($1,$2,'temp-only',$3)`, [String(FIXED_USER_ID),
+        `${randomUUID()}@example.invalid`, initialCredits.toString()]);
+      const query = client.query.bind(client);
+      const sameConnection = { query, connect: async () => ({ query, release() {} }),
+        async end() {} } as unknown as Pool;
+      const { h, headers } = boxRouteHarness();
+      await resetPool(); // replace the harness fake before any request is sent
+      h.deps.pgPool = sameConnection;
+      setPoolOverride(sameConnection);
+      let modelCalls = 0;
+      h.deps.boxModel = { async fetch() { modelCalls++;
+        return sseResponse(200, makeFullSseChunks({ inputTok: 1000, outputTok: 5000 }));
+      } };
+      process.env.OC_BOX_MODEL_API = "1";
+      const request = { ...minBody(BOX_API_MODEL), max_tokens: 8192,
+        metadata: { user_id: JSON.stringify({ session_id: `web-box-pg-${randomUUID()}`,
+          oc_turn_key: randomBytes(32).toString("hex") }) } };
+      const res = await h.run(request, headers);
+      assert.equal(res.statusCode, 200, res.bodyText());
+      assert.equal(modelCalls, 1);
+      const usage = await client.query<{ request_id: string; cost_credits: string }>(
+        "SELECT request_id,cost_credits::text FROM usage_records");
+      const ledger = await client.query<{ delta: string }>(
+        "SELECT delta::text FROM credit_ledger WHERE user_id=$1", [FIXED_USER_ID]);
+      const wallet = await client.query<{ credits: string }>(
+        "SELECT credits::text FROM users WHERE id=$1", [FIXED_USER_ID]);
+      assert.equal(usage.rows.length, 1);
+      assert.equal(ledger.rows.length, 1);
+      const debit = BigInt(usage.rows[0]!.cost_credits);
+      assert.ok(debit > 0n);
+      assert.equal(BigInt(ledger.rows[0]!.delta), -debit);
+      assert.equal(BigInt(wallet.rows[0]!.credits), initialCredits - debit);
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+      client.release();
+      await pg.end();
     }
   });
 
