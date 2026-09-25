@@ -158,6 +158,22 @@ async function lock(client: PoolClient, keys: string[]): Promise<void> {
   }
 }
 
+/** Every multi-row transition and resume uses the session advisory lock
+ * before taking any row lock. The later FOR UPDATE must revalidate this peek. */
+async function lockChainSession(client: PoolClient, uid: bigint,
+  requestId: string): Promise<string> {
+  const found = await client.query<{ session_id: string }>(
+    `SELECT ctx->>'boxSessionId' AS session_id FROM request_finalize_journal
+      WHERE request_id=$1 AND user_id=$2`, [requestId, uid.toString()]);
+  const sessionId = found.rows[0]?.session_id;
+  if (found.rowCount !== 1 || typeof sessionId !== "string"
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) {
+    throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+  }
+  await lock(client, [`box:session:${uid}:${sessionId}`]);
+  return sessionId;
+}
+
 export class BoxDurableJournal implements BoxJournalPort {
   constructor(private readonly pool: Pick<Pool, "connect" | "query">) {}
 
@@ -704,6 +720,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     let committed = false;
     try {
       await client.query("BEGIN");
+      const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
       type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
       const rows: Row[] = [];
       const seen = new Set<string>();
@@ -737,6 +754,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const roundNo = basis.boxRoundNo;
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
         || Number(roundNo) > 32 || rows.length !== roundNo
+        || basis.boxSessionId !== lockedSessionId
         || current.state !== "inflight"
         || !["linked", "unknown"].includes(String(basis.boxState))
         || basis.boxToolHandoff !== undefined
@@ -813,6 +831,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     let committed = false;
     try {
       await client.query("BEGIN");
+      const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
       type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
       const rows: Row[] = [];
       const seen = new Set<string>();
@@ -849,6 +868,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
         || Number(roundNo) > 32 || rows.length !== roundNo
+        || basis.boxSessionId !== lockedSessionId
         || current.state !== "inflight"
         || !["linked", "unknown"].includes(String(basis.boxState))
         || basis.boxToolHandoff !== undefined

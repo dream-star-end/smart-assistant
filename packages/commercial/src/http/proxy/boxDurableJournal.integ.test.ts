@@ -29,9 +29,18 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     // Pin all journal operations to this one connection, whose temp table
     // shadows the real table. No shared schema or persistent row is touched.
     const privateMarker = "synthetic-private-marker";
+    let enforceChainLockOrder = false, sawSessionAdvisoryLock = false;
     const guardedQuery = async (sql: string, params: unknown[] = []) => {
       assert.ok(!JSON.stringify(params).includes(privateMarker),
         "raw tool arguments must never enter a PostgreSQL query parameter");
+      if (enforceChainLockOrder) {
+        if (sql.includes("pg_advisory_xact_lock")
+          && String(params[0]).startsWith("box:session:")) sawSessionAdvisoryLock = true;
+        if (sql.includes("request_finalize_journal") && sql.includes("FOR UPDATE")) {
+          assert.ok(sawSessionAdvisoryLock,
+            "multi-row terminal/cancel must take session lock before any row lock");
+        }
+      }
       return client.query(sql, params);
     };
     const sameConnection = { connect: async () => ({
@@ -400,8 +409,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         SET ctx=jsonb_set(ctx,ARRAY[$2::text],to_jsonb($3::text)) WHERE request_id=$1`,
       [id, key, secondRevision]);
     }
+    enforceChainLockOrder = true; sawSessionAdvisoryLock = false;
     await journal.completeToolChain({ requestId: `box-e-${suffix}`,
       uid: 3n, leaseEpoch: toolCall.leaseEpoch, proof: chainProof, usage: finalUsage });
+    assert.equal(sawSessionAdvisoryLock, true);
+    enforceChainLockOrder = false;
     const closed = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal
         WHERE request_id IN ($1,$2,$3) ORDER BY request_id`,
@@ -601,7 +613,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       verifiedPendingToolUseIds: ["toolu_A"] });
     await journal.claimToolResume({ requestId: `box-h-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: failedResumeBody });
+    enforceChainLockOrder = true; sawSessionAdvisoryLock = false;
     await journal.recordUserCancelIntent(failedChainRoot);
+    assert.equal(sawSessionAdvisoryLock, true);
+    enforceChainLockOrder = false;
     await journal.recordUserCancelIntent(failedChainRoot);
     const canceledChain = await client.query<{ request_id: string;
       ctx: Record<string, unknown> }>(
@@ -638,8 +653,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       requestId: failedChainRoot.requestId, uid: 3n,
       leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof }),
     /BOX_FAILED_STOP_CHAIN_INVALID/, "root with handoff is not an unbilled final row");
+    enforceChainLockOrder = true; sawSessionAdvisoryLock = false;
     await journal.markToolChainStoppedFailure({ requestId: `box-h-${suffix}`,
       uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof });
+    assert.equal(sawSessionAdvisoryLock, true);
+    enforceChainLockOrder = false;
     await journal.markToolChainStoppedFailure({ requestId: `box-h-${suffix}`,
       uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof });
     const failedChainRows = await client.query<{ request_id: string; state: string;
