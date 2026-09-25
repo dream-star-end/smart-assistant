@@ -121,7 +121,8 @@ function assistantContent(events: Event[]): Array<Record<string, unknown>> {
 async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   boxModel: AnthropicProxyDeps["boxModel"]; price: ModelPricing;
   containerId: number; bindHost?: string; containerInboundIp?: string;
-  assignedRequestIds?: readonly string[]; shapeOnly?: boolean }) {
+  listenPort?: number; assignedRequestIds?: readonly string[];
+  shapeOnly?: boolean }) {
   const diagnostics: Array<{ msg: string; code?: string; detail?: string }> = [];
   const pricing = new PricingCache();
   pricing._setForTests([args.price]);
@@ -260,7 +261,7 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, args.bindHost ?? "127.0.0.1", () => {
+    server.listen(args.listenPort ?? 0, args.bindHost ?? "127.0.0.1", () => {
       server.off("error", reject); resolve();
     });
   });
@@ -323,7 +324,7 @@ env["ANTHROPIC_BASE_URL"]=cfg["baseUrl"]
 env["ANTHROPIC_AUTH_TOKEN"]=cfg["authToken"]
 env["ANTHROPIC_CUSTOM_HEADERS"]="x-oc-local-catalog: "+cfg["catalogToken"]
 env["CLAUDE_CODE_EXTRA_METADATA"]=json.dumps({"oc_turn_key":cfg["turnKey"]})
-env["NO_PROXY"]="172.31.0.1,"+env.get("NO_PROXY","")
+env["NO_PROXY"]="127.0.0.1,localhost,"+env.get("NO_PROXY","")
 env.pop("ANTHROPIC_API_KEY",None)
 env.pop("CLAUDE_CODE_OAUTH_TOKEN",None)
 os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools.",
@@ -565,8 +566,10 @@ async function main(): Promise<void> {
     process.env.OC_BOX_MODEL_API = "1";
     process.env.OC_BOX_TOOL_BRIDGE = "1";
     loopback = await startSignedLoopback({ pool, redis, containerId,
-      ...(ccbPreflight ? { bindHost: "172.31.0.1",
-        containerInboundIp: owners.rows[0]!.bound_ip,
+      ...(ccbPreflight ? { bindHost: "127.0.0.1", listenPort: 31000,
+        // Existing key-authenticated host SSH tunnel terminates on loopback;
+        // no arbitrary host port is exposed across the Docker firewall.
+        containerInboundIp: "127.0.0.1",
         assignedRequestIds: [firstId, secondId], shapeOnly: true } : {}),
       boxModel: { toolBridgeReady: true, fetch: (args) => {
         transportCalls++;
@@ -576,7 +579,7 @@ async function main(): Promise<void> {
       } }, price });
     if (ccbPreflight) {
       ccbProcessUnconfirmed = true;
-      const result = await runContainerCcbPreflight({ baseUrl: loopback.baseUrl,
+      const result = await runContainerCcbPreflight({ baseUrl: "http://127.0.0.1:31002",
         authToken: loopback.authToken, catalogToken: loopback.catalogToken, turnKey });
       ccbProcessUnconfirmed = false;
       const observed = loopback.observedRequestIds();
