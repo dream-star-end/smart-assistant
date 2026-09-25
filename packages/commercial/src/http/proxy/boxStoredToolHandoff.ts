@@ -9,6 +9,7 @@ export interface BoxStoredToolHandoff {
   roundNo: number;
   messageId: string;
   assistantContentHash: string;
+  assistantEchoHash?: string;
   spoolOffset: number;
   detachedRunnerHash: string;
   catalogHash: string;
@@ -25,14 +26,19 @@ function dense(x: unknown[], max: number): boolean {
 }
 export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | null {
   if (!record(raw)
-    || Object.keys(raw).sort().join(",") !==
-      "assistantContentHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version"
+    || ![
+      "assistantContentHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
+      "assistantContentHash,assistantEchoHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
+    ].includes(Object.keys(raw).sort().join(","))
     || raw.version !== 1 || !Number.isSafeInteger(raw.roundNo)
     || Number(raw.roundNo) < 1 || Number(raw.roundNo) > 32
     || typeof raw.messageId !== "string" || raw.messageId.length < 1
     || raw.messageId.length > 128
     || typeof raw.assistantContentHash !== "string"
     || !/^[a-f0-9]{64}$/.test(raw.assistantContentHash)
+    || (raw.assistantEchoHash !== undefined
+      && (typeof raw.assistantEchoHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(raw.assistantEchoHash)))
     || !Number.isSafeInteger(raw.spoolOffset) || Number(raw.spoolOffset) < 1
     || Number(raw.spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
     || typeof raw.detachedRunnerHash !== "string"

@@ -100,6 +100,20 @@ export function hashBoxAssistantContent(content: unknown): string {
   return hasher.digest("hex");
 }
 
+/** Claude Code may omit prior thinking blocks from the next HTTP history when
+ * adaptive thinking display is omitted. The held Box CLI still owns its exact
+ * original thinking; only the non-thinking client echo is compared on resume.
+ * Text and tool_use remain fully bound, in order. */
+export function hashBoxAssistantEchoContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+  }
+  const echo = content.filter((block) => block && typeof block === "object"
+    && !Array.isArray(block) && block.type !== "thinking"
+    && block.type !== "redacted_thinking");
+  return hashBoxAssistantContent(echo);
+}
+
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
   if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");

@@ -2,7 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProxyBody } from "./shared.js";
 import { BoxCallFingerprintError, deriveBoxCallFingerprint,
-  deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerprint.js";
+  deriveBoxContextHash, hashBoxAssistantContent,
+  hashBoxAssistantEchoContent } from "./boxCallFingerprint.js";
+
+test("CCB omitted thinking matches only the original text and tool echo", () => {
+  const text = { type: "text", text: "synthetic pre-tool text" };
+  const tool = { type: "tool_use", id: "toolu_echo", name: "local_echo", input: {} };
+  const full = [{ type: "thinking", thinking: "synthetic", signature: "sig" }, text, tool];
+  assert.equal(hashBoxAssistantEchoContent(full), hashBoxAssistantContent([text, tool]));
+  assert.notEqual(hashBoxAssistantEchoContent(full), hashBoxAssistantContent([tool]));
+  assert.notEqual(hashBoxAssistantEchoContent(full),
+    hashBoxAssistantContent([{ ...text, text: "rewritten" }, tool]));
+});
 
 function body(turnKey = "a".repeat(64)): ProxyBody {
   return { model: "claude-opus-5-5", max_tokens: 128, stream: true,

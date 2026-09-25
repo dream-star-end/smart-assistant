@@ -513,6 +513,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       || candidate.messageId.length < 1 || candidate.messageId.length > 128
       || typeof candidate.assistantContentHash !== "string"
       || !/^[a-f0-9]{64}$/.test(candidate.assistantContentHash)
+      || (candidate.assistantEchoHash !== undefined
+        && (typeof candidate.assistantEchoHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(candidate.assistantEchoHash)))
       || ids.length < 1 || ids.length > 32 || new Set(ids).size !== ids.length
       || ids.some((id) => typeof id !== "string"
         || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))
@@ -545,6 +548,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
     const frozen = { version: 1, roundNo, messageId: candidate.messageId,
       assistantContentHash: candidate.assistantContentHash,
+      ...(candidate.assistantEchoHash === undefined ? {}
+        : { assistantEchoHash: candidate.assistantEchoHash }),
       spoolOffset: input.spoolOffset,
       detachedRunnerHash: input.detachedRunnerHash,
       catalogHash: input.catalogHash,
@@ -668,8 +673,17 @@ export class BoxDurableJournal implements BoxJournalPort {
       try {
         const assistant = effectiveBody.messages.at(-2) as
           { content?: unknown } | undefined;
-        if (!assistant || hashBoxAssistantContent(assistant.content)
-          !== handoff.assistantContentHash) {
+        if (!assistant) throw new Error("assistant message missing");
+        const fullHash = hashBoxAssistantContent(assistant.content);
+        const echoed = Array.isArray(assistant.content)
+          && assistant.content.every((block: unknown) => {
+            if (!block || typeof block !== "object" || Array.isArray(block)) return true;
+            const type = (block as Record<string, unknown>).type;
+            return type !== "thinking" && type !== "redacted_thinking";
+          });
+        if (fullHash !== handoff.assistantContentHash
+          && !(echoed && handoff.assistantEchoHash
+            && fullHash === handoff.assistantEchoHash)) {
           throw new Error("assistant message changed");
         }
       } catch {

@@ -7,7 +7,7 @@ import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  hashBoxAssistantContent } from "./boxCallFingerprint.js";
+  hashBoxAssistantContent, hashBoxAssistantEchoContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 
@@ -145,12 +145,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         clientName: "local_echo", input: { value: privateMarker } },
     ];
     const firstAssistantContent = [
+      { type: "thinking", thinking: "synthetic model reasoning", signature: "synthetic-signature" },
       { type: "text", text: "Box said A before calling tools" },
       ...firstToolUses.map((use) => ({ type: "tool_use", id: use.id,
         name: use.clientName, input: use.input })),
     ];
     const candidate = { messageId: "msg_box_tool_1", toolUses: firstToolUses,
       assistantContentHash: hashBoxAssistantContent(firstAssistantContent),
+      assistantEchoHash: hashBoxAssistantEchoContent(firstAssistantContent),
       inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
@@ -191,7 +193,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await put(`box-d-${suffix}`);
     const resumeBody = { ...firstBody, messages: [
         ...firstBody.messages,
-        { role: "assistant", content: firstAssistantContent },
+         { role: "assistant", content: firstAssistantContent.slice(1) },
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
           { type: "tool_result", tool_use_id: "toolu_A", content: "x".repeat(1_100_000) },
@@ -247,11 +249,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       ctx=jsonb_set(ctx,'{boxToolHandoff,verifiedPendingToolUseIds}',
         '["toolu_A"]'::jsonb) WHERE request_id=$1`, [toolCall.requestId]);
     for (const alteredContent of [
-      [{ type: "text", text: "Box said B before calling tools" },
-        ...firstAssistantContent.slice(1)],
-      firstAssistantContent.slice(1),
-      [{ type: "thinking", thinking: "inserted", signature: "sig" },
-        ...firstAssistantContent],
+       [{ type: "text", text: "Box said B before calling tools" },
+         ...firstAssistantContent.slice(2)],
+       firstAssistantContent.slice(2),
+       [{ type: "thinking", thinking: "inserted", signature: "sig" },
+         ...firstAssistantContent.slice(1)],
     ]) {
       await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
         uid: 3n, canonicalModel: basis.model,
