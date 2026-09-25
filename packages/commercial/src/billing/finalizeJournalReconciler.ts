@@ -365,6 +365,7 @@ export async function reconcileStuckFinalizeJournal(
             updated_at = NOW()
       WHERE rfj.state IN ('inflight', 'finalizing')
         AND COALESCE(rfj.ctx->>'durableBillingRecovery', '') <> $2
+        AND COALESCE(rfj.ctx->>'boxInvocationRecovery', '') <> 'v1'
         AND NOT EXISTS (
           SELECT 1 FROM usage_records ur
            WHERE ur.request_id = rfj.request_id AND ur.user_id = rfj.user_id
@@ -449,6 +450,7 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
          WHERE state IN ('committed', 'aborted')
            AND updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
            AND COALESCE(ctx->>'durableBillingRecovery', '') <> $3
+           AND COALESCE(ctx->>'boxInvocationRecovery', '') <> 'v1'
          ORDER BY updated_at ASC
          LIMIT $2
       )
@@ -494,7 +496,8 @@ export async function gcFinalizeJournal(olderThanMs: number, limit: number): Pro
 }
 
 export interface ReconcilerHandle {
-  stop(): void
+  /** Stops new ticks and waits for an already running tick before lease handoff. */
+  stop(): Promise<void>
   /** 测试/运维:立即跑一轮(reconcile + durable finalizing 老化告警 + 视 cadence 决定是否 GC)。与 interval tick 共用 running 守卫。 */
   runNow(): Promise<{
     committed: number
@@ -522,6 +525,8 @@ export interface ReconcilerOptions {
   onError?: (err: unknown) => void
   /** 测试注入:覆盖默认 DB 调用。 */
   reconcileFn?: () => Promise<ReconcileCounts>
+  /** Box 终态证据单独恢复；未接线时不改变现有 reconciler 行为。 */
+  boxRecoveryFn?: () => Promise<unknown>
   gcFn?: () => Promise<number>
   /** 测试注入:覆盖 durable finalizing 老化告警(返回命中行数)。 */
   alertStuckFinalizingFn?: () => Promise<number>
@@ -559,6 +564,8 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
 
   let stopped = false
   let running = false
+  let tickDone: Promise<void> | null = null
+  let resolveTickDone: (() => void) | null = null
   let lastGcAt = 0 // 0 → 首轮即 GC(部署后立即清历史终态行)
 
   async function runOneTick(): Promise<{
@@ -569,8 +576,9 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
     gc: number
   }> {
     // DB 卡时跳过重叠 tick
-    if (running) return { committed: 0, aborted: 0, durableWaived: 0, finalizingAlerted: 0, gc: 0 }
+    if (stopped || running) return { committed: 0, aborted: 0, durableWaived: 0, finalizingAlerted: 0, gc: 0 }
     running = true
+    tickDone = new Promise<void>((resolve) => { resolveTickDone = resolve })
     try {
       let committed = 0
       let aborted = 0
@@ -584,6 +592,12 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
         durableWaived = r.durableWaived
       } catch (err) {
         onError(err)
+      }
+      // 独立于 legacy timeout-abort。Box 只从已持久化的终止/用量/定价
+      // 证据结算，失败保留原行并在下一 tick 重试，绝不重放模型调用。
+      if (!stopped && opts.boxRecoveryFn) {
+        try { await opts.boxRecoveryFn() }
+        catch (err) { onError(err) }
       }
       // durable finalizing 老化告警(二级检测):独立 try —— 告警扫描失败不拖累 reconcile/GC。
       // 纯只读 + safeEnqueueAlert(fire-and-forget),不改任何行状态;dedupe 按行 id+天。
@@ -604,6 +618,9 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
       return { committed, aborted, durableWaived, finalizingAlerted, gc }
     } finally {
       running = false
+      resolveTickDone?.()
+      resolveTickDone = null
+      tickDone = null
     }
   }
 
@@ -618,6 +635,7 @@ export function startFinalizeJournalReconciler(opts: ReconcilerOptions = {}): Re
     stop() {
       stopped = true
       clearInterval(timer)
+      return tickDone ?? Promise.resolve()
     },
     runNow: runOneTick,
   }

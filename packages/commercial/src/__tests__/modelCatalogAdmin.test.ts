@@ -250,9 +250,11 @@ describe("model catalog admin — provider 机制集 parity(禁止第二份枚�
   test("ccbProviderIds() 的每个 id 都能被 proxy 的 selectUpstreamRoute 接受", () => {
     for (const id of ccbProviderIds()) {
       const route = selectUpstreamRoute("x", { providerId: id, upstreamModelId: "x" });
-      assert.ok(route.kind === "oauth" || route.kind === "static", `provider ${id} 无法路由`);
+      assert.ok(route.kind === "oauth" || route.kind === "static" || route.kind === "box",
+        `provider ${id} 无法路由`);
     }
     assert.ok(ccbProviderIds().includes(OAUTH_PROVIDER_ID));
+    assert.ok(ccbProviderIds().includes("box_cli"));
     assert.deepEqual(codexProviderIds(), ["codex"]);
   });
 
@@ -263,6 +265,26 @@ describe("model catalog admin — provider 机制集 parity(禁止第二份枚�
       UnroutableProviderError,
     );
   });
+});
+
+test("Box CLI model can be staged only with its narrow capability ceiling", () => {
+  const base = { model_id: "box-api-claude-opus-5-5", engine: "ccb",
+    provider_id: "box_cli", upstream_model_id: "claude-opus-5-5",
+    context_window: 200_000,
+    capability_profile: { supports_vision: false,
+      reasoning: { supported: [], codex_model_default: null },
+      ccb: { capability_zero: true, supports_thinking: false } } };
+  assert.deepEqual(validateVersionSemantics(normalizeVersionInput(base), true), []);
+  const vision = { ...base, capability_profile: { ...base.capability_profile,
+    supports_vision: true } };
+  assert.ok(validateVersionSemantics(normalizeVersionInput(vision), true)
+    .some((item) => item.includes("vision")));
+  assert.ok(validateVersionSemantics(normalizeVersionInput({ ...base,
+    model_id: "box-api-unconfigured" }), true)
+    .some((item) => item.includes("仅接线")));
+  assert.ok(validateVersionSemantics(normalizeVersionInput({ ...base,
+    upstream_model_id: "claude-opus-5" }), true)
+    .some((item) => item.includes("仅接线")));
 });
 
 describe("四面 capability 广播 + 步骤 5 兼容地板", () => {

@@ -1,0 +1,274 @@
+/** Real SQL outcome in one PG connection with TEMP shadow tables only.
+ * No migration, persistent financial write, or Box model invocation. */
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { Pool } from "pg";
+import { recoverBoxBillingRequest } from "./boxBillingRecovery.js";
+import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
+import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
+
+const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
+  ?? process.env.TEST_DATABASE_URL;
+test("terminal Box evidence settles once, with durable usage and turn locator",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl,
+    max: 1 });
+  const client = await pool.connect();
+  try {
+    // The PR shard's dedicated test DB starts with an empty public schema. An
+    // operator may instead point at selfhost's live schema, but both paths
+    // create ONLY session-local TEMP tables and never migrate/write public.
+    const names = ["request_finalize_journal", "usage_records", "pending_usage_patches",
+      "users", "user_subscriptions", "org_memberships", "orgs",
+      "org_subscriptions", "turn_waivers", "client_sessions", "chat_projects",
+      "credit_ledger"];
+    const source = await client.query<{ ready: boolean }>(
+      `SELECT bool_and(to_regclass('public.' || name) IS NOT NULL) AS ready
+         FROM unnest($1::text[]) AS name`, [names]);
+    const hasPublicSchema = source.rows[0]?.ready === true;
+    await client.query("CREATE TEMP SEQUENCE box_recovery_usage_id_seq");
+    if (hasPublicSchema) {
+      for (const name of names) {
+        await client.query(`CREATE TEMP TABLE ${name} (LIKE public.${name} INCLUDING ALL)`);
+      }
+    } else {
+      // Checked-in schema-only fixture, not a migration; all DDL is TEMP.
+      await client.query(readFileSync(new URL("./boxBillingRecoveryTempSchema.sql", import.meta.url), "utf8"));
+    }
+    await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_usage_id_seq'::regclass)");
+    // Every spend/organization relation is shadowed on the pinned connection.
+    // A coincidentally existing real subscription or org membership for this
+    // uid must never be read and, especially, never be UPDATEd by this test.
+    await client.query("CREATE TEMP SEQUENCE box_recovery_ledger_id_seq");
+    await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
+    const sameConnection = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as unknown as Pool;
+    const requestId = `box-recovery-${randomBytes(6).toString("hex")}`;
+    const userId = 900_000_000n, turnKey = "a".repeat(64);
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [userId.toString(), `${requestId}@example.invalid`]);
+    const shadow = await client.query<{ only_temp: boolean }>(
+      `SELECT 'user_subscriptions'::regclass = 'pg_temp.user_subscriptions'::regclass
+        AND 'org_memberships'::regclass = 'pg_temp.org_memberships'::regclass
+        AND 'orgs'::regclass = 'pg_temp.orgs'::regclass
+        AND 'org_subscriptions'::regclass = 'pg_temp.org_subscriptions'::regclass
+        AND 'turn_waivers'::regclass = 'pg_temp.turn_waivers'::regclass
+        AND 'client_sessions'::regclass = 'pg_temp.client_sessions'::regclass
+        AND 'chat_projects'::regclass = 'pg_temp.chat_projects'::regclass
+        AS only_temp`);
+    assert.equal(shadow.rows[0]?.only_temp, true);
+    // Same uid has an active subscription. The real spend path must debit only
+    // this TEMP row, not a coincidentally matching persistent subscription.
+    await client.query(`INSERT INTO user_subscriptions
+      (id,user_id,plan_code,period_end,period_credits)
+      VALUES (1,$1,'plus',NOW()+INTERVAL '1 day',1000)`, [userId.toString()]);
+    const nonce = "b".repeat(24), epoch = "c".repeat(32);
+    const ctx = { model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
+      boxState: "terminal", boxAccountId: "20", boxReplayFingerprint: "d".repeat(64),
+      boxTurnKey: turnKey, boxRunNonce: nonce, boxLeaseEpoch: epoch,
+      boxTerminalProof: { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101,
+        cliPid: 102, reason: "worker_complete", revision: 1 },
+      boxUsage: { inputTokens: 2, outputTokens: 3,
+        cacheReadTokens: 0, cacheWriteTokens: 0 },
+      billingPricing: { v: 1, modelId: "box-api-claude-opus-5-5", displayName: "Opus",
+        inputPerMtok: "100000000", outputPerMtok: "100000000",
+        cacheReadPerMtok: "100000000", cacheWritePerMtok: "100000000",
+        multiplier: "1" },
+      boxBillingContext: { v: 1, sessionId: "web-box-recovery", mode: "chat",
+        parentSessionId: null, delegateAgentId: null, turnKey, parentTurnKey: null,
+        authority: null, dispatchId: null, attemptNo: null,
+        verificationSponsorship: null, apiKeyId: null } };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+       VALUES ($1,$2,'inflight',$3::jsonb,0,NOW())`,
+    [requestId, userId.toString(), JSON.stringify(ctx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, requestId, userId), "pending",
+      "fresh live terminal evidence must honor the five-minute grace period");
+    await client.query(`UPDATE pg_temp.request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '10 minutes' WHERE request_id=$1`, [requestId]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, requestId, userId), "settled");
+    const usage = await client.query<{ request_id: string; cost_credits: string }>(
+      "SELECT request_id,cost_credits::text FROM usage_records WHERE request_id=$1", [requestId]);
+    assert.equal(usage.rows.length, 1);
+    assert.ok(BigInt(usage.rows[0]?.cost_credits ?? "0") > 0n);
+    const debited = await client.query<{ credits: string }>(
+      "SELECT credits::text FROM users WHERE id=$1", [userId.toString()]);
+    const balance = BigInt(debited.rows[0]?.credits ?? "0");
+    assert.equal(balance, 1000n, "active TEMP period bucket is spent before wallet");
+    const period = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM user_subscriptions WHERE user_id=$1", [userId.toString()]);
+    const periodAfter = BigInt(period.rows[0]?.period_credits ?? "0");
+    assert.ok(periodAfter < 1000n && periodAfter >= 0n);
+    const ledger = await client.query<{ delta: string }>(
+      "SELECT delta::text FROM credit_ledger WHERE user_id=$1", [userId.toString()]);
+    assert.equal(ledger.rows.length, 1);
+    assert.equal(BigInt(ledger.rows[0]!.delta), periodAfter - 1000n);
+    const locator = await client.query(
+      "SELECT request_id FROM pending_usage_patches WHERE request_id=$1", [requestId]);
+    assert.equal(locator.rows.length, 1);
+    const journal = await client.query<{ state: string }>(
+      "SELECT state FROM request_finalize_journal WHERE request_id=$1", [requestId]);
+    assert.equal(journal.rows[0]?.state, "committed");
+    assert.equal(await recoverBoxBillingRequest(sameConnection, requestId, userId),
+      "already_committed");
+    // Crash window: usage/ledger COMMIT succeeded, journal terminal CAS did not.
+    await client.query(`UPDATE request_finalize_journal SET state='inflight',
+      usage_id=NULL, ledger_id=NULL, final_credits=NULL WHERE request_id=$1`, [requestId]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, requestId, userId),
+      "already_committed", "permanent usage must repair the lagging journal");
+    const after = await client.query(
+      "SELECT request_id FROM usage_records WHERE request_id=$1", [requestId]);
+    assert.equal(after.rows.length, 1, "retry must not create a second usage record");
+    const afterBalance = await client.query<{ credits: string }>(
+      "SELECT credits::text FROM users WHERE id=$1", [userId.toString()]);
+    assert.equal(BigInt(afterBalance.rows[0]!.credits), balance,
+      "retry must not debit twice");
+    const afterPeriod = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM user_subscriptions WHERE user_id=$1", [userId.toString()]);
+    assert.equal(BigInt(afterPeriod.rows[0]!.period_credits), periodAfter);
+
+    // Same-UID org membership negative control: an active org subscription
+    // may exist outside this test, but all reads and debits resolve to TEMP.
+    const orgUser = 900_000_001n, orgRequest = `${requestId}-org`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`, [orgUser.toString(), `${orgRequest}@example.invalid`]);
+    await client.query("INSERT INTO orgs(id,name,credits) VALUES (1,'temp-only-org',1000)");
+    await client.query(`INSERT INTO org_memberships(org_id,user_id,billing_enabled)
+      VALUES (1,$1,true)`, [orgUser.toString()]);
+    await client.query(`INSERT INTO org_subscriptions
+      (id,org_id,plan_code,seats,period_end,period_credits)
+      VALUES (1,1,'team',1,NOW()+INTERVAL '1 day',1000)`);
+    const orgTurnKey = "e".repeat(64);
+    const orgCtx = { ...ctx, boxReplayFingerprint: "f".repeat(64),
+      boxTurnKey: orgTurnKey,
+      boxBillingContext: { ...ctx.boxBillingContext, sessionId: "web-org-recovery",
+        turnKey: orgTurnKey } };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [orgRequest, orgUser.toString(), JSON.stringify(orgCtx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, orgRequest, orgUser), "settled");
+    const orgPeriod = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM org_subscriptions WHERE org_id=1");
+    const orgAfter = BigInt(orgPeriod.rows[0]?.period_credits ?? "0");
+    assert.ok(orgAfter < 1000n && orgAfter >= 0n);
+    const orgWallet = await client.query<{ credits: string }>(
+      "SELECT credits::text FROM orgs WHERE id=1");
+    assert.equal(orgWallet.rows[0]?.credits, "1000");
+    assert.equal(await recoverBoxBillingRequest(sameConnection, orgRequest, orgUser),
+      "already_committed");
+    const orgPeriodAgain = await client.query<{ period_credits: string }>(
+      "SELECT period_credits::text FROM org_subscriptions WHERE org_id=1");
+    assert.equal(BigInt(orgPeriodAgain.rows[0]!.period_credits), orgAfter);
+
+    // A completed model tool message is billable even while the remote CLI
+    // remains alive for OpenClaude-local tool results. It must use this round's
+    // usage, never a later cumulative CLI terminal snapshot.
+    const toolUser = 900_000_002n, toolRequest = `${requestId}-tool`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [toolUser.toString(), `${toolRequest}@example.invalid`]);
+    const toolTurnKey = "5".repeat(64);
+    const toolCtx = { ...ctx, boxState: "handoff",
+      boxReplayFingerprint: "6".repeat(64), boxTurnKey: toolTurnKey,
+      boxTerminalProof: undefined, boxUsage: undefined,
+      boxHandoffRevision: "123e4567-e89b-42d3-a456-426614174000",
+      boxToolHandoff: { version: 1, roundNo: 1, messageId: "msg_tool", spoolOffset: 1234,
+        assistantContentHash: "d".repeat(64),
+        detachedRunnerHash: "f".repeat(64),
+        catalogHash: "e".repeat(64),
+        toolUses: [{ id: "toolu_one", boxName: "mcp__ocbridge__t0",
+          clientName: "local_echo", inputHash: hashBoxToolInput({ value: "ping" }) }],
+        verifiedPendingToolUseIds: ["toolu_one"],
+        usage: { inputTokens: 2, outputTokens: 3,
+          cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      boxBillingContext: { ...ctx.boxBillingContext, sessionId: "web-tool-recovery",
+        turnKey: toolTurnKey } };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+       VALUES ($1,$2,'inflight',$3::jsonb,0,NOW())`,
+    [toolRequest, toolUser.toString(), JSON.stringify(toolCtx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, toolRequest, toolUser), "pending",
+      "fresh handoff must not be recovered while its live finalizer can still own it");
+    await client.query(`UPDATE pg_temp.request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '10 minutes' WHERE request_id=$1`, [toolRequest]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, toolRequest, toolUser), "settled");
+    const toolUsage = await client.query<{ cost_credits: string }>(
+      "SELECT cost_credits::text FROM usage_records WHERE request_id=$1", [toolRequest]);
+    assert.equal(toolUsage.rows.length, 1);
+    assert.ok(BigInt(toolUsage.rows[0]!.cost_credits) > 0n);
+    const toolBalance = await client.query<{ credits: string }>(
+      "SELECT credits::text FROM users WHERE id=$1", [toolUser.toString()]);
+    assert.ok(BigInt(toolBalance.rows[0]!.credits) < 1000n);
+    const toolState = await client.query<{ box_state: string }>(
+      "SELECT ctx->>'boxState' AS box_state FROM request_finalize_journal WHERE request_id=$1",
+      [toolRequest]);
+    assert.equal(toolState.rows[0]?.box_state, "handoff",
+      "billing settlement must not release the live Box process/account fence");
+
+    // A later linked round can fail after this earlier handoff. Its stopped
+    // proof releases remote capacity, not the earlier completed message debt.
+    const stoppedUser = 900_000_004n, stoppedRequest = `${requestId}-stopped-handoff`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [stoppedUser.toString(), `${stoppedRequest}@example.invalid`]);
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [stoppedRequest, stoppedUser.toString(), JSON.stringify({ ...toolCtx,
+      boxState: "failed_stopped", boxStopOutcome: "failed",
+      boxReplayFingerprint: "7".repeat(64) })]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, stoppedRequest, stoppedUser),
+      "settled");
+    const stoppedUsage = await client.query<{ cost_credits: string }>(
+      "SELECT cost_credits::text FROM usage_records WHERE request_id=$1", [stoppedRequest]);
+    assert.equal(stoppedUsage.rows.length, 1);
+    assert.equal(stoppedUsage.rows[0]?.cost_credits, toolUsage.rows[0]?.cost_credits);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, stoppedRequest, stoppedUser),
+      "already_committed");
+
+    // Remote cleanup may keep failing while PG and financial settlement are
+    // healthy. Its private retry clock must not refresh billing updated_at.
+    const delayedUser = 900_000_003n, delayedRequest = `${requestId}-cleanup-clock`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [delayedUser.toString(), `${delayedRequest}@example.invalid`]);
+    await client.query(`INSERT INTO user_subscriptions
+      (id,user_id,plan_code,period_end,period_credits)
+      VALUES (2,$1,'plus',NOW()+INTERVAL '1 day',1000)`, [delayedUser.toString()]);
+    const delayedCtx = { ...ctx, boxInvocationMode: "detached_tool",
+      boxReplayFingerprint: "7".repeat(64) };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [delayedRequest, delayedUser.toString(), JSON.stringify(delayedCtx)]);
+    const journalPort = new BoxDurableJournal(sameConnection);
+    const cleanup = { requestId: delayedRequest, uid: delayedUser,
+      accountId: 20n, runNonce: nonce, leaseEpoch: epoch,
+      proof: { ...ctx.boxTerminalProof, reason: "worker_complete" as const,
+        revision: 1 as const } };
+    const before = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1", [delayedRequest]);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      assert.equal(await journalPort.claimRemoteCleanup(cleanup), true);
+      await client.query(`UPDATE request_finalize_journal
+        SET ctx=jsonb_set(ctx,'{boxRemoteCleanupRetryAfterMs}',
+          to_jsonb((EXTRACT(EPOCH FROM NOW()-INTERVAL '1 minute')*1000)::bigint))
+        WHERE request_id=$1`, [delayedRequest]);
+    }
+    const afterClaims = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1", [delayedRequest]);
+    assert.equal(afterClaims.rows[0]?.updated_at.getTime(), before.rows[0]?.updated_at.getTime());
+    assert.equal(await recoverBoxBillingRequest(sameConnection, delayedRequest, delayedUser),
+      "settled", "repeated failed remote cleanup must not starve billable proof");
+    const delayedUsage = await client.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM usage_records WHERE request_id=$1", [delayedRequest]);
+    assert.equal(delayedUsage.rows[0]?.n, "1");
+  } finally {
+    client.release();
+    await pool.end(); // TEMP tables and sequence vanish with this connection.
+  }
+});

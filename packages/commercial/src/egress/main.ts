@@ -24,6 +24,8 @@
 
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import IORedis from "ioredis";
 
 import { loadConfig } from "../config.js";
@@ -51,6 +53,13 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_UID,
 } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
+import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
+import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
+import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
+import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
+import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
+import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
@@ -226,6 +235,80 @@ export async function startEgress(): Promise<void> {
     DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
     Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
   );
+  // Off by default. Keep the same authenticated /v1/messages handler and
+  // OpenClaude user-container agent; Box owns only the supervised model call.
+  // Missing staged assets make egress refuse startup when explicitly enabled.
+  const boxResolver = process.env.OC_BOX_MODEL_API === "1"
+    ? createProductionBoxAccountResolver() : null;
+  const boxJournal = boxResolver ? new BoxDurableJournal(getPool()) : null;
+  const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {
+    uid: bigint; accountId: bigint; requestId: string; phase: string }) => {
+    log.error("box_model_outcome_unknown", { uid: uid.toString(),
+      accountId: accountId.toString(), requestId, phase });
+  };
+  const boxTextModel = boxResolver && boxJournal ? new BoxTextFetch({
+    supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
+    keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
+    registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
+      leaseMs: 900_000 }),
+    journal: boxJournal,
+    maxOutputTokensForModel: (model) =>
+      model === "box-api-claude-opus-5-5" ? 128_000 : null,
+    resolveTarget: (args) => boxResolver.resolve(args),
+    onUnknown: reportBoxUnknown,
+  }) : undefined;
+  // This second flag stays OFF until actual Box detached lifetime, multi-round
+  // live acceptance, remote cleanup/reconciliation and T2 review all pass.
+  const boxToolModel = boxResolver && boxJournal
+    && process.env.OC_BOX_MODEL_API === "1" && process.env.OC_BOX_TOOL_BRIDGE === "1"
+    ? new BoxToolFetch({
+      supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
+      keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
+      virtualMcpAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_virtual_mcp.py")),
+      detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
+      journal: boxJournal,
+      maxOutputTokensForModel: (model) =>
+        model === "box-api-claude-opus-5-5" ? 128_000 : null,
+      resolveTarget: (args) => boxResolver.resolve(args),
+      onUnknown: reportBoxUnknown,
+    }) : undefined;
+  const boxModel = boxTextModel ? {
+    toolBridgeReady: boxToolModel !== undefined,
+    fetch: (args: Parameters<BoxTextFetch["fetch"]>[0]) =>
+      args.canonicalBody.tools?.length && boxToolModel
+        ? boxToolModel.fetch(args) : boxTextModel.fetch(args),
+  } : undefined;
+  // The resolver retains failed private ProxyAgent closes across requests;
+  // retry only these proven pre-invocation orphans, never a remote unknown CLI.
+  const boxCleanupTimer = boxResolver && boxTextModel ? setInterval(() => {
+    void boxResolver.retryFailedAgentCleanup().catch(() =>
+      log.error("box_resolver_orphan_cleanup_failed"));
+    void boxTextModel.retryFailedOrphanCleanup().catch(() =>
+      log.error("box_target_orphan_cleanup_failed"));
+    void boxToolModel?.retryFailedCleanup().catch(() =>
+      log.error("box_tool_target_cleanup_failed"));
+    void boxToolModel?.retryTerminalCleanup().catch(() =>
+      log.error("box_tool_remote_cleanup_failed"));
+    void boxToolModel?.reconcileRemoteCleanup(10).catch(() =>
+      log.error("box_tool_remote_reconcile_failed"));
+  }, 60_000) : null;
+  boxCleanupTimer?.unref();
+  // A stop for an already-admitted Box run must remain available even after
+  // the model launch flag is turned OFF. It cannot create a new paid call.
+  const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
+  const boxStopJournal = boxJournal ?? new BoxDurableJournal(getPool());
+  const boxStopCoordinator = new BoxUserStopCoordinator({
+    journal: boxStopJournal,
+    resolver: boxStopResolver,
+  });
+  const boxStopHandler = makeBoxUserStopHandler({ identity: identityStrategy,
+    journal: boxStopJournal,
+    coordinator: boxStopCoordinator });
+  const boxStopCleanupTimer = setInterval(() => {
+    void boxStopCoordinator.retryFailedLocal().catch(() =>
+      log.error("box_stop_local_cleanup_failed"));
+  }, 60_000);
+  boxStopCleanupTimer.unref();
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -236,6 +319,7 @@ export async function startEgress(): Promise<void> {
     rateLimitRedis,
     concurrencyLimiter: sharedProxyConcurrency,
     fallbackLimiter: sharedProxyFallback,
+    boxModel,
     modelCatalog,
     modelAuthorityEnforce,
     // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。
@@ -344,6 +428,19 @@ export async function startEgress(): Promise<void> {
   const server = createHttpServer((req, res) => {
     const path = (req.url ?? "/").split("?")[0];
     const peerIp = req.socket.remoteAddress ?? "";
+    if (path === "/internal/box/stop") {
+      Promise.resolve(boxStopHandler(req, res, {
+        hostUuid: selfHostUuid, boundIp: peerIp,
+      })).catch((err) => {
+        log.error("box_stop_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: "INTERNAL" }));
+        } else try { res.destroy(); } catch { /* */ }
+      });
+      return;
+    }
     if (path === "/v1/messages") {
       Promise.resolve(
         proxyHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
@@ -600,6 +697,8 @@ export async function startEgress(): Promise<void> {
     shuttingDown = true;
     latencyProber?.stop();
     recoveryProber?.stop();
+    if (boxCleanupTimer) clearInterval(boxCleanupTimer);
+    clearInterval(boxStopCleanupTimer);
     void desktopTlsClose?.().catch(() => {});
     // eslint-disable-next-line no-console
     console.log(

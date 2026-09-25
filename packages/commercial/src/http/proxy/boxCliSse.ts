@@ -1,0 +1,287 @@
+/** Convert a completed, supervised Claude CLI stream-json call back to
+ * Anthropic Messages SSE. Visible block indexes are renumbered only after
+ * the reconstructed visible text matches the final CLI assistant snapshot.
+ * Tool handoffs need a separate live-path; this complete-call path forbids
+ * tool_use so it can never swallow a pending OpenClaude-local tool execution.
+ */
+export class BoxCliSseError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = "BoxCliSseError";
+  }
+}
+
+interface ObjectValue { [key: string]: unknown }
+function object(value: unknown): ObjectValue {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+  }
+  return value as ObjectValue;
+}
+function count(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new BoxCliSseError("BOX_CLI_USAGE_INVALID");
+  }
+  return value as number;
+}
+function usage(value: unknown): ObjectValue {
+  const parsed = object(value);
+  for (const key of ["input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens"]) {
+    if (parsed[key] !== undefined) count(parsed[key]);
+  }
+  return parsed;
+}
+
+export interface BoxCliSseResult {
+  sse: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
+/** Incremental decoder for supervised CLI JSONL. `message_stop` is withheld
+ * until the final CLI result validates, so the proxy usage observer cannot
+ * mistake a partial/failed CLI invocation for a completed billable response.
+ * Each push returns only newly validated SSE frames; it never replays a prefix.
+ */
+export function createBoxCliSseDecoder(expectedModel: string): {
+  push: (chunk: string) => string;
+  finish: () => BoxCliSseResult & { tailSse: string };
+} {
+  if (!expectedModel) {
+    throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+  }
+  let started = false, stopped = false, resultSeen = false, initSeen = false;
+  let inputTokens: number | null = null, outputTokens: number | null = null;
+  let cacheRead = 0, cacheCreation = 0, nextVisibleIndex = 0, lastOriginalIndex = -1;
+  let deltaPhase = false, assistantSeen = false, lastAssistantText = "";
+  let currentMessageId: string | null = null;
+  const assistantTexts: string[] = [];
+  let stopReason: string | null = null;
+  let activeBlock: { originalIndex: number; visibleIndex: number; type: string; text: string } | null = null;
+  const visibleTextParts: string[] = [];
+  const frames: string[] = [];
+  let pending = "", bytes = 0, finished = false, failed = false;
+  let splitHighSurrogate = "";
+  const heldTerminalFrames: string[] = [];
+  const processLine = (line: string): string => {
+    let emitted = "";
+    let record: ObjectValue;
+    try { record = object(JSON.parse(line)); }
+    catch { throw new BoxCliSseError("BOX_CLI_STREAM_INVALID"); }
+    if (resultSeen) throw new BoxCliSseError("BOX_CLI_RECORD_AFTER_RESULT");
+    const kind = record.type;
+    if (kind === "stream_event") {
+      const event = object(record.event);
+      let forwardedEvent: ObjectValue = event;
+      const eventType = event.type;
+      if (typeof eventType !== "string") throw new BoxCliSseError("BOX_CLI_EVENT_INVALID");
+      if (eventType === "message_start") {
+        if (started || !initSeen) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
+        const message = object(event.message);
+        if (message.model !== expectedModel) throw new BoxCliSseError("BOX_CLI_MODEL_MISMATCH");
+        if (message.role !== "assistant" || typeof message.id !== "string" || !message.id) {
+          throw new BoxCliSseError("BOX_CLI_MESSAGE_ID_INVALID");
+        }
+        currentMessageId = message.id;
+        if (!Array.isArray(message.content) || message.content.length !== 0) {
+          throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
+        }
+        const startUsage = usage(message.usage);
+        inputTokens = count(startUsage.input_tokens);
+        outputTokens = count(startUsage.output_tokens);
+        cacheRead = count(startUsage.cache_read_input_tokens ?? 0);
+        cacheCreation = count(startUsage.cache_creation_input_tokens ?? 0);
+        started = true;
+      } else if (eventType === "content_block_start") {
+        const index = event.index;
+        if (!started || stopped || deltaPhase || !Number.isSafeInteger(index)
+          || Number(index) < 0 || Number(index) <= lastOriginalIndex
+          || activeBlock !== null) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
+        const block = object(event.content_block);
+        if (block.type === "tool_use") throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
+        if (block.type !== "text" && block.type !== "thinking" && block.type !== "redacted_thinking") {
+          throw new BoxCliSseError("BOX_CLI_BLOCK_UNSUPPORTED");
+        }
+        if (block.type === "text" && typeof block.text !== "string") {
+          throw new BoxCliSseError("BOX_CLI_BLOCK_UNSUPPORTED");
+        }
+        activeBlock = { originalIndex: index as number, visibleIndex: nextVisibleIndex++,
+          type: block.type as string, text: block.type === "text" ? block.text as string : "" };
+        lastOriginalIndex = index as number;
+        forwardedEvent = { ...event, index: activeBlock.visibleIndex };
+      } else if (eventType === "content_block_delta" || eventType === "content_block_stop") {
+        const index = event.index;
+        if (!started || stopped || deltaPhase || activeBlock === null || activeBlock.originalIndex !== index) {
+          throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
+        }
+        forwardedEvent = { ...event, index: activeBlock.visibleIndex };
+        if (eventType === "content_block_stop") {
+          if (activeBlock.type === "text") visibleTextParts.push(activeBlock.text);
+          activeBlock = null;
+        } else {
+          const delta = object(event.delta);
+          if (!((activeBlock.type === "text" && delta.type === "text_delta" && typeof delta.text === "string")
+            || (activeBlock.type === "thinking" && delta.type === "thinking_delta"
+              && typeof delta.thinking === "string")
+            || (activeBlock.type === "thinking" && delta.type === "signature_delta"
+              && typeof delta.signature === "string"))) {
+            throw new BoxCliSseError("BOX_CLI_DELTA_INVALID");
+          }
+          if (activeBlock.type === "text") activeBlock.text += delta.text as string;
+        }
+      } else if (eventType === "message_delta") {
+        if (!started || stopped || activeBlock !== null) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
+        deltaPhase = true;
+        const reason = object(event.delta).stop_reason;
+        if (reason === "tool_use") throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
+        if (stopReason !== null && (reason === null || reason === undefined || reason !== stopReason)) {
+          throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
+        }
+        if (reason !== null && reason !== undefined) {
+          if (reason !== "end_turn" && reason !== "max_tokens" && reason !== "stop_sequence") {
+            throw new BoxCliSseError("BOX_CLI_STOP_REASON_UNSUPPORTED");
+          }
+          stopReason = reason;
+        }
+        const observed = usage(event.usage);
+        if ((observed.input_tokens !== undefined && count(observed.input_tokens) !== inputTokens)
+          || (observed.cache_read_input_tokens !== undefined
+            && count(observed.cache_read_input_tokens) !== cacheRead)
+          || (observed.cache_creation_input_tokens !== undefined
+            && count(observed.cache_creation_input_tokens) !== cacheCreation)) {
+          throw new BoxCliSseError("BOX_CLI_USAGE_MISMATCH");
+        }
+        const nextOutput = count(observed.output_tokens);
+        if (outputTokens !== null && nextOutput < outputTokens) {
+          throw new BoxCliSseError("BOX_CLI_USAGE_REGRESSION");
+        }
+        outputTokens = nextOutput;
+      } else if (eventType === "message_stop") {
+        if (!started || stopped || activeBlock !== null || stopReason === null) {
+          throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
+        }
+        stopped = true;
+      } else if (eventType !== "ping") {
+        throw new BoxCliSseError("BOX_CLI_EVENT_UNSUPPORTED");
+      }
+      const frame = `event: ${eventType}\ndata: ${JSON.stringify(forwardedEvent)}\n\n`;
+      // UsageObserver treats any message_delta with a stop_reason as final.
+      // Withhold it and message_stop until result, snapshot and text all prove
+      // successful, or a failed CLI could be charged as a completed response.
+      if (eventType === "message_stop"
+        || (eventType === "message_delta" && stopReason !== null)) {
+        heldTerminalFrames.push(frame);
+      }
+      else { frames.push(frame); emitted += frame; }
+    } else if (kind === "result") {
+      if (!stopped || resultSeen || record.subtype !== "success" || record.is_error !== false) {
+        throw new BoxCliSseError("BOX_CLI_RESULT_INVALID");
+      }
+      const finalUsage = usage(record.usage);
+      if (count(finalUsage.input_tokens) !== inputTokens
+        || count(finalUsage.output_tokens) !== outputTokens
+        || count(finalUsage.cache_read_input_tokens ?? 0) !== cacheRead
+        || count(finalUsage.cache_creation_input_tokens ?? 0) !== cacheCreation) {
+        throw new BoxCliSseError("BOX_CLI_USAGE_MISMATCH");
+      }
+      resultSeen = true;
+    } else if (kind === "system") {
+      if (record.subtype === "init") {
+        if (initSeen || started || !Array.isArray(record.tools) || record.tools.length !== 0
+          || !Array.isArray(record.mcp_servers) || record.mcp_servers.length !== 0) {
+          throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
+        }
+        initSeen = true;
+      }
+    } else if (kind === "assistant") {
+      const snapshot = object(record.message);
+      if (!started || snapshot.id !== currentMessageId || snapshot.model !== expectedModel
+        || snapshot.role !== "assistant") {
+        throw new BoxCliSseError("BOX_CLI_ASSISTANT_MISMATCH");
+      }
+      const content = snapshot.content;
+      if (!Array.isArray(content) || content.some((block) => {
+        if (!block || typeof block !== "object" || Array.isArray(block)) return true;
+        const type = (block as { type?: unknown }).type;
+        return type !== "text" && type !== "thinking" && type !== "redacted_thinking";
+      })) throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
+      assistantSeen = true;
+      lastAssistantText = content.filter((block) => block.type === "text")
+        .map((block) => {
+          if (typeof block.text !== "string") throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+          return block.text;
+        }).join("");
+      assistantTexts.push(lastAssistantText);
+    } else if (kind !== "rate_limit_event") {
+      throw new BoxCliSseError("BOX_CLI_RECORD_UNSUPPORTED");
+    }
+    return emitted;
+  };
+  const push = (chunk: string): string => {
+    if (finished || failed || typeof chunk !== "string") {
+      throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    }
+    try {
+      let measured = splitHighSurrogate + chunk;
+      splitHighSurrogate = "";
+      if (measured.length > 0) {
+        const last = measured.charCodeAt(measured.length - 1);
+        if (last >= 0xd800 && last <= 0xdbff) {
+          splitHighSurrogate = measured.slice(-1);
+          measured = measured.slice(0, -1);
+        }
+      }
+      bytes += Buffer.byteLength(measured);
+      if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+      pending += chunk;
+      let emitted = "";
+      for (;;) {
+        const index = pending.indexOf("\n");
+        if (index < 0) break;
+        const line = pending.slice(0, index).replace(/\r$/, "");
+        pending = pending.slice(index + 1);
+        if (line) emitted += processLine(line);
+      }
+      return emitted;
+    } catch (error) {
+      failed = true;
+      throw error;
+    }
+  };
+  const finish = (): BoxCliSseResult & { tailSse: string } => {
+    if (finished || failed) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    finished = true;
+    bytes += Buffer.byteLength(splitHighSurrogate);
+    if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+    let tailSse = pending ? processLine(pending) : "";
+    pending = "";
+    if (!started || !stopped || !resultSeen || inputTokens === null || outputTokens === null) {
+      throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
+    }
+    if (!assistantSeen || visibleTextParts.join("") !== lastAssistantText
+      || assistantTexts.some((text) => !lastAssistantText.startsWith(text))) {
+      throw new BoxCliSseError("BOX_CLI_TEXT_MISMATCH");
+    }
+    if (!heldTerminalFrames.some((frame) => frame.startsWith("event: message_stop\n"))) {
+      throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
+    }
+    frames.push(...heldTerminalFrames);
+    tailSse += heldTerminalFrames.join("");
+    return { sse: frames.join(""), inputTokens, outputTokens,
+      cacheReadTokens: cacheRead, cacheWriteTokens: cacheCreation, tailSse };
+  };
+  return { push, finish };
+}
+
+export function completedBoxCliToSse(stdout: string, expectedModel: string): BoxCliSseResult {
+  if (!stdout || Buffer.byteLength(stdout) > 1_048_576) {
+    throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
+  }
+  const decoder = createBoxCliSseDecoder(expectedModel);
+  decoder.push(stdout);
+  const { sse, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens } = decoder.finish();
+  return { sse, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+}

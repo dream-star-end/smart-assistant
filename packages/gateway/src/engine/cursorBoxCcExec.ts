@@ -159,7 +159,7 @@ export function boxCcControlSummary(control: BoxCcControl): {
 }
 
 export interface ExecFrame {
-  kind: 'stdout' | 'stderr' | 'exit'
+  kind: 'stdout' | 'stderr' | 'exit' | 'end'
   data?: string
   code?: number
 }
@@ -192,6 +192,77 @@ export function parseExecFrames(buffer: Buffer): { events: ExecFrame[]; rest: Bu
       const code = (exit as { exitCode?: unknown; exit_code?: unknown }).exitCode
         ?? (exit as { exit_code?: unknown }).exit_code
       events.push({ kind: 'exit', code: typeof code === 'number' ? code : 0 })
+    }
+  }
+  return { events, rest: buffer.subarray(offset) }
+}
+
+/** Strict decoder for paid Box model API traffic. The older CLI bridge keeps
+ * its permissive parser for compatibility; this variant never silently drops
+ * a malformed frame and then treats a later exit=0 as a complete response.
+ */
+export function parseExecFramesStrict(buffer: Buffer): { events: ExecFrame[]; rest: Buffer } {
+  const events: ExecFrame[] = []
+  const utf8 = new TextDecoder('utf-8', { fatal: true })
+  const own = (value: Record<string, unknown>, key: string): boolean =>
+    Object.prototype.hasOwnProperty.call(value, key)
+  let offset = 0
+  while (offset + 5 <= buffer.length) {
+    const flag = buffer[offset]
+    const length = buffer.readUInt32BE(offset + 1)
+    if (length < 2 || length > 8 * 1024 * 1024) throw new Error('BOX_EXEC_FRAME_LENGTH_INVALID')
+    if (offset + 5 + length > buffer.length) break
+    let record: Record<string, unknown>
+    try {
+      const value: unknown = JSON.parse(utf8.decode(buffer.subarray(offset + 5, offset + 5 + length)))
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid')
+      record = value as Record<string, unknown>
+    } catch { throw new Error('BOX_EXEC_FRAME_JSON_INVALID') }
+    offset += 5 + length
+    if (flag === 2) {
+      // Connect streaming end envelope. The real Box currently emits `{}`;
+      // error/metadata variants must be explicitly understood before use.
+      if (Object.keys(record).length !== 0) throw new Error('BOX_EXEC_END_INVALID')
+      events.push({ kind: 'end' })
+      continue
+    }
+    if (flag !== 0) throw new Error('BOX_EXEC_FRAME_FLAGS_INVALID')
+    for (const [camel, snake] of [
+      ['stdoutEvent', 'stdout_event'], ['stderrEvent', 'stderr_event'], ['exitEvent', 'exit_event'],
+    ]) {
+      if (own(record, camel) && own(record, snake)) throw new Error('BOX_EXEC_FRAME_ALIAS_CONFLICT')
+    }
+    const stdout = record.stdoutEvent ?? record.stdout_event
+    const stderr = record.stderrEvent ?? record.stderr_event
+    const exit = record.exitEvent ?? record.exit_event
+    const variants = Number(stdout !== undefined) + Number(stderr !== undefined) + Number(exit !== undefined)
+    if (variants !== 1) throw new Error('BOX_EXEC_FRAME_VARIANT_INVALID')
+    if (stdout !== undefined || stderr !== undefined) {
+      const value = stdout ?? stderr
+      if (!value || typeof value !== 'object' || Array.isArray(value)
+        || typeof (value as { data?: unknown }).data !== 'string') {
+        throw new Error('BOX_EXEC_FRAME_DATA_INVALID')
+      }
+      events.push({ kind: stdout !== undefined ? 'stdout' : 'stderr',
+        data: (value as { data: string }).data })
+    } else {
+      if (!exit || typeof exit !== 'object' || Array.isArray(exit)) {
+        throw new Error('BOX_EXEC_FRAME_EXIT_INVALID')
+      }
+      if (own(exit as Record<string, unknown>, 'exitCode')
+        && own(exit as Record<string, unknown>, 'exit_code')) {
+        throw new Error('BOX_EXEC_FRAME_ALIAS_CONFLICT')
+      }
+      const code = (exit as { exitCode?: unknown; exit_code?: unknown }).exitCode
+        ?? (exit as { exit_code?: unknown }).exit_code
+      // Proto3 JSON omits scalar defaults: the real Box emits exitEvent:{}
+      // for a successful exit 0. A non-empty object without a numeric code
+      // is not that canonical default and must not be treated as success.
+      const normalizedCode = code === undefined && Object.keys(exit).length === 0 ? 0 : code
+      if (!Number.isSafeInteger(normalizedCode) || Number(normalizedCode) < 0 || Number(normalizedCode) > 255) {
+        throw new Error('BOX_EXEC_FRAME_EXIT_INVALID')
+      }
+      events.push({ kind: 'exit', code: normalizedCode as number })
     }
   }
   return { events, rest: buffer.subarray(offset) }

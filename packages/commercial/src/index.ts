@@ -52,6 +52,10 @@ import {
   type CursorExternalApiOutbox,
 } from "./billing/cursorExternalApiOutbox.js";
 import { closePool, createPool, getPool } from "./db/index.js";
+import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
+import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
+import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
+import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
 import {
   assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool,
@@ -6152,6 +6156,12 @@ export async function registerCommercial(
   // 阈值向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min)；durable Codex 另用 ≥24h
   // evidence SLA，且只豁免无 usage 的 inflight，绝不抢 finalizing owner。
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
+    // Local ProxyAgent cleanup state must outlive a temporary loss of shared
+    // leadership. Only the scheduler starts/stops on each leader term.
+    const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+      journal: new BoxDurableJournal(getPool()),
+      resolver: createProductionBoxAccountResolver(),
+    });
     leaderBundle.add({
       name: "finalizeReconciler",
       domain: "shared",
@@ -6174,6 +6184,15 @@ export async function registerCommercial(
           intervalMs,
           thresholdMs,
           durableWaiverAgeMs,
+          boxRecoveryFn: async () => {
+            const results = await Promise.allSettled([
+              reconcileBoxBillingBatch(getPool()),
+              boxRemoteCleanup.reconcileBatch(10),
+            ]);
+            if (results.some((result) => result.status === "rejected")) {
+              throw new Error("BOX_RECOVERY_PARTIAL_FAILURE");
+            }
+          },
         }));
         return { stop: () => h.stop() };
       },

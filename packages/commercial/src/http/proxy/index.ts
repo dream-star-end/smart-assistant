@@ -40,6 +40,8 @@ import {
   makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
+import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
+import { serializeBoxBillingContext } from "./boxBillingContext.js";
 import {
   resolveAuthorityTurnDispatchSponsorship,
   admitVerificationSponsorship,
@@ -110,6 +112,8 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
+import { validateBoxRequest } from "./boxRequestGate.js";
+import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -776,11 +780,17 @@ export function makeAnthropicProxyHandler(
         ? gate.descriptor.capabilityProfile.supportsVision
         : route.kind === "static"
           ? route.provider.supportsVision === true
-          : true;
+          : route.kind !== "box";
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
+        boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
       });
       if (cfgErr) {
+        if (cfgErr.kind === "box_not_configured") {
+          incrAnthropicProxyReject("model_config_invalid");
+          sendJsonError(res, 503, "MODEL_NOT_AVAILABLE", "model not available", requestId);
+          return;
+        }
         // cfgErr.kind === "static_not_configured" —— 由 provider 的 commercial 语义映射决定
         // 503 错误码 + reject metric(deepseek/minimax/ark 各自一套，新增 provider 零改本处)。
         const meta = STATIC_PROVIDER_META[cfgErr.providerId];
@@ -797,6 +807,21 @@ export function makeAnthropicProxyHandler(
           requestId,
         );
         return;
+      }
+      if (route.kind === "box") {
+        if (containerIdBig === null) {
+          incrAnthropicProxyReject("unauthorized_model");
+          sendJsonError(res, 403, "NOT_AUTHORIZED", "model not authorized", requestId);
+          return;
+        }
+        const unsupported = validateBoxRequest(body,
+          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true);
+        if (unsupported) {
+          userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
+          incrAnthropicProxyReject("bad_body");
+          sendJsonError(res, 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported", requestId);
+          return;
+        }
       }
 
       // 5d) Phase 5 platform envelope rewriter(2026-05-21,外接 ApiKey 路径
@@ -1348,12 +1373,30 @@ export function makeAnthropicProxyHandler(
           ...(dispatchIdentity
             ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
             : {}),
-          ctxJson: buildProxyJournalCtxJson({
+          ctxJson: { ...buildProxyJournalCtxJson({
             runtimeKind: deps.runtimeKind,
             gate,
             dispatchIdentity,
             turnKey: attribution.turnKey ?? undefined,
-          }),
+          }), ...(route.kind === "box" ? {
+            boxInvocationRecovery: "v1",
+            billingPricing: serializeBillingPricing(pricing),
+            boxBillingContext: serializeBoxBillingContext({
+              sessionId, mode: attribution.mode,
+              parentSessionId: attribution.parentSessionId,
+              delegateAgentId: attribution.delegateAgentId,
+              turnKey: attribution.turnKey,
+              parentTurnKey: attribution.parentTurnKey,
+              authority: gate ? { kind: gate.authorityKind,
+                executionRevision: gate.executionRevision,
+                projectionRevision: gate.projectionRevision,
+                securityEpoch: gate.securityEpoch } : null,
+              dispatchId: dispatchIdentity?.dispatchId ?? null,
+              attemptNo: dispatchIdentity?.attemptNo ?? null,
+              verificationSponsorship,
+              apiKeyId: identity.apiKey?.id ?? null,
+            }),
+          } : {}) },
         });
         if (!admitted) {
           await releaseUpstreamSession(
@@ -1405,6 +1448,9 @@ export function makeAnthropicProxyHandler(
       // 广播与 finalize ledger 提取出不同结果(Codex plan v3 修订 J 锁定)。
       // 归因键已提取完毕 → 从 user_id JSON 剥掉 oc_ 内部键再转发上游
       // (内部会话拓扑不出代理;普通 chat 请求无 oc_ 键,原串零改写)。
+      // Box 的服务端 replay fingerprint 必须绑定清洗前的 canonical 请求。
+      // 仅内部 transport 消费这份深拷贝；实际上游 body 仍照常清洗。
+      const boxCanonicalBody = route.kind === "box" ? structuredClone(body) : null;
       if (body.metadata?.user_id !== undefined) {
         body.metadata.user_id = stripUsageAttributionKeys(body.metadata.user_id);
       }
@@ -1462,7 +1508,16 @@ export function makeAnthropicProxyHandler(
       // SSE 透传 + finalize + post-commit 广播 + zeroize。release 责任已在 finalize。
       await runUpstreamRoundTrip({
         pgPool: deps.pgPool,
-        fetchFn,
+        fetchFn: route.kind === "box"
+          ? ((url: string, init: RequestInit) => {
+              if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel || !boxCanonicalBody) {
+                throw new Error("BOX_FETCH_NOT_CONFIGURED");
+              }
+              return deps.boxModel.fetch({ uid, sessionId, requestId,
+                canonicalModel: boxCanonicalBody.model, canonicalBody: boxCanonicalBody,
+                upstreamModel: session.upstreamModel, url, init });
+            }) as typeof fetch
+          : fetchFn,
         appendCostCredits: deps.appendCostCredits,
         broadcastToUser: deps.broadcastToUser,
         req,
@@ -1471,6 +1526,7 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        noHistoryRewriteRetry: route.kind === "box",
         quotaProbeProviderId,
         finalize,
         sessionId,

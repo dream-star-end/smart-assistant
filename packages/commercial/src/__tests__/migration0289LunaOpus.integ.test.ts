@@ -10,7 +10,7 @@ import path from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { contextFamilyCollapsedByDefault } from '../../../protocol/src/engineModels.ts'
+import { contextFamilyCollapsedByDefault } from '../../../protocol/src/engineModels.js'
 import { query } from '../db/queries.js'
 import { resetAndMigrateBefore, useDedicatedTestDatabase } from './helpers/db.js'
 

@@ -28,6 +28,8 @@ import {
   pickUpstream,
   providerCapabilityCeiling,
   selectUpstreamRoute,
+  validateUpstreamConfig,
+  BOX_INTERNAL_ENDPOINT,
   type PickUpstreamDeps,
 } from "../http/proxy/upstream.js";
 import { rootLogger } from "../logging/logger.js";
@@ -59,6 +61,26 @@ function body(model: string) {
 }
 
 describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
+  test("Box CLI only routes from signed catalog hint, never legacy OAuth fallback", async () => {
+    assert.throws(() => selectUpstreamRoute("box-api-claude-opus-5-5"),
+      (error: unknown) => error instanceof UnroutableProviderError
+        && error.providerId === "box_cli_authority_required");
+    const route = selectUpstreamRoute("box-api-claude-opus-5-5", {
+      providerId: "box_cli", upstreamModelId: "claude-opus-5-5",
+    });
+    assert.deepEqual(route, { kind: "box", upstreamModel: "claude-opus-5-5" });
+    assert.deepEqual(providerCapabilityCeiling(route), { supportsVision: false, efforts: [] });
+    assert.deepEqual(validateUpstreamConfig(route, { boxConfigured: false }),
+      { kind: "box_not_configured" });
+    assert.equal(validateUpstreamConfig(route, { boxConfigured: true }), null);
+    const picked = await pickUpstream(NOOP_DEPS, body("box-api-claude-opus-5-5"), route, log);
+    assert.ok(picked.ok);
+    assert.equal(picked.session.endpoint, BOX_INTERNAL_ENDPOINT);
+    assert.equal(picked.session.upstreamModel, "claude-opus-5-5");
+    assert.equal(picked.session.accountId, null);
+    assert.equal(picked.session.slotId, null);
+  });
+
   test("hint.provider_id 决定 provider 机制,与 model 字面量无关", () => {
     // 一个 matchesRoute 完全不认识的 model id(新上架模型),catalog 说它归 ark。
     const route = selectUpstreamRoute("brand-new-model-2027", {

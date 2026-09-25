@@ -115,6 +115,8 @@ export interface RoundTripCtx {
   uid: bigint;
   body: ProxyBody;
   session: PreparedUpstreamSession;
+  /** Box CLI calls are non-replayable: never strip signed history and invoke it again. */
+  noHistoryRewriteRetry?: boolean;
   /** Set only for the one request that atomically won an expired quota probe lease. */
   quotaProbeProviderId: string | null;
   finalize: FinalizerHandle;
@@ -263,7 +265,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       } catch {
         upstreamErrorPreview = "";
       }
-      if (isProviderBoundHistoryError(upstreamErrorPreview)) {
+      if (!ctx.noHistoryRewriteRetry && isProviderBoundHistoryError(upstreamErrorPreview)) {
         const stripped = stripProviderBoundAssistantBlocks(upstreamMessages);
         if (stripped.blocksStripped > 0) {
           userLog.info("proxy_provider_bound_history_retry", {

@@ -74,7 +74,7 @@ export function consultAdvisorResultFromGateway(res: ConsultGatewayResponse): Co
   if (res.statusCode >= 400) {
     const parsed = parseConsultAdvisorBody(text)
     const message = typeof parsed?.error === 'string' ? parsed.error.trim() : ''
-    if (message) return { kind: 'error', text: message, parsed }
+    if (message) return { kind: 'error', text: message, parsed: parsed ?? undefined }
     return { kind: 'error', text: `consult_advisor failed (${res.statusCode}): ${text.slice(0, 2000)}` }
   }
   const parsed = parseConsultAdvisorBody(text)

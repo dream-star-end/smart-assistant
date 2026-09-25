@@ -6894,7 +6894,8 @@ export class SessionManager {
           }
 
           try {
-            runner.interrupt()
+            runner.interrupt(status === 'interrupted' && errorCode === 'USER_CANCELLED'
+              ? 'user' : 'system')
           } catch {}
 
           // Give a cooperative interrupt one short window to produce its own
@@ -7225,6 +7226,13 @@ export class SessionManager {
               result.errorDetail?.includes('"result":"codex app-server exited code=') === true))
             ? requestedTerminal
             : null
+        const systemInterruptionOverride =
+          requestedTerminal?.status === 'interrupted' &&
+          requestedTerminal.errorCode === 'SYSTEM_INTERRUPT' &&
+          (result?.stopReason === 'interrupted' ||
+            ccbUserCancellationResult || engineUserCancellationResult)
+            ? requestedTerminal
+            : null
         if (userCancellationOverride && terminalEngineBilling?.status === 'error') {
           // A forced Codex app-server shutdown reports a generic CODEX_ERROR
           // because the runner cannot know why its process was killed. At
@@ -7237,7 +7245,8 @@ export class SessionManager {
           }
         }
         let terminalOverride =
-          (requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride) ??
+          (requestedTerminal?.waiveReason ? requestedTerminal
+            : userCancellationOverride ?? systemInterruptionOverride) ??
           (modelAuthorityFailure
             ? {
                 status: 'crashed' as const,
@@ -7977,18 +7986,20 @@ export class SessionManager {
     })
   }
 
-  interrupt(sessionKey: string): boolean {
+  interrupt(sessionKey: string, reason: 'user' | 'system' = 'system'): boolean {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
     const external = s._externalTurnAbort
     if (external && !external.signal.aborted) external.abort()
     const persistActiveTurn = s._persistActiveTurn
     if (persistActiveTurn) {
-      const persistence = persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
+      const persistence = reason === 'user'
+        ? persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
+        : persistActiveTurn('interrupted', '本轮因系统调度中断。', 'SYSTEM_INTERRUPT')
       this._trackPersistence(persistence)
       return true
     }
-    const runnerInterrupted = s.runner.interrupt()
+    const runnerInterrupted = s.runner.interrupt(reason)
     return !!external || runnerInterrupted
   }
 
@@ -7997,7 +8008,7 @@ export class SessionManager {
   interruptExact(sessionKey: string, turnKey: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._currentTurnKey !== turnKey) return false
-    return this.interrupt(sessionKey)
+    return this.interrupt(sessionKey, 'user')
   }
 
   /** Browser Stop fence: only interrupt the turn that owns this exact
@@ -8005,7 +8016,7 @@ export class SessionManager {
   interruptClientTurn(sessionKey: string, clientMessageId: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._runningClientMessageId !== clientMessageId) return false
-    return this.interrupt(sessionKey)
+    return this.interrupt(sessionKey, 'user')
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {
