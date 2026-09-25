@@ -21,7 +21,8 @@ import type { ProxyBody } from
 
 const UID = 3n, ACCOUNT_ID = 20n;
 const MODEL = "box-api-claude-opus-5-5", UPSTREAM = "claude-opus-5-5";
-const EVIDENCE_DIR = "/var/lib/openclaude/ocv5-289-box-operator";
+const EVIDENCE_PARENT = "/var/lib/openclaude";
+const EVIDENCE_DIR = `${EVIDENCE_PARENT}/ocv5-289-box-operator`;
 const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-20.json`;
 type Event = { event: string; data: Record<string, unknown> };
 function assertion(ok: unknown, code: string): asserts ok {
@@ -108,8 +109,8 @@ async function main(): Promise<void> {
   let identityPersisted = false;
   let lockHeld = false;
   let tempReady = false;
-  const syncDirectory = (): void => {
-    const fd = openSync(EVIDENCE_DIR, constants.O_RDONLY | constants.O_DIRECTORY
+  const syncDirectory = (path = EVIDENCE_DIR): void => {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY
       | constants.O_NOFOLLOW);
     try { fsyncSync(fd); } finally { closeSync(fd); }
   };
@@ -140,10 +141,17 @@ async function main(): Promise<void> {
     identityPersisted = true;
   };
   try {
+    const parent = lstatSync(EVIDENCE_PARENT);
+    assertion(parent.isDirectory() && !parent.isSymbolicLink()
+      && parent.uid === process.getuid()
+      && (parent.mode & 0o777) === 0o700,
+    "BOX_TOOL_EVIDENCE_PARENT_INVALID");
     try { mkdirSync(EVIDENCE_DIR, { mode: 0o700 }); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
+    // Persist the newly-created child directory entry as well as files in it.
+    syncDirectory(EVIDENCE_PARENT);
     const directory = lstatSync(EVIDENCE_DIR);
     assertion(directory.isDirectory() && !directory.isSymbolicLink()
       && directory.uid === process.getuid()
