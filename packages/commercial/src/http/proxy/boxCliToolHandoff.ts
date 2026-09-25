@@ -100,7 +100,9 @@ export class BoxCliToolHandoffDecoder {
   private lastOriginalIndex = -1;
   private active: ActiveBlock | null = null;
   private blocks: CompletedBlock[] = [];
-  private snapshot: Obj | null = null;
+  /** Claude Code can emit one assistant snapshot per completed content block
+   * (Opus 5.5: [thinking], then [tool_use]) or a cumulative prefix. */
+  private readonly snapshots: Obj[][] = [];
   private heldTerminal: string[] = [];
   private candidate: BoxToolHandoffCandidate | null = null;
   private finalCandidate: BoxToolFinalCandidate | null = null;
@@ -237,12 +239,18 @@ export class BoxCliToolHandoffDecoder {
     if (record.type === "system" || record.type === "rate_limit_event") return "";
     if (record.type === "assistant") {
       const snapshot = obj(record.message);
+      const content = snapshot.content;
       if (!this.started || snapshot.id !== this.messageId
         || snapshot.model !== this.expectedModel || snapshot.role !== "assistant"
-        || !Array.isArray(snapshot.content)) {
+        || !Array.isArray(content) || content.length > 32
+        || this.snapshots.length >= 128
+        || Array.from({ length: content.length }, (_, i) => i)
+          .some((i) => !Object.hasOwn(content, i)
+            || !content[i] || typeof content[i] !== "object"
+            || Array.isArray(content[i]))) {
         throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_INVALID");
       }
-      this.snapshot = snapshot;
+      this.snapshots.push(structuredClone(content) as Obj[]);
       return "";
     }
     if (record.type === "result") {
@@ -434,16 +442,27 @@ export class BoxCliToolHandoffDecoder {
   }
 
   private verifySnapshot(): void {
-    const content = this.snapshot?.content;
-    if (!Array.isArray(content) || content.length !== this.blocks.length) {
+    if (this.snapshots.length === 0) {
       throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }
-    for (let i = 0; i < this.blocks.length; i++) {
-      const observed = obj(content[i]);
-      const block = this.blocks[i]!;
-      if (!isDeepStrictEqual(observed, block.upstream)) {
+    let covered = 0;
+    for (const content of this.snapshots) {
+      if (content.length === 0) continue;
+      const cumulative = content.length >= covered
+        && content.length <= this.blocks.length
+        && content.every((observed, i) =>
+          isDeepStrictEqual(observed, this.blocks[i]?.upstream));
+      const segment = covered + content.length <= this.blocks.length
+        && content.every((observed, i) =>
+          isDeepStrictEqual(observed, this.blocks[covered + i]?.upstream));
+      if (cumulative) covered = content.length;
+      else if (segment) covered += content.length;
+      else {
         throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
       }
+    }
+    if (covered !== this.blocks.length) {
+      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }
   }
 

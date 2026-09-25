@@ -100,6 +100,54 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
       && error.code === "BOX_TOOL_HANDOFF_NOT_READY");
 });
 
+test("Opus 5.5 segmented assistant snapshots preserve thinking then local tool_use", () => {
+  const thought = { type: "thinking", thinking: "private-thought", signature: "signed" };
+  const tool = use("toolu_segmented_opus55");
+  const source = [
+    { type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] },
+    event({ type: "message_start", message: { id: "msg_segmented", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    event({ type: "content_block_start", index: 0,
+      content_block: { type: "thinking", thinking: "" } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "thinking_delta", thinking: "private-thought" } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "signature_delta", signature: "signed" } }),
+    { type: "assistant", message: { id: "msg_segmented", model,
+      role: "assistant", content: [thought] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "content_block_start", index: 1,
+      content_block: { type: "tool_use", id: tool.id, name: boxName, input: {} } }),
+    event({ type: "content_block_delta", index: 1,
+      delta: { type: "input_json_delta", partial_json: '{"value":"same"}' } }),
+    { type: "assistant", message: { id: "msg_segmented", model,
+      role: "assistant", content: [tool] } },
+    event({ type: "content_block_stop", index: 1 }),
+    event({ type: "message_delta", delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 8, input_tokens: 2 } }),
+    event({ type: "message_stop" }),
+  ];
+  const valid = new BoxCliToolHandoffDecoder(model, catalog);
+  for (const line of lines(source)) valid.push(line);
+  assert.deepEqual(valid.push("").candidate?.toolUses.map((item) =>
+    [item.clientName, item.input.value]), [["Bash", "same"]]);
+  const firstContentType = (item: unknown): string | undefined =>
+    (item as { message?: { content?: Array<{ type?: string }> } })
+      .message?.content?.[0]?.type;
+  for (const changed of [
+    source.filter((item) => !(item.type === "assistant"
+      && firstContentType(item) === "thinking")),
+    source.map((item) => item.type === "assistant"
+      && firstContentType(item) === "tool_use"
+      ? { ...item, message: { ...((item as { message?: object }).message ?? {}),
+        content: [{ ...tool, input: { value: "changed" } }] } } : item),
+  ]) {
+    const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+    assert.throws(() => { for (const line of lines(changed)) decoder.push(line); },
+      /BOX_TOOL_SNAPSHOT_MISMATCH/);
+  }
+});
+
 test("handoff digest binds the full visible assistant text before tool_use", () => {
   const tool = use("toolu_text_then_tool");
   const source = [
