@@ -2,8 +2,8 @@
  * TEMP journal: no migration, no live billing row, no user content. A paid or
  * side-effecting operation is never replayed on an ambiguous result. */
 import { randomBytes } from "node:crypto";
-import { constants, closeSync, fsyncSync, openSync, readFileSync, readdirSync,
-  unlinkSync, writeSync } from "node:fs";
+import { constants, closeSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { Pool } from "pg";
 import { BoxDurableJournal } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
@@ -21,6 +21,8 @@ import type { ProxyBody } from
 
 const UID = 3n, ACCOUNT_ID = 20n;
 const MODEL = "box-api-claude-opus-5-5", UPSTREAM = "claude-opus-5-5";
+const EVIDENCE_DIR = "/var/lib/openclaude/ocv5-289-box-operator";
+const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-20.json`;
 type Event = { event: string; data: Record<string, unknown> };
 function assertion(ok: unknown, code: string): asserts ok {
   if (!ok) throw new Error(code);
@@ -94,33 +96,25 @@ async function main(): Promise<void> {
     || getRuntimeChannel() !== "v5") throw new Error("BOX_TOOL_FETCH_ACK_REQUIRED");
   const databaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL;
   assertion(!!databaseUrl, "BOX_TOOL_TEMP_DB_REQUIRED");
-  assertion(!readdirSync(process.cwd()).some((name) =>
-    /^\.ocv5-289-box-tool-attempt-[a-f0-9]{24}\.json$/.test(name)),
-  "BOX_TOOL_PRIOR_UNKNOWN_REQUIRES_RECONCILIATION");
   const pool = new Pool({ connectionString: databaseUrl, max: 1 });
   const client = await pool.connect();
   const nonce = randomBytes(12).toString("hex");
   const sessionId = `ocv5-289-live-${nonce}`;
   const turnKey = randomBytes(32).toString("hex");
   const firstId = `box-live-a-${nonce}`, secondId = `box-live-b-${nonce}`;
-  const evidencePath = `${process.cwd()}/.ocv5-289-box-tool-attempt-${nonce}.json`;
   const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
   let localExecutions = 0, unknownPhase: string | null = null;
   let terminal = false;
   let identityPersisted = false;
+  let lockHeld = false;
+  let tempReady = false;
   const syncDirectory = (): void => {
-    const fd = openSync(process.cwd(), constants.O_RDONLY | constants.O_DIRECTORY
+    const fd = openSync(EVIDENCE_DIR, constants.O_RDONLY | constants.O_DIRECTORY
       | constants.O_NOFOLLOW);
     try { fsyncSync(fd); } finally { closeSync(fd); }
   };
-  const persistIdentity = (input: BoxJournalAdmission): void => {
-    assertion(!identityPersisted && input.requestId === firstId && input.uid === UID
-      && input.accountId === ACCOUNT_ID, "BOX_TOOL_ATTEMPT_IDENTITY_INVALID");
-    const raw = JSON.stringify({ v: 1, accountId: String(ACCOUNT_ID), uid: String(UID),
-      firstId, secondId, sessionId, runNonce: input.runNonce,
-      leaseEpoch: input.leaseEpoch, state: "unresolved",
-      createdAt: new Date().toISOString() }) + "\n";
-    const fd = openSync(evidencePath, constants.O_WRONLY | constants.O_CREAT
+  const writeDurable = (path: string, raw: string): void => {
+    const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT
       | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
       const bytes = Buffer.from(raw);
@@ -131,14 +125,46 @@ async function main(): Promise<void> {
       }
       fsyncSync(fd);
     } finally { closeSync(fd); }
+  };
+  const persistIdentity = (input: BoxJournalAdmission): void => {
+    assertion(lockHeld && !identityPersisted && input.requestId === firstId && input.uid === UID
+      && input.accountId === ACCOUNT_ID, "BOX_TOOL_ATTEMPT_IDENTITY_INVALID");
+    const raw = JSON.stringify({ v: 1, accountId: String(ACCOUNT_ID), uid: String(UID),
+      firstId, secondId, sessionId, runNonce: input.runNonce,
+      leaseEpoch: input.leaseEpoch, state: "unresolved",
+      createdAt: new Date().toISOString() }) + "\n";
+    const staged = `${EVIDENCE_PATH}.${nonce}.part`;
+    writeDurable(staged, raw);
+    renameSync(staged, EVIDENCE_PATH);
     syncDirectory();
     identityPersisted = true;
   };
   try {
+    try { mkdirSync(EVIDENCE_DIR, { mode: 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const directory = lstatSync(EVIDENCE_DIR);
+    assertion(directory.isDirectory() && !directory.isSymbolicLink()
+      && directory.uid === process.getuid()
+      && (directory.mode & 0o777) === 0o700,
+    "BOX_TOOL_EVIDENCE_DIR_INVALID");
+    try {
+      writeDurable(EVIDENCE_PATH, JSON.stringify({ v: 1,
+        accountId: String(ACCOUNT_ID), uid: String(UID), firstId, secondId,
+        state: "preparing", createdAt: new Date().toISOString() }) + "\n");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error("BOX_TOOL_PRIOR_UNKNOWN_REQUIRES_RECONCILIATION");
+      }
+      throw error;
+    }
+    syncDirectory(); lockHeld = true;
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
       ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
+    tempReady = true;
     const query = async (sql: string, params: unknown[] = []) => {
       assertion(!JSON.stringify(params).includes(localResult), "BOX_TOOL_PRIVATE_SQL_LEAK");
       return client.query(sql, params);
@@ -234,7 +260,7 @@ async function main(): Promise<void> {
     assertion(pendingCleanup === 0 && cleanupRow.rows[0]?.cleanup === "done",
       "BOX_TOOL_PROBE_CLEANUP_UNPROVEN");
     assertion(identityPersisted, "BOX_TOOL_PROBE_IDENTITY_NOT_DURABLE");
-    unlinkSync(evidencePath); syncDirectory();
+    unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
     process.stdout.write(JSON.stringify({ accountId: String(ACCOUNT_ID),
       modelId: UPSTREAM, detachedAcrossHttp: true,
       localToolExecutions: localExecutions,
@@ -242,15 +268,23 @@ async function main(): Promise<void> {
       firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
       remoteCleanupDone: true, unknown: false, tempOnly: true }) + "\n");
   } catch (error) {
-    const observed = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
-      `SELECT request_id,ctx FROM request_finalize_journal
-       WHERE request_id IN ($1,$2)`, [firstId, secondId]).catch(() => ({ rows: [] }));
+    if (lockHeld && !identityPersisted) {
+      // The durable admission wrapper has not run, so no paid CLI can have
+      // started. Release this prelaunch-only reservation, still fail the probe.
+      try { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; }
+      catch { /* Keep a conservative unknown lock on cleanup failure. */ }
+    }
+    const observed = tempReady
+      ? await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+        `SELECT request_id,ctx FROM request_finalize_journal
+         WHERE request_id IN ($1,$2)`, [firstId, secondId]).catch(() => ({ rows: [] }))
+      : { rows: [] as Array<{ request_id: string; ctx: Record<string, unknown> }> };
     const evidence = observed.rows.map((row) => ({ requestId: row.request_id,
       state: row.ctx.boxState, runNonce: row.ctx.boxRunNonce,
       leaseEpoch: row.ctx.boxLeaseEpoch }));
     process.stderr.write(JSON.stringify({ code: error instanceof Error
       && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "BOX_TOOL_PROBE_FAILED",
-      terminal, unknownPhase, evidencePath: identityPersisted ? evidencePath : null,
+      terminal, unknownPhase, evidencePath: lockHeld ? EVIDENCE_PATH : null,
       evidence }) + "\n");
     throw error;
   } finally {
