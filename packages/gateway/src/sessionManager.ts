@@ -7160,6 +7160,13 @@ export class SessionManager {
               result.errorDetail?.includes('"result":"codex app-server exited code=') === true))
             ? requestedTerminal
             : null
+        const systemInterruptionOverride =
+          requestedTerminal?.status === 'interrupted' &&
+          requestedTerminal.errorCode === 'SYSTEM_INTERRUPT' &&
+          (result?.stopReason === 'interrupted' ||
+            ccbUserCancellationResult || engineUserCancellationResult)
+            ? requestedTerminal
+            : null
         if (userCancellationOverride && terminalEngineBilling?.status === 'error') {
           // A forced Codex app-server shutdown reports a generic CODEX_ERROR
           // because the runner cannot know why its process was killed. At
@@ -7172,7 +7179,8 @@ export class SessionManager {
           }
         }
         let terminalOverride =
-          (requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride) ??
+          (requestedTerminal?.waiveReason ? requestedTerminal
+            : userCancellationOverride ?? systemInterruptionOverride) ??
           (modelAuthorityFailure
             ? {
                 status: 'crashed' as const,
@@ -7934,7 +7942,7 @@ export class SessionManager {
   interruptExact(sessionKey: string, turnKey: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._currentTurnKey !== turnKey) return false
-    return this.interrupt(sessionKey)
+    return this.interrupt(sessionKey, 'user')
   }
 
   /** Browser Stop fence: only interrupt the turn that owns this exact
