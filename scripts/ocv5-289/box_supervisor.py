@@ -339,7 +339,7 @@ def main() -> int:
     ack_read, ack_write = os.pipe()
     try:
         child = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--gated", str(gate_read), *command],
+            [sys.executable, "-I", os.path.abspath(__file__), "--gated", str(gate_read), *command],
             stdin=stdin_fd if stdin_fd is not None else subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True,
             preexec_fn=lambda: child_setup(parent_pid), close_fds=True, pass_fds=(gate_read,),
@@ -391,7 +391,7 @@ def main() -> int:
             startup_expired = True
             raise RuntimeError("START_DEADLINE")
         watcher = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--watchdog", str(watch_read), str(ack_write), str(child.pid)],
+            [sys.executable, "-I", os.path.abspath(__file__), "--watchdog", str(watch_read), str(ack_write), str(child.pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, close_fds=True, pass_fds=(watch_read, ack_write),
         )

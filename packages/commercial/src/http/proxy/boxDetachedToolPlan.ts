@@ -32,8 +32,11 @@ export function makeBoxDetachedToolPlan(input: {
   const access = makeBoxDetachedRunAccess({ runNonce: base.runNonce, detachedRunnerHash });
   const runnerPath = access.runnerPath;
   const stageDetachedRunner = makeBoxAssetStage(detachedRunnerAsset, runnerPath).request;
+  // The pinned runner owns the interpreter invocation. Do not pass Python's
+  // -I switch as its first business argument (which must be the keeper path).
+  if (base.run.args[0] !== "-I") throw new Error("BOX_DETACHED_PYTHON_ISOLATION_MISSING");
   const launch: BoxCcExecRequest = makeBoxPinnedRunnerRequest({ runnerPath,
-    detachedRunnerHash, args: [base.cwd, ...base.run.args], cwd: base.cwd,
+    detachedRunnerHash, args: [base.cwd, ...base.run.args.slice(1)], cwd: base.cwd,
     environment: base.run.environment });
   // Only after nonce/epoch-bound remote terminal proof: stdout/stderr contain
   // model output and must be removed with the private input/catalog files.
