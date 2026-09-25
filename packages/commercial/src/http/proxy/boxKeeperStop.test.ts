@@ -26,12 +26,19 @@ test("stop binds a live keeper by nonce, epoch, pinned PID and cwd", async () =>
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
     }
     assert.ok(existsSync(`${run}/ready`));
+    const request = makeBoxKeeperStop(nonce, epoch);
+    const premature = spawnSync(request.command, request.args, { cwd: request.cwd,
+      encoding: "utf8", timeout: 5000 });
+    assert.equal(premature.status, 125, "no handshake means no signal");
+    assert.equal(child.exitCode, null);
+    writeFileSync(`${proof}/stop.ready`, JSON.stringify({ runNonce: nonce,
+      leaseEpoch: epoch, keeperPid: child.pid, cliPid: child.pid,
+      revision: 1 }) + "\n", { mode: 0o600 });
     const wrong = makeBoxKeeperStop(nonce, "c".repeat(32));
     const refused = spawnSync(wrong.command, wrong.args, { cwd: wrong.cwd,
       encoding: "utf8", timeout: 5000 });
     assert.equal(refused.status, 125);
     assert.equal(child.exitCode, null, "wrong epoch cannot signal the keeper");
-    const request = makeBoxKeeperStop(nonce, epoch);
     const stopped = spawnSync(request.command, request.args, { cwd: request.cwd,
       encoding: "utf8", timeout: 5000 });
     assert.equal(stopped.status, 0, stopped.stderr);

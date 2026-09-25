@@ -113,6 +113,12 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual((result['runNonce'], result['leaseEpoch'], result['reason'],
                           result['revision']), (proof.name[-24:], epoch, 'worker_complete', 1))
         self.assertEqual(result['keeperPid'], proc.pid)
+        ready_file = proof / 'stop.ready'
+        self.assertEqual(ready_file.stat().st_mode & 0o777, 0o600)
+        ready = json.loads(ready_file.read_text())
+        self.assertEqual((ready['runNonce'], ready['leaseEpoch'], ready['keeperPid'],
+                          ready['cliPid'], ready['revision']),
+                         (proof.name[-24:], epoch, proc.pid, result['cliPid'], 1))
 
     def test_failed_cli_has_distinct_stop_proof_after_full_reap(self) -> None:
         options, proof, epoch = self.proof_args()

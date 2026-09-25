@@ -96,6 +96,37 @@ def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str,
         os.close(directory)
 
 
+def publish_stop_ready(proof_dir: str, epoch: str, cli_pid: int) -> None:
+    """A stop request may signal us only after our handler and pidfd exist.
+
+    Publish before opening the CLI execution gate. This is readiness, never
+    terminal evidence and never permission to release capacity.
+    """
+    info = os.lstat(proof_dir)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise ValueError("PROOF_DIR_INVALID")
+    record = {"runNonce": PROOF_DIR.fullmatch(proof_dir)[1],
+        "leaseEpoch": epoch, "keeperPid": os.getpid(), "cliPid": cli_pid,
+        "revision": 1}
+    content = (json.dumps(record, sort_keys=True,
+        separators=(",", ":")) + "\n").encode("ascii")
+    directory = os.open(proof_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open("stop.ready", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=directory)
+        try:
+            written = 0
+            while written < len(content):
+                written += os.write(fd, content[written:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def verify_supervisor(path: str) -> bool:
     match = SUPERVISOR_PATH.fullmatch(path)
     if not match or os.path.realpath(path) != path:
@@ -284,8 +315,10 @@ def main() -> int:
                 pidfd = os.pidfd_open(cli_pid, 0)
                 if os.getpgid(cli_pid) != cli_pid:
                     raise OSError(errno.EINVAL, "CLI is not process-group leader")
+                if proof_dir is not None:
+                    publish_stop_ready(proof_dir, epoch, cli_pid)
                 os.write(ack_write, b"K")
-            except OSError:
+            except (OSError, ValueError):
                 worker.terminate()
         os.close(ack_write)
         ack_write = -1
