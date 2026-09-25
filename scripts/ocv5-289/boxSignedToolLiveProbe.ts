@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { hostname } from "node:os";
 import { constants, closeSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
+  fchownSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import type { Pool } from "pg";
 import { Redis } from "ioredis";
 import { BoxDurableJournal } from
@@ -52,6 +52,8 @@ import type { ProxyBody } from
 
 const UID = 3n, ACCOUNT_ID = 20n;
 const MODEL = "box-api-claude-opus-5-5", UPSTREAM = "claude-opus-5-5";
+const WORK_HOST = "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-289-box-api";
+const WORK_CONTAINER = "/home/agent/.openclaude/workspace/ocv5-289-box-api";
 const EVIDENCE_PARENT = "/var/lib/openclaude";
 const EVIDENCE_DIR = `${EVIDENCE_PARENT}/ocv5-289-box-operator`;
 const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-20.json`;
@@ -387,13 +389,15 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
 /** No adapter or remote execution layer: run the installed Claude Code CLI in
  * the existing uid3 container. Credentials travel over docker-exec stdin and
  * are never printed, put in argv, or written to a persistent file. */
-async function runContainerCcbPreflight(input: { baseUrl: string;
-  authToken: string; catalogToken: string; turnKey: string }): Promise<{
+async function runContainerCcbProbe(input: { baseUrl: string;
+  authToken: string; catalogToken: string; turnKey: string;
+  prompt?: string; expectedMarker?: string; deadlineSeconds?: number }): Promise<{
   exitCode: number; stdoutBytes: number; stderrBytes: number;
   stderrTail: string; stdoutEvents: Array<{ type: unknown;
     subtype: unknown; keys: string[] }>;
   initSummary: { model: unknown; apiKeySource: unknown; permissionMode: unknown;
-    memoryPathCount: number; skillCount: number; toolCount: number } | null }> {
+    memoryPathCount: number; skillCount: number; toolCount: number } | null;
+  toolUseCount: number; exactResult: boolean }> {
   const python = `import json,os,sys
 cfg=json.load(sys.stdin)
 env=os.environ.copy()
@@ -404,25 +408,28 @@ env["CLAUDE_CODE_EXTRA_METADATA"]=json.dumps({"oc_turn_key":cfg["turnKey"]})
 env["NO_PROXY"]="127.0.0.1,localhost,"+env.get("NO_PROXY","")
 env.pop("ANTHROPIC_API_KEY",None)
 env.pop("CLAUDE_CODE_OAUTH_TOKEN",None)
-os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools.",
+os.execvpe("claude",["claude","-p",cfg["prompt"],
   "--model","box-api-claude-opus-5-5","--tools","Read",
   "--allowedTools","Read","--output-format","stream-json","--verbose",
   "--no-session-persistence"],env)
 `;
   const child = spawn("docker", ["exec", "-i", "--user", "1000:1000",
     "--workdir", "/home/agent/.openclaude/workspace/ocv5-289-box-api",
-    "oc-v5-u3", "/usr/bin/timeout", "-s", "TERM", "-k", "5s", "30s",
+    "oc-v5-u3", "/usr/bin/timeout", "-s", "TERM", "-k", "5s",
+    `${input.deadlineSeconds ?? 30}s`,
     "python3", "-I", "-c", python],
   { stdio: ["pipe", "pipe", "pipe"] });
-  const cfg = JSON.stringify(input);
+  const cfg = JSON.stringify({ baseUrl: input.baseUrl, authToken: input.authToken,
+    catalogToken: input.catalogToken, turnKey: input.turnKey,
+    prompt: input.prompt ?? "Reply with exactly READY. Do not use tools." });
   child.stdin.end(cfg);
   let stdoutBytes = 0, stderrBytes = 0;
-  let stdoutTail = "";
+  const stdoutChunks: Buffer[] = [];
   let stderrTail = "";
   let outputExceeded = false;
   child.stdout.on("data", (chunk: Buffer) => {
     stdoutBytes += chunk.length;
-    stdoutTail = (stdoutTail + chunk.toString("utf8")).slice(-32_768);
+    if (stdoutBytes <= 2_000_000) stdoutChunks.push(Buffer.from(chunk));
     if (stdoutBytes > 2_000_000) {
       outputExceeded = true; child.kill("SIGTERM");
     }
@@ -436,7 +443,7 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
   });
   let hostTimedOut = false;
   const timeout = setTimeout(() => { hostTimedOut = true; child.kill("SIGTERM"); },
-    45_000);
+    (input.deadlineSeconds ?? 30) * 1000 + 15_000);
   try {
     const closed = await new Promise<{ code: number; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.once("error", reject);
@@ -445,7 +452,8 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
     if (hostTimedOut || outputExceeded || closed.signal !== null) {
       throw new Error("BOX_CCB_PROCESS_UNCONFIRMED");
     }
-    const stdoutEvents = stdoutTail.split("\n").filter(Boolean).slice(-20).map((line) => {
+    const stdoutRaw = Buffer.concat(stdoutChunks).toString("utf8");
+    const stdoutEvents = stdoutRaw.split("\n").filter(Boolean).slice(-20).map((line) => {
       try {
         const value = JSON.parse(line) as Record<string, unknown>;
         return { type: value.type, subtype: value.subtype,
@@ -455,7 +463,9 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
     let initSummary: { model: unknown; apiKeySource: unknown;
       permissionMode: unknown; memoryPathCount: number; skillCount: number;
       toolCount: number } | null = null;
-    for (const line of stdoutTail.split("\n")) {
+    const toolUseIds = new Set<string>();
+    let exactResult = false;
+    for (const line of stdoutRaw.split("\n")) {
       try {
         const value = JSON.parse(line) as Record<string, unknown>;
         if (value.type === "system" && value.subtype === "init") {
@@ -465,10 +475,25 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
             skillCount: Array.isArray(value.skills) ? value.skills.length : 0,
             toolCount: Array.isArray(value.tools) ? value.tools.length : 0 };
         }
+        if (value.type === "assistant" && value.message
+          && typeof value.message === "object" && !Array.isArray(value.message)) {
+          const blocks = (value.message as { content?: unknown }).content;
+          if (Array.isArray(blocks)) for (const block of blocks) {
+            if (block && typeof block === "object" && "type" in block
+              && "name" in block && "id" in block
+              && block.type === "tool_use" && block.name === "Read"
+              && typeof block.id === "string") {
+              toolUseIds.add(block.id);
+            }
+          }
+        }
+        if (value.type === "result" && input.expectedMarker !== undefined
+          && typeof value.result === "string"
+          && value.result.trim() === input.expectedMarker) exactResult = true;
       } catch { /* No raw CLI content enters the report. */ }
     }
     return { exitCode: closed.code, stdoutBytes, stderrBytes,
-      stdoutEvents, initSummary,
+      stdoutEvents, initSummary, toolUseCount: toolUseIds.size, exactResult,
       stderrTail: stderrTail.replaceAll(input.authToken, "[synthetic-auth]")
         .replaceAll(input.catalogToken, "[synthetic-catalog]").slice(-300) };
   } finally { clearTimeout(timeout); }
@@ -497,10 +522,13 @@ async function main(): Promise<void> {
   const firstId = `box-signed-a-${nonce}`, secondId = `box-signed-b-${nonce}`;
   const challenge = `probe-${randomBytes(8).toString("hex")}`;
   const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
+  const fixtureHostPath = `${WORK_HOST}/.ocv5-289-read-${nonce}.txt`;
+  const fixtureContainerPath = `${WORK_CONTAINER}/.ocv5-289-read-${nonce}.txt`;
   let localExecutions = 0, unknownPhase: string | null = null;
   let terminal = false;
   let identityPersisted = false;
   let lockHeld = false;
+  let fixtureCreated = false;
   let ccbProcessUnconfirmed = false;
   let dbReady = false;
   let loopback: Awaited<ReturnType<typeof startSignedLoopback>> | null = null;
@@ -638,16 +666,19 @@ async function main(): Promise<void> {
     });
     const preflightOnly = process.env.OCV5_289_SIGNED_PREFLIGHT_ONLY === "1";
     const ccbPreflight = process.env.OCV5_289_CCB_PREFLIGHT_ONLY === "1";
+    const ccbLive = process.env.OCV5_289_CCB_LIVE_ACK === "1";
+    assertion(Number(preflightOnly) + Number(ccbPreflight) + Number(ccbLive) <= 1,
+      "BOX_SIGNED_PROBE_MODE_CONFLICT");
     let transportCalls = 0;
     let paidCalls = 0;
     process.env.OC_BOX_MODEL_API = "1";
     process.env.OC_BOX_TOOL_BRIDGE = "1";
     loopback = await startSignedLoopback({ pool, redis, containerId,
-      ...(ccbPreflight ? { bindHost: "127.0.0.1", listenPort: 31000,
+      ...(ccbPreflight || ccbLive ? { bindHost: "127.0.0.1", listenPort: 31000,
         // Existing key-authenticated host SSH tunnel terminates on loopback;
         // no arbitrary host port is exposed across the Docker firewall.
         containerInboundIp: "127.0.0.1",
-        assignedRequestIds: [firstId, secondId], shapeOnly: true } : {}),
+        assignedRequestIds: [firstId, secondId], shapeOnly: ccbPreflight } : {}),
       boxModel: { toolBridgeReady: true, fetch: (args) => {
         transportCalls++;
         if (preflightOnly || ccbPreflight) throw new Error("BOX_PREFLIGHT_TRANSPORT_CALLED");
@@ -656,7 +687,7 @@ async function main(): Promise<void> {
       } }, price });
     if (ccbPreflight) {
       ccbProcessUnconfirmed = true;
-      const result = await runContainerCcbPreflight({ baseUrl: "http://127.0.0.1:31002",
+      const result = await runContainerCcbProbe({ baseUrl: "http://127.0.0.1:31002",
         authToken: loopback.authToken, catalogToken: loopback.catalogToken, turnKey });
       ccbProcessUnconfirmed = false;
       const observed = loopback.observedRequestIds();
@@ -683,6 +714,92 @@ async function main(): Promise<void> {
         stderrBytes: result.stderrBytes,
         shapes: loopback.shapes,
         diagnostics: loopback.diagnostics.slice(-12) }) + "\n");
+      return;
+    }
+    if (ccbLive) {
+      const work = lstatSync(WORK_HOST);
+      assertion(process.cwd() === WORK_HOST && work.isDirectory()
+        && !work.isSymbolicLink(), "BOX_CCB_FIXTURE_DIR_INVALID");
+      const fd = openSync(fixtureHostPath, constants.O_WRONLY | constants.O_CREAT
+        | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      fixtureCreated = true;
+      try {
+        fchownSync(fd, 1000, 1000);
+        const raw = Buffer.from(localResult + "\n");
+        for (let n = 0; n < raw.length;) {
+          const count = writeSync(fd, raw, n, raw.length - n);
+          assertion(count > 0, "BOX_CCB_FIXTURE_WRITE_FAILED"); n += count;
+        }
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      syncDirectory(WORK_HOST);
+      const prompt = `Use the Read tool exactly once to read ${fixtureContainerPath}. `
+        + "Reply with exactly the file's single-line content, without quotes or explanation. "
+        + "Do not guess or invent the content; it is unpredictable and absent from this prompt.";
+      ccbProcessUnconfirmed = true;
+      const result = await runContainerCcbProbe({ baseUrl: "http://127.0.0.1:31002",
+        authToken: loopback.authToken, catalogToken: loopback.catalogToken,
+        turnKey, prompt, expectedMarker: localResult, deadlineSeconds: 240 });
+      ccbProcessUnconfirmed = false;
+      const observed = loopback.observedRequestIds();
+      for (const id of observed) await loopback.waitHandler(id);
+      assertion(result.exitCode === 0 && result.exactResult
+        && result.toolUseCount === 1 && observed.length === 2
+        && observed[0] === firstId && observed[1] === secondId
+        && transportCalls === 2 && paidCalls === 2 && unknownPhase === null,
+      "BOX_CCB_LIVE_BUSINESS_RESULT_INVALID");
+      const rows = await client.query<{ request_id: string; state: string;
+        ctx: Record<string, unknown> }>(
+        "SELECT request_id,state,ctx FROM request_finalize_journal WHERE request_id IN ($1,$2)",
+        [firstId, secondId]);
+      const owner = rows.rows.find((row) => row.request_id === firstId);
+      const final = rows.rows.find((row) => row.request_id === secondId);
+      assertion(rows.rows.length === 2 && owner?.state === "committed"
+        && final?.state === "committed"
+        && owner.ctx.boxState === "terminal" && !!owner.ctx.boxToolHandoff
+        && final.ctx.boxState === "terminal"
+        && final.ctx.boxRunNonce === owner.ctx.boxRunNonce
+        && final.ctx.boxLeaseEpoch === owner.ctx.boxLeaseEpoch
+        && (final.ctx.boxTerminalProof as { reason?: unknown } | undefined)?.reason
+          === "worker_complete",
+      "BOX_CCB_LIVE_TERMINAL_UNPROVEN");
+      const usage = await client.query<{ id: string; request_id: string;
+        model: string; cost: string; ledger_id: string | null }>(
+        `SELECT id::text,request_id,model,cost_credits::text AS cost,ledger_id::text
+           FROM usage_records WHERE user_id=$1 AND request_id IN ($2,$3)`,
+        [UID.toString(), firstId, secondId]);
+      const ids = usage.rows.map((row) => row.id);
+      const ledger = await client.query<{ id: string; ref_id: string; delta: string }>(
+        `SELECT id::text,ref_id,delta::text FROM credit_ledger
+          WHERE user_id=$1 AND ref_type='usage_record' AND ref_id=ANY($2::text[])`,
+        [UID.toString(), ids]);
+      assertion(usage.rows.length === 2
+        && new Set(usage.rows.map((row) => row.request_id)).size === 2
+        && usage.rows.every((row) => {
+          const charges = ledger.rows.filter((item) => item.ref_id === row.id);
+          return row.model === MODEL && BigInt(row.cost) > 0n && row.ledger_id
+            && charges.length >= 1 && charges.length <= 4
+            && charges.some((item) => item.id === row.ledger_id)
+            && charges.every((item) => BigInt(item.delta) < 0n)
+            && charges.reduce((sum, item) => sum - BigInt(item.delta), 0n)
+              === BigInt(row.cost);
+        }), "BOX_CCB_LIVE_LEDGER_MISMATCH");
+      const pendingCleanup = await service.retryTerminalCleanup();
+      const cleaned = await client.query<{ status: string | null }>(
+        "SELECT ctx->>'boxRemoteCleanup' AS status FROM request_finalize_journal WHERE request_id=$1",
+        [secondId]);
+      assertion(pendingCleanup === 0 && cleaned.rows[0]?.status === "done"
+        && identityPersisted, "BOX_CCB_LIVE_CLEANUP_UNPROVEN");
+      terminal = true;
+      unlinkSync(fixtureHostPath); syncDirectory(WORK_HOST); fixtureCreated = false;
+      withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
+      process.stdout.write(JSON.stringify({ ccbUserContainer: true,
+        modelId: UPSTREAM, localReadExecutedOnce: true, exactFinal: true,
+        detachedAcrossHttp: true, requestIds: observed,
+        persistentUsageRows: usage.rows.length, persistentLedgerRows: ledger.rows.length,
+        debitedCredits: usage.rows.reduce((n, row) => n + BigInt(row.cost), 0n).toString(),
+        remoteCleanupDone: true, unknown: false,
+        initSummary: result.initSummary }) + "\n");
       return;
     }
     if (preflightOnly) {
@@ -835,6 +952,10 @@ async function main(): Promise<void> {
         unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
       }); }
       catch { /* Keep a conservative unknown lock on cleanup failure. */ }
+    }
+    if (fixtureCreated && !identityPersisted && !ccbProcessUnconfirmed) {
+      try { unlinkSync(fixtureHostPath); syncDirectory(WORK_HOST); fixtureCreated = false; }
+      catch { /* Private synthetic file is safer retained than misreported removed. */ }
     }
     const observed = dbReady
       ? await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
