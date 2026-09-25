@@ -391,13 +391,15 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
  * are never printed, put in argv, or written to a persistent file. */
 async function runContainerCcbProbe(input: { baseUrl: string;
   authToken: string; catalogToken: string; turnKey: string;
-  prompt?: string; expectedMarker?: string; deadlineSeconds?: number }): Promise<{
+  prompt?: string; expectedMarker?: string; deadlineSeconds?: number;
+  localToolConfig?: { script: string; fixture: string } }): Promise<{
   exitCode: number; stdoutBytes: number; stderrBytes: number;
   stderrTail: string; stdoutEvents: Array<{ type: unknown;
     subtype: unknown; keys: string[] }>;
   initSummary: { model: unknown; apiKeySource: unknown; permissionMode: unknown;
     memoryPathCount: number; skillCount: number; toolCount: number } | null;
-  toolUseCount: number; exactResult: boolean }> {
+  toolUseCount: number; toolUseEvents: number; resultCount: number;
+  malformedOutput: boolean; exactResult: boolean }> {
   const python = `import json,os,sys
 cfg=json.load(sys.stdin)
 env=os.environ.copy()
@@ -408,10 +410,18 @@ env["CLAUDE_CODE_EXTRA_METADATA"]=json.dumps({"oc_turn_key":cfg["turnKey"]})
 env["NO_PROXY"]="127.0.0.1,localhost,"+env.get("NO_PROXY","")
 env.pop("ANTHROPIC_API_KEY",None)
 env.pop("CLAUDE_CODE_OAUTH_TOKEN",None)
-os.execvpe("claude",["claude","-p",cfg["prompt"],
-  "--model","box-api-claude-opus-5-5","--tools","Read",
-  "--allowedTools","Read","--output-format","stream-json","--verbose",
-  "--no-session-persistence"],env)
+args=["claude","-p",cfg["prompt"],"--model","box-api-claude-opus-5-5"]
+if "localToolConfig" in cfg:
+    tool=cfg["localToolConfig"]
+    mcp={"mcpServers":{"ocv5probe":{"type":"stdio","command":"/usr/bin/python3",
+         "args":["-I",tool["script"],tool["fixture"]]}}}
+    args += ["--mcp-config",json.dumps(mcp),"--strict-mcp-config",
+             "--tools","mcp__ocv5probe__read_secret",
+             "--allowedTools","mcp__ocv5probe__read_secret"]
+else:
+    args += ["--tools","Read","--allowedTools","Read"]
+args += ["--output-format","stream-json","--verbose","--no-session-persistence"]
+os.execvpe("claude",args,env)
 `;
   const child = spawn("docker", ["exec", "-i", "--user", "1000:1000",
     "--workdir", "/home/agent/.openclaude/workspace/ocv5-289-box-api",
@@ -421,7 +431,8 @@ os.execvpe("claude",["claude","-p",cfg["prompt"],
   { stdio: ["pipe", "pipe", "pipe"] });
   const cfg = JSON.stringify({ baseUrl: input.baseUrl, authToken: input.authToken,
     catalogToken: input.catalogToken, turnKey: input.turnKey,
-    prompt: input.prompt ?? "Reply with exactly READY. Do not use tools." });
+    prompt: input.prompt ?? "Reply with exactly READY. Do not use tools.",
+    ...(input.localToolConfig ? { localToolConfig: input.localToolConfig } : {}) });
   child.stdin.end(cfg);
   let stdoutBytes = 0, stderrBytes = 0;
   const stdoutChunks: Buffer[] = [];
@@ -464,7 +475,10 @@ os.execvpe("claude",["claude","-p",cfg["prompt"],
       permissionMode: unknown; memoryPathCount: number; skillCount: number;
       toolCount: number } | null = null;
     const toolUseIds = new Set<string>();
+    const expectedToolName = input.localToolConfig
+      ? "mcp__ocv5probe__read_secret" : "Read";
     let exactResult = false;
+    let toolUseEvents = 0, resultCount = 0, malformedOutput = false;
     for (const line of stdoutRaw.split("\n")) {
       try {
         const value = JSON.parse(line) as Record<string, unknown>;
@@ -481,19 +495,25 @@ os.execvpe("claude",["claude","-p",cfg["prompt"],
           if (Array.isArray(blocks)) for (const block of blocks) {
             if (block && typeof block === "object" && "type" in block
               && "name" in block && "id" in block
-              && block.type === "tool_use" && block.name === "Read"
+              && block.type === "tool_use" && block.name === expectedToolName
               && typeof block.id === "string") {
+              toolUseEvents++;
               toolUseIds.add(block.id);
             }
           }
         }
-        if (value.type === "result" && input.expectedMarker !== undefined
-          && typeof value.result === "string"
-          && value.result.trim() === input.expectedMarker) exactResult = true;
-      } catch { /* No raw CLI content enters the report. */ }
+        if (value.type === "result") {
+          resultCount++;
+          exactResult = input.expectedMarker !== undefined
+            && value.subtype === "success" && value.is_error === false
+            && typeof value.result === "string"
+            && value.result.trim() === input.expectedMarker;
+        }
+      } catch { if (line.trim()) malformedOutput = true; }
     }
     return { exitCode: closed.code, stdoutBytes, stderrBytes,
-      stdoutEvents, initSummary, toolUseCount: toolUseIds.size, exactResult,
+      stdoutEvents, initSummary, toolUseCount: toolUseIds.size,
+      toolUseEvents, resultCount, malformedOutput, exactResult,
       stderrTail: stderrTail.replaceAll(input.authToken, "[synthetic-auth]")
         .replaceAll(input.catalogToken, "[synthetic-catalog]").slice(-300) };
   } finally { clearTimeout(timeout); }
@@ -524,6 +544,7 @@ async function main(): Promise<void> {
   const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
   const fixtureHostPath = `${WORK_HOST}/.ocv5-289-read-${nonce}.txt`;
   const fixtureContainerPath = `${WORK_CONTAINER}/.ocv5-289-read-${nonce}.txt`;
+  const fixtureUsedPath = fixtureHostPath + ".used";
   let localExecutions = 0, unknownPhase: string | null = null;
   let terminal = false;
   let identityPersisted = false;
@@ -688,7 +709,10 @@ async function main(): Promise<void> {
     if (ccbPreflight) {
       ccbProcessUnconfirmed = true;
       const result = await runContainerCcbProbe({ baseUrl: "http://127.0.0.1:31002",
-        authToken: loopback.authToken, catalogToken: loopback.catalogToken, turnKey });
+        authToken: loopback.authToken, catalogToken: loopback.catalogToken, turnKey,
+        prompt: "Use the local read_secret tool once and report its result.",
+        localToolConfig: { script: `${WORK_CONTAINER}/scripts/ocv5-289/ccb_local_probe_mcp.py`,
+          fixture: fixtureContainerPath } });
       ccbProcessUnconfirmed = false;
       const observed = loopback.observedRequestIds();
       const usage = await client.query("SELECT 1 FROM usage_records WHERE request_id=ANY($1::text[])",
@@ -733,18 +757,27 @@ async function main(): Promise<void> {
         fsyncSync(fd);
       } finally { closeSync(fd); }
       syncDirectory(WORK_HOST);
-      const prompt = `Use the Read tool exactly once to read ${fixtureContainerPath}. `
-        + "Reply with exactly the file's single-line content, without quotes or explanation. "
-        + "Do not guess or invent the content; it is unpredictable and absent from this prompt.";
+      const prompt = "Use the local read_secret tool exactly once. It has no arguments and "
+        + "returns an unpredictable synthetic token held only in this OpenClaude user container. "
+        + "Reply with exactly that token, without quotes or explanation. Do not guess.";
       ccbProcessUnconfirmed = true;
       const result = await runContainerCcbProbe({ baseUrl: "http://127.0.0.1:31002",
         authToken: loopback.authToken, catalogToken: loopback.catalogToken,
-        turnKey, prompt, expectedMarker: localResult, deadlineSeconds: 240 });
+        turnKey, prompt, expectedMarker: localResult, deadlineSeconds: 240,
+        localToolConfig: { script: `${WORK_CONTAINER}/scripts/ocv5-289/ccb_local_probe_mcp.py`,
+          fixture: fixtureContainerPath } });
       ccbProcessUnconfirmed = false;
       const observed = loopback.observedRequestIds();
       for (const id of observed) await loopback.waitHandler(id);
+      const used = lstatSync(fixtureUsedPath);
+      assertion(used.isFile() && !used.isSymbolicLink() && used.uid === 1000
+        && (used.mode & 0o777) === 0o600 && used.nlink === 1
+        && readFileSync(fixtureUsedPath, "utf8") === "1\n",
+      "BOX_CCB_LOCAL_TOOL_ONCE_UNPROVEN");
       assertion(result.exitCode === 0 && result.exactResult
-        && result.toolUseCount === 1 && observed.length === 2
+        && result.resultCount === 1 && !result.malformedOutput
+        && result.toolUseCount === 1 && result.toolUseEvents === 1
+        && observed.length === 2
         && observed[0] === firstId && observed[1] === secondId
         && transportCalls === 2 && paidCalls === 2 && unknownPhase === null,
       "BOX_CCB_LIVE_BUSINESS_RESULT_INVALID");
@@ -791,6 +824,7 @@ async function main(): Promise<void> {
       assertion(pendingCleanup === 0 && cleaned.rows[0]?.status === "done"
         && identityPersisted, "BOX_CCB_LIVE_CLEANUP_UNPROVEN");
       terminal = true;
+      unlinkSync(fixtureUsedPath);
       unlinkSync(fixtureHostPath); syncDirectory(WORK_HOST); fixtureCreated = false;
       withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
       process.stdout.write(JSON.stringify({ ccbUserContainer: true,
@@ -954,7 +988,11 @@ async function main(): Promise<void> {
       catch { /* Keep a conservative unknown lock on cleanup failure. */ }
     }
     if (fixtureCreated && !identityPersisted && !ccbProcessUnconfirmed) {
-      try { unlinkSync(fixtureHostPath); syncDirectory(WORK_HOST); fixtureCreated = false; }
+      try {
+        try { unlinkSync(fixtureUsedPath); }
+        catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+        unlinkSync(fixtureHostPath); syncDirectory(WORK_HOST); fixtureCreated = false;
+      }
       catch { /* Private synthetic file is safer retained than misreported removed. */ }
     }
     const observed = dbReady
