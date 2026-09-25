@@ -332,24 +332,31 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
   const cfg = JSON.stringify(input);
   child.stdin.end(cfg);
   let stdoutBytes = 0, stderrBytes = 0;
+  let outputExceeded = false;
   child.stdout.on("data", (chunk: Buffer) => {
     stdoutBytes += chunk.length;
-    if (stdoutBytes > 2_000_000) child.kill("SIGTERM");
+    if (stdoutBytes > 2_000_000) {
+      outputExceeded = true; child.kill("SIGTERM");
+    }
   });
   child.stderr.on("data", (chunk: Buffer) => {
     stderrBytes += chunk.length;
-    if (stderrBytes > 500_000) child.kill("SIGTERM");
+    if (stderrBytes > 500_000) {
+      outputExceeded = true; child.kill("SIGTERM");
+    }
   });
   let hostTimedOut = false;
   const timeout = setTimeout(() => { hostTimedOut = true; child.kill("SIGTERM"); },
     105_000);
   try {
-    const exitCode = await new Promise<number>((resolve, reject) => {
+    const closed = await new Promise<{ code: number; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.once("error", reject);
-      child.once("close", (code) => resolve(code ?? 1));
+      child.once("close", (code, signal) => resolve({ code: code ?? 1, signal }));
     });
-    if (hostTimedOut) throw new Error("BOX_CCB_PROCESS_UNCONFIRMED");
-    return { exitCode, stdoutBytes, stderrBytes };
+    if (hostTimedOut || outputExceeded || closed.signal !== null) {
+      throw new Error("BOX_CCB_PROCESS_UNCONFIRMED");
+    }
+    return { exitCode: closed.code, stdoutBytes, stderrBytes };
   } finally { clearTimeout(timeout); }
 }
 
