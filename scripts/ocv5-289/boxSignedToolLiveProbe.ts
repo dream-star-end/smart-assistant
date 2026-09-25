@@ -199,7 +199,10 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
       diagnostics.push({ msg: "ccb_source_ip_mismatch" });
       res.writeHead(403); res.end(); return;
     }
-    if (req.url !== "/v1/messages" || req.method !== "POST") {
+    // Claude Code 2.1.280 sends /v1/messages?beta=true; production proxy
+    // routes on URL.pathname, so this test listener must do the same.
+    const path = new URL(req.url ?? "/", "http://probe.invalid").pathname;
+    if (path !== "/v1/messages" || req.method !== "POST") {
       res.writeHead(404); res.end(); return;
     }
     const requestId = args.assignedRequestIds
