@@ -146,7 +146,9 @@ async function main(): Promise<void> {
     const usedContent = readFileSync(used, "utf8");
     if (exitCode !== 0 || first !== 1 || second !== 1 || !resultMatched
       || usedContent !== "1\n" || final.length !== 1
-      || final[0]?.is_error !== false || final[0]?.result !== marker) {
+      || final[0]?.is_error !== false || final[0]?.result !== marker
+      || continuation?.gate !== null || continuation.prefixMatch !== true
+      || continuation.matcher !== "ok") {
       throw new Error("CCB_LOCAL_MCP_LOOP_FAILED");
     }
     process.stdout.write(JSON.stringify({ ccbUserContainer: true, paidCalls: 0,

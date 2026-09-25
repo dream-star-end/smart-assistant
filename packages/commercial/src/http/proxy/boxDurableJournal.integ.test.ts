@@ -340,11 +340,16 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       catalogHash,
       verifiedPendingToolUseIds: ["toolu_C"] });
     await put(`box-e-${suffix}`);
+    const roundBudget = (tokens: number) => ({ role: "system", content: [{ type: "text",
+      text: `<total_tokens>${tokens} tokens left</total_tokens>`,
+      cache_control: { type: "ephemeral" } }] });
     const secondResumeBody = { ...resumeBody, messages: [
       ...resumeBody.messages,
+      roundBudget(14_999_987),
       { role: "assistant", content: secondAssistantContent },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
         content: "third" }] },
+      roundBudget(14_999_974),
     ] };
     const secondResume = await journal.claimToolResume({ requestId: `box-e-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: secondResumeBody });

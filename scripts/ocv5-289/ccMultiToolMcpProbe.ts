@@ -175,7 +175,8 @@ try {
     is_error?: unknown; result?: unknown } | undefined;
   if (exit !== 0 || requests !== 2 || !advertised || !responseExact
     || final?.is_error !== false || final.result !== "done"
-    || !turnKeyMatches.every(Boolean) || bodyHashes[0] === bodyHashes[1]) {
+    || !turnKeyMatches.every(Boolean) || bodyHashes[0] === bodyHashes[1]
+    || trailingBudgetHints.length !== 2 || trailingBudgetHints[1] !== true) {
     throw new Error("GENERIC_MCP_REAL_CC_CONTRACT_FAILED");
   }
   process.stdout.write(JSON.stringify({ version, synthetic: true,

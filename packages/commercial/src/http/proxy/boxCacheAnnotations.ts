@@ -76,22 +76,21 @@ export function isBoxNoopContextManagement(body: ProxyBody): boolean {
   return object(edit) && Object.keys(edit).sort().join(",") === "keep,type"
     && edit.type === "clear_thinking_20251015" && edit.keep === "all";
 }
-/** CCB2.1.280 appends this budget telemetry *after* the tool_result user
+/** CCB2.1.280 appends this budget telemetry *after each* tool_result user
  * message. The held inner Claude Code CLI independently emits its own
  * <total_tokens> system hint after the virtual MCP result (proved by the
  * local two-CLI tool loop); the outer hint is not a new user instruction.
- * Recognize only this exact shape. Every other trailing system message stays
- * in the body and must fail the resume gate rather than being discarded. */
-export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
+ * Recognize only this exact shape at each handoff boundary. Every other
+ * system message stays in the body and fails the resume gate if misplaced. */
+function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
   if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
-    || !Array.isArray(body.messages) || body.messages.length < 3) return false;
-  const lastIndex = body.messages.length - 1;
-  if (!Object.hasOwn(body.messages, lastIndex)
-    || !Object.hasOwn(body.messages, lastIndex - 1)
-    || !Object.hasOwn(body.messages, lastIndex - 2)) return false;
-  const tail = body.messages[lastIndex];
-  const result = body.messages[lastIndex - 1];
-  const assistant = body.messages[lastIndex - 2];
+    || !Array.isArray(body.messages) || index < 2 || index >= body.messages.length) return false;
+  if (!Object.hasOwn(body.messages, index)
+    || !Object.hasOwn(body.messages, index - 1)
+    || !Object.hasOwn(body.messages, index - 2)) return false;
+  const tail = body.messages[index];
+  const result = body.messages[index - 1];
+  const assistant = body.messages[index - 2];
   if (!object(tail) || tail.role !== "system"
     || Object.keys(tail).sort().join(",") !== "content,role"
     || !Array.isArray(tail.content) || tail.content.length !== 1
@@ -113,9 +112,19 @@ export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
     && Object.keys(block.cache_control).join(",") === "type"
     && block.cache_control.type === "ephemeral";
 }
+export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
+  return Array.isArray(body.messages)
+    && isBoxCcbToolBudgetAt(body, body.messages.length - 1);
+}
 export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
-  return isBoxCcbToolBudgetTail(body)
-    ? { ...body, messages: body.messages.slice(0, -1) } as ProxyBody : body;
+  if (!Array.isArray(body.messages)) return body;
+  // Never compact a malformed sparse message array into a different request.
+  for (let i = 0; i < body.messages.length; i++) {
+    if (!Object.hasOwn(body.messages, i)) return body;
+  }
+  const kept = body.messages.filter((_, index) => !isBoxCcbToolBudgetAt(body, index));
+  return kept.length === body.messages.length ? body
+    : { ...body, messages: kept } as ProxyBody;
 }
 export function normalizeBoxSemanticBody(body: ProxyBody,
   options: { collapseSingleText?: boolean } = {}): ProxyBody {
