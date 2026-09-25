@@ -95,9 +95,28 @@ async function main(): Promise<void> {
         && (ctx.boxState === "handoff" ? !ctx.boxTerminalProof
           : !!ctx.boxTerminalProof && ctx.boxStopOutcome === "failed"),
       "BOX_RECOVERY_HANDOFF_INVALID");
-      const second = await pool.query(
-        "SELECT 1 FROM request_finalize_journal WHERE request_id=$1", [lock.secondId]);
-      assertion(second.rowCount === 0, "BOX_RECOVERY_SECOND_CALL_PRESENT");
+      const second = await pool.query<{ state: string; user_id: string;
+        ctx: Record<string, unknown>; final_credits: string; failure_code: string }>(
+        `SELECT state,user_id::text,ctx,final_credits::text,failure_code
+           FROM request_finalize_journal WHERE request_id=$1`, [lock.secondId]);
+      // The second HTTP request may have failed in the shared handler before
+      // Box admission. Accept only that exact zero-cost, unowned terminal row;
+      // any Box-owned/ambiguous second call must be investigated separately.
+      assertion(second.rows.length === 0 || (second.rows.length === 1
+        && second.rows[0]?.state === "aborted"
+        && second.rows[0]?.user_id === "3"
+        && second.rows[0]?.failure_code === "STREAM_FAILED"
+        && second.rows[0]?.final_credits === "0"
+        && second.rows[0]?.ctx?.boxInvocationRecovery === "v1"
+        && !second.rows[0]?.ctx?.boxState
+        && !second.rows[0]?.ctx?.boxOwnerRequestId
+        && !second.rows[0]?.ctx?.boxRunNonce
+        && !second.rows[0]?.ctx?.boxToolHandoff
+        && !second.rows[0]?.ctx?.boxResumeRequestId),
+      "BOX_RECOVERY_SECOND_CALL_PRESENT");
+      const secondUsage = await pool.query(
+        "SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=3", [lock.secondId]);
+      assertion(secondUsage.rowCount === 0, "BOX_RECOVERY_SECOND_USAGE_PRESENT");
       const initialUsage = await pool.query<{ id: string; cost: string }>(
         `SELECT id::text,cost_credits::text AS cost FROM usage_records
           WHERE request_id=$1 AND user_id=3`, [lock.firstId]);
@@ -183,6 +202,9 @@ async function main(): Promise<void> {
         [afterUsage.rows[0]!.id]);
       assertion(JSON.stringify(afterLedger.rows) === JSON.stringify(initialLedger.rows),
         "BOX_RECOVERY_LEDGER_CHANGED");
+      const afterSecondUsage = await pool.query(
+        "SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=3", [lock.secondId]);
+      assertion(afterSecondUsage.rowCount === 0, "BOX_RECOVERY_SECOND_USAGE_CHANGED");
       const archivePath = `${DIR}/account-20.stopped-${lock.runNonce}.json`;
       const archive = { kind: "signed_operator_stopped_handoff", originalLock: lock,
         terminalProof: proof, usageId: afterUsage.rows[0]!.id,
