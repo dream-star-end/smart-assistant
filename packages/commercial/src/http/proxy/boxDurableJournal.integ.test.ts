@@ -178,9 +178,19 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         { role: "assistant", content: firstAssistantContent },
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
-          { type: "tool_result", tool_use_id: "toolu_A", content: "first" },
+          { type: "tool_result", tool_use_id: "toolu_A", content: "x".repeat(1_100_000) },
         ] },
       ] };
+    await client.query(`UPDATE request_finalize_journal SET
+      ctx=jsonb_set(ctx,'{boxToolHandoff,spoolOffset}',to_jsonb($2::bigint))
+      WHERE request_id=$1`, [toolCall.requestId, 64 * 1024 * 1024 - 1_000_000]);
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
+    await client.query(`UPDATE request_finalize_journal SET
+      ctx=jsonb_set(ctx,'{boxToolHandoff,spoolOffset}',to_jsonb(1234::bigint))
+      WHERE request_id=$1`, [toolCall.requestId]);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model,
       canonicalBody: { ...resumeBody, messages: [...resumeBody.messages.slice(0, -1),

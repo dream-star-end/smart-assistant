@@ -8,6 +8,7 @@ import { makeBoxTextPlan, makeBoxAssetStage, BoxTextPlanError,
   type BoxTextPlan } from "./boxTextPlan.js";
 import { compileBoxToolCatalog, mapBoxCliEffort,
   type BoxToolCatalog } from "./boxToolCatalog.js";
+import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 export interface BoxToolPlan extends BoxTextPlan {
   readonly stageVirtualMcp: BoxCcExecRequest;
@@ -51,6 +52,11 @@ export function makeBoxToolPlan(input: {
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
     command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });
   const args = [...base.run.args];
+  const outputAt = args.indexOf("--max-output");
+  if (outputAt < 0 || args[outputAt + 1] !== "1048576") {
+    throw new BoxTextPlanError("BOX_TOOL_PLAN_INVALID");
+  }
+  args[outputAt + 1] = String(BOX_TOOL_SPOOL_MAX_BYTES);
   const deny = args.indexOf("--disallowedTools");
   if (deny < 0 || args[deny + 1] !== "mcp__*") throw new BoxTextPlanError("BOX_TOOL_PLAN_INVALID");
   args.splice(deny, 2);

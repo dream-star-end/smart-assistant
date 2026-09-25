@@ -2,6 +2,7 @@
  * but a model/tool-result write or an ambiguous SSE delivery is never replayed. */
 import type { BoxExecTransport } from "./boxExecTransport.js";
 import type { BoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
+import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 export class BoxSpoolReadError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxSpoolReadError"; }
@@ -9,7 +10,7 @@ export class BoxSpoolReadError extends Error {
 export interface BoxSpoolChunk { bytes: Buffer; nextOffset: number }
 export function parseBoxSpoolChunk(raw: string, offset: number,
   limit: number): BoxSpoolChunk {
-  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 8 * 1024 * 1024
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > BOX_TOOL_SPOOL_MAX_BYTES
     || !Number.isSafeInteger(limit) || limit < 1 || limit > 65536
     || Buffer.byteLength(raw) > 131072) {
     throw new BoxSpoolReadError("BOX_SPOOL_FRAME_INVALID");
@@ -27,7 +28,7 @@ export function parseBoxSpoolChunk(raw: string, offset: number,
   }
   const bytes = Buffer.from(x.data, "base64");
   if (bytes.length > limit || bytes.toString("base64") !== x.data
-    || x.offset !== offset + bytes.length || x.offset > 8 * 1024 * 1024) {
+    || x.offset !== offset + bytes.length || x.offset > BOX_TOOL_SPOOL_MAX_BYTES) {
     throw new BoxSpoolReadError("BOX_SPOOL_FRAME_INVALID");
   }
   return { bytes, nextOffset: x.offset as number };

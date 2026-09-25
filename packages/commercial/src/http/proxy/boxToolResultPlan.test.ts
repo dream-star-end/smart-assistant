@@ -55,6 +55,29 @@ test("one owner-scoped pending file produces one atomic sidecar result", () => {
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test("a 1.1 MB tool result survives actual multi-chunk private publication", () => {
+  const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  mkdirSync(cwd, { mode: 0o700 });
+  try {
+    const text = "x".repeat(1_100_000);
+    const largeBody: ProxyBody = { ...body, messages: [body.messages[0]!,
+      { role: "user", content: [{ type: "tool_result",
+        tool_use_id: use.id, content: text }] }] };
+    const matched = matchBoxToolResults(largeBody, [use])[0]!;
+    const plan = makeBoxToolResultPlan({ cwd, expected: use, pending, matched });
+    assert.ok(plan.requests.length > 2, "result exceeds one staged chunk");
+    for (const request of plan.requests) {
+      const staged = spawnSync(request.command, request.args, { cwd: request.cwd,
+        env: { ...process.env, ...request.environment },
+        encoding: "utf8", timeout: 5000 });
+      assert.equal(staged.status, 0, staged.stderr);
+    }
+    const result = JSON.parse(readFileSync(plan.path, "utf8")) as {
+      content: Array<{ text: string }> };
+    assert.equal(result.content[0]?.text, text);
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test("pending identity and mutated local result cannot publish", () => {
   assert.throws(() => parseBoxPendingCall(JSON.stringify({ ...pending,
     modelToolUseId: "toolu_other" }), use), /BOX_PENDING_INVALID/);

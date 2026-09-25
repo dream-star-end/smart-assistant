@@ -1,15 +1,17 @@
 /** Exact byte boundaries for a detached Box CLI JSONL spool. A committed
  * handoff persists a line's endOffset, never an unprocessed chunk-end or raw
  * remainder, so another HTTP request can resume without duplicating bytes. */
-const MAX_LINE_BYTES = 1_048_576;
-const MAX_SPOOL_BYTES = 8 * 1024 * 1024;
+import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
+const MAX_LINE_BYTES = BOX_TOOL_SPOOL_MAX_BYTES;
+const MAX_SPOOL_BYTES = BOX_TOOL_SPOOL_MAX_BYTES;
 export class BoxSpoolFrameError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxSpoolFrameError"; }
 }
 export interface BoxSpoolLine { readonly text: string; readonly endOffset: number }
 
 export class BoxSpoolJsonlFramer {
-  private pending = Buffer.alloc(0);
+  private pendingChunks: Buffer[] = [];
+  private pendingLength = 0;
   private nextReadOffset: number;
   private failed = false;
   constructor(startOffset = 0) {
@@ -30,23 +32,28 @@ export class BoxSpoolJsonlFramer {
       throw new BoxSpoolFrameError("BOX_SPOOL_CHUNK_INVALID");
     }
     this.nextReadOffset += bytes.length;
-    const joined = Buffer.concat([this.pending, bytes]);
-    const base = this.nextReadOffset - joined.length;
     const lines: BoxSpoolLine[] = [];
     let cursor = 0;
     for (;;) {
-      const newline = joined.indexOf(0x0a, cursor);
+      const newline = bytes.indexOf(0x0a, cursor);
       if (newline < 0) break;
-      const raw = joined.subarray(cursor, newline + 1);
-      if (raw.length > MAX_LINE_BYTES) throw new BoxSpoolFrameError("BOX_SPOOL_LINE_TOO_LARGE");
+      const part = bytes.subarray(cursor, newline + 1);
+      const size = this.pendingLength + part.length;
+      if (size > MAX_LINE_BYTES) throw new BoxSpoolFrameError("BOX_SPOOL_LINE_TOO_LARGE");
+      const raw = this.pendingLength
+        ? Buffer.concat([...this.pendingChunks, part], size) : part;
       let text: string;
       try { text = new TextDecoder("utf-8", { fatal: true }).decode(raw); }
       catch { throw new BoxSpoolFrameError("BOX_SPOOL_UTF8_INVALID"); }
-      lines.push({ text, endOffset: base + newline + 1 });
+      lines.push({ text, endOffset: chunkStartOffset + newline + 1 });
+      this.pendingChunks = []; this.pendingLength = 0;
       cursor = newline + 1;
     }
-    this.pending = Buffer.from(joined.subarray(cursor));
-    if (this.pending.length > MAX_LINE_BYTES) {
+    if (cursor < bytes.length) {
+      const rest = Buffer.from(bytes.subarray(cursor));
+      this.pendingChunks.push(rest); this.pendingLength += rest.length;
+    }
+    if (this.pendingLength > MAX_LINE_BYTES) {
       throw new BoxSpoolFrameError("BOX_SPOOL_LINE_TOO_LARGE");
     }
     return lines;

@@ -15,6 +15,7 @@ import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
+import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
@@ -269,7 +270,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !Array.isArray(pending) || pending.length < 1
       || pending.length > ids.length || new Set(pending).size !== pending.length
       || !Number.isSafeInteger(input.spoolOffset) || input.spoolOffset < 1
-      || input.spoolOffset > 8 * 1024 * 1024
+      || input.spoolOffset > BOX_TOOL_SPOOL_MAX_BYTES
       || typeof input.detachedRunnerHash !== "string"
       || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
       || typeof input.catalogHash !== "string"
@@ -413,6 +414,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         }
       } catch {
         throw new BoxDurableJournalError("BOX_TOOL_ASSISTANT_CHANGED");
+      }
+      try {
+        reserveBoxToolEcho(handoff.spoolOffset, input.canonicalBody.messages.at(-1));
+      } catch {
+        throw new BoxDurableJournalError("BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
       }
       const durableRevision = randomUUID();
       const resultHashes = results.map((result) => ({

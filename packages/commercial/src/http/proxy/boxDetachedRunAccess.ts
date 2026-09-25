@@ -1,6 +1,7 @@
 /** Reconstruct only read access to an already admitted detached Box run.
  * A resumed HTTP request must not rebuild the original prompt or launch CLI. */
 import type { BoxExecTransport } from "./boxExecTransport.js";
+import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 type BoxCcExecRequest = Parameters<BoxExecTransport["run"]>[0];
 
@@ -60,7 +61,7 @@ export function makeBoxDetachedRunAccess(input: {
   const cwd = `/tmp/ocv5-289-run-${input.runNonce}`;
   const runnerPath = `/tmp/ocv5-289-detached-runner-${input.detachedRunnerHash.slice(0, 16)}.py`;
   return { cwd, runnerPath, readSpool: (offset: number, limit = 65536) => {
-    if (!Number.isSafeInteger(offset) || offset < 0 || offset > 8 * 1024 * 1024
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > BOX_TOOL_SPOOL_MAX_BYTES
       || !Number.isSafeInteger(limit) || limit < 1 || limit > 65536) {
       throw new BoxDetachedRunAccessError("BOX_SPOOL_READ_INVALID");
     }

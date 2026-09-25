@@ -36,7 +36,8 @@ function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean } =
     results: [{ modelToolUseId: id, content, isError: false, contentHash }] };
   const target = { accountId: options.wrongAccount ? 21n : 20n,
     exec: { run: async (request: { args: string[] }) => {
-      if (request.args[1]?.includes("pending.")) {
+      if (request.args[0] === "-I" && request.args[1] === "-c"
+        && request.args[2]?.includes("pending.")) {
         sequence.push("pending-read");
         return { stdout: JSON.stringify({ version: 1, modelToolUseId: id,
           mcpRequestId: 7, name: "t0", arguments: toolInput }),
@@ -120,8 +121,8 @@ test("out-of-order pending B is published before dependent A without replay", as
   const published: string[] = [];
   f.target.exec.run = async (request: { args: string[] }) => {
     const args = request.args;
-    if (args[1]?.includes("pending.")) {
-      const pendingId = args[3];
+    if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
+      const pendingId = args[4];
       if (pendingId === id && !bPublished) {
         throw new BoxExecTransportError("synthetic missing pending", true, 1);
       }
@@ -129,8 +130,8 @@ test("out-of-order pending B is published before dependent A without replay", as
         mcpRequestId: pendingId === b ? 8 : 7, name: "t0", arguments: toolInput }),
       stderrBytes: 0, exitCode: 0 as const };
     }
-    const path = args[4] ?? "";
-    if (args.length === 7 && path.includes("/result.")) {
+    const path = args[5] ?? "";
+    if (args.length === 8 && path.includes("/result.")) {
       const resultId = path.includes(b) ? b : id;
       published.push(resultId);
       if (resultId === b) bPublished = true;

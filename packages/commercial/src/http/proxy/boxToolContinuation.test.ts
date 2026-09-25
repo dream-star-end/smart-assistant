@@ -54,8 +54,14 @@ const echoHash = createHash("sha256").update(JSON.stringify({
   content: [{ type: "text", text: localResult }], isError: false })).digest("hex");
 
 function fixture(kind: "tool" | "final", failComplete = false,
-  trailing = false, omitEcho = false) {
+  trailing = false, omitEcho = false, largeEcho = false) {
   const sequence: string[] = [], emitted: string[] = [];
+  const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
+  const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
+    { type: "tool_result", tool_use_id: "toolu_prior_a", content: resultText },
+  ] } } : echoRecord;
+  const currentHash = largeEcho ? createHash("sha256").update(JSON.stringify({
+    content: [{ type: "text", text: resultText }], isError: false })).digest("hex") : echoHash;
   let retained = false;
   const claim = { ownerRequestId: "box-owner", accountId: 20n,
     runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
@@ -63,9 +69,9 @@ function fixture(kind: "tool" | "final", failComplete = false,
     catalogHash: catalog.bindingSha256, durableRevision: "synthetic-revision",
     toolUses: [{ id: "toolu_prior_a", boxName, clientName: "local_echo",
       inputHash: "f".repeat(64) }],
-    results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: localResult }],
-      isError: false, contentHash: echoHash }] };
-  const bytes = Buffer.concat([raw([...(omitEcho ? [] : [echoRecord]),
+    results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: resultText }],
+      isError: false, contentHash: currentHash }] };
+  const bytes = Buffer.concat([raw([...(omitEcho ? [] : [currentEcho]),
     ...(kind === "tool" ? toolRecords : finalRecords)]),
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
   const proof = { runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch,
@@ -75,11 +81,12 @@ function fixture(kind: "tool" | "final", failComplete = false,
     if (args[5] === "--read") {
       sequence.push("spool-read");
       const offset = Number(args[7]);
-      const part = bytes.subarray(Math.max(0, offset - claim.spoolOffset));
+      const start = Math.max(0, offset - claim.spoolOffset);
+      const part = bytes.subarray(start, start + 65536);
       return { stdout: JSON.stringify({ offset: offset + part.length,
         data: part.toString("base64") }), stderrBytes: 0, exitCode: 0 as const };
     }
-    if (args[1]?.includes("pending.")) {
+    if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
       sequence.push("pending-read");
       return { stdout: JSON.stringify({ version: 1, modelToolUseId: id,
         mcpRequestId: 7, name: "t0", arguments: { value: "x" } }),
@@ -126,6 +133,15 @@ test("final round waits for Box terminal and journal before terminal SSE", async
   assert.ok(f.sequence.indexOf("proof-read") < f.sequence.indexOf("terminal-journal"));
   assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.lastIndexOf("emit"));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+});
+
+test("1.1 MB complete tool echo crosses chunk boundaries before final billing", async () => {
+  const f = fixture("final", false, false, false, true);
+  const result = await runBoxToolContinuation(f.input, f.deps);
+  assert.equal(result.kind, "final");
+  assert.ok(f.sequence.filter((step) => step === "spool-read").length > 16);
+  assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.lastIndexOf("emit"));
+  assert.equal(f.retained, false);
 });
 
 test("journal failure after terminal proof withholds final SSE and preserves unknown", async () => {
