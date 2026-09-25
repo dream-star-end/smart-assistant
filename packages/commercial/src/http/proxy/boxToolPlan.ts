@@ -57,6 +57,7 @@ export function makeBoxToolPlan(input: {
     throw new BoxTextPlanError("BOX_TOOL_PLAN_INVALID");
   }
   args[outputAt + 1] = String(BOX_TOOL_SPOOL_MAX_BYTES);
+  args.splice(outputAt + 2, 0, "--stderr-limit", String(2 * 1024 * 1024));
   const deny = args.indexOf("--disallowedTools");
   if (deny < 0 || args[deny + 1] !== "mcp__*") throw new BoxTextPlanError("BOX_TOOL_PLAN_INVALID");
   args.splice(deny, 2);

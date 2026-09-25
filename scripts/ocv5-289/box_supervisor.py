@@ -305,6 +305,7 @@ def main() -> int:
     parser.add_argument("--deadline", type=float, required=True)
     parser.add_argument("--kill-after", type=float, default=1.0)
     parser.add_argument("--max-output", type=int, default=262144)
+    parser.add_argument("--stderr-limit", type=int, default=0)
     parser.add_argument("--stdin-file")
     parser.add_argument("--stdin-sha256")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -312,6 +313,7 @@ def main() -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if (not command or not (0 < args.deadline <= 900) or not (0 < args.kill_after <= 10)
             or not (0 < args.max_output <= 64 * 1024 * 1024)
+            or not (0 <= args.stderr_limit <= 2 * 1024 * 1024)
             or (args.stdin_file is None) != (args.stdin_sha256 is None)
             or (args.stdin_file is not None and (not args.stdin_file or not args.stdin_sha256))):
         return 126
@@ -467,7 +469,8 @@ def main() -> int:
                     selector.unregister(key.fileobj)
                     continue
                 if key.data == "stdout":
-                    if stdout_bytes + len(chunk) + stderr_bytes > args.max_output:
+                    if (stdout_bytes + len(chunk)
+                            + (0 if args.stderr_limit else stderr_bytes) > args.max_output):
                         reason = 125
                         break
                     stdout_bytes += len(chunk)
@@ -479,7 +482,8 @@ def main() -> int:
                         break
                 else:
                     stderr_bytes += len(chunk)
-                    if stdout_bytes + stderr_bytes > args.max_output:
+                    if (stderr_bytes > args.stderr_limit if args.stderr_limit
+                            else stdout_bytes + stderr_bytes > args.max_output):
                         reason = 125
                         break
             if reason is not None:

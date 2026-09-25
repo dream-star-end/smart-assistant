@@ -49,7 +49,7 @@ def extract_proof_args(argv: list[str]) -> tuple[list[str], str | None, str | No
         raise ValueError("PROOF_ARGS_INVALID")
     supervisor_options = args[:separator]
     allowed = {"--deadline", "--kill-after", "--max-output",
-               "--stdin-file", "--stdin-sha256"}
+               "--stderr-limit", "--stdin-file", "--stdin-sha256"}
     if (len(supervisor_options) % 2 or
             any(supervisor_options[i] not in allowed
                 for i in range(0, len(supervisor_options), 2)) or

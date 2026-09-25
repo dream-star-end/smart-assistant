@@ -55,13 +55,18 @@ test("real detached plan reaches keeper and supervisor without a paid model", as
       "/usr/bin/python3", "-I", "-c", "print('synthetic-model-output')",
     ] };
     const launched = run(synthetic);
-    assert.equal(launched.status, 0, launched.stderr);
+    assert.equal(launched.status, 0, `${launched.stderr}; remote stderr=${
+      existsSync(`${plan.cwd}/stderr.log`)
+        ? readFileSync(`${plan.cwd}/stderr.log`, "utf8").slice(0, 2000) : "absent"}`);
     assert.equal(launched.stdout.trim(), "launched");
     const proof = `${plan.proofDir}/terminal.json`;
     const deadline = Date.now() + 5000;
     while (!existsSync(proof) && Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, 20));
     }
+    assert.ok(existsSync(proof), `missing terminal proof; stderr=${
+      existsSync(`${plan.cwd}/stderr.log`)
+        ? readFileSync(`${plan.cwd}/stderr.log`, "utf8").slice(0, 2000) : "absent"}`);
     const proofText = readFileSync(proof, "utf8");
     assert.equal(parseBoxTerminalProof(proofText, { runNonce: plan.runNonce,
       leaseEpoch: plan.leaseEpoch }).reason, "worker_complete");

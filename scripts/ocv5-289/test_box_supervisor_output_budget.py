@@ -24,6 +24,27 @@ class SupervisorOutputBudgetTest(unittest.TestCase):
         self.assertEqual(len(after.stdout), 1_100_000)
         self.assertEqual(after.stderr, b"")
 
+    def test_stderr_does_not_spend_reserved_tool_stdout_capacity(self) -> None:
+        writer = ('import sys;sys.stderr.write("e"*1500000);sys.stderr.flush();'
+                  'sys.stdout.write("x"*1100000)')
+        base = [sys.executable, "-I", str(SUPERVISOR), "--deadline", "10",
+                "--max-output", "1100000"]
+        combined = subprocess.run([*base, "--", sys.executable, "-I", "-c", writer],
+                                  capture_output=True, timeout=15)
+        self.assertEqual(combined.returncode, 125)
+        isolated = subprocess.run([*base, "--stderr-limit", "2097152", "--",
+                                   sys.executable, "-I", "-c", writer],
+                                  capture_output=True, timeout=15)
+        self.assertEqual(isolated.returncode, 0, isolated.stderr)
+        self.assertEqual(len(isolated.stdout), 1_100_000)
+        over = subprocess.run([*base, "--stderr-limit", "2097152", "--",
+                               sys.executable, "-I", "-c",
+                               'import sys;sys.stderr.write("e"*3000000);'
+                               'sys.stderr.flush();sys.stdout.write("x"*1100000)'],
+                              capture_output=True, timeout=15)
+        self.assertEqual(over.returncode, 125,
+                         "stderr over its independent cap stops before a paid echo can be admitted")
+
 
 if __name__ == "__main__":
     unittest.main()

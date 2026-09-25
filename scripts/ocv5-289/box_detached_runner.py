@@ -60,7 +60,8 @@ def launch(argv: list[str]) -> int:
         separator = options.index("--")
         prefix = options[:separator]
         allowed = {"--proof-dir", "--lease-epoch", "--deadline",
-                   "--kill-after", "--max-output", "--stdin-file", "--stdin-sha256"}
+                   "--kill-after", "--max-output", "--stderr-limit",
+                   "--stdin-file", "--stdin-sha256"}
         if (len(prefix) % 2 or
                 any(prefix[i] not in allowed for i in range(0, len(prefix), 2)) or
                 len(set(prefix[::2])) != len(prefix[::2])):

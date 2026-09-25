@@ -35,6 +35,8 @@ test("first tool round stages private MCP catalog and permits only virtual tools
   assert.equal(args[args.indexOf("--deadline") + 1], "900");
   assert.equal(args[args.indexOf("--max-output") + 1], "67108864",
     "detached tool output must carry the full result echo across rounds");
+  assert.equal(args[args.indexOf("--stderr-limit") + 1], "2097152",
+    "stderr must not consume the reserved stdout budget");
   const config = JSON.parse(args[args.indexOf("--mcp-config") + 1]!) as {
     mcpServers: { ocbridge: { args: string[] } } };
   assert.deepEqual(config.mcpServers.ocbridge.args.slice(0, 2), ["-I",
