@@ -309,7 +309,8 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
 async function runContainerCcbPreflight(input: { baseUrl: string;
   authToken: string; catalogToken: string; turnKey: string }): Promise<{
   exitCode: number; stdoutBytes: number; stderrBytes: number;
-  stderrTail: string }> {
+  stderrTail: string; stdoutEvents: Array<{ type: unknown;
+    subtype: unknown; keys: string[] }> }> {
   const python = `import json,os,sys
 cfg=json.load(sys.stdin)
 env=os.environ.copy()
@@ -333,10 +334,12 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
   const cfg = JSON.stringify(input);
   child.stdin.end(cfg);
   let stdoutBytes = 0, stderrBytes = 0;
+  let stdoutTail = "";
   let stderrTail = "";
   let outputExceeded = false;
   child.stdout.on("data", (chunk: Buffer) => {
     stdoutBytes += chunk.length;
+    stdoutTail = (stdoutTail + chunk.toString("utf8")).slice(-32_768);
     if (stdoutBytes > 2_000_000) {
       outputExceeded = true; child.kill("SIGTERM");
     }
@@ -359,7 +362,15 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
     if (hostTimedOut || outputExceeded || closed.signal !== null) {
       throw new Error("BOX_CCB_PROCESS_UNCONFIRMED");
     }
+    const stdoutEvents = stdoutTail.split("\n").filter(Boolean).slice(-20).map((line) => {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>;
+        return { type: value.type, subtype: value.subtype,
+          keys: Object.keys(value).sort() };
+      } catch { return { type: "non_json", subtype: null, keys: [] }; }
+    });
     return { exitCode: closed.code, stdoutBytes, stderrBytes,
+      stdoutEvents,
       stderrTail: stderrTail.replaceAll(input.authToken, "[synthetic-auth]")
         .replaceAll(input.catalogToken, "[synthetic-catalog]").slice(-300) };
   } finally { clearTimeout(timeout); }
@@ -555,6 +566,7 @@ async function main(): Promise<void> {
         requestIds: observed, transportCalls, paidCalls,
         exitCode: result.exitCode, stdoutBytes: result.stdoutBytes,
         stderrBytes: result.stderrBytes, stderrTail: result.stderrTail,
+        stdoutEvents: result.stdoutEvents,
         shapes: loopback.shapes, diagnostics: loopback.diagnostics.slice(-8) }) + "\n");
       assertion(observed.length >= 1 && observed.length <= 2
         && transportCalls === 0 && paidCalls === 0
