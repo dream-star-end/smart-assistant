@@ -126,24 +126,39 @@ const SAFE_CONTROL_VALUES = new Set(["adaptive", "omitted", "low", "medium",
   "clear_tool_uses_20250919", "clear_thinking_20251015", "all", "none"]);
 /** Preserve only protocol enums/numbers and known keys. Unknown strings are
  * represented by length, never copied into an operator report. */
-function safeControlShape(value: unknown, depth = 0): unknown {
+function safeControlShape(value: unknown, depth = 0,
+  budget = { remaining: 256 }): unknown {
+  if (budget.remaining <= 0) return "<node-limit>";
+  budget.remaining--;
   if (depth > 6) return "<depth-limit>";
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : "<number>";
   if (typeof value === "string") return SAFE_CONTROL_VALUES.has(value) ? value
     : { stringBytes: Buffer.byteLength(value) };
-  if (Array.isArray(value)) return { items: value.slice(0, 16)
-    .map((item) => safeControlShape(item, depth + 1)), omitted: Math.max(0, value.length - 16) };
+  if (Array.isArray(value)) {
+    const items: unknown[] = [];
+    for (const item of value.slice(0, 16)) {
+      if (budget.remaining <= 0) break;
+      items.push(safeControlShape(item, depth + 1, budget));
+    }
+    return { items, omitted: Math.max(0, value.length - items.length) };
+  }
   if (typeof value !== "object") return `<${typeof value}>`;
   const source = value as Record<string, unknown>;
   const safe: Record<string, unknown> = {};
   let omitted = 0;
   for (const [key, item] of Object.entries(source)) {
-    if (SAFE_CONTROL_KEYS.has(key)) safe[key] = safeControlShape(item, depth + 1);
+    if (budget.remaining <= 0) { safe.truncated = true; break; }
+    if (SAFE_CONTROL_KEYS.has(key)) safe[key] = safeControlShape(item, depth + 1, budget);
     else omitted++;
   }
   if (omitted) safe.omittedFields = omitted;
   return safe;
+}
+function boundedControlShape(value: unknown): unknown {
+  const summary = safeControlShape(value);
+  return Buffer.byteLength(JSON.stringify(summary)) <= 4096
+    ? summary : "<summary-too-large>";
 }
 
 async function startSignedLoopback(args: { pool: Pool; redis: Redis;
@@ -271,9 +286,9 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
           toolNames: Array.isArray(body.tools) ? body.tools.map((tool) =>
             tool !== null && typeof tool === "object" && "name" in tool
               && typeof tool.name === "string" ? tool.name : "<invalid>") : [],
-          contextManagement: safeControlShape(body.context_management ?? null),
-          thinking: safeControlShape(body.thinking ?? null),
-          outputConfig: safeControlShape(body.output_config ?? null),
+          contextManagement: boundedControlShape(body.context_management ?? null),
+          thinking: boundedControlShape(body.thinking ?? null),
+          outputConfig: boundedControlShape(body.output_config ?? null),
           messageRoles: Array.isArray(body.messages) ? body.messages.slice(0, 64)
             .map((msg) => msg && typeof msg === "object" && "role" in msg
               && typeof msg.role === "string"
