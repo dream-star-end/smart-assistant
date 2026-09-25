@@ -13,14 +13,30 @@ type Identity = Pick<BoxJournalAdmission,
   "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">;
 type Journal = Pick<BoxDurableJournal, "recordUserCancelIntent" | "getCancelLeaf" |
   "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure">;
-type Resolver = Pick<BoxAccountResolver, "resolve">;
+type Resolver = Pick<BoxAccountResolver, "resolve"> &
+  Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 export type BoxUserStopOutcome = "stopped_proven" | "completed_unsettled" | "pending";
+
+class BoxUserStopTimeout extends Error {}
+async function bounded<T>(pending: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try { return await Promise.race([pending, new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new BoxUserStopTimeout()), ms);
+  })]); }
+  finally { if (timer) clearTimeout(timer); }
+}
 
 export class BoxUserStopCoordinator {
   private readonly orphaned = new Map<BoxResolvedTarget,
     { pending: Promise<void> | null; failed: boolean }>();
   constructor(private readonly deps: { journal: Journal; resolver: Resolver;
-    proofWaitMs?: number }) {}
+    proofWaitMs?: number; journalTimeoutMs?: number }) {
+    if (deps.journalTimeoutMs !== undefined
+      && (!Number.isSafeInteger(deps.journalTimeoutMs)
+        || deps.journalTimeoutMs < 1 || deps.journalTimeoutMs > 5_000)) {
+      throw new Error("BOX_USER_STOP_JOURNAL_TIMEOUT_INVALID");
+    }
+  }
 
   private async closeLocal(target: BoxResolvedTarget): Promise<void> {
     const state = this.orphaned.get(target) ?? { pending: null, failed: false };
@@ -39,6 +55,9 @@ export class BoxUserStopCoordinator {
   }
 
   async retryFailedLocal(): Promise<number> {
+    if (this.deps.resolver.retryFailedAgentCleanup) {
+      await bounded(this.deps.resolver.retryFailedAgentCleanup(), 200).catch(() => {});
+    }
     for (const [target, state] of this.orphaned) {
       if (state.failed && !state.pending) {
         state.failed = false;
@@ -75,9 +94,14 @@ export class BoxUserStopCoordinator {
   async requestStop(input: Identity): Promise<BoxUserStopOutcome> {
     // This must commit before the first remote stop Exec. Failure here must
     // propagate to the authenticated caller; do not signal an unjournaled run.
-    await this.deps.journal.recordUserCancelIntent(input);
+    const journalTimeoutMs = this.deps.journalTimeoutMs ?? 5_000;
+    try { await bounded(this.deps.journal.recordUserCancelIntent(input), journalTimeoutMs); }
+    catch (error) {
+      if (error instanceof BoxUserStopTimeout) return "pending";
+      throw error;
+    }
     let leaf: BoxStoppedFailureProbeCandidate;
-    try { leaf = await this.deps.journal.getCancelLeaf(input); }
+    try { leaf = await bounded(this.deps.journal.getCancelLeaf(input), journalTimeoutMs); }
     catch { return "pending"; } // A concurrent terminal may already own it.
     let target: BoxResolvedTarget | null = null;
     try {
@@ -105,8 +129,11 @@ export class BoxUserStopCoordinator {
           if (proof.reason === "worker_complete") return "completed_unsettled";
           const close = { requestId: leaf.requestId, uid: leaf.uid,
             leaseEpoch: leaf.leaseEpoch, proof };
-          if (leaf.linked) await this.deps.journal.markToolChainStoppedFailure(close);
-          else await this.deps.journal.markFirstRoundStoppedFailure(close);
+          try {
+            if (leaf.linked) await bounded(
+              this.deps.journal.markToolChainStoppedFailure(close), journalTimeoutMs);
+            else await bounded(this.deps.journal.markFirstRoundStoppedFailure(close), journalTimeoutMs);
+          } catch { return "pending"; } // A late CAS may still commit; never infer it.
           return "stopped_proven";
         } catch { /* Missing proof or losing CAS remains pending. */ }
         if (Date.now() >= deadline) break;

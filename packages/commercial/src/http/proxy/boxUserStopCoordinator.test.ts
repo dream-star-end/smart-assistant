@@ -79,3 +79,28 @@ test("missing proof or wrong account never releases capacity", async () => {
   assert.equal(remote, 2, "one stop and one proof read, no replay");
   assert.equal(closed, 0);
 });
+
+test("hung journal CAS returns pending, disposes target, and never overlaps a retry", async () => {
+  let casCalls = 0, disposeCalls = 0, resolverRetries = 0;
+  const coordinator = new BoxUserStopCoordinator({
+    journal: { recordUserCancelIntent: async () => {}, getCancelLeaf: async () => leaf,
+      markFirstRoundStoppedFailure: async () => { throw new Error("wrong leaf"); },
+      markToolChainStoppedFailure: async () => {
+        casCalls++;
+        await new Promise<void>(() => {});
+      } } as never,
+    resolver: { resolve: async () => ({ accountId: 20n,
+      exec: { run: async (req: { args: string[] }) =>
+        req.args.at(-1) === identity.leaseEpoch
+          ? { stdout: "stop-requested\n", exitCode: 0 }
+          : { stdout: JSON.stringify(stoppedProof) + "\n", exitCode: 0 } },
+      dispose: async () => { disposeCalls++; } }) as never,
+      retryFailedAgentCleanup: async () => { resolverRetries++; return 0; } } as never,
+    proofWaitMs: 0, journalTimeoutMs: 10,
+  });
+  assert.equal(await coordinator.requestStop(identity), "pending");
+  assert.equal(casCalls, 1);
+  assert.equal(disposeCalls, 1);
+  assert.equal(await coordinator.retryFailedLocal(), 0);
+  assert.equal(resolverRetries, 1);
+});
