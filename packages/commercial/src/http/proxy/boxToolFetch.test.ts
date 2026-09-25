@@ -162,6 +162,82 @@ test("fresh egress instance recovers proven remote cleanup from durable journal"
   assert.equal(cleans, 1, "already-cleaned remote run is not touched again");
 });
 
+test("stalled restart cleanup resolver is bounded and frees local single-flight", async () => {
+  const candidate = { requestId: "box-stalled", uid: 3n, accountId: 20n,
+    runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+    proof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+      keeperPid: 101, cliPid: 102, reason: "worker_complete" as const,
+      revision: 1 as const } };
+  let resolves = 0, aborts = 0;
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), cleanupResolveTimeoutMs: 20,
+    journal: { listRemoteCleanupCandidates: async () => [candidate],
+      claimRemoteCleanup: async () => true } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async ({ signal }) => {
+      resolves++;
+      signal.addEventListener("abort", () => { aborts++; }, { once: true });
+      return new Promise<never>(() => {});
+    }, onUnknown: async () => {} });
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  assert.equal(aborts, 1);
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  assert.equal(resolves, 2, "the timeout must release this run's local in-flight marker");
+});
+
+test("late cleanup resolver target closes locally and failed dispose is retried", async () => {
+  const candidate = { requestId: "box-late", uid: 3n, accountId: 20n,
+    runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32),
+    proof: { runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32),
+      keeperPid: 101, cliPid: 102, reason: "worker_complete" as const,
+      revision: 1 as const } };
+  let finish!: (target: unknown) => void;
+  const pending = new Promise<unknown>((resolve) => { finish = resolve; });
+  let remoteCalls = 0, disposals = 0;
+  const target = { accountId: 20n,
+    exec: { run: async () => { remoteCalls++; throw new Error("no remote cleanup after timeout"); } },
+    dispose: async () => { disposals++; if (disposals === 1) throw new Error("transient"); } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), cleanupResolveTimeoutMs: 20,
+    journal: { listRemoteCleanupCandidates: async () => [candidate],
+      claimRemoteCleanup: async () => true } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => pending as never,
+    onUnknown: async () => {} });
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  finish(target);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposals, 1);
+  assert.equal(remoteCalls, 0);
+  assert.equal(await service.retryFailedCleanup(), 0);
+  assert.equal(disposals, 2);
+});
+
+test("mismatched pinned cleanup account closes its unused local target", async () => {
+  const candidate = { requestId: "box-wrong-account", uid: 3n, accountId: 20n,
+    runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32),
+    proof: { runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32),
+      keeperPid: 101, cliPid: 102, reason: "worker_complete" as const,
+      revision: 1 as const } };
+  let closed = 0, remoteCalls = 0;
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { listRemoteCleanupCandidates: async () => [candidate],
+      claimRemoteCleanup: async () => true } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => ({ accountId: 21n,
+      exec: { run: async () => { remoteCalls++; throw new Error("no cross-account Exec"); } },
+      dispose: async () => { closed++; } }) as never,
+    onUnknown: async () => {} });
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(closed, 1);
+  assert.equal(remoteCalls, 0);
+});
+
 test("worker that lost cleanup claim releases local target once peer marked exact proof done", async () => {
   let disposed = false, remoteCalls = 0;
   const target = { accountId: 20n,

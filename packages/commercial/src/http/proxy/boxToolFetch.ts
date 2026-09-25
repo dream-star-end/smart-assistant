@@ -51,6 +51,8 @@ export class BoxToolFetch {
     runFirst?: First;
     publishResume?: Publish;
     runContinuation?: Continue;
+    /** Test-only shortening of the bounded restart-cleanup resolver wait. */
+    cleanupResolveTimeoutMs?: number;
   }) {}
 
   private own(nonce: string, target: BoxResolvedTarget): void {
@@ -66,6 +68,40 @@ export class BoxToolFetch {
     void handle.pending.then(() => { this.cleanup.delete(state); }, () => {
       state.failed = true;
     });
+  }
+
+  private closeUnusedTarget(target: BoxResolvedTarget): void {
+    const pending = Promise.resolve().then(() => target.dispose?.());
+    this.retainCleanup({ target, pending });
+  }
+
+  private async resolveCleanupTarget(candidate: BoxRemoteCleanupCandidate): Promise<BoxResolvedTarget> {
+    const timeoutMs = this.deps.cleanupResolveTimeoutMs ?? 30_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
+      throw new Error("BOX_CLEANUP_RESOLVE_BUDGET_INVALID");
+    }
+    const abort = new AbortController();
+    const pending = Promise.resolve().then(() => this.deps.resolveTarget({ uid: candidate.uid,
+      sessionId: null, requestId: candidate.requestId,
+      upstreamModel: "claude-opus-5-5", requiredAccountId: candidate.accountId,
+      signal: abort.signal }));
+    let abandoned = false, completed: BoxResolvedTarget | null = null;
+    void pending.then((target) => {
+      completed = target;
+      if (abandoned) this.closeUnusedTarget(target);
+    }, () => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([pending, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          abort.abort(); reject(new Error("BOX_CLEANUP_RESOLVE_TIMEOUT"));
+        }, timeoutMs);
+      })]);
+    } catch (error) {
+      abandoned = true;
+      if (completed) this.closeUnusedTarget(completed);
+      throw error;
+    } finally { if (timer) clearTimeout(timer); }
   }
 
   private async cleanedElsewhere(candidate: BoxRemoteCleanupCandidate): Promise<boolean> {
@@ -134,12 +170,9 @@ export class BoxToolFetch {
         }
         let held = this.terminalCleanup.get(candidate.runNonce);
         if (!held) {
-          const target = await this.deps.resolveTarget({ uid: candidate.uid,
-            sessionId: null, requestId: candidate.requestId,
-            upstreamModel: "claude-opus-5-5",
-            requiredAccountId: candidate.accountId,
-            signal: new AbortController().signal });
+          const target = await this.resolveCleanupTarget(candidate);
           if (target.accountId !== candidate.accountId) {
+            this.closeUnusedTarget(target);
             throw new Error("BOX_CLEANUP_ACCOUNT_MISMATCH");
           }
           held = { target, candidate, claimed: true };
