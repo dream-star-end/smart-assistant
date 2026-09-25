@@ -1,7 +1,7 @@
 /** Read-only exact-run recovery inspection. No model launch, mutation, retry
  * or cleanup; the fixed account lock remains until proof permits release. */
 import { createHash } from "node:crypto";
-import { constants, closeSync, fsyncSync, lstatSync, openSync,
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync,
   readFileSync, unlinkSync, writeSync } from "node:fs";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
@@ -48,22 +48,42 @@ def stream_shape(path):
   result_count=0;tool_use_count=0;tool_result_count=0
   invalid_count=0;unrecognized_count=0
   last_type=None;last_result_error=None;last_result_subtype=None
+  def nested_tool_evidence(value,depth=0):
+   if depth>12:raise ValueError('nested record too deep')
+   if isinstance(value,dict):
+    hit=int(value.get('type') in ('tool_use','tool_result')
+      or value.get('stop_reason')=='tool_use' or 'tool_use_id' in value)
+    return hit+sum(nested_tool_evidence(v,depth+1) for v in value.values())
+   if isinstance(value,list):
+    if len(value)>4096:raise ValueError('nested record too wide')
+    return sum(nested_tool_evidence(v,depth+1) for v in value)
+   return 0
   for line in all_lines:
    try:whole=json.loads(line)
    except (UnicodeDecodeError,ValueError):
     invalid_count+=1;last_type='invalid_json';continue
    if not isinstance(whole,dict):
     invalid_count+=1;last_type='non_object';continue
+   try:tool_use_count+=nested_tool_evidence(whole)
+   except ValueError:unrecognized_count+=1
    last_type=whole.get('type') if whole.get('type') in allowed else 'other'
    if last_type=='other':unrecognized_count+=1
    if whole.get('type')=='result':
     result_count+=1;last_result_error=whole.get('is_error') is True
-    last_result_subtype=whole.get('subtype') if isinstance(whole.get('subtype'),str) else None
+    subtype=whole.get('subtype')
+    last_result_subtype=(subtype if subtype in
+      ('success','error','error_during_execution','error_max_turns') else None)
    if whole.get('type') in ('tool_progress','tool_use_summary'):tool_use_count+=1
    if whole.get('type')=='stream_event':
     event=whole.get('event')
     if not isinstance(event,dict) or event.get('type') not in events:
      unrecognized_count+=1
+    elif event.get('type')=='message_start':
+     msg=event.get('message')
+     content=msg.get('content') if isinstance(msg,dict) else None
+     if not isinstance(content,list) or any(not isinstance(b,dict)
+       or b.get('type') not in ('text','thinking','redacted_thinking','tool_use')
+       for b in content):unrecognized_count+=1
     elif event.get('type')=='content_block_start':
      block=event.get('content_block')
      kind=block.get('type') if isinstance(block,dict) else None
@@ -71,10 +91,16 @@ def stream_shape(path):
      elif kind not in ('text','thinking','redacted_thinking'):unrecognized_count+=1
     elif event.get('type')=='content_block_delta':
      delta=event.get('delta')
-     if isinstance(delta,dict) and delta.get('type')=='input_json_delta':tool_use_count+=1
+     if (not isinstance(delta,dict) or delta.get('type') not in
+       ('text_delta','thinking_delta','signature_delta','input_json_delta')):
+      unrecognized_count+=1
+     elif delta.get('type')=='input_json_delta':tool_use_count+=1
     elif event.get('type')=='message_delta':
      delta=event.get('delta')
-     if isinstance(delta,dict) and delta.get('stop_reason')=='tool_use':tool_use_count+=1
+     if (not isinstance(delta,dict) or delta.get('stop_reason') not in
+       (None,'tool_use','end_turn','max_tokens','stop_sequence')):
+      unrecognized_count+=1
+     elif delta.get('stop_reason')=='tool_use':tool_use_count+=1
    msg=whole.get('message')
    blocks=msg.get('content') if isinstance(msg,dict) else None
    if whole.get('type') in ('assistant','user') and not isinstance(blocks,list):
@@ -395,14 +421,16 @@ async function main(): Promise<void> {
           originalLock: record, first: previous, second: assessed.snapshot,
           quarantinedAt: new Date().toISOString() };
         try {
-          const priorArchive = lstatSync(archive);
-          if (!priorArchive.isFile() || priorArchive.isSymbolicLink()
-            || priorArchive.uid !== process.getuid()
+          const archiveFd = openSync(archive, constants.O_RDONLY | constants.O_NOFOLLOW);
+          try {
+          const priorArchive = fstatSync(archiveFd);
+          if (!priorArchive.isFile() || priorArchive.uid !== process.getuid()
             || (priorArchive.mode & 0o777) !== 0o600
+            || priorArchive.nlink !== 1
             || priorArchive.size < 1 || priorArchive.size > 8192) {
             throw new Error("BOX_UNKNOWN_ARCHIVE_INVALID");
           }
-          const saved = JSON.parse(readFileSync(archive, "utf8")) as Record<string, unknown>;
+          const saved = JSON.parse(readFileSync(archiveFd, "utf8")) as Record<string, unknown>;
           const first = saved.first as Record<string, unknown> | undefined;
           const second = saved.second as Record<string, unknown> | undefined;
           if (saved.kind !== "synthetic_unknown_cli_error"
@@ -421,6 +449,11 @@ async function main(): Promise<void> {
             || second.observedAtMs - first.observedAtMs < 60_000) {
             throw new Error("BOX_UNKNOWN_ARCHIVE_CONFLICT");
           }
+          // A previous process may have crashed after writing but before the
+          // file fsync. Re-establish durability before deleting the only lock.
+          fsyncSync(archiveFd);
+          } finally { closeSync(archiveFd); }
+          syncDirectory();
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           writeOnce(archive, JSON.stringify(archiveRecord));

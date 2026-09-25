@@ -61,6 +61,25 @@ class UnknownReadTest(unittest.TestCase):
             {"type": "result", "subtype": "success", "is_error": True},
         ])
         self.assertGreater(summary["toolUseCount"], 0)
+        summary = self.inspect([
+            {"type": "stream_event", "event": {"type": "message_start",
+             "message": {"content": [{"type": "tool_use"}]}}},
+            {"type": "result", "subtype": "success", "is_error": True},
+        ])
+        self.assertGreater(summary["toolUseCount"], 0)
+
+    def test_malformed_delta_and_unknown_subtype_fail_closed_without_echo(self) -> None:
+        for delta in ([], {"type": "future_secret_delta"}):
+            summary = self.inspect([
+                {"type": "stream_event", "event": {"type": "content_block_delta",
+                 "delta": delta}},
+                {"type": "result", "subtype": "success", "is_error": True},
+            ])
+            self.assertGreater(summary["unrecognizedCount"], 0)
+        summary = self.inspect([{"type": "result", "subtype": "private-marker",
+                                 "is_error": True}])
+        self.assertIsNone(summary["lastResultSubtype"])
+        self.assertNotIn("private-marker", json.dumps(summary))
 
 
 if __name__ == "__main__":
