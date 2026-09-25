@@ -15,6 +15,8 @@ import type { BoxJournalAdmission } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
 import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
+import { validateBoxToolRequest } from
+  "../../packages/commercial/src/http/proxy/boxRequestGate.js";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { makeAnthropicProxyHandler } from
@@ -431,22 +433,32 @@ async function main(): Promise<void> {
         diagnostics: loopback.diagnostics.slice(-8) }) + "\n");
       return;
     }
-    const tools = [{ name: "local_echo", description: "Synthetic OpenClaude-local tool",
+    const tools = [{ name: "local_echo", description:
+      "Returns a private, unpredictable result token for the supplied value. The result is not the input and cannot be inferred without invoking this tool.",
       input_schema: { type: "object", properties: { value: { type: "string" } },
         required: ["value"] } }];
     // Opus 5.5 adaptive thinking can consume a 128-token ceiling before it
     // reaches tool_use; use the actual CCB-scale request budget for this probe.
     const first: ProxyBody = { model: MODEL, max_tokens: 8192, stream: true,
-      system: "Synthetic OpenClaude tool verification. No real user content.",
+      system: "Synthetic tool-dispatch verification; no real user content. The user asks for a secret result that exists only behind local_echo. Do not guess or echo its input. Call local_echo before answering; emit no explanatory text before the call.",
       metadata: { user_id: JSON.stringify({ oc_turn_key: turnKey, session_id: sessionId }) },
       messages: [{ role: "user", content:
-        `Call local_echo exactly once with value ${challenge}. Then answer with exactly its result text.` }],
+        `The answer is an unpredictable secret held by local_echo. Invoke local_echo exactly once with value ${challenge}. Only after receiving its result, reply with exactly that result text. A reply without the tool result is incorrect.` }],
       tools, tool_choice: { type: "auto" } };
+    assertion(validateBoxToolRequest(first) === null, "BOX_SIGNED_FIXTURE_INVALID");
     const firstResponse = await loopback.call(first, firstId);
     const firstEvents = await readEvents(firstResponse);
     await loopback.waitHandler(firstId);
     const content = assistantContent(firstEvents);
     const toolUse = content.filter((block) => block.type === "tool_use");
+    if (toolUse.length !== 1) {
+      const finalText = content.filter((block) => block.type === "text")
+        .map((block) => String(block.text ?? "")).join("");
+      process.stderr.write(JSON.stringify({ code: "BOX_SIGNED_NO_TOOL_DIAGNOSTIC",
+        stopReason: firstEvents.filter((item) => item.event === "message_delta")
+          .map((item) => (item.data.delta as { stop_reason?: unknown } | undefined)?.stop_reason)
+          .at(-1), textPreview: finalText.slice(0, 160) }) + "\n");
+    }
     assertion(toolUse.length === 1 && toolUse[0]?.name === "local_echo"
       && typeof toolUse[0]?.id === "string"
       && JSON.stringify(toolUse[0]?.input) === JSON.stringify({ value: challenge }),
