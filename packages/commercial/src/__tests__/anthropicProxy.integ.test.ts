@@ -1121,6 +1121,39 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       else process.env.OC_BOX_MODEL_API = old;
     }
   });
+
+  test("Box 429/503 failure responses never create usage or silently retry", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      for (const status of [429, 503]) {
+        const { h, headers } = boxRouteHarness();
+        try {
+          let calls = 0;
+          h.deps.boxModel = { async fetch() {
+            calls++;
+            return new Response(JSON.stringify({ error: { type: "overloaded_error",
+              message: "synthetic upstream unavailable" } }),
+            { status, headers: { "content-type": "application/json" } });
+          } };
+          const request = { ...minBody(BOX_API_MODEL), metadata: {
+            user_id: JSON.stringify({ session_id: `web-box-fault-${status}`,
+              oc_turn_key: "a".repeat(64) }) } };
+          const response = await h.run(request, headers);
+          assert.notEqual(response.statusCode, 200, response.bodyText());
+          assert.equal(calls, 1, "one model transport invocation, no hidden retry");
+          assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+            .startsWith("INSERT INTO USAGE_RECORDS")).length, 0,
+          "failed Box response must not create a usage record");
+          assert.equal(h.preCheckSpy.releaseCalls.length, 1,
+            "failed Box response must release the precheck reservation");
+        } finally { await resetPool(); }
+      }
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
 });
 
 /** sendJsonError 输出 `{error: {code, message}}` —— body.error.code 才是 code。 */
