@@ -32,6 +32,8 @@ let requests = 0, responseExact = false, advertised = false;
 const headerShapes: Array<Record<string, string>> = [];
 const bodyHashes: string[] = [];
 const turnKeyMatches: boolean[] = [];
+const roleSequences: string[][] = [];
+const trailingBudgetHints: boolean[] = [];
 const server = createServer(async (req, res) => {
   let raw = "";
   for await (const chunk of req) raw += chunk;
@@ -46,6 +48,14 @@ const server = createServer(async (req, res) => {
     .map(([key, value]) => [key, createHash("sha256")
       .update(JSON.stringify(value)).digest("hex").slice(0, 12)])));
   const body = JSON.parse(raw) as Record<string, unknown>;
+  const messageList = Array.isArray(body.messages) ? body.messages as Array<{
+    role?: string; content?: unknown }> : [];
+  roleSequences.push(messageList.map((item) => String(item.role ?? "<missing>")));
+  const last = messageList.at(-1);
+  const content = last?.content;
+  trailingBudgetHints.push(last?.role === "system" && Array.isArray(content)
+    && content.length === 1 && typeof content[0]?.text === "string"
+    && /^<total_tokens>[0-9]+ tokens left<\/total_tokens>$/.test(content[0].text));
   const userMeta = (body.metadata as { user_id?: unknown } | undefined)?.user_id;
   let parsedMeta: Record<string, unknown> = {};
   try { if (typeof userMeta === "string") parsedMeta = JSON.parse(userMeta); }
@@ -177,6 +187,7 @@ try {
     headerShapes,
     sameTurnKeyAcrossModelCalls: turnKeyMatches.every(Boolean),
     modelRequestBodiesDistinct: bodyHashes[0] !== bodyHashes[1],
+    roleSequences, trailingBudgetHints,
   }) + "\n");
 } finally {
   clearTimeout(timer);

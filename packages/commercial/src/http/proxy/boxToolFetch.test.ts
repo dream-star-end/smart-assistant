@@ -13,6 +13,9 @@ const nextBody: ProxyBody = { ...firstBody, messages: [
     name: "local_echo", input: {} }] },
   { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_A",
     content: "local result" }] },
+  { role: "system", content: [{ type: "text",
+    text: "<total_tokens>14999987 tokens left</total_tokens>",
+    cache_control: { type: "ephemeral" } }] },
 ] };
 const call = (canonicalBody: ProxyBody) => ({ uid: 3n, sessionId: "session",
   requestId: canonicalBody === firstBody ? "box-first" : "box-next",

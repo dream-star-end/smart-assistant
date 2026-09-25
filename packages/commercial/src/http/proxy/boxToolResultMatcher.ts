@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { ProxyBody } from "./shared.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
-import { normalizeBoxToolResultBlock } from "./boxCacheAnnotations.js";
+import { normalizeBoxSemanticBody, normalizeBoxToolResultBlock } from "./boxCacheAnnotations.js";
 
 const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 // Leave room for the sidecar result envelope under its 8 MiB frame bound.
@@ -62,11 +62,12 @@ function content(value: unknown): McpContent[] {
 
 export function matchBoxToolResults(body: ProxyBody,
   expected: readonly (BoxToolUse | BoxToolUseDigest)[]): readonly BoxMatchedToolResult[] {
+  const effective = normalizeBoxSemanticBody(body);
   if (!Array.isArray(expected) || expected.length < 1 || expected.length > 32
-    || !Array.isArray(body.messages) || body.messages.length < 2) {
+    || !Array.isArray(effective.messages) || effective.messages.length < 2) {
     throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
   }
-  const assistant = body.messages.at(-2), user = body.messages.at(-1);
+  const assistant = effective.messages.at(-2), user = effective.messages.at(-1);
   if (!record(assistant) || assistant.role !== "assistant"
     || !Array.isArray(assistant.content) || !record(user) || user.role !== "user"
     || !Array.isArray(user.content)) {

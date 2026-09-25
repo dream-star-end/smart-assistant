@@ -17,6 +17,7 @@ import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.js";
+import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
@@ -656,13 +657,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (ctx.boxContextHash !== priorContextHash) {
         throw new BoxDurableJournalError("BOX_TOOL_CONTEXT_CHANGED");
       }
+      let effectiveBody: ProxyBody;
+      try { effectiveBody = normalizeBoxSemanticBody(input.canonicalBody); }
+      catch { throw new BoxDurableJournalError("BOX_TOOL_RESULT_MISMATCH"); }
       const digests = handoff.toolUses;
       let results: readonly BoxMatchedToolResult[];
       try { results = matchBoxToolResults(input.canonicalBody,
         digests); }
       catch { throw new BoxDurableJournalError("BOX_TOOL_RESULT_MISMATCH"); }
       try {
-        const assistant = input.canonicalBody.messages.at(-2) as
+        const assistant = effectiveBody.messages.at(-2) as
           { content?: unknown } | undefined;
         if (!assistant || hashBoxAssistantContent(assistant.content)
           !== handoff.assistantContentHash) {
@@ -672,7 +676,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         throw new BoxDurableJournalError("BOX_TOOL_ASSISTANT_CHANGED");
       }
       try {
-        reserveBoxToolEcho(handoff.spoolOffset, input.canonicalBody.messages.at(-1));
+        reserveBoxToolEcho(handoff.spoolOffset, effectiveBody.messages.at(-1));
       } catch {
         throw new BoxDurableJournalError("BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
       }

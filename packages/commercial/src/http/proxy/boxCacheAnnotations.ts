@@ -76,6 +76,47 @@ export function isBoxNoopContextManagement(body: ProxyBody): boolean {
   return object(edit) && Object.keys(edit).sort().join(",") === "keep,type"
     && edit.type === "clear_thinking_20251015" && edit.keep === "all";
 }
+/** CCB2.1.280 appends this budget telemetry *after* the tool_result user
+ * message. The held inner Claude Code CLI independently emits its own
+ * <total_tokens> system hint after the virtual MCP result (proved by the
+ * local two-CLI tool loop); the outer hint is not a new user instruction.
+ * Recognize only this exact shape. Every other trailing system message stays
+ * in the body and must fail the resume gate rather than being discarded. */
+export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
+  if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
+    || !Array.isArray(body.messages) || body.messages.length < 3) return false;
+  const lastIndex = body.messages.length - 1;
+  if (!Object.hasOwn(body.messages, lastIndex)
+    || !Object.hasOwn(body.messages, lastIndex - 1)
+    || !Object.hasOwn(body.messages, lastIndex - 2)) return false;
+  const tail = body.messages[lastIndex];
+  const result = body.messages[lastIndex - 1];
+  const assistant = body.messages[lastIndex - 2];
+  if (!object(tail) || tail.role !== "system"
+    || Object.keys(tail).sort().join(",") !== "content,role"
+    || !Array.isArray(tail.content) || tail.content.length !== 1
+    || !Object.hasOwn(tail.content, 0)
+    || !object(result) || result.role !== "user"
+    || !Array.isArray(result.content) || result.content.length < 1
+    || result.content.some((part: unknown) => !object(part) || part.type !== "tool_result")
+    || !object(assistant) || assistant.role !== "assistant"
+    || !Array.isArray(assistant.content)
+    || !assistant.content.some((part: unknown) => object(part) && part.type === "tool_use")) {
+    return false;
+  }
+  const block = tail.content[0];
+  return object(block) && Object.keys(block).sort().join(",") === "cache_control,text,type"
+    && block.type === "text"
+    && typeof block.text === "string"
+    && /^<total_tokens>[1-9][0-9]{0,15} tokens left<\/total_tokens>$/.test(block.text)
+    && object(block.cache_control)
+    && Object.keys(block.cache_control).join(",") === "type"
+    && block.cache_control.type === "ephemeral";
+}
+export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
+  return isBoxCcbToolBudgetTail(body)
+    ? { ...body, messages: body.messages.slice(0, -1) } as ProxyBody : body;
+}
 export function normalizeBoxSemanticBody(body: ProxyBody,
   options: { collapseSingleText?: boolean } = {}): ProxyBody {
   // A validated keep-all hint has no model-visible effect. Drop it from the
@@ -86,6 +127,7 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
     const { context_management: _hint, ...rest } = body;
     semanticBody = rest as ProxyBody;
   }
+  semanticBody = stripBoxCcbToolBudgetTail(semanticBody);
   // Opus 5.5 defaults adaptive display to "omitted". The actual Box CLI plan
   // maps both request forms to the same effort and response behavior; normalize
   // only this verified equivalence so a retry/continuation cannot evade its

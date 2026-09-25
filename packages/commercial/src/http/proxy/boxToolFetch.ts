@@ -8,6 +8,7 @@ import { runBoxToolFirstRound, type BoxToolFirstHandoff,
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
+import { stripBoxCcbToolBudgetTail } from "./boxCacheAnnotations.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -19,7 +20,7 @@ type Publish = typeof publishBoxToolResume;
 type Continue = typeof runBoxToolContinuation;
 
 function resumeShape(body: ProxyBody): boolean {
-  const messages = body.messages;
+  const messages = stripBoxCcbToolBudgetTail(body).messages;
   const last = Array.isArray(messages) ? messages.at(-1) : null;
   if (!last || typeof last !== "object" || !("role" in last)
     || last.role !== "user" || !("content" in last)

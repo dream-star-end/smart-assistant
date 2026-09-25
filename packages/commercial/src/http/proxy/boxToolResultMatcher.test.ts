@@ -34,6 +34,17 @@ test("same-name same-input tool results bind by model ID, not arrival order", ()
     "cross-request resume must validate only persisted hashes, not PG raw arguments");
 });
 
+test("real CCB trailing token-budget system hint does not hide the exact tool result", () => {
+  const value = body();
+  value.messages.push({ role: "system", content: [{ type: "text",
+    text: "<total_tokens>14999987 tokens left</total_tokens>",
+    cache_control: { type: "ephemeral" } }] });
+  assert.deepEqual(matchBoxToolResults(value, uses), matchBoxToolResults(body(), uses));
+  value.messages.at(-1)!.content = [{ type: "text", text: "different system instruction",
+    cache_control: { type: "ephemeral" } }];
+  assert.throws(() => matchBoxToolResults(value, uses), /BOX_TOOL_RESULT_CONTEXT_INVALID/);
+});
+
 test("missing, duplicate or rewritten tool history fails before result publication", () => {
   const missing = body();
   (missing.messages[1] as { content: unknown[] }).content.pop();

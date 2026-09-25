@@ -863,13 +863,17 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     // prompt/tool catalog to the just-completed tool_result. It cannot change
     // the model-visible history or strand an already-paid tool handoff.
     const cacheSession = `cache-${suffix}`, cacheTurn = "6".repeat(64);
+    const budget = (tokens: number) => ({ role: "system", content: [{ type: "text",
+      text: `<total_tokens>${tokens} tokens left</total_tokens>`,
+      cache_control: { type: "ephemeral" } }] });
     const cacheTools = toolDeclarations.map((tool) => ({ ...tool,
       cache_control: { type: "ephemeral" } }));
     const cacheFirst: ProxyBody = { ...firstBody, tools: cacheTools,
       metadata: { user_id: JSON.stringify({ oc_turn_key: cacheTurn,
         session_id: cacheSession }) },
       messages: [{ role: "user", content: [{ type: "text",
-        text: "synthetic cache prompt", cache_control: { type: "ephemeral" } }] }] };
+        text: "synthetic cache prompt", cache_control: { type: "ephemeral" } }] },
+        budget(15_000_000)] };
     const cacheBasis = { ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: cacheSession, turnKey: cacheTurn } };
     const cacheRoot = { ...toolCall, requestId: `box-cache-root-${suffix}`,
@@ -890,6 +894,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     [cacheChild, JSON.stringify(cacheBasis)]);
     const cacheResume: ProxyBody = { ...cacheFirst, tools: toolDeclarations,
       messages: [{ role: "user", content: "synthetic cache prompt" },
+        budget(15_000_000),
         { role: "assistant", content: firstAssistantContent.map((block, index) =>
           index === firstAssistantContent.length - 1
             ? { ...block, cache_control: { type: "ephemeral" } } : block) },
@@ -898,6 +903,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
           { type: "tool_result", tool_use_id: "toolu_B", content: "second",
             cache_control: { type: "ephemeral" } },
         ] },
+        budget(14_999_987),
       ] };
     const cacheClaim = await journal.claimToolResume({ requestId: cacheChild,
       uid: 3n, canonicalModel: basis.model, canonicalBody: cacheResume });

@@ -5,7 +5,7 @@
 import type { ProxyBody } from "./shared.js";
 import { BoxMessagesShapeError, compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { compileBoxToolCatalog, mapBoxCliEffort } from "./boxToolCatalog.js";
-import { isBoxNoopContextManagement } from "./boxCacheAnnotations.js";
+import { isBoxNoopContextManagement, stripBoxCcbToolBudgetTail } from "./boxCacheAnnotations.js";
 
 export function validateBoxTextRequest(body: ProxyBody): string | null {
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
@@ -56,7 +56,8 @@ export function validateBoxToolRequest(body: ProxyBody): string | null {
     if (body.thinking !== undefined || body.output_config !== undefined) {
       mapBoxCliEffort(body.thinking, body.output_config);
     }
-    const last = Array.isArray(body.messages) ? body.messages.at(-1) : null;
+    const effective = stripBoxCcbToolBudgetTail(body);
+    const last = Array.isArray(effective.messages) ? effective.messages.at(-1) : null;
     const content = last && typeof last === "object" && "content" in last
       ? last.content : null;
     const isResume = last && typeof last === "object" && "role" in last
@@ -65,7 +66,7 @@ export function validateBoxToolRequest(body: ProxyBody): string | null {
         && "type" in block && block.type === "tool_result");
     if (!isResume) {
       const { tools: _tools, tool_choice: _choice, thinking: _thinking,
-        output_config: _output, ...textBody } = body;
+        output_config: _output, ...textBody } = effective;
       compileBoxCliSyntheticTurn(textBody, {
         cwd: "/tmp/ocv5-289-run-000000000000000000000000",
         cliVersion: "2.1.280",
