@@ -6828,7 +6828,8 @@ export class SessionManager {
           }
 
           try {
-            runner.interrupt()
+            runner.interrupt(status === 'interrupted' && errorCode === 'USER_CANCELLED'
+              ? 'user' : 'system')
           } catch {}
 
           // Give a cooperative interrupt one short window to produce its own
@@ -7922,7 +7923,7 @@ export class SessionManager {
       this._trackPersistence(persistence)
       return true
     }
-    const runnerInterrupted = s.runner.interrupt()
+    const runnerInterrupted = s.runner.interrupt('user')
     return !!external || runnerInterrupted
   }
 

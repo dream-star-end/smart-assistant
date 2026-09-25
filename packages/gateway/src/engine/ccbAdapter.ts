@@ -732,10 +732,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     log.warn('dropped unattributable bash_output_tail (fail-closed)', { toolUseId })
   }
 
-  interrupt(): boolean {
+  interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const active = this._activeTurn
     const nativeSessionId = this.runner.sessionId
-    if (active && !active.boxStopNotified
+    if (reason === 'user' && active && !active.boxStopNotified
       && this.model === 'box-api-claude-opus-5-5'
       && active.turnKey && nativeSessionId) {
       active.boxStopNotified = true

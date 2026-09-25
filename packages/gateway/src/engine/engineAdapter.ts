@@ -216,8 +216,9 @@ export interface EngineAdapter extends EventEmitter {
    * (grok/cursor/zcode) omit it and are skipped by the caller. */
   preheat?(): Promise<void>
   submitTurn(params: TurnParams): EngineTurnRun
-  /** 中断当前 turn(CCB: stdin control_request interrupt)。false = 无活进程。 */
-  interrupt(): boolean
+  /** Only the explicit browser Stop may use reason='user'; automatic timeout,
+   * quota and recovery interrupts default to system. */
+  interrupt(reason?: 'user' | 'system'): boolean
   shutdown(): Promise<void>
   /** Resolves only after the current process generation's stdout has closed.
    * `shutdown()` itself is deliberately bounded for process supervision, so

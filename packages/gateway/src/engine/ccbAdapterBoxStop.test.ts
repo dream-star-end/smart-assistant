@@ -40,9 +40,9 @@ test('browser Stop notifies internal Box route once before interrupting local CC
       onEvent: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0 },
       toolUseIdToName: new Map() })
     await turn.submitted
-    assert.equal(adapter.interrupt(), true)
+    assert.equal(adapter.interrupt('user'), true)
     await sent
-    assert.equal(adapter.interrupt(), true)
+    assert.equal(adapter.interrupt('user'), true)
     assert.equal(runner.interrupts, 2)
     assert.deepEqual(sequence, ['box-stop'])
     turn.end()
@@ -53,4 +53,21 @@ test('browser Stop notifies internal Box route once before interrupting local CC
       else process.env[key] = saved[key]
     }
   }
+})
+
+test('automatic adapter interrupt does not claim explicit user Stop', async () => {
+  const oldFetch = globalThis.fetch
+  const runner = new FakeRunner()
+  let sent = 0
+  globalThis.fetch = (async () => { sent++; throw new Error('must not notify') }) as typeof fetch
+  try {
+    const adapter = new CcbAdapter({} as never, runner as unknown as SubprocessRunner)
+    const turn = adapter.submitTurn({ input: 'synthetic', turnKey: 'b'.repeat(64),
+      onEvent: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map() })
+    await turn.submitted
+    assert.equal(adapter.interrupt(), true)
+    assert.equal(sent, 0)
+    turn.end()
+  } finally { globalThis.fetch = oldFetch }
 })
