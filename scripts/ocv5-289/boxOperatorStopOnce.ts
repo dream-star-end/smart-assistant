@@ -3,7 +3,7 @@
  * A durable stop intent precedes the remote signal; proof is reported only
  * after the original keeper publishes its strict terminal marker. */
 import { createHash } from "node:crypto";
-import { constants, closeSync, fsyncSync, lstatSync, openSync,
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync,
   readFileSync, writeSync } from "node:fs";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
@@ -71,17 +71,37 @@ async function main(): Promise<void> {
     try { writeOnce(intentPath, JSON.stringify(intent)); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const previous = lstatSync(intentPath);
-      if (!previous.isFile() || previous.isSymbolicLink()
-        || previous.uid !== process.getuid() || (previous.mode & 0o777) !== 0o600
-        || readFileSync(intentPath, "utf8") !== JSON.stringify(intent)) {
-        throw new Error("BOX_OPERATOR_STOP_INTENT_CONFLICT");
-      }
+      const fd = openSync(intentPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const previous = fstatSync(fd);
+        if (!previous.isFile() || previous.uid !== process.getuid()
+          || (previous.mode & 0o777) !== 0o600 || previous.nlink !== 1
+          || previous.size < 1 || previous.size > 4096
+          || readFileSync(fd, "utf8") !== JSON.stringify(intent)) {
+          throw new Error("BOX_OPERATOR_STOP_INTENT_CONFLICT");
+        }
+        // A previous process may have crashed after writing but before fsync.
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      syncDir();
     }
     const resolver = createProductionBoxAccountResolver();
-    const target = await resolver.resolve({ uid: 3n, sessionId: null,
+    const abort = new AbortController();
+    const pendingTarget = resolver.resolve({ uid: 3n, sessionId: null,
       requestId: String(record.firstId), upstreamModel: "claude-opus-5-5",
-      requiredAccountId: 20n, signal: new AbortController().signal });
+      requiredAccountId: 20n, signal: abort.signal });
+    let abandoned = false;
+    void pendingTarget.then((late) => {
+      if (abandoned) void Promise.resolve().then(() => late.dispose?.()).catch(() => {});
+    }, () => {});
+    let resolveTimer: ReturnType<typeof setTimeout> | undefined;
+    let target: Awaited<typeof pendingTarget>;
+    try { target = await Promise.race([pendingTarget, new Promise<never>((_, reject) => {
+      resolveTimer = setTimeout(() => { abort.abort();
+        reject(new Error("BOX_OPERATOR_RESOLVE_TIMEOUT")); }, 30_000);
+    })]); }
+    catch (error) { abandoned = true; throw error; }
+    finally { if (resolveTimer) clearTimeout(resolveTimer); }
     try {
       if (target.accountId !== 20n) throw new Error("BOX_OPERATOR_ACCOUNT_MISMATCH");
       let stopAck = "unknown";
@@ -107,7 +127,15 @@ async function main(): Promise<void> {
       } while (true);
       process.stdout.write(JSON.stringify({ runNonce: record.runNonce,
         stopAck, proofReason, lockRetained: true, replayed: false }) + "\n");
-    } finally { await target.dispose?.(); }
+    } finally {
+      const closing = Promise.resolve().then(() => target.dispose?.());
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try { await Promise.race([closing, new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 2_000);
+      })]); }
+      catch { /* Process exit releases any lingering local agent socket. */ }
+      finally { if (timer) clearTimeout(timer); }
+    }
   } finally {
     const { unlinkSync } = await import("node:fs");
     unlinkSync(MUTEX); syncDir();
