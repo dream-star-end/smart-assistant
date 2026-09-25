@@ -2,7 +2,7 @@
  * Durable cancel intent -> pinned original keeper stop -> strict proof -> PG
  * failed_stopped CAS -> exact remote cleanup -> archive -> local lock release.
  * Never launches a model or replays an OpenClaude tool. */
-import { constants, closeSync, fsyncSync, lstatSync, openSync, readFileSync,
+import { constants, closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
   unlinkSync, writeSync } from "node:fs";
 import { hostname } from "node:os";
 import { Pool } from "pg";
@@ -138,9 +138,21 @@ async function main(): Promise<void> {
         "BOX_RECOVERY_CLEANUP_CLAIM_PENDING");
       if (claimed) {
         const abort = new AbortController();
-        const target = await resolver.resolve({ uid: UID, sessionId: null,
+        const pending = resolver.resolve({ uid: UID, sessionId: null,
           requestId: lock.firstId, upstreamModel: "claude-opus-5-5",
           requiredAccountId: ACCOUNT, signal: abort.signal });
+        let timedOut = false;
+        void pending.then((late) => {
+          if (timedOut) void Promise.resolve().then(() => late.dispose?.()).catch(() => {});
+        }, () => {});
+        let resolveTimer: ReturnType<typeof setTimeout> | undefined;
+        let target: Awaited<typeof pending>;
+        try {
+          target = await Promise.race([pending, new Promise<never>((_, reject) => {
+            resolveTimer = setTimeout(() => { timedOut = true; abort.abort();
+              reject(new Error("BOX_RECOVERY_RESOLVE_TIMEOUT")); }, 30_000);
+          })]);
+        } finally { if (resolveTimer) clearTimeout(resolveTimer); }
         try {
           assertion(target.accountId === ACCOUNT, "BOX_RECOVERY_ACCOUNT_MISMATCH");
           const cleanup = await target.exec.run(makeBoxRunCleanup(lock.runNonce), {
@@ -180,11 +192,17 @@ async function main(): Promise<void> {
       try { writeOnce(archivePath, archiveRaw); }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const st = lstatSync(archivePath);
-        assertion(st.isFile() && !st.isSymbolicLink() && st.uid === process.getuid()
-          && (st.mode & 0o777) === 0o600 && st.nlink === 1
-          && readFileSync(archivePath, "utf8") === archiveRaw,
-        "BOX_RECOVERY_ARCHIVE_CONFLICT");
+        const fd = openSync(archivePath, constants.O_RDONLY | constants.O_NOFOLLOW
+          | constants.O_NONBLOCK);
+        try {
+          const st = fstatSync(fd);
+          assertion(st.isFile() && st.uid === process.getuid()
+            && (st.mode & 0o777) === 0o600 && st.nlink === 1
+            && st.size === Buffer.byteLength(archiveRaw)
+            && readFileSync(fd, "utf8") === archiveRaw,
+          "BOX_RECOVERY_ARCHIVE_CONFLICT");
+          fsyncSync(fd);
+        } finally { closeSync(fd); }
         syncDir(DIR);
       }
       for (const path of [`${WORK}/.ocv5-289-read-${request[1]}.txt.used`,
