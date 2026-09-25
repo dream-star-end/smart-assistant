@@ -3,6 +3,7 @@
  * per invocation; Box never receives authority to execute the tool locally.
  */
 import { createHash } from "node:crypto";
+import { normalizeBoxToolDeclaration } from "./boxCacheAnnotations.js";
 
 export class BoxToolCatalogError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolCatalogError"; }
@@ -57,7 +58,9 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
   const clientNameByBoxName = new Map<string, string>();
   const boxNameByClientName = new Map<string, string>();
   for (let i = 0; i < rawTools.length; i++) {
-    const source = rawTools[i];
+    let source: unknown;
+    try { source = normalizeBoxToolDeclaration(rawTools[i]); }
+    catch { throw new BoxToolCatalogError("BOX_TOOL_DECLARATION_INVALID"); }
     if (!record(source) || Object.keys(source).some((key) =>
       key !== "name" && key !== "description" && key !== "input_schema")
       || typeof source.name !== "string"
@@ -85,7 +88,7 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
     throw new BoxToolCatalogError("BOX_TOOL_CATALOG_TOO_LARGE");
   }
   const bindingJson = JSON.stringify({ catalog: json,
-    clientNames: rawTools.map((tool) => (tool as Record<string, unknown>).name) });
+    clientNames: [...boxNameByClientName.keys()] });
   return { tools, clientNameByBoxName, boxNameByClientName,
     sha256: createHash("sha256").update(json).digest("hex"),
     bindingSha256: createHash("sha256").update(bindingJson).digest("hex"), json };

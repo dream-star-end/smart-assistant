@@ -52,7 +52,7 @@ test("duplicate, malformed, oversized and dangerous tool declarations fail close
     { strict: true },
     { allowed_callers: ["code_execution_20260120"] },
     { type: "custom" },
-    { cache_control: { type: "ephemeral" } },
+    { cache_control: { type: "persistent" } },
   ]) {
     rejects([{ ...tool("Bash"), ...unsupported }], "BOX_TOOL_DECLARATION_INVALID");
   }

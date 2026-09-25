@@ -6,6 +6,7 @@
  */
 import { createHash } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
+import { normalizeBoxAssistantContent, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 
 export class BoxCallFingerprintError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxCallFingerprintError"; }
@@ -66,8 +67,9 @@ export function deriveBoxContextHash(body: ProxyBody,
     || (completedToolTail && body.messages.length < 2)) {
     throw new BoxCallFingerprintError("BOX_CALL_CONTEXT_INVALID");
   }
-  const { metadata: _tracking, ...modelBody } = body;
-  const messages = completedToolTail ? body.messages.slice(0, -2) : body.messages;
+  const normalized = normalizeBoxSemanticBody(body);
+  const { metadata: _tracking, ...modelBody } = normalized;
+  const messages = completedToolTail ? normalized.messages.slice(0, -2) : normalized.messages;
   const hasher = createHash("sha256").update("ocv5-box-context-v1\0");
   let bytes = 0;
   updateStableJson({ ...modelBody, messages }, (part) => {
@@ -88,7 +90,7 @@ export function hashBoxAssistantContent(content: unknown): string {
   }
   const hasher = createHash("sha256").update("ocv5-box-assistant-content-v1\0");
   let bytes = 0;
-  updateStableJson(content, (part) => {
+  updateStableJson(normalizeBoxAssistantContent(content), (part) => {
     bytes += Buffer.byteLength(part);
     if (bytes > 16 * 1024 * 1024) {
       throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
@@ -130,7 +132,7 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
   }
   // Tracking metadata can change independently of the model request. Identity
   // is separately bound by authenticated uid, session and the signed turn key.
-  const { metadata: _tracking, ...modelBody } = body;
+  const { metadata: _tracking, ...modelBody } = normalizeBoxSemanticBody(body);
   const hasher = createHash("sha256");
   let bytes = 0;
   updateStableJson(modelBody, (part) => {

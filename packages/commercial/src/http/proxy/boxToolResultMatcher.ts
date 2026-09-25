@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { ProxyBody } from "./shared.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
+import { normalizeBoxToolResultBlock } from "./boxCacheAnnotations.js";
 
 const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 // Leave room for the sidecar result envelope under its 8 MiB frame bound.
@@ -92,7 +93,10 @@ export function matchBoxToolResults(body: ProxyBody,
     }
   }
   const byId = new Map<string, BoxMatchedToolResult>();
-  for (const block of user.content) {
+  for (const raw of user.content) {
+    let block: unknown;
+    try { block = normalizeBoxToolResultBlock(raw); }
+    catch { throw new BoxToolResultMatchError("BOX_TOOL_RESULT_SET_MISMATCH"); }
     if (!record(block) || block.type !== "tool_result"
       || typeof block.tool_use_id !== "string" || !TOOL_ID.test(block.tool_use_id)
       || Object.keys(block).some((key) =>

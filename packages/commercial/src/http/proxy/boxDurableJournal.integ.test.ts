@@ -853,6 +853,56 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.ok((await journal.listRemoteCleanupCandidates(20)).some((item) =>
       item.requestId === linkedChildId));
 
+    // Real CCB addCacheBreakpoints moves the ephemeral marker from the first
+    // prompt/tool catalog to the just-completed tool_result. It cannot change
+    // the model-visible history or strand an already-paid tool handoff.
+    const cacheSession = `cache-${suffix}`, cacheTurn = "6".repeat(64);
+    const cacheTools = toolDeclarations.map((tool) => ({ ...tool,
+      cache_control: { type: "ephemeral" } }));
+    const cacheFirst: ProxyBody = { ...firstBody, tools: cacheTools,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: cacheTurn,
+        session_id: cacheSession }) },
+      messages: [{ role: "user", content: [{ type: "text",
+        text: "synthetic cache prompt", cache_control: { type: "ephemeral" } }] }] };
+    const cacheBasis = { ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: cacheSession, turnKey: cacheTurn } };
+    const cacheRoot = { ...toolCall, requestId: `box-cache-root-${suffix}`,
+      runNonce: "e".repeat(24), leaseEpoch: "8".repeat(32),
+      fingerprint: deriveBoxCallFingerprint(3n, cacheFirst),
+      contextHash: deriveBoxContextHash(cacheFirst) };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [cacheRoot.requestId, JSON.stringify(cacheBasis)]);
+    await journal.admit(cacheRoot);
+    await journal.markRunning(cacheRoot);
+    await journal.recordToolHandoff({ ...cacheRoot, candidate,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_A"] });
+    const cacheChild = `box-cache-child-${suffix}`;
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [cacheChild, JSON.stringify(cacheBasis)]);
+    const cacheResume: ProxyBody = { ...cacheFirst, tools: toolDeclarations,
+      messages: [{ role: "user", content: "synthetic cache prompt" },
+        { role: "assistant", content: firstAssistantContent.map((block, index) =>
+          index === firstAssistantContent.length - 1
+            ? { ...block, cache_control: { type: "ephemeral" } } : block) },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "toolu_A", content: "first" },
+          { type: "tool_result", tool_use_id: "toolu_B", content: "second",
+            cache_control: { type: "ephemeral" } },
+        ] },
+      ] };
+    const cacheClaim = await journal.claimToolResume({ requestId: cacheChild,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: cacheResume });
+    assert.equal(cacheClaim.ownerRequestId, cacheRoot.requestId);
+    assert.deepEqual(cacheClaim.results.map((result) => result.modelToolUseId),
+      ["toolu_A", "toolu_B"]);
+    await journal.completeToolChain({ requestId: cacheChild, uid: 3n,
+      leaseEpoch: cacheRoot.leaseEpoch,
+      proof: { ...chainProof, runNonce: cacheRoot.runNonce,
+        leaseEpoch: cacheRoot.leaseEpoch }, usage: finalUsage });
+
     // Queue fairness: malformed oldest rows cannot occupy LIMIT slots; ten
     // proof-less old runs must rotate behind one newer recoverable run even
     // when the tick arrives after the full two-minute retry delay.

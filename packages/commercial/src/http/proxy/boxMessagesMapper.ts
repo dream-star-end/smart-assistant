@@ -6,6 +6,7 @@
  */
 import { randomUUID } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
+import { BoxCacheAnnotationError, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 
 export class BoxMessagesShapeError extends Error {
   constructor(readonly code: string) {
@@ -96,7 +97,15 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(sessionId)) {
     throw new BoxMessagesShapeError("BOX_SESSION_ID_INVALID");
   }
-  const messages = body.messages.map(readMessage);
+  let semantic: ProxyBody;
+  try { semantic = normalizeBoxSemanticBody(body, { collapseSingleText: false }); }
+  catch (error) {
+    if (error instanceof BoxCacheAnnotationError) {
+      throw new BoxMessagesShapeError(error.code);
+    }
+    throw error;
+  }
+  const messages = semantic.messages.map(readMessage);
   let currentIndex = -1;
   for (let index = messages.length - 1; index >= 0; index--) {
     if (messages[index]?.role === "user") { currentIndex = index; break; }
@@ -109,7 +118,7 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     throw new BoxMessagesShapeError("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
   }
   const promptParts: string[] = [];
-  if (body.system !== undefined) promptParts.push(systemText(body.system));
+  if (semantic.system !== undefined) promptParts.push(systemText(semantic.system));
   for (const message of messages) {
     if (message.role === "system") promptParts.push(systemText(message.content));
   }
@@ -143,7 +152,7 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     return message.role === "user"
       ? { ...base, message: { role: "user", content: message.content } }
       : { ...base, message: { id: `msg_${uuid.replaceAll("-", "")}`, type: "message",
-        role: "assistant", model: body.model, content: message.content,
+        role: "assistant", model: semantic.model, content: message.content,
         stop_reason: blocks(message.content).some((block) => block.type === "tool_use")
           ? "tool_use" : "end_turn",
         usage: { input_tokens: 0, output_tokens: 0 } } };
