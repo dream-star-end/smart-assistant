@@ -51,7 +51,8 @@ async function main(): Promise<void> {
         throw new Error("BOX_PROBE_ACCOUNT_MISMATCH");
       }
       return { ...target, exec: { run: async (request, opts) => {
-        const modelRun = request.args[0]?.startsWith("/tmp/ocv5-289-keeper-");
+        const modelRun = request.args[0] === "-I"
+          && request.args[1]?.startsWith("/tmp/ocv5-289-keeper-");
         if (modelRun) {
           const proofDir = request.args[request.args.indexOf("--proof-dir") + 1];
           const leaseEpoch = request.args[request.args.indexOf("--lease-epoch") + 1];
@@ -119,7 +120,7 @@ async function main(): Promise<void> {
   if (!proofIdentity) throw new Error("BOX_PROBE_PROOF_IDENTITY_MISSING");
   const recovered = await resolver.resolve({ uid: UID, sessionId: requestId,
     requestId: `${requestId}-recovery`, upstreamModel: MODEL,
-    signal: new AbortController().signal });
+    signal: new AbortController().signal, requiredAccountId: ACCOUNT_ID });
   try {
     const proof = await readBoxTerminalProof({ target: recovered,
       expectedAccountId: ACCOUNT_ID, ...proofIdentity });
