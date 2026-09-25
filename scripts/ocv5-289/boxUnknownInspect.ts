@@ -22,8 +22,64 @@ def inspect(path,want=None):
  if want is not None and kind=='file' and st.st_size<=32768:
   with open(path,'rb') as f:result['hashMatches']=hashlib.sha256(f.read()).hexdigest()==want
  return result
+def stream_shape(path):
+ try:dfd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ except FileNotFoundError:return {'present':False}
+ try:
+  d=os.fstat(dfd)
+  if d.st_uid!=os.getuid() or stat.S_IMODE(d.st_mode)!=0o700:raise SystemExit(126)
+  try:fd=os.open('stdout.jsonl',os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=dfd)
+  except FileNotFoundError:return {'present':False}
+  try:
+   st=os.fstat(fd)
+   if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1:raise SystemExit(126)
+   data=os.pread(fd,min(st.st_size,2*1024*1024),0)
+  finally:os.close(fd)
+  def safe_type(value,allowed):
+   if isinstance(value,str) and value in allowed:return value
+   return 'other-'+hashlib.sha256(str(value).encode()).hexdigest()[:8]
+  allowed={'system','assistant','user','result','rate_limit_event','stream_event','tool_progress','tool_use_summary','auth_status'}
+  events={'message_start','content_block_start','content_block_delta','content_block_stop','message_delta','message_stop','ping'}
+  records=[]
+  for line in data.split(b'\n')[:-1][:64]:
+   try:record=json.loads(line)
+   except (UnicodeDecodeError,ValueError):records.append({'type':'invalid_json'});continue
+   if not isinstance(record,dict):records.append({'type':'non_object'});continue
+   item={'type':safe_type(record.get('type'),allowed)}
+   if item['type']=='stream_event':
+    event=record.get('event')
+    item['event']=safe_type(event.get('type') if isinstance(event,dict) else None,events)
+   if item['type']=='system':
+    item['subtype']=safe_type(record.get('subtype'),{'init','status','compact_boundary'})
+   records.append(item)
+  try:err=os.stat('stderr.log',dir_fd=dfd,follow_symlinks=False).st_size
+  except FileNotFoundError:err=None
+  return {'present':True,'stdoutBytes':st.st_size,'stderrBytes':err,
+   'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64,'records':records}
+ finally:os.close(dfd)
+def terminal_shape(path):
+ try:dfd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ except FileNotFoundError:return {'present':False}
+ try:
+  d=os.fstat(dfd)
+  if d.st_uid!=os.getuid() or stat.S_IMODE(d.st_mode)!=0o700:raise SystemExit(126)
+  try:fd=os.open('terminal.json',os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=dfd)
+  except FileNotFoundError:return {'present':False}
+  try:
+   st=os.fstat(fd)
+   if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or st.st_size>4096:raise SystemExit(126)
+   raw=os.read(fd,4097)
+  finally:os.close(fd)
+ finally:os.close(dfd)
+ try:proof=json.loads(raw)
+ except (UnicodeDecodeError,ValueError):return {'present':True,'invalid':True}
+ return {'present':True,'nonceMatches':proof.get('runNonce')==nonce,
+  'reason':proof.get('reason') if proof.get('reason') in ('worker_complete','keeper_stopped','deadline','unknown') else 'other',
+  'revision':proof.get('revision') if isinstance(proof.get('revision'),int) else None}
 out={'run':inspect('/tmp/ocv5-289-run-'+nonce),
  'proof':inspect('/tmp/ocv5-289-proof-'+nonce),
+ 'terminal':terminal_shape('/tmp/ocv5-289-proof-'+nonce),
+ 'stream':stream_shape('/tmp/ocv5-289-run-'+nonce),
  'assets':[inspect(path,want) for path,want in
   (item.split(':',1) for item in assets)]}
 print(json.dumps(out,separators=(',',':'))) `;
@@ -87,7 +143,7 @@ async function main(): Promise<void> {
     const result = await target.exec.run({ command: "/usr/bin/python3",
       args: ["-I", "-c", READ, record.runNonce, ...assets], cwd: "/tmp",
       environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } },
-    { timeoutMs: 20_000, maxResponseBytes: 4096 });
+    { timeoutMs: 20_000, maxResponseBytes: 8192 });
     const observed = JSON.parse(result.stdout) as Record<string, unknown>;
     let clearedLock = false;
     if (clearing) {
