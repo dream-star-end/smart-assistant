@@ -27,6 +27,9 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     await client.query("CREATE TEMP TABLE org_memberships (LIKE public.org_memberships INCLUDING ALL)");
     await client.query("CREATE TEMP TABLE orgs (LIKE public.orgs INCLUDING ALL)");
     await client.query("CREATE TEMP TABLE org_subscriptions (LIKE public.org_subscriptions INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE turn_waivers (LIKE public.turn_waivers INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE chat_projects (LIKE public.chat_projects INCLUDING ALL)");
     await client.query("CREATE TEMP SEQUENCE box_recovery_ledger_id_seq");
     await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
     await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
@@ -42,6 +45,9 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
         AND 'org_memberships'::regclass = 'pg_temp.org_memberships'::regclass
         AND 'orgs'::regclass = 'pg_temp.orgs'::regclass
         AND 'org_subscriptions'::regclass = 'pg_temp.org_subscriptions'::regclass
+        AND 'turn_waivers'::regclass = 'pg_temp.turn_waivers'::regclass
+        AND 'client_sessions'::regclass = 'pg_temp.client_sessions'::regclass
+        AND 'chat_projects'::regclass = 'pg_temp.chat_projects'::regclass
         AS only_temp`);
     assert.equal(shadow.rows[0]?.only_temp, true);
     // Same uid has an active subscription. The real spend path must debit only
@@ -67,8 +73,12 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
         verificationSponsorship: null, apiKeyId: null } };
     await client.query(`INSERT INTO request_finalize_journal
       (request_id,user_id,state,ctx,precheck_credits,updated_at)
-      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+       VALUES ($1,$2,'inflight',$3::jsonb,0,NOW())`,
     [requestId, userId.toString(), JSON.stringify(ctx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, requestId, userId), "pending",
+      "fresh live terminal evidence must honor the five-minute grace period");
+    await client.query(`UPDATE pg_temp.request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '10 minutes' WHERE request_id=$1`, [requestId]);
     assert.equal(await recoverBoxBillingRequest(sameConnection, requestId, userId), "settled");
     const usage = await client.query<{ request_id: string; cost_credits: string }>(
       "SELECT request_id,cost_credits::text FROM usage_records WHERE request_id=$1", [requestId]);
@@ -169,8 +179,12 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
         turnKey: toolTurnKey } };
     await client.query(`INSERT INTO request_finalize_journal
       (request_id,user_id,state,ctx,precheck_credits,updated_at)
-      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+       VALUES ($1,$2,'inflight',$3::jsonb,0,NOW())`,
     [toolRequest, toolUser.toString(), JSON.stringify(toolCtx)]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, toolRequest, toolUser), "pending",
+      "fresh handoff must not be recovered while its live finalizer can still own it");
+    await client.query(`UPDATE pg_temp.request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '10 minutes' WHERE request_id=$1`, [toolRequest]);
     assert.equal(await recoverBoxBillingRequest(sameConnection, toolRequest, toolUser), "settled");
     const toolUsage = await client.query<{ cost_credits: string }>(
       "SELECT cost_credits::text FROM usage_records WHERE request_id=$1", [toolRequest]);

@@ -201,6 +201,9 @@ async function main(): Promise<void> {
     await client.query("CREATE TEMP TABLE org_memberships (LIKE public.org_memberships INCLUDING ALL)");
     await client.query("CREATE TEMP TABLE orgs (LIKE public.orgs INCLUDING ALL)");
     await client.query("CREATE TEMP TABLE org_subscriptions (LIKE public.org_subscriptions INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE turn_waivers (LIKE public.turn_waivers INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE chat_projects (LIKE public.chat_projects INCLUDING ALL)");
     await client.query("CREATE TEMP SEQUENCE box_live_ledger_id_seq");
     await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
     await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_live_ledger_id_seq'::regclass)");
@@ -213,6 +216,9 @@ async function main(): Promise<void> {
       AND 'org_memberships'::regclass = 'pg_temp.org_memberships'::regclass
       AND 'orgs'::regclass = 'pg_temp.orgs'::regclass
       AND 'org_subscriptions'::regclass = 'pg_temp.org_subscriptions'::regclass
+      AND 'turn_waivers'::regclass = 'pg_temp.turn_waivers'::regclass
+      AND 'client_sessions'::regclass = 'pg_temp.client_sessions'::regclass
+      AND 'chat_projects'::regclass = 'pg_temp.chat_projects'::regclass
       AND 'credit_ledger'::regclass = 'pg_temp.credit_ledger'::regclass AS only_temp`);
     assertion(shadow.rows[0]?.only_temp, "BOX_TOOL_FINANCE_SHADOW_INVALID");
     const initialCredits = 100_000_000n;
@@ -252,6 +258,17 @@ async function main(): Promise<void> {
       `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx,precheck_credits)
        VALUES ($1,$2,'inflight',$3::jsonb,0)`,
       [requestId, UID.toString(), JSON.stringify(basis)]);
+    const ageTerminalEvidence = async (requestId: string, state: "handoff" | "terminal") => {
+      // Recovery intentionally protects fresh live finalizers for five minutes.
+      // Only this verified TEMP row may be aged to exercise the recovery path;
+      // never shorten the production protection period or mutate public rows.
+      const changed = await client.query(`UPDATE pg_temp.request_finalize_journal
+        SET updated_at=NOW()-INTERVAL '10 minutes'
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxInvocationRecovery'='v1' AND ctx->>'boxState'=$3`,
+      [requestId, UID.toString(), state]);
+      assertion(changed.rowCount === 1, "BOX_TOOL_TEMP_EVIDENCE_NOT_READY");
+    };
     const resolver = createProductionBoxAccountResolver();
     const service = new BoxToolFetch({
       supervisorAsset: readFileSync(new URL("./box_supervisor.py", import.meta.url)),
@@ -288,6 +305,7 @@ async function main(): Promise<void> {
     assertion(firstEvents.some((item) => item.event === "message_delta"
       && (item.data.delta as { stop_reason?: unknown } | undefined)?.stop_reason === "tool_use"),
     "BOX_TOOL_PROBE_HANDOFF_INVALID");
+    await ageTerminalEvidence(firstId, "handoff");
     assertion(await recoverBoxBillingRequest(sameConnection, firstId, UID) === "settled",
       "BOX_TOOL_HANDOFF_BILLING_NOT_SETTLED");
     // The only tool implementation is here in OpenClaude's operator process;
@@ -318,6 +336,7 @@ async function main(): Promise<void> {
       && (finalRow?.ctx.boxTerminalProof as { reason?: unknown } | undefined)?.reason
         === "worker_complete",
     "BOX_TOOL_PROBE_JOURNAL_NOT_TERMINAL");
+    await ageTerminalEvidence(secondId, "terminal");
     assertion(await recoverBoxBillingRequest(sameConnection, secondId, UID) === "settled",
       "BOX_TOOL_FINAL_BILLING_NOT_SETTLED");
     assertion(await recoverBoxBillingRequest(sameConnection, firstId, UID) === "already_committed"
