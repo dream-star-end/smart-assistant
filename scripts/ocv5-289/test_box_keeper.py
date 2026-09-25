@@ -114,15 +114,19 @@ class KeeperTest(unittest.TestCase):
                           result['revision']), (proof.name[-24:], epoch, 'worker_complete', 1))
         self.assertEqual(result['keeperPid'], proc.pid)
 
-    def test_failed_cli_has_no_terminal_marker_without_worker_proof(self) -> None:
-        options, proof, _ = self.proof_args()
+    def test_failed_cli_has_distinct_stop_proof_after_full_reap(self) -> None:
+        options, proof, epoch = self.proof_args()
         command = self.command('import sys;sys.exit(7)')
         command[3:3] = options
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.processes.append(proc)
         proc.communicate(timeout=12)
         self.assertEqual(proc.returncode, 7)
-        self.assertFalse((proof / 'terminal.json').exists())
+        marker = json.loads((proof / 'terminal.json').read_text())
+        self.assertEqual((marker['runNonce'], marker['leaseEpoch'], marker['reason'],
+                          marker['revision'], marker['workerExitCode']),
+                         (proof.name[-24:], epoch, 'worker_failed', 2, 7))
+        self.assertEqual(marker['keeperPid'], proc.pid)
 
     def test_escaped_descendant_blocks_terminal_proof(self) -> None:
         options, proof, _ = self.proof_args()

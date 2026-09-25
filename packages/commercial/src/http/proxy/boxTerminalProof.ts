@@ -21,14 +21,16 @@ try:
  finally:os.close(fd)
 finally:os.close(directory)`;
 
-export interface BoxTerminalProof {
+interface BoxTerminalIdentity {
   runNonce: string;
   leaseEpoch: string;
   keeperPid: number;
   cliPid: number;
-  reason: "worker_complete" | "keeper_stopped";
-  revision: 1;
 }
+export type BoxTerminalProof = BoxTerminalIdentity & (
+  { reason: "worker_complete" | "keeper_stopped"; revision: 1 }
+  | { reason: "worker_failed"; revision: 2; workerExitCode: number }
+);
 
 export function makeBoxTerminalRead(proofDir: string): BoxCcExecRequest {
   if (!/^\/tmp\/ocv5-289-proof-[0-9a-f]{24}$/.test(proofDir)) {
@@ -51,12 +53,19 @@ export function parseBoxTerminalProof(raw: string, expected: {
   }
   const proof = data as Record<string, unknown>;
   const keys = Object.keys(proof).sort().join(",");
-  if (keys !== "cliPid,keeperPid,leaseEpoch,reason,revision,runNonce"
+  const successShape = keys === "cliPid,keeperPid,leaseEpoch,reason,revision,runNonce"
+    && (proof.reason === "worker_complete" || proof.reason === "keeper_stopped")
+    && proof.revision === 1;
+  const failureShape = keys === "cliPid,keeperPid,leaseEpoch,reason,revision,runNonce,workerExitCode"
+    && proof.reason === "worker_failed" && proof.revision === 2
+    && Number.isSafeInteger(proof.workerExitCode)
+    && Number(proof.workerExitCode) !== 0
+    && Number(proof.workerExitCode) >= -255 && Number(proof.workerExitCode) <= 255;
+  if ((!successShape && !failureShape)
     || proof.runNonce !== expected.runNonce || proof.leaseEpoch !== expected.leaseEpoch
     || !Number.isSafeInteger(proof.keeperPid) || (proof.keeperPid as number) < 1
     || !Number.isSafeInteger(proof.cliPid) || (proof.cliPid as number) < 1
-    || (proof.reason !== "worker_complete" && proof.reason !== "keeper_stopped")
-    || proof.revision !== 1) {
+  ) {
     throw new Error("BOX_TERMINAL_PROOF_INVALID");
   }
   return proof as unknown as BoxTerminalProof;

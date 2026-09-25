@@ -23,6 +23,20 @@ test("terminal proof is bound to account, nonce, epoch and exact schema", async 
     { runNonce, leaseEpoch }), /BOX_TERMINAL_PROOF_INVALID/);
 });
 
+test("nonzero worker exit proves only stop, never successful usage", () => {
+  const failed = { ...record, reason: "worker_failed", revision: 2,
+    workerExitCode: 7 };
+  assert.deepEqual(parseBoxTerminalProof(JSON.stringify(failed) + "\n",
+    { runNonce, leaseEpoch }), failed);
+  for (const invalid of [
+    { ...failed, workerExitCode: 0 },
+    { ...failed, workerExitCode: 256 },
+    { ...failed, revision: 1 },
+    { ...failed, billed: true },
+  ]) assert.throws(() => parseBoxTerminalProof(JSON.stringify(invalid) + "\n",
+    { runNonce, leaseEpoch }), /BOX_TERMINAL_PROOF_INVALID/);
+});
+
 test("terminal read script refuses symlink and non-0600 marker", () => {
   const proofDir = `/tmp/ocv5-289-proof-${runNonce}`;
   const request = makeBoxTerminalRead(proofDir);

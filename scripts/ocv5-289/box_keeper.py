@@ -59,7 +59,8 @@ def extract_proof_args(argv: list[str]) -> tuple[list[str], str | None, str | No
     return args, proof_dir, epoch
 
 
-def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str) -> None:
+def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str,
+                     worker_exit_code: int | None = None) -> None:
     """Publish only after the keeper has reaped every adopted descendant."""
     info = os.lstat(proof_dir)
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
@@ -68,9 +69,18 @@ def publish_terminal(proof_dir: str, epoch: str, cli_pid: int, reason: str) -> N
     name = "terminal.json"
     directory = os.open(proof_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        content = (json.dumps({"runNonce": PROOF_DIR.fullmatch(proof_dir)[1],
+        record = {"runNonce": PROOF_DIR.fullmatch(proof_dir)[1],
             "leaseEpoch": epoch, "keeperPid": os.getpid(), "cliPid": cli_pid,
-            "reason": reason, "revision": 1}, sort_keys=True,
+            "reason": reason, "revision": 1}
+        if reason == "worker_failed":
+            if (not isinstance(worker_exit_code, int) or worker_exit_code == 0
+                    or not -255 <= worker_exit_code <= 255):
+                raise ValueError("WORKER_EXIT_INVALID")
+            record["revision"] = 2
+            record["workerExitCode"] = worker_exit_code
+        elif reason not in ("worker_complete", "keeper_stopped") or worker_exit_code is not None:
+            raise ValueError("TERMINAL_REASON_INVALID")
+        content = (json.dumps(record, sort_keys=True,
             separators=(",", ":")) + "\n").encode("ascii")
         fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600, dir_fd=directory)
@@ -299,10 +309,15 @@ def main() -> int:
             code = 125
         if cli_pid is None or pidfd is None:
             return 124 if time.monotonic() >= startup_until else 126
-        if proof_dir is not None and all_reaped and (worker.returncode == 0 or adopted_stopped):
+        if proof_dir is not None and all_reaped:
             try:
-                publish_terminal(proof_dir, epoch, cli_pid,
-                    "worker_complete" if worker.returncode == 0 else "keeper_stopped")
+                if worker.returncode == 0:
+                    publish_terminal(proof_dir, epoch, cli_pid, "worker_complete")
+                elif adopted_stopped:
+                    publish_terminal(proof_dir, epoch, cli_pid, "keeper_stopped")
+                else:
+                    publish_terminal(proof_dir, epoch, cli_pid, "worker_failed",
+                        worker_exit_code=worker.returncode)
             except (OSError, ValueError):
                 # The marker is mandatory once requested: no success without
                 # durable terminal evidence, even though the CLI may be gone.
