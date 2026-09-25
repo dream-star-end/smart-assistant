@@ -105,6 +105,8 @@ export interface BoxJournalPort {
   markPrestartStopped(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void>;
   markUnknown(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { phase: string }): Promise<void>;
+  recordUserCancelIntent?(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<void>;
   complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
   recordToolHandoff?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
@@ -238,6 +240,64 @@ export class BoxDurableJournal implements BoxJournalPort {
       [input.requestId, input.uid.toString(), input.leaseEpoch,
         JSON.stringify({ boxState: "unknown", boxUnknownPhase: input.phase.slice(0, 80) }), ACTIVE]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_UNKNOWN_FENCE_LOST");
+  }
+
+  /** A user stop is durable intent, not a terminal or release event. The
+   * original keeper must still prove all descendants stopped. */
+  async recordUserCancelIntent(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
+      throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+    }
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      const found = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+        `SELECT state,ctx FROM request_finalize_journal
+          WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+        [input.requestId, input.uid.toString()]);
+      const row = found.rows[0], ctx = row?.ctx;
+      if (found.rowCount !== 1 || !row || !ctx
+        || ctx.boxInvocationRecovery !== "v1"
+        || ctx.boxInvocationMode !== "detached_tool"
+        || ctx.boxAccountId !== input.accountId.toString()
+        || ctx.boxRunNonce !== input.runNonce
+        || ctx.boxLeaseEpoch !== input.leaseEpoch) {
+        throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+      }
+      const existing = ctx.boxCancelIntent;
+      if (existing !== undefined) {
+        if (!existing || typeof existing !== "object" || Array.isArray(existing)
+          || (existing as Record<string, unknown>).v !== 1
+          || (existing as Record<string, unknown>).reason !== "user_cancel"
+          || (existing as Record<string, unknown>).requestId !== input.requestId) {
+          throw new BoxDurableJournalError("BOX_CANCEL_CONFLICT");
+        }
+        await client.query("COMMIT"); committed = true; return;
+      }
+      if (!["inflight", "finalizing", "committed"].includes(row.state)
+        || !ACTIVE.includes(String(ctx.boxState))
+        || ctx.boxTerminalProof !== undefined) {
+        throw new BoxDurableJournalError("BOX_CANCEL_NOT_ACTIVE");
+      }
+      const changed = await client.query(
+        `UPDATE request_finalize_journal
+            SET ctx=ctx || $4::jsonb
+          WHERE request_id=$1 AND user_id=$2
+            AND ctx->>'boxLeaseEpoch'=$3 AND NOT (ctx ? 'boxCancelIntent')
+            AND ctx->>'boxState'=ANY($5::text[])`,
+        [input.requestId, input.uid.toString(), input.leaseEpoch,
+          JSON.stringify({ boxCancelIntent: { v: 1, reason: "user_cancel",
+            requestId: input.requestId, atMs: Date.now() } }), ACTIVE]);
+      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_CANCEL_FENCE_LOST");
+      await client.query("COMMIT"); committed = true;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
   }
 
   /** A failed first detached round may release capacity only after the exact
@@ -403,6 +463,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
           AND ctx->>'boxLeaseEpoch' = $3
           AND ctx->>'boxInvocationMode' = 'detached_tool'
+          AND NOT (ctx ? 'boxCancelIntent')
           AND ((($5::int = 1) AND ctx->>'boxState' = 'running')
             OR (($5::int > 1) AND ctx->>'boxState' = 'linked'
               AND ctx->>'boxRoundNo' = $5::text
@@ -454,7 +515,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const owners = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
         `SELECT request_id,ctx FROM request_finalize_journal
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-            AND ctx->>'boxState'='handoff'
+            AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
             AND state IN ('inflight','finalizing','committed') FOR UPDATE`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
       if (owners.rows.length !== 1) throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
@@ -522,7 +583,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `UPDATE request_finalize_journal
             SET ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2
-            AND ctx->>'boxState'='handoff'
+            AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
             AND state IN ('inflight','finalizing','committed')
             AND ctx->>'boxHandoffRevision'=$3`,
         [owner.request_id, input.uid.toString(), ctx.boxHandoffRevision,

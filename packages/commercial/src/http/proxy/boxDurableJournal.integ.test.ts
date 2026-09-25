@@ -638,6 +638,41 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.admit({ ...failedChainRoot,
       requestId: `box-i-${suffix}` }), /BOX_CALL_AMBIGUOUS/);
 
+    const cancelTurn = "1".repeat(64), cancelSession = `cancel-${suffix}`;
+    const cancelBody: ProxyBody = { ...firstBody,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: cancelTurn,
+        session_id: cancelSession }) },
+      messages: [{ role: "user", content: "synthetic cancel only" }] };
+    const cancelId = `box-cancel-${suffix}`;
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [cancelId, JSON.stringify({ ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: cancelSession, turnKey: cancelTurn } })]);
+    const cancelCall = { ...toolCall, requestId: cancelId,
+      runNonce: "9".repeat(24), leaseEpoch: "a".repeat(32),
+      fingerprint: deriveBoxCallFingerprint(3n, cancelBody),
+      contextHash: deriveBoxContextHash(cancelBody) };
+    await journal.admit(cancelCall);
+    await journal.markRunning(cancelCall);
+    await journal.recordUserCancelIntent(cancelCall);
+    await journal.recordUserCancelIntent(cancelCall);
+    const cancelled = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      `SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1`, [cancelId]);
+    assert.equal(cancelled.rows[0]?.state, "inflight",
+      "stop intent cannot release paid-call capacity");
+    assert.equal((cancelled.rows[0]?.ctx.boxCancelIntent as
+      Record<string, unknown>).reason, "user_cancel");
+    await assert.rejects(() => journal.recordToolHandoff({ ...cancelCall, candidate,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_A"] }), /BOX_TOOL_HANDOFF_FENCE_LOST/);
+    await assert.rejects(() => journal.admit({ ...cancelCall,
+      requestId: `box-i-${suffix}`, runNonce: "a".repeat(24),
+      leaseEpoch: "b".repeat(32), fingerprint: { ...cancelCall.fingerprint,
+        replayFingerprint: "0".repeat(64) } }), /BOX_CAPACITY_HELD/);
+    const cancelProof = { ...failedProof, runNonce: cancelCall.runNonce,
+      leaseEpoch: cancelCall.leaseEpoch };
+    await journal.markFirstRoundStoppedFailure({ ...cancelCall, proof: cancelProof });
+
     // Queue fairness: malformed oldest rows cannot occupy LIMIT slots; ten
     // proof-less old runs must rotate behind one newer recoverable run even
     // when the tick arrives after the full two-minute retry delay.
