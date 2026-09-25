@@ -17896,6 +17896,26 @@ export class Gateway {
       } else if (frame.type === 'inbound.goal_sync') {
         if (!isFromBridge) return
         await this.sessions.syncGoalState(frame.goal.sessionId, frame.goal)
+      } else if ((frame as any).type === 'inbound.control.goal') {
+        const goalFrame = frame as any
+        const goalAction = goalFrame.action
+        if (
+          goalAction !== 'set' &&
+          goalAction !== 'pause' &&
+          goalAction !== 'resume' &&
+          goalAction !== 'clear'
+        ) return
+        const goalPeer = goalFrame.peer
+        if (!goalPeer || typeof goalPeer.id !== 'string' || typeof goalFrame.channel !== 'string') return
+        const goalAgentId = typeof goalFrame.agentId === 'string' && goalFrame.agentId
+          ? goalFrame.agentId
+          : 'main'
+        const goalKind = typeof goalPeer.kind === 'string' && goalPeer.kind ? goalPeer.kind : 'dm'
+        const goalSessionKey = `agent:${goalAgentId}:${goalFrame.channel}:${goalKind}:${goalPeer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+        const goalSession = this.sessions.getByKey(goalSessionKey)
+        if (!goalSession || goalSession.userId !== this.getWsUserId(ws)) return
+        const goalObjective = typeof goalFrame.objective === 'string' ? goalFrame.objective : undefined
+        await this.sessions.applyUserGoalAction(goalSessionKey, goalAction, goalObjective)
       } else if (frame.type === 'inbound.control.stop') {
         const applied = await this.handleStop(frame)
         const controlId = (frame as unknown as { controlId?: unknown }).controlId

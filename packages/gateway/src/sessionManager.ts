@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import {
@@ -1994,6 +1994,44 @@ export interface PromptQueueExecutionFence {
   release(): void
 }
 
+
+const USER_GOAL_OBJECTIVE_MAX = 4000
+
+/** Browser goal-bar mutation. Usage counters stay on the previous snapshot. */
+export function nextUserGoal(
+  current: GoalStateSnapshot | null,
+  sessionId: string,
+  action: 'set' | 'pause' | 'resume' | 'clear',
+  objective: string | undefined,
+): GoalStateSnapshot | 'noop' | 'rejected' {
+  const clean = typeof objective === 'string' ? objective.trim() : ''
+  if (clean.length > USER_GOAL_OBJECTIVE_MAX) return 'rejected'
+  const now = new Date().toISOString()
+  const text = action === 'set' ? clean : current?.objective || clean
+  if (action !== 'clear' && !text) return 'rejected'
+  if (action === 'clear' && current?.status === 'cleared') return 'noop'
+  if (action === 'pause' && current?.status === 'paused') return 'noop'
+  if (action === 'resume' && current?.status === 'active' && current.objective === text) return 'noop'
+  if (action === 'set' && current?.status === 'active' && current.objective === text) return 'noop'
+  const status = action === 'clear' ? 'cleared' : action === 'pause' ? 'paused' : 'active'
+  return {
+    sessionId,
+    goalId: current?.goalId ?? randomUUID(),
+    objective: text || current?.objective || ' ',
+    status,
+    tokenBudget: current?.tokenBudget ?? null,
+    creditBudget: current?.creditBudget ?? null,
+    tokensUsed: current?.tokensUsed ?? 0,
+    creditsUsed: current?.creditsUsed ?? '0',
+    timeUsedSeconds: current?.timeUsedSeconds ?? 0,
+    stateRevision: (current?.stateRevision ?? 0) + 1,
+    snapshotRevision: (current?.snapshotRevision ?? 0) + 1,
+    createdAt: current?.createdAt ?? now,
+    updatedAt: now,
+    statusChangedAt: current?.status === status ? current.statusChangedAt : now,
+  }
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   /** OCV5-180 B1 — `${ownerTurnKey}\0${runId}` → exact-owner logical-run
@@ -2119,6 +2157,34 @@ export class SessionManager {
    */
   setRepoSnapshotProvider(fn: (sessionId: string) => RepoSnapshot | null): void {
     this._getRepoSnapshot = fn
+  }
+
+  /** Browser goal bar: pause, resume, replace, or clear the session goal.
+   * Objective text is accepted only for set, or when this session has no
+   * platform snapshot yet. Usage counters and budgets stay server-owned. */
+  async applyUserGoalAction(
+    sessionKey: string,
+    action: 'set' | 'pause' | 'resume' | 'clear',
+    objective: string | undefined,
+  ): Promise<'applied' | 'noop' | 'rejected'> {
+    const session = this.sessions.get(sessionKey)
+    if (!session) return 'rejected'
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    try {
+      await prev
+      const next = nextUserGoal(session._platformGoal ?? null, session.peerId, action, objective)
+      if (next === 'rejected') return 'rejected'
+      if (next === 'noop') return 'noop'
+      session._platformGoal = next
+      await session.runner.setGoalState(next)
+      return 'applied'
+    } finally {
+      release()
+    }
   }
 
   /** Apply a master-authored goal update at the next session lock boundary.
