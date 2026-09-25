@@ -118,6 +118,34 @@ function assistantContent(events: Event[]): Array<Record<string, unknown>> {
   return blocks;
 }
 
+const SAFE_CONTROL_KEYS = new Set(["edits", "type", "trigger", "value", "keep",
+  "clear_at_least", "minimum", "effort", "display", "budget_tokens",
+  "min_tokens", "max_tokens", "mode", "threshold"]);
+const SAFE_CONTROL_VALUES = new Set(["adaptive", "omitted", "low", "medium",
+  "high", "max", "enabled", "disabled", "input_tokens", "tool_uses",
+  "clear_tool_uses_20250919", "clear_thinking_20251015", "all", "none"]);
+/** Preserve only protocol enums/numbers and known keys. Unknown strings are
+ * represented by length, never copied into an operator report. */
+function safeControlShape(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "<depth-limit>";
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : "<number>";
+  if (typeof value === "string") return SAFE_CONTROL_VALUES.has(value) ? value
+    : { stringBytes: Buffer.byteLength(value) };
+  if (Array.isArray(value)) return { items: value.slice(0, 16)
+    .map((item) => safeControlShape(item, depth + 1)), omitted: Math.max(0, value.length - 16) };
+  if (typeof value !== "object") return `<${typeof value}>`;
+  const source = value as Record<string, unknown>;
+  const safe: Record<string, unknown> = {};
+  let omitted = 0;
+  for (const [key, item] of Object.entries(source)) {
+    if (SAFE_CONTROL_KEYS.has(key)) safe[key] = safeControlShape(item, depth + 1);
+    else omitted++;
+  }
+  if (omitted) safe.omittedFields = omitted;
+  return safe;
+}
+
 async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   boxModel: AnthropicProxyDeps["boxModel"]; price: ModelPricing;
   containerId: number; bindHost?: string; containerInboundIp?: string;
@@ -243,14 +271,14 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
           toolNames: Array.isArray(body.tools) ? body.tools.map((tool) =>
             tool !== null && typeof tool === "object" && "name" in tool
               && typeof tool.name === "string" ? tool.name : "<invalid>") : [],
-          // These control-plane options contain no prompt/tool-result content;
-          // cap the serialized shape to prevent accidental overcollection.
-          contextManagement: JSON.stringify(body.context_management ?? null).slice(0, 2048),
-          thinking: JSON.stringify(body.thinking ?? null).slice(0, 512),
-          outputConfig: JSON.stringify(body.output_config ?? null).slice(0, 512),
-          messageRoles: Array.isArray(body.messages) ? body.messages.map((msg) =>
-            msg && typeof msg === "object" && "role" in msg
-              && typeof msg.role === "string" ? msg.role : "<invalid>") : [],
+          contextManagement: safeControlShape(body.context_management ?? null),
+          thinking: safeControlShape(body.thinking ?? null),
+          outputConfig: safeControlShape(body.output_config ?? null),
+          messageRoles: Array.isArray(body.messages) ? body.messages.slice(0, 64)
+            .map((msg) => msg && typeof msg === "object" && "role" in msg
+              && typeof msg.role === "string"
+              && ["user", "assistant", "system", "tool"].includes(msg.role)
+              ? msg.role : "<invalid>") : [],
           hasTurnKey: typeof identity.oc_turn_key === "string"
             && /^[a-f0-9]{64}$/.test(identity.oc_turn_key),
           hasSessionId: typeof identity.session_id === "string" && !!identity.session_id,
