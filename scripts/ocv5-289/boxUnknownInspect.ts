@@ -2,14 +2,17 @@
  * or cleanup; the fixed account lock remains until proof permits release. */
 import { createHash } from "node:crypto";
 import { constants, closeSync, fsyncSync, lstatSync, openSync,
-  readFileSync, unlinkSync } from "node:fs";
+  readFileSync, unlinkSync, writeSync } from "node:fs";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { assessUnknownProbeQuarantine,
+  type UnknownObservationSnapshot } from "./boxUnknownQuarantinePolicy.js";
 
 const LOCK = "/var/lib/openclaude/ocv5-289-box-operator/account-20.json";
 const MUTEX = "/var/lib/openclaude/ocv5-289-box-operator/account-20.mutex";
 const DIR = "/var/lib/openclaude/ocv5-289-box-operator";
+const SNAPSHOT = `${DIR}/account-20.unknown-observation.json`;
 const READ = String.raw`import hashlib,json,os,re,stat,sys
 nonce,*assets=sys.argv[1:]
 if not re.fullmatch(r'[a-f0-9]{24}',nonce) or len(assets)!=4:raise SystemExit(126)
@@ -18,7 +21,8 @@ def inspect(path,want=None):
  except FileNotFoundError:return {'present':False}
  if stat.S_ISLNK(st.st_mode):return {'present':True,'kind':'symlink'}
  kind='dir' if stat.S_ISDIR(st.st_mode) else 'file' if stat.S_ISREG(st.st_mode) else 'other'
- result={'present':True,'kind':kind,'mode':stat.S_IMODE(st.st_mode),'size':st.st_size}
+ result={'present':True,'kind':kind,'mode':stat.S_IMODE(st.st_mode),
+  'size':st.st_size,'ageSec':max(0,int(__import__('time').time()-st.st_mtime))}
  if want is not None and kind=='file' and st.st_size<=32768:
   with open(path,'rb') as f:result['hashMatches']=hashlib.sha256(f.read()).hexdigest()==want
  return result
@@ -40,8 +44,22 @@ def stream_shape(path):
    return 'other-'+hashlib.sha256(str(value).encode()).hexdigest()[:8]
   allowed={'system','assistant','user','result','rate_limit_event','stream_event','tool_progress','tool_use_summary','auth_status'}
   events={'message_start','content_block_start','content_block_delta','content_block_stop','message_delta','message_stop','ping'}
+  all_lines=data.split(b'\n')[:-1]
+  result_count=0;tool_use_count=0;tool_result_count=0;last_type=None;last_result_error=None
+  for line in all_lines:
+   try:whole=json.loads(line)
+   except (UnicodeDecodeError,ValueError):continue
+   if not isinstance(whole,dict):continue
+   last_type=whole.get('type') if whole.get('type') in allowed else 'other'
+   if whole.get('type')=='result':
+    result_count+=1;last_result_error=whole.get('is_error') is True
+   msg=whole.get('message')
+   blocks=msg.get('content') if isinstance(msg,dict) else None
+   if isinstance(blocks,list):
+    tool_use_count+=sum(isinstance(b,dict) and b.get('type')=='tool_use' for b in blocks)
+    tool_result_count+=sum(isinstance(b,dict) and b.get('type')=='tool_result' for b in blocks)
   records=[];used=0;budget_exceeded=False
-  for line in data.split(b'\n')[:-1][:64]:
+  for line in all_lines[:64]:
    try:record=json.loads(line)
    except (UnicodeDecodeError,ValueError):records.append({'type':'invalid_json'});continue
    if not isinstance(record,dict):records.append({'type':'non_object'});continue
@@ -79,9 +97,27 @@ def stream_shape(path):
   except FileNotFoundError:err=None
   partial=bool(data and not data.endswith(b'\n'))
   return {'present':True,'stdoutBytes':st.st_size,'stderrBytes':err,
-   'partialLine':partial,
-   'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64 or partial or budget_exceeded,
-   'records':records}
+    'stdoutSha256':hashlib.sha256(data).hexdigest() if st.st_size==len(data) else None,
+    'partialLine':partial,
+    'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64 or partial or budget_exceeded,
+    'resultCount':result_count,'lastType':last_type,
+    'lastResultIsError':last_result_error,
+    'toolUseCount':tool_use_count,'toolResultCount':tool_result_count,
+    'records':records}
+ finally:os.close(dfd)
+def run_entries(path):
+ try:dfd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ except FileNotFoundError:return {'present':False}
+ try:
+  st=os.fstat(dfd)
+  if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(126)
+  names=os.listdir(dfd)
+  return {'present':True,'count':len(names),
+   'pendingCount':sum(n.startswith('pending.toolu_') for n in names),
+   'resultCount':sum(n.startswith('result.toolu_') for n in names),
+   'unexpectedCount':sum(not (n in ('stdin.jsonl','system.txt','tool-catalog.json',
+    'stdout.jsonl','stderr.log') or n.startswith('pending.toolu_')
+    or n.startswith('result.toolu_')) for n in names)}
  finally:os.close(dfd)
 def terminal_shape(path):
  try:dfd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
@@ -104,31 +140,80 @@ def terminal_shape(path):
   'reason':proof.get('reason') if proof.get('reason') in ('worker_complete','keeper_stopped','deadline','unknown') else 'other',
   'revision':proof.get('revision') if isinstance(proof.get('revision'),int) else None}
 def process_shape():
- matches=[];scanned=0;unreadable=0;cmdline_truncated=False
+ matches=[];scanned=0;unreadable=0;unreadable_young=0
+ cmdline_truncated=False;fd_truncated=False;claude_like=[]
+ with open('/proc/uptime',encoding='ascii') as f:uptime=float(f.read().split()[0])
+ ticks=os.sysconf('SC_CLK_TCK')
+ try:runstat=os.stat('/tmp/ocv5-289-run-'+nonce)
+ except FileNotFoundError:runstat=None
+ run_age=max(0,int(__import__('time').time()-runstat.st_mtime)) if runstat else None
+ try:outstat=os.stat('/tmp/ocv5-289-run-'+nonce+'/stdout.jsonl')
+ except FileNotFoundError:outstat=None
  for raw_pid in os.listdir('/proc'):
   if not raw_pid.isdigit():continue
   scanned+=1
   if scanned>4096:break
   pid=int(raw_pid)
   if pid==os.getpid():continue
+  root='/proc/'+raw_pid
   try:
-   with open('/proc/'+raw_pid+'/cmdline','rb') as f:cmd=f.read(4097)
-   if len(cmd)>4096:cmdline_truncated=True
-   if nonce.encode() not in cmd:continue
-   with open('/proc/'+raw_pid+'/status',encoding='ascii',errors='ignore') as f:lines=f.readlines()[:8]
-  except PermissionError:unreadable+=1;continue
+   if os.stat(root).st_uid!=os.getuid():continue
+   with open(root+'/cmdline','rb') as f:cmd=f.read(16385)
+   if len(cmd)>16384:cmdline_truncated=True
+   with open(root+'/status',encoding='ascii',errors='ignore') as f:lines=f.readlines()[:8]
+  except PermissionError:unreadable+=1;unreadable_young+=1;continue
   except (FileNotFoundError,ProcessLookupError):continue
   fields={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in lines if ':' in line}
   name=fields.get('Name','')
   state=fields.get('State','')[:1]
   ppid=fields.get('PPid','')
+  age=None
+  try:
+   with open(root+'/stat',encoding='ascii',errors='ignore') as f:statline=f.read(4096)
+   tail=statline.rsplit(')',1)[1].split()
+   age=max(0,int(uptime-int(tail[19])/ticks))
+  except (OSError,ValueError,IndexError):unreadable+=1
+  if name=='claude' or (name in ('node','python3') and b'claude' in cmd.lower()):
+   if len(claude_like)<16:claude_like.append({'pid':pid,'name':name,
+    'state':state if state in ('R','S','D','T','Z','I') else 'other',
+    'ppid':int(ppid) if ppid.isdigit() else None,'ageSec':age})
+  same_cwd=False;same_stdout=False
+  if runstat is not None:
+   try:
+    cwd=os.stat(root+'/cwd')
+    same_cwd=(cwd.st_dev,cwd.st_ino)==(runstat.st_dev,runstat.st_ino)
+   except PermissionError:
+    unreadable+=1
+    if run_age is None or age is None or age<=run_age+60:unreadable_young+=1
+   except (FileNotFoundError,ProcessLookupError):pass
+  if outstat is not None:
+   try:
+    fds=os.listdir(root+'/fd')
+    if len(fds)>128:fd_truncated=True
+    for fd in fds[:128]:
+     try:opened=os.stat(root+'/fd/'+fd)
+     except (FileNotFoundError,ProcessLookupError):continue
+     if (opened.st_dev,opened.st_ino)==(outstat.st_dev,outstat.st_ino):
+      same_stdout=True;break
+   except PermissionError:
+    unreadable+=1
+    if run_age is None or age is None or age<=run_age+60:unreadable_young+=1
+   except (FileNotFoundError,ProcessLookupError):pass
+  nonce_arg=nonce.encode() in cmd
+  if not (nonce_arg or same_cwd or same_stdout):continue
   matches.append({'pid':pid,'ppid':int(ppid) if ppid.isdigit() else None,
-   'name':name if name in ('python3','claude','node') else 'other',
-   'state':state if state in ('R','S','D','T','Z','I') else 'other'})
+    'name':name if name in ('python3','claude','node') else 'other',
+    'state':state if state in ('R','S','D','T','Z','I') else 'other',
+    'nonceArg':nonce_arg,'sameCwd':same_cwd,'sameStdout':same_stdout})
   if len(matches)>=8:break
- return {'matches':matches,
-  'incomplete':scanned>4096 or len(matches)>=8 or unreadable>0 or cmdline_truncated}
+ return {'matches':matches,'claudeLikeCount':len(claude_like),
+  'claudeLike':claude_like,'scanned':scanned,'unreadable':unreadable,
+  'unreadableYoung':unreadable_young,
+  'cmdlineTruncated':cmdline_truncated,'fdTruncated':fd_truncated,
+  'incomplete':scanned>4096 or len(matches)>=8 or len(claude_like)>=16 or unreadable>0
+    or cmdline_truncated or fd_truncated}
 out={'run':inspect('/tmp/ocv5-289-run-'+nonce),
+ 'runEntries':run_entries('/tmp/ocv5-289-run-'+nonce),
  'proof':inspect('/tmp/ocv5-289-proof-'+nonce),
  'terminal':terminal_shape('/tmp/ocv5-289-proof-'+nonce),
  'stream':stream_shape('/tmp/ocv5-289-run-'+nonce),
@@ -143,13 +228,15 @@ async function main(): Promise<void> {
     || process.env.OCV5_289_INSPECT_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_INSPECT_ACK_REQUIRED");
   const clearing = process.env.OCV5_289_CLEAR_PRESTART_ACK === "1";
+  const quarantining = process.env.OCV5_289_QUARANTINE_UNKNOWN_ACK === "1";
+  if (clearing && quarantining) throw new Error("BOX_INSPECT_MODE_CONFLICT");
   let mutexHeld = false;
   const syncDirectory = (): void => {
     const fd = openSync(DIR, constants.O_RDONLY | constants.O_DIRECTORY
       | constants.O_NOFOLLOW);
     try { fsyncSync(fd); } finally { closeSync(fd); }
   };
-  if (clearing) {
+  if (clearing || quarantining) {
     let fd: number;
     try { fd = openSync(MUTEX, constants.O_WRONLY | constants.O_CREAT
       | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
@@ -199,6 +286,8 @@ async function main(): Promise<void> {
     { timeoutMs: 20_000, maxResponseBytes: 8192 });
     const observed = JSON.parse(result.stdout) as Record<string, unknown>;
     let clearedLock = false;
+    let quarantinedLock = false;
+    let awaitingSecondObservation = false;
     if (clearing) {
       if (process.env.OCV5_289_EXPECTED_RUN_NONCE !== record.runNonce
         || process.env.OCV5_289_EXPECTED_FIRST_ID !== record.firstId
@@ -231,8 +320,66 @@ async function main(): Promise<void> {
       syncDirectory();
       clearedLock = true;
     }
+    if (quarantining) {
+      if (process.env.OCV5_289_EXPECTED_RUN_NONCE !== record.runNonce
+        || process.env.OCV5_289_EXPECTED_FIRST_ID !== record.firstId
+        || process.env.OCV5_289_EXPECTED_PHASE !== "first_round_unknown"
+        || record.state !== "unresolved"
+        || typeof record.pid !== "number" || !Number.isSafeInteger(record.pid)
+        || record.pid <= 0) throw new Error("BOX_UNKNOWN_QUARANTINE_IDENTITY_INVALID");
+      try { process.kill(record.pid, 0); throw new Error("BOX_UNKNOWN_PROBE_STILL_RUNNING"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      const lockSha256 = createHash("sha256").update(rawLock).digest("hex");
+      let previous: UnknownObservationSnapshot | undefined;
+      try {
+        const prior = lstatSync(SNAPSHOT);
+        if (!prior.isFile() || prior.isSymbolicLink() || prior.uid !== process.getuid()
+          || (prior.mode & 0o777) !== 0o600 || prior.size < 1 || prior.size > 4096) {
+          throw new Error("BOX_UNKNOWN_SNAPSHOT_INVALID");
+        }
+        previous = JSON.parse(readFileSync(SNAPSHOT, "utf8")) as UnknownObservationSnapshot;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      const assessed = assessUnknownProbeQuarantine({ observed,
+        runNonce: record.runNonce, lockSha256, nowMs: Date.now(), previous });
+      const writeOnce = (path: string, raw: string): void => {
+        const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT
+          | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        try {
+          const data = Buffer.from(raw, "utf8");
+          let written = 0;
+          while (written < data.length) written += writeSync(fd, data, written);
+          fsyncSync(fd);
+        } finally { closeSync(fd); }
+        syncDirectory();
+      };
+      if (!assessed.ready) {
+        writeOnce(SNAPSHOT, JSON.stringify(assessed.snapshot));
+        awaitingSecondObservation = true;
+      } else {
+        const archive = `${DIR}/account-20.quarantined-${record.runNonce}.json`;
+        writeOnce(archive, JSON.stringify({ kind: "synthetic_unknown_cli_error",
+          terminalProof: false, settledUsage: false, replayAllowed: false,
+          originalLock: record, first: previous, second: assessed.snapshot,
+          quarantinedAt: new Date().toISOString() }));
+        const latest = lstatSync(LOCK);
+        if (latest.dev !== st.dev || latest.ino !== st.ino
+          || readFileSync(LOCK, "utf8") !== rawLock) {
+          throw new Error("BOX_INSPECT_LOCK_CHANGED");
+        }
+        // This releases ONLY the synthetic operator mutex. It does not alter
+        // the live billing journal, claim keeper proof, or delete Box files.
+        unlinkSync(LOCK);
+        unlinkSync(SNAPSHOT);
+        syncDirectory();
+        quarantinedLock = true;
+      }
+    }
     process.stdout.write(JSON.stringify({ accountId: "20", runNonce: record.runNonce,
-      observed, clearedLock }) + "\n");
+      observed, clearedLock, quarantinedLock, awaitingSecondObservation }) + "\n");
   } finally { await target.dispose?.(); }
   } finally {
     if (mutexHeld) { unlinkSync(MUTEX); syncDirectory(); }
