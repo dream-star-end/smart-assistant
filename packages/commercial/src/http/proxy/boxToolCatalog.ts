@@ -78,7 +78,13 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
     }
     const mcpName = `t${i}`;
     const boxName = `mcp__${BOX_MCP_SERVER}__${mcpName}`;
-    tools.push({ name: mcpName, description: source.description,
+    // The CLI sees only the opaque MCP alias (t0/t1/...), while the
+    // OpenClaude-side prompt and tool_choice name the original client tool.
+    // Preserve that name in the model-visible description; otherwise a model
+    // can truthfully say that e.g. `local_echo` is unavailable despite t0
+    // being present. This is identity metadata, never execution authority.
+    tools.push({ name: mcpName,
+      description: `OpenClaude tool name: ${source.name}. ${source.description}`,
       inputSchema: source.input_schema });
     clientNameByBoxName.set(boxName, source.name);
     boxNameByClientName.set(source.name, boxName);

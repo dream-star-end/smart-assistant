@@ -20,7 +20,7 @@ test("real CC built-in tool names get unique Box MCP aliases and exact reverse n
   const source = ccNames.map(tool);
   const compiled = compileBoxToolCatalog(source);
   const staged = JSON.parse(compiled.json) as { tools: Array<{ name: string;
-    inputSchema: unknown }> };
+    description: string; inputSchema: unknown }> };
   assert.equal(staged.tools.length, 20);
   assert.equal(compiled.clientNameByBoxName.size, 20);
   assert.equal(compiled.boxNameByClientName.size, 20);
@@ -29,13 +29,15 @@ test("real CC built-in tool names get unique Box MCP aliases and exact reverse n
     assert.equal(compiled.clientNameByBoxName.get(boxName), source[i]!.name);
     assert.equal(compiled.boxNameByClientName.get(source[i]!.name), boxName);
     assert.equal(staged.tools[i]!.name, `t${i}`);
+    assert.equal(staged.tools[i]!.description,
+      `OpenClaude tool name: ${source[i]!.name}. ${source[i]!.description}`);
     assert.deepEqual(staged.tools[i]!.inputSchema, source[i]!.input_schema);
   }
   assert.match(compiled.sha256, /^[a-f0-9]{64}$/);
   assert.equal(compileBoxToolCatalog(source).sha256, compiled.sha256);
   const renamed = source.map((item, i) => i === 0 ? { ...item, name: "RenamedAgent" } : item);
-  assert.equal(compileBoxToolCatalog(renamed).sha256, compiled.sha256,
-    "remote catalog aliases alone cannot bind the original client tool name");
+  assert.notEqual(compileBoxToolCatalog(renamed).sha256, compiled.sha256,
+    "the model-visible alias description must identify the real client tool");
   assert.notEqual(compileBoxToolCatalog(renamed).bindingSha256, compiled.bindingSha256);
 });
 
