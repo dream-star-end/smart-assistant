@@ -651,6 +651,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         boxRunNonce: i.toString(16).padStart(24, "0"), boxOwnerRequestId: null })]);
       await client.query(`INSERT INTO request_finalize_journal
         (request_id,user_id,state,ctx,updated_at)
+        VALUES ($1,3,'inflight',$2::jsonb,NOW()-INTERVAL '2 days')`,
+      [`box-number-probe-${i}-${suffix}`, JSON.stringify({ ...probeCtx,
+        boxAccountId: 20, boxRunNonce: (i + 40).toString(16).padStart(24, "0") })]);
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
         VALUES ($1,3,'inflight',$2::jsonb,NOW()-INTERVAL '1 day')`,
       [`box-old-probe-${i}-${suffix}`, JSON.stringify({ ...probeCtx,
         boxRunNonce: (i + 20).toString(16).padStart(24, "0") })]);

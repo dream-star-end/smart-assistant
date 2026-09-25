@@ -816,8 +816,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE state='inflight' AND ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
           AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
+          AND jsonb_typeof(ctx->'boxAccountId')='string'
           AND ctx->>'boxAccountId' ~ '^[1-9][0-9]{0,19}$'
+          AND jsonb_typeof(ctx->'boxRunNonce')='string'
           AND ctx->>'boxRunNonce' ~ '^[a-f0-9]{24}$'
+          AND jsonb_typeof(ctx->'boxLeaseEpoch')='string'
           AND ctx->>'boxLeaseEpoch' ~ '^[a-f0-9]{32}$'
           AND (NOT (ctx ? 'boxOwnerRequestId')
             OR (jsonb_typeof(ctx->'boxOwnerRequestId')='string'
@@ -873,6 +876,9 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id=$1 AND user_id=$2 AND state='inflight'
           AND ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
+          AND jsonb_typeof(ctx->'boxAccountId')='string'
+          AND jsonb_typeof(ctx->'boxRunNonce')='string'
+          AND jsonb_typeof(ctx->'boxLeaseEpoch')='string'
           AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
           AND ctx->>'boxLeaseEpoch'=$5
           AND ctx->>'boxState' IN ('running','unknown','linked')
