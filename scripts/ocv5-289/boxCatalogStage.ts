@@ -6,13 +6,15 @@ import { hostname } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import { getPool, closePool } from "../../packages/commercial/src/db/index.js";
 import { assertModelCatalogAdminPoolConfigured,
-  closeModelCatalogAdminPool } from
+  closeModelCatalogAdminPool, getModelCatalogAdminPool } from
   "../../packages/commercial/src/db/modelCatalogAdmin.js";
+import { loadConfig } from "../../packages/commercial/src/config.js";
 import { createStaged, normalizeVersionInput,
   validateVersionSemantics } from
   "../../packages/commercial/src/admin/modelCatalogOps.js";
 import { writeAdminAudit } from "../../packages/commercial/src/admin/audit.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { sameSelfhostCatalogEndpoint } from "./boxCatalogBoundary.js";
 
 const MODEL = "box-api-claude-opus-5-5";
 const SOURCE = "claude-opus-5-5";
@@ -69,10 +71,25 @@ async function main(): Promise<void> {
   const normalized = normalizeVersionInput(VERSION);
   assertion(validateVersionSemantics(normalized).length === 0,
     "BOX_CATALOG_VERSION_INVALID");
+  const cfg = loadConfig();
+  assertion(!!cfg.MODEL_CATALOG_ADMIN_DATABASE_URL
+    && sameSelfhostCatalogEndpoint(cfg.DATABASE_URL,
+      cfg.MODEL_CATALOG_ADMIN_DATABASE_URL),
+  "BOX_CATALOG_ADMIN_ENDPOINT_INVALID");
   const pool = getPool();
   try {
-    const db = await pool.query<{ name: string }>("SELECT current_database() AS name");
-    assertion(db.rows[0]?.name === "openclaude_v5_selfhost", "BOX_CATALOG_DATABASE_INVALID");
+    await assertModelCatalogAdminPoolConfigured();
+    const identitySql = `SELECT current_database() AS name,
+      host(inet_server_addr()) AS addr, inet_server_port() AS port`;
+    const [db, adminDb] = await Promise.all([
+      pool.query<{ name: string; addr: string; port: number }>(identitySql),
+      getModelCatalogAdminPool().query<{ name: string; addr: string; port: number }>(identitySql),
+    ]);
+    assertion(db.rows.length === 1 && adminDb.rows.length === 1
+      && db.rows[0]?.name === "openclaude_v5_selfhost"
+      && db.rows[0]?.addr === "127.0.0.1" && db.rows[0]?.port === 5432
+      && isDeepStrictEqual(adminDb.rows[0], db.rows[0]),
+    "BOX_CATALOG_DATABASE_INVALID");
     const source = await pool.query<PriceRow>(
       `SELECT ${PRICE_COLUMNS} FROM model_pricing WHERE model_id=$1`, [SOURCE]);
     const rate = source.rows[0];
@@ -96,7 +113,6 @@ async function main(): Promise<void> {
       && (!price.rows[0] || exactPrice(price.rows[0], rate)),
     "BOX_CATALOG_PRICE_CONFLICT");
     if (mode === "stage" && !catalog.rows[0]) {
-      await assertModelCatalogAdminPoolConfigured();
       await createStaged(VERSION, { adminId: UID,
         userAgent: "ocv5-289-box-catalog-stage" });
       catalog = await pool.query<CatalogRow>(
