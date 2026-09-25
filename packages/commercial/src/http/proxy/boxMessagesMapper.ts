@@ -97,7 +97,10 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     throw new BoxMessagesShapeError("BOX_SESSION_ID_INVALID");
   }
   const messages = body.messages.map(readMessage);
-  const currentIndex = messages.findLastIndex((message) => message.role === "user");
+  let currentIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index]?.role === "user") { currentIndex = index; break; }
+  }
   if (currentIndex < 0 || messages.slice(currentIndex + 1).some((message) => message.role !== "system")) {
     throw new BoxMessagesShapeError("BOX_CURRENT_USER_REQUIRED");
   }
