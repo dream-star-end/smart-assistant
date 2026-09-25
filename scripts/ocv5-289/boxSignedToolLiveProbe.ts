@@ -326,7 +326,8 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
 `;
   const child = spawn("docker", ["exec", "-i", "--user", "1000:1000",
     "--workdir", "/home/agent/.openclaude/workspace/ocv5-289-box-api",
-    "oc-v5-u3", "python3", "-c", python],
+    "oc-v5-u3", "/usr/bin/timeout", "-s", "TERM", "-k", "5s", "90s",
+    "python3", "-I", "-c", python],
   { stdio: ["pipe", "pipe", "pipe"] });
   const cfg = JSON.stringify(input);
   child.stdin.end(cfg);
@@ -339,12 +340,15 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
     stderrBytes += chunk.length;
     if (stderrBytes > 500_000) child.kill("SIGTERM");
   });
-  const timeout = setTimeout(() => child.kill("SIGTERM"), 120_000);
+  let hostTimedOut = false;
+  const timeout = setTimeout(() => { hostTimedOut = true; child.kill("SIGTERM"); },
+    105_000);
   try {
     const exitCode = await new Promise<number>((resolve, reject) => {
       child.once("error", reject);
       child.once("close", (code) => resolve(code ?? 1));
     });
+    if (hostTimedOut) throw new Error("BOX_CCB_PROCESS_UNCONFIRMED");
     return { exitCode, stdoutBytes, stderrBytes };
   } finally { clearTimeout(timeout); }
 }
@@ -376,6 +380,7 @@ async function main(): Promise<void> {
   let terminal = false;
   let identityPersisted = false;
   let lockHeld = false;
+  let ccbProcessUnconfirmed = false;
   let dbReady = false;
   let loopback: Awaited<ReturnType<typeof startSignedLoopback>> | null = null;
   const oldModelFlag = process.env.OC_BOX_MODEL_API;
@@ -527,13 +532,16 @@ async function main(): Promise<void> {
         return service.fetch(args);
       } }, price });
     if (ccbPreflight) {
+      ccbProcessUnconfirmed = true;
       const result = await runContainerCcbPreflight({ baseUrl: loopback.baseUrl,
         authToken: loopback.authToken, catalogToken: loopback.catalogToken, turnKey });
+      ccbProcessUnconfirmed = false;
       const observed = loopback.observedRequestIds();
       const usage = await client.query("SELECT 1 FROM usage_records WHERE request_id=ANY($1::text[])",
         [observed]);
       assertion(observed.length >= 1 && observed.length <= 2
         && transportCalls === 0 && paidCalls === 0
+        && result.exitCode !== 124 && result.exitCode !== 137
         && !identityPersisted && usage.rowCount === 0,
       "BOX_CCB_PREFLIGHT_INVALID");
       withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
@@ -688,7 +696,7 @@ async function main(): Promise<void> {
       firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
       remoteCleanupDone: true, unknown: false }) + "\n");
   } catch (error) {
-    if (lockHeld && !identityPersisted) {
+    if (lockHeld && !identityPersisted && !ccbProcessUnconfirmed) {
       // The durable admission wrapper has not run, so no paid CLI can have
       // started. Release this prelaunch-only reservation, still fail the probe.
       try { withOperatorMutex(() => {
