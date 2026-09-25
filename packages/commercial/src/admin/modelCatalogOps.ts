@@ -244,6 +244,11 @@ export function validateVersionSemantics(
       `provider_id='${providerId ?? "null"}' ∉ engine='${engine}' 的服务端机制集 [${allowed.join(",")}]`,
     );
   }
+  if (providerId === "box_cli"
+    && (modelId !== "box-api-claude-opus-5-5"
+      || v.upstream_model_id !== "claude-opus-5-5")) {
+    out.push("box_cli 目前仅接线 box-api-claude-opus-5-5 → claude-opus-5-5");
+  }
 
   // ② capability ⊆ provider 机制上限(codex engine 不走 anthropic proxy 机制,跳过)
   if (engine === "ccb" && providerId !== null && allowed.includes(providerId)) {

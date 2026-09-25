@@ -279,6 +279,12 @@ test("Box CLI model can be staged only with its narrow capability ceiling", () =
     supports_vision: true } };
   assert.ok(validateVersionSemantics(normalizeVersionInput(vision), true)
     .some((item) => item.includes("vision")));
+  assert.ok(validateVersionSemantics(normalizeVersionInput({ ...base,
+    model_id: "box-api-unconfigured" }), true)
+    .some((item) => item.includes("仅接线")));
+  assert.ok(validateVersionSemantics(normalizeVersionInput({ ...base,
+    upstream_model_id: "claude-opus-5" }), true)
+    .some((item) => item.includes("仅接线")));
 });
 
 describe("四面 capability 广播 + 步骤 5 兼容地板", () => {
