@@ -310,7 +310,9 @@ async function runContainerCcbPreflight(input: { baseUrl: string;
   authToken: string; catalogToken: string; turnKey: string }): Promise<{
   exitCode: number; stdoutBytes: number; stderrBytes: number;
   stderrTail: string; stdoutEvents: Array<{ type: unknown;
-    subtype: unknown; keys: string[] }> }> {
+    subtype: unknown; keys: string[] }>;
+  initSummary: { model: unknown; apiKeySource: unknown; permissionMode: unknown;
+    memoryPathCount: number; skillCount: number; toolCount: number } | null }> {
   const python = `import json,os,sys
 cfg=json.load(sys.stdin)
 env=os.environ.copy()
@@ -328,7 +330,7 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
 `;
   const child = spawn("docker", ["exec", "-i", "--user", "1000:1000",
     "--workdir", "/home/agent/.openclaude/workspace/ocv5-289-box-api",
-    "oc-v5-u3", "/usr/bin/timeout", "-s", "TERM", "-k", "5s", "90s",
+    "oc-v5-u3", "/usr/bin/timeout", "-s", "TERM", "-k", "5s", "30s",
     "python3", "-I", "-c", python],
   { stdio: ["pipe", "pipe", "pipe"] });
   const cfg = JSON.stringify(input);
@@ -353,7 +355,7 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
   });
   let hostTimedOut = false;
   const timeout = setTimeout(() => { hostTimedOut = true; child.kill("SIGTERM"); },
-    105_000);
+    45_000);
   try {
     const closed = await new Promise<{ code: number; signal: NodeJS.Signals | null }>((resolve, reject) => {
       child.once("error", reject);
@@ -369,8 +371,23 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
           keys: Object.keys(value).sort() };
       } catch { return { type: "non_json", subtype: null, keys: [] }; }
     });
+    let initSummary: { model: unknown; apiKeySource: unknown;
+      permissionMode: unknown; memoryPathCount: number; skillCount: number;
+      toolCount: number } | null = null;
+    for (const line of stdoutTail.split("\n")) {
+      try {
+        const value = JSON.parse(line) as Record<string, unknown>;
+        if (value.type === "system" && value.subtype === "init") {
+          initSummary = { model: value.model, apiKeySource: value.apiKeySource,
+            permissionMode: value.permissionMode,
+            memoryPathCount: Array.isArray(value.memory_paths) ? value.memory_paths.length : 0,
+            skillCount: Array.isArray(value.skills) ? value.skills.length : 0,
+            toolCount: Array.isArray(value.tools) ? value.tools.length : 0 };
+        }
+      } catch { /* No raw CLI content enters the report. */ }
+    }
     return { exitCode: closed.code, stdoutBytes, stderrBytes,
-      stdoutEvents,
+      stdoutEvents, initSummary,
       stderrTail: stderrTail.replaceAll(input.authToken, "[synthetic-auth]")
         .replaceAll(input.catalogToken, "[synthetic-catalog]").slice(-300) };
   } finally { clearTimeout(timeout); }
@@ -566,7 +583,7 @@ async function main(): Promise<void> {
         requestIds: observed, transportCalls, paidCalls,
         exitCode: result.exitCode, stdoutBytes: result.stdoutBytes,
         stderrBytes: result.stderrBytes, stderrTail: result.stderrTail,
-        stdoutEvents: result.stdoutEvents,
+        stdoutEvents: result.stdoutEvents, initSummary: result.initSummary,
         shapes: loopback.shapes, diagnostics: loopback.diagnostics.slice(-8) }) + "\n");
       assertion(observed.length >= 1 && observed.length <= 2
         && transportCalls === 0 && paidCalls === 0
