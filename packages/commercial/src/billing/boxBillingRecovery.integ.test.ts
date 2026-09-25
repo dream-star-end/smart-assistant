@@ -185,6 +185,27 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     assert.equal(toolState.rows[0]?.box_state, "handoff",
       "billing settlement must not release the live Box process/account fence");
 
+    // A later linked round can fail after this earlier handoff. Its stopped
+    // proof releases remote capacity, not the earlier completed message debt.
+    const stoppedUser = 900_000_004n, stoppedRequest = `${requestId}-stopped-handoff`;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'test-only-hash',1000)`,
+    [stoppedUser.toString(), `${stoppedRequest}@example.invalid`]);
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits,updated_at)
+      VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+    [stoppedRequest, stoppedUser.toString(), JSON.stringify({ ...toolCtx,
+      boxState: "failed_stopped", boxStopOutcome: "failed",
+      boxReplayFingerprint: "7".repeat(64) })]);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, stoppedRequest, stoppedUser),
+      "settled");
+    const stoppedUsage = await client.query<{ cost_credits: string }>(
+      "SELECT cost_credits::text FROM usage_records WHERE request_id=$1", [stoppedRequest]);
+    assert.equal(stoppedUsage.rows.length, 1);
+    assert.equal(stoppedUsage.rows[0]?.cost_credits, toolUsage.rows[0]?.cost_credits);
+    assert.equal(await recoverBoxBillingRequest(sameConnection, stoppedRequest, stoppedUser),
+      "already_committed");
+
     // Remote cleanup may keep failing while PG and financial settlement are
     // healthy. Its private retry clock must not refresh billing updated_at.
     const delayedUser = 900_000_003n, delayedRequest = `${requestId}-cleanup-clock`;

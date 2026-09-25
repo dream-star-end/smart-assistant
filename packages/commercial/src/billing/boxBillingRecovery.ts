@@ -36,7 +36,7 @@ function evidence(row: JournalRow): { usage: TokenUsage;
   if (!pricing || !context || context.turnKey !== ctx.boxTurnKey) return null;
   let source: unknown;
   if (ctx.boxToolHandoff !== undefined) {
-    if (!["handoff", "resuming", "unknown", "terminal"].includes(String(ctx.boxState))
+    if (!["handoff", "resuming", "unknown", "terminal", "failed_stopped"].includes(String(ctx.boxState))
       || typeof ctx.boxHandoffRevision !== "string"
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(ctx.boxHandoffRevision)
       || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
@@ -109,7 +109,7 @@ export async function recoverBoxBillingRequest(pool: Pool, requestId: string,
         WHERE rfj.request_id=$1 AND rfj.user_id=$2
           AND rfj.state='finalizing' AND rfj.ctx->>'boxInvocationRecovery'='v1'
           AND (rfj.ctx->>'boxState'='terminal'
-            OR (rfj.ctx->>'boxState' IN ('handoff','resuming','unknown')
+            OR (rfj.ctx->>'boxState' IN ('handoff','resuming','unknown','failed_stopped')
               AND rfj.ctx ? 'boxToolHandoff'))
           AND rfj.updated_at < NOW() - ($3::bigint * INTERVAL '1 millisecond')
           AND NOT EXISTS (SELECT 1 FROM usage_records ur
@@ -142,7 +142,7 @@ export async function reconcileBoxBillingBatch(pool: Pool, limit = 20): Promise<
     `SELECT request_id,user_id::text FROM request_finalize_journal
       WHERE ctx->>'boxInvocationRecovery'='v1'
         AND (ctx->>'boxState'='terminal'
-          OR (ctx->>'boxState' IN ('handoff','resuming','unknown')
+          OR (ctx->>'boxState' IN ('handoff','resuming','unknown','failed_stopped')
             AND ctx ? 'boxToolHandoff'))
         AND state IN ('inflight','finalizing')
         AND updated_at < NOW() - ($2::bigint * INTERVAL '1 millisecond')

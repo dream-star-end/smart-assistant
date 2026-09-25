@@ -6,7 +6,8 @@ import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerprint.js";
+import { deriveBoxCallFingerprint, deriveBoxContextHash,
+  hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 
@@ -566,13 +567,65 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(await journal.remoteCleanupStatus(failedCleanup), "done");
     assert.ok(!(await journal.listRemoteCleanupCandidates(20)).some((item) =>
       item.requestId === failedCall.requestId));
-    await put(`box-g-${suffix}`);
-    await journal.admit({ ...failedCall, requestId: `box-g-${suffix}`,
-      fingerprint: { ...fingerprint, replayFingerprint: "7".repeat(64) },
-      runNonce: "6".repeat(24), leaseEpoch: "7".repeat(32) });
-    await put(`box-h-${suffix}`);
-    await assert.rejects(() => journal.admit({ ...failedCall,
+    const failedSession = `failed-session-${suffix}`;
+    const failedTurn = "f".repeat(64);
+    const failedFirstBody: ProxyBody = { ...firstBody,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: failedTurn,
+        session_id: failedSession }) },
+      messages: [{ role: "user", content: "a distinct synthetic first prompt" }] };
+    const failedResumeBody: ProxyBody = { ...failedFirstBody,
+      messages: [...failedFirstBody.messages, ...resumeBody.messages.slice(1)] };
+    const failedBasis = { ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: failedSession, turnKey: failedTurn } };
+    const putFailed = async (id: string) => client.query(
+      `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+       VALUES ($1,3,'inflight',$2::jsonb)`, [id, JSON.stringify(failedBasis)]);
+    await putFailed(`box-g-${suffix}`);
+    const failedChainRoot = { ...failedCall, requestId: `box-g-${suffix}`,
+      contextHash: deriveBoxContextHash(failedFirstBody),
+      fingerprint: deriveBoxCallFingerprint(3n, failedFirstBody),
+      runNonce: "6".repeat(24), leaseEpoch: "7".repeat(32) };
+    await journal.admit(failedChainRoot);
+    await putFailed(`box-h-${suffix}`);
+    await assert.rejects(() => journal.admit({ ...failedChainRoot,
       requestId: `box-h-${suffix}` }), /BOX_CALL_AMBIGUOUS/);
+    await journal.markRunning(failedChainRoot);
+    await journal.recordToolHandoff({ ...failedChainRoot, candidate,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_A"] });
+    await journal.claimToolResume({ requestId: `box-h-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: failedResumeBody });
+    const failedChainProof = { ...failedProof, runNonce: failedChainRoot.runNonce,
+      leaseEpoch: failedChainRoot.leaseEpoch };
+    await assert.rejects(() => journal.markToolChainStoppedFailure({
+      requestId: failedChainRoot.requestId, uid: 3n,
+      leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof }),
+    /BOX_FAILED_STOP_CHAIN_INVALID/, "root with handoff is not an unbilled final row");
+    await journal.markToolChainStoppedFailure({ requestId: `box-h-${suffix}`,
+      uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof });
+    await journal.markToolChainStoppedFailure({ requestId: `box-h-${suffix}`,
+      uid: 3n, leaseEpoch: failedChainRoot.leaseEpoch, proof: failedChainProof });
+    const failedChainRows = await client.query<{ request_id: string; state: string;
+      ctx: Record<string, unknown>; final_credits: string | null }>(
+      `SELECT request_id,state,ctx,final_credits::text
+         FROM request_finalize_journal WHERE request_id IN ($1,$2) ORDER BY request_id`,
+      [failedChainRoot.requestId, `box-h-${suffix}`]);
+    assert.equal(failedChainRows.rows.find((row) => row.request_id === failedChainRoot.requestId)
+      ?.ctx.boxState, "failed_stopped");
+    assert.deepEqual((failedChainRows.rows.find((row) =>
+      row.request_id === failedChainRoot.requestId)?.ctx.boxToolHandoff as
+      { usage: unknown }).usage, candidate && { inputTokens: candidate.inputTokens,
+      outputTokens: candidate.outputTokens, cacheReadTokens: candidate.cacheReadTokens,
+      cacheWriteTokens: candidate.cacheWriteTokens });
+    assert.equal(failedChainRows.rows.find((row) => row.request_id === `box-h-${suffix}`)
+      ?.state, "aborted");
+    assert.equal(failedChainRows.rows.find((row) => row.request_id === `box-h-${suffix}`)
+      ?.final_credits, "0");
+    assert.ok((await journal.listRemoteCleanupCandidates(20)).some((item) =>
+      item.requestId === `box-h-${suffix}`));
+    await putFailed(`box-i-${suffix}`);
+    await assert.rejects(() => journal.admit({ ...failedChainRoot,
+      requestId: `box-i-${suffix}` }), /BOX_CALL_AMBIGUOUS/);
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.usage_records");
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");

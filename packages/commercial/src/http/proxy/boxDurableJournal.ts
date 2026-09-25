@@ -110,6 +110,8 @@ export interface BoxJournalPort {
     canonicalModel: string; canonicalBody: ProxyBody }): Promise<BoxToolResumeClaim>;
   completeToolChain?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
+  markToolChainStoppedFailure?(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void>;
 }
 
 function goodId(input: BoxJournalAdmission): void {
@@ -670,6 +672,127 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       await client.query("COMMIT");
       committed = true;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
+  /** A linked final round failed after earlier tool messages were durably
+   * handed off. Abort only the unbilled final row. Earlier rows retain their
+   * exact handoff usage and billing state, but cease holding remote capacity.
+   * No missing model usage is invented and no CLI/tool call is replayed. */
+  async markToolChainStoppedFailure(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
+      || !input.proof || input.proof.reason === "worker_complete") {
+      throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID");
+    }
+    try { parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
+      runNonce: input.proof.runNonce, leaseEpoch: input.leaseEpoch }); }
+    catch { throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID"); }
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
+      const rows: Row[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = input.requestId;
+      while (cursor !== null) {
+        if (rows.length >= 32 || seen.has(cursor)) {
+          throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+        }
+        seen.add(cursor);
+        const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
+          `SELECT request_id,state,ctx FROM request_finalize_journal
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [cursor, input.uid.toString()]);
+        const row = found.rows[0];
+        if (found.rowCount !== 1 || !row?.ctx
+          || row.ctx.boxInvocationRecovery !== "v1"
+          || row.ctx.boxInvocationMode !== "detached_tool"
+          || row.ctx.boxRunNonce !== input.proof.runNonce
+          || row.ctx.boxLeaseEpoch !== input.leaseEpoch) {
+          throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+        }
+        rows.push(row);
+        const parent: unknown = row.ctx.boxOwnerRequestId;
+        if (parent === undefined) cursor = null;
+        else if (typeof parent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parent)) cursor = parent;
+        else throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+      }
+      const current = rows[0]!;
+      const basis = current.ctx;
+      const roundNo = basis.boxRoundNo;
+      if (current.state === "aborted" && basis.boxState === "failed_stopped"
+        && rows.length === roundNo && isDeepStrictEqual(basis.boxTerminalProof, input.proof)) {
+        await client.query("COMMIT"); committed = true; return;
+      }
+      if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
+        || Number(roundNo) > 32 || rows.length !== roundNo
+        || current.state !== "inflight"
+        || !["linked", "unknown"].includes(String(basis.boxState))
+        || basis.boxToolHandoff !== undefined
+        || typeof basis.boxAccountId !== "string"
+        || !/^[1-9][0-9]{0,19}$/.test(basis.boxAccountId)
+        || typeof basis.boxCatalogHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
+        || typeof basis.boxDetachedRunnerHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+      }
+      for (let i = 1; i < rows.length; i++) {
+        const child = rows[i - 1]!, parent = rows[i]!;
+        const ctx = parent.ctx;
+        const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+        if (!handoff || handoff.roundNo !== Number(roundNo) - i
+          || handoff.catalogHash !== basis.boxCatalogHash
+          || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash
+          || !["inflight", "finalizing", "committed"].includes(parent.state)
+          || !["resuming", "unknown"].includes(String(ctx.boxState))
+          || ctx.boxResumeRequestId !== child.request_id
+          || typeof ctx.boxResumeRevision !== "string"
+          || !UUID_V4.test(ctx.boxResumeRevision)
+          || typeof child.ctx.boxParentResumeRevision !== "string"
+          || !UUID_V4.test(child.ctx.boxParentResumeRevision)
+          || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
+          || ctx.boxAccountId !== basis.boxAccountId
+          || ctx.boxSessionId !== basis.boxSessionId
+          || ctx.boxTurnKey !== basis.boxTurnKey
+          || ctx.model !== basis.model) {
+          throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+        }
+      }
+      const usage = await client.query(
+        `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
+        [current.request_id, input.uid.toString()]);
+      if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
+      const stopped = await client.query(
+        `UPDATE request_finalize_journal
+            SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                ctx=ctx || $4::jsonb, updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
+            AND ctx->>'boxState' IN ('linked','unknown')
+            AND NOT (ctx ? 'boxToolHandoff')`,
+        [current.request_id, input.uid.toString(), input.leaseEpoch,
+          JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+            boxStopOutcome: "failed" }), input.proof.runNonce]);
+      if (stopped.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+      for (const ancestor of rows.slice(1)) {
+        const changed = await client.query(
+          `UPDATE request_finalize_journal
+              SET ctx=ctx || '{"boxState":"failed_stopped","boxStopOutcome":"failed"}'::jsonb,
+                  updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
+              AND ctx->>'boxState' IN ('resuming','unknown')
+              AND ctx ? 'boxToolHandoff'`,
+          [ancestor.request_id, input.uid.toString(), input.leaseEpoch]);
+        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+      }
+      await client.query("COMMIT"); committed = true;
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
