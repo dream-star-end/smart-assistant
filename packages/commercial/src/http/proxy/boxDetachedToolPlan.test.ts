@@ -4,6 +4,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { makeBoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
+import { parseBoxTerminalProof } from "./boxTerminalProof.js";
 import type { ProxyBody } from "./shared.js";
 
 const read = (name: string) => readFileSync(
@@ -61,7 +62,11 @@ test("real detached plan reaches keeper and supervisor without a paid model", as
     while (!existsSync(proof) && Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, 20));
     }
-    assert.equal(JSON.parse(readFileSync(proof, "utf8")).reason, "worker_complete");
+    const proofText = readFileSync(proof, "utf8");
+    assert.equal(parseBoxTerminalProof(proofText, { runNonce: plan.runNonce,
+      leaseEpoch: plan.leaseEpoch }).reason, "worker_complete");
+    assert.throws(() => parseBoxTerminalProof(proofText, { runNonce: "f".repeat(24),
+      leaseEpoch: plan.leaseEpoch }), /BOX_TERMINAL_PROOF_INVALID/);
     assert.match(readFileSync(`${plan.cwd}/stdout.jsonl`, "utf8"), /synthetic-model-output/);
     assert.equal(run(plan.cleanup).status, 0);
   } finally {
