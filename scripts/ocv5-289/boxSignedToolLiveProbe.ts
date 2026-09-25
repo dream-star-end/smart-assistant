@@ -176,7 +176,7 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   shapeOnly?: boolean }) {
   const diagnostics: Array<{ msg: string; code?: string; detail?: string }> = [];
   const continuationEvidence: Array<{ requestId: string; assistantHash: string | null;
-    assistantShape: Array<{ type: unknown; keys: string[] }>;
+    assistantShape: Array<{ type: string; keys: string[]; unknownKeys: number }>;
     messageRoles: string[]; parseCode: string }> = [];
   const pricing = new PricingCache();
   pricing._setForTests([args.price]);
@@ -271,32 +271,58 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
     // Observe the real CCB continuation in memory only. No prompt, private
     // tool result, auth header, or model text is ever logged or persisted.
     if (args.assignedRequestIds?.[1] === requestId && !args.shapeOnly) {
+      const originalIterator = req[Symbol.asyncIterator].bind(req);
       const parts: Buffer[] = []; let size = 0;
-      req.on("data", (chunk: Buffer) => {
-        size += chunk.length;
-        if (size <= 2_000_000) parts.push(Buffer.from(chunk));
-      });
-      req.on("end", () => {
+      const finishCapture = (): void => {
         let parseCode = "ok", assistantHash: string | null = null;
-        let assistantShape: Array<{ type: unknown; keys: string[] }> = [];
+        let assistantShape: Array<{ type: string; keys: string[];
+          unknownKeys: number }> = [];
         let messageRoles: string[] = [];
         try {
           if (size > 2_000_000) throw new Error("BODY_TOO_LARGE");
           const parsed = JSON.parse(Buffer.concat(parts).toString("utf8")) as ProxyBody;
           const effective = normalizeBoxSemanticBody(parsed);
-          messageRoles = effective.messages.map((item) => item.role).slice(0, 64);
+          messageRoles = effective.messages.slice(0, 64).map((item) =>
+            ["user", "assistant", "system"].includes(item.role) ? item.role : "<other>");
           const content = (effective.messages.at(-2) as { content?: unknown } | undefined)?.content;
           if (!Array.isArray(content)) throw new Error("ASSISTANT_NOT_ARRAY");
           assistantHash = hashBoxAssistantContent(content);
-          assistantShape = content.map((block: unknown) => block && typeof block === "object"
-            && !Array.isArray(block) ? { type: (block as Record<string, unknown>).type,
-              keys: Object.keys(block).sort() } : { type: typeof block, keys: [] });
+          assistantShape = content.slice(0, 64).map((block: unknown) => {
+            if (!block || typeof block !== "object" || Array.isArray(block)) {
+              return { type: "<other>", keys: [], unknownKeys: 0 };
+            }
+            const obj = block as Record<string, unknown>;
+            const allowed = new Set(["type", "thinking", "signature", "data",
+              "text", "id", "name", "input", "cache_control"]);
+            const keys = Object.keys(obj);
+            return { type: typeof obj.type === "string"
+              && ["thinking", "redacted_thinking", "text", "tool_use"].includes(obj.type)
+                ? obj.type : "<other>",
+              keys: keys.filter((key) => allowed.has(key)).sort(),
+              unknownKeys: keys.filter((key) => !allowed.has(key)).length };
+          });
         } catch (error) {
           parseCode = error instanceof Error && /^[A-Z][A-Z0-9_]{1,80}$/.test(error.message)
             ? error.message : "CAPTURE_FAILED";
         }
         continuationEvidence.push({ requestId, assistantHash,
           assistantShape, messageRoles, parseCode });
+      };
+      // The proxy's bounded JSON reader is the only stream consumer. Capture
+      // each chunk as *it* pulls, never add a data listener that starts flow
+      // before async auth/rate-limit prechecks finish.
+      Object.defineProperty(req, Symbol.asyncIterator, {
+        configurable: true,
+        value: async function* () {
+          try {
+            for await (const chunk of originalIterator()) {
+              const part = Buffer.from(chunk);
+              size += part.length;
+              if (size <= 2_000_000) parts.push(part);
+              yield chunk;
+            }
+          } finally { finishCapture(); }
+        },
       });
     }
     if (args.shapeOnly) {

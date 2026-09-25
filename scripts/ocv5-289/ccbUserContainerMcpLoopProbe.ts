@@ -67,9 +67,20 @@ const server = createServer(async (req, res) => {
     const priorSystem = firstBody?.messages.at(-1) as Record<string, unknown> | undefined;
     continuation = { roles, lastIsToolResultUser: roles.at(-1) === "user",
       gate: validateBoxRequest(proxyBody, true), prefixMatch, matcher,
-       assistantShape: assistantContent.map((part) => part && typeof part === "object"
-         ? { type: (part as Record<string, unknown>).type,
-           keys: Object.keys(part as Record<string, unknown>).sort() } : { type: typeof part }),
+       assistantShape: assistantContent.map((part) => {
+         if (!part || typeof part !== "object" || Array.isArray(part)) {
+           return { type: "<other>", keys: [], unknownKeys: 0 };
+         }
+         const obj = part as Record<string, unknown>;
+         const allowed = new Set(["type", "thinking", "signature", "data",
+           "text", "id", "name", "input", "cache_control"]);
+         const keys = Object.keys(obj);
+         return { type: typeof obj.type === "string"
+           && ["thinking", "redacted_thinking", "text", "tool_use"].includes(obj.type)
+             ? obj.type : "<other>",
+           keys: keys.filter((key) => allowed.has(key)).sort(),
+           unknownKeys: keys.filter((key) => !allowed.has(key)).length };
+       }),
        assistantHash: assistantContent.length ? hashBoxAssistantContent(assistantContent) : null,
        trailingSystem: tail?.role === "system" ? {
         keys: Object.keys(tail).sort(), contentEmpty: tail.content === ""
