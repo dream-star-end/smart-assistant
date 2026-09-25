@@ -61,9 +61,9 @@ import {
 /** OAuth(Anthropic 官方账号池)虚拟 provider —— 与 0143 fn_model_catalog_provider 的 'anthropic' 同源。 */
 export const OAUTH_PROVIDER_ID = "anthropic";
 
-/** engine='ccb' 合法 provider_id 集:静态 key provider(protocol 注册表)+ OAuth 虚拟条目。 */
+/** engine='ccb' 合法 provider_id 集:静态 key、OAuth 与受内部旗门保护的 Box CLI。 */
 export function ccbProviderIds(): string[] {
-  return [...STATIC_KEY_PROVIDERS.map((p) => p.id), OAUTH_PROVIDER_ID];
+  return [...STATIC_KEY_PROVIDERS.map((p) => p.id), OAUTH_PROVIDER_ID, "box_cli"];
 }
 
 /** engine='codex' 合法 provider_id 集:codex 虚拟条目(ChatGPT OAuth 池 + 容器 loopback relay)。 */
