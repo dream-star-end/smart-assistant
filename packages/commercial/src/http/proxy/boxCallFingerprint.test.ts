@@ -13,6 +13,8 @@ test("CCB omitted thinking matches only the original text and tool echo", () => 
   assert.notEqual(hashBoxAssistantEchoContent(full), hashBoxAssistantContent([tool]));
   assert.notEqual(hashBoxAssistantEchoContent(full),
     hashBoxAssistantContent([{ ...text, text: "rewritten" }, tool]));
+  assert.equal(hashBoxAssistantEchoContent([{
+    ...tool, caller: { type: "provider_only" } }]), hashBoxAssistantContent([tool]));
 });
 
 function body(turnKey = "a".repeat(64)): ProxyBody {

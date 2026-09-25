@@ -148,7 +148,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       { type: "thinking", thinking: "synthetic model reasoning", signature: "synthetic-signature" },
       { type: "text", text: "Box said A before calling tools" },
       ...firstToolUses.map((use) => ({ type: "tool_use", id: use.id,
-        name: use.clientName, input: use.input })),
+        name: use.clientName, input: use.input,
+        caller: { type: "provider_only" } })),
     ];
     const candidate = { messageId: "msg_box_tool_1", toolUses: firstToolUses,
       assistantContentHash: hashBoxAssistantContent(firstAssistantContent),
@@ -193,7 +194,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await put(`box-d-${suffix}`);
     const resumeBody = { ...firstBody, messages: [
         ...firstBody.messages,
-         { role: "assistant", content: firstAssistantContent.slice(1) },
+         { role: "assistant", content: [firstAssistantContent[1],
+           ...firstToolUses.map((use) => ({ type: "tool_use", id: use.id,
+             name: use.clientName, input: use.input }))] },
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
           { type: "tool_result", tool_use_id: "toolu_A", content: "x".repeat(1_100_000) },

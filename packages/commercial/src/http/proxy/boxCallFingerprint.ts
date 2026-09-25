@@ -100,17 +100,29 @@ export function hashBoxAssistantContent(content: unknown): string {
   return hasher.digest("hex");
 }
 
-/** Claude Code may omit prior thinking blocks from the next HTTP history when
- * adaptive thinking display is omitted. The held Box CLI still owns its exact
- * original thinking; only the non-thinking client echo is compared on resume.
- * Text and tool_use remain fully bound, in order. */
+/** Claude Code may omit thinking and reserialize tool_use to its canonical
+ * four fields in the next HTTP history. The held Box CLI retains the exact
+ * original message; client echo still binds every text block and tool
+ * identity/input in order. Extra provider-only tool metadata is not echoed. */
 export function hashBoxAssistantEchoContent(content: unknown): string {
   if (!Array.isArray(content)) {
     throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
   }
-  const echo = content.filter((block) => block && typeof block === "object"
-    && !Array.isArray(block) && block.type !== "thinking"
-    && block.type !== "redacted_thinking");
+  const echo = content.flatMap((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+    }
+    const item = block as Record<string, unknown>;
+    if (item.type === "thinking" || item.type === "redacted_thinking") return [];
+    if (item.type === "tool_use") {
+      if (typeof item.id !== "string" || typeof item.name !== "string"
+        || !item.input || typeof item.input !== "object" || Array.isArray(item.input)) {
+        throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+      }
+      return [{ type: "tool_use", id: item.id, name: item.name, input: item.input }];
+    }
+    return [item];
+  });
   return hashBoxAssistantContent(echo);
 }
 
