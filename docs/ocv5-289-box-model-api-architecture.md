@@ -419,6 +419,15 @@ user decision and a documented UX tradeoff.
    completed history with tool pair; forced Bot switch; per-user cross-read negative;
    disconnect/429/503/timeouts and non-retry proof. The Sand installer remains
    paused and is not a dependency of this route.
+
+   **2026-09-25 user acceptance decision:** the second eligible Box identity is
+   unavailable and the user explicitly permits deferring only the cross-Bot
+   switch portion for an initial single-account launch. Do not mark switching
+   verified, advertise seamless cross-Bot migration, enable disabled accounts,
+   or replay an ambiguous paid/tool call to manufacture this evidence. All
+   single-account real-Box, authenticated-agent, usage/ledger, cancel/restart,
+   parity and release gates remain mandatory. Reopen the two-identity switch
+   gate when another account is legitimately active.
 3. Code review to PASS; full T2 test/train; shared-branch fast-forward merge
    and push; one selfhost lease ride; post-deploy read-only health and a real
    local OpenClaude agent session that uses the API without moving execution,
