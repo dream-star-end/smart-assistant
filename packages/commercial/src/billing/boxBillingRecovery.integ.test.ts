@@ -3,35 +3,45 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { Pool } from "pg";
 import { recoverBoxBillingRequest } from "./boxBillingRecovery.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
 
+const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
+  ?? process.env.TEST_DATABASE_URL;
 test("terminal Box evidence settles once, with durable usage and turn locator",
-  { skip: !process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL }, async () => {
-  const pool = new Pool({ connectionString: process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL,
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl,
     max: 1 });
   const client = await pool.connect();
   try {
+    // The PR shard's dedicated test DB starts with an empty public schema. An
+    // operator may instead point at selfhost's live schema, but both paths
+    // create ONLY session-local TEMP tables and never migrate/write public.
+    const names = ["request_finalize_journal", "usage_records", "pending_usage_patches",
+      "users", "user_subscriptions", "org_memberships", "orgs",
+      "org_subscriptions", "turn_waivers", "client_sessions", "chat_projects",
+      "credit_ledger"];
+    const source = await client.query<{ ready: boolean }>(
+      `SELECT bool_and(to_regclass('public.' || name) IS NOT NULL) AS ready
+         FROM unnest($1::text[]) AS name`, [names]);
+    const hasPublicSchema = source.rows[0]?.ready === true;
     await client.query("CREATE TEMP SEQUENCE box_recovery_usage_id_seq");
-    await client.query("CREATE TEMP TABLE request_finalize_journal (LIKE public.request_finalize_journal INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE usage_records (LIKE public.usage_records INCLUDING ALL)");
+    if (hasPublicSchema) {
+      for (const name of names) {
+        await client.query(`CREATE TEMP TABLE ${name} (LIKE public.${name} INCLUDING ALL)`);
+      }
+    } else {
+      // Checked-in schema-only fixture, not a migration; all DDL is TEMP.
+      await client.query(readFileSync(new URL("./boxBillingRecoveryTempSchema.sql", import.meta.url), "utf8"));
+    }
     await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_usage_id_seq'::regclass)");
-    await client.query("CREATE TEMP TABLE pending_usage_patches (LIKE public.pending_usage_patches INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE users (LIKE public.users INCLUDING ALL)");
     // Every spend/organization relation is shadowed on the pinned connection.
     // A coincidentally existing real subscription or org membership for this
     // uid must never be read and, especially, never be UPDATEd by this test.
-    await client.query("CREATE TEMP TABLE user_subscriptions (LIKE public.user_subscriptions INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE org_memberships (LIKE public.org_memberships INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE orgs (LIKE public.orgs INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE org_subscriptions (LIKE public.org_subscriptions INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE turn_waivers (LIKE public.turn_waivers INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");
-    await client.query("CREATE TEMP TABLE chat_projects (LIKE public.chat_projects INCLUDING ALL)");
     await client.query("CREATE TEMP SEQUENCE box_recovery_ledger_id_seq");
-    await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
     await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
     const sameConnection = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
       query: client.query.bind(client) } as unknown as Pool;

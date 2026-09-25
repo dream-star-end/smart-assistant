@@ -11,9 +11,11 @@ import { deriveBoxCallFingerprint, deriveBoxContextHash,
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 
+const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
+  ?? process.env.TEST_DATABASE_URL;
 test("Box journal fences replay/account capacity and persists proof plus exact usage",
-  { skip: !process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL }, async () => {
-  const pool = new Pool({ connectionString: process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL,
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl,
     max: 1 });
   const client = await pool.connect();
   try {
