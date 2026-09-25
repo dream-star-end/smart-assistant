@@ -148,6 +148,59 @@ def stream_shape(path):
    records.append(item);used+=item_bytes
   try:err=os.stat('stderr.log',dir_fd=dfd,follow_symlinks=False).st_size
   except FileNotFoundError:err=None
+  def safe_key(value):
+   key=str(value)
+   return key if key in ('type','thinking','signature','text','id','name','input','caller') else 'key-'+hashlib.sha256(key.encode()).hexdigest()[:8]
+  def safe_shape(value):
+   if isinstance(value,str):return {'kind':'string','length':len(value),
+    'sha256':hashlib.sha256(value.encode()).hexdigest()[:16]}
+   if isinstance(value,dict):return {'kind':'object','keys':sorted(safe_key(k) for k in value)[:16],
+    'sha256':hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()[:16]}
+   return {'kind':type(value).__name__}
+  active={};built=[];snapshot=[]
+  for line in all_lines:
+   try:item=json.loads(line)
+   except (UnicodeDecodeError,ValueError):continue
+   if not isinstance(item,dict):continue
+   if item.get('type')=='assistant':
+    msg=item.get('message')
+    if isinstance(msg,dict) and isinstance(msg.get('content'),list):snapshot.extend(msg['content'])
+   if item.get('type')!='stream_event':continue
+   ev=item.get('event')
+   if not isinstance(ev,dict):continue
+   kind=ev.get('type');index=ev.get('index')
+   if not isinstance(index,int) or index<0 or index>32:continue
+   if kind=='content_block_start' and isinstance(ev.get('content_block'),dict):
+    active[index]={'block':dict(ev['content_block']),'text':'','thinking':'',
+     'signature':None,'partial':''}
+   elif kind=='content_block_delta' and index in active:
+    delta=ev.get('delta')
+    if not isinstance(delta,dict):continue
+    if delta.get('type')=='text_delta' and isinstance(delta.get('text'),str):active[index]['text']+=delta['text']
+    if delta.get('type')=='thinking_delta' and isinstance(delta.get('thinking'),str):active[index]['thinking']+=delta['thinking']
+    if delta.get('type')=='signature_delta' and isinstance(delta.get('signature'),str):active[index]['signature']=delta['signature']
+    if delta.get('type')=='input_json_delta' and isinstance(delta.get('partial_json'),str):active[index]['partial']+=delta['partial_json']
+   elif kind=='content_block_stop' and index in active:
+    state=active.pop(index);block=state['block'];type_=block.get('type')
+    if type_=='text':block['text']=state['text']
+    if type_=='thinking' and state['thinking']:block['thinking']=(block.get('thinking') or '')+state['thinking']
+    if state['signature'] is not None:block['signature']=state['signature']
+    if type_=='tool_use' and state['partial']:
+     try:block['input']=json.loads(state['partial'])
+     except ValueError:pass
+    built.append(block)
+  parity=[]
+  if isinstance(snapshot,list):
+   for index in range(min(8,max(len(snapshot),len(built)))):
+    left=built[index] if index<len(built) else None
+    right=snapshot[index] if index<len(snapshot) else None
+    if isinstance(left,dict) and isinstance(right,dict):
+     keys=sorted(set(left)|set(right))
+     parity.append({'index':index,'streamType':left.get('type') if left.get('type') in ('text','thinking','redacted_thinking','tool_use') else 'other',
+      'snapshotType':right.get('type') if right.get('type') in ('text','thinking','redacted_thinking','tool_use') else 'other',
+      'different':[{ 'field':safe_key(key), 'stream':safe_shape(left.get(key)),
+       'snapshot':safe_shape(right.get(key)) } for key in keys if left.get(key)!=right.get(key)][:8]})
+    else:parity.append({'index':index,'shapeMismatch':True})
   partial=bool(data and not data.endswith(b'\n'))
   return {'present':True,'stdoutBytes':st.st_size,'stderrBytes':err,
     'stdoutSha256':hashlib.sha256(data).hexdigest() if st.st_size==len(data) else None,
@@ -158,6 +211,7 @@ def stream_shape(path):
     'lastResultSubtype':last_result_subtype,
     'invalidCount':invalid_count,'unrecognizedCount':unrecognized_count,
     'toolUseCount':tool_use_count,'toolResultCount':tool_result_count,
+    'snapshotParity':parity,
     'records':records}
  finally:os.close(dfd)
 def run_entries(path):
