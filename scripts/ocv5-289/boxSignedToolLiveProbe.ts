@@ -4,6 +4,7 @@
  * paid or side-effecting work is never replayed. */
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
+import { hostname } from "node:os";
 import { constants, closeSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import type { Pool } from "pg";
@@ -24,6 +25,8 @@ import { makeContainerIdentityStrategy } from
   "../../packages/commercial/src/auth/proxyIdentity.js";
 import { PricingCache, type ModelPricing } from
   "../../packages/commercial/src/billing/pricing.js";
+import { multiplierToScaled } from
+  "../../packages/commercial/src/billing/calculator.js";
 import { ModelCatalogSnapshot, type ModelCatalogEntry, type ModelCatalogPricing } from
   "../../packages/commercial/src/billing/modelCatalog.js";
 import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from
@@ -113,7 +116,8 @@ function assistantContent(events: Event[]): Array<Record<string, unknown>> {
 }
 
 async function startSignedLoopback(args: { pool: Pool; redis: Redis;
-  boxModel: AnthropicProxyDeps["boxModel"]; price: ModelPricing }) {
+  boxModel: AnthropicProxyDeps["boxModel"]; price: ModelPricing;
+  containerId: number }) {
   const diagnostics: Array<{ msg: string; code?: string; detail?: string }> = [];
   const pricing = new PricingCache();
   pricing._setForTests([args.price]);
@@ -140,7 +144,7 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
     grantedModelIds: new Set<string>() });
   const hostUuid = `ocv5-289-signed-${randomBytes(6).toString("hex")}`;
   const boundIp = "127.0.0.1";
-  const containerId = 900_000_289;
+  const containerId = args.containerId;
   const secret = randomBytes(32);
   const secretHex = secret.toString("hex");
   const identity = makeContainerIdentityStrategy({
@@ -181,13 +185,19 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
       } }),
     appendCostCredits: async () => {}, broadcastToUser: () => {},
   });
+  const inFlight = new Map<string, Promise<void>>();
   const server = createServer((req, res) => {
-    void handler(req, res, { hostUuid, boundIp }).catch((error: unknown) => {
+    const requestId = req.headers["x-request-id"];
+    if (typeof requestId !== "string" || inFlight.has(requestId)) {
+      res.writeHead(409); res.end(); return;
+    }
+    const done = handler(req, res, { hostUuid, boundIp }).catch((error: unknown) => {
       diagnostics.push({ msg: "handler_exception", code: error instanceof Error
         && /^[A-Z][A-Z0-9_]{1,80}$/.test(error.message) ? error.message : "UNKNOWN" });
       if (!res.headersSent) res.writeHead(500);
       res.end();
     });
+    inFlight.set(requestId, done);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -205,7 +215,22 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
         body: JSON.stringify(body), signal: AbortSignal.timeout(180_000),
       });
     },
+    async waitHandler(requestId: string): Promise<void> {
+      const pending = inFlight.get(requestId);
+      assertion(pending, "BOX_SIGNED_HANDLER_UNKNOWN");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([pending, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("BOX_SIGNED_FINALIZER_TIMEOUT")), 120_000);
+        })]);
+      } finally { if (timer) clearTimeout(timer); }
+    },
     async close(): Promise<void> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([Promise.allSettled([...inFlight.values()]),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, 5_000); })]);
+      } finally { if (timer) clearTimeout(timer); }
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       secret.fill(0);
@@ -218,7 +243,14 @@ async function main(): Promise<void> {
     || process.env.OCV5_289_ACK_USER_ID !== String(UID)
     || process.env.OCV5_289_SIGNED_LIVE_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_SIGNED_LIVE_ACK_REQUIRED");
+  const expectedContainerId = process.env.OCV5_289_EXPECT_CONTAINER_ID;
+  assertion(expectedContainerId && /^[1-9][0-9]{0,9}$/.test(expectedContainerId),
+    "BOX_SIGNED_CONTAINER_ID_ACK_REQUIRED");
   const cfg = loadConfig();
+  const redisUrl = new URL(cfg.REDIS_URL);
+  assertion(hostname() === "v3-dev-sg"
+    && redisUrl.hostname === "127.0.0.1" && redisUrl.port === "6379"
+    && redisUrl.pathname === "/3", "BOX_SIGNED_SELFHOST_BOUNDARY_INVALID");
   const pool = getPool();
   const client = await pool.connect();
   const redis = new Redis(cfg.REDIS_URL, { maxRetriesPerRequest: 3,
@@ -284,6 +316,10 @@ async function main(): Promise<void> {
     identityPersisted = true;
   };
   try {
+    const database = await client.query<{ current_database: string }>(
+      "SELECT current_database()");
+    assertion(database.rows[0]?.current_database === "openclaude_v5_selfhost",
+      "BOX_SIGNED_DATABASE_BOUNDARY_INVALID");
     const parent = lstatSync(EVIDENCE_PARENT);
     assertion(parent.isDirectory() && !parent.isSymbolicLink()
       && parent.uid === process.getuid()
@@ -313,11 +349,24 @@ async function main(): Promise<void> {
       }
       syncDirectory(); lockHeld = true;
     });
+    const owners = await client.query<{ id: string }>(
+      `SELECT id::text FROM agent_containers
+       WHERE user_id=$1 AND state='active' AND runtime_channel='v5'
+         AND runtime_kind='docker' AND secret_hash IS NOT NULL`, [UID.toString()]);
+    assertion(owners.rows.length === 1 && owners.rows[0]?.id === expectedContainerId,
+      "BOX_SIGNED_CONTAINER_NOT_CURRENT");
+    const containerId = Number(expectedContainerId);
+    assertion(Number.isSafeInteger(containerId), "BOX_SIGNED_CONTAINER_ID_INVALID");
     const livePricing = new PricingCache();
     await livePricing.load();
     const directPrice = livePricing.get(UPSTREAM);
     assertion(directPrice?.enabled && directPrice.input_per_mtok > 0n
-      && directPrice.output_per_mtok > 0n,
+      && directPrice.input_per_mtok <= 1000n
+      && directPrice.output_per_mtok > 0n
+      && directPrice.output_per_mtok <= 5000n
+      && directPrice.cache_read_per_mtok <= 1000n
+      && directPrice.cache_write_per_mtok <= 5000n
+      && multiplierToScaled(directPrice.multiplier) <= 5000n,
     "BOX_SIGNED_PRICE_UNAVAILABLE");
     // This one-off local route inherits the current selfhost Opus rate. It
     // never inserts a catalog/pricing row or exposes a public model entry.
@@ -354,7 +403,7 @@ async function main(): Promise<void> {
     let transportCalls = 0;
     process.env.OC_BOX_MODEL_API = "1";
     process.env.OC_BOX_TOOL_BRIDGE = "1";
-    loopback = await startSignedLoopback({ pool, redis,
+    loopback = await startSignedLoopback({ pool, redis, containerId,
       boxModel: { toolBridgeReady: true, fetch: (args) => {
         transportCalls++;
         if (preflightOnly) throw new Error("BOX_PREFLIGHT_TRANSPORT_CALLED");
@@ -367,6 +416,7 @@ async function main(): Promise<void> {
       const response = await loopback.call(invalid, firstId);
       const code = (await response.json().catch(() => null)) as
         { error?: { code?: string } } | null;
+      await loopback.waitHandler(firstId);
       assertion(response.status === 500 && code?.error?.code === "INTERNAL"
         && loopback.diagnostics.some((item) => item.msg === "proxy_journal_insert_failed"
           && item.detail === "BOX_BILLING_TURN_KEY_INVALID")
@@ -394,6 +444,7 @@ async function main(): Promise<void> {
       tools, tool_choice: { type: "auto" } };
     const firstResponse = await loopback.call(first, firstId);
     const firstEvents = await readEvents(firstResponse);
+    await loopback.waitHandler(firstId);
     const content = assistantContent(firstEvents);
     const toolUse = content.filter((block) => block.type === "tool_use");
     assertion(toolUse.length === 1 && toolUse[0]?.name === "local_echo"
@@ -417,6 +468,7 @@ async function main(): Promise<void> {
     ] };
     const secondResponse = await loopback.call(second, secondId);
     const secondEvents = await readEvents(secondResponse);
+    await loopback.waitHandler(secondId);
     const answer = assistantContent(secondEvents)
       .filter((block) => block.type === "text").map((block) => block.text).join("");
     assertion(answer.trim() === localResult && localExecutions === 1
@@ -433,22 +485,36 @@ async function main(): Promise<void> {
       && (finalRow?.ctx.boxTerminalProof as { reason?: unknown } | undefined)?.reason
         === "worker_complete",
     "BOX_TOOL_PROBE_JOURNAL_NOT_TERMINAL");
-    const finance = await client.query<{ request_id: string; model: string;
+    const finance = await client.query<{ id: string; request_id: string; model: string;
       cost_credits: string; input_tokens: string; output_tokens: string;
-      ledger_id: string | null; delta: string | null }>(
-      `SELECT ur.request_id,ur.model,ur.cost_credits::text,
-         ur.input_tokens::text,ur.output_tokens::text,ur.ledger_id::text,
-         cl.delta::text
-       FROM usage_records ur LEFT JOIN credit_ledger cl ON cl.id=ur.ledger_id
+      ledger_id: string | null }>(
+      `SELECT ur.id::text,ur.request_id,ur.model,ur.cost_credits::text,
+         ur.input_tokens::text,ur.output_tokens::text,ur.ledger_id::text
+       FROM usage_records ur
        WHERE ur.request_id IN ($1,$2) AND ur.user_id=$3 ORDER BY ur.request_id`,
       [firstId, secondId, UID.toString()]);
+    const usageIds = finance.rows.map((row) => row.id);
+    const ledger = await client.query<{ id: string; ref_id: string; delta: string;
+      bucket: string; reason: string }>(
+      `SELECT id::text,ref_id,delta::text,bucket,reason FROM credit_ledger
+        WHERE user_id=$1 AND ref_type='usage_record' AND ref_id=ANY($2::text[])`,
+      [UID.toString(), usageIds]);
     assertion(finance.rows.length === 2
       && new Set(finance.rows.map((row) => row.request_id)).size === 2
-      && finance.rows.every((row) => row.model === MODEL
+      && finance.rows.every((row) => {
+        const charges = ledger.rows.filter((item) => item.ref_id === row.id);
+        return row.model === MODEL
         && BigInt(row.input_tokens) >= 0n && BigInt(row.output_tokens) > 0n
-        && row.ledger_id && row.delta
-        && BigInt(row.cost_credits) > 0n
-        && BigInt(row.delta) === -BigInt(row.cost_credits)),
+        && BigInt(row.cost_credits) > 0n && row.ledger_id
+        && charges.length >= 1 && charges.length <= 4
+        && charges.some((item) => item.id === row.ledger_id)
+        && charges.every((item) => item.reason === "chat"
+          && ["period", "wallet", "org_period", "org_wallet"].includes(item.bucket)
+          && BigInt(item.delta) < 0n)
+        && charges.reduce((sum, item) => sum - BigInt(item.delta), 0n)
+          === BigInt(row.cost_credits);
+      })
+      && ledger.rows.length <= 8,
     "BOX_SIGNED_REAL_LEDGER_MISMATCH");
     const debited = finance.rows.reduce((sum, row) => sum + BigInt(row.cost_credits), 0n);
     const after = await client.query<{ credits: string }>(
@@ -471,7 +537,7 @@ async function main(): Promise<void> {
       localToolExecutions: localExecutions,
       exactFinal: true, terminalRows: rows.rows.length,
       signedContainerRoute: true, persistentUsageRows: 2,
-      persistentLedgerRows: 2, inheritsDirectOpusPrice: true,
+      persistentLedgerRows: ledger.rows.length, inheritsDirectOpusPrice: true,
       debitedCredits: debited.toString(),
       firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
       remoteCleanupDone: true, unknown: false }) + "\n");
