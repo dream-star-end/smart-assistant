@@ -16,6 +16,10 @@ import type { BoxJournalAdmission } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
 import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
+import { makeBoxDetachedToolPlan } from
+  "../../packages/commercial/src/http/proxy/boxDetachedToolPlan.js";
+import { deriveBoxCallFingerprint } from
+  "../../packages/commercial/src/http/proxy/boxCallFingerprint.js";
 import { validateBoxRequest, validateBoxToolRequest } from
   "../../packages/commercial/src/http/proxy/boxRequestGate.js";
 import { createProductionBoxAccountResolver } from
@@ -238,7 +242,7 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
     toolNames: string[]; hasTurnKey: boolean; hasSessionId: boolean;
     contextManagement: unknown; thinking: unknown; outputConfig: unknown;
     messageRoles: string[];
-    unsupported: string | null }> = [];
+    unsupported: string | null; planStatus: string; fingerprintOk: boolean }> = [];
   let assigned = 0;
   const server = createServer((req, res) => {
     if (args.containerInboundIp && req.socket.remoteAddress !== args.containerInboundIp) {
@@ -282,6 +286,26 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
         let unsupported: string | null;
         try { unsupported = validateBoxRequest(body, true); }
         catch { unsupported = "BOX_SHAPE_PARSE_FAILED"; }
+        let planStatus = unsupported ?? "BOX_PLAN_NOT_RUN";
+        let fingerprintOk = false;
+        if (unsupported === null) {
+          try {
+            deriveBoxCallFingerprint(UID, body);
+            fingerprintOk = true;
+            // Build the exact detached tool plan in memory; never execute any
+            // Box request or stage a private file during this shape preflight.
+            makeBoxDetachedToolPlan({ body, upstreamModel: UPSTREAM,
+              maxOutputTokensLimit: 128_000,
+              supervisorAsset: readFileSync(new URL("./box_supervisor.py", import.meta.url)),
+              keeperAsset: readFileSync(new URL("./box_keeper.py", import.meta.url)),
+              virtualMcpAsset: readFileSync(new URL("./box_virtual_mcp.py", import.meta.url)),
+              detachedRunnerAsset: readFileSync(new URL("./box_detached_runner.py", import.meta.url)) });
+            planStatus = "ok";
+          } catch (error) {
+            planStatus = error instanceof Error && /^[A-Z][A-Z0-9_]{1,80}$/.test(error.message)
+              ? error.message : "BOX_PLAN_FAILED";
+          }
+        }
         shapes.push({ requestId, model: body.model, keys: Object.keys(body).sort(),
           toolNames: Array.isArray(body.tools) ? body.tools.map((tool) =>
             tool !== null && typeof tool === "object" && "name" in tool
@@ -297,7 +321,7 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
           hasTurnKey: typeof identity.oc_turn_key === "string"
             && /^[a-f0-9]{64}$/.test(identity.oc_turn_key),
           hasSessionId: typeof identity.session_id === "string" && !!identity.session_id,
-          unsupported });
+          unsupported, planStatus, fingerprintOk });
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { code: "BOX_CCB_SHAPE_PREFLIGHT",
           message: "intentional no-paid shape probe" } }));
