@@ -103,6 +103,12 @@ export class BoxCliToolHandoffDecoder {
   /** Claude Code can emit one assistant snapshot per completed content block
    * (Opus 5.5: [thinking], then [tool_use]) or a cumulative prefix. */
   private readonly snapshots: Obj[][] = [];
+  /** The client executes a tool at its content_block_stop, before message_stop.
+   * Hold the entire first tool block and every later frame until the handoff
+   * is validated and durable; prior text/thinking still streams live. */
+  private holdToolFrames = false;
+  private readonly heldToolFrames: string[] = [];
+  private heldToolBytes = 0;
   private heldTerminal: string[] = [];
   private candidate: BoxToolHandoffCandidate | null = null;
   private finalCandidate: BoxToolFinalCandidate | null = null;
@@ -182,7 +188,7 @@ export class BoxCliToolHandoffDecoder {
       throw new BoxCliToolHandoffError("BOX_TOOL_HANDOFF_PROOF_INVALID");
     }
     this.committed = true;
-    return this.heldTerminal.join("");
+    return this.heldToolFrames.join("") + this.heldTerminal.join("");
   }
 
   /** Caller invokes only after remote terminal proof and journal completion. */
@@ -192,6 +198,7 @@ export class BoxCliToolHandoffDecoder {
     const final = this.finalCandidate;
     if (this.failed || this.committed || !this.finalStreamChecked
       || !final || this.heldTerminal.length !== 2
+      || this.heldToolFrames.length !== 0
       || proof?.terminalReason !== "worker_complete"
       || !proof.journaledUsage
       || proof.journaledUsage.inputTokens !== final.inputTokens
@@ -329,6 +336,7 @@ export class BoxCliToolHandoffDecoder {
         active.boxName = block.name;
         active.clientName = this.catalog.clientNameByBoxName.get(block.name)!;
         active.startInput = obj(block.input);
+        this.holdToolFrames = true;
         forwarded = { ...event, index: active.visible,
           content_block: { ...block, name: active.clientName } };
       } else {
@@ -436,6 +444,14 @@ export class BoxCliToolHandoffDecoder {
     const frame = `event: ${kind}\ndata: ${JSON.stringify(forwarded)}\n\n`;
     if (kind === "message_delta" || kind === "message_stop") {
       this.heldTerminal.push(frame);
+      return "";
+    }
+    if (this.holdToolFrames) {
+      this.heldToolBytes += Buffer.byteLength(frame);
+      if (this.heldToolBytes > 16 * 1024 * 1024) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_HELD_FRAMES_TOO_LARGE");
+      }
+      this.heldToolFrames.push(frame);
       return "";
     }
     return frame;

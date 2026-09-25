@@ -52,7 +52,8 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
   }
   observer.flush();
   assert.equal(observer.result().kind, "partial");
-  assert.ok(streamed.includes('"name":"Bash"'));
+  assert.ok(!streamed.includes('"name":"Bash"'),
+    "tool block must stay hidden until durable handoff");
   assert.ok(!streamed.includes("event: message_delta"));
   const candidate = decoder.push("").candidate;
   assert.equal(candidate?.assistantContentHash, hashBoxAssistantContent([
@@ -91,6 +92,8 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
       && error.code === "BOX_TOOL_HANDOFF_PROOF_INVALID");
   }
   const terminal = decoder.commitHandoff(proof);
+  assert.ok(terminal.includes('"name":"Bash"'));
+  assert.ok(terminal.includes("event: content_block_stop"));
   assert.ok(terminal.includes('"stop_reason":"tool_use"'));
   assert.ok(terminal.includes("event: message_stop"));
   observer.push(terminal); observer.flush();
@@ -98,6 +101,31 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
   assert.throws(() => decoder.commitHandoff(proof),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_TOOL_HANDOFF_NOT_READY");
+});
+
+test("client tool execution cannot start before snapshot and durable handoff", () => {
+  const bad = records().map((item) => {
+    if (item.type !== "assistant") return item;
+    const msg = (item as { message: { content: Array<Record<string, unknown>> } }).message;
+    if (msg.content.length !== 2) return item;
+    return { ...item, message: { ...msg, content: [msg.content[0],
+      { ...msg.content[1], input: { value: "tampered" } }] } };
+  });
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  let visible = "";
+  assert.throws(() => {
+    for (const line of lines(bad)) visible += decoder.push(line).sse;
+  }, /BOX_TOOL_SNAPSHOT_MISMATCH/);
+  assert.ok(!visible.includes("event: content_block_start"));
+  assert.ok(!visible.includes("event: content_block_stop"));
+  const valid = new BoxCliToolHandoffDecoder(model, catalog);
+  let before = "";
+  for (const line of lines(records())) before += valid.push(line).sse;
+  assert.ok(!before.includes("event: content_block_stop"));
+  const after = valid.commitHandoff({ durableRevision: "journal-rev-1",
+    journaledToolUseIds: ["toolu_parallel_a", "toolu_parallel_b"],
+    verifiedPendingToolUseIds: ["toolu_parallel_a"] });
+  assert.equal((after.match(/event: content_block_stop/g) ?? []).length, 2);
 });
 
 test("Opus 5.5 segmented assistant snapshots preserve thinking then local tool_use", () => {
