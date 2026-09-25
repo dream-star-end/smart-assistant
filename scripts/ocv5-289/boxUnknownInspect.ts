@@ -54,8 +54,11 @@ def stream_shape(path):
    records.append(item)
   try:err=os.stat('stderr.log',dir_fd=dfd,follow_symlinks=False).st_size
   except FileNotFoundError:err=None
+  partial=bool(data and not data.endswith(b'\n'))
   return {'present':True,'stdoutBytes':st.st_size,'stderrBytes':err,
-   'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64,'records':records}
+   'partialLine':partial,
+   'truncated':st.st_size>len(data) or len(data.split(b'\n'))-1>64 or partial,
+   'records':records}
  finally:os.close(dfd)
 def terminal_shape(path):
  try:dfd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
@@ -73,6 +76,7 @@ def terminal_shape(path):
  finally:os.close(dfd)
  try:proof=json.loads(raw)
  except (UnicodeDecodeError,ValueError):return {'present':True,'invalid':True}
+ if not isinstance(proof,dict):return {'present':True,'invalid':True}
  return {'present':True,'nonceMatches':proof.get('runNonce')==nonce,
   'reason':proof.get('reason') if proof.get('reason') in ('worker_complete','keeper_stopped','deadline','unknown') else 'other',
   'revision':proof.get('revision') if isinstance(proof.get('revision'),int) else None}
