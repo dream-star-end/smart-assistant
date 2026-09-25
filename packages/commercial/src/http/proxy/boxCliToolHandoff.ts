@@ -350,7 +350,9 @@ export class BoxCliToolHandoffDecoder {
         } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
           this.active.thinking = (this.active.thinking ?? "") + delta.thinking;
         } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
-          this.active.signature = (this.active.signature ?? "") + delta.signature;
+          // Anthropic's MessageStream accumulation overwrites on each
+          // signature_delta; signatures are complete values, not fragments.
+          this.active.signature = delta.signature;
         } else {
           throw new BoxCliToolHandoffError("BOX_TOOL_DELTA_INVALID");
         }

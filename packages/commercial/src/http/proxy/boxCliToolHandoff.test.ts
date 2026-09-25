@@ -134,8 +134,9 @@ test("handoff digest binds the full visible assistant text before tool_use", () 
 });
 
 test("thinking, signature and redacted data bind streamed content, not a divergent snapshot", () => {
-  const source = (mutation?: "thinking" | "signature" | "redacted") => {
-    const thought = { type: "thinking", thinking: "private-thought", signature: "signed" };
+  const source = (mutation?: "thinking" | "signature" | "redacted" | "multi_signature") => {
+    const thought = { type: "thinking", thinking: "private-thought",
+      signature: mutation === "multi_signature" ? "second" : "signed" };
     const redacted = { type: "redacted_thinking", data: "ciphertext" };
     const tool = use("toolu_thinking_then_tool");
     const snapshot = [{ ...thought }, { ...redacted }, { ...tool }];
@@ -150,8 +151,13 @@ test("thinking, signature and redacted data bind streamed content, not a diverge
         content_block: { type: "thinking", thinking: "" } }),
       event({ type: "content_block_delta", index: 0,
         delta: { type: "thinking_delta", thinking: "private-thought" } }),
-      event({ type: "content_block_delta", index: 0,
-        delta: { type: "signature_delta", signature: "signed" } }),
+      ...(mutation === "multi_signature" ? [
+        event({ type: "content_block_delta", index: 0,
+          delta: { type: "signature_delta", signature: "first" } }),
+        event({ type: "content_block_delta", index: 0,
+          delta: { type: "signature_delta", signature: "second" } }),
+      ] : [event({ type: "content_block_delta", index: 0,
+        delta: { type: "signature_delta", signature: "signed" } })]),
       event({ type: "content_block_stop", index: 0 }),
       event({ type: "content_block_start", index: 1, content_block: redacted }),
       event({ type: "content_block_stop", index: 1 }),
@@ -181,6 +187,14 @@ test("thinking, signature and redacted data bind streamed content, not a diverge
       for (const line of lines(source(mutation).records)) decoder.push(line);
     }, /BOX_TOOL_SNAPSHOT_MISMATCH/);
   }
+  const repeated = new BoxCliToolHandoffDecoder(model, catalog);
+  for (const line of lines(source("multi_signature").records)) repeated.push(line);
+  assert.equal(repeated.push("").candidate?.assistantContentHash,
+    hashBoxAssistantContent([
+      { type: "thinking", thinking: "private-thought", signature: "second" },
+      { type: "redacted_thinking", data: "ciphertext" },
+      { ...use("toolu_thinking_then_tool"), name: "Bash" },
+    ]));
 });
 
 test("UTF-8 byte cap does not depend on a split surrogate pair", () => {
