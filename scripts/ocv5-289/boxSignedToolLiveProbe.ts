@@ -416,7 +416,7 @@ if "localToolConfig" in cfg:
     mcp={"mcpServers":{"ocv5probe":{"type":"stdio","command":"/usr/bin/python3",
          "args":["-I",tool["script"],tool["fixture"]]}}}
     args += ["--mcp-config",json.dumps(mcp),"--strict-mcp-config",
-             "--tools","mcp__ocv5probe__read_secret",
+             "--tools","",
              "--allowedTools","mcp__ocv5probe__read_secret"]
 else:
     args += ["--tools","Read","--allowedTools","Read"]
@@ -479,9 +479,14 @@ os.execvpe("claude",args,env)
       ? "mcp__ocv5probe__read_secret" : "Read";
     let exactResult = false;
     let toolUseEvents = 0, resultCount = 0, malformedOutput = false;
+    let seenResult = false;
     for (const line of stdoutRaw.split("\n")) {
+      if (!line.trim()) continue;
       try {
-        const value = JSON.parse(line) as Record<string, unknown>;
+        const parsed: unknown = JSON.parse(line);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+          || seenResult) { malformedOutput = true; continue; }
+        const value = parsed as Record<string, unknown>;
         if (value.type === "system" && value.subtype === "init") {
           initSummary = { model: value.model, apiKeySource: value.apiKeySource,
             permissionMode: value.permissionMode,
@@ -504,6 +509,7 @@ os.execvpe("claude",args,env)
         }
         if (value.type === "result") {
           resultCount++;
+          seenResult = true;
           exactResult = input.expectedMarker !== undefined
             && value.subtype === "success" && value.is_error === false
             && typeof value.result === "string"
@@ -729,7 +735,9 @@ async function main(): Promise<void> {
         && !identityPersisted && usage.rowCount === 0
         && loopback.shapes.length === observed.length
         && loopback.shapes.every((shape) => shape.unsupported === null
-          && shape.fingerprintOk && shape.planStatus === "ok"),
+          && shape.fingerprintOk && shape.planStatus === "ok"
+          && shape.toolNames.length === 1
+          && shape.toolNames[0] === "mcp__ocv5probe__read_secret"),
       "BOX_CCB_PREFLIGHT_INVALID");
       withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
       process.stdout.write(JSON.stringify({ ccbUserContainer: true, preflightOnly: true,
