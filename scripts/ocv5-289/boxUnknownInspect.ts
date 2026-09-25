@@ -73,7 +73,7 @@ def stream_shape(path):
     item['subtype']=safe_type(record.get('subtype'),{'success','error','error_during_execution','error_max_turns'})
     item['isError']=record.get('is_error') is True
    item_bytes=len(json.dumps(item,separators=(',',':')).encode())+1
-   if used+item_bytes>5000:budget_exceeded=True;break
+   if used+item_bytes>4000:budget_exceeded=True;break
    records.append(item);used+=item_bytes
   try:err=os.stat('stderr.log',dir_fd=dfd,follow_symlinks=False).st_size
   except FileNotFoundError:err=None
@@ -104,7 +104,7 @@ def terminal_shape(path):
   'reason':proof.get('reason') if proof.get('reason') in ('worker_complete','keeper_stopped','deadline','unknown') else 'other',
   'revision':proof.get('revision') if isinstance(proof.get('revision'),int) else None}
 def process_shape():
- matches=[];scanned=0
+ matches=[];scanned=0;unreadable=0;cmdline_truncated=False
  for raw_pid in os.listdir('/proc'):
   if not raw_pid.isdigit():continue
   scanned+=1
@@ -112,10 +112,12 @@ def process_shape():
   pid=int(raw_pid)
   if pid==os.getpid():continue
   try:
-   with open('/proc/'+raw_pid+'/cmdline','rb') as f:cmd=f.read(4096)
+   with open('/proc/'+raw_pid+'/cmdline','rb') as f:cmd=f.read(4097)
+   if len(cmd)>4096:cmdline_truncated=True
    if nonce.encode() not in cmd:continue
    with open('/proc/'+raw_pid+'/status',encoding='ascii',errors='ignore') as f:lines=f.readlines()[:8]
-  except (FileNotFoundError,PermissionError,ProcessLookupError):continue
+  except PermissionError:unreadable+=1;continue
+  except (FileNotFoundError,ProcessLookupError):continue
   fields={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in lines if ':' in line}
   name=fields.get('Name','')
   state=fields.get('State','')[:1]
@@ -123,8 +125,9 @@ def process_shape():
   matches.append({'pid':pid,'ppid':int(ppid) if ppid.isdigit() else None,
    'name':name if name in ('python3','claude','node') else 'other',
    'state':state if state in ('R','S','D','T','Z','I') else 'other'})
-  if len(matches)>=16:break
- return {'matches':matches,'truncated':scanned>4096 or len(matches)>=16}
+  if len(matches)>=8:break
+ return {'matches':matches,
+  'incomplete':scanned>4096 or len(matches)>=8 or unreadable>0 or cmdline_truncated}
 out={'run':inspect('/tmp/ocv5-289-run-'+nonce),
  'proof':inspect('/tmp/ocv5-289-proof-'+nonce),
  'terminal':terminal_shape('/tmp/ocv5-289-proof-'+nonce),
