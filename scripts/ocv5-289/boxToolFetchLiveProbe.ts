@@ -2,10 +2,12 @@
  * TEMP journal: no migration, no live billing row, no user content. A paid or
  * side-effecting operation is never replayed on an ambiguous result. */
 import { randomBytes } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { constants, closeSync, fsyncSync, openSync, readFileSync, readdirSync,
+  unlinkSync, writeSync } from "node:fs";
 import { Pool } from "pg";
 import { BoxDurableJournal } from
+  "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
+import type { BoxJournalAdmission } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
 import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
@@ -78,7 +80,9 @@ function assistantContent(events: Event[]): Array<Record<string, unknown>> {
       if (input !== undefined) blocks[index as number]!.input = JSON.parse(input);
     }
   }
-  assertion(blocks.length > 0 && blocks.every((block) => !!block),
+  assertion(blocks.length > 0 && blocks.length <= 64
+    && Array.from({ length: blocks.length }, (_, index) => index)
+      .every((index) => Object.hasOwn(blocks, index) && !!blocks[index]),
     "BOX_TOOL_PROBE_CONTENT_INVALID");
   return blocks;
 }
@@ -90,15 +94,46 @@ async function main(): Promise<void> {
     || getRuntimeChannel() !== "v5") throw new Error("BOX_TOOL_FETCH_ACK_REQUIRED");
   const databaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL;
   assertion(!!databaseUrl, "BOX_TOOL_TEMP_DB_REQUIRED");
+  assertion(!readdirSync(process.cwd()).some((name) =>
+    /^\.ocv5-289-box-tool-attempt-[a-f0-9]{24}\.json$/.test(name)),
+  "BOX_TOOL_PRIOR_UNKNOWN_REQUIRES_RECONCILIATION");
   const pool = new Pool({ connectionString: databaseUrl, max: 1 });
   const client = await pool.connect();
   const nonce = randomBytes(12).toString("hex");
   const sessionId = `ocv5-289-live-${nonce}`;
   const turnKey = randomBytes(32).toString("hex");
   const firstId = `box-live-a-${nonce}`, secondId = `box-live-b-${nonce}`;
+  const evidencePath = `${process.cwd()}/.ocv5-289-box-tool-attempt-${nonce}.json`;
   const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
   let localExecutions = 0, unknownPhase: string | null = null;
   let terminal = false;
+  let identityPersisted = false;
+  const syncDirectory = (): void => {
+    const fd = openSync(process.cwd(), constants.O_RDONLY | constants.O_DIRECTORY
+      | constants.O_NOFOLLOW);
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  };
+  const persistIdentity = (input: BoxJournalAdmission): void => {
+    assertion(!identityPersisted && input.requestId === firstId && input.uid === UID
+      && input.accountId === ACCOUNT_ID, "BOX_TOOL_ATTEMPT_IDENTITY_INVALID");
+    const raw = JSON.stringify({ v: 1, accountId: String(ACCOUNT_ID), uid: String(UID),
+      firstId, secondId, sessionId, runNonce: input.runNonce,
+      leaseEpoch: input.leaseEpoch, state: "unresolved",
+      createdAt: new Date().toISOString() }) + "\n";
+    const fd = openSync(evidencePath, constants.O_WRONLY | constants.O_CREAT
+      | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      const bytes = Buffer.from(raw);
+      for (let offset = 0; offset < bytes.length;) {
+        const written = writeSync(fd, bytes, offset, bytes.length - offset);
+        assertion(written > 0, "BOX_TOOL_EVIDENCE_WRITE_FAILED");
+        offset += written;
+      }
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    syncDirectory();
+    identityPersisted = true;
+  };
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
@@ -110,7 +145,17 @@ async function main(): Promise<void> {
     };
     const sameConnection = { connect: async () => ({ query, release: () => {} }),
       query } as never;
-    const journal = new BoxDurableJournal(sameConnection);
+    const baseJournal = new BoxDurableJournal(sameConnection);
+    const journal = new Proxy(baseJournal, { get(target, key) {
+      if (key === "admit") return async (input: BoxJournalAdmission) => {
+        // This durable, private file is fsynced before the TEMP admission and
+        // therefore before any paid CLI launch. A crash cannot erase identity.
+        persistIdentity(input);
+        return target.admit(input);
+      };
+      const value = Reflect.get(target, key, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
     const basis = { model: MODEL, boxInvocationRecovery: "v1",
       billingPricing: { v: 1, modelId: MODEL, displayName: "Opus synthetic",
         inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1",
@@ -182,13 +227,20 @@ async function main(): Promise<void> {
       && rows.rows.every((row) => !!row.ctx.boxTerminalProof),
     "BOX_TOOL_PROBE_JOURNAL_NOT_TERMINAL");
     terminal = true;
-    await service.retryTerminalCleanup();
+    const pendingCleanup = await service.retryTerminalCleanup();
+    const cleanupRow = await client.query<{ cleanup: string | null }>(
+      `SELECT ctx->>'boxRemoteCleanup' AS cleanup FROM request_finalize_journal
+       WHERE request_id=$1`, [secondId]);
+    assertion(pendingCleanup === 0 && cleanupRow.rows[0]?.cleanup === "done",
+      "BOX_TOOL_PROBE_CLEANUP_UNPROVEN");
+    assertion(identityPersisted, "BOX_TOOL_PROBE_IDENTITY_NOT_DURABLE");
+    unlinkSync(evidencePath); syncDirectory();
     process.stdout.write(JSON.stringify({ accountId: String(ACCOUNT_ID),
       modelId: UPSTREAM, detachedAcrossHttp: true,
       localToolExecutions: localExecutions,
       exactFinal: true, terminalRows: rows.rows.length,
       firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
-      unknown: false, tempOnly: true }) + "\n");
+      remoteCleanupDone: true, unknown: false, tempOnly: true }) + "\n");
   } catch (error) {
     const observed = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal
@@ -196,20 +248,10 @@ async function main(): Promise<void> {
     const evidence = observed.rows.map((row) => ({ requestId: row.request_id,
       state: row.ctx.boxState, runNonce: row.ctx.boxRunNonce,
       leaseEpoch: row.ctx.boxLeaseEpoch }));
-    let evidencePath: string | undefined;
-    if (evidence.some((row) => row.state !== undefined && row.state !== "terminal"
-      && row.state !== "prestart_stopped")) {
-      evidencePath = join(process.cwd(), "scripts/ocv5-289",
-        `.box-tool-unknown-${nonce}.json`);
-      try {
-        writeFileSync(evidencePath, JSON.stringify({ accountId: String(ACCOUNT_ID),
-          observedAt: new Date().toISOString(), unknownPhase, evidence }) + "\n",
-        { mode: 0o600, flag: "wx" });
-      } catch { evidencePath = "EVIDENCE_FILE_WRITE_FAILED"; }
-    }
     process.stderr.write(JSON.stringify({ code: error instanceof Error
       && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "BOX_TOOL_PROBE_FAILED",
-      terminal, unknownPhase, evidencePath, evidence }) + "\n");
+      terminal, unknownPhase, evidencePath: identityPersisted ? evidencePath : null,
+      evidence }) + "\n");
     throw error;
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal").catch(() => {});
