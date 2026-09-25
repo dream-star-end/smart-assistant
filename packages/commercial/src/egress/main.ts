@@ -58,6 +58,8 @@ import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
+import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
+import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
@@ -291,6 +293,22 @@ export async function startEgress(): Promise<void> {
       log.error("box_tool_remote_reconcile_failed"));
   }, 60_000) : null;
   boxCleanupTimer?.unref();
+  // A stop for an already-admitted Box run must remain available even after
+  // the model launch flag is turned OFF. It cannot create a new paid call.
+  const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
+  const boxStopJournal = boxJournal ?? new BoxDurableJournal(getPool());
+  const boxStopCoordinator = new BoxUserStopCoordinator({
+    journal: boxStopJournal,
+    resolver: boxStopResolver,
+  });
+  const boxStopHandler = makeBoxUserStopHandler({ identity: identityStrategy,
+    journal: boxStopJournal,
+    coordinator: boxStopCoordinator });
+  const boxStopCleanupTimer = setInterval(() => {
+    void boxStopCoordinator.retryFailedLocal().catch(() =>
+      log.error("box_stop_local_cleanup_failed"));
+  }, 60_000);
+  boxStopCleanupTimer.unref();
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -410,6 +428,19 @@ export async function startEgress(): Promise<void> {
   const server = createHttpServer((req, res) => {
     const path = (req.url ?? "/").split("?")[0];
     const peerIp = req.socket.remoteAddress ?? "";
+    if (path === "/internal/box/stop") {
+      Promise.resolve(boxStopHandler(req, res, {
+        hostUuid: selfHostUuid, boundIp: peerIp,
+      })).catch((err) => {
+        log.error("box_stop_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: "INTERNAL" }));
+        } else try { res.destroy(); } catch { /* */ }
+      });
+      return;
+    }
     if (path === "/v1/messages") {
       Promise.resolve(
         proxyHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
@@ -667,6 +698,7 @@ export async function startEgress(): Promise<void> {
     latencyProber?.stop();
     recoveryProber?.stop();
     if (boxCleanupTimer) clearInterval(boxCleanupTimer);
+    clearInterval(boxStopCleanupTimer);
     void desktopTlsClose?.().catch(() => {});
     // eslint-disable-next-line no-console
     console.log(
