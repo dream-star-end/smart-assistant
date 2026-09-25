@@ -48,6 +48,7 @@ import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { notifyClaimFenceOf } from '../engineNotifier.js'
 import { createLogger } from '../logger.js'
 import { renewTurnLease } from '../masterTurnLease.js'
+import { notifyBoxUserStop } from './boxUserStopClient.js'
 
 const log = createLogger({ module: 'ccbAdapter' })
 
@@ -195,6 +196,8 @@ export function asCcbSessionTotals(totals: EngineSessionTotals): CcbSessionTotal
 interface CcbTurnContext {
   parser: CcbMessageParser
   telemetry: TelemetryChannel
+  turnKey?: string
+  boxStopNotified: boolean
   /**
    * F3 — 本 turn **明确拥有**的 Bash tool_use_id 集(只收 name==='Bash' 的工具)。
    * 用于 bash_output_tail 路由的 fail-closed 判定:全局 origin map 若把某 id 逐出,
@@ -369,6 +372,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * pendingToolCalls 归 0、telemetry 停止 ingest。
    */
   private _activeTurn: CcbTurnContext | null = null
+  private _boxStopPending: Promise<void> | null = null
   /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
   private _interrupting = false
   /**
@@ -517,6 +521,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     const ctx: CcbTurnContext = {
       parser,
       telemetry,
+      turnKey: params.turnKey,
+      boxStopNotified: false,
       ownedBashToolUseIds: new Set(),
       pendingPermissionRequestIds: new Set(),
       creditGuard: null as unknown as CreditBudgetGuard,
@@ -727,12 +733,35 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   interrupt(): boolean {
+    const active = this._activeTurn
+    const nativeSessionId = this.runner.sessionId
+    if (active && !active.boxStopNotified
+      && this.model === 'box-api-claude-opus-5-5'
+      && active.turnKey && nativeSessionId) {
+      active.boxStopNotified = true
+      // Browser Stop is explicit; an ordinary provider HTTP disconnect never
+      // calls this notifier. The gateway owns it beyond the CLI interrupt.
+      this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
+        turnKey: active.turnKey }).then((outcome) => {
+        if (outcome === 'skipped') log.warn('box_user_stop_notification_skipped')
+      }).catch(() => {
+        log.warn('box_user_stop_notification_pending')
+      })
+    }
     this._interrupting = true
     if (this._activeTurn) this._activeTurn = null
     return this.runner.interrupt()
   }
 
   async shutdown(): Promise<void> {
+    if (this._boxStopPending) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([this._boxStopPending, new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 2_000)
+        })])
+      } finally { if (timer) clearTimeout(timer) }
+    }
     // F3⑤:先 await 底座停产出(SIGTERM+SIGKILL 链走完),drain 期间的尾帧仍能按
     // origin map 正确归位;**之后**再清 map,避免清早了让尾 tail 落回 fail-closed 丢弃。
     await this.runner.shutdown()
