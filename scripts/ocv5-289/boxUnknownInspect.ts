@@ -103,10 +103,33 @@ def terminal_shape(path):
  return {'present':True,'nonceMatches':proof.get('runNonce')==nonce,
   'reason':proof.get('reason') if proof.get('reason') in ('worker_complete','keeper_stopped','deadline','unknown') else 'other',
   'revision':proof.get('revision') if isinstance(proof.get('revision'),int) else None}
+def process_shape():
+ matches=[];scanned=0
+ for raw_pid in os.listdir('/proc'):
+  if not raw_pid.isdigit():continue
+  scanned+=1
+  if scanned>4096:break
+  pid=int(raw_pid)
+  if pid==os.getpid():continue
+  try:
+   with open('/proc/'+raw_pid+'/cmdline','rb') as f:cmd=f.read(4096)
+   if nonce.encode() not in cmd:continue
+   with open('/proc/'+raw_pid+'/status',encoding='ascii',errors='ignore') as f:lines=f.readlines()[:8]
+  except (FileNotFoundError,PermissionError,ProcessLookupError):continue
+  fields={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in lines if ':' in line}
+  name=fields.get('Name','')
+  state=fields.get('State','')[:1]
+  ppid=fields.get('PPid','')
+  matches.append({'pid':pid,'ppid':int(ppid) if ppid.isdigit() else None,
+   'name':name if name in ('python3','claude','node') else 'other',
+   'state':state if state in ('R','S','D','T','Z','I') else 'other'})
+  if len(matches)>=16:break
+ return {'matches':matches,'truncated':scanned>4096 or len(matches)>=16}
 out={'run':inspect('/tmp/ocv5-289-run-'+nonce),
  'proof':inspect('/tmp/ocv5-289-proof-'+nonce),
  'terminal':terminal_shape('/tmp/ocv5-289-proof-'+nonce),
  'stream':stream_shape('/tmp/ocv5-289-run-'+nonce),
+ 'processes':process_shape(),
  'assets':[inspect(path,want) for path,want in
   (item.split(':',1) for item in assets)]}
 print(json.dumps(out,separators=(',',':'))) `;
