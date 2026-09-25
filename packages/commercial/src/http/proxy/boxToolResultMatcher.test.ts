@@ -40,7 +40,7 @@ test("real CCB trailing token-budget system hint does not hide the exact tool re
     text: "<total_tokens>14999987 tokens left</total_tokens>",
     cache_control: { type: "ephemeral" } }] });
   assert.deepEqual(matchBoxToolResults(value, uses), matchBoxToolResults(body(), uses));
-  value.messages.at(-1)!.content = [{ type: "text", text: "different system instruction",
+  (value.messages.at(-1) as { content: unknown }).content = [{ type: "text", text: "different system instruction",
     cache_control: { type: "ephemeral" } }];
   assert.throws(() => matchBoxToolResults(value, uses), /BOX_TOOL_RESULT_CONTEXT_INVALID/);
 });
