@@ -24,6 +24,7 @@ const MODEL = "box-api-claude-opus-5-5", UPSTREAM = "claude-opus-5-5";
 const EVIDENCE_PARENT = "/var/lib/openclaude";
 const EVIDENCE_DIR = `${EVIDENCE_PARENT}/ocv5-289-box-operator`;
 const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-20.json`;
+const OPERATOR_MUTEX = `${EVIDENCE_DIR}/account-20.mutex`;
 type Event = { event: string; data: Record<string, unknown> };
 function assertion(ok: unknown, code: string): asserts ok {
   if (!ok) throw new Error(code);
@@ -127,10 +128,25 @@ async function main(): Promise<void> {
       fsyncSync(fd);
     } finally { closeSync(fd); }
   };
+  const withOperatorMutex = (action: () => void): void => {
+    try {
+      writeDurable(OPERATOR_MUTEX, JSON.stringify({ pid: process.pid,
+        createdAt: new Date().toISOString() }) + "\n");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error("BOX_TOOL_OPERATOR_BUSY");
+      }
+      throw error;
+    }
+    syncDirectory();
+    try { action(); }
+    finally { unlinkSync(OPERATOR_MUTEX); syncDirectory(); }
+  };
   const persistIdentity = (input: BoxJournalAdmission): void => {
     assertion(lockHeld && !identityPersisted && input.requestId === firstId && input.uid === UID
       && input.accountId === ACCOUNT_ID, "BOX_TOOL_ATTEMPT_IDENTITY_INVALID");
-    const raw = JSON.stringify({ v: 1, accountId: String(ACCOUNT_ID), uid: String(UID),
+    const raw = JSON.stringify({ v: 1, pid: process.pid,
+      accountId: String(ACCOUNT_ID), uid: String(UID),
       firstId, secondId, sessionId, runNonce: input.runNonce,
       leaseEpoch: input.leaseEpoch, state: "unresolved",
       createdAt: new Date().toISOString() }) + "\n";
@@ -157,17 +173,19 @@ async function main(): Promise<void> {
       && directory.uid === process.getuid()
       && (directory.mode & 0o777) === 0o700,
     "BOX_TOOL_EVIDENCE_DIR_INVALID");
-    try {
-      writeDurable(EVIDENCE_PATH, JSON.stringify({ v: 1,
-        accountId: String(ACCOUNT_ID), uid: String(UID), firstId, secondId,
-        state: "preparing", createdAt: new Date().toISOString() }) + "\n");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new Error("BOX_TOOL_PRIOR_UNKNOWN_REQUIRES_RECONCILIATION");
+    withOperatorMutex(() => {
+      try {
+        writeDurable(EVIDENCE_PATH, JSON.stringify({ v: 1, pid: process.pid,
+          accountId: String(ACCOUNT_ID), uid: String(UID), firstId, secondId,
+          state: "preparing", createdAt: new Date().toISOString() }) + "\n");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new Error("BOX_TOOL_PRIOR_UNKNOWN_REQUIRES_RECONCILIATION");
+        }
+        throw error;
       }
-      throw error;
-    }
-    syncDirectory(); lockHeld = true;
+      syncDirectory(); lockHeld = true;
+    });
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
       ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
@@ -268,7 +286,9 @@ async function main(): Promise<void> {
     assertion(pendingCleanup === 0 && cleanupRow.rows[0]?.cleanup === "done",
       "BOX_TOOL_PROBE_CLEANUP_UNPROVEN");
     assertion(identityPersisted, "BOX_TOOL_PROBE_IDENTITY_NOT_DURABLE");
-    unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
+    withOperatorMutex(() => {
+      unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
+    });
     process.stdout.write(JSON.stringify({ accountId: String(ACCOUNT_ID),
       modelId: UPSTREAM, detachedAcrossHttp: true,
       localToolExecutions: localExecutions,
@@ -279,7 +299,9 @@ async function main(): Promise<void> {
     if (lockHeld && !identityPersisted) {
       // The durable admission wrapper has not run, so no paid CLI can have
       // started. Release this prelaunch-only reservation, still fail the probe.
-      try { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; }
+      try { withOperatorMutex(() => {
+        unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
+      }); }
       catch { /* Keep a conservative unknown lock on cleanup failure. */ }
     }
     const observed = tempReady
