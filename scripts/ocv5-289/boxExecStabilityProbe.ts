@@ -1,6 +1,7 @@
 /** Eight distinct read-only Box Exec calls on one pinned account target.
  * Stop at first failure; no stage, paid model, retry or remote mutation. */
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { getAccount, getCursorTokenSnapshot, getTokenForUse, listAccounts } from
   "../../packages/commercial/src/account-pool/store.js";
@@ -16,6 +17,9 @@ async function main(): Promise<void> {
     || process.env.OCV5_289_STABILITY_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_STABILITY_ACK_REQUIRED");
   const failures: Array<{ path: string; code: string; name: string }> = [];
+  const payloadProbe = process.env.OCV5_289_PAYLOAD_ACK === "1";
+  const encoded = payloadProbe ? readFileSync(new URL("./box_detached_runner.py",
+    import.meta.url)).toString("base64") : "";
   const resolver = new BoxAccountResolver({
     list: () => listAccounts({ provider: "cursor", status: "active", limit: 500 }),
     account: getAccount,
@@ -47,25 +51,33 @@ async function main(): Promise<void> {
     signal: new AbortController().signal });
   let completed = 0;
   const elapsedMs: number[] = [];
+  let attempted = 0, started = 0;
   try {
     if (target.accountId !== 20n) throw new Error("BOX_STABILITY_ACCOUNT_MISMATCH");
     for (let i = 0; i < 8; i++) {
+      attempted = i + 1;
       const nonce = randomBytes(6).toString("hex");
-      const started = Date.now();
+      const large = payloadProbe && i >= 4;
+      const argument = large ? encoded : nonce;
+      const expected = large ? String(encoded.length) : nonce;
+      started = Date.now();
       const result = await target.exec.run({ command: "/usr/bin/python3",
-        args: ["-I", "-c", "import sys;print(sys.argv[1])", nonce], cwd: "/tmp",
+        args: ["-I", "-c", large ? "import sys;print(len(sys.argv[1]))"
+          : "import sys;print(sys.argv[1])", argument], cwd: "/tmp",
         environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } },
       { timeoutMs: 45_000, maxResponseBytes: 4096 });
-      if (result.stdout.trim() !== nonce || result.exitCode !== 0) {
+      if (result.stdout.trim() !== expected || result.exitCode !== 0) {
         throw new Error("BOX_STABILITY_ECHO_INVALID");
       }
       completed++;
       elapsedMs.push(Date.now() - started);
     }
     process.stdout.write(JSON.stringify({ accountId: "20", completed,
-      readOnlyExec: true, elapsedMs, transportFailures: failures }) + "\n");
+      readOnlyExec: true, payloadProbe, payloadBytes: encoded.length,
+      elapsedMs, transportFailures: failures }) + "\n");
   } catch (error) {
-    process.stderr.write(JSON.stringify({ completed, elapsedMs,
+    process.stderr.write(JSON.stringify({ completed, attempted,
+      pendingMs: started ? Date.now() - started : null, elapsedMs,
       code: error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message)
         ? error.message : "BOX_STABILITY_FAILED", transportFailures: failures }) + "\n");
     throw error;
