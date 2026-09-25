@@ -49,7 +49,7 @@ export function makeBoxToolPlan(input: {
   const virtualMcpPath = `/tmp/ocv5-289-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
-    command: "/usr/bin/python3", args: [virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });
+    command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });
   const args = [...base.run.args];
   const deny = args.indexOf("--disallowedTools");
   if (deny < 0 || args[deny + 1] !== "mcp__*") throw new BoxTextPlanError("BOX_TOOL_PLAN_INVALID");

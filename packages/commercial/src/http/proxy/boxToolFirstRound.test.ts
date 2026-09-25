@@ -64,12 +64,18 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
     exec: { run: async (request: { args: string[] }) => {
       const args = request.args;
-      if (args[0] === "-I" && args[5] !== "--read") {
+      if (args[0] === "-I" && args[1] === "-c"
+        && args[2]?.includes("sys.argv=[p,*argv]")
+        && args[3]?.startsWith("/tmp/ocv5-289-detached-runner-")
+        && args[5] !== "--read") {
         sequence.push("launch"); launches++;
         if (options.ambiguousLaunch) throw new BoxExecTransportError("synthetic", false);
         return { stdout: "launched\n", stderrBytes: 0, exitCode: 0 as const };
       }
-      if (args[0] === "-I" && args[5] === "--read") {
+      if (args[0] === "-I" && args[1] === "-c"
+        && args[2]?.includes("sys.argv=[p,*argv]")
+        && args[3]?.startsWith("/tmp/ocv5-289-detached-runner-")
+        && args[5] === "--read") {
         sequence.push("spool-read");
         const offset = Number(args[7]);
         const spool = options.directFinal
@@ -79,22 +85,23 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         return { stdout: JSON.stringify({ data: bytes.toString("base64"),
           offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 as const };
       }
-      if (args[0] === "-c" && args[1]?.includes("pending.")) {
+      if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
         sequence.push("pending-read");
         return { stdout: JSON.stringify({ version: 1, modelToolUseId: toolId,
           mcpRequestId: 7, name: "t0", arguments: { value: "x" } }),
         stderrBytes: 0, exitCode: 0 as const };
       }
-      if (args[0] === "-c" && args[1]?.includes("terminal.json")) {
+      if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
         sequence.push("proof-read");
         return { stdout: JSON.stringify({ runNonce: currentNonce,
           leaseEpoch: currentEpoch, keeperPid: 101, cliPid: 102,
           reason: "worker_complete", revision: 1 }) + "\n",
         stderrBytes: 0, exitCode: 0 as const };
       }
-      if (args[0] === "-c" && args[2]?.startsWith("/tmp/ocv5-289-")) {
+      if (args[0] === "-I" && args[1] === "-c"
+        && args[3]?.startsWith("/tmp/ocv5-289-")) {
         sequence.push("asset-stage");
-        return { stdout: `${args[4]}\n`, stderrBytes: 0, exitCode: 0 as const };
+        return { stdout: `${args[5]}\n`, stderrBytes: 0, exitCode: 0 as const };
       }
       sequence.push("input-stage");
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };

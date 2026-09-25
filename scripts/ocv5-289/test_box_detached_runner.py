@@ -7,6 +7,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 
@@ -15,6 +16,21 @@ RUNNER = HERE / "box_detached_runner.py"
 
 
 class DetachedRunnerTest(unittest.TestCase):
+    def test_isolated_python_rejects_adjacent_standard_library_shadow(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ocv5-289-isolated-") as directory:
+            root = Path(directory)
+            (root / "hashlib.py").write_text("raise RuntimeError('shadow imported')\n")
+            child = root / "child.py"
+            child.write_text("import hashlib;print(hashlib.sha256(b'ok').hexdigest())\n")
+            unsafe = subprocess.run([sys.executable, str(child)], cwd=root,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(unsafe.returncode, 0)
+            self.assertIn("shadow imported", unsafe.stderr)
+            isolated = subprocess.run([sys.executable, "-I", str(child)], cwd=root,
+                                      capture_output=True, text=True, timeout=5)
+            self.assertEqual(isolated.returncode, 0, isolated.stderr)
+            self.assertEqual(len(isolated.stdout.strip()), 64)
+
     def setUp(self) -> None:
         self.nonce = secrets.token_hex(12)
         self.run_dir = Path(f"/tmp/ocv5-289-run-{self.nonce}")

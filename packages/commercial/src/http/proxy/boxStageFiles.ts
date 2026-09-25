@@ -141,7 +141,7 @@ export function makeBoxStageFiles(input: {
     paths.add(file.path);
   }
   const fixed = (script: string, args: string[]): BoxCcExecRequest => ({
-    command: PYTHON, args: ["-c", script, ...args], cwd: "/tmp", environment: ENV,
+    command: PYTHON, args: ["-I", "-c", script, ...args], cwd: "/tmp", environment: ENV,
   });
   const requests: BoxCcExecRequest[] = input.initialize === false
     ? [] : [fixed(INIT, [input.cwd, input.project])];

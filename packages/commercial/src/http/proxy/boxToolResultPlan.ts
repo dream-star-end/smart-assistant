@@ -45,7 +45,7 @@ export function makeBoxPendingRead(cwd: string, toolId: string): BoxCcExecReques
   if (!RUN_DIR.test(cwd) || !TOOL_ID.test(toolId)) {
     throw new BoxToolResultPlanError("BOX_PENDING_PATH_INVALID");
   }
-  return { command: PYTHON, args: ["-c", READ_PENDING, cwd, toolId],
+  return { command: PYTHON, args: ["-I", "-c", READ_PENDING, cwd, toolId],
     cwd: "/tmp", environment: ENV };
 }
 

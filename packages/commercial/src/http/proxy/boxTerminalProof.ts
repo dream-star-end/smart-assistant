@@ -34,7 +34,7 @@ export function makeBoxTerminalRead(proofDir: string): BoxCcExecRequest {
   if (!/^\/tmp\/ocv5-289-proof-[0-9a-f]{24}$/.test(proofDir)) {
     throw new Error("BOX_TERMINAL_PATH_INVALID");
   }
-  return { command: "/usr/bin/python3", args: ["-c", READ_PROOF, proofDir],
+  return { command: "/usr/bin/python3", args: ["-I", "-c", READ_PROOF, proofDir],
     cwd: "/tmp", environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } };
 }
 

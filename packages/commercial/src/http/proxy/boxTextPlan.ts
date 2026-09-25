@@ -67,7 +67,7 @@ export function makeBoxAssetStage(asset: Buffer, path: string): {
     throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
   }
   return { hash, request: { command: PYTHON,
-    args: ["-c", STAGE_SUPERVISOR, path, asset.toString("base64"), hash],
+    args: ["-I", "-c", STAGE_SUPERVISOR, path, asset.toString("base64"), hash],
     cwd: "/tmp", environment: BASE_ENV } };
 }
 
@@ -140,7 +140,7 @@ export function makeBoxTextPlan(input: {
     ] });
   const run: BoxCcExecRequest = {
     command: PYTHON,
-    args: [keeperPath, supervisorPath, "--proof-dir", proofDir,
+    args: ["-I", keeperPath, supervisorPath, "--proof-dir", proofDir,
       "--lease-epoch", leaseEpoch, "--deadline", String(supervisorDeadlineSeconds), "--kill-after", "2",
       "--max-output", "1048576", "--stdin-file", stdinPath,
       "--stdin-sha256", stdinHash, "--", MODEL, "-p", "--model", input.upstreamModel,

@@ -88,7 +88,7 @@ def launch(argv: list[str]) -> int:
             err = os.open("stderr.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                           0o600, dir_fd=directory_fd)
             try:
-                process = subprocess.Popen([sys.executable, keeper, supervisor, *options],
+                process = subprocess.Popen([sys.executable, "-I", keeper, supervisor, *options],
                     cwd=directory, env=os.environ.copy(), stdin=subprocess.DEVNULL,
                     stdout=out, stderr=err, start_new_session=True, close_fds=True)
             finally:

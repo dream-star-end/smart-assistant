@@ -27,7 +27,7 @@ test("terminal read script refuses symlink and non-0600 marker", () => {
   const proofDir = `/tmp/ocv5-289-proof-${runNonce}`;
   const request = makeBoxTerminalRead(proofDir);
   const syntax = spawnSync("python3", ["-c", "import ast,sys;ast.parse(sys.stdin.read())"],
-    { input: request.args[1], encoding: "utf8" });
+    { input: request.args[2], encoding: "utf8" });
   assert.equal(syntax.status, 0, syntax.stderr);
   // Use a random directory because a deterministic nonce may be in use by
   // another offline test; the fixed script validates its shape.
@@ -36,11 +36,11 @@ test("terminal read script refuses symlink and non-0600 marker", () => {
   try {
     writeFileSync(`${random}/terminal.json`, raw);
     chmodSync(`${random}/terminal.json`, 0o644);
-    const denied = spawnSync(request.command, ["-c", request.args[1], random]);
+    const denied = spawnSync(request.command, ["-I", "-c", request.args[2]!, random]);
     assert.notEqual(denied.status, 0);
     rmSync(`${random}/terminal.json`);
     symlinkSync("/etc/passwd", `${random}/terminal.json`);
-    const linked = spawnSync(request.command, ["-c", request.args[1], random]);
+    const linked = spawnSync(request.command, ["-I", "-c", request.args[2]!, random]);
     assert.notEqual(linked.status, 0);
   } finally { rmSync(random, { recursive: true, force: true }); }
 });

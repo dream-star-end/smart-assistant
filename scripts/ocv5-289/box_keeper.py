@@ -235,7 +235,7 @@ def main() -> int:
     env = { **os.environ, "OCV5_KEEPER_REPORT_FD": str(report_write),
         "OCV5_KEEPER_ACK_FD": str(ack_read) }
     try:
-        worker = subprocess.Popen([sys.executable, sys.argv[1], *worker_args],
+        worker = subprocess.Popen([sys.executable, "-I", sys.argv[1], *worker_args],
             env=env, stdin=subprocess.DEVNULL, stdout=None, stderr=None,
             pass_fds=(report_write, ack_read), close_fds=True,
             preexec_fn=lambda: worker_setup(keeper_pid))

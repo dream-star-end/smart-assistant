@@ -62,11 +62,12 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
     active++; maxActive = Math.max(maxActive, active);
     await new Promise((resolve) => setTimeout(resolve, 1));
-    const isModel = request.args[0]?.startsWith("/tmp/ocv5-289-keeper-");
-    const isSupervisor = request.args[2]?.startsWith("/tmp/ocv5-289-supervisor-");
-    const isKeeper = request.args[2]?.startsWith("/tmp/ocv5-289-keeper-");
-    const isCleanup = request.args[1]?.includes("print('clean')");
-    const isProof = request.args[1]?.includes("terminal.json");
+    const isModel = request.args[0] === "-I"
+      && request.args[1]?.startsWith("/tmp/ocv5-289-keeper-");
+    const isSupervisor = request.args[3]?.startsWith("/tmp/ocv5-289-supervisor-");
+    const isKeeper = request.args[3]?.startsWith("/tmp/ocv5-289-keeper-");
+    const isCleanup = request.args[2]?.includes("print('clean')");
+    const isProof = request.args[2]?.includes("terminal.json");
     const phase = isModel ? "model" : isSupervisor ? "supervisor"
       : isKeeper ? "keeper" : isCleanup ? "cleanup" : isProof ? "proof" : "stage";
     stages.push(phase);
@@ -100,7 +101,7 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
       } else options.onStdout?.(output);
       return ok(output);
     }
-    if (isSupervisor || isKeeper) return ok(request.args[4]);
+    if (isSupervisor || isKeeper) return ok(request.args[5]);
     if (isProof) return ok(JSON.stringify({ runNonce: proofDir.slice(-24), leaseEpoch,
       keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 }) + "\n");
     if (isCleanup) return ok("clean\n");

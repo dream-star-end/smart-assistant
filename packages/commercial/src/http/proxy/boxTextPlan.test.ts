@@ -19,21 +19,22 @@ test("first text request stages only files and carries no prompt/system on Claud
     runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) });
   assert.equal(plan.expectedModel, "claude-opus-5");
   assert.equal(plan.proofDir, `/tmp/ocv5-289-proof-${"a".repeat(24)}`);
-  assert.deepEqual(plan.run.args.slice(2, 6),
+  assert.deepEqual(plan.run.args.slice(3, 7),
     ["--proof-dir", plan.proofDir, "--lease-epoch", "b".repeat(32)]);
   assert.equal(plan.run.args[plan.run.args.indexOf("--deadline") + 1], "110");
   assert.ok(plan.run.args.includes("--session-id"));
   assert.ok(!plan.run.args.includes("--resume"));
   assert.ok(plan.run.args.includes("--system-prompt-file"));
   assert.equal(plan.snapshotHash, null);
-  assert.equal(plan.stageInputs[0]?.args[3], "");
+  assert.equal(plan.stageInputs[0]?.args[4], "");
   assert.ok(!plan.run.args.join(" ").includes("private current user marker"));
   assert.ok(!plan.run.args.join(" ").includes("OpenClaude memory marker"));
   assert.equal(plan.run.environment.CLAUDE_CODE_MAX_RETRIES, "0");
   assert.equal(plan.run.environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "128");
   assert.equal(plan.run.cwd, plan.cwd);
-  assert.ok(plan.run.args[0]?.startsWith("/tmp/ocv5-289-keeper-"));
-  assert.ok(plan.run.args[1]?.startsWith("/tmp/ocv5-289-supervisor-"));
+  assert.equal(plan.run.args[0], "-I");
+  assert.ok(plan.run.args[1]?.startsWith("/tmp/ocv5-289-keeper-"));
+  assert.ok(plan.run.args[2]?.startsWith("/tmp/ocv5-289-supervisor-"));
 });
 
 test("completed history stages actual upstream model with a structured current turn", () => {
@@ -47,19 +48,19 @@ test("completed history stages actual upstream model with a structured current t
   assert.ok(plan.run.args.includes("--resume"));
   assert.ok(plan.snapshotHash);
   const snapshotWrites = plan.stageInputs.filter((step) =>
-    step.args[4]?.endsWith(`${plan.sessionId}.jsonl`) && step.args[1]?.includes("base64.b64decode"));
-  const transcript = Buffer.concat(snapshotWrites.flatMap((step) => step.args.slice(7)
+    step.args[5]?.endsWith(`${plan.sessionId}.jsonl`) && step.args[2]?.includes("base64.b64decode"));
+  const transcript = Buffer.concat(snapshotWrites.flatMap((step) => step.args.slice(8)
     .map((encoded) => Buffer.from(encoded, "base64")))).toString("utf8");
   assert.ok(transcript.includes('"model":"claude-opus-5"'));
   assert.ok(!transcript.includes('"model":"box-api-claude-opus-5"'));
   const stdinWrites = plan.stageInputs.filter((step) =>
-    step.args[4]?.endsWith("/stdin.jsonl") && step.args[1]?.includes("base64.b64decode"));
-  const stdin = Buffer.concat(stdinWrites.flatMap((step) => step.args.slice(7)
+    step.args[5]?.endsWith("/stdin.jsonl") && step.args[2]?.includes("base64.b64decode"));
+  const stdin = Buffer.concat(stdinWrites.flatMap((step) => step.args.slice(8)
     .map((encoded) => Buffer.from(encoded, "base64")))).toString("utf8");
   assert.deepEqual(JSON.parse(stdin).message.content, [{ type: "text", text: "current" }]);
-  for (const script of [plan.stageSupervisor.args[1], plan.stageKeeper.args[1],
-    ...plan.stageInputs.map((step) => step.args[1]),
-    plan.cleanup.args[1]]) {
+  for (const script of [plan.stageSupervisor.args[2], plan.stageKeeper.args[2],
+    ...plan.stageInputs.map((step) => step.args[2]),
+    plan.cleanup.args[2]]) {
     const parsed = spawnSync("python3", ["-c", "import ast,sys;ast.parse(sys.stdin.read())"],
       { input: script, encoding: "utf8" });
     assert.equal(parsed.status, 0, parsed.stderr);

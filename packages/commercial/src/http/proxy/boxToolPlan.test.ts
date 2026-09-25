@@ -23,8 +23,9 @@ test("first tool round stages private MCP catalog and permits only virtual tools
   const plan = makeBoxToolPlan({ ...assets, body });
   const args = plan.run.args;
   assert.equal(plan.expectedModel, "claude-opus-5-5");
-  assert.ok(args[0]?.startsWith("/tmp/ocv5-289-keeper-"));
-  assert.ok(plan.stageVirtualMcp.args[2]?.startsWith("/tmp/ocv5-289-box-virtual-mcp-"));
+  assert.equal(args[0], "-I");
+  assert.ok(args[1]?.startsWith("/tmp/ocv5-289-keeper-"));
+  assert.ok(plan.stageVirtualMcp.args[3]?.startsWith("/tmp/ocv5-289-box-virtual-mcp-"));
   assert.ok(plan.stageInputs.some((step) => step.args.includes(`${plan.cwd}/tool-catalog.json`)));
   assert.ok(plan.cleanup.args.includes(`${plan.cwd}/tool-catalog.json`));
   assert.equal(args[args.indexOf("--tools") + 1], "");
@@ -34,15 +35,17 @@ test("first tool round stages private MCP catalog and permits only virtual tools
   assert.equal(args[args.indexOf("--deadline") + 1], "900");
   const config = JSON.parse(args[args.indexOf("--mcp-config") + 1]!) as {
     mcpServers: { ocbridge: { args: string[] } } };
-  assert.equal(config.mcpServers.ocbridge.args[1], plan.cwd);
-  assert.equal(config.mcpServers.ocbridge.args[2], plan.catalog.sha256);
-  assert.equal(config.mcpServers.ocbridge.args[3], "900");
+  assert.deepEqual(config.mcpServers.ocbridge.args.slice(0, 2), ["-I",
+    plan.stageVirtualMcp.args[3]]);
+  assert.equal(config.mcpServers.ocbridge.args[2], plan.cwd);
+  assert.equal(config.mcpServers.ocbridge.args[3], plan.catalog.sha256);
+  assert.equal(config.mcpServers.ocbridge.args[4], "900");
   assert.ok(!args.join(" ").includes("Use local_echo on ping"));
   assert.ok(!args.join(" ").includes("OpenClaude local-only echo"));
   for (const stage of [plan.stageVirtualMcp, ...plan.stageInputs, plan.cleanup]) {
-    if (stage.args[0] !== "-c") continue;
+    if (stage.args[0] !== "-I" || stage.args[1] !== "-c") continue;
     const parsed = spawnSync("python3", ["-c", "import ast,sys;ast.parse(sys.stdin.read())"],
-      { input: stage.args[1], encoding: "utf8" });
+      { input: stage.args[2], encoding: "utf8" });
     assert.equal(parsed.status, 0, parsed.stderr);
   }
 });
