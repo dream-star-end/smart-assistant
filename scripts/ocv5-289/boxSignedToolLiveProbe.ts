@@ -671,7 +671,10 @@ async function main(): Promise<void> {
       assertion(observed.length >= 1 && observed.length <= 2
         && transportCalls === 0 && paidCalls === 0
         && result.exitCode !== 124 && result.exitCode !== 137
-        && !identityPersisted && usage.rowCount === 0,
+        && !identityPersisted && usage.rowCount === 0
+        && loopback.shapes.length === observed.length
+        && loopback.shapes.every((shape) => shape.unsupported === null
+          && shape.fingerprintOk && shape.planStatus === "ok"),
       "BOX_CCB_PREFLIGHT_INVALID");
       withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
       process.stdout.write(JSON.stringify({ ccbUserContainer: true, preflightOnly: true,
