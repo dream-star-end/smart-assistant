@@ -19,6 +19,7 @@ import { getV3ContainerStatus,
   resolveCcbBaselineMounts, type V3RuntimeTuple, type V3SupervisorDeps } from
   "../../packages/commercial/src/agent-sandbox/v3supervisor.js";
 import { DEFAULT_PLATFORM_ROOT, DEFAULT_RUNTIME_RELEASES_ROOT,
+  RUNTIME_RELEASE_LABEL_KEY,
   resolvePlatformBundleMount, resolveRuntimeReleaseMount } from
   "../../packages/commercial/src/agent-sandbox/platformBundle.js";
 import { DEFAULT_BRIDGE_SECRET_PATH } from
@@ -27,10 +28,10 @@ import { AuthorityKeyringReader } from
   "../../packages/commercial/src/ws/authoritySigner.js";
 import { getRuntimeChannel } from
   "../../packages/commercial/src/runtimeChannel.js";
+import { runtimeMatches } from "./boxRuntimeMatch.js";
 
 const UID = 3n;
 const LIVE = "/opt/openclaude/openclaude-v5-selfhost-live";
-const RELEASE_LABEL = "com.openclaude.runtime.release";
 function assertion(ok: unknown, code: string): asserts ok {
   if (!ok) throw new Error(code);
 }
@@ -111,6 +112,8 @@ async function main(): Promise<number> {
       } } : {}) };
     assertion(deps.image.startsWith("openclaude/openclaude-runtime:"),
       "BOX_RUNTIME_IMAGE_INVALID");
+    const image = await docker.getImage(deps.image).inspect();
+    assertion(image.Id === desired.imageId, "BOX_RUNTIME_IMAGE_TAG_DRIFTED");
     const before = await getV3ContainerStatus(deps, Number(UID));
     assertion(before?.state === "running" && before.hostId === host.id
       && typeof before.dockerContainerId === "string",
@@ -119,7 +122,8 @@ async function main(): Promise<number> {
     const beforeVolumes = namedVolumes(beforeInfo);
     assertion(beforeVolumes.get("/home/agent/.openclaude") !== undefined,
       "BOX_RUNTIME_PERSISTENT_VOLUME_MISSING");
-    if (mode === "run" && before.labels?.[RELEASE_LABEL] !== desiredRelease) {
+    const beforeFresh = runtimeMatches(before, beforeInfo, desired, desiredRelease);
+    if (mode === "run" && !beforeFresh) {
       // The production function performs the authenticated v5 turn-drain and
       // defers rather than removing if ingress/session/durable fences are busy.
       await makeV3EnsureRunning(deps)(UID);
@@ -128,15 +132,15 @@ async function main(): Promise<number> {
     assertion(after?.state === "running" && after.hostId === host.id
       && typeof after.dockerContainerId === "string",
     "BOX_RUNTIME_AFTER_STATUS_INVALID");
-    const fresh = after.labels?.[RELEASE_LABEL] === desiredRelease;
+    const afterInfo = await docker.getContainer(after.dockerContainerId).inspect();
+    const fresh = runtimeMatches(after, afterInfo, desired, desiredRelease);
     if (mode === "run" && fresh) {
-      const afterInfo = await docker.getContainer(after.dockerContainerId).inspect();
       assertion(sameVolumes(beforeVolumes, namedVolumes(afterInfo)),
         "BOX_RUNTIME_VOLUME_CHANGED");
     }
     process.stdout.write(JSON.stringify({ mode, uid: String(UID),
-      beforeRelease: before.labels?.[RELEASE_LABEL] ?? null,
-      desiredRelease, afterRelease: after.labels?.[RELEASE_LABEL] ?? null,
+      beforeRelease: before.labels?.[RUNTIME_RELEASE_LABEL_KEY] ?? null,
+      desiredRelease, afterRelease: after.labels?.[RUNTIME_RELEASE_LABEL_KEY] ?? null,
       result: fresh ? "converged" : mode === "plan" ? "stale" : "deferred",
       forced: false, migrationRun: false }) + "\n");
     return mode === "plan" || fresh ? 0 : 3;
