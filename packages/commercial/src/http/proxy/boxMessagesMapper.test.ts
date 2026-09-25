@@ -51,6 +51,25 @@ describe("Box Messages → Claude CLI synthetic session boundary", () => {
     assert.deepEqual(messages, before);
   });
 
+  it("preserves signed thinking and redacted thinking in completed assistant history", () => {
+    const history = [
+      { role: "user", content: "prior" },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "prior private reasoning", signature: "signed" },
+        { type: "redacted_thinking", data: "ciphertext" },
+        { type: "text", text: "prior answer" },
+      ] },
+      { role: "user", content: "next question" },
+    ];
+    const output = compileBoxCliSyntheticTurn(body(history), args);
+    const records = output.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(records[1].message.content, history[1]!.content);
+    assert.equal(JSON.parse(output.stdinJsonl).message.content, "next question");
+    assert.equal(code(body([{ role: "assistant", content: [
+      { type: "thinking", thinking: "x", signature: 123 },
+    ] }, { role: "user", content: "next" }])), "BOX_BLOCK_UNSUPPORTED");
+  });
+
   it("rejects a current tool result: only the held live CLI may consume it", () => {
     assert.equal(code(body([
       { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "x", input: {} }] },

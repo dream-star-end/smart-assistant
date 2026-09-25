@@ -57,8 +57,17 @@ function validateContent(content: unknown, role: "user" | "assistant"): void {
         || (Array.isArray(block.content) && block.content.length > 0
           && block.content.every((part) => part !== null && typeof part === "object"
             && !Array.isArray(part) && part.type === "text" && typeof part.text === "string")))) continue;
-    // No silent multimodal/thinking downgrade: these require real CLI matrix
-    // evidence before this mapper may claim compatibility.
+    // Preserve signed completed thinking history exactly. It is not rendered
+    // as plaintext or treated as a new model request; malformed signatures
+    // and unsupported extra fields still fail closed.
+    if (role === "assistant" && block.type === "thinking"
+      && Object.keys(block).sort().join(",") === "signature,thinking,type"
+      && typeof block.thinking === "string"
+      && typeof block.signature === "string" && block.signature.length > 0) continue;
+    if (role === "assistant" && block.type === "redacted_thinking"
+      && Object.keys(block).sort().join(",") === "data,type"
+      && typeof block.data === "string" && block.data.length > 0) continue;
+    // No silent multimodal or unknown thinking downgrade.
     throw new BoxMessagesShapeError("BOX_BLOCK_UNSUPPORTED");
   }
 }
