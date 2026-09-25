@@ -49,8 +49,29 @@ def stream_shape(path):
    if item['type']=='stream_event':
     event=record.get('event')
     item['event']=safe_type(event.get('type') if isinstance(event,dict) else None,events)
+    if isinstance(event,dict) and item['event']=='content_block_start':
+     block=event.get('content_block')
+     item['block']=safe_type(block.get('type') if isinstance(block,dict) else None,
+      {'text','thinking','redacted_thinking','tool_use'})
+    if isinstance(event,dict) and item['event']=='message_delta':
+     delta=event.get('delta')
+     item['stop']=safe_type(delta.get('stop_reason') if isinstance(delta,dict) else None,
+      {'tool_use','end_turn','max_tokens','stop_sequence'})
    if item['type']=='system':
     item['subtype']=safe_type(record.get('subtype'),{'init','status','compact_boundary'})
+   if item['type']=='assistant':
+    msg=record.get('message')
+    content=msg.get('content') if isinstance(msg,dict) else None
+    item['blocks']=[safe_type(b.get('type') if isinstance(b,dict) else None,
+     {'text','thinking','redacted_thinking','tool_use'}) for b in content[:8]] if isinstance(content,list) else []
+   if item['type']=='user':
+    msg=record.get('message')
+    content=msg.get('content') if isinstance(msg,dict) else None
+    item['blocks']=[safe_type(b.get('type') if isinstance(b,dict) else None,
+     {'text','image','tool_result'}) for b in content[:8]] if isinstance(content,list) else []
+   if item['type']=='result':
+    item['subtype']=safe_type(record.get('subtype'),{'success','error','error_during_execution','error_max_turns'})
+    item['isError']=record.get('is_error') is True
    records.append(item)
   try:err=os.stat('stderr.log',dir_fd=dfd,follow_symlinks=False).st_size
   except FileNotFoundError:err=None
