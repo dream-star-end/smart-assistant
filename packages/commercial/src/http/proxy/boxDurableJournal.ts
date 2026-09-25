@@ -100,14 +100,24 @@ function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): bool
 
 const CLEANUP_STATE_FENCE = `((ctx->>'boxState'='terminal'
   AND state IN ('inflight','finalizing','committed'))
-  OR (ctx->>'boxState'='failed_stopped' AND state='aborted'))`;
+  OR (ctx->>'boxState'='failed_stopped'
+    AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
+      AND ctx ? 'boxToolHandoff'))))`;
 
 const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
   AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
   AND state IN ('inflight','finalizing','committed'))
   OR (ctx->>'boxState'='failed_stopped'
     AND ctx->'boxTerminalProof'->>'reason' IN ('keeper_stopped','worker_failed')
-    AND state='aborted'))`;
+    AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
+      AND ctx ? 'boxToolHandoff'))))`;
+
+const STOP_PROBE_STATE_FENCE = `((state='inflight'
+  AND ctx->>'boxState' IN ('running','unknown','linked')
+  AND NOT (ctx ? 'boxToolHandoff'))
+  OR (state IN ('inflight','finalizing','committed')
+    AND ctx->>'boxState' IN ('handoff','unknown')
+    AND ctx ? 'boxToolHandoff'))`;
 
 export interface BoxJournalPort {
   admit(input: BoxJournalAdmission): Promise<void>;
@@ -393,12 +403,39 @@ export class BoxDurableJournal implements BoxJournalPort {
         || typeof ctx.boxAccountId !== "string"
         || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
         || ctx.boxOwnerRequestId !== undefined
-        || ctx.boxResumeRequestId !== undefined
-        || ctx.boxToolHandoff !== undefined) {
+        || ctx.boxResumeRequestId !== undefined) {
         throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
       }
-      if (row.state === "aborted" && ctx.boxState === "failed_stopped"
+      const handoff = ctx.boxToolHandoff === undefined ? null
+        : parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+      if (ctx.boxToolHandoff !== undefined && (!handoff || handoff.roundNo !== 1
+        || typeof ctx.boxHandoffRevision !== "string"
+        || !UUID_V4.test(ctx.boxHandoffRevision))) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+      }
+      if ((handoff ? ["inflight", "finalizing", "committed"].includes(row.state)
+        : row.state === "aborted") && ctx.boxState === "failed_stopped"
         && isDeepStrictEqual(ctx.boxTerminalProof, input.proof)) {
+        await client.query("COMMIT"); committed = true; return;
+      }
+      if (handoff) {
+        if (!["inflight", "finalizing", "committed"].includes(row.state)
+          || !["handoff", "unknown"].includes(String(ctx.boxState))) {
+          throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+        }
+        const changed = await client.query(
+          `UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb
+            WHERE request_id=$1 AND user_id=$2
+              AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
+              AND ctx->>'boxInvocationMode'='detached_tool'
+              AND ctx->>'boxState' IN ('handoff','unknown')
+              AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxOwnerRequestId')
+              AND NOT (ctx ? 'boxResumeRequestId')
+              AND state IN ('inflight','finalizing','committed')`,
+          [input.requestId, input.uid.toString(), input.leaseEpoch,
+            JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+              boxStopOutcome: "failed" }), input.proof.runNonce]);
+        if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
         await client.query("COMMIT"); committed = true; return;
       }
       if (row.state !== "inflight" || !["running", "unknown"].includes(String(ctx.boxState))) {
@@ -862,16 +899,28 @@ export class BoxDurableJournal implements BoxJournalPort {
       const current = rows[0]!;
       const basis = current.ctx;
       const roundNo = basis.boxRoundNo;
-      if (current.state === "aborted" && basis.boxState === "failed_stopped"
+      const handoff = basis.boxToolHandoff === undefined ? null
+        : parseBoxStoredToolHandoff(basis.boxToolHandoff);
+      if (basis.boxToolHandoff !== undefined && !handoff) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+      }
+      if ((handoff ? ["inflight", "finalizing", "committed"].includes(current.state)
+        : current.state === "aborted") && basis.boxState === "failed_stopped"
         && rows.length === roundNo && isDeepStrictEqual(basis.boxTerminalProof, input.proof)) {
         await client.query("COMMIT"); committed = true; return;
       }
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
         || Number(roundNo) > 32 || rows.length !== roundNo
         || basis.boxSessionId !== lockedSessionId
-        || current.state !== "inflight"
-        || !["linked", "unknown"].includes(String(basis.boxState))
-        || basis.boxToolHandoff !== undefined
+        || (handoff
+          ? (!["inflight", "finalizing", "committed"].includes(current.state)
+            || !["handoff", "unknown"].includes(String(basis.boxState))
+            || handoff.roundNo !== roundNo
+            || handoff.catalogHash !== basis.boxCatalogHash
+            || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash)
+          : (current.state !== "inflight"
+            || !["linked", "unknown"].includes(String(basis.boxState))))
+        || basis.boxResumeRequestId !== undefined
         || typeof basis.boxAccountId !== "string"
         || !/^[1-9][0-9]{0,19}$/.test(basis.boxAccountId)
         || typeof basis.boxCatalogHash !== "string"
@@ -902,21 +951,30 @@ export class BoxDurableJournal implements BoxJournalPort {
           throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
         }
       }
-      const usage = await client.query(
-        `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
-        [current.request_id, input.uid.toString()]);
-      if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
-      const stopped = await client.query(
-        `UPDATE request_finalize_journal
-            SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
-                ctx=ctx || $4::jsonb, updated_at=NOW()
-          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+      if (!handoff) {
+        const usage = await client.query(
+          `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
+          [current.request_id, input.uid.toString()]);
+        if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
+      }
+      const stopParams = [current.request_id, input.uid.toString(), input.leaseEpoch,
+        JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+          boxStopOutcome: "failed" }), input.proof.runNonce];
+      const stopped = handoff ? await client.query(
+        `UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb
+          WHERE request_id=$1 AND user_id=$2
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-            AND ctx->>'boxState' IN ('linked','unknown')
-            AND NOT (ctx ? 'boxToolHandoff')`,
-        [current.request_id, input.uid.toString(), input.leaseEpoch,
-          JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
-            boxStopOutcome: "failed" }), input.proof.runNonce]);
+            AND ctx->>'boxState' IN ('handoff','unknown')
+            AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxResumeRequestId')
+            AND state IN ('inflight','finalizing','committed')`, stopParams)
+        : await client.query(
+          `UPDATE request_finalize_journal
+              SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                  ctx=ctx || $4::jsonb, updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+              AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
+              AND ctx->>'boxState' IN ('linked','unknown')
+              AND NOT (ctx ? 'boxToolHandoff')`, stopParams);
       if (stopped.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
       for (const ancestor of rows.slice(1)) {
         const changed = await client.query(
@@ -942,7 +1000,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     const found = await this.pool.query<{ request_id: string; user_id: string;
       ctx: Record<string, unknown> }>(
       `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
-        WHERE state='inflight' AND ctx->>'boxInvocationRecovery'='v1'
+        WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
           AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
           AND jsonb_typeof(ctx->'boxAccountId')='string'
@@ -954,8 +1012,6 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND (NOT (ctx ? 'boxOwnerRequestId')
             OR (jsonb_typeof(ctx->'boxOwnerRequestId')='string'
               AND ctx->>'boxOwnerRequestId' ~ '^[A-Za-z0-9_-]{1,64}$'))
-          AND ctx->>'boxState' IN ('running','unknown','linked')
-          AND NOT (ctx ? 'boxToolHandoff')
           AND NOT (ctx ? 'boxResumeRequestId')
           AND NOT (ctx ? 'boxTerminalProof')
           AND (NOT (ctx ? 'boxStopProbeAfterMs')
@@ -1002,7 +1058,7 @@ export class BoxDurableJournal implements BoxJournalPort {
             'boxStopProbeLastAttemptMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
             'boxStopProbeAfterMs',
               (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
-        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+        WHERE request_id=$1 AND user_id=$2 AND ${STOP_PROBE_STATE_FENCE}
           AND ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
           AND jsonb_typeof(ctx->'boxAccountId')='string'
@@ -1010,8 +1066,6 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND jsonb_typeof(ctx->'boxLeaseEpoch')='string'
           AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
           AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxState' IN ('running','unknown','linked')
-          AND NOT (ctx ? 'boxToolHandoff')
           AND NOT (ctx ? 'boxResumeRequestId')
           AND NOT (ctx ? 'boxTerminalProof')
           AND (NOT (ctx ? 'boxOwnerRequestId')

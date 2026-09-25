@@ -717,6 +717,111 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       leaseEpoch: cancelCall.leaseEpoch };
     await journal.markFirstRoundStoppedFailure({ ...cancelCall, proof: cancelProof });
 
+    // A stopped CLI can be waiting on OpenClaude-local tools after a completed
+    // assistant handoff. Preserve that billable handoff; release only remote
+    // capacity and stage remote cleanup after the exact keeper proof.
+    const handoffTurn = "3".repeat(64), handoffSession = `handoff-${suffix}`;
+    const handoffBody: ProxyBody = { ...firstBody,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: handoffTurn,
+        session_id: handoffSession }) },
+      messages: [{ role: "user", content: "synthetic stopped handoff" }] };
+    const handoffRoot = { ...toolCall, requestId: `box-handoff-stop-${suffix}`,
+      runNonce: "b".repeat(24), leaseEpoch: "c".repeat(32),
+      fingerprint: deriveBoxCallFingerprint(3n, handoffBody),
+      contextHash: deriveBoxContextHash(handoffBody) };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [handoffRoot.requestId, JSON.stringify({ ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: handoffSession, turnKey: handoffTurn } })]);
+    await journal.admit(handoffRoot);
+    await journal.markRunning(handoffRoot);
+    await journal.recordToolHandoff({ ...handoffRoot, candidate,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_A"] });
+    await journal.recordUserCancelIntent(handoffRoot);
+    const handoffResumeBody: ProxyBody = { ...handoffBody,
+      messages: [...handoffBody.messages, ...resumeBody.messages.slice(1)] };
+    await put(`box-handoff-next-${suffix}`);
+    await assert.rejects(() => journal.claimToolResume({
+      requestId: `box-handoff-next-${suffix}`, uid: 3n,
+      canonicalModel: basis.model, canonicalBody: handoffResumeBody }),
+    /BOX_TOOL_OWNER_UNKNOWN/);
+    const handoffProbe = (await journal.listStoppedFailureProbeCandidates(20))
+      .find((item) => item.requestId === handoffRoot.requestId);
+    assert.ok(handoffProbe);
+    assert.equal(handoffProbe.linked, false);
+    assert.equal(await journal.claimStoppedFailureProbe(handoffProbe), true);
+    const handoffStopProof = { ...failedProof, runNonce: handoffRoot.runNonce,
+      leaseEpoch: handoffRoot.leaseEpoch };
+    await journal.markFirstRoundStoppedFailure({ ...handoffRoot, proof: handoffStopProof });
+    await journal.markFirstRoundStoppedFailure({ ...handoffRoot, proof: handoffStopProof });
+    const stoppedHandoff = await client.query<{ state: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1`,
+      [handoffRoot.requestId]);
+    assert.equal(stoppedHandoff.rows[0]?.state, "inflight");
+    assert.equal(stoppedHandoff.rows[0]?.ctx.boxState, "failed_stopped");
+    assert.deepEqual((stoppedHandoff.rows[0]?.ctx.boxToolHandoff as
+      { usage: unknown }).usage, { inputTokens: candidate.inputTokens,
+      outputTokens: candidate.outputTokens, cacheReadTokens: candidate.cacheReadTokens,
+      cacheWriteTokens: candidate.cacheWriteTokens });
+    assert.ok((await journal.listRemoteCleanupCandidates(20)).some((item) =>
+      item.requestId === handoffRoot.requestId));
+
+    const linkedTurn = "4".repeat(64), linkedSession = `linked-handoff-${suffix}`;
+    const linkedBody: ProxyBody = { ...firstBody,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: linkedTurn,
+        session_id: linkedSession }) },
+      messages: [{ role: "user", content: "synthetic linked handoff" }] };
+    const linkedBasis = { ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: linkedSession, turnKey: linkedTurn } };
+    const linkedRoot = { ...toolCall, requestId: `box-linked-root-${suffix}`,
+      runNonce: "d".repeat(24), leaseEpoch: "f".repeat(32),
+      fingerprint: deriveBoxCallFingerprint(3n, linkedBody),
+      contextHash: deriveBoxContextHash(linkedBody) };
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [linkedRoot.requestId, JSON.stringify(linkedBasis)]);
+    await journal.admit(linkedRoot);
+    await journal.markRunning(linkedRoot);
+    await journal.recordToolHandoff({ ...linkedRoot, candidate,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_A"] });
+    const linkedChildId = `box-linked-child-${suffix}`;
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [linkedChildId, JSON.stringify(linkedBasis)]);
+    const linkedResumeBody: ProxyBody = { ...linkedBody,
+      messages: [...linkedBody.messages, ...resumeBody.messages.slice(1)] };
+    await journal.claimToolResume({ requestId: linkedChildId, uid: 3n,
+      canonicalModel: basis.model, canonicalBody: linkedResumeBody });
+    await journal.recordToolHandoff({ requestId: linkedChildId, uid: 3n,
+      leaseEpoch: linkedRoot.leaseEpoch, candidate: secondCandidate, roundNo: 2,
+      spoolOffset: 2345, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_C"] });
+    await journal.recordUserCancelIntent(linkedRoot);
+    const linkedHandoffProbe = (await journal.listStoppedFailureProbeCandidates(20))
+      .find((item) => item.requestId === linkedChildId);
+    assert.ok(linkedHandoffProbe);
+    assert.equal(linkedHandoffProbe.linked, true);
+    assert.equal(await journal.claimStoppedFailureProbe(linkedHandoffProbe), true);
+    const linkedStopProof = { ...failedProof, runNonce: linkedRoot.runNonce,
+      leaseEpoch: linkedRoot.leaseEpoch };
+    await journal.markToolChainStoppedFailure({ requestId: linkedChildId,
+      uid: 3n, leaseEpoch: linkedRoot.leaseEpoch, proof: linkedStopProof });
+    await journal.markToolChainStoppedFailure({ requestId: linkedChildId,
+      uid: 3n, leaseEpoch: linkedRoot.leaseEpoch, proof: linkedStopProof });
+    const linkedStopped = await client.query<{ request_id: string; state: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,state,ctx FROM request_finalize_journal
+        WHERE request_id IN ($1,$2) ORDER BY request_id`,
+      [linkedRoot.requestId, linkedChildId]);
+    assert.equal(linkedStopped.rows.length, 2);
+    assert.ok(linkedStopped.rows.every((row) => row.state === "inflight"
+      && row.ctx.boxState === "failed_stopped" && row.ctx.boxToolHandoff));
+    assert.ok((await journal.listRemoteCleanupCandidates(20)).some((item) =>
+      item.requestId === linkedChildId));
+
     // Queue fairness: malformed oldest rows cannot occupy LIMIT slots; ten
     // proof-less old runs must rotate behind one newer recoverable run even
     // when the tick arrives after the full two-minute retry delay.
