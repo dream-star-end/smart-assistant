@@ -11,6 +11,8 @@ import type { BoxJournalAdmission } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
 import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
+import { recoverBoxBillingRequest } from
+  "../../packages/commercial/src/billing/boxBillingRecovery.js";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { BOX_INTERNAL_ENDPOINT } from
@@ -187,10 +189,36 @@ async function main(): Promise<void> {
       }
       syncDirectory(); lockHeld = true;
     });
-    await client.query(`CREATE TEMP TABLE request_finalize_journal (
-      request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
-      ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
-      error_msg text, failure_code text, final_credits bigint)`);
+    // Shadow every financial relation on this one pinned connection. Nothing
+    // below may read or mutate a persistent wallet, subscription, or ledger.
+    await client.query("CREATE TEMP TABLE request_finalize_journal (LIKE public.request_finalize_journal INCLUDING ALL)");
+    await client.query("CREATE TEMP SEQUENCE box_live_usage_id_seq");
+    await client.query("CREATE TEMP TABLE usage_records (LIKE public.usage_records INCLUDING ALL)");
+    await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_live_usage_id_seq'::regclass)");
+    await client.query("CREATE TEMP TABLE pending_usage_patches (LIKE public.pending_usage_patches INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE users (LIKE public.users INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE user_subscriptions (LIKE public.user_subscriptions INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE org_memberships (LIKE public.org_memberships INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE orgs (LIKE public.orgs INCLUDING ALL)");
+    await client.query("CREATE TEMP TABLE org_subscriptions (LIKE public.org_subscriptions INCLUDING ALL)");
+    await client.query("CREATE TEMP SEQUENCE box_live_ledger_id_seq");
+    await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
+    await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_live_ledger_id_seq'::regclass)");
+    const shadow = await client.query<{ only_temp: boolean }>(`SELECT
+      'request_finalize_journal'::regclass = 'pg_temp.request_finalize_journal'::regclass
+      AND 'usage_records'::regclass = 'pg_temp.usage_records'::regclass
+      AND 'pending_usage_patches'::regclass = 'pg_temp.pending_usage_patches'::regclass
+      AND 'users'::regclass = 'pg_temp.users'::regclass
+      AND 'user_subscriptions'::regclass = 'pg_temp.user_subscriptions'::regclass
+      AND 'org_memberships'::regclass = 'pg_temp.org_memberships'::regclass
+      AND 'orgs'::regclass = 'pg_temp.orgs'::regclass
+      AND 'org_subscriptions'::regclass = 'pg_temp.org_subscriptions'::regclass
+      AND 'credit_ledger'::regclass = 'pg_temp.credit_ledger'::regclass AS only_temp`);
+    assertion(shadow.rows[0]?.only_temp, "BOX_TOOL_FINANCE_SHADOW_INVALID");
+    const initialCredits = 100_000_000n;
+    await client.query(`INSERT INTO users(id,email,password_hash,credits)
+      VALUES ($1,$2,'operator-temp-only',$3)`,
+    [UID.toString(), `${sessionId}@example.invalid`, initialCredits.toString()]);
     tempReady = true;
     const query = async (sql: string, params: unknown[] = []) => {
       assertion(!JSON.stringify(params).includes(localResult), "BOX_TOOL_PRIVATE_SQL_LEAK");
@@ -210,16 +238,19 @@ async function main(): Promise<void> {
       return typeof value === "function" ? value.bind(target) : value;
     } });
     const basis = { model: MODEL, boxInvocationRecovery: "v1",
+      // Deliberately synthetic high credits/token so a real low-token Box
+      // response still proves a debit. This is NOT a launch price assertion.
       billingPricing: { v: 1, modelId: MODEL, displayName: "Opus synthetic",
-        inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1",
-        cacheWritePerMtok: "1", multiplier: "1" },
+        inputPerMtok: "100000000", outputPerMtok: "100000000",
+        cacheReadPerMtok: "100000000", cacheWritePerMtok: "100000000",
+        multiplier: "1" },
       boxBillingContext: { v: 1, sessionId, mode: "chat", parentSessionId: null,
         delegateAgentId: null, turnKey, parentTurnKey: null, authority: null,
         dispatchId: null, attemptNo: null, verificationSponsorship: null,
         apiKeyId: null } };
     const seed = async (requestId: string) => client.query(
-      `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
-       VALUES ($1,$2,'inflight',$3::jsonb)`,
+      `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx,precheck_credits)
+       VALUES ($1,$2,'inflight',$3::jsonb,0)`,
       [requestId, UID.toString(), JSON.stringify(basis)]);
     const resolver = createProductionBoxAccountResolver();
     const service = new BoxToolFetch({
@@ -257,6 +288,8 @@ async function main(): Promise<void> {
     assertion(firstEvents.some((item) => item.event === "message_delta"
       && (item.data.delta as { stop_reason?: unknown } | undefined)?.stop_reason === "tool_use"),
     "BOX_TOOL_PROBE_HANDOFF_INVALID");
+    assertion(await recoverBoxBillingRequest(sameConnection, firstId, UID) === "settled",
+      "BOX_TOOL_HANDOFF_BILLING_NOT_SETTLED");
     // The only tool implementation is here in OpenClaude's operator process;
     // Box receives only schema/pending/result via the virtual MCP.
     localExecutions++;
@@ -285,6 +318,25 @@ async function main(): Promise<void> {
       && (finalRow?.ctx.boxTerminalProof as { reason?: unknown } | undefined)?.reason
         === "worker_complete",
     "BOX_TOOL_PROBE_JOURNAL_NOT_TERMINAL");
+    assertion(await recoverBoxBillingRequest(sameConnection, secondId, UID) === "settled",
+      "BOX_TOOL_FINAL_BILLING_NOT_SETTLED");
+    assertion(await recoverBoxBillingRequest(sameConnection, firstId, UID) === "already_committed"
+      && await recoverBoxBillingRequest(sameConnection, secondId, UID) === "already_committed",
+    "BOX_TOOL_BILLING_REPLAY_NOT_CLOSED");
+    const finance = await client.query<{ count: string; sum: string }>(
+      `SELECT count(*)::text AS count, coalesce(sum(cost_credits),0)::text AS sum
+       FROM usage_records WHERE request_id IN ($1,$2)`, [firstId, secondId]);
+    const ledger = await client.query<{ count: string; sum: string }>(
+      `SELECT count(*)::text AS count, coalesce(sum(delta),0)::text AS sum
+       FROM credit_ledger WHERE user_id=$1`, [UID.toString()]);
+    const balance = await client.query<{ credits: string }>(
+      `SELECT credits::text FROM users WHERE id=$1`, [UID.toString()]);
+    const debited = initialCredits - BigInt(balance.rows[0]?.credits ?? "0");
+    assertion(finance.rows[0]?.count === "2" && ledger.rows[0]?.count === "2"
+      && BigInt(finance.rows[0]?.sum ?? "0") > 0n
+      && debited === BigInt(finance.rows[0]?.sum ?? "0")
+      && BigInt(ledger.rows[0]?.sum ?? "0") === -debited,
+    "BOX_TOOL_REAL_USAGE_LEDGER_MISMATCH");
     terminal = true;
     const pendingCleanup = await service.retryTerminalCleanup();
     const cleanupRow = await client.query<{ cleanup: string | null }>(
@@ -300,6 +352,8 @@ async function main(): Promise<void> {
       modelId: UPSTREAM, detachedAcrossHttp: true,
       localToolExecutions: localExecutions,
       exactFinal: true, terminalRows: rows.rows.length,
+      tempUsageRows: 2, tempLedgerRows: 2, syntheticPriceOnly: true,
+      debitedCredits: debited.toString(),
       firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
       remoteCleanupDone: true, unknown: false, tempOnly: true }) + "\n");
   } catch (error) {
