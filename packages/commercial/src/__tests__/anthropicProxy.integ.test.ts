@@ -989,6 +989,7 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       await client.query("CREATE TEMP TABLE turn_waivers (LIKE public.turn_waivers INCLUDING ALL)");
       await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");
       await client.query("CREATE TEMP TABLE chat_projects (LIKE public.chat_projects INCLUDING ALL)");
+      await client.query("CREATE TEMP TABLE turn_upstream_performance (LIKE public.turn_upstream_performance INCLUDING ALL)");
       await client.query("CREATE TEMP SEQUENCE box_signed_ledger_id_seq");
       await client.query("CREATE TEMP TABLE credit_ledger (LIKE public.credit_ledger INCLUDING ALL)");
       await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_signed_ledger_id_seq'::regclass)");
@@ -1004,13 +1005,23 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
         AND 'turn_waivers'::regclass='pg_temp.turn_waivers'::regclass
         AND 'client_sessions'::regclass='pg_temp.client_sessions'::regclass
         AND 'chat_projects'::regclass='pg_temp.chat_projects'::regclass
+        AND 'turn_upstream_performance'::regclass='pg_temp.turn_upstream_performance'::regclass
         AND 'credit_ledger'::regclass='pg_temp.credit_ledger'::regclass AS only_temp`);
       assert.equal(shadow.rows[0]?.only_temp, true);
+      // The handler's fail-soft observability writes must not silently fall
+      // through to public (or any later unshadowed relation).
+      await client.query("SET search_path TO pg_temp");
+      const path = await client.query<{ search_path: string }>("SHOW search_path");
+      assert.equal(path.rows[0]?.search_path, "pg_temp");
       const initialCredits = 1000n;
       await client.query(`INSERT INTO users(id,email,password_hash,credits)
         VALUES ($1,$2,'temp-only',$3)`, [String(FIXED_USER_ID),
         `${randomUUID()}@example.invalid`, initialCredits.toString()]);
-      const query = client.query.bind(client);
+      const query = (sql: string, params?: unknown[]) => {
+        assert.doesNotMatch(sql, /\bpublic\.|\b(?:SET|RESET)\s+(?:LOCAL\s+)?search_path\b/i,
+          "handler may use only the isolated TEMP search path");
+        return client.query(sql, params);
+      };
       const sameConnection = { query, connect: async () => ({ query, release() {} }),
         async end() {} } as unknown as Pool;
       const { h, headers } = boxRouteHarness();
@@ -1028,8 +1039,11 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       const res = await h.run(request, headers);
       assert.equal(res.statusCode, 200, res.bodyText());
       assert.equal(modelCalls, 1);
-      const usage = await client.query<{ request_id: string; cost_credits: string }>(
-        "SELECT request_id,cost_credits::text FROM usage_records");
+      const usage = await client.query<{ request_id: string; model: string;
+        input_tokens: string; output_tokens: string; cost_credits: string;
+        ledger_id: string | null }>(
+        `SELECT request_id,model,input_tokens::text,output_tokens::text,
+          cost_credits::text,ledger_id::text FROM usage_records`);
       const ledger = await client.query<{ delta: string }>(
         "SELECT delta::text FROM credit_ledger WHERE user_id=$1", [FIXED_USER_ID]);
       const wallet = await client.query<{ credits: string }>(
@@ -1037,9 +1051,17 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       assert.equal(usage.rows.length, 1);
       assert.equal(ledger.rows.length, 1);
       const debit = BigInt(usage.rows[0]!.cost_credits);
-      assert.ok(debit > 0n);
+      assert.equal(usage.rows[0]!.model, BOX_API_MODEL);
+      assert.equal(usage.rows[0]!.input_tokens, "1000");
+      assert.equal(usage.rows[0]!.output_tokens, "5000");
+      assert.equal(debit, 16n, "independent fixed-price expectation: ceil((1000*300+5000*1500)*2/1e6)");
+      assert.ok(usage.rows[0]!.ledger_id);
       assert.equal(BigInt(ledger.rows[0]!.delta), -debit);
       assert.equal(BigInt(wallet.rows[0]!.credits), initialCredits - debit);
+      const performance = await client.query<{ request_id: string; model: string;
+        outcome: string }>("SELECT request_id,model,outcome FROM turn_upstream_performance");
+      assert.deepEqual(performance.rows, [{ request_id: usage.rows[0]!.request_id,
+        model: BOX_API_MODEL, outcome: "success" }]);
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
