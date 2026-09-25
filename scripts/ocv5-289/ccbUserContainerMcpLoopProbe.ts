@@ -10,10 +10,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateBoxRequest } from
   "../../packages/commercial/src/http/proxy/boxRequestGate.js";
-import { deriveBoxContextHash } from
+import { deriveBoxContextHash, hashBoxAssistantContent } from
   "../../packages/commercial/src/http/proxy/boxCallFingerprint.js";
 import { matchBoxToolResults } from
   "../../packages/commercial/src/http/proxy/boxToolResultMatcher.js";
+import { normalizeBoxSemanticBody } from
+  "../../packages/commercial/src/http/proxy/boxCacheAnnotations.js";
 import type { ProxyBody } from
   "../../packages/commercial/src/http/proxy/shared.js";
 
@@ -28,6 +30,7 @@ const toolId = `toolu_local_${nonce}`;
 let first = 0, second = 0, resultMatched = false;
 const requestModels: string[] = [];
 const replyModel = process.env.OCV5_289_SYNTHETIC_REPLY_MODEL;
+const syntheticThinking = process.env.OCV5_289_SYNTHETIC_THINKING === "1";
 let firstBody: ProxyBody | null = null;
 let continuation: Record<string, unknown> | null = null;
 const server = createServer(async (req, res) => {
@@ -58,10 +61,17 @@ const server = createServer(async (req, res) => {
       boxName: "mcp__ocbridge__t0", input: {} }]); }
     catch (error) { matcher = error instanceof Error ? error.message : "match-error"; }
     const tail = (body.messages ?? []).at(-1) as Record<string, unknown> | undefined;
+    const assistant = normalizeBoxSemanticBody(proxyBody).messages.at(-2) as
+      Record<string, unknown> | undefined;
+    const assistantContent = Array.isArray(assistant?.content) ? assistant.content : [];
     const priorSystem = firstBody?.messages.at(-1) as Record<string, unknown> | undefined;
     continuation = { roles, lastIsToolResultUser: roles.at(-1) === "user",
       gate: validateBoxRequest(proxyBody, true), prefixMatch, matcher,
-      trailingSystem: tail?.role === "system" ? {
+       assistantShape: assistantContent.map((part) => part && typeof part === "object"
+         ? { type: (part as Record<string, unknown>).type,
+           keys: Object.keys(part as Record<string, unknown>).sort() } : { type: typeof part }),
+       assistantHash: assistantContent.length ? hashBoxAssistantContent(assistantContent) : null,
+       trailingSystem: tail?.role === "system" ? {
         keys: Object.keys(tail).sort(), contentEmpty: tail.content === ""
           || Array.isArray(tail.content) && tail.content.length === 0,
         contentKind: typeof tail.content,
@@ -86,11 +96,21 @@ const server = createServer(async (req, res) => {
     model: replyModel ?? body.model, content: [],
     usage: { input_tokens: 5, output_tokens: 0 } } });
   if (second === 0) {
-    event("content_block_start", { type: "content_block_start", index: 0,
-      content_block: { type: "tool_use", id: toolId, name: toolName, input: {} } });
-    event("content_block_delta", { type: "content_block_delta", index: 0,
-      delta: { type: "input_json_delta", partial_json: "{}" } });
-    event("content_block_stop", { type: "content_block_stop", index: 0 });
+    if (syntheticThinking) {
+      event("content_block_start", { type: "content_block_start", index: 0,
+        content_block: { type: "thinking", thinking: "" } });
+      event("content_block_delta", { type: "content_block_delta", index: 0,
+        delta: { type: "thinking_delta", thinking: "Synthetic private reasoning." } });
+      event("content_block_delta", { type: "content_block_delta", index: 0,
+        delta: { type: "signature_delta", signature: "synthetic-signature" } });
+      event("content_block_stop", { type: "content_block_stop", index: 0 });
+    }
+    const toolIndex = syntheticThinking ? 1 : 0;
+    event("content_block_start", { type: "content_block_start", index: toolIndex,
+       content_block: { type: "tool_use", id: toolId, name: toolName, input: {} } });
+    event("content_block_delta", { type: "content_block_delta", index: toolIndex,
+       delta: { type: "input_json_delta", partial_json: "{}" } });
+    event("content_block_stop", { type: "content_block_stop", index: toolIndex });
   } else {
     event("content_block_start", { type: "content_block_start", index: 0,
       content_block: { type: "text", text: "" } });
@@ -151,7 +171,13 @@ async function main(): Promise<void> {
       || continuation.matcher !== "ok") {
       throw new Error("CCB_LOCAL_MCP_LOOP_FAILED");
     }
-    process.stdout.write(JSON.stringify({ ccbUserContainer: true, paidCalls: 0,
+     process.stdout.write(JSON.stringify({ ccbUserContainer: true, paidCalls: 0,
+       syntheticThinking,
+       expectedAssistantHash: hashBoxAssistantContent(syntheticThinking
+         ? [{ type: "thinking", thinking: "Synthetic private reasoning.",
+           signature: "synthetic-signature" },
+           { type: "tool_use", id: toolId, name: toolName, input: {} }]
+         : [{ type: "tool_use", id: toolId, name: toolName, input: {} }]),
       firstRequests: first, secondRequests: second, localToolUsedOnce: true,
       toolResultExact: true, finalExact: true, stderrBytes,
       requestModels, replyModel: replyModel ?? requestModels[0],

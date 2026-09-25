@@ -18,8 +18,10 @@ import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
 import { makeBoxDetachedToolPlan } from
   "../../packages/commercial/src/http/proxy/boxDetachedToolPlan.js";
-import { deriveBoxCallFingerprint } from
+import { deriveBoxCallFingerprint, hashBoxAssistantContent } from
   "../../packages/commercial/src/http/proxy/boxCallFingerprint.js";
+import { normalizeBoxSemanticBody } from
+  "../../packages/commercial/src/http/proxy/boxCacheAnnotations.js";
 import { validateBoxRequest, validateBoxToolRequest } from
   "../../packages/commercial/src/http/proxy/boxRequestGate.js";
 import { createProductionBoxAccountResolver } from
@@ -173,6 +175,9 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   listenPort?: number; assignedRequestIds?: readonly string[];
   shapeOnly?: boolean }) {
   const diagnostics: Array<{ msg: string; code?: string; detail?: string }> = [];
+  const continuationEvidence: Array<{ requestId: string; assistantHash: string | null;
+    assistantShape: Array<{ type: unknown; keys: string[] }>;
+    messageRoles: string[]; parseCode: string }> = [];
   const pricing = new PricingCache();
   pricing._setForTests([args.price]);
   const entry: ModelCatalogEntry = {
@@ -263,6 +268,37 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
       res.writeHead(409); res.end(); return;
     }
     req.headers["x-request-id"] = requestId;
+    // Observe the real CCB continuation in memory only. No prompt, private
+    // tool result, auth header, or model text is ever logged or persisted.
+    if (args.assignedRequestIds?.[1] === requestId && !args.shapeOnly) {
+      const parts: Buffer[] = []; let size = 0;
+      req.on("data", (chunk: Buffer) => {
+        size += chunk.length;
+        if (size <= 2_000_000) parts.push(Buffer.from(chunk));
+      });
+      req.on("end", () => {
+        let parseCode = "ok", assistantHash: string | null = null;
+        let assistantShape: Array<{ type: unknown; keys: string[] }> = [];
+        let messageRoles: string[] = [];
+        try {
+          if (size > 2_000_000) throw new Error("BODY_TOO_LARGE");
+          const parsed = JSON.parse(Buffer.concat(parts).toString("utf8")) as ProxyBody;
+          const effective = normalizeBoxSemanticBody(parsed);
+          messageRoles = effective.messages.map((item) => item.role).slice(0, 64);
+          const content = (effective.messages.at(-2) as { content?: unknown } | undefined)?.content;
+          if (!Array.isArray(content)) throw new Error("ASSISTANT_NOT_ARRAY");
+          assistantHash = hashBoxAssistantContent(content);
+          assistantShape = content.map((block: unknown) => block && typeof block === "object"
+            && !Array.isArray(block) ? { type: (block as Record<string, unknown>).type,
+              keys: Object.keys(block).sort() } : { type: typeof block, keys: [] });
+        } catch (error) {
+          parseCode = error instanceof Error && /^[A-Z][A-Z0-9_]{1,80}$/.test(error.message)
+            ? error.message : "CAPTURE_FAILED";
+        }
+        continuationEvidence.push({ requestId, assistantHash,
+          assistantShape, messageRoles, parseCode });
+      });
+    }
     if (args.shapeOnly) {
       void (async () => {
         if (req.headers.authorization !== `Bearer oc-v3.${containerId}.${secretHex}`
@@ -348,6 +384,7 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   assertion(address && typeof address !== "string", "BOX_SIGNED_LISTENER_INVALID");
   return {
     diagnostics,
+    continuationEvidence,
     shapes,
     observedRequestIds(): string[] {
       return args.shapeOnly ? shapes.map((item) => item.requestId) : [...inFlight.keys()];
@@ -1010,11 +1047,15 @@ async function main(): Promise<void> {
       : { rows: [] as Array<{ request_id: string; ctx: Record<string, unknown> }> };
     const evidence = observed.rows.map((row) => ({ requestId: row.request_id,
       state: row.ctx.boxState, runNonce: row.ctx.boxRunNonce,
-      leaseEpoch: row.ctx.boxLeaseEpoch }));
+      leaseEpoch: row.ctx.boxLeaseEpoch,
+      assistantHash: row.ctx.boxToolHandoff && typeof row.ctx.boxToolHandoff === "object"
+        ? (row.ctx.boxToolHandoff as { assistantContentHash?: unknown }).assistantContentHash
+        : null }));
     process.stderr.write(JSON.stringify({ code: error instanceof Error
       && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "BOX_TOOL_PROBE_FAILED",
       terminal, unknownPhase, evidencePath: lockHeld ? EVIDENCE_PATH : null,
-      evidence }) + "\n");
+       evidence, continuationEvidence: loopback?.continuationEvidence,
+       diagnostics: loopback?.diagnostics.slice(-12) }) + "\n");
     throw error;
   } finally {
     if (oldModelFlag === undefined) delete process.env.OC_BOX_MODEL_API;
