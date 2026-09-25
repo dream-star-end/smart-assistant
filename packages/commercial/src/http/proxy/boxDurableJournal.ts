@@ -1284,6 +1284,33 @@ export class BoxDurableJournal implements BoxJournalPort {
     return found.rows[0]?.status === "done" ? "done" : "pending";
   }
 
+  /** The original egress may still own a local ProxyAgent after the shared
+   * worker cleaned the remote run. Only this exact proven/done row permits
+   * disposing that local handle; this does not touch the remote Box. */
+  async remoteCleanupDoneByRunIdentity(input: Pick<BoxJournalAdmission,
+    "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<boolean> {
+    if (input.uid <= 0n || input.accountId <= 0n
+      || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) return false;
+    const found = await this.pool.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
+          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxRemoteCleanup'='done'
+          AND ${CLEANUP_PROOF_FENCE}`,
+      [input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch]);
+    const ctx = found.rows[0]?.ctx;
+    if (found.rowCount !== 1 || !ctx) return false;
+    try {
+      const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
+        { runNonce: input.runNonce, leaseEpoch: input.leaseEpoch });
+      return cleanupProofMatchesState(ctx.boxState, proof);
+    } catch { return false; }
+  }
+
   async markRemoteCleaned(input: BoxRemoteCleanupCandidate): Promise<void> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
       || input.uid <= 0n || input.accountId <= 0n

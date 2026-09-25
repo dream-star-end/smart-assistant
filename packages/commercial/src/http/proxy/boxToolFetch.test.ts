@@ -41,7 +41,8 @@ test("same internal model fetch streams first handoff then next final without to
     onUnknown: async () => {},
     runFirst: (async (input: { emit: (sse: string) => void }) => {
       calls.push("first"); input.emit("event: message_stop\ndata: {}\n\n");
-      return { kind: "tool_handoff", plan: { runNonce: claim.runNonce }, target };
+      return { kind: "tool_handoff", plan: { runNonce: claim.runNonce,
+        leaseEpoch: claim.leaseEpoch }, target };
     }) as never,
     publishResume: (async () => { calls.push("claim-and-publish");
       return { claim, target, access: {} }; }) as never,
@@ -263,6 +264,39 @@ test("worker that lost cleanup claim releases local target once peer marked exac
   assert.match(await response.text(), /message_stop/);
   assert.equal(remoteCalls, 0);
   assert.equal(disposed, true);
+});
+
+test("shared worker done after handoff reaps original egress target without another remote Exec", async () => {
+  let done = false, disposed = 0, remoteCalls = 0;
+  const nonce = "7".repeat(24), epoch = "8".repeat(32);
+  const target = { accountId: 20n,
+    exec: { run: async () => { remoteCalls++; throw new Error("no remote replay"); } },
+    dispose: async () => { disposed++; } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { remoteCleanupDoneByRunIdentity: async (identity: {
+      uid: bigint; accountId: bigint; runNonce: string; leaseEpoch: string }) => {
+      assert.deepEqual(identity, { uid: 3n, accountId: 20n,
+        runNonce: nonce, leaseEpoch: epoch });
+      return done;
+    }, listRemoteCleanupCandidates: async () => [] } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never,
+    onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void }) => {
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "tool_handoff", plan: { runNonce: nonce,
+        leaseEpoch: epoch }, target };
+    }) as never,
+  });
+  assert.match(await (await service.fetch(call(firstBody))).text(), /message_stop/);
+  assert.equal(await service.retryTerminalCleanup(), 0);
+  assert.equal(disposed, 0);
+  done = true;
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  assert.equal(disposed, 1);
+  assert.equal(remoteCalls, 0);
 });
 
 test("cleanup status query failure never poisons an already-final SSE response", async () => {

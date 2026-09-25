@@ -527,6 +527,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(afterDone.rows[0]?.updated_at.getTime(),
       beforeCleanup.rows[0]?.updated_at.getTime());
     assert.equal(await journal.remoteCleanupStatus(finalCleanup!), "done");
+    assert.equal(await journal.remoteCleanupDoneByRunIdentity({ uid: 3n,
+      accountId: finalCleanup!.accountId, runNonce: finalCleanup!.runNonce,
+      leaseEpoch: finalCleanup!.leaseEpoch }), true);
+    assert.equal(await journal.remoteCleanupDoneByRunIdentity({ uid: 3n,
+      accountId: finalCleanup!.accountId, runNonce: finalCleanup!.runNonce,
+      leaseEpoch: "0".repeat(32) }), false);
     assert.ok(!(await journal.listRemoteCleanupCandidates()).some((item) =>
       item.requestId === `box-e-${suffix}`));
     await assert.rejects(() => journal.completeToolChain({

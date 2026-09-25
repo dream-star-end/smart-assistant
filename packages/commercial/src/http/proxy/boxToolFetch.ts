@@ -30,6 +30,8 @@ function resumeShape(body: ProxyBody): boolean {
 
 export class BoxToolFetch {
   private readonly targets = new Map<string, Set<BoxResolvedTarget>>();
+  private readonly ownedRunIdentity = new Map<string, { uid: bigint;
+    accountId: bigint; runNonce: string; leaseEpoch: string }>();
   private readonly terminalCleanup = new Map<string, { target: BoxResolvedTarget;
     candidate: BoxRemoteCleanupCandidate; claimed: boolean }>();
   private readonly terminalInFlight = new Map<string, Promise<void>>();
@@ -55,7 +57,16 @@ export class BoxToolFetch {
     cleanupResolveTimeoutMs?: number;
   }) {}
 
-  private own(nonce: string, target: BoxResolvedTarget): void {
+  private own(nonce: string, target: BoxResolvedTarget, uid: bigint,
+    leaseEpoch: string): void {
+    const existing = this.ownedRunIdentity.get(nonce);
+    if (existing && (existing.uid !== uid || existing.accountId !== target.accountId
+      || existing.leaseEpoch !== leaseEpoch)) {
+      this.closeUnusedTarget(target);
+      throw new Error("BOX_LOCAL_OWNER_MISMATCH");
+    }
+    this.ownedRunIdentity.set(nonce, { uid, accountId: target.accountId,
+      runNonce: nonce, leaseEpoch });
     let group = this.targets.get(nonce);
     if (!group) { group = new Set(); this.targets.set(nonce, group); }
     group.add(target);
@@ -149,7 +160,21 @@ export class BoxToolFetch {
         await this.releaseLocalTargets(nonce);
       }
     }));
+    await this.reapCleanedOwnedTargets();
     return this.terminalCleanup.size;
+  }
+
+  private async reapCleanedOwnedTargets(): Promise<void> {
+    await Promise.allSettled([...this.ownedRunIdentity].map(async ([nonce, identity]) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const done = await Promise.race([
+          this.deps.journal.remoteCleanupDoneByRunIdentity(identity),
+          new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), 2_000); }),
+        ]);
+        if (done) await this.releaseLocalTargets(nonce);
+      } finally { if (timer) clearTimeout(timer); }
+    }));
   }
 
   /** Restart-safe takeover: a new egress process can find already-proven
@@ -177,12 +202,13 @@ export class BoxToolFetch {
           }
           held = { target, candidate, claimed: true };
           this.terminalCleanup.set(candidate.runNonce, held);
-          this.own(candidate.runNonce, target);
+          this.own(candidate.runNonce, target, candidate.uid, candidate.leaseEpoch);
         }
         held.claimed = true;
         await this.cleanKnownTerminal(candidate.runNonce, held.target, candidate);
       } finally { this.reconcileInFlight.delete(candidate.runNonce); }
     }));
+    await this.reapCleanedOwnedTargets();
     return this.terminalCleanup.size;
   }
 
@@ -214,6 +240,7 @@ export class BoxToolFetch {
 
   private async releaseLocalTargets(runNonce: string): Promise<void> {
     this.terminalCleanup.delete(runNonce);
+    this.ownedRunIdentity.delete(runNonce);
     const group = this.targets.get(runNonce);
     if (!group) return;
     this.targets.delete(runNonce);
@@ -270,17 +297,20 @@ export class BoxToolFetch {
               ?? publishBoxToolResume)({ ...args, init }, {
               journal: this.deps.journal,
               resolveTarget: (input) => this.deps.resolveTarget(input),
-              retainUnknownTarget: ({ target, claim }) => this.own(claim.runNonce, target),
+              retainUnknownTarget: ({ target, claim }) => this.own(claim.runNonce,
+                target, args.uid, claim.leaseEpoch),
               onUnknown: this.deps.onUnknown,
             });
-            this.own(published.claim.runNonce, published.target);
+            this.own(published.claim.runNonce, published.target,
+              args.uid, published.claim.leaseEpoch);
             const result = await (this.deps.runContinuation ?? runBoxToolContinuation)({
               published, uid: args.uid, requestId: args.requestId,
               canonicalBody: args.canonicalBody, upstreamModel: args.upstreamModel,
               signal: abort.signal, emit,
             }, { journal: this.deps.journal,
               retainUnknownTarget: ({ published: held }) =>
-                this.own(held.claim.runNonce, held.target),
+                this.own(held.claim.runNonce, held.target,
+                  args.uid, held.claim.leaseEpoch),
               onUnknown: this.deps.onUnknown });
             if (result.kind === "final") {
               await this.releaseAfterProof({ requestId: args.requestId,
@@ -299,10 +329,12 @@ export class BoxToolFetch {
               maxOutputTokensForModel: this.deps.maxOutputTokensForModel,
               resolveTarget: (input) => this.deps.resolveTarget(input),
               onUnknown: this.deps.onUnknown,
-              retainUnknownTarget: ({ target, plan }) => this.own(plan.runNonce, target),
+              retainUnknownTarget: ({ target, plan }) => this.own(plan.runNonce,
+                target, args.uid, plan.leaseEpoch),
               retainCleanupTarget: (handle) => this.retainCleanup(handle),
             });
-            this.own(outcome.plan.runNonce, outcome.target);
+            this.own(outcome.plan.runNonce, outcome.target,
+              args.uid, outcome.plan.leaseEpoch);
             if (outcome.kind === "final") {
               await this.releaseAfterProof({ requestId: args.requestId,
                 uid: args.uid, accountId: outcome.target.accountId,
