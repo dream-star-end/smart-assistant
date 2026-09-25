@@ -308,7 +308,8 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
  * are never printed, put in argv, or written to a persistent file. */
 async function runContainerCcbPreflight(input: { baseUrl: string;
   authToken: string; catalogToken: string; turnKey: string }): Promise<{
-  exitCode: number; stdoutBytes: number; stderrBytes: number }> {
+  exitCode: number; stdoutBytes: number; stderrBytes: number;
+  stderrTail: string }> {
   const python = `import json,os,sys
 cfg=json.load(sys.stdin)
 env=os.environ.copy()
@@ -332,6 +333,7 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
   const cfg = JSON.stringify(input);
   child.stdin.end(cfg);
   let stdoutBytes = 0, stderrBytes = 0;
+  let stderrTail = "";
   let outputExceeded = false;
   child.stdout.on("data", (chunk: Buffer) => {
     stdoutBytes += chunk.length;
@@ -341,6 +343,7 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
   });
   child.stderr.on("data", (chunk: Buffer) => {
     stderrBytes += chunk.length;
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-2048);
     if (stderrBytes > 500_000) {
       outputExceeded = true; child.kill("SIGTERM");
     }
@@ -356,7 +359,9 @@ os.execvpe("claude",["claude","-p","Reply with exactly READY. Do not use tools."
     if (hostTimedOut || outputExceeded || closed.signal !== null) {
       throw new Error("BOX_CCB_PROCESS_UNCONFIRMED");
     }
-    return { exitCode: closed.code, stdoutBytes, stderrBytes };
+    return { exitCode: closed.code, stdoutBytes, stderrBytes,
+      stderrTail: stderrTail.replaceAll(input.authToken, "[synthetic-auth]")
+        .replaceAll(input.catalogToken, "[synthetic-catalog]").slice(-300) };
   } finally { clearTimeout(timeout); }
 }
 
@@ -546,6 +551,11 @@ async function main(): Promise<void> {
       const observed = loopback.observedRequestIds();
       const usage = await client.query("SELECT 1 FROM usage_records WHERE request_id=ANY($1::text[])",
         [observed]);
+      process.stderr.write(JSON.stringify({ code: "BOX_CCB_PREFLIGHT_OBSERVED",
+        requestIds: observed, transportCalls, paidCalls,
+        exitCode: result.exitCode, stdoutBytes: result.stdoutBytes,
+        stderrBytes: result.stderrBytes, stderrTail: result.stderrTail,
+        shapes: loopback.shapes, diagnostics: loopback.diagnostics.slice(-8) }) + "\n");
       assertion(observed.length >= 1 && observed.length <= 2
         && transportCalls === 0 && paidCalls === 0
         && result.exitCode !== 124 && result.exitCode !== 137
