@@ -62,3 +62,16 @@ test("only validated wrapper hints are ignored; nested tool input remains semant
     messages: [{ role: "user", content: [{ type: "text", text: "hello",
       cache_control: { type: "persistent" } }] }] }), /BOX_CACHE_ANNOTATION_INVALID/);
 });
+
+test("Opus 5.5 keep-all thinking edit is a semantic no-op for replay and resume", () => {
+  const plain = { ...first, messages: [{ role: "user", content: "hello" }] } as ProxyBody;
+  const keepAll = { ...plain, context_management: {
+    edits: [{ type: "clear_thinking_20251015", keep: "all" }] } } as ProxyBody;
+  assert.equal(deriveBoxContextHash(plain), deriveBoxContextHash(keepAll));
+  assert.equal(deriveBoxCallFingerprint(3n, plain).replayFingerprint,
+    deriveBoxCallFingerprint(3n, keepAll).replayFingerprint);
+  assert.equal(Object.hasOwn(normalizeBoxSemanticBody(keepAll), "context_management"), false);
+  const edit = { ...keepAll, context_management: {
+    edits: [{ type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 1 } }] } };
+  assert.notEqual(deriveBoxContextHash(plain), deriveBoxContextHash(edit));
+});

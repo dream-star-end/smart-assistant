@@ -63,6 +63,15 @@ test("unsupported tool choice and thinking budget fail before a Box request exis
   /BOX_EFFORT_UNMAPPED/);
 });
 
+test("real CCB keep-all thinking context and omitted display preserve tool plan", () => {
+  const current = { ...body,
+    context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
+    thinking: { type: "adaptive" } } as ProxyBody;
+  const plan = makeBoxToolPlan({ ...assets, body: current });
+  assert.equal(plan.run.args[plan.run.args.indexOf("--effort") + 1], "medium");
+  assert.equal(plan.catalog.tools[0]?.name, "t0");
+});
+
 test("tool catalog is actually staged into a private run dir and removed after known cleanup", () => {
   const plan = makeBoxToolPlan({ ...assets, body,
     runNonce: randomBytes(12).toString("hex") });

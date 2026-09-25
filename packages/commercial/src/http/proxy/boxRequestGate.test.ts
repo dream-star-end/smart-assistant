@@ -19,6 +19,14 @@ test("Box text route accepts only proved completed-history text shape", () => {
     "BOX_EFFORT_UNMAPPED");
   assert.equal(validateBoxTextRequest({ ...base, context_management: {} }),
     "BOX_PARAMETER_UNMAPPED");
+  const keepAll = { edits: [{ type: "clear_thinking_20251015", keep: "all" }] };
+  assert.equal(validateBoxTextRequest({ ...base, context_management: keepAll }), null);
+  assert.equal(validateBoxTextRequest({ ...base, context_management: {
+    edits: [{ type: "clear_thinking_20251015", keep: "all", extra: true }] } }),
+  "BOX_PARAMETER_UNMAPPED");
+  assert.equal(validateBoxTextRequest({ ...base, context_management: {
+    edits: [{ type: "clear_thinking_20251015", keep: { type: "thinking_turns", value: 1 } }] } }),
+  "BOX_PARAMETER_UNMAPPED");
   assert.equal(validateBoxTextRequest({ ...base, messages: [
     { role: "user", content: [{ type: "image", source: { type: "base64", data: "abc" } }] },
   ] }), "BOX_BLOCK_UNSUPPORTED");
@@ -45,6 +53,13 @@ test("tool bridge gate is explicit and validates first and next HTTP rounds", ()
       content: "OpenClaude user-container result" }] },
   ] } as ProxyBody;
   assert.equal(validateBoxToolRequest(next), null);
+  const realCcb = { ...first,
+    context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
+    thinking: { type: "adaptive" } } as ProxyBody;
+  assert.equal(validateBoxToolRequest(realCcb), null);
+  assert.equal(validateBoxToolRequest({ ...realCcb, context_management: {
+    edits: [{ type: "clear_tool_uses_20250919", keep: "all" }] } }),
+  "BOX_PARAMETER_UNMAPPED");
   assert.equal(validateBoxToolRequest({ ...first, tool_choice: {
     type: "tool", name: "local_echo" } }), "BOX_TOOL_CHOICE_UNMAPPED");
   assert.equal(validateBoxToolRequest({ ...first,

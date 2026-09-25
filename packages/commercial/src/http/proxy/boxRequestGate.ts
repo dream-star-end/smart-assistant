@@ -5,12 +5,16 @@
 import type { ProxyBody } from "./shared.js";
 import { BoxMessagesShapeError, compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { compileBoxToolCatalog, mapBoxCliEffort } from "./boxToolCatalog.js";
+import { isBoxNoopContextManagement } from "./boxCacheAnnotations.js";
 
 export function validateBoxTextRequest(body: ProxyBody): string | null {
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
   if (body.tools?.length || body.tool_choice !== undefined) return "BOX_TOOLS_REQUIRE_LIVE_BRIDGE";
   if (body.thinking !== undefined || body.output_config !== undefined) return "BOX_EFFORT_UNMAPPED";
-  if (body.context_management !== undefined || body.stop_sequences !== undefined
+  if (body.context_management !== undefined && !isBoxNoopContextManagement(body)) {
+    return "BOX_PARAMETER_UNMAPPED";
+  }
+  if (body.stop_sequences !== undefined
     || body.temperature !== undefined || body.top_p !== undefined
     || body.top_k !== undefined || body.service_tier !== undefined) {
     return "BOX_PARAMETER_UNMAPPED";
@@ -39,7 +43,10 @@ export function validateBoxToolRequest(body: ProxyBody): string | null {
     || (body.tool_choice as { type?: unknown }).type !== "auto")) {
     return "BOX_TOOL_CHOICE_UNMAPPED";
   }
-  if (body.context_management !== undefined || body.stop_sequences !== undefined
+  if (body.context_management !== undefined && !isBoxNoopContextManagement(body)) {
+    return "BOX_PARAMETER_UNMAPPED";
+  }
+  if (body.stop_sequences !== undefined
     || body.temperature !== undefined || body.top_p !== undefined
     || body.top_k !== undefined || body.service_tier !== undefined) {
     return "BOX_PARAMETER_UNMAPPED";

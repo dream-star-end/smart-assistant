@@ -73,6 +73,8 @@ test("duplicate, malformed, oversized and dangerous tool declarations fail close
 test("default real CCB adaptive-medium effort maps exactly, unsupported settings reject", () => {
   assert.equal(mapBoxCliEffort({ type: "adaptive", display: "omitted" },
     { effort: "medium" }), "medium");
+  assert.equal(mapBoxCliEffort({ type: "adaptive" }, { effort: "medium" }), "medium",
+    "real CCB2.1.280 omits the optional display field");
   for (const effort of ["low", "high", "max"] as const) {
     assert.equal(mapBoxCliEffort({ type: "adaptive", display: "omitted" },
       { effort }), effort);
@@ -80,6 +82,7 @@ test("default real CCB adaptive-medium effort maps exactly, unsupported settings
   for (const args of [
     [{ type: "enabled", budget_tokens: 1024 }, { effort: "medium" }],
     [{ type: "adaptive", display: "omitted" }, { effort: "xhigh" }],
+    [{ type: "adaptive", display: "summarized" }, { effort: "medium" }],
     [{ type: "adaptive", display: "omitted" }, { effort: "medium", format: "json" }],
     [undefined, { effort: "medium" }],
   ]) {

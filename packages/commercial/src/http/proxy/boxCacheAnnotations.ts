@@ -61,18 +61,42 @@ export function normalizeBoxAssistantContent(raw: unknown): unknown {
 export function normalizeBoxToolResultBlock(raw: unknown): unknown {
   return block(raw, ["tool_result"]);
 }
+/** Anthropic context editing with keep=all makes no edit for Opus 5.5.
+ * Accept only the exact current CCB2.1.280 shape; all other policies require
+ * a separately proved mapping and remain rejected before any paid launch. */
+export function isBoxNoopContextManagement(body: ProxyBody): boolean {
+  if (body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5") {
+    return false;
+  }
+  const ctx = body.context_management;
+  if (!object(ctx) || Object.keys(ctx).join(",") !== "edits"
+    || !Array.isArray(ctx.edits) || ctx.edits.length !== 1
+    || !Object.hasOwn(ctx.edits, 0)) return false;
+  const edit = ctx.edits[0];
+  return object(edit) && Object.keys(edit).sort().join(",") === "keep,type"
+    && edit.type === "clear_thinking_20251015" && edit.keep === "all";
+}
 export function normalizeBoxSemanticBody(body: ProxyBody,
   options: { collapseSingleText?: boolean } = {}): ProxyBody {
+  // A validated keep-all hint has no model-visible effect. Drop it from the
+  // semantic request hash as well as the CLI plan so a retry with/without the
+  // hint cannot evade the same paid-call replay fingerprint.
+  let semanticBody = body;
+  if (isBoxNoopContextManagement(body)) {
+    const { context_management: _hint, ...rest } = body;
+    semanticBody = rest as ProxyBody;
+  }
   const collapse = options.collapseSingleText !== false;
-  const messages = body.messages.map((raw) => {
+  const messages = semanticBody.messages.map((raw) => {
     if (!object(raw)) return raw;
     const allowed = raw.role === "assistant" ? ["text", "tool_use"]
       : ["text", "tool_result", "image"];
     return { ...raw, content: content(raw.content, allowed, collapse) };
   });
-  const system = content(body.system, ["text"], collapse);
-  const tools = Array.isArray(body.tools)
-    ? body.tools.map(normalizeBoxToolDeclaration) : body.tools;
-  return { ...body, messages, ...(body.system === undefined ? {} : { system }),
-    ...(body.tools === undefined ? {} : { tools }) } as ProxyBody;
+  const system = content(semanticBody.system, ["text"], collapse);
+  const tools = Array.isArray(semanticBody.tools)
+    ? semanticBody.tools.map(normalizeBoxToolDeclaration) : semanticBody.tools;
+  return { ...semanticBody, messages,
+    ...(semanticBody.system === undefined ? {} : { system }),
+    ...(semanticBody.tools === undefined ? {} : { tools }) } as ProxyBody;
 }

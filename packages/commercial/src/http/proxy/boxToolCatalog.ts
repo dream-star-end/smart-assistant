@@ -100,11 +100,13 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
     bindingSha256: createHash("sha256").update(bindingJson).digest("hex"), json };
 }
 
-/** Current real Claude Code 2.1.280 default is adaptive/omitted + medium.
- * Do not silently coerce fixed-budget thinking or unsupported effort levels. */
+/** Current real Claude Code 2.1.280 sends adaptive (display omitted) + medium.
+ * The API makes display optional for adaptive thinking; on Opus 5.5 the
+ * omitted display maps to the same CLI behavior as explicit "omitted".
+ * Do not coerce summarized or fixed-budget thinking. */
 export function mapBoxCliEffort(thinking: unknown, outputConfig: unknown): "low" | "medium" | "high" | "max" {
   if (!record(thinking) || thinking.type !== "adaptive"
-    || thinking.display !== "omitted"
+    || (thinking.display !== undefined && thinking.display !== "omitted")
     || Object.keys(thinking).some((key) => key !== "type" && key !== "display")
     || !record(outputConfig) || typeof outputConfig.effort !== "string"
     || Object.keys(outputConfig).some((key) => key !== "effort")) {
