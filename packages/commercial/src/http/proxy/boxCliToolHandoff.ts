@@ -69,6 +69,16 @@ interface ActiveBlock {
   startInput?: Obj;
   text: string;
   partial: string;
+  start: Obj;
+  thinking?: string;
+  signature?: string;
+}
+
+interface CompletedBlock {
+  type: string;
+  use?: BoxToolUse;
+  upstream: Obj;
+  visible: Obj;
 }
 
 export class BoxCliToolHandoffDecoder {
@@ -89,7 +99,7 @@ export class BoxCliToolHandoffDecoder {
   private nextIndex = 0;
   private lastOriginalIndex = -1;
   private active: ActiveBlock | null = null;
-  private blocks: Array<{ type: string; text?: string; use?: BoxToolUse }> = [];
+  private blocks: CompletedBlock[] = [];
   private snapshot: Obj | null = null;
   private heldTerminal: string[] = [];
   private candidate: BoxToolHandoffCandidate | null = null;
@@ -289,9 +299,18 @@ export class BoxCliToolHandoffDecoder {
       if (type === "text" && typeof block.text !== "string") {
         throw new BoxCliToolHandoffError("BOX_TOOL_BLOCK_INVALID");
       }
+      if ((type === "thinking" && block.thinking !== undefined
+          && typeof block.thinking !== "string")
+        || (type === "redacted_thinking" && typeof block.data !== "string")
+        || (block.signature !== undefined && typeof block.signature !== "string")) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_BLOCK_INVALID");
+      }
       const active: ActiveBlock = { original: index as number,
         visible: this.nextIndex++, type: type as string,
-        text: type === "text" ? block.text as string : "", partial: "" };
+        text: type === "text" ? block.text as string : "", partial: "",
+        start: { ...block },
+        thinking: typeof block.thinking === "string" ? block.thinking : undefined,
+        signature: typeof block.signature === "string" ? block.signature : undefined };
       if (type === "tool_use") {
         if (typeof block.id !== "string" || !TOOL_ID.test(block.id)
           || typeof block.name !== "string"
@@ -328,8 +347,11 @@ export class BoxCliToolHandoffDecoder {
             throw new BoxCliToolHandoffError("BOX_TOOL_DELTA_INVALID");
           }
           this.active.text += delta.text;
-        } else if (!((delta.type === "thinking_delta" && typeof delta.thinking === "string")
-          || (delta.type === "signature_delta" && typeof delta.signature === "string"))) {
+        } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+          this.active.thinking = (this.active.thinking ?? "") + delta.thinking;
+        } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
+          this.active.signature = (this.active.signature ?? "") + delta.signature;
+        } else {
           throw new BoxCliToolHandoffError("BOX_TOOL_DELTA_INVALID");
         }
       } else {
@@ -345,9 +367,18 @@ export class BoxCliToolHandoffDecoder {
           if (this.blocks.some((item) => item.use?.id === this.active!.id)) {
             throw new BoxCliToolHandoffError("BOX_TOOL_DUPLICATE_ID");
           }
-          this.blocks.push({ type: "tool_use", use: { id: this.active.id!,
-            boxName: this.active.boxName!, clientName: this.active.clientName!, input } });
-        } else this.blocks.push({ type: this.active.type, text: this.active.text });
+          const use = { id: this.active.id!, boxName: this.active.boxName!,
+            clientName: this.active.clientName!, input };
+          const upstream = { ...this.active.start, input };
+          this.blocks.push({ type: "tool_use", use, upstream,
+            visible: { ...upstream, name: use.clientName } });
+        } else {
+          const upstream = { ...this.active.start };
+          if (this.active.type === "text") upstream.text = this.active.text;
+          if (this.active.thinking !== undefined) upstream.thinking = this.active.thinking;
+          if (this.active.signature !== undefined) upstream.signature = this.active.signature;
+          this.blocks.push({ type: this.active.type, upstream, visible: upstream });
+        }
         this.active = null;
       }
     } else if (kind === "message_delta") {
@@ -408,31 +439,15 @@ export class BoxCliToolHandoffDecoder {
     for (let i = 0; i < this.blocks.length; i++) {
       const observed = obj(content[i]);
       const block = this.blocks[i]!;
-      if (observed.type !== block.type) {
-        throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
-      }
-      if (block.use) {
-        if (observed.id !== block.use.id || observed.name !== block.use.boxName
-          || !isDeepStrictEqual(observed.input, block.use.input)) {
-          throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
-        }
-      } else if (block.type === "text" && observed.text !== block.text) {
+      if (!isDeepStrictEqual(observed, block.upstream)) {
         throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
       }
     }
   }
 
   private visibleAssistantContentHash(): string {
-    const content = this.snapshot?.content;
-    if (!Array.isArray(content) || content.length !== this.blocks.length) {
-      throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
-    }
     try {
-      return hashBoxAssistantContent(content.map((raw, index) => {
-        const block = obj(raw);
-        const use = this.blocks[index]?.use;
-        return use ? { ...block, name: use.clientName } : block;
-      }));
+      return hashBoxAssistantContent(this.blocks.map((block) => block.visible));
     } catch {
       throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }

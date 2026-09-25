@@ -133,6 +133,56 @@ test("handoff digest binds the full visible assistant text before tool_use", () 
   ]));
 });
 
+test("thinking, signature and redacted data bind streamed content, not a divergent snapshot", () => {
+  const source = (mutation?: "thinking" | "signature" | "redacted") => {
+    const thought = { type: "thinking", thinking: "private-thought", signature: "signed" };
+    const redacted = { type: "redacted_thinking", data: "ciphertext" };
+    const tool = use("toolu_thinking_then_tool");
+    const snapshot = [{ ...thought }, { ...redacted }, { ...tool }];
+    if (mutation === "thinking") snapshot[0] = { ...thought, thinking: "different" };
+    if (mutation === "signature") snapshot[0] = { ...thought, signature: "different" };
+    if (mutation === "redacted") snapshot[1] = { ...redacted, data: "different" };
+    return { snapshot, records: [
+      { type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] },
+      event({ type: "message_start", message: { id: "msg_thought_tool", model,
+        role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+      event({ type: "content_block_start", index: 0,
+        content_block: { type: "thinking", thinking: "" } }),
+      event({ type: "content_block_delta", index: 0,
+        delta: { type: "thinking_delta", thinking: "private-thought" } }),
+      event({ type: "content_block_delta", index: 0,
+        delta: { type: "signature_delta", signature: "signed" } }),
+      event({ type: "content_block_stop", index: 0 }),
+      event({ type: "content_block_start", index: 1, content_block: redacted }),
+      event({ type: "content_block_stop", index: 1 }),
+      event({ type: "content_block_start", index: 2,
+        content_block: { type: "tool_use", id: tool.id, name: boxName, input: {} } }),
+      event({ type: "content_block_delta", index: 2,
+        delta: { type: "input_json_delta", partial_json: '{"value":"same"}' } }),
+      { type: "assistant", message: { id: "msg_thought_tool", model,
+        role: "assistant", content: snapshot } },
+      event({ type: "content_block_stop", index: 2 }),
+      event({ type: "message_delta", delta: { stop_reason: "tool_use" },
+        usage: { output_tokens: 8, input_tokens: 2 } }),
+      event({ type: "message_stop" }),
+    ] };
+  };
+  const valid = new BoxCliToolHandoffDecoder(model, catalog);
+  for (const line of lines(source().records)) valid.push(line);
+  assert.equal(valid.push("").candidate?.assistantContentHash,
+    hashBoxAssistantContent([
+      { type: "thinking", thinking: "private-thought", signature: "signed" },
+      { type: "redacted_thinking", data: "ciphertext" },
+      { ...use("toolu_thinking_then_tool"), name: "Bash" },
+    ]));
+  for (const mutation of ["thinking", "signature", "redacted"] as const) {
+    const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+    assert.throws(() => {
+      for (const line of lines(source(mutation).records)) decoder.push(line);
+    }, /BOX_TOOL_SNAPSHOT_MISMATCH/);
+  }
+});
+
 test("UTF-8 byte cap does not depend on a split surrogate pair", () => {
   const decoder = new BoxCliToolHandoffDecoder(model, catalog);
   decoder.push("x".repeat(1_048_572));
