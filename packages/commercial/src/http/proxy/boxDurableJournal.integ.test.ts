@@ -20,6 +20,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
       ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
+    await client.query(`CREATE TEMP TABLE usage_records (
+      request_id text NOT NULL, user_id bigint NOT NULL)`);
     // Pin all journal operations to this one connection, whose temp table
     // shadows the real table. No shared schema or persistent row is touched.
     const privateMarker = "synthetic-private-marker";
@@ -516,10 +518,41 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_CHAIN_INVALID");
     await put(`box-f-${suffix}`);
-    await journal.admit({ ...input, requestId: `box-f-${suffix}`,
+    const failedCall = { ...input, requestId: `box-f-${suffix}`,
+      invocationMode: "detached_tool" as const, contextHash: "7".repeat(64),
       fingerprint: { ...fingerprint, replayFingerprint: "8".repeat(64) },
-      runNonce: "5".repeat(24), leaseEpoch: "6".repeat(32) });
+      runNonce: "5".repeat(24), leaseEpoch: "6".repeat(32) };
+    await journal.admit(failedCall);
+    await journal.markRunning(failedCall);
+    await journal.markUnknown({ ...failedCall, phase: "synthetic_failed_model" });
+    const failedProof = { runNonce: failedCall.runNonce,
+      leaseEpoch: failedCall.leaseEpoch, keeperPid: 111, cliPid: 112,
+      reason: "worker_failed" as const, revision: 2 as const, workerExitCode: 7 };
+    await assert.rejects(() => journal.complete({ ...failedCall,
+      proof: failedProof, usage }), /BOX_JOURNAL_EVIDENCE_INVALID/);
+    await assert.rejects(() => journal.markFirstRoundStoppedFailure({ ...failedCall,
+      proof: { ...failedProof, workerExitCode: 0 } }),
+    /BOX_FAILED_STOP_EVIDENCE_INVALID/);
+    await journal.markFirstRoundStoppedFailure({ ...failedCall, proof: failedProof });
+    await journal.markFirstRoundStoppedFailure({ ...failedCall, proof: failedProof });
+    const failedRow = await client.query<{ state: string; ctx: Record<string, unknown>;
+      final_credits: string }>(
+      `SELECT state,ctx,final_credits::text FROM request_finalize_journal
+        WHERE request_id=$1`, [failedCall.requestId]);
+    assert.equal(failedRow.rows[0]?.state, "aborted");
+    assert.equal(failedRow.rows[0]?.ctx.boxState, "failed_stopped");
+    assert.deepEqual(failedRow.rows[0]?.ctx.boxTerminalProof, failedProof);
+    assert.equal(failedRow.rows[0]?.ctx.boxUsage, undefined);
+    assert.equal(failedRow.rows[0]?.final_credits, "0");
+    await put(`box-g-${suffix}`);
+    await journal.admit({ ...failedCall, requestId: `box-g-${suffix}`,
+      fingerprint: { ...fingerprint, replayFingerprint: "7".repeat(64) },
+      runNonce: "6".repeat(24), leaseEpoch: "7".repeat(32) });
+    await put(`box-h-${suffix}`);
+    await assert.rejects(() => journal.admit({ ...failedCall,
+      requestId: `box-h-${suffix}` }), /BOX_CALL_AMBIGUOUS/);
   } finally {
+    await client.query("DROP TABLE IF EXISTS pg_temp.usage_records");
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();
     await pool.end();

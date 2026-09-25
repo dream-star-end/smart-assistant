@@ -2,6 +2,7 @@
  * No schema change. This is deliberately stricter than HTTP idempotency: an
  * identical body in one signed turn remains ambiguous and is never re-run. */
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { Pool, PoolClient } from "pg";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
@@ -210,6 +211,72 @@ export class BoxDurableJournal implements BoxJournalPort {
       [input.requestId, input.uid.toString(), input.leaseEpoch,
         JSON.stringify({ boxState: "unknown", boxUnknownPhase: input.phase.slice(0, 80) }), ACTIVE]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_UNKNOWN_FENCE_LOST");
+  }
+
+  /** A failed first detached round may release capacity only after the exact
+   * keeper proves every descendant stopped. No usage or success is inferred. */
+  async markFirstRoundStoppedFailure(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
+      || !input.proof || input.proof.reason === "worker_complete") {
+      throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID");
+    }
+    try { parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
+      runNonce: input.proof.runNonce, leaseEpoch: input.leaseEpoch }); }
+    catch { throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID"); }
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      const found = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+        `SELECT state,ctx FROM request_finalize_journal
+          WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+        [input.requestId, input.uid.toString()]);
+      const row = found.rows[0], ctx = row?.ctx;
+      if (found.rowCount !== 1 || !row || !ctx
+        || ctx.boxInvocationRecovery !== "v1"
+        || ctx.boxInvocationMode !== "detached_tool"
+        || ctx.boxRunNonce !== input.proof.runNonce
+        || ctx.boxLeaseEpoch !== input.leaseEpoch
+        || typeof ctx.boxAccountId !== "string"
+        || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+        || ctx.boxOwnerRequestId !== undefined
+        || ctx.boxResumeRequestId !== undefined
+        || ctx.boxToolHandoff !== undefined) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+      }
+      if (row.state === "aborted" && ctx.boxState === "failed_stopped"
+        && isDeepStrictEqual(ctx.boxTerminalProof, input.proof)) {
+        await client.query("COMMIT"); committed = true; return;
+      }
+      if (row.state !== "inflight" || !["running", "unknown"].includes(String(ctx.boxState))) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+      }
+      const usage = await client.query(
+        `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
+        [input.requestId, input.uid.toString()]);
+      if (usage.rowCount) throw new BoxDurableJournalError("BOX_FAILED_STOP_USAGE_CONFLICT");
+      const changed = await client.query(
+        `UPDATE request_finalize_journal
+            SET state='aborted', failure_code='BOX_REMOTE_STOPPED_FAILED',
+                final_credits=0,
+                ctx=ctx || $4::jsonb, updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
+            AND ctx->>'boxInvocationMode'='detached_tool'
+            AND ctx->>'boxState' IN ('running','unknown')
+            AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxOwnerRequestId')
+            AND NOT (ctx ? 'boxResumeRequestId')`,
+        [input.requestId, input.uid.toString(), input.leaseEpoch,
+          JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+            boxStopOutcome: "failed" }), input.proof.runNonce]);
+      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
+      await client.query("COMMIT"); committed = true;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
   }
 
   async complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
