@@ -1085,6 +1085,45 @@ export class BoxDurableJournal implements BoxJournalPort {
     return changed.rowCount === 1;
   }
 
+  /** After a durable user stop, locate the one current HTTP leaf. The caller
+   * must never infer it from the request that originally received the stop. */
+  async getCancelLeaf(input: Pick<BoxJournalAdmission,
+    "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<BoxStoppedFailureProbeCandidate> {
+    if (input.uid <= 0n || input.accountId <= 0n
+      || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
+      throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+    }
+    const found = await this.pool.query<{ request_id: string; user_id: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
+          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${STOP_PROBE_STATE_FENCE}
+          AND NOT (ctx ? 'boxResumeRequestId')
+          AND NOT (ctx ? 'boxTerminalProof')
+          AND ctx ? 'boxCancelIntent'`,
+      [input.uid.toString(), input.accountId.toString(), input.runNonce,
+        input.leaseEpoch]);
+    const row = found.rows[0], ctx = row?.ctx;
+    if (found.rowCount !== 1 || !row || !ctx
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+      || typeof ctx.boxAccountId !== "string"
+      || typeof ctx.boxRunNonce !== "string"
+      || typeof ctx.boxLeaseEpoch !== "string"
+      || !validCancelIntent(ctx.boxCancelIntent)
+      || (ctx.boxOwnerRequestId !== undefined
+        && (typeof ctx.boxOwnerRequestId !== "string"
+          || !/^[A-Za-z0-9_-]{1,64}$/.test(ctx.boxOwnerRequestId)))) {
+      throw new BoxDurableJournalError("BOX_CANCEL_LEAF_UNKNOWN");
+    }
+    return { requestId: row.request_id, uid: input.uid,
+      accountId: input.accountId, runNonce: input.runNonce,
+      leaseEpoch: input.leaseEpoch, linked: ctx.boxOwnerRequestId !== undefined };
+  }
+
   /** Restart-safe privacy cleanup selection. Corrupt terminal evidence is
    * durably quarantined (no remote touch) so it cannot starve newer runs. */
   async listRemoteCleanupCandidates(limit = 10): Promise<BoxRemoteCleanupCandidate[]> {

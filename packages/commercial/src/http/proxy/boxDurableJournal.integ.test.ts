@@ -618,6 +618,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(sawSessionAdvisoryLock, true);
     enforceChainLockOrder = false;
     await journal.recordUserCancelIntent(failedChainRoot);
+    const failedChainLeaf = await journal.getCancelLeaf(failedChainRoot);
+    assert.equal(failedChainLeaf.requestId, `box-h-${suffix}`);
+    assert.equal(failedChainLeaf.linked, true);
     const canceledChain = await client.query<{ request_id: string;
       ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal
@@ -739,6 +742,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
       verifiedPendingToolUseIds: ["toolu_A"] });
     await journal.recordUserCancelIntent(handoffRoot);
+    const handoffLeaf = await journal.getCancelLeaf(handoffRoot);
+    assert.equal(handoffLeaf.requestId, handoffRoot.requestId);
+    assert.equal(handoffLeaf.linked, false);
     const handoffResumeBody: ProxyBody = { ...handoffBody,
       messages: [...handoffBody.messages, ...resumeBody.messages.slice(1)] };
     await put(`box-handoff-next-${suffix}`);
