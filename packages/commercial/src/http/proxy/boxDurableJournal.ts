@@ -819,6 +819,9 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->>'boxAccountId' ~ '^[1-9][0-9]{0,19}$'
           AND ctx->>'boxRunNonce' ~ '^[a-f0-9]{24}$'
           AND ctx->>'boxLeaseEpoch' ~ '^[a-f0-9]{32}$'
+          AND (NOT (ctx ? 'boxOwnerRequestId')
+            OR (jsonb_typeof(ctx->'boxOwnerRequestId')='string'
+              AND ctx->>'boxOwnerRequestId' ~ '^[A-Za-z0-9_-]{1,64}$'))
           AND ctx->>'boxState' IN ('running','unknown','linked')
           AND NOT (ctx ? 'boxToolHandoff')
           AND NOT (ctx ? 'boxResumeRequestId')
@@ -828,7 +831,10 @@ export class BoxDurableJournal implements BoxJournalPort {
               AND (ctx->>'boxStopProbeAfterMs') ~ '^[0-9]{13}$'
               AND (ctx->>'boxStopProbeAfterMs')::bigint
                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
-        ORDER BY updated_at ASC LIMIT $1`,
+        ORDER BY CASE WHEN jsonb_typeof(ctx->'boxStopProbeLastAttemptMs')='number'
+            AND (ctx->>'boxStopProbeLastAttemptMs') ~ '^[0-9]{13}$'
+          THEN (ctx->>'boxStopProbeLastAttemptMs')::bigint ELSE 0 END ASC,
+          updated_at ASC LIMIT $1`,
       [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
     const candidates: BoxStoppedFailureProbeCandidate[] = [];
     for (const row of found.rows) {
@@ -860,8 +866,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
-          SET ctx=ctx || jsonb_build_object('boxStopProbeAfterMs',
-            (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
+          SET ctx=ctx || jsonb_build_object(
+            'boxStopProbeLastAttemptMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
+            'boxStopProbeAfterMs',
+              (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
         WHERE request_id=$1 AND user_id=$2 AND state='inflight'
           AND ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
@@ -871,6 +879,9 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND NOT (ctx ? 'boxToolHandoff')
           AND NOT (ctx ? 'boxResumeRequestId')
           AND NOT (ctx ? 'boxTerminalProof')
+          AND (NOT (ctx ? 'boxOwnerRequestId')
+            OR (jsonb_typeof(ctx->'boxOwnerRequestId')='string'
+              AND ctx->>'boxOwnerRequestId' ~ '^[A-Za-z0-9_-]{1,64}$'))
           AND (($6::boolean AND ctx->>'boxOwnerRequestId' IS NOT NULL)
             OR (NOT $6::boolean AND NOT (ctx ? 'boxOwnerRequestId')))
           AND (NOT (ctx ? 'boxStopProbeAfterMs')

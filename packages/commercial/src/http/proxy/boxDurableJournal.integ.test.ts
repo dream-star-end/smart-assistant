@@ -637,6 +637,37 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await putFailed(`box-i-${suffix}`);
     await assert.rejects(() => journal.admit({ ...failedChainRoot,
       requestId: `box-i-${suffix}` }), /BOX_CALL_AMBIGUOUS/);
+
+    // Queue fairness: malformed oldest rows cannot occupy LIMIT slots; ten
+    // proof-less old runs must rotate behind one newer recoverable run even
+    // when the tick arrives after the full two-minute retry delay.
+    const probeCtx = { boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool",
+      boxState: "unknown", boxAccountId: "20", boxLeaseEpoch: "9".repeat(32) };
+    for (let i = 0; i < 10; i++) {
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
+        VALUES ($1,3,'inflight',$2::jsonb,NOW()-INTERVAL '2 days')`,
+      [`box-bad-probe-${i}-${suffix}`, JSON.stringify({ ...probeCtx,
+        boxRunNonce: i.toString(16).padStart(24, "0"), boxOwnerRequestId: null })]);
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
+        VALUES ($1,3,'inflight',$2::jsonb,NOW()-INTERVAL '1 day')`,
+      [`box-old-probe-${i}-${suffix}`, JSON.stringify({ ...probeCtx,
+        boxRunNonce: (i + 20).toString(16).padStart(24, "0") })]);
+    }
+    const oldProbes = await journal.listStoppedFailureProbeCandidates(10);
+    assert.equal(oldProbes.length, 10);
+    assert.ok(oldProbes.every((item) => item.requestId.startsWith("box-old-probe-")));
+    for (const item of oldProbes) assert.equal(await journal.claimStoppedFailureProbe(item), true);
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
+    [`box-new-probe-${suffix}`, JSON.stringify({ ...probeCtx,
+      boxRunNonce: "8".repeat(24) })]);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxStopProbeAfterMs}',to_jsonb($2::bigint))
+      WHERE request_id LIKE $1`, [`box-old-probe-%-${suffix}`, String(Date.now() - 1)]);
+    const rotated = await journal.listStoppedFailureProbeCandidates(10);
+    assert.equal(rotated[0]?.requestId, `box-new-probe-${suffix}`);
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.usage_records");
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");

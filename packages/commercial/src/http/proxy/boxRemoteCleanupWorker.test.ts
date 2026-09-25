@@ -121,7 +121,7 @@ test("missing terminal marker leaves unknown Box run fenced and never cleans", a
       exec: { run: async () => { throw new Error("terminal.json absent"); } },
       dispose: async () => {} }) as never } as never,
   });
-  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
   assert.equal(stopped, 0);
   assert.equal(cleaned, 0);
 });

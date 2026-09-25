@@ -115,9 +115,9 @@ export class BoxRemoteCleanupWorker {
         await this.closeLocal(target);
       }
     }
-    await this.reconcileStoppedFailures(limit);
+    const probe = await this.reconcileStoppedFailures(limit);
     const candidates = await this.deps.journal.listRemoteCleanupCandidates(limit);
-    let cleaned = 0, pending = 0;
+    let cleaned = 0, pending = probe.pending;
     for (const candidate of candidates) {
       let target: BoxResolvedTarget | null = null;
       try {
