@@ -74,6 +74,23 @@ export interface BoxRemoteCleanupCandidate {
   readonly proof: BoxTerminalProof;
 }
 
+/** Cleanup never promotes a stopped failure to a successful model result. */
+function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): boolean {
+  return state === "terminal" ? proof.reason === "worker_complete"
+    : state === "failed_stopped" && proof.reason !== "worker_complete";
+}
+
+const CLEANUP_STATE_FENCE = `((ctx->>'boxState'='terminal'
+  AND state IN ('inflight','finalizing','committed'))
+  OR (ctx->>'boxState'='failed_stopped' AND state='aborted'))`;
+
+const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
+  AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
+  AND state IN ('inflight','finalizing','committed'))
+  OR (ctx->>'boxState'='failed_stopped'
+    AND ctx->'boxTerminalProof'->>'reason' IN ('keeper_stopped','worker_failed')
+    AND state='aborted'))`;
+
 export interface BoxJournalPort {
   admit(input: BoxJournalAdmission): Promise<void>;
   markRunning(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void>;
@@ -667,7 +684,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
         WHERE ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
            AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
@@ -677,7 +694,6 @@ export class BoxDurableJournal implements BoxJournalPort {
                  <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint)
              OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
                AND updated_at <= NOW()-INTERVAL '2 minutes'))
-           AND state IN ('inflight','finalizing','committed')
          ORDER BY CASE WHEN jsonb_typeof(ctx->'boxRemoteCleanupLastAttemptMs')='number'
              AND (ctx->>'boxRemoteCleanupLastAttemptMs') ~ '^[0-9]{13}$'
            THEN (ctx->>'boxRemoteCleanupLastAttemptMs')::bigint ELSE 0 END ASC,
@@ -694,7 +710,7 @@ export class BoxDurableJournal implements BoxJournalPort {
               AND ctx->'boxTerminalProof'=$3::jsonb
               AND ctx->>'boxInvocationRecovery'='v1'
               AND ctx->>'boxInvocationMode'='detached_tool'
-              AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+              AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
               AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
               AND NOT (ctx ? 'boxRemoteCleanupQuarantine')`,
           [row.request_id, row.user_id, JSON.stringify(ctx?.boxTerminalProof)]);
@@ -712,7 +728,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       try {
         const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
           { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
-        if (proof.reason !== "worker_complete") { await quarantine(); continue; }
+        if (!cleanupProofMatchesState(ctx.boxState, proof)) { await quarantine(); continue; }
         candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
           accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
           leaseEpoch: ctx.boxLeaseEpoch, proof });
@@ -731,8 +747,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
     }
     try {
-      if (parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input).reason
-        !== "worker_complete") throw new Error("non-success proof");
+      parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
@@ -745,10 +760,9 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
           AND ctx->'boxTerminalProof'=$6::jsonb
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
@@ -768,15 +782,14 @@ export class BoxDurableJournal implements BoxJournalPort {
    * has durably marked the exact same proven remote run cleaned. */
   async remoteCleanupStatus(input: BoxRemoteCleanupCandidate): Promise<"done" | "pending" | "invalid"> {
     try {
-      if (parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input).reason
-        !== "worker_complete") return "invalid";
+      parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { return "invalid"; }
     const found = await this.pool.query<{ status: string | null }>(
       `SELECT ctx->>'boxRemoteCleanup' AS status FROM request_finalize_journal
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ctx->>'boxState'='terminal' AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
+          AND ${CLEANUP_PROOF_FENCE} AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
           AND ctx->'boxTerminalProof'=$6::jsonb`,
       [input.requestId, input.uid.toString(), input.accountId.toString(),
         input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
@@ -792,8 +805,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
     }
     try {
-      if (parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input).reason
-        !== "worker_complete") throw new Error("non-success proof");
+      parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
     const params = [input.requestId, input.uid.toString(), input.accountId.toString(),
       input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)];
@@ -802,11 +814,10 @@ export class BoxDurableJournal implements BoxJournalPort {
           SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
           AND ctx->>'boxInvocationMode'='detached_tool'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
           AND ctx->'boxTerminalProof'=$6::jsonb
           AND ctx->>'boxRemoteCleanupClaimed'='true'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
@@ -816,11 +827,10 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT 1 FROM request_finalize_journal
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxState'='terminal' AND ctx ? 'boxTerminalProof'
+          AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
           AND ctx->>'boxInvocationMode'='detached_tool'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'->>'reason'='worker_complete'
           AND ctx->'boxTerminalProof'=$6::jsonb
           AND ctx->>'boxRemoteCleanup'='done'`, params);
     if (already.rowCount !== 1) throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");

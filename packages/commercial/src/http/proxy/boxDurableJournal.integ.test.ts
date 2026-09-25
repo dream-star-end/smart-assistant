@@ -553,6 +553,19 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(failedRow.rows[0]?.ctx.boxUsage, undefined);
     assert.equal(failedRow.rows[0]?.final_credits, "0");
     assert.equal(failedRow.rows[0]?.failure_code, "STREAM_FAILED");
+    const failedCleanup = (await journal.listRemoteCleanupCandidates(20))
+      .find((item) => item.requestId === failedCall.requestId);
+    assert.ok(failedCleanup, "a proven stopped failure still needs remote private-file cleanup");
+    assert.equal(failedCleanup.proof.reason, "worker_failed");
+    assert.equal(await journal.claimRemoteCleanup(failedCleanup), true);
+    assert.equal(await journal.remoteCleanupStatus(failedCleanup), "pending");
+    await assert.rejects(() => journal.markRemoteCleaned({ ...failedCleanup,
+      runNonce: "f".repeat(24) }), /BOX_CLEANUP_IDENTITY_INVALID/);
+    await journal.markRemoteCleaned(failedCleanup);
+    await journal.markRemoteCleaned(failedCleanup);
+    assert.equal(await journal.remoteCleanupStatus(failedCleanup), "done");
+    assert.ok(!(await journal.listRemoteCleanupCandidates(20)).some((item) =>
+      item.requestId === failedCall.requestId));
     await put(`box-g-${suffix}`);
     await journal.admit({ ...failedCall, requestId: `box-g-${suffix}`,
       fingerprint: { ...fingerprint, replayFingerprint: "7".repeat(64) },
