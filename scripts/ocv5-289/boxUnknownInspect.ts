@@ -94,8 +94,11 @@ async function main(): Promise<void> {
       if (process.env.OCV5_289_EXPECTED_RUN_NONCE !== record.runNonce
         || process.env.OCV5_289_EXPECTED_FIRST_ID !== record.firstId
         || process.env.OCV5_289_EXPECTED_PHASE !== "stage_transport_unknown"
-        || (record.pid === undefined
+        || (!Object.hasOwn(record, "pid")
           && process.env.OCV5_289_PROBE_PROCESS_EXITED_ACK !== "1")
+        || (Object.hasOwn(record, "pid")
+          && (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid)
+            || record.pid <= 0))
         || record.state !== "unresolved"
         || (observed.run as { present?: unknown } | undefined)?.present !== false
         || (observed.proof as { present?: unknown } | undefined)?.present !== false) {
