@@ -16,6 +16,12 @@ import type { BoxJournalAdmission } from
   "../../packages/commercial/src/http/proxy/boxDurableJournal.js";
 import { BoxToolFetch } from
   "../../packages/commercial/src/http/proxy/boxToolFetch.js";
+import { BoxUserStopCoordinator } from
+  "../../packages/commercial/src/http/proxy/boxUserStopCoordinator.js";
+import { makeBoxUserStopHandler } from
+  "../../packages/commercial/src/http/proxy/boxUserStopHandler.js";
+import { parseBoxTerminalProof } from
+  "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { makeBoxDetachedToolPlan } from
   "../../packages/commercial/src/http/proxy/boxDetachedToolPlan.js";
 import { deriveBoxCallFingerprint, hashBoxAssistantContent } from
@@ -244,6 +250,10 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
       } }),
     appendCostCredits: async () => {}, broadcastToUser: () => {},
   });
+  const stopHandler = makeBoxUserStopHandler({ identity,
+    journal: new BoxDurableJournal(args.pool),
+    coordinator: new BoxUserStopCoordinator({ journal: new BoxDurableJournal(args.pool),
+      resolver: createProductionBoxAccountResolver() }) });
   const inFlight = new Map<string, Promise<void>>();
   const shapes: Array<{ requestId: string; model: unknown; keys: string[];
     toolNames: string[]; hasTurnKey: boolean; hasSessionId: boolean;
@@ -259,6 +269,13 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
     // Claude Code 2.1.280 sends /v1/messages?beta=true; production proxy
     // routes on URL.pathname, so this test listener must do the same.
     const path = new URL(req.url ?? "/", "http://probe.invalid").pathname;
+    if (path === "/internal/box/stop") {
+      void stopHandler(req, res, { hostUuid, boundIp }).catch(() => {
+        if (!res.headersSent) res.writeHead(503);
+        res.end();
+      });
+      return;
+    }
     if (path !== "/v1/messages" || req.method !== "POST") {
       res.writeHead(404); res.end(); return;
     }
@@ -424,6 +441,14 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
           "content-type": "application/json", "anthropic-version": "2023-06-01",
           "x-request-id": requestId, [LOCAL_CATALOG_HEADER]: token },
         body: JSON.stringify(body), signal: AbortSignal.timeout(180_000),
+      });
+    },
+    async stop(sessionId: string, turnKey: string): Promise<Response> {
+      return fetch(`http://${args.bindHost ?? "127.0.0.1"}:${address.port}/internal/box/stop`, {
+        method: "POST", headers: { authorization: `Bearer oc-v3.${containerId}.${secretHex}`,
+          "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, oc_turn_key: turnKey }),
+        signal: AbortSignal.timeout(60_000),
       });
     },
     async waitHandler(requestId: string): Promise<void> {
@@ -757,7 +782,9 @@ async function main(): Promise<void> {
     const preflightOnly = process.env.OCV5_289_SIGNED_PREFLIGHT_ONLY === "1";
     const ccbPreflight = process.env.OCV5_289_CCB_PREFLIGHT_ONLY === "1";
     const ccbLive = process.env.OCV5_289_CCB_LIVE_ACK === "1";
-    assertion(Number(preflightOnly) + Number(ccbPreflight) + Number(ccbLive) <= 1,
+    const signedCancel = process.env.OCV5_289_SIGNED_CANCEL_ACK === "1";
+    assertion(Number(preflightOnly) + Number(ccbPreflight) + Number(ccbLive)
+      + Number(signedCancel) <= 1,
       "BOX_SIGNED_PROBE_MODE_CONFLICT");
     let transportCalls = 0;
     let paidCalls = 0;
@@ -966,6 +993,49 @@ async function main(): Promise<void> {
       "SELECT request_id FROM usage_records WHERE request_id=$1 AND user_id=$2",
       [firstId, UID.toString()]);
     assertion(firstBilled.rows.length === 1, "BOX_SIGNED_HANDOFF_NOT_BILLED");
+    if (signedCancel) {
+      const stopped = await loopback.stop(sessionId, turnKey);
+      const reply = await stopped.json() as { status?: unknown };
+      assertion(stopped.status === 200 && reply.status === "stopped",
+        "BOX_SIGNED_STOP_NOT_PROVEN");
+      const row = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+        "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [firstId]);
+      const ctx = row.rows[0]?.ctx;
+      assertion(row.rows.length === 1 && row.rows[0]?.state === "committed"
+        && ctx?.boxState === "failed_stopped"
+        && ctx.boxStopOutcome === "failed" && !!ctx.boxTerminalProof
+        && typeof ctx.boxRunNonce === "string" && typeof ctx.boxLeaseEpoch === "string",
+      "BOX_SIGNED_STOP_JOURNAL_INVALID");
+      const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
+        { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
+      assertion(proof.reason === "keeper_stopped" || proof.reason === "worker_failed",
+        "BOX_SIGNED_STOP_PROOF_INVALID");
+      await service.reconcileRemoteCleanup();
+      const after = await client.query<{ state: string; cleanup: string | null }>(
+        "SELECT state,ctx->>'boxRemoteCleanup' AS cleanup FROM request_finalize_journal WHERE request_id=$1",
+        [firstId]);
+      assertion(after.rows[0]?.state === "committed" && after.rows[0]?.cleanup === "done",
+        "BOX_SIGNED_STOP_CLEANUP_UNPROVEN");
+      const usage = await client.query<{ id: string; cost: string }>(
+        `SELECT id::text,cost_credits::text AS cost FROM usage_records
+          WHERE user_id=$1 AND request_id=$2`, [UID.toString(), firstId]);
+      assertion(usage.rows.length === 1 && BigInt(usage.rows[0]!.cost) > 0n,
+        "BOX_SIGNED_STOP_USAGE_INVALID");
+      const ledger = await client.query<{ delta: string }>(
+        `SELECT delta::text FROM credit_ledger WHERE user_id=$1
+          AND ref_type='usage_record' AND ref_id=$2`, [UID.toString(), usage.rows[0]!.id]);
+      assertion(ledger.rows.length >= 1 && ledger.rows.length <= 4
+        && ledger.rows.every((entry) => BigInt(entry.delta) < 0n)
+        && ledger.rows.reduce((sum, entry) => sum - BigInt(entry.delta), 0n)
+          === BigInt(usage.rows[0]!.cost), "BOX_SIGNED_STOP_LEDGER_INVALID");
+      terminal = true;
+      withOperatorMutex(() => { unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false; });
+      process.stdout.write(JSON.stringify({ signedStop: true, accountId: String(ACCOUNT_ID),
+        firstId, onePaidMessage: true, remoteProof: proof.reason,
+        remoteCleanupDone: true, ledgerRows: ledger.rows.length,
+        debitedCredits: usage.rows[0]!.cost, replayed: false }) + "\n");
+      return;
+    }
     // The only tool implementation is here in OpenClaude's operator process;
     // Box receives only schema/pending/result via the virtual MCP.
     localExecutions++;
