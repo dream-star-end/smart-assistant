@@ -403,7 +403,8 @@ export class BoxToolFetch {
               await this.releaseAfterProof({ requestId: args.requestId,
                 uid: args.uid, accountId: outcome.target.accountId,
                 runNonce: outcome.plan.runNonce,
-                leaseEpoch: outcome.plan.leaseEpoch, proof: outcome.proof });
+                leaseEpoch: outcome.plan.leaseEpoch, proof: outcome.proof,
+                ...(outcome.nativePointer ? { nativePointer: outcome.nativePointer } : {}) });
             }
           }
           controller.close();
