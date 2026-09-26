@@ -104,6 +104,27 @@ for (const [source, markers] of [
 }
 console.log('INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof')
 
+// INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof.
+// The real HIBERNATED→no-paid Box capability probe and signed user-container
+// business turn are separate acceptance evidence; never infer them from text.
+const boxProvision = readFileSync(join(root,
+  'packages/commercial/src/account-pool/cursorSandProvision.ts'), 'utf8')
+const boxResolver = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxAccountResolver.ts'), 'utf8')
+for (const [source, markers] of [
+  [boxProvision, ['allowWakeIfHibernated', 'BOX_WAKE_UNPROVEN',
+    'SAND_BOX_RUN_STATE_HIBERNATED']],
+  [boxResolver, ['allowWakeIfHibernated?: boolean',
+    'allowWakeIfHibernated: args.allowWakeIfHibernated === true']],
+  [boxFetch, ['allowWakeIfHibernated: true', 'reconcilePrelaunchRecovery']],
+  [boxEgress, ['allowWakeIfHibernated: true', 'boxRecoveryTimer']],
+] as const) {
+  for (const marker of markers) {
+    if (!source.includes(marker)) throw new Error(`[box-idle-wake] missing ${marker}`)
+  }
+}
+console.log('INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof')
+
 // INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
 // The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
 const mediaStore = readFileSync(join(root, 'packages/commercial/src/media-generation/store.ts'), 'utf8')

@@ -4797,6 +4797,40 @@
           "assertion": "INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof"
         }
       ]
+    },
+    {
+      "id": "INC-20260926-BOX-IDLE-WAKE",
+      "occurredAt": "2026-09-26",
+      "severity": "P1",
+      "symptom": "Box 空闲休眠后，已上架模型的首轮调用会因 BOX_NOT_RUNNING 直接失败；必须仅在已鉴权的真实模型调用上单次唤醒并证明 RUNNING。",
+      "rootFixCommit": "1debc5c3",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandProvision.test.ts",
+          "assertion": "only explicit model-call wake turns HIBERNATED into a proven Exec descriptor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+          "assertion": "only explicitly authorized resolver calls wake a hibernated Box"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+          "assertion": "credential rotation after wake Ensure blocks post-state read and Exec"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "only model first/resume paths request wake; recovery resolver remains default no-wake"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }
