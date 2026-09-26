@@ -25,6 +25,8 @@ const call = (canonicalBody: ProxyBody) => ({ uid: 3n, sessionId: "session",
     model: "claude-opus-5-5" }) } });
 const journal = () => ({ claimRemoteCleanup: async () => true,
   remoteCleanupStatus: async () => "pending",
+  remoteCleanupDoneByRunIdentity: async () => false,
+  prelaunchCleanupDoneByRunIdentity: async () => false,
   markRemoteCleaned: async () => {},
   listRemoteCleanupCandidates: async () => [] }) as never;
 
@@ -100,6 +102,78 @@ test("failed local close retry is bounded and never starts concurrent dispose", 
   assert.equal(attempts, 2);
   assert.equal(await service.retryFailedCleanup(), 1);
   assert.equal(attempts, 2, "unsettled close attempt is not duplicated");
+});
+
+test("fresh egress recovers only a no-launch prelaunch row without paid replay", async () => {
+  const receipt = { version: 2 as const, runNonce: "a".repeat(24),
+    leaseEpoch: "b".repeat(32), accountId: "20", controlId: "c".repeat(32),
+    controlDev: "2049", controlIno: "9001", lockDev: "2049", lockIno: "9002",
+    identityHash: "d".repeat(64) };
+  const candidate = { requestId: "box-prelaunch", uid: 3n, accountId: 20n,
+    runNonce: receipt.runNonce, leaseEpoch: receipt.leaseEpoch, receipt };
+  let claimed = 0, settled = 0, cleaned = 0, disposed = false;
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { listPrelaunchRecoveryCandidates: async () => settled ? [] : [candidate],
+      claimPrelaunchRecovery: async () => { claimed++; return true; },
+      markGuardedPrestartStopped: async (value: { cleanedReceipt: string }) => {
+        assert.equal(value.cleanedReceipt, `cleaned:${receipt.identityHash}`);
+        settled++;
+      } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async (args) => {
+      assert.equal(args.requiredAccountId, 20n);
+      return { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+        assert.ok(request.args[2]?.includes("def clean_dir(parent_path,name,allowed):"));
+        assert.ok(!request.args.some((arg) => arg.includes("/home/box/.local/bin/claude")));
+        cleaned++;
+        return { stdout: `cleaned:${receipt.identityHash}\n`, stderrBytes: 0,
+          exitCode: 0 as const };
+      } }, dispose: async () => { disposed = true; } } as never;
+    }, onUnknown: async () => {},
+  });
+  assert.equal(await service.reconcilePrelaunchRecovery(), 1);
+  assert.equal(claimed, 1);
+  assert.equal(cleaned, 1);
+  assert.equal(settled, 1);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposed, true);
+  assert.equal(await service.reconcilePrelaunchRecovery(), 0);
+});
+
+test("original egress reaps held target after peer's exact prelaunch cleanup proof", async () => {
+  const nonce = "e".repeat(24), epoch = "f".repeat(32);
+  let disposed = false, done = false;
+  const target = { accountId: 20n, exec: { run: async () => {
+    throw new Error("paid or cleanup Exec must not be dispatched by the reaper");
+  } }, dispose: async () => { disposed = true; } };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { listRemoteCleanupCandidates: async () => [],
+      remoteCleanupDoneByRunIdentity: async () => false,
+      prelaunchCleanupDoneByRunIdentity: async (identity: { runNonce: string;
+        leaseEpoch: string; accountId: bigint }) => {
+        assert.equal(identity.runNonce, nonce);
+        assert.equal(identity.leaseEpoch, epoch);
+        assert.equal(identity.accountId, 20n);
+        return done;
+      } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    runFirst: (async (_input: unknown, deps: { retainUnknownTarget: (handle: {
+      target: typeof target; plan: { runNonce: string; leaseEpoch: string } }) => void }) => {
+      deps.retainUnknownTarget({ target, plan: { runNonce: nonce, leaseEpoch: epoch } });
+      throw new Error("synthetic prelaunch unknown");
+    }) as never,
+  });
+  const response = await service.fetch(call(firstBody));
+  await assert.rejects(() => response.text(), /synthetic prelaunch unknown/);
+  assert.equal(disposed, false);
+  done = true;
+  assert.equal(await service.reconcileRemoteCleanup(), 0);
+  assert.equal(disposed, true);
 });
 
 test("terminal cleanup failure retains the pinned Box target for idempotent retry", async () => {
@@ -283,7 +357,8 @@ test("shared worker done after handoff reaps original egress target without anot
       assert.deepEqual(identity, { uid: 3n, accountId: 20n,
         runNonce: nonce, leaseEpoch: epoch });
       return done;
-    }, listRemoteCleanupCandidates: async () => [] } as never,
+    }, prelaunchCleanupDoneByRunIdentity: async () => false,
+    listRemoteCleanupCandidates: async () => [] } as never,
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: async () => target as never,
     onUnknown: async () => {},

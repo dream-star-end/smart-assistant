@@ -281,22 +281,36 @@ export async function startEgress(): Promise<void> {
   // The resolver retains failed private ProxyAgent closes across requests;
   // retry only these proven pre-invocation orphans, never a remote unknown CLI.
   const boxCleanupTimer = boxResolver && boxTextModel ? setInterval(() => {
-    void boxResolver.retryFailedAgentCleanup().catch(() =>
-      log.error("box_resolver_orphan_cleanup_failed"));
     void boxTextModel.retryFailedOrphanCleanup().catch(() =>
       log.error("box_target_orphan_cleanup_failed"));
-    void boxToolModel?.retryFailedCleanup().catch(() =>
-      log.error("box_tool_target_cleanup_failed"));
-    void boxToolModel?.retryTerminalCleanup().catch(() =>
-      log.error("box_tool_remote_cleanup_failed"));
-    void boxToolModel?.reconcileRemoteCleanup(10).catch(() =>
-      log.error("box_tool_remote_reconcile_failed"));
   }, 60_000) : null;
   boxCleanupTimer?.unref();
   // A stop for an already-admitted Box run must remain available even after
   // the model launch flag is turned OFF. It cannot create a new paid call.
   const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
   const boxStopJournal = boxJournal ?? new BoxDurableJournal(getPool());
+  // Recovery survives disabling the model launch flags. Empty assets are never
+  // used by this off-route worker; it dispatches only idempotent cleanup Exec.
+  const boxRecoveryModel = boxToolModel ?? new BoxToolFetch({
+    supervisorAsset: Buffer.alloc(0), keeperAsset: Buffer.alloc(0),
+    virtualMcpAsset: Buffer.alloc(0), detachedRunnerAsset: Buffer.alloc(0),
+    journal: boxStopJournal, maxOutputTokensForModel: () => null,
+    resolveTarget: (args) => boxStopResolver.resolve(args),
+    onUnknown: reportBoxUnknown,
+  });
+  const boxRecoveryTimer = setInterval(() => {
+    void boxStopResolver.retryFailedAgentCleanup().catch(() =>
+      log.error("box_resolver_orphan_cleanup_failed"));
+    void boxRecoveryModel.retryFailedCleanup().catch(() =>
+      log.error("box_tool_target_cleanup_failed"));
+    void boxRecoveryModel.retryTerminalCleanup().catch(() =>
+      log.error("box_tool_remote_cleanup_failed"));
+    void boxRecoveryModel.reconcileRemoteCleanup(10).catch(() =>
+      log.error("box_tool_remote_reconcile_failed"));
+    void boxRecoveryModel.reconcilePrelaunchRecovery(10).catch(() =>
+      log.error("box_tool_prelaunch_recovery_failed"));
+  }, 60_000);
+  boxRecoveryTimer.unref();
   const boxStopCoordinator = new BoxUserStopCoordinator({
     journal: boxStopJournal,
     resolver: boxStopResolver,
@@ -698,6 +712,7 @@ export async function startEgress(): Promise<void> {
     latencyProber?.stop();
     recoveryProber?.stop();
     if (boxCleanupTimer) clearInterval(boxCleanupTimer);
+    clearInterval(boxRecoveryTimer);
     clearInterval(boxStopCleanupTimer);
     void desktopTlsClose?.().catch(() => {});
     // eslint-disable-next-line no-console

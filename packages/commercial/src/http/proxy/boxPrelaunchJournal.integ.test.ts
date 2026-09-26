@@ -57,6 +57,7 @@ test("prelaunch cleanup CAS cannot cross a durable launch permit", { skip: !url 
       (e: unknown) => e instanceof BoxDurableJournalError
         && e.code === "BOX_JOURNAL_PRESTART_FENCE_LOST");
     await journal.armGuardedLaunch({ ...first.identity, receipt: first.receipt });
+    assert.equal(await journal.prelaunchCleanupDoneByRunIdentity(first.identity), false);
     await assert.rejects(() => journal.markGuardedPrestartStopped({ ...first.identity,
       receipt: first.receipt, cleanedReceipt: `cleaned:${first.receipt.identityHash}` }),
       (e: unknown) => e instanceof BoxDurableJournalError
@@ -64,6 +65,12 @@ test("prelaunch cleanup CAS cannot cross a durable launch permit", { skip: !url 
     const second = await make(`box-pre-b-${suffix}`, 21n,
       randomBytes(12).toString("hex"), randomBytes(32).toString("hex"));
     await journal.markUnknown({ ...second.identity, phase: "stage_transport_unknown:input_0" });
+    const pending = await journal.listPrelaunchRecoveryCandidates();
+    assert.deepEqual(pending.map((item) => item.requestId), [second.identity.requestId],
+      "armed first row must not be taken as prelaunch cleanup");
+    assert.equal(await journal.claimPrelaunchRecovery(pending[0]!), true);
+    assert.equal(await journal.claimPrelaunchRecovery(pending[0]!), false,
+      "second worker must not duplicate a claimed cleanup");
     await assert.rejects(() => journal.markGuardedPrestartStopped({ ...second.identity,
       receipt: second.receipt, cleanedReceipt: "cleaned:" + "0".repeat(64) }),
       (e: unknown) => e instanceof BoxDurableJournalError
@@ -75,5 +82,36 @@ test("prelaunch cleanup CAS cannot cross a durable launch permit", { skip: !url 
     assert.equal(rows.rows[0]?.ctx.boxState, "prestart_stopped");
     assert.deepEqual(rows.rows[0]?.ctx.boxPrelaunchCleanup,
       { v: 1, receipt: `cleaned:${second.receipt.identityHash}` });
+    assert.equal(await journal.prelaunchCleanupDoneByRunIdentity(second.identity), true);
+    assert.deepEqual(await journal.listPrelaunchRecoveryCandidates(), []);
+    const third = await make(`box-pre-c-${suffix}`, 22n,
+      randomBytes(12).toString("hex"), randomBytes(32).toString("hex"));
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()-INTERVAL '17 minutes' WHERE request_id=$1`,
+      [third.identity.requestId]);
+    const stale = await journal.listPrelaunchRecoveryCandidates();
+    assert.deepEqual(stale.map((item) => item.requestId), [third.identity.requestId]);
+    assert.equal(await journal.claimPrelaunchRecovery(stale[0]!), true);
+    const taken = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [third.identity.requestId]);
+    assert.equal(taken.rows[0]?.ctx.boxState, "unknown");
+    const fourth = await make(`box-pre-d-${suffix}`, 23n,
+      randomBytes(12).toString("hex"), randomBytes(32).toString("hex"));
+    await journal.markUnknown({ ...fourth.identity, phase: "stage_transport_unknown:input_0" });
+    for (let i = 0; i < 10; i++) {
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,updated_at)
+        VALUES ($1,3,'inflight',$2::jsonb,NOW()-INTERVAL '20 minutes')`,
+      [`box-malformed-${suffix}-${i}`, JSON.stringify({
+        boxInvocationMode: "detached_tool", boxState: "unknown",
+        boxAccountId: "021", boxRunNonce: second.identity.runNonce,
+        boxLeaseEpoch: second.identity.leaseEpoch,
+        boxPrelaunchControl: second.receipt })]);
+    }
+    assert.deepEqual(await journal.listPrelaunchRecoveryCandidates(10), [],
+      "first batch quarantines malformed identities instead of dispatching cleanup");
+    const afterQuarantine = await journal.listPrelaunchRecoveryCandidates(10);
+    assert.deepEqual(afterQuarantine.map((item) => item.requestId),
+      [fourth.identity.requestId], "healthy row must not starve behind malformed rows");
   } finally { client.release(); await pool.end(); }
 });
