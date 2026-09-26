@@ -236,7 +236,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
           AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
           AND request_id<>$4
-        ORDER BY updated_at DESC, request_id DESC LIMIT 1`,
+        ORDER BY updated_at DESC, (ctx ? 'boxNativePointer') DESC,
+          request_id DESC LIMIT 1`,
       [input.uid.toString(), input.sessionId, input.canonicalModel,
         input.currentRequestId]);
     const row = found.rows[0];
@@ -290,7 +291,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
               AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
               AND request_id<>$4
-            ORDER BY updated_at DESC, request_id DESC LIMIT 1 FOR UPDATE`,
+            ORDER BY updated_at DESC, (ctx ? 'boxNativePointer') DESC,
+              request_id DESC LIMIT 1 FOR UPDATE`,
           [input.uid.toString(), input.fingerprint.sessionId,
             input.model, input.requestId]);
         if (latest.rowCount !== 1

@@ -1141,6 +1141,27 @@ test("native predecessor claim and paid admission commit or roll back together",
     assert.equal(await journal.attachNativePointer({ requestId: detachedId,
       uid: 3n, accountId: 20n, proof: detachedProof,
       pointer: toolPointer }), false);
+    const chainSession = `chain-${suffix}`;
+    const chainOwner = `chain-z-${suffix}`, chainFinal = `chain-a-${suffix}`;
+    await put(chainOwner, { ...owner, boxSessionId: chainSession,
+      boxNativePointer: undefined });
+    await put(chainFinal, { ...owner, boxSessionId: chainSession });
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()+interval '1 second'
+      WHERE request_id=ANY($1::text[])`, [[chainOwner, chainFinal]]);
+    const chainCandidate = await journal.findNativeCandidate({ uid: 3n,
+      sessionId: chainSession, canonicalModel: model,
+      currentRequestId: `chain-current-${suffix}` });
+    assert.equal(chainCandidate?.ownerRequestId, chainFinal,
+      "same-timestamp tool chain must prefer the terminal leaf with a pointer");
+    const chainRequestId = `chain-current-${suffix}`;
+    await put(chainRequestId, { ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: chainSession } });
+    await journal.admit({ ...admission, requestId: chainRequestId,
+      fingerprint: { ...fingerprint, sessionId: chainSession,
+        replayFingerprint: "5".repeat(64) },
+      nativeClaim: { ownerRequestId: chainFinal, pointer,
+        upstreamModel: pointer.upstreamModel } });
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();
