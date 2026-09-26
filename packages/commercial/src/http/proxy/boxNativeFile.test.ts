@@ -34,10 +34,11 @@ test("native transcript inspection returns only digest and size; bad hash/path/m
     chmodSync(file, 0o644);
     assert.notEqual(execute(digest).status, 0);
     rmSync(file);
+    assert.equal(execute(digest).status, 126);
     const decoy = join(root, "decoy.jsonl");
     writeFileSync(decoy, raw, { mode: 0o600 });
     symlinkSync(decoy, file);
-    assert.notEqual(execute(digest).status, 0);
+    assert.equal(execute(digest).status, 126);
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });

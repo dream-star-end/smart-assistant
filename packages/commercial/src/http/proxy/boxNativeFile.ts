@@ -13,22 +13,28 @@ const INSPECT = String.raw`import hashlib,json,os,re,stat,sys
 if len(sys.argv)!=5:raise SystemExit(126)
 cwd,sid,want,ensure=sys.argv[1:]
 if not re.fullmatch(r'/tmp/ocv5-289-run-[a-f0-9]{24}',cwd) or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',sid) or (want!='-' and not re.fullmatch(r'[a-f0-9]{64}',want)) or ensure not in ('0','1'):raise SystemExit(126)
-parent=os.open('/home/box/.claude/projects',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+def safeopen(path,flags,dir_fd=None):
+ try:return os.open(path,flags,dir_fd=dir_fd)
+ except OSError:raise SystemExit(126)
+parent=safeopen('/home/box/.claude/projects',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 try:
- project=os.open(cwd.replace('/','-'),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+ project=safeopen(cwd.replace('/','-'),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
  try:
   st=os.fstat(project)
   if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(126)
-  fd=os.open(sid+'.jsonl',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=project)
+  fd=safeopen(sid+'.jsonl',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=project)
   try:
    st=os.fstat(fd)
    if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or not 1<=st.st_size<=67108864:raise SystemExit(126)
    size=st.st_size
    digest=hashlib.sha256()
-   while True:
-    part=os.read(fd,65536)
-    if not part:break
+   remaining=size
+   while remaining:
+    part=os.read(fd,min(65536,remaining))
+    if not part:raise SystemExit(126)
     digest.update(part)
+    remaining-=len(part)
+   if os.read(fd,1):raise SystemExit(126)
    actual=digest.hexdigest()
    if want!='-' and actual!=want:raise SystemExit(126)
   finally:os.close(fd)
@@ -37,7 +43,7 @@ finally:os.close(parent)
 if ensure=='1':
  try:os.mkdir(cwd,0o700)
  except FileExistsError:pass
- dfd=os.open(cwd,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ dfd=safeopen(cwd,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
  try:
   st=os.fstat(dfd)
   if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(126)
