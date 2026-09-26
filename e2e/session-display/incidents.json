@@ -4769,14 +4769,7 @@
       "occurredAt": "2026-09-26",
       "severity": "P1",
       "symptom": "Box 第二轮私有输入 staging 超时被误归为无来源取消；无远端写入围栏和清理证明，用户请求失败且账号容量长期占用。",
-      "rootFixCommit": "74be9976",
-      "coverageCommits": [
-        "72a7234e",
-        "46e93f75",
-        "79429081",
-        "74be9976",
-        "0a3412eb"
-      ],
+      "rootFixCommit": "9a851852",
       "regressions": [
         {
           "layer": "unit",
