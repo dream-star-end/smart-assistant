@@ -4737,6 +4737,32 @@
           "assertion": "离底补更早过程步骤时按前插后的真实位置保持锚点"
         }
       ]
+    },
+    {
+      "id": "INC-20260926-BOX-CC-CALLERLESS-RESUME",
+      "occurredAt": "2026-09-26",
+      "severity": "P1",
+      "symptom": "自用 V5 管理员在 Box Claude Opus 5.5 网页回合中本地 skill_search 和 Bash 均成功，Claude Code 续接时保留 thinking 但省略 tool_use.caller，旧 Box journal 误报 BOX_TOOL_ASSISTANT_CHANGED；请求显示无法处理，首轮模型用量仍扣 5 积分。",
+      "rootFixCommit": "dc6f53fb66d1144021c55f1b628f34f17641b1c4",
+      "coverageCommits": [
+        "dc6f53fb66d1144021c55f1b628f34f17641b1c4"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCallFingerprint.test.ts",
+          "assertion": "CCB preserved thinking with callerless two-tool echo binds all semantic bytes"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.integ.test.ts",
+          "assertion": "Box journal fences replay/account capacity and persists proof plus exact usage"
+        }
+      ],
+      "proofPending": {
+        "reason": "真实自用管理员网页故障和远端终止清理已取证；当前只有实际 Claude Code 2.1.280 离线双工具协议回归及 PG TEMP 集成，尚无可在商业候选自动重放的同链浏览器或 live-e2e 夹具。selfhost 修复上线后需用新的用户认证网页回合验收，不得重放失败付费调用。",
+        "since": "2026-09-26"
+      }
     }
   ]
 }
