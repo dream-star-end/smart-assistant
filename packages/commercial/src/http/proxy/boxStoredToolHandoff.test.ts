@@ -21,6 +21,8 @@ test("valid handoff stores only unique model IDs and argument hashes", () => {
   assert.deepEqual(parseBoxStoredToolHandoff(later), later);
   const ccbEcho = { ...evidence(), assistantEchoHash: "b".repeat(64) };
   assert.deepEqual(parseBoxStoredToolHandoff(ccbEcho), ccbEcho);
+  const callerless = { ...ccbEcho, assistantNoCallerHash: "c".repeat(64) };
+  assert.deepEqual(parseBoxStoredToolHandoff(callerless), callerless);
 });
 
 test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed", () => {
@@ -44,6 +46,7 @@ test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed",
   const wrongAssistant = evidence(); wrongAssistant.assistantContentHash = "x".repeat(64);
   assert.equal(parseBoxStoredToolHandoff(wrongAssistant), null);
   assert.equal(parseBoxStoredToolHandoff({ ...evidence(), assistantEchoHash: "private" }), null);
+  assert.equal(parseBoxStoredToolHandoff({ ...evidence(), assistantNoCallerHash: "private" }), null);
   const beyondCap = evidence(); beyondCap.roundNo = 33;
   assert.equal(parseBoxStoredToolHandoff(beyondCap), null);
 });

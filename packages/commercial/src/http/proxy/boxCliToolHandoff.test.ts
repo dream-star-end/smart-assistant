@@ -60,6 +60,7 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
     { ...use("toolu_parallel_a"), name: "Bash" },
     { ...use("toolu_parallel_b"), name: "Bash" },
   ]));
+  assert.equal(candidate?.assistantNoCallerHash, candidate?.assistantContentHash);
   assert.deepEqual(candidate?.toolUses.map((item) => [item.id, item.boxName,
     item.clientName, item.input.value]), [
     ["toolu_parallel_a", boxName, "Bash", "same"],

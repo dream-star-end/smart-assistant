@@ -10,6 +10,8 @@ export interface BoxStoredToolHandoff {
   messageId: string;
   assistantContentHash: string;
   assistantEchoHash?: string;
+  /** Missing on pre-fix journal rows; those remain fail-closed if CCB keeps thinking. */
+  assistantNoCallerHash?: string;
   spoolOffset: number;
   detachedRunnerHash: string;
   catalogHash: string;
@@ -29,6 +31,8 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
     || ![
       "assistantContentHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
       "assistantContentHash,assistantEchoHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
+      "assistantContentHash,assistantNoCallerHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
+      "assistantContentHash,assistantEchoHash,assistantNoCallerHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
     ].includes(Object.keys(raw).sort().join(","))
     || raw.version !== 1 || !Number.isSafeInteger(raw.roundNo)
     || Number(raw.roundNo) < 1 || Number(raw.roundNo) > 32
@@ -39,6 +43,9 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
     || (raw.assistantEchoHash !== undefined
       && (typeof raw.assistantEchoHash !== "string"
         || !/^[a-f0-9]{64}$/.test(raw.assistantEchoHash)))
+    || (raw.assistantNoCallerHash !== undefined
+      && (typeof raw.assistantNoCallerHash !== "string"
+        || !/^[a-f0-9]{64}$/.test(raw.assistantNoCallerHash)))
     || !Number.isSafeInteger(raw.spoolOffset) || Number(raw.spoolOffset) < 1
     || Number(raw.spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
     || typeof raw.detachedRunnerHash !== "string"

@@ -18,9 +18,10 @@ test("catalog staging permits only separate roles on the same exact selfhost end
 });
 test("catalog activation never enables pricing before the staged catalog transition", () => {
   assert.equal(boxCatalogActivationAction("staged", false), "activate");
+  assert.equal(boxCatalogActivationAction("disabled", false), "activate");
   assert.equal(boxCatalogActivationAction("active", true), "already_active");
   for (const [state, enabled] of [["staged", true], ["active", false],
-    ["disabled", true], ["disabled", false]]) {
+    ["disabled", true]]) {
     assert.throws(() => boxCatalogActivationAction(String(state), Boolean(enabled)),
       /BOX_CATALOG_STATE_MIRROR_INVALID/);
   }

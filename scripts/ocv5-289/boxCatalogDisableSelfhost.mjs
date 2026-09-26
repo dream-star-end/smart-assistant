@@ -6,12 +6,13 @@ import { hostname } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
 const model = 'box-api-claude-opus-5-5';
-const expected = '577ba459a2e42dbfe5aaf38e0c1d825ecf8363ad';
+const expected = process.env.OCV5_289_EXPECT_LIVE_SHA ?? '';
 try {
 const live = realpathSync('/opt/openclaude/openclaude-v5-selfhost-live');
 const assert = (ok, code) => { if (!ok) throw new Error(code); };
 const mode = process.argv[2] ?? 'plan';
 assert(mode === 'plan' || mode === 'disable', 'BOX_DISABLE_MODE_INVALID');
+assert(/^[a-f0-9]{40}$/.test(expected), 'BOX_DISABLE_LIVE_SHA_ACK_REQUIRED');
 assert(hostname() === 'v3-dev-sg' && process.env.OCV5_289_ACK_USER_ID === '3',
   'BOX_DISABLE_SELFHOST_BOUNDARY');
 assert(live.startsWith('/opt/openclaude/openclaude-v5-selfhost-releases/rel-')
