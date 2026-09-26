@@ -260,6 +260,21 @@ test("one guarded private-stage Exec still precedes durable arm and sole launch"
   }
 });
 
+test("ambiguous guarded batch never arms or launches a paid model", async () => {
+  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  try {
+    const f = fixture({ failInputStage: 0 });
+    await assert.rejects(runBoxToolFirstRound(f.input, f.deps));
+    assert.equal(f.launches, 0);
+    assert.ok(!f.sequence.includes("launch-arm"));
+    assert.ok(f.sequence.includes("prelaunch-cleanup"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+  }
+});
+
 test("tool_choice auto may answer directly with one paid launch and proven final usage", async () => {
   const f = fixture({ directFinal: true });
   const result = await runBoxToolFirstRound(f.input, f.deps);

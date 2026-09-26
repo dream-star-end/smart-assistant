@@ -48,7 +48,7 @@ class SpyRegistry extends BoxInvocationRegistry {
   }
 }
 type Runner = Pick<BoxExecTransport, "run">;
-function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "proof" | "cleanup";
+function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "proof" | "cleanup";
   journalFailPhase?: "admit" | "running" | "complete";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
@@ -209,6 +209,20 @@ test("text private staging batches small files without changing billing", async 
     assert.equal(f.stages.filter((phase) => phase === "stage").length, 0);
     assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
     assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+  }
+});
+
+test("ambiguous text batch remains unknown and never reaches the paid model", async () => {
+  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  try {
+    const f = fixture({ failPhase: "batch-stage" });
+    await assert.rejects(f.service.fetch(input));
+    assert.equal(f.stages.filter((phase) => phase === "model").length, 0);
+    assert.ok(f.unknowns.includes("staging_unknown"));
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
     else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
