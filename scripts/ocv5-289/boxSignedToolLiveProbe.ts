@@ -24,6 +24,8 @@ import { parseBoxTerminalProof } from
   "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { parseBoxNativePointer } from
   "../../packages/commercial/src/http/proxy/boxNativePointer.js";
+import { boxFastPathEnabled } from
+  "../../packages/commercial/src/http/proxy/boxFastPath.js";
 import { makeBoxDetachedToolPlan } from
   "../../packages/commercial/src/http/proxy/boxDetachedToolPlan.js";
 import { deriveBoxCallFingerprint, hashBoxAssistantContent } from
@@ -639,7 +641,7 @@ async function main(): Promise<void> {
   const firstId = `box-signed-a-${nonce}`, secondId = `box-signed-b-${nonce}`;
   const thirdId = `box-signed-c-${nonce}`;
   const thirdTurn = process.env.OCV5_291_THIRD_TURN_ACK === "1";
-  if (thirdTurn && process.env.OC_BOX_NATIVE_RESUME !== "1") {
+  if (thirdTurn && !boxFastPathEnabled()) {
     throw new Error("BOX_NATIVE_THIRD_FLAG_REQUIRED");
   }
   const challenge = `probe-${randomBytes(8).toString("hex")}`;

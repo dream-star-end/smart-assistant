@@ -14,6 +14,7 @@ import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.
 import { deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
+import { boxFastPathEnabled } from "./boxFastPath.js";
 import type { ProxyBody } from "./shared.js";
 
 export class BoxToolContinuationError extends Error {
@@ -166,7 +167,7 @@ export async function runBoxToolContinuation(input: {
         await race(deps.journal.completeToolChain({ requestId: input.requestId,
           uid: input.uid, leaseEpoch: claim.leaseEpoch, proof, usage }));
         let nativePointer: BoxNativePointer | undefined;
-        if (process.env.OC_BOX_NATIVE_RESUME === "1" && final.assistantContentHash
+        if (boxFastPathEnabled() && final.assistantContentHash
           && claim.nativeSessionId && claim.nativeCliCwd
           && deps.journal.attachNativePointer) {
           try {

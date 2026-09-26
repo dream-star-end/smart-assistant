@@ -8,6 +8,13 @@ import { _UsageObserver, type ProxyBody } from "./shared.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 
+const inheritedInstance = process.env.OC_INSTANCE_ID;
+process.env.OC_INSTANCE_ID = "box-test";
+test.after(() => {
+  if (inheritedInstance === undefined) delete process.env.OC_INSTANCE_ID;
+  else process.env.OC_INSTANCE_ID = inheritedInstance;
+});
+
 const model = "claude-opus-5";
 const canonicalAlias = "box-api-claude-opus-5";
 const body: ProxyBody = { model, max_tokens: 256, stream: true,
@@ -169,8 +176,8 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
 });
 
 test("text batch stages both immutable assets in one Exec without changing billing", async () => {
-  const previous = process.env.OC_BOX_ASSET_BATCH;
-  process.env.OC_BOX_ASSET_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture();
     const response = await f.service.fetch(input);
@@ -180,27 +187,27 @@ test("text batch stages both immutable assets in one Exec without changing billi
     assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
     assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
-    else process.env.OC_BOX_ASSET_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
 test("text batch manifest mismatch cannot reach the paid model", async () => {
-  const previous = process.env.OC_BOX_ASSET_BATCH;
-  process.env.OC_BOX_ASSET_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture({ badAssetManifest: true });
     await assert.rejects(f.service.fetch(input), /BOX_STAGING_FAILED/);
     assert.equal(f.stages.filter((phase) => phase === "model").length, 0);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
-    else process.env.OC_BOX_ASSET_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
 test("text private staging batches small files without changing billing", async () => {
-  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture();
     const response = await f.service.fetch(input);
@@ -210,22 +217,22 @@ test("text private staging batches small files without changing billing", async 
     assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
     assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
 test("ambiguous text batch remains unknown and never reaches the paid model", async () => {
-  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture({ failPhase: "batch-stage" });
     await assert.rejects(f.service.fetch(input));
     assert.equal(f.stages.filter((phase) => phase === "model").length, 0);
     assert.ok(f.unknowns.includes("staging_unknown"));
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 

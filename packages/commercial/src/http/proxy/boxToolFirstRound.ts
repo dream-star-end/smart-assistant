@@ -13,6 +13,7 @@ import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
+import { boxFastPathEnabled } from "./boxFastPath.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
@@ -109,7 +110,7 @@ export async function runBoxToolFirstRound(input: {
     if (error instanceof BoxToolFirstRoundError) throw error;
     throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
   }
-  const nativeEnabled = process.env.OC_BOX_NATIVE_RESUME === "1";
+  const nativeEnabled = boxFastPathEnabled();
   let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
@@ -299,7 +300,7 @@ export async function runBoxToolFirstRound(input: {
     admitted = true;
     let stageLabel = "before_stage";
     try {
-      if (process.env.OC_BOX_ASSET_BATCH === "1") {
+      if (boxFastPathEnabled()) {
         stageLabel = "assets";
         const staged = await run(plan.stageAssets);
         if (staged.stdout.trim() !== plan.assetManifest) {
@@ -333,7 +334,7 @@ export async function runBoxToolFirstRound(input: {
       await race(deps.journal.recordPrelaunchControl({ requestId: input.requestId,
         uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
         leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
-      if (process.env.OC_BOX_PRIVATE_STAGE_BATCH === "1") {
+      if (boxFastPathEnabled()) {
         const receipt = prelaunchReceipt;
         const guarded = plan.stageInputs.map((request, index) => {
           if (index === 0) {

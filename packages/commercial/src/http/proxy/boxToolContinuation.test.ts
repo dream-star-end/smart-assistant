@@ -6,6 +6,13 @@ import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import type { ProxyBody } from "./shared.js";
 
+const inheritedInstance = process.env.OC_INSTANCE_ID;
+process.env.OC_INSTANCE_ID = "box-test";
+test.after(() => {
+  if (inheritedInstance === undefined) delete process.env.OC_INSTANCE_ID;
+  else process.env.OC_INSTANCE_ID = inheritedInstance;
+});
+
 const model = "claude-opus-5-5", id = "toolu_continued_a";
 const boxName = "mcp__ocbridge__t0";
 const tools = [{ name: "local_echo", description: "synthetic local tool",
@@ -144,8 +151,8 @@ test("final round waits for Box terminal and journal before terminal SSE", async
 });
 
 test("native final tool round publishes transcript pointer after durable usage", async () => {
-  const previous = process.env.OC_BOX_NATIVE_RESUME;
-  process.env.OC_BOX_NATIVE_RESUME = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture("final", false, false, false, false, true);
     const result = await runBoxToolContinuation(f.input, f.deps);
@@ -157,8 +164,8 @@ test("native final tool round publishes transcript pointer after durable usage",
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_NATIVE_RESUME;
-    else process.env.OC_BOX_NATIVE_RESUME = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 

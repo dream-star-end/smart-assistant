@@ -9,6 +9,7 @@ import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
+import { boxFastPathEnabled } from "./boxFastPath.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import type { BoxJournalPort } from "./boxDurableJournal.js";
@@ -251,7 +252,7 @@ export class BoxTextFetch {
       // forbids cleanup/retry because a write may remain in flight.
       let inputStageStarted = false;
       try {
-        if (process.env.OC_BOX_ASSET_BATCH === "1") {
+        if (boxFastPathEnabled()) {
           const assets = await exec(plan.stageAssets, 20_000);
           if (assets.stdout.trim() !== plan.assetManifest) {
             throw new BoxTextFetchError("BOX_ASSET_STAGE_INVALID");
@@ -267,7 +268,7 @@ export class BoxTextFetch {
           }
         }
         inputStageStarted = true;
-        const batch = process.env.OC_BOX_PRIVATE_STAGE_BATCH === "1"
+        const batch = boxFastPathEnabled()
           ? makeBoxStageBatch(plan.stageInputs) : null;
         if (batch) {
           const staged = await exec(batch.request, 60_000);

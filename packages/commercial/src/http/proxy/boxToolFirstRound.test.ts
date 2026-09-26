@@ -10,6 +10,13 @@ import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import type { ProxyBody } from "./shared.js";
 
+const inheritedInstance = process.env.OC_INSTANCE_ID;
+process.env.OC_INSTANCE_ID = "box-test";
+test.after(() => {
+  if (inheritedInstance === undefined) delete process.env.OC_INSTANCE_ID;
+  else process.env.OC_INSTANCE_ID = inheritedInstance;
+});
+
 const asset = (name: string) => readFileSync(
   new URL(`../../../../../scripts/ocv5-289/${name}`, import.meta.url));
 const model = "claude-opus-5-5", toolId = "toolu_synthetic_a";
@@ -230,8 +237,8 @@ test("first tool round admits before one launch and emits terminal only after du
 });
 
 test("one batched asset Exec still precedes durable arm and the sole paid launch", async () => {
-  const previous = process.env.OC_BOX_ASSET_BATCH;
-  process.env.OC_BOX_ASSET_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture();
     const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -240,14 +247,14 @@ test("one batched asset Exec still precedes durable arm and the sole paid launch
     assert.ok(f.sequence.indexOf("asset-stage") < f.sequence.indexOf("launch-arm"));
     assert.equal(f.launches, 1);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
-    else process.env.OC_BOX_ASSET_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
 test("batch manifest mismatch cannot arm or start a paid model", async () => {
-  const previous = process.env.OC_BOX_ASSET_BATCH;
-  process.env.OC_BOX_ASSET_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture({ badAssetManifest: true });
     await assert.rejects(runBoxToolFirstRound(f.input, f.deps),
@@ -255,14 +262,14 @@ test("batch manifest mismatch cannot arm or start a paid model", async () => {
     assert.equal(f.launches, 0);
     assert.ok(!f.sequence.includes("launch-arm"));
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
-    else process.env.OC_BOX_ASSET_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
 test("one guarded private-stage Exec still precedes durable arm and sole launch", async () => {
-  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture();
     const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -273,14 +280,14 @@ test("one guarded private-stage Exec still precedes durable arm and sole launch"
     assert.ok(f.sequence.indexOf("input-batch") < f.sequence.indexOf("launch-arm"));
     assert.equal(f.launches, 1);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
 test("ambiguous guarded batch never arms or launches a paid model", async () => {
-  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const f = fixture({ failInputStage: 0 });
     await assert.rejects(runBoxToolFirstRound(f.input, f.deps));
@@ -288,8 +295,8 @@ test("ambiguous guarded batch never arms or launches a paid model", async () => 
     assert.ok(!f.sequence.includes("launch-arm"));
     assert.ok(f.sequence.includes("prelaunch-cleanup"));
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
-    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 
@@ -305,9 +312,11 @@ test("tool_choice auto may answer directly with one paid launch and proven final
   assert.equal(f.retained, false);
 });
 
-test("native first final publishes a pointer only after terminal usage and proof", async () => {
-  const previous = process.env.OC_BOX_NATIVE_RESUME;
-  process.env.OC_BOX_NATIVE_RESUME = "1";
+test("selfhost default runs native and both batches in one paid first round", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  const instance = process.env.OC_INSTANCE_ID;
+  process.env.OC_INSTANCE_ID = "v5-selfhost-sg";
+  delete process.env.OC_BOX_FAST_NATIVE;
   try {
     const f = fixture({ directFinal: true });
     const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -317,20 +326,49 @@ test("native first final publishes a pointer only after terminal usage and proof
     assert.equal(result.nativePointer?.transcriptSha256, "f".repeat(64));
     assert.ok(!result.plan.run.args.includes("--no-session-persistence"));
     assert.equal(f.launches, 1);
+    assert.equal(f.sequence.filter((step) => step === "asset-stage").length, 1);
+    assert.equal(f.sequence.filter((step) => step === "input-batch").length, 1);
+    assert.equal(f.sequence.filter((step) => step === "input-stage").length, 0);
     assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId,
       cliCwd: result.plan.cliCwd });
     assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_NATIVE_RESUME;
-    else process.env.OC_BOX_NATIVE_RESUME = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+    if (instance === undefined) delete process.env.OC_INSTANCE_ID;
+    else process.env.OC_INSTANCE_ID = instance;
+  }
+});
+
+test("one emergency off switch restores serial staging and no native persistence", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  const instance = process.env.OC_INSTANCE_ID;
+  process.env.OC_INSTANCE_ID = "v5-selfhost-sg";
+  process.env.OC_BOX_FAST_NATIVE = "0";
+  try {
+    const f = fixture({ directFinal: true });
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(result.nativePointer, undefined);
+    assert.ok(result.plan.run.args.includes("--no-session-persistence"));
+    assert.equal(f.sequence.filter((step) => step === "asset-stage").length, 4);
+    assert.equal(f.sequence.filter((step) => step === "input-batch").length, 0);
+    assert.equal(f.sequence.filter((step) => step === "input-stage").length, 7);
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+    if (instance === undefined) delete process.env.OC_INSTANCE_ID;
+    else process.env.OC_INSTANCE_ID = instance;
   }
 });
 
 test("warm native hit preflights one UUID and atomically claims before one paid launch", async () => {
-  const previous = process.env.OC_BOX_NATIVE_RESUME;
-  process.env.OC_BOX_NATIVE_RESUME = "1";
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
   try {
     const priorBody = { ...canonicalBody,
       messages: [{ role: "user", content: "prior question" }] } as ProxyBody;
@@ -366,8 +404,8 @@ test("warm native hit preflights one UUID and atomically claims before one paid 
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("admit"));
     assert.equal(f.launches, 1);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_NATIVE_RESUME;
-    else process.env.OC_BOX_NATIVE_RESUME = previous;
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
 

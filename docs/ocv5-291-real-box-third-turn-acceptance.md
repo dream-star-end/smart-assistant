@@ -1,7 +1,8 @@
 # OCV5-291 · real Box native-resume acceptance (selfhost operator lane)
 
 The existing signed `boxSignedToolLiveProbe.ts` has already passed one real
-account-20 synthetic tool roundtrip with `OC_BOX_NATIVE_RESUME=1`: one local
+account-20 synthetic tool roundtrip with the then-current `OC_BOX_NATIVE_RESUME=1`
+(now one selfhost-default-on `OC_BOX_FAST_NATIVE` policy): one local
 tool execution, two authenticated HTTP requests, two usage/ledger rows,
 terminal proof, cleanup done, no unknown. A read-only check of the final
 request journal confirms a native UUID + transcript SHA pointer and positive
