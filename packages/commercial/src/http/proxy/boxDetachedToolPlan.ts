@@ -53,7 +53,12 @@ export function makeBoxDetachedToolPlan(input: {
   // model output and must be removed with the private input/catalog files.
   const cleanup: BoxCcExecRequest = { ...base.cleanup,
     args: [...base.cleanup.args, `${base.cwd}/stdout.jsonl`, `${base.cwd}/stderr.log`] };
-  return { ...base, cleanup, stageDetachedRunner, detachedRunnerHash, launch,
+  const discardNativeCleanup = base.discardNativeCleanup
+    ? { ...base.discardNativeCleanup, args: [...base.discardNativeCleanup.args,
+      `${base.cwd}/stdout.jsonl`, `${base.cwd}/stderr.log`] } : undefined;
+  return { ...base, cleanup,
+    ...(discardNativeCleanup ? { discardNativeCleanup } : {}),
+    stageDetachedRunner, detachedRunnerHash, launch,
     stageAssets: assetBatch.request, assetManifest: assetBatch.manifest,
     readSpool: access.readSpool };
 }

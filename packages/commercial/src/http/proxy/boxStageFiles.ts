@@ -108,6 +108,12 @@ try:
   for target in (name,name+'.part'):
    try:os.unlink(target,dir_fd=fds[parent])
    except FileNotFoundError:pass
+ allowed=re.compile(r'(?:(?:pending|result)\.toolu_[A-Za-z0-9_-]{1,120}\.json(?:\.part)?|pending\.toolu_[A-Za-z0-9_-]{1,120}\.json\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,19}\.tmp)')
+ for name in sorted(os.listdir(fds[cwd])):
+  if not allowed.fullmatch(name):raise SystemExit(1)
+  st=os.stat(name,dir_fd=fds[cwd],follow_symlinks=False)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1:raise SystemExit(1)
+  os.unlink(name,dir_fd=fds[cwd])
  if mode=='full':
   for d in (project,cwd):
    if not d:continue

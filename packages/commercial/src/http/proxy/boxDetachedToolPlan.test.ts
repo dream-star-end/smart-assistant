@@ -110,6 +110,38 @@ test("known-terminal cleanup removes detached stdout and stderr with private inp
   }
 });
 
+test("native detached keep and discard both remove dynamic private tool files", () => {
+  const run = (step: ReturnType<typeof makeBoxDetachedToolPlan>["cleanup"]) =>
+    spawnSync(step.command, step.args, { cwd: step.cwd,
+      env: { ...process.env, ...step.environment }, encoding: "utf8", timeout: 5000 });
+  for (const preserve of [true, false]) {
+    const plan = makeBoxDetachedToolPlan({ body, upstreamModel: "claude-opus-5-5",
+      maxOutputTokensLimit: 128_000, supervisorAsset: read("box_supervisor.py"),
+      keeperAsset: read("box_keeper.py"), virtualMcpAsset: read("box_virtual_mcp.py"),
+      detachedRunnerAsset: read("box_detached_runner.py"), nativePersistence: true,
+      runNonce: randomBytes(12).toString("hex") });
+    try {
+      for (const step of plan.stageInputs) {
+        const staged = run(step);
+        assert.equal(staged.status, 0, staged.stderr);
+      }
+      for (const name of ["stdout.jsonl", "stderr.log", "pending.toolu_abc.json",
+        "result.toolu_abc.json"]) {
+        writeFileSync(`${plan.cwd}/${name}`, "synthetic private data", { mode: 0o600 });
+      }
+      const cleanup = preserve ? plan.cleanup : plan.discardNativeCleanup!;
+      const result = run(cleanup);
+      assert.equal(result.status, 0, result.stderr);
+      for (const name of ["stdin.jsonl", "system.txt", "tool-catalog.json",
+        "stdout.jsonl", "stderr.log", "pending.toolu_abc.json",
+        "result.toolu_abc.json"]) {
+        assert.equal(existsSync(`${plan.cwd}/${name}`), false);
+      }
+      assert.equal(existsSync(plan.cwd), preserve);
+    } finally { if (existsSync(plan.cwd)) rmSync(plan.cwd, { recursive: true, force: true }); }
+  }
+});
+
 test("native resume keeps a stable pinned CLI cwd while spool uses a fresh run", async () => {
   const cliCwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
   mkdirSync(cliCwd, { mode: 0o700 });
