@@ -141,6 +141,9 @@ export class BoxAccountResolver {
 
   async resolve(args: { uid: bigint; sessionId: string | null; requestId: string;
     upstreamModel: string; signal: AbortSignal;
+    /** Explicitly authorized real model-call path only. Cleanup/stop/probes
+     * leave this false so they cannot wake a hibernated account. */
+    allowWakeIfHibernated?: boolean;
     /** Operator-only exact account fence, checked before the first Box control request. */
     requiredAccountId?: bigint }): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
@@ -232,7 +235,8 @@ export class BoxAccountResolver {
       const client = new CursorSandProvisionClient({ fetchImpl, now });
       // Guard MUST be installed before GetState, not just before Ensure/Exec.
       client.setAccountGuard(assertCurrent);
-      const descriptor = await client.resolveBoxExec(credential, machine, args.signal);
+      const descriptor = await client.resolveBoxExec(credential, machine, args.signal,
+        { allowWakeIfHibernated: args.allowWakeIfHibernated === true });
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
       const exec = new BoxExecTransport(descriptor, fetchImpl, assertCurrent);
       const owned = owner;
@@ -240,6 +244,7 @@ export class BoxAccountResolver {
       return { accountId, exec, ...(owned ? { dispose: () => owned.close() } : {}) };
     } catch (error) {
       if (error instanceof BoxAccountResolverError) throw error;
+      if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
       throw new BoxAccountResolverError("BOX_TARGET_UNAVAILABLE");
     } finally {
       if (owner && !handedOff) this.closeFailedResolve(owner);

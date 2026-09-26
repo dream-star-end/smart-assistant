@@ -27,6 +27,8 @@ function fixture() {
     cursor_billing_cycle_end: null } as AccountRow;
   const calls: string[] = [];
   let closed = 0;
+  let boxState = "SAND_BOX_RUN_STATE_RUNNING";
+  let wakeOnEnsure = true;
   let route: "unbound" | "unavailable" = "unbound";
   const accountToken = (): AccountToken => ({ id: 20n, plan: "pro",
     token: Buffer.from(credential), refresh: Buffer.from("synthetic-refresh"),
@@ -46,9 +48,10 @@ function fixture() {
     fetch: async (url) => {
       calls.push(url);
       if (url.endsWith("/GetSandBoxRunState")) {
-        return Response.json({ state: "SAND_BOX_RUN_STATE_RUNNING" });
+        return Response.json({ state: boxState });
       }
       if (url.endsWith("/EnsureSandBox")) {
+        if (wakeOnEnsure) boxState = "SAND_BOX_RUN_STATE_RUNNING";
         return Response.json({ execDaemonUrl: "https://box.example.cursorvm.com",
           execDaemonAuthToken: "synthetic-exec-token", networkToken: "synthetic-network-token" });
       }
@@ -68,6 +71,8 @@ function fixture() {
     setRow: (value: AccountRow) => { row = value; },
     setStatus: (value: AccountRow["status"]) => { row = { ...row, status: value }; },
     setProxy: (value: string) => { proxy = value; },
+    setBoxState: (value: string) => { boxState = value; },
+    setWakeOnEnsure: (value: boolean) => { wakeOnEnsure = value; },
     setRoute: (value: "unbound" | "unavailable") => { route = value; } };
 }
 
@@ -86,6 +91,35 @@ test("official control guard precedes GetState/Ensure and terminal target has ow
   assert.equal(f.getClosed(), 1);
 });
 
+test("only explicitly authorized resolver calls wake a hibernated Box", async () => {
+  const cold = fixture(); cold.setBoxState("SAND_BOX_RUN_STATE_HIBERNATED");
+  await assert.rejects(cold.resolver.resolve(cold.args),
+    (error: unknown) => error instanceof BoxAccountResolverError
+      && error.code === "BOX_TARGET_UNAVAILABLE");
+  assert.deepEqual(cold.calls.map((url) => url.split("/").at(-1)),
+    ["GetSandBoxRunState"], "cleanup/operator default must not wake");
+  const model = fixture(); model.setBoxState("SAND_BOX_RUN_STATE_HIBERNATED");
+  const target = await model.resolver.resolve({ ...model.args,
+    allowWakeIfHibernated: true });
+  assert.equal(target.accountId, 20n);
+  assert.deepEqual(model.calls.map((url) => url.split("/").at(-1)),
+    ["GetSandBoxRunState", "EnsureSandBox", "GetSandBoxRunState"]);
+  const result = await target.exec.run({ command: "/usr/bin/python3",
+    args: ["--version"], cwd: "/tmp", environment: {} }, { timeoutMs: 2000 });
+  assert.equal(result.stdout, "synthetic-exec-ok");
+  await target.dispose?.();
+  const unproven = fixture(); unproven.setBoxState("SAND_BOX_RUN_STATE_HIBERNATED");
+  unproven.setWakeOnEnsure(false);
+  await assert.rejects(unproven.resolver.resolve({ ...unproven.args,
+    allowWakeIfHibernated: true }),
+  (error: unknown) => error instanceof BoxAccountResolverError
+    && error.code === "BOX_TARGET_UNAVAILABLE");
+  assert.deepEqual(unproven.calls.map((url) => url.split("/").at(-1)),
+    ["GetSandBoxRunState", "EnsureSandBox", "GetSandBoxRunState"]);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(unproven.getClosed(), 1, "failed wake retains proxy cleanup ownership");
+});
+
 test("account rotation after GetState blocks Ensure and disposes failed resolve", async () => {
   const f = fixture();
   const resolver = new BoxAccountResolver({
@@ -100,6 +134,44 @@ test("account rotation after GetState blocks Ensure and disposes failed resolve"
     (error: unknown) => error instanceof BoxAccountResolverError
       && error.code === "BOX_ACCOUNT_CHANGED");
   assert.deepEqual(f.calls.map((url) => url.split("/").at(-1)), ["GetSandBoxRunState"]);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(f.getClosed(), 1);
+});
+
+test("credential rotation after wake Ensure blocks post-state read and Exec", async () => {
+  const f = fixture(); f.setBoxState("SAND_BOX_RUN_STATE_HIBERNATED");
+  const resolver = new BoxAccountResolver({ ...f.deps,
+    fetch: async (url, init, dispatcher) => {
+      const result = await f.deps.fetch(url, init, dispatcher);
+      if (url.endsWith("/EnsureSandBox")) f.setCredential(session("rotated-after-wake"));
+      return result;
+    } });
+  await assert.rejects(resolver.resolve({ ...f.args,
+    allowWakeIfHibernated: true }),
+  (error: unknown) => error instanceof BoxAccountResolverError
+    && error.code === "BOX_ACCOUNT_CHANGED");
+  assert.deepEqual(f.calls.map((url) => url.split("/").at(-1)),
+    ["GetSandBoxRunState", "EnsureSandBox"],
+    "rotated credential must stop the post-wake status request");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(f.getClosed(), 1);
+});
+
+test("caller abort after Ensure stops post-wake state read and paid target delivery", async () => {
+  const f = fixture(); f.setBoxState("SAND_BOX_RUN_STATE_HIBERNATED");
+  const abort = new AbortController();
+  const resolver = new BoxAccountResolver({ ...f.deps,
+    fetch: async (url, init, dispatcher) => {
+      const result = await f.deps.fetch(url, init, dispatcher);
+      if (url.endsWith("/EnsureSandBox")) abort.abort();
+      return result;
+    } });
+  await assert.rejects(resolver.resolve({ ...f.args,
+    signal: abort.signal, allowWakeIfHibernated: true }),
+  (error: unknown) => error instanceof BoxAccountResolverError
+    && error.code === "BOX_RESOLVE_ABORTED");
+  assert.deepEqual(f.calls.map((url) => url.split("/").at(-1)),
+    ["GetSandBoxRunState", "EnsureSandBox"]);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(f.getClosed(), 1);
 });

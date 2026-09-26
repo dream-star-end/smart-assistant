@@ -104,9 +104,11 @@ async function main(): Promise<void> {
     { path: `${project}/${uuid}.jsonl`, raw: snapshot, hash: sha(snapshot) },
   ] });
   const resolver = createProductionBoxAccountResolver();
+  const wakeAuthorized = process.env.OCV5_289_AUTO_WAKE_TEST_ACK === "1";
   const target = await resolver.resolve({ uid: 3n, sessionId: null,
     requestId: `box-no-paid-fence-${runNonce}`, upstreamModel: "claude-opus-5-5",
-    requiredAccountId: 20n, signal: new AbortController().signal });
+    requiredAccountId: 20n, allowWakeIfHibernated: wakeAuthorized,
+    signal: new AbortController().signal });
   let receipt: BoxPrelaunchReceipt | null = null;
   let clean = false;
   let postconditionProven = false;
@@ -199,7 +201,7 @@ async function main(): Promise<void> {
         separatedMs: Number(second.sampleTimeMs) - Number(first.sampleTimeMs) };
     }
     process.stdout.write(JSON.stringify({ accountId: "20", runNonce,
-      realBox: true, paidCalls: 0, syntheticProjectFile: true,
+      realBox: true, paidCalls: 0, wakeAuthorized, syntheticProjectFile: true,
       stagedHashesMatch: true, remoteCleaned: true,
       ...(oldEvidence === undefined ? {} : { oldEvidence }) }) + "\n");
   } catch (error) {

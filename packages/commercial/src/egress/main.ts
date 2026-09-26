@@ -254,7 +254,8 @@ export async function startEgress(): Promise<void> {
     journal: boxJournal,
     maxOutputTokensForModel: (model) =>
       model === "box-api-claude-opus-5-5" ? 128_000 : null,
-    resolveTarget: (args) => boxResolver.resolve(args),
+    resolveTarget: (args) => boxResolver.resolve({ ...args,
+      allowWakeIfHibernated: true }),
     onUnknown: reportBoxUnknown,
   }) : undefined;
   // This second flag stays OFF until actual Box detached lifetime, multi-round

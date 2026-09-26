@@ -51,6 +51,7 @@ export class BoxToolFetch {
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null;
       requestId: string; upstreamModel: string; signal: AbortSignal;
+      allowWakeIfHibernated?: boolean;
       requiredAccountId?: bigint }) => Promise<BoxResolvedTarget>;
     onUnknown: (args: { uid: bigint; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
@@ -354,7 +355,8 @@ export class BoxToolFetch {
             const published: BoxToolPublishedResume = await (this.deps.publishResume
               ?? publishBoxToolResume)({ ...args, init }, {
               journal: this.deps.journal,
-              resolveTarget: (input) => this.deps.resolveTarget(input),
+              resolveTarget: (input) => this.deps.resolveTarget({ ...input,
+                allowWakeIfHibernated: true }),
               retainUnknownTarget: ({ target, claim }) => this.own(claim.runNonce,
                 target, args.uid, claim.leaseEpoch),
               onUnknown: this.deps.onUnknown,
@@ -385,7 +387,8 @@ export class BoxToolFetch {
               detachedRunnerAsset: this.deps.detachedRunnerAsset,
               journal: this.deps.journal,
               maxOutputTokensForModel: this.deps.maxOutputTokensForModel,
-              resolveTarget: (input) => this.deps.resolveTarget(input),
+              resolveTarget: (input) => this.deps.resolveTarget({ ...input,
+                allowWakeIfHibernated: true }),
               onUnknown: this.deps.onUnknown,
               retainUnknownTarget: ({ target, plan }) => this.own(plan.runNonce,
                 target, args.uid, plan.leaseEpoch),

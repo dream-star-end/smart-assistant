@@ -69,6 +69,43 @@ test("same internal model fetch streams first handoff then next final without to
   assert.equal(await service.retryFailedCleanup(), 0);
 });
 
+test("only model first/resume paths request wake; recovery resolver remains default no-wake", async () => {
+  const seen: Array<boolean | undefined> = [];
+  const target = { accountId: 20n, exec: { run: async () => {
+    throw new Error("paid Exec forbidden in purpose test");
+  } }, dispose: async () => {} };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async (args) => { seen.push(args.allowWakeIfHibernated);
+      return target as never; }, onUnknown: async () => {},
+    runFirst: (async (_input: unknown, deps: { resolveTarget: (args: {
+      uid: bigint; sessionId: string | null; requestId: string;
+      upstreamModel: string; signal: AbortSignal }) => Promise<typeof target> }) => {
+      const held = await deps.resolveTarget({ uid: 3n, sessionId: "session",
+        requestId: "first", upstreamModel: "claude-opus-5-5",
+        signal: new AbortController().signal });
+      await held.dispose();
+      throw new Error("synthetic first stopped before paid work");
+    }) as never,
+    publishResume: (async (_input: unknown, deps: { resolveTarget: (args: {
+      uid: bigint; sessionId: string | null; requestId: string;
+      upstreamModel: string; signal: AbortSignal }) => Promise<typeof target> }) => {
+      const held = await deps.resolveTarget({ uid: 3n, sessionId: "session",
+        requestId: "resume", upstreamModel: "claude-opus-5-5",
+        signal: new AbortController().signal });
+      await held.dispose();
+      throw new Error("synthetic resume stopped before paid work");
+    }) as never,
+  });
+  await assert.rejects(() => service.fetch(call(firstBody)).then((r) => r.text()),
+    /synthetic first stopped/);
+  await assert.rejects(() => service.fetch(call(nextBody)).then((r) => r.text()),
+    /synthetic resume stopped/);
+  assert.deepEqual(seen, [true, true]);
+});
+
 test("failed local close retry is bounded and never starts concurrent dispose", async () => {
   let attempts = 0;
   const target = { accountId: 20n,
@@ -124,6 +161,8 @@ test("fresh egress recovers only a no-launch prelaunch row without paid replay",
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: async (args) => {
       assert.equal(args.requiredAccountId, 20n);
+      assert.equal(args.allowWakeIfHibernated, undefined,
+        "restart cleanup must not wake a hibernated Box");
       return { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
         assert.ok(request.args[2]?.includes("def clean_dir(parent_path,name,allowed):"));
         assert.ok(!request.args.some((arg) => arg.includes("/home/box/.local/bin/claude")));

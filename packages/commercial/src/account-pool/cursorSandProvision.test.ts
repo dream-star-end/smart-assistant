@@ -129,6 +129,56 @@ test("read-only Box run-state never sends EnsureSandBox or wakes a hibernated Bo
   } finally { await f.close(); }
 });
 
+test("only explicit model-call wake turns HIBERNATED into a proven Exec descriptor", async () => {
+  const methods: string[] = [];
+  let state = "SAND_BOX_RUN_STATE_HIBERNATED";
+  let ensureStatus = 200, wakeOnEnsure = true;
+  const f = await server((q, s) => { q.resume(); q.on("end", () => {
+    const method = q.url!.split("/").at(-1)!; methods.push(method);
+    if (method === "GetSandBoxRunState") return json(s, { state });
+    if (method === "EnsureSandBox") {
+      if (ensureStatus !== 200) return json(s, {}, ensureStatus);
+      if (wakeOnEnsure) state = "SAND_BOX_RUN_STATE_RUNNING";
+      return json(s, { execDaemonUrl: f.url + "/box",
+        execDaemonAuthToken: "EXEC", networkToken: "NETWORK" });
+    }
+    json(s, {}, 404);
+  }); });
+  try {
+    const c = new CursorSandProvisionClient({ fetchImpl: fetch,
+      apiBase: f.url, allowTestLoopback: true });
+    await assert.rejects(c.resolveBoxExec(accountToken, machine, signal()),
+      (e: unknown) => e instanceof SandProvisionError && e.code === "BOX_NOT_RUNNING");
+    assert.deepEqual(methods.splice(0), ["GetSandBoxRunState"]);
+    const target = await c.resolveBoxExec(accountToken, machine, signal(),
+      { allowWakeIfHibernated: true });
+    assert.equal(target.execUrl, f.url + "/box/agent.v1.ControlService/Exec");
+    assert.deepEqual(methods.splice(0),
+      ["GetSandBoxRunState", "EnsureSandBox", "GetSandBoxRunState"]);
+    await c.resolveBoxExec(accountToken, machine, signal(),
+      { allowWakeIfHibernated: true });
+    assert.deepEqual(methods.splice(0), ["GetSandBoxRunState", "EnsureSandBox"],
+      "already-running account needs no second status request");
+    state = "SAND_BOX_RUN_STATE_HIBERNATED"; wakeOnEnsure = false;
+    await assert.rejects(c.resolveBoxExec(accountToken, machine, signal(),
+      { allowWakeIfHibernated: true }),
+    (e: unknown) => e instanceof SandProvisionError && e.code === "BOX_WAKE_UNPROVEN");
+    assert.deepEqual(methods.splice(0),
+      ["GetSandBoxRunState", "EnsureSandBox", "GetSandBoxRunState"]);
+    ensureStatus = 503;
+    await assert.rejects(c.resolveBoxExec(accountToken, machine, signal(),
+      { allowWakeIfHibernated: true }),
+    (e: unknown) => e instanceof SandProvisionError && e.code === "BOX_CONTROL_PENDING");
+    assert.deepEqual(methods.splice(0), ["GetSandBoxRunState", "EnsureSandBox"],
+      "ambiguous Ensure must not be retried or treated as proof");
+    state = "SAND_BOX_RUN_STATE_ABSENT"; ensureStatus = 200;
+    await assert.rejects(c.resolveBoxExec(accountToken, machine, signal(),
+      { allowWakeIfHibernated: true }),
+    (e: unknown) => e instanceof SandProvisionError && e.code === "BOX_NOT_RUNNING");
+    assert.deepEqual(methods.splice(0), ["GetSandBoxRunState"]);
+  } finally { await f.close(); }
+});
+
 test("Box Exec rejects non-running, invalid identity, and malicious descriptors before use", async () => {
   let state = "SAND_BOX_RUN_STATE_ABSENT", descriptor = "https://evil.example/box", requests = 0;
   const f = await server((q, s) => { q.resume(); q.on("end", () => {

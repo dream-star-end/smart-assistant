@@ -144,9 +144,16 @@ export class CursorSandProvisionClient {
    * relay probe. Only call after the account has been authorized and its
    * session credential and machine ID were read from the same trusted store.
    * An ambiguous Ensure response is never retried in this method. */
-  async resolveBoxExec(token: string, machine: string, signal: AbortSignal): Promise<SandBoxExecTarget> {
+  async resolveBoxExec(token: string, machine: string, signal: AbortSignal,
+    options?: { allowWakeIfHibernated?: boolean }): Promise<SandBoxExecTarget> {
     const state = await this.getBoxRunState(token, machine, signal);
-    if (state !== "SAND_BOX_RUN_STATE_RUNNING") throw new SandProvisionError("BOX_NOT_RUNNING");
+    const waking = state === "SAND_BOX_RUN_STATE_HIBERNATED"
+      && options?.allowWakeIfHibernated === true;
+    if (state !== "SAND_BOX_RUN_STATE_RUNNING" && !waking) {
+      throw new SandProvisionError("BOX_NOT_RUNNING");
+    }
+    // The authorized model-call path may make exactly one Ensure request.
+    // A timeout/ambiguous response is not retried or treated as a descriptor.
     const value = await this.control("EnsureSandBox", token, machine, signal);
     if (typeof value.execDaemonUrl !== "string" || value.execDaemonUrl.length === 0 || value.execDaemonUrl.length > 2048) {
       throw new SandProvisionError("EXEC_DESCRIPTOR_INVALID");
@@ -163,6 +170,10 @@ export class CursorSandProvisionClient {
     const prefix = url.pathname.replace(/\/+$/, "");
     if (!prefix.endsWith("/agent.v1.ControlService/Exec")) {
       url.pathname = `${prefix}/agent.v1.ControlService/Exec`;
+    }
+    if (waking && await this.getBoxRunState(token, machine, signal)
+      !== "SAND_BOX_RUN_STATE_RUNNING") {
+      throw new SandProvisionError("BOX_WAKE_UNPROVEN");
     }
     return { execUrl: url.href, execToken: bearer(value.execDaemonAuthToken), networkToken: bearer(value.networkToken) };
   }
