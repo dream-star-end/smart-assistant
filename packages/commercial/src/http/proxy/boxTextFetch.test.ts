@@ -101,7 +101,8 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
       } else options.onStdout?.(output);
       return ok(output);
     }
-    if (isSupervisor || isKeeper) return ok(request.args[5]);
+    if (isSupervisor || isKeeper) return ok(Array.from(
+      { length: (request.args.length - 3) / 4 }, (_, i) => request.args[5 + i * 4]).join(","));
     if (isProof) return ok(JSON.stringify({ runNonce: proofDir.slice(-24), leaseEpoch,
       keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 }) + "\n");
     if (isCleanup) return ok("clean\n");
@@ -157,6 +158,23 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
   assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
   assert.deepEqual(f.getJournalUsage(), { inputTokens: 2, outputTokens: 7,
     cacheReadTokens: 20, cacheWriteTokens: 0 });
+});
+
+test("text batch stages both immutable assets in one Exec without changing billing", async () => {
+  const previous = process.env.OC_BOX_ASSET_BATCH;
+  process.env.OC_BOX_ASSET_BATCH = "1";
+  try {
+    const f = fixture();
+    const response = await f.service.fetch(input);
+    assert.ok((await response.text()).includes("event: message_stop"));
+    assert.equal(f.stages.filter((phase) => phase === "supervisor").length, 1);
+    assert.equal(f.stages.filter((phase) => phase === "keeper").length, 0);
+    assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
+    assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
+    else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
 });
 
 test("canonical billing identity stays distinct from the Box upstream model", async () => {

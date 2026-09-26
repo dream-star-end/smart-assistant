@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
-import { makeBoxAssetStage } from "./boxTextPlan.js";
+import { makeBoxAssetStage, makeBoxAssetsStage } from "./boxTextPlan.js";
 import { makeBoxToolPlan, type BoxToolPlan } from "./boxToolPlan.js";
 import { makeBoxDetachedRunAccess, makeBoxPinnedRunnerRequest } from "./boxDetachedRunAccess.js";
 
@@ -32,6 +32,12 @@ export function makeBoxDetachedToolPlan(input: {
   const access = makeBoxDetachedRunAccess({ runNonce: base.runNonce, detachedRunnerHash });
   const runnerPath = access.runnerPath;
   const stageDetachedRunner = makeBoxAssetStage(detachedRunnerAsset, runnerPath).request;
+  const assetBatch = makeBoxAssetsStage([
+    { asset: input.supervisorAsset, path: base.stageSupervisor.args[3]! },
+    { asset: input.keeperAsset, path: base.stageKeeper.args[3]! },
+    { asset: input.virtualMcpAsset, path: base.stageVirtualMcp.args[3]! },
+    { asset: detachedRunnerAsset, path: runnerPath },
+  ]);
   // The pinned runner owns the interpreter invocation. Do not pass Python's
   // -I switch as its first business argument (which must be the keeper path).
   if (base.run.args[0] !== "-I") throw new Error("BOX_DETACHED_PYTHON_ISOLATION_MISSING");
@@ -43,5 +49,6 @@ export function makeBoxDetachedToolPlan(input: {
   const cleanup: BoxCcExecRequest = { ...base.cleanup,
     args: [...base.cleanup.args, `${base.cwd}/stdout.jsonl`, `${base.cwd}/stderr.log`] };
   return { ...base, cleanup, stageDetachedRunner, detachedRunnerHash, launch,
+    stageAssets: assetBatch.request, assetManifest: assetBatch.manifest,
     readSpool: access.readSpool };
 }

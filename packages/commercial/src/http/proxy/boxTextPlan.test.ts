@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { makeBoxTextPlan, BoxTextPlanError } from "./boxTextPlan.js";
+import { readFileSync, unlinkSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError } from "./boxTextPlan.js";
 import type { ProxyBody } from "./shared.js";
 
 const supervisor = readFileSync(new URL("../../../../../scripts/ocv5-289/box_supervisor.py", import.meta.url));
@@ -10,6 +11,37 @@ const keeper = readFileSync(new URL("../../../../../scripts/ocv5-289/box_keeper.
 const body = (messages: unknown[]): ProxyBody => ({ model: "box-api-claude-opus-5",
   max_tokens: 128, stream: true, system: "OpenClaude memory marker",
   messages } as ProxyBody);
+
+test("batched immutable assets keep per-file verification and save remote round trips", () => {
+  const assets = (["supervisor", "keeper", "box-virtual-mcp", "detached-runner"] as const)
+    .map((name) => {
+      const asset = Buffer.from(`print('${randomBytes(12).toString("hex")}')\n`);
+      const hash = createHash("sha256").update(asset).digest("hex");
+      return { asset, path: `/tmp/ocv5-289-v2-${name}-${hash.slice(0, 16)}.py` };
+    });
+  const run = (args: string[]) => spawnSync("python3", args, { encoding: "utf8" });
+  try {
+    const batch = makeBoxAssetsStage(assets);
+    assert.equal(batch.request.args.length, 3 + 4 * assets.length);
+    const first = run(batch.request.args);
+    assert.equal(first.status, 0, `stdout=${first.stdout} stderr=${first.stderr}`);
+    assert.equal(first.stdout.trim(), batch.manifest);
+    const warm = run(batch.request.args);
+    assert.equal(warm.status, 0, `stdout=${warm.stdout} stderr=${warm.stderr}`);
+    assert.equal(warm.stdout.trim(), batch.manifest);
+    const changed = [...batch.request.args];
+    changed[4] = Buffer.from("different").toString("base64");
+    const corrupt = run(changed);
+    assert.notEqual(corrupt.status, 0);
+    assert.equal(corrupt.stdout, "");
+  } finally {
+    for (const { path } of assets) {
+      try { unlinkSync(path); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+});
 
 test("first text request stages only files and carries no prompt/system on Claude argv", () => {
   const plan = makeBoxTextPlan({ body: body([{ role: "user", content: [

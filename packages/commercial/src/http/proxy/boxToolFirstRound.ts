@@ -252,16 +252,24 @@ export async function runBoxToolFirstRound(input: {
     admitted = true;
     let stageLabel = "before_stage";
     try {
-      for (const [label, request, expected] of [
-        ["supervisor", plan.stageSupervisor, plan.supervisorHash],
-        ["keeper", plan.stageKeeper, plan.keeperHash],
-        ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
-        ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
-      ] as const) {
-        stageLabel = label;
-        const staged = await run(request);
-        if (staged.stdout.trim() !== expected) {
+      if (process.env.OC_BOX_ASSET_BATCH === "1") {
+        stageLabel = "assets";
+        const staged = await run(plan.stageAssets);
+        if (staged.stdout.trim() !== plan.assetManifest) {
           throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
+        }
+      } else {
+        for (const [label, request, expected] of [
+          ["supervisor", plan.stageSupervisor, plan.supervisorHash],
+          ["keeper", plan.stageKeeper, plan.keeperHash],
+          ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
+          ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
+        ] as const) {
+          stageLabel = label;
+          const staged = await run(request);
+          if (staged.stdout.trim() !== expected) {
+            throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
+          }
         }
       }
       stageLabel = "prelaunch_bootstrap";

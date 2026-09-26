@@ -126,7 +126,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         if (assetIndex === options.failAssetStage) {
           throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
         }
-        return { stdout: `${args[5]}\n`, stderrBytes: 0, exitCode: 0 as const };
+        return { stdout: `${Array.from({ length: (args.length - 3) / 4 }, (_, i) =>
+          args[5 + i * 4]).join(",")}\n`, stderrBytes: 0, exitCode: 0 as const };
       }
       sequence.push("input-stage");
       inputIndex++;
@@ -197,6 +198,22 @@ test("first tool round admits before one launch and emits terminal only after du
   assert.ok(f.sequence.indexOf("durable-handoff") < f.sequence.lastIndexOf("emit"));
   assert.ok(f.emitted.join("").includes('"name":"local_echo"'));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+});
+
+test("one batched asset Exec still precedes durable arm and the sole paid launch", async () => {
+  const previous = process.env.OC_BOX_ASSET_BATCH;
+  process.env.OC_BOX_ASSET_BATCH = "1";
+  try {
+    const f = fixture();
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "tool_handoff");
+    assert.equal(f.sequence.filter((step) => step === "asset-stage").length, 1);
+    assert.ok(f.sequence.indexOf("asset-stage") < f.sequence.indexOf("launch-arm"));
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
+    else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
 });
 
 test("tool_choice auto may answer directly with one paid launch and proven final usage", async () => {
