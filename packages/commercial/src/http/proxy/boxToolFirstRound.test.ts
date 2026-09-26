@@ -55,12 +55,16 @@ const finalRecords = [records[0],
 const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record) + "\n").join(""));
 
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
-  directFinal?: boolean; finalTrailing?: boolean } = {}) {
+  directFinal?: boolean; finalTrailing?: boolean;
+  failAssetStage?: number; failInputStage?: number;
+  stageFailureCode?: string } = {}) {
   const sequence: string[] = [];
+  const unknownPhases: string[] = [];
   const emitted: string[] = [];
   let disposed = false, launches = 0, recordedOffset = -1;
   let currentNonce = "", currentEpoch = "";
   let retained = false, cleanupRetained = false;
+  let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
     exec: { run: async (request: { args: string[] }) => {
       const args = request.args;
@@ -99,11 +103,20 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         stderrBytes: 0, exitCode: 0 as const };
       }
       if (args[0] === "-I" && args[1] === "-c"
-        && args[3]?.startsWith("/tmp/ocv5-289-")) {
+        && args[3]?.startsWith("/tmp/ocv5-289-")
+        && !args[3]?.startsWith("/tmp/ocv5-289-run-")) {
         sequence.push("asset-stage");
+        assetIndex++;
+        if (assetIndex === options.failAssetStage) {
+          throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
+        }
         return { stdout: `${args[5]}\n`, stderrBytes: 0, exitCode: 0 as const };
       }
       sequence.push("input-stage");
+      inputIndex++;
+      if (inputIndex === options.failInputStage) {
+        throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
+      }
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
     } } };
   const journal = {
@@ -113,7 +126,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       if (options.rejectAdmission) throw new Error("synthetic admission denied"); },
     markRunning: async () => { sequence.push("mark-running"); },
     markPrestartStopped: async () => { sequence.push("prestart-stopped"); },
-    markUnknown: async () => { sequence.push("unknown"); },
+    markUnknown: async (arg: { phase: string }) => {
+      sequence.push("unknown"); unknownPhases.push(arg.phase);
+    },
     recordToolHandoff: async (arg: { spoolOffset: number; catalogHash: string;
       detachedRunnerHash: string }) => {
       sequence.push("durable-handoff"); recordedOffset = arg.spoolOffset;
@@ -141,7 +156,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     canonicalModel: canonicalBody.model, canonicalBody, upstreamModel: model,
     url: BOX_INTERNAL_ENDPOINT, init: { method: "POST", body: JSON.stringify(upstreamBody) },
     emit: (sse: string) => { sequence.push("emit"); emitted.push(sse); } };
-  return { input, deps, target, sequence, emitted,
+  return { input, deps, target, sequence, unknownPhases, emitted,
     get disposed() { return disposed; }, get launches() { return launches; },
     get recordedOffset() { return recordedOffset; },
     get retained() { return retained; },
@@ -193,6 +208,29 @@ test("denied admission never stages or launches paid CLI and closes prestart tar
   assert.equal(f.launches, 0);
   assert.equal(f.disposed, true);
   assert.deepEqual(f.sequence, ["admit"]);
+});
+
+test("asset stage timeout is durable unknown with exact safe phase and zero paid launches", async () => {
+  const f = fixture({ failAssetStage: 0 });
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
+    (error: unknown) => error instanceof BoxExecTransportError
+      && error.code === "BOX_EXEC_TIMEOUT");
+  assert.deepEqual(f.unknownPhases,
+    ["stage_transport_unknown:supervisor:BOX_EXEC_TIMEOUT"]);
+  assert.equal(f.launches, 0);
+  assert.equal(f.retained, true);
+  assert.equal(f.disposed, false);
+});
+
+test("injected transport abort code retains its private-input stage label", async () => {
+  const f = fixture({ failInputStage: 0, stageFailureCode: "BOX_EXEC_ABORTED" });
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
+    (error: unknown) => error instanceof BoxExecTransportError
+      && error.code === "BOX_EXEC_ABORTED");
+  assert.deepEqual(f.unknownPhases,
+    ["stage_transport_unknown:input_0:BOX_EXEC_ABORTED"]);
+  assert.equal(f.launches, 0);
+  assert.equal(f.retained, true);
 });
 
 test("ambiguous launch is not retried and leaves durable capacity unknown", async () => {

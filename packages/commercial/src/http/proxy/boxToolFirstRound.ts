@@ -231,20 +231,25 @@ export async function runBoxToolFirstRound(input: {
     }, () => {});
     await race(pendingAdmission);
     admitted = true;
+    let stageLabel = "before_stage";
     try {
-      for (const [request, expected] of [
-        [plan.stageSupervisor, plan.supervisorHash],
-        [plan.stageKeeper, plan.keeperHash],
-        [plan.stageVirtualMcp, plan.virtualMcpHash],
-        [plan.stageDetachedRunner, plan.detachedRunnerHash],
+      for (const [label, request, expected] of [
+        ["supervisor", plan.stageSupervisor, plan.supervisorHash],
+        ["keeper", plan.stageKeeper, plan.keeperHash],
+        ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
+        ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
       ] as const) {
+        stageLabel = label;
         const staged = await run(request);
         if (staged.stdout.trim() !== expected) {
           throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
         }
       }
       inputStageStarted = true;
-      for (const request of plan.stageInputs) await run(request);
+      for (const [index, request] of plan.stageInputs.entries()) {
+        stageLabel = `input_${index}`;
+        await run(request);
+      }
       if (signal.aborted || remaining() < 60_000) {
         throw new BoxToolFirstRoundError("BOX_TOOL_BUDGET_EXHAUSTED");
       }
@@ -252,7 +257,7 @@ export async function runBoxToolFirstRound(input: {
         leaseEpoch: plan.leaseEpoch }));
     } catch (error) {
       if (error instanceof BoxExecTransportError && !error.terminalKnown) {
-        await unknown("stage_transport_unknown");
+        await unknown(`stage_transport_unknown:${stageLabel}:${error.code}`);
       } else await prestart();
       throw error;
     }

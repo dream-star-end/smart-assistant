@@ -135,10 +135,31 @@ describe("bounded Box Connect Exec transport", () => {
       return streamResponse(frame({ exitEvent: {} }), frame({}, 2));
     }, () => guard);
     const error = await code(transport.run(request, { timeoutMs: 1000 }));
-    assert.equal(error.code, "BOX_EXEC_ABORTED");
+    assert.equal(error.code, "BOX_EXEC_TIMEOUT");
     releaseGuard();
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(called, false);
+  });
+
+  it("distinguishes a dispatched fetch deadline from caller cancellation without replay", async () => {
+    let calls = 0;
+    const transport = new BoxExecTransport(target, async () => {
+      calls++;
+      return new Promise<Response>(() => {});
+    }, async () => {});
+    const error = await code(transport.run(request, { timeoutMs: 1000 }));
+    assert.equal(error.code, "BOX_EXEC_TIMEOUT");
+    assert.equal(error.terminalKnown, false);
+    assert.equal(calls, 1);
+  });
+
+  it("distinguishes a stalled response stream deadline from caller cancellation", async () => {
+    const transport = new BoxExecTransport(target, async () =>
+      new Response(new ReadableStream<Uint8Array>({ start() {} }), { status: 200 }),
+    async () => {});
+    const error = await code(transport.run(request, { timeoutMs: 1000 }));
+    assert.equal(error.code, "BOX_EXEC_TIMEOUT");
+    assert.equal(error.terminalKnown, false);
   });
 
   it("does not deliver a second same-batch stdout after callback cancellation", async () => {
