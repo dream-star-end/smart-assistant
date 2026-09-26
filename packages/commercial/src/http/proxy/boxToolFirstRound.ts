@@ -252,7 +252,10 @@ export async function runBoxToolFirstRound(input: {
       try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
         sessionId: input.sessionId, currentRequestId: input.requestId,
         canonicalModel: input.canonicalModel })); }
-      catch { /* Cache lookup failure leaves the ordinary one-launch path. */ }
+      catch (error) {
+        if (signal.aborted) throw error;
+        /* Cache lookup failure leaves the ordinary one-launch path. */
+      }
       if (candidate && candidate.pointer.accountId === target.accountId.toString()
         && candidate.pointer.upstreamModel === input.upstreamModel
         && candidate.pointer.catalogHash === plan.catalog.bindingSha256
@@ -273,7 +276,8 @@ export async function runBoxToolFirstRound(input: {
           nativeClaim = { ownerRequestId: candidate.ownerRequestId,
             pointer: candidate.pointer, upstreamModel: input.upstreamModel };
         } catch (error) {
-          if (signal.aborted) throw error;
+          if (signal.aborted || error instanceof BoxToolFirstRoundError
+            && error.code === "BOX_TOOL_ABORTED") throw error;
           // Preflight is read-only/no paid CLI. A miss falls back exactly once.
         }
       }
@@ -282,7 +286,9 @@ export async function runBoxToolFirstRound(input: {
       accountId: target.accountId, model: input.canonicalModel, fingerprint,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
       invocationMode: "detached_tool", contextHash,
-      ...(nativeClaim ? { nativeClaim } : {}) });
+      ...(nativeClaim ? { nativeClaim }
+        : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
+          cliCwd: plan.cliCwd } } : {}) });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {

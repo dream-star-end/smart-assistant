@@ -379,7 +379,8 @@ export class BoxToolFetch {
               await this.releaseAfterProof({ requestId: args.requestId,
                 uid: args.uid, accountId: published.claim.accountId,
                 runNonce: published.claim.runNonce,
-                leaseEpoch: published.claim.leaseEpoch, proof: result.proof });
+                leaseEpoch: published.claim.leaseEpoch, proof: result.proof,
+                ...(result.nativePointer ? { nativePointer: result.nativePointer } : {}) });
             }
           } else {
             const outcome: BoxToolFirstHandoff | BoxToolFirstFinal = await (this.deps.runFirst

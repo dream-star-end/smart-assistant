@@ -181,7 +181,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       invocationMode: "detached_tool" as const,
       contextHash: deriveBoxContextHash(firstBody),
       fingerprint: { ...fingerprint, replayFingerprint: "9".repeat(64) },
-      runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32) };
+      runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32),
+      nativeStart: { sessionId: "12345678-1234-4123-8123-123456789abc",
+        cliCwd: `/tmp/ocv5-289-run-${"3".repeat(24)}` } };
     await journal.admit(toolCall);
     await journal.markRunning(toolCall);
     const firstToolUses = [
@@ -339,6 +341,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(resumed.accountId, 20n);
     assert.equal(resumed.spoolOffset, 1234);
     assert.equal(resumed.roundNo, 2);
+    assert.equal(resumed.nativeSessionId, toolCall.nativeStart.sessionId);
+    assert.equal(resumed.nativeCliCwd, toolCall.nativeStart.cliCwd);
     assert.equal(resumed.detachedRunnerHash, "f".repeat(64));
     assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
       ["toolu_A", "toolu_B"]);
@@ -350,6 +354,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "resuming");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
       "linked");
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxNativeSessionId,
+      toolCall.nativeStart.sessionId);
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxRoundNo,
       2);
     assert.deepEqual(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)
@@ -774,7 +780,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
     [cancelId, JSON.stringify({ ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: cancelSession, turnKey: cancelTurn } })]);
-    const cancelCall = { ...toolCall, requestId: cancelId,
+    const cancelCall = { ...toolCall, nativeStart: undefined, requestId: cancelId,
       runNonce: "9".repeat(24), leaseEpoch: "a".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, cancelBody),
       contextHash: deriveBoxContextHash(cancelBody) };
@@ -807,7 +813,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       metadata: { user_id: JSON.stringify({ oc_turn_key: handoffTurn,
         session_id: handoffSession }) },
       messages: [{ role: "user", content: "synthetic stopped handoff" }] };
-    const handoffRoot = { ...toolCall, requestId: `box-handoff-stop-${suffix}`,
+    const handoffRoot = { ...toolCall, nativeStart: undefined,
+      requestId: `box-handoff-stop-${suffix}`,
       runNonce: "b".repeat(24), leaseEpoch: "c".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, handoffBody),
       contextHash: deriveBoxContextHash(handoffBody) };
@@ -860,7 +867,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       messages: [{ role: "user", content: "synthetic linked handoff" }] };
     const linkedBasis = { ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: linkedSession, turnKey: linkedTurn } };
-    const linkedRoot = { ...toolCall, requestId: `box-linked-root-${suffix}`,
+    const linkedRoot = { ...toolCall, nativeStart: undefined,
+      requestId: `box-linked-root-${suffix}`,
       runNonce: "d".repeat(24), leaseEpoch: "f".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, linkedBody),
       contextHash: deriveBoxContextHash(linkedBody) };
@@ -936,7 +944,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         budget(15_000_000)] };
     const cacheBasis = { ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: cacheSession, turnKey: cacheTurn } };
-    const cacheRoot = { ...toolCall, requestId: `box-cache-root-${suffix}`,
+    const cacheRoot = { ...toolCall, nativeStart: undefined,
+      requestId: `box-cache-root-${suffix}`,
       runNonce: "e".repeat(24), leaseEpoch: "8".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, cacheFirst),
       contextHash: deriveBoxContextHash(cacheFirst) };

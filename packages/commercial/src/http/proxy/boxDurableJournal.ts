@@ -67,6 +67,8 @@ export interface BoxJournalAdmission {
   /** Optional completed-turn native cache claim, never inferred from body hash. */
   nativeClaim?: { ownerRequestId: string; pointer: BoxNativePointer;
     upstreamModel: string };
+  /** First native invocation mints an opaque Claude UUID in its own run cwd. */
+  nativeStart?: { sessionId: string; cliCwd: string };
 }
 export interface BoxNativeCandidate {
   readonly ownerRequestId: string;
@@ -84,6 +86,8 @@ export interface BoxToolResumeClaim {
   readonly durableRevision: string;
   readonly results: readonly BoxMatchedToolResult[];
   readonly toolUses: readonly BoxToolUseDigest[];
+  readonly nativeSessionId?: string;
+  readonly nativeCliCwd?: string;
 }
 export interface BoxRemoteCleanupCandidate {
   readonly requestId: string;
@@ -186,6 +190,9 @@ function goodId(input: BoxJournalAdmission): void {
       && input.invocationMode !== "detached_tool")
     || (input.invocationMode === "detached_tool"
       && !/^[a-f0-9]{64}$/.test(input.contextHash ?? ""))
+    || (input.nativeStart !== undefined && (input.nativeClaim !== undefined
+      || !UUID_V4.test(input.nativeStart.sessionId)
+      || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`))
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -327,7 +334,9 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
         ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
           boxNativeSessionId: native.pointer.nativeSessionId,
-          boxNativeCliCwd: native.pointer.cliCwd } : {}) };
+          boxNativeCliCwd: native.pointer.cliCwd } : {}),
+        ...(input.nativeStart ? { boxNativeSessionId: input.nativeStart.sessionId,
+          boxNativeCliCwd: input.nativeStart.cliCwd } : {}) };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
@@ -875,6 +884,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
       if (owners.rows.length !== 1) throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
       const owner = owners.rows[0]!, ctx = owner.ctx;
+      const nativeSessionId = ctx.boxNativeSessionId;
+      const nativeCliCwd = ctx.boxNativeCliCwd;
       if (ctx.model !== input.canonicalModel
         || ctx.boxInvocationMode !== "detached_tool"
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -884,7 +895,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         || !/^[a-f0-9]{64}$/.test(ctx.boxContextHash)
         || typeof ctx.boxHandoffRevision !== "string" || ctx.boxHandoffRevision.length > 128
         || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
-        || Array.isArray(ctx.boxToolHandoff)) {
+        || Array.isArray(ctx.boxToolHandoff)
+        || (nativeSessionId === undefined) !== (nativeCliCwd === undefined)
+        || (nativeSessionId !== undefined &&
+          (typeof nativeSessionId !== "string" || !UUID_V4.test(nativeSessionId)
+            || typeof nativeCliCwd !== "string"
+            || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(nativeCliCwd)))) {
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
       }
       const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
@@ -980,7 +996,10 @@ export class BoxDurableJournal implements BoxJournalPort {
             boxReplayFingerprint: fingerprint.replayFingerprint,
              boxRequestHash: fingerprint.requestHash,
              boxContextHash: nextContextHash,
-             boxParentResumeRevision: durableRevision })]);
+             boxParentResumeRevision: durableRevision,
+             ...(nativeSessionId === undefined ? {} : {
+               boxNativeSessionId: nativeSessionId,
+               boxNativeCliCwd: nativeCliCwd }) })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
@@ -994,8 +1013,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         spoolOffset: handoff.spoolOffset, roundNo: handoff.roundNo + 1,
         durableRevision, results,
         detachedRunnerHash: handoff.detachedRunnerHash,
-        catalogHash: handoff.catalogHash,
-        toolUses: digests };
+         catalogHash: handoff.catalogHash,
+         toolUses: digests,
+         ...(nativeSessionId === undefined ? {} : {
+           nativeSessionId: nativeSessionId as string,
+           nativeCliCwd: nativeCliCwd as string }) };
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
@@ -1087,7 +1109,9 @@ export class BoxDurableJournal implements BoxJournalPort {
           || ctx.boxAccountId !== basis.boxAccountId
           || ctx.boxSessionId !== basis.boxSessionId
           || ctx.boxTurnKey !== basis.boxTurnKey
-          || ctx.model !== basis.model) {
+          || ctx.model !== basis.model
+          || ctx.boxNativeSessionId !== basis.boxNativeSessionId
+          || ctx.boxNativeCliCwd !== basis.boxNativeCliCwd) {
           throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
         }
       }

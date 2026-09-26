@@ -72,6 +72,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   let controlHash = "";
   let retained = false, cleanupRetained = false;
   let admittedNative: unknown = null;
+  let admittedStart: unknown = null;
   let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
     exec: { run: async (request: { args: string[] }) => {
@@ -159,10 +160,12 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     } } };
   const journal = {
     findNativeCandidate: async () => options.nativeCandidate ?? null,
-    admit: async (identity: { runNonce: string; leaseEpoch: string; nativeClaim?: unknown }) => {
+    admit: async (identity: { runNonce: string; leaseEpoch: string;
+      nativeClaim?: unknown; nativeStart?: unknown }) => {
       sequence.push("admit"); currentNonce = identity.runNonce;
       currentEpoch = identity.leaseEpoch;
       admittedNative = identity.nativeClaim ?? null;
+      admittedStart = identity.nativeStart ?? null;
       if (options.rejectAdmission) throw new Error("synthetic admission denied"); },
     recordPrelaunchControl: async () => { sequence.push("prelaunch-journal"); },
     armGuardedLaunch: async () => { sequence.push("launch-arm");
@@ -205,6 +208,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     get recordedOffset() { return recordedOffset; },
     get retained() { return retained; },
     get admittedNative() { return admittedNative; },
+    get admittedStart() { return admittedStart; },
     get cleanupRetained() { return cleanupRetained; } };
 }
 
@@ -313,6 +317,8 @@ test("native first final publishes a pointer only after terminal usage and proof
     assert.equal(result.nativePointer?.transcriptSha256, "f".repeat(64));
     assert.ok(!result.plan.run.args.includes("--no-session-persistence"));
     assert.equal(f.launches, 1);
+    assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId,
+      cliCwd: result.plan.cliCwd });
     assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
@@ -355,6 +361,7 @@ test("warm native hit preflights one UUID and atomically claims before one paid 
     assert.equal(result.plan.snapshotHash, null);
     assert.equal((f.admittedNative as { ownerRequestId: string }).ownerRequestId,
       "native-owner");
+    assert.equal(f.admittedStart, null);
     assert.equal(f.sequence.filter((step) => step === "native-inspect").length, 2);
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("admit"));
     assert.equal(f.launches, 1);

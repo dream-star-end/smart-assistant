@@ -11,6 +11,9 @@ import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
+import { deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
+import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { ProxyBody } from "./shared.js";
 
 export class BoxToolContinuationError extends Error {
@@ -18,9 +21,10 @@ export class BoxToolContinuationError extends Error {
 }
 export type BoxToolContinuationResult =
   | { kind: "tool_handoff"; spoolOffset: number }
-  | { kind: "final"; proof: BoxTerminalProof };
+  | { kind: "final"; proof: BoxTerminalProof; nativePointer?: BoxNativePointer };
 type Journal = Pick<BoxDurableJournal, "recordToolHandoff" |
-  "completeToolChain" | "markUnknown">;
+  "completeToolChain" | "markUnknown">
+  & Partial<Pick<BoxDurableJournal, "attachNativePointer">>;
 
 export async function runBoxToolContinuation(input: {
   published: BoxToolPublishedResume;
@@ -161,9 +165,34 @@ export async function runBoxToolContinuation(input: {
           cacheWriteTokens: final.cacheWriteTokens };
         await race(deps.journal.completeToolChain({ requestId: input.requestId,
           uid: input.uid, leaseEpoch: claim.leaseEpoch, proof, usage }));
+        let nativePointer: BoxNativePointer | undefined;
+        if (process.env.OC_BOX_NATIVE_RESUME === "1" && final.assistantContentHash
+          && claim.nativeSessionId && claim.nativeCliCwd
+          && deps.journal.attachNativePointer) {
+          try {
+            const inspected = await target.exec.run(makeBoxNativeFileInspect({
+              cliCwd: claim.nativeCliCwd, nativeSessionId: claim.nativeSessionId }), {
+              timeoutMs: 10_000, maxResponseBytes: 4096 });
+            const file = parseBoxNativeFileEvidence(inspected.stdout);
+            const candidate = parseBoxNativePointer({ version: 1,
+              accountId: claim.accountId.toString(), upstreamModel: input.upstreamModel,
+              cliVersion: "2.1.280", nativeSessionId: claim.nativeSessionId,
+              cliCwd: claim.nativeCliCwd, transcriptSha256: file.sha256,
+              contextHashBeforeFinal: deriveBoxContextHash(input.canonicalBody),
+              assistantContentHash: final.assistantContentHash,
+              catalogHash: claim.catalogHash,
+              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+            if (candidate && await deps.journal.attachNativePointer({
+              requestId: input.requestId, uid: input.uid,
+              accountId: claim.accountId, proof, pointer: candidate })) {
+              nativePointer = candidate;
+            }
+          } catch { /* Cache miss must not erase durable usage or model result. */ }
+        }
         input.emit(decoder.commitFinal({ terminalReason: proof.reason,
           journaledUsage: usage }));
-        return { kind: "final", proof };
+        return { kind: "final", proof,
+          ...(nativePointer ? { nativePointer } : {}) };
       }
     }
     throw new BoxToolContinuationError("BOX_TOOL_STREAM_INCOMPLETE");
