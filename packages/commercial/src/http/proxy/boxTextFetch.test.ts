@@ -51,7 +51,8 @@ type Runner = Pick<BoxExecTransport, "run">;
 function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "proof" | "cleanup";
   journalFailPhase?: "admit" | "running" | "complete";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
-  resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean } = {}) {
+  resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
+  badAssetManifest?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
@@ -68,8 +69,10 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
     const isKeeper = request.args[3]?.startsWith("/tmp/ocv5-289-v2-keeper-");
     const isCleanup = request.args[2]?.includes("print('clean')");
     const isProof = request.args[2]?.includes("terminal.json");
+    const isBatch = request.args[2]?.includes("print('staged:'+str(len(steps)))");
     const phase = isModel ? "model" : isSupervisor ? "supervisor"
-      : isKeeper ? "keeper" : isCleanup ? "cleanup" : isProof ? "proof" : "stage";
+      : isKeeper ? "keeper" : isCleanup ? "cleanup" : isProof ? "proof"
+        : isBatch ? "batch-stage" : "stage";
     stages.push(phase);
     active--;
     if (phase === "stage") opts.advanceAtStage?.();
@@ -101,8 +104,13 @@ function fixture(opts: { failPhase?: "stage" | "stage_typeerror" | "keeper" | "k
       } else options.onStdout?.(output);
       return ok(output);
     }
-    if (isSupervisor || isKeeper) return ok(Array.from(
-      { length: (request.args.length - 3) / 4 }, (_, i) => request.args[5 + i * 4]).join(","));
+    if (isSupervisor || isKeeper) return ok(opts.badAssetManifest && request.args.length > 7
+      ? "bad" : Array.from({ length: (request.args.length - 3) / 4 },
+        (_, i) => request.args[5 + i * 4]).join(","));
+    if (isBatch) {
+      const steps = JSON.parse(Buffer.from(request.args[3]!, "base64").toString("utf8")) as unknown[];
+      return ok(`staged:${steps.length}\n`);
+    }
     if (isProof) return ok(JSON.stringify({ runNonce: proofDir.slice(-24), leaseEpoch,
       keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 }) + "\n");
     if (isCleanup) return ok("clean\n");
@@ -174,6 +182,36 @@ test("text batch stages both immutable assets in one Exec without changing billi
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
     else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
+});
+
+test("text batch manifest mismatch cannot reach the paid model", async () => {
+  const previous = process.env.OC_BOX_ASSET_BATCH;
+  process.env.OC_BOX_ASSET_BATCH = "1";
+  try {
+    const f = fixture({ badAssetManifest: true });
+    await assert.rejects(f.service.fetch(input), /BOX_STAGING_FAILED/);
+    assert.equal(f.stages.filter((phase) => phase === "model").length, 0);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
+    else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
+});
+
+test("text private staging batches small files without changing billing", async () => {
+  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  try {
+    const f = fixture();
+    const response = await f.service.fetch(input);
+    assert.ok((await response.text()).includes("event: message_stop"));
+    assert.equal(f.stages.filter((phase) => phase === "batch-stage").length, 1);
+    assert.equal(f.stages.filter((phase) => phase === "stage").length, 0);
+    assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
+    assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
   }
 });
 

@@ -12,6 +12,7 @@ import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
@@ -286,15 +287,41 @@ export async function runBoxToolFirstRound(input: {
       await race(deps.journal.recordPrelaunchControl({ requestId: input.requestId,
         uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
         leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
-      for (const [index, request] of plan.stageInputs.entries()) {
-        stageLabel = `input_${index}`;
-        if (index === 0) {
-          if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
-            throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+      if (process.env.OC_BOX_PRIVATE_STAGE_BATCH === "1") {
+        const receipt = prelaunchReceipt;
+        const guarded = plan.stageInputs.map((request, index) => {
+          if (index === 0) {
+            if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+              throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+            }
+            return makeBoxPrelaunchInit(receipt, request.args[4]);
           }
-          await run(makeBoxPrelaunchInit(prelaunchReceipt, request.args[4]));
+          return guardBoxPrivateStage(request, receipt);
+        });
+        const batch = makeBoxStageBatch(guarded);
+        if (batch) {
+          stageLabel = "input_batch";
+          const staged = await run(batch.request, 60_000);
+          if (staged.stdout.trim() !== batch.expected) {
+            throw new BoxToolFirstRoundError("BOX_TOOL_INPUT_STAGE_INVALID");
+          }
         } else {
-          await run(guardBoxPrivateStage(request, prelaunchReceipt));
+          for (const [index, request] of guarded.entries()) {
+            stageLabel = `input_${index}`;
+            await run(request);
+          }
+        }
+      } else {
+        for (const [index, request] of plan.stageInputs.entries()) {
+          stageLabel = `input_${index}`;
+          if (index === 0) {
+            if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+              throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+            }
+            await run(makeBoxPrelaunchInit(prelaunchReceipt, request.args[4]));
+          } else {
+            await run(guardBoxPrivateStage(request, prelaunchReceipt));
+          }
         }
       }
       if (signal.aborted || remaining() < 60_000) {

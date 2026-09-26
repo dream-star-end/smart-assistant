@@ -58,7 +58,8 @@ const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record)
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
   directFinal?: boolean; finalTrailing?: boolean;
   failAssetStage?: number; failInputStage?: number;
-  stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean } = {}) {
+  stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
+  badAssetManifest?: boolean } = {}) {
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
@@ -126,8 +127,18 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         if (assetIndex === options.failAssetStage) {
           throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
         }
-        return { stdout: `${Array.from({ length: (args.length - 3) / 4 }, (_, i) =>
-          args[5 + i * 4]).join(",")}\n`, stderrBytes: 0, exitCode: 0 as const };
+        const manifest = Array.from({ length: (args.length - 3) / 4 }, (_, i) =>
+          args[5 + i * 4]).join(",");
+        return { stdout: `${options.badAssetManifest && args.length > 7 ? "bad" : manifest}\n`,
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("print('staged:'+str(len(steps)))")) {
+        sequence.push("input-batch");
+        const steps = JSON.parse(Buffer.from(args[3]!, "base64").toString("utf8")) as unknown[];
+        if (options.failInputStage === 0) {
+          throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
+        }
+        return { stdout: `staged:${steps.length}\n`, stderrBytes: 0, exitCode: 0 as const };
       }
       sequence.push("input-stage");
       inputIndex++;
@@ -213,6 +224,39 @@ test("one batched asset Exec still precedes durable arm and the sole paid launch
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
     else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
+});
+
+test("batch manifest mismatch cannot arm or start a paid model", async () => {
+  const previous = process.env.OC_BOX_ASSET_BATCH;
+  process.env.OC_BOX_ASSET_BATCH = "1";
+  try {
+    const f = fixture({ badAssetManifest: true });
+    await assert.rejects(runBoxToolFirstRound(f.input, f.deps),
+      /BOX_TOOL_ASSET_STAGE_INVALID/);
+    assert.equal(f.launches, 0);
+    assert.ok(!f.sequence.includes("launch-arm"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
+    else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
+});
+
+test("one guarded private-stage Exec still precedes durable arm and sole launch", async () => {
+  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  try {
+    const f = fixture();
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "tool_handoff");
+    assert.equal(f.sequence.filter((step) => step === "input-batch").length, 1);
+    assert.equal(f.sequence.filter((step) => step === "input-stage").length, 0);
+    assert.ok(f.sequence.indexOf("prelaunch-journal") < f.sequence.indexOf("input-batch"));
+    assert.ok(f.sequence.indexOf("input-batch") < f.sequence.indexOf("launch-arm"));
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
   }
 });
 
