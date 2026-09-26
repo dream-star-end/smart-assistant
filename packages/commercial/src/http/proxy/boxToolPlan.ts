@@ -4,7 +4,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
-import { makeBoxTextPlan, makeBoxAssetStage, BoxTextPlanError,
+import { makeBoxTextPlan, makeBoxAssetStage, makeBoxAssetsStage, BoxTextPlanError,
   type BoxTextPlan } from "./boxTextPlan.js";
 import { compileBoxToolCatalog, mapBoxCliEffort,
   type BoxToolCatalog } from "./boxToolCatalog.js";
@@ -25,6 +25,8 @@ export function makeBoxToolPlan(input: {
   virtualMcpAsset: Buffer;
   runNonce?: string;
   leaseEpoch?: string;
+  nativePersistence?: boolean;
+  nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
   if (choice !== undefined && (choice === null || typeof choice !== "object"
@@ -45,10 +47,16 @@ export function makeBoxToolPlan(input: {
       maxOutputTokensLimit: input.maxOutputTokensLimit,
       supervisorAsset: input.supervisorAsset, keeperAsset: input.keeperAsset,
       extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
-      runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900 });
+       runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900,
+       nativePersistence: input.nativePersistence, nativeResume: input.nativeResume });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;
+  const assetBatch = makeBoxAssetsStage([
+    { asset: input.supervisorAsset, path: base.stageSupervisor.args[3]! },
+    { asset: input.keeperAsset, path: base.stageKeeper.args[3]! },
+    { asset: input.virtualMcpAsset, path: virtualMcpPath },
+  ]);
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
     command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });
   const args = [...base.run.args];
@@ -68,5 +76,6 @@ export function makeBoxToolPlan(input: {
   args.splice(configAt, 0, "--allowedTools", allowed);
   if (effort !== null) args.splice(configAt, 0, "--effort", effort);
   const run: BoxCcExecRequest = { ...base.run, args };
-  return { ...base, stageVirtualMcp, virtualMcpHash, catalog, run };
+  return { ...base, stageVirtualMcp, virtualMcpHash, catalog, run,
+    stageAssets: assetBatch.request, assetManifest: assetBatch.manifest };
 }

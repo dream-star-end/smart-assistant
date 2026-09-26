@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { makeBoxTextPlan, BoxTextPlanError } from "./boxTextPlan.js";
+import { readFileSync, unlinkSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError } from "./boxTextPlan.js";
 import type { ProxyBody } from "./shared.js";
 
 const supervisor = readFileSync(new URL("../../../../../scripts/ocv5-289/box_supervisor.py", import.meta.url));
@@ -10,6 +11,38 @@ const keeper = readFileSync(new URL("../../../../../scripts/ocv5-289/box_keeper.
 const body = (messages: unknown[]): ProxyBody => ({ model: "box-api-claude-opus-5",
   max_tokens: 128, stream: true, system: "OpenClaude memory marker",
   messages } as ProxyBody);
+const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
+
+test("batched immutable assets keep per-file verification and save remote round trips", () => {
+  const assets = (["supervisor", "keeper", "box-virtual-mcp", "detached-runner"] as const)
+    .map((name) => {
+      const asset = Buffer.from(`print('${randomBytes(12).toString("hex")}')\n`);
+      const hash = createHash("sha256").update(asset).digest("hex");
+      return { asset, path: `/tmp/ocv5-289-v2-${name}-${hash.slice(0, 16)}.py` };
+    });
+  const run = (args: string[]) => spawnSync("python3", args, { encoding: "utf8" });
+  try {
+    const batch = makeBoxAssetsStage(assets);
+    assert.equal(batch.request.args.length, 3 + 4 * assets.length);
+    const first = run(batch.request.args);
+    assert.equal(first.status, 0, `stdout=${first.stdout} stderr=${first.stderr}`);
+    assert.equal(first.stdout.trim(), batch.manifest);
+    const warm = run(batch.request.args);
+    assert.equal(warm.status, 0, `stdout=${warm.stdout} stderr=${warm.stderr}`);
+    assert.equal(warm.stdout.trim(), batch.manifest);
+    const changed = [...batch.request.args];
+    changed[4] = Buffer.from("different").toString("base64");
+    const corrupt = run(changed);
+    assert.notEqual(corrupt.status, 0);
+    assert.equal(corrupt.stdout, "");
+  } finally {
+    for (const { path } of assets) {
+      try { unlinkSync(path); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+});
 
 test("first text request stages only files and carries no prompt/system on Claude argv", () => {
   const plan = makeBoxTextPlan({ body: body([{ role: "user", content: [
@@ -65,6 +98,42 @@ test("completed history stages actual upstream model with a structured current t
       { input: script, encoding: "utf8" });
     assert.equal(parsed.status, 0, parsed.stderr);
   }
+});
+
+test("native completed-turn resume stages only current input and keeps one CLI UUID", () => {
+  const cliCwd = `/tmp/ocv5-289-run-${"a".repeat(24)}`;
+  const sessionId = "12345678-1234-4123-8123-123456789abc";
+  const history = body([user("prior"), { role: "assistant", content: [
+    { type: "text", text: "previous answer" }] }, user("current")]);
+  const fresh = makeBoxTextPlan({ body: body([user("initial")]),
+    upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+    maxOutputTokensLimit: 128_000, nativePersistence: true,
+    runNonce: "b".repeat(24) });
+  assert.equal(fresh.nativePersistence, true);
+  assert.ok(fresh.run.args.includes("--session-id"));
+  assert.ok(!fresh.run.args.includes("--no-session-persistence"));
+  assert.equal(fresh.run.environment.DISABLE_AUTO_COMPACT, "1");
+  const resumed = makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
+    supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
+    nativeResume: { cliCwd, sessionId, expectedSha256: "e".repeat(64) },
+    runNonce: "c".repeat(24) });
+  assert.equal(resumed.cliCwd, cliCwd);
+  assert.equal(resumed.run.cwd, cliCwd);
+  assert.equal(resumed.sessionId, sessionId);
+  assert.equal(resumed.snapshotHash, null);
+  assert.ok(resumed.run.args.includes("--resume"));
+  assert.ok(!resumed.run.args.includes("--no-session-persistence"));
+  assert.equal(resumed.run.environment.DISABLE_AUTO_COMPACT, "1");
+  assert.ok(resumed.nativePreflight?.args.includes("e".repeat(64)));
+  assert.equal(fresh.cleanup.args[5], "keep");
+  assert.equal(fresh.discardNativeCleanup?.args[5], "full");
+  assert.equal(resumed.stageInputs.some((step) => step.args[5]?.includes("/.claude/projects/")), false);
+  assert.equal(resumed.cleanup.args[4], "");
+  assert.throws(() => makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
+    supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
+    nativeResume: { cliCwd: "/tmp/../other", sessionId,
+      expectedSha256: "e".repeat(64) } }),
+  (error: unknown) => error instanceof BoxTextPlanError && error.code === "BOX_NATIVE_SESSION_INVALID");
 });
 
 test("unproved tools and mismatched model family fail before any Box command is created", () => {

@@ -12,10 +12,14 @@ import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { randomBytes } from "node:crypto";
+import { matchesBoxNativeHistory } from "./boxNativeHistory.js";
+import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
+import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -35,10 +39,12 @@ export interface BoxToolFirstFinal {
   readonly plan: BoxDetachedToolPlan;
   readonly target: BoxResolvedTarget;
   readonly proof: BoxTerminalProof;
+  readonly nativePointer?: BoxNativePointer;
 }
 type Journal = Pick<BoxDurableJournal, "admit" |
   "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
-  "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">;
+  "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
+  & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer">>;
 
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
@@ -103,10 +109,12 @@ export async function runBoxToolFirstRound(input: {
     if (error instanceof BoxToolFirstRoundError) throw error;
     throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
   }
-  const plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+  const nativeEnabled = process.env.OC_BOX_NATIVE_RESUME === "1";
+  let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
-    detachedRunnerAsset: deps.detachedRunnerAsset });
+    detachedRunnerAsset: deps.detachedRunnerAsset,
+    nativePersistence: nativeEnabled });
   const budget = deps.budgetMs ?? 900_000;
   if (!Number.isSafeInteger(budget) || budget < 60_000 || budget > 900_000) {
     throw new BoxToolFirstRoundError("BOX_TOOL_BUDGET_INVALID");
@@ -238,10 +246,49 @@ export async function runBoxToolFirstRound(input: {
       if (completedTarget) void closeBounded(completedTarget, "late_resolver").catch(() => {});
       throw error;
     }
+    let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
+    if (nativeEnabled && input.sessionId && deps.journal.findNativeCandidate) {
+      let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
+      try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
+        sessionId: input.sessionId, currentRequestId: input.requestId,
+        canonicalModel: input.canonicalModel })); }
+      catch (error) {
+        if (signal.aborted) throw error;
+        /* Cache lookup failure leaves the ordinary one-launch path. */
+      }
+      if (candidate && candidate.pointer.accountId === target.accountId.toString()
+        && candidate.pointer.upstreamModel === input.upstreamModel
+        && candidate.pointer.catalogHash === plan.catalog.bindingSha256
+        && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
+        const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+          maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
+          keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
+          detachedRunnerAsset: deps.detachedRunnerAsset,
+          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+          nativeResume: { cliCwd: candidate.pointer.cliCwd,
+            sessionId: candidate.pointer.nativeSessionId,
+            expectedSha256: candidate.pointer.transcriptSha256 } });
+        try {
+          const inspected = await run(warm.nativePreflight!, 20_000);
+          parseBoxNativeFileEvidence(inspected.stdout,
+            candidate.pointer.transcriptSha256);
+          plan = warm;
+          nativeClaim = { ownerRequestId: candidate.ownerRequestId,
+            pointer: candidate.pointer, upstreamModel: input.upstreamModel };
+        } catch (error) {
+          if (signal.aborted || error instanceof BoxToolFirstRoundError
+            && error.code === "BOX_TOOL_ABORTED") throw error;
+          // Preflight is read-only/no paid CLI. A miss falls back exactly once.
+        }
+      }
+    }
     const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
       accountId: target.accountId, model: input.canonicalModel, fingerprint,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
-      invocationMode: "detached_tool", contextHash });
+      invocationMode: "detached_tool", contextHash,
+      ...(nativeClaim ? { nativeClaim }
+        : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
+          cliCwd: plan.cliCwd } } : {}) });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
@@ -252,16 +299,24 @@ export async function runBoxToolFirstRound(input: {
     admitted = true;
     let stageLabel = "before_stage";
     try {
-      for (const [label, request, expected] of [
-        ["supervisor", plan.stageSupervisor, plan.supervisorHash],
-        ["keeper", plan.stageKeeper, plan.keeperHash],
-        ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
-        ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
-      ] as const) {
-        stageLabel = label;
-        const staged = await run(request);
-        if (staged.stdout.trim() !== expected) {
+      if (process.env.OC_BOX_ASSET_BATCH === "1") {
+        stageLabel = "assets";
+        const staged = await run(plan.stageAssets);
+        if (staged.stdout.trim() !== plan.assetManifest) {
           throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
+        }
+      } else {
+        for (const [label, request, expected] of [
+          ["supervisor", plan.stageSupervisor, plan.supervisorHash],
+          ["keeper", plan.stageKeeper, plan.keeperHash],
+          ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
+          ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
+        ] as const) {
+          stageLabel = label;
+          const staged = await run(request);
+          if (staged.stdout.trim() !== expected) {
+            throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
+          }
         }
       }
       stageLabel = "prelaunch_bootstrap";
@@ -278,15 +333,41 @@ export async function runBoxToolFirstRound(input: {
       await race(deps.journal.recordPrelaunchControl({ requestId: input.requestId,
         uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
         leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
-      for (const [index, request] of plan.stageInputs.entries()) {
-        stageLabel = `input_${index}`;
-        if (index === 0) {
-          if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
-            throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+      if (process.env.OC_BOX_PRIVATE_STAGE_BATCH === "1") {
+        const receipt = prelaunchReceipt;
+        const guarded = plan.stageInputs.map((request, index) => {
+          if (index === 0) {
+            if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+              throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+            }
+            return makeBoxPrelaunchInit(receipt, request.args[4]);
           }
-          await run(makeBoxPrelaunchInit(prelaunchReceipt, request.args[4]));
+          return guardBoxPrivateStage(request, receipt);
+        });
+        const batch = makeBoxStageBatch(guarded);
+        if (batch) {
+          stageLabel = "input_batch";
+          const staged = await run(batch.request, 60_000);
+          if (staged.stdout.trim() !== batch.expected) {
+            throw new BoxToolFirstRoundError("BOX_TOOL_INPUT_STAGE_INVALID");
+          }
         } else {
-          await run(guardBoxPrivateStage(request, prelaunchReceipt));
+          for (const [index, request] of guarded.entries()) {
+            stageLabel = `input_${index}`;
+            await run(request);
+          }
+        }
+      } else {
+        for (const [index, request] of plan.stageInputs.entries()) {
+          stageLabel = `input_${index}`;
+          if (index === 0) {
+            if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+              throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+            }
+            await run(makeBoxPrelaunchInit(prelaunchReceipt, request.args[4]));
+          } else {
+            await run(guardBoxPrivateStage(request, prelaunchReceipt));
+          }
         }
       }
       if (signal.aborted || remaining() < 60_000) {
@@ -350,9 +431,33 @@ export async function runBoxToolFirstRound(input: {
           cacheWriteTokens: final.cacheWriteTokens };
         await race(deps.journal.complete({ requestId: input.requestId,
           uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage }));
+        let nativePointer: BoxNativePointer | undefined;
+        if (nativeEnabled && final.assistantContentHash
+          && deps.journal.attachNativePointer) {
+          try {
+            const inspected = await target.exec.run(makeBoxNativeFileInspect({
+              cliCwd: plan.cliCwd, nativeSessionId: plan.sessionId }), {
+              timeoutMs: 10_000, maxResponseBytes: 4096 });
+            const file = parseBoxNativeFileEvidence(inspected.stdout);
+            const candidate = parseBoxNativePointer({ version: 1,
+              accountId: target.accountId.toString(), upstreamModel: input.upstreamModel,
+              cliVersion: "2.1.280", nativeSessionId: plan.sessionId,
+              cliCwd: plan.cliCwd, transcriptSha256: file.sha256,
+              contextHashBeforeFinal: contextHash,
+              assistantContentHash: final.assistantContentHash,
+              catalogHash: plan.catalog.bindingSha256,
+              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+            if (candidate && await deps.journal.attachNativePointer({
+              requestId: input.requestId, uid: input.uid,
+              accountId: target.accountId, proof, pointer: candidate })) {
+              nativePointer = candidate;
+            }
+          } catch { /* Optional cache failure cannot erase settled model usage. */ }
+        }
         input.emit(decoder.commitFinal({ terminalReason: proof.reason,
           journaledUsage: usage }));
-        return { kind: "final", plan, target, proof };
+        return { kind: "final", plan, target, proof,
+          ...(nativePointer ? { nativePointer } : {}) };
       }
       if (!decoded.candidate) continue;
       const candidate = decoded.candidate;

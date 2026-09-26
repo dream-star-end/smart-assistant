@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
+import type { BoxNativePointer } from "./boxNativePointer.js";
 
 const tools = [{ name: "local_echo", description: "synthetic",
   input_schema: { type: "object", properties: {} } }];
@@ -69,6 +70,47 @@ test("same internal model fetch streams first handoff then next final without to
   assert.equal(await service.retryFailedCleanup(), 0);
 });
 
+test("proven native final carries its exact pointer into preserving cleanup", async () => {
+  const pointer: BoxNativePointer = { version: 1, accountId: "20",
+    upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+    nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+    cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+    transcriptSha256: "f".repeat(64), contextHashBeforeFinal: "c".repeat(64),
+    assistantContentHash: "d".repeat(64), catalogHash: "e".repeat(64),
+    expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 };
+  let claimed = false, cleaned = false;
+  const target = { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+    assert.deepEqual(request.args.slice(-2), ["a".repeat(24), "1"]);
+    return { stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const };
+  } }, dispose: async () => {} };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { claimRemoteCleanup: async (candidate: {
+      nativePointer?: BoxNativePointer }) => {
+      assert.deepEqual(candidate.nativePointer, pointer); claimed = true; return true;
+    }, markRemoteCleaned: async () => { cleaned = true; },
+    remoteCleanupStatus: async () => "pending",
+    remoteCleanupDoneByRunIdentity: async () => false,
+    prelaunchCleanupDoneByRunIdentity: async () => false,
+    listRemoteCleanupCandidates: async () => [] } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void }) => {
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "final", plan: { runNonce: "a".repeat(24),
+        leaseEpoch: "b".repeat(32) }, target,
+        proof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+          keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 },
+        nativePointer: pointer };
+    }) as never,
+  });
+  const response = await service.fetch(call(firstBody));
+  assert.ok((await response.text()).includes("event: message_stop"));
+  assert.equal(claimed, true);
+  assert.equal(cleaned, true);
+});
+
 test("only model first/resume paths request wake; recovery resolver remains default no-wake", async () => {
   const seen: Array<boolean | undefined> = [];
   const target = { accountId: 20n, exec: { run: async () => {
@@ -104,6 +146,48 @@ test("only model first/resume paths request wake; recovery resolver remains defa
   await assert.rejects(() => service.fetch(call(nextBody)).then((r) => r.text()),
     /synthetic resume stopped/);
   assert.deepEqual(seen, [true, true]);
+});
+
+test("native expiry GC uses a no-wake exact-account Python delete after claim", async () => {
+  const pointer: BoxNativePointer = { version: 1, accountId: "20",
+    upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+    nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+    cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+    transcriptSha256: "f".repeat(64), contextHashBeforeFinal: "c".repeat(64),
+    assistantContentHash: "d".repeat(64), catalogHash: null,
+    expiresAtMs: Date.now() - 1000 };
+  const candidate = { requestId: "native-gc-test", uid: 3n,
+    accountId: 20n, sessionId: "test-session", pointer };
+  let disposed = false;
+  const finished: string[] = [];
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.alloc(0),
+    keeperAsset: Buffer.alloc(0), virtualMcpAsset: Buffer.alloc(0),
+    detachedRunnerAsset: Buffer.alloc(0),
+    journal: { listNativeGcCandidates: async () => [candidate],
+      claimNativeGc: async (value: unknown) => {
+        assert.equal(value, candidate); return true;
+      }, finishNativeGc: async (_value: unknown, outcome: string) => {
+        finished.push(outcome); return true;
+      } } as never,
+    maxOutputTokensForModel: () => null,
+    resolveTarget: async (args) => {
+      assert.equal(args.uid, 3n);
+      assert.equal(args.requiredAccountId, 20n);
+      assert.equal(args.allowWakeIfHibernated, undefined);
+      assert.equal(args.upstreamModel, pointer.upstreamModel);
+      return { accountId: 20n, exec: { run: async (request: {
+        command: string; args: string[] }) => {
+        assert.equal(request.command, "/usr/bin/python3");
+        assert.deepEqual(request.args.slice(-3), [pointer.cliCwd,
+          pointer.nativeSessionId, pointer.transcriptSha256]);
+        return { stdout: "deleted\n", stderrBytes: 0, exitCode: 0 as const };
+      } }, dispose: async () => { disposed = true; } };
+    }, onUnknown: async () => {},
+  });
+  assert.equal(await service.reconcileNativeGc(1), 1);
+  assert.deepEqual(finished, ["done"]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposed, true);
 });
 
 test("failed local close retry is bounded and never starts concurrent dispose", async () => {

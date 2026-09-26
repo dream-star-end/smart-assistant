@@ -63,3 +63,32 @@ test("symlinked spool is refused without touching decoy", () => {
   } finally { f.close(); rmSync(decoy, { force: true }); }
   assert.throws(() => makeBoxRunCleanup("../wrong"), /BOX_RUN_CLEANUP_ID_INVALID/);
 });
+
+test("terminal private cleanup can retain only the native project transcript", () => {
+  const f = fixture();
+  const root = `/tmp/ocv5-291-projects-${randomBytes(8).toString("hex")}`;
+  const project = `${root}/${f.cwd.replaceAll("/", "-")}`;
+  const transcript = `${project}/12345678-1234-4123-8123-123456789abc.jsonl`;
+  mkdirSync(project, { recursive: true, mode: 0o700 });
+  writeFileSync(transcript, "synthetic native history\n", { mode: 0o600 });
+  writeFileSync(`${f.cwd}/stdout.jsonl`, "private model output", { mode: 0o600 });
+  writeFileSync(`${f.cwd}/stderr.log`, "private stderr", { mode: 0o600 });
+  writeFileSync(`${f.cwd}/stdin.jsonl`, "private current user", { mode: 0o600 });
+  const run = (preserve: boolean) => {
+    const request = makeBoxRunCleanup(f.nonce, preserve);
+    const script = request.args[2]!.replace("/home/box/.claude/projects/", `${root}/`);
+    return spawnSync(request.command, ["-I", "-c", script, ...request.args.slice(3)],
+      { cwd: request.cwd, env: { ...process.env, ...request.environment },
+        encoding: "utf8", timeout: 5000 });
+  };
+  try {
+    const kept = run(true);
+    assert.equal(kept.status, 0, kept.stderr);
+    assert.equal(existsSync(`${f.cwd}/stdin.jsonl`), false);
+    assert.equal(readFileSync(`${f.cwd}/stdout.jsonl`).length, 0);
+    assert.equal(readFileSync(transcript, "utf8"), "synthetic native history\n");
+    const removed = run(false);
+    assert.equal(removed.status, 0, removed.stderr);
+    assert.equal(existsSync(transcript), false);
+  } finally { f.close(); rmSync(root, { recursive: true, force: true }); }
+});

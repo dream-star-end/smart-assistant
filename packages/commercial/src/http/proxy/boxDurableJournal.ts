@@ -19,6 +19,7 @@ import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
+import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
@@ -63,6 +64,15 @@ export interface BoxJournalAdmission {
   invocationMode?: "text" | "detached_tool";
   /** Hash of model-affecting context actually launched in the detached CLI. */
   contextHash?: string;
+  /** Optional completed-turn native cache claim, never inferred from body hash. */
+  nativeClaim?: { ownerRequestId: string; pointer: BoxNativePointer;
+    upstreamModel: string };
+  /** First native invocation mints an opaque Claude UUID in its own run cwd. */
+  nativeStart?: { sessionId: string; cliCwd: string };
+}
+export interface BoxNativeCandidate {
+  readonly ownerRequestId: string;
+  readonly pointer: BoxNativePointer;
 }
 export interface BoxToolResumeClaim {
   readonly ownerRequestId: string;
@@ -76,6 +86,8 @@ export interface BoxToolResumeClaim {
   readonly durableRevision: string;
   readonly results: readonly BoxMatchedToolResult[];
   readonly toolUses: readonly BoxToolUseDigest[];
+  readonly nativeSessionId?: string;
+  readonly nativeCliCwd?: string;
 }
 export interface BoxRemoteCleanupCandidate {
   readonly requestId: string;
@@ -84,6 +96,15 @@ export interface BoxRemoteCleanupCandidate {
   readonly runNonce: string;
   readonly leaseEpoch: string;
   readonly proof: BoxTerminalProof;
+  /** Exact optional pointer observed when this cleanup candidate was read. */
+  readonly nativePointer?: BoxNativePointer;
+}
+export interface BoxNativeGcCandidate {
+  readonly requestId: string;
+  readonly uid: bigint;
+  readonly sessionId: string;
+  readonly accountId: bigint;
+  readonly pointer: BoxNativePointer;
 }
 export interface BoxPrelaunchRecoveryCandidate {
   readonly requestId: string;
@@ -176,6 +197,9 @@ function goodId(input: BoxJournalAdmission): void {
       && input.invocationMode !== "detached_tool")
     || (input.invocationMode === "detached_tool"
       && !/^[a-f0-9]{64}$/.test(input.contextHash ?? ""))
+    || (input.nativeStart !== undefined && (input.nativeClaim !== undefined
+      || !UUID_V4.test(input.nativeStart.sessionId)
+      || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`))
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -206,8 +230,188 @@ async function lockChainSession(client: PoolClient, uid: bigint,
 export class BoxDurableJournal implements BoxJournalPort {
   constructor(private readonly pool: Pick<Pool, "connect" | "query">) {}
 
+  /** An older pointer cannot be reused after an intervening uncached turn. */
+  async findNativeCandidate(input: { uid: bigint; sessionId: string;
+    currentRequestId: string;
+    canonicalModel: string }): Promise<BoxNativeCandidate | null> {
+    if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
+      || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return null;
+    const found = await this.pool.query<{ request_id: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
+          AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
+          AND request_id<>$4
+        ORDER BY updated_at DESC, (ctx ? 'boxNativePointer') DESC,
+          request_id DESC LIMIT 1`,
+      [input.uid.toString(), input.sessionId, input.canonicalModel,
+        input.currentRequestId]);
+    const row = found.rows[0];
+    if (found.rowCount !== 1 || !row || !row.ctx
+      || row.ctx.boxState !== "terminal" || row.ctx.boxNativeClaimRequestId !== undefined
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)) return null;
+    const pointer = parseBoxNativePointer(row.ctx.boxNativePointer);
+    if (!pointer || row.ctx.boxAccountId !== pointer.accountId
+      || row.ctx.boxSessionId !== input.sessionId
+      || row.ctx.model !== input.canonicalModel) return null;
+    const proof = row.ctx.boxTerminalProof;
+    if (!proof || typeof proof !== "object" || Array.isArray(proof)
+      || (proof as { reason?: unknown }).reason !== "worker_complete") return null;
+    return { ownerRequestId: row.request_id, pointer };
+  }
+
+  /** At most one latest expired pointer per native project. A successful
+   * cleanup claim is still required before any remote file operation. */
+  async listNativeGcCandidates(limit = 10): Promise<BoxNativeGcCandidate[]> {
+    const found = await this.pool.query<{ request_id: string; user_id: string;
+      ctx: Record<string, unknown> }>(
+      `WITH pointers AS (
+         SELECT request_id,user_id,ctx,
+           row_number() OVER (PARTITION BY user_id,ctx->>'boxAccountId',
+             ctx->'boxNativePointer'->>'cliCwd',
+             ctx->'boxNativePointer'->>'nativeSessionId'
+             ORDER BY (ctx->'boxNativePointer'->>'expiresAtMs')::bigint DESC,
+               request_id DESC) AS rn
+           FROM request_finalize_journal
+          WHERE ctx ? 'boxNativePointer'
+            AND jsonb_typeof(ctx->'boxNativePointer'->'expiresAtMs')='number'
+            AND (ctx->'boxNativePointer'->>'expiresAtMs') ~ '^[0-9]{13}$'
+       ) SELECT request_id,user_id::text,ctx FROM pointers
+         WHERE rn=1
+           AND (ctx->'boxNativePointer'->>'expiresAtMs')::bigint
+             <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint
+           AND NOT (ctx ? 'boxNativeGcQuarantine')
+           AND COALESCE(ctx->>'boxNativeGcStatus','pending')<>'done'
+           AND (ctx->>'boxNativeGcStatus' IS DISTINCT FROM 'claimed'
+             OR (jsonb_typeof(ctx->'boxNativeGcRetryAfterMs')='number'
+               AND (ctx->>'boxNativeGcRetryAfterMs') ~ '^[0-9]{13}$'
+               AND (ctx->>'boxNativeGcRetryAfterMs')::bigint
+                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
+         ORDER BY (ctx->'boxNativePointer'->>'expiresAtMs')::bigint ASC
+         LIMIT $1`,
+      [Math.max(1, Math.min(10, Number.isSafeInteger(limit) ? limit : 10))]);
+    const out: BoxNativeGcCandidate[] = [];
+    for (const row of found.rows) {
+      const ctx = row.ctx;
+      const pointer = parseBoxNativePointer(ctx?.boxNativePointer, Date.now(), true);
+      if (!pointer || pointer.expiresAtMs > Date.now()
+        || typeof ctx.boxSessionId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,256}$/.test(ctx.boxSessionId)
+        || ctx.boxAccountId !== pointer.accountId
+        || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)) continue;
+      out.push({ requestId: row.request_id, uid: BigInt(row.user_id),
+        sessionId: ctx.boxSessionId, accountId: BigInt(pointer.accountId), pointer });
+    }
+    return out;
+  }
+
+  /** Same account/session locks as admit. All rows sharing the project are
+   * re-read under row locks before a durable claim authorizes remote deletion. */
+  async claimNativeGc(input: BoxNativeGcCandidate): Promise<boolean> {
+    if (input.uid <= 0n || input.accountId <= 0n
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
+      || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !parseBoxNativePointer(input.pointer, Date.now(), true)
+      || input.pointer.accountId !== input.accountId.toString()) return false;
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      await lock(client, [`box:account:${input.accountId}`,
+        `box:session:${input.uid}:${input.sessionId}`]);
+      const found = await client.query<{ request_id: string;
+        ctx: Record<string, unknown> }>(
+        `SELECT request_id,ctx FROM request_finalize_journal
+          WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
+            AND ctx->>'boxNativeCliCwd'=$3
+          ORDER BY request_id FOR UPDATE`,
+        [input.uid.toString(), input.accountId.toString(), input.pointer.cliCwd]);
+      const rows = found.rows;
+      const owner = rows.find((row) => row.request_id === input.requestId);
+      if (!owner || owner.ctx.boxSessionId !== input.sessionId
+        || !isDeepStrictEqual(owner.ctx.boxNativePointer, input.pointer)
+        || input.pointer.expiresAtMs > Date.now()
+        || owner.ctx.boxNativeGcQuarantine !== undefined
+        || owner.ctx.boxNativeGcStatus === "done") return false;
+      const retry = owner.ctx.boxNativeGcRetryAfterMs;
+      if (owner.ctx.boxNativeGcStatus === "claimed"
+        && (typeof retry !== "number" || !Number.isSafeInteger(retry)
+          || retry > Date.now())) return false;
+      const group = rows.filter((row) =>
+        row.ctx.boxNativeSessionId === input.pointer.nativeSessionId);
+      if (group.length === 0 || group.length !== rows.length) return false;
+      const pointers = group.flatMap((row) => {
+        const parsed = row.ctx.boxNativePointer === undefined ? null
+          : parseBoxNativePointer(row.ctx.boxNativePointer, Date.now(), true);
+        return parsed ? [{ row, pointer: parsed }] : [];
+      });
+      if (pointers.length === 0 || pointers.some(({ pointer }) =>
+        pointer.cliCwd !== input.pointer.cliCwd
+        || pointer.accountId !== input.pointer.accountId)) return false;
+      const latest = pointers.sort((a, b) => b.pointer.expiresAtMs - a.pointer.expiresAtMs
+        || b.row.request_id.localeCompare(a.row.request_id))[0];
+      if (latest?.row.request_id !== input.requestId) return false;
+      const byId = new Map(group.map((row) => [row.request_id, row]));
+      if (group.some((row) => ACTIVE.includes(String(row.ctx.boxState))
+        || row.ctx.boxSessionId !== input.sessionId
+        || row.ctx.boxNativePointer !== undefined
+          && !parseBoxNativePointer(row.ctx.boxNativePointer, Date.now(), true)
+        || typeof row.ctx.boxNativeClaimRequestId === "string"
+          && !byId.has(row.ctx.boxNativeClaimRequestId))) return false;
+      const proven = group.some((row) => row.ctx.boxState === "terminal"
+        && row.ctx.boxTerminalProof && typeof row.ctx.boxTerminalProof === "object"
+        && (row.ctx.boxTerminalProof as { reason?: unknown }).reason === "worker_complete"
+        && row.ctx.boxUsage !== undefined
+        && (row.ctx.boxInvocationMode === "detached_tool"
+          ? row.ctx.boxRemoteCleanup === "done" : row.ctx.boxInvocationMode === "text"));
+      if (!proven) return false;
+      const changed = await client.query(
+        `UPDATE request_finalize_journal
+            SET ctx=ctx || $4::jsonb,updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND ctx->'boxNativePointer'=$3::jsonb
+            AND COALESCE(ctx->>'boxNativeGcStatus','pending')<>'done'
+            AND NOT (ctx ? 'boxNativeGcQuarantine')`,
+        [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
+          JSON.stringify({ boxNativeGcStatus: "claimed",
+            boxNativeGcRetryAfterMs: Date.now() + 120_000 })]);
+      if (changed.rowCount !== 1) return false;
+      await client.query("COMMIT");
+      committed = true;
+      return true;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
+  async finishNativeGc(input: BoxNativeGcCandidate,
+    outcome: "done" | "blocked"): Promise<boolean> {
+    const update = outcome === "done"
+      ? { boxNativeGcStatus: "done" }
+      : { boxNativeGcQuarantine: "remote_project_not_exclusive" };
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || $4::jsonb,updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2
+          AND ctx->'boxNativePointer'=$3::jsonb
+          AND ctx->>'boxNativeGcStatus'='claimed'
+          AND NOT (ctx ? 'boxNativeGcQuarantine')`,
+      [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
+        JSON.stringify(update)]);
+    return changed.rowCount === 1;
+  }
+
   async admit(input: BoxJournalAdmission): Promise<void> {
     goodId(input);
+    const native = input.nativeClaim;
+    if (native && (!/^[A-Za-z0-9_-]{1,64}$/.test(native.ownerRequestId)
+      || native.ownerRequestId === input.requestId
+      || parseBoxNativePointer(native.pointer) === null
+      || native.pointer.accountId !== input.accountId.toString()
+      || native.pointer.upstreamModel !== native.upstreamModel)) {
+      throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_INVALID");
+    }
     const client = await this.pool.connect();
     let committed = false;
     try {
@@ -227,6 +431,53 @@ export class BoxDurableJournal implements BoxJournalPort {
               (user_id = $3 AND ctx->>'boxSessionId' = $4)) LIMIT 1`,
         [ACTIVE, input.accountId.toString(), input.uid.toString(), input.fingerprint.sessionId]);
       if (occupied.rowCount) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      if (native) {
+        // The remote preflight happens before these locks. A pointer can expire
+        // while waiting for another account/session transaction; never commit
+        // a claim that the expiry reaper is now allowed to delete.
+        if (!parseBoxNativePointer(native.pointer, Date.now())) {
+          throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        }
+        // The candidate was read before the account/turn locks. A completed
+        // intervening turn can make it stale without leaving ACTIVE capacity.
+        const latest = await client.query<{ request_id: string }>(
+          `SELECT request_id FROM request_finalize_journal
+            WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
+              AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
+              AND request_id<>$4
+            ORDER BY updated_at DESC, (ctx ? 'boxNativePointer') DESC,
+              request_id DESC LIMIT 1 FOR UPDATE`,
+          [input.uid.toString(), input.fingerprint.sessionId,
+            input.model, input.requestId]);
+        if (latest.rowCount !== 1
+          || latest.rows[0]?.request_id !== native.ownerRequestId) {
+          throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        }
+        const prior = await client.query<{ ctx: Record<string, unknown> }>(
+          `SELECT ctx FROM request_finalize_journal
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [native.ownerRequestId, input.uid.toString()]);
+        const ctx = prior.rows[0]?.ctx;
+        if (prior.rowCount !== 1 || !ctx || ctx.boxState !== "terminal"
+          || ctx.boxInvocationRecovery !== "v1"
+          || ctx.boxAccountId !== input.accountId.toString()
+          || ctx.boxSessionId !== input.fingerprint.sessionId
+          || ctx.model !== input.model
+          || ctx.boxNativeClaimRequestId !== undefined
+          || !isDeepStrictEqual(ctx.boxNativePointer, native.pointer)
+          || !ctx.boxTerminalProof || typeof ctx.boxTerminalProof !== "object"
+          || (ctx.boxTerminalProof as { reason?: unknown }).reason !== "worker_complete") {
+          throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        }
+        const claimed = await client.query(
+          `UPDATE request_finalize_journal
+              SET ctx=ctx || $3::jsonb, updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2
+              AND ctx->>'boxState'='terminal' AND NOT (ctx ? 'boxNativeClaimRequestId')`,
+          [native.ownerRequestId, input.uid.toString(),
+            JSON.stringify({ boxNativeClaimRequestId: input.requestId })]);
+        if (claimed.rowCount !== 1) throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+      }
       const identity = { boxInvocationRecovery: "v1", boxState: "reserved",
         boxInvocationMode: input.invocationMode ?? "text",
         boxAccountId: input.accountId.toString(),
@@ -236,7 +487,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxSessionId: input.fingerprint.sessionId,
         ...(input.invocationMode === "detached_tool"
           ? { boxContextHash: input.contextHash } : {}),
-        boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch };
+        boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
+        ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
+          boxNativeSessionId: native.pointer.nativeSessionId,
+          boxNativeCliCwd: native.pointer.cliCwd } : {}),
+        ...(input.nativeStart ? { boxNativeSessionId: input.nativeStart.sessionId,
+          boxNativeCliCwd: input.nativeStart.cliCwd } : {}) };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
@@ -604,6 +860,45 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_COMPLETE_FENCE_LOST");
   }
 
+  /** Optional text cache publication AFTER exact terminal proof and billable
+   * usage are durable. Detached runs remain ineligible until their shared
+   * cleanup worker can preserve the native transcript. */
+  async attachNativePointer(input: { requestId: string; uid: bigint;
+    accountId: bigint; proof: BoxTerminalProof; pointer: BoxNativePointer }): Promise<boolean> {
+    const pointer = parseBoxNativePointer(input.pointer);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !pointer
+      || pointer.accountId !== input.accountId.toString()
+      || input.proof.reason !== "worker_complete") return false;
+    const ownerCwd = `/tmp/ocv5-289-run-${input.proof.runNonce}`;
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || $5::jsonb
+        WHERE request_id=$1 AND user_id=$2
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxState'='terminal'
+          AND (ctx->>'boxInvocationMode'='text' OR
+            (ctx->>'boxInvocationMode'='detached_tool'
+              AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
+              AND ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
+              AND NOT (ctx ? 'boxRemoteCleanupQuarantine')))
+          AND ctx->'boxTerminalProof'=$4::jsonb
+          AND ctx ? 'boxUsage' AND NOT (ctx ? 'boxNativePointer')
+          AND ((ctx ? 'boxNativeCliCwd' AND ctx->>'boxNativeCliCwd'=$6)
+            OR (NOT (ctx ? 'boxNativeCliCwd')
+              AND $6=$11 AND ctx->>'boxRunNonce'=$7))
+          AND (ctx->>'boxNativeSessionId' IS NULL
+            OR ctx->>'boxNativeSessionId'=$8)
+          AND (ctx->>'boxContextHash' IS NULL
+            OR ctx->>'boxContextHash'=$9)
+          AND (ctx->>'boxCatalogHash' IS NULL
+            OR ctx->>'boxCatalogHash'=$10)`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        JSON.stringify(input.proof), JSON.stringify({ boxNativePointer: pointer }),
+        pointer.cliCwd, input.proof.runNonce, pointer.nativeSessionId,
+        pointer.contextHashBeforeFinal, pointer.catalogHash, ownerCwd]);
+    return changed.rowCount === 1;
+  }
+
   /** The full model set and exact round usage must commit before the first
    * tool-use terminal SSE. A pending subset proves the CLI began dispatch;
    * later sidecar calls may appear only after earlier tool results. */
@@ -745,6 +1040,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
       if (owners.rows.length !== 1) throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
       const owner = owners.rows[0]!, ctx = owner.ctx;
+      const nativeSessionId = ctx.boxNativeSessionId;
+      const nativeCliCwd = ctx.boxNativeCliCwd;
       if (ctx.model !== input.canonicalModel
         || ctx.boxInvocationMode !== "detached_tool"
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -754,7 +1051,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         || !/^[a-f0-9]{64}$/.test(ctx.boxContextHash)
         || typeof ctx.boxHandoffRevision !== "string" || ctx.boxHandoffRevision.length > 128
         || !ctx.boxToolHandoff || typeof ctx.boxToolHandoff !== "object"
-        || Array.isArray(ctx.boxToolHandoff)) {
+        || Array.isArray(ctx.boxToolHandoff)
+        || (nativeSessionId === undefined) !== (nativeCliCwd === undefined)
+        || (nativeSessionId !== undefined &&
+          (typeof nativeSessionId !== "string" || !UUID_V4.test(nativeSessionId)
+            || typeof nativeCliCwd !== "string"
+            || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(nativeCliCwd)))) {
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
       }
       const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
@@ -850,7 +1152,10 @@ export class BoxDurableJournal implements BoxJournalPort {
             boxReplayFingerprint: fingerprint.replayFingerprint,
              boxRequestHash: fingerprint.requestHash,
              boxContextHash: nextContextHash,
-             boxParentResumeRevision: durableRevision })]);
+             boxParentResumeRevision: durableRevision,
+             ...(nativeSessionId === undefined ? {} : {
+               boxNativeSessionId: nativeSessionId,
+               boxNativeCliCwd: nativeCliCwd }) })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
@@ -864,8 +1169,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         spoolOffset: handoff.spoolOffset, roundNo: handoff.roundNo + 1,
         durableRevision, results,
         detachedRunnerHash: handoff.detachedRunnerHash,
-        catalogHash: handoff.catalogHash,
-        toolUses: digests };
+         catalogHash: handoff.catalogHash,
+         toolUses: digests,
+         ...(nativeSessionId === undefined ? {} : {
+           nativeSessionId: nativeSessionId as string,
+           nativeCliCwd: nativeCliCwd as string }) };
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
@@ -957,7 +1265,9 @@ export class BoxDurableJournal implements BoxJournalPort {
           || ctx.boxAccountId !== basis.boxAccountId
           || ctx.boxSessionId !== basis.boxSessionId
           || ctx.boxTurnKey !== basis.boxTurnKey
-          || ctx.model !== basis.model) {
+          || ctx.model !== basis.model
+          || ctx.boxNativeSessionId !== basis.boxNativeSessionId
+          || ctx.boxNativeCliCwd !== basis.boxNativeCliCwd) {
           throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
         }
       }
@@ -1439,9 +1749,16 @@ export class BoxDurableJournal implements BoxJournalPort {
         const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
           { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
         if (!cleanupProofMatchesState(ctx.boxState, proof)) { await quarantine(); continue; }
+        const pointer = ctx.boxNativePointer === undefined ? undefined
+          : parseBoxNativePointer(ctx.boxNativePointer, Date.now(), true);
+        if (ctx.boxNativePointer !== undefined && (!pointer
+          || pointer.accountId !== ctx.boxAccountId)) {
+          await quarantine(); continue;
+        }
         candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
           accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
-          leaseEpoch: ctx.boxLeaseEpoch, proof });
+          leaseEpoch: ctx.boxLeaseEpoch, proof,
+          ...(pointer ? { nativePointer: pointer } : {}) });
       } catch { await quarantine(); /* Corrupt proof is manual, never automatic cleanup. */ }
     }
     return candidates;
@@ -1459,6 +1776,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     try {
       parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
+    if (input.nativePointer && (parseBoxNativePointer(input.nativePointer, Date.now(), true) === null
+      || input.nativePointer.accountId !== input.accountId.toString())) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
+    }
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || jsonb_build_object(
@@ -1473,7 +1794,8 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'=$6::jsonb
+           AND ctx->'boxTerminalProof'=$6::jsonb
+           AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
            AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
@@ -1484,7 +1806,8 @@ export class BoxDurableJournal implements BoxJournalPort {
              OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
                AND updated_at <= NOW()-INTERVAL '2 minutes'))`,
       [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
+        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof),
+        input.nativePointer ? JSON.stringify(input.nativePointer) : null]);
     return changed.rowCount === 1;
   }
 
@@ -1578,8 +1901,13 @@ export class BoxDurableJournal implements BoxJournalPort {
     try {
       parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
+    if (input.nativePointer && (parseBoxNativePointer(input.nativePointer, Date.now(), true) === null
+      || input.nativePointer.accountId !== input.accountId.toString())) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
+    }
     const params = [input.requestId, input.uid.toString(), input.accountId.toString(),
-      input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)];
+      input.runNonce, input.leaseEpoch, JSON.stringify(input.proof),
+      input.nativePointer ? JSON.stringify(input.nativePointer) : null];
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
@@ -1590,6 +1918,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'=$6::jsonb
+          AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
           AND ctx->>'boxRemoteCleanupClaimed'='true'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'`, params);
@@ -1603,6 +1932,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'=$6::jsonb
+          AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
           AND ctx->>'boxRemoteCleanup'='done'`, params);
     if (already.rowCount !== 1) throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");
   }

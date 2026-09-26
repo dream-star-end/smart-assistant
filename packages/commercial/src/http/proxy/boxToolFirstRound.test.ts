@@ -5,6 +5,9 @@ import { createHash } from "node:crypto";
 import { runBoxToolFirstRound } from "./boxToolFirstRound.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { makeBoxNativeHistoryBasis } from "./boxNativeHistory.js";
+import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
+import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import type { ProxyBody } from "./shared.js";
 
 const asset = (name: string) => readFileSync(
@@ -58,7 +61,9 @@ const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record)
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
   directFinal?: boolean; finalTrailing?: boolean;
   failAssetStage?: number; failInputStage?: number;
-  stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean } = {}) {
+  stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
+  badAssetManifest?: boolean;
+  nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer } } = {}) {
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
@@ -66,6 +71,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   let currentNonce = "", currentEpoch = "";
   let controlHash = "";
   let retained = false, cleanupRetained = false;
+  let admittedNative: unknown = null;
+  let admittedStart: unknown = null;
   let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
     exec: { run: async (request: { args: string[] }) => {
@@ -118,6 +125,11 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
           reason: "worker_complete", revision: 1 }) + "\n",
         stderrBytes: 0, exitCode: 0 as const };
       }
+      if (args[2]?.includes("print(json.dumps({'sha256':actual")) {
+        sequence.push("native-inspect");
+        return { stdout: JSON.stringify({ sha256: "f".repeat(64), size: 100 }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+      }
       if (args[0] === "-I" && args[1] === "-c"
         && args[3]?.startsWith("/tmp/ocv5-289-")
         && !args[3]?.startsWith("/tmp/ocv5-289-run-")) {
@@ -126,7 +138,18 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         if (assetIndex === options.failAssetStage) {
           throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
         }
-        return { stdout: `${args[5]}\n`, stderrBytes: 0, exitCode: 0 as const };
+        const manifest = Array.from({ length: (args.length - 3) / 4 }, (_, i) =>
+          args[5 + i * 4]).join(",");
+        return { stdout: `${options.badAssetManifest && args.length > 7 ? "bad" : manifest}\n`,
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("print('staged:'+str(len(steps)))")) {
+        sequence.push("input-batch");
+        const steps = JSON.parse(Buffer.from(args[3]!, "base64").toString("utf8")) as unknown[];
+        if (options.failInputStage === 0) {
+          throw new BoxExecTransportError(options.stageFailureCode ?? "BOX_EXEC_TIMEOUT", false);
+        }
+        return { stdout: `staged:${steps.length}\n`, stderrBytes: 0, exitCode: 0 as const };
       }
       sequence.push("input-stage");
       inputIndex++;
@@ -136,9 +159,13 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
     } } };
   const journal = {
-    admit: async (identity: { runNonce: string; leaseEpoch: string }) => {
+    findNativeCandidate: async () => options.nativeCandidate ?? null,
+    admit: async (identity: { runNonce: string; leaseEpoch: string;
+      nativeClaim?: unknown; nativeStart?: unknown }) => {
       sequence.push("admit"); currentNonce = identity.runNonce;
       currentEpoch = identity.leaseEpoch;
+      admittedNative = identity.nativeClaim ?? null;
+      admittedStart = identity.nativeStart ?? null;
       if (options.rejectAdmission) throw new Error("synthetic admission denied"); },
     recordPrelaunchControl: async () => { sequence.push("prelaunch-journal"); },
     armGuardedLaunch: async () => { sequence.push("launch-arm");
@@ -162,6 +189,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       assert.equal(evidence.usage.outputTokens, 4);
       assert.equal(evidence.proof.runNonce, currentNonce);
     },
+    attachNativePointer: async () => { sequence.push("native-attach"); return true; },
   };
   const deps = { supervisorAsset: asset("box_supervisor.py"),
     keeperAsset: asset("box_keeper.py"), virtualMcpAsset: asset("box_virtual_mcp.py"),
@@ -179,6 +207,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     get disposed() { return disposed; }, get launches() { return launches; },
     get recordedOffset() { return recordedOffset; },
     get retained() { return retained; },
+    get admittedNative() { return admittedNative; },
+    get admittedStart() { return admittedStart; },
     get cleanupRetained() { return cleanupRetained; } };
 }
 
@@ -199,6 +229,70 @@ test("first tool round admits before one launch and emits terminal only after du
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
 });
 
+test("one batched asset Exec still precedes durable arm and the sole paid launch", async () => {
+  const previous = process.env.OC_BOX_ASSET_BATCH;
+  process.env.OC_BOX_ASSET_BATCH = "1";
+  try {
+    const f = fixture();
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "tool_handoff");
+    assert.equal(f.sequence.filter((step) => step === "asset-stage").length, 1);
+    assert.ok(f.sequence.indexOf("asset-stage") < f.sequence.indexOf("launch-arm"));
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
+    else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
+});
+
+test("batch manifest mismatch cannot arm or start a paid model", async () => {
+  const previous = process.env.OC_BOX_ASSET_BATCH;
+  process.env.OC_BOX_ASSET_BATCH = "1";
+  try {
+    const f = fixture({ badAssetManifest: true });
+    await assert.rejects(runBoxToolFirstRound(f.input, f.deps),
+      /BOX_TOOL_ASSET_STAGE_INVALID/);
+    assert.equal(f.launches, 0);
+    assert.ok(!f.sequence.includes("launch-arm"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_ASSET_BATCH;
+    else process.env.OC_BOX_ASSET_BATCH = previous;
+  }
+});
+
+test("one guarded private-stage Exec still precedes durable arm and sole launch", async () => {
+  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  try {
+    const f = fixture();
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "tool_handoff");
+    assert.equal(f.sequence.filter((step) => step === "input-batch").length, 1);
+    assert.equal(f.sequence.filter((step) => step === "input-stage").length, 0);
+    assert.ok(f.sequence.indexOf("prelaunch-journal") < f.sequence.indexOf("input-batch"));
+    assert.ok(f.sequence.indexOf("input-batch") < f.sequence.indexOf("launch-arm"));
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+  }
+});
+
+test("ambiguous guarded batch never arms or launches a paid model", async () => {
+  const previous = process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+  process.env.OC_BOX_PRIVATE_STAGE_BATCH = "1";
+  try {
+    const f = fixture({ failInputStage: 0 });
+    await assert.rejects(runBoxToolFirstRound(f.input, f.deps));
+    assert.equal(f.launches, 0);
+    assert.ok(!f.sequence.includes("launch-arm"));
+    assert.ok(f.sequence.includes("prelaunch-cleanup"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_PRIVATE_STAGE_BATCH;
+    else process.env.OC_BOX_PRIVATE_STAGE_BATCH = previous;
+  }
+});
+
 test("tool_choice auto may answer directly with one paid launch and proven final usage", async () => {
   const f = fixture({ directFinal: true });
   const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -209,6 +303,72 @@ test("tool_choice auto may answer directly with one paid launch and proven final
   assert.ok(f.emitted.join("").includes("direct answer"));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
   assert.equal(f.retained, false);
+});
+
+test("native first final publishes a pointer only after terminal usage and proof", async () => {
+  const previous = process.env.OC_BOX_NATIVE_RESUME;
+  process.env.OC_BOX_NATIVE_RESUME = "1";
+  try {
+    const f = fixture({ directFinal: true });
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(result.nativePointer?.accountId, "20");
+    assert.equal(result.nativePointer?.transcriptSha256, "f".repeat(64));
+    assert.ok(!result.plan.run.args.includes("--no-session-persistence"));
+    assert.equal(f.launches, 1);
+    assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId,
+      cliCwd: result.plan.cliCwd });
+    assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
+    assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
+    assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_NATIVE_RESUME;
+    else process.env.OC_BOX_NATIVE_RESUME = previous;
+  }
+});
+
+test("warm native hit preflights one UUID and atomically claims before one paid launch", async () => {
+  const previous = process.env.OC_BOX_NATIVE_RESUME;
+  process.env.OC_BOX_NATIVE_RESUME = "1";
+  try {
+    const priorBody = { ...canonicalBody,
+      messages: [{ role: "user", content: "prior question" }] } as ProxyBody;
+    const basis = makeBoxNativeHistoryBasis(priorBody,
+      [{ type: "text", text: "READY" }]);
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: model, cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "f".repeat(64), ...basis,
+      catalogHash: compileBoxToolCatalog(canonicalBody.tools).bindingSha256,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const f = fixture({ directFinal: true,
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const next = { ...canonicalBody, messages: [
+      { role: "user", content: "prior question" },
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "new question" },
+    ] } as ProxyBody;
+    const input = { ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } };
+    const result = await runBoxToolFirstRound(input, f.deps);
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(result.plan.sessionId, pointer.nativeSessionId);
+    assert.equal(result.plan.cliCwd, pointer.cliCwd);
+    assert.equal(result.plan.snapshotHash, null);
+    assert.equal((f.admittedNative as { ownerRequestId: string }).ownerRequestId,
+      "native-owner");
+    assert.equal(f.admittedStart, null);
+    assert.equal(f.sequence.filter((step) => step === "native-inspect").length, 2);
+    assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("admit"));
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_NATIVE_RESUME;
+    else process.env.OC_BOX_NATIVE_RESUME = previous;
+  }
 });
 
 test("direct final cannot bill or emit terminal when success has trailing bytes", async () => {

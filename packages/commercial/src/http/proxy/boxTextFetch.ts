@@ -8,6 +8,7 @@ import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationR
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
+import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import type { BoxJournalPort } from "./boxDurableJournal.js";
@@ -250,20 +251,37 @@ export class BoxTextFetch {
       // forbids cleanup/retry because a write may remain in flight.
       let inputStageStarted = false;
       try {
-        const supervisor = await exec(plan.stageSupervisor, 20_000);
-        if (supervisor.stdout.trim() !== plan.supervisorHash) {
-          throw new BoxTextFetchError("BOX_SUPERVISOR_STAGE_INVALID");
-        }
-        const keeper = await exec(plan.stageKeeper, 20_000);
-        if (keeper.stdout.trim() !== plan.keeperHash) {
-          throw new BoxTextFetchError("BOX_KEEPER_STAGE_INVALID");
+        if (process.env.OC_BOX_ASSET_BATCH === "1") {
+          const assets = await exec(plan.stageAssets, 20_000);
+          if (assets.stdout.trim() !== plan.assetManifest) {
+            throw new BoxTextFetchError("BOX_ASSET_STAGE_INVALID");
+          }
+        } else {
+          const supervisor = await exec(plan.stageSupervisor, 20_000);
+          if (supervisor.stdout.trim() !== plan.supervisorHash) {
+            throw new BoxTextFetchError("BOX_SUPERVISOR_STAGE_INVALID");
+          }
+          const keeper = await exec(plan.stageKeeper, 20_000);
+          if (keeper.stdout.trim() !== plan.keeperHash) {
+            throw new BoxTextFetchError("BOX_KEEPER_STAGE_INVALID");
+          }
         }
         inputStageStarted = true;
-        for (const step of plan.stageInputs) await exec(step, 20_000);
+        const batch = process.env.OC_BOX_PRIVATE_STAGE_BATCH === "1"
+          ? makeBoxStageBatch(plan.stageInputs) : null;
+        if (batch) {
+          const staged = await exec(batch.request, 60_000);
+          if (staged.stdout.trim() !== batch.expected) {
+            throw new BoxTextFetchError("BOX_PRIVATE_STAGE_INVALID");
+          }
+        } else {
+          for (const step of plan.stageInputs) await exec(step, 20_000);
+        }
       } catch (error) {
         const provenStageTerminal = (error instanceof BoxExecTransportError && error.terminalKnown)
           || (error instanceof BoxTextFetchError && (error.code === "BOX_SUPERVISOR_STAGE_INVALID"
-            || error.code === "BOX_KEEPER_STAGE_INVALID"));
+            || error.code === "BOX_KEEPER_STAGE_INVALID" || error.code === "BOX_ASSET_STAGE_INVALID"
+            || error.code === "BOX_PRIVATE_STAGE_INVALID"));
         if (!provenStageTerminal) {
           await markUnknown("staging_unknown");
         } else if (!inputStageStarted) {

@@ -11,6 +11,7 @@ import { deriveBoxCallFingerprint, deriveBoxContextHash,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
+import { parseBoxNativePointer } from "./boxNativePointer.js";
 
 const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
   ?? process.env.TEST_DATABASE_URL;
@@ -100,6 +101,48 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const usage = { inputTokens: 51, outputTokens: 7,
       cacheReadTokens: 9, cacheWriteTokens: 3 };
     await journal.complete({ ...input, proof, usage });
+    const nativePointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${input.runNonce}`,
+      transcriptSha256: "a".repeat(64), contextHashBeforeFinal: "b".repeat(64),
+      assistantContentHash: "c".repeat(64), catalogHash: null,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(nativePointer);
+    const beforeNative = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [input.requestId]);
+    assert.equal(await journal.attachNativePointer({ requestId: input.requestId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), true);
+    const afterNative = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [input.requestId]);
+    assert.equal(afterNative.rows[0]?.updated_at.getTime(),
+      beforeNative.rows[0]?.updated_at.getTime(),
+    "publishing an old pointer must not make its turn newest");
+    assert.equal(await journal.attachNativePointer({ requestId: input.requestId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
+    "a native cache pointer is published once");
+    assert.equal(await journal.attachNativePointer({ requestId: input.requestId,
+      uid: 3n, accountId: 21n, proof, pointer: nativePointer }), false);
+    const rejectedId = `box-native-rejected-${suffix}`;
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [rejectedId, JSON.stringify({
+      model: input.model, boxInvocationRecovery: "v1", boxState: "terminal",
+      boxInvocationMode: "detached_tool", boxAccountId: "20",
+      boxRemoteCleanupClaimed: true,
+      boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
+      boxTerminalProof: proof, boxUsage: usage })]);
+    assert.equal(await journal.attachNativePointer({ requestId: rejectedId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
+    "an already-claimed detached cleanup cannot acquire a native pointer");
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb
+      WHERE request_id=$1`, [rejectedId, JSON.stringify({ boxInvocationMode: "text",
+        boxNativeCliCwd: `/tmp/ocv5-289-run-${"f".repeat(24)}`,
+        boxNativeSessionId: nativePointer.nativeSessionId })]);
+    assert.equal(await journal.attachNativePointer({ requestId: rejectedId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
+    "a claimed native cwd cannot be replaced with the current run cwd");
     await assert.rejects(() => journal.complete({ ...input, proof,
       usage: { "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens": 1 } as never }),
     (error: unknown) => error instanceof BoxDurableJournalError
@@ -138,7 +181,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       invocationMode: "detached_tool" as const,
       contextHash: deriveBoxContextHash(firstBody),
       fingerprint: { ...fingerprint, replayFingerprint: "9".repeat(64) },
-      runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32) };
+      runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32),
+      nativeStart: { sessionId: "12345678-1234-4123-8123-123456789abc",
+        cliCwd: `/tmp/ocv5-289-run-${"3".repeat(24)}` } };
     await journal.admit(toolCall);
     await journal.markRunning(toolCall);
     const firstToolUses = [
@@ -296,6 +341,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(resumed.accountId, 20n);
     assert.equal(resumed.spoolOffset, 1234);
     assert.equal(resumed.roundNo, 2);
+    assert.equal(resumed.nativeSessionId, toolCall.nativeStart.sessionId);
+    assert.equal(resumed.nativeCliCwd, toolCall.nativeStart.cliCwd);
     assert.equal(resumed.detachedRunnerHash, "f".repeat(64));
     assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
       ["toolu_A", "toolu_B"]);
@@ -307,6 +354,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "resuming");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
       "linked");
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxNativeSessionId,
+      toolCall.nativeStart.sessionId);
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxRoundNo,
       2);
     assert.deepEqual(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)
@@ -731,7 +780,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       (request_id,user_id,state,ctx) VALUES ($1,3,'inflight',$2::jsonb)`,
     [cancelId, JSON.stringify({ ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: cancelSession, turnKey: cancelTurn } })]);
-    const cancelCall = { ...toolCall, requestId: cancelId,
+    const cancelCall = { ...toolCall, nativeStart: undefined, requestId: cancelId,
       runNonce: "9".repeat(24), leaseEpoch: "a".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, cancelBody),
       contextHash: deriveBoxContextHash(cancelBody) };
@@ -764,7 +813,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       metadata: { user_id: JSON.stringify({ oc_turn_key: handoffTurn,
         session_id: handoffSession }) },
       messages: [{ role: "user", content: "synthetic stopped handoff" }] };
-    const handoffRoot = { ...toolCall, requestId: `box-handoff-stop-${suffix}`,
+    const handoffRoot = { ...toolCall, nativeStart: undefined,
+      requestId: `box-handoff-stop-${suffix}`,
       runNonce: "b".repeat(24), leaseEpoch: "c".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, handoffBody),
       contextHash: deriveBoxContextHash(handoffBody) };
@@ -817,7 +867,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       messages: [{ role: "user", content: "synthetic linked handoff" }] };
     const linkedBasis = { ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: linkedSession, turnKey: linkedTurn } };
-    const linkedRoot = { ...toolCall, requestId: `box-linked-root-${suffix}`,
+    const linkedRoot = { ...toolCall, nativeStart: undefined,
+      requestId: `box-linked-root-${suffix}`,
       runNonce: "d".repeat(24), leaseEpoch: "f".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, linkedBody),
       contextHash: deriveBoxContextHash(linkedBody) };
@@ -893,7 +944,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         budget(15_000_000)] };
     const cacheBasis = { ...basis, boxBillingContext: {
       ...basis.boxBillingContext, sessionId: cacheSession, turnKey: cacheTurn } };
-    const cacheRoot = { ...toolCall, requestId: `box-cache-root-${suffix}`,
+    const cacheRoot = { ...toolCall, nativeStart: undefined,
+      requestId: `box-cache-root-${suffix}`,
       runNonce: "e".repeat(24), leaseEpoch: "8".repeat(32),
       fingerprint: deriveBoxCallFingerprint(3n, cacheFirst),
       contextHash: deriveBoxContextHash(cacheFirst) };
@@ -969,6 +1021,251 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(rotated[0]?.requestId, `box-new-probe-${suffix}`);
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.usage_records");
+    await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
+    client.release();
+    await pool.end();
+  }
+});
+
+test("native predecessor claim and paid admission commit or roll back together",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (
+      request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
+      ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
+    let delayNextLockMs = 0;
+    const query = async (sql: string, params?: unknown[]) => {
+      if (delayNextLockMs && sql.includes("pg_advisory_xact_lock")) {
+        const wait = delayNextLockMs;
+        delayNextLockMs = 0;
+        await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      }
+      return client.query(sql, params);
+    };
+    const sameConnection = { connect: async () => ({ query, release: () => {} }),
+      query } as never;
+    const journal = new BoxDurableJournal(sameConnection);
+    const suffix = randomBytes(6).toString("hex");
+    const sessionId = `native-${suffix}`;
+    const ownerRequestId = `native-owner-${suffix}`;
+    const requestId = `native-next-${suffix}`;
+    const failedRequestId = `native-failed-${suffix}`;
+    const model = "box-api-claude-opus-5-5";
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "b".repeat(64), contextHashBeforeFinal: "c".repeat(64),
+      assistantContentHash: "d".repeat(64), catalogHash: null,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const owner = { model, boxInvocationRecovery: "v1", boxState: "terminal",
+      boxAccountId: "20", boxSessionId: sessionId, boxNativePointer: pointer,
+      boxTerminalProof: { runNonce: "a".repeat(24), leaseEpoch: "e".repeat(32),
+        keeperPid: 1, cliPid: 2, reason: "worker_complete" as const,
+        revision: 1 as const } };
+    const basis = { model, boxInvocationRecovery: "v1",
+      billingPricing: { v: 1, modelId: model, displayName: "Opus",
+        inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1",
+        cacheWritePerMtok: "1", multiplier: "1" },
+      boxBillingContext: { v: 1, sessionId, mode: "chat",
+        parentSessionId: null, delegateAgentId: null, turnKey: "a".repeat(64),
+        parentTurnKey: null, authority: null, dispatchId: null, attemptNo: null,
+        verificationSponsorship: null, apiKeyId: null } };
+    const put = async (id: string, ctx: unknown) => client.query(
+      `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+        VALUES ($1,3,'inflight',$2::jsonb)`, [id, JSON.stringify(ctx)]);
+    await put(ownerRequestId, owner);
+    await put(requestId, basis);
+    const candidate = await journal.findNativeCandidate({ uid: 3n, sessionId,
+      canonicalModel: model, currentRequestId: requestId });
+    assert.deepEqual(candidate, { ownerRequestId, pointer });
+    const fingerprint = { turnKey: "a".repeat(64), sessionId,
+      requestHash: "f".repeat(64), replayFingerprint: "1".repeat(64) };
+    const admission = { requestId, uid: 3n, accountId: 20n, model,
+      fingerprint, runNonce: "2".repeat(24), leaseEpoch: "3".repeat(32),
+      nativeClaim: { ownerRequestId, pointer, upstreamModel: pointer.upstreamModel } };
+    const interveningId = `native-intervening-${suffix}`;
+    await put(interveningId, { ...owner, boxNativePointer: undefined });
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()+interval '1 second' WHERE request_id=$1`, [interveningId]);
+    await assert.rejects(() => journal.admit(admission),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_NATIVE_CLAIM_LOST");
+    const staleOwner = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [ownerRequestId]);
+    assert.equal(staleOwner.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+    await client.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [interveningId]);
+    const expiringPointer = { ...pointer, expiresAtMs: Date.now() + 300 };
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || jsonb_build_object('boxNativePointer',$2::jsonb)
+      WHERE request_id=$1`, [ownerRequestId, JSON.stringify(expiringPointer)]);
+    delayNextLockMs = 450;
+    await assert.rejects(() => journal.admit({ ...admission,
+      nativeClaim: { ...admission.nativeClaim, pointer: expiringPointer } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_NATIVE_CLAIM_LOST",
+    "expiry while waiting for the account lock must roll back the native claim");
+    const expiredOwner = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [ownerRequestId]);
+    assert.equal(expiredOwner.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || jsonb_build_object('boxNativePointer',$2::jsonb)
+      WHERE request_id=$1`, [ownerRequestId, JSON.stringify(pointer)]);
+    await journal.admit(admission);
+    const rows = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE request_id=ANY($1::text[])`, [[ownerRequestId, requestId]]);
+    const prior = rows.rows.find((row) => row.request_id === ownerRequestId)?.ctx;
+    const next = rows.rows.find((row) => row.request_id === requestId)?.ctx;
+    assert.equal(prior?.boxNativeClaimRequestId, requestId);
+    assert.equal(next?.boxNativeOwnerRequestId, ownerRequestId);
+    assert.equal(next?.boxNativeSessionId, pointer.nativeSessionId);
+    await journal.markPrestartStopped({ requestId, uid: 3n,
+      leaseEpoch: admission.leaseEpoch });
+    const secondOwnerId = `native-owner2-${suffix}`;
+    await put(secondOwnerId, owner);
+    await put(failedRequestId, { ...basis, billingPricing: undefined });
+    await assert.rejects(() => journal.admit({ ...admission,
+      requestId: failedRequestId,
+      nativeClaim: { ...admission.nativeClaim, ownerRequestId: secondOwnerId },
+      fingerprint: { ...fingerprint,
+        replayFingerprint: "4".repeat(64) } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_NOT_INFLIGHT");
+    const after = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [secondOwnerId]);
+    assert.equal(after.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+    const detachedId = `native-detached-${suffix}`;
+    const toolPointer = parseBoxNativePointer({ ...pointer,
+      catalogHash: "e".repeat(64) });
+    assert.ok(toolPointer);
+    const detachedProof = owner.boxTerminalProof;
+    await put(detachedId, { ...owner, boxNativePointer: undefined,
+      boxInvocationMode: "detached_tool", boxRunNonce: "a".repeat(24),
+      boxLeaseEpoch: "e".repeat(32), boxContextHash: "c".repeat(64),
+      boxCatalogHash: "e".repeat(64), boxUsage: { inputTokens: 1,
+        outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    assert.equal(await journal.attachNativePointer({ requestId: detachedId,
+      uid: 3n, accountId: 20n, proof: detachedProof,
+      pointer: toolPointer }), true);
+    const candidates = await journal.listRemoteCleanupCandidates(10);
+    const clean = candidates.find((item) => item.requestId === detachedId);
+    assert.ok(clean);
+    assert.deepEqual(clean.nativePointer, toolPointer);
+    assert.equal(await journal.claimRemoteCleanup({ ...clean,
+      nativePointer: undefined }), false, "stale no-pointer cleanup cannot win");
+    assert.equal(await journal.claimRemoteCleanup(clean), true);
+    await assert.rejects(() => journal.markRemoteCleaned({ ...clean,
+      nativePointer: undefined }), (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_CLEANUP_FENCE_LOST");
+    await journal.markRemoteCleaned(clean);
+    assert.equal(await journal.attachNativePointer({ requestId: detachedId,
+      uid: 3n, accountId: 20n, proof: detachedProof,
+      pointer: toolPointer }), false);
+    const chainSession = `chain-${suffix}`;
+    const chainOwner = `chain-z-${suffix}`, chainFinal = `chain-a-${suffix}`;
+    await put(chainOwner, { ...owner, boxSessionId: chainSession,
+      boxNativePointer: undefined });
+    await put(chainFinal, { ...owner, boxSessionId: chainSession });
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()+interval '1 second'
+      WHERE request_id=ANY($1::text[])`, [[chainOwner, chainFinal]]);
+    const chainCandidate = await journal.findNativeCandidate({ uid: 3n,
+      sessionId: chainSession, canonicalModel: model,
+      currentRequestId: `chain-current-${suffix}` });
+    assert.equal(chainCandidate?.ownerRequestId, chainFinal,
+      "same-timestamp tool chain must prefer the terminal leaf with a pointer");
+    const chainRequestId = `chain-current-${suffix}`;
+    await put(chainRequestId, { ...basis, boxBillingContext: {
+      ...basis.boxBillingContext, sessionId: chainSession } });
+    await journal.admit({ ...admission, requestId: chainRequestId,
+      fingerprint: { ...fingerprint, sessionId: chainSession,
+        replayFingerprint: "5".repeat(64) },
+      nativeClaim: { ownerRequestId: chainFinal, pointer,
+        upstreamModel: pointer.upstreamModel } });
+    const gcSession = `gc-${suffix}`;
+    const gcCwd = `/tmp/ocv5-289-run-${"9".repeat(24)}`;
+    const gcPointer = { ...pointer, cliCwd: gcCwd,
+      expiresAtMs: Date.now() - 10_000 };
+    const gcAncestor = `gc-ancestor-${suffix}`;
+    const gcLeaf = `gc-leaf-${suffix}`;
+    const gcActive = `gc-active-${suffix}`;
+    await put(gcAncestor, { ...owner, boxSessionId: gcSession,
+      boxNativePointer: undefined, boxNativeCliCwd: gcCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxNativeClaimRequestId: gcLeaf, boxTerminalProof: undefined });
+    await put(gcLeaf, { ...owner, boxSessionId: gcSession,
+      boxNativePointer: gcPointer, boxNativeCliCwd: gcCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxInvocationMode: "detached_tool", boxRemoteCleanup: "done",
+      boxUsage: { inputTokens: 1, outputTokens: 1,
+        cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    const gcCandidate = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.requestId === gcLeaf);
+    assert.ok(gcCandidate, "expired latest pointer should enter GC queue");
+    await put(gcActive, { ...owner, boxSessionId: gcSession,
+      boxState: "unknown", boxNativePointer: undefined,
+      boxNativeCliCwd: gcCwd, boxNativeSessionId: pointer.nativeSessionId });
+    assert.equal(await journal.claimNativeGc(gcCandidate), false,
+      "unknown sibling must keep the remote transcript");
+    await client.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [gcActive]);
+    assert.equal(await journal.claimNativeGc(gcCandidate), true,
+      "terminal ancestor claim must not permanently retain a completed tool chain");
+    assert.equal(await journal.claimNativeGc(gcCandidate), false,
+      "another worker must not delete under an active GC claim");
+    assert.equal(await journal.finishNativeGc(gcCandidate, "done"), true);
+    assert.equal((await journal.listNativeGcCandidates(10))
+      .some((item) => item.requestId === gcLeaf), false);
+    const tiedCwd = `/tmp/ocv5-289-run-${"8".repeat(24)}`;
+    const tiedPointer = { ...gcPointer, cliCwd: tiedCwd };
+    const tiedA = `gc-tie-a-${suffix}`, tiedZ = `gc-tie-z-${suffix}`;
+    const tiedCtx = { ...owner, boxSessionId: `gc-tie-${suffix}`,
+      boxNativePointer: tiedPointer, boxNativeCliCwd: tiedCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxInvocationMode: "text", boxUsage: { inputTokens: 1,
+        outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    await put(tiedA, tiedCtx);
+    await put(tiedZ, tiedCtx);
+    const tieCandidate = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.pointer.cliCwd === tiedCwd);
+    assert.equal(tieCandidate?.requestId, tiedZ,
+      "equal expiry must use the same request-id ordering at list and claim");
+    assert.equal(await journal.claimNativeGc(tieCandidate!), true);
+    const guardedCwd = `/tmp/ocv5-289-run-${"7".repeat(24)}`;
+    const guardedId = `gc-guarded-${suffix}`;
+    await put(guardedId, { ...owner, boxSessionId: `gc-guarded-${suffix}`,
+      boxNativePointer: { ...gcPointer, cliCwd: guardedCwd },
+      boxNativeCliCwd: guardedCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxInvocationMode: "detached_tool", boxUsage: { inputTokens: 1,
+        outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    const guarded = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.requestId === guardedId);
+    assert.ok(guarded);
+    assert.equal(await journal.claimNativeGc(guarded), false,
+      "detached terminal without remote cleanup proof must not delete history");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
+      WHERE request_id=$1`, [guardedId]);
+    assert.equal(await journal.claimNativeGc(guarded), true);
+    const warmCwd = `/tmp/ocv5-289-run-${"6".repeat(24)}`;
+    const warmOld = `gc-warm-old-${suffix}`;
+    const warmNew = `gc-warm-new-${suffix}`;
+    await put(warmOld, { ...tiedCtx, boxSessionId: `gc-warm-${suffix}`,
+      boxNativePointer: { ...gcPointer, cliCwd: warmCwd },
+      boxNativeCliCwd: warmCwd });
+    const warmCandidate = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.requestId === warmOld);
+    assert.ok(warmCandidate);
+    await put(warmNew, { ...tiedCtx, boxSessionId: `gc-warm-${suffix}`,
+      boxNativePointer: { ...pointer, cliCwd: warmCwd },
+      boxNativeCliCwd: warmCwd });
+    assert.equal(await journal.claimNativeGc(warmCandidate), false,
+      "a newer unexpired pointer for the same project must block stale GC");
+  } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();
     await pool.end();

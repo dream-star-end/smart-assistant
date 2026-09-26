@@ -54,7 +54,7 @@ const echoHash = createHash("sha256").update(JSON.stringify({
   content: [{ type: "text", text: localResult }], isError: false })).digest("hex");
 
 function fixture(kind: "tool" | "final", failComplete = false,
-  trailing = false, omitEcho = false, largeEcho = false) {
+  trailing = false, omitEcho = false, largeEcho = false, native = false) {
   const sequence: string[] = [], emitted: string[] = [];
   const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
   const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
@@ -70,7 +70,9 @@ function fixture(kind: "tool" | "final", failComplete = false,
     toolUses: [{ id: "toolu_prior_a", boxName, clientName: "local_echo",
       inputHash: "f".repeat(64) }],
     results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: resultText }],
-      isError: false, contentHash: currentHash }] };
+      isError: false, contentHash: currentHash }],
+    ...(native ? { nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}` } : {}) };
   const bytes = Buffer.concat([raw([...(omitEcho ? [] : [currentEcho]),
     ...(kind === "tool" ? toolRecords : finalRecords)]),
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
@@ -92,6 +94,11 @@ function fixture(kind: "tool" | "final", failComplete = false,
         mcpRequestId: 7, name: "t0", arguments: { value: "x" } }),
       stderrBytes: 0, exitCode: 0 as const };
     }
+    if (args[2]?.includes("print(json.dumps({'sha256':actual")) {
+      sequence.push("native-inspect");
+      return { stdout: JSON.stringify({ sha256: "f".repeat(64), size: 100 }) + "\n",
+        stderrBytes: 0, exitCode: 0 as const };
+    }
     sequence.push("proof-read");
     return { stdout: JSON.stringify(proof) + "\n", stderrBytes: 0, exitCode: 0 as const };
   } } };
@@ -106,7 +113,8 @@ function fixture(kind: "tool" | "final", failComplete = false,
     sequence.push("terminal-journal");
     assert.equal(evidence.usage.outputTokens, 4);
     if (failComplete) throw new Error("synthetic journal failure");
-  }, markUnknown: async () => { sequence.push("unknown"); } };
+  }, attachNativePointer: async () => { sequence.push("native-attach"); return true; },
+  markUnknown: async () => { sequence.push("unknown"); } };
   const deps = { journal: journal as never,
     retainUnknownTarget: () => { retained = true; sequence.push("retain"); },
     onUnknown: async () => { sequence.push("notify"); } };
@@ -133,6 +141,25 @@ test("final round waits for Box terminal and journal before terminal SSE", async
   assert.ok(f.sequence.indexOf("proof-read") < f.sequence.indexOf("terminal-journal"));
   assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.lastIndexOf("emit"));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+});
+
+test("native final tool round publishes transcript pointer after durable usage", async () => {
+  const previous = process.env.OC_BOX_NATIVE_RESUME;
+  process.env.OC_BOX_NATIVE_RESUME = "1";
+  try {
+    const f = fixture("final", false, false, false, false, true);
+    const result = await runBoxToolContinuation(f.input, f.deps);
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(result.nativePointer?.accountId, "20");
+    assert.equal(result.nativePointer?.transcriptSha256, "f".repeat(64));
+    assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
+    assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
+    assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_NATIVE_RESUME;
+    else process.env.OC_BOX_NATIVE_RESUME = previous;
+  }
 });
 
 test("1.1 MB complete tool echo crosses chunk boundaries before final billing", async () => {

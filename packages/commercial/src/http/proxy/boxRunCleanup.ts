@@ -6,8 +6,8 @@ import type { BoxExecTransport } from "./boxExecTransport.js";
 type BoxCcExecRequest = Parameters<BoxExecTransport["run"]>[0];
 
 const CLEAN = String.raw`import os,re,stat,sys
-nonce=sys.argv[1] if len(sys.argv)==2 else ''
-if not re.fullmatch(r'[a-f0-9]{24}',nonce):raise SystemExit(126)
+nonce,keep=sys.argv[1:] if len(sys.argv)==3 else ('','')
+if not re.fullmatch(r'[a-f0-9]{24}',nonce) or keep not in ('0','1'):raise SystemExit(126)
 cwd='/tmp/ocv5-289-run-'+nonce
 project='/home/box/.claude/projects/'+cwd.replace('/','-')
 def private_dir(path):
@@ -40,21 +40,24 @@ try:
   os.unlink(name,dir_fd=run)
  os.fsync(run)
 finally:os.close(run)
-try:history=private_dir(project)
-except FileNotFoundError:history=None
-if history is not None:
- try:
-  pattern=re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl(?:\.part)?')
-  for name in sorted(os.listdir(history)):
-   if not pattern.fullmatch(name):raise SystemExit(126)
-   private_file(history,name)
-   os.unlink(name,dir_fd=history)
-  os.fsync(history)
- finally:os.close(history)
+if keep=='0':
+ try:history=private_dir(project)
+ except FileNotFoundError:history=None
+ if history is not None:
+  try:
+   pattern=re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl(?:\.part)?')
+   for name in sorted(os.listdir(history)):
+    if not pattern.fullmatch(name):raise SystemExit(126)
+    private_file(history,name)
+    os.unlink(name,dir_fd=history)
+   os.fsync(history)
+  finally:os.close(history)
 print('clean')`;
 
-export function makeBoxRunCleanup(runNonce: string): BoxCcExecRequest {
+export function makeBoxRunCleanup(runNonce: string,
+  preserveNativeProject = false): BoxCcExecRequest {
   if (!/^[a-f0-9]{24}$/.test(runNonce)) throw new Error("BOX_RUN_CLEANUP_ID_INVALID");
-  return { command: "/usr/bin/python3", args: ["-I", "-c", CLEAN, runNonce],
+  return { command: "/usr/bin/python3", args: ["-I", "-c", CLEAN, runNonce,
+    preserveNativeProject ? "1" : "0"],
     cwd: "/tmp", environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } };
 }

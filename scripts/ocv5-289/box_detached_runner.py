@@ -61,11 +61,19 @@ def launch(argv: list[str]) -> int:
         prefix = options[:separator]
         allowed = {"--proof-dir", "--lease-epoch", "--deadline",
                    "--kill-after", "--max-output", "--stderr-limit",
-                   "--stdin-file", "--stdin-sha256"}
+                   "--stdin-file", "--stdin-sha256", "--cli-cwd"}
         if (len(prefix) % 2 or
                 any(prefix[i] not in allowed for i in range(0, len(prefix), 2)) or
                 len(set(prefix[::2])) != len(prefix[::2])):
             return 126
+        cli_cwd = directory
+        if "--cli-cwd" in prefix:
+            at = options.index("--cli-cwd")
+            cli_cwd = options[at + 1]
+            if not RUN_DIR.fullmatch(cli_cwd):
+                return 126
+            options = options[:at] + options[at + 2:]
+            separator -= 2
         command = options[separator + 1]
         if not os.path.isabs(command):
             return 126
@@ -82,6 +90,13 @@ def launch(argv: list[str]) -> int:
         directory_fd = verified_dir(directory)
     except (OSError, ValueError, IndexError):
         return 126
+    cli_fd = directory_fd
+    if cli_cwd != directory:
+        try:
+            cli_fd = verified_dir(cli_cwd)
+        except (OSError, ValueError):
+            os.close(directory_fd)
+            return 126
     try:
         out = os.open("stdout.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                       0o600, dir_fd=directory_fd)
@@ -89,9 +104,13 @@ def launch(argv: list[str]) -> int:
             err = os.open("stderr.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                           0o600, dir_fd=directory_fd)
             try:
+                def enter_pinned_cwd() -> None:
+                    os.fchdir(cli_fd)
+                    os.close(cli_fd)
                 process = subprocess.Popen([sys.executable, "-I", keeper, supervisor, *options],
-                    cwd=directory, env=os.environ.copy(), stdin=subprocess.DEVNULL,
-                    stdout=out, stderr=err, start_new_session=True, close_fds=True)
+                    env=os.environ.copy(), stdin=subprocess.DEVNULL,
+                    stdout=out, stderr=err, start_new_session=True, close_fds=True,
+                    pass_fds=(cli_fd,), preexec_fn=enter_pinned_cwd)
             finally:
                 os.close(err)
         finally:
@@ -104,6 +123,8 @@ def launch(argv: list[str]) -> int:
     except (OSError, subprocess.SubprocessError):
         return 126
     finally:
+        if cli_fd != directory_fd:
+            os.close(cli_fd)
         os.close(directory_fd)
 
 

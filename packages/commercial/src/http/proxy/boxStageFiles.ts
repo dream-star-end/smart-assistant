@@ -89,8 +89,8 @@ finally:os.close(directory)
 print(want)`;
 
 const CLEANUP = String.raw`import os,re,stat,sys
-cwd,project,*paths=sys.argv[1:]
-if not re.fullmatch(r'/tmp/ocv5-289-run-[0-9a-f]{24}',cwd):raise SystemExit(1)
+cwd,project,mode,*paths=sys.argv[1:]
+if not re.fullmatch(r'/tmp/ocv5-289-run-[0-9a-f]{24}',cwd) or mode not in ('full','keep'):raise SystemExit(1)
 if project and project!='/home/box/.claude/projects/'+cwd.replace('/','-'):raise SystemExit(1)
 fds={}
 try:
@@ -104,14 +104,22 @@ try:
   if path not in (cwd+'/stdin.jsonl',cwd+'/system.txt',cwd+'/tool-catalog.json',cwd+'/stdout.jsonl',cwd+'/stderr.log') and not re.fullmatch(re.escape(cwd)+r'/result\.toolu_[A-Za-z0-9_-]{1,120}\.json',path) and not (project and re.fullmatch(re.escape(project)+r'/[0-9a-f-]{36}\.jsonl',path)):raise SystemExit(1)
   parent,name=os.path.split(path)
   if parent not in fds:raise SystemExit(1)
+  if mode=='keep' and parent==project:continue
   for target in (name,name+'.part'):
    try:os.unlink(target,dir_fd=fds[parent])
    except FileNotFoundError:pass
- for d in (project,cwd):
-  if not d:continue
-  held=os.fstat(fds[d]);current=os.lstat(d)
-  if held.st_dev!=current.st_dev or held.st_ino!=current.st_ino:raise SystemExit(1)
-  os.rmdir(d)
+ allowed=re.compile(r'(?:(?:pending|result)\.toolu_[A-Za-z0-9_-]{1,120}\.json(?:\.part)?|pending\.toolu_[A-Za-z0-9_-]{1,120}\.json\.[1-9][0-9]{0,9}\.[1-9][0-9]{0,19}\.tmp)')
+ for name in sorted(os.listdir(fds[cwd])):
+  if not allowed.fullmatch(name):raise SystemExit(1)
+  st=os.stat(name,dir_fd=fds[cwd],follow_symlinks=False)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1:raise SystemExit(1)
+  os.unlink(name,dir_fd=fds[cwd])
+ if mode=='full':
+  for d in (project,cwd):
+   if not d:continue
+   held=os.fstat(fds[d]);current=os.lstat(d)
+   if held.st_dev!=current.st_dev or held.st_ino!=current.st_ino:raise SystemExit(1)
+   os.rmdir(d)
 finally:
  for fd in fds.values():os.close(fd)
 print('clean')`;
@@ -120,7 +128,8 @@ export function makeBoxStageFiles(input: {
   cwd: string; project: string; files: readonly BoxStageFile[];
   /** Existing owner-0700 run directory; never create it a second time. */
   initialize?: boolean;
-}): { requests: BoxCcExecRequest[]; cleanup: BoxCcExecRequest } {
+}): { requests: BoxCcExecRequest[]; cleanup: BoxCcExecRequest;
+  cleanupPreservingNative: BoxCcExecRequest } {
   if (!/^\/tmp\/ocv5-289-run-[0-9a-f]{24}$/.test(input.cwd)
     || (input.project !== "" && input.project !==
       `/home/box/.claude/projects/${input.cwd.replaceAll("/", "-")}`)) {
@@ -161,6 +170,10 @@ export function makeBoxStageFiles(input: {
     requests.push(fixed(FINISH, [input.cwd, input.project, file.path,
       String(file.raw.length), file.hash]));
   }
-  return { requests, cleanup: fixed(CLEANUP, [input.cwd, input.project,
-    ...input.files.map((file) => file.path)]) };
+  const cleanupArgs = [input.cwd, input.project, ...input.files.map((file) => file.path)];
+  return { requests,
+    cleanup: fixed(CLEANUP, [cleanupArgs[0]!, cleanupArgs[1]!, "full",
+      ...cleanupArgs.slice(2)]),
+    cleanupPreservingNative: fixed(CLEANUP, [cleanupArgs[0]!, cleanupArgs[1]!, "keep",
+      ...cleanupArgs.slice(2)]) };
 }

@@ -395,6 +395,8 @@ test("a resumed final round streams blocks but withholds terminal until result a
   assert.equal(decoder.push("").finalCandidate, null);
   const final = decoder.push(lines(finalRecords.slice(-1))[0]!).finalCandidate;
   assert.equal(final?.stopReason, "end_turn");
+  assert.equal(final?.assistantContentHash,
+    hashBoxAssistantContent([{ type: "text", text: "done" }]));
   assert.equal(final?.outputTokens, 4, "bill only this HTTP model round, not CLI cumulative total");
   assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
     journaledUsage: { inputTokens: 2, outputTokens: 4,
@@ -409,6 +411,29 @@ test("a resumed final round streams blocks but withholds terminal until result a
   assert.ok(terminal.includes('"stop_reason":"end_turn"'));
   assert.ok(terminal.includes("event: message_stop"));
   assert.throws(() => decoder.push(""), /BOX_TOOL_DECODER_CLOSED/);
+});
+
+test("empty final remains billable without publishing a native cache hash", () => {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog,
+    { alreadyInitialized: true, allowFinal: true });
+  const records = [
+    event({ type: "message_start", message: { id: "msg_empty", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    { type: "assistant", message: { id: "msg_empty", model,
+      role: "assistant", content: [] } },
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 2, output_tokens: 0 } }),
+    event({ type: "message_stop" }),
+    { type: "result", subtype: "success", is_error: false,
+      usage: { input_tokens: 2, output_tokens: 0 } },
+  ];
+  let final: ReturnType<typeof decoder.push>["finalCandidate"] = null;
+  for (const line of lines(records)) final = decoder.push(line).finalCandidate;
+  assert.equal(final?.assistantContentHash, undefined);
+  decoder.finishFinal();
+  assert.ok(decoder.commitFinal({ terminalReason: "worker_complete",
+    journaledUsage: { inputTokens: 2, outputTokens: 0,
+      cacheReadTokens: 0, cacheWriteTokens: 0 } }).includes("event: message_stop"));
 });
 
 test("success result followed by same-chunk or later bytes cannot release final SSE", () => {

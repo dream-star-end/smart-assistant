@@ -22,6 +22,8 @@ import { makeBoxUserStopHandler } from
   "../../packages/commercial/src/http/proxy/boxUserStopHandler.js";
 import { parseBoxTerminalProof } from
   "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
+import { parseBoxNativePointer } from
+  "../../packages/commercial/src/http/proxy/boxNativePointer.js";
 import { makeBoxDetachedToolPlan } from
   "../../packages/commercial/src/http/proxy/boxDetachedToolPlan.js";
 import { deriveBoxCallFingerprint, hashBoxAssistantContent } from
@@ -55,6 +57,7 @@ import { createLogger } from
 import { loadConfig } from "../../packages/commercial/src/config.js";
 import { getPool, closePool } from "../../packages/commercial/src/db/index.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { makeBoxThirdTurnBody } from "./boxThirdTurnPlan.js";
 import type { ProxyBody } from
   "../../packages/commercial/src/http/proxy/shared.js";
 
@@ -634,6 +637,11 @@ async function main(): Promise<void> {
   const sessionId = `ocv5-289-signed-${nonce}`;
   const turnKey = randomBytes(32).toString("hex");
   const firstId = `box-signed-a-${nonce}`, secondId = `box-signed-b-${nonce}`;
+  const thirdId = `box-signed-c-${nonce}`;
+  const thirdTurn = process.env.OCV5_291_THIRD_TURN_ACK === "1";
+  if (thirdTurn && process.env.OC_BOX_NATIVE_RESUME !== "1") {
+    throw new Error("BOX_NATIVE_THIRD_FLAG_REQUIRED");
+  }
   const challenge = `probe-${randomBytes(8).toString("hex")}`;
   const localResult = `ocv5-289-local-${randomBytes(12).toString("hex")}`;
   const fixtureHostPath = `${WORK_HOST}/.ocv5-289-read-${nonce}.txt`;
@@ -642,6 +650,8 @@ async function main(): Promise<void> {
   let localExecutions = 0, unknownPhase: string | null = null;
   let terminal = false;
   let identityPersisted = false;
+  let thirdArmed = false, thirdAdmitted = false;
+  let secondTerminalCleaned = false;
   let lockHeld = false;
   let fixtureCreated = false;
   let ccbProcessUnconfirmed = false;
@@ -683,6 +693,23 @@ async function main(): Promise<void> {
     finally { unlinkSync(OPERATOR_MUTEX); syncDirectory(); }
   };
   const persistIdentity = (input: BoxJournalAdmission): void => {
+    if (thirdTurn && input.requestId === thirdId) {
+      assertion(lockHeld && identityPersisted && thirdArmed && !thirdAdmitted
+        && input.uid === UID && input.accountId === ACCOUNT_ID,
+      "BOX_TOOL_THIRD_IDENTITY_INVALID");
+      withOperatorMutex(() => {
+        const before = JSON.parse(readFileSync(EVIDENCE_PATH, "utf8")) as Record<string, unknown>;
+        assertion(before.firstId === firstId && before.secondId === secondId
+          && before.thirdId === thirdId && before.state === "third_preparing",
+        "BOX_TOOL_THIRD_EVIDENCE_INVALID");
+        const staged = `${EVIDENCE_PATH}.${nonce}.third-run.part`;
+        writeDurable(staged, JSON.stringify({ ...before, state: "third_unresolved",
+          thirdRunNonce: input.runNonce, thirdLeaseEpoch: input.leaseEpoch }) + "\n");
+        renameSync(staged, EVIDENCE_PATH); syncDirectory();
+      });
+      thirdAdmitted = true;
+      return;
+    }
     assertion(lockHeld && !identityPersisted && input.requestId === firstId && input.uid === UID
       && input.accountId === ACCOUNT_ID, "BOX_TOOL_ATTEMPT_IDENTITY_INVALID");
     const raw = JSON.stringify({ v: 1, pid: process.pid,
@@ -695,6 +722,22 @@ async function main(): Promise<void> {
     renameSync(staged, EVIDENCE_PATH);
     syncDirectory();
     identityPersisted = true;
+  };
+  const armThird = (): void => {
+    assertion(thirdTurn && lockHeld && identityPersisted && !thirdArmed,
+      "BOX_TOOL_THIRD_ARM_INVALID");
+    withOperatorMutex(() => {
+      const before = JSON.parse(readFileSync(EVIDENCE_PATH, "utf8")) as Record<string, unknown>;
+      assertion(before.firstId === firstId && before.secondId === secondId
+        && before.sessionId === sessionId && before.state === "unresolved"
+        && before.thirdId === undefined,
+      "BOX_TOOL_THIRD_EVIDENCE_INVALID");
+      const staged = `${EVIDENCE_PATH}.${nonce}.third.part`;
+      writeDurable(staged, JSON.stringify({ ...before, thirdId,
+        state: "third_preparing" }) + "\n");
+      renameSync(staged, EVIDENCE_PATH); syncDirectory();
+    });
+    thirdArmed = true;
   };
   try {
     const database = await client.query<{ current_database: string }>(
@@ -785,7 +828,7 @@ async function main(): Promise<void> {
     const ccbLive = process.env.OCV5_289_CCB_LIVE_ACK === "1";
     const signedCancel = process.env.OCV5_289_SIGNED_CANCEL_ACK === "1";
     assertion(Number(preflightOnly) + Number(ccbPreflight) + Number(ccbLive)
-      + Number(signedCancel) <= 1,
+      + Number(signedCancel) + Number(thirdTurn) <= 1,
       "BOX_SIGNED_PROBE_MODE_CONFLICT");
     let transportCalls = 0;
     let paidCalls = 0;
@@ -797,6 +840,7 @@ async function main(): Promise<void> {
         // no arbitrary host port is exposed across the Docker firewall.
         containerInboundIp: "127.0.0.1",
         assignedRequestIds: [firstId, secondId], shapeOnly: ccbPreflight } : {}),
+      ...(thirdTurn ? { assignedRequestIds: [firstId, secondId, thirdId] } : {}),
       boxModel: { toolBridgeReady: true, fetch: (args) => {
         transportCalls++;
         if (preflightOnly || ccbPreflight) throw new Error("BOX_PREFLIGHT_TRANSPORT_CALLED");
@@ -1053,7 +1097,8 @@ async function main(): Promise<void> {
     const secondResponse = await loopback.call(second, secondId);
     const secondEvents = await readEvents(secondResponse);
     await loopback.waitHandler(secondId);
-    const answer = assistantContent(secondEvents)
+    const secondContent = assistantContent(secondEvents);
+    const answer = secondContent
       .filter((block) => block.type === "text").map((block) => block.text).join("");
     assertion(answer.trim() === localResult && localExecutions === 1
       && unknownPhase === null, "BOX_TOOL_PROBE_FINAL_INVALID");
@@ -1105,14 +1150,101 @@ async function main(): Promise<void> {
       "SELECT credits::text FROM users WHERE id=$1", [UID.toString()]);
     assertion(after.rows.length === 1 && BigInt(after.rows[0]!.credits) >= 0n
       && initialCredits > 0n, "BOX_SIGNED_WALLET_INVALID");
-    terminal = true;
+    if (!thirdTurn) terminal = true;
     const pendingCleanup = await service.retryTerminalCleanup();
     const cleanupRow = await client.query<{ cleanup: string | null }>(
       `SELECT ctx->>'boxRemoteCleanup' AS cleanup FROM request_finalize_journal
        WHERE request_id=$1`, [secondId]);
     assertion(pendingCleanup === 0 && cleanupRow.rows[0]?.cleanup === "done",
-      "BOX_TOOL_PROBE_CLEANUP_UNPROVEN");
+    "BOX_TOOL_PROBE_CLEANUP_UNPROVEN");
+    secondTerminalCleaned = true;
     assertion(identityPersisted, "BOX_TOOL_PROBE_IDENTITY_NOT_DURABLE");
+    let thirdSummary: Record<string, unknown> = {};
+    if (thirdTurn) {
+      diagnosticStage = "third_preflight";
+      const pointer = parseBoxNativePointer(finalRow?.ctx.boxNativePointer);
+      assertion(pointer && pointer.accountId === String(ACCOUNT_ID)
+        && pointer.cliCwd === `/tmp/ocv5-289-run-${ownerRow?.ctx.boxRunNonce}`,
+      "BOX_NATIVE_THIRD_POINTER_INVALID");
+      const thirdPrompt = "Without calling tools, repeat exactly the token returned by "
+        + "local_echo in the previous turn. Do not call local_echo again. "
+        + "Reply with only that token.";
+      const third = makeBoxThirdTurnBody({ second,
+        fullAssistantContent: secondContent,
+        assistantContentHash: pointer.assistantContentHash,
+        turnKey: randomBytes(32).toString("hex"), sessionId,
+        userPrompt: thirdPrompt });
+      assertion(!thirdPrompt.includes(localResult)
+        && validateBoxToolRequest(third) === null,
+      "BOX_NATIVE_THIRD_FIXTURE_INVALID");
+      armThird();
+      diagnosticStage = "third_paid_dispatch";
+      const startedThird = Date.now();
+      const thirdResponse = await loopback.call(third, thirdId);
+      const thirdEvents = await readEvents(thirdResponse);
+      await loopback.waitHandler(thirdId);
+      const thirdContent = assistantContent(thirdEvents);
+      const thirdText = thirdContent.filter((block) => block.type === "text")
+        .map((block) => String(block.text ?? "")).join("");
+      assertion(thirdText.trim() === localResult && localExecutions === 1
+        && thirdContent.every((block) => block.type !== "tool_use")
+        && unknownPhase === null,
+      "BOX_NATIVE_THIRD_FINAL_INVALID");
+      const thirdRows = await client.query<{ request_id: string; state: string;
+        ctx: Record<string, unknown> }>(
+        `SELECT request_id,state,ctx FROM request_finalize_journal
+          WHERE request_id=ANY($1::text[])`, [[secondId, thirdId]]);
+      const secondAfter = thirdRows.rows.find((row) => row.request_id === secondId);
+      const thirdAfter = thirdRows.rows.find((row) => row.request_id === thirdId);
+      const thirdUsage = thirdAfter?.ctx.boxUsage as { cacheReadTokens?: unknown } | undefined;
+      assertion(secondAfter?.ctx.boxNativeClaimRequestId === thirdId
+        && thirdAfter?.ctx.boxNativeOwnerRequestId === secondId
+        && thirdAfter.ctx.boxNativeSessionId === pointer.nativeSessionId
+        && thirdAfter.ctx.boxNativeCliCwd === pointer.cliCwd
+        && thirdAfter.ctx.boxAccountId === String(ACCOUNT_ID)
+        && thirdAfter.ctx.boxSessionId === sessionId
+        && thirdAfter.ctx.boxState === "terminal" && thirdAfter.state === "committed"
+        && (thirdAfter.ctx.boxTerminalProof as { reason?: unknown } | undefined)?.reason
+          === "worker_complete"
+        && typeof thirdUsage?.cacheReadTokens === "number"
+        && thirdUsage.cacheReadTokens > 0,
+      "BOX_NATIVE_THIRD_CLAIM_UNPROVEN");
+      const billed = await client.query<{ id: string; cost: string;
+        cache_read: string; ledger_id: string | null }>(
+        `SELECT id::text,cost_credits::text AS cost,ledger_id::text,
+          cache_read_tokens::text AS cache_read FROM usage_records
+          WHERE user_id=$1 AND request_id=$2`, [UID.toString(), thirdId]);
+      assertion(billed.rows.length === 1 && BigInt(billed.rows[0]!.cost) > 0n
+        && BigInt(billed.rows[0]!.cache_read) > 0n,
+      "BOX_NATIVE_THIRD_USAGE_INVALID");
+      const thirdLedger = await client.query<{ id: string; delta: string;
+        reason: string; bucket: string }>(
+        `SELECT id::text,delta::text,reason,bucket FROM credit_ledger WHERE user_id=$1
+          AND ref_type='usage_record' AND ref_id=$2`,
+        [UID.toString(), billed.rows[0]!.id]);
+      assertion(thirdLedger.rows.length >= 1 && thirdLedger.rows.length <= 4
+        && !!billed.rows[0]!.ledger_id
+        && thirdLedger.rows.some((row) => row.id === billed.rows[0]!.ledger_id)
+        && thirdLedger.rows.every((row) => row.reason === "chat"
+          && ["period", "wallet", "org_period", "org_wallet"].includes(row.bucket)
+          && BigInt(row.delta) < 0n)
+        && thirdLedger.rows.reduce((sum, row) => sum - BigInt(row.delta), 0n)
+          === BigInt(billed.rows[0]!.cost),
+      "BOX_NATIVE_THIRD_LEDGER_INVALID");
+      const thirdPendingCleanup = await service.retryTerminalCleanup();
+      const thirdCleanup = await client.query<{ cleanup: string | null }>(
+        `SELECT ctx->>'boxRemoteCleanup' AS cleanup FROM request_finalize_journal
+          WHERE request_id=$1`, [thirdId]);
+      assertion(thirdPendingCleanup === 0 && thirdCleanup.rows[0]?.cleanup === "done",
+      "BOX_NATIVE_THIRD_CLEANUP_UNPROVEN");
+      terminal = true;
+      thirdSummary = { nativeResume: true, thirdRequestBound: true,
+        thirdCacheReadTokens: billed.rows[0]!.cache_read,
+        thirdElapsedMs: Date.now() - startedThird, thirdEventCount: thirdEvents.length,
+        persistentUsageRows: 3,
+        persistentLedgerRows: ledger.rows.length + thirdLedger.rows.length,
+        debitedCredits: (debited + BigInt(billed.rows[0]!.cost)).toString() };
+    }
     withOperatorMutex(() => {
       unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
     });
@@ -1124,8 +1256,16 @@ async function main(): Promise<void> {
       persistentLedgerRows: ledger.rows.length, inheritsDirectOpusPrice: true,
       debitedCredits: debited.toString(),
       firstEventCount: firstEvents.length, secondEventCount: secondEvents.length,
-      remoteCleanupDone: true, unknown: false }) + "\n");
+      remoteCleanupDone: true, unknown: false, ...thirdSummary }) + "\n");
   } catch (error) {
+    if (lockHeld && thirdTurn && secondTerminalCleaned && !thirdArmed) {
+      // First two paid rounds are proven complete and cleaned; no third
+      // dispatch was armed. A local preflight mismatch cannot be unknown.
+      try { withOperatorMutex(() => {
+        unlinkSync(EVIDENCE_PATH); syncDirectory(); lockHeld = false;
+      }); }
+      catch { /* Retain the conservative lock on filesystem failure. */ }
+    }
     if (lockHeld && !identityPersisted && !ccbProcessUnconfirmed) {
       // The durable admission wrapper has not run, so no paid CLI can have
       // started. Release this prelaunch-only reservation, still fail the probe.
@@ -1145,7 +1285,8 @@ async function main(): Promise<void> {
     const observed = dbReady
       ? await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
         `SELECT request_id,ctx FROM request_finalize_journal
-         WHERE request_id IN ($1,$2)`, [firstId, secondId]).catch(() => ({ rows: [] }))
+         WHERE request_id=ANY($1::text[])`,
+        [[firstId, secondId, ...(thirdTurn ? [thirdId] : [])]]).catch(() => ({ rows: [] }))
       : { rows: [] as Array<{ request_id: string; ctx: Record<string, unknown> }> };
     const evidence = observed.rows.map((row) => ({ requestId: row.request_id,
       state: row.ctx.boxState, runNonce: row.ctx.boxRunNonce,
