@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
+import type { BoxNativePointer } from "./boxNativePointer.js";
 
 const tools = [{ name: "local_echo", description: "synthetic",
   input_schema: { type: "object", properties: {} } }];
@@ -67,6 +68,43 @@ test("same internal model fetch streams first handoff then next final without to
   assert.deepEqual(calls, ["first", "claim-and-publish", "continued-final"]);
   assert.equal(disposed, true, "local target closes only after terminal proof");
   assert.equal(await service.retryFailedCleanup(), 0);
+});
+
+test("proven native final carries its exact pointer into preserving cleanup", async () => {
+  const pointer: BoxNativePointer = { version: 1, accountId: "20",
+    upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+    nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+    cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+    transcriptSha256: "f".repeat(64), contextHashBeforeFinal: "c".repeat(64),
+    assistantContentHash: "d".repeat(64), catalogHash: "e".repeat(64),
+    expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 };
+  let claimed = false, cleaned = false;
+  const target = { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+    assert.deepEqual(request.args.slice(-2), ["a".repeat(24), "1"]);
+    return { stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const };
+  } }, dispose: async () => {} };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"),
+    journal: { ...journal(), claimRemoteCleanup: async (candidate: {
+      nativePointer?: BoxNativePointer }) => {
+      assert.deepEqual(candidate.nativePointer, pointer); claimed = true; return true;
+    }, markRemoteCleaned: async () => { cleaned = true; } } as never,
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void }) => {
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "final", plan: { runNonce: "a".repeat(24),
+        leaseEpoch: "b".repeat(32) }, target,
+        proof: { runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
+          keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 },
+        nativePointer: pointer };
+    }) as never,
+  });
+  const response = await service.fetch(call(firstBody));
+  assert.ok((await response.text()).includes("event: message_stop"));
+  assert.equal(claimed, true);
+  assert.equal(cleaned, true);
 });
 
 test("only model first/resume paths request wake; recovery resolver remains default no-wake", async () => {
