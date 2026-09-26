@@ -2,13 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync,
-  symlinkSync } from "node:fs";
+  symlinkSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import { makeBoxStageFiles } from "./boxStageFiles.js";
 import { BoxPrelaunchControlError, guardBoxPrivateStage,
-  makeBoxPrelaunchBootstrap, makeBoxPrelaunchCloseFence,
-  parseBoxPrelaunchBootstrap } from "./boxPrelaunchControl.js";
+  makeBoxPrelaunchBootstrap, makeBoxPrelaunchCleanup, makeBoxPrelaunchCloseFence,
+  makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap } from "./boxPrelaunchControl.js";
 
 function execute(request: BoxCcExecRequest) {
   assert.ok(request.args.every((arg) => Buffer.byteLength(arg) < 70_000));
@@ -32,8 +32,9 @@ test("private stage requires the permanent lock identity and CLOSED rejects late
     const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
     assert.equal(statSync(controlDir).mode & 0o777, 0o700);
     assert.equal(statSync(`${controlDir}/lock`).mode & 0o777, 0o600);
-    for (const step of plan.requests) {
-      const staged = execute(guardBoxPrivateStage(step, receipt));
+    for (const [index, step] of plan.requests.entries()) {
+      const staged = execute(index === 0 ? makeBoxPrelaunchInit(receipt, "")
+        : guardBoxPrivateStage(step, receipt));
       assert.equal(staged.status, 0, staged.stderr);
     }
     assert.deepEqual(readFileSync(file), raw);
@@ -44,7 +45,7 @@ test("private stage requires the permanent lock identity and CLOSED rejects late
     assert.equal(closed.stdout.trim(), `closed:${receipt.identityHash}`);
     assert.equal(execute(makeBoxPrelaunchCloseFence(receipt)).status, 0,
       "same CLOSED receipt may be re-observed without reopening writes");
-    assert.notEqual(execute(guardBoxPrivateStage(plan.requests[0]!, receipt)).status, 0);
+    assert.notEqual(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
     assert.notEqual(execute(guardBoxPrivateStage(plan.requests.at(-1)!, receipt)).status, 0);
     assert.deepEqual(readFileSync(file), raw);
     assert.throws(() => parseBoxPrelaunchBootstrap(boot.stdout, { ...identity,
@@ -73,8 +74,8 @@ test("wrong receipt hash fails before creating a private run directory", () => {
     assert.throws(() => guardBoxPrivateStage({ ...stage,
       args: [...stage.args.slice(0, 3), `/tmp/ocv5-289-run-${"f".repeat(24)}`, ...stage.args.slice(4)] },
       receipt), (e: unknown) => e instanceof BoxPrelaunchControlError);
-    assert.notEqual(execute(guardBoxPrivateStage(stage,
-      { ...receipt, identityHash: "0".repeat(64) })).status, 0);
+    assert.notEqual(execute(makeBoxPrelaunchInit(
+      { ...receipt, identityHash: "0".repeat(64) }, "")).status, 0);
     assert.equal(existsSync(cwd), false);
   } finally { rmSync(controlDir, { recursive: true, force: true }); }
 });
@@ -90,16 +91,15 @@ test("replaced control path cannot authorize staging into a decoy", () => {
     const boot = execute(makeBoxPrelaunchBootstrap(identity));
     assert.equal(boot.status, 0, boot.stderr);
     const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
-    const stage = makeBoxStageFiles({ cwd, project: "", files: [] }).requests[0]!;
     renameSync(controlDir, moved);
     mkdirSync(decoy, { mode: 0o700 });
     symlinkSync(decoy, controlDir);
-    assert.notEqual(execute(guardBoxPrivateStage(stage, receipt)).status, 0);
+    assert.notEqual(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
     assert.equal(existsSync(cwd), false);
     rmSync(controlDir);
     renameSync(moved, controlDir);
     assert.equal(execute(makeBoxPrelaunchCloseFence(receipt)).status, 0);
-    assert.notEqual(execute(guardBoxPrivateStage(stage, receipt)).status, 0);
+    assert.notEqual(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
   } finally {
     rmSync(controlDir, { recursive: true, force: true });
     rmSync(moved, { recursive: true, force: true });
@@ -139,6 +139,106 @@ test("cross-process lock holder prevents close from passing an active writer", a
     assert.equal(after.status, 0, after.stderr);
   } finally {
     holder?.kill("SIGKILL");
+    rmSync(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("prelaunch cleanup closes writes, removes partial private files, and is idempotent", () => {
+  const runNonce = randomBytes(12).toString("hex");
+  const identity = { runNonce, leaseEpoch: randomBytes(16).toString("hex"),
+    controlId: randomBytes(16).toString("hex"), accountId: "20" };
+  const controlDir = `/tmp/ocv5-289-stage-${runNonce}`;
+  const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  const raw = Buffer.alloc(100 * 1024, 0x68);
+  const plan = makeBoxStageFiles({ cwd, project: "", files: [{ path: `${cwd}/stdin.jsonl`,
+    raw, hash: createHash("sha256").update(raw).digest("hex") }] });
+  try {
+    const boot = execute(makeBoxPrelaunchBootstrap(identity));
+    assert.equal(boot.status, 0, boot.stderr);
+    const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
+    assert.equal(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
+    assert.equal(execute(guardBoxPrivateStage(plan.requests[1]!, receipt)).status, 0);
+    assert.equal(existsSync(`${cwd}/stdin.jsonl.part`), true);
+    const cleaned = execute(makeBoxPrelaunchCleanup(receipt));
+    assert.equal(cleaned.status, 0, cleaned.stderr);
+    assert.equal(cleaned.stdout.trim(), `cleaned:${receipt.identityHash}`);
+    assert.equal(existsSync(cwd), false);
+    assert.equal(execute(makeBoxPrelaunchCleanup(receipt)).status, 0);
+    assert.notEqual(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("unknown private file cannot be silently erased or receipt as CLEANED", () => {
+  const runNonce = randomBytes(12).toString("hex");
+  const identity = { runNonce, leaseEpoch: randomBytes(16).toString("hex"),
+    controlId: randomBytes(16).toString("hex"), accountId: "20" };
+  const controlDir = `/tmp/ocv5-289-stage-${runNonce}`;
+  const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  try {
+    const boot = execute(makeBoxPrelaunchBootstrap(identity));
+    assert.equal(boot.status, 0, boot.stderr);
+    const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
+    assert.equal(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
+    writeFileSync(`${cwd}/unexpected`, "synthetic", { mode: 0o600 });
+    assert.notEqual(execute(makeBoxPrelaunchCleanup(receipt)).status, 0);
+    assert.equal(existsSync(`${controlDir}/CLOSED`), true);
+    assert.equal(existsSync(`${controlDir}/CLEANED`), false);
+    assert.equal(existsSync(`${cwd}/unexpected`), true);
+    assert.notEqual(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("forged CLEANED marker cannot hide staged private data", () => {
+  const runNonce = randomBytes(12).toString("hex");
+  const identity = { runNonce, leaseEpoch: randomBytes(16).toString("hex"),
+    controlId: randomBytes(16).toString("hex"), accountId: "20" };
+  const controlDir = `/tmp/ocv5-289-stage-${runNonce}`;
+  const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  const raw = Buffer.from("synthetic-private-data");
+  const plan = makeBoxStageFiles({ cwd, project: "", files: [{ path: `${cwd}/stdin.jsonl`,
+    raw, hash: createHash("sha256").update(raw).digest("hex") }] });
+  try {
+    const boot = execute(makeBoxPrelaunchBootstrap(identity));
+    assert.equal(boot.status, 0, boot.stderr);
+    const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
+    assert.equal(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
+    for (const step of plan.requests.slice(1)) {
+      assert.equal(execute(guardBoxPrivateStage(step, receipt)).status, 0);
+    }
+    writeFileSync(`${controlDir}/CLEANED`, "", { mode: 0o600, flag: "wx" });
+    const clean = execute(makeBoxPrelaunchCleanup(receipt));
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.equal(existsSync(cwd), false, "must recheck postcondition despite marker");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("failed INIT cannot authorize deletion of a preexisting run directory", () => {
+  const runNonce = randomBytes(12).toString("hex");
+  const identity = { runNonce, leaseEpoch: randomBytes(16).toString("hex"),
+    controlId: randomBytes(16).toString("hex"), accountId: "20" };
+  const controlDir = `/tmp/ocv5-289-stage-${runNonce}`;
+  const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  try {
+    mkdirSync(cwd, { mode: 0o700 });
+    writeFileSync(`${cwd}/stdin.jsonl`, "preexisting", { mode: 0o600 });
+    const boot = execute(makeBoxPrelaunchBootstrap(identity));
+    assert.equal(boot.status, 0, boot.stderr);
+    const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
+    assert.notEqual(execute(makeBoxPrelaunchInit(receipt, "")).status, 0);
+    assert.notEqual(execute(makeBoxPrelaunchCleanup(receipt)).status, 0);
+    assert.equal(readFileSync(`${cwd}/stdin.jsonl`, "utf8"), "preexisting");
+    assert.equal(existsSync(`${controlDir}/CLEANED`), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
     rmSync(controlDir, { recursive: true, force: true });
   }
 });

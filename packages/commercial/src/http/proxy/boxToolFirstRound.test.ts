@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { runBoxToolFirstRound } from "./boxToolFirstRound.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -57,17 +58,32 @@ const finalRaw = Buffer.from(finalRecords.map((record) => JSON.stringify(record)
 function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean;
   directFinal?: boolean; finalTrailing?: boolean;
   failAssetStage?: number; failInputStage?: number;
-  stageFailureCode?: string } = {}) {
+  stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean } = {}) {
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
   let disposed = false, launches = 0, recordedOffset = -1;
   let currentNonce = "", currentEpoch = "";
+  let controlHash = "";
   let retained = false, cleanupRetained = false;
   let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
     exec: { run: async (request: { args: string[] }) => {
       const args = request.args;
+      if (args[2]?.includes("identity['identityHash']")) {
+        sequence.push("prelaunch-bootstrap");
+        const manifest = { accountId: args[5], controlDev: "2049",
+          controlId: args[6], controlIno: "9001", leaseEpoch: args[4],
+          lockDev: "2049", lockIno: "9002", runNonce: args[3], version: 2 };
+        controlHash = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+        return { stdout: JSON.stringify({ ...manifest, identityHash: controlHash }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("def clean_dir(parent_path,name,allowed):")) {
+        sequence.push("prelaunch-cleanup");
+        if (options.failCleanup) throw new BoxExecTransportError("BOX_EXEC_TIMEOUT", false);
+        return { stdout: `cleaned:${controlHash}\n`, stderrBytes: 0, exitCode: 0 as const };
+      }
       if (args[0] === "-I" && args[1] === "-c"
         && args[2]?.includes("sys.argv=[p,*argv]")
         && args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-")
@@ -124,7 +140,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       sequence.push("admit"); currentNonce = identity.runNonce;
       currentEpoch = identity.leaseEpoch;
       if (options.rejectAdmission) throw new Error("synthetic admission denied"); },
-    markRunning: async () => { sequence.push("mark-running"); },
+    recordPrelaunchControl: async () => { sequence.push("prelaunch-journal"); },
+    armGuardedLaunch: async () => { sequence.push("launch-arm");
+      if (options.ambiguousArm) throw new Error("synthetic arm acknowledgement lost"); },
+    markGuardedPrestartStopped: async () => { sequence.push("guarded-prestart-stopped"); },
     markPrestartStopped: async () => { sequence.push("prestart-stopped"); },
     markUnknown: async (arg: { phase: string }) => {
       sequence.push("unknown"); unknownPhases.push(arg.phase);
@@ -173,7 +192,8 @@ test("first tool round admits before one launch and emits terminal only after du
   assert.equal(f.launches, 1);
   assert.equal(f.disposed, false, "detached target remains owned until terminal proof");
   assert.ok(f.sequence.indexOf("admit") < f.sequence.indexOf("launch"));
-  assert.ok(f.sequence.indexOf("mark-running") < f.sequence.indexOf("launch"));
+  assert.ok(f.sequence.indexOf("prelaunch-journal") < f.sequence.indexOf("input-stage"));
+  assert.ok(f.sequence.indexOf("launch-arm") < f.sequence.indexOf("launch"));
   assert.ok(f.sequence.indexOf("durable-handoff") < f.sequence.lastIndexOf("emit"));
   assert.ok(f.emitted.join("").includes('"name":"local_echo"'));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
@@ -210,27 +230,48 @@ test("denied admission never stages or launches paid CLI and closes prestart tar
   assert.deepEqual(f.sequence, ["admit"]);
 });
 
-test("asset stage timeout is durable unknown with exact safe phase and zero paid launches", async () => {
+test("asset-only stage timeout closes paid capacity without private data or launch", async () => {
   const f = fixture({ failAssetStage: 0 });
   await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
     (error: unknown) => error instanceof BoxExecTransportError
       && error.code === "BOX_EXEC_TIMEOUT");
-  assert.deepEqual(f.unknownPhases,
-    ["stage_transport_unknown:supervisor:BOX_EXEC_TIMEOUT"]);
+  assert.deepEqual(f.unknownPhases, []);
   assert.equal(f.launches, 0);
-  assert.equal(f.retained, true);
-  assert.equal(f.disposed, false);
+  assert.equal(f.sequence.includes("prestart-stopped"), true);
+  assert.equal(f.retained, false);
+  assert.equal(f.disposed, true);
 });
 
-test("injected transport abort code retains its private-input stage label", async () => {
+test("injected private-stage abort is fenced and cleaned before capacity release", async () => {
   const f = fixture({ failInputStage: 0, stageFailureCode: "BOX_EXEC_ABORTED" });
   await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
     (error: unknown) => error instanceof BoxExecTransportError
       && error.code === "BOX_EXEC_ABORTED");
-  assert.deepEqual(f.unknownPhases,
-    ["stage_transport_unknown:input_0:BOX_EXEC_ABORTED"]);
+  assert.deepEqual(f.unknownPhases, []);
+  assert.ok(f.sequence.indexOf("prelaunch-cleanup") <
+    f.sequence.indexOf("guarded-prestart-stopped"));
   assert.equal(f.launches, 0);
+  assert.equal(f.retained, false);
+});
+
+test("private-stage ambiguity remains unknown if remote cleanup cannot be proven", async () => {
+  const f = fixture({ failInputStage: 0, failCleanup: true });
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps), BoxExecTransportError);
+  assert.equal(f.launches, 0);
+  assert.equal(f.sequence.includes("guarded-prestart-stopped"), false);
   assert.equal(f.retained, true);
+  assert.equal(f.unknownPhases.length, 1);
+});
+
+test("arm acknowledgement loss never dispatches prelaunch cleanup or paid CLI", async () => {
+  const f = fixture({ ambiguousArm: true });
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
+    /synthetic arm acknowledgement lost/);
+  assert.equal(f.launches, 0);
+  assert.equal(f.sequence.includes("prelaunch-cleanup"), false);
+  assert.equal(f.sequence.includes("guarded-prestart-stopped"), false);
+  assert.equal(f.retained, true);
+  assert.deepEqual(f.unknownPhases, ["launch_arm_unknown"]);
 });
 
 test("ambiguous launch is not retried and leaves durable capacity unknown", async () => {

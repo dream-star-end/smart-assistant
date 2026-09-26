@@ -67,6 +67,32 @@ try:
 finally:os.close(parent)`;
 
 const COMMON = String.raw`import base64,fcntl,hashlib,json,os,re,stat,sys,time
+def project_parent():
+ fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  for name in ('home','box','.claude','projects'):
+   nxt=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+   os.close(fd);fd=nxt
+  if os.fstat(fd).st_uid!=os.getuid():raise SystemExit(126)
+  return fd
+ except BaseException:os.close(fd);raise
+def read_owned(dfd,name):
+ fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=dfd)
+ try:
+  st=os.fstat(fd)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or st.st_size<3 or st.st_size>48:raise SystemExit(126)
+  raw=os.read(fd,49)
+  if len(raw)!=st.st_size or not re.fullmatch(rb'[1-9][0-9]{0,19}:[1-9][0-9]{0,19}\n',raw):raise SystemExit(126)
+  return raw.decode().strip()
+ finally:os.close(fd)
+def write_owned(dfd,name,st):
+ raw=(str(st.st_dev)+':'+str(st.st_ino)+'\n').encode()
+ fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=dfd)
+ try:
+  if os.write(fd,raw)!=len(raw):raise SystemExit(126)
+  os.fsync(fd)
+ finally:os.close(fd)
+ os.fsync(dfd)
 def open_control(nonce,want,allow_closed=False):
  if not re.fullmatch(r'[a-f0-9]{24}',nonce) or not re.fullmatch(r'[a-f0-9]{64}',want):raise SystemExit(126)
  parent=os.open('/tmp',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
@@ -110,10 +136,61 @@ def open_control(nonce,want,allow_closed=False):
  except BaseException:os.close(dfd);os.close(parent);raise
 `;
 
+const GUARDED_INIT = COMMON + String.raw`
+nonce,want,project=sys.argv[1:]
+dfd,lfd,_closed=open_control(nonce,want)
+try:
+ cwd='ocv5-289-run-'+nonce
+ expected='/home/box/.claude/projects/-tmp-'+cwd
+ if project not in ('',expected):raise SystemExit(126)
+ tmp=os.open('/tmp',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  os.mkdir(cwd,0o700,dir_fd=tmp)
+  run=os.open(cwd,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=tmp)
+  try:
+   st=os.fstat(run)
+   if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(126)
+   write_owned(dfd,'OWNED_RUN',st)
+  finally:os.close(run)
+  os.fsync(tmp)
+ finally:os.close(tmp)
+ if project:
+  parent=project_parent()
+  try:
+   name='-tmp-'+cwd
+   os.mkdir(name,0o700,dir_fd=parent)
+   child=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+   try:
+    st=os.fstat(child)
+    if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:raise SystemExit(126)
+    write_owned(dfd,'OWNED_PROJECT',st)
+   finally:os.close(child)
+   os.fsync(parent)
+  finally:os.close(parent)
+ print('ready')
+finally:os.close(lfd);os.close(dfd)`;
+
 const GUARDED_STAGE = COMMON + String.raw`
 nonce,want,encoded,*argv=sys.argv[1:]
 dfd,lfd,_closed=open_control(nonce,want)
 try:
+ cwd=argv[0] if argv else ''
+ project=argv[1] if len(argv)>1 else ''
+ if cwd!='/tmp/ocv5-289-run-'+nonce or project not in ('','/home/box/.claude/projects/-tmp-ocv5-289-run-'+nonce):raise SystemExit(126)
+ run=os.open(cwd,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  st=os.fstat(run)
+  if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700 or read_owned(dfd,'OWNED_RUN')!=str(st.st_dev)+':'+str(st.st_ino):raise SystemExit(126)
+ finally:os.close(run)
+ if project:
+  parent=project_parent()
+  try:
+   child=os.open('-tmp-ocv5-289-run-'+nonce,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+   try:
+    st=os.fstat(child)
+    if st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700 or read_owned(dfd,'OWNED_PROJECT')!=str(st.st_dev)+':'+str(st.st_ino):raise SystemExit(126)
+   finally:os.close(child)
+  finally:os.close(parent)
  source=base64.b64decode(encoded,validate=True)
  if not source or len(source)>16384:raise SystemExit(126)
  sys.argv=['-c',*argv]
@@ -137,6 +214,70 @@ try:
   finally:os.close(fd)
   os.fsync(dfd)
  print('closed:'+want)
+finally:os.close(lfd);os.close(dfd)`;
+
+// This is only safe before a durable launch permit. The caller/reconciler must
+// prove that from the journal, not infer it from the absence of CLI output.
+// The lock is held across CLOSED, exact private-file removal, and CLEANED.
+const CLEAN_PRELAUNCH = COMMON + String.raw`
+nonce,want=sys.argv[1:]
+dfd,lfd,closed=open_control(nonce,want,True)
+def marker(name):
+ try:fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=dfd)
+ except FileNotFoundError:return False
+ try:
+  st=os.fstat(fd)
+  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or st.st_size!=0:raise SystemExit(126)
+  return True
+ finally:os.close(fd)
+def clean_dir(parent_path,name,allowed):
+ try:parent=project_parent() if parent_path=='project' else os.open('/tmp',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ except FileNotFoundError:return
+ try:
+  try:target=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+  except FileNotFoundError:return
+  try:
+   original=os.fstat(target)
+   if not stat.S_ISDIR(original.st_mode) or original.st_uid!=os.getuid() or stat.S_IMODE(original.st_mode)!=0o700:raise SystemExit(126)
+   owned=read_owned(dfd,'OWNED_PROJECT' if parent_path=='project' else 'OWNED_RUN')
+   if owned!=str(original.st_dev)+':'+str(original.st_ino):raise SystemExit(126)
+   entries=os.listdir(target)
+   if len(entries)>256:raise SystemExit(126)
+   for entry in entries:
+    if not allowed(entry):raise SystemExit(126)
+    st=os.stat(entry,dir_fd=target,follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1:raise SystemExit(126)
+   for entry in entries:os.unlink(entry,dir_fd=target)
+   os.fsync(target)
+   now=os.stat(name,dir_fd=parent,follow_symlinks=False)
+   if (original.st_dev,original.st_ino)!=(now.st_dev,now.st_ino):raise SystemExit(126)
+   os.rmdir(name,dir_fd=parent)
+   os.fsync(parent)
+  finally:os.close(target)
+ finally:os.close(parent)
+try:
+ if not closed:
+  fd=os.open('CLOSED',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=dfd)
+  try:os.fsync(fd)
+  finally:os.close(fd)
+  os.fsync(dfd)
+ elif not marker('CLOSED'):raise SystemExit(126)
+ already_cleaned=marker('CLEANED')
+ if True:
+  run='ocv5-289-run-'+nonce
+  project='-tmp-ocv5-289-run-'+nonce
+  def run_allowed(x):
+   return bool(re.fullmatch(r'(?:stdin\.jsonl|system\.txt|tool-catalog\.json)(?:\.part)?',x))
+  def project_allowed(x):
+   return bool(re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl(?:\.part)?',x))
+  clean_dir('project',project,project_allowed)
+  clean_dir('/tmp',run,run_allowed)
+  if not already_cleaned:
+   fd=os.open('CLEANED',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=dfd)
+   try:os.fsync(fd)
+   finally:os.close(fd)
+   os.fsync(dfd)
+ print('cleaned:'+want)
 finally:os.close(lfd);os.close(dfd)`;
 
 export function makeBoxPrelaunchBootstrap(identity: BoxPrelaunchIdentity): BoxCcExecRequest {
@@ -186,6 +327,16 @@ export function guardBoxPrivateStage(request: BoxCcExecRequest,
     receipt.runNonce, receipt.identityHash,
     Buffer.from(request.args[2], "utf8").toString("base64"), ...request.args.slice(3)] };
 }
+export function makeBoxPrelaunchInit(receipt: BoxPrelaunchReceipt,
+  project: string): BoxCcExecRequest {
+  if (!HEX24.test(receipt.runNonce) || !HEX64.test(receipt.identityHash)
+    || (project !== "" && project !==
+      `/home/box/.claude/projects/-tmp-ocv5-289-run-${receipt.runNonce}`)) {
+    throw new BoxPrelaunchControlError("BOX_PRELAUNCH_INIT_INVALID");
+  }
+  return { command: PYTHON, args: ["-I", "-c", GUARDED_INIT,
+    receipt.runNonce, receipt.identityHash, project], cwd: "/tmp", environment: ENV };
+}
 /** CLOSED is only a write fence. It is not CLEANED and never licenses journal
  * terminalization or capacity release. */
 export function makeBoxPrelaunchCloseFence(receipt: BoxPrelaunchReceipt): BoxCcExecRequest {
@@ -193,5 +344,16 @@ export function makeBoxPrelaunchCloseFence(receipt: BoxPrelaunchReceipt): BoxCcE
     throw new BoxPrelaunchControlError("BOX_PRELAUNCH_CLOSE_INVALID");
   }
   return { command: PYTHON, args: ["-I", "-c", CLOSE_WRITE_FENCE,
+    receipt.runNonce, receipt.identityHash], cwd: "/tmp", environment: ENV };
+}
+
+/** Caller must hold a durable no-launch permit; CLEANED is not proof of any
+ * paid CLI terminal outcome. Never use this for a run whose launch may have
+ * been dispatched. */
+export function makeBoxPrelaunchCleanup(receipt: BoxPrelaunchReceipt): BoxCcExecRequest {
+  if (!HEX24.test(receipt.runNonce) || !HEX64.test(receipt.identityHash)) {
+    throw new BoxPrelaunchControlError("BOX_PRELAUNCH_CLEAN_INVALID");
+  }
+  return { command: PYTHON, args: ["-I", "-c", CLEAN_PRELAUNCH,
     receipt.runNonce, receipt.identityHash], cwd: "/tmp", environment: ENV };
 }

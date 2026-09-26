@@ -18,6 +18,7 @@ import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
@@ -124,6 +125,15 @@ export interface BoxJournalPort {
   admit(input: BoxJournalAdmission): Promise<void>;
   markRunning(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void>;
   markPrestartStopped(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void>;
+  recordPrelaunchControl?(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt }): Promise<void>;
+  armGuardedLaunch?(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt }): Promise<void>;
+  markGuardedPrestartStopped?(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt; cleanedReceipt: string }): Promise<void>;
   markUnknown(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { phase: string }): Promise<void>;
   recordUserCancelIntent?(input: Pick<BoxJournalAdmission,
@@ -248,7 +258,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       `UPDATE request_finalize_journal
           SET ctx = jsonb_set(ctx, '{boxState}', '"running"'::jsonb), updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-          AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxState' = 'reserved'`,
+          AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxState' = 'reserved'
+          AND NOT (ctx ? 'boxPrelaunchControl')`,
       [input.requestId, input.uid.toString(), input.leaseEpoch]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_START_FENCE_LOST");
   }
@@ -261,9 +272,105 @@ export class BoxDurableJournal implements BoxJournalPort {
               updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
           AND ctx->>'boxLeaseEpoch' = $3
-          AND ctx->>'boxState' IN ('reserved', 'running')`,
+          AND ctx->>'boxState' IN ('reserved', 'running')
+          AND NOT (ctx ? 'boxPrelaunchControl')`,
       [input.requestId, input.uid.toString(), input.leaseEpoch]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_PRESTART_FENCE_LOST");
+  }
+
+  /** Persist the exact remote lock/control identity before the first private
+   * stage Exec. Failure or an ambiguous DB response must not dispatch input. */
+  async recordPrelaunchControl(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt }): Promise<void> {
+    this.validatePrelaunchReceipt(input);
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || $6::jsonb, updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState'='reserved'
+          AND NOT (ctx ? 'boxPrelaunchControl')
+          AND NOT (ctx ? 'boxLaunchPermit')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch,
+        JSON.stringify({ boxPrelaunchControl: input.receipt })]);
+    if (changed.rowCount !== 1) {
+      throw new BoxDurableJournalError("BOX_PRELAUNCH_CONTROL_FENCE_LOST");
+    }
+  }
+
+  /** The unique durable launch permit. Recovery must not run prelaunch
+   * cleanup after this CAS, even if no paid CLI output has been observed. */
+  async armGuardedLaunch(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt }): Promise<void> {
+    this.validatePrelaunchReceipt(input);
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || '{"boxState":"running","boxLaunchPermit":true}'::jsonb,
+              updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState'='reserved'
+          AND ctx->'boxPrelaunchControl'=$6::jsonb
+          AND NOT (ctx ? 'boxLaunchPermit')
+          AND NOT (ctx ? 'boxPrelaunchCleanup')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, JSON.stringify(input.receipt)]);
+    if (changed.rowCount !== 1) {
+      throw new BoxDurableJournalError("BOX_PRELAUNCH_ARM_FENCE_LOST");
+    }
+  }
+
+  /** Remote CLEANED is necessary but not sufficient: this CAS also proves
+   * that the journal never armed a paid launch. */
+  async markGuardedPrestartStopped(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt; cleanedReceipt: string }): Promise<void> {
+    this.validatePrelaunchReceipt(input);
+    if (input.cleanedReceipt !== `cleaned:${input.receipt.identityHash}`) {
+      throw new BoxDurableJournalError("BOX_PRELAUNCH_CLEAN_EVIDENCE_INVALID");
+    }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || $7::jsonb, updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState' IN ('reserved','unknown')
+          AND ctx->'boxPrelaunchControl'=$6::jsonb
+          AND NOT (ctx ? 'boxLaunchPermit')
+          AND NOT (ctx ? 'boxTerminalProof')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, JSON.stringify(input.receipt),
+        JSON.stringify({ boxState: "prestart_stopped",
+          boxPrelaunchCleanup: { v: 1, receipt: input.cleanedReceipt } })]);
+    if (changed.rowCount !== 1) {
+      throw new BoxDurableJournalError("BOX_PRELAUNCH_STOP_FENCE_LOST");
+    }
+  }
+
+  private validatePrelaunchReceipt(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
+    { receipt: BoxPrelaunchReceipt }): void {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || input.receipt.runNonce !== input.runNonce
+      || input.receipt.leaseEpoch !== input.leaseEpoch
+      || input.receipt.accountId !== input.accountId.toString()) {
+      throw new BoxDurableJournalError("BOX_PRELAUNCH_IDENTITY_INVALID");
+    }
+    try {
+      const sorted = Object.fromEntries(Object.entries(input.receipt)
+        .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0));
+      parseBoxPrelaunchBootstrap(JSON.stringify(sorted), input.receipt);
+    }
+    catch { throw new BoxDurableJournalError("BOX_PRELAUNCH_IDENTITY_INVALID"); }
   }
 
   async markUnknown(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
