@@ -11,6 +11,7 @@ const keeper = readFileSync(new URL("../../../../../scripts/ocv5-289/box_keeper.
 const body = (messages: unknown[]): ProxyBody => ({ model: "box-api-claude-opus-5",
   max_tokens: 128, stream: true, system: "OpenClaude memory marker",
   messages } as ProxyBody);
+const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
 
 test("batched immutable assets keep per-file verification and save remote round trips", () => {
   const assets = (["supervisor", "keeper", "box-virtual-mcp", "detached-runner"] as const)
@@ -97,6 +98,37 @@ test("completed history stages actual upstream model with a structured current t
       { input: script, encoding: "utf8" });
     assert.equal(parsed.status, 0, parsed.stderr);
   }
+});
+
+test("native completed-turn resume stages only current input and keeps one CLI UUID", () => {
+  const cliCwd = `/tmp/ocv5-289-run-${"a".repeat(24)}`;
+  const sessionId = "12345678-1234-4123-8123-123456789abc";
+  const history = body([user("prior"), { role: "assistant", content: [
+    { type: "text", text: "previous answer" }] }, user("current")]);
+  const fresh = makeBoxTextPlan({ body: body([user("initial")]),
+    upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+    maxOutputTokensLimit: 128_000, nativePersistence: true,
+    runNonce: "b".repeat(24) });
+  assert.equal(fresh.nativePersistence, true);
+  assert.ok(fresh.run.args.includes("--session-id"));
+  assert.ok(!fresh.run.args.includes("--no-session-persistence"));
+  assert.equal(fresh.run.environment.DISABLE_AUTO_COMPACT, "1");
+  const resumed = makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
+    supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
+    nativeResume: { cliCwd, sessionId }, runNonce: "c".repeat(24) });
+  assert.equal(resumed.cliCwd, cliCwd);
+  assert.equal(resumed.run.cwd, cliCwd);
+  assert.equal(resumed.sessionId, sessionId);
+  assert.equal(resumed.snapshotHash, null);
+  assert.ok(resumed.run.args.includes("--resume"));
+  assert.ok(!resumed.run.args.includes("--no-session-persistence"));
+  assert.equal(resumed.run.environment.DISABLE_AUTO_COMPACT, "1");
+  assert.equal(resumed.stageInputs.some((step) => step.args[5]?.includes("/.claude/projects/")), false);
+  assert.equal(resumed.cleanup.args[4], "");
+  assert.throws(() => makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
+    supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
+    nativeResume: { cliCwd: "/tmp/../other", sessionId } }),
+  (error: unknown) => error instanceof BoxTextPlanError && error.code === "BOX_NATIVE_SESSION_INVALID");
 });
 
 test("unproved tools and mismatched model family fail before any Box command is created", () => {

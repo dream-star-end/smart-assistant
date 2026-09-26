@@ -16,6 +16,8 @@ export class BoxTextPlanError extends Error {
 }
 export interface BoxTextPlan {
   readonly cwd: string;
+  readonly cliCwd: string;
+  readonly nativePersistence: boolean;
   readonly proofDir: string;
   readonly runNonce: string;
   readonly leaseEpoch: string;
@@ -132,6 +134,10 @@ export function makeBoxTextPlan(input: {
   leaseEpoch?: string;
   /** Detached tool bridge only; text path keeps its existing 110s default. */
   supervisorDeadlineSeconds?: number;
+  /** Off-by-default native completed-turn cache. Account/history/CAS preflight
+   * belongs to the caller; this builder only emits the pinned CLI plan. */
+  nativePersistence?: boolean;
+  nativeResume?: { cliCwd: string; sessionId: string };
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body);
   if (unsupported) throw new BoxTextPlanError(unsupported);
@@ -155,6 +161,13 @@ export function makeBoxTextPlan(input: {
   if (!/^[0-9a-f]{24}$/.test(runNonce)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   if (!/^[0-9a-f]{32}$/.test(leaseEpoch)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  const nativePersistence = input.nativePersistence === true || input.nativeResume !== undefined;
+  if (input.nativeResume && (input.nativePersistence === false
+    || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(input.nativeResume.cliCwd)
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.nativeResume.sessionId))) {
+    throw new BoxTextPlanError("BOX_NATIVE_SESSION_INVALID");
+  }
+  const cliCwd = input.nativeResume?.cliCwd ?? cwd;
   if (input.extraStageFiles?.length
     && (input.extraStageFiles.length !== 1
       || input.extraStageFiles[0]?.path !== `${cwd}/tool-catalog.json`)) {
@@ -162,16 +175,17 @@ export function makeBoxTextPlan(input: {
   }
   const proofDir = `/tmp/ocv5-289-proof-${runNonce}`;
   const mapped = compileBoxCliSyntheticTurn({ ...input.body, model: input.upstreamModel },
-    { cwd, cliVersion: "2.1.280" });
+    { cwd, cliVersion: "2.1.280", sessionId: input.nativeResume?.sessionId });
   const supervisorHash = sha(input.supervisorAsset);
   const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${supervisorHash.slice(0, 16)}.py`;
   const keeperHash = sha(input.keeperAsset);
   const keeperPath = `/tmp/ocv5-289-v2-keeper-${keeperHash.slice(0, 16)}.py`;
-  const hasHistory = mapped.snapshotJsonl.length > 0;
+  const hasHistory = !input.nativeResume && mapped.snapshotJsonl.length > 0;
   const project = hasHistory ? `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}` : "";
   const snapshotPath = hasHistory ? `${project}/${mapped.sessionId}.jsonl` : "";
   const stdinPath = `${cwd}/stdin.jsonl`, systemPath = `${cwd}/system.txt`;
-  const snapshot = Buffer.from(mapped.snapshotJsonl), stdin = Buffer.from(mapped.stdinJsonl);
+  const snapshot = Buffer.from(hasHistory ? mapped.snapshotJsonl : "");
+  const stdin = Buffer.from(mapped.stdinJsonl);
   const system = Buffer.from(mapped.systemPrompt);
   if (snapshot.length > 8 * 1024 * 1024 || stdin.length > 8 * 1024 * 1024
     || system.length > 8 * 1024 * 1024) throw new BoxTextPlanError("BOX_TEXT_INPUT_TOO_LARGE");
@@ -200,17 +214,18 @@ export function makeBoxTextPlan(input: {
       "--include-partial-messages", "--verbose", "--tools", "",
       "--disallowedTools", "mcp__*", "--strict-mcp-config",
       "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
-      "--disable-slash-commands", "--no-session-persistence",
+      "--disable-slash-commands", ...(nativePersistence ? [] : ["--no-session-persistence"]),
       "--system-prompt-file", systemPath,
-      hasHistory ? "--resume" : "--session-id", mapped.sessionId],
-    cwd,
+      hasHistory || input.nativeResume ? "--resume" : "--session-id", mapped.sessionId],
+    cwd: cliCwd,
     environment: { HOME: "/home/box", PATH: "/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin",
       LANG: "C.UTF-8", CLAUDE_CODE_MAX_RETRIES: "0",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(input.body.max_tokens),
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" },
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      ...(nativePersistence ? { DISABLE_AUTO_COMPACT: "1" } : {}) },
   };
   const cleanup = staged.cleanup;
-  return { cwd, proofDir, runNonce, leaseEpoch,
+  return { cwd, cliCwd, nativePersistence, proofDir, runNonce, leaseEpoch,
     sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
     stageSupervisor, stageKeeper, stageAssets: assetBatch.request,
     assetManifest: assetBatch.manifest, stageInputs: staged.requests, run, cleanup,
