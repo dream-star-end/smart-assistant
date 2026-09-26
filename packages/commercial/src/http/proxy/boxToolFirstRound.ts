@@ -426,7 +426,8 @@ export async function runBoxToolFirstRound(input: {
         await race(deps.journal.complete({ requestId: input.requestId,
           uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage }));
         let nativePointer: BoxNativePointer | undefined;
-        if (nativeEnabled && deps.journal.attachNativePointer) {
+        if (nativeEnabled && final.assistantContentHash
+          && deps.journal.attachNativePointer) {
           try {
             const inspected = await target.exec.run(makeBoxNativeFileInspect({
               cliCwd: plan.cliCwd, nativeSessionId: plan.sessionId }), {
