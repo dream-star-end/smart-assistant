@@ -20,7 +20,8 @@ const HEX64 = /^[a-f0-9]{64}$/;
 const CWD = /^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export function parseBoxNativePointer(value: unknown, nowMs = Date.now()): BoxNativePointer | null {
+export function parseBoxNativePointer(value: unknown, nowMs = Date.now(),
+  allowExpiredForCleanup = false): BoxNativePointer | null {
   if (!Number.isFinite(nowMs)) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const item = value as Record<string, unknown>;
@@ -39,8 +40,9 @@ export function parseBoxNativePointer(value: unknown, nowMs = Date.now()): BoxNa
     || item.catalogHash !== null && (typeof item.catalogHash !== "string"
       || !HEX64.test(item.catalogHash))
     || !Number.isSafeInteger(item.expiresAtMs)
-    || Number(item.expiresAtMs) <= nowMs
-    || Number(item.expiresAtMs) > nowMs + 30 * 24 * 60 * 60 * 1000) return null;
+    || Number(item.expiresAtMs) <= 0
+    || (!allowExpiredForCleanup && (Number(item.expiresAtMs) <= nowMs
+      || Number(item.expiresAtMs) > nowMs + 30 * 24 * 60 * 60 * 1000))) return null;
   return item as unknown as BoxNativePointer;
 }
 

@@ -130,11 +130,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       VALUES ($1,3,'inflight',$2::jsonb)`, [rejectedId, JSON.stringify({
       model: input.model, boxInvocationRecovery: "v1", boxState: "terminal",
       boxInvocationMode: "detached_tool", boxAccountId: "20",
+      boxRemoteCleanupClaimed: true,
       boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
       boxTerminalProof: proof, boxUsage: usage })]);
     assert.equal(await journal.attachNativePointer({ requestId: rejectedId,
       uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
-    "detached cleanup still deletes native projects, so cache attachment is off");
+    "an already-claimed detached cleanup cannot acquire a native pointer");
     await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb
       WHERE request_id=$1`, [rejectedId, JSON.stringify({ boxInvocationMode: "text",
         boxNativeCliCwd: `/tmp/ocv5-289-run-${"f".repeat(24)}`,
@@ -1103,6 +1104,33 @@ test("native predecessor claim and paid admission commit or roll back together",
     const after = await client.query<{ ctx: Record<string, unknown> }>(
       `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [secondOwnerId]);
     assert.equal(after.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+    const detachedId = `native-detached-${suffix}`;
+    const toolPointer = parseBoxNativePointer({ ...pointer,
+      catalogHash: "e".repeat(64) });
+    assert.ok(toolPointer);
+    const detachedProof = owner.boxTerminalProof;
+    await put(detachedId, { ...owner, boxNativePointer: undefined,
+      boxInvocationMode: "detached_tool", boxRunNonce: "a".repeat(24),
+      boxLeaseEpoch: "e".repeat(32), boxContextHash: "c".repeat(64),
+      boxCatalogHash: "e".repeat(64), boxUsage: { inputTokens: 1,
+        outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    assert.equal(await journal.attachNativePointer({ requestId: detachedId,
+      uid: 3n, accountId: 20n, proof: detachedProof,
+      pointer: toolPointer }), true);
+    const candidates = await journal.listRemoteCleanupCandidates(10);
+    const clean = candidates.find((item) => item.requestId === detachedId);
+    assert.ok(clean);
+    assert.deepEqual(clean.nativePointer, toolPointer);
+    assert.equal(await journal.claimRemoteCleanup({ ...clean,
+      nativePointer: undefined }), false, "stale no-pointer cleanup cannot win");
+    assert.equal(await journal.claimRemoteCleanup(clean), true);
+    await assert.rejects(() => journal.markRemoteCleaned({ ...clean,
+      nativePointer: undefined }), (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_CLEANUP_FENCE_LOST");
+    await journal.markRemoteCleaned(clean);
+    assert.equal(await journal.attachNativePointer({ requestId: detachedId,
+      uid: 3n, accountId: 20n, proof: detachedProof,
+      pointer: toolPointer }), false);
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();

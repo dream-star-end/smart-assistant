@@ -124,7 +124,10 @@ export class BoxRemoteCleanupWorker {
         if (!await this.deps.journal.claimRemoteCleanup(candidate)) continue;
         target = await this.resolvePinned(candidate);
         if (target.accountId !== candidate.accountId) throw new Error("BOX_CLEANUP_ACCOUNT_MISMATCH");
-        const remote = target.exec.run(makeBoxRunCleanup(candidate.runNonce), {
+        const keepNativeProject = candidate.nativePointer?.cliCwd
+          === `/tmp/ocv5-289-run-${candidate.runNonce}`;
+        const remote = target.exec.run(makeBoxRunCleanup(candidate.runNonce,
+          keepNativeProject), {
           timeoutMs: 20_000, maxResponseBytes: 4096 });
         let timeout: ReturnType<typeof setTimeout> | undefined;
         let result: Awaited<typeof remote>;

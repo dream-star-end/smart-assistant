@@ -34,5 +34,7 @@ test("malformed, expired and path-swapped native pointers are cache misses", () 
   ]) assert.equal(parseBoxNativePointer(altered, now), null);
   assert.equal(parseBoxNativePointer(null, now), null);
   assert.equal(parseBoxNativePointer(valid, Number.NaN), null);
+  assert.ok(parseBoxNativePointer({ ...valid, expiresAtMs: now - 1 }, now, true),
+    "cleanup must still recognize an expired transcript pointer");
   assert.equal(parseBoxNativePointer({ ...valid, upstreamModel: "claude-." }, now), null);
 });

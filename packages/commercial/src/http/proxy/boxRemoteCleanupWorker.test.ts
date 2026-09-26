@@ -14,7 +14,7 @@ test("shared leader cleans only claimed terminal proof and never launches CLI", 
     command: string }) => {
     sequence.push("remote-clean");
     assert.equal(request.command, "/usr/bin/python3");
-    assert.equal(request.args.at(-1), candidate.runNonce);
+    assert.deepEqual(request.args.slice(-2), [candidate.runNonce, "0"]);
     return { stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const };
   } }, dispose: async () => { sequence.push("dispose"); } };
   const worker = new BoxRemoteCleanupWorker({

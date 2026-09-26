@@ -92,6 +92,8 @@ export interface BoxRemoteCleanupCandidate {
   readonly runNonce: string;
   readonly leaseEpoch: string;
   readonly proof: BoxTerminalProof;
+  /** Exact optional pointer observed when this cleanup candidate was read. */
+  readonly nativePointer?: BoxNativePointer;
 }
 export interface BoxPrelaunchRecoveryCandidate {
   readonly requestId: string;
@@ -709,7 +711,11 @@ export class BoxDurableJournal implements BoxJournalPort {
           SET ctx=ctx || $5::jsonb
         WHERE request_id=$1 AND user_id=$2
           AND ctx->>'boxAccountId'=$3 AND ctx->>'boxState'='terminal'
-          AND ctx->>'boxInvocationMode'='text'
+          AND (ctx->>'boxInvocationMode'='text' OR
+            (ctx->>'boxInvocationMode'='detached_tool'
+              AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
+              AND ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
+              AND NOT (ctx ? 'boxRemoteCleanupQuarantine')))
           AND ctx->'boxTerminalProof'=$4::jsonb
           AND ctx ? 'boxUsage' AND NOT (ctx ? 'boxNativePointer')
           AND ((ctx ? 'boxNativeCliCwd' AND ctx->>'boxNativeCliCwd'=$6)
@@ -1563,9 +1569,16 @@ export class BoxDurableJournal implements BoxJournalPort {
         const proof = parseBoxTerminalProof(JSON.stringify(ctx.boxTerminalProof) + "\n",
           { runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch });
         if (!cleanupProofMatchesState(ctx.boxState, proof)) { await quarantine(); continue; }
+        const pointer = ctx.boxNativePointer === undefined ? undefined
+          : parseBoxNativePointer(ctx.boxNativePointer, Date.now(), true);
+        if (ctx.boxNativePointer !== undefined && (!pointer
+          || pointer.accountId !== ctx.boxAccountId)) {
+          await quarantine(); continue;
+        }
         candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
           accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
-          leaseEpoch: ctx.boxLeaseEpoch, proof });
+          leaseEpoch: ctx.boxLeaseEpoch, proof,
+          ...(pointer ? { nativePointer: pointer } : {}) });
       } catch { await quarantine(); /* Corrupt proof is manual, never automatic cleanup. */ }
     }
     return candidates;
@@ -1583,6 +1596,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     try {
       parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
+    if (input.nativePointer && (parseBoxNativePointer(input.nativePointer, Date.now(), true) === null
+      || input.nativePointer.accountId !== input.accountId.toString())) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
+    }
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || jsonb_build_object(
@@ -1597,7 +1614,8 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
-          AND ctx->'boxTerminalProof'=$6::jsonb
+           AND ctx->'boxTerminalProof'=$6::jsonb
+           AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
            AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
@@ -1608,7 +1626,8 @@ export class BoxDurableJournal implements BoxJournalPort {
              OR (NOT (ctx ? 'boxRemoteCleanupRetryAfterMs')
                AND updated_at <= NOW()-INTERVAL '2 minutes'))`,
       [input.requestId, input.uid.toString(), input.accountId.toString(),
-        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)]);
+        input.runNonce, input.leaseEpoch, JSON.stringify(input.proof),
+        input.nativePointer ? JSON.stringify(input.nativePointer) : null]);
     return changed.rowCount === 1;
   }
 
@@ -1702,8 +1721,13 @@ export class BoxDurableJournal implements BoxJournalPort {
     try {
       parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", input);
     } catch { throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID"); }
+    if (input.nativePointer && (parseBoxNativePointer(input.nativePointer, Date.now(), true) === null
+      || input.nativePointer.accountId !== input.accountId.toString())) {
+      throw new BoxDurableJournalError("BOX_CLEANUP_IDENTITY_INVALID");
+    }
     const params = [input.requestId, input.uid.toString(), input.accountId.toString(),
-      input.runNonce, input.leaseEpoch, JSON.stringify(input.proof)];
+      input.runNonce, input.leaseEpoch, JSON.stringify(input.proof),
+      input.nativePointer ? JSON.stringify(input.nativePointer) : null];
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
@@ -1714,6 +1738,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'=$6::jsonb
+          AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
           AND ctx->>'boxRemoteCleanupClaimed'='true'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'`, params);
@@ -1727,6 +1752,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'=$6::jsonb
+          AND ctx->'boxNativePointer' IS NOT DISTINCT FROM $7::jsonb
           AND ctx->>'boxRemoteCleanup'='done'`, params);
     if (already.rowCount !== 1) throw new BoxDurableJournalError("BOX_CLEANUP_FENCE_LOST");
   }

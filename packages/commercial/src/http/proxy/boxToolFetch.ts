@@ -284,7 +284,10 @@ export class BoxToolFetch {
 
   private async performTerminalCleanup(runNonce: string,
     target: BoxResolvedTarget, candidate: BoxRemoteCleanupCandidate): Promise<void> {
-    const remote = target.exec.run(makeBoxRunCleanup(runNonce), {
+    const keepNativeProject = candidate.nativePointer?.cliCwd
+      === `/tmp/ocv5-289-run-${runNonce}`;
+    const remote = target.exec.run(makeBoxRunCleanup(runNonce,
+      keepNativeProject), {
       timeoutMs: 20_000, maxResponseBytes: 4096 });
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let result: Awaited<typeof remote>;
