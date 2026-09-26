@@ -1056,7 +1056,8 @@ test("native predecessor claim and paid admission commit or roll back together",
     const owner = { model, boxInvocationRecovery: "v1", boxState: "terminal",
       boxAccountId: "20", boxSessionId: sessionId, boxNativePointer: pointer,
       boxTerminalProof: { runNonce: "a".repeat(24), leaseEpoch: "e".repeat(32),
-        keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 } };
+        keeperPid: 1, cliPid: 2, reason: "worker_complete" as const,
+        revision: 1 as const } };
     const basis = { model, boxInvocationRecovery: "v1",
       billingPricing: { v: 1, modelId: model, displayName: "Opus",
         inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1",

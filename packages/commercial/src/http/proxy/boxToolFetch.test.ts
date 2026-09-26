@@ -86,10 +86,14 @@ test("proven native final carries its exact pointer into preserving cleanup", as
   const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
     keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
     detachedRunnerAsset: Buffer.from("d"),
-    journal: { ...journal(), claimRemoteCleanup: async (candidate: {
+    journal: { claimRemoteCleanup: async (candidate: {
       nativePointer?: BoxNativePointer }) => {
       assert.deepEqual(candidate.nativePointer, pointer); claimed = true; return true;
-    }, markRemoteCleaned: async () => { cleaned = true; } } as never,
+    }, markRemoteCleaned: async () => { cleaned = true; },
+    remoteCleanupStatus: async () => "pending",
+    remoteCleanupDoneByRunIdentity: async () => false,
+    prelaunchCleanupDoneByRunIdentity: async () => false,
+    listRemoteCleanupCandidates: async () => [] } as never,
     maxOutputTokensForModel: () => 128_000,
     resolveTarget: async () => target as never, onUnknown: async () => {},
     runFirst: (async (input: { emit: (sse: string) => void }) => {
