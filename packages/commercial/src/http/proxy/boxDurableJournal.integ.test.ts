@@ -11,6 +11,7 @@ import { deriveBoxCallFingerprint, deriveBoxContextHash,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
+import { parseBoxNativePointer } from "./boxNativePointer.js";
 
 const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
   ?? process.env.TEST_DATABASE_URL;
@@ -969,6 +970,99 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(rotated[0]?.requestId, `box-new-probe-${suffix}`);
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.usage_records");
+    await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
+    client.release();
+    await pool.end();
+  }
+});
+
+test("native predecessor claim and paid admission commit or roll back together",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (
+      request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
+      ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
+    const sameConnection = { connect: async () => ({ query: (sql: string, params?: unknown[]) =>
+      client.query(sql, params), release: () => {} }),
+      query: (sql: string, params?: unknown[]) => client.query(sql, params) } as never;
+    const journal = new BoxDurableJournal(sameConnection);
+    const suffix = randomBytes(6).toString("hex");
+    const sessionId = `native-${suffix}`;
+    const ownerRequestId = `native-owner-${suffix}`;
+    const requestId = `native-next-${suffix}`;
+    const failedRequestId = `native-failed-${suffix}`;
+    const model = "box-api-claude-opus-5-5";
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "b".repeat(64), contextHashBeforeFinal: "c".repeat(64),
+      assistantContentHash: "d".repeat(64), catalogHash: null,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const owner = { model, boxInvocationRecovery: "v1", boxState: "terminal",
+      boxAccountId: "20", boxSessionId: sessionId, boxNativePointer: pointer,
+      boxTerminalProof: { runNonce: "a".repeat(24), leaseEpoch: "e".repeat(32),
+        keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 } };
+    const basis = { model, boxInvocationRecovery: "v1",
+      billingPricing: { v: 1, modelId: model, displayName: "Opus",
+        inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1",
+        cacheWritePerMtok: "1", multiplier: "1" },
+      boxBillingContext: { v: 1, sessionId, mode: "chat",
+        parentSessionId: null, delegateAgentId: null, turnKey: "a".repeat(64),
+        parentTurnKey: null, authority: null, dispatchId: null, attemptNo: null,
+        verificationSponsorship: null, apiKeyId: null } };
+    const put = async (id: string, ctx: unknown) => client.query(
+      `INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+        VALUES ($1,3,'inflight',$2::jsonb)`, [id, JSON.stringify(ctx)]);
+    await put(ownerRequestId, owner);
+    await put(requestId, basis);
+    const candidate = await journal.findNativeCandidate({ uid: 3n, sessionId,
+      canonicalModel: model, currentRequestId: requestId });
+    assert.deepEqual(candidate, { ownerRequestId, pointer });
+    const fingerprint = { turnKey: "a".repeat(64), sessionId,
+      requestHash: "f".repeat(64), replayFingerprint: "1".repeat(64) };
+    const admission = { requestId, uid: 3n, accountId: 20n, model,
+      fingerprint, runNonce: "2".repeat(24), leaseEpoch: "3".repeat(32),
+      nativeClaim: { ownerRequestId, pointer, upstreamModel: pointer.upstreamModel } };
+    const interveningId = `native-intervening-${suffix}`;
+    await put(interveningId, { ...owner, boxNativePointer: undefined });
+    await client.query(`UPDATE request_finalize_journal
+      SET updated_at=NOW()+interval '1 second' WHERE request_id=$1`, [interveningId]);
+    await assert.rejects(() => journal.admit(admission),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_NATIVE_CLAIM_LOST");
+    const staleOwner = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [ownerRequestId]);
+    assert.equal(staleOwner.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+    await client.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [interveningId]);
+    await journal.admit(admission);
+    const rows = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE request_id=ANY($1::text[])`, [[ownerRequestId, requestId]]);
+    const prior = rows.rows.find((row) => row.request_id === ownerRequestId)?.ctx;
+    const next = rows.rows.find((row) => row.request_id === requestId)?.ctx;
+    assert.equal(prior?.boxNativeClaimRequestId, requestId);
+    assert.equal(next?.boxNativeOwnerRequestId, ownerRequestId);
+    assert.equal(next?.boxNativeSessionId, pointer.nativeSessionId);
+    await journal.markPrestartStopped({ requestId, uid: 3n,
+      leaseEpoch: admission.leaseEpoch });
+    const secondOwnerId = `native-owner2-${suffix}`;
+    await put(secondOwnerId, owner);
+    await put(failedRequestId, { ...basis, billingPricing: undefined });
+    await assert.rejects(() => journal.admit({ ...admission,
+      requestId: failedRequestId,
+      nativeClaim: { ...admission.nativeClaim, ownerRequestId: secondOwnerId },
+      fingerprint: { ...fingerprint,
+        replayFingerprint: "4".repeat(64) } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_NOT_INFLIGHT");
+    const after = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [secondOwnerId]);
+    assert.equal(after.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+  } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();
     await pool.end();

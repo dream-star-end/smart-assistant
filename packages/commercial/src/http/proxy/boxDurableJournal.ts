@@ -19,6 +19,7 @@ import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
+import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
@@ -63,6 +64,13 @@ export interface BoxJournalAdmission {
   invocationMode?: "text" | "detached_tool";
   /** Hash of model-affecting context actually launched in the detached CLI. */
   contextHash?: string;
+  /** Optional completed-turn native cache claim, never inferred from body hash. */
+  nativeClaim?: { ownerRequestId: string; pointer: BoxNativePointer;
+    upstreamModel: string };
+}
+export interface BoxNativeCandidate {
+  readonly ownerRequestId: string;
+  readonly pointer: BoxNativePointer;
 }
 export interface BoxToolResumeClaim {
   readonly ownerRequestId: string;
@@ -206,8 +214,46 @@ async function lockChainSession(client: PoolClient, uid: bigint,
 export class BoxDurableJournal implements BoxJournalPort {
   constructor(private readonly pool: Pick<Pool, "connect" | "query">) {}
 
+  /** An older pointer cannot be reused after an intervening uncached turn. */
+  async findNativeCandidate(input: { uid: bigint; sessionId: string;
+    currentRequestId: string;
+    canonicalModel: string }): Promise<BoxNativeCandidate | null> {
+    if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
+      || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return null;
+    const found = await this.pool.query<{ request_id: string;
+      ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
+          AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
+          AND request_id<>$4
+        ORDER BY updated_at DESC, request_id DESC LIMIT 1`,
+      [input.uid.toString(), input.sessionId, input.canonicalModel,
+        input.currentRequestId]);
+    const row = found.rows[0];
+    if (found.rowCount !== 1 || !row || !row.ctx
+      || row.ctx.boxState !== "terminal" || row.ctx.boxNativeClaimRequestId !== undefined
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)) return null;
+    const pointer = parseBoxNativePointer(row.ctx.boxNativePointer);
+    if (!pointer || row.ctx.boxAccountId !== pointer.accountId
+      || row.ctx.boxSessionId !== input.sessionId
+      || row.ctx.model !== input.canonicalModel) return null;
+    const proof = row.ctx.boxTerminalProof;
+    if (!proof || typeof proof !== "object" || Array.isArray(proof)
+      || (proof as { reason?: unknown }).reason !== "worker_complete") return null;
+    return { ownerRequestId: row.request_id, pointer };
+  }
+
   async admit(input: BoxJournalAdmission): Promise<void> {
     goodId(input);
+    const native = input.nativeClaim;
+    if (native && (!/^[A-Za-z0-9_-]{1,64}$/.test(native.ownerRequestId)
+      || native.ownerRequestId === input.requestId
+      || parseBoxNativePointer(native.pointer) === null
+      || native.pointer.accountId !== input.accountId.toString()
+      || native.pointer.upstreamModel !== native.upstreamModel)) {
+      throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_INVALID");
+    }
     const client = await this.pool.connect();
     let committed = false;
     try {
@@ -227,6 +273,46 @@ export class BoxDurableJournal implements BoxJournalPort {
               (user_id = $3 AND ctx->>'boxSessionId' = $4)) LIMIT 1`,
         [ACTIVE, input.accountId.toString(), input.uid.toString(), input.fingerprint.sessionId]);
       if (occupied.rowCount) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      if (native) {
+        // The candidate was read before the account/turn locks. A completed
+        // intervening turn can make it stale without leaving ACTIVE capacity.
+        const latest = await client.query<{ request_id: string }>(
+          `SELECT request_id FROM request_finalize_journal
+            WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
+              AND ctx->>'model'=$3 AND ctx->>'boxInvocationRecovery'='v1'
+              AND request_id<>$4
+            ORDER BY updated_at DESC, request_id DESC LIMIT 1 FOR UPDATE`,
+          [input.uid.toString(), input.fingerprint.sessionId,
+            input.model, input.requestId]);
+        if (latest.rowCount !== 1
+          || latest.rows[0]?.request_id !== native.ownerRequestId) {
+          throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        }
+        const prior = await client.query<{ ctx: Record<string, unknown> }>(
+          `SELECT ctx FROM request_finalize_journal
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [native.ownerRequestId, input.uid.toString()]);
+        const ctx = prior.rows[0]?.ctx;
+        if (prior.rowCount !== 1 || !ctx || ctx.boxState !== "terminal"
+          || ctx.boxInvocationRecovery !== "v1"
+          || ctx.boxAccountId !== input.accountId.toString()
+          || ctx.boxSessionId !== input.fingerprint.sessionId
+          || ctx.model !== input.model
+          || ctx.boxNativeClaimRequestId !== undefined
+          || !isDeepStrictEqual(ctx.boxNativePointer, native.pointer)
+          || !ctx.boxTerminalProof || typeof ctx.boxTerminalProof !== "object"
+          || (ctx.boxTerminalProof as { reason?: unknown }).reason !== "worker_complete") {
+          throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        }
+        const claimed = await client.query(
+          `UPDATE request_finalize_journal
+              SET ctx=ctx || $3::jsonb, updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2
+              AND ctx->>'boxState'='terminal' AND NOT (ctx ? 'boxNativeClaimRequestId')`,
+          [native.ownerRequestId, input.uid.toString(),
+            JSON.stringify({ boxNativeClaimRequestId: input.requestId })]);
+        if (claimed.rowCount !== 1) throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+      }
       const identity = { boxInvocationRecovery: "v1", boxState: "reserved",
         boxInvocationMode: input.invocationMode ?? "text",
         boxAccountId: input.accountId.toString(),
@@ -236,7 +322,10 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxSessionId: input.fingerprint.sessionId,
         ...(input.invocationMode === "detached_tool"
           ? { boxContextHash: input.contextHash } : {}),
-        boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch };
+        boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
+        ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
+          boxNativeSessionId: native.pointer.nativeSessionId,
+          boxNativeCliCwd: native.pointer.cliCwd } : {}) };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
