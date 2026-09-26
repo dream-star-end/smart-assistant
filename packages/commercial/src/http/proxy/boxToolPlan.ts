@@ -25,6 +25,8 @@ export function makeBoxToolPlan(input: {
   virtualMcpAsset: Buffer;
   runNonce?: string;
   leaseEpoch?: string;
+  nativePersistence?: boolean;
+  nativeResume?: { cliCwd: string; sessionId: string };
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
   if (choice !== undefined && (choice === null || typeof choice !== "object"
@@ -45,7 +47,8 @@ export function makeBoxToolPlan(input: {
       maxOutputTokensLimit: input.maxOutputTokensLimit,
       supervisorAsset: input.supervisorAsset, keeperAsset: input.keeperAsset,
       extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
-      runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900 });
+       runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900,
+       nativePersistence: input.nativePersistence, nativeResume: input.nativeResume });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;

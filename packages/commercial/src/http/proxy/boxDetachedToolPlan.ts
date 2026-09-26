@@ -25,6 +25,8 @@ export function makeBoxDetachedToolPlan(input: {
   detachedRunnerAsset: Buffer;
   runNonce?: string;
   leaseEpoch?: string;
+  nativePersistence?: boolean;
+  nativeResume?: { cliCwd: string; sessionId: string };
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;
   const base = makeBoxToolPlan(toolInput);
@@ -41,8 +43,11 @@ export function makeBoxDetachedToolPlan(input: {
   // The pinned runner owns the interpreter invocation. Do not pass Python's
   // -I switch as its first business argument (which must be the keeper path).
   if (base.run.args[0] !== "-I") throw new Error("BOX_DETACHED_PYTHON_ISOLATION_MISSING");
+  const runnerArgs = [base.cwd, ...base.run.args.slice(1, 3),
+    ...(base.cliCwd === base.cwd ? [] : ["--cli-cwd", base.cliCwd]),
+    ...base.run.args.slice(3)];
   const launch: BoxCcExecRequest = makeBoxPinnedRunnerRequest({ runnerPath,
-    detachedRunnerHash, args: [base.cwd, ...base.run.args.slice(1)], cwd: base.cwd,
+    detachedRunnerHash, args: runnerArgs, cwd: base.cwd,
     environment: base.run.environment });
   // Only after nonce/epoch-bound remote terminal proof: stdout/stderr contain
   // model output and must be removed with the private input/catalog files.
