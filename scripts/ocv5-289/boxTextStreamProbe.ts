@@ -52,7 +52,7 @@ async function main(): Promise<void> {
       }
       return { ...target, exec: { run: async (request, opts) => {
         const modelRun = request.args[0] === "-I"
-          && request.args[1]?.startsWith("/tmp/ocv5-289-keeper-");
+          && request.args[1]?.startsWith("/tmp/ocv5-289-v2-keeper-");
         if (modelRun) {
           const proofDir = request.args[request.args.indexOf("--proof-dir") + 1];
           const leaseEpoch = request.args[request.args.indexOf("--lease-epoch") + 1];

@@ -647,6 +647,7 @@ async function main(): Promise<void> {
   let ccbProcessUnconfirmed = false;
   let dbReady = false;
   let loopback: Awaited<ReturnType<typeof startSignedLoopback>> | null = null;
+  let diagnosticStage = "setup";
   const oldModelFlag = process.env.OC_BOX_MODEL_API;
   const oldToolFlag = process.env.OC_BOX_TOOL_BRIDGE;
   const syncDirectory = (path = EVIDENCE_DIR): void => {
@@ -802,6 +803,7 @@ async function main(): Promise<void> {
         paidCalls++;
         return service.fetch(args);
       } }, price });
+    diagnosticStage = "loopback_ready";
     if (ccbPreflight) {
       ccbProcessUnconfirmed = true;
       const result = await runContainerCcbProbe({ baseUrl: "http://127.0.0.1:31002",
@@ -839,6 +841,7 @@ async function main(): Promise<void> {
       return;
     }
     if (ccbLive) {
+      diagnosticStage = "ccb_fixture_precheck";
       const work = lstatSync(WORK_HOST);
       assertion(process.cwd() === WORK_HOST && work.isDirectory()
         && !work.isSymbolicLink(), "BOX_CCB_FIXTURE_DIR_INVALID");
@@ -855,16 +858,19 @@ async function main(): Promise<void> {
         fsyncSync(fd);
       } finally { closeSync(fd); }
       syncDirectory(WORK_HOST);
+      diagnosticStage = "ccb_fixture_ready";
       const prompt = "Use the local read_secret tool exactly once. It has no arguments and "
         + "returns an unpredictable synthetic token held only in this OpenClaude user container. "
         + "Reply with exactly that token, without quotes or explanation. Do not guess.";
       ccbProcessUnconfirmed = true;
+      diagnosticStage = "ccb_process";
       const result = await runContainerCcbProbe({ baseUrl: "http://127.0.0.1:31002",
         authToken: loopback.authToken, catalogToken: loopback.catalogToken,
         turnKey, prompt, expectedMarker: localResult, deadlineSeconds: 240,
         localToolConfig: { script: `${WORK_CONTAINER}/scripts/ocv5-289/ccb_local_probe_mcp.py`,
           fixture: fixtureContainerPath } });
       ccbProcessUnconfirmed = false;
+      diagnosticStage = "ccb_process_returned";
       const observed = loopback.observedRequestIds();
       for (const id of observed) await loopback.waitHandler(id);
       const used = lstatSync(fixtureUsedPath);
@@ -1149,6 +1155,10 @@ async function main(): Promise<void> {
         : null }));
     process.stderr.write(JSON.stringify({ code: error instanceof Error
       && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message) ? error.message : "BOX_TOOL_PROBE_FAILED",
+      diagnosticStage,
+      nodeErrorCode: error && typeof error === "object"
+        && "code" in error && typeof error.code === "string"
+        && /^[A-Z][A-Z0-9_]{0,39}$/.test(error.code) ? error.code : null,
       terminal, unknownPhase, evidencePath: lockHeld ? EVIDENCE_PATH : null,
        evidence, continuationEvidence: loopback?.continuationEvidence,
        diagnostics: loopback?.diagnostics.slice(-12) }) + "\n");

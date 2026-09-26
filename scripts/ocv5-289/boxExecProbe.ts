@@ -88,7 +88,11 @@ if (process.env.OCV5_289_ACK_ACCOUNT_ID !== ACCOUNT_ID || process.env.OCV5_289_A
 }
 if (['OCV5_289_PARALLEL_ACK', 'OCV5_289_INFERENCE_ACK', 'OCV5_289_TOOL_ACK',
   'OCV5_289_GENERIC_TOOL_ACK', 'OCV5_289_HISTORY_ACK']
-  .filter((key) => process.env[key] === '1').length > 1) {
+  .filter((key) => process.env[key] === '1').length >
+    (process.env.OCV5_289_STATE_ONLY === '1'
+      || process.env.OCV5_289_WAKE_FOR_REPAIR_ACK === '1' ? 0 : 1)
+  || (process.env.OCV5_289_STATE_ONLY === '1'
+    && process.env.OCV5_289_WAKE_FOR_REPAIR_ACK === '1')) {
   throw new Error('BOX_PROBE_MODES_CONFLICT')
 }
 if (getRuntimeChannel() !== 'v5') throw new Error('WRONG_RUNTIME_CHANNEL')
@@ -171,6 +175,34 @@ try {
   }
   client.setAccountGuard(assertCurrent)
   const controlAbort = new AbortController()
+  if (process.env.OCV5_289_STATE_ONLY === '1') {
+    await assertCurrent()
+    const state = await client.getBoxRunState(snap.token.toString('utf8').trim(),
+      snap.machine_id, controlAbort.signal)
+    process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, state,
+      wakeAttempted: false, ensureCalled: false, paidCalls: 0 }) + '\n')
+    return
+  }
+  if (process.env.OCV5_289_WAKE_FOR_REPAIR_ACK === '1') {
+    await assertCurrent()
+    const token = snap.token.toString('utf8').trim()
+    const before = await client.getBoxRunState(token, snap.machine_id,
+      controlAbort.signal)
+    if (before !== 'SAND_BOX_RUN_STATE_HIBERNATED'
+      && before !== 'SAND_BOX_RUN_STATE_RUNNING') throw new Error('BOX_WAKE_STATE_UNSUPPORTED')
+    let ensureAmbiguous = false
+    if (before === 'SAND_BOX_RUN_STATE_HIBERNATED') {
+      try { await client.connect(token, snap.machine_id, controlAbort.signal) }
+      catch { ensureAmbiguous = true } // No second Ensure, even if its reply was ambiguous.
+    }
+    const after = await client.getBoxRunState(token, snap.machine_id,
+      controlAbort.signal)
+    process.stdout.write(JSON.stringify({ accountId: ACCOUNT_ID, before, after,
+      connectAttempts: before === 'SAND_BOX_RUN_STATE_HIBERNATED' ? 1 : 0,
+      ensureAmbiguous, paidCalls: 0 }) + '\n')
+    if (after !== 'SAND_BOX_RUN_STATE_RUNNING') throw new Error('BOX_WAKE_UNPROVEN')
+    return
+  }
   const target = await client.resolveBoxExec(snap.token.toString('utf8').trim(), snap.machine_id, controlAbort.signal)
   const runFixed = async (input: { command: string; args: string[]; cwd: string;
     environment: Record<string, string>; timeoutMs?: number }): Promise<string> => {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { makeBoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
 import { parseBoxTerminalProof } from "./boxTerminalProof.js";
@@ -21,7 +21,7 @@ test("detached tool launch reuses private staged plan without putting user conte
     keeperAsset: read("box_keeper.py"), virtualMcpAsset: read("box_virtual_mcp.py"),
     detachedRunnerAsset: read("box_detached_runner.py"),
     runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) });
-  assert.ok(plan.stageDetachedRunner.args[3]?.startsWith("/tmp/ocv5-289-detached-runner-"));
+  assert.ok(plan.stageDetachedRunner.args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-"));
   assert.equal(plan.launch.args[5], plan.cwd);
   assert.deepEqual(plan.launch.args.slice(6), plan.run.args.slice(1),
     "the runner receives keeper first, not Python's -I interpreter flag");
@@ -47,6 +47,11 @@ test("real detached plan reaches keeper and supervisor without a paid model", as
     const staged = run(step);
     assert.equal(staged.status, 0, staged.stderr);
   }
+  assert.equal(plan.launch.args[3], plan.stageDetachedRunner.args[3]);
+  const pinned = String(plan.launch.args[3]);
+  assert.equal(statSync(pinned).mode & 0o777, 0o600);
+  assert.equal(createHash("sha256").update(readFileSync(pinned)).digest("hex"),
+    plan.detachedRunnerHash);
   try {
     const separator = plan.launch.args.indexOf("--");
     assert.ok(separator > 6);

@@ -47,7 +47,7 @@ export function makeBoxToolPlan(input: {
       extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
       runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900 });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
-  const virtualMcpPath = `/tmp/ocv5-289-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
+  const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
     command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });

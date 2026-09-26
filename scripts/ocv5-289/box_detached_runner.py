@@ -15,7 +15,7 @@ import sys
 import time
 
 RUN_DIR = re.compile(r"^/tmp/ocv5-289-run-([a-f0-9]{24})$")
-ASSET = re.compile(r"^/tmp/ocv5-289-(keeper|supervisor)-([a-f0-9]{16})\.py$")
+ASSET = re.compile(r"^/tmp/ocv5-289-(?:v2-)?(keeper|supervisor)-([a-f0-9]{16})\.py$")
 PROOF = re.compile(r"^/tmp/ocv5-289-proof-([a-f0-9]{24})$")
 MAX_SPOOL = 64 * 1024 * 1024
 

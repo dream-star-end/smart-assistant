@@ -24,8 +24,8 @@ test("first tool round stages private MCP catalog and permits only virtual tools
   const args = plan.run.args;
   assert.equal(plan.expectedModel, "claude-opus-5-5");
   assert.equal(args[0], "-I");
-  assert.ok(args[1]?.startsWith("/tmp/ocv5-289-keeper-"));
-  assert.ok(plan.stageVirtualMcp.args[3]?.startsWith("/tmp/ocv5-289-box-virtual-mcp-"));
+  assert.ok(args[1]?.startsWith("/tmp/ocv5-289-v2-keeper-"));
+  assert.ok(plan.stageVirtualMcp.args[3]?.startsWith("/tmp/ocv5-289-v2-box-virtual-mcp-"));
   assert.ok(plan.stageInputs.some((step) => step.args.includes(`${plan.cwd}/tool-catalog.json`)));
   assert.ok(plan.cleanup.args.includes(`${plan.cwd}/tool-catalog.json`));
   assert.equal(args[args.indexOf("--tools") + 1], "");

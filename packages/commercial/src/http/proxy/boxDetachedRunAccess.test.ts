@@ -44,7 +44,7 @@ test("malformed run identity and cursor fail before any Box request", () => {
 test("pinned loader executes verified fd bytes, rejecting replacement and symlink", () => {
   const raw = Buffer.from(`print('trusted-${randomBytes(8).toString("hex")}')\n`);
   const hash = createHash("sha256").update(raw).digest("hex");
-  const path = `/tmp/ocv5-289-detached-runner-${hash.slice(0, 16)}.py`;
+  const path = `/tmp/ocv5-289-v2-detached-runner-${hash.slice(0, 16)}.py`;
   const decoy = `/tmp/ocv5-289-decoy-${randomBytes(8).toString("hex")}.py`;
   const cwd = mkdtempSync("/tmp/ocv5-289-loader-");
   writeFileSync(`${cwd}/hashlib.py`, "print('hijacked-before-digest')\n", { mode: 0o600 });

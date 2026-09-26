@@ -80,6 +80,30 @@ console.log(
 )
 console.log('[session-unavailable-rootfix] PASS — INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL team-leader default-model test contract is locked')
 
+// INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof.
+// The Box tests and real account canary must separately prove cleanup and
+// cross-HTTP business outcomes before its model catalog entry is enabled.
+const boxPrelaunch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxPrelaunchControl.ts'), 'utf8')
+const boxJournal = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const boxFetch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolFetch.ts'), 'utf8')
+const boxEgress = readFileSync(join(root,
+  'packages/commercial/src/egress/main.ts'), 'utf8')
+for (const [source, markers] of [
+  [boxPrelaunch, ['fcntl.flock', 'OWNED_RUN', 'OWNED_PROJECT', 'CLOSED', 'CLEANED']],
+  [boxJournal, ['boxLaunchPermit', 'markGuardedPrestartStopped',
+    'listPrelaunchRecoveryCandidates']],
+  [boxFetch, ['reconcilePrelaunchRecovery', 'makeBoxPrelaunchCleanup']],
+  [boxEgress, ['boxRecoveryTimer', 'reconcilePrelaunchRecovery(10)']],
+] as const) {
+  for (const marker of markers) {
+    if (!source.includes(marker)) throw new Error(`[box-stage-unknown] missing ${marker}`)
+  }
+}
+console.log('INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof')
+
 // INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
 // The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
 const mediaStore = readFileSync(join(root, 'packages/commercial/src/media-generation/store.ts'), 'utf8')

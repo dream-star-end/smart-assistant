@@ -12,6 +12,10 @@ import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
+  makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
+  type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
+import { randomBytes } from "node:crypto";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -32,8 +36,9 @@ export interface BoxToolFirstFinal {
   readonly target: BoxResolvedTarget;
   readonly proof: BoxTerminalProof;
 }
-type Journal = Pick<BoxDurableJournal, "admit" | "markRunning" |
-  "markPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">;
+type Journal = Pick<BoxDurableJournal, "admit" |
+  "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
+  "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">;
 
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
@@ -121,7 +126,9 @@ export async function runBoxToolFirstRound(input: {
   void aborted.catch(() => {});
   const race = <T>(value: Promise<T>): Promise<T> => Promise.race([value, aborted]);
   let target: BoxResolvedTarget | null = null;
-  let admitted = false, launchAttempted = false, inputStageStarted = false;
+  let admitted = false, launchAttempted = false;
+  let armAttempted = false;
+  let prelaunchReceipt: BoxPrelaunchReceipt | null = null;
   let prestartClosed = false;
   let unknownNotified = false;
   type Disposal = { pending: Promise<void>; retained: boolean };
@@ -192,12 +199,24 @@ export async function runBoxToolFirstRound(input: {
   };
   const prestart = async (): Promise<void> => {
     if (!target || !admitted) return;
-    if (inputStageStarted) {
+    if (prelaunchReceipt) {
       try {
-        const cleaned = await bounded(target.exec.run(plan.cleanup, {
+        // Never use caller abort here: a timed-out private stage can still be
+        // mutating remotely. CLEANED is emitted only under the same flock.
+        const cleaned = await bounded(target.exec.run(
+          makeBoxPrelaunchCleanup(prelaunchReceipt), {
           timeoutMs: 20_000, maxResponseBytes: 4096 }), 20_500);
-        if (cleaned.stdout.trim() !== "clean") throw new Error("cleanup mismatch");
-      } catch { await unknown("prestart_cleanup_unknown"); return; }
+        if (cleaned.stdout.trim() !== `cleaned:${prelaunchReceipt.identityHash}`) {
+          throw new Error("cleanup receipt mismatch");
+        }
+        await bounded(deps.journal.markGuardedPrestartStopped({
+          requestId: input.requestId, uid: input.uid, accountId: target.accountId,
+          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+          receipt: prelaunchReceipt, cleanedReceipt: cleaned.stdout.trim(),
+        }), 2_000);
+        prestartClosed = true;
+      } catch { await unknown("prestart_cleanup_unknown"); }
+      return;
     }
     try { await bounded(deps.journal.markPrestartStopped({ requestId: input.requestId,
       uid: input.uid, leaseEpoch: plan.leaseEpoch }), 2_000); prestartClosed = true; }
@@ -231,29 +250,66 @@ export async function runBoxToolFirstRound(input: {
     }, () => {});
     await race(pendingAdmission);
     admitted = true;
+    let stageLabel = "before_stage";
     try {
-      for (const [request, expected] of [
-        [plan.stageSupervisor, plan.supervisorHash],
-        [plan.stageKeeper, plan.keeperHash],
-        [plan.stageVirtualMcp, plan.virtualMcpHash],
-        [plan.stageDetachedRunner, plan.detachedRunnerHash],
+      for (const [label, request, expected] of [
+        ["supervisor", plan.stageSupervisor, plan.supervisorHash],
+        ["keeper", plan.stageKeeper, plan.keeperHash],
+        ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
+        ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
       ] as const) {
+        stageLabel = label;
         const staged = await run(request);
         if (staged.stdout.trim() !== expected) {
           throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
         }
       }
-      inputStageStarted = true;
-      for (const request of plan.stageInputs) await run(request);
+      stageLabel = "prelaunch_bootstrap";
+      const controlId = randomBytes(16).toString("hex");
+      const bootstrap = await run(makeBoxPrelaunchBootstrap({
+        runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+        accountId: target.accountId.toString(), controlId,
+      }));
+      prelaunchReceipt = parseBoxPrelaunchBootstrap(bootstrap.stdout, {
+        runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+        accountId: target.accountId.toString(), controlId,
+      });
+      stageLabel = "prelaunch_journal";
+      await race(deps.journal.recordPrelaunchControl({ requestId: input.requestId,
+        uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
+        leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
+      for (const [index, request] of plan.stageInputs.entries()) {
+        stageLabel = `input_${index}`;
+        if (index === 0) {
+          if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+            throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+          }
+          await run(makeBoxPrelaunchInit(prelaunchReceipt, request.args[4]));
+        } else {
+          await run(guardBoxPrivateStage(request, prelaunchReceipt));
+        }
+      }
       if (signal.aborted || remaining() < 60_000) {
         throw new BoxToolFirstRoundError("BOX_TOOL_BUDGET_EXHAUSTED");
       }
-      await race(deps.journal.markRunning({ requestId: input.requestId, uid: input.uid,
-        leaseEpoch: plan.leaseEpoch }));
+      stageLabel = "launch_arm";
+      armAttempted = true;
+      await race(deps.journal.armGuardedLaunch({ requestId: input.requestId,
+        uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
+        leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
     } catch (error) {
-      if (error instanceof BoxExecTransportError && !error.terminalKnown) {
-        await unknown("stage_transport_unknown");
-      } else await prestart();
+      // An arm CAS may have committed before its acknowledgement was lost.
+      // Never clean remotely after that point without a separate proof that
+      // the paid launch permit was not granted.
+      if (armAttempted) {
+        await unknown("launch_arm_unknown");
+        throw error;
+      }
+      await prestart();
+      if (!prestartClosed && error instanceof BoxExecTransportError
+        && !error.terminalKnown) {
+        await unknown(`stage_transport_unknown:${stageLabel}:${error.code}`);
+      }
       throw error;
     }
     launchAttempted = true;

@@ -83,23 +83,29 @@ export class BoxExecTransport {
       throw new BoxExecTransportError("BOX_EXEC_REQUEST_TOO_LARGE", false);
     }
     const abort = new AbortController();
-    const onAbort = (): void => abort.abort();
+    let abortOrigin: "caller" | "deadline" | null = null;
+    const abortWith = (origin: "caller" | "deadline"): void => {
+      if (abortOrigin === null) abortOrigin = origin;
+      abort.abort();
+    };
+    const abortedError = (): BoxExecTransportError => new BoxExecTransportError(
+      abortOrigin === "deadline" ? "BOX_EXEC_TIMEOUT" : "BOX_EXEC_ABORTED", false);
+    const onCallerAbort = (): void => abortWith("caller");
     const deadlineAt = Date.now() + opts.timeoutMs;
     const aborted = new Promise<never>((_, reject) => {
-      abort.signal.addEventListener("abort", () => reject(
-        new BoxExecTransportError("BOX_EXEC_ABORTED", false)), { once: true });
+      abort.signal.addEventListener("abort", () => reject(abortedError()), { once: true });
     });
     // Caller signal may already be aborted before the first Promise.race is
     // installed; keep the shared cancellation promise rejection observed.
     void aborted.catch(() => {});
     const raceAbort = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, aborted]);
     const ensureLive = (): void => {
-      if (Date.now() >= deadlineAt) onAbort();
-      if (abort.signal.aborted) throw new BoxExecTransportError("BOX_EXEC_ABORTED", false);
+      if (Date.now() >= deadlineAt) abortWith("deadline");
+      if (abort.signal.aborted) throw abortedError();
     };
-    opts.signal?.addEventListener("abort", onAbort, { once: true });
-    if (opts.signal?.aborted) abort.abort();
-    const timer = setTimeout(onAbort, opts.timeoutMs);
+    opts.signal?.addEventListener("abort", onCallerAbort, { once: true });
+    if (opts.signal?.aborted) abortWith("caller");
+    const timer = setTimeout(() => abortWith("deadline"), opts.timeoutMs);
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     try {
       ensureLive();
@@ -121,6 +127,7 @@ export class BoxExecTransport {
         }));
       } catch (error) {
         if (error instanceof BoxExecTransportError) throw error;
+        if (abort.signal.aborted) throw abortedError();
         throw new BoxExecTransportError("BOX_EXEC_TRANSPORT_UNKNOWN", false);
       }
       ensureLive();
@@ -136,6 +143,7 @@ export class BoxExecTransport {
         try { chunk = await raceAbort(reader.read()); }
         catch (error) {
           if (error instanceof BoxExecTransportError) throw error;
+          if (abort.signal.aborted) throw abortedError();
           throw new BoxExecTransportError("BOX_EXEC_STREAM_UNKNOWN", false);
         }
         ensureLive();
@@ -180,7 +188,7 @@ export class BoxExecTransport {
       return { stdout, stderrBytes, exitCode: 0 };
     } finally {
       clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", onAbort);
+      opts.signal?.removeEventListener("abort", onCallerAbort);
       if (reader) {
         await boundedCancel(() => reader!.cancel(), deadlineAt);
         try { reader.releaseLock(); } catch { /* pending read/cancel already detached */ }

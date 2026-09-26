@@ -2,13 +2,15 @@
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
-import type { BoxDurableJournal, BoxRemoteCleanupCandidate } from "./boxDurableJournal.js";
+import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
+  BoxPrelaunchRecoveryCandidate } from "./boxDurableJournal.js";
 import { runBoxToolFirstRound, type BoxToolFirstHandoff,
   type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { stripBoxCcbToolBudgetTail } from "./boxCacheAnnotations.js";
+import { makeBoxPrelaunchCleanup } from "./boxPrelaunchControl.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -37,6 +39,7 @@ export class BoxToolFetch {
     candidate: BoxRemoteCleanupCandidate; claimed: boolean }>();
   private readonly terminalInFlight = new Map<string, Promise<void>>();
   private readonly reconcileInFlight = new Set<string>();
+  private readonly prelaunchInFlight = new Set<string>();
   private readonly cleanup = new Set<{ target: BoxResolvedTarget;
     pending: Promise<void>; failed: boolean }>();
   constructor(private readonly deps: {
@@ -87,7 +90,8 @@ export class BoxToolFetch {
     this.retainCleanup({ target, pending });
   }
 
-  private async resolveCleanupTarget(candidate: BoxRemoteCleanupCandidate): Promise<BoxResolvedTarget> {
+  private async resolveCleanupTarget(candidate: BoxRemoteCleanupCandidate |
+    BoxPrelaunchRecoveryCandidate): Promise<BoxResolvedTarget> {
     const timeoutMs = this.deps.cleanupResolveTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
       throw new Error("BOX_CLEANUP_RESOLVE_BUDGET_INVALID");
@@ -114,6 +118,58 @@ export class BoxToolFetch {
       if (completed) this.closeUnusedTarget(completed);
       throw error;
     } finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Restart-safe, no-paid takeover of a private stage that never acquired a
+   * durable launch permit. Old v1 rows without the control receipt are not
+   * eligible and must be resolved by exact operator proof. */
+  async reconcilePrelaunchRecovery(limit = 10): Promise<number> {
+    const candidates = await this.deps.journal.listPrelaunchRecoveryCandidates(limit);
+    let settled = 0;
+    await Promise.allSettled(candidates.map(async (candidate) => {
+      if (this.prelaunchInFlight.has(candidate.runNonce)) return;
+      this.prelaunchInFlight.add(candidate.runNonce);
+      let target: BoxResolvedTarget | null = null;
+      let targetWasOwned = false;
+      try {
+        if (!await this.deps.journal.claimPrelaunchRecovery(candidate)) return;
+        target = await this.resolveCleanupTarget(candidate);
+        targetWasOwned = this.targets.get(candidate.runNonce)?.has(target) ?? false;
+        if (target.accountId !== candidate.accountId) {
+          throw new Error("BOX_PRELAUNCH_RECOVERY_ACCOUNT_MISMATCH");
+        }
+        const pending = target.exec.run(makeBoxPrelaunchCleanup(candidate.receipt), {
+          timeoutMs: 20_000, maxResponseBytes: 4096 });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let result: Awaited<typeof pending>;
+        try {
+          result = await Promise.race([pending, new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("BOX_PRELAUNCH_RECOVERY_TIMEOUT")), 20_500);
+          })]);
+        } finally { if (timer) clearTimeout(timer); }
+        const cleanedReceipt = result.stdout.trim();
+        if (cleanedReceipt !== `cleaned:${candidate.receipt.identityHash}`) {
+          throw new Error("BOX_PRELAUNCH_RECOVERY_UNPROVEN");
+        }
+        await this.deps.journal.markGuardedPrestartStopped({
+          requestId: candidate.requestId, uid: candidate.uid,
+          accountId: candidate.accountId, runNonce: candidate.runNonce,
+          leaseEpoch: candidate.leaseEpoch, receipt: candidate.receipt,
+          cleanedReceipt,
+        });
+        const owned = this.ownedRunIdentity.get(candidate.runNonce);
+        if (owned && owned.uid === candidate.uid
+          && owned.accountId === candidate.accountId
+          && owned.leaseEpoch === candidate.leaseEpoch) {
+          await this.releaseLocalTargets(candidate.runNonce);
+        }
+        settled++;
+      } finally {
+        if (target && !targetWasOwned) this.closeUnusedTarget(target);
+        this.prelaunchInFlight.delete(candidate.runNonce);
+      }
+    }));
+    return settled;
   }
 
   private async cleanedElsewhere(candidate: BoxRemoteCleanupCandidate): Promise<boolean> {
@@ -170,7 +226,8 @@ export class BoxToolFetch {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const done = await Promise.race([
-          this.deps.journal.remoteCleanupDoneByRunIdentity(identity),
+          (async () => await this.deps.journal.remoteCleanupDoneByRunIdentity(identity)
+            || await this.deps.journal.prelaunchCleanupDoneByRunIdentity(identity))(),
           new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), 2_000); }),
         ]);
         if (done) await this.releaseLocalTargets(nonce);

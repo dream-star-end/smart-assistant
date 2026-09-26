@@ -4763,6 +4763,47 @@
         "reason": "真实自用管理员网页故障和远端终止清理已取证；当前只有实际 Claude Code 2.1.280 离线双工具协议回归及 PG TEMP 集成，尚无可在商业候选自动重放的同链浏览器或 live-e2e 夹具。selfhost 修复上线后需用新的用户认证网页回合验收，不得重放失败付费调用。",
         "since": "2026-09-26"
       }
+    },
+    {
+      "id": "INC-20260926-BOX-STAGE-UNKNOWN",
+      "occurredAt": "2026-09-26",
+      "severity": "P1",
+      "symptom": "Box 第二轮私有输入 staging 超时被误归为无来源取消；无远端写入围栏和清理证明，用户请求失败且账号容量长期占用。",
+      "rootFixCommit": "74be9976",
+      "coverageCommits": [
+        "72a7234e",
+        "46e93f75",
+        "79429081",
+        "74be9976",
+        "0a3412eb"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "prelaunch cleanup closes writes, removes partial private files, and is idempotent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "failed INIT cannot authorize deletion of a preexisting run directory"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchJournal.integ.test.ts",
+          "assertion": "prelaunch cleanup CAS cannot cross a durable launch permit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "fresh egress recovers only a no-launch prelaunch row without paid replay"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof"
+        }
+      ]
     }
   ]
 }

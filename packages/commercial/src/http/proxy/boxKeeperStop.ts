@@ -51,8 +51,8 @@ try:
    with open(path+'/cmdline','rb') as f:raw=f.read(16384)
    args=raw.split(b'\0')
    if len(args)<8 or args[1]!=b'-I':return False
-   if not re.fullmatch(rb'/tmp/ocv5-289-keeper-[a-f0-9]{16}\.py',args[2]):return False
-   if not re.fullmatch(rb'/tmp/ocv5-289-supervisor-[a-f0-9]{16}\.py',args[3]):return False
+   if not re.fullmatch(rb'/tmp/ocv5-289-(?:v2-)?keeper-[a-f0-9]{16}\.py',args[2]):return False
+   if not re.fullmatch(rb'/tmp/ocv5-289-(?:v2-)?supervisor-[a-f0-9]{16}\.py',args[3]):return False
    if args[4:8]!=[b'--proof-dir',proof.encode(),b'--lease-epoch',epoch.encode()]:return False
    return True
   except (FileNotFoundError,ProcessLookupError,PermissionError,OSError):return False

@@ -10,8 +10,8 @@ test("stop binds a live keeper by nonce, epoch, pinned PID and cwd", async () =>
   const epoch = randomBytes(16).toString("hex");
   const run = `/tmp/ocv5-289-run-${nonce}`;
   const proof = `/tmp/ocv5-289-proof-${nonce}`;
-  const keeper = `/tmp/ocv5-289-keeper-${randomBytes(8).toString("hex")}.py`;
-  const supervisor = `/tmp/ocv5-289-supervisor-${randomBytes(8).toString("hex")}.py`;
+  const keeper = `/tmp/ocv5-289-v2-keeper-${randomBytes(8).toString("hex")}.py`;
+  const supervisor = `/tmp/ocv5-289-v2-supervisor-${randomBytes(8).toString("hex")}.py`;
   mkdirSync(run, { mode: 0o700 });
   mkdirSync(proof, { mode: 0o700 });
   writeFileSync(keeper, "import signal,time,sys\n" +
@@ -29,7 +29,7 @@ test("stop binds a live keeper by nonce, epoch, pinned PID and cwd", async () =>
     const request = makeBoxKeeperStop(nonce, epoch);
     const premature = spawnSync(request.command, request.args, { cwd: request.cwd,
       encoding: "utf8", timeout: 5000 });
-    assert.equal(premature.status, 125, "no handshake means no signal");
+    assert.equal(premature.status, 125, `no handshake means no signal; stderr=${premature.stderr}`);
     assert.equal(child.exitCode, null);
     writeFileSync(`${proof}/stop.ready`, JSON.stringify({ runNonce: nonce,
       leaseEpoch: epoch, keeperPid: child.pid, cliPid: child.pid,
