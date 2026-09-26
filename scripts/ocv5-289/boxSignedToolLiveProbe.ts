@@ -1209,19 +1209,25 @@ async function main(): Promise<void> {
         && typeof thirdUsage?.cacheReadTokens === "number"
         && thirdUsage.cacheReadTokens > 0,
       "BOX_NATIVE_THIRD_CLAIM_UNPROVEN");
-      const billed = await client.query<{ id: string; cost: string; cache_read: string }>(
-        `SELECT id::text,cost_credits::text AS cost,
+      const billed = await client.query<{ id: string; cost: string;
+        cache_read: string; ledger_id: string | null }>(
+        `SELECT id::text,cost_credits::text AS cost,ledger_id::text,
           cache_read_tokens::text AS cache_read FROM usage_records
           WHERE user_id=$1 AND request_id=$2`, [UID.toString(), thirdId]);
       assertion(billed.rows.length === 1 && BigInt(billed.rows[0]!.cost) > 0n
         && BigInt(billed.rows[0]!.cache_read) > 0n,
       "BOX_NATIVE_THIRD_USAGE_INVALID");
-      const thirdLedger = await client.query<{ delta: string }>(
-        `SELECT delta::text FROM credit_ledger WHERE user_id=$1
+      const thirdLedger = await client.query<{ id: string; delta: string;
+        reason: string; bucket: string }>(
+        `SELECT id::text,delta::text,reason,bucket FROM credit_ledger WHERE user_id=$1
           AND ref_type='usage_record' AND ref_id=$2`,
         [UID.toString(), billed.rows[0]!.id]);
       assertion(thirdLedger.rows.length >= 1 && thirdLedger.rows.length <= 4
-        && thirdLedger.rows.every((row) => BigInt(row.delta) < 0n)
+        && !!billed.rows[0]!.ledger_id
+        && thirdLedger.rows.some((row) => row.id === billed.rows[0]!.ledger_id)
+        && thirdLedger.rows.every((row) => row.reason === "chat"
+          && ["period", "wallet", "org_period", "org_wallet"].includes(row.bucket)
+          && BigInt(row.delta) < 0n)
         && thirdLedger.rows.reduce((sum, row) => sum - BigInt(row.delta), 0n)
           === BigInt(billed.rows[0]!.cost),
       "BOX_NATIVE_THIRD_LEDGER_INVALID");
