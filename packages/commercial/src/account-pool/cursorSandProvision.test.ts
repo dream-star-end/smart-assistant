@@ -110,6 +110,25 @@ test("Box Exec resolves from the official account control plane without a Sand r
   } finally { await f.close(); }
 });
 
+test("read-only Box run-state never sends EnsureSandBox or wakes a hibernated Box", async () => {
+  const paths: string[] = [];
+  let state = "SAND_BOX_RUN_STATE_HIBERNATED";
+  const f = await server((q, s) => { q.resume(); q.on("end", () => {
+    paths.push(q.url!);
+    if (q.url!.endsWith("GetSandBoxRunState")) return json(s, { state });
+    json(s, {}, 500);
+  }); });
+  try {
+    const client = new CursorSandProvisionClient({ fetchImpl: fetch,
+      apiBase: f.url, allowTestLoopback: true });
+    assert.equal(await client.getBoxRunState(accountToken, machine, signal()), state);
+    state = "SAND_BOX_RUN_STATE_RUNNING";
+    assert.equal(await client.getBoxRunState(accountToken, machine, signal()), state);
+    assert.deepEqual(paths.map((p) => p.split("/").at(-1)),
+      ["GetSandBoxRunState", "GetSandBoxRunState"]);
+  } finally { await f.close(); }
+});
+
 test("Box Exec rejects non-running, invalid identity, and malicious descriptors before use", async () => {
   let state = "SAND_BOX_RUN_STATE_ABSENT", descriptor = "https://evil.example/box", requests = 0;
   const f = await server((q, s) => { q.resume(); q.on("end", () => {

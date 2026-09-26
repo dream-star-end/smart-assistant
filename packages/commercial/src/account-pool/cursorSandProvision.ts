@@ -114,6 +114,18 @@ export class CursorSandProvisionClient {
     return object(r.value);
   }
 
+  /** Pure control-plane observation. Never calls EnsureSandBox or wakes a
+   * hibernated Box; suitable before deciding whether a no-paid probe may run. */
+  async getBoxRunState(token: string, machine: string, signal: AbortSignal): Promise<string> {
+    sandPrincipal(token, "session", this.options.now?.());
+    const state = await this.control("GetSandBoxRunState", token, machine, signal);
+    if (typeof state.state !== "string"
+      || !state.state.startsWith("SAND_BOX_RUN_STATE_")) {
+      throw new SandProvisionError("BOX_STATE_INVALID");
+    }
+    return state.state;
+  }
+
   async connect(token: string, machine: string, signal: AbortSignal): Promise<SandGatewayConnection> {
     // Every attempt begins with state. An ambiguous Ensure response is never
     // immediately repeated, force/recreate are never used. The next tick reads state again.
@@ -133,9 +145,8 @@ export class CursorSandProvisionClient {
    * session credential and machine ID were read from the same trusted store.
    * An ambiguous Ensure response is never retried in this method. */
   async resolveBoxExec(token: string, machine: string, signal: AbortSignal): Promise<SandBoxExecTarget> {
-    sandPrincipal(token, "session", this.options.now?.());
-    const state = await this.control("GetSandBoxRunState", token, machine, signal);
-    if (state.state !== "SAND_BOX_RUN_STATE_RUNNING") throw new SandProvisionError("BOX_NOT_RUNNING");
+    const state = await this.getBoxRunState(token, machine, signal);
+    if (state !== "SAND_BOX_RUN_STATE_RUNNING") throw new SandProvisionError("BOX_NOT_RUNNING");
     const value = await this.control("EnsureSandBox", token, machine, signal);
     if (typeof value.execDaemonUrl !== "string" || value.execDaemonUrl.length === 0 || value.execDaemonUrl.length > 2048) {
       throw new SandProvisionError("EXEC_DESCRIPTOR_INVALID");
