@@ -9,6 +9,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compileBoxToolCatalog } from "../../packages/commercial/src/http/proxy/boxToolCatalog.js";
+import { hashBoxAssistantContent, hashBoxAssistantNoCallerContent } from
+  "../../packages/commercial/src/http/proxy/boxCallFingerprint.js";
 
 const version = execFileSync("/usr/local/bin/claude", ["--version"],
   { encoding: "utf8", timeout: 5000 }).trim();
@@ -26,9 +28,15 @@ const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
   command: "/usr/bin/python3", args: [sidecar, directory, catalog.sha256, "20"] } } });
 const toolName = "mcp__ocbridge__t0";
 const ids = ["toolu_multi_a", "toolu_multi_b"];
+const thought = { type: "thinking", thinking: "synthetic-thought", signature: "synthetic-signature" };
+const firstAssistantContent = [thought, ...ids.map((id) => ({ type: "tool_use", id,
+  name: toolName, input: { value: "same" }, caller: { type: "direct" } }))];
+const expectedCallerlessHash = hashBoxAssistantNoCallerContent(firstAssistantContent);
 const results = [`local-${randomBytes(8).toString("hex")}`,
   `local-${randomBytes(8).toString("hex")}`];
 let requests = 0, responseExact = false, advertised = false;
+const observation: { assistantEchoShape: { blockTypes: string[];
+  toolIds: string[]; hash: string } | null } = { assistantEchoShape: null };
 const headerShapes: Array<Record<string, string>> = [];
 const bodyHashes: string[] = [];
 const turnKeyMatches: boolean[] = [];
@@ -65,7 +73,18 @@ const server = createServer(async (req, res) => {
   advertised ||= toolDefs?.some((tool) => tool.name === toolName) === true;
   if (requests === 2) {
     const messages = body.messages as Array<{ role?: string; content?: Array<{
-      type?: string; tool_use_id?: string; content?: string | Array<{ type?: string; text?: string }> }> }>;
+      type?: string; id?: string; tool_use_id?: string; content?: string | Array<{ type?: string; text?: string }> }> }>;
+    const assistant = messages.findLast((message) => message.role === "assistant"
+      && Array.isArray(message.content)
+      && message.content.some((block) => block.type === "tool_use"));
+    if (assistant && Array.isArray(assistant.content)) {
+      observation.assistantEchoShape = {
+        blockTypes: assistant.content.map((block) => String(block.type ?? "<missing>")),
+        toolIds: assistant.content.filter((block) => block.type === "tool_use")
+          .map((block) => String(block.id ?? "<missing>")),
+        hash: hashBoxAssistantContent(assistant.content),
+      };
+    }
     const found = messages.flatMap((message) => message.role === "user"
       && Array.isArray(message.content)
       ? message.content.filter((block) => block.type === "tool_result") : []);
@@ -86,12 +105,20 @@ const server = createServer(async (req, res) => {
     id: `msg_multi_${requests}`, type: "message", role: "assistant", model: body.model,
     content: [], usage: { input_tokens: 5, output_tokens: 0 } } });
   if (requests === 1) {
+    event("content_block_start", { type: "content_block_start", index: 0,
+      content_block: { type: "thinking", thinking: "" } });
+    event("content_block_delta", { type: "content_block_delta", index: 0,
+      delta: { type: "thinking_delta", thinking: thought.thinking } });
+    event("content_block_delta", { type: "content_block_delta", index: 0,
+      delta: { type: "signature_delta", signature: thought.signature } });
+    event("content_block_stop", { type: "content_block_stop", index: 0 });
     ids.forEach((id, index) => {
-      event("content_block_start", { type: "content_block_start", index,
-        content_block: { type: "tool_use", id, name: toolName, input: {} } });
-      event("content_block_delta", { type: "content_block_delta", index,
+      event("content_block_start", { type: "content_block_start", index: index + 1,
+        content_block: { type: "tool_use", id, name: toolName, input: {},
+          caller: { type: "direct" } } });
+      event("content_block_delta", { type: "content_block_delta", index: index + 1,
         delta: { type: "input_json_delta", partial_json: '{"value":"same"}' } });
-      event("content_block_stop", { type: "content_block_stop", index });
+      event("content_block_stop", { type: "content_block_stop", index: index + 1 });
     });
   } else {
     event("content_block_start", { type: "content_block_start", index: 0,
@@ -176,7 +203,9 @@ try {
   if (exit !== 0 || requests !== 2 || !advertised || !responseExact
     || final?.is_error !== false || final.result !== "done"
     || !turnKeyMatches.every(Boolean) || bodyHashes[0] === bodyHashes[1]
-    || trailingBudgetHints.length !== 2 || trailingBudgetHints[1] !== true) {
+    || trailingBudgetHints.length !== 2 || trailingBudgetHints[1] !== true
+    || observation.assistantEchoShape?.hash !== expectedCallerlessHash
+    || observation.assistantEchoShape.blockTypes.join(",") !== "thinking,tool_use,tool_use") {
     throw new Error("GENERIC_MCP_REAL_CC_CONTRACT_FAILED");
   }
   process.stdout.write(JSON.stringify({ version, synthetic: true,
@@ -189,6 +218,7 @@ try {
     sameTurnKeyAcrossModelCalls: turnKeyMatches.every(Boolean),
     modelRequestBodiesDistinct: bodyHashes[0] !== bodyHashes[1],
     roleSequences, trailingBudgetHints,
+    assistantEchoShape: observation.assistantEchoShape,
   }) + "\n");
 } finally {
   clearTimeout(timer);

@@ -7,7 +7,8 @@ import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  hashBoxAssistantContent, hashBoxAssistantEchoContent } from "./boxCallFingerprint.js";
+  hashBoxAssistantContent, hashBoxAssistantEchoContent,
+  hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 
@@ -156,6 +157,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const candidate = { messageId: "msg_box_tool_1", toolUses: firstToolUses,
       assistantContentHash: hashBoxAssistantContent(firstAssistantContent),
       assistantEchoHash: hashBoxAssistantEchoContent(firstAssistantContent),
+      assistantNoCallerHash: hashBoxAssistantNoCallerContent(firstAssistantContent),
       inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
@@ -196,9 +198,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await put(`box-d-${suffix}`);
     const resumeBody = { ...firstBody, messages: [
         ...firstBody.messages,
-         { role: "assistant", content: [firstAssistantContent[1],
-           ...firstToolUses.map((use) => ({ type: "tool_use", id: use.id,
-             name: use.clientName, input: use.input }))] },
+          { role: "assistant", content: [firstAssistantContent[0], firstAssistantContent[1],
+            ...firstToolUses.map((use) => ({ type: "tool_use", id: use.id,
+              name: use.clientName, input: use.input }))] },
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
           { type: "tool_result", tool_use_id: "toolu_A", content: "x".repeat(1_100_000) },
@@ -257,8 +259,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
        [{ type: "text", text: "Box said B before calling tools" },
          ...firstAssistantContent.slice(2)],
        firstAssistantContent.slice(2),
-       [{ type: "thinking", thinking: "inserted", signature: "sig" },
-         ...firstAssistantContent.slice(1)],
+        [{ type: "thinking", thinking: "inserted", signature: "sig" },
+          ...firstAssistantContent.slice(1)],
+        [{ type: "thinking", thinking: "rewritten", signature: "synthetic-signature" },
+          ...firstAssistantContent.slice(1)],
     ]) {
       await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
         uid: 3n, canonicalModel: basis.model,
@@ -319,6 +323,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       id: use.id, name: use.clientName, input: use.input }));
     const secondCandidate = { messageId: "msg_box_tool_2", toolUses: secondToolUses,
       assistantContentHash: hashBoxAssistantContent(secondAssistantContent),
+      assistantNoCallerHash: hashBoxAssistantNoCallerContent(secondAssistantContent),
       inputTokens: 8, outputTokens: 12, cacheReadTokens: 0, cacheWriteTokens: 1 };
     await assert.rejects(() => journal.recordToolHandoff({
       requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { ProxyBody } from "./shared.js";
 import { BoxCallFingerprintError, deriveBoxCallFingerprint,
   deriveBoxContextHash, hashBoxAssistantContent,
-  hashBoxAssistantEchoContent } from "./boxCallFingerprint.js";
+  hashBoxAssistantEchoContent, hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 
 test("CCB omitted thinking matches only the original text and tool echo", () => {
   const text = { type: "text", text: "synthetic pre-tool text" };
@@ -15,6 +15,27 @@ test("CCB omitted thinking matches only the original text and tool echo", () => 
     hashBoxAssistantContent([{ ...text, text: "rewritten" }, tool]));
   assert.equal(hashBoxAssistantEchoContent([{
     ...tool, caller: { type: "provider_only" } }]), hashBoxAssistantContent([tool]));
+});
+
+test("CCB preserved thinking with callerless two-tool echo binds all semantic bytes", () => {
+  const thinking = { type: "thinking", thinking: "private-synthetic", signature: "sig" };
+  const a = { type: "tool_use", id: "toolu_A", name: "skill_search",
+    input: { query: "synthetic" }, caller: { type: "direct" } };
+  const b = { type: "tool_use", id: "toolu_B", name: "Bash",
+    input: { command: "printf synthetic" }, caller: { type: "direct" } };
+  const full = [thinking, a, b];
+  const echoed = [thinking, ...[a, b].map(({ caller: _caller, ...rest }) => rest)];
+  const bound = hashBoxAssistantNoCallerContent(full);
+  assert.equal(bound, hashBoxAssistantContent(echoed));
+  assert.notEqual(bound, hashBoxAssistantContent([
+    { ...thinking, thinking: "changed" }, ...echoed.slice(1)]));
+  assert.notEqual(bound, hashBoxAssistantContent([
+    thinking, echoed[2]!, echoed[1]!]));
+  assert.notEqual(bound, hashBoxAssistantContent([
+    thinking, echoed[1]!, { ...echoed[2]!, input: { command: "changed" } }]));
+  assert.notEqual(bound, hashBoxAssistantContent(echoed.slice(1)));
+  assert.equal(hashBoxAssistantEchoContent(full),
+    hashBoxAssistantContent(echoed.slice(1)));
 });
 
 function body(turnKey = "a".repeat(64)): ProxyBody {

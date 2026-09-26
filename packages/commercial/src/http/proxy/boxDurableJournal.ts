@@ -516,6 +516,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       || (candidate.assistantEchoHash !== undefined
         && (typeof candidate.assistantEchoHash !== "string"
           || !/^[a-f0-9]{64}$/.test(candidate.assistantEchoHash)))
+      || typeof candidate.assistantNoCallerHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(candidate.assistantNoCallerHash)
       || ids.length < 1 || ids.length > 32 || new Set(ids).size !== ids.length
       || ids.some((id) => typeof id !== "string"
         || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))
@@ -550,6 +552,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       assistantContentHash: candidate.assistantContentHash,
       ...(candidate.assistantEchoHash === undefined ? {}
         : { assistantEchoHash: candidate.assistantEchoHash }),
+      assistantNoCallerHash: candidate.assistantNoCallerHash,
       spoolOffset: input.spoolOffset,
       detachedRunnerHash: input.detachedRunnerHash,
       catalogHash: input.catalogHash,
@@ -682,6 +685,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             return type !== "thinking" && type !== "redacted_thinking";
           });
         if (fullHash !== handoff.assistantContentHash
+          && !(handoff.assistantNoCallerHash
+            && fullHash === handoff.assistantNoCallerHash)
           && !(echoed && handoff.assistantEchoHash
             && fullHash === handoff.assistantEchoHash)) {
           throw new Error("assistant message changed");

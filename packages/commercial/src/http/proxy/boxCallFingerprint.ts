@@ -100,6 +100,26 @@ export function hashBoxAssistantContent(content: unknown): string {
   return hasher.digest("hex");
 }
 
+/** CCB 2.1.280 keeps signed thinking but drops the provider-only `caller`
+ * field from tool_use when it reserializes the assistant into the next HTTP
+ * request. Bind every model-visible block and its order while allowing only
+ * that exact metadata omission. Unlike assistantEchoHash, this still binds
+ * thinking/signature bytes whenever they are present. */
+export function hashBoxAssistantNoCallerContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+  }
+  return hashBoxAssistantContent(content.map((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+    }
+    const item = block as Record<string, unknown>;
+    if (item.type !== "tool_use" || !Object.hasOwn(item, "caller")) return item;
+    const { caller: _providerOnly, ...semantic } = item;
+    return semantic;
+  }));
+}
+
 /** Claude Code may omit thinking and reserialize tool_use to its canonical
  * four fields in the next HTTP history. The held Box CLI retains the exact
  * original message; client echo still binds every text block and tool

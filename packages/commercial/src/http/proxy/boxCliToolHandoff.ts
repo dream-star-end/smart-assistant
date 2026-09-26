@@ -4,7 +4,8 @@
  * This is a protocol primitive, not the production bridge by itself.
  */
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
-import { hashBoxAssistantContent, hashBoxAssistantEchoContent } from "./boxCallFingerprint.js";
+import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
+  hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 import { isDeepStrictEqual } from "node:util";
 
 export class BoxCliToolHandoffError extends Error {
@@ -38,6 +39,8 @@ export interface BoxToolHandoffCandidate {
   readonly assistantContentHash: string;
   /** CCB echo of non-thinking blocks; used only when CCB omits thinking. */
   readonly assistantEchoHash?: string;
+  /** CCB may keep thinking while omitting only tool_use.caller. */
+  readonly assistantNoCallerHash: string;
   readonly toolUses: readonly BoxToolUse[];
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -435,6 +438,8 @@ export class BoxCliToolHandoffDecoder {
         this.candidate = { messageId: this.messageId!,
           assistantContentHash: this.visibleAssistantContentHash(),
           assistantEchoHash: hashBoxAssistantEchoContent(
+            this.blocks.map((block) => block.visible)),
+          assistantNoCallerHash: hashBoxAssistantNoCallerContent(
             this.blocks.map((block) => block.visible)), toolUses: uses,
           inputTokens: this.inputTokens, outputTokens: this.outputTokens,
           cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };

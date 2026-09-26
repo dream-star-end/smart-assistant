@@ -105,7 +105,7 @@ async function main(): Promise<void> {
     const source = await pool.query<Price>(PRICE_SQL, [SOURCE]);
     const row = entry.rows[0], cost = price.rows[0], baseline = source.rows[0];
     assertion(entry.rows.length === 1 && row
-      && ["staged", "active"].includes(row.state)
+      && ["staged", "active", "disabled"].includes(row.state)
       && row.engine === "ccb" && row.provider_id === "box_cli"
       && row.upstream_model_id === SOURCE && row.context_window === 200_000
       && isDeepStrictEqual(row.capability_profile, { supports_vision: false,
