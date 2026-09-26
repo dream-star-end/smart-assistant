@@ -40,7 +40,7 @@ export function makeBoxPinnedRunnerRequest(input: {
   cwd: string;
   environment: Record<string, string>;
 }): BoxCcExecRequest {
-  if (!/^\/tmp\/ocv5-289-detached-runner-[a-f0-9]{16}\.py$/.test(input.runnerPath)
+  if (!/^\/tmp\/ocv5-289-v2-detached-runner-[a-f0-9]{16}\.py$/.test(input.runnerPath)
     || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
     || !input.runnerPath.endsWith(`${input.detachedRunnerHash.slice(0, 16)}.py`)) {
     throw new BoxDetachedRunAccessError("BOX_DETACHED_RUN_IDENTITY_INVALID");
@@ -59,7 +59,7 @@ export function makeBoxDetachedRunAccess(input: {
     throw new BoxDetachedRunAccessError("BOX_DETACHED_RUN_IDENTITY_INVALID");
   }
   const cwd = `/tmp/ocv5-289-run-${input.runNonce}`;
-  const runnerPath = `/tmp/ocv5-289-detached-runner-${input.detachedRunnerHash.slice(0, 16)}.py`;
+  const runnerPath = `/tmp/ocv5-289-v2-detached-runner-${input.detachedRunnerHash.slice(0, 16)}.py`;
   return { cwd, runnerPath, readSpool: (offset: number, limit = 65536) => {
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > BOX_TOOL_SPOOL_MAX_BYTES
       || !Number.isSafeInteger(limit) || limit < 1 || limit > 65536) {

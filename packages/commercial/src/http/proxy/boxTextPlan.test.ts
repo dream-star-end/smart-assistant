@@ -33,8 +33,8 @@ test("first text request stages only files and carries no prompt/system on Claud
   assert.equal(plan.run.environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "128");
   assert.equal(plan.run.cwd, plan.cwd);
   assert.equal(plan.run.args[0], "-I");
-  assert.ok(plan.run.args[1]?.startsWith("/tmp/ocv5-289-keeper-"));
-  assert.ok(plan.run.args[2]?.startsWith("/tmp/ocv5-289-supervisor-"));
+  assert.ok(plan.run.args[1]?.startsWith("/tmp/ocv5-289-v2-keeper-"));
+  assert.ok(plan.run.args[2]?.startsWith("/tmp/ocv5-289-v2-supervisor-"));
 });
 
 test("completed history stages actual upstream model with a structured current turn", () => {

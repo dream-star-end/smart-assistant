@@ -21,7 +21,7 @@ import time
 
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
-SUPERVISOR_PATH = re.compile(r"^/tmp/ocv5-289-supervisor-([a-f0-9]{16})\.py$")
+SUPERVISOR_PATH = re.compile(r"^/tmp/ocv5-289-(?:v2-)?supervisor-([a-f0-9]{16})\.py$")
 PROOF_DIR = re.compile(r"^/tmp/ocv5-289-proof-([a-f0-9]{24})$")
 EPOCH = re.compile(r"^[a-f0-9]{32}$")
 

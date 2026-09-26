@@ -70,7 +70,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       const args = request.args;
       if (args[0] === "-I" && args[1] === "-c"
         && args[2]?.includes("sys.argv=[p,*argv]")
-        && args[3]?.startsWith("/tmp/ocv5-289-detached-runner-")
+        && args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-")
         && args[5] !== "--read") {
         sequence.push("launch"); launches++;
         if (options.ambiguousLaunch) throw new BoxExecTransportError("synthetic", false);
@@ -78,7 +78,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       }
       if (args[0] === "-I" && args[1] === "-c"
         && args[2]?.includes("sys.argv=[p,*argv]")
-        && args[3]?.startsWith("/tmp/ocv5-289-detached-runner-")
+        && args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-")
         && args[5] === "--read") {
         sequence.push("spool-read");
         const offset = Number(args[7]);
