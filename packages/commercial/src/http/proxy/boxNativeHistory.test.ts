@@ -28,6 +28,8 @@ test("completed text turn hits only its exact authenticated prefix and assistant
     user("new question")]), system: "changed system" }, basis), false);
   assert.equal(matchesBoxNativeHistory(body([user("prior question"),
     user("new question")]), basis), false);
+  assert.equal(matchesBoxNativeHistory(body([user("prior question"), assistant("READY"),
+    { role: "user" }]), basis), false);
 });
 
 test("tool result budget telemetry is normalized before matching completed turn", () => {

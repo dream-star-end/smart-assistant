@@ -10,6 +10,12 @@ export interface BoxNativeHistoryBasis {
   readonly assistantContentHash: string;
 }
 
+function hasRoleAndContent(value: unknown, role: "user" | "assistant"):
+  value is { role: typeof role; content: unknown } {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+    && "role" in value && value.role === role && "content" in value;
+}
+
 export function makeBoxNativeHistoryBasis(previousBody: ProxyBody,
   validatedFinalAssistantContent: unknown): BoxNativeHistoryBasis {
   return { contextHashBeforeFinal: deriveBoxContextHash(previousBody),
@@ -21,18 +27,21 @@ export function makeBoxNativeHistoryBasis(previousBody: ProxyBody,
 export function matchesBoxNativeHistory(nextBody: ProxyBody,
   basis: BoxNativeHistoryBasis): boolean {
   try {
+    const rawMessages = nextBody.messages;
+    if (!Array.isArray(rawMessages) || rawMessages.length < 3
+      || !Object.hasOwn(rawMessages, rawMessages.length - 1)) return false;
+    const rawCurrent = rawMessages.at(-1);
+    if (!rawCurrent || typeof rawCurrent !== "object" || Array.isArray(rawCurrent)
+      || !Object.hasOwn(rawCurrent, "content")) return false;
     const normalized = normalizeBoxSemanticBody(nextBody);
     const messages = normalized.messages;
     if (!Array.isArray(messages) || messages.length < 3) return false;
     const previousUser = messages.at(-3);
     const assistant = messages.at(-2);
     const currentUser = messages.at(-1);
-    if (!previousUser || typeof previousUser !== "object" || Array.isArray(previousUser)
-      || previousUser.role !== "user"
-      || !assistant || typeof assistant !== "object" || Array.isArray(assistant)
-      || assistant.role !== "assistant"
-      || !currentUser || typeof currentUser !== "object" || Array.isArray(currentUser)
-      || currentUser.role !== "user") return false;
+    if (!hasRoleAndContent(previousUser, "user")
+      || !hasRoleAndContent(assistant, "assistant")
+      || !hasRoleAndContent(currentUser, "user")) return false;
     const currentContent = currentUser.content;
     if (Array.isArray(currentContent) && currentContent.some((part) => part
       && typeof part === "object" && "type" in part && part.type === "tool_result")) return false;
