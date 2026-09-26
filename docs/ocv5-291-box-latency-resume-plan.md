@@ -36,6 +36,25 @@ observed request failed (exit 1, no expected final). Probe:
 4. **Before any CAS or paid launch**, resolve the pinned account and read/check the native file's presence, size and SHA-256. An absent/corrupt file, account mismatch, expired pointer, or any transcript/system/tool mismatch is a cache miss and takes the existing synthetic path **once**. If the pinned account is unavailable before launch, treat it as a cache miss and use the ordinary account resolver for the synthetic path; do not copy the native directory or mark an invocation unknown. A cache hit atomically claims the predecessor, admits the new request and binds its replay fingerprint in one transaction under the existing `(uid,session)` advisory lock; the CAS records the new request ID and commits before any Box Exec. Do not use the per-run random lease epoch as a cross-turn cache key. After the first launch attempt, ambiguous transport is `unknown`: retain the claim and never fall back or retry. No mid-tool Bot switch or native resume after unknown termination; do not copy native config to another account.
 5. Keep the in-flight cross-HTTP tool_result coordinator unchanged: it already resumes the same live CLI.
 
+Minimal completed-prefix binding (no extra transcript parser): the final
+decoder exposes the hash of its validated client-visible assistant content.
+At terminal, store `contextHashBeforeFinal = deriveBoxContextHash(previous
+authenticated request)` and `assistantContentHash` with the native pointer.
+For a proposed next user message, first apply the **same**
+`normalizeBoxSemanticBody` used by `deriveBoxContextHash` (CCB can insert an
+exact `<total_tokens>…` system budget message after tool_result); only then
+require the normalized history to end in
+`... previous user, previous assistant, new user`. Rebuild a body with the
+normalized prefix before that assistant and run the existing context-hash
+function on that body, then hash the
+assistant content with the existing assistant-content hash. Both must match,
+along with system/tool catalog/model/account and the native file SHA-256.
+Any client-side context rewrite, dropped thinking, or compaction is a **cache
+miss** to the current synthetic-snapshot path, never a permissive resume. The
+durable predecessor claim prevents two concurrent new turns from reusing one
+native transcript; it is the existing session advisory-lock pattern, not a
+new cache service.
+
 Implementation boundary: the existing operator `boxSignedToolLiveProbe.ts`
 already owns a durable signed request/billing path and an operator mutex. Real
 Box native acceptance should extend that controlled path rather than launch
