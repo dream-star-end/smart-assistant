@@ -49,6 +49,7 @@ export interface BoxToolHandoffCandidate {
 }
 export interface BoxToolFinalCandidate {
   readonly messageId: string;
+  readonly assistantContentHash: string;
   readonly stopReason: "end_turn" | "max_tokens" | "stop_sequence";
   readonly inputTokens: number;
   readonly outputTokens: number;
@@ -278,6 +279,7 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_FINAL_USAGE_INVALID");
       }
       this.finalCandidate = { messageId: this.messageId!,
+        assistantContentHash: this.visibleAssistantContentHash(),
         stopReason: this.stopReason as BoxToolFinalCandidate["stopReason"],
         inputTokens: this.inputTokens, outputTokens: this.outputTokens,
         cacheReadTokens: this.cacheRead, cacheWriteTokens: this.cacheWrite };

@@ -395,6 +395,8 @@ test("a resumed final round streams blocks but withholds terminal until result a
   assert.equal(decoder.push("").finalCandidate, null);
   const final = decoder.push(lines(finalRecords.slice(-1))[0]!).finalCandidate;
   assert.equal(final?.stopReason, "end_turn");
+  assert.equal(final?.assistantContentHash,
+    hashBoxAssistantContent([{ type: "text", text: "done" }]));
   assert.equal(final?.outputTokens, 4, "bill only this HTTP model round, not CLI cumulative total");
   assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
     journaledUsage: { inputTokens: 2, outputTokens: 4,
