@@ -26,7 +26,7 @@ export function makeBoxDetachedToolPlan(input: {
   runNonce?: string;
   leaseEpoch?: string;
   nativePersistence?: boolean;
-  nativeResume?: { cliCwd: string; sessionId: string };
+  nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;
   const base = makeBoxToolPlan(toolInput);

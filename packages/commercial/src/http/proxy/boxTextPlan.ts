@@ -10,6 +10,7 @@ import type { ProxyBody } from "./shared.js";
 import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { validateBoxTextRequest } from "./boxRequestGate.js";
 import { makeBoxStageFiles, type BoxStageFile } from "./boxStageFiles.js";
+import { makeBoxNativeFileInspect } from "./boxNativeFile.js";
 
 export class BoxTextPlanError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxTextPlanError"; }
@@ -31,6 +32,10 @@ export interface BoxTextPlan {
   readonly stageInputs: readonly BoxCcExecRequest[];
   readonly run: BoxCcExecRequest;
   readonly cleanup: BoxCcExecRequest;
+  /** Full deletion when optional native pointer publication did not commit. */
+  readonly discardNativeCleanup?: BoxCcExecRequest;
+  /** Must run and match before native resume admission; also ensures old cwd. */
+  readonly nativePreflight?: BoxCcExecRequest;
   readonly supervisorHash: string;
   readonly keeperHash: string;
   readonly snapshotHash: string | null;
@@ -137,7 +142,7 @@ export function makeBoxTextPlan(input: {
   /** Off-by-default native completed-turn cache. Account/history/CAS preflight
    * belongs to the caller; this builder only emits the pinned CLI plan. */
   nativePersistence?: boolean;
-  nativeResume?: { cliCwd: string; sessionId: string };
+  nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body);
   if (unsupported) throw new BoxTextPlanError(unsupported);
@@ -164,7 +169,8 @@ export function makeBoxTextPlan(input: {
   const nativePersistence = input.nativePersistence === true || input.nativeResume !== undefined;
   if (input.nativeResume && (input.nativePersistence === false
     || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(input.nativeResume.cliCwd)
-    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.nativeResume.sessionId))) {
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(input.nativeResume.sessionId)
+    || !/^[a-f0-9]{64}$/.test(input.nativeResume.expectedSha256))) {
     throw new BoxTextPlanError("BOX_NATIVE_SESSION_INVALID");
   }
   const cliCwd = input.nativeResume?.cliCwd ?? cwd;
@@ -224,11 +230,19 @@ export function makeBoxTextPlan(input: {
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       ...(nativePersistence ? { DISABLE_AUTO_COMPACT: "1" } : {}) },
   };
-  const cleanup = staged.cleanup;
+  const cleanup = nativePersistence && !input.nativeResume
+    ? staged.cleanupPreservingNative : staged.cleanup;
+  const discardNativeCleanup = nativePersistence && !input.nativeResume
+    ? staged.cleanup : undefined;
+  const nativePreflight = input.nativeResume ? makeBoxNativeFileInspect({
+    cliCwd: input.nativeResume.cliCwd, nativeSessionId: input.nativeResume.sessionId,
+    expectedSha256: input.nativeResume.expectedSha256, ensureCwd: true }) : undefined;
   return { cwd, cliCwd, nativePersistence, proofDir, runNonce, leaseEpoch,
     sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
     stageSupervisor, stageKeeper, stageAssets: assetBatch.request,
     assetManifest: assetBatch.manifest, stageInputs: staged.requests, run, cleanup,
+    ...(discardNativeCleanup ? { discardNativeCleanup } : {}),
+    ...(nativePreflight ? { nativePreflight } : {}),
     supervisorHash, keeperHash,
     snapshotHash, stdinHash, systemHash };
 }

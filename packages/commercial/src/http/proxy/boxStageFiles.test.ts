@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync, statSync, truncateSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, truncateSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { makeBoxStageFiles, BoxStageError } from "./boxStageFiles.js";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
@@ -67,4 +67,43 @@ test("builder rejects unowned path and wrong digest before any Exec", () => {
   assert.throws(() => makeBoxStageFiles({ cwd, project: "", files: [
     { path: `${cwd}/stdin.jsonl`, raw, hash: "0".repeat(64) },
   ] }), (error: unknown) => error instanceof BoxStageError && error.code === "BOX_STAGE_FILE_INVALID");
+});
+
+test("native cleanup removes private inputs but preserves completed project and cwd", () => {
+  const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const root = `/tmp/ocv5-291-project-root-${randomBytes(8).toString("hex")}`;
+  const originalProject = `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}`;
+  const project = `${root}/${cwd.replaceAll("/", "-")}`;
+  const sid = "12345678-1234-4123-8123-123456789abc";
+  const snapshot = Buffer.from('{"type":"user","message":"synthetic history"}\n');
+  const stdin = Buffer.from('{"type":"user","message":"current"}\n');
+  const plan = makeBoxStageFiles({ cwd, project: originalProject, files: [
+    { path: `${originalProject}/${sid}.jsonl`, raw: snapshot, hash: sha(snapshot) },
+    { path: `${cwd}/stdin.jsonl`, raw: stdin, hash: sha(stdin) },
+  ] });
+  mkdirSync(root, { mode: 0o700 });
+  const local = (step: BoxCcExecRequest) => {
+    const args = step.args.map((arg) => arg.replaceAll("/home/box/.claude/projects", root));
+    return spawnSync(step.command, args, { cwd: step.cwd,
+      env: step.environment, encoding: "utf8", timeout: 5000 });
+  };
+  try {
+    for (const step of plan.requests) {
+      const staged = local(step);
+      assert.equal(staged.status, 0, staged.stderr);
+    }
+    assert.deepEqual(readFileSync(`${project}/${sid}.jsonl`), snapshot);
+    const kept = local(plan.cleanupPreservingNative);
+    assert.equal(kept.status, 0, kept.stderr);
+    assert.equal(existsSync(cwd), true);
+    assert.equal(existsSync(`${cwd}/stdin.jsonl`), false);
+    assert.deepEqual(readFileSync(`${project}/${sid}.jsonl`), snapshot);
+    const discarded = local(plan.cleanup);
+    assert.equal(discarded.status, 0, discarded.stderr);
+    assert.equal(existsSync(cwd), false);
+    assert.equal(existsSync(project), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -115,7 +115,8 @@ test("native completed-turn resume stages only current input and keeps one CLI U
   assert.equal(fresh.run.environment.DISABLE_AUTO_COMPACT, "1");
   const resumed = makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
     supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
-    nativeResume: { cliCwd, sessionId }, runNonce: "c".repeat(24) });
+    nativeResume: { cliCwd, sessionId, expectedSha256: "e".repeat(64) },
+    runNonce: "c".repeat(24) });
   assert.equal(resumed.cliCwd, cliCwd);
   assert.equal(resumed.run.cwd, cliCwd);
   assert.equal(resumed.sessionId, sessionId);
@@ -123,11 +124,15 @@ test("native completed-turn resume stages only current input and keeps one CLI U
   assert.ok(resumed.run.args.includes("--resume"));
   assert.ok(!resumed.run.args.includes("--no-session-persistence"));
   assert.equal(resumed.run.environment.DISABLE_AUTO_COMPACT, "1");
+  assert.ok(resumed.nativePreflight?.args.includes("e".repeat(64)));
+  assert.equal(fresh.cleanup.args[5], "keep");
+  assert.equal(fresh.discardNativeCleanup?.args[5], "full");
   assert.equal(resumed.stageInputs.some((step) => step.args[5]?.includes("/.claude/projects/")), false);
   assert.equal(resumed.cleanup.args[4], "");
   assert.throws(() => makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
     supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
-    nativeResume: { cliCwd: "/tmp/../other", sessionId } }),
+    nativeResume: { cliCwd: "/tmp/../other", sessionId,
+      expectedSha256: "e".repeat(64) } }),
   (error: unknown) => error instanceof BoxTextPlanError && error.code === "BOX_NATIVE_SESSION_INVALID");
 });
 

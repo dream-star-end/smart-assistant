@@ -26,7 +26,7 @@ export function makeBoxToolPlan(input: {
   runNonce?: string;
   leaseEpoch?: string;
   nativePersistence?: boolean;
-  nativeResume?: { cliCwd: string; sessionId: string };
+  nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
   if (choice !== undefined && (choice === null || typeof choice !== "object"
