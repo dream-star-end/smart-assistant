@@ -3,12 +3,13 @@
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
-  BoxPrelaunchRecoveryCandidate } from "./boxDurableJournal.js";
+  BoxPrelaunchRecoveryCandidate, BoxNativeGcCandidate } from "./boxDurableJournal.js";
 import { runBoxToolFirstRound, type BoxToolFirstHandoff,
   type BoxToolFirstFinal } from "./boxToolFirstRound.js";
 import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
+import { makeBoxNativeGcDelete, parseBoxNativeGcResult } from "./boxNativeGcFile.js";
 import { stripBoxCcbToolBudgetTail } from "./boxCacheAnnotations.js";
 import { makeBoxPrelaunchCleanup } from "./boxPrelaunchControl.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -40,6 +41,7 @@ export class BoxToolFetch {
   private readonly terminalInFlight = new Map<string, Promise<void>>();
   private readonly reconcileInFlight = new Set<string>();
   private readonly prelaunchInFlight = new Set<string>();
+  private readonly nativeGcInFlight = new Set<string>();
   private readonly cleanup = new Set<{ target: BoxResolvedTarget;
     pending: Promise<void>; failed: boolean }>();
   constructor(private readonly deps: {
@@ -92,7 +94,7 @@ export class BoxToolFetch {
   }
 
   private async resolveCleanupTarget(candidate: BoxRemoteCleanupCandidate |
-    BoxPrelaunchRecoveryCandidate): Promise<BoxResolvedTarget> {
+    BoxPrelaunchRecoveryCandidate | BoxNativeGcCandidate): Promise<BoxResolvedTarget> {
     const timeoutMs = this.deps.cleanupResolveTimeoutMs ?? 30_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
       throw new Error("BOX_CLEANUP_RESOLVE_BUDGET_INVALID");
@@ -100,7 +102,8 @@ export class BoxToolFetch {
     const abort = new AbortController();
     const pending = Promise.resolve().then(() => this.deps.resolveTarget({ uid: candidate.uid,
       sessionId: null, requestId: candidate.requestId,
-      upstreamModel: "claude-opus-5-5", requiredAccountId: candidate.accountId,
+      upstreamModel: "pointer" in candidate ? candidate.pointer.upstreamModel
+        : "claude-opus-5-5", requiredAccountId: candidate.accountId,
       signal: abort.signal }));
     let abandoned = false, completed: BoxResolvedTarget | null = null;
     void pending.then((target) => {
@@ -269,6 +272,41 @@ export class BoxToolFetch {
     }));
     await this.reapCleanedOwnedTargets();
     return this.terminalCleanup.size;
+  }
+
+  /** Expired native cache privacy GC. This is intentionally independent of
+   * the model launch flag, never wakes Box, and never invokes paid Claude. */
+  async reconcileNativeGc(limit = 10): Promise<number> {
+    const candidates = await this.deps.journal.listNativeGcCandidates(limit);
+    await Promise.allSettled(candidates.map(async (candidate) => {
+      if (this.nativeGcInFlight.has(candidate.requestId)) return;
+      this.nativeGcInFlight.add(candidate.requestId);
+      let target: BoxResolvedTarget | null = null;
+      try {
+        if (!await this.deps.journal.claimNativeGc(candidate)) return;
+        target = await this.resolveCleanupTarget(candidate);
+        if (target.accountId !== candidate.accountId) {
+          throw new Error("BOX_NATIVE_GC_ACCOUNT_MISMATCH");
+        }
+        const pending = target.exec.run(makeBoxNativeGcDelete(candidate.pointer), {
+          timeoutMs: 20_000, maxResponseBytes: 1024 });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let result: Awaited<typeof pending>;
+        try { result = await Promise.race([pending, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("BOX_NATIVE_GC_TIMEOUT")), 20_500);
+        })]); }
+        finally { if (timer) clearTimeout(timer); }
+        const outcome = parseBoxNativeGcResult(result.stdout);
+        if (!await this.deps.journal.finishNativeGc(candidate,
+          outcome === "blocked" ? "blocked" : "done")) {
+          throw new Error("BOX_NATIVE_GC_FENCE_LOST");
+        }
+      } finally {
+        this.nativeGcInFlight.delete(candidate.requestId);
+        if (target) this.closeUnusedTarget(target);
+      }
+    }));
+    return candidates.length;
   }
 
   private cleanKnownTerminal(runNonce: string, target: BoxResolvedTarget,

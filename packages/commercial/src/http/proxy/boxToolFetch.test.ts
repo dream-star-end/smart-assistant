@@ -148,6 +148,48 @@ test("only model first/resume paths request wake; recovery resolver remains defa
   assert.deepEqual(seen, [true, true]);
 });
 
+test("native expiry GC uses a no-wake exact-account Python delete after claim", async () => {
+  const pointer: BoxNativePointer = { version: 1, accountId: "20",
+    upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+    nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+    cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+    transcriptSha256: "f".repeat(64), contextHashBeforeFinal: "c".repeat(64),
+    assistantContentHash: "d".repeat(64), catalogHash: null,
+    expiresAtMs: Date.now() - 1000 };
+  const candidate = { requestId: "native-gc-test", uid: 3n,
+    accountId: 20n, sessionId: "test-session", pointer };
+  let disposed = false;
+  const finished: string[] = [];
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.alloc(0),
+    keeperAsset: Buffer.alloc(0), virtualMcpAsset: Buffer.alloc(0),
+    detachedRunnerAsset: Buffer.alloc(0),
+    journal: { listNativeGcCandidates: async () => [candidate],
+      claimNativeGc: async (value: unknown) => {
+        assert.equal(value, candidate); return true;
+      }, finishNativeGc: async (_value: unknown, outcome: string) => {
+        finished.push(outcome); return true;
+      } } as never,
+    maxOutputTokensForModel: () => null,
+    resolveTarget: async (args) => {
+      assert.equal(args.uid, 3n);
+      assert.equal(args.requiredAccountId, 20n);
+      assert.equal(args.allowWakeIfHibernated, undefined);
+      assert.equal(args.upstreamModel, pointer.upstreamModel);
+      return { accountId: 20n, exec: { run: async (request: {
+        command: string; args: string[] }) => {
+        assert.equal(request.command, "/usr/bin/python3");
+        assert.deepEqual(request.args.slice(-3), [pointer.cliCwd,
+          pointer.nativeSessionId, pointer.transcriptSha256]);
+        return { stdout: "deleted\n", stderrBytes: 0, exitCode: 0 as const };
+      } }, dispose: async () => { disposed = true; } };
+    }, onUnknown: async () => {},
+  });
+  assert.equal(await service.reconcileNativeGc(1), 1);
+  assert.deepEqual(finished, ["done"]);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposed, true);
+});
+
 test("failed local close retry is bounded and never starts concurrent dispose", async () => {
   let attempts = 0;
   const target = { accountId: 20n,

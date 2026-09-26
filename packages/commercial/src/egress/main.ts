@@ -299,6 +299,7 @@ export async function startEgress(): Promise<void> {
     resolveTarget: (args) => boxStopResolver.resolve(args),
     onUnknown: reportBoxUnknown,
   });
+  let boxNativeGcTicks = 0;
   const boxRecoveryTimer = setInterval(() => {
     void boxStopResolver.retryFailedAgentCleanup().catch(() =>
       log.error("box_resolver_orphan_cleanup_failed"));
@@ -310,6 +311,10 @@ export async function startEgress(): Promise<void> {
       log.error("box_tool_remote_reconcile_failed"));
     void boxRecoveryModel.reconcilePrelaunchRecovery(10).catch(() =>
       log.error("box_tool_prelaunch_recovery_failed"));
+    if (++boxNativeGcTicks % 15 === 0) {
+      void boxRecoveryModel.reconcileNativeGc(10).catch(() =>
+        log.error("box_native_gc_failed"));
+    }
   }, 60_000);
   boxRecoveryTimer.unref();
   const boxStopCoordinator = new BoxUserStopCoordinator({

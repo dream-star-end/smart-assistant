@@ -1186,6 +1186,85 @@ test("native predecessor claim and paid admission commit or roll back together",
         replayFingerprint: "5".repeat(64) },
       nativeClaim: { ownerRequestId: chainFinal, pointer,
         upstreamModel: pointer.upstreamModel } });
+    const gcSession = `gc-${suffix}`;
+    const gcCwd = `/tmp/ocv5-289-run-${"9".repeat(24)}`;
+    const gcPointer = { ...pointer, cliCwd: gcCwd,
+      expiresAtMs: Date.now() - 10_000 };
+    const gcAncestor = `gc-ancestor-${suffix}`;
+    const gcLeaf = `gc-leaf-${suffix}`;
+    const gcActive = `gc-active-${suffix}`;
+    await put(gcAncestor, { ...owner, boxSessionId: gcSession,
+      boxNativePointer: undefined, boxNativeCliCwd: gcCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxNativeClaimRequestId: gcLeaf, boxTerminalProof: undefined });
+    await put(gcLeaf, { ...owner, boxSessionId: gcSession,
+      boxNativePointer: gcPointer, boxNativeCliCwd: gcCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxInvocationMode: "detached_tool", boxRemoteCleanup: "done",
+      boxUsage: { inputTokens: 1, outputTokens: 1,
+        cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    const gcCandidate = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.requestId === gcLeaf);
+    assert.ok(gcCandidate, "expired latest pointer should enter GC queue");
+    await put(gcActive, { ...owner, boxSessionId: gcSession,
+      boxState: "unknown", boxNativePointer: undefined,
+      boxNativeCliCwd: gcCwd, boxNativeSessionId: pointer.nativeSessionId });
+    assert.equal(await journal.claimNativeGc(gcCandidate), false,
+      "unknown sibling must keep the remote transcript");
+    await client.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [gcActive]);
+    assert.equal(await journal.claimNativeGc(gcCandidate), true,
+      "terminal ancestor claim must not permanently retain a completed tool chain");
+    assert.equal(await journal.claimNativeGc(gcCandidate), false,
+      "another worker must not delete under an active GC claim");
+    assert.equal(await journal.finishNativeGc(gcCandidate, "done"), true);
+    assert.equal((await journal.listNativeGcCandidates(10))
+      .some((item) => item.requestId === gcLeaf), false);
+    const tiedCwd = `/tmp/ocv5-289-run-${"8".repeat(24)}`;
+    const tiedPointer = { ...gcPointer, cliCwd: tiedCwd };
+    const tiedA = `gc-tie-a-${suffix}`, tiedZ = `gc-tie-z-${suffix}`;
+    const tiedCtx = { ...owner, boxSessionId: `gc-tie-${suffix}`,
+      boxNativePointer: tiedPointer, boxNativeCliCwd: tiedCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxInvocationMode: "text", boxUsage: { inputTokens: 1,
+        outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    await put(tiedA, tiedCtx);
+    await put(tiedZ, tiedCtx);
+    const tieCandidate = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.pointer.cliCwd === tiedCwd);
+    assert.equal(tieCandidate?.requestId, tiedZ,
+      "equal expiry must use the same request-id ordering at list and claim");
+    assert.equal(await journal.claimNativeGc(tieCandidate!), true);
+    const guardedCwd = `/tmp/ocv5-289-run-${"7".repeat(24)}`;
+    const guardedId = `gc-guarded-${suffix}`;
+    await put(guardedId, { ...owner, boxSessionId: `gc-guarded-${suffix}`,
+      boxNativePointer: { ...gcPointer, cliCwd: guardedCwd },
+      boxNativeCliCwd: guardedCwd,
+      boxNativeSessionId: pointer.nativeSessionId,
+      boxInvocationMode: "detached_tool", boxUsage: { inputTokens: 1,
+        outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    const guarded = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.requestId === guardedId);
+    assert.ok(guarded);
+    assert.equal(await journal.claimNativeGc(guarded), false,
+      "detached terminal without remote cleanup proof must not delete history");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxRemoteCleanup":"done"}'::jsonb
+      WHERE request_id=$1`, [guardedId]);
+    assert.equal(await journal.claimNativeGc(guarded), true);
+    const warmCwd = `/tmp/ocv5-289-run-${"6".repeat(24)}`;
+    const warmOld = `gc-warm-old-${suffix}`;
+    const warmNew = `gc-warm-new-${suffix}`;
+    await put(warmOld, { ...tiedCtx, boxSessionId: `gc-warm-${suffix}`,
+      boxNativePointer: { ...gcPointer, cliCwd: warmCwd },
+      boxNativeCliCwd: warmCwd });
+    const warmCandidate = (await journal.listNativeGcCandidates(10))
+      .find((item) => item.requestId === warmOld);
+    assert.ok(warmCandidate);
+    await put(warmNew, { ...tiedCtx, boxSessionId: `gc-warm-${suffix}`,
+      boxNativePointer: { ...pointer, cliCwd: warmCwd },
+      boxNativeCliCwd: warmCwd });
+    assert.equal(await journal.claimNativeGc(warmCandidate), false,
+      "a newer unexpired pointer for the same project must block stale GC");
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
     client.release();

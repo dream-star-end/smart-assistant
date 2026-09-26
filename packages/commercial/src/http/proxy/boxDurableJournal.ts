@@ -99,6 +99,13 @@ export interface BoxRemoteCleanupCandidate {
   /** Exact optional pointer observed when this cleanup candidate was read. */
   readonly nativePointer?: BoxNativePointer;
 }
+export interface BoxNativeGcCandidate {
+  readonly requestId: string;
+  readonly uid: bigint;
+  readonly sessionId: string;
+  readonly accountId: bigint;
+  readonly pointer: BoxNativePointer;
+}
 export interface BoxPrelaunchRecoveryCandidate {
   readonly requestId: string;
   readonly uid: bigint;
@@ -252,6 +259,147 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (!proof || typeof proof !== "object" || Array.isArray(proof)
       || (proof as { reason?: unknown }).reason !== "worker_complete") return null;
     return { ownerRequestId: row.request_id, pointer };
+  }
+
+  /** At most one latest expired pointer per native project. A successful
+   * cleanup claim is still required before any remote file operation. */
+  async listNativeGcCandidates(limit = 10): Promise<BoxNativeGcCandidate[]> {
+    const found = await this.pool.query<{ request_id: string; user_id: string;
+      ctx: Record<string, unknown> }>(
+      `WITH pointers AS (
+         SELECT request_id,user_id,ctx,
+           row_number() OVER (PARTITION BY user_id,ctx->>'boxAccountId',
+             ctx->'boxNativePointer'->>'cliCwd',
+             ctx->'boxNativePointer'->>'nativeSessionId'
+             ORDER BY (ctx->'boxNativePointer'->>'expiresAtMs')::bigint DESC,
+               request_id DESC) AS rn
+           FROM request_finalize_journal
+          WHERE ctx ? 'boxNativePointer'
+            AND jsonb_typeof(ctx->'boxNativePointer'->'expiresAtMs')='number'
+            AND (ctx->'boxNativePointer'->>'expiresAtMs') ~ '^[0-9]{13}$'
+       ) SELECT request_id,user_id::text,ctx FROM pointers
+         WHERE rn=1
+           AND (ctx->'boxNativePointer'->>'expiresAtMs')::bigint
+             <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint
+           AND NOT (ctx ? 'boxNativeGcQuarantine')
+           AND COALESCE(ctx->>'boxNativeGcStatus','pending')<>'done'
+           AND (ctx->>'boxNativeGcStatus' IS DISTINCT FROM 'claimed'
+             OR (jsonb_typeof(ctx->'boxNativeGcRetryAfterMs')='number'
+               AND (ctx->>'boxNativeGcRetryAfterMs') ~ '^[0-9]{13}$'
+               AND (ctx->>'boxNativeGcRetryAfterMs')::bigint
+                 <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
+         ORDER BY (ctx->'boxNativePointer'->>'expiresAtMs')::bigint ASC
+         LIMIT $1`,
+      [Math.max(1, Math.min(10, Number.isSafeInteger(limit) ? limit : 10))]);
+    const out: BoxNativeGcCandidate[] = [];
+    for (const row of found.rows) {
+      const ctx = row.ctx;
+      const pointer = parseBoxNativePointer(ctx?.boxNativePointer, Date.now(), true);
+      if (!pointer || pointer.expiresAtMs > Date.now()
+        || typeof ctx.boxSessionId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,256}$/.test(ctx.boxSessionId)
+        || ctx.boxAccountId !== pointer.accountId
+        || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)) continue;
+      out.push({ requestId: row.request_id, uid: BigInt(row.user_id),
+        sessionId: ctx.boxSessionId, accountId: BigInt(pointer.accountId), pointer });
+    }
+    return out;
+  }
+
+  /** Same account/session locks as admit. All rows sharing the project are
+   * re-read under row locks before a durable claim authorizes remote deletion. */
+  async claimNativeGc(input: BoxNativeGcCandidate): Promise<boolean> {
+    if (input.uid <= 0n || input.accountId <= 0n
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
+      || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !parseBoxNativePointer(input.pointer, Date.now(), true)
+      || input.pointer.accountId !== input.accountId.toString()) return false;
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      await lock(client, [`box:account:${input.accountId}`,
+        `box:session:${input.uid}:${input.sessionId}`]);
+      const found = await client.query<{ request_id: string;
+        ctx: Record<string, unknown> }>(
+        `SELECT request_id,ctx FROM request_finalize_journal
+          WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
+            AND ctx->>'boxNativeCliCwd'=$3
+          ORDER BY request_id FOR UPDATE`,
+        [input.uid.toString(), input.accountId.toString(), input.pointer.cliCwd]);
+      const rows = found.rows;
+      const owner = rows.find((row) => row.request_id === input.requestId);
+      if (!owner || owner.ctx.boxSessionId !== input.sessionId
+        || !isDeepStrictEqual(owner.ctx.boxNativePointer, input.pointer)
+        || input.pointer.expiresAtMs > Date.now()
+        || owner.ctx.boxNativeGcQuarantine !== undefined
+        || owner.ctx.boxNativeGcStatus === "done") return false;
+      const retry = owner.ctx.boxNativeGcRetryAfterMs;
+      if (owner.ctx.boxNativeGcStatus === "claimed"
+        && (typeof retry !== "number" || !Number.isSafeInteger(retry)
+          || retry > Date.now())) return false;
+      const group = rows.filter((row) =>
+        row.ctx.boxNativeSessionId === input.pointer.nativeSessionId);
+      if (group.length === 0 || group.length !== rows.length) return false;
+      const pointers = group.flatMap((row) => {
+        const parsed = row.ctx.boxNativePointer === undefined ? null
+          : parseBoxNativePointer(row.ctx.boxNativePointer, Date.now(), true);
+        return parsed ? [{ row, pointer: parsed }] : [];
+      });
+      if (pointers.length === 0 || pointers.some(({ pointer }) =>
+        pointer.cliCwd !== input.pointer.cliCwd
+        || pointer.accountId !== input.pointer.accountId)) return false;
+      const latest = pointers.sort((a, b) => b.pointer.expiresAtMs - a.pointer.expiresAtMs
+        || b.row.request_id.localeCompare(a.row.request_id))[0];
+      if (latest?.row.request_id !== input.requestId) return false;
+      const byId = new Map(group.map((row) => [row.request_id, row]));
+      if (group.some((row) => ACTIVE.includes(String(row.ctx.boxState))
+        || row.ctx.boxSessionId !== input.sessionId
+        || row.ctx.boxNativePointer !== undefined
+          && !parseBoxNativePointer(row.ctx.boxNativePointer, Date.now(), true)
+        || typeof row.ctx.boxNativeClaimRequestId === "string"
+          && !byId.has(row.ctx.boxNativeClaimRequestId))) return false;
+      const proven = group.some((row) => row.ctx.boxState === "terminal"
+        && row.ctx.boxTerminalProof && typeof row.ctx.boxTerminalProof === "object"
+        && (row.ctx.boxTerminalProof as { reason?: unknown }).reason === "worker_complete"
+        && row.ctx.boxUsage !== undefined
+        && (row.ctx.boxInvocationMode === "detached_tool"
+          ? row.ctx.boxRemoteCleanup === "done" : row.ctx.boxInvocationMode === "text"));
+      if (!proven) return false;
+      const changed = await client.query(
+        `UPDATE request_finalize_journal
+            SET ctx=ctx || $4::jsonb,updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND ctx->'boxNativePointer'=$3::jsonb
+            AND COALESCE(ctx->>'boxNativeGcStatus','pending')<>'done'
+            AND NOT (ctx ? 'boxNativeGcQuarantine')`,
+        [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
+          JSON.stringify({ boxNativeGcStatus: "claimed",
+            boxNativeGcRetryAfterMs: Date.now() + 120_000 })]);
+      if (changed.rowCount !== 1) return false;
+      await client.query("COMMIT");
+      committed = true;
+      return true;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
+  async finishNativeGc(input: BoxNativeGcCandidate,
+    outcome: "done" | "blocked"): Promise<boolean> {
+    const update = outcome === "done"
+      ? { boxNativeGcStatus: "done" }
+      : { boxNativeGcQuarantine: "remote_project_not_exclusive" };
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || $4::jsonb,updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2
+          AND ctx->'boxNativePointer'=$3::jsonb
+          AND ctx->>'boxNativeGcStatus'='claimed'
+          AND NOT (ctx ? 'boxNativeGcQuarantine')`,
+      [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
+        JSON.stringify(update)]);
+    return changed.rowCount === 1;
   }
 
   async admit(input: BoxJournalAdmission): Promise<void> {
