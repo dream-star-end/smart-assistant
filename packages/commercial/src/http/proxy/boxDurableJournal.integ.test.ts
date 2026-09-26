@@ -1035,9 +1035,17 @@ test("native predecessor claim and paid admission commit or roll back together",
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL,
       ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
-    const sameConnection = { connect: async () => ({ query: (sql: string, params?: unknown[]) =>
-      client.query(sql, params), release: () => {} }),
-      query: (sql: string, params?: unknown[]) => client.query(sql, params) } as never;
+    let delayNextLockMs = 0;
+    const query = async (sql: string, params?: unknown[]) => {
+      if (delayNextLockMs && sql.includes("pg_advisory_xact_lock")) {
+        const wait = delayNextLockMs;
+        delayNextLockMs = 0;
+        await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      }
+      return client.query(sql, params);
+    };
+    const sameConnection = { connect: async () => ({ query, release: () => {} }),
+      query } as never;
     const journal = new BoxDurableJournal(sameConnection);
     const suffix = randomBytes(6).toString("hex");
     const sessionId = `native-${suffix}`;
@@ -1090,6 +1098,22 @@ test("native predecessor claim and paid admission commit or roll back together",
       `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [ownerRequestId]);
     assert.equal(staleOwner.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
     await client.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [interveningId]);
+    const expiringPointer = { ...pointer, expiresAtMs: Date.now() + 300 };
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || jsonb_build_object('boxNativePointer',$2::jsonb)
+      WHERE request_id=$1`, [ownerRequestId, JSON.stringify(expiringPointer)]);
+    delayNextLockMs = 450;
+    await assert.rejects(() => journal.admit({ ...admission,
+      nativeClaim: { ...admission.nativeClaim, pointer: expiringPointer } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_NATIVE_CLAIM_LOST",
+    "expiry while waiting for the account lock must roll back the native claim");
+    const expiredOwner = await client.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1`, [ownerRequestId]);
+    assert.equal(expiredOwner.rows[0]?.ctx.boxNativeClaimRequestId, undefined);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || jsonb_build_object('boxNativePointer',$2::jsonb)
+      WHERE request_id=$1`, [ownerRequestId, JSON.stringify(pointer)]);
     await journal.admit(admission);
     const rows = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal

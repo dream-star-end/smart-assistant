@@ -284,6 +284,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         [ACTIVE, input.accountId.toString(), input.uid.toString(), input.fingerprint.sessionId]);
       if (occupied.rowCount) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       if (native) {
+        // The remote preflight happens before these locks. A pointer can expire
+        // while waiting for another account/session transaction; never commit
+        // a claim that the expiry reaper is now allowed to delete.
+        if (!parseBoxNativePointer(native.pointer, Date.now())) {
+          throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
+        }
         // The candidate was read before the account/turn locks. A completed
         // intervening turn can make it stale without leaving ACTIVE capacity.
         const latest = await client.query<{ request_id: string }>(
