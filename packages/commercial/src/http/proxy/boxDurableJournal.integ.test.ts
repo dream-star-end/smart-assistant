@@ -101,6 +101,47 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const usage = { inputTokens: 51, outputTokens: 7,
       cacheReadTokens: 9, cacheWriteTokens: 3 };
     await journal.complete({ ...input, proof, usage });
+    const nativePointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${input.runNonce}`,
+      transcriptSha256: "a".repeat(64), contextHashBeforeFinal: "b".repeat(64),
+      assistantContentHash: "c".repeat(64), catalogHash: null,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(nativePointer);
+    const beforeNative = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [input.requestId]);
+    assert.equal(await journal.attachNativePointer({ requestId: input.requestId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), true);
+    const afterNative = await client.query<{ updated_at: Date }>(
+      "SELECT updated_at FROM request_finalize_journal WHERE request_id=$1",
+      [input.requestId]);
+    assert.equal(afterNative.rows[0]?.updated_at.getTime(),
+      beforeNative.rows[0]?.updated_at.getTime(),
+    "publishing an old pointer must not make its turn newest");
+    assert.equal(await journal.attachNativePointer({ requestId: input.requestId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
+    "a native cache pointer is published once");
+    assert.equal(await journal.attachNativePointer({ requestId: input.requestId,
+      uid: 3n, accountId: 21n, proof, pointer: nativePointer }), false);
+    const rejectedId = `box-native-rejected-${suffix}`;
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [rejectedId, JSON.stringify({
+      model: input.model, boxInvocationRecovery: "v1", boxState: "terminal",
+      boxInvocationMode: "detached_tool", boxAccountId: "20",
+      boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
+      boxTerminalProof: proof, boxUsage: usage })]);
+    assert.equal(await journal.attachNativePointer({ requestId: rejectedId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
+    "detached cleanup still deletes native projects, so cache attachment is off");
+    await client.query(`UPDATE request_finalize_journal SET ctx=ctx || $2::jsonb
+      WHERE request_id=$1`, [rejectedId, JSON.stringify({ boxInvocationMode: "text",
+        boxNativeCliCwd: `/tmp/ocv5-289-run-${"f".repeat(24)}`,
+        boxNativeSessionId: nativePointer.nativeSessionId })]);
+    assert.equal(await journal.attachNativePointer({ requestId: rejectedId,
+      uid: 3n, accountId: 20n, proof, pointer: nativePointer }), false,
+    "a claimed native cwd cannot be replaced with the current run cwd");
     await assert.rejects(() => journal.complete({ ...input, proof,
       usage: { "cacheReadTokens,cacheWriteTokens,inputTokens,outputTokens": 1 } as never }),
     (error: unknown) => error instanceof BoxDurableJournalError

@@ -693,6 +693,41 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_COMPLETE_FENCE_LOST");
   }
 
+  /** Optional text cache publication AFTER exact terminal proof and billable
+   * usage are durable. Detached runs remain ineligible until their shared
+   * cleanup worker can preserve the native transcript. */
+  async attachNativePointer(input: { requestId: string; uid: bigint;
+    accountId: bigint; proof: BoxTerminalProof; pointer: BoxNativePointer }): Promise<boolean> {
+    const pointer = parseBoxNativePointer(input.pointer);
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !pointer
+      || pointer.accountId !== input.accountId.toString()
+      || input.proof.reason !== "worker_complete") return false;
+    const ownerCwd = `/tmp/ocv5-289-run-${input.proof.runNonce}`;
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || $5::jsonb
+        WHERE request_id=$1 AND user_id=$2
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxState'='terminal'
+          AND ctx->>'boxInvocationMode'='text'
+          AND ctx->'boxTerminalProof'=$4::jsonb
+          AND ctx ? 'boxUsage' AND NOT (ctx ? 'boxNativePointer')
+          AND ((ctx ? 'boxNativeCliCwd' AND ctx->>'boxNativeCliCwd'=$6)
+            OR (NOT (ctx ? 'boxNativeCliCwd')
+              AND $6=$11 AND ctx->>'boxRunNonce'=$7))
+          AND (ctx->>'boxNativeSessionId' IS NULL
+            OR ctx->>'boxNativeSessionId'=$8)
+          AND (ctx->>'boxContextHash' IS NULL
+            OR ctx->>'boxContextHash'=$9)
+          AND (ctx->>'boxCatalogHash' IS NULL
+            OR ctx->>'boxCatalogHash'=$10)`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        JSON.stringify(input.proof), JSON.stringify({ boxNativePointer: pointer }),
+        pointer.cliCwd, input.proof.runNonce, pointer.nativeSessionId,
+        pointer.contextHashBeforeFinal, pointer.catalogHash, ownerCwd]);
+    return changed.rowCount === 1;
+  }
+
   /** The full model set and exact round usage must commit before the first
    * tool-use terminal SSE. A pending subset proves the CLI began dispatch;
    * later sidecar calls may appear only after earlier tool results. */
