@@ -4838,7 +4838,7 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box Opus 5.5 在真实 Claude Code 第二次 Bash 工具结果续接时，将 PreToolUse hook additionalContext 合并产生的兄弟文本误判为新合成回合，HTTP 400 中断已付费工具链。",
       "rootFixCommit": "aeefb65b",
-      "coverageCommits": ["aeefb65b"],
+      "coverageCommits": ["aeefb65b", "74e263ed"],
       "regressions": [
         {
           "layer": "unit",
@@ -4849,6 +4849,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
           "assertion": "two CCB hook-context tool rounds preserve bytes and the next context hash"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "CCB budget is a no-op beside or inside tool results"
         },
         {
           "layer": "integration",
