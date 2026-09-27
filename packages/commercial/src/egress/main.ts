@@ -286,6 +286,7 @@ export async function startEgress(): Promise<void> {
   const boxTextModel = boxResolver && boxJournal ? new BoxTextFetch({
     supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
     keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
+    detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
     registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
       leaseMs: 900_000 }),
     journal: boxJournal,

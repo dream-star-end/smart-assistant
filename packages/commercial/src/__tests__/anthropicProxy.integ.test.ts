@@ -42,6 +42,9 @@
 import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash, createCipheriv, randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import {
@@ -64,6 +67,10 @@ import { ModelCatalogSnapshot, type ModelCatalogEntry,
   type ModelCatalogPricing } from "../billing/modelCatalog.js";
 import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "../http/proxy/modelAuthorityGate.js";
 import { deriveBoxCallFingerprint } from "../http/proxy/boxCallFingerprint.js";
+import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
+import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
+import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
+import { writeBoxReplayMessage } from "../http/proxy/boxReplayMessageFile.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import {
@@ -1165,6 +1172,105 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
         outcome: string }>("SELECT request_id,model,outcome FROM turn_upstream_performance");
       assert.deepEqual(performance.rows, [{ request_id: usage.rows[0]!.request_id,
         model: BOX_API_MODEL, outcome: "success" }]);
+
+      // Same authenticated handler and TEMP ledger, but now exercise the
+      // actual detached BoxTextFetch/journal path with a nonpaid fake Box Exec.
+      const capsuleDir = await mkdtemp(join(tmpdir(), "ocv5-box-signed-capsule-"));
+      const oldInstance = process.env.OC_INSTANCE_ID;
+      process.env.OC_INSTANCE_ID = "v5-selfhost-sg";
+      try {
+        const cliModel = "claude-opus-5-5";
+        const event = (value: unknown) => ({ type: "stream_event", event: value });
+        const cliLines = [
+          { type: "system", subtype: "init", tools: [], mcp_servers: [] },
+          event({ type: "message_start", message: { id: "msg_box_detached_pg",
+            model: cliModel, role: "assistant", content: [],
+            usage: { input_tokens: 1000, output_tokens: 0 } } }),
+          event({ type: "content_block_start", index: 0,
+            content_block: { type: "text", text: "" } }),
+          event({ type: "content_block_delta", index: 0,
+            delta: { type: "text_delta", text: "detached PG answer" } }),
+          { type: "assistant", message: { id: "msg_box_detached_pg", model: cliModel,
+            role: "assistant", content: [{ type: "text", text: "detached PG answer" }] } },
+          event({ type: "content_block_stop", index: 0 }),
+          event({ type: "message_delta", delta: { stop_reason: "end_turn" },
+            usage: { input_tokens: 1000, output_tokens: 5000 } }),
+          event({ type: "message_stop" }),
+          { type: "result", subtype: "success", is_error: false,
+            usage: { input_tokens: 1000, output_tokens: 5000 } },
+        ];
+        const spool = Buffer.from(cliLines.map((line) => JSON.stringify(line) + "\n").join(""));
+        let launches = 0, nonce = "", epoch = "", cleans = 0, assetStages = 0;
+        const ok = (stdout = "") => ({ stdout, stderrBytes: 0,
+          exitCode: 0 as const });
+        const exec = { run: async (command: { args: string[] }) => {
+          const argv = command.args;
+          if (argv[5] === "--read") {
+            const offset = Number(argv[7]);
+            const chunk = spool.subarray(offset);
+            return ok(JSON.stringify({ data: chunk.toString("base64"),
+              offset: offset + chunk.length }));
+          }
+          if (argv[2]?.includes("terminal.json")) return ok(JSON.stringify({
+            runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
+            reason: "worker_complete", revision: 1 }) + "\n");
+          if (argv[2]?.includes("print('clean')")) { cleans++; return ok("clean\n"); }
+          if (argv[2]?.includes("sys.argv=[p,*argv]")
+            && argv[5]?.startsWith("/tmp/ocv5-289-run-")) {
+            launches++;
+            nonce = String(argv[argv.indexOf("--proof-dir") + 1]).slice(-24);
+            epoch = String(argv[argv.indexOf("--lease-epoch") + 1]);
+            return ok("launched\n");
+          }
+          if (argv[3]?.startsWith("/tmp/ocv5-289-v2-")) {
+            assetStages++;
+            return ok(Array.from({ length: (argv.length - 3) / 4 },
+              (_, index) => argv[5 + index * 4]).join(","));
+          }
+          if (argv[2]?.includes("print('staged:'+str(len(steps)))")) {
+            const steps = JSON.parse(Buffer.from(argv[3]!, "base64").toString()) as unknown[];
+            return ok(`staged:${steps.length}\n`);
+          }
+          return ok(); // owner-scoped private stage; no model process here
+        } };
+        const journal = new BoxDurableJournal(sameConnection as never);
+        const bridge = new BoxTextFetch({ supervisorAsset: Buffer.from("print('supervisor')\n"),
+          keeperAsset: Buffer.from("print('keeper')\n"),
+          detachedRunnerAsset: Buffer.from("print('runner')\n"),
+          registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
+            leaseMs: 900_000 }), journal,
+          writeMessage: (id, message) => writeBoxReplayMessage(capsuleDir, id, message),
+          maxOutputTokensForModel: (model) => model === BOX_API_MODEL ? 128_000 : null,
+          resolveTarget: async () => ({ accountId: 20n, exec: exec as never }),
+          onUnknown: async () => { throw new Error("DETACHED_OUTCOME_UNKNOWN"); },
+        });
+        h.deps.boxModel = { fetch: (args) => bridge.fetch(args) };
+        const detachedRequest = { ...minBody(BOX_API_MODEL), max_tokens: 8192,
+          metadata: { user_id: JSON.stringify({
+            session_id: `web-box-detached-${randomUUID()}`,
+            oc_turn_key: randomBytes(32).toString("hex") }) } };
+        const detachedResponse = await h.run(detachedRequest, headers);
+        assert.equal(detachedResponse.statusCode, 200, detachedResponse.bodyText());
+        assert.match(detachedResponse.bodyText(), /detached PG answer/);
+        assert.equal(launches, 1);
+        assert.equal(assetStages, 1, "selfhost fast path stages all three assets once");
+        assert.equal(cleans, 1);
+        const rows = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
+          `SELECT request_id,ctx FROM request_finalize_journal
+            WHERE ctx->>'boxInvocationMode'='text' AND ctx->>'boxLaunchPermit'='true'`);
+        assert.equal(rows.rows.length, 1);
+        assert.equal(rows.rows[0]?.ctx.boxState, "terminal");
+        assert.equal(rows.rows[0]?.ctx.boxRemoteCleanup, "done");
+        assert.ok(rows.rows[0]?.ctx.boxReplayMessage);
+        const usages = await client.query("SELECT 1 FROM usage_records");
+        const ledgers = await client.query("SELECT 1 FROM credit_ledger");
+        assert.equal(usages.rowCount, 2, "one debit per authenticated HTTP turn");
+        assert.equal(ledgers.rowCount, 2);
+      } finally {
+        if (oldInstance === undefined) delete process.env.OC_INSTANCE_ID;
+        else process.env.OC_INSTANCE_ID = oldInstance;
+        await rm(capsuleDir, { recursive: true, force: true });
+      }
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
