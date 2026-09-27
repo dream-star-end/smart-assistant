@@ -56,11 +56,65 @@ test("fragmented live JSONL emits text before CLI terminal and withholds message
   let later = "";
   for (const record of source.slice(4)) later += decoder.push(JSON.stringify(record) + "\n");
   assert.ok(!later.includes("event: message_stop"), "terminal is held until final integrity proof");
+  assert.throws(() => decoder.completedMessage(), /BOX_CLI_MESSAGE_NOT_COMPLETE/);
   const final = decoder.finish();
   assert.equal(final.tailSse.includes("event: message_stop"), true);
   assert.equal(early + later + final.tailSse, completedBoxCliToSse(jsonl(source), model).sse);
   assert.equal(final.inputTokens, 2);
   assert.equal(final.outputTokens, 7);
+  const message = decoder.completedMessage();
+  assert.equal(message.id, "msg_1");
+  assert.deepEqual(message.content, [{ type: "text", text: "fixture" }]);
+  assert.equal((message.usage as { input_tokens: number }).input_tokens, 2);
+  assert.equal((message.usage as { output_tokens: number }).output_tokens, 7);
+  (message.content as Array<{ text: string }>)[0]!.text = "changed";
+  assert.equal((decoder.completedMessage().content as Array<{ text: string }>)[0]!.text,
+    "fixture", "capsule reader cannot mutate decoder state");
+});
+
+test("completed text Message keeps thinking signature and redacted blocks", () => {
+  const content = [{ type: "redacted_thinking", data: "redacted-synthetic" },
+    { type: "thinking", thinking: "thought", signature: "signed" },
+    { type: "text", text: "fixture" }];
+  const source = [records()[0], records()[1],
+    event({ type: "content_block_start", index: 0, content_block: content[0] }),
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "content_block_start", index: 1,
+      content_block: { type: "thinking", thinking: "" } }),
+    event({ type: "content_block_delta", index: 1,
+      delta: { type: "thinking_delta", thinking: "thought" } }),
+    event({ type: "content_block_delta", index: 1,
+      delta: { type: "signature_delta", signature: "signed" } }),
+    event({ type: "content_block_stop", index: 1 }),
+    event({ type: "content_block_start", index: 2,
+      content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index: 2,
+      delta: { type: "text_delta", text: "fixture" } }),
+    event({ type: "content_block_stop", index: 2 }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 7 } }),
+    event({ type: "message_stop" }),
+    { type: "assistant", message: { id: "msg_1", model,
+      role: "assistant", content } },
+    { type: "result", subtype: "success", is_error: false,
+      usage: { input_tokens: 2, output_tokens: 7 } }];
+  const decoder = createBoxCliSseDecoder(model);
+  decoder.push(jsonl(source)); decoder.finish();
+  assert.deepEqual(decoder.completedMessage().content, content);
+});
+
+test("later terminal delta clears stop_sequence in the retained Message", () => {
+  const source = records();
+  source[5] = event({ type: "message_delta",
+    delta: { stop_reason: "end_turn", stop_sequence: "SEQ" },
+    usage: { output_tokens: 4 } });
+  source.splice(6, 0, event({ type: "message_delta",
+    delta: { stop_reason: "end_turn", stop_sequence: null },
+    usage: { output_tokens: 7 } }));
+  const decoder = createBoxCliSseDecoder(model);
+  decoder.push(jsonl(source)); decoder.finish();
+  assert.equal(decoder.completedMessage().stop_sequence, null);
+  assert.equal((decoder.completedMessage().usage as { output_tokens: number }).output_tokens, 7);
 });
 
 test("live decoder never emits terminal success if final snapshot contradicts earlier text", () => {
@@ -74,6 +128,7 @@ test("live decoder never emits terminal success if final snapshot contradicts ea
   assert.ok(!streamed.includes("event: message_stop"));
   assert.throws(() => decoder.finish(),
     (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_TEXT_MISMATCH");
+  assert.throws(() => decoder.completedMessage(), /BOX_CLI_MESSAGE_NOT_COMPLETE/);
 });
 
 test("live UsageObserver stays partial until terminal result and text proof pass", () => {

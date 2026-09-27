@@ -49,6 +49,7 @@ export interface BoxCliSseResult {
 export function createBoxCliSseDecoder(expectedModel: string): {
   push: (chunk: string) => string;
   finish: () => BoxCliSseResult & { tailSse: string };
+  completedMessage: () => ObjectValue;
 } {
   if (!expectedModel) {
     throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
@@ -60,7 +61,11 @@ export function createBoxCliSseDecoder(expectedModel: string): {
   let currentMessageId: string | null = null;
   const assistantTexts: string[] = [];
   let stopReason: string | null = null;
-  let activeBlock: { originalIndex: number; visibleIndex: number; type: string; text: string } | null = null;
+  let activeBlock: { originalIndex: number; visibleIndex: number; type: string;
+    text: string; block: ObjectValue } | null = null;
+  let startMessage: ObjectValue | null = null, deltaUsage: ObjectValue = {};
+  let stopSequence: string | null = null, completed = false;
+  const visibleBlocks: ObjectValue[] = [];
   const visibleTextParts: string[] = [];
   const frames: string[] = [];
   let pending = "", bytes = 0, finished = false, failed = false;
@@ -86,6 +91,7 @@ export function createBoxCliSseDecoder(expectedModel: string): {
           throw new BoxCliSseError("BOX_CLI_MESSAGE_ID_INVALID");
         }
         currentMessageId = message.id;
+        startMessage = structuredClone(message);
         if (!Array.isArray(message.content) || message.content.length !== 0) {
           throw new BoxCliSseError("BOX_CLI_TOOL_REQUIRES_LIVE_INVOCATION");
         }
@@ -109,7 +115,8 @@ export function createBoxCliSseDecoder(expectedModel: string): {
           throw new BoxCliSseError("BOX_CLI_BLOCK_UNSUPPORTED");
         }
         activeBlock = { originalIndex: index as number, visibleIndex: nextVisibleIndex++,
-          type: block.type as string, text: block.type === "text" ? block.text as string : "" };
+          type: block.type as string, text: block.type === "text" ? block.text as string : "",
+          block: structuredClone(block) };
         lastOriginalIndex = index as number;
         forwardedEvent = { ...event, index: activeBlock.visibleIndex };
       } else if (eventType === "content_block_delta" || eventType === "content_block_stop") {
@@ -120,6 +127,7 @@ export function createBoxCliSseDecoder(expectedModel: string): {
         forwardedEvent = { ...event, index: activeBlock.visibleIndex };
         if (eventType === "content_block_stop") {
           if (activeBlock.type === "text") visibleTextParts.push(activeBlock.text);
+          visibleBlocks.push(activeBlock.block);
           activeBlock = null;
         } else {
           const delta = object(event.delta);
@@ -130,7 +138,15 @@ export function createBoxCliSseDecoder(expectedModel: string): {
               && typeof delta.signature === "string"))) {
             throw new BoxCliSseError("BOX_CLI_DELTA_INVALID");
           }
-          if (activeBlock.type === "text") activeBlock.text += delta.text as string;
+          if (activeBlock.type === "text") {
+            activeBlock.text += delta.text as string;
+            activeBlock.block.text = activeBlock.text;
+          } else if (delta.type === "thinking_delta") {
+            activeBlock.block.thinking = String(activeBlock.block.thinking ?? "")
+              + delta.thinking;
+          } else if (delta.type === "signature_delta") {
+            activeBlock.block.signature = delta.signature;
+          }
         }
       } else if (eventType === "message_delta") {
         if (!started || stopped || activeBlock !== null) throw new BoxCliSseError("BOX_CLI_EVENT_ORDER_INVALID");
@@ -146,7 +162,15 @@ export function createBoxCliSseDecoder(expectedModel: string): {
           }
           stopReason = reason;
         }
+        const sequence = object(event.delta).stop_sequence;
+        if (sequence !== undefined && sequence !== null && typeof sequence !== "string") {
+          throw new BoxCliSseError("BOX_CLI_STOP_REASON_UNSUPPORTED");
+        }
+        if (Object.hasOwn(object(event.delta), "stop_sequence")) {
+          stopSequence = typeof sequence === "string" ? sequence : null;
+        }
         const observed = usage(event.usage);
+        deltaUsage = { ...deltaUsage, ...observed };
         if ((observed.input_tokens !== undefined && count(observed.input_tokens) !== inputTokens)
           || (observed.cache_read_input_tokens !== undefined
             && count(observed.cache_read_input_tokens) !== cacheRead)
@@ -270,10 +294,24 @@ export function createBoxCliSseDecoder(expectedModel: string): {
     }
     frames.push(...heldTerminalFrames);
     tailSse += heldTerminalFrames.join("");
+    completed = true;
     return { sse: frames.join(""), inputTokens, outputTokens,
       cacheReadTokens: cacheRead, cacheWriteTokens: cacheCreation, tailSse };
   };
-  return { push, finish };
+  const completedMessage = (): ObjectValue => {
+    if (!completed || !startMessage || !currentMessageId
+      || inputTokens === null || outputTokens === null || !stopReason) {
+      throw new BoxCliSseError("BOX_CLI_MESSAGE_NOT_COMPLETE");
+    }
+    const startUsage = usage(startMessage.usage);
+    return structuredClone({ ...startMessage, type: "message", role: "assistant",
+      id: currentMessageId, model: expectedModel, content: visibleBlocks,
+      stop_reason: stopReason, stop_sequence: stopSequence,
+      usage: { ...startUsage, ...deltaUsage, input_tokens: inputTokens,
+        output_tokens: outputTokens, cache_read_input_tokens: cacheRead,
+        cache_creation_input_tokens: cacheCreation } });
+  };
+  return { push, finish, completedMessage };
 }
 
 export function completedBoxCliToSse(stdout: string, expectedModel: string): BoxCliSseResult {
