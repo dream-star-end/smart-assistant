@@ -617,6 +617,19 @@ export function shouldEmitContextRebuilt(opts: {
  */
 export const IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
+/** One admitted Box detached tool chain may live four hours. Give its owner
+ * turn five minutes to observe the keeper's terminal proof before interrupt. */
+export const BOX_ACTIVE_TURN_IDLE_MS = 4 * 60 * 60_000 + 5 * 60_000
+const BOX_CANONICAL_MODEL = 'box-api-claude-opus-5-5'
+
+function isBoxActiveTurn(engineId?: string, modelId?: string): boolean {
+  return engineId === 'ccb' && modelId === BOX_CANONICAL_MODEL
+}
+
+export function pickTurnSilentBackstopMs(engineId?: string, modelId?: string): number {
+  return isBoxActiveTurn(engineId, modelId)
+    ? BOX_ACTIVE_TURN_IDLE_MS : 30 * 60_000
+}
 
 /**
  * 给定 turn 当前的 backend-side 状态 + parser 未完成工具数,返回该 turn 此刻
@@ -636,7 +649,9 @@ export function pickIdleTimeoutMs(
   /** M1a:providerTag 泛化为 engine id('ccb' | 'codex')。codex 判定从旧
    *  'codex-native'(provider 语义)改为 'codex'(engine 语义),真值表不变。 */
   engineId?: string,
+  modelId?: string,
 ): number {
+  if (isBoxActiveTurn(engineId, modelId)) return BOX_ACTIVE_TURN_IDLE_MS
   const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||
     (typeof currentTurnStatus === 'object' && currentTurnStatus !== null)
@@ -5532,6 +5547,7 @@ export class SessionManager {
             session.currentTurnStatus,
             session.runner.pendingToolCalls,
             session.providerTag,
+            session.model,
           )
           if (
             shouldTripIdleWatchdog({
@@ -6327,7 +6343,8 @@ export class SessionManager {
       // active tasks keep running while genuinely stuck turns still get interrupted.
       // Waiting for the user is not silence: re-arm instead of IDLE_TIMEOUT/waiver.
       // The 12h logical-turn hard limit in submit() is unchanged.
-      const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
+      const IDLE_TIMEOUT_MS = pickTurnSilentBackstopMs(
+        session.providerTag, session.model)
       const timer = setTimeout(() => {
         const fire = applyTurnIdleTimeoutTick({
           waitingForUserInput: runner.waitingForUserInput === true,
@@ -6335,7 +6352,9 @@ export class SessionManager {
           refresh: () => timer.refresh(),
         })
         if (!fire) return
-        const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
+        const duration = IDLE_TIMEOUT_MS === BOX_ACTIVE_TURN_IDLE_MS
+          ? '4 小时 5 分钟' : '30 分钟'
+        const reason = `任务 ${duration}没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。`
         const persistence =
           requestTerminalPersistence?.('interrupted', reason, 'IDLE_TIMEOUT', 'idle_timeout') ??
           Promise.resolve()
