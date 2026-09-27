@@ -119,6 +119,7 @@ export interface BoxReplayIdentity {
   readonly roundNo: number;
   readonly spoolOffset: number;
   readonly rootLaunchPermit: boolean;
+  readonly messagePointer?: BoxReplayMessagePointer;
 }
 export interface BoxRemoteCleanupCandidate {
   readonly requestId: string;
@@ -484,6 +485,10 @@ export class BoxDurableJournal implements BoxJournalPort {
       const mode = original.boxInvocationMode;
       const roundNo = original.boxRoundNo ?? 1;
       const spoolOffset = original.boxResumeSpoolOffset ?? 0;
+      const messagePointer = original.boxReplayMessage === undefined ? undefined
+        : matchingReplayPointer(original.boxReplayMessage, { uid: input.uid,
+          requestId: matched.request_id, runNonce: String(runNonce),
+          leaseEpoch: String(leaseEpoch), roundNo: Number(roundNo) });
       if (original.boxInvocationRecovery !== "v1"
         || typeof accountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(accountId)
         || typeof runNonce !== "string" || !/^[a-f0-9]{24}$/.test(runNonce)
@@ -492,6 +497,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         || !Number.isSafeInteger(roundNo) || Number(roundNo) < 1 || Number(roundNo) > 32
         || !Number.isSafeInteger(spoolOffset) || Number(spoolOffset) < 0
         || Number(spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
+        || (original.boxReplayMessage !== undefined && !messagePointer)
         || ![...ACTIVE, "terminal", "failed_stopped", "prestart_stopped"]
           .includes(String(original.boxState))) {
         throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -517,7 +523,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             uid: input.uid, accountId: BigInt(accountId), runNonce, leaseEpoch,
             invocationMode: mode, state: original.boxState as string,
             roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
-            rootLaunchPermit: row.ctx.boxLaunchPermit === true };
+            rootLaunchPermit: row.ctx.boxLaunchPermit === true,
+            ...(messagePointer ? { messagePointer } : {}) };
         }
         if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) {
           throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");

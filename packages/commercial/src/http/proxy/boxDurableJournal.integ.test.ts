@@ -536,6 +536,21 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         toolCall.leaseEpoch, 2),
       catalogHash,
       verifiedPendingToolUseIds: ["toolu_C"] });
+    const replayedHandoff = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody });
+    assert.deepEqual(replayedHandoff?.messagePointer,
+      messagePointer(`box-d-${suffix}`, toolCall.runNonce, toolCall.leaseEpoch, 2));
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxReplayMessage,roundNo}','1'::jsonb)
+      WHERE request_id=$1`, [`box-d-${suffix}`]);
+    await assert.rejects(() => journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_REPLAY_EVIDENCE_INVALID",
+    "stored round-1 pointer cannot be returned for a round-2 HTTP row");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxReplayMessage,roundNo}','2'::jsonb)
+      WHERE request_id=$1`, [`box-d-${suffix}`]);
     await put(`box-e-${suffix}`);
     const roundBudget = (tokens: number) => ({ role: "system", content: [{ type: "text",
       text: `<total_tokens>${tokens} tokens left</total_tokens>`,
