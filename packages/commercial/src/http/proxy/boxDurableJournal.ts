@@ -621,6 +621,91 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
+  /** Background takeover of only armed, unknown detached text. This produces
+   * read identity, never another admission or paid launch permission. */
+  async listTextUnknownCandidates(limit = 10): Promise<BoxReplayIdentity[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+      throw new BoxDurableJournalError("BOX_TEXT_OBSERVER_LIMIT_INVALID");
+    }
+    const found = await this.pool.query<{ request_id: string;
+      user_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
+        WHERE state='inflight' AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='unknown'
+          AND ctx->>'boxLaunchPermit'='true'
+          AND ctx->>'boxUpstreamModel'='claude-opus-5-5'
+          AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'
+          AND (ctx->>'boxAccountId') ~ '^[1-9][0-9]{0,19}$'
+          AND (ctx->>'boxRunNonce') ~ '^[a-f0-9]{24}$'
+          AND (ctx->>'boxLeaseEpoch') ~ '^[a-f0-9]{32}$'
+          AND NOT (ctx ? 'boxOwnerRequestId')
+          AND NOT (ctx ? 'boxReplayMessage') AND NOT (ctx ? 'boxTerminalProof')
+          AND (NOT (ctx ? 'boxTextObserverRetryAfterMs')
+            OR (jsonb_typeof(ctx->'boxTextObserverRetryAfterMs')='number'
+              AND (ctx->>'boxTextObserverRetryAfterMs') ~ '^[0-9]{13}$'
+              AND (ctx->>'boxTextObserverRetryAfterMs')::bigint
+                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))
+        ORDER BY CASE WHEN jsonb_typeof(ctx->'boxTextObserverLastAttemptMs')='number'
+          AND (ctx->>'boxTextObserverLastAttemptMs') ~ '^[0-9]{13}$'
+          THEN (ctx->>'boxTextObserverLastAttemptMs')::bigint ELSE 0 END ASC,
+          updated_at ASC LIMIT $1`, [limit]);
+    return found.rows.flatMap((row): BoxReplayIdentity[] => {
+      const ctx = row.ctx;
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+        || !/^[1-9][0-9]{0,19}$/.test(row.user_id)
+        || !ctx || typeof ctx.boxAccountId !== "string"
+        || typeof ctx.boxRunNonce !== "string"
+        || typeof ctx.boxLeaseEpoch !== "string"
+        || typeof ctx.boxDetachedRunnerHash !== "string") return [];
+      return [{ requestId: row.request_id, rootRequestId: row.request_id,
+        uid: BigInt(row.user_id), accountId: BigInt(ctx.boxAccountId),
+        runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch,
+        invocationMode: "text", state: "unknown", roundNo: 1,
+        spoolOffset: 0, rootLaunchPermit: true,
+        detachedRunnerHash: ctx.boxDetachedRunnerHash,
+        upstreamModel: "claude-opus-5-5" }];
+    });
+  }
+
+  async claimTextUnknownCandidate(input: BoxReplayIdentity): Promise<boolean> {
+    if (input.invocationMode !== "text" || input.state !== "unknown"
+      || !input.rootLaunchPermit || input.requestId !== input.rootRequestId
+      || input.roundNo !== 1 || input.uid <= 0n || input.accountId <= 0n
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
+      || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
+      || typeof input.detachedRunnerHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
+      || input.upstreamModel !== "claude-opus-5-5") {
+      throw new BoxDurableJournalError("BOX_TEXT_OBSERVER_IDENTITY_INVALID");
+    }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || jsonb_build_object(
+            'boxTextObserverLastAttemptMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
+            'boxTextObserverRetryAfterMs',
+              (EXTRACT(EPOCH FROM NOW()+INTERVAL '1 minute')*1000)::bigint)
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='unknown'
+          AND ctx->>'boxLaunchPermit'='true'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxDetachedRunnerHash'=$6
+          AND ctx->>'boxUpstreamModel'=$7
+          AND NOT (ctx ? 'boxOwnerRequestId')
+          AND NOT (ctx ? 'boxReplayMessage') AND NOT (ctx ? 'boxTerminalProof')
+          AND (NOT (ctx ? 'boxTextObserverRetryAfterMs')
+            OR (jsonb_typeof(ctx->'boxTextObserverRetryAfterMs')='number'
+              AND (ctx->>'boxTextObserverRetryAfterMs') ~ '^[0-9]{13}$'
+              AND (ctx->>'boxTextObserverRetryAfterMs')::bigint
+                <= (EXTRACT(EPOCH FROM NOW())*1000)::bigint))`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, input.detachedRunnerHash,
+        input.upstreamModel]);
+    return changed.rowCount === 1;
+  }
+
   async admit(input: BoxJournalAdmission): Promise<void> {
     goodId(input);
     const detachedText = (input.invocationMode ?? "text") === "text"

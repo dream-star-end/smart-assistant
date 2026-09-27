@@ -178,6 +178,16 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       && error.code === "BOX_JOURNAL_PRESTART_FENCE_LOST");
     await journal.markUnknown({ requestId: detachedRequestId,
       uid: 3n, leaseEpoch: detachedEpoch, phase: "synthetic_detached_transport" });
+    const textUnknown = (await journal.listTextUnknownCandidates(20))
+      .find((item) => item.requestId === detachedRequestId);
+    assert.ok(textUnknown);
+    assert.equal(textUnknown.upstreamModel, "claude-opus-5-5");
+    assert.equal(textUnknown.accountId, 21n);
+    assert.equal(await journal.claimTextUnknownCandidate(textUnknown), true);
+    assert.equal(await journal.claimTextUnknownCandidate(textUnknown), false,
+      "a peer worker must not observe the same unknown run in this retry window");
+    assert.equal((await journal.listTextUnknownCandidates(20))
+      .some((item) => item.requestId === detachedRequestId), false);
     await journal.complete({ requestId: detachedRequestId, uid: 3n,
       leaseEpoch: detachedEpoch,
       proof: { ...proof, runNonce: detachedNonce, leaseEpoch: detachedEpoch },
