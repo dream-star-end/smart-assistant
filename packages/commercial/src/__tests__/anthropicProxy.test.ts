@@ -1023,6 +1023,31 @@ describe("isClientAbort", () => {
 // ─── makeFinalizer.failClient — handler 级行为(Codex MEDIUM #3) ─────────
 
 describe("makeFinalizer.failClient → scheduler.release 走 client_error", () => {
+  test("Box paid abort holds precheck until exact usage settles; prelaunch abort releases", async () => {
+    let retained = true, releases = 0;
+    const pool = { query: async (sql: string) => sql.includes("AS retained")
+      ? { rows: [{ retained }], rowCount: 1 }
+      : { rows: [], rowCount: 0 } };
+    const redis = { releaseReservation: async () => { releases++; return true; } };
+    const scheduler = { release: async () => {} };
+    const base = { requestId: "box-paid-abort", userId: 1n,
+      containerId: 1n, accountId: null, slotId: null,
+      model: "box-api-claude-opus-5-5", pricing: sonnet,
+      precheckCredits: 100n,
+      preCheckReservation: { userId: "1", requestId: "box-paid-abort" },
+      log: rootLogger, sessionId: "box-session" };
+    const paid = makeFinalizer({ pgPool: pool, preCheckRedis: redis,
+      scheduler } as never, base);
+    assert.equal((await paid.failClient({ kind: "none" }, new Error("client closed"))).state,
+      "aborted");
+    assert.equal(releases, 0, "paid but unbilled Box call retains its Redis lock");
+    retained = false;
+    const prelaunch = makeFinalizer({ pgPool: pool, preCheckRedis: redis,
+      scheduler } as never, { ...base, requestId: "box-prelaunch-abort",
+      preCheckReservation: { userId: "1", requestId: "box-prelaunch-abort" } });
+    await prelaunch.failClient({ kind: "none" }, new Error("client closed"));
+    assert.equal(releases, 1, "unarmed/prelaunch failure must not hold credits for four hours");
+  });
   test("fail vs failClient:同样写 abort journal,但 release.kind 区分", async () => {
     type ReleaseCall = { account_id: bigint | string; slotId: string; kind: string; error?: string | null };
     const releaseCalls: ReleaseCall[] = [];

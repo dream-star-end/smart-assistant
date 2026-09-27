@@ -393,6 +393,25 @@ export async function abortInflightJournal(
   return aborted.rowCount === 1;
 }
 
+/** An already-paid Box invocation may finish after its HTTP client leaves.
+ * Keep that request's Redis reservation until its original usage settles;
+ * prelaunch failures and all other models retain the normal release path. */
+export async function shouldRetainBoxPrecheck(pool: Pool, requestId: string,
+  userId: bigint): Promise<boolean> {
+  const found = await pool.query<{ retained: boolean }>(
+    `SELECT (rfj.state IN ('inflight','finalizing')
+        AND rfj.ctx->>'boxInvocationRecovery'='v1'
+        AND (rfj.ctx->>'boxLaunchPermit'='true'
+          OR rfj.ctx ? 'boxOwnerRequestId')
+        AND NOT EXISTS (SELECT 1 FROM usage_records ur
+          WHERE ur.request_id=rfj.request_id AND ur.user_id=rfj.user_id))
+        AS retained
+       FROM request_finalize_journal rfj
+      WHERE rfj.request_id=$1 AND rfj.user_id=$2`,
+    [requestId, userId.toString()]);
+  return found.rowCount === 1 && found.rows[0]?.retained === true;
+}
+
 /**
  * Single-shot finalizer 工厂。
  *
@@ -601,11 +620,20 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     inflight = (async () => {
       try {
         const out = await runner();
-        // releasePreCheck:即使失败,Redis TTL 也会兜底(300s)
-        try {
-          await releasePreCheck(deps.preCheckRedis, ctx.preCheckReservation);
-        } catch (e) {
-          ctx.log.warn("proxy_release_precheck_failed", { err: errSummary(e) });
+        // A Box call can outlive its HTTP stream. On an aborted stream, do
+        // not hand its reserved balance to another request while the paid CLI
+        // still has no settled usage. An uncertain status retains until TTL.
+        let retainBoxReservation = false;
+        if (ctx.model === "box-api-claude-opus-5-5" && out.state === "aborted") {
+          try { retainBoxReservation = await shouldRetainBoxPrecheck(
+            deps.pgPool, ctx.requestId, ctx.userId); }
+          catch { retainBoxReservation = true; }
+        }
+        if (!retainBoxReservation) {
+          try { await releasePreCheck(deps.preCheckRedis, ctx.preCheckReservation); }
+          catch (e) {
+            ctx.log.warn("proxy_release_precheck_failed", { err: errSummary(e) });
+          }
         }
         // DeepSeek/MiniMax 路径(accountId===null)无 claude_accounts pool slot 要回流;
         // 跳过 scheduler.release。accountId 与 slotId 同生死,配对判 null 同时让 TS 收窄

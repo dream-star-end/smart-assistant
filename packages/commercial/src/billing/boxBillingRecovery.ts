@@ -8,6 +8,10 @@ import { claimInflightJournalForSettlement, finalizeInflightJournal,
 import { parseBoxBillingContext } from "../http/proxy/boxBillingContext.js";
 import { parseBoxTerminalProof } from "../http/proxy/boxTerminalProof.js";
 import { parseBoxStoredToolHandoff } from "../http/proxy/boxStoredToolHandoff.js";
+import { parseBoxReplayMessagePointer,
+  type BoxReplayMessagePointer } from "../http/proxy/boxReplayMessageFile.js";
+import { isDeepStrictEqual } from "node:util";
+import { releasePreCheck, type PreCheckRedis } from "./preCheck.js";
 
 const STALE_CLAIM_MS = 5 * 60_000;
 const LIVE_FINALIZER_GRACE_MS = 5 * 60_000;
@@ -83,12 +87,25 @@ async function repairFromUsage(pool: Pool, row: JournalRow): Promise<boolean> {
 }
 
 export async function recoverBoxBillingRequest(pool: Pool, requestId: string,
-  userId: bigint): Promise<RecoveryResult> {
+  userId: bigint, options?: { immediateReplayPointer?: BoxReplayMessagePointer }):
+  Promise<RecoveryResult> {
   const found = await pool.query<JournalRow>(
     `SELECT request_id,user_id::text,state,ctx,updated_at FROM request_finalize_journal
       WHERE request_id=$1 AND user_id=$2`, [requestId, userId.toString()]);
   const row = found.rows[0];
   if (!row || row.ctx?.boxInvocationRecovery !== "v1") return "manual";
+  const requested = options?.immediateReplayPointer;
+  if (requested) {
+    const pointer = parseBoxReplayMessagePointer(requested);
+    const stored = parseBoxReplayMessagePointer(row.ctx.boxReplayMessage);
+    if (!pointer || !stored || !isDeepStrictEqual(pointer, stored)
+      || pointer.uid !== userId.toString()
+      || pointer.requestId !== requestId
+      || pointer.runNonce !== row.ctx.boxRunNonce
+      || pointer.leaseEpoch !== row.ctx.boxLeaseEpoch
+      || pointer.roundNo !== (row.ctx.boxRoundNo ?? 1)
+      || row.ctx.boxReplayRequired !== true) return "manual";
+  }
   if (row.state === "committed") {
     const usage = await pool.query<{ present: boolean }>(
       `SELECT EXISTS(SELECT 1 FROM usage_records
@@ -99,7 +116,7 @@ export async function recoverBoxBillingRequest(pool: Pool, requestId: string,
   const validated = evidence(row);
   if (!validated || row.state === "aborted") return "manual";
   if (!(row.updated_at instanceof Date) || !Number.isFinite(row.updated_at.getTime())) return "manual";
-  if (row.state === "inflight"
+  if (row.state === "inflight" && !requested
     && Date.now() - row.updated_at.getTime() < LIVE_FINALIZER_GRACE_MS) return "pending";
   if (row.state === "finalizing") {
     const reopened = await pool.query(
@@ -135,8 +152,38 @@ export async function recoverBoxBillingRequest(pool: Pool, requestId: string,
   return "settled";
 }
 
+/** Do not deliver a private Box replay merely because its Message exists.
+ * The original HTTP round must have a committed usage row and enough actual
+ * chat debits to cover its settled cost (zero-cost waivers need no ledger). */
+export async function settleBoxReplayBeforeDelivery(pool: Pool, input: {
+  uid: bigint; pointer: BoxReplayMessagePointer }): Promise<boolean> {
+  const pointer = parseBoxReplayMessagePointer(input.pointer);
+  if (!pointer || pointer.uid !== input.uid.toString()) return false;
+  const recovered = await recoverBoxBillingRequest(pool, pointer.requestId,
+    input.uid, { immediateReplayPointer: pointer });
+  if (recovered !== "settled" && recovered !== "already_committed") return false;
+  const found = await pool.query<{ expected: string; debited: string }>(
+    `SELECT ur.cost_credits::text AS expected,
+        COALESCE((SELECT SUM(-cl.delta) FROM credit_ledger cl
+          WHERE cl.user_id=ur.user_id AND cl.reason='chat'
+            AND cl.ref_type='usage_record' AND cl.ref_id=ur.id::text
+            AND cl.delta<0),0)::text AS debited
+       FROM request_finalize_journal rfj
+       JOIN usage_records ur ON ur.request_id=rfj.request_id
+         AND ur.user_id=rfj.user_id
+      WHERE rfj.request_id=$1 AND rfj.user_id=$2 AND rfj.state='committed'
+        AND rfj.ctx->'boxReplayMessage'=$3::jsonb
+        AND ur.status='success'`,
+    [pointer.requestId, input.uid.toString(), JSON.stringify(pointer)]);
+  if (found.rowCount !== 1 || !found.rows[0]) return false;
+  const expected = BigInt(found.rows[0].expected);
+  const debited = BigInt(found.rows[0].debited);
+  return expected >= 0n && debited >= expected;
+}
+
 /** Bounded operator/scheduler entry. Unknown outcomes are never promoted. */
-export async function reconcileBoxBillingBatch(pool: Pool, limit = 20): Promise<{
+export async function reconcileBoxBillingBatch(pool: Pool, limit = 20,
+  preCheckRedis?: PreCheckRedis): Promise<{
   settled: number; pending: number; manual: number }> {
   const rows = await pool.query<{ request_id: string; user_id: string }>(
     `SELECT request_id,user_id::text FROM request_finalize_journal
@@ -152,7 +199,11 @@ export async function reconcileBoxBillingBatch(pool: Pool, limit = 20): Promise<
   for (const row of rows.rows) {
     try {
       const result = await recoverBoxBillingRequest(pool, row.request_id, BigInt(row.user_id));
-      if (result === "settled" || result === "already_committed") counts.settled++;
+      if (result === "settled" || result === "already_committed") {
+        counts.settled++;
+        if (preCheckRedis) await releasePreCheck(preCheckRedis, {
+          userId: row.user_id, requestId: row.request_id }).catch(() => {});
+      }
       else counts[result]++;
     } catch { counts.pending++; } // Leave journal/evidence for the next pass.
   }

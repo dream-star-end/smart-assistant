@@ -36,7 +36,8 @@ import {
   getModelCatalogCache,
   isModelAuthorityEnforced,
 } from "../billing/modelCatalogRuntime.js";
-import { wrapIoredisForPreCheck } from "../billing/preCheck.js";
+import { releasePreCheck, wrapIoredisForPreCheck } from "../billing/preCheck.js";
+import { settleBoxReplayBeforeDelivery } from "../billing/boxBillingRecovery.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "../account-pool/health.js";
 import { AccountScheduler } from "../account-pool/scheduler.js";
@@ -259,7 +260,19 @@ export async function startEgress(): Promise<void> {
   const boxReplay = boxReplayReader ? {
     lookup: async (input: Parameters<typeof findCompletedBoxReplay>[0]) => {
       const deps = { journal: boxReplayJournal, readMessage: boxReplayReader };
+      const onlyAfterSettlement = async (
+        replay: Awaited<ReturnType<typeof findCompletedBoxReplay>>,
+      ): Promise<Awaited<ReturnType<typeof findCompletedBoxReplay>>> => {
+        if (replay.kind !== "ready") return replay;
+        const pointer = replay.identity.messagePointer;
+        if (!pointer || !await settleBoxReplayBeforeDelivery(getPool(), {
+          uid: input.uid, pointer })) return { kind: "pending", identity: replay.identity };
+        await releasePreCheck(preCheckRedis, { userId: input.uid.toString(),
+          requestId: pointer.requestId }).catch(() => {});
+        return replay;
+      };
       const first = await findCompletedBoxReplay(input, deps);
+      if (first.kind === "ready") return onlyAfterSettlement(first);
       if (first.kind !== "pending" || first.identity.state !== "unknown"
         || !first.identity.rootLaunchPermit || !boxReplayWriter) return first;
       if (first.identity.invocationMode === "detached_tool") {
@@ -275,7 +288,7 @@ export async function startEgress(): Promise<void> {
           resolveTarget: (args) => boxStopResolver.resolve(args),
         });
       } else return first;
-      return findCompletedBoxReplay(input, deps);
+      return onlyAfterSettlement(await findCompletedBoxReplay(input, deps));
     },
   } : undefined;
   const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {

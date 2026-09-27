@@ -42,6 +42,7 @@ import {
 } from "../../billing/proxyBilling.js";
 import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { serializeBoxBillingContext } from "./boxBillingContext.js";
+import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import {
   resolveAuthorityTurnDispatchSponsorship,
   admitVerificationSponsorship,
@@ -1084,6 +1085,8 @@ export function makeAnthropicProxyHandler(
           userId: uid,
           requestId,
           maxCost: totalMaxCost,
+          ...(route.kind === "box"
+            ? { ttlSeconds: BOX_TOOL_MAX_WALL_MS / 1000 + 300 } : {}),
         });
       } catch (err) {
         if (err instanceof InsufficientCreditsError) {

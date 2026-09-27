@@ -6186,7 +6186,7 @@ export async function registerCommercial(
           durableWaiverAgeMs,
           boxRecoveryFn: async () => {
             const results = await Promise.allSettled([
-              reconcileBoxBillingBatch(getPool()),
+              reconcileBoxBillingBatch(getPool(), 20, preCheckRedis),
               boxRemoteCleanup.reconcileBatch(10),
             ]);
             if (results.some((result) => result.status === "rejected")) {

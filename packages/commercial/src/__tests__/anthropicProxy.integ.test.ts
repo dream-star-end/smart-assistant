@@ -379,7 +379,8 @@ function buildFakeIdentityRepo(opts: {
 
 interface PreCheckSpy {
   redis: PreCheckRedis;
-  reserveCalls: Array<{ userId: string; requestId: string; maxCost: string }>;
+  reserveCalls: Array<{ userId: string; requestId: string;
+    maxCost: string; ttlSeconds: number }>;
   releaseCalls: Array<{ userId: string; requestId: string }>;
 }
 
@@ -392,6 +393,7 @@ function buildFakePreCheckRedis(releaseOrder?: string[]): PreCheckSpy {
         userId: String(input.userId),
         requestId: input.requestId,
         maxCost: input.maxCost.toString(),
+        ttlSeconds: input.ttlSeconds,
       });
       return { ok: true, locked: BigInt(input.maxCost), needed: BigInt(input.maxCost) };
     },
@@ -1013,6 +1015,8 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       assert.equal(accepted.statusCode, 200, accepted.bodyText());
       assert.equal(calls, 1);
       assert.equal(h.preCheckSpy.reserveCalls.length, 1);
+      assert.equal(h.preCheckSpy.reserveCalls[0]?.ttlSeconds, 14_700,
+        "only Box paid rounds retain reservation through a four-hour keeper");
       assert.equal(h.pool.queries.filter((query) =>
         query.sql.trim().toUpperCase().startsWith("INSERT INTO USAGE_RECORDS")).length, 1);
     } finally {

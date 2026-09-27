@@ -5,9 +5,11 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Pool } from "pg";
-import { recoverBoxBillingRequest } from "./boxBillingRecovery.js";
+import { recoverBoxBillingRequest,
+  settleBoxReplayBeforeDelivery } from "./boxBillingRecovery.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
+import { shouldRetainBoxPrecheck } from "./proxyBilling.js";
 
 const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
   ?? process.env.TEST_DATABASE_URL;
@@ -267,6 +269,73 @@ test("terminal Box evidence settles once, with durable usage and turn locator",
     const delayedUsage = await client.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM usage_records WHERE request_id=$1", [delayedRequest]);
     assert.equal(delayedUsage.rows[0]?.n, "1");
+
+    // A callerless Box retry may read a finished private Message immediately,
+    // but may not deliver it before this exact HTTP round is fully debited.
+    for (const [suffix, balance, shouldDeliver, outputTokens] of [
+      ["full", 1000n, true, 3], ["clamped", 1n, false, 3],
+      ["zero-output", 1000n, true, 0],
+    ] as const) {
+      const replayUser = suffix === "full" ? 900_000_005n
+        : suffix === "clamped" ? 900_000_006n : 900_000_007n;
+      const replayRequest = `${requestId}-replay-${suffix}`;
+      const replayNonce = suffix === "full" ? "1".repeat(24)
+        : suffix === "clamped" ? "2".repeat(24) : "8".repeat(24);
+      const replayEpoch = suffix === "full" ? "3".repeat(32)
+        : suffix === "clamped" ? "4".repeat(32) : "9".repeat(32);
+      const replayTurn = suffix === "full" ? "5".repeat(64)
+        : suffix === "clamped" ? "6".repeat(64) : "7".repeat(64);
+      const pointer = { version: 1 as const, uid: replayUser.toString(),
+        requestId: replayRequest, runNonce: replayNonce, leaseEpoch: replayEpoch,
+        roundNo: 1, bytes: 123, sha256: "a".repeat(64) };
+      const replayCtx = { ...ctx, boxRunNonce: replayNonce,
+        boxLeaseEpoch: replayEpoch,
+        boxReplayFingerprint: suffix === "full" ? "1".repeat(64)
+          : suffix === "clamped" ? "2".repeat(64) : "8".repeat(64),
+        boxTurnKey: replayTurn, boxReplayRequired: true,
+        boxLaunchPermit: true,
+        boxReplayMessage: pointer,
+        boxUsage: { ...ctx.boxUsage, outputTokens },
+        boxTerminalProof: { ...ctx.boxTerminalProof,
+          runNonce: replayNonce, leaseEpoch: replayEpoch },
+        boxBillingContext: { ...ctx.boxBillingContext,
+          sessionId: `web-replay-${suffix}`, turnKey: replayTurn } };
+      await client.query(`INSERT INTO users(id,email,password_hash,credits)
+        VALUES ($1,$2,'test-only-hash',$3)`, [replayUser.toString(),
+        `${replayRequest}@example.invalid`, balance.toString()]);
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,precheck_credits,updated_at)
+        VALUES ($1,$2,'inflight',$3::jsonb,0,NOW())`,
+      [replayRequest, replayUser.toString(), JSON.stringify(replayCtx)]);
+      assert.equal(await recoverBoxBillingRequest(sameConnection,
+        replayRequest, replayUser), "pending", "background sweep keeps its grace");
+      assert.equal(await shouldRetainBoxPrecheck(sameConnection,
+        replayRequest, replayUser), true,
+      "paid Box proof before debit must retain the exact Redis reservation");
+      assert.equal(await settleBoxReplayBeforeDelivery(sameConnection, {
+        uid: replayUser, pointer: { ...pointer, requestId: `${replayRequest}-wrong` } }), false);
+      const firstDelivery = await settleBoxReplayBeforeDelivery(sameConnection,
+        { uid: replayUser, pointer });
+      assert.equal(firstDelivery, shouldDeliver);
+      assert.equal(await shouldRetainBoxPrecheck(sameConnection,
+        replayRequest, replayUser), false,
+      "settled or clamped usage no longer needs a Redis reservation");
+      assert.equal(await settleBoxReplayBeforeDelivery(sameConnection,
+        { uid: replayUser, pointer }), shouldDeliver,
+      "same fallback must neither double debit nor rescue a clamped debit");
+      const replayUsage = await client.query<{ cost_credits: string }>(
+        "SELECT cost_credits::text FROM usage_records WHERE request_id=$1",
+        [replayRequest]);
+      assert.equal(replayUsage.rows.length, 1);
+      const debit = await client.query<{ amount: string }>(
+        `SELECT COALESCE(SUM(-cl.delta),0)::text AS amount
+           FROM credit_ledger cl JOIN usage_records ur
+             ON cl.ref_type='usage_record' AND cl.ref_id=ur.id::text
+          WHERE ur.request_id=$1 AND ur.user_id=$2 AND cl.reason='chat' AND cl.delta<0`,
+        [replayRequest, replayUser.toString()]);
+      assert.equal(BigInt(debit.rows[0]!.amount) >= BigInt(replayUsage.rows[0]!.cost_credits),
+        shouldDeliver);
+    }
   } finally {
     client.release();
     await pool.end(); // TEMP tables and sequence vanish with this connection.

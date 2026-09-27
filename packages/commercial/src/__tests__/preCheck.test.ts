@@ -280,10 +280,12 @@ describe("InMemoryPreCheckRedis — 输入校验", () => {
     );
     await assert.rejects(
       r.atomicReserve({
-        userId: 1n, requestId: "req", balance: 1n, maxCost: 0n, ttlSeconds: 3601,
+        userId: 1n, requestId: "req", balance: 1n, maxCost: 0n, ttlSeconds: 14_701,
       }),
       TypeError,
     );
+    assert.equal((await r.atomicReserve({ userId: 1n, requestId: "box-four-hour",
+      balance: 1n, maxCost: 1n, ttlSeconds: 14_700 })).ok, true);
   });
 
   test("balance / maxCost 超 2^53-1 → TypeError(Lua double 精度)", async () => {
