@@ -189,6 +189,13 @@ const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
 const CLEANUP_REPLAY_FENCE = `(ctx->>'boxState'<>'terminal'
   OR ctx->>'boxReplayRequired' IS DISTINCT FROM 'true'
   OR ctx ? 'boxReplayMessage')`;
+// Legacy connected text has no detached spool and must never enter the
+// runner cleanup queue. Only the new, durably armed text lane shares it.
+const CLEANUP_MODE_FENCE = `(ctx->>'boxInvocationMode'='detached_tool'
+  OR (ctx->>'boxInvocationMode'='text'
+    AND ctx->>'boxLaunchPermit'='true'
+    AND ctx->>'boxUpstreamModel'='claude-opus-5-5'
+    AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'))`;
 
 const STOP_PROBE_STATE_FENCE = `((state='inflight'
   AND ctx->>'boxState' IN ('running','unknown','linked')
@@ -2045,7 +2052,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       ctx: Record<string, unknown> }>(
       `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
         WHERE ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${CLEANUP_MODE_FENCE}
            AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
            AND ${CLEANUP_REPLAY_FENCE}
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
@@ -2072,7 +2079,7 @@ export class BoxDurableJournal implements BoxJournalPort {
             WHERE request_id=$1 AND user_id=$2
               AND ctx->'boxTerminalProof'=$3::jsonb
               AND ctx->>'boxInvocationRecovery'='v1'
-              AND ctx->>'boxInvocationMode'='detached_tool'
+              AND ${CLEANUP_MODE_FENCE}
               AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
               AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
               AND NOT (ctx ? 'boxRemoteCleanupQuarantine')`,
@@ -2133,7 +2140,7 @@ export class BoxDurableJournal implements BoxJournalPort {
               (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${CLEANUP_MODE_FENCE}
            AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
            AND ${CLEANUP_REPLAY_FENCE}
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
@@ -2165,7 +2172,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT ctx->>'boxRemoteCleanup' AS status FROM request_finalize_journal
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${CLEANUP_MODE_FENCE}
           AND ${CLEANUP_PROOF_FENCE} AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
           AND ctx->'boxTerminalProof'=$6::jsonb`,
       [input.requestId, input.uid.toString(), input.accountId.toString(),
@@ -2187,7 +2194,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
           AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
           AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${CLEANUP_MODE_FENCE}
           AND ctx->>'boxRemoteCleanup'='done'
           AND ${CLEANUP_PROOF_FENCE}`,
       [input.uid.toString(), input.accountId.toString(),
@@ -2258,7 +2265,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${CLEANUP_MODE_FENCE}
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'=$6::jsonb
@@ -2272,7 +2279,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${CLEANUP_MODE_FENCE}
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
           AND ctx->'boxTerminalProof'=$6::jsonb

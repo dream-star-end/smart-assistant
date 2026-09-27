@@ -173,6 +173,18 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       canonicalModel: basis.model, canonicalBody: detachedBody });
     assert.equal(detachedReplay?.state, "terminal");
     assert.ok(detachedReplay?.messagePointer);
+    const textCleanup = (await journal.listRemoteCleanupCandidates(20))
+      .find((item) => item.requestId === detachedRequestId);
+    assert.ok(textCleanup, "only proven, armed detached text enters shared spool cleanup");
+    assert.equal((await journal.listRemoteCleanupCandidates(20))
+      .some((item) => item.requestId === input.requestId), false,
+    "legacy connected text must never enter detached spool cleanup");
+    assert.equal(await journal.claimRemoteCleanup(textCleanup), true);
+    await journal.markRemoteCleaned(textCleanup);
+    await journal.markRemoteCleaned(textCleanup);
+    assert.equal(await journal.remoteCleanupStatus(textCleanup), "done");
+    assert.equal(await journal.remoteCleanupDoneByRunIdentity({ uid: 3n,
+      accountId: 21n, runNonce: detachedNonce, leaseEpoch: detachedEpoch }), true);
     const nativePointer = parseBoxNativePointer({ version: 1, accountId: "20",
       upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
       nativeSessionId: "12345678-1234-4123-8123-123456789abc",
