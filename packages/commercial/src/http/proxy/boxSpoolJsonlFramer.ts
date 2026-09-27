@@ -1,8 +1,9 @@
 /** Exact byte boundaries for a detached Box CLI JSONL spool. A committed
  * handoff persists a line's endOffset, never an unprocessed chunk-end or raw
  * remainder, so another HTTP request can resume without duplicating bytes. */
-import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
-const MAX_LINE_BYTES = BOX_TOOL_SPOOL_MAX_BYTES;
+import { BOX_TOOL_MAX_LINE_BYTES,
+  BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
+const MAX_LINE_BYTES = BOX_TOOL_MAX_LINE_BYTES;
 const MAX_SPOOL_BYTES = BOX_TOOL_SPOOL_MAX_BYTES;
 export class BoxSpoolFrameError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxSpoolFrameError"; }

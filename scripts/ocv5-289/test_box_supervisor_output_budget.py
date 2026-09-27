@@ -19,7 +19,7 @@ class SupervisorOutputBudgetTest(unittest.TestCase):
         before = self.run_writer(1_048_576)
         self.assertEqual(before.returncode, 125)
         self.assertEqual(len(before.stdout), 1_048_576)
-        after = self.run_writer(64 * 1024 * 1024)
+        after = self.run_writer(256 * 1024 * 1024)
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(len(after.stdout), 1_100_000)
         self.assertEqual(after.stderr, b"")

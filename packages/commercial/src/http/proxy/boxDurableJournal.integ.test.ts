@@ -469,7 +469,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       ] };
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,spoolOffset}',to_jsonb($2::bigint))
-      WHERE request_id=$1`, [toolCall.requestId, 64 * 1024 * 1024 - 1_000_000]);
+      WHERE request_id=$1`, [toolCall.requestId, 256 * 1024 * 1024 - 1_000_000]);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: resumeBody }),
     (error: unknown) => error instanceof BoxDurableJournalError

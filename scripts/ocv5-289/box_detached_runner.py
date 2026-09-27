@@ -17,7 +17,7 @@ import time
 RUN_DIR = re.compile(r"^/tmp/ocv5-289-run-([a-f0-9]{24})$")
 ASSET = re.compile(r"^/tmp/ocv5-289-(?:v2-)?(keeper|supervisor)-([a-f0-9]{16})\.py$")
 PROOF = re.compile(r"^/tmp/ocv5-289-proof-([a-f0-9]{24})$")
-MAX_SPOOL = 64 * 1024 * 1024
+MAX_SPOOL = 256 * 1024 * 1024
 
 
 def verified_dir(path: str) -> int:
@@ -85,7 +85,7 @@ def launch(argv: list[str]) -> int:
         duration = float(options[options.index("--deadline") + 1])
         if (not PROOF.fullmatch(proof) or PROOF.fullmatch(proof)[1] != nonce[1]
                 or not re.fullmatch(r"[a-f0-9]{32}", epoch)
-                or not 1 <= duration <= 900):
+                or not 1 <= duration <= 14400):
             return 126
         directory_fd = verified_dir(directory)
     except (OSError, ValueError, IndexError):

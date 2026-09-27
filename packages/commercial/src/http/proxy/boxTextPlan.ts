@@ -158,7 +158,7 @@ export function makeBoxTextPlan(input: {
   }
   const supervisorDeadlineSeconds = input.supervisorDeadlineSeconds ?? 110;
   if (!Number.isSafeInteger(supervisorDeadlineSeconds)
-    || supervisorDeadlineSeconds < 1 || supervisorDeadlineSeconds > 900) {
+    || supervisorDeadlineSeconds < 1 || supervisorDeadlineSeconds > 14_400) {
     throw new BoxTextPlanError("BOX_SUPERVISOR_DEADLINE_INVALID");
   }
   const runNonce = input.runNonce ?? randomBytes(12).toString("hex");

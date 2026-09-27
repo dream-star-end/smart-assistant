@@ -10,6 +10,7 @@ import { makeBoxPendingRead, makeBoxToolResultPlan,
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
+import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 
 export class BoxToolResumePublishError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolResumePublishError"; }
@@ -55,8 +56,9 @@ export async function publishBoxToolResume(input: {
     || body.max_tokens !== input.canonicalBody.max_tokens) {
     throw new BoxToolResumePublishError("BOX_TOOL_RESUME_BINDING_INVALID");
   }
-  const budget = deps.budgetMs ?? 900_000;
-  if (!Number.isSafeInteger(budget) || budget < 1000 || budget > 900_000) {
+  const budget = deps.budgetMs ?? BOX_TOOL_MAX_WALL_MS;
+  if (!Number.isSafeInteger(budget) || budget < 1000
+    || budget > BOX_TOOL_MAX_WALL_MS) {
     throw new BoxToolResumePublishError("BOX_TOOL_RESUME_BUDGET_INVALID");
   }
   const abort = new AbortController();

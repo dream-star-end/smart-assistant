@@ -231,7 +231,7 @@ def startup_budget(argv: list[str]) -> float:
             raw = token.split("=", 1)[1]
     try:
         value = float(raw)
-        if math.isfinite(value) and 0 < value <= 900:
+        if math.isfinite(value) and 0 < value <= 14400:
             return min(5.0, value)
     except (TypeError, ValueError):
         pass
@@ -248,7 +248,7 @@ def worker_budget(argv: list[str]) -> float:
             raw = token.split("=", 1)[1]
     try:
         value = float(raw)
-        if math.isfinite(value) and 0 < value <= 900:
+        if math.isfinite(value) and 0 < value <= 14400:
             return value + 30
     except (TypeError, ValueError):
         pass

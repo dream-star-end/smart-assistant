@@ -14,6 +14,7 @@ import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
+import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
@@ -120,8 +121,9 @@ export async function runBoxToolFirstRound(input: {
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
     detachedRunnerAsset: deps.detachedRunnerAsset,
     nativePersistence: nativeEnabled });
-  const budget = deps.budgetMs ?? 900_000;
-  if (!Number.isSafeInteger(budget) || budget < 60_000 || budget > 900_000) {
+  const budget = deps.budgetMs ?? BOX_TOOL_MAX_WALL_MS;
+  if (!Number.isSafeInteger(budget) || budget < 60_000
+    || budget > BOX_TOOL_MAX_WALL_MS) {
     throw new BoxToolFirstRoundError("BOX_TOOL_BUDGET_INVALID");
   }
   const startedAt = Date.now();

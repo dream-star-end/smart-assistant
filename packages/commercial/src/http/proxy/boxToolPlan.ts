@@ -8,7 +8,7 @@ import { makeBoxTextPlan, makeBoxAssetStage, makeBoxAssetsStage, BoxTextPlanErro
   type BoxTextPlan } from "./boxTextPlan.js";
 import { compileBoxToolCatalog, mapBoxCliEffort,
   type BoxToolCatalog } from "./boxToolCatalog.js";
-import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
+import { BOX_TOOL_MAX_WALL_MS, BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 export interface BoxToolPlan extends BoxTextPlan {
   readonly stageVirtualMcp: BoxCcExecRequest;
@@ -47,7 +47,8 @@ export function makeBoxToolPlan(input: {
       maxOutputTokensLimit: input.maxOutputTokensLimit,
       supervisorAsset: input.supervisorAsset, keeperAsset: input.keeperAsset,
       extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
-       runNonce, leaseEpoch: input.leaseEpoch, supervisorDeadlineSeconds: 900,
+       runNonce, leaseEpoch: input.leaseEpoch,
+       supervisorDeadlineSeconds: BOX_TOOL_MAX_WALL_MS / 1000,
        nativePersistence: input.nativePersistence, nativeResume: input.nativeResume });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
@@ -58,7 +59,8 @@ export function makeBoxToolPlan(input: {
     { asset: input.virtualMcpAsset, path: virtualMcpPath },
   ]);
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
-    command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd, catalog.sha256, "900"] } } });
+    command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd,
+      catalog.sha256, String(BOX_TOOL_MAX_WALL_MS / 1000)] } } });
   const args = [...base.run.args];
   const outputAt = args.indexOf("--max-output");
   if (outputAt < 0 || args[outputAt + 1] !== "1048576") {

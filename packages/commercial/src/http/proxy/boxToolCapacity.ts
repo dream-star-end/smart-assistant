@@ -2,7 +2,10 @@
  * before its sidecar file is published; failure after publication is unknown
  * and cannot be safely replayed. Keep this in sync with the Python runner and
  * supervisor bounds, then verify the actual Box echo format before enabling. */
-export const BOX_TOOL_SPOOL_MAX_BYTES = 64 * 1024 * 1024;
+export const BOX_TOOL_MAX_ROUNDS = 128;
+export const BOX_TOOL_MAX_WALL_MS = 4 * 60 * 60 * 1000;
+export const BOX_TOOL_SPOOL_MAX_BYTES = 256 * 1024 * 1024;
+export const BOX_TOOL_MAX_LINE_BYTES = 16 * 1024 * 1024;
 export const BOX_TOOL_POST_ECHO_RESERVE_BYTES = 2 * 1024 * 1024;
 const ECHO_ENVELOPE_BYTES = 4096;
 const ECHO_EXPANSION_FACTOR = 4;

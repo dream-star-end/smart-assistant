@@ -17,6 +17,7 @@ import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer
 import { boxFastPathEnabled } from "./boxFastPath.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
+import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 
 export class BoxToolContinuationError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolContinuationError"; }
@@ -46,8 +47,9 @@ export async function runBoxToolContinuation(input: {
   budgetMs?: number;
 }): Promise<BoxToolContinuationResult> {
   const { claim, target, access } = input.published;
-  const budget = deps.budgetMs ?? 900_000;
-  if (!Number.isSafeInteger(budget) || budget < 1000 || budget > 900_000) {
+  const budget = deps.budgetMs ?? BOX_TOOL_MAX_WALL_MS;
+  if (!Number.isSafeInteger(budget) || budget < 1000
+    || budget > BOX_TOOL_MAX_WALL_MS) {
     throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_BUDGET_INVALID");
   }
   const abort = new AbortController();
@@ -85,7 +87,7 @@ export async function runBoxToolContinuation(input: {
     const catalog = compileBoxToolCatalog(input.canonicalBody.tools);
     if (catalog.bindingSha256 !== claim.catalogHash
       || target.accountId !== claim.accountId || claim.roundNo < 2
-      || claim.roundNo > 32) {
+      || claim.roundNo > BOX_TOOL_MAX_ROUNDS) {
       throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_BINDING_INVALID");
     }
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,

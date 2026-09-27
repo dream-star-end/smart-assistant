@@ -220,7 +220,7 @@ def main() -> int:
     directory, catalog_hash, wait_raw = sys.argv[1:]
     try:
         wait_seconds = int(wait_raw)
-        if not 1 <= wait_seconds <= 900:
+        if not 1 <= wait_seconds <= 14400:
             return 126
         dir_fd = verified_dir(directory)
         tools = read_catalog(dir_fd, catalog_hash)

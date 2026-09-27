@@ -2,7 +2,7 @@
  * input/result may appear here; every reader shares this validator. */
 import type { BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { BoxUsageEvidence } from "./boxDurableJournal.js";
-import { BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
+import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 export interface BoxStoredToolHandoff {
   version: 1;
@@ -35,7 +35,7 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
       "assistantContentHash,assistantEchoHash,assistantNoCallerHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
     ].includes(Object.keys(raw).sort().join(","))
     || raw.version !== 1 || !Number.isSafeInteger(raw.roundNo)
-    || Number(raw.roundNo) < 1 || Number(raw.roundNo) > 32
+    || Number(raw.roundNo) < 1 || Number(raw.roundNo) > BOX_TOOL_MAX_ROUNDS
     || typeof raw.messageId !== "string" || raw.messageId.length < 1
     || raw.messageId.length > 128
     || typeof raw.assistantContentHash !== "string"

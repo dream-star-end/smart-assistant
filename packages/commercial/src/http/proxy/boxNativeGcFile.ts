@@ -35,7 +35,7 @@ try:
    fd=os.open(filename,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=project)
    try:
     st=os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or not 1<=st.st_size<=67108864:
+    if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or not 1<=st.st_size<=268435456:
      print('blocked');raise SystemExit(0)
     digest=hashlib.sha256()
     remain=st.st_size

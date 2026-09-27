@@ -7,7 +7,7 @@ const ENV = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" };
 const RUN = /^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const HEX64 = /^[a-f0-9]{64}$/;
-const MAX_BYTES = 64 * 1024 * 1024;
+const MAX_BYTES = 256 * 1024 * 1024;
 
 const INSPECT = String.raw`import hashlib,json,os,re,stat,sys
 if len(sys.argv)!=5:raise SystemExit(126)
@@ -25,7 +25,7 @@ try:
   fd=safeopen(sid+'.jsonl',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=project)
   try:
    st=os.fstat(fd)
-   if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or not 1<=st.st_size<=67108864:raise SystemExit(126)
+   if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1 or not 1<=st.st_size<=268435456:raise SystemExit(126)
    size=st.st_size
    digest=hashlib.sha256()
    remaining=size

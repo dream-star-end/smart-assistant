@@ -5,6 +5,7 @@ import type { BoxExecTransport } from "./boxExecTransport.js";
 import type { BoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { BoxSpoolJsonlFramer, type BoxSpoolLine } from "./boxSpoolJsonlFramer.js";
+import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 
 export class BoxSpoolPollError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxSpoolPollError"; }
@@ -30,7 +31,9 @@ export async function* pollBoxSpoolLines(input: {
   pollIntervalMs?: number;
 }): AsyncGenerator<BoxSpoolLine> {
   if (!Number.isSafeInteger(input.deadlineMs) || input.deadlineMs < 1
-    || input.deadlineMs > 900_000) throw new BoxSpoolPollError("BOX_SPOOL_POLL_BUDGET_INVALID");
+    || input.deadlineMs > BOX_TOOL_MAX_WALL_MS) {
+    throw new BoxSpoolPollError("BOX_SPOOL_POLL_BUDGET_INVALID");
+  }
   const interval = input.pollIntervalMs ?? 100;
   if (!Number.isSafeInteger(interval) || interval < 1 || interval > 1000) {
     throw new BoxSpoolPollError("BOX_SPOOL_POLL_INTERVAL_INVALID");

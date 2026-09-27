@@ -47,7 +47,7 @@ test("image and multi-round results have a bounded prepublication spool budget",
     admitted++;
     offset += bound + 1_000_000; // one bounded model response after each echo
   }
-  assert.ok(admitted >= 2 && admitted < 20);
+  assert.ok(admitted >= 20 && admitted < 128);
   assert.throws(() => reserveBoxToolEcho(BOX_TOOL_SPOOL_MAX_BYTES - 1_000_000,
     message("last")), /BOX_TOOL_SPOOL_CAPACITY_EXCEEDED/);
 });

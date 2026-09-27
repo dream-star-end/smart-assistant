@@ -32,8 +32,8 @@ test("first tool round stages private MCP catalog and permits only virtual tools
   assert.equal(args[args.indexOf("--allowedTools") + 1], "mcp__ocbridge__t0");
   assert.ok(!args.includes("--disallowedTools"));
   assert.equal(args[args.indexOf("--effort") + 1], "medium");
-  assert.equal(args[args.indexOf("--deadline") + 1], "900");
-  assert.equal(args[args.indexOf("--max-output") + 1], "67108864",
+  assert.equal(args[args.indexOf("--deadline") + 1], "14400");
+  assert.equal(args[args.indexOf("--max-output") + 1], "268435456",
     "detached tool output must carry the full result echo across rounds");
   assert.equal(args[args.indexOf("--stderr-limit") + 1], "2097152",
     "stderr must not consume the reserved stdout budget");
@@ -43,7 +43,7 @@ test("first tool round stages private MCP catalog and permits only virtual tools
     plan.stageVirtualMcp.args[3]]);
   assert.equal(config.mcpServers.ocbridge.args[2], plan.cwd);
   assert.equal(config.mcpServers.ocbridge.args[3], plan.catalog.sha256);
-  assert.equal(config.mcpServers.ocbridge.args[4], "900");
+  assert.equal(config.mcpServers.ocbridge.args[4], "14400");
   assert.ok(!args.join(" ").includes("Use local_echo on ping"));
   assert.ok(!args.join(" ").includes("OpenClaude local-only echo"));
   for (const stage of [plan.stageVirtualMcp, ...plan.stageInputs, plan.cleanup]) {

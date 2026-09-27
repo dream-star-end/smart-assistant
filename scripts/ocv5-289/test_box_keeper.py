@@ -25,7 +25,8 @@ class KeeperTest(unittest.TestCase):
     def test_detached_worker_budget_uses_verified_deadline_not_old_140s(self) -> None:
         budget = runpy.run_path(str(KEEPER))["worker_budget"]
         self.assertEqual(budget(["--deadline", "900", "--", "echo"]), 930)
-        self.assertEqual(budget(["--deadline", "901", "--", "echo"]), 140)
+        self.assertEqual(budget(["--deadline", "14400", "--", "echo"]), 14430)
+        self.assertEqual(budget(["--deadline", "14401", "--", "echo"]), 140)
 
     def test_abbreviated_or_duplicate_deadline_is_rejected_before_worker(self) -> None:
         extract = runpy.run_path(str(KEEPER))["extract_proof_args"]

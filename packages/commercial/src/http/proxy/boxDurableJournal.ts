@@ -16,7 +16,8 @@ import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.js";
+import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES,
+  reserveBoxToolEcho } from "./boxToolCapacity.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
@@ -535,7 +536,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         || typeof runNonce !== "string" || !/^[a-f0-9]{24}$/.test(runNonce)
         || typeof leaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(leaseEpoch)
         || (mode !== "text" && mode !== "detached_tool")
-        || !Number.isSafeInteger(roundNo) || Number(roundNo) < 1 || Number(roundNo) > 32
+        || !Number.isSafeInteger(roundNo) || Number(roundNo) < 1
+        || Number(roundNo) > BOX_TOOL_MAX_ROUNDS
         || !Number.isSafeInteger(spoolOffset) || Number(spoolOffset) < 0
         || Number(spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
         || (original.boxReplayMessage !== undefined && !messagePointer)
@@ -555,7 +557,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       let row = matched;
       const seen = new Set<string>();
-      for (let hop = 0; hop < 32; hop++) {
+      for (let hop = 0; hop < BOX_TOOL_MAX_ROUNDS; hop++) {
         if (seen.has(row.request_id)
           || row.ctx.boxInvocationRecovery !== "v1"
           || row.ctx.boxInvocationMode !== mode
@@ -1324,7 +1326,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       outputTokens: candidate?.outputTokens,
       cacheReadTokens: candidate?.cacheReadTokens,
       cacheWriteTokens: candidate?.cacheWriteTokens };
-    if (!Number.isSafeInteger(roundNo) || roundNo < 1 || roundNo > 32
+    if (!Number.isSafeInteger(roundNo) || roundNo < 1
+      || roundNo > BOX_TOOL_MAX_ROUNDS
       || (input.messagePointer !== undefined && !pointer)
       || !candidate || typeof candidate.messageId !== "string"
       || candidate.messageId.length < 1 || candidate.messageId.length > 128
@@ -1493,7 +1496,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       const handoff = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
       if (!handoff) throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
-      if (handoff.roundNo >= 32) throw new BoxDurableJournalError("BOX_TOOL_ROUND_LIMIT");
+      if (handoff.roundNo >= BOX_TOOL_MAX_ROUNDS) {
+        throw new BoxDurableJournalError("BOX_TOOL_ROUND_LIMIT");
+      }
       const priorIds = ctx.boxPriorMessageIds === undefined ? [] : ctx.boxPriorMessageIds;
       if (!Array.isArray(priorIds) || priorIds.length !== handoff.roundNo - 1
         || new Set(priorIds).size !== priorIds.length
@@ -1651,7 +1656,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const seen = new Set<string>();
       let cursor: string | null = input.requestId;
       while (cursor !== null) {
-        if (rows.length >= 32 || seen.has(cursor)) {
+        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) {
           throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
         }
         seen.add(cursor);
@@ -1678,7 +1683,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const basis = current.ctx;
       const roundNo = basis.boxRoundNo;
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
-        || Number(roundNo) > 32 || rows.length !== roundNo
+        || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== roundNo
         || (pointer && pointer.roundNo !== roundNo)
         || (basis.boxReplayRequired === true && !pointer)
         || basis.boxSessionId !== lockedSessionId
@@ -1768,7 +1773,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const seen = new Set<string>();
       let cursor: string | null = input.requestId;
       while (cursor !== null) {
-        if (rows.length >= 32 || seen.has(cursor)) {
+        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) {
           throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
         }
         seen.add(cursor);
@@ -1804,7 +1809,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         await client.query("COMMIT"); committed = true; return;
       }
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
-        || Number(roundNo) > 32 || rows.length !== roundNo
+        || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== roundNo
         || basis.boxSessionId !== lockedSessionId
         || (handoff
           ? (!["inflight", "finalizing", "committed"].includes(current.state)

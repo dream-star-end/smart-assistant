@@ -47,6 +47,8 @@ test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed",
   assert.equal(parseBoxStoredToolHandoff(wrongAssistant), null);
   assert.equal(parseBoxStoredToolHandoff({ ...evidence(), assistantEchoHash: "private" }), null);
   assert.equal(parseBoxStoredToolHandoff({ ...evidence(), assistantNoCallerHash: "private" }), null);
-  const beyondCap = evidence(); beyondCap.roundNo = 33;
+  const lastAllowed = evidence(); lastAllowed.roundNo = 128;
+  assert.ok(parseBoxStoredToolHandoff(lastAllowed));
+  const beyondCap = evidence(); beyondCap.roundNo = 129;
   assert.equal(parseBoxStoredToolHandoff(beyondCap), null);
 });

@@ -6,6 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
+import { BOX_TOOL_MAX_ROUNDS } from "./boxToolCapacity.js";
 
 const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -54,7 +55,8 @@ function ownerUid(): number {
 function validIdentity(x: Identity): boolean {
   return /^[1-9][0-9]{0,19}$/.test(x.uid) && ID.test(x.requestId)
     && HEX24.test(x.runNonce) && HEX32.test(x.leaseEpoch)
-    && Number.isSafeInteger(x.roundNo) && x.roundNo >= 1 && x.roundNo <= 32;
+    && Number.isSafeInteger(x.roundNo) && x.roundNo >= 1
+    && x.roundNo <= BOX_TOOL_MAX_ROUNDS;
 }
 function filename(x: Identity): string {
   return `${x.uid}.${x.requestId}.${x.runNonce}.${x.leaseEpoch}.${x.roundNo}.json`;
