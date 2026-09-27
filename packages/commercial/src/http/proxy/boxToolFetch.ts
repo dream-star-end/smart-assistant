@@ -14,6 +14,7 @@ import { stripBoxCcbToolBudgetTail } from "./boxCacheAnnotations.js";
 import { makeBoxPrelaunchCleanup } from "./boxPrelaunchControl.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
+import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 
 type FetchArgs = { uid: bigint; sessionId: string | null; requestId: string;
   canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
@@ -50,6 +51,7 @@ export class BoxToolFetch {
     virtualMcpAsset: Buffer;
     detachedRunnerAsset: Buffer;
     journal: BoxDurableJournal;
+    writeMessage?: BoxReplayMessageWriter;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null;
       requestId: string; upstreamModel: string; signal: AbortSignal;
@@ -409,6 +411,7 @@ export class BoxToolFetch {
               canonicalBody: args.canonicalBody, upstreamModel: args.upstreamModel,
               signal: abort.signal, emit,
             }, { journal: this.deps.journal,
+              writeMessage: this.deps.writeMessage,
               retainUnknownTarget: ({ published: held }) =>
                 this.own(held.claim.runNonce, held.target,
                   args.uid, held.claim.leaseEpoch),
@@ -428,6 +431,7 @@ export class BoxToolFetch {
               virtualMcpAsset: this.deps.virtualMcpAsset,
               detachedRunnerAsset: this.deps.detachedRunnerAsset,
               journal: this.deps.journal,
+              writeMessage: this.deps.writeMessage,
               maxOutputTokensForModel: this.deps.maxOutputTokensForModel,
               resolveTarget: (input) => this.deps.resolveTarget({ ...input,
                 allowWakeIfHibernated: true }),

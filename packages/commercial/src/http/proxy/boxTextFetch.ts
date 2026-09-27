@@ -13,6 +13,7 @@ import { boxFastPathEnabled } from "./boxFastPath.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import type { BoxJournalPort } from "./boxDurableJournal.js";
+import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { ProxyBody } from "./shared.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -38,6 +39,7 @@ export class BoxTextFetch {
     keeperAsset: Buffer;
     registry: BoxInvocationRegistry;
     journal: BoxJournalPort;
+    writeMessage?: BoxReplayMessageWriter;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
       upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
@@ -348,12 +350,18 @@ export class BoxTextFetch {
                 throw new BoxTextFetchError("BOX_MODEL_PROTOCOL_INVALID");
               }
               try {
+                const messagePointer = this.deps.writeMessage
+                  ? await race(this.deps.writeMessage({ uid: args.uid.toString(),
+                    requestId: args.requestId, runNonce: plan.runNonce,
+                    leaseEpoch: plan.leaseEpoch, roundNo: 1 },
+                  decoder.completedMessage())) : undefined;
                 await race(this.deps.journal.complete({ requestId: args.requestId,
                   uid: args.uid, leaseEpoch: plan.leaseEpoch, proof: terminalProof!,
                   usage: { inputTokens: converted.inputTokens,
                     outputTokens: converted.outputTokens,
                     cacheReadTokens: converted.cacheReadTokens,
-                    cacheWriteTokens: converted.cacheWriteTokens } }));
+                    cacheWriteTokens: converted.cacheWriteTokens },
+                  ...(messagePointer ? { messagePointer } : {}) }));
               } catch {
                 await markUnknown("billing_evidence_unknown");
                 throw new BoxTextFetchError("BOX_BILLING_EVIDENCE_UNAVAILABLE");

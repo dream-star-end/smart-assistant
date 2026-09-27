@@ -59,12 +59,12 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   journalFailPhase?: "admit" | "running" | "complete";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
-  badAssetManifest?: boolean } = {}) {
+  badAssetManifest?: boolean; writeMessage?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
   const stages: string[] = [], unknowns: string[] = [], journalCalls: string[] = [];
-  let journalUsage: unknown = null;
+  let journalUsage: unknown = null, journalPointer: unknown = null;
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
   const runner: Runner = { async run(request: BoxCcExecRequest,
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
@@ -134,7 +134,16 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
       markUnknown: async () => { journalCalls.push("unknown"); },
       complete: async (evidence) => { journalCalls.push("complete");
         journalUsage = evidence.usage;
+        journalPointer = evidence.messagePointer;
         if (opts.journalFailPhase === "complete") throw new Error("db down"); } },
+    ...(opts.writeMessage ? { writeMessage: async (identity: { uid: string;
+      requestId: string; runNonce: string; leaseEpoch: string; roundNo: number },
+      message: unknown) => {
+      journalCalls.push("capsule");
+      assert.equal((message as { id: string }).id, "msg_289");
+      return { version: 1 as const, ...identity, bytes: 100,
+        sha256: "a".repeat(64) };
+    } } : {}),
     maxOutputTokensForModel: (value) => value === model || value === canonicalAlias ? 128_000 : null,
     resolveTarget: async () => {
       if (opts.resolverThrow) throw new Error("raw credential detail must not leak");
@@ -146,7 +155,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
     },
     now: () => now, budgetMs: 600_000 });
   return { service, registry, stages, unknowns, journalCalls,
-    getJournalUsage: () => journalUsage, getMaxActive: () => maxActive,
+    getJournalUsage: () => journalUsage, getJournalPointer: () => journalPointer,
+    getMaxActive: () => maxActive,
     advance: (ms: number) => { now += ms; }, releaseModel: () => releaseModel() };
 }
 
@@ -173,6 +183,16 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
   assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
   assert.deepEqual(f.getJournalUsage(), { inputTokens: 2, outputTokens: 7,
     cacheReadTokens: 20, cacheWriteTokens: 0 });
+});
+
+test("text Message capsule is written before terminal usage and attached to same journal row", async () => {
+  const f = fixture({ writeMessage: true });
+  const response = await f.service.fetch(input);
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /event: message_stop/);
+  assert.ok(f.journalCalls.indexOf("capsule") < f.journalCalls.indexOf("complete"));
+  assert.equal((f.getJournalPointer() as { requestId: string }).requestId, input.requestId);
+  assert.equal((f.getJournalPointer() as { roundNo: number }).roundNo, 1);
 });
 
 test("text batch stages both immutable assets in one Exec without changing billing", async () => {

@@ -5,6 +5,8 @@ import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import type { ProxyBody } from "./shared.js";
+import type { BoxReplayMessageWriter,
+  BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 
 const inheritedInstance = process.env.OC_INSTANCE_ID;
 process.env.OC_INSTANCE_ID = "box-test";
@@ -148,6 +150,38 @@ test("final round waits for Box terminal and journal before terminal SSE", async
   assert.ok(f.sequence.indexOf("proof-read") < f.sequence.indexOf("terminal-journal"));
   assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.lastIndexOf("emit"));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+});
+
+test("each continued round writes its Message before the same-row journal CAS", async () => {
+  for (const kind of ["tool", "final"] as const) {
+    const f = fixture(kind);
+    const journal = f.deps.journal as unknown as {
+      recordToolHandoff: (input: { messagePointer?: BoxReplayMessagePointer }) => Promise<unknown>;
+      completeToolChain: (input: { messagePointer?: BoxReplayMessagePointer }) => Promise<void>;
+    };
+    const originalHandoff = journal.recordToolHandoff.bind(journal);
+    const originalFinal = journal.completeToolChain.bind(journal);
+    journal.recordToolHandoff = async (input) => {
+      assert.equal(input.messagePointer?.requestId, f.input.requestId);
+      assert.equal(input.messagePointer?.roundNo, 2);
+      return originalHandoff(input);
+    };
+    journal.completeToolChain = async (input) => {
+      assert.equal(input.messagePointer?.requestId, f.input.requestId);
+      assert.equal(input.messagePointer?.roundNo, 2);
+      return originalFinal(input);
+    };
+    const writeMessage: BoxReplayMessageWriter = async (identity, message) => {
+      f.sequence.push("capsule-write");
+      assert.equal((message as { id: string }).id,
+        kind === "tool" ? "msg_tool_next" : "msg_final_next");
+      return { version: 1, ...identity, bytes: 100, sha256: "c".repeat(64) };
+    };
+    await runBoxToolContinuation(f.input, { ...f.deps, writeMessage });
+    const journalEvent = kind === "tool" ? "durable-handoff" : "terminal-journal";
+    assert.ok(f.sequence.indexOf("capsule-write") < f.sequence.indexOf(journalEvent));
+    assert.ok(f.sequence.indexOf(journalEvent) < f.sequence.lastIndexOf("emit"));
+  }
 });
 
 test("native final tool round publishes transcript pointer after durable usage", async () => {

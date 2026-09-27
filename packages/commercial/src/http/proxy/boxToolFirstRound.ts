@@ -22,6 +22,7 @@ import { matchesBoxNativeHistory } from "./boxNativeHistory.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
+import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { ProxyBody } from "./shared.js";
 
 export class BoxToolFirstRoundError extends Error {
@@ -63,6 +64,7 @@ export async function runBoxToolFirstRound(input: {
   virtualMcpAsset: Buffer;
   detachedRunnerAsset: Buffer;
   journal: Journal;
+  writeMessage?: BoxReplayMessageWriter;
   maxOutputTokensForModel: (model: string) => number | null;
   resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
     upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
@@ -431,8 +433,14 @@ export async function runBoxToolFirstRound(input: {
         const usage = { inputTokens: final.inputTokens,
           outputTokens: final.outputTokens, cacheReadTokens: final.cacheReadTokens,
           cacheWriteTokens: final.cacheWriteTokens };
+        const messagePointer = deps.writeMessage
+          ? await race(deps.writeMessage({ uid: input.uid.toString(),
+            requestId: input.requestId, runNonce: plan.runNonce,
+            leaseEpoch: plan.leaseEpoch, roundNo: 1 }, decoder.completedMessage()))
+          : undefined;
         await race(deps.journal.complete({ requestId: input.requestId,
-          uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage }));
+          uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage,
+          ...(messagePointer ? { messagePointer } : {}) }));
         let nativePointer: BoxNativePointer | undefined;
         if (nativeEnabled && final.assistantContentHash
           && deps.journal.attachNativePointer) {
@@ -478,11 +486,17 @@ export async function runBoxToolFirstRound(input: {
         if (pending.size === 0) await new Promise<void>((resolve) => setTimeout(resolve, 50));
       }
       if (pending.size === 0) throw new BoxToolFirstRoundError("BOX_TOOL_PENDING_UNPROVEN");
+      const messagePointer = deps.writeMessage
+        ? await race(deps.writeMessage({ uid: input.uid.toString(),
+          requestId: input.requestId, runNonce: plan.runNonce,
+          leaseEpoch: plan.leaseEpoch, roundNo: 1 }, decoder.completedMessage()))
+        : undefined;
       const proof = await race(deps.journal.recordToolHandoff({ requestId: input.requestId,
         uid: input.uid, leaseEpoch: plan.leaseEpoch, candidate, roundNo: 1,
         spoolOffset: line.endOffset, detachedRunnerHash: plan.detachedRunnerHash,
         catalogHash: plan.catalog.bindingSha256,
-        verifiedPendingToolUseIds: [...pending] }));
+        verifiedPendingToolUseIds: [...pending],
+        ...(messagePointer ? { messagePointer } : {}) }));
       input.emit(decoder.commitHandoff(proof));
       return { kind: "tool_handoff", plan, target, candidate,
         spoolOffset: line.endOffset };

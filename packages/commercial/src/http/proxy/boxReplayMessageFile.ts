@@ -42,6 +42,8 @@ export function parseBoxReplayMessagePointer(raw: unknown): BoxReplayMessagePoin
 }
 type Identity = Pick<BoxReplayMessagePointer,
   "uid" | "requestId" | "runNonce" | "leaseEpoch" | "roundNo">;
+export type BoxReplayMessageWriter = (identity: Identity,
+  message: unknown) => Promise<BoxReplayMessagePointer>;
 function ownerUid(): number {
   if (typeof process.getuid !== "function") {
     throw new BoxReplayMessageFileError("BOX_REPLAY_UNSUPPORTED_HOST");

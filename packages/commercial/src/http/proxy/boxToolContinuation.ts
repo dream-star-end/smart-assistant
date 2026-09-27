@@ -16,6 +16,7 @@ import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativ
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
 import type { ProxyBody } from "./shared.js";
+import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 
 export class BoxToolContinuationError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolContinuationError"; }
@@ -37,6 +38,7 @@ export async function runBoxToolContinuation(input: {
   emit: (sse: string) => void;
 }, deps: {
   journal: Journal;
+  writeMessage?: BoxReplayMessageWriter;
   retainUnknownTarget: (handle: { published: BoxToolPublishedResume;
     uid: bigint; requestId: string }) => void;
   onUnknown: (args: { uid: bigint; accountId: bigint; requestId: string;
@@ -127,12 +129,18 @@ export async function runBoxToolContinuation(input: {
           if (pending.size === 0) await new Promise<void>((resolve) => setTimeout(resolve, 50));
         }
         if (pending.size === 0) throw new BoxToolContinuationError("BOX_TOOL_PENDING_UNPROVEN");
+        const messagePointer = deps.writeMessage
+          ? await race(deps.writeMessage({ uid: input.uid.toString(),
+            requestId: input.requestId, runNonce: claim.runNonce,
+            leaseEpoch: claim.leaseEpoch, roundNo: claim.roundNo },
+          decoder.completedMessage())) : undefined;
         const receipt = await race(deps.journal.recordToolHandoff({ requestId: input.requestId,
           uid: input.uid, leaseEpoch: claim.leaseEpoch, candidate,
           roundNo: claim.roundNo, spoolOffset: line.endOffset,
           detachedRunnerHash: claim.detachedRunnerHash,
           catalogHash: claim.catalogHash,
-          verifiedPendingToolUseIds: [...pending] }));
+          verifiedPendingToolUseIds: [...pending],
+          ...(messagePointer ? { messagePointer } : {}) }));
         input.emit(decoder.commitHandoff(receipt));
         return { kind: "tool_handoff", spoolOffset: line.endOffset };
       }
@@ -164,8 +172,14 @@ export async function runBoxToolContinuation(input: {
         const usage = { inputTokens: final.inputTokens,
           outputTokens: final.outputTokens, cacheReadTokens: final.cacheReadTokens,
           cacheWriteTokens: final.cacheWriteTokens };
+        const messagePointer = deps.writeMessage
+          ? await race(deps.writeMessage({ uid: input.uid.toString(),
+            requestId: input.requestId, runNonce: claim.runNonce,
+            leaseEpoch: claim.leaseEpoch, roundNo: claim.roundNo },
+          decoder.completedMessage())) : undefined;
         await race(deps.journal.completeToolChain({ requestId: input.requestId,
-          uid: input.uid, leaseEpoch: claim.leaseEpoch, proof, usage }));
+          uid: input.uid, leaseEpoch: claim.leaseEpoch, proof, usage,
+          ...(messagePointer ? { messagePointer } : {}) }));
         let nativePointer: BoxNativePointer | undefined;
         if (boxFastPathEnabled() && final.assistantContentHash
           && claim.nativeSessionId && claim.nativeCliCwd

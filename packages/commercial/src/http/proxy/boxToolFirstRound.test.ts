@@ -9,6 +9,8 @@ import { makeBoxNativeHistoryBasis } from "./boxNativeHistory.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import type { ProxyBody } from "./shared.js";
+import type { BoxReplayMessageWriter,
+  BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 
 const inheritedInstance = process.env.OC_INSTANCE_ID;
 process.env.OC_INSTANCE_ID = "box-test";
@@ -234,6 +236,38 @@ test("first tool round admits before one launch and emits terminal only after du
   assert.ok(f.sequence.indexOf("durable-handoff") < f.sequence.lastIndexOf("emit"));
   assert.ok(f.emitted.join("").includes('"name":"local_echo"'));
   assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+});
+
+test("first tool or final Message is retained before its exact journal CAS", async () => {
+  for (const directFinal of [false, true]) {
+    const f = fixture({ directFinal });
+    const journal = f.deps.journal as unknown as {
+      recordToolHandoff: (input: { messagePointer?: BoxReplayMessagePointer }) => Promise<unknown>;
+      complete: (input: { messagePointer?: BoxReplayMessagePointer }) => Promise<void>;
+    };
+    const originalHandoff = journal.recordToolHandoff.bind(journal);
+    const originalFinal = journal.complete.bind(journal);
+    journal.recordToolHandoff = async (input) => {
+      assert.equal(input.messagePointer?.requestId, f.input.requestId);
+      assert.equal(input.messagePointer?.roundNo, 1);
+      return originalHandoff(input);
+    };
+    journal.complete = async (input) => {
+      assert.equal(input.messagePointer?.requestId, f.input.requestId);
+      assert.equal(input.messagePointer?.roundNo, 1);
+      return originalFinal(input);
+    };
+    const writeMessage: BoxReplayMessageWriter = async (identity, message) => {
+      f.sequence.push("capsule-write");
+      assert.equal((message as { id: string }).id,
+        directFinal ? "msg_direct_final" : "msg_synthetic");
+      return { version: 1, ...identity, bytes: 100, sha256: "a".repeat(64) };
+    };
+    await runBoxToolFirstRound(f.input, { ...f.deps, writeMessage });
+    const journalEvent = directFinal ? "terminal-journal" : "durable-handoff";
+    assert.ok(f.sequence.indexOf("capsule-write") < f.sequence.indexOf(journalEvent));
+    assert.ok(f.sequence.indexOf(journalEvent) < f.sequence.lastIndexOf("emit"));
+  }
 });
 
 test("one batched asset Exec still precedes durable arm and the sole paid launch", async () => {
