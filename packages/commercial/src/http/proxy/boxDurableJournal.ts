@@ -1221,17 +1221,34 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
     const durableRevision = randomUUID();
     const changed = await this.pool.query(
-      `UPDATE request_finalize_journal
-          SET ctx = ctx || $4::jsonb, updated_at = NOW()
+      `UPDATE request_finalize_journal AS handoff_row
+          SET ctx = handoff_row.ctx || $4::jsonb, updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
            AND ctx->>'boxLeaseEpoch' = $3
            AND ($10::text IS NULL OR ctx->>'boxRunNonce' = $10)
            AND (ctx->>'boxReplayRequired' IS DISTINCT FROM 'true' OR $10::text IS NOT NULL)
            AND ctx->>'boxInvocationMode' = 'detached_tool'
           AND NOT (ctx ? 'boxCancelIntent')
-          AND ((($5::int = 1) AND ctx->>'boxState' = 'running')
-            OR (($5::int > 1) AND ctx->>'boxState' = 'linked'
-              AND ctx->>'boxRoundNo' = $5::text
+           AND NOT (ctx ? 'boxToolHandoff')
+           AND NOT (ctx ? 'boxReplayMessage')
+           AND NOT (ctx ? 'boxTerminalProof')
+           AND ((($5::int = 1) AND (ctx->>'boxState' = 'running'
+             OR (ctx->>'boxState'='unknown'
+               AND ctx->>'boxReplayRequired'='true'
+               AND ctx->>'boxLaunchPermit'='true')))
+             OR (($5::int > 1) AND (ctx->>'boxState' = 'linked'
+               OR (ctx->>'boxState'='unknown'
+                 AND ctx->>'boxReplayRequired'='true'
+                 AND EXISTS (SELECT 1 FROM request_finalize_journal root
+                   WHERE root.user_id=$2
+                     AND root.ctx->>'boxRunNonce'=handoff_row.ctx->>'boxRunNonce'
+                     AND root.ctx->>'boxLeaseEpoch'=$3
+                     AND root.ctx->>'boxAccountId'=handoff_row.ctx->>'boxAccountId'
+                     AND root.ctx->>'boxSessionId'=handoff_row.ctx->>'boxSessionId'
+                     AND root.ctx->>'boxTurnKey'=handoff_row.ctx->>'boxTurnKey'
+                     AND root.ctx->>'boxLaunchPermit'='true'
+                     AND NOT (root.ctx ? 'boxOwnerRequestId'))))
+               AND ctx->>'boxRoundNo' = $5::text
               AND ctx->>'boxCatalogHash' = $6
               AND ctx->>'boxDetachedRunnerHash' = $7
               AND jsonb_typeof(ctx->'boxResumeSpoolOffset') = 'number'

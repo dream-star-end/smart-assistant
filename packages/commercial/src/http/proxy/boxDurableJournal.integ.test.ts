@@ -536,6 +536,29 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       (error: unknown) => error instanceof BoxDurableJournalError
         && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
     }
+    await journal.markUnknown({ requestId: `box-d-${suffix}`, uid: 3n,
+      leaseEpoch: toolCall.leaseEpoch, phase: "synthetic_observer_takeover" });
+    const decoyRoot = `box-decoy-root-${suffix}`;
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx-'boxLaunchPermit' WHERE request_id=$1`, [toolCall.requestId]);
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [decoyRoot, JSON.stringify({
+      ...basis, boxLeaseEpoch: toolCall.leaseEpoch,
+      boxRunNonce: "9".repeat(24), boxAccountId: "21",
+      boxSessionId: `other-${suffix}`, boxTurnKey: "9".repeat(64),
+      boxLaunchPermit: true })]);
+    await assert.rejects(() => journal.recordToolHandoff({
+      requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+      candidate: secondCandidate, roundNo: 2, spoolOffset: 2345,
+      detachedRunnerHash: "f".repeat(64), catalogHash,
+      messagePointer: messagePointer(`box-d-${suffix}`, toolCall.runNonce,
+        toolCall.leaseEpoch, 2), verifiedPendingToolUseIds: ["toolu_C"] }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST",
+    "same-epoch decoy permit must not authorize another run/account/session/turn");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxLaunchPermit":true}'::jsonb WHERE request_id=$1`,
+    [toolCall.requestId]);
     await journal.recordToolHandoff({ requestId: `box-d-${suffix}`, uid: 3n,
       leaseEpoch: toolCall.leaseEpoch, candidate: secondCandidate, roundNo: 2,
       spoolOffset: 2345, detachedRunnerHash: "f".repeat(64),
@@ -543,6 +566,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         toolCall.leaseEpoch, 2),
       catalogHash,
       verifiedPendingToolUseIds: ["toolu_C"] });
+    const recoveredSecond = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-${suffix}`]);
+    assert.equal(recoveredSecond.rows[0]?.ctx.boxState, "handoff",
+      "read-only observer may commit exact unknown linked round only once");
     const replayedHandoff = await journal.findReplayIdentity({ uid: 3n,
       canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody });
     assert.deepEqual(replayedHandoff?.messagePointer,
@@ -1202,6 +1229,25 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       WHERE request_id LIKE $1`, [`box-old-probe-%-${suffix}`, String(Date.now() - 1)]);
     const rotated = await journal.listStoppedFailureProbeCandidates(10);
     assert.equal(rotated[0]?.requestId, `box-new-probe-${suffix}`);
+    const observerId = `box-observer-root-${suffix}`;
+    const observerNonce = "0".repeat(24), observerEpoch = "9".repeat(32);
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [observerId, JSON.stringify({
+      ...basis, boxState: "unknown", boxInvocationMode: "detached_tool",
+      boxAccountId: "20", boxRunNonce: observerNonce,
+      boxLeaseEpoch: observerEpoch, boxSessionId: fingerprint.sessionId,
+      boxTurnKey: fingerprint.turnKey, boxReplayRequired: true,
+      boxLaunchPermit: true, boxDetachedRunnerHash: "f".repeat(64),
+      boxCatalogHash: catalogHash })]);
+    await journal.recordToolHandoff({ requestId: observerId, uid: 3n,
+      leaseEpoch: observerEpoch, candidate, roundNo: 1,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64),
+      catalogHash, verifiedPendingToolUseIds: ["toolu_A"],
+      messagePointer: messagePointer(observerId, observerNonce, observerEpoch, 1) });
+    const rootRecovered = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [observerId]);
+    assert.equal(rootRecovered.rows[0]?.ctx.boxState, "handoff",
+      "root unknown with its own paid permit may commit the proven handoff once");
   } finally {
     await client.query("DROP TABLE IF EXISTS pg_temp.usage_records");
     await client.query("DROP TABLE IF EXISTS pg_temp.request_finalize_journal");
