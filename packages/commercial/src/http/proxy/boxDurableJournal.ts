@@ -20,6 +20,8 @@ import { BOX_TOOL_SPOOL_MAX_BYTES, reserveBoxToolEcho } from "./boxToolCapacity.
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
+import { parseBoxReplayMessagePointer,
+  type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
@@ -40,6 +42,15 @@ function validUsageEvidence(value: unknown): value is BoxUsageEvidence {
   return Object.keys(usage).length === keys.length
     && keys.every((key) => Object.hasOwn(usage, key)
       && Number.isSafeInteger(usage[key]) && Number(usage[key]) >= 0);
+}
+function matchingReplayPointer(value: unknown, input: { uid: bigint; requestId: string;
+  runNonce: string; leaseEpoch: string; roundNo: number }): BoxReplayMessagePointer | null {
+  const pointer = parseBoxReplayMessagePointer(value);
+  return pointer && pointer.uid === input.uid.toString()
+    && pointer.requestId === input.requestId
+    && pointer.runNonce === input.runNonce
+    && pointer.leaseEpoch === input.leaseEpoch
+    && pointer.roundNo === input.roundNo ? pointer : null;
 }
 function validCancelIntent(value: unknown): value is {
   v: 1; reason: "user_cancel"; requestId: string; atMs: number } {
@@ -185,18 +196,21 @@ export interface BoxJournalPort {
   recordUserCancelIntent?(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">): Promise<void>;
   complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
-    { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
+    { proof: BoxTerminalProof; usage: BoxUsageEvidence;
+      messagePointer?: BoxReplayMessagePointer }): Promise<void>;
   recordToolHandoff?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { candidate: BoxToolHandoffCandidate;
       roundNo?: number;
       spoolOffset: number;
       detachedRunnerHash: string;
-      catalogHash: string;
-      verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof>;
+       catalogHash: string;
+       verifiedPendingToolUseIds: readonly string[];
+       messagePointer?: BoxReplayMessagePointer }): Promise<BoxToolHandoffProof>;
   claimToolResume?(input: { requestId: string; uid: bigint;
     canonicalModel: string; canonicalBody: ProxyBody }): Promise<BoxToolResumeClaim>;
   completeToolChain?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
-    { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void>;
+    { proof: BoxTerminalProof; usage: BoxUsageEvidence;
+      messagePointer?: BoxReplayMessagePointer }): Promise<void>;
   markToolChainStoppedFailure?(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void>;
 }
@@ -967,23 +981,34 @@ export class BoxDurableJournal implements BoxJournalPort {
   }
 
   async complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
-    { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void> {
+    { proof: BoxTerminalProof; usage: BoxUsageEvidence;
+      messagePointer?: BoxReplayMessagePointer }): Promise<void> {
     const u = input.usage;
+    const pointer = input.messagePointer === undefined ? undefined
+      : matchingReplayPointer(input.messagePointer, { uid: input.uid,
+        requestId: input.requestId, runNonce: input.proof.runNonce,
+        leaseEpoch: input.leaseEpoch, roundNo: 1 });
     if (input.proof.leaseEpoch !== input.leaseEpoch
       || input.proof.reason !== "worker_complete"
-      || !validUsageEvidence(u)) {
+      || !validUsageEvidence(u)
+      || (input.messagePointer !== undefined && !pointer)) {
       throw new BoxDurableJournalError("BOX_JOURNAL_EVIDENCE_INVALID");
     }
     const changed = await this.pool.query(
       `UPDATE request_finalize_journal
           SET ctx = ctx || $4::jsonb, updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-          AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxRunNonce' = $5
-          AND ctx->>'boxState' IN ('running', 'unknown')
-          AND ctx ? 'billingPricing'`,
+           AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxRunNonce' = $5
+           AND ctx->>'boxState' IN ('running', 'unknown')
+           AND ($6::boolean = false OR (
+             COALESCE(ctx->>'boxRoundNo','1')='1'
+             AND NOT (ctx ? 'boxToolHandoff')
+             AND NOT (ctx ? 'boxReplayMessage')))
+           AND ctx ? 'billingPricing'`,
       [input.requestId, input.uid.toString(), input.leaseEpoch,
-        JSON.stringify({ boxState: "terminal", boxUsage: u, boxTerminalProof: input.proof }),
-        input.proof.runNonce]);
+        JSON.stringify({ boxState: "terminal", boxUsage: u, boxTerminalProof: input.proof,
+          ...(pointer ? { boxReplayMessage: pointer } : {}) }),
+        input.proof.runNonce, pointer !== undefined]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_COMPLETE_FENCE_LOST");
   }
 
@@ -1033,11 +1058,16 @@ export class BoxDurableJournal implements BoxJournalPort {
     { candidate: BoxToolHandoffCandidate;
       roundNo?: number;
       spoolOffset: number;
-      detachedRunnerHash: string;
-      catalogHash: string;
-      verifiedPendingToolUseIds: readonly string[] }): Promise<BoxToolHandoffProof> {
+       detachedRunnerHash: string;
+       catalogHash: string;
+       verifiedPendingToolUseIds: readonly string[];
+       messagePointer?: BoxReplayMessagePointer }): Promise<BoxToolHandoffProof> {
     const candidate = input.candidate;
     const roundNo = input.roundNo ?? 1;
+    const pointer = input.messagePointer === undefined ? undefined
+      : matchingReplayPointer(input.messagePointer, { uid: input.uid,
+        requestId: input.requestId, runNonce: input.messagePointer.runNonce,
+        leaseEpoch: input.leaseEpoch, roundNo });
     const toolUses = candidate && Array.isArray(candidate.toolUses) ? candidate.toolUses : [];
     const ids = toolUses.map((use) => use?.id ?? "");
     const pending = input.verifiedPendingToolUseIds;
@@ -1046,6 +1076,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       cacheReadTokens: candidate?.cacheReadTokens,
       cacheWriteTokens: candidate?.cacheWriteTokens };
     if (!Number.isSafeInteger(roundNo) || roundNo < 1 || roundNo > 32
+      || (input.messagePointer !== undefined && !pointer)
       || !candidate || typeof candidate.messageId !== "string"
       || candidate.messageId.length < 1 || candidate.messageId.length > 128
       || typeof candidate.assistantContentHash !== "string"
@@ -1108,8 +1139,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       `UPDATE request_finalize_journal
           SET ctx = ctx || $4::jsonb, updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
-          AND ctx->>'boxLeaseEpoch' = $3
-          AND ctx->>'boxInvocationMode' = 'detached_tool'
+           AND ctx->>'boxLeaseEpoch' = $3
+           AND ($10::text IS NULL OR ctx->>'boxRunNonce' = $10)
+           AND ctx->>'boxInvocationMode' = 'detached_tool'
           AND NOT (ctx ? 'boxCancelIntent')
           AND ((($5::int = 1) AND ctx->>'boxState' = 'running')
             OR (($5::int > 1) AND ctx->>'boxState' = 'linked'
@@ -1123,9 +1155,11 @@ export class BoxDurableJournal implements BoxJournalPort {
               AND NOT (ctx->'boxPriorMessageIds' ? $8)))
           AND ctx ? 'billingPricing' AND ctx ? 'boxBillingContext'`,
       [input.requestId, input.uid.toString(), input.leaseEpoch,
-        JSON.stringify({ boxState: "handoff", boxHandoffRevision: durableRevision,
-          boxToolHandoff: frozen }), roundNo, input.catalogHash,
-        input.detachedRunnerHash, candidate.messageId, input.spoolOffset]);
+         JSON.stringify({ boxState: "handoff", boxHandoffRevision: durableRevision,
+           boxToolHandoff: frozen,
+           ...(pointer ? { boxReplayMessage: pointer } : {}) }), roundNo, input.catalogHash,
+         input.detachedRunnerHash, candidate.messageId, input.spoolOffset,
+         pointer?.runNonce ?? null]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_FENCE_LOST");
     return { durableRevision, journaledToolUseIds: ids,
       verifiedPendingToolUseIds: pendingIds };
@@ -1317,11 +1351,19 @@ export class BoxDurableJournal implements BoxJournalPort {
    * only the final linked row receives final-message usage and terminal proof.
    * Until this transaction commits, the original owner keeps account capacity. */
   async completeToolChain(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
-    { proof: BoxTerminalProof; usage: BoxUsageEvidence }): Promise<void> {
+    { proof: BoxTerminalProof; usage: BoxUsageEvidence;
+      messagePointer?: BoxReplayMessagePointer }): Promise<void> {
     const usage = input.usage;
+    const pointer = input.messagePointer === undefined ? undefined
+      : parseBoxReplayMessagePointer(input.messagePointer);
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
-      || !validUsageEvidence(usage)) {
+      || !validUsageEvidence(usage)
+      || (input.messagePointer !== undefined && (!pointer
+        || pointer.uid !== input.uid.toString()
+        || pointer.requestId !== input.requestId
+        || pointer.runNonce !== input.proof.runNonce
+        || pointer.leaseEpoch !== input.leaseEpoch))) {
       throw new BoxDurableJournalError("BOX_TOOL_CHAIN_EVIDENCE_INVALID");
     }
     try {
@@ -1369,6 +1411,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const roundNo = basis.boxRoundNo;
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
         || Number(roundNo) > 32 || rows.length !== roundNo
+        || (pointer && pointer.roundNo !== roundNo)
         || basis.boxSessionId !== lockedSessionId
         || current.state !== "inflight"
         || !["linked", "unknown"].includes(String(basis.boxState))
@@ -1410,8 +1453,9 @@ export class BoxDurableJournal implements BoxJournalPort {
             AND ctx->>'boxLeaseEpoch'=$3
             AND ctx->>'boxState' IN ('linked','unknown')`,
         [current.request_id, input.uid.toString(), input.leaseEpoch,
-          JSON.stringify({ boxState: "terminal", boxTerminalProof: input.proof,
-            boxUsage: usage })]);
+           JSON.stringify({ boxState: "terminal", boxTerminalProof: input.proof,
+             boxUsage: usage,
+             ...(pointer ? { boxReplayMessage: pointer } : {}) })]);
       if (final.rowCount !== 1) throw new BoxDurableJournalError("BOX_TOOL_CHAIN_FENCE_LOST");
       for (const ancestor of rows.slice(1)) {
         const changed = await client.query(

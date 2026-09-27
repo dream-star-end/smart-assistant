@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { link, mkdtemp, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readBoxReplayMessage, writeBoxReplayMessage } from "./boxReplayMessageFile.js";
+import { parseBoxReplayMessagePointer, readBoxReplayMessage,
+  writeBoxReplayMessage } from "./boxReplayMessageFile.js";
 
 const identity = { uid: "3", requestId: "synthetic-round", runNonce: "a".repeat(24),
   leaseEpoch: "b".repeat(32), roundNo: 2 };
@@ -18,6 +19,9 @@ test("private Box Message capsule is exact, durable and no-clobber", async () =>
   try {
     const proof = await writeBoxReplayMessage(dir, identity, message);
     assert.equal(proof.version, 1);
+    assert.deepEqual(parseBoxReplayMessagePointer(JSON.parse(JSON.stringify(proof))), proof);
+    assert.equal(parseBoxReplayMessagePointer({ ...proof, authorization: "secret" }), null);
+    assert.equal(parseBoxReplayMessagePointer({ ...proof, version: 9 }), null);
     assert.equal(JSON.stringify(proof).includes("private-synthetic"), false);
     assert.deepEqual(await readBoxReplayMessage(dir, proof), message);
     assert.deepEqual(await writeBoxReplayMessage(dir, identity, message), proof);

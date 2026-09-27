@@ -26,6 +26,20 @@ export interface BoxReplayMessagePointer {
   readonly bytes: number;
   readonly sha256: string;
 }
+export function parseBoxReplayMessagePointer(raw: unknown): BoxReplayMessagePointer | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const x = raw as Record<string, unknown>;
+  if (Object.keys(x).sort().join(",")
+    !== "bytes,leaseEpoch,requestId,roundNo,runNonce,sha256,uid,version"
+    || x.version !== 1 || typeof x.uid !== "string"
+    || typeof x.requestId !== "string" || typeof x.runNonce !== "string"
+    || typeof x.leaseEpoch !== "string" || typeof x.roundNo !== "number"
+    || !validIdentity(x as unknown as Identity)
+    || !Number.isSafeInteger(x.bytes) || Number(x.bytes) < 1
+    || Number(x.bytes) > MAX_MESSAGE_BYTES
+    || typeof x.sha256 !== "string" || !SHA.test(x.sha256)) return null;
+  return x as unknown as BoxReplayMessagePointer;
+}
 type Identity = Pick<BoxReplayMessagePointer,
   "uid" | "requestId" | "runNonce" | "leaseEpoch" | "roundNo">;
 function ownerUid(): number {
@@ -144,9 +158,7 @@ export async function writeBoxReplayMessage(directory: string, identity: Identit
 }
 export async function readBoxReplayMessage(directory: string,
   proof: BoxReplayMessagePointer): Promise<unknown> {
-  if (!proof || proof.version !== 1 || !validIdentity(proof)
-    || !Number.isSafeInteger(proof.bytes) || proof.bytes < 1
-    || proof.bytes > MAX_MESSAGE_BYTES || !SHA.test(proof.sha256)) {
+  if (!parseBoxReplayMessagePointer(proof)) {
     throw new BoxReplayMessageFileError("BOX_REPLAY_POINTER_INVALID");
   }
   await privateDirectory(directory);
