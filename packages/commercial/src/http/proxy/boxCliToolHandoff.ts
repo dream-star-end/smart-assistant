@@ -99,6 +99,9 @@ export class BoxCliToolHandoffDecoder {
   private stopReason: string | null = null;
   private sawStop = false;
   private messageId: string | null = null;
+  private startMessage: Obj | null = null;
+  private deltaUsage: Obj = {};
+  private stopSequence: string | null = null;
   private inputTokens = 0;
   private outputTokens = 0;
   private cacheRead = 0;
@@ -171,6 +174,25 @@ export class BoxCliToolHandoffDecoder {
       throw error instanceof BoxCliToolHandoffError ? error
         : new BoxCliToolHandoffError("BOX_TOOL_STREAM_INVALID");
     }
+  }
+
+  /** Model-visible completed Message, not a CLI JSONL record or partial SSE.
+   * Callers may persist this privately before committing handoff/terminal
+   * evidence; the returned clone cannot mutate decoder authorization state. */
+  completedMessage(): Obj {
+    if (this.failed || !this.sawStop || !this.startMessage || !this.messageId
+      || !this.stopReason || (!this.candidate && !this.finalCandidate)) {
+      throw new BoxCliToolHandoffError("BOX_TOOL_MESSAGE_NOT_COMPLETE");
+    }
+    const startUsage = obj(this.startMessage.usage);
+    return structuredClone({ ...this.startMessage, type: "message", role: "assistant",
+      id: this.messageId, model: this.expectedModel,
+      content: this.blocks.map((block) => block.visible),
+      stop_reason: this.stopReason, stop_sequence: this.stopSequence,
+      usage: { ...startUsage, ...this.deltaUsage, input_tokens: this.inputTokens,
+        output_tokens: this.outputTokens,
+        cache_read_input_tokens: this.cacheRead,
+        cache_creation_input_tokens: this.cacheWrite } });
   }
 
   /** Only call after sidecar pending records and durable journal agree. */
@@ -308,6 +330,7 @@ export class BoxCliToolHandoffDecoder {
       this.cacheRead = count(usage.cache_read_input_tokens ?? 0);
       this.cacheWrite = count(usage.cache_creation_input_tokens ?? 0);
       this.messageId = message.id;
+      this.startMessage = structuredClone(message);
       this.started = true;
     } else if (kind === "content_block_start") {
       const index = event.index;
@@ -419,6 +442,7 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_STOP_REASON_INVALID");
       }
       const usage = obj(event.usage);
+      this.deltaUsage = { ...this.deltaUsage, ...usage };
       if ((usage.input_tokens !== undefined && count(usage.input_tokens) !== this.inputTokens)
         || (usage.cache_read_input_tokens !== undefined
           && count(usage.cache_read_input_tokens) !== this.cacheRead)
@@ -430,6 +454,11 @@ export class BoxCliToolHandoffDecoder {
       if (nextOutput < this.outputTokens) throw new BoxCliToolHandoffError("BOX_TOOL_USAGE_REGRESSION");
       this.outputTokens = nextOutput;
       this.stopReason = reason as string;
+      const sequence = obj(event.delta).stop_sequence;
+      if (sequence !== undefined && sequence !== null && typeof sequence !== "string") {
+        throw new BoxCliToolHandoffError("BOX_TOOL_STOP_REASON_INVALID");
+      }
+      this.stopSequence = typeof sequence === "string" ? sequence : null;
     } else if (kind === "message_stop") {
       if (!this.started || this.active || this.sawStop || this.stopReason === null) {
         throw new BoxCliToolHandoffError("BOX_TOOL_ORDER_INVALID");

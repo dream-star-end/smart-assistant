@@ -56,6 +56,17 @@ test("interleaved real-CC-style snapshots and two identical tools form one guard
     "tool block must stay hidden until durable handoff");
   assert.ok(!streamed.includes("event: message_delta"));
   const candidate = decoder.push("").candidate;
+  const completed = decoder.completedMessage();
+  assert.equal(completed.id, "msg_tool_1");
+  assert.equal(completed.stop_reason, "tool_use");
+  assert.deepEqual((completed.usage as { input_tokens: number; output_tokens: number }),
+    { input_tokens: 2, output_tokens: 8,
+      cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+  assert.deepEqual((completed.content as Array<{ name: string }>).map((block) => block.name),
+    ["Bash", "Bash"], "capsule uses client-visible tool names");
+  (completed.content as Array<{ name: string }>)[0]!.name = "tampered";
+  assert.equal((decoder.completedMessage().content as Array<{ name: string }>)[0]!.name,
+    "Bash", "capsule callers cannot mutate decoder proof");
   assert.equal(candidate?.assistantContentHash, hashBoxAssistantContent([
     { ...use("toolu_parallel_a"), name: "Bash" },
     { ...use("toolu_parallel_b"), name: "Bash" },
@@ -372,7 +383,8 @@ test("a resumed tool round accepts no second init and still fences terminal SSE"
 test("a resumed final round streams blocks but withholds terminal until result and durable proof", () => {
   const finalRecords = [
     event({ type: "message_start", message: { id: "msg_final", model,
-      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0,
+        server_tool_use: { web_search_requests: 0 } } } }),
     event({ type: "content_block_start", index: 0,
       content_block: { type: "text", text: "" } }),
     event({ type: "content_block_delta", index: 0,
@@ -381,7 +393,9 @@ test("a resumed final round streams blocks but withholds terminal until result a
       role: "assistant", content: [{ type: "text", text: "done" }] } },
     event({ type: "content_block_stop", index: 0 }),
     event({ type: "message_delta", delta: { stop_reason: "end_turn" },
-      usage: { input_tokens: 2, output_tokens: 4 } }),
+      usage: { input_tokens: 2, output_tokens: 4,
+        server_tool_use: { web_search_requests: 4 },
+        cache_creation: { ephemeral_5m_input_tokens: 80 } } }),
     event({ type: "message_stop" }),
     { type: "result", subtype: "success", is_error: false,
       usage: { input_tokens: 10, output_tokens: 12 } },
@@ -398,6 +412,15 @@ test("a resumed final round streams blocks but withholds terminal until result a
   assert.equal(final?.assistantContentHash,
     hashBoxAssistantContent([{ type: "text", text: "done" }]));
   assert.equal(final?.outputTokens, 4, "bill only this HTTP model round, not CLI cumulative total");
+  const finalMessage = decoder.completedMessage();
+  assert.equal(finalMessage.id, "msg_final");
+  assert.deepEqual(finalMessage.content, [{ type: "text", text: "done" }]);
+  assert.equal((finalMessage.usage as { input_tokens: number }).input_tokens, 2);
+  assert.equal((finalMessage.usage as { output_tokens: number }).output_tokens, 4);
+  assert.deepEqual((finalMessage.usage as { server_tool_use: unknown }).server_tool_use,
+    { web_search_requests: 4 });
+  assert.deepEqual((finalMessage.usage as { cache_creation: unknown }).cache_creation,
+    { ephemeral_5m_input_tokens: 80 });
   assert.throws(() => decoder.commitFinal({ terminalReason: "worker_complete",
     journaledUsage: { inputTokens: 2, outputTokens: 4,
       cacheReadTokens: 0, cacheWriteTokens: 0 } }), /BOX_TOOL_FINAL_PROOF_INVALID/);
