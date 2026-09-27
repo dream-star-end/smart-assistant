@@ -191,3 +191,43 @@ test("two CCB hook-context tool rounds preserve bytes and the next context hash"
     input: { value: "ping" } }])[0]?.content.at(-1),
   { type: "text", text: dottedHook });
 });
+
+test("CCB budget is a no-op beside or inside tool results", () => {
+  const assistant = { role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_meta", name: "local_echo", input: { value: "ping" } }] };
+  const result = { type: "tool_result", tool_use_id: "toolu_meta", content: "pong" };
+  const prefix = [{ role: "user", content: "hello" }, assistant];
+  const budget = "<system-reminder>\n<total_tokens>0 tokens left</total_tokens>\n</system-reminder>";
+  const hook = "<system-reminder>\nPreToolUse:Bash hook additional context: Use Read.\n</system-reminder>";
+  const plain = { ...first, messages: [...prefix,
+    { role: "user", content: [result, { type: "text", text: hook }] }] } as ProxyBody;
+  const separate = { ...first, messages: [...prefix,
+    { role: "user", content: [result, { type: "text", text: hook },
+      { type: "text", text: budget }] }] } as ProxyBody;
+  const embedded = (tokens: string) => ({ ...first, messages: [...prefix,
+    { role: "user", content: [{ ...result,
+      content: "pong\n\n" + hook + "\n\n" +
+        `<system-reminder>\n<total_tokens>${tokens} tokens left</total_tokens>\n</system-reminder>` }] }] }) as ProxyBody;
+  const budgetOnly = { ...first, messages: [...prefix,
+    { role: "user", content: [result, { type: "text", text: budget }] }] } as ProxyBody;
+  const bare = { ...first, messages: [...prefix,
+    { role: "user", content: [result] }] } as ProxyBody;
+  assert.equal(deriveBoxCallFingerprint(3n, plain).replayFingerprint,
+    deriveBoxCallFingerprint(3n, separate).replayFingerprint);
+  assert.equal(deriveBoxCallFingerprint(3n, embedded("0")).replayFingerprint,
+    deriveBoxCallFingerprint(3n, embedded("14974580")).replayFingerprint);
+  const normalized = normalizeBoxSemanticBody(embedded("Infinite"));
+  assert.equal((normalized.messages.at(-1) as { content: Array<{ content: string }> })
+    .content[0]?.content.includes("<total_tokens>"), false);
+  const array = { ...first, messages: [...prefix, { role: "user", content: [{ ...result,
+    content: [{ type: "text", text: "pong\n\n" + hook + "\n\n" + budget }] }] }] } as ProxyBody;
+  assert.equal(deriveBoxCallFingerprint(3n, array).replayFingerprint,
+    deriveBoxCallFingerprint(3n, { ...plain, messages: [...prefix,
+      { role: "user", content: [{ ...result, content: [{ type: "text",
+        text: "pong\n\n" + hook }] }] }] }).replayFingerprint);
+  assert.equal(deriveBoxCallFingerprint(3n, bare).replayFingerprint,
+    deriveBoxCallFingerprint(3n, budgetOnly).replayFingerprint);
+  assert.notEqual(deriveBoxCallFingerprint(3n, plain).replayFingerprint,
+    deriveBoxCallFingerprint(3n, bare).replayFingerprint,
+    "hook content remains part of the model-visible tool result");
+});

@@ -83,6 +83,39 @@ export function isBoxNoopContextManagement(body: ProxyBody): boolean {
 // CCB HISTORY_SNIP's mergeUserMessages can append a six-char base36 [id:]
 // tag after a non-meta tool result joins this generated hook reminder.
 const HOOK_CONTEXT = /^<system-reminder>\n(?:PreToolUse|PostToolUse|PostToolUseFailure):[A-Za-z][A-Za-z0-9_.:-]{0,127} hook additional context: [\s\S]+\n<\/system-reminder>\n?(?:\[id:[0-9a-z]{1,6}\])?$/;
+// CCB 2.1.280 emits this as a meta user text block. Unlike a hook it is
+// local token-budget telemetry, not a tool result or a new user instruction.
+const USER_BUDGET = /^<system-reminder>\n<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>\n<\/system-reminder>\n?(?:\[id:[0-9a-z]{1,6}\])?$/;
+function generatedToolMeta(text: string): { hook?: string; budget: boolean } | null {
+  if (USER_BUDGET.test(text)) return { budget: true };
+  return HOOK_CONTEXT.test(text) ? { hook: text, budget: false } : null;
+}
+/** CCB's default mergeUserContentBlocks folds generated meta into the LAST
+ * tool_result.content with a two-newline seam. Only remove an exact terminal
+ * budget wrapper; an ordinary result, including embedded reminder-like text,
+ * remains untouched. The separate-sibling branch below covers other layouts. */
+function stripEmbeddedBudget(last: Record<string, unknown>): Record<string, unknown> {
+  const strip = (value: string): string | null => {
+    if (USER_BUDGET.test(value)) return "";
+    const seam = "\n\n<system-reminder>\n<total_tokens>";
+    const at = value.lastIndexOf(seam);
+    if (at < 0 || !USER_BUDGET.test(value.slice(at + 2))) return null;
+    return value.slice(0, at);
+  };
+  if (typeof last.content === "string") {
+    const text = strip(last.content);
+    return text === null ? last : { ...last, content: text };
+  }
+  if (!Array.isArray(last.content) || last.content.length === 0) return last;
+  const tail = last.content.at(-1);
+  if (!object(tail) || tail.type !== "text" || typeof tail.text !== "string") return last;
+  const text = strip(tail.text);
+  if (text === null) return last;
+  const content = text === "" && USER_BUDGET.test(tail.text)
+    ? last.content.slice(0, -1)
+    : [...last.content.slice(0, -1), { ...tail, text }];
+  return { ...last, content };
+}
 function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
   if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
     || !Array.isArray(body.messages)) return body;
@@ -103,6 +136,7 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
     }
     const results: Record<string, unknown>[] = [];
     const reminders: string[] = [];
+    let removedBudget = false;
     for (let i = 0; i < message.content.length; i++) {
       if (!Object.hasOwn(message.content, i)) return message;
       const part = message.content[i];
@@ -112,13 +146,24 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
       }
       const text = block(part, ["text"]);
       if (!object(text) || Object.keys(text).sort().join(",") !== "text,type"
-        || text.type !== "text" || typeof text.text !== "string"
-        || !HOOK_CONTEXT.test(text.text)) return message;
-      reminders.push(text.text);
+        || text.type !== "text" || typeof text.text !== "string") return message;
+      const meta = generatedToolMeta(text.text);
+      if (!meta) return message;
+      if (meta.hook !== undefined) reminders.push(meta.hook);
+      if (meta.budget) removedBudget = true;
     }
-    if (results.length === 0 || reminders.length === 0) return message;
     const last = results.at(-1)!;
-    const previous = last.content;
+    if (!last) return message;
+    const stripped = stripEmbeddedBudget(last);
+    const embeddedChanged = stripped !== last;
+    if (reminders.length === 0 && !removedBudget && !embeddedChanged) return message;
+    if (reminders.length === 0) {
+      const folded = [...results];
+      folded[folded.length - 1] = stripped;
+      changed = true;
+      return { ...message, content: folded };
+    }
+    const previous = stripped.content;
     if (typeof previous !== "string" && !Array.isArray(previous)) return message;
     if (Array.isArray(previous)) {
       for (let i = 0; i < previous.length; i++) {
@@ -130,7 +175,7 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
       : [...previous];
     content.push(...reminders.map((text) => ({ type: "text", text })));
     const folded = [...results];
-    folded[folded.length - 1] = { ...last, content };
+    folded[folded.length - 1] = { ...stripped, content };
     changed = true;
     return { ...message, content: folded };
   });
@@ -167,7 +212,7 @@ function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
   return object(block) && Object.keys(block).sort().join(",") === "cache_control,text,type"
     && block.type === "text"
     && typeof block.text === "string"
-    && /^<total_tokens>[1-9][0-9]{0,15} tokens left<\/total_tokens>$/.test(block.text)
+    && /^<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>$/.test(block.text)
     && object(block.cache_control)
     && Object.keys(block.cache_control).join(",") === "type"
     && block.cache_control.type === "ephemeral";
