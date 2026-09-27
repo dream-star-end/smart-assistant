@@ -237,6 +237,12 @@ function buildFakePool(override: FakePoolOverride = {}) {
     // Box 的真实 turn key 让结算锁同 turn 并检查免单栅栏；测试默认无 waiver。
     if (head.startsWith("SELECT PG_ADVISORY_XACT_LOCK(")) return { rows: [], rowCount: 1 };
     if (head.startsWith("SELECT 1 FROM TURN_WAIVERS")) return { rows: [], rowCount: 0 };
+    // This fake's failed-response path has no durable paid launch. The real
+    // retention query must answer explicitly; an unknown SQL error correctly
+    // makes production retain the reservation rather than release it.
+    if (head.startsWith("SELECT (RFJ.STATE IN")) {
+      return { rows: [{ retained: false }], rowCount: 1 };
+    }
 
     if (head.startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")) {
       if (override.failJournalInsert) throw override.failJournalInsert;
