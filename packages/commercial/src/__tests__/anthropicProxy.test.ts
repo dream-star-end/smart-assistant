@@ -201,14 +201,17 @@ describe("proxyBodySchema — 数值/数组边界", () => {
     assert.equal(r.success, false);
   });
 
-  test("stream:false 显式给 → fail(我们只跑 stream)", () => {
+  test("stream:false 可解析供 Box 原调用回放,非 Box 在路由层拒绝", () => {
     const r = proxyBodySchema.safeParse({
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
       messages: [{ role: "user", content: "hi" }],
       stream: false,
     });
-    assert.equal(r.success, false);
+    assert.equal(r.success, true);
+    assert.equal(proxyBodySchema.safeParse({ model: "claude-sonnet-4-6",
+      max_tokens: 1024, messages: [{ role: "user", content: "hi" }],
+      stream: "false" }).success, false);
   });
 
   test("stream:true 显式给 OK,stream 字段省略也 OK", () => {
