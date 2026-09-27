@@ -228,9 +228,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       canonicalBody: changedCap }), (error: unknown) => error instanceof BoxDurableJournalError
         && error.code === "BOX_CALL_AMBIGUOUS",
     "different original max_tokens above CCB fallback cap must not admit a second paid call");
+    const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
     const toolCall = { ...input, requestId: `box-c-${suffix}`,
       invocationMode: "detached_tool" as const,
       contextHash: deriveBoxContextHash(firstBody),
+      detachedRunnerHash: "f".repeat(64), catalogHash,
       fingerprint: { ...fingerprint, replayFingerprint: "9".repeat(64) },
       runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32),
       nativeStart: { sessionId: "12345678-1234-4123-8123-123456789abc",
@@ -258,7 +260,6 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       assistantEchoHash: hashBoxAssistantEchoContent(firstAssistantContent),
       assistantNoCallerHash: hashBoxAssistantNoCallerContent(firstAssistantContent),
       inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
-    const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
     await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
       verifiedPendingToolUseIds: ["toolu_A"] }),
@@ -461,6 +462,12 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(replay?.rootLaunchPermit, true);
     assert.equal(replay?.roundNo, 2);
     assert.equal(replay?.spoolOffset, 1234);
+    assert.equal(replay?.detachedRunnerHash, "f".repeat(64));
+    assert.equal(replay?.catalogHash, catalogHash);
+    assert.deepEqual(replay?.resultHashes, resumed.results.map((item) => ({
+      modelToolUseId: item.modelToolUseId, contentHash: item.contentHash,
+      isError: item.isError })),
+    "read-only observer gets the exact parent-approved result hashes, not just IDs");
     const retry = await journal.findReplayIdentity({ uid: 3n,
       canonicalModel: basis.model, canonicalBody: { ...resumeBody,
         stream: false } as unknown as ProxyBody });

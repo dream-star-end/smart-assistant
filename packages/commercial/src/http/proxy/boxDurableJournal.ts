@@ -81,6 +81,8 @@ export interface BoxJournalAdmission {
   invocationMode?: "text" | "detached_tool";
   /** Hash of model-affecting context actually launched in the detached CLI. */
   contextHash?: string;
+  detachedRunnerHash?: string;
+  catalogHash?: string;
   /** Optional completed-turn native cache claim, never inferred from body hash. */
   nativeClaim?: { ownerRequestId: string; pointer: BoxNativePointer;
     upstreamModel: string };
@@ -120,6 +122,10 @@ export interface BoxReplayIdentity {
   readonly spoolOffset: number;
   readonly rootLaunchPermit: boolean;
   readonly messagePointer?: BoxReplayMessagePointer;
+  readonly detachedRunnerHash?: string;
+  readonly catalogHash?: string;
+  readonly resultHashes?: readonly { modelToolUseId: string;
+    contentHash: string; isError: boolean }[];
 }
 export interface BoxRemoteCleanupCandidate {
   readonly requestId: string;
@@ -237,6 +243,12 @@ function goodId(input: BoxJournalAdmission): void {
       && input.invocationMode !== "detached_tool")
     || (input.invocationMode === "detached_tool"
       && !/^[a-f0-9]{64}$/.test(input.contextHash ?? ""))
+    || (input.detachedRunnerHash !== undefined
+      && !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash))
+    || (input.catalogHash !== undefined
+      && !/^[a-f0-9]{64}$/.test(input.catalogHash))
+    || (input.replayRequired === true && input.invocationMode === "detached_tool"
+      && (!input.detachedRunnerHash || !input.catalogHash))
     || (input.nativeStart !== undefined && (input.nativeClaim !== undefined
       || !UUID_V4.test(input.nativeStart.sessionId)
       || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`))
@@ -485,6 +497,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       const mode = original.boxInvocationMode;
       const roundNo = original.boxRoundNo ?? 1;
       const spoolOffset = original.boxResumeSpoolOffset ?? 0;
+      const detachedRunnerHash = original.boxDetachedRunnerHash;
+      const catalogHash = original.boxCatalogHash;
+      let resultHashes: BoxReplayIdentity["resultHashes"];
       const messagePointer = original.boxReplayMessage === undefined ? undefined
         : matchingReplayPointer(original.boxReplayMessage, { uid: input.uid,
           requestId: matched.request_id, runNonce: String(runNonce),
@@ -498,6 +513,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         || !Number.isSafeInteger(spoolOffset) || Number(spoolOffset) < 0
         || Number(spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
         || (original.boxReplayMessage !== undefined && !messagePointer)
+        || (detachedRunnerHash !== undefined && (typeof detachedRunnerHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(detachedRunnerHash)))
+        || (catalogHash !== undefined && (typeof catalogHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(catalogHash)))
+        || (mode === "detached_tool" && Number(roundNo) > 1
+          && (!detachedRunnerHash || !catalogHash))
         || ![...ACTIVE, "terminal", "failed_stopped", "prestart_stopped"]
           .includes(String(original.boxState))) {
         throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -522,9 +543,12 @@ export class BoxDurableJournal implements BoxJournalPort {
           return { requestId: matched.request_id, rootRequestId: row.request_id,
             uid: input.uid, accountId: BigInt(accountId), runNonce, leaseEpoch,
             invocationMode: mode, state: original.boxState as string,
-            roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
-            rootLaunchPermit: row.ctx.boxLaunchPermit === true,
-            ...(messagePointer ? { messagePointer } : {}) };
+             roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
+             rootLaunchPermit: row.ctx.boxLaunchPermit === true,
+             ...(messagePointer ? { messagePointer } : {}),
+             ...(detachedRunnerHash ? { detachedRunnerHash } : {}),
+             ...(catalogHash ? { catalogHash } : {}),
+             ...(resultHashes ? { resultHashes } : {}) };
         }
         if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) {
           throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -534,6 +558,28 @@ export class BoxDurableJournal implements BoxJournalPort {
           [owner, input.uid.toString()]);
         if (parent.rowCount !== 1 || !parent.rows[0]) {
           throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+        }
+        if (hop === 0) {
+          const parentCtx = parent.rows[0].ctx;
+          const raw = parentCtx.boxResumeResultHashes;
+          if (parentCtx.boxResumeRequestId !== matched.request_id
+            || parentCtx.boxResumeRevision !== original.boxParentResumeRevision
+            || !Array.isArray(raw) || raw.length < 1 || raw.length > 32
+            || Array.from({ length: raw.length }, (_, i) => i)
+              .some((i) => !Object.hasOwn(raw, i))
+            || raw.some((item) => !item || typeof item !== "object"
+              || Array.isArray(item)
+              || Object.keys(item).sort().join(",") !== "contentHash,isError,modelToolUseId"
+              || typeof item.modelToolUseId !== "string"
+              || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.modelToolUseId)
+              || typeof item.contentHash !== "string"
+              || !/^[a-f0-9]{64}$/.test(item.contentHash)
+              || typeof item.isError !== "boolean")
+            || new Set(raw.map((item) => item.modelToolUseId)).size !== raw.length) {
+            throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+          }
+          resultHashes = raw.map((item) => ({ modelToolUseId: item.modelToolUseId,
+            contentHash: item.contentHash, isError: item.isError }));
         }
         row = parent.rows[0];
       }
@@ -646,7 +692,9 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxTurnKey: input.fingerprint.turnKey,
         boxSessionId: input.fingerprint.sessionId,
         ...(input.invocationMode === "detached_tool"
-          ? { boxContextHash: input.contextHash } : {}),
+          ? { boxContextHash: input.contextHash,
+            ...(input.detachedRunnerHash ? { boxDetachedRunnerHash: input.detachedRunnerHash } : {}),
+            ...(input.catalogHash ? { boxCatalogHash: input.catalogHash } : {}) } : {}),
         boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
         ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
           boxNativeSessionId: native.pointer.nativeSessionId,

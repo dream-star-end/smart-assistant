@@ -291,6 +291,8 @@ export async function runBoxToolFirstRound(input: {
       replayRequired: deps.writeMessage !== undefined,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
       invocationMode: "detached_tool", contextHash,
+      detachedRunnerHash: plan.detachedRunnerHash,
+      catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
           cliCwd: plan.cliCwd } } : {}) });
