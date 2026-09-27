@@ -1,5 +1,5 @@
 /** One existing selfhost state root, no replay feature-flag maze. */
-import { lstatSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import { readBoxReplayMessage, writeBoxReplayMessage,
   type BoxReplayMessagePointer,
@@ -34,4 +34,13 @@ export function createBoxReplayWriter(enabled: boolean,
     throw new Error("BOX_REPLAY_STATE_DIR_INVALID");
   }
   return (identity, message) => writeBoxReplayMessage(directory, identity, message);
+}
+
+/** A flag-off recovery worker may finish a previously admitted call, but
+ * must not create Box storage on an instance that never enabled the route. */
+export function createBoxReplayRecoveryWriter(platformRoot: string | undefined):
+  BoxReplayMessageWriter | undefined {
+  const directory = boxReplayDirectory(platformRoot);
+  return directory && existsSync(directory)
+    ? createBoxReplayWriter(true, platformRoot) : undefined;
 }

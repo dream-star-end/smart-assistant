@@ -57,7 +57,8 @@ import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
 import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
-import { createBoxReplayReader, createBoxReplayWriter } from "./boxReplaySetup.js";
+import { createBoxReplayReader, createBoxReplayRecoveryWriter,
+  createBoxReplayWriter } from "./boxReplaySetup.js";
 import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
 import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
 import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
@@ -250,6 +251,8 @@ export async function startEgress(): Promise<void> {
   // durable sibling directory; commercial instances with Box off create none.
   const boxReplayWriter = createBoxReplayWriter(boxResolver !== null,
     process.env.OC_PLATFORM_ROOT);
+  const boxRecoveryWriter = boxReplayWriter
+    ?? createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT);
   const boxReplayReader = createBoxReplayReader(process.env.OC_PLATFORM_ROOT);
   const boxReplayJournal = boxJournal ?? new BoxDurableJournal(getPool());
   const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
@@ -336,8 +339,27 @@ export async function startEgress(): Promise<void> {
     resolveTarget: (args) => boxStopResolver.resolve(args),
     onUnknown: reportBoxUnknown,
   });
+  let textObserverBusy = false;
+  const reconcileTextUnknown = async (): Promise<void> => {
+    if (!boxRecoveryWriter || textObserverBusy) return;
+    textObserverBusy = true;
+    try {
+      for (const candidate of await boxStopJournal.listTextUnknownCandidates(2)) {
+        try {
+          if (!await boxStopJournal.claimTextUnknownCandidate(candidate)) continue;
+          await observeBoxTextUnknown({ identity: candidate }, {
+            journal: boxStopJournal, writeMessage: boxRecoveryWriter,
+            resolveTarget: (args) => boxStopResolver.resolve(args),
+          });
+        } catch { log.error("box_text_unknown_reconcile_failed", {
+          requestId: candidate.requestId }); }
+      }
+    } finally { textObserverBusy = false; }
+  };
   let boxNativeGcTicks = 0;
   const boxRecoveryTimer = setInterval(() => {
+    void reconcileTextUnknown().catch(() =>
+      log.error("box_text_unknown_selection_failed"));
     void boxStopResolver.retryFailedAgentCleanup().catch(() =>
       log.error("box_resolver_orphan_cleanup_failed"));
     void boxRecoveryModel.retryFailedCleanup().catch(() =>
