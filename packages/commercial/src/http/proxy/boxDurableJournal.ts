@@ -196,6 +196,14 @@ const CLEANUP_MODE_FENCE = `(ctx->>'boxInvocationMode'='detached_tool'
     AND ctx->>'boxLaunchPermit'='true'
     AND ctx->>'boxUpstreamModel'='claude-opus-5-5'
     AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'))`;
+const STOP_MODE_FENCE = CLEANUP_MODE_FENCE;
+function stoppedRunMode(ctx: Record<string, unknown>): boolean {
+  return ctx.boxInvocationMode === "detached_tool"
+    || (ctx.boxInvocationMode === "text" && ctx.boxLaunchPermit === true
+      && ctx.boxUpstreamModel === "claude-opus-5-5"
+      && typeof ctx.boxDetachedRunnerHash === "string"
+      && /^[a-f0-9]{64}$/.test(ctx.boxDetachedRunnerHash));
+}
 
 const STOP_PROBE_STATE_FENCE = `((state='inflight'
   AND ctx->>'boxState' IN ('running','unknown','linked')
@@ -976,7 +984,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const row = found.rows[0], ctx = row?.ctx;
       if (found.rowCount !== 1 || !row || !ctx
         || ctx.boxInvocationRecovery !== "v1"
-        || ctx.boxInvocationMode !== "detached_tool"
+        || !stoppedRunMode(ctx)
         || ctx.boxAccountId !== input.accountId.toString()
         || ctx.boxRunNonce !== input.runNonce
         || ctx.boxLeaseEpoch !== input.leaseEpoch
@@ -1009,7 +1017,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       for (const current of active.rows) {
         const linked = current.ctx;
         if (linked.boxInvocationRecovery !== "v1"
-          || linked.boxInvocationMode !== "detached_tool"
+          || !stoppedRunMode(linked)
+          || linked.boxInvocationMode !== ctx.boxInvocationMode
           || linked.boxSessionId !== sessionId
           || linked.boxTurnKey !== ctx.boxTurnKey
           || linked.model !== ctx.model
@@ -1064,7 +1073,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const row = found.rows[0], ctx = row?.ctx;
       if (found.rowCount !== 1 || !row || !ctx
         || ctx.boxInvocationRecovery !== "v1"
-        || ctx.boxInvocationMode !== "detached_tool"
+        || !stoppedRunMode(ctx)
         || ctx.boxRunNonce !== input.proof.runNonce
         || ctx.boxLeaseEpoch !== input.leaseEpoch
         || typeof ctx.boxAccountId !== "string"
@@ -1119,7 +1128,7 @@ export class BoxDurableJournal implements BoxJournalPort {
                 ctx=ctx || $4::jsonb, updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND state='inflight'
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
-            AND ctx->>'boxInvocationMode'='detached_tool'
+            AND ${STOP_MODE_FENCE}
             AND ctx->>'boxState' IN ('running','unknown')
             AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxOwnerRequestId')
             AND NOT (ctx ? 'boxResumeRequestId')`,
@@ -1803,7 +1812,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       ctx: Record<string, unknown> }>(
       `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
         WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${STOP_MODE_FENCE}
           AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
           AND jsonb_typeof(ctx->'boxAccountId')='string'
           AND ctx->>'boxAccountId' ~ '^[1-9][0-9]{0,19}$'
@@ -1862,7 +1871,7 @@ export class BoxDurableJournal implements BoxJournalPort {
               (EXTRACT(EPOCH FROM NOW()+INTERVAL '2 minutes')*1000)::bigint)
         WHERE request_id=$1 AND user_id=$2 AND ${STOP_PROBE_STATE_FENCE}
           AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${STOP_MODE_FENCE}
           AND jsonb_typeof(ctx->'boxAccountId')='string'
           AND jsonb_typeof(ctx->'boxRunNonce')='string'
           AND jsonb_typeof(ctx->'boxLeaseEpoch')='string'
@@ -1900,7 +1909,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE user_id=$1 AND ctx->>'boxAccountId'=$2
           AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4
           AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${STOP_MODE_FENCE}
           AND ${STOP_PROBE_STATE_FENCE}
           AND NOT (ctx ? 'boxResumeRequestId')
           AND NOT (ctx ? 'boxTerminalProof')
@@ -1941,7 +1950,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
           AND ctx->>'model'='box-api-claude-opus-5-5'
           AND ctx->>'boxInvocationRecovery'='v1'
-          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ${STOP_MODE_FENCE}
           AND ${STOP_PROBE_STATE_FENCE}
           AND NOT (ctx ? 'boxResumeRequestId')
           AND NOT (ctx ? 'boxTerminalProof')`,

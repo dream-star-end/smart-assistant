@@ -158,6 +158,20 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(detachedIdentity?.rootLaunchPermit, true);
     assert.equal(detachedIdentity?.detachedRunnerHash, detachedRunnerHash);
     assert.equal(detachedIdentity?.upstreamModel, "claude-opus-5-5");
+    await client.query(`UPDATE request_finalize_journal SET container_id=500
+      WHERE request_id=$1`, [detachedRequestId]);
+    const cancelableText = await journal.findCancelableRun({ uid: 3n,
+      containerId: 500n, sessionId: detachedSessionId,
+      turnKey: "8".repeat(64) });
+    assert.equal(cancelableText.requestId, detachedRequestId);
+    await journal.recordUserCancelIntent(cancelableText);
+    const textLeaf = await journal.getCancelLeaf(cancelableText);
+    assert.equal(textLeaf.requestId, detachedRequestId);
+    assert.equal(textLeaf.linked, false);
+    const textProbe = (await journal.listStoppedFailureProbeCandidates(20))
+      .find((candidate) => candidate.requestId === detachedRequestId);
+    assert.ok(textProbe);
+    assert.equal(await journal.claimStoppedFailureProbe(textProbe), true);
     await assert.rejects(() => journal.markPrestartStopped({
       requestId: detachedRequestId, uid: 3n, leaseEpoch: detachedEpoch }),
     (error: unknown) => error instanceof BoxDurableJournalError
@@ -185,6 +199,38 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(await journal.remoteCleanupStatus(textCleanup), "done");
     assert.equal(await journal.remoteCleanupDoneByRunIdentity({ uid: 3n,
       accountId: 21n, runNonce: detachedNonce, leaseEpoch: detachedEpoch }), true);
+    const failedTextId = `box-text-failed-${suffix}`;
+    const failedTextSession = `session-failed-${suffix}`;
+    const failedBody = { ...detachedBody, metadata: { user_id: JSON.stringify({
+      session_id: failedTextSession, oc_turn_key: "4".repeat(64) }) } };
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [failedTextId,
+      JSON.stringify({ ...basis, boxBillingContext: { ...basis.boxBillingContext,
+        sessionId: failedTextSession, turnKey: "4".repeat(64) } })]);
+    await journal.admit({ requestId: failedTextId, uid: 3n, accountId: 22n,
+      model: basis.model, canonicalBody: failedBody,
+      fingerprint: deriveBoxCallFingerprint(3n, failedBody),
+      runNonce: "3".repeat(24), leaseEpoch: "2".repeat(32),
+      replayRequired: true, detachedRunnerHash,
+      upstreamModel: "claude-opus-5-5" });
+    await journal.armTextLaunch({ requestId: failedTextId, uid: 3n,
+      accountId: 22n, runNonce: "3".repeat(24), leaseEpoch: "2".repeat(32),
+      detachedRunnerHash, upstreamModel: "claude-opus-5-5" });
+    await journal.markUnknown({ requestId: failedTextId, uid: 3n,
+      leaseEpoch: "2".repeat(32), phase: "synthetic_failed_worker" });
+    const failedTextProof = { runNonce: "3".repeat(24),
+      leaseEpoch: "2".repeat(32), keeperPid: 101, cliPid: 102,
+      reason: "worker_failed" as const, revision: 2 as const, workerExitCode: 1 };
+    await journal.markFirstRoundStoppedFailure({ requestId: failedTextId,
+      uid: 3n, leaseEpoch: "2".repeat(32), proof: failedTextProof });
+    const failedTextRow = await client.query<{ state: string;
+      ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1",
+      [failedTextId]);
+    assert.equal(failedTextRow.rows[0]?.state, "aborted");
+    assert.equal(failedTextRow.rows[0]?.ctx.boxState, "failed_stopped");
+    assert.equal((await journal.listRemoteCleanupCandidates(20))
+      .some((item) => item.requestId === failedTextId), true);
     const nativePointer = parseBoxNativePointer({ version: 1, accountId: "20",
       upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
       nativeSessionId: "12345678-1234-4123-8123-123456789abc",
