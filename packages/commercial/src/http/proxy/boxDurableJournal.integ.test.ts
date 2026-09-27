@@ -102,6 +102,15 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       (error: unknown) => error instanceof BoxDurableJournalError
         && error.code === "BOX_CAPACITY_HELD");
     await journal.markRunning(input);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxLaunchPermit":true}'::jsonb WHERE request_id=$1`,
+    [input.requestId]);
+    await assert.rejects(() => journal.markPrestartStopped(input),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_PRESTART_FENCE_LOST",
+    "an armed text call cannot be released as prestart while its CLI may run");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx-'boxLaunchPermit' WHERE request_id=$1`, [input.requestId]);
     await journal.markUnknown({ ...input, phase: "model_transport_unknown" });
     const proof = { runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
       keeperPid: 101, cliPid: 102, reason: "worker_complete" as const, revision: 1 as const };

@@ -745,7 +745,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
           AND ctx->>'boxLeaseEpoch' = $3
           AND ctx->>'boxState' IN ('reserved', 'running')
-          AND NOT (ctx ? 'boxPrelaunchControl')`,
+          AND NOT (ctx ? 'boxPrelaunchControl')
+          AND NOT (ctx ? 'boxLaunchPermit')`,
       [input.requestId, input.uid.toString(), input.leaseEpoch]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_PRESTART_FENCE_LOST");
   }
