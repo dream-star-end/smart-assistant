@@ -127,6 +127,52 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       && error.code === "BOX_JOURNAL_COMPLETE_FENCE_LOST");
     await journal.complete({ ...input, proof, usage,
       messagePointer: textMessagePointer });
+    const detachedRequestId = `box-text-detached-${suffix}`;
+    const detachedSessionId = `session-text-${suffix}`;
+    const detachedBody = { model: basis.model, stream: true, max_tokens: 128,
+      messages: [{ role: "user", content: "synthetic detached text" }],
+      metadata: { user_id: JSON.stringify({ session_id: detachedSessionId,
+        oc_turn_key: "8".repeat(64) }) } } as ProxyBody;
+    const detachedNonce = "7".repeat(24), detachedEpoch = "6".repeat(32);
+    const detachedRunnerHash = "5".repeat(64);
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [detachedRequestId,
+      JSON.stringify({ ...basis, boxBillingContext: { ...basis.boxBillingContext,
+        sessionId: detachedSessionId, turnKey: "8".repeat(64) } })]);
+    await journal.admit({ requestId: detachedRequestId, uid: 3n,
+      accountId: 21n, model: basis.model, canonicalBody: detachedBody,
+      fingerprint: deriveBoxCallFingerprint(3n, detachedBody),
+      runNonce: detachedNonce, leaseEpoch: detachedEpoch,
+      replayRequired: true, detachedRunnerHash,
+      upstreamModel: "claude-opus-5-5" });
+    await assert.rejects(() => journal.markRunning({ requestId: detachedRequestId,
+      uid: 3n, leaseEpoch: detachedEpoch }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_START_FENCE_LOST");
+    await journal.armTextLaunch({ requestId: detachedRequestId,
+      uid: 3n, accountId: 21n, runNonce: detachedNonce,
+      leaseEpoch: detachedEpoch, detachedRunnerHash,
+      upstreamModel: "claude-opus-5-5" });
+    const detachedIdentity = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: detachedBody });
+    assert.equal(detachedIdentity?.rootLaunchPermit, true);
+    assert.equal(detachedIdentity?.detachedRunnerHash, detachedRunnerHash);
+    assert.equal(detachedIdentity?.upstreamModel, "claude-opus-5-5");
+    await assert.rejects(() => journal.markPrestartStopped({
+      requestId: detachedRequestId, uid: 3n, leaseEpoch: detachedEpoch }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_PRESTART_FENCE_LOST");
+    await journal.markUnknown({ requestId: detachedRequestId,
+      uid: 3n, leaseEpoch: detachedEpoch, phase: "synthetic_detached_transport" });
+    await journal.complete({ requestId: detachedRequestId, uid: 3n,
+      leaseEpoch: detachedEpoch,
+      proof: { ...proof, runNonce: detachedNonce, leaseEpoch: detachedEpoch },
+      usage, messagePointer: messagePointer(detachedRequestId, detachedNonce,
+        detachedEpoch, 1) });
+    const detachedReplay = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: detachedBody });
+    assert.equal(detachedReplay?.state, "terminal");
+    assert.ok(detachedReplay?.messagePointer);
     const nativePointer = parseBoxNativePointer({ version: 1, accountId: "20",
       upstreamModel: "claude-opus-5-5", cliVersion: "2.1.280",
       nativeSessionId: "12345678-1234-4123-8123-123456789abc",

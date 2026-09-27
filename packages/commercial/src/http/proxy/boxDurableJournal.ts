@@ -83,6 +83,9 @@ export interface BoxJournalAdmission {
   contextHash?: string;
   detachedRunnerHash?: string;
   catalogHash?: string;
+  /** Exact upstream CLI model already selected by the authenticated Box route.
+   * Required only for newly detached text runs, not legacy text capsules. */
+  upstreamModel?: string;
   /** Optional completed-turn native cache claim, never inferred from body hash. */
   nativeClaim?: { ownerRequestId: string; pointer: BoxNativePointer;
     upstreamModel: string };
@@ -124,6 +127,7 @@ export interface BoxReplayIdentity {
   readonly messagePointer?: BoxReplayMessagePointer;
   readonly detachedRunnerHash?: string;
   readonly catalogHash?: string;
+  readonly upstreamModel?: string;
   readonly resultHashes?: readonly { modelToolUseId: string;
     contentHash: string; isError: boolean }[];
 }
@@ -196,6 +200,9 @@ const STOP_PROBE_STATE_FENCE = `((state='inflight'
 export interface BoxJournalPort {
   admit(input: BoxJournalAdmission): Promise<void>;
   markRunning(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void>;
+  armTextLaunch?(input: Pick<BoxJournalAdmission, "requestId" | "uid" |
+    "accountId" | "runNonce" | "leaseEpoch"> &
+    { detachedRunnerHash: string; upstreamModel: string }): Promise<void>;
   markPrestartStopped(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch">): Promise<void>;
   recordPrelaunchControl?(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> &
@@ -499,6 +506,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       const spoolOffset = original.boxResumeSpoolOffset ?? 0;
       const detachedRunnerHash = original.boxDetachedRunnerHash;
       const catalogHash = original.boxCatalogHash;
+      const upstreamModel = original.boxUpstreamModel;
       let resultHashes: BoxReplayIdentity["resultHashes"];
       const messagePointer = original.boxReplayMessage === undefined ? undefined
         : matchingReplayPointer(original.boxReplayMessage, { uid: input.uid,
@@ -519,6 +527,10 @@ export class BoxDurableJournal implements BoxJournalPort {
           || !/^[a-f0-9]{64}$/.test(catalogHash)))
         || (mode === "detached_tool" && Number(roundNo) > 1
           && (!detachedRunnerHash || !catalogHash))
+        || (mode === "text" && (detachedRunnerHash !== undefined
+          || original.boxLaunchPermit !== undefined)
+          && (typeof upstreamModel !== "string"
+            || upstreamModel !== "claude-opus-5-5"))
         || ![...ACTIVE, "terminal", "failed_stopped", "prestart_stopped"]
           .includes(String(original.boxState))) {
         throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -548,6 +560,7 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(messagePointer ? { messagePointer } : {}),
              ...(detachedRunnerHash ? { detachedRunnerHash } : {}),
              ...(catalogHash ? { catalogHash } : {}),
+             ...(typeof upstreamModel === "string" ? { upstreamModel } : {}),
              ...(resultHashes ? { resultHashes } : {}) };
         }
         if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) {
@@ -592,6 +605,16 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   async admit(input: BoxJournalAdmission): Promise<void> {
     goodId(input);
+    const detachedText = (input.invocationMode ?? "text") === "text"
+      && input.detachedRunnerHash !== undefined;
+    if (detachedText ? (typeof input.detachedRunnerHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
+      || input.model !== "box-api-claude-opus-5-5"
+      || input.upstreamModel !== "claude-opus-5-5"
+      || input.catalogHash !== undefined)
+      : input.upstreamModel !== undefined) {
+      throw new BoxDurableJournalError("BOX_TEXT_DETACHED_BINDING_INVALID");
+    }
     if (input.replayRequired === true && !input.canonicalBody) {
       throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
     }
@@ -695,6 +718,8 @@ export class BoxDurableJournal implements BoxJournalPort {
           ? { boxContextHash: input.contextHash,
             ...(input.detachedRunnerHash ? { boxDetachedRunnerHash: input.detachedRunnerHash } : {}),
             ...(input.catalogHash ? { boxCatalogHash: input.catalogHash } : {}) } : {}),
+        ...(detachedText ? { boxDetachedRunnerHash: input.detachedRunnerHash,
+          boxUpstreamModel: input.upstreamModel } : {}),
         boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
         ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
           boxNativeSessionId: native.pointer.nativeSessionId,
@@ -731,9 +756,43 @@ export class BoxDurableJournal implements BoxJournalPort {
           SET ctx = jsonb_set(ctx, '{boxState}', '"running"'::jsonb), updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
           AND ctx->>'boxLeaseEpoch' = $3 AND ctx->>'boxState' = 'reserved'
+          AND NOT (ctx->>'boxInvocationMode'='text'
+            AND ctx ? 'boxDetachedRunnerHash')
           AND NOT (ctx ? 'boxPrelaunchControl')`,
       [input.requestId, input.uid.toString(), input.leaseEpoch]);
     if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_START_FENCE_LOST");
+  }
+
+  /** One durable text launch permit. Once committed, a missing/ambiguous
+   * detached-runner acknowledgement is unknown, never prestart cleanup. */
+  async armTextLaunch(input: Pick<BoxJournalAdmission, "requestId" | "uid" |
+    "accountId" | "runNonce" | "leaseEpoch"> &
+    { detachedRunnerHash: string; upstreamModel: string }): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
+      || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
+      || input.upstreamModel !== "claude-opus-5-5") {
+      throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_IDENTITY_INVALID");
+    }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || '{"boxState":"running","boxLaunchPermit":true}'::jsonb,
+              updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='reserved'
+          AND ctx->>'boxDetachedRunnerHash'=$6
+          AND ctx->>'boxUpstreamModel'=$7
+          AND NOT (ctx ? 'boxLaunchPermit')
+          AND NOT (ctx ? 'boxPrelaunchControl')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, input.detachedRunnerHash,
+        input.upstreamModel]);
+    if (changed.rowCount !== 1) {
+      throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_FENCE_LOST");
+    }
   }
 
   /** Only the caller that has not invoked plan.run may use this transition. */
