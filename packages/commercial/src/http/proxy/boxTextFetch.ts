@@ -8,11 +8,15 @@ import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationR
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxTextPlan } from "./boxTextPlan.js";
+import { makeBoxDetachedTextPlan } from "./boxDetachedTextPlan.js";
+import { observeBoxDetachedText } from "./boxDetachedTextObserve.js";
+import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
+import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
-import type { BoxJournalPort } from "./boxDurableJournal.js";
+import type { BoxJournalPort, BoxRemoteCleanupCandidate } from "./boxDurableJournal.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { ProxyBody } from "./shared.js";
 import { rootLogger } from "../../logging/logger.js";
@@ -32,11 +36,15 @@ export class BoxTextFetchError extends Error {
 
 export class BoxTextFetch {
   private readonly orphanedTargets = new Set<BoxResolvedTarget>();
+  private readonly detachedCleanupPending = new Map<string, {
+    candidate: BoxRemoteCleanupCandidate; lease: BoxInvocationLease }>();
   private readonly disposal = new WeakMap<BoxResolvedTarget,
     { done: boolean; pending: Promise<void> | null }>();
   constructor(private readonly deps: {
     supervisorAsset: Buffer;
     keeperAsset: Buffer;
+    /** When injected, the text lane reuses the proven detached Box spool. */
+    detachedRunnerAsset?: Buffer;
     registry: BoxInvocationRegistry;
     journal: BoxJournalPort;
     writeMessage?: BoxReplayMessageWriter;
@@ -71,6 +79,19 @@ export class BoxTextFetch {
   retryFailedCleanup(input: { uid: bigint; sessionId: string;
     accountId: bigint }): Promise<void> {
     return this.deps.registry.retryFailedCleanupByIdentity(input);
+  }
+
+  /** A different worker may win the terminal cleanup claim. Release this
+   * process's local lease only after the exact journal row says done. */
+  async retryDetachedCleanupRelease(): Promise<number> {
+    if (!this.deps.journal.remoteCleanupStatus) return this.detachedCleanupPending.size;
+    await Promise.allSettled([...this.detachedCleanupPending].map(async ([key, held]) => {
+      const status = await this.deps.journal.remoteCleanupStatus!(held.candidate);
+      if (status !== "done") return;
+      this.deps.registry.confirmRemoteStopped(held.lease);
+      this.detachedCleanupPending.delete(key);
+    }));
+    return this.detachedCleanupPending.size;
   }
 
   private disposeTarget(target: BoxResolvedTarget): Promise<void> {
@@ -118,9 +139,22 @@ export class BoxTextFetch {
     let fingerprint: ReturnType<typeof deriveBoxCallFingerprint>;
     try { fingerprint = deriveBoxCallFingerprint(args.uid, args.canonicalBody); }
     catch { throw new BoxTextFetchError("BOX_CALL_IDENTITY_MISSING"); }
-    const plan = makeBoxTextPlan({ body, upstreamModel: args.upstreamModel,
+    const planInput = { body, upstreamModel: args.upstreamModel,
       maxOutputTokensLimit: cap, supervisorAsset: this.deps.supervisorAsset,
-      keeperAsset: this.deps.keeperAsset });
+      keeperAsset: this.deps.keeperAsset };
+    const detached = this.deps.detachedRunnerAsset
+      ? makeBoxDetachedTextPlan({ ...planInput,
+        detachedRunnerAsset: this.deps.detachedRunnerAsset }) : null;
+    if (detached && (!this.deps.journal.armTextLaunch
+      || !this.deps.journal.claimRemoteCleanup
+      || !this.deps.journal.markRemoteCleaned
+      || !this.deps.journal.remoteCleanupStatus)) {
+      throw new BoxTextFetchError("BOX_DETACHED_JOURNAL_UNAVAILABLE");
+    }
+    const plan = detached ? { ...detached.text,
+      stageAssets: detached.stageAssets, assetManifest: detached.assetManifest,
+      run: detached.launch, cleanup: detached.prelaunchCleanup }
+      : makeBoxTextPlan(planInput);
     const now = this.deps.now ?? Date.now;
     const budgetMs = this.deps.budgetMs ?? 600_000;
     if (!Number.isSafeInteger(budgetMs) || budgetMs < MIN_RUN_BUDGET_MS || budgetMs > 900_000) {
@@ -138,13 +172,20 @@ export class BoxTextFetch {
         new BoxTextFetchError("BOX_FETCH_ABORTED")), { once: true });
     });
     void aborted.catch(() => {});
-    const race = <T>(promise: Promise<T>): Promise<T> => Promise.race([promise, aborted]);
+    const race = <T>(promise: Promise<T>): Promise<T> => {
+      if (!detachedPermitAttempted) return Promise.race([promise, aborted]);
+      // Once remote proof is in hand, preserve one write/complete chain even
+      // when the HTTP budget or browser expires. A local timeout here would
+      // race a late committed debit and orphan the terminal cleanup owner.
+      return promise;
+    };
     let lease: BoxInvocationLease | null = null;
     let resolved: BoxResolvedTarget | null = null;
     let resolutionAbandoned = false;
     let completedTarget: BoxResolvedTarget | null = null;
     let clientLeaseListener: (() => void) | null = null;
     let streamHandedOff = false, unknownNotified = false, localCleaned = false;
+    let detachedPermitAttempted = false;
     let journalAdmitted = false;
     const cleanupLocal = (): void => {
       if (localCleaned) return;
@@ -235,6 +276,9 @@ export class BoxTextFetch {
         onRemoteStopped: () => this.disposeTarget(resolved!) });
       const currentLease = lease;
       clientLeaseListener = () => {
+        // Once detached launch is acknowledged, the remote keeper must be
+        // observed through proof even if the browser closes its SSE stream.
+        if (detachedPermitAttempted) return;
         if (currentLease.state !== "completed") void markUnknown("request_abort");
       };
       abort.signal.addEventListener("abort", clientLeaseListener, { once: true });
@@ -244,6 +288,8 @@ export class BoxTextFetch {
           uid: args.uid, accountId: resolved.accountId, model: args.canonicalModel,
           fingerprint, canonicalBody: args.canonicalBody,
           replayRequired: this.deps.writeMessage !== undefined,
+          ...(detached ? { detachedRunnerHash: detached.detachedRunnerHash,
+            upstreamModel: plan.expectedModel } : {}),
           runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
         journalAdmitted = true;
       } catch {
@@ -270,6 +316,12 @@ export class BoxTextFetch {
           if (keeper.stdout.trim() !== plan.keeperHash) {
             throw new BoxTextFetchError("BOX_KEEPER_STAGE_INVALID");
           }
+          if (detached) {
+            const runner = await exec(detached.stageDetachedRunner, 20_000);
+            if (runner.stdout.trim() !== detached.detachedRunnerHash) {
+              throw new BoxTextFetchError("BOX_DETACHED_RUNNER_STAGE_INVALID");
+            }
+          }
         }
         inputStageStarted = true;
         const batch = boxFastPathEnabled()
@@ -286,6 +338,7 @@ export class BoxTextFetch {
         const provenStageTerminal = (error instanceof BoxExecTransportError && error.terminalKnown)
           || (error instanceof BoxTextFetchError && (error.code === "BOX_SUPERVISOR_STAGE_INVALID"
             || error.code === "BOX_KEEPER_STAGE_INVALID" || error.code === "BOX_ASSET_STAGE_INVALID"
+            || error.code === "BOX_DETACHED_RUNNER_STAGE_INVALID"
             || error.code === "BOX_PRIVATE_STAGE_INVALID"));
         if (!provenStageTerminal) {
           await markUnknown("staging_unknown");
@@ -307,55 +360,104 @@ export class BoxTextFetch {
         else await markUnknown("pre_run_cleanup_unknown");
         throw new BoxTextFetchError("BOX_BUDGET_EXHAUSTED");
       }
-      try { await race(this.deps.journal.markRunning({ requestId: args.requestId,
-        uid: args.uid, leaseEpoch: plan.leaseEpoch })); }
-      catch {
-        if (await cleanupKnown()) await closePrestart();
-        else await markUnknown("pre_run_cleanup_unknown");
-        throw new BoxTextFetchError("BOX_JOURNAL_START_FAILED");
+      if (detached) {
+        detachedPermitAttempted = true;
+        try { await this.deps.journal.armTextLaunch!({ requestId: args.requestId,
+          uid: args.uid, accountId: resolved.accountId, runNonce: plan.runNonce,
+          leaseEpoch: plan.leaseEpoch,
+          detachedRunnerHash: detached.detachedRunnerHash,
+          upstreamModel: plan.expectedModel }); }
+        catch {
+          // The CAS may have committed before its reply was lost. Once armed,
+          // neither prestart cleanup nor another paid launch is safe.
+          await markUnknown("text_launch_permit_unknown");
+          throw new BoxTextFetchError("BOX_JOURNAL_START_FAILED");
+        }
+        try {
+          const launch = await exec(detached.launch, 20_000);
+          if (launch.stdout.trim() !== "launched") {
+            throw new BoxTextFetchError("BOX_TEXT_LAUNCH_UNKNOWN");
+          }
+        } catch {
+          await markUnknown("text_launch_ack_unknown");
+          throw new BoxTextFetchError("BOX_TEXT_LAUNCH_UNKNOWN");
+        }
+      } else {
+        try { await race(this.deps.journal.markRunning({ requestId: args.requestId,
+          uid: args.uid, leaseEpoch: plan.leaseEpoch })); }
+        catch {
+          if (await cleanupKnown()) await closePrestart();
+          else await markUnknown("pre_run_cleanup_unknown");
+          throw new BoxTextFetchError("BOX_JOURNAL_START_FAILED");
+        }
       }
       const stream = new ReadableStream<Uint8Array>({
         start: (controller) => {
           const decoder = createBoxCliSseDecoder(plan.expectedModel);
           let remoteTerminalKnown = false;
           let terminalProof: BoxTerminalProof | null = null;
+          let deliveryClosed = false;
           const emit = (sse: string): void => {
-            if (sse) controller.enqueue(Buffer.from(sse, "utf8"));
+            if (!sse || deliveryClosed) return;
+            try { controller.enqueue(Buffer.from(sse, "utf8")); }
+            catch {
+              if (detached) deliveryClosed = true;
+              else throw new BoxTextFetchError("BOX_MODEL_STREAM_FAILED");
+            }
           };
           void (async () => {
             try {
+              let converted: ReturnType<typeof decoder.finish>;
+              let completedMessage: unknown;
               try {
-                await exec(plan.run, 120_000, true, (chunk) => emit(decoder.push(chunk)));
-                const proof = await readBoxTerminalProof({ target: resolved!,
-                  expectedAccountId: resolved!.accountId,
-                  runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
-                  signal: currentLease.signal });
-                remoteTerminalKnown = true;
-                // The proof is retained until the decoder validates exact
-                // usage; no terminal SSE may leave before durable evidence.
-                terminalProof = proof;
-              } catch {
+                if (detached) {
+                  const access = makeBoxDetachedRunAccess({ runNonce: plan.runNonce,
+                    detachedRunnerHash: detached.detachedRunnerHash });
+                  const observed = await observeBoxDetachedText({ target: resolved!,
+                    access, expectedModel: plan.expectedModel,
+                    runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+                    signal: currentLease.signal, deadlineMs: Math.max(1, remaining()),
+                    emit });
+                  remoteTerminalKnown = true;
+                  terminalProof = observed.proof;
+                  converted = { sse: "", ...observed.usage,
+                    tailSse: observed.tailSse };
+                  completedMessage = observed.message;
+                } else {
+                  await exec(plan.run, 120_000, true, (chunk) => emit(decoder.push(chunk)));
+                  const proof = await readBoxTerminalProof({ target: resolved!,
+                    expectedAccountId: resolved!.accountId,
+                    runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+                    signal: currentLease.signal });
+                  remoteTerminalKnown = true;
+                  // The proof is retained until the decoder validates exact
+                  // usage; no terminal SSE may leave before durable evidence.
+                  terminalProof = proof;
+                  try {
+                    converted = decoder.finish();
+                    completedMessage = decoder.completedMessage();
+                  } catch {
+                    if (await cleanupKnown()) {
+                      this.deps.registry.confirmRemoteStopped(currentLease);
+                    } else await markUnknown("protocol_cleanup_unknown");
+                    throw new BoxTextFetchError("BOX_MODEL_PROTOCOL_INVALID");
+                  }
+                }
+              } catch (error) {
+                if (error instanceof BoxTextFetchError
+                  && error.code === "BOX_MODEL_PROTOCOL_INVALID") throw error;
                 // A failed Connect Exec or failed stream consumer does not prove
                 // the remote supervisor and descendants stopped. Never retry.
                 await markUnknown(abort.signal.aborted ? "request_abort" : "model_outcome_unknown");
                 throw new BoxTextFetchError(abort.signal.aborted
                   ? "BOX_FETCH_ABORTED" : "BOX_MODEL_OUTCOME_UNKNOWN");
               }
-              let converted: ReturnType<typeof decoder.finish>;
-              try { converted = decoder.finish(); }
-              catch {
-                // Full Connect exit0 proves watcher completion even if the CLI
-                // protocol body is invalid. No terminal SSE or final usage.
-                if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(currentLease);
-                else await markUnknown("protocol_cleanup_unknown");
-                throw new BoxTextFetchError("BOX_MODEL_PROTOCOL_INVALID");
-              }
               try {
                 const messagePointer = this.deps.writeMessage
                   ? await race(this.deps.writeMessage({ uid: args.uid.toString(),
                     requestId: args.requestId, runNonce: plan.runNonce,
                     leaseEpoch: plan.leaseEpoch, roundNo: 1 },
-                  decoder.completedMessage())) : undefined;
+                  completedMessage)) : undefined;
                 await race(this.deps.journal.complete({ requestId: args.requestId,
                   uid: args.uid, leaseEpoch: plan.leaseEpoch, proof: terminalProof!,
                   usage: { inputTokens: converted.inputTokens,
@@ -369,10 +471,34 @@ export class BoxTextFetch {
               }
               // A verified model result is billable even if post-run GC is
               // uncertain; record unknown but do not erase final usage.
-              if (await cleanupKnown()) this.deps.registry.confirmRemoteStopped(currentLease);
-              else await markUnknown("completed_gc_unknown");
+              if (detached) {
+                const candidate: BoxRemoteCleanupCandidate = { requestId: args.requestId,
+                  uid: args.uid, accountId: resolved!.accountId,
+                  runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+                  proof: terminalProof! };
+                try {
+                  if (!await this.deps.journal.claimRemoteCleanup!(candidate)) {
+                    throw new BoxTextFetchError("BOX_TEXT_CLEANUP_CLAIMED_ELSEWHERE");
+                  }
+                  const cleaned = await exec(makeBoxRunCleanup(plan.runNonce), 20_000, false);
+                  if (cleaned.stdout.trim() !== "clean") {
+                    throw new BoxTextFetchError("BOX_TEXT_CLEANUP_UNPROVEN");
+                  }
+                  await this.deps.journal.markRemoteCleaned!(candidate);
+                  this.deps.registry.confirmRemoteStopped(currentLease);
+                } catch {
+                  // Terminal proof and usage are already durable. A peer may
+                  // own cleanup; retain only this local lease until its exact
+                  // row reports done, without reverting journal to unknown.
+                  this.detachedCleanupPending.set(plan.runNonce,
+                    { candidate, lease: currentLease });
+                  await this.retryDetachedCleanupRelease().catch(() => {});
+                }
+              } else if (await cleanupKnown()) {
+                this.deps.registry.confirmRemoteStopped(currentLease);
+              } else await markUnknown("completed_gc_unknown");
               emit(converted.tailSse);
-              controller.close();
+              try { controller.close(); } catch { /* client cancelled after detached ack */ }
             } catch (error) {
               if (!remoteTerminalKnown) await markUnknown("model_stream_unknown");
               try { controller.error(error instanceof BoxTextFetchError ? error

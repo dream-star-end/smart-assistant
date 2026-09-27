@@ -227,6 +227,9 @@ export interface BoxJournalPort {
   complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { proof: BoxTerminalProof; usage: BoxUsageEvidence;
       messagePointer?: BoxReplayMessagePointer }): Promise<void>;
+  claimRemoteCleanup?(input: BoxRemoteCleanupCandidate): Promise<boolean>;
+  markRemoteCleaned?(input: BoxRemoteCleanupCandidate): Promise<void>;
+  remoteCleanupStatus?(input: BoxRemoteCleanupCandidate): Promise<"done" | "pending" | "invalid">;
   recordToolHandoff?(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { candidate: BoxToolHandoffCandidate;
       roundNo?: number;

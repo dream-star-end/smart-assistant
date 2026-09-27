@@ -59,26 +59,34 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   journalFailPhase?: "admit" | "running" | "complete";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
-  badAssetManifest?: boolean; writeMessage?: boolean } = {}) {
+  badAssetManifest?: boolean; writeMessage?: boolean; detached?: boolean;
+  cleanupClaimedElsewhere?: boolean; consumeBudgetAtWrite?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
   const stages: string[] = [], unknowns: string[] = [], journalCalls: string[] = [];
   let journalUsage: unknown = null, journalPointer: unknown = null;
+  let cleanupDone = false;
   const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
   const runner: Runner = { async run(request: BoxCcExecRequest,
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
     active++; maxActive = Math.max(maxActive, active);
     await new Promise((resolve) => setTimeout(resolve, 1));
-    const isModel = request.args[0] === "-I"
+    const isDetachedLaunch = request.args[2]?.includes("sys.argv=[p,*argv]")
+      && request.args[5]?.startsWith("/tmp/ocv5-289-run-");
+    const isSpoolRead = request.args[5] === "--read";
+    const isModel = isDetachedLaunch || request.args[0] === "-I"
       && request.args[1]?.startsWith("/tmp/ocv5-289-v2-keeper-");
     const isSupervisor = request.args[3]?.startsWith("/tmp/ocv5-289-v2-supervisor-");
     const isKeeper = request.args[3]?.startsWith("/tmp/ocv5-289-v2-keeper-");
+    const isRunner = request.args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-");
     const isCleanup = request.args[2]?.includes("print('clean')");
     const isProof = request.args[2]?.includes("terminal.json");
     const isBatch = request.args[2]?.includes("print('staged:'+str(len(steps)))");
-    const phase = isModel ? "model" : isSupervisor ? "supervisor"
+    const phase = isSpoolRead ? "spool-read" : isModel ? "model"
+      : isSupervisor ? "supervisor"
       : isKeeper ? "keeper" : isCleanup ? "cleanup" : isProof ? "proof"
+        : isRunner ? "runner"
         : isBatch ? "batch-stage" : "stage";
     stages.push(phase);
     active--;
@@ -98,6 +106,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
         ? cliOutput.replace('"content":[{"type":"text","text":"answer"}]',
           '"content":[{"type":"text","text":"contradiction"}]')
         : cliOutput;
+      if (isDetachedLaunch) return ok("launched\n");
       if (opts.holdModel) {
         const lines = output.split("\n");
         options.onStdout?.(lines.slice(0, 4).join("\n") + "\n");
@@ -111,7 +120,16 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
       } else options.onStdout?.(output);
       return ok(output);
     }
-    if (isSupervisor || isKeeper) return ok(opts.badAssetManifest && request.args.length > 7
+    if (isSpoolRead) {
+      if (opts.holdModel && Number(request.args[7]) === 0) {
+        await new Promise<void>((resolve) => { releaseModel = resolve; });
+      }
+      const offset = Number(request.args[7]);
+      const bytes = Buffer.from(cliOutput).subarray(offset);
+      return ok(JSON.stringify({ data: bytes.toString("base64"),
+        offset: offset + bytes.length }));
+    }
+    if (isSupervisor || isKeeper || isRunner) return ok(opts.badAssetManifest && request.args.length > 7
       ? "bad" : Array.from({ length: (request.args.length - 3) / 4 },
         (_, i) => request.args[5 + i * 4]).join(","));
     if (isBatch) {
@@ -125,22 +143,30 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   } };
   const service = new BoxTextFetch({ supervisorAsset: Buffer.from("#!/usr/bin/python3\nprint('fixture')\n"),
     keeperAsset: Buffer.from("#!/usr/bin/python3\nprint('keeper fixture')\n"),
+    ...(opts.detached ? { detachedRunnerAsset: Buffer.from("#!/usr/bin/python3\nprint('runner fixture')\n") } : {}),
     registry,
     journal: { admit: async (identity) => { journalCalls.push("admit");
         if (opts.writeMessage) assert.equal(identity.replayRequired, true);
         if (opts.journalFailPhase === "admit") throw new Error("db down"); },
       markRunning: async () => { journalCalls.push("running");
         if (opts.journalFailPhase === "running") throw new Error("db down"); },
+      armTextLaunch: async () => { journalCalls.push("arm");
+        if (opts.journalFailPhase === "running") throw new Error("db down"); },
       markPrestartStopped: async () => { journalCalls.push("prestart_stopped"); },
       markUnknown: async () => { journalCalls.push("unknown"); },
       complete: async (evidence) => { journalCalls.push("complete");
         journalUsage = evidence.usage;
         journalPointer = evidence.messagePointer;
-        if (opts.journalFailPhase === "complete") throw new Error("db down"); } },
+        if (opts.journalFailPhase === "complete") throw new Error("db down"); },
+      claimRemoteCleanup: async () => { journalCalls.push("claim-cleanup");
+        return !opts.cleanupClaimedElsewhere; },
+      markRemoteCleaned: async () => { journalCalls.push("cleaned"); cleanupDone = true; },
+      remoteCleanupStatus: async () => cleanupDone ? "done" as const : "pending" as const },
     ...(opts.writeMessage ? { writeMessage: async (identity: { uid: string;
       requestId: string; runNonce: string; leaseEpoch: string; roundNo: number },
       message: unknown) => {
       journalCalls.push("capsule");
+      if (opts.consumeBudgetAtWrite) now += 599_999;
       assert.equal((message as { id: string }).id, "msg_289");
       return { version: 1 as const, ...identity, bytes: 100,
         sha256: "a".repeat(64) };
@@ -156,6 +182,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
     },
     now: () => now, budgetMs: 600_000 });
   return { service, registry, stages, unknowns, journalCalls,
+    setCleanupDone: () => { cleanupDone = true; },
     getJournalUsage: () => journalUsage, getJournalPointer: () => journalPointer,
     getMaxActive: () => maxActive,
     advance: (ms: number) => { now += ms; }, releaseModel: () => releaseModel() };
@@ -184,6 +211,81 @@ test("one authenticated proxy fetch stages serially, returns billable SSE, then 
   assert.deepEqual(f.journalCalls, ["admit", "running", "complete"]);
   assert.deepEqual(f.getJournalUsage(), { inputTokens: 2, outputTokens: 7,
     cacheReadTokens: 20, cacheWriteTokens: 0 });
+});
+
+test("detached text acks one launch before HTTP 200, replays spool and cleans only after proof", async () => {
+  const f = fixture({ detached: true, writeMessage: true });
+  const response = await f.service.fetch(input);
+  assert.equal(response.status, 200);
+  assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
+  const sse = await response.text();
+  assert.ok(sse.includes("event: message_stop"));
+  assert.ok(f.stages.includes("spool-read"));
+  assert.deepEqual(f.journalCalls, ["admit", "arm", "capsule", "complete",
+    "claim-cleanup", "cleaned"]);
+  assert.equal(f.stages.at(-1), "cleanup");
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
+});
+
+test("ambiguous detached launch returns no 200, does not prestart-clean or replay paid CLI", async () => {
+  const f = fixture({ detached: true, failPhase: "model", writeMessage: true });
+  await assert.rejects(() => f.service.fetch(input),
+    (error: unknown) => error instanceof BoxTextFetchError
+      && error.code === "BOX_TEXT_LAUNCH_UNKNOWN");
+  assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
+  assert.ok(!f.stages.includes("cleanup"));
+  assert.ok(!f.journalCalls.includes("prestart_stopped"));
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 1, account: 1 });
+});
+
+test("peer cleanup claim keeps only local text lease until exact done receipt", async () => {
+  const f = fixture({ detached: true, writeMessage: true,
+    cleanupClaimedElsewhere: true });
+  const response = await f.service.fetch(input);
+  assert.ok((await response.text()).includes("event: message_stop"));
+  assert.deepEqual(f.journalCalls.slice(0, 5), ["admit", "arm", "capsule",
+    "complete", "claim-cleanup"]);
+  assert.equal(f.journalCalls.includes("unknown"), false);
+  assert.equal(f.stages.includes("cleanup"), false);
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 1, account: 1 });
+  f.setCleanupDone();
+  assert.equal(await f.service.retryDetachedCleanupRelease(), 0);
+  const until = Date.now() + 2000;
+  while (f.registry.counts(3n, 20n).account && Date.now() < until) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
+});
+
+test("client cancels after detached launch ack but original observer still settles proof", async () => {
+  const f = fixture({ detached: true, writeMessage: true, holdModel: true });
+  const response = await f.service.fetch(input);
+  assert.equal(response.status, 200);
+  await response.body!.cancel();
+  const spoolUntil = Date.now() + 2000;
+  while (!f.stages.includes("spool-read") && Date.now() < spoolUntil) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  f.releaseModel();
+  const until = Date.now() + 2000;
+  while (!f.journalCalls.includes("cleaned") && Date.now() < until) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(f.journalCalls.includes("complete"));
+  assert.ok(f.journalCalls.includes("cleaned"));
+  assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
+});
+
+test("late detached proof commits usage; worker can clean after HTTP budget is spent", async () => {
+  const f = fixture({ detached: true, writeMessage: true,
+    consumeBudgetAtWrite: true });
+  const response = await f.service.fetch(input);
+  assert.ok((await response.text()).includes("event: message_stop"));
+  assert.deepEqual(f.journalCalls.slice(-3), ["capsule", "complete", "claim-cleanup"]);
+  assert.equal(f.journalCalls.includes("unknown"), false);
+  f.setCleanupDone();
+  assert.equal(await f.service.retryDetachedCleanupRelease(), 0);
+  assert.equal(f.stages.filter((phase) => phase === "model").length, 1);
 });
 
 test("text Message capsule is written before terminal usage and attached to same journal row", async () => {

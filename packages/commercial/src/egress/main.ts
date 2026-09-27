@@ -312,6 +312,8 @@ export async function startEgress(): Promise<void> {
   const boxCleanupTimer = boxResolver && boxTextModel ? setInterval(() => {
     void boxTextModel.retryFailedOrphanCleanup().catch(() =>
       log.error("box_target_orphan_cleanup_failed"));
+    void boxTextModel.retryDetachedCleanupRelease().catch(() =>
+      log.error("box_text_detached_local_release_failed"));
   }, 60_000) : null;
   boxCleanupTimer?.unref();
   // A stop for an already-admitted Box run must remain available even after
