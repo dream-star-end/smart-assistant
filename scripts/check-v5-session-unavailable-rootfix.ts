@@ -125,6 +125,25 @@ for (const [source, markers] of [
 }
 console.log('INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof')
 
+// INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof.
+// The focused real-shape tests and authenticated Box canary are separate proof;
+// this only locks the shared fold-before-budget entry used by both routes.
+const boxCache = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxCacheAnnotations.ts'), 'utf8')
+const boxGate = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRequestGate.ts'), 'utf8')
+const stripAt = boxCache.indexOf('export function stripBoxCcbToolBudgetTail(')
+const stripEnd = boxCache.indexOf('export function normalizeBoxSemanticBody(', stripAt)
+const foldAt = boxCache.indexOf('const effective = foldBoxCcbHookContext(body);', stripAt)
+const budgetAt = boxCache.indexOf('const kept = effective.messages.filter(', foldAt)
+if (stripAt < 0 || stripEnd <= stripAt || foldAt <= stripAt
+  || foldAt >= stripEnd || budgetAt <= foldAt || budgetAt >= stripEnd
+  || !boxGate.includes('const effective = stripBoxCcbToolBudgetTail(body);')
+  || !boxFetch.includes('const messages = stripBoxCcbToolBudgetTail(body).messages;')) {
+  throw new Error('[box-hook-resume] shared fold-before-budget continuation path missing')
+}
+console.log('INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof')
+
 // INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
 // The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
 const mediaStore = readFileSync(join(root, 'packages/commercial/src/media-generation/store.ts'), 'utf8')
