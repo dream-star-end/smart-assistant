@@ -249,6 +249,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
           { type: "tool_result", tool_use_id: "toolu_A", content: "x".repeat(1_100_000) },
+          { type: "text", text: "<system-reminder>\nPreToolUse:Bash hook additional context: "
+            + "Use Read rather than cat.\n</system-reminder>" },
         ] },
       ] };
     await client.query(`UPDATE request_finalize_journal SET
@@ -346,6 +348,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(resumed.detachedRunnerHash, "f".repeat(64));
     assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
       ["toolu_A", "toolu_B"]);
+    assert.deepEqual(resumed.results[0]?.content.at(-1), { type: "text",
+      text: "<system-reminder>\nPreToolUse:Bash hook additional context: "
+        + "Use Read rather than cat.\n</system-reminder>" });
     const linked = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal
         WHERE request_id IN ($1,$2) ORDER BY request_id`,
@@ -408,8 +413,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       ...resumeBody.messages,
       roundBudget(14_999_987),
       { role: "assistant", content: secondAssistantContent },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
-        content: "third" }] },
+       { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
+         content: "third" }, { type: "text",
+         text: "<system-reminder>\nPreToolUse:Bash hook additional context: "
+           + "Read the next file.\n</system-reminder>" }] },
       roundBudget(14_999_974),
     ] };
     const secondResume = await journal.claimToolResume({ requestId: `box-e-${suffix}`,

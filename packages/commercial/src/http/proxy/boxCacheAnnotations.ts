@@ -76,6 +76,66 @@ export function isBoxNoopContextManagement(body: ProxyBody): boolean {
   return object(edit) && Object.keys(edit).sort().join(",") === "keep,type"
     && edit.type === "clear_thinking_20251015" && edit.keep === "all";
 }
+/** CCB merges a generated hook reminder into the following user tool_result.
+ * The held Claude CLI has no separate user-message channel while awaiting its
+ * virtual MCP result, so retain the reminder bytes as another result text
+ * block. Unrecognized sibling text stays untouched and is rejected later. */
+// CCB HISTORY_SNIP's mergeUserMessages can append a six-char base36 [id:]
+// tag after a non-meta tool result joins this generated hook reminder.
+const HOOK_CONTEXT = /^<system-reminder>\n(?:PreToolUse|PostToolUse|PostToolUseFailure):[A-Za-z][A-Za-z0-9_.:-]{0,127} hook additional context: [\s\S]+\n<\/system-reminder>\n?(?:\[id:[0-9a-z]{1,6}\])?$/;
+function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
+  if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
+    || !Array.isArray(body.messages)) return body;
+  for (let i = 0; i < body.messages.length; i++) {
+    if (!Object.hasOwn(body.messages, i)) return body;
+  }
+  let changed = false;
+  const messages = body.messages.map((message, index) => {
+    if (!object(message) || message.role !== "user" || !Array.isArray(message.content)
+      || !message.content.some((part: unknown) => object(part) && part.type === "tool_result")) {
+      return message;
+    }
+    const assistant = body.messages[index - 1];
+    if (!object(assistant) || assistant.role !== "assistant"
+      || !Array.isArray(assistant.content)
+      || !assistant.content.some((part: unknown) => object(part) && part.type === "tool_use")) {
+      return message;
+    }
+    const results: Record<string, unknown>[] = [];
+    const reminders: string[] = [];
+    for (let i = 0; i < message.content.length; i++) {
+      if (!Object.hasOwn(message.content, i)) return message;
+      const part = message.content[i];
+      if (object(part) && part.type === "tool_result") {
+        results.push(part);
+        continue;
+      }
+      const text = block(part, ["text"]);
+      if (!object(text) || Object.keys(text).sort().join(",") !== "text,type"
+        || text.type !== "text" || typeof text.text !== "string"
+        || !HOOK_CONTEXT.test(text.text)) return message;
+      reminders.push(text.text);
+    }
+    if (results.length === 0 || reminders.length === 0) return message;
+    const last = results.at(-1)!;
+    const previous = last.content;
+    if (typeof previous !== "string" && !Array.isArray(previous)) return message;
+    if (Array.isArray(previous)) {
+      for (let i = 0; i < previous.length; i++) {
+        if (!Object.hasOwn(previous, i)) return message;
+      }
+    }
+    const content = typeof previous === "string"
+      ? [{ type: "text", text: previous }]
+      : [...previous];
+    content.push(...reminders.map((text) => ({ type: "text", text })));
+    const folded = [...results];
+    folded[folded.length - 1] = { ...last, content };
+    changed = true;
+    return { ...message, content: folded };
+  });
+  return changed ? { ...body, messages } as ProxyBody : body;
+}
 /** CCB2.1.280 appends this budget telemetry *after each* tool_result user
  * message. The held inner Claude Code CLI independently emits its own
  * <total_tokens> system hint after the virtual MCP result (proved by the
@@ -113,8 +173,9 @@ function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
     && block.cache_control.type === "ephemeral";
 }
 export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
-  return Array.isArray(body.messages)
-    && isBoxCcbToolBudgetAt(body, body.messages.length - 1);
+  const effective = foldBoxCcbHookContext(body);
+  return Array.isArray(effective.messages)
+    && isBoxCcbToolBudgetAt(effective, effective.messages.length - 1);
 }
 export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
   if (!Array.isArray(body.messages)) return body;
@@ -122,9 +183,10 @@ export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
   for (let i = 0; i < body.messages.length; i++) {
     if (!Object.hasOwn(body.messages, i)) return body;
   }
-  const kept = body.messages.filter((_, index) => !isBoxCcbToolBudgetAt(body, index));
-  return kept.length === body.messages.length ? body
-    : { ...body, messages: kept } as ProxyBody;
+  const effective = foldBoxCcbHookContext(body);
+  const kept = effective.messages.filter((_, index) => !isBoxCcbToolBudgetAt(effective, index));
+  return kept.length === effective.messages.length ? effective
+    : { ...effective, messages: kept } as ProxyBody;
 }
 export function normalizeBoxSemanticBody(body: ProxyBody,
   options: { collapseSingleText?: boolean } = {}): ProxyBody {

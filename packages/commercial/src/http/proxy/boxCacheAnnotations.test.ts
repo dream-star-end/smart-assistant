@@ -127,3 +127,67 @@ test("CCB tool-result budget telemetry is delegated to the held inner CLI", () =
     ...third.messages.slice(5)] } as ProxyBody;
   assert.notEqual(deriveBoxContextHash(unsafeHistory, true), deriveBoxContextHash(continued));
 });
+
+test("two CCB hook-context tool rounds preserve bytes and the next context hash", () => {
+  const budget = (tokens: number) => ({ role: "system", content: [{ type: "text",
+    text: `<total_tokens>${tokens} tokens left</total_tokens>`,
+    cache_control: marker }] });
+  const hook = (tool: string, message: string) =>
+    `<system-reminder>\nPreToolUse:${tool} hook additional context: ${message}\n</system-reminder>`;
+  const assistant = (id: string) => ({ role: "assistant", content: [{ type: "tool_use",
+    id, name: "local_echo", input: { value: "ping" } }] });
+  const result = (id: string, text: string, reminder: string) => ({ role: "user",
+    content: [{ type: "tool_result", tool_use_id: id, content: text },
+      { type: "text", text: reminder, cache_control: marker }] });
+  const prior = { ...first, messages: [{ role: "user", content: "hello" }] } as ProxyBody;
+  const firstHook = hook("Bash", "Use Read rather than cat.");
+  const continued = { ...prior, messages: [...prior.messages,
+    assistant("toolu_hook_1"), result("toolu_hook_1", "pong", firstHook),
+    budget(14_999_987)] } as ProxyBody;
+  const normalized = normalizeBoxSemanticBody(continued);
+  assert.equal(normalized.messages.length, 3);
+  const effectiveResult = normalized.messages.at(-1) as { content: Array<{
+    content?: unknown }> };
+  assert.equal(effectiveResult.content.length, 1);
+  const matched = matchBoxToolResults(continued, [{ id: "toolu_hook_1",
+    clientName: "local_echo", boxName: "mcp__ocbridge__t0",
+    input: { value: "ping" } }]);
+  assert.deepEqual(matched[0]?.content, [{ type: "text", text: "pong" },
+    { type: "text", text: firstHook }]);
+  assert.equal(deriveBoxContextHash(continued, true), deriveBoxContextHash(prior));
+  const secondHook = hook("Bash", "Read the next file.");
+  const third = { ...continued, messages: [...continued.messages,
+    assistant("toolu_hook_2"), result("toolu_hook_2", "pong-2", secondHook),
+    budget(14_999_974)] } as ProxyBody;
+  assert.equal(normalizeBoxSemanticBody(third).messages.length, 5);
+  assert.equal(deriveBoxContextHash(third, true), deriveBoxContextHash(continued));
+  const noBudget = { ...continued, messages: continued.messages.slice(0, -1) } as ProxyBody;
+  assert.equal((normalizeBoxSemanticBody(noBudget).messages.at(-1) as
+    { content: unknown[] }).content.length, 1);
+  const twoHooks = { ...prior, messages: [...prior.messages,
+    assistant("toolu_hook_3"), { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_hook_3", content: "pong-3" },
+      { type: "text", text: firstHook + "\n" },
+      { type: "text", text: secondHook },
+    ] }, budget(14_999_960)] } as ProxyBody;
+  assert.deepEqual(matchBoxToolResults(twoHooks, [{ id: "toolu_hook_3",
+    clientName: "local_echo", boxName: "mcp__ocbridge__t0",
+    input: { value: "ping" } }])[0]?.content, [
+    { type: "text", text: "pong-3" }, { type: "text", text: firstHook + "\n" },
+    { type: "text", text: secondHook },
+  ]);
+  const longHook = hook("Bash", "x".repeat(70_000));
+  const longBody = { ...prior, messages: [...prior.messages,
+    assistant("toolu_hook_4"), result("toolu_hook_4", "pong-4", longHook)] } as ProxyBody;
+  assert.deepEqual(matchBoxToolResults(longBody, [{ id: "toolu_hook_4",
+    clientName: "local_echo", boxName: "mcp__ocbridge__t0",
+    input: { value: "ping" } }])[0]?.content.at(-1),
+  { type: "text", text: longHook });
+  const dottedHook = hook("Read.file:local", "Read the next file.");
+  const dottedBody = { ...prior, messages: [...prior.messages,
+    assistant("toolu_hook_5"), result("toolu_hook_5", "pong-5", dottedHook)] } as ProxyBody;
+  assert.deepEqual(matchBoxToolResults(dottedBody, [{ id: "toolu_hook_5",
+    clientName: "local_echo", boxName: "mcp__ocbridge__t0",
+    input: { value: "ping" } }])[0]?.content.at(-1),
+  { type: "text", text: dottedHook });
+});
