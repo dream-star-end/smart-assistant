@@ -195,3 +195,27 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
     .update(requestHash).digest("hex");
   return { turnKey, sessionId, requestHash, replayFingerprint };
 }
+
+/** CCB 2.1.280's non-streaming retry is a read-only alias of the original
+ * paid call, never permission to launch another model. The pinned CLI removes
+ * stream, caps max_tokens at 64k and caps enabled thinking below that limit.
+ * The same transform is applied to the admitted streaming request and the
+ * incoming non-streaming fallback before comparing their authenticated keys. */
+export function deriveBoxFallbackAlias(uid: bigint, body: ProxyBody): string {
+  const semantic = normalizeBoxSemanticBody(body);
+  if (!Number.isSafeInteger(semantic.max_tokens) || semantic.max_tokens < 1) {
+    throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");
+  }
+  const { stream: _stream, ...rest } = semantic;
+  const max_tokens = Math.min(semantic.max_tokens, 64_000);
+  const thinking = rest.thinking;
+  const adjustedThinking = thinking && typeof thinking === "object"
+    && !Array.isArray(thinking) && (thinking as { type?: unknown }).type === "enabled"
+    && typeof (thinking as { budget_tokens?: unknown }).budget_tokens === "number"
+    ? { ...thinking, budget_tokens: Math.min(
+      (thinking as { budget_tokens: number }).budget_tokens, max_tokens - 1) }
+    : thinking;
+  const fallback = { ...rest, max_tokens,
+    ...(adjustedThinking === undefined ? {} : { thinking: adjustedThinking }) } as ProxyBody;
+  return deriveBoxCallFingerprint(uid, fallback).replayFingerprint;
+}

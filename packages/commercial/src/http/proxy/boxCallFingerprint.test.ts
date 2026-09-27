@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProxyBody } from "./shared.js";
 import { BoxCallFingerprintError, deriveBoxCallFingerprint,
-  deriveBoxContextHash, hashBoxAssistantContent,
+  deriveBoxContextHash, deriveBoxFallbackAlias, hashBoxAssistantContent,
   hashBoxAssistantEchoContent, hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 
 test("CCB omitted thinking matches only the original text and tool echo", () => {
@@ -83,6 +83,31 @@ test("same-turn identical independent call remains deliberately ambiguous", () =
   const b = deriveBoxCallFingerprint(3n, body());
   assert.equal(a.replayFingerprint, b.replayFingerprint,
     "this must not be advertised as a unique logical-call ID");
+});
+
+test("pinned CCB stream-to-nonstream fallback has one authenticated alias", () => {
+  const original = { ...body(), max_tokens: 100_000,
+    thinking: { type: "enabled", budget_tokens: 90_000 } } as ProxyBody;
+  const fallback = { ...original, stream: false, max_tokens: 64_000,
+    thinking: { type: "enabled", budget_tokens: 63_999 } } as unknown as ProxyBody;
+  assert.equal(deriveBoxFallbackAlias(3n, original), deriveBoxFallbackAlias(3n, fallback));
+  assert.notEqual(deriveBoxCallFingerprint(3n, original).replayFingerprint,
+    deriveBoxCallFingerprint(3n, fallback).replayFingerprint);
+  const adaptive = { ...original, thinking: { type: "adaptive" } } as ProxyBody;
+  assert.equal(deriveBoxFallbackAlias(3n, adaptive), deriveBoxFallbackAlias(3n,
+    { ...adaptive, stream: false, max_tokens: 64_000 } as unknown as ProxyBody));
+  const lowBudget = { ...original, thinking: { type: "enabled",
+    budget_tokens: 1000 } } as ProxyBody;
+  assert.equal(deriveBoxFallbackAlias(3n, lowBudget), deriveBoxFallbackAlias(3n,
+    { ...lowBudget, stream: false, max_tokens: 64_000 } as unknown as ProxyBody));
+  assert.notEqual(deriveBoxFallbackAlias(3n, lowBudget), deriveBoxFallbackAlias(3n,
+    { ...lowBudget, thinking: { type: "enabled", budget_tokens: 63_999 } } as ProxyBody));
+  assert.notEqual(deriveBoxFallbackAlias(3n, original), deriveBoxFallbackAlias(4n, original));
+  assert.notEqual(deriveBoxFallbackAlias(3n, original), deriveBoxFallbackAlias(3n,
+    { ...original, messages: [{ role: "user", content: "changed" }] } as ProxyBody));
+  assert.notEqual(deriveBoxFallbackAlias(3n, original), deriveBoxFallbackAlias(3n,
+    { ...original, metadata: { ...original.metadata,
+      session_id: "different-session" } } as ProxyBody));
 });
 
 test("tool continuation binds the complete prior CLI context without storing text", () => {
