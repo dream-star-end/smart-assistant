@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { BoxSpoolJsonlFramer } from "./boxSpoolJsonlFramer.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
+import { BOX_TOOL_MAX_LINE_BYTES,
+  BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 test("JSONL offsets stay byte-exact across split UTF-8 and a later HTTP request", () => {
   const first = Buffer.from('{"text":"你好"}\n');
@@ -32,13 +34,16 @@ test("overlap, invalid UTF-8 and oversized unfinished lines fail closed", () => 
   assert.throws(() => invalid.push(Buffer.from("ok\n"), 2), /BOX_SPOOL_FRAMER_CLOSED/);
   const big = new BoxSpoolJsonlFramer();
   let offset = 0;
-  for (let i = 0; i < 1024; i++) {
+  for (let i = 0; i < BOX_TOOL_MAX_LINE_BYTES / 65536; i++) {
     const chunk = Buffer.alloc(65536, 0x61);
     assert.deepEqual(big.push(chunk, offset), []);
     offset += chunk.length;
   }
-  assert.throws(() => big.push(Buffer.from("x"), offset), /BOX_SPOOL_CHUNK_INVALID/,
-    "the total spool bound rejects an unfinished line beyond its capacity");
+  assert.throws(() => big.push(Buffer.from("x"), offset), /BOX_SPOOL_LINE_TOO_LARGE/,
+    "an unfinished JSONL record cannot use the entire 256MB spool");
+  const atEnd = new BoxSpoolJsonlFramer(BOX_TOOL_SPOOL_MAX_BYTES - 1);
+  assert.throws(() => atEnd.push(Buffer.from("xy"), BOX_TOOL_SPOOL_MAX_BYTES - 1),
+    /BOX_SPOOL_CHUNK_INVALID/, "the total spool bound is independent of the line bound");
 });
 
 test("real handoff decoder commits the message_stop byte boundary, not whole read chunk", () => {
