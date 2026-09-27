@@ -57,6 +57,7 @@ import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
 import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
+import { createBoxReplayWriter } from "./boxReplaySetup.js";
 import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
@@ -241,6 +242,11 @@ export async function startEgress(): Promise<void> {
   const boxResolver = process.env.OC_BOX_MODEL_API === "1"
     ? createProductionBoxAccountResolver() : null;
   const boxJournal = boxResolver ? new BoxDurableJournal(getPool()) : null;
+  // The Box model route has no independent feature flag for private response
+  // capsules. Its already-injected platform state root gives this instance a
+  // durable sibling directory; commercial instances with Box off create none.
+  const boxReplayWriter = createBoxReplayWriter(boxResolver !== null,
+    process.env.OC_PLATFORM_ROOT);
   const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {
     uid: bigint; accountId: bigint; requestId: string; phase: string }) => {
     log.error("box_model_outcome_unknown", { uid: uid.toString(),
@@ -252,6 +258,7 @@ export async function startEgress(): Promise<void> {
     registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
       leaseMs: 900_000 }),
     journal: boxJournal,
+    writeMessage: boxReplayWriter,
     maxOutputTokensForModel: (model) =>
       model === "box-api-claude-opus-5-5" ? 128_000 : null,
     resolveTarget: (args) => boxResolver.resolve({ ...args,
@@ -268,6 +275,7 @@ export async function startEgress(): Promise<void> {
       virtualMcpAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_virtual_mcp.py")),
       detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
       journal: boxJournal,
+      writeMessage: boxReplayWriter,
       maxOutputTokensForModel: (model) =>
         model === "box-api-claude-opus-5-5" ? 128_000 : null,
       resolveTarget: (args) => boxResolver.resolve(args),
