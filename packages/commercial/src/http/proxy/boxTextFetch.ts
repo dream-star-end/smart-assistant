@@ -243,6 +243,7 @@ export class BoxTextFetch {
         await race(this.deps.journal.admit({ requestId: args.requestId,
           uid: args.uid, accountId: resolved.accountId, model: args.canonicalModel,
           fingerprint, canonicalBody: args.canonicalBody,
+          replayRequired: this.deps.writeMessage !== undefined,
           runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
         journalAdmitted = true;
       } catch {

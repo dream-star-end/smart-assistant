@@ -126,7 +126,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   const service = new BoxTextFetch({ supervisorAsset: Buffer.from("#!/usr/bin/python3\nprint('fixture')\n"),
     keeperAsset: Buffer.from("#!/usr/bin/python3\nprint('keeper fixture')\n"),
     registry,
-    journal: { admit: async () => { journalCalls.push("admit");
+    journal: { admit: async (identity) => { journalCalls.push("admit");
+        if (opts.writeMessage) assert.equal(identity.replayRequired, true);
         if (opts.journalFailPhase === "admit") throw new Error("db down"); },
       markRunning: async () => { journalCalls.push("running");
         if (opts.journalFailPhase === "running") throw new Error("db down"); },

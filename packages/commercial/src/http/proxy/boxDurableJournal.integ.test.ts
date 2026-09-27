@@ -89,6 +89,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       (error: unknown) => error instanceof BoxDurableJournalError
         && error.code === "BOX_JOURNAL_BASIS_INVALID");
     await journal.admit(input);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxReplayRequired":true}'::jsonb WHERE request_id=$1`,
+    [input.requestId]);
     assert.equal(await abortInflightJournal(sameConnection, input.requestId,
       "client disconnected"), false, "reserved Box call cannot be legacy-aborted");
     await assert.rejects(() => journal.admit({ ...input, requestId: `box-b-${suffix}` }),
@@ -110,6 +113,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       messagePointer: { ...textMessagePointer, requestId: "wrong" } }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_JOURNAL_EVIDENCE_INVALID");
+    await assert.rejects(() => journal.complete({ ...input, proof, usage }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_COMPLETE_FENCE_LOST");
     await journal.complete({ ...input, proof, usage,
       messagePointer: textMessagePointer });
     const nativePointer = parseBoxNativePointer({ version: 1, accountId: "20",
@@ -194,12 +200,14 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     const aliasBody = { ...firstBody, stream: true, max_tokens: 100_000 } as ProxyBody;
     const aliasAdmission = { ...input, requestId: aliasId,
       fingerprint: deriveBoxCallFingerprint(3n, aliasBody), canonicalBody: aliasBody,
+      replayRequired: true,
       runNonce: "6".repeat(24), leaseEpoch: "7".repeat(32) };
     await journal.admit(aliasAdmission);
     const aliasRow = await client.query<{ ctx: Record<string, unknown> }>(
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [aliasId]);
     assert.equal(aliasRow.rows[0]?.ctx.boxFallbackAlias,
       deriveBoxFallbackAlias(3n, aliasBody));
+    assert.equal(aliasRow.rows[0]?.ctx.boxReplayRequired, true);
     const aliasLookup = await journal.findReplayIdentity({ uid: 3n,
       canonicalModel: basis.model, canonicalBody: { ...aliasBody,
         stream: false, max_tokens: 64_000 } as unknown as ProxyBody });
@@ -228,6 +236,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       nativeStart: { sessionId: "12345678-1234-4123-8123-123456789abc",
         cliCwd: `/tmp/ocv5-289-run-${"3".repeat(24)}` } };
     await journal.admit(toolCall);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxReplayRequired":true}'::jsonb WHERE request_id=$1`,
+    [toolCall.requestId]);
     await journal.markRunning(toolCall);
     const firstToolUses = [
       { id: "toolu_A", boxName: "mcp__ocbridge__t0",
@@ -248,6 +259,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       assistantNoCallerHash: hashBoxAssistantNoCallerContent(firstAssistantContent),
       inputTokens: 7, outputTokens: 11, cacheReadTokens: 2, cacheWriteTokens: 0 };
     const catalogHash = compileBoxToolCatalog(toolDeclarations).bindingSha256;
+    await assert.rejects(() => journal.recordToolHandoff({ ...toolCall, candidate,
+      spoolOffset: 1234, detachedRunnerHash: "f".repeat(64), catalogHash,
+      verifiedPendingToolUseIds: ["toolu_A"] }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
     const receipt = await journal.recordToolHandoff({ ...toolCall, candidate,
       spoolOffset: 1234,
       messagePointer: messagePointer(toolCall.requestId,
@@ -266,6 +282,15 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       leaseEpoch: toolCall.leaseEpoch };
     await journal.markUnknown({ requestId: toolCall.requestId, uid: 3n,
       leaseEpoch: toolCall.leaseEpoch, phase: "synthetic_late_error" });
+    const afterLateError = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
+    assert.equal(afterLateError.rows[0]?.ctx.boxState, "handoff",
+      "late error cannot undo a durable tool handoff");
+    // Legacy/corrupt unknown-with-handoff is still forbidden from using the
+    // text completion route to replace its already committed Message.
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxState}','"unknown"'::jsonb) WHERE request_id=$1`,
+    [toolCall.requestId]);
     await assert.rejects(() => journal.complete({ requestId: toolCall.requestId,
       uid: 3n, leaseEpoch: toolCall.leaseEpoch, proof: handoffCompleteProof, usage,
       messagePointer: { ...messagePointer(toolCall.requestId,
@@ -424,6 +449,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "resuming");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
       "linked");
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxReplayRequired,
+      true);
     await client.query(`UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxLaunchPermit":true}'::jsonb WHERE request_id=$1`,
     [toolCall.requestId]);
@@ -480,6 +507,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.recordToolHandoff({
       requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
       candidate: secondCandidate, roundNo: 1, spoolOffset: 2345,
+      messagePointer: messagePointer(`box-d-${suffix}`, toolCall.runNonce,
+        toolCall.leaseEpoch, 1),
       detachedRunnerHash: "f".repeat(64), catalogHash,
       verifiedPendingToolUseIds: ["toolu_C"] }),
     (error: unknown) => error instanceof BoxDurableJournalError
@@ -494,6 +523,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       await assert.rejects(() => journal.recordToolHandoff({
         requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
         roundNo: 2, catalogHash, verifiedPendingToolUseIds: ["toolu_C"],
+        messagePointer: messagePointer(`box-d-${suffix}`, toolCall.runNonce,
+          toolCall.leaseEpoch, 2),
         ...mutation }),
       (error: unknown) => error instanceof BoxDurableJournalError
         && error.code === "BOX_TOOL_HANDOFF_FENCE_LOST");
@@ -501,6 +532,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await journal.recordToolHandoff({ requestId: `box-d-${suffix}`, uid: 3n,
       leaseEpoch: toolCall.leaseEpoch, candidate: secondCandidate, roundNo: 2,
       spoolOffset: 2345, detachedRunnerHash: "f".repeat(64),
+      messagePointer: messagePointer(`box-d-${suffix}`, toolCall.runNonce,
+        toolCall.leaseEpoch, 2),
       catalogHash,
       verifiedPendingToolUseIds: ["toolu_C"] });
     await put(`box-e-${suffix}`);
@@ -603,6 +636,25 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       finalUsage);
     assert.deepEqual(closed.rows.find((row) => row.request_id === `box-e-${suffix}`)?.ctx.boxReplayMessage,
       messagePointer(`box-e-${suffix}`, toolCall.runNonce, toolCall.leaseEpoch, 3));
+    await journal.markUnknown({ requestId: `box-e-${suffix}`, uid: 3n,
+      leaseEpoch: toolCall.leaseEpoch, phase: "synthetic_late_final_error" });
+    const afterFinalError = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-e-${suffix}`]);
+    assert.equal(afterFinalError.rows[0]?.ctx.boxState, "terminal",
+      "late error cannot undo a proven billed final Message");
+    const cleanCandidate = (await journal.listRemoteCleanupCandidates(20))
+      .find((item) => item.requestId === `box-e-${suffix}`);
+    assert.ok(cleanCandidate, "completed replay-required run with pointer may clean");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx-'boxReplayMessage' WHERE request_id=$1`, [`box-e-${suffix}`]);
+    assert.equal((await journal.listRemoteCleanupCandidates(20))
+      .some((item) => item.requestId === `box-e-${suffix}`), false,
+    "missing Message must keep remote stdout for read-only recovery");
+    assert.equal(await journal.claimRemoteCleanup(cleanCandidate), false);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || $2::jsonb WHERE request_id=$1`, [`box-e-${suffix}`,
+      JSON.stringify({ boxReplayMessage: messagePointer(`box-e-${suffix}`,
+        toolCall.runNonce, toolCall.leaseEpoch, 3) })]);
     for (let i = 0; i < 10; i++) {
       await client.query(`INSERT INTO request_finalize_journal
         (request_id,user_id,state,ctx,updated_at)

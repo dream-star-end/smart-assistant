@@ -73,6 +73,9 @@ export interface BoxJournalAdmission {
   /** Live callers provide the original body so the alias is derived and
    * checked here, never accepted as an unrelated caller-supplied hash. */
   canonicalBody?: ProxyBody;
+  /** New calls with a private Message writer must never terminalize/clean
+   * without a same-round capsule pointer. Old in-flight rows omit this. */
+  replayRequired?: boolean;
   runNonce: string;
   leaseEpoch: string;
   invocationMode?: "text" | "detached_tool";
@@ -168,8 +171,13 @@ const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
   AND state IN ('inflight','finalizing','committed'))
   OR (ctx->>'boxState'='failed_stopped'
     AND ctx->'boxTerminalProof'->>'reason' IN ('keeper_stopped','worker_failed')
-    AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
-      AND ctx ? 'boxToolHandoff'))))`;
+      AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
+        AND ctx ? 'boxToolHandoff'))))`;
+// New successful Box rounds retain the completed Message before stdout is
+// truncated. Old rows and proven stopped failures keep their cleanup route.
+const CLEANUP_REPLAY_FENCE = `(ctx->>'boxState'<>'terminal'
+  OR ctx->>'boxReplayRequired' IS DISTINCT FROM 'true'
+  OR ctx ? 'boxReplayMessage')`;
 
 const STOP_PROBE_STATE_FENCE = `((state='inflight'
   AND ctx->>'boxState' IN ('running','unknown','linked')
@@ -531,6 +539,9 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   async admit(input: BoxJournalAdmission): Promise<void> {
     goodId(input);
+    if (input.replayRequired === true && !input.canonicalBody) {
+      throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
+    }
     let fallbackAlias: string | undefined;
     if (input.canonicalBody) {
       try {
@@ -619,6 +630,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         if (claimed.rowCount !== 1) throw new BoxDurableJournalError("BOX_NATIVE_CLAIM_LOST");
       }
       const identity = { boxInvocationRecovery: "v1", boxState: "reserved",
+        ...(input.replayRequired === true ? { boxReplayRequired: true } : {}),
         boxInvocationMode: input.invocationMode ?? "text",
         boxAccountId: input.accountId.toString(),
         boxReplayFingerprint: input.fingerprint.replayFingerprint,
@@ -785,10 +797,27 @@ export class BoxDurableJournal implements BoxJournalPort {
           SET ctx = ctx || $4::jsonb, updated_at = NOW()
         WHERE request_id = $1 AND user_id = $2
           AND ctx->>'boxLeaseEpoch' = $3
-          AND ctx->>'boxState' = ANY($5::text[])`,
+          AND ctx->>'boxState' = ANY($5::text[])
+          AND NOT (ctx ? 'boxToolHandoff')
+          AND NOT (ctx ? 'boxReplayMessage')
+          AND NOT (ctx ? 'boxTerminalProof')`,
       [input.requestId, input.uid.toString(), input.leaseEpoch,
-        JSON.stringify({ boxState: "unknown", boxUnknownPhase: input.phase.slice(0, 80) }), ACTIVE]);
-    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_JOURNAL_UNKNOWN_FENCE_LOST");
+        JSON.stringify({ boxState: "unknown", boxUnknownPhase: input.phase.slice(0, 80) }),
+        ["reserved", "starting", "running", "linked", "resuming", "unknown"]]);
+    if (changed.rowCount === 1) return;
+    // A late caller abort or stream error cannot turn already-published model
+    // evidence back into unknown. No UPDATE (or updated_at bump) on that path.
+    const found = await this.pool.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2
+        AND ctx->>'boxLeaseEpoch'=$3`,
+      [input.requestId, input.uid.toString(), input.leaseEpoch]);
+    const ctx = found.rows[0]?.ctx;
+    if (found.rowCount === 1 && ctx && (
+      (ctx.boxState === "handoff" && ctx.boxToolHandoff !== undefined)
+      || (ctx.boxState === "terminal" && ctx.boxTerminalProof !== undefined
+        && ctx.boxUsage !== undefined)
+      || (ctx.boxState === "failed_stopped" && ctx.boxTerminalProof !== undefined))) return;
+    throw new BoxDurableJournalError("BOX_JOURNAL_UNKNOWN_FENCE_LOST");
   }
 
   /** A user stop is durable intent, not a terminal or release event. The
@@ -1004,6 +1033,7 @@ export class BoxDurableJournal implements BoxJournalPort {
              COALESCE(ctx->>'boxRoundNo','1')='1'
              AND NOT (ctx ? 'boxToolHandoff')
              AND NOT (ctx ? 'boxReplayMessage')))
+           AND (ctx->>'boxReplayRequired' IS DISTINCT FROM 'true' OR $6::boolean = true)
            AND ctx ? 'billingPricing'`,
       [input.requestId, input.uid.toString(), input.leaseEpoch,
         JSON.stringify({ boxState: "terminal", boxUsage: u, boxTerminalProof: input.proof,
@@ -1141,6 +1171,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id = $1 AND user_id = $2 AND state = 'inflight'
            AND ctx->>'boxLeaseEpoch' = $3
            AND ($10::text IS NULL OR ctx->>'boxRunNonce' = $10)
+           AND (ctx->>'boxReplayRequired' IS DISTINCT FROM 'true' OR $10::text IS NOT NULL)
            AND ctx->>'boxInvocationMode' = 'detached_tool'
           AND NOT (ctx ? 'boxCancelIntent')
           AND ((($5::int = 1) AND ctx->>'boxState' = 'running')
@@ -1316,6 +1347,7 @@ export class BoxDurableJournal implements BoxJournalPort {
             boxSessionId: fingerprint.sessionId,
              boxReplayFingerprint: fingerprint.replayFingerprint,
              boxFallbackAlias: fallbackAlias,
+             ...(ctx.boxReplayRequired === true ? { boxReplayRequired: true } : {}),
              boxRequestHash: fingerprint.requestHash,
              boxContextHash: nextContextHash,
              boxParentResumeRevision: durableRevision,
@@ -1412,6 +1444,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 2
         || Number(roundNo) > 32 || rows.length !== roundNo
         || (pointer && pointer.roundNo !== roundNo)
+        || (basis.boxReplayRequired === true && !pointer)
         || basis.boxSessionId !== lockedSessionId
         || current.state !== "inflight"
         || !["linked", "unknown"].includes(String(basis.boxState))
@@ -1441,6 +1474,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           || ctx.boxSessionId !== basis.boxSessionId
           || ctx.boxTurnKey !== basis.boxTurnKey
           || ctx.model !== basis.model
+          || ctx.boxReplayRequired !== basis.boxReplayRequired
           || ctx.boxNativeSessionId !== basis.boxNativeSessionId
           || ctx.boxNativeCliCwd !== basis.boxNativeCliCwd) {
           throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
@@ -1880,7 +1914,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
         WHERE ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
+           AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
+           AND ${CLEANUP_REPLAY_FENCE}
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
            AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
@@ -1967,7 +2002,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxAccountId'=$3
           AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxLeaseEpoch'=$5
           AND ctx->>'boxInvocationMode'='detached_tool'
-          AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
+           AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
+           AND ${CLEANUP_REPLAY_FENCE}
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
            AND ctx->'boxTerminalProof'=$6::jsonb

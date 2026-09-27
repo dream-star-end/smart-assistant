@@ -242,8 +242,14 @@ test("first tool or final Message is retained before its exact journal CAS", asy
   for (const directFinal of [false, true]) {
     const f = fixture({ directFinal });
     const journal = f.deps.journal as unknown as {
+      admit: (input: { replayRequired?: boolean }) => Promise<void>;
       recordToolHandoff: (input: { messagePointer?: BoxReplayMessagePointer }) => Promise<unknown>;
       complete: (input: { messagePointer?: BoxReplayMessagePointer }) => Promise<void>;
+    };
+    const originalAdmit = journal.admit.bind(journal);
+    journal.admit = async (input) => {
+      assert.equal(input.replayRequired, true);
+      return originalAdmit(input);
     };
     const originalHandoff = journal.recordToolHandoff.bind(journal);
     const originalFinal = journal.complete.bind(journal);
