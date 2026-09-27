@@ -285,6 +285,7 @@ export async function runBoxToolFirstRound(input: {
     }
     const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
       accountId: target.accountId, model: input.canonicalModel, fingerprint,
+      canonicalBody: input.canonicalBody,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
       invocationMode: "detached_tool", contextHash,
       ...(nativeClaim ? { nativeClaim }

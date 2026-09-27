@@ -10,7 +10,7 @@ import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  hashBoxAssistantContent } from "./boxCallFingerprint.js";
+  deriveBoxFallbackAlias, hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import { matchBoxToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
@@ -59,6 +59,9 @@ export interface BoxJournalAdmission {
   accountId: bigint;
   model: string;
   fingerprint: BoxCallFingerprint;
+  /** Live callers provide the original body so the alias is derived and
+   * checked here, never accepted as an unrelated caller-supplied hash. */
+  canonicalBody?: ProxyBody;
   runNonce: string;
   leaseEpoch: string;
   invocationMode?: "text" | "detached_tool";
@@ -404,6 +407,17 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   async admit(input: BoxJournalAdmission): Promise<void> {
     goodId(input);
+    let fallbackAlias: string | undefined;
+    if (input.canonicalBody) {
+      try {
+        const derived = deriveBoxCallFingerprint(input.uid, input.canonicalBody);
+        if (!isDeepStrictEqual(derived, input.fingerprint)
+          || input.canonicalBody.model !== input.model) {
+          throw new Error("fingerprint mismatch");
+        }
+        fallbackAlias = deriveBoxFallbackAlias(input.uid, input.canonicalBody);
+      } catch { throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID"); }
+    }
     const native = input.nativeClaim;
     if (native && (!/^[A-Za-z0-9_-]{1,64}$/.test(native.ownerRequestId)
       || native.ownerRequestId === input.requestId
@@ -421,8 +435,10 @@ export class BoxDurableJournal implements BoxJournalPort {
         `box:session:${input.uid}:${input.fingerprint.sessionId}`,
       ]);
       const duplicate = await client.query(
-        "SELECT 1 FROM request_finalize_journal WHERE ctx->>'boxReplayFingerprint' = $1 LIMIT 1",
-        [input.fingerprint.replayFingerprint]);
+        `SELECT 1 FROM request_finalize_journal
+          WHERE ctx->>'boxReplayFingerprint' = $1
+             OR ctx->>'boxFallbackAlias' = $2 LIMIT 1`,
+        [input.fingerprint.replayFingerprint, fallbackAlias ?? null]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       const occupied = await client.query(
         `SELECT 1 FROM request_finalize_journal
@@ -482,6 +498,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxInvocationMode: input.invocationMode ?? "text",
         boxAccountId: input.accountId.toString(),
         boxReplayFingerprint: input.fingerprint.replayFingerprint,
+        ...(fallbackAlias ? { boxFallbackAlias: fallbackAlias } : {}),
         boxRequestHash: input.fingerprint.requestHash,
         boxTurnKey: input.fingerprint.turnKey,
         boxSessionId: input.fingerprint.sessionId,
@@ -1014,10 +1031,12 @@ export class BoxDurableJournal implements BoxJournalPort {
       throw new BoxDurableJournalError("BOX_TOOL_RESUME_IDENTITY_INVALID");
     }
     let fingerprint: BoxCallFingerprint;
+    let fallbackAlias: string;
     let priorContextHash: string;
     let nextContextHash: string;
     try {
       fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody);
+      fallbackAlias = deriveBoxFallbackAlias(input.uid, input.canonicalBody);
       priorContextHash = deriveBoxContextHash(input.canonicalBody, true);
       nextContextHash = deriveBoxContextHash(input.canonicalBody);
     }
@@ -1029,8 +1048,10 @@ export class BoxDurableJournal implements BoxJournalPort {
       await lock(client, [`box:fingerprint:${fingerprint.replayFingerprint}`,
         `box:session:${input.uid}:${fingerprint.sessionId}`]);
       const duplicate = await client.query(
-        "SELECT 1 FROM request_finalize_journal WHERE ctx->>'boxReplayFingerprint'=$1 LIMIT 1",
-        [fingerprint.replayFingerprint]);
+        `SELECT 1 FROM request_finalize_journal
+          WHERE ctx->>'boxReplayFingerprint'=$1
+             OR ctx->>'boxFallbackAlias'=$2 LIMIT 1`,
+        [fingerprint.replayFingerprint, fallbackAlias]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       const owners = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
         `SELECT request_id,ctx FROM request_finalize_journal
@@ -1149,7 +1170,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             boxDetachedRunnerHash: handoff.detachedRunnerHash,
             boxCatalogHash: handoff.catalogHash,
             boxSessionId: fingerprint.sessionId,
-            boxReplayFingerprint: fingerprint.replayFingerprint,
+             boxReplayFingerprint: fingerprint.replayFingerprint,
+             boxFallbackAlias: fallbackAlias,
              boxRequestHash: fingerprint.requestHash,
              boxContextHash: nextContextHash,
              boxParentResumeRevision: durableRevision,

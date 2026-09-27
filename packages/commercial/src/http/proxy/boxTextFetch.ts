@@ -240,7 +240,8 @@ export class BoxTextFetch {
       try {
         await race(this.deps.journal.admit({ requestId: args.requestId,
           uid: args.uid, accountId: resolved.accountId, model: args.canonicalModel,
-          fingerprint, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
+          fingerprint, canonicalBody: args.canonicalBody,
+          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
         journalAdmitted = true;
       } catch {
         // No Box command has started, so the acquired target is safe to close.

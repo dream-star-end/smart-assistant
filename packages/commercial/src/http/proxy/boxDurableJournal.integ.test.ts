@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { deriveBoxCallFingerprint, deriveBoxContextHash,
+import { deriveBoxCallFingerprint, deriveBoxContextHash, deriveBoxFallbackAlias,
   hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
@@ -177,6 +177,26 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       metadata: { user_id: JSON.stringify({ oc_turn_key: "a".repeat(64),
         session_id: `session-${suffix}` }) },
       messages: [{ role: "user", content: "synthetic first prompt" }] };
+    const aliasId = `box-alias-${suffix}`;
+    await put(aliasId);
+    const aliasBody = { ...firstBody, stream: true, max_tokens: 100_000 } as ProxyBody;
+    const aliasAdmission = { ...input, requestId: aliasId,
+      fingerprint: deriveBoxCallFingerprint(3n, aliasBody), canonicalBody: aliasBody,
+      runNonce: "6".repeat(24), leaseEpoch: "7".repeat(32) };
+    await journal.admit(aliasAdmission);
+    const aliasRow = await client.query<{ ctx: Record<string, unknown> }>(
+      "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [aliasId]);
+    assert.equal(aliasRow.rows[0]?.ctx.boxFallbackAlias,
+      deriveBoxFallbackAlias(3n, aliasBody));
+    await journal.markPrestartStopped(aliasAdmission);
+    const aliasCollisionId = `box-alias-collision-${suffix}`;
+    await put(aliasCollisionId);
+    const changedCap = { ...aliasBody, max_tokens: 120_000 } as ProxyBody;
+    await assert.rejects(() => journal.admit({ ...aliasAdmission,
+      requestId: aliasCollisionId, fingerprint: deriveBoxCallFingerprint(3n, changedCap),
+      canonicalBody: changedCap }), (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_CALL_AMBIGUOUS",
+    "different original max_tokens above CCB fallback cap must not admit a second paid call");
     const toolCall = { ...input, requestId: `box-c-${suffix}`,
       invocationMode: "detached_tool" as const,
       contextHash: deriveBoxContextHash(firstBody),
@@ -359,6 +379,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "resuming");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
       "linked");
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxFallbackAlias,
+      deriveBoxFallbackAlias(3n, resumeBody as ProxyBody));
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxNativeSessionId,
       toolCall.nativeStart.sessionId);
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxRoundNo,
