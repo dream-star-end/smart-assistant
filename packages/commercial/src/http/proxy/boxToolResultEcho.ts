@@ -4,6 +4,9 @@
 import { createHash } from "node:crypto";
 import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 
+type ExpectedEcho = Pick<BoxMatchedToolResult,
+  "modelToolUseId" | "contentHash" | "isError">;
+
 export class BoxToolResultEchoError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolResultEchoError"; }
 }
@@ -46,9 +49,9 @@ function content(value: unknown): Array<Record<string, unknown>> {
 }
 
 export class BoxToolResultEcho {
-  private readonly expected = new Map<string, BoxMatchedToolResult>();
+  private readonly expected = new Map<string, ExpectedEcho>();
   private readonly seen = new Set<string>();
-  constructor(results: readonly BoxMatchedToolResult[]) {
+  constructor(results: readonly ExpectedEcho[]) {
     if (!Array.isArray(results) || results.length < 1 || results.length > 32) {
       throw new BoxToolResultEchoError("BOX_TOOL_ECHO_EXPECTED_INVALID");
     }

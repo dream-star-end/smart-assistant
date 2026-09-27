@@ -59,6 +59,7 @@ import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { createBoxReplayReader, createBoxReplayWriter } from "./boxReplaySetup.js";
 import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
+import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
 import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
@@ -250,10 +251,21 @@ export async function startEgress(): Promise<void> {
     process.env.OC_PLATFORM_ROOT);
   const boxReplayReader = createBoxReplayReader(process.env.OC_PLATFORM_ROOT);
   const boxReplayJournal = boxJournal ?? new BoxDurableJournal(getPool());
+  const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
   const boxReplay = boxReplayReader ? {
-    lookup: (input: Parameters<typeof findCompletedBoxReplay>[0]) =>
-      findCompletedBoxReplay(input, { journal: boxReplayJournal,
-        readMessage: boxReplayReader }),
+    lookup: async (input: Parameters<typeof findCompletedBoxReplay>[0]) => {
+      const deps = { journal: boxReplayJournal, readMessage: boxReplayReader };
+      const first = await findCompletedBoxReplay(input, deps);
+      if (first.kind !== "pending" || first.identity.invocationMode !== "detached_tool"
+        || first.identity.state !== "unknown" || !first.identity.rootLaunchPermit
+        || !boxReplayWriter) return first;
+      await observeBoxToolUnknown({ identity: first.identity,
+        canonicalBody: input.canonicalBody, upstreamModel: input.upstreamModel }, {
+        journal: boxReplayJournal, writeMessage: boxReplayWriter,
+        resolveTarget: (args) => boxStopResolver.resolve(args),
+      });
+      return findCompletedBoxReplay(input, deps);
+    },
   } : undefined;
   const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {
     uid: bigint; accountId: bigint; requestId: string; phase: string }) => {
@@ -304,7 +316,6 @@ export async function startEgress(): Promise<void> {
   boxCleanupTimer?.unref();
   // A stop for an already-admitted Box run must remain available even after
   // the model launch flag is turned OFF. It cannot create a new paid call.
-  const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
   const boxStopJournal = boxJournal ?? new BoxDurableJournal(getPool());
   // Recovery survives disabling the model launch flags. Empty assets are never
   // used by this off-route worker; it dispatches only idempotent cleanup Exec.
