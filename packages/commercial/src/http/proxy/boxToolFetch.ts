@@ -383,6 +383,17 @@ export class BoxToolFetch {
   }
 
   async fetch(args: FetchArgs): Promise<Response> {
+    let responseReady = false;
+    let readyResolve!: () => void;
+    let readyReject!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      readyResolve = resolve; readyReject = reject;
+    });
+    const acknowledge = (): void => {
+      if (responseReady) return;
+      responseReady = true;
+      readyResolve();
+    };
     const abort = new AbortController();
     const onAbort = (): void => abort.abort();
     args.init.signal?.addEventListener("abort", onAbort, { once: true });
@@ -406,6 +417,7 @@ export class BoxToolFetch {
             });
             this.own(published.claim.runNonce, published.target,
               args.uid, published.claim.leaseEpoch);
+            acknowledge(); // the existing CLI received the durable tool-result handoff
             const result = await (this.deps.runContinuation ?? runBoxToolContinuation)({
               published, uid: args.uid, requestId: args.requestId,
               canonicalBody: args.canonicalBody, upstreamModel: args.upstreamModel,
@@ -425,7 +437,7 @@ export class BoxToolFetch {
             }
           } else {
             const outcome: BoxToolFirstHandoff | BoxToolFirstFinal = await (this.deps.runFirst
-              ?? runBoxToolFirstRound)({ ...args, init, emit }, {
+              ?? runBoxToolFirstRound)({ ...args, init, emit, onLaunchAck: acknowledge }, {
               supervisorAsset: this.deps.supervisorAsset,
               keeperAsset: this.deps.keeperAsset,
               virtualMcpAsset: this.deps.virtualMcpAsset,
@@ -440,6 +452,7 @@ export class BoxToolFetch {
                 target, args.uid, plan.leaseEpoch),
               retainCleanupTarget: (handle) => this.retainCleanup(handle),
             });
+            acknowledge(); // injected completed runner compatibility; live path acks at launch
             this.own(outcome.plan.runNonce, outcome.target,
               args.uid, outcome.plan.leaseEpoch);
             if (outcome.kind === "final") {
@@ -452,6 +465,14 @@ export class BoxToolFetch {
           }
           controller.close();
         })().catch((error: unknown) => {
+          if (!responseReady) {
+            // Before headers, caller cancellation is still a client abort.
+            // Preserve that classification rather than cooling the Box
+            // account for a user pressing Stop during staging/launch.
+            readyReject(args.init.signal?.aborted
+              ? Object.assign(new Error("BOX_TOOL_CLIENT_ABORTED"), {
+                name: "AbortError", cause: error }) : error);
+          }
           try { controller.error(error); } catch { /* downstream already cancelled */ }
         }).finally(() => {
           args.init.signal?.removeEventListener("abort", onAbort);
@@ -459,6 +480,7 @@ export class BoxToolFetch {
       },
       cancel: () => { abort.abort(); },
     });
+    await ready;
     return new Response(stream, { status: 200,
       headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
   }

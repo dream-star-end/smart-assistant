@@ -58,6 +58,8 @@ export async function runBoxToolFirstRound(input: {
   url: string;
   init: RequestInit;
   emit: (sse: string) => void;
+  /** Resolve the HTTP response only after this invocation's paid launch ack. */
+  onLaunchAck?: () => void;
 }, deps: {
   supervisorAsset: Buffer;
   keeperAsset: Buffer;
@@ -405,6 +407,7 @@ export async function runBoxToolFirstRound(input: {
     if (launch.stdout.trim() !== "launched") {
       throw new BoxToolFirstRoundError("BOX_TOOL_LAUNCH_UNKNOWN");
     }
+    input.onLaunchAck?.();
     const decoder = new BoxCliToolHandoffDecoder(plan.expectedModel, plan.catalog,
       { allowFinal: true });
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access: plan,

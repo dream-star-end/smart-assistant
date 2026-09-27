@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
+import { BoxToolFirstRoundError } from "./boxToolFirstRound.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
@@ -30,6 +31,74 @@ const journal = () => ({ claimRemoteCleanup: async () => true,
   prelaunchCleanupDoneByRunIdentity: async () => false,
   markRemoteCleaned: async () => {},
   listRemoteCleanupCandidates: async () => [] }) as never;
+
+test("first tool HTTP 200 waits for launch ack, not for model handoff", async () => {
+  let releaseModel = (): void => {};
+  let acknowledge = (): void => {};
+  let started!: () => void;
+  const runStarted = new Promise<void>((resolve) => { started = resolve; });
+  let finished = false;
+  const target = { accountId: 20n,
+    exec: { run: async () => ({ stdout: "clean\n", stderrBytes: 0,
+      exitCode: 0 as const }) }, dispose: async () => {} };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    runFirst: (async (input: { emit: (sse: string) => void;
+      onLaunchAck?: () => void }) => {
+      acknowledge = () => input.onLaunchAck?.();
+      started();
+      await new Promise<void>((resolve) => { releaseModel = resolve; });
+      acknowledge();
+      await new Promise<void>((resolve) => { releaseModel = resolve; });
+      finished = true;
+      input.emit("event: message_stop\ndata: {}\n\n");
+      return { kind: "tool_handoff", plan: { runNonce: "a".repeat(24),
+        leaseEpoch: "b".repeat(32) }, target };
+    }) as never,
+  });
+  let fetchSettled = false;
+  const fetching = service.fetch(call(firstBody)).then((response) => {
+    fetchSettled = true; return response;
+  });
+  await runStarted;
+  assert.equal(fetchSettled, false, "no HTTP response may exist before launch ack");
+  releaseModel(); // permits the synthetic runner to acknowledge launch
+  const response = await fetching;
+  assert.equal(response.status, 200);
+  assert.equal(finished, false, "first byte must not wait for a completed model turn");
+  releaseModel();
+  assert.match(await response.text(), /message_stop/);
+});
+
+test("pre-ack caller Stop is classified as client abort, not Box account failure", async () => {
+  const abort = new AbortController();
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => { throw new Error("must not resolve"); },
+    onUnknown: async () => {},
+    runFirst: (async (input: { init: RequestInit }) => {
+      entered();
+      await new Promise<never>((_, reject) => {
+        const cancelled = () => reject(new BoxToolFirstRoundError("BOX_TOOL_ABORTED"));
+        if (input.init.signal?.aborted) cancelled();
+        else input.init.signal?.addEventListener("abort", cancelled, { once: true });
+      });
+    }) as never,
+  });
+  const first = call(firstBody);
+  const request = service.fetch({ ...first, init: { ...first.init, signal: abort.signal } });
+  await started;
+  abort.abort();
+  await assert.rejects(() => request, (error: unknown) => error instanceof Error
+    && error.name === "AbortError" && error.message === "BOX_TOOL_CLIENT_ABORTED");
+});
 
 test("same internal model fetch streams first handoff then next final without tool execution", async () => {
   const calls: string[] = [];
@@ -297,8 +366,8 @@ test("original egress reaps held target after peer's exact prelaunch cleanup pro
       throw new Error("synthetic prelaunch unknown");
     }) as never,
   });
-  const response = await service.fetch(call(firstBody));
-  await assert.rejects(() => response.text(), /synthetic prelaunch unknown/);
+  await assert.rejects(() => service.fetch(call(firstBody)),
+    /synthetic prelaunch unknown/);
   assert.equal(disposed, false);
   done = true;
   assert.equal(await service.reconcileRemoteCleanup(), 0);
