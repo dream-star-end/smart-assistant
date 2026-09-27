@@ -172,7 +172,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await put(`box-c-${suffix}`);
     const toolDeclarations = [{ name: "local_echo", description: "local-only",
       input_schema: { type: "object", properties: { value: { type: "string" } } } }];
-    const firstBody: ProxyBody = { model: basis.model, max_tokens: 128,
+    const firstBody: ProxyBody = { model: basis.model, max_tokens: 128, stream: true,
       tools: toolDeclarations,
       metadata: { user_id: JSON.stringify({ oc_turn_key: "a".repeat(64),
         session_id: `session-${suffix}` }) },
@@ -188,6 +188,17 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [aliasId]);
     assert.equal(aliasRow.rows[0]?.ctx.boxFallbackAlias,
       deriveBoxFallbackAlias(3n, aliasBody));
+    const aliasLookup = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: { ...aliasBody,
+        stream: false, max_tokens: 64_000 } as unknown as ProxyBody });
+    assert.equal(aliasLookup?.requestId, aliasId);
+    assert.equal(aliasLookup?.rootRequestId, aliasId);
+    assert.equal(aliasLookup?.rootLaunchPermit, false);
+    assert.equal(await journal.findReplayIdentity({ uid: 4n,
+      canonicalModel: basis.model, canonicalBody: aliasBody }), null);
+    assert.equal(await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: { ...aliasBody,
+        messages: [{ role: "user", content: "changed" }] } as ProxyBody }), null);
     await journal.markPrestartStopped(aliasAdmission);
     const aliasCollisionId = `box-alias-collision-${suffix}`;
     await put(aliasCollisionId);
@@ -379,6 +390,21 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "resuming");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxState,
       "linked");
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxLaunchPermit":true}'::jsonb WHERE request_id=$1`,
+    [toolCall.requestId]);
+    const replay = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody });
+    assert.equal(replay?.requestId, `box-d-${suffix}`);
+    assert.equal(replay?.rootRequestId, toolCall.requestId);
+    assert.equal(replay?.rootLaunchPermit, true);
+    assert.equal(replay?.roundNo, 2);
+    assert.equal(replay?.spoolOffset, 1234);
+    const retry = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: basis.model, canonicalBody: { ...resumeBody,
+        stream: false } as unknown as ProxyBody });
+    assert.equal(retry?.requestId, `box-d-${suffix}`,
+      "nonstreaming retry must attach the linked HTTP row, not the root");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxFallbackAlias,
       deriveBoxFallbackAlias(3n, resumeBody as ProxyBody));
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxNativeSessionId,

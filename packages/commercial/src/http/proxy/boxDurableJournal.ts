@@ -92,6 +92,20 @@ export interface BoxToolResumeClaim {
   readonly nativeSessionId?: string;
   readonly nativeCliCwd?: string;
 }
+/** A matched HTTP request is observable, never permission to launch it again. */
+export interface BoxReplayIdentity {
+  readonly requestId: string;
+  readonly rootRequestId: string;
+  readonly uid: bigint;
+  readonly accountId: bigint;
+  readonly runNonce: string;
+  readonly leaseEpoch: string;
+  readonly invocationMode: "text" | "detached_tool";
+  readonly state: string;
+  readonly roundNo: number;
+  readonly spoolOffset: number;
+  readonly rootLaunchPermit: boolean;
+}
 export interface BoxRemoteCleanupCandidate {
   readonly requestId: string;
   readonly uid: bigint;
@@ -403,6 +417,102 @@ export class BoxDurableJournal implements BoxJournalPort {
       [input.requestId, input.uid.toString(), JSON.stringify(input.pointer),
         JSON.stringify(update)]);
     return changed.rowCount === 1;
+  }
+
+  /** Find the original round before precharge or account selection. This only
+   * reads committed evidence; the caller must separately observe the pinned
+   * spool/proof or load a completed Message before returning any answer. */
+  async findReplayIdentity(input: { uid: bigint; canonicalModel: string;
+    canonicalBody: ProxyBody }): Promise<BoxReplayIdentity | null> {
+    const stream = (input.canonicalBody as { stream?: boolean }).stream;
+    if (input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel
+      || (stream !== true && stream !== false)) {
+      throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID");
+    }
+    let fingerprint: BoxCallFingerprint;
+    let key: string;
+    try {
+      fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody);
+      key = stream === false ? deriveBoxFallbackAlias(input.uid, input.canonicalBody)
+        : fingerprint.replayFingerprint;
+    } catch { throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID"); }
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      await lock(client, [`box:session:${input.uid}:${fingerprint.sessionId}`]);
+      type Row = { request_id: string; ctx: Record<string, unknown> };
+      const column = stream === false ? "boxFallbackAlias" : "boxReplayFingerprint";
+      const found = await client.query<Row>(
+        `SELECT request_id,ctx FROM request_finalize_journal
+          WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
+            AND ctx->>'boxTurnKey'=$3 AND ctx->>'model'=$4
+            AND ctx->>$5=$6 LIMIT 2`,
+        [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
+          input.canonicalModel, column, key]);
+      if (found.rows.length > 1) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
+      const matched = found.rows[0];
+      if (!matched) {
+        await client.query("COMMIT"); committed = true; return null;
+      }
+      const original = matched.ctx;
+      const accountId = original.boxAccountId;
+      const runNonce = original.boxRunNonce;
+      const leaseEpoch = original.boxLeaseEpoch;
+      const mode = original.boxInvocationMode;
+      const roundNo = original.boxRoundNo ?? 1;
+      const spoolOffset = original.boxResumeSpoolOffset ?? 0;
+      if (original.boxInvocationRecovery !== "v1"
+        || typeof accountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(accountId)
+        || typeof runNonce !== "string" || !/^[a-f0-9]{24}$/.test(runNonce)
+        || typeof leaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(leaseEpoch)
+        || (mode !== "text" && mode !== "detached_tool")
+        || !Number.isSafeInteger(roundNo) || Number(roundNo) < 1 || Number(roundNo) > 32
+        || !Number.isSafeInteger(spoolOffset) || Number(spoolOffset) < 0
+        || Number(spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
+        || ![...ACTIVE, "terminal", "failed_stopped", "prestart_stopped"]
+          .includes(String(original.boxState))) {
+        throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+      }
+      let row = matched;
+      const seen = new Set<string>();
+      for (let hop = 0; hop < 32; hop++) {
+        if (seen.has(row.request_id)
+          || row.ctx.boxInvocationRecovery !== "v1"
+          || row.ctx.boxInvocationMode !== mode
+          || row.ctx.boxAccountId !== accountId
+          || row.ctx.boxRunNonce !== runNonce || row.ctx.boxLeaseEpoch !== leaseEpoch
+          || row.ctx.boxSessionId !== fingerprint.sessionId
+          || row.ctx.boxTurnKey !== fingerprint.turnKey
+          || row.ctx.model !== input.canonicalModel) {
+          throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+        }
+        seen.add(row.request_id);
+        const owner = row.ctx.boxOwnerRequestId;
+        if (owner === undefined) {
+          await client.query("COMMIT"); committed = true;
+          return { requestId: matched.request_id, rootRequestId: row.request_id,
+            uid: input.uid, accountId: BigInt(accountId), runNonce, leaseEpoch,
+            invocationMode: mode, state: original.boxState as string,
+            roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
+            rootLaunchPermit: row.ctx.boxLaunchPermit === true };
+        }
+        if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) {
+          throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+        }
+        const parent = await client.query<Row>(
+          "SELECT request_id,ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2",
+          [owner, input.uid.toString()]);
+        if (parent.rowCount !== 1 || !parent.rows[0]) {
+          throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+        }
+        row = parent.rows[0];
+      }
+      throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
   }
 
   async admit(input: BoxJournalAdmission): Promise<void> {
