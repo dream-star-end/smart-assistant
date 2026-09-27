@@ -1,16 +1,29 @@
 /** One existing selfhost state root, no replay feature-flag maze. */
 import { lstatSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
-import { writeBoxReplayMessage,
+import { readBoxReplayMessage, writeBoxReplayMessage,
+  type BoxReplayMessagePointer,
   type BoxReplayMessageWriter } from "../http/proxy/boxReplayMessageFile.js";
+
+export function boxReplayDirectory(platformRoot: string | undefined): string | null {
+  return platformRoot && isAbsolute(platformRoot)
+    ? join(dirname(normalize(platformRoot)), "box-replay-messages") : null;
+}
+
+/** Read-only recovery remains available when new Box launches are disabled. */
+export function createBoxReplayReader(platformRoot: string | undefined):
+  ((pointer: BoxReplayMessagePointer) => Promise<unknown>) | undefined {
+  const directory = boxReplayDirectory(platformRoot);
+  return directory ? (pointer) => readBoxReplayMessage(directory, pointer) : undefined;
+}
 
 export function createBoxReplayWriter(enabled: boolean,
   platformRoot: string | undefined): BoxReplayMessageWriter | undefined {
   if (!enabled) return undefined;
-  if (!platformRoot || !isAbsolute(platformRoot)) {
+  const directory = boxReplayDirectory(platformRoot);
+  if (!directory) {
     throw new Error("BOX_REPLAY_STATE_ROOT_MISSING");
   }
-  const directory = join(dirname(normalize(platformRoot)), "box-replay-messages");
   try { mkdirSync(directory, { mode: 0o700 }); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

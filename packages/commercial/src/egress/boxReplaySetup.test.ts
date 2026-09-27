@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createBoxReplayWriter } from "./boxReplaySetup.js";
+import { createBoxReplayReader, createBoxReplayWriter } from "./boxReplaySetup.js";
 
 test("Box-off creates no capsule directory; Box-on uses the existing state root", async () => {
   const state = await mkdtemp(path.join(tmpdir(), "ocv5-box-state-"));
   try {
     const platform = path.join(state, "platform");
     assert.equal(createBoxReplayWriter(false, platform), undefined);
+    assert.ok(createBoxReplayReader(platform), "old completed runs stay readable with launch off");
     assert.deepEqual(await readdir(state), []);
     const writer = createBoxReplayWriter(true, platform);
     assert.ok(writer);
@@ -23,6 +24,7 @@ test("Box-off creates no capsule directory; Box-on uses the existing state root"
     const pointer = await writer!({ uid: "3", requestId: "setup-test",
       runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), roundNo: 1 }, message);
     assert.equal(pointer.requestId, "setup-test");
+    assert.deepEqual(await createBoxReplayReader(platform)!(pointer), message);
     assert.match(await readFile(path.join(directory, (await readdir(directory))[0]!), "utf8"),
       /synthetic/);
   } finally { await rm(state, { recursive: true, force: true }); }

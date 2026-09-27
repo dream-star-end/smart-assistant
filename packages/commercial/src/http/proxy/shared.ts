@@ -278,8 +278,9 @@ export const proxyBodySchema = z
     temperature: z.number().min(0).max(2).optional(),
     top_p: z.number().min(0).max(1).optional(),
     top_k: z.number().int().nonnegative().max(500).optional(),
-    /** stream 强制为 true(我们只跑流式;非流接口 MVP 不开)。 */
-    stream: z.literal(true).optional(),
+    /** Explicit false is parsed only so Box can reattach the SAME prior paid
+     * call as JSON. All other routes reject it before external dispatch. */
+    stream: z.boolean().optional(),
     /** Claude SDK 会在 system + messages 之外塞 thinking;允许透传 */
     thinking: z.unknown().optional(),
     /**
@@ -1517,6 +1518,11 @@ export interface AnthropicProxyDeps {
     fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
       canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
       url: string; init: RequestInit }): Promise<Response>;
+  };
+  /** Read-only same-round capsule replay, independent of the Box launch flag. */
+  boxReplay?: {
+    lookup(args: { uid: bigint; canonicalModel: string; canonicalBody: ProxyBody;
+      upstreamModel: string }): Promise<import("./boxReplayCompleted.js").BoxReplayLookup>;
   };
   /** 上游 endpoint;默认 api.anthropic.com */
   upstreamEndpoint?: string;

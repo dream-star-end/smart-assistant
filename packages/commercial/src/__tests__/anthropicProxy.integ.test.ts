@@ -857,6 +857,109 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
     }
   });
 
+  test("completed Box retry returns original JSON/SSE before any new reservation or launch", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      delete process.env.OC_BOX_MODEL_API;
+      const { h, headers } = boxRouteHarness();
+      let lookups = 0, launches = 0;
+      const replayed = { type: "message", role: "assistant", id: "msg_replayed",
+        model: "claude-opus-5-5", content: [{ type: "text", text: "same answer" }],
+        stop_reason: "end_turn", stop_sequence: null,
+        usage: { input_tokens: 5, output_tokens: 2,
+          cache_read_input_tokens: 3, cache_creation_input_tokens: 0 } };
+      h.deps.boxModel = { async fetch() { launches++; throw new Error("PAID_REPLAY_FORBIDDEN"); } };
+      h.deps.boxReplay = { lookup: async ({ uid, canonicalBody }: {
+        uid: bigint; canonicalBody: { model: string; stream?: boolean } }) => {
+        lookups++;
+        assert.equal(uid, BigInt(FIXED_USER_ID));
+        assert.equal(canonicalBody.model, BOX_API_MODEL);
+        return { kind: "ready", identity: {} as never,
+          response: canonicalBody.stream === false
+            ? new Response(JSON.stringify(replayed), { headers: {
+              "content-type": "application/json" } })
+            : new Response("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", {
+              headers: { "content-type": "text/event-stream" } }) };
+      } } as never;
+      const request = { ...minBody(BOX_API_MODEL), metadata: { user_id: JSON.stringify({
+        session_id: "web-box-replay", oc_turn_key: "a".repeat(64) }) } };
+      const realCcbFallback = { ...request } as Record<string, unknown>;
+      delete realCcbFallback.stream;
+      const json = await h.run(realCcbFallback, headers);
+      assert.equal(json.statusCode, 200, json.bodyText());
+      assert.deepEqual(JSON.parse(json.bodyText()), replayed);
+      const sse = await h.run({ ...request, stream: true }, headers);
+      assert.equal(sse.statusCode, 200, sse.bodyText());
+      assert.match(sse.bodyText(), /event: message_stop/);
+      assert.equal(lookups, 2);
+      assert.equal(launches, 0);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+      assert.equal(h.pool.queries.filter((query) =>
+        query.sql.trim().toUpperCase().startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")).length, 0);
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("Box false missing or pending and non-Box false never dispatch a new paid call", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      let lookups = 0, launches = 0;
+      h.deps.boxModel = { async fetch() { launches++;
+        return sseResponse(200, makeFullSseChunks()); } };
+      h.deps.boxReplay = { lookup: async () => { lookups++;
+        return { kind: "missing" }; } } as never;
+      const request = { ...minBody(BOX_API_MODEL), metadata: { user_id: JSON.stringify({
+        session_id: "web-box-replay", oc_turn_key: "a".repeat(64) }) } };
+      const realCcbFallback = { ...request } as Record<string, unknown>;
+      delete realCcbFallback.stream;
+      const missing = await h.run(realCcbFallback, headers);
+      assert.equal(missing.statusCode, 409);
+      assert.match(missing.bodyText(), /BOX_REPLAY_NOT_FOUND/);
+      assert.equal(launches, 0);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      h.deps.boxReplay = { lookup: async () => { lookups++;
+        return { kind: "pending", identity: {} as never }; } } as never;
+      const pending = await h.run(realCcbFallback, headers);
+      assert.equal(pending.statusCode, 409);
+      assert.match(pending.bodyText(), /BOX_REPLAY_PENDING/);
+      assert.equal(launches, 0);
+      h.deps.boxReplay = { lookup: async () => { lookups++;
+        return { kind: "missing" }; } } as never;
+      const first = await h.run({ ...request, stream: true }, headers);
+      assert.equal(first.statusCode, 200, first.bodyText());
+      assert.equal(launches, 1);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 1);
+      const nonBox = await h.run({ ...minBody("claude-opus-5-5"), stream: false }, headers);
+      assert.equal(nonBox.statusCode, 400);
+      assert.equal(lookups, 3, "non-Box false must reject before replay or Cursor routing");
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("Box replay cannot bypass the current model authorization gate", async () => {
+    const { h, headers } = boxRouteHarness();
+    let lookups = 0;
+    h.deps.boxReplay = { lookup: async () => { lookups++;
+      return { kind: "ready", identity: {} as never,
+        response: new Response("{}") }; } } as never;
+    h.setAuthz(async () => ({ role: "user", grantedModelIds: new Set(),
+      deniedModelIds: new Set([BOX_API_MODEL]) }));
+    const denied = await h.run({ ...minBody(BOX_API_MODEL), stream: false,
+      metadata: { user_id: JSON.stringify({ session_id: "web-box-replay",
+        oc_turn_key: "a".repeat(64) }) } }, headers);
+    assert.notEqual(denied.statusCode, 200);
+    assert.equal(lookups, 0);
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+  });
+
   test("unsupported tools reject before reservation or Box call", async () => {
     const old = process.env.OC_BOX_MODEL_API;
     try {

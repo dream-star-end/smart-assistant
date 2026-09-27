@@ -57,7 +57,8 @@ import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
 import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
-import { createBoxReplayWriter } from "./boxReplaySetup.js";
+import { createBoxReplayReader, createBoxReplayWriter } from "./boxReplaySetup.js";
+import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
 import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
@@ -247,6 +248,13 @@ export async function startEgress(): Promise<void> {
   // durable sibling directory; commercial instances with Box off create none.
   const boxReplayWriter = createBoxReplayWriter(boxResolver !== null,
     process.env.OC_PLATFORM_ROOT);
+  const boxReplayReader = createBoxReplayReader(process.env.OC_PLATFORM_ROOT);
+  const boxReplayJournal = boxJournal ?? new BoxDurableJournal(getPool());
+  const boxReplay = boxReplayReader ? {
+    lookup: (input: Parameters<typeof findCompletedBoxReplay>[0]) =>
+      findCompletedBoxReplay(input, { journal: boxReplayJournal,
+        readMessage: boxReplayReader }),
+  } : undefined;
   const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {
     uid: bigint; accountId: bigint; requestId: string; phase: string }) => {
     log.error("box_model_outcome_unknown", { uid: uid.toString(),
@@ -348,6 +356,7 @@ export async function startEgress(): Promise<void> {
     concurrencyLimiter: sharedProxyConcurrency,
     fallbackLimiter: sharedProxyFallback,
     boxModel,
+    boxReplay,
     modelCatalog,
     modelAuthorityEnforce,
     // 公钥 keyring(验签用)。每请求现取:轮换五步期间 ring 会变,闭包快照会认不出新签名。

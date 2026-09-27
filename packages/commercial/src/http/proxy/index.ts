@@ -460,6 +460,15 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
+      // A non-streaming request is never a fresh paid model dispatch. Only
+      // Box can use it to retrieve the exact prior round; reject it before
+      // Cursor external (which branches off ahead of the regular provider).
+      if (body.stream === false && !body.model.startsWith("box-api-")) {
+        incrAnthropicProxyReject("bad_body");
+        sendJsonError(res, 400, "BAD_BODY", "invalid request body", requestId);
+        return;
+      }
+
       // 4-pre) 0277 单 key 名义积分上限(仅 API key identity 携带 apiKey 快照)。
       // 放在 cursor 分流与 authority gate 之前:上限是 owner 对该 key 的硬约束,
       // 与模型 / 引擎无关;count_tokens 在 1b 已返回,不受影响。
@@ -781,6 +790,46 @@ export function makeAnthropicProxyHandler(
         : route.kind === "static"
           ? route.provider.supportsVision === true
           : route.kind !== "box";
+      // Same-round replay is a read-only path before account selection,
+      // preCheck, the generic inflight journal and the SSE finalizer. A
+      // disabled Box launch flag does not erase already completed capsules.
+      if (route.kind === "box") {
+        if (deps.boxReplay) {
+          let replay: Awaited<ReturnType<NonNullable<typeof deps.boxReplay>["lookup"]>>;
+          try {
+            // CCB 2.1.280's messages.create non-streaming fallback OMITS the
+            // stream key rather than sending false. Only the original paid
+            // stream:true shape may proceed to a fresh Box launch.
+            const replayBody = structuredClone(body);
+            if (replayBody.stream !== true) replayBody.stream = false;
+            replay = await deps.boxReplay.lookup({ uid, canonicalModel: body.model,
+              canonicalBody: replayBody, upstreamModel: route.upstreamModel });
+          } catch (error) {
+            userLog.warn("proxy_box_replay_unavailable", { err: errSummary(error) });
+            sendJsonError(res, 503, "BOX_REPLAY_UNAVAILABLE",
+              "previous Box response unavailable", requestId);
+            return;
+          }
+          if (replay.kind === "ready") {
+            const bytes = Buffer.from(await replay.response.arrayBuffer());
+            const headers: Record<string, string> = {};
+            replay.response.headers.forEach((value, key) => { headers[key] = value; });
+            res.writeHead(replay.response.status, headers);
+            res.end(bytes);
+            return;
+          }
+          if (replay.kind === "pending") {
+            sendJsonError(res, 409, "BOX_REPLAY_PENDING",
+              "previous Box call still resolving", requestId);
+            return;
+          }
+        }
+        if (body.stream !== true) {
+          sendJsonError(res, 409, "BOX_REPLAY_NOT_FOUND",
+            "previous Box call not found", requestId);
+          return;
+        }
+      }
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
         boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
