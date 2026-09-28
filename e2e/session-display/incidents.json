@@ -4888,7 +4888,7 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box detached tool chain can finish with worker_complete while the local journal leaf stays unknown if the user does not retry. The shared-leader stop probe treated that proof as pending, so the seat, capsule and per-request usage were not closed.",
       "rootFixCommit": "d9879ab2",
-      "coverageCommits": ["d9879ab2", "cee76e0c", "990dd064", "78906790", "a925e98e", "d13d12e0"],
+      "coverageCommits": ["d9879ab2", "cee76e0c", "990dd064", "78906790", "a925e98e", "d13d12e0", "01a716a1"],
       "regressions": [
         {
           "layer": "unit",
