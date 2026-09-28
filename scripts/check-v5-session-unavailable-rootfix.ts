@@ -157,10 +157,14 @@ const editEcho = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolInputEcho.ts'), 'utf8')
 const editJournal = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const editFinger = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxCallFingerprint.ts'), 'utf8')
 if (!editEcho.includes('export function editReplaceAllFalseDefault(')
   || !editEcho.includes('export function selectStoredToolInput(')
   || !editJournal.includes('comparableAssistantContent(')
-  || !editJournal.includes('hashAssistantClaimViews(')) {
+  || !editJournal.includes('incomingAssistantAccepted(')
+  || editJournal.includes('hashAssistantClaimViews(')
+  || editFinger.includes('function hashAssistantClaimViews')) {
   throw new Error('[box-edit-default] comparison alias is not on the claim path')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION edit-default comparison guard')

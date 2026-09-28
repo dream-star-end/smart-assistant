@@ -10,7 +10,7 @@ import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  deriveBoxFallbackAlias, hashAssistantClaimViews, hashBoxAssistantContent } from "./boxCallFingerprint.js";
+  deriveBoxFallbackAlias, incomingAssistantAccepted } from "./boxCallFingerprint.js";
 import { comparableAssistantContent } from "./boxToolInputEcho.js";
 import { matchBoxToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
@@ -1621,21 +1621,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           { content?: unknown } | undefined;
         if (!assistant) throw new Error("assistant message missing");
         const view = comparableAssistantContent(assistant.content, digests, boundCatalog);
-        const claimHashes = hashAssistantClaimViews(view);
-        const fullHash = claimHashes.full;
-        const echoed = Array.isArray(view)
-          && view.every((block: unknown) => {
-            if (!block || typeof block !== "object" || Array.isArray(block)) return true;
-            const type = (block as Record<string, unknown>).type;
-            return type !== "thinking" && type !== "redacted_thinking";
-          });
-        if (fullHash !== handoff.assistantContentHash
-          && !(handoff.assistantNoCallerHash
-            && (fullHash === handoff.assistantNoCallerHash
-              || claimHashes.noCaller === handoff.assistantNoCallerHash))
-          && !(echoed && handoff.assistantEchoHash
-            && (fullHash === handoff.assistantEchoHash
-              || claimHashes.echo === handoff.assistantEchoHash))) {
+        if (!incomingAssistantAccepted(view, handoff)) {
           throw new Error("assistant message changed");
         }
       } catch {

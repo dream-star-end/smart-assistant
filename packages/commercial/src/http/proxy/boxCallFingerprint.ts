@@ -146,16 +146,23 @@ export function hashBoxAssistantEchoContent(content: unknown): string {
   return hashBoxAssistantContent(echo);
 }
 
-/** Three existing assistant hashes of one already-selected comparison view.
- * The hash functions themselves still emit their original bytes. */
-export function hashAssistantClaimViews(content: unknown): {
-  full: string; noCaller: string; echo: string;
-} {
-  return {
-    full: hashBoxAssistantContent(content),
-    noCaller: hashBoxAssistantNoCallerContent(content),
-    echo: hashBoxAssistantEchoContent(content),
-  };
+/** Original claim predicate on one comparison view. Only the full-content hash
+ * is computed. Stored noCaller/echo values are accepted only when that full
+ * hash already equals them; this function does not strip caller or thinking. */
+export function incomingAssistantAccepted(content: unknown, stored: {
+  assistantContentHash: string;
+  assistantNoCallerHash?: string;
+  assistantEchoHash?: string;
+}): boolean {
+  const fullHash = hashBoxAssistantContent(content);
+  const echoed = Array.isArray(content) && content.every((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return true;
+    const type = (block as { type?: unknown }).type;
+    return type !== "thinking" && type !== "redacted_thinking";
+  });
+  return fullHash === stored.assistantContentHash
+    || (!!stored.assistantNoCallerHash && fullHash === stored.assistantNoCallerHash)
+    || (echoed && !!stored.assistantEchoHash && fullHash === stored.assistantEchoHash);
 }
 
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {

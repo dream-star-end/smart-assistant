@@ -4952,7 +4952,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolInputEcho.test.ts",
-          "assertion": "sealed omit wire is red without a bound catalog and matched with it"
+          "assertion": "mixed omit and false match, and a tampered caller is not stripped into acceptance"
         }
       ],
       "preparedBehaviorGate": {

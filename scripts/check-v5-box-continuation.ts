@@ -225,7 +225,10 @@ async function load(): Promise<Api> {
       compile: catalogMod.compileBoxToolCatalog,
       hashInput: hashMod.hashBoxToolInput,
       project: echoMod.comparableAssistantContent,
-      views: finger.hashAssistantClaimViews,
+      accept: finger.incomingAssistantAccepted,
+      hashFull: finger.hashBoxAssistantContent,
+      hashNoCaller: finger.hashBoxAssistantNoCallerContent,
+      hashEcho: finger.hashBoxAssistantEchoContent,
     }),
   };
 }
@@ -288,7 +291,11 @@ function proveEditDefault(api: {
   hashInput: (input: unknown) => string;
   project: (content: unknown, digests: readonly { clientName: string; inputHash: string }[],
     catalog: unknown) => unknown[];
-  views: (content: unknown) => { full: string; noCaller: string; echo: string };
+  accept: (content: unknown, stored: { assistantContentHash: string;
+    assistantNoCallerHash?: string; assistantEchoHash?: string }) => boolean;
+  hashFull: (content: unknown) => string;
+  hashNoCaller: (content: unknown) => string;
+  hashEcho: (content: unknown) => string;
 }): void {
   const edit = {
     name: "Edit", description: "edit a file",
@@ -327,11 +334,59 @@ function proveEditDefault(api: {
     echoed[1],
   ];
   const view = api.project(echoed, expected, catalog);
-  const got = api.views(view);
-  const want = api.views(storedContent);
-  if (got.full !== want.full || got.noCaller !== want.noCaller || got.echo !== want.echo) {
-    fail("EDIT_DEFAULT_ASSISTANT");
-  }
+  const storedHashes = {
+    assistantContentHash: api.hashFull(storedContent),
+    assistantNoCallerHash: api.hashNoCaller(storedContent),
+    assistantEchoHash: api.hashEcho(storedContent),
+  };
+  if (api.hashFull(view) !== storedHashes.assistantContentHash) fail("EDIT_DEFAULT_FULL");
+  if (!api.accept(view, storedHashes)) fail("EDIT_DEFAULT_ASSISTANT");
+  const tampered = view.map((block) => block && typeof block === "object"
+    ? { ...(block as object), caller: { type: "tampered" } } : block);
+  if (api.accept(tampered, storedHashes)) fail("EDIT_DEFAULT_CALLER");
+  const metaStored = [
+    { type: "tool_use", id: "toolu_meta", name: "Edit", input: plain,
+      caller: { type: "direct" }, provider_meta: "keep" },
+  ];
+  const metaIncoming = [
+    { type: "tool_use", id: "toolu_meta", name: "Edit", input: explicit, provider_meta: "keep" },
+  ];
+  const metaExpected = [{ id: "toolu_meta", clientName: "Edit", inputHash: api.hashInput(plain) }];
+  const metaView = api.project(metaIncoming, metaExpected, catalog);
+  const metaHashes = {
+    assistantContentHash: api.hashFull(metaStored),
+    assistantNoCallerHash: api.hashNoCaller(metaStored),
+    assistantEchoHash: api.hashEcho(metaStored),
+  };
+  if (api.hashFull(metaView) !== metaHashes.assistantNoCallerHash) fail("EDIT_DEFAULT_NOCALLER");
+  if (api.hashFull(metaView) === metaHashes.assistantContentHash
+    || api.hashFull(metaView) === metaHashes.assistantEchoHash) fail("EDIT_DEFAULT_NOCALLER_DISTINCT");
+  if (!api.accept(metaView, metaHashes)) fail("EDIT_DEFAULT_NOCALLER_ACCEPT");
+  const echoStored = [
+    { type: "thinking", thinking: "note", signature: "sig-a" },
+    { type: "tool_use", id: "toolu_echo", name: "Edit", input: plain, caller: { type: "direct" } },
+  ];
+  const echoIncoming = [
+    { type: "tool_use", id: "toolu_echo", name: "Edit", input: explicit },
+  ];
+  const echoExpected = [{ id: "toolu_echo", clientName: "Edit", inputHash: api.hashInput(plain) }];
+  const echoView = api.project(echoIncoming, echoExpected, catalog);
+  const echoHashes = {
+    assistantContentHash: api.hashFull(echoStored),
+    assistantNoCallerHash: api.hashNoCaller(echoStored),
+    assistantEchoHash: api.hashEcho(echoStored),
+  };
+  if (api.hashFull(echoView) !== echoHashes.assistantEchoHash) fail("EDIT_DEFAULT_ECHO");
+  if (api.hashFull(echoView) === echoHashes.assistantContentHash
+    || api.hashFull(echoView) === echoHashes.assistantNoCallerHash) fail("EDIT_DEFAULT_ECHO_DISTINCT");
+  if (!api.accept(echoView, echoHashes)) fail("EDIT_DEFAULT_ECHO_ACCEPT");
+  const signed = [
+    { type: "thinking", thinking: "note", signature: "sig-b" },
+    echoStored[1],
+  ];
+  if (api.accept(api.project(signed, echoExpected, catalog), echoHashes)) fail("EDIT_DEFAULT_SIGNATURE");
+  const redacted = [{ type: "redacted_thinking", data: "opaque" }, ...echoIncoming];
+  if (api.accept(api.project(redacted, echoExpected, catalog), echoHashes)) fail("EDIT_DEFAULT_REDACTED");
   expectCode(() => api.match(body, [
     { id: "toolu_edit_omit", clientName: "Edit", inputHash: stored[0] },
     { id: "toolu_edit_false", clientName: "Edit", inputHash: api.hashInput({ ...explicit, replace_all: true }) },
