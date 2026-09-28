@@ -4,7 +4,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,7 @@ const SCRIPT_FILES = [
   "scripts/check-v5-box-continuation-fixture.ts",
   "scripts/check-v5-box-continuation-resolve.mjs",
 ];
-const BUSINESS = /PROGRESS_COUNT_|HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL|C2_GATE|C2_DRIFT|CONTEXT_|HOOK_COUNT_|WRAPPED_|UNKNOWN_|MATCH_|FINGERPRINT|NOT_IDEMPOTENT|RAW_MUTATED|REWRITE_|EXPECTED_/;
+const BUSINESS = /PROGRESS_COUNT_|HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL|C2_GATE|C2_DRIFT|CONTEXT_|HOOK_COUNT_|HOOK_CURRENT_|WRAPPED_|UNKNOWN_|CONTINUATION_|OPENING_|REWRITE_|EXPECTED_/;
 const LOADER = /Cannot find module|ERR_MODULE|ERR_UNSUPPORTED|UNRESOLVED|DEP_ESCAPE|SyntaxError|RUNTIME_MODULES_/;
 
 function loader(): { cmd: string; args: string[] } {
@@ -312,7 +312,7 @@ test("a missing sibling is a loader failure, not business proof", () => {
 });
 
 for (const kind of ["progress", "keep-budget", "promote-wrapper"]) {
-  const expected = kind === "progress" ? /PROGRESS_COUNT_|GATE_NOT_NULL|CONTEXT_/
+  const expected = kind === "progress" ? /CONTINUATION_|PROGRESS_COUNT_|GATE_NOT_NULL|CONTEXT_/
     : kind === "keep-budget" ? /HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL/
       : /C2_GATE|C2_DRIFT/;
   test(`${kind} changes only product behavior and fails a business assertion`, () => {
@@ -352,16 +352,83 @@ test("SIGTERM is not a successful proof", async () => {
   }
 });
 
-const git = spawnSync("git", ["-C", SOURCE, "rev-parse", "HEAD"], { encoding: "utf8" });
-const head = git.status === 0 ? (git.stdout ?? "").trim() : "";
-if (/^[0-9a-f]{40}$/.test(head)) {
-  test("a real git tree cross-checks the builder sha", () => {
-    const mismatch = run(SOURCE, ["--expect-sha", SHA]);
-    assert.notEqual(mismatch.code, 0);
-    assert.match(mismatch.stderr, /GIT_SHA_MISMATCH/);
-    const match = run(SOURCE, ["--expect-sha", head]);
-    assert.equal(match.code, 0, match.stderr);
-    assert.equal(JSON.parse(match.stdout).git, "match");
+function gitCandidate(root: string): { ok: boolean; head: string; reason: string } {
+  if (!existsSync(join(root, ".git"))) return { ok: false, head: "", reason: "no .git at candidate root" };
+  const top = spawnSync("git", ["-C", root, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+  if (top.status !== 0) return { ok: false, head: "", reason: "rev-parse --show-toplevel failed" };
+  let topPath = (top.stdout ?? "").trim();
+  let rootPath = root;
+  try { topPath = realpathSync(topPath); rootPath = realpathSync(root); }
+  catch { /* compare the strings git printed */ }
+  if (topPath !== rootPath) return { ok: false, head: "", reason: `toplevel ${topPath} is not ${rootPath}` };
+  const head = spawnSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" });
+  const value = (head.stdout ?? "").trim();
+  if (head.status !== 0 || !/^[0-9a-f]{40}$/.test(value)) return { ok: false, head: "", reason: "HEAD invalid" };
+  return { ok: true, head: value, reason: "" };
+}
+const sourceGit = gitCandidate(SOURCE);
+test("an archive nested in a parent repo does not enable git cross-check", () => {
+  const nested = mkdtempSync(join("/home/agent/.openclaude/generated", "ocv5-b1-nested-"));
+  try {
+    const verdict = gitCandidate(nested);
+    const walked = spawnSync("git", ["-C", nested, "rev-parse", "HEAD"], { encoding: "utf8" });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.reason, /no \.git/);
+    if (walked.status === 0) assert.notEqual(verdict.ok, true);
+  } finally {
+    rmSync(nested, { recursive: true, force: true });
+  }
+});
+test("a real git tree cross-checks the builder sha", { skip: sourceGit.ok ? false : sourceGit.reason }, () => {
+  const mismatch = run(SOURCE, ["--expect-sha", SHA]);
+  assert.notEqual(mismatch.code, 0);
+  assert.match(mismatch.stderr, /GIT_SHA_MISMATCH/);
+  const match = run(SOURCE, ["--expect-sha", sourceGit.head]);
+  assert.equal(match.code, 0, match.stderr);
+  assert.equal(JSON.parse(match.stdout).git, "match");
+});
+
+const AUDITOR_FAULT = "/home/agent/.openclaude/generated/ocv5-294-b1-gate-audit-hook-byte-negative/packages/commercial/src/http/proxy/boxCacheAnnotations.ts";
+function bytePatch(kind: "hook-space" | "wrapped-byte", source: string): string {
+  if (kind === "hook-space") {
+    const needle = "if (head === PROGRESS_SENTENCE || exactMatch(BARE_HOOK, head)) return head;";
+    assert.equal(source.includes(needle), true, "hook-space anchor missing");
+    return source.replace(needle,
+      "if (head === PROGRESS_SENTENCE || exactMatch(BARE_HOOK, head)) return head === PROGRESS_SENTENCE ? head : head + \" \";");
+  }
+  const needle = "const hookBytes = wrapped ? part.text as string : bare;";
+  assert.equal(source.includes(needle), true, "wrapped-byte anchor missing");
+  return source.replace(needle, "const hookBytes = wrapped ? (part.text as string) + \"x\" : bare;");
+}
+for (const kind of ["hook-space", "wrapped-byte"] as const) {
+  const expected = kind === "hook-space" ? /CONTINUATION_4_TEXT_|REWRITE_HIST_toolu_syn_5|HOOK_CURRENT_TEXT/
+    : /WRAPPED_TEXT_|WRAPPED_BYTES/;
+  test(`${kind} extra byte fails the exact oracle`, () => {
+    const dir = stage();
+    try {
+      const green = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(green), "green", green.stderr);
+      const target = join(dir, "packages/commercial/src/http/proxy/boxCacheAnnotations.ts");
+      writeFileSync(target, bytePatch(kind, readFileSync(target, "utf8")));
+      const red = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(red), "business", `${red.stderr}\n${red.stdout}`);
+      assert.match(red.stderr, expected);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 }
+test("auditor hook-space tree is business-red under this gate", { skip: existsSync(AUDITOR_FAULT) ? false : "auditor fault tree absent" }, () => {
+  const dir = stage();
+  try {
+    const green = run(dir, ["--expect-sha", SHA]);
+    assert.equal(classify(green), "green", green.stderr);
+    copyFileSync(AUDITOR_FAULT, join(dir, "packages/commercial/src/http/proxy/boxCacheAnnotations.ts"));
+    const red = run(dir, ["--expect-sha", SHA]);
+    assert.equal(classify(red), "business", `${red.stderr}\n${red.stdout}`);
+    assert.match(red.stderr, /CONTINUATION_4_TEXT_|REWRITE_HIST_toolu_syn_5|HOOK_CURRENT_TEXT/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 

@@ -52,9 +52,45 @@ const http4 = [...withTail(http3, progressHistorical), ...pair("toolu_syn_4", "f
 const http5 = [...http4, ...pair("toolu_syn_5", "five", "r5"), hookCached];
 const http6 = [...withTail(http5, hookHistorical), ...pair("toolu_syn_6", "six", "r6"), progressCached];
 
-/** Six HTTP requests and the five continuations between them. */
+/** Six snapshots on top of an opening handoff, and five adjacent links.
+ * This is not the native six-HTTP capture that starts from the first user turn. */
 export const chain = [http1, http2, http3, http4, http5, http6].map(request);
-/** Counts after one normalization. Not derived from a normalizer run. */
+
+export type ExpectedToolResult = {
+  id: string;
+  input: string;
+  isError: false;
+  content: Array<{ type: "text"; text: string }>;
+};
+/** Opening snapshot only. The five continuations are listed separately. */
+export const openingResult: ExpectedToolResult = {
+  id: "toolu_syn_1", input: "one", isError: false,
+  content: [{ type: "text", text: "r1" }],
+};
+/** New tool result at the end of each adjacent continuation, snapshots 1..5. */
+export const continuationResults: ExpectedToolResult[] = [
+  { id: "toolu_syn_2", input: "two", isError: false,
+    content: [{ type: "text", text: "r2" }] },
+  { id: "toolu_syn_3", input: "three", isError: false,
+    content: [{ type: "text", text: "r3" }, { type: "text", text: PROGRESS }] },
+  { id: "toolu_syn_4", input: "four", isError: false,
+    content: [{ type: "text", text: "r4" }] },
+  { id: "toolu_syn_5", input: "five", isError: false,
+    content: [{ type: "text", text: "r5" }, { type: "text", text: HOOK }] },
+  { id: "toolu_syn_6", input: "six", isError: false,
+    content: [{ type: "text", text: "r6" }, { type: "text", text: PROGRESS }] },
+];
+/** Same historical tool after the cached system becomes the exact string. */
+export const rewriteProofs = [
+  { previous: 2, next: 3, id: "toolu_syn_3", result: continuationResults[1]! },
+  { previous: 4, next: 5, id: "toolu_syn_5", result: continuationResults[3]! },
+];
+export const wrappedResult: ExpectedToolResult = {
+  id: "toolu_syn_wrap", input: "wrap", isError: false,
+  content: [{ type: "text", text: "rw" }, { type: "text", text: WRAPPED }],
+};
+
+/** Counts after one normalization. Auxiliary only; exact blocks are above. */
 export const annotationCounts = [
   { progress: 0, hook: 0, wrapped: 0 },
   { progress: 0, hook: 0, wrapped: 0 },
@@ -66,12 +102,6 @@ export const annotationCounts = [
 export const rewrites = [
   { from: 2, to: 3, cached: progressCached, historical: progressHistorical },
   { from: 4, to: 5, cached: hookCached, historical: hookHistorical },
-];
-export const matchedTails = [
-  { step: 2, id: "toolu_syn_3", input: "three", content: [
-    { type: "text", text: "r3" }, { type: "text", text: PROGRESS }] },
-  { step: 5, id: "toolu_syn_6", input: "six", content: [
-    { type: "text", text: "r6" }, { type: "text", text: PROGRESS }] },
 ];
 export const legalWrapped = request([user, ...pair("toolu_syn_wrap", "wrap", "rw"), wrappedHook, arrayBudget]);
 export const legalWrappedBytes = WRAPPED;

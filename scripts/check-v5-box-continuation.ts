@@ -37,7 +37,7 @@ type Api = {
   normalize: (body: Record<string, unknown>) => { messages: unknown[] };
   gate: (body: Record<string, unknown>, enabled: boolean) => string | null;
   match: (body: Record<string, unknown>, expected: readonly Record<string, unknown>[]) =>
-    readonly { content: unknown }[];
+    readonly { modelToolUseId: string; content: ReadonlyArray<{ type?: string; text?: string }>; isError: boolean }[];
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
 };
@@ -50,7 +50,11 @@ type Fixture = {
   HOOK: string;
   legalWrapped: Record<string, unknown>;
   legalWrappedBytes: string;
-  matchedTails: Array<{ step: number; id: string; input: string; content: unknown }>;
+  openingResult: { id: string; input: string; isError: false; content: Array<{ type: "text"; text: string }> };
+  continuationResults: Array<{ id: string; input: string; isError: false; content: Array<{ type: "text"; text: string }> }>;
+  rewriteProofs: Array<{ previous: number; next: number; id: string;
+    result: { id: string; input: string; isError: false; content: Array<{ type: "text"; text: string }> } }>;
+  wrappedResult: { id: string; input: string; isError: false; content: Array<{ type: "text"; text: string }> };
   PROGRESS: string;
   rewrites: Array<{ from: number; to: number; cached: unknown; historical: { content?: unknown } }>;
   unknownMarker: Record<string, unknown>;
@@ -232,9 +236,44 @@ function expectCode(run: () => unknown, code: string): void {
   }
   fail(`EXPECTED_THROW_${code}`);
 }
+function useOf(spec: { id: string; input: string }): Record<string, unknown> {
+  return { id: spec.id, clientName: "local_echo", boxName: "mcp__ocbridge__t0", input: { value: spec.input } };
+}
+function expectTail(api: Api, body: Record<string, unknown>,
+  spec: { id: string; input: string; isError: false; content: Array<{ type: "text"; text: string }> },
+  label: string): ReadonlyArray<{ type?: string; text?: string }> {
+  const matched = api.match(body, [useOf(spec)]);
+  if (matched.length !== 1) fail(`${label}_COUNT`);
+  const row = matched[0]!;
+  if (row.modelToolUseId !== spec.id) fail(`${label}_ID`);
+  if (row.isError !== spec.isError) fail(`${label}_ISERROR`);
+  if (row.content.length !== spec.content.length) fail(`${label}_BLOCKS`);
+  for (let index = 0; index < spec.content.length; index++) {
+    const actual = row.content[index]?.text;
+    const expected = spec.content[index]!.text;
+    if (actual !== expected || row.content[index]?.type !== "text") fail(`${label}_TEXT_${index}`);
+  }
+  if (!isDeepStrictEqual(row.content, spec.content)) fail(`${label}_BYTES`);
+  return row.content;
+}
+function sliceThroughTool(body: Record<string, unknown>, id: string): Record<string, unknown> {
+  const messages = body.messages as Array<{ role?: string; content?: unknown }>;
+  let userIndex = -1;
+  for (let index = 0; index < messages.length; index++) {
+    const content = messages[index]?.content;
+    if (!Array.isArray(content)) continue;
+    if (content.some((block) => block && typeof block === "object"
+      && (block as { tool_use_id?: unknown }).tool_use_id === id)) userIndex = index;
+  }
+  if (userIndex < 0) fail(`SLICE_${id}`);
+  let end = userIndex;
+  if (messages[userIndex + 1]?.role === "system") end = userIndex + 1;
+  return { ...body, messages: messages.slice(0, end + 1) };
+}
 function checks(api: Api): void {
-  const { annotationCounts, chain, composedRejects, historicalBudgetOnly, HOOK, legalWrapped,
-    legalWrappedBytes, matchedTails, PROGRESS, rewrites, unknownMarker, unknownText, WRAPPED } = fx;
+  const { annotationCounts, chain, composedRejects, continuationResults, historicalBudgetOnly, HOOK,
+    legalWrapped, legalWrappedBytes, openingResult, PROGRESS, rewriteProofs, rewrites, unknownMarker,
+    unknownText, WRAPPED, wrappedResult } = fx;
   if (chain.length !== 6 || annotationCounts.length !== 6) fail("CHAIN_COUNT");
   const normalized = chain.map((body) => {
     const snapshot = JSON.stringify(body);
@@ -259,6 +298,18 @@ function checks(api: Api): void {
     if (countText(body, HOOK) !== expected.hook) fail(`HOOK_COUNT_${index}`);
     if (countText(body, WRAPPED) !== expected.wrapped) fail(`WRAPPED_COUNT_${index}`);
   });
+  const opening = expectTail(api, chain[0]!, openingResult, "OPENING");
+  if (opening.length !== 1 || opening[0]?.text !== "r1") fail("OPENING_TEXT_0");
+  const tails = continuationResults.map((spec, index) =>
+    expectTail(api, chain[index + 1]!, spec, `CONTINUATION_${index + 1}`));
+  for (const proof of rewriteProofs) {
+    const previous = expectTail(api, chain[proof.previous]!, proof.result, `REWRITE_PREV_${proof.id}`);
+    const historical = expectTail(api, sliceThroughTool(chain[proof.next]!, proof.id), proof.result,
+      `REWRITE_HIST_${proof.id}`);
+    if (!isDeepStrictEqual(historical, previous)) fail(`REWRITE_DRIFT_${proof.id}`);
+    if (!isDeepStrictEqual(historical, proof.result.content)) fail(`REWRITE_EXPECTED_${proof.id}`);
+  }
+  if (tails[3]?.[1]?.text !== HOOK) fail("HOOK_CURRENT_TEXT");
   for (const rewrite of rewrites) {
     const before = chain[rewrite.from]!.messages as unknown[];
     const after = chain[rewrite.to]!.messages as unknown[];
@@ -267,17 +318,17 @@ function checks(api: Api): void {
     if (isDeepStrictEqual(rewrite.cached, rewrite.historical)) fail("REWRITE_SAME");
     if (typeof (rewrite.historical as { content?: unknown }).content !== "string") fail("REWRITE_NOT_STRING");
   }
-  for (const tail of matchedTails) {
-    const matched = api.match(chain[tail.step]!, [{ id: tail.id, clientName: "local_echo",
-      boxName: "mcp__ocbridge__t0", input: { value: tail.input } }]);
-    if (!isDeepStrictEqual(matched[0]?.content, tail.content)) fail(`MATCH_${tail.step}`);
-    expectCode(() => api.match(chain[tail.step]!, [{ id: "toolu_other", clientName: "local_echo",
-      boxName: "mcp__ocbridge__t0", input: { value: tail.input } }]), "BOX_TOOL_RESULT_");
-    expectCode(() => api.match(chain[tail.step]!, [{ id: tail.id, clientName: "local_echo",
+  for (const [body, spec] of [[chain[2]!, continuationResults[1]!],
+    [chain[4]!, continuationResults[3]!], [chain[5]!, continuationResults[4]!]] as const) {
+    expectCode(() => api.match(body, [{ id: "toolu_other", clientName: "local_echo",
+      boxName: "mcp__ocbridge__t0", input: { value: spec.input } }]), "BOX_TOOL_RESULT_");
+    expectCode(() => api.match(body, [{ id: spec.id, clientName: "local_echo",
       boxName: "mcp__ocbridge__t0", input: { value: "other" } }]), "BOX_TOOL_RESULT_");
   }
+  const wrappedBlocks = expectTail(api, legalWrapped, wrappedResult, "WRAPPED");
+  if (wrappedBlocks[1]?.text !== legalWrappedBytes) fail("WRAPPED_TEXT_1");
   const wrappedOnce = api.normalize(legalWrapped);
-  if (countText(wrappedOnce, legalWrappedBytes) !== 1) fail("WRAPPED_BYTES");
+  if (countText(wrappedOnce, legalWrappedBytes) !== 1) fail("WRAPPED_COUNT");
   if (api.gate(legalWrapped, true) !== null) fail("WRAPPED_GATE");
   if (!isDeepStrictEqual(wrappedOnce, api.normalize(wrappedOnce as unknown as Record<string, unknown>))) {
     fail("WRAPPED_IDEMPOTENT");
