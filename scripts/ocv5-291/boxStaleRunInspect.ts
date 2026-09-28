@@ -166,7 +166,7 @@ export async function inspectStaleRun() {
     }
     requireValue(currentMessage === null && finalUsage !== null
       && Object.entries(summed).every(([key, value]) => finalUsage![key] === value));
-    return { requestId, proofReason: proof.reason,
+    return { requestId, terminalProof: proof, proofReason: proof.reason,
       proofRevision: proof.revision, spoolBytes: offset, spoolSha256, rows, eof,
       incompleteTailBytes: Buffer.byteLength(tail), types, afterHandoff,
       toolUseBlocks, toolResultBlocks, finalUsage, summed, messages, last,
