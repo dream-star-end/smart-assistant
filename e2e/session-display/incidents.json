@@ -4930,7 +4930,8 @@
         "400d418d",
         "1a7a6fa3",
         "c26f0005",
-        "ebea094e"
+        "ebea094e",
+        "4dae0956d"
       ],
       "regressions": [
         {
@@ -4947,6 +4948,11 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "ocv5-b1-continuation-pass"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolInputEcho.test.ts",
+          "assertion": "sealed omit wire is red without a bound catalog and matched with it"
         }
       ],
       "preparedBehaviorGate": {
