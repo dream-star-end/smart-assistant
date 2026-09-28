@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "ticket": "OCV5-291",
+  "uid": "3",
+  "accountId": "20",
+  "rootRequestId": "a317076592979b517ba71abe492bad22",
+  "leafRequestId": "91da5d7643ecdc67b30f476b4449072a",
+  "runNonce": "2892e254b7cff66b38a0e54f",
+  "leaseEpoch": "38ac2b0f25ad98156d558f3191c60fb1",
+  "rootHandoffRevision": "ddb16ceb-6d03-4983-855c-fffcf9a203ec",
+  "rootResumeRevision": "badcea48-7402-480a-9e6a-16b3c52fba55",
+  "leafHandoffRevision": "99eaa3b7-f5f4-4340-88c3-e17100a89409",
+  "spoolBytes": 170348,
+  "spoolSha256": "93f12b4a764ff7faec2cfb5f56d28613e8b942c673b4cd38e950be2ee3f2f926",
+  "historicalProof": {
+    "reason": "worker_complete",
+    "revision": 1,
+    "observedAtUtc": "2026-09-28T03:42:00Z",
+    "status": "historical_unverifiable_now"
+  },
+  "messages": [
+    { "startOffset": 1910, "endOffset": 20801, "inputTokens": 2, "outputTokens": 249, "cacheReadTokens": 22872, "cacheWriteTokens": 2343, "stopReason": "tool_use", "afterHandoff": false },
+    { "startOffset": 26056, "endOffset": 44313, "inputTokens": 2, "outputTokens": 244, "cacheReadTokens": 25215, "cacheWriteTokens": 1282, "stopReason": "tool_use", "afterHandoff": false },
+    { "startOffset": 64200, "endOffset": 82212, "inputTokens": 2, "outputTokens": 230, "cacheReadTokens": 26497, "cacheWriteTokens": 404, "stopReason": "tool_use", "afterHandoff": true },
+    { "startOffset": 102099, "endOffset": 111373, "inputTokens": 2, "outputTokens": 95, "cacheReadTokens": 26901, "cacheWriteTokens": 390, "stopReason": "tool_use", "afterHandoff": true },
+    { "startOffset": 131758, "endOffset": 167348, "inputTokens": 2, "outputTokens": 444, "cacheReadTokens": 27291, "cacheWriteTokens": 255, "stopReason": "end_turn", "afterHandoff": true }
+  ],
+  "observedTotalUsage": { "inputTokens": 10, "outputTokens": 1262, "cacheReadTokens": 128776, "cacheWriteTokens": 4674 },
+  "priorUsageRecordIds": ["20474", "20475"],
+  "writeOffFen": "10",
+  "approval": {
+    "ref": "agent:main:webchat:dm:webmuehg8n99a9p4i:20260928T0429Z:box_no_current_proof",
+    "choice": "例外结清并释放（推荐）",
+    "userDebitFen": "0",
+    "platformWriteOffFen": "10"
+  },
+  "currentRemoteProof": "unavailable",
+  "remotePrivacy": "unknown",
+  "remoteCleanup": "unverified"
+}
