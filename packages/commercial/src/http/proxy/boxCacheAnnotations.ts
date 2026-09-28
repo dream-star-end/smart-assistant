@@ -88,16 +88,23 @@ const HOOK_CONTEXT = /^<system-reminder>\n(?:PreToolUse|PostToolUse|PostToolUseF
 const USER_BUDGET = /^<system-reminder>\n<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>\n<\/system-reminder>\n?(?:\[id:[0-9a-z]{1,6}\])?$/;
 // CCB 2.1.280 can place the same hook line, without a system-reminder
 // wrapper, in one system text block ahead of the existing budget line.
-const BARE_HOOK = /^(?:PreToolUse|PostToolUse|PostToolUseFailure):[A-Za-z][A-Za-z0-9_.:-]{0,127} hook additional context: [\s\S]+$/;
-const BARE_BUDGET = /^<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>$/;
+const BARE_HOOK = /^(?:PreToolUse|PostToolUse|PostToolUseFailure):[A-Za-z][A-Za-z0-9_.:-]{0,127} hook additional context: [\s\S]+/;
+// Do not end this with `$`. JavaScript's `$` can succeed before a final LF.
+const BARE_BUDGET = /^<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>/;
+const PROGRESS_SENTENCE = "The user hasn't heard from you in a while. As you continue, keep them updated when there's something to tell \u2014 a finding, a change of plan.";
+function exactMatch(pattern: RegExp, text: string): boolean {
+  const match = pattern.exec(text);
+  return match !== null && match[0].length === text.length;
+}
 function bareHookBeforeBudget(text: string): string | null {
   const seam = "\n\n";
   const at = text.lastIndexOf(seam);
   if (at <= 0) return null;
-  const hook = text.slice(0, at);
+  const head = text.slice(0, at);
   const budget = text.slice(at + seam.length);
-  if (!BARE_HOOK.test(hook) || !BARE_BUDGET.test(budget)) return null;
-  return hook;
+  if (!exactMatch(BARE_BUDGET, budget)) return null;
+  if (head === PROGRESS_SENTENCE || exactMatch(BARE_HOOK, head)) return head;
+  return null;
 }
 function denseArray(value: unknown[]): boolean {
   for (let i = 0; i < value.length; i++) {
@@ -208,6 +215,37 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
   for (const message of messages) {
     if (object(message) && message.role === "system"
       && Object.keys(message).sort().join(",") === "content,role"
+      && typeof message.content === "string") {
+      const kept = bareHookBeforeBudget(message.content);
+      const budget = exactMatch(BARE_BUDGET, message.content);
+      if (kept !== null || budget) {
+        const result = folded.at(-1);
+        const assistant = folded.at(-2);
+        const boundary = object(result) && result.role === "user" && Array.isArray(result.content)
+          && denseArray(result.content) && result.content.length > 0
+          && result.content.every((block: unknown) => object(block) && block.type === "tool_result")
+          && object(assistant) && assistant.role === "assistant" && Array.isArray(assistant.content)
+          && assistant.content.some((block: unknown) => object(block) && block.type === "tool_use");
+        if (!boundary || !object(result) || !Array.isArray(result.content)) {
+          folded.push(message); continue;
+        }
+        if (kept !== null) {
+          const results = [...result.content];
+          const last = results.at(-1);
+          const previous = object(last) ? last.content : null;
+          if (typeof previous === "string" || Array.isArray(previous) && denseArray(previous)) {
+            const content = typeof previous === "string"
+              ? [{ type: "text", text: previous }] : [...previous];
+            results[results.length - 1] = { ...last, content: [...content, { type: "text", text: kept }] };
+            folded[folded.length - 1] = { ...result, content: results };
+          } else { folded.push(message); continue; }
+        }
+        changed = true;
+        continue;
+      }
+    }
+    if (object(message) && message.role === "system"
+      && Object.keys(message).sort().join(",") === "content,role"
       && Array.isArray(message.content) && message.content.length === 1
       && Object.hasOwn(message.content, 0)) {
       const part = message.content[0];
@@ -262,35 +300,70 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
  * local two-CLI tool loop); the outer hint is not a new user instruction.
  * Recognize only this exact shape at each handoff boundary. Every other
  * system message stays in the body and fails the resume gate if misplaced. */
-function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
-  if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
-    || !Array.isArray(body.messages) || index < 2 || index >= body.messages.length) return false;
+function opusModel(body: ProxyBody): boolean {
+  return body.model === "box-api-claude-opus-5-5" || body.model === "claude-opus-5-5";
+}
+function handoffNeighbors(body: ProxyBody, index: number): boolean {
+  if (!opusModel(body) || !Array.isArray(body.messages) || index < 2 || index >= body.messages.length) {
+    return false;
+  }
   if (!Object.hasOwn(body.messages, index)
     || !Object.hasOwn(body.messages, index - 1)
     || !Object.hasOwn(body.messages, index - 2)) return false;
-  const tail = body.messages[index];
   const result = body.messages[index - 1];
   const assistant = body.messages[index - 2];
-  if (!object(tail) || tail.role !== "system"
-    || Object.keys(tail).sort().join(",") !== "content,role"
-    || !Array.isArray(tail.content) || tail.content.length !== 1
-    || !Object.hasOwn(tail.content, 0)
-    || !object(result) || result.role !== "user"
-    || !Array.isArray(result.content) || result.content.length < 1
-    || result.content.some((part: unknown) => !object(part) || part.type !== "tool_result")
-    || !object(assistant) || assistant.role !== "assistant"
-    || !Array.isArray(assistant.content)
-    || !assistant.content.some((part: unknown) => object(part) && part.type === "tool_use")) {
-    return false;
-  }
-  const block = tail.content[0];
-  return object(block) && Object.keys(block).sort().join(",") === "cache_control,text,type"
+  return object(result) && result.role === "user"
+    && Array.isArray(result.content) && result.content.length > 0
+    && result.content.every((part: unknown) => object(part) && part.type === "tool_result")
+    && object(assistant) && assistant.role === "assistant"
+    && Array.isArray(assistant.content)
+    && assistant.content.some((part: unknown) => object(part) && part.type === "tool_use");
+}
+function approvedBudgetMarker(block: Record<string, unknown>): boolean {
+  return Object.keys(block).sort().join(",") === "cache_control,text,type"
     && block.type === "text"
     && typeof block.text === "string"
-    && /^<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>$/.test(block.text)
     && object(block.cache_control)
     && Object.keys(block.cache_control).join(",") === "type"
     && block.cache_control.type === "ephemeral";
+}
+function boundaryText(tail: Record<string, unknown>): string | null {
+  if (typeof tail.content === "string") return tail.content;
+  if (!Array.isArray(tail.content) || tail.content.length !== 1 || !object(tail.content[0])) return null;
+  return typeof tail.content[0].text === "string" ? tail.content[0].text : null;
+}
+/** An unapproved wrapper must not collapse into the legal historical string. */
+function rejectUnapprovedToolBoundary(body: ProxyBody): void {
+  if (!opusModel(body) || !Array.isArray(body.messages)) return;
+  for (let index = 2; index < body.messages.length; index++) {
+    if (!handoffNeighbors(body, index)) continue;
+    const tail = body.messages[index];
+    if (!object(tail) || Object.keys(tail).sort().join(",") !== "content,role") continue;
+    const text = boundaryText(tail);
+    if (text === null || (!exactMatch(BARE_BUDGET, text) && bareHookBeforeBudget(text) === null)) continue;
+    if (typeof tail.content === "string") continue;
+    const block = Array.isArray(tail.content) ? tail.content[0] : null;
+    if (object(block) && approvedBudgetMarker(block)) continue;
+    if (!Array.isArray(tail.content) || tail.content.length !== 1 || !object(block)
+      || block.type !== "text") continue;
+    const rest = Object.keys(block).filter((key) => key !== "cache_control").sort().join(",");
+    const markerOk = !Object.hasOwn(block, "cache_control") || validMarker(block.cache_control);
+    if (rest === "text,type" && markerOk) {
+      throw new BoxCacheAnnotationError("BOX_CACHE_ANNOTATION_INVALID");
+    }
+  }
+}
+function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
+  if (!handoffNeighbors(body, index)) return false;
+  const tail = body.messages[index];
+  if (!object(tail) || tail.role !== "system"
+    || Object.keys(tail).sort().join(",") !== "content,role") return false;
+  if (typeof tail.content === "string") return exactMatch(BARE_BUDGET, tail.content);
+  if (!Array.isArray(tail.content) || tail.content.length !== 1
+    || !Object.hasOwn(tail.content, 0)) return false;
+  const block = tail.content[0];
+  return object(block) && approvedBudgetMarker(block)
+    && typeof block.text === "string" && exactMatch(BARE_BUDGET, block.text);
 }
 export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
   const effective = foldBoxCcbHookContext(body);
@@ -303,6 +376,7 @@ export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
   for (let i = 0; i < body.messages.length; i++) {
     if (!Object.hasOwn(body.messages, i)) return body;
   }
+  rejectUnapprovedToolBoundary(body);
   const effective = foldBoxCcbHookContext(body);
   const kept = effective.messages.filter((_, index) => !isBoxCcbToolBudgetAt(effective, index));
   return kept.length === effective.messages.length ? effective
