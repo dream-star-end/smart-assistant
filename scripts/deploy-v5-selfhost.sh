@@ -2482,6 +2482,7 @@ cmd_cutover() {
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
   assert_master_release_tsx_selfcheck "$rel"
+  cutover_clog "  Box success recovery 已在 build_master_release 封存前执行;已封存 rel 的切流与回退不再依赖该脚本"
   expected_build="$(dist_oc_build "$rel")"
   cutover_clog "  dist oc-build=$expected_build"
   cutover_clog "  从已过 digest 的候选快照 unit(危险窗口不再读工作树)"

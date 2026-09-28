@@ -4838,7 +4838,44 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box Opus 5.5 在真实 Claude Code 第二次 Bash 工具结果续接时，将 PreToolUse hook additionalContext 产生的兄弟文本或独立 system 钩子误判为新合成回合，HTTP 400 中断已付费工具链。",
       "rootFixCommit": "aeefb65b",
-      "coverageCommits": ["aeefb65b", "74e263ed", "d68d1c24", "49c87d0e", "2872667f", "fa56a333", "799460f6", "2191f6dc", "1be8c94d", "15b26fba", "2cdc7341", "e8a41a03", "39fc5bbe", "29065741", "d785e372", "b1bca9bf", "d707ac36", "6a070d9e", "32832c6b", "0610a28c", "97fd6525", "b99cc952", "46650320", "4b603e6b", "7c356956", "bb510411", "c43d600c", "f81e5489", "4ffc4779", "b4c04573", "970d8ac1", "fdde945b", "9cd8bff9", "5dae9fac", "a9fab8cb", "4b42122e"],
+      "coverageCommits": [
+        "aeefb65b",
+        "74e263ed",
+        "d68d1c24",
+        "49c87d0e",
+        "2872667f",
+        "fa56a333",
+        "799460f6",
+        "2191f6dc",
+        "1be8c94d",
+        "15b26fba",
+        "2cdc7341",
+        "e8a41a03",
+        "39fc5bbe",
+        "29065741",
+        "d785e372",
+        "b1bca9bf",
+        "d707ac36",
+        "6a070d9e",
+        "32832c6b",
+        "0610a28c",
+        "97fd6525",
+        "b99cc952",
+        "46650320",
+        "4b603e6b",
+        "7c356956",
+        "bb510411",
+        "c43d600c",
+        "f81e5489",
+        "4ffc4779",
+        "b4c04573",
+        "970d8ac1",
+        "fdde945b",
+        "9cd8bff9",
+        "5dae9fac",
+        "a9fab8cb",
+        "4b42122e"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -4879,6 +4916,120 @@
           "layer": "integration",
           "path": "scripts/lib/user-contract-browser.test.mjs",
           "assertion": "cold UI login waits for a delayed real button rather than bypassing login"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260928-BOX-MULTITOOL-CONTINUATION",
+      "occurredAt": "2026-09-28",
+      "severity": "P1",
+      "symptom": "V5 selfhost Box 在第二次 Bash 的效率 PreToolUse additionalContext 与 total_tokens 被 CCB 2.1.280 合成同一条无 system-reminder 包装的 system 消息后，第三跳被 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝。",
+      "rootFixCommit": "6f559fec",
+      "coverageCommits": [
+        "bcae6f63",
+        "400d418d",
+        "1a7a6fa3",
+        "c26f0005",
+        "ebea094e"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "unwrapped CCB hook plus budget system tail stays one continuation"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "ocv5-b1-continuation-pass"
+        }
+      ],
+      "preparedBehaviorGate": {
+        "path": "scripts/check-v5-box-continuation.ts",
+        "wired": true,
+        "note": "Formal root is an external supervisor: required --expect-sha, no unknown args, worker in its own process group, 60s deadline from before spawn, exit 0 only with the business receipt. deploy-v5.sh and scripts/v5-selfhost-master-release-lib.sh run the candidate node/tsx on this script before seal. The source guard remains auxiliary."
+      }
+    },
+    {
+      "id": "INC-20260928-BOX-TOOL-SUCCESS-RECOVERY",
+      "occurredAt": "2026-09-28",
+      "severity": "P1",
+      "symptom": "V5 selfhost Box detached tool chain can finish with worker_complete while the local journal leaf stays unknown if the user does not retry. The shared-leader stop probe treated that proof as pending, so the seat, capsule and per-request usage were not closed.",
+      "rootFixCommit": "d9879ab2",
+      "coverageCommits": [
+        "d9879ab2",
+        "cee76e0c",
+        "990dd064",
+        "78906790",
+        "a925e98e",
+        "d13d12e0",
+        "01a716a1"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "terminal-only recovery does not write a handoff or skip to a later final"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "journal state committed with boxState handoff is not a terminal winner"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.recovery.test.ts",
+          "assertion": "recovery evidence reads parent hashes, root permit, and fixed model mapping"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStagedCatalogRead.test.ts",
+          "assertion": "chunked catalog read stays inside one Connect frame and still closes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStagedCatalogRead.test.ts",
+          "assertion": "near-1MiB catalog frames in chunks and a changed chunk identity is rejected"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "third-round unknown closes once and settles each original request"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "two connections racing completeToolChain leave one terminal leaf"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "a real catalog read plus a capsule write failure does not settle or clean"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "a real capsule followed by a stop CAS does not bill or delete the remote catalog"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "cancel intent survives a second tick and cleanup retries on the temp journal"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "unknown worker_complete closed through reconcileBatch to a readable capsule and this-round usage"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260928-BOX-TOOL-SUCCESS-RECOVERY source regression guard, not end-to-end proof"
         }
       ]
     }

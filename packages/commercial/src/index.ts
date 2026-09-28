@@ -56,6 +56,7 @@ import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
 import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
 import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
 import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
+import { createBoxReplayRecoveryWriter } from "./egress/boxReplaySetup.js";
 import {
   assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool,
@@ -6161,6 +6162,7 @@ export async function registerCommercial(
     const boxRemoteCleanup = new BoxRemoteCleanupWorker({
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
+      writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),
     });
     leaderBundle.add({
       name: "finalizeReconciler",

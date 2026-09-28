@@ -5,7 +5,9 @@ import { deriveBoxCallFingerprint, deriveBoxContextHash,
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { matchBoxToolResults } from "./boxToolResultMatcher.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { validateBoxRequest } from "./boxRequestGate.js";
 import type { ProxyBody } from "./shared.js";
+import { isDeepStrictEqual } from "node:util";
 
 const marker = { type: "ephemeral" as const };
 const tool = { name: "local_echo", description: "local", input_schema: {
@@ -268,4 +270,363 @@ test("CCB budget is a no-op beside or inside tool results", () => {
   assert.notEqual(deriveBoxCallFingerprint(3n, plain).replayFingerprint,
     deriveBoxCallFingerprint(3n, bare).replayFingerprint,
     "hook content remains part of the model-visible tool result");
+});
+
+test("unwrapped CCB hook plus budget system tail stays one continuation", () => {
+  const hook = "PreToolUse:Bash hook additional context: 本容器内文件请用原生 Read/Grep/Glob,不要 `sed -n` 隔空读。host 读宿主文件可以保留。 替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`";
+  const budget = "<total_tokens>14999985 tokens left</total_tokens>";
+  const assistant = { role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_ocv5_294_sed", name: "local_echo", input: { value: "sed" } }] };
+  const result = { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_ocv5_294_sed", is_error: false, content: "ocv5-294-sed-line\n" }] };
+  const system = { role: "system", content: [{ type: "text",
+    text: `${hook}\n\n${budget}`, cache_control: marker }] };
+  const raw = { ...first, messages: [first.messages[0], assistant, result, system] } as ProxyBody;
+  const snapshot = JSON.stringify(raw);
+  const once = normalizeBoxSemanticBody(raw);
+  const twice = normalizeBoxSemanticBody(once);
+  assert.equal(JSON.stringify(raw), snapshot);
+  assert.ok(isDeepStrictEqual(once, twice));
+  assert.deepEqual((once.messages as Array<{ role: string }>).map((message) => message.role),
+    ["user", "assistant", "user"]);
+  const folded = (once.messages.at(-1) as { content: Array<{ content: unknown }> }).content[0]!.content;
+  assert.deepEqual(folded, [
+    { type: "text", text: "ocv5-294-sed-line\n" },
+    { type: "text", text: hook },
+  ]);
+  assert.equal(JSON.stringify(folded).split(hook).length - 1, 1);
+  assert.equal(JSON.stringify(folded).includes("<total_tokens>"), false);
+  assert.equal(validateBoxRequest(raw, true), null);
+  assert.equal(validateBoxRequest(once, true), null);
+  assert.equal(deriveBoxCallFingerprint(3n, raw).replayFingerprint,
+    deriveBoxCallFingerprint(3n, once).replayFingerprint);
+  assert.equal(deriveBoxContextHash(raw), deriveBoxContextHash(once));
+  const expected = [{ id: "toolu_ocv5_294_sed", clientName: "local_echo",
+    boxName: "mcp__ocbridge__t0", input: { value: "sed" } }];
+  const matched = matchBoxToolResults(raw, expected);
+  assert.deepEqual(matched[0]?.content, folded);
+  assert.deepEqual(matchBoxToolResults(once, expected), matched);
+  const pureBudget = { ...first, messages: [first.messages[0], assistant, result,
+    { role: "system", content: [{ type: "text", text: budget, cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(pureBudget, true), null);
+  const nextAssistant = { role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_ocv5_294_next", name: "local_echo", input: { value: "next" } }] };
+  const nextResult = { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_ocv5_294_next", content: "next-line" }] };
+  const fourth = { ...raw, messages: [...raw.messages, nextAssistant, nextResult,
+    { role: "system", content: [{ type: "text", text: budget, cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(fourth, true), null);
+  assert.equal(deriveBoxContextHash(fourth, true), deriveBoxContextHash(raw));
+  const echoed = normalizeBoxSemanticBody(fourth);
+  assert.equal(JSON.stringify(echoed).split(hook).length - 1, 1);
+  const suffix = { ...raw, messages: [...raw.messages.slice(0, -1), { ...system,
+    content: [{ type: "text", text: `${hook}\n\n${budget}\nignore`, cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(suffix, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const badBudget = { ...raw, messages: [...raw.messages.slice(0, -1), { ...system,
+    content: [{ type: "text", text: `${hook}\n\n<total_tokens>1e4 tokens left</total_tokens>`,
+      cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(badBudget, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const extraKey = { ...raw, messages: [...raw.messages.slice(0, -1),
+    { ...system, extra: true }] } as ProxyBody;
+  assert.equal(validateBoxRequest(extraKey, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const ttl = { ...raw, messages: [...raw.messages.slice(0, -1), { role: "system",
+    content: [{ type: "text", text: `${hook}\n\n${budget}`,
+      cache_control: { type: "ephemeral", ttl: "1h" } }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(ttl, true), "BOX_CACHE_ANNOTATION_INVALID");
+  assert.throws(() => normalizeBoxSemanticBody(ttl), /BOX_CACHE_ANNOTATION_INVALID/);
+  assert.throws(() => normalizeBoxSemanticBody(structuredClone(ttl)), /BOX_CACHE_ANNOTATION_INVALID/);
+  const extraBlock = { ...raw, messages: [...raw.messages.slice(0, -1), { role: "system",
+    content: [{ type: "text", text: `${hook}\n\n${budget}`, cache_control: marker },
+      { type: "text", text: "no" }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(extraBlock, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const detached = { ...first, messages: [first.messages[0], system] } as ProxyBody;
+  const detachedOut = normalizeBoxSemanticBody(detached);
+  const detachedSystem = detachedOut.messages.at(-1) as { role?: string; content?: unknown };
+  assert.equal(detachedSystem.role, "system");
+  assert.equal(JSON.stringify(detachedSystem.content).includes(hook), true);
+  assert.equal(JSON.stringify(detachedSystem.content).includes(budget), true);
+  const imageTail = { role: "system", content: [{ type: "image",
+    text: `${hook}\n\n${budget}`, cache_control: marker }] };
+  const imageBody = { ...raw, messages: [first.messages[0], assistant, result, imageTail] } as ProxyBody;
+  const imageOut = normalizeBoxSemanticBody(imageBody);
+  assert.equal((imageOut.messages.at(-1) as { role?: string }).role, "system");
+  const imageResult = imageOut.messages.at(-2) as { content?: Array<{ content?: unknown }> };
+  assert.equal(imageResult.content?.[0]?.content, "ocv5-294-sed-line\n");
+  assert.equal(validateBoxRequest(imageBody, true), "BOX_SYSTEM_UNSUPPORTED");
+  const wrongId = { ...raw, messages: [first.messages[0], assistant,
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_other",
+      is_error: false, content: "x" }] }, system] } as ProxyBody;
+  assert.deepEqual((wrongId.messages as Array<{ role: string }>).map((message) => message.role),
+    ["user", "assistant", "user", "system"]);
+  assert.throws(() => matchBoxToolResults(wrongId, expected), /BOX_TOOL_RESULT_/);
+  const changedInput = { ...raw, messages: [first.messages[0],
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_ocv5_294_sed",
+      name: "local_echo", input: { value: "other" } }] }, result, system] } as ProxyBody;
+  assert.throws(() => matchBoxToolResults(changedInput, expected), /BOX_TOOL_RESULT_/);
+  const changedText = { ...raw, messages: [first.messages[0],
+    { role: "assistant", content: [{ type: "text", text: "not the same tool turn" },
+      { type: "tool_use", id: "toolu_ocv5_294_sed", name: "local_echo",
+        input: { value: "sed" } }] }, result, system] } as ProxyBody;
+  assert.notEqual(deriveBoxContextHash(changedText), deriveBoxContextHash(raw));
+  assert.notEqual(deriveBoxCallFingerprint(3n, changedText).replayFingerprint,
+    deriveBoxCallFingerprint(3n, raw).replayFingerprint);
+});
+
+const PROGRESS = "The user hasn't heard from you in a while. As you continue, keep them updated when there's something to tell \u2014 a finding, a change of plan.";
+
+function handoff(id: string, input: string, resultText: string, system: unknown): ProxyBody["messages"] {
+  return [
+    { role: "assistant", content: [{ type: "tool_use", id, name: "local_echo", input: { value: input } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: resultText }] },
+    system,
+  ];
+}
+function budgetSystem(text: string, cache: Record<string, unknown> | null): unknown {
+  return cache === null
+    ? { role: "system", content: text }
+    : { role: "system", content: [{ type: "text", text, cache_control: cache }] };
+}
+
+test("historical budget strings and the default progress sentence stay one continuation", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const arrayBudget = budgetSystem(budget, marker);
+  const stringBudget = budgetSystem(budget, null);
+  const progress = budgetSystem(`${PROGRESS}\n\n${budget}`, marker);
+  const progressString = budgetSystem(`${PROGRESS}\n\n${budget}`, null);
+  const hook = "PreToolUse:Bash hook additional context: keep this byte-for-byte";
+  const hookString = budgetSystem(`${hook}\n\n${budget}`, null);
+  const prior = { ...first, messages: [first.messages[0], ...handoff("toolu_b12_1", "one", "path-2", arrayBudget)] } as ProxyBody;
+  const third = { ...prior, messages: [...prior.messages, ...handoff("toolu_b12_2", "two", "path-3", stringBudget)] } as ProxyBody;
+  const fourth = { ...third, messages: [...third.messages, ...handoff("toolu_b12_3", "three", "path-4", arrayBudget)] } as ProxyBody;
+  const fifth = { ...fourth, messages: [...fourth.messages, ...handoff("toolu_b12_4", "four", "path-5", stringBudget)] } as ProxyBody;
+  const sixth = { ...fifth, messages: [...fifth.messages, ...handoff("toolu_b12_5", "five", "nonce-5", progress)] } as ProxyBody;
+  // Appends a new string reminder. It does not rewrite sixth's cached system into history.
+  const seventh = { ...sixth, messages: [...sixth.messages, ...handoff("toolu_b12_6", "six", "after", progressString)] } as ProxyBody;
+  const chain = [prior, third, fourth, fifth, sixth, seventh];
+  for (const body of chain) {
+    const snapshot = JSON.stringify(body);
+    const once = normalizeBoxSemanticBody(body);
+    const twice = normalizeBoxSemanticBody(once);
+    assert.equal(JSON.stringify(body), snapshot);
+    assert.ok(isDeepStrictEqual(once, twice));
+    assert.equal(validateBoxRequest(body, true), null);
+    assert.equal(validateBoxRequest(once, true), null);
+    assert.equal(deriveBoxCallFingerprint(3n, body).replayFingerprint,
+      deriveBoxCallFingerprint(3n, once).replayFingerprint);
+  }
+  for (let i = 1; i < chain.length; i++) {
+    assert.equal(deriveBoxContextHash(chain[i]!, true), deriveBoxContextHash(chain[i - 1]!));
+  }
+  const progressNorm = normalizeBoxSemanticBody(sixth);
+  const progressBlocks = JSON.stringify(progressNorm).split(PROGRESS);
+  assert.equal(progressBlocks.length - 1, 1);
+  assert.equal(JSON.stringify(progressNorm).includes("<total_tokens>"), false);
+  const echoed = normalizeBoxSemanticBody(seventh);
+  assert.equal(JSON.stringify(echoed).split(PROGRESS).length - 1, 2);
+  assert.equal(JSON.stringify(echoed).split(hook).length - 1, 0);
+  // Current string only. The previous hop is not rewritten from a cached system.
+  const withHook = { ...fifth, messages: [...fifth.messages,
+    ...handoff("toolu_b12_h", "hook", "tool-says", hookString)] } as ProxyBody;
+  const hookNorm = normalizeBoxSemanticBody(withHook);
+  assert.equal(JSON.stringify(hookNorm).split(hook).length - 1, 1);
+  assert.equal(deriveBoxContextHash(withHook, true), deriveBoxContextHash(fifth));
+  const toolEcho = { ...first, messages: [first.messages[0],
+    ...handoff("toolu_b12_echo", "echo", PROGRESS, arrayBudget)] } as ProxyBody;
+  const echoedTool = normalizeBoxSemanticBody(toolEcho);
+  assert.equal(JSON.stringify(echoedTool).split(PROGRESS).length - 1, 1);
+  const changedBudget = { ...prior, messages: [...prior.messages.slice(0, -1),
+    budgetSystem("<total_tokens>1 tokens left</total_tokens>", marker)] } as ProxyBody;
+  assert.equal(deriveBoxContextHash(changedBudget), deriveBoxContextHash(prior));
+  const changedProgress = budgetSystem(`not the progress sentence\n\n${budget}`, marker);
+  const changedBody = { ...fifth, messages: [...fifth.messages,
+    ...handoff("toolu_b12_bad", "bad", "x", changedProgress)] } as ProxyBody;
+  assert.equal(validateBoxRequest(changedBody, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const matched = matchBoxToolResults(sixth, [{ id: "toolu_b12_5", clientName: "local_echo",
+    boxName: "mcp__ocbridge__t0", input: { value: "five" } }]);
+  assert.equal(matched[0]?.isError, false);
+  assert.deepEqual(matched[0]?.content, [
+    { type: "text", text: "nonce-5" },
+    { type: "text", text: PROGRESS },
+  ]);
+  assert.throws(() => matchBoxToolResults(sixth, [{ id: "toolu_other", clientName: "local_echo",
+    boxName: "mcp__ocbridge__t0", input: { value: "five" } }]), /BOX_TOOL_RESULT_/);
+  assert.throws(() => matchBoxToolResults(sixth, [{ id: "toolu_b12_5", clientName: "local_echo",
+    boxName: "mcp__ocbridge__t0", input: { value: "other" } }]), /BOX_TOOL_RESULT_/);
+});
+
+test("unapproved budget wrappers stay rejected at every handoff and do not collapse", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const legal = { role: "system", content: [{ type: "text", text: budget, cache_control: marker }] };
+  const base = { ...first, messages: [first.messages[0], ...handoff("toolu_c1_1", "one", "a", legal),
+    ...handoff("toolu_c1_2", "two", "b", legal).slice(0, 2)] } as ProxyBody;
+  const promoted = [
+    { role: "system", content: [{ type: "text", text: budget, cache_control: { type: "ephemeral", ttl: "1h" } }] },
+    { role: "system", content: [{ type: "text", text: budget, cache_control: { type: "ephemeral", scope: "global" } }] },
+    { role: "system", content: [{ type: "text", text: budget }] },
+  ];
+  for (const tail of promoted) {
+    const body = { ...base, messages: [...base.messages, tail] } as ProxyBody;
+    assert.equal(validateBoxRequest(body, true), "BOX_CACHE_ANNOTATION_INVALID");
+    assert.throws(() => normalizeBoxSemanticBody(body), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => normalizeBoxSemanticBody(structuredClone(body)), /BOX_CACHE_ANNOTATION_INVALID/);
+  }
+  const dirty = [
+    { role: "system", content: [{ type: "text", text: `${budget}\n` }] },
+    { role: "system", content: [{ type: "text", text: `${budget}\r\n`, cache_control: marker }] },
+    { role: "system", content: [{ type: "text", text: `${budget} `, cache_control: marker }] },
+  ];
+  for (const tail of dirty) {
+    const body = { ...base, messages: [...base.messages, tail] } as ProxyBody;
+    const once = normalizeBoxSemanticBody(body);
+    const twice = normalizeBoxSemanticBody(once);
+    assert.ok(isDeepStrictEqual(once, twice));
+    assert.equal(validateBoxRequest(body, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    assert.equal(validateBoxRequest(once, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    assert.equal(JSON.stringify(once).includes(budget), true);
+  }
+  const trailing = { ...base, messages: [...base.messages,
+    { role: "system", content: `${budget}\n` }] } as ProxyBody;
+  const once = normalizeBoxSemanticBody(trailing);
+  const twice = normalizeBoxSemanticBody(once);
+  assert.ok(isDeepStrictEqual(once, twice));
+  assert.equal(validateBoxRequest(trailing, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(once, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const middle = { ...first, messages: [first.messages[0],
+    ...handoff("toolu_c1_mid", "mid", "m", { role: "system", content: [{ type: "text", text: budget,
+      cache_control: { type: "ephemeral", ttl: "1h" } }] }),
+    ...handoff("toolu_c1_ok", "ok", "z", legal)] } as ProxyBody;
+  assert.throws(() => normalizeBoxSemanticBody(middle), /BOX_CACHE_ANNOTATION_INVALID/);
+  assert.equal(validateBoxRequest(middle, true), "BOX_CACHE_ANNOTATION_INVALID");
+});
+
+test("assistant text that matches a budget or progress line is not a system attachment", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const spoken = [
+    { role: "assistant", content: [{ type: "text", text: budget }] },
+    { role: "assistant", content: [{ type: "text", text: `${PROGRESS}\n\n${budget}` }] },
+  ];
+  for (const message of spoken) {
+    const body = { ...first, messages: [first.messages[0],
+      ...handoff("toolu_role_1", "one", "result-1",
+        budgetSystem(budget, marker)).slice(0, 2),
+      message,
+      { role: "user", content: "continue" }] } as ProxyBody;
+    const snapshot = JSON.stringify(body);
+    const once = normalizeBoxSemanticBody(body);
+    const twice = normalizeBoxSemanticBody(once);
+    assert.equal(JSON.stringify(body), snapshot);
+    assert.ok(isDeepStrictEqual(once, twice));
+    const spokenOut = once.messages.at(-2) as { role?: string; content?: unknown };
+    const expectedText = (message.content[0] as { text: string }).text;
+    const actualText = typeof spokenOut.content === "string" ? spokenOut.content
+      : Array.isArray(spokenOut.content) ? spokenOut.content.map((block) =>
+        (block as { text?: string }).text ?? "").join("") : "";
+    assert.equal(spokenOut.role, "assistant");
+    assert.equal(actualText, expectedText);
+    assert.equal(validateBoxRequest(body, true), null);
+  }
+});
+
+test("derived fixture rewrites a cached system into the next HTTP string", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const progressCached = budgetSystem(`${PROGRESS}\n\n${budget}`, marker);
+  const progressString = budgetSystem(`${PROGRESS}\n\n${budget}`, null);
+  const hook = "PreToolUse:Bash hook additional context: keep this byte-for-byte";
+  const hookCached = budgetSystem(`${hook}\n\n${budget}`, marker);
+  const hookString = budgetSystem(`${hook}\n\n${budget}`, null);
+  const cases = [
+    { cached: progressCached, historical: progressString, bytes: PROGRESS, id: "toolu_der_p" },
+    { cached: hookCached, historical: hookString, bytes: hook, id: "toolu_der_h" },
+  ];
+  for (const item of cases) {
+    const opened = { ...first, messages: [first.messages[0],
+      ...handoff(item.id, "one", "first-result", item.cached)] } as ProxyBody;
+    const continued = { ...opened, messages: [first.messages[0],
+      ...handoff(item.id, "one", "first-result", item.historical),
+      ...handoff(`${item.id}_2`, "two", "second-result", item.cached)] } as ProxyBody;
+    const snapshot = JSON.stringify(continued);
+    const once = normalizeBoxSemanticBody(continued);
+    const twice = normalizeBoxSemanticBody(once);
+    assert.equal(JSON.stringify(continued), snapshot);
+    assert.ok(isDeepStrictEqual(once, twice));
+    assert.equal(deriveBoxContextHash(continued, true), deriveBoxContextHash(opened));
+    assert.equal(validateBoxRequest(continued, true), null);
+    assert.equal(JSON.stringify(once).split(item.bytes).length - 1, 2);
+    assert.equal(JSON.stringify(normalizeBoxSemanticBody(opened)).split(item.bytes).length - 1, 1);
+  }
+});
+
+test("hook fold or budget removal does not promote the next unapproved wrapper", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const wrappedText = "<system-reminder>\nPreToolUse:Bash hook additional context: keep annotation.\n</system-reminder>";
+  const bare = "PreToolUse:Bash hook additional context: keep annotation.";
+  const wrapped = { role: "system", content: [{ type: "text", text: wrappedText, cache_control: marker }] };
+  const bareCombo = budgetSystem(`${bare}\n\n${budget}`, marker);
+  const legalArray = budgetSystem(budget, marker);
+  const legalString = budgetSystem(budget, null);
+  const badMarkers: Array<Record<string, unknown> | null> = [
+    { type: "ephemeral", ttl: "1h" },
+    { type: "ephemeral", scope: "global" },
+    null,
+  ];
+  const badBudget = (cache: Record<string, unknown> | null) => cache === null
+    ? { role: "system", content: [{ type: "text", text: budget }] }
+    : budgetSystem(budget, cache);
+  const openings = [
+    [wrapped],
+    [bareCombo],
+    [legalArray],
+    [legalString],
+    [legalArray, legalString],
+  ];
+  const pair = (id: string, input: string, text: string) => [
+    { role: "assistant", content: [{ type: "tool_use", id, name: "local_echo", input: { value: input } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] },
+  ];
+  const reject = (body: ProxyBody, id: string, input: string) => {
+    const snapshot = JSON.stringify(body);
+    assert.equal(validateBoxRequest(body, true), "BOX_CACHE_ANNOTATION_INVALID");
+    assert.throws(() => normalizeBoxSemanticBody(body), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => normalizeBoxSemanticBody(structuredClone(body)), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => deriveBoxContextHash(body), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => matchBoxToolResults(body, [{ id, clientName: "local_echo",
+      boxName: "mcp__ocbridge__t0", input: { value: input } }]), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.equal(JSON.stringify(body), snapshot);
+    assert.notEqual(validateBoxRequest(body, true), null);
+  };
+  for (const opening of openings) {
+    for (const cache of badMarkers) {
+      const bad = badBudget(cache);
+      const current = { ...first, messages: [first.messages[0],
+        ...pair("toolu_c2_now", "now", "current"), ...opening, bad] } as ProxyBody;
+      reject(current, "toolu_c2_now", "now");
+      const historical = { ...first, messages: [first.messages[0],
+        ...pair("toolu_c2_old", "old", "history"), ...opening, bad,
+        ...pair("toolu_c2_new", "new", "next"), legalArray] } as ProxyBody;
+      reject(historical, "toolu_c2_new", "new");
+    }
+  }
+  const legal = { ...first, messages: [first.messages[0],
+    ...pair("toolu_c2_ok", "ok", "kept"), wrapped, legalArray] } as ProxyBody;
+  const snapshot = JSON.stringify(legal);
+  const once = normalizeBoxSemanticBody(legal);
+  const twice = normalizeBoxSemanticBody(once);
+  assert.equal(JSON.stringify(legal), snapshot);
+  assert.ok(isDeepStrictEqual(once, twice));
+  assert.equal(validateBoxRequest(legal, true), null);
+  assert.equal(validateBoxRequest(once, true), null);
+  const kept = (once.messages.at(-1) as { content: Array<{ content: unknown }> }).content[0]?.content;
+  assert.deepEqual(kept, [
+    { type: "text", text: "kept" },
+    { type: "text", text: wrappedText },
+  ]);
+  assert.equal(JSON.stringify(once).includes("<total_tokens>"), false);
+  assert.equal(deriveBoxCallFingerprint(3n, legal).replayFingerprint,
+    deriveBoxCallFingerprint(3n, once).replayFingerprint);
+  const afterBudget = { ...first, messages: [first.messages[0],
+    ...pair("toolu_c2_budget", "b", "row"), legalArray, legalString, legalArray] } as ProxyBody;
+  const budgetOnce = normalizeBoxSemanticBody(afterBudget);
+  assert.ok(isDeepStrictEqual(budgetOnce, normalizeBoxSemanticBody(budgetOnce)));
+  assert.equal(validateBoxRequest(afterBudget, true), null);
+  assert.equal((budgetOnce.messages as Array<{ role: string }>).some((message) => message.role === "system"), false);
 });
