@@ -540,6 +540,16 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box success recovery behavioral gate 失败"
   fi
+  mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+  if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-v5-box-continuation.ts"
+  fi
+  if ! ( cd "$staging" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
+    cleanup_master_staging
+    die "pinned Box multitool continuation gate 失败"
+  fi
   mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
   if ! ( cd "$staging" && npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
     cleanup_master_staging

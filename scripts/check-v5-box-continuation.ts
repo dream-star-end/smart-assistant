@@ -1,5 +1,5 @@
 /** Formal continuation gate for INC-20260928-BOX-MULTITOOL-CONTINUATION.
- * Not a deploy-gate proof. wired stays false until a release script calls it.
+ * Release scripts call this file. The receipt wired field is true.
  *
  * From the candidate root, with that tree's node or tsx:
  *   tsx scripts/check-v5-box-continuation.ts --expect-sha <40-hex>
@@ -416,7 +416,7 @@ function acceptReceipt(stdout: string, expectSha: string): boolean {
   try {
     const body = JSON.parse(line) as { ok?: boolean; wired?: boolean; expectSha?: string;
       receipt?: string; runtimeModules?: number; homeIsolated?: boolean; database?: boolean };
-    return body.ok === true && body.wired === false && body.expectSha === expectSha
+    return body.ok === true && body.wired === true && body.expectSha === expectSha
       && body.receipt === RECEIPT && (body.runtimeModules ?? 0) >= 9
       && body.homeIsolated === true && body.database === false;
   } catch { return false; }
@@ -510,7 +510,7 @@ async function workerMain(expectSha: string): Promise<void> {
   if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");
   const runtime = before.filter((item) => item.path.startsWith(`packages${sep}commercial${sep}src${sep}http${sep}proxy${sep}`));
   console.log(JSON.stringify({
-    ok: true, wired: false, receipt: RECEIPT, expectSha, candidate: CANDIDATE, git,
+    ok: true, wired: true, receipt: RECEIPT, expectSha, candidate: CANDIDATE, git,
     runtimeModules: runtime.length, modules: before.length, digest: before,
     node: process.version, execPath: realpathSync(process.execPath),
     homeIsolated: process.env.HOME === join(scratch, "home"),

@@ -4049,6 +4049,13 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha"); then
+    echo "✗ pinned box multitool continuation gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
     echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2

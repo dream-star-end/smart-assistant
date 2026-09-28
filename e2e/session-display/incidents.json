@@ -4838,7 +4838,44 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box Opus 5.5 在真实 Claude Code 第二次 Bash 工具结果续接时，将 PreToolUse hook additionalContext 产生的兄弟文本或独立 system 钩子误判为新合成回合，HTTP 400 中断已付费工具链。",
       "rootFixCommit": "aeefb65b",
-      "coverageCommits": ["aeefb65b", "74e263ed", "d68d1c24", "49c87d0e", "2872667f", "fa56a333", "799460f6", "2191f6dc", "1be8c94d", "15b26fba", "2cdc7341", "e8a41a03", "39fc5bbe", "29065741", "d785e372", "b1bca9bf", "d707ac36", "6a070d9e", "32832c6b", "0610a28c", "97fd6525", "b99cc952", "46650320", "4b603e6b", "7c356956", "bb510411", "c43d600c", "f81e5489", "4ffc4779", "b4c04573", "970d8ac1", "fdde945b", "9cd8bff9", "5dae9fac", "a9fab8cb", "4b42122e"],
+      "coverageCommits": [
+        "aeefb65b",
+        "74e263ed",
+        "d68d1c24",
+        "49c87d0e",
+        "2872667f",
+        "fa56a333",
+        "799460f6",
+        "2191f6dc",
+        "1be8c94d",
+        "15b26fba",
+        "2cdc7341",
+        "e8a41a03",
+        "39fc5bbe",
+        "29065741",
+        "d785e372",
+        "b1bca9bf",
+        "d707ac36",
+        "6a070d9e",
+        "32832c6b",
+        "0610a28c",
+        "97fd6525",
+        "b99cc952",
+        "46650320",
+        "4b603e6b",
+        "7c356956",
+        "bb510411",
+        "c43d600c",
+        "f81e5489",
+        "4ffc4779",
+        "b4c04573",
+        "970d8ac1",
+        "fdde945b",
+        "9cd8bff9",
+        "5dae9fac",
+        "a9fab8cb",
+        "4b42122e"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -4882,7 +4919,7 @@
         }
       ]
     },
-        {
+    {
       "id": "INC-20260928-BOX-MULTITOOL-CONTINUATION",
       "occurredAt": "2026-09-28",
       "severity": "P1",
@@ -4904,12 +4941,17 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "ocv5-b1-continuation-pass"
         }
       ],
       "preparedBehaviorGate": {
         "path": "scripts/check-v5-box-continuation.ts",
-        "wired": false,
-        "note": "Formal root is an external supervisor: required --expect-sha, no unknown args, worker in its own process group, 60s deadline from before spawn, exit 0 only with the business receipt. Not an in-process timer. Not a deploy-gate proof until deploy-v5.sh or scripts/v5-selfhost-master-release-lib.sh runs the candidate node/tsx on this script. The source guard above is not that proof."
+        "wired": true,
+        "note": "Formal root is an external supervisor: required --expect-sha, no unknown args, worker in its own process group, 60s deadline from before spawn, exit 0 only with the business receipt. deploy-v5.sh and scripts/v5-selfhost-master-release-lib.sh run the candidate node/tsx on this script before seal. The source guard remains auxiliary."
       }
     },
     {

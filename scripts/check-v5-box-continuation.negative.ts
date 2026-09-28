@@ -284,7 +284,7 @@ test("archive without git passes only with a strict expect-sha", () => {
     assert.equal(ok.code, 0, `${ok.stderr}\n${ok.stdout}`);
     const body = JSON.parse(ok.stdout);
     assert.equal(body.ok, true);
-    assert.equal(body.wired, false);
+    assert.equal(body.wired, true);
     assert.equal(body.git, "absent");
     assert.equal(body.expectSha, SHA);
     assert.equal(body.database, false);
