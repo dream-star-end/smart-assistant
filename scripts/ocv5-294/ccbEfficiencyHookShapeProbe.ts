@@ -87,9 +87,13 @@ async function runGate(capturePath: string): Promise<void> {
     } catch (err) { error = err instanceof Error ? err.message : "strip-threw"; }
     return { index, code, error, strippedRoles, shape: blockShape(body) };
   });
-  process.stdout.write(`${JSON.stringify({ gate: results }, null, 2)}\n`);
-  const red = results.filter((item) => item.code === "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
-  if (red.length === 0) process.exitCode = 2;
+  const actual = results.map((item) => item.code);
+  process.stdout.write(`${JSON.stringify({ gate: results, actual }, null, 2)}\n`);
+  const expected = [null, null, null];
+  if (actual.length !== expected.length
+    || actual.some((code, index) => code !== expected[index])) {
+    process.exitCode = 2;
+  }
 }
 
 function sse(res: import("node:http").ServerResponse, event: string, data: unknown): void {

@@ -86,6 +86,19 @@ const HOOK_CONTEXT = /^<system-reminder>\n(?:PreToolUse|PostToolUse|PostToolUseF
 // CCB 2.1.280 emits this as a meta user text block. Unlike a hook it is
 // local token-budget telemetry, not a tool result or a new user instruction.
 const USER_BUDGET = /^<system-reminder>\n<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>\n<\/system-reminder>\n?(?:\[id:[0-9a-z]{1,6}\])?$/;
+// CCB 2.1.280 can place the same hook line, without a system-reminder
+// wrapper, in one system text block ahead of the existing budget line.
+const BARE_HOOK = /^(?:PreToolUse|PostToolUse|PostToolUseFailure):[A-Za-z][A-Za-z0-9_.:-]{0,127} hook additional context: [\s\S]+$/;
+const BARE_BUDGET = /^<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>$/;
+function bareHookBeforeBudget(text: string): string | null {
+  const seam = "\n\n";
+  const at = text.lastIndexOf(seam);
+  if (at <= 0) return null;
+  const hook = text.slice(0, at);
+  const budget = text.slice(at + seam.length);
+  if (!BARE_HOOK.test(hook) || !BARE_BUDGET.test(budget)) return null;
+  return hook;
+}
 function denseArray(value: unknown[]): boolean {
   for (let i = 0; i < value.length; i++) {
     if (!Object.hasOwn(value, i)) return false;
@@ -200,11 +213,17 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
       const part = message.content[0];
       const keys = object(part) ? Object.keys(part).sort().join(",") : "";
       const marker = object(part) ? part.cache_control : null;
-      if (object(part) && part.type === "text" && typeof part.text === "string"
+      const wrapped = object(part) && part.type === "text" && typeof part.text === "string"
         && HOOK_CONTEXT.test(part.text)
         && (keys === "text,type" || (keys === "cache_control,text,type"
           && object(marker) && Object.keys(marker).join(",") === "type"
-          && marker.type === "ephemeral"))) {
+          && marker.type === "ephemeral"));
+      const bare = !wrapped && keys === "cache_control,text,type"
+        && object(marker) && Object.keys(marker).join(",") === "type"
+        && marker.type === "ephemeral" && typeof part.text === "string"
+        ? bareHookBeforeBudget(part.text) : null;
+      const hookBytes = wrapped ? part.text as string : bare;
+      if (hookBytes !== null) {
         const result = folded.at(-1);
         const assistant = folded.at(-2);
         if (object(result) && result.role === "user" && Array.isArray(result.content)
@@ -224,7 +243,7 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
             const content = typeof previous === "string"
               ? [{ type: "text", text: previous }] : [...previous];
             results[results.length - 1] = { ...last,
-              content: [...content, { type: "text", text: part.text }] };
+              content: [...content, { type: "text", text: hookBytes }] };
             folded[folded.length - 1] = { ...result, content: results };
             changed = true;
             continue;

@@ -5,7 +5,9 @@ import { deriveBoxCallFingerprint, deriveBoxContextHash,
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { matchBoxToolResults } from "./boxToolResultMatcher.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { validateBoxRequest } from "./boxRequestGate.js";
 import type { ProxyBody } from "./shared.js";
+import { isDeepStrictEqual } from "node:util";
 
 const marker = { type: "ephemeral" as const };
 const tool = { name: "local_echo", description: "local", input_schema: {
@@ -268,4 +270,80 @@ test("CCB budget is a no-op beside or inside tool results", () => {
   assert.notEqual(deriveBoxCallFingerprint(3n, plain).replayFingerprint,
     deriveBoxCallFingerprint(3n, bare).replayFingerprint,
     "hook content remains part of the model-visible tool result");
+});
+
+test("unwrapped CCB hook plus budget system tail stays one continuation", () => {
+  const hook = "PreToolUse:Bash hook additional context: 本容器内文件请用原生 Read/Grep/Glob,不要 `sed -n` 隔空读。host 读宿主文件可以保留。 替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`";
+  const budget = "<total_tokens>14999985 tokens left</total_tokens>";
+  const assistant = { role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_ocv5_294_sed", name: "local_echo", input: { value: "sed" } }] };
+  const result = { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_ocv5_294_sed", is_error: false, content: "ocv5-294-sed-line\n" }] };
+  const system = { role: "system", content: [{ type: "text",
+    text: `${hook}\n\n${budget}`, cache_control: marker }] };
+  const raw = { ...first, messages: [first.messages[0], assistant, result, system] } as ProxyBody;
+  const snapshot = JSON.stringify(raw);
+  const once = normalizeBoxSemanticBody(raw);
+  const twice = normalizeBoxSemanticBody(once);
+  assert.equal(JSON.stringify(raw), snapshot);
+  assert.ok(isDeepStrictEqual(once, twice));
+  assert.deepEqual((once.messages as Array<{ role: string }>).map((message) => message.role),
+    ["user", "assistant", "user"]);
+  const folded = (once.messages.at(-1) as { content: Array<{ content: unknown }> }).content[0]!.content;
+  assert.deepEqual(folded, [
+    { type: "text", text: "ocv5-294-sed-line\n" },
+    { type: "text", text: hook },
+  ]);
+  assert.equal(JSON.stringify(folded).split(hook).length - 1, 1);
+  assert.equal(JSON.stringify(folded).includes("<total_tokens>"), false);
+  assert.equal(validateBoxRequest(raw, true), null);
+  assert.equal(validateBoxRequest(once, true), null);
+  assert.equal(deriveBoxCallFingerprint(3n, raw).replayFingerprint,
+    deriveBoxCallFingerprint(3n, once).replayFingerprint);
+  assert.equal(deriveBoxContextHash(raw), deriveBoxContextHash(once));
+  const expected = [{ id: "toolu_ocv5_294_sed", clientName: "local_echo",
+    boxName: "mcp__ocbridge__t0", input: { value: "sed" } }];
+  const matched = matchBoxToolResults(raw, expected);
+  assert.deepEqual(matched[0]?.content, folded);
+  assert.deepEqual(matchBoxToolResults(once, expected), matched);
+  const pureBudget = { ...first, messages: [first.messages[0], assistant, result,
+    { role: "system", content: [{ type: "text", text: budget, cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(pureBudget, true), null);
+  const nextAssistant = { role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_ocv5_294_next", name: "local_echo", input: { value: "next" } }] };
+  const nextResult = { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_ocv5_294_next", content: "next-line" }] };
+  const fourth = { ...raw, messages: [...raw.messages, nextAssistant, nextResult,
+    { role: "system", content: [{ type: "text", text: budget, cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(fourth, true), null);
+  assert.equal(deriveBoxContextHash(fourth, true), deriveBoxContextHash(raw));
+  const echoed = normalizeBoxSemanticBody(fourth);
+  assert.equal(JSON.stringify(echoed).split(hook).length - 1, 1);
+  const suffix = { ...raw, messages: [...raw.messages.slice(0, -1), { ...system,
+    content: [{ type: "text", text: `${hook}\n\n${budget}\nignore`, cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(suffix, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const badBudget = { ...raw, messages: [...raw.messages.slice(0, -1), { ...system,
+    content: [{ type: "text", text: `${hook}\n\n<total_tokens>1e4 tokens left</total_tokens>`,
+      cache_control: marker }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(badBudget, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const extraKey = { ...raw, messages: [...raw.messages.slice(0, -1),
+    { ...system, extra: true }] } as ProxyBody;
+  assert.equal(validateBoxRequest(extraKey, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const ttl = { ...raw, messages: [...raw.messages.slice(0, -1), { role: "system",
+    content: [{ type: "text", text: `${hook}\n\n${budget}`,
+      cache_control: { type: "ephemeral", ttl: "1h" } }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(ttl, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const extraBlock = { ...raw, messages: [...raw.messages.slice(0, -1), { role: "system",
+    content: [{ type: "text", text: `${hook}\n\n${budget}`, cache_control: marker },
+      { type: "text", text: "no" }] }] } as ProxyBody;
+  assert.equal(validateBoxRequest(extraBlock, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const detached = { ...first, messages: [first.messages[0], system] } as ProxyBody;
+  const detachedOut = normalizeBoxSemanticBody(detached);
+  const detachedSystem = detachedOut.messages.at(-1) as { role?: string; content?: unknown };
+  assert.equal(detachedSystem.role, "system");
+  assert.equal(JSON.stringify(detachedSystem.content).includes(hook), true);
+  assert.equal(JSON.stringify(detachedSystem.content).includes(budget), true);
+  assert.throws(() => matchBoxToolResults({ ...raw, messages: [...raw.messages.slice(0, -1),
+    { ...result, content: [{ type: "tool_result", tool_use_id: "toolu_other", content: "x" }] },
+    system] } as ProxyBody, expected), /BOX_TOOL_RESULT_/);
 });
