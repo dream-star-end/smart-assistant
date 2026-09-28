@@ -4,9 +4,34 @@ import { assertOutbound, parseFrame, turnEvidence, turnPolicy } from "./user-con
 export async function coldUiLogin(page, options, password) {
   // A fresh context has no cookies, IndexedDB or service workers. Clear web storage
   // once on the landing page, never add an init script that would erase UI login.
-  await page.goto(options.base, { waitUntil: "domcontentloaded" });
+  const pageErrors = [];
+  let failedScripts = 0;
+  const onPageError = (error) => { if (pageErrors.length < 3) pageErrors.push(error.name); };
+  const onRequestFailed = (request) => {
+    if (request.resourceType() === "script") failedScripts++;
+  };
+  page.on("pageerror", onPageError);
+  page.on("requestfailed", onRequestFailed);
+  const landing = await page.goto(options.base, { waitUntil: "domcontentloaded" });
+  if (!landing?.ok()) throw new Error(`Cold landing HTTP ${landing?.status() ?? "no response"}`);
   await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); });
   if (await page.evaluate(() => localStorage.getItem("oc_auth_hint")) !== null) throw new Error("Cold context contains auth hint");
+  try {
+    // A cold master can be healthy before its browser has fetched and executed
+    // the UI bundle. Keep the real login requirement; only extend that bounded
+    // render wait, never substitute an API login or reuse an authenticated page.
+    await page.getByRole("button", { name: "登录", exact: true }).first()
+      .waitFor({ state: "visible", timeout: 60_000 });
+  } catch {
+    const state = await page.evaluate(() => ({ readyState: document.readyState,
+      rootChildren: document.getElementById("root")?.childElementCount ?? -1 }))
+      .catch(() => ({ readyState: "unavailable", rootChildren: -1 }));
+    throw new Error(`Cold login not rendered: ${JSON.stringify({
+      ...state, pageErrors, failedScripts })}`);
+  } finally {
+    page.off("pageerror", onPageError);
+    page.off("requestfailed", onRequestFailed);
+  }
   await page.getByRole("button", { name: "登录", exact: true }).first().click();
   const form = page.locator('form').filter({ has: page.locator('input[type="password"]') });
   await form.locator('input[type="email"]').fill(options.email);
