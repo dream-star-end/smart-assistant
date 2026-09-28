@@ -59,6 +59,19 @@ test("recovery evidence reads parent hashes, root permit, and fixed model mappin
       WHERE request_id='root-1'`);
     const missing = await journal.readDetachedUnknownRecovery(candidate);
     assert.deepEqual(missing, { ok: false, reason: "BOX_RECOVERY_ROOT_PERMIT_MISSING" });
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxLaunchPermit}','true'::jsonb)
+        || jsonb_build_object('boxResumeRevision','wrong-revision')
+      WHERE request_id='root-1'`);
+    const wrongRevision = await journal.readDetachedUnknownRecovery(candidate);
+    assert.deepEqual(wrongRevision, { ok: false, reason: "BOX_RECOVERY_REVISION_MISMATCH" });
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxResumeRevision}',to_jsonb($1::text))
+        || jsonb_build_object('boxResumeResultHashes',
+          '[{"contentHash":"${"2".repeat(64)}","isError":false}]'::jsonb)
+      WHERE request_id='root-1'`, [revision]);
+    const wrongKey = await journal.readDetachedUnknownRecovery(candidate);
+    assert.deepEqual(wrongKey, { ok: false, reason: "BOX_RECOVERY_PARENT_HASHES_MISSING" });
   } finally {
     client.release();
     await pool.end();

@@ -144,3 +144,62 @@ test("a failed_stopped winner is not overwritten after BOX_TOOL_CHAIN_INVALID", 
   assert.equal(completes, 1);
   assert.deepEqual(outcome, { status: "pending", reason: "BOX_RECOVERY_LOST_RACE" });
 });
+
+test("a catalog binding mismatch does not write or complete", async () => {
+  let writes = 0;
+  const outcome = await observeBoxToolTerminalOnly({
+    evidence: { ...evidence, catalogHash: "0".repeat(64) },
+    catalog, target: spool(finalRecords) as never }, {
+    writeMessage: async () => { writes++; throw new Error("must not write"); },
+    journal: { complete: async () => { throw new Error("must not complete"); },
+      completeToolChain: async () => { throw new Error("must not complete"); },
+      readRecoveryWinner: async () => null } as never });
+  assert.deepEqual(outcome, { status: "pending", reason: "BOX_RECOVERY_CATALOG_MISMATCH" });
+  assert.equal(writes, 0);
+});
+
+test("journal state committed with boxState unknown is not a terminal winner", async () => {
+  const echo = { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: use.id, content: "ok" }] } };
+  const { createHash } = await import("node:crypto");
+  const hash = createHash("sha256").update(JSON.stringify({
+    content: [{ type: "text", text: "ok" }], isError: false })).digest("hex");
+  const outcome = await observeBoxToolTerminalOnly({
+    evidence: { ...evidence, roundNo: 2, spoolOffset: 0,
+      resultHashes: [{ modelToolUseId: use.id, contentHash: hash, isError: false }] },
+    catalog, target: spool([echo, ...finalRecords.slice(1)]) as never }, {
+    writeMessage: async (id) => ({ version: 1 as const, ...id, bytes: 8,
+      sha256: "e".repeat(64) }),
+    journal: {
+      complete: async () => { throw new Error("not root"); },
+      completeToolChain: async () => {
+        throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+      },
+      readRecoveryWinner: async () => ({ state: "committed", boxState: "unknown",
+        proofReason: null }),
+    } as never });
+  assert.deepEqual(outcome, { status: "pending", reason: "BOX_TOOL_CHAIN_INVALID" });
+});
+
+test("journal state committed with boxState handoff is not a terminal winner", async () => {
+  const echo = { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: use.id, content: "ok" }] } };
+  const { createHash } = await import("node:crypto");
+  const hash = createHash("sha256").update(JSON.stringify({
+    content: [{ type: "text", text: "ok" }], isError: false })).digest("hex");
+  const outcome = await observeBoxToolTerminalOnly({
+    evidence: { ...evidence, roundNo: 2, spoolOffset: 0,
+      resultHashes: [{ modelToolUseId: use.id, contentHash: hash, isError: false }] },
+    catalog, target: spool([echo, ...finalRecords.slice(1)]) as never }, {
+    writeMessage: async (id) => ({ version: 1 as const, ...id, bytes: 8,
+      sha256: "e".repeat(64) }),
+    journal: {
+      complete: async () => { throw new Error("not root"); },
+      completeToolChain: async () => {
+        throw new BoxDurableJournalError("BOX_TOOL_CHAIN_INVALID");
+      },
+      readRecoveryWinner: async () => ({ state: "committed", boxState: "handoff",
+        proofReason: null }),
+    } as never });
+  assert.deepEqual(outcome, { status: "pending", reason: "BOX_TOOL_CHAIN_INVALID" });
+});

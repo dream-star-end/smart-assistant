@@ -131,6 +131,64 @@ test("worker_complete without a recovery writer stays pending and does not compl
   assert.equal(completes, 0);
 });
 
+test("cleanup retries after the first remote failure and marks done once", async () => {
+  let attempts = 0, marked = 0;
+  const worker = new BoxRemoteCleanupWorker({
+    journal: { listRemoteCleanupCandidates: async () => [candidate],
+      claimRemoteCleanup: async () => true,
+      markRemoteCleaned: async () => { marked++; },
+      listStoppedFailureProbeCandidates: async () => [] } as never,
+    resolver: { resolve: async () => ({ accountId: 20n,
+      exec: { run: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("synthetic first cleanup failure");
+        return { stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const };
+      } }, dispose: async () => {} }) as never } as never,
+  });
+  assert.equal((await worker.reconcileBatch()).cleaned, 0);
+  assert.equal(marked, 0);
+  assert.equal((await worker.reconcileBatch()).cleaned, 1);
+  assert.equal(marked, 1);
+  assert.equal(attempts, 2);
+});
+
+test("capsule or CAS failure does not run remote cleanup", async () => {
+  const remote = `/tmp/ocv5-289-run-${candidate.runNonce}`;
+  const { mkdirSync, writeFileSync, rmSync, existsSync } = await import("node:fs");
+  mkdirSync(remote, { mode: 0o700 });
+  writeFileSync(`${remote}/tool-catalog.json`, "{\"tools\":[]}");
+  let cleans = 0;
+  try {
+    const probe = { requestId: "box-keep", uid: 3n, accountId: 20n,
+      runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: true };
+    const worker = new BoxRemoteCleanupWorker({
+      journal: { listStoppedFailureProbeCandidates: async () => [probe],
+        claimStoppedFailureProbe: async () => true,
+        markFirstRoundStoppedFailure: async () => { throw new Error("not a failure"); },
+        markToolChainStoppedFailure: async () => { throw new Error("not a failure"); },
+        readDetachedUnknownRecovery: async () => ({ ok: false,
+          reason: "BOX_RECOVERY_REVISION_MISMATCH" }),
+        listRemoteCleanupCandidates: async () => [],
+        claimRemoteCleanup: async () => { cleans++; return true; },
+        markRemoteCleaned: async () => { cleans++; } } as never,
+      writeRecoveryMessage: async () => { throw new Error("capsule failed"); },
+      resolver: { resolve: async () => ({ accountId: 20n,
+        exec: { run: async (req: { args: string[] }) => {
+          if (req.args.some((arg) => arg.includes("tool-catalog") || arg.includes("cleanup"))) {
+            cleans++;
+          }
+          return { stdout: JSON.stringify({ runNonce: candidate.runNonce,
+            leaseEpoch: candidate.leaseEpoch, keeperPid: 101, cliPid: 102,
+            reason: "worker_complete", revision: 1 }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+        } }, dispose: async () => {} }) as never } as never,
+    });
+    assert.equal((await worker.reconcileBatch()).pending, 1);
+    assert.equal(cleans, 0);
+    assert.equal(existsSync(`${remote}/tool-catalog.json`), true);
+  } finally { rmSync(remote, { recursive: true, force: true }); }
+});
+
 test("missing terminal marker leaves unknown Box run fenced and never cleans", async () => {
   let stopped = 0, cleaned = 0;
   const probe = { requestId: "box-unknown", uid: 3n, accountId: 20n,

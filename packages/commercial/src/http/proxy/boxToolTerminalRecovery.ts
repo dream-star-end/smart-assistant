@@ -22,8 +22,11 @@ export type BoxToolTerminalRecovery =
 
 function winnerClosed(winner: BoxRecoveryWinner | null): boolean {
   if (!winner) return false;
-  return winner.boxState === "failed_stopped" || winner.boxState === "terminal"
-    || winner.state === "aborted" || winner.state === "committed";
+  // request_finalize_journal.state=committed is settlement, not a Box terminal.
+  if (winner.boxState === "failed_stopped") {
+    return winner.proofReason !== null && winner.proofReason !== "worker_complete";
+  }
+  return winner.boxState === "terminal" && winner.proofReason === "worker_complete";
 }
 
 export async function observeBoxToolTerminalOnly(input: {

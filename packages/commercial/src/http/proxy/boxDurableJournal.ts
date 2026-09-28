@@ -2121,7 +2121,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
       }
       seen.add(cursor);
-      const row = cursor === leaf.request_id ? leaf : await load(cursor);
+      const row: Row | null = cursor === leaf.request_id ? leaf : await load(cursor);
       if (!row?.ctx || row.ctx.boxInvocationRecovery !== "v1"
         || row.ctx.boxInvocationMode !== "detached_tool"
         || row.ctx.boxAccountId !== ctx.boxAccountId
@@ -2137,7 +2137,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           ? "BOX_RECOVERY_MODEL_UNMAPPED" : "BOX_RECOVERY_CHAIN_INVALID" };
       }
       rows.push(row);
-      const owner = row.ctx.boxOwnerRequestId;
+      const owner: unknown = row.ctx.boxOwnerRequestId;
       if (owner === undefined) cursor = null;
       else if (typeof owner === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(owner)) cursor = owner;
       else return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
@@ -2192,9 +2192,11 @@ export class BoxDurableJournal implements BoxJournalPort {
       rootRequestId: root.request_id, rootLaunchPermit: true, resultHashes } };
   }
 
-  /** Same-identity reread after a lost CAS. Not a second admission. */
-  async readRecoveryWinner(input: Pick<BoxStoppedFailureProbeCandidate,
-    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch">):
+  /** Same-identity reread after a lost CAS. Not a second admission.
+   * request_finalize_journal.state is settlement, not the Box terminal. */
+  async readRecoveryWinner(input: Pick<BoxDetachedUnknownRecovery,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"
+    | "sessionId" | "turnKey" | "model" | "roundNo">):
     Promise<BoxRecoveryWinner | null> {
     const found = await this.pool.query<{ state: string; ctx: Record<string, unknown> }>(
       `SELECT state,ctx FROM request_finalize_journal
@@ -2204,12 +2206,25 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (found.rowCount !== 1 || !row?.ctx
       || row.ctx.boxAccountId !== input.accountId.toString()
       || row.ctx.boxRunNonce !== input.runNonce
-      || row.ctx.boxLeaseEpoch !== input.leaseEpoch) return null;
-    const proof = row.ctx.boxTerminalProof;
-    const proofReason = proof && typeof proof === "object" && !Array.isArray(proof)
-      && typeof (proof as { reason?: unknown }).reason === "string"
-      ? (proof as { reason: string }).reason : null;
-    return { state: row.state, boxState: String(row.ctx.boxState ?? ""), proofReason };
+      || row.ctx.boxLeaseEpoch !== input.leaseEpoch
+      || row.ctx.boxSessionId !== input.sessionId
+      || row.ctx.boxTurnKey !== input.turnKey
+      || row.ctx.model !== input.model
+      || input.model !== "box-api-claude-opus-5-5"
+      || row.ctx.boxInvocationRecovery !== "v1"
+      || row.ctx.boxInvocationMode !== "detached_tool") return null;
+    const storedRound = row.ctx.boxRoundNo === undefined ? 1 : row.ctx.boxRoundNo;
+    if (storedRound !== input.roundNo) return null;
+    let proofReason: string | null = null;
+    if (row.ctx.boxTerminalProof !== undefined) {
+      try {
+        proofReason = parseBoxTerminalProof(
+          JSON.stringify(row.ctx.boxTerminalProof) + "\n",
+          { runNonce: input.runNonce, leaseEpoch: input.leaseEpoch }).reason;
+      } catch { proofReason = null; }
+    }
+    const boxState = typeof row.ctx.boxState === "string" ? row.ctx.boxState : "";
+    return { state: row.state, boxState, proofReason };
   }
 
   /** After a durable user stop, locate the one current HTTP leaf. The caller
