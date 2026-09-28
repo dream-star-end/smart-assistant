@@ -22,6 +22,14 @@ const ROOT = dirname(fileURLToPath(import.meta.url));
 const HOST = "/home/agent/.local/bin/host";
 const HOST_WT = "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-294-parallel-repro-wt";
 const FIXED = "74b42e09cd6404b230b4d86aa5cb813f383cebb7";
+const PRODUCT = [
+  "packages/commercial/src/http/proxy/boxToolInputHash.ts",
+  "packages/commercial/src/http/proxy/boxToolResultMatcher.ts",
+  "packages/commercial/src/http/proxy/boxCacheAnnotations.ts",
+  "packages/commercial/src/http/proxy/boxRequestGate.ts",
+  "packages/commercial/src/http/proxy/boxDurableJournal.ts",
+];
+const SCENE_MESSAGE = "msg_011CfVqHJANyQGbbttCBFMD6";
 const RUNNER = "/opt/openclaude/packages/gateway/dist/efficiencyHookRunner.cjs";
 const ALPHA_OLD = "ALPHA_OLD_TOKEN";
 const BETA_OLD = "BETA_OLD_TOKEN";
@@ -43,6 +51,30 @@ function hostText(command: string): string {
   const result = spawnSync(HOST, [command], { encoding: "utf8", timeout: 30_000 });
   if (result.status !== 0) throw new Error("HOST_COMMAND_FAILED");
   return result.stdout.trim();
+}
+function productPins(): Array<{ path: string; blob: string; work: string; same: boolean }> {
+  const script = PRODUCT.map((path) =>
+    `printf '%s %s %s\\n' ${JSON.stringify(path)} $(git -c safe.directory=${HOST_WT} -C ${HOST_WT} rev-parse ${FIXED}:${path}) $(git -c safe.directory=${HOST_WT} -C ${HOST_WT} hash-object ${JSON.stringify(path)})`).join("; ");
+  return hostText(script).split("\n").filter(Boolean).map((line) => {
+    const [path, blob, work] = line.split(" ");
+    return { path: path!, blob: blob!, work: work!, same: blob === work };
+  });
+}
+function sceneEdits(jsonl: string, target: string): Array<Record<string, unknown>> {
+  const found: Array<Record<string, unknown>> = [];
+  for (const line of readFileSync(jsonl, "utf8").split("\n")) {
+    if (!line) continue;
+    const row = JSON.parse(line) as { message?: { id?: string; content?: unknown } };
+    if (row.message?.id !== SCENE_MESSAGE || !Array.isArray(row.message.content)) continue;
+    for (const block of row.message.content) {
+      if (!block || typeof block !== "object") continue;
+      const tool = block as { type?: string; name?: string; input?: Record<string, unknown> };
+      if (tool.type !== "tool_use" || tool.name !== "Edit" || !tool.input) continue;
+      found.push({ ...tool.input, file_path: target });
+    }
+  }
+  if (found.length !== 2) throw new Error("SCENE_EDIT_COUNT");
+  return found;
 }
 
 function sse(res: ServerResponse, event: string, data: unknown): void {
@@ -78,8 +110,10 @@ function armGroup(child: ChildProcess): void {
 async function main(): Promise<void> {
   const version = spawnSync("/usr/local/bin/claude", ["--version"], { encoding: "utf8" }).stdout.trim();
   if (version !== "2.1.280 (Claude Code)") throw new Error("CC_VERSION_UNEXPECTED");
-  const sha = hostText(`git -c safe.directory=${HOST_WT} -C ${HOST_WT} rev-parse HEAD`);
-  if (sha !== FIXED) throw new Error("SHA_NOT_FIXED");
+  const head = hostText(`git -c safe.directory=${HOST_WT} -C ${HOST_WT} rev-parse HEAD`);
+  const pinsBefore = productPins();
+  if (pinsBefore.some((pin) => !pin.same)) throw new Error("PRODUCT_BLOB_DRIFT");
+  const scriptHash = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
   const run = randomBytes(8).toString("hex");
   const dir = join(tmpdir(), `ocv5-parallel-${run}`);
   const home = join(dir, "home");
@@ -87,10 +121,18 @@ async function main(): Promise<void> {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   mkdirSync(config, { recursive: true, mode: 0o700 });
   const target = join(dir, "sample.txt");
-  writeFileSync(target, `${ALPHA_OLD}\n${BETA_OLD}\nGAMMA_KEEP_LINE\n`, { mode: 0o600 });
+  const sceneAt = process.argv.indexOf("--scene-jsonl");
+  const sceneEditsFound = sceneAt >= 0 ? sceneEdits(process.argv[sceneAt + 1]!, target) : null;
+  const editA = sceneEditsFound ? sceneEditsFound[0]! : {
+    file_path: target, old_string: ALPHA_OLD, new_string: ALPHA_NEW, replace_all: false,
+  };
+  const editB = sceneEditsFound ? sceneEditsFound[1]! : {
+    file_path: target, old_string: BETA_OLD, new_string: BETA_NEW, replace_all: false,
+  };
+  const olds = [String(editA.old_string), String(editB.old_string)];
+  const news = [String(editA.new_string), String(editB.new_string)];
+  writeFileSync(target, `${olds[0]}\n${olds[1]}\nGAMMA_KEEP_LINE\n`, { mode: 0o600 });
   const readInput = { file_path: target, limit: 3 };
-  const editA = { file_path: target, old_string: ALPHA_OLD, new_string: ALPHA_NEW, replace_all: false };
-  const editB = { file_path: target, old_string: BETA_OLD, new_string: BETA_NEW, replace_all: false };
   const allow = { tuples: [
     { name: "Read", input: readInput },
     { name: "Edit", input: editA },
@@ -103,7 +145,7 @@ async function main(): Promise<void> {
     hooks: {
       PreToolUse: [
         { matcher: ".*", hooks: [{ type: "command",
-          command: `${process.execPath} ${JSON.stringify(guard)} ${JSON.stringify(allowPath)}`,
+          command: `${process.execPath} ${JSON.stringify(guard)} ${JSON.stringify(allowPath)} ${JSON.stringify(join(dir, "guard.jsonl"))}`,
           timeout: 4 }] },
         { matcher: "Bash|Shell", hooks: [{ type: "command",
           command: `${process.execPath} ${JSON.stringify(RUNNER)} --protocol=ccb --mode=warn`,
@@ -198,14 +240,14 @@ async function main(): Promise<void> {
     await new Promise<void>((done) => server.close(() => done()));
   }
   const edited = readFileSync(target, "utf8");
-  const fileOk = edited.includes(ALPHA_NEW) && edited.includes(BETA_NEW)
-    && !edited.includes(ALPHA_OLD) && !edited.includes(BETA_OLD);
+  const fileOk = news.every((text) => edited.includes(text)) && olds.every((text) => !edited.includes(text));
   if (!fileOk) fail("EDIT_FILE_NOT_BOTH");
   if (!stdout.includes(`PARALLEL_NONCE:${nonce}`)) fail("NONCE_MISSING");
   const hostWire = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-parallel-wire-${run}.json`;
   const hostOffline = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-parallel-offline-${run}.json`;
   exclusiveWrite(wireContainer, `${JSON.stringify({
-    labeled: "native-ccb-loopback", sha, run, raws,
+    labeled: sceneEditsFound ? "native-ccb-loopback-scene-params" : "native-ccb-loopback",
+    head, productBase: FIXED, scriptHash, run, raws,
     rawSha256: raws.map((raw) => createHash("sha256").update(raw).digest("hex")),
     bodies, sent,
   })}\n`);
@@ -214,8 +256,14 @@ async function main(): Promise<void> {
   ], { encoding: "utf8", timeout: 60_000 });
   if (verified.status !== 0) fail("OFFLINE_FAILED");
   exclusiveWrite(offlineContainer, verified.stdout.trim().split("\n").filter((line) => line.startsWith("{")).at(-1) ?? "{}\n");
+  const pinsAfter = productPins();
+  if (pinsAfter.some((pin, index) => pin.blob !== pinsBefore[index]?.blob || !pin.same)) {
+    fail("PRODUCT_BLOB_CHANGED");
+  }
   const receipt = {
-    success: firstFailure === null && exitCode === 0, sha, version, run, exitCode, firstFailure,
+    success: firstFailure === null && exitCode === 0, head, productBase: FIXED,
+    headIsNotProductIdentity: true, scriptHash, pins: pinsBefore.map((pin) => pin.blob),
+    version, run, exitCode, firstFailure, scene: Boolean(sceneEditsFound),
     http: bodies.length, sent: sent.map((item) => ({ id: item.id, name: item.name,
       inputKeys: Object.keys(item.input).sort() })),
     fileOk, wireContainer, offlineContainer, hostWire, hostOffline,
@@ -226,7 +274,7 @@ async function main(): Promise<void> {
     stderrTail: stderr.slice(-500),
   };
   exclusiveWrite(outPath, `${JSON.stringify(receipt)}\n`);
-  process.stdout.write(`${JSON.stringify({ success: receipt.success, sha, run, exitCode,
+  process.stdout.write(`${JSON.stringify({ success: receipt.success, head, run, exitCode,
     firstFailure, http: bodies.length, outPath, wireContainer, offlineContainer })}\n`);
   process.exit(receipt.success ? 0 : 2);
 }

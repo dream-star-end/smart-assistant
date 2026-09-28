@@ -40,7 +40,15 @@ async function main() {
   let allow = { tuples: [] };
   try { allow = JSON.parse(readFileSync(process.argv[2] ?? "", "utf8")); }
   catch { allow = { tuples: [] }; }
-  process.stdout.write(`${JSON.stringify(response(decide(event, allow)))}\n`);
+  const decision = decide(event, allow);
+  if (process.argv[3]) {
+    const { appendFileSync } = await import("node:fs");
+    const input = event && event.tool_input && typeof event.tool_input === "object" ? event.tool_input : {};
+    appendFileSync(process.argv[3], `${JSON.stringify({
+      decision, name: event && event.tool_name, keys: Object.keys(input).sort(),
+    })}\n`);
+  }
+  process.stdout.write(`${JSON.stringify(response(decision))}\n`);
 }
 
 if (process.argv[1] && process.argv[1].endsWith("readEditGuard.mjs") && process.argv[2]) {
