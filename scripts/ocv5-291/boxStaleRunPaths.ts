@@ -17,6 +17,16 @@ for key,path in paths.items():
  except FileNotFoundError:out[key]={'present':False};continue
  out[key]={'present':True,'kind':'dir' if stat.S_ISDIR(s.st_mode) else 'file' if stat.S_ISREG(s.st_mode) else 'other',
   'mode':stat.S_IMODE(s.st_mode),'owner':s.st_uid==os.getuid(),'bytes':s.st_size,'nlink':s.st_nlink}
+own={os.getpid(),os.getppid()};matches=0
+for item in os.listdir('/proc'):
+ if not item.isdecimal() or int(item) in own:continue
+ try:
+  p='/proc/'+item+'/cmdline';st=os.stat(p)
+  if st.st_uid!=os.getuid():continue
+  with open(p,'rb') as f:raw=f.read(8192)
+  if nonce.encode() in raw:matches+=1
+ except (FileNotFoundError,ProcessLookupError,PermissionError):continue
+out['matchingRunProcesses']=matches
 print(json.dumps(out,sort_keys=True))`;
 async function main(): Promise<void> {
   const nonce = process.env.OCV5_291_EXPECT_RUN_NONCE ?? "";
@@ -41,7 +51,8 @@ async function main(): Promise<void> {
       environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } },
     { timeoutMs: 10_000, maxResponseBytes: 2048, signal: abort.signal });
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
-    if (Object.keys(parsed).sort().join(",") !== "proof,run,runner,stderr,stdout")
+    if (Object.keys(parsed).sort().join(",") !==
+      "matchingRunProcesses,proof,run,runner,stderr,stdout")
       throw new Error("BOX_PATHS_FRAME_INVALID");
     process.stdout.write(JSON.stringify(parsed) + "\n");
   } finally {
