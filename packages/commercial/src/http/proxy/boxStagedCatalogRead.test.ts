@@ -10,7 +10,8 @@ import { BoxExecTransport } from "./boxExecTransport.js";
 import { createBoxReplayReader, createBoxReplayWriter } from "../../egress/boxReplaySetup.js";
 import { compileBoxToolCatalog, rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
 import { observeBoxToolTerminalOnly } from "./boxToolTerminalRecovery.js";
-import { makeBoxStagedCatalogRead, readBoxStagedToolCatalog } from "./boxStagedCatalogRead.js";
+import { BoxStagedCatalogReadError, makeBoxStagedCatalogRead,
+  readBoxStagedToolCatalog } from "./boxStagedCatalogRead.js";
 
 test("catalog read script rejects symlink, loose mode and bad utf-8", async () => {
   const nonce = randomBytes(12).toString("hex");
@@ -104,6 +105,8 @@ test("chunked catalog read stays inside one Connect frame and still closes", asy
   if (!selected) throw new Error("a legal catalog must exceed one framed Exec response");
   const admitted = selected;
   const file = Buffer.from(admitted.json);
+  assert.equal(Buffer.byteLength(description), 9900);
+  assert.equal(file.length, 805264);
   let calls = 0;
   let largestFrame = 0;
   const nonce = "a".repeat(24);
@@ -188,4 +191,60 @@ test("chunked catalog read stays inside one Connect frame and still closes", asy
     assert.equal(completes, 1);
     assert.ok(largestFrame <= 1_048_576);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+function framedCatalog(file: Buffer, alter?: (call: number) => { ino: string; offsetDelta: number }):
+  BoxExecTransport {
+  let calls = 0;
+  return new BoxExecTransport(
+    { execUrl: "https://offline.invalid/exec", execToken: "synthetic", networkToken: "synthetic" },
+    async (_url, init) => {
+      const body = Buffer.from(init.body as Uint8Array);
+      const request = JSON.parse(body.subarray(5).toString("utf8")) as { args: string[] };
+      const offset = Number(request.args[4]);
+      const limit = Number(request.args[5]);
+      calls += 1;
+      const change = alter?.(calls) ?? { ino: "9", offsetDelta: 0 };
+      const slice = file.subarray(offset, offset + limit);
+      const stdout = JSON.stringify({ data: slice.toString("base64"), dev: "7",
+        ino: change.ino, offset: offset + change.offsetDelta, size: file.length });
+      const wire = Buffer.concat([
+        connectFrame({ stdoutEvent: { data: stdout } }),
+        connectFrame({ exitEvent: {} }),
+        connectFrame({}, 2),
+      ]);
+      assert.ok(wire.length <= 1_048_576, `frame ${wire.length}`);
+      return new Response(wire, { status: 200 });
+    }, async () => {});
+}
+
+test("near-1MiB catalog frames in chunks and a changed chunk identity is rejected", async () => {
+  const description = "Example: {\"path\":\"docs/a.txt\",\"mode\":\"read\"}\n".repeat(220);
+  const near = compileBoxToolCatalog(Array.from({ length: 87 }, (_, index) => ({
+    name: `read_doc_${index}`, description,
+    input_schema: { type: "object", properties: { path: { type: "string" } } },
+  })));
+  const file = Buffer.from(near.json);
+  assert.equal(file.length, 1_045_644);
+  assert.ok(file.length <= 1_048_576);
+  const whole = Buffer.concat([
+    connectFrame({ stdoutEvent: { data: near.json } }),
+    connectFrame({ exitEvent: {} }),
+    connectFrame({}, 2),
+  ]);
+  assert.ok(whole.length > 1_048_576);
+  const read = await readBoxStagedToolCatalog({
+    exec: framedCatalog(file), runNonce: "b".repeat(24) });
+  assert.equal(rehydrateBoxToolCatalog(read.json).bindingSha256, near.bindingSha256);
+  const bytes = Buffer.alloc(300_000, 0x61);
+  await assert.rejects(() => readBoxStagedToolCatalog({
+    exec: framedCatalog(bytes, (call) => ({ ino: call === 2 ? "99" : "9", offsetDelta: 0 })),
+    runNonce: "c".repeat(24) }),
+  (error: unknown) => error instanceof BoxStagedCatalogReadError
+    && error.code === "BOX_CATALOG_READ_INVALID");
+  await assert.rejects(() => readBoxStagedToolCatalog({
+    exec: framedCatalog(bytes, (call) => ({ ino: "9", offsetDelta: call === 2 ? 1 : 0 })),
+    runNonce: "d".repeat(24) }),
+  (error: unknown) => error instanceof BoxStagedCatalogReadError
+    && error.code === "BOX_CATALOG_READ_INVALID");
 });

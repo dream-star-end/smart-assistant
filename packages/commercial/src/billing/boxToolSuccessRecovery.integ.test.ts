@@ -1,14 +1,16 @@
 /** TEMP or a private schema only. Never writes public financial tables or Box. */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { Pool } from "pg";
 import { recoverBoxBillingRequest } from "./boxBillingRecovery.js";
 import { BoxDurableJournal, BoxDurableJournalError } from "../http/proxy/boxDurableJournal.js";
+import { BoxRemoteCleanupWorker } from "../http/proxy/boxRemoteCleanupWorker.js";
 import { compileBoxToolCatalog } from "../http/proxy/boxToolCatalog.js";
 import { observeBoxToolTerminalOnly } from "../http/proxy/boxToolTerminalRecovery.js";
 import { createBoxReplayReader, createBoxReplayWriter } from "../egress/boxReplaySetup.js";
@@ -316,5 +318,262 @@ test("two connections racing completeToolChain leave one terminal leaf",
     await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     client.release();
     await admin.end();
+  }
+});
+
+function roundOneSpool(): Buffer {
+  const records = [
+    { type: "system", subtype: "init", tools: ["mcp__ocbridge__t0"], mcp_servers: [{}] },
+    event({ type: "message_start", message: { id: "msg_gap", model, role: "assistant",
+      content: [], usage: { input_tokens: 3, output_tokens: 0, cache_read_input_tokens: 1,
+        cache_creation_input_tokens: 2 } } }),
+    event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } }),
+    { type: "assistant", message: { id: "msg_gap", model, role: "assistant",
+      content: [{ type: "text", text: "done" }] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 3, output_tokens: 4 } }),
+    event({ type: "message_stop" }),
+    { type: "result", subtype: "success", is_error: false,
+      usage: { input_tokens: 90, output_tokens: 80, cache_read_input_tokens: 1,
+        cache_creation_input_tokens: 2 } },
+  ];
+  return Buffer.from(records.map((item) => JSON.stringify(item) + "\n").join(""));
+}
+
+function stageRun(nonce: string, json: string | null): string {
+  const run = `/tmp/ocv5-289-run-${nonce}`;
+  mkdirSync(run, { mode: 0o700 });
+  chmodSync(run, 0o700);
+  if (json !== null) {
+    writeFileSync(`${run}/tool-catalog.json`, json);
+    chmodSync(`${run}/tool-catalog.json`, 0o600);
+  }
+  return run;
+}
+
+function remoteRun(raw: Buffer, proof: { runNonce: string; leaseEpoch: string;
+  keeperPid: number; cliPid: number; reason: string; revision: number;
+  workerExitCode?: number }) {
+  return async (req: { command: string; args: string[] }) => {
+    const script = String(req.args[2] ?? "");
+    if (req.args[5] === "--read") {
+      const offset = Number(req.args[7]);
+      const bytes = raw.subarray(Number.isSafeInteger(offset) ? offset : raw.length);
+      return { stdout: JSON.stringify({ data: bytes.toString("base64"),
+        offset: (Number.isSafeInteger(offset) ? offset : raw.length) + bytes.length }),
+      stderrBytes: 0, exitCode: 0 as const };
+    }
+    if (script.includes("terminal.json")) {
+      return { stdout: JSON.stringify(proof) + "\n", stderrBytes: 0, exitCode: 0 as const };
+    }
+    const child = spawnSync(req.command, req.args, { encoding: "utf8" });
+    if (child.status !== 0) throw new Error(`remote exit ${child.status ?? "signal"}`);
+    return { stdout: child.stdout, stderrBytes: Buffer.byteLength(child.stderr ?? ""),
+      exitCode: 0 as const };
+  };
+}
+
+async function ledgerCount(client: import("pg").PoolClient, userId: bigint): Promise<number> {
+  const found = await client.query<{ n: string }>(
+    `SELECT (SELECT COUNT(*) FROM usage_records WHERE user_id=$1)
+       + (SELECT COUNT(*) FROM credit_ledger WHERE user_id=$1) AS n`,
+    [userId.toString()]);
+  return Number(found.rows[0]?.n ?? "0");
+}
+
+test("a real catalog read plus a capsule write failure does not settle or clean",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl, max: 1 });
+  const client = await pool.connect();
+  const nonce = randomBytes(12).toString("hex");
+  const run = stageRun(nonce, catalog.json);
+  try {
+    await shadow(client);
+    const same = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as unknown as Pool;
+    const userId = 900_000_221n;
+    const epoch = randomBytes(16).toString("hex");
+    const turn = "f".repeat(64);
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits) VALUES
+      ('gap-throw',$1,'inflight',$2::jsonb,0)`, [userId.toString(), JSON.stringify({
+        model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
+        boxInvocationMode: "detached_tool", boxAccountId: "20", boxRunNonce: nonce,
+        boxLeaseEpoch: epoch, boxSessionId: "gap-throw", boxTurnKey: turn,
+        boxCatalogHash: catalog.bindingSha256, boxDetachedRunnerHash: "d".repeat(64),
+        boxState: "unknown", boxLaunchPermit: true,
+        boxCancelIntent: { version: 1, at: "before-proof" },
+        billingPricing: { v: 1, modelId: "box-api-claude-opus-5-5", displayName: "Opus",
+          inputPerMtok: "100000000", outputPerMtok: "100000000",
+          cacheReadPerMtok: "100000000", cacheWritePerMtok: "100000000", multiplier: "1" } })]);
+    const proof = { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
+      reason: "worker_complete", revision: 1 };
+    let writes = 0;
+    const worker = new BoxRemoteCleanupWorker({
+      journal: new BoxDurableJournal(same),
+      writeRecoveryMessage: async () => { writes += 1; throw new Error("capsule failed"); },
+      resolver: { resolve: async () => ({ accountId: 20n,
+        exec: { run: remoteRun(roundOneSpool(), proof) }, dispose: async () => {} }) as never },
+    });
+    assert.equal((await worker.reconcileBatch()).pending, 1);
+    assert.equal(writes, 1);
+    const row = await client.query<{ state: string; box: string; cleaned: string | null }>(
+      `SELECT state, ctx->>'boxState' AS box, ctx->>'boxRemoteCleanup' AS cleaned
+         FROM request_finalize_journal WHERE request_id='gap-throw'`);
+    assert.equal(row.rows[0]?.state, "inflight");
+    assert.equal(row.rows[0]?.box, "unknown");
+    assert.equal(row.rows[0]?.cleaned, null);
+    assert.equal(await ledgerCount(client, userId), 0);
+    assert.equal(existsSync(`${run}/tool-catalog.json`), true);
+  } finally {
+    client.release();
+    await pool.end();
+    rmSync(run, { recursive: true, force: true });
+  }
+});
+
+test("a real capsule followed by a stop CAS does not bill or delete the remote catalog",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl, max: 1 });
+  const client = await pool.connect();
+  const nonce = randomBytes(12).toString("hex");
+  const run = stageRun(nonce, catalog.json);
+  const capsuleRoot = mkdtempSync(join(tmpdir(), "ocv5-stop-"));
+  try {
+    await shadow(client);
+    const same = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as unknown as Pool;
+    const journal = new BoxDurableJournal(same);
+    const userId = 900_000_222n;
+    const epoch = randomBytes(16).toString("hex");
+    const turn = "e".repeat(64);
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits) VALUES
+      ('gap-stop',$1,'inflight',$2::jsonb,0)`, [userId.toString(), JSON.stringify({
+        model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
+        boxInvocationMode: "detached_tool", boxAccountId: "20", boxRunNonce: nonce,
+        boxLeaseEpoch: epoch, boxSessionId: "gap-stop", boxTurnKey: turn,
+        boxCatalogHash: catalog.bindingSha256, boxDetachedRunnerHash: "d".repeat(64),
+        boxState: "unknown", boxLaunchPermit: true,
+        boxCancelIntent: { version: 1, at: "before-proof" },
+        billingPricing: { v: 1, modelId: "box-api-claude-opus-5-5", displayName: "Opus",
+          inputPerMtok: "100000000", outputPerMtok: "100000000",
+          cacheReadPerMtok: "100000000", cacheWritePerMtok: "100000000", multiplier: "1" } })]);
+    const proof = { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
+      reason: "worker_complete" as const, revision: 1 as const };
+    const writer = createBoxReplayWriter(true, join(capsuleRoot, "state"));
+    const reader = createBoxReplayReader(join(capsuleRoot, "state"));
+    assert.ok(writer && reader);
+    let pointer: Awaited<ReturnType<typeof writer>> | undefined;
+    const worker = new BoxRemoteCleanupWorker({
+      journal,
+      writeRecoveryMessage: async (id, message) => {
+        pointer = await writer(id, message);
+        await journal.markFirstRoundStoppedFailure({ requestId: "gap-stop", uid: userId,
+          leaseEpoch: epoch, proof: { ...proof, reason: "worker_failed", revision: 2,
+            workerExitCode: 7 } });
+        return pointer;
+      },
+      resolver: { resolve: async () => ({ accountId: 20n,
+        exec: { run: remoteRun(roundOneSpool(), proof) }, dispose: async () => {} }) as never },
+    });
+    assert.equal((await worker.reconcileBatch()).cleaned, 0);
+    assert.ok(pointer);
+    assert.equal((await reader(pointer) as { id?: string }).id, "msg_gap");
+    const row = await client.query<{ state: string; box: string; cleaned: string | null;
+      replay: unknown }>(
+      `SELECT state, ctx->>'boxState' AS box, ctx->>'boxRemoteCleanup' AS cleaned,
+              ctx->'boxReplayMessage' AS replay
+         FROM request_finalize_journal WHERE request_id='gap-stop'`);
+    assert.equal(row.rows[0]?.state, "aborted");
+    assert.equal(row.rows[0]?.box, "failed_stopped");
+    assert.equal(row.rows[0]?.replay, null);
+    assert.notEqual(row.rows[0]?.cleaned, "done");
+    assert.equal(await ledgerCount(client, userId), 0);
+    assert.equal(existsSync(`${run}/tool-catalog.json`), true);
+  } finally {
+    client.release();
+    await pool.end();
+    rmSync(run, { recursive: true, force: true });
+    rmSync(capsuleRoot, { recursive: true, force: true });
+  }
+});
+
+test("cancel intent survives a second tick and cleanup retries on the temp journal",
+  { skip: !testDatabaseUrl }, async () => {
+  const pool = new Pool({ connectionString: testDatabaseUrl, max: 1 });
+  const client = await pool.connect();
+  const nonce = randomBytes(12).toString("hex");
+  const run = stageRun(nonce, null);
+  const capsuleRoot = mkdtempSync(join(tmpdir(), "ocv5-tick-"));
+  try {
+    await shadow(client);
+    const same = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as unknown as Pool;
+    const journal = new BoxDurableJournal(same);
+    const userId = 900_000_223n;
+    const epoch = randomBytes(16).toString("hex");
+    const turn = "9".repeat(64);
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits) VALUES
+      ('gap-tick',$1,'inflight',$2::jsonb,0)`, [userId.toString(), JSON.stringify({
+        model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
+        boxInvocationMode: "detached_tool", boxAccountId: "20", boxRunNonce: nonce,
+        boxLeaseEpoch: epoch, boxSessionId: "gap-tick", boxTurnKey: turn,
+        boxCatalogHash: catalog.bindingSha256, boxDetachedRunnerHash: "d".repeat(64),
+        boxState: "unknown", boxLaunchPermit: true,
+        boxCancelIntent: { version: 1, at: "before-proof" },
+        billingPricing: { v: 1, modelId: "box-api-claude-opus-5-5", displayName: "Opus",
+          inputPerMtok: "100000000", outputPerMtok: "100000000",
+          cacheReadPerMtok: "100000000", cacheWritePerMtok: "100000000", multiplier: "1" } })]);
+    const proof = { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
+      reason: "worker_complete", revision: 1 };
+    const writer = createBoxReplayWriter(true, join(capsuleRoot, "state"));
+    assert.ok(writer);
+    const worker = new BoxRemoteCleanupWorker({
+      journal, writeRecoveryMessage: writer,
+      resolver: { resolve: async () => ({ accountId: 20n,
+        exec: { run: remoteRun(roundOneSpool(), proof) }, dispose: async () => {} }) as never },
+    });
+    assert.equal((await worker.reconcileBatch()).pending, 1);
+    assert.equal(existsSync(`${run}/tool-catalog.json`), false);
+    writeFileSync(`${run}/tool-catalog.json`, catalog.json);
+    chmodSync(`${run}/tool-catalog.json`, 0o600);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxStopProbeAfterMs":1700000000000}'::jsonb
+      WHERE request_id='gap-tick'`);
+    const closed = await worker.reconcileBatch();
+    assert.equal(closed.cleaned, 0);
+    const mid = await client.query<{ box: string; intent: string | null; usage: unknown }>(
+      `SELECT ctx->>'boxState' AS box, ctx->'boxCancelIntent'->>'at' AS intent,
+              ctx->'boxUsage' AS usage
+         FROM request_finalize_journal WHERE request_id='gap-tick'`);
+    assert.equal(mid.rows[0]?.box, "terminal");
+    assert.equal(mid.rows[0]?.intent, "before-proof");
+    assert.deepEqual(mid.rows[0]?.usage, { inputTokens: 3, outputTokens: 4,
+      cacheReadTokens: 1, cacheWriteTokens: 2 });
+    assert.equal(await ledgerCount(client, userId), 0);
+    assert.equal(existsSync(`${run}/tool-catalog.json`), true);
+    writeFileSync(`${run}/stdout.jsonl`, "");
+    writeFileSync(`${run}/stderr.log`, "");
+    chmodSync(`${run}/stdout.jsonl`, 0o600);
+    chmodSync(`${run}/stderr.log`, 0o600);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx || '{"boxRemoteCleanupRetryAfterMs":1700000000000}'::jsonb
+      WHERE request_id='gap-tick'`);
+    assert.equal((await worker.reconcileBatch()).cleaned, 1);
+    const done = await client.query<{ cleaned: string | null }>(
+      `SELECT ctx->>'boxRemoteCleanup' AS cleaned FROM request_finalize_journal
+        WHERE request_id='gap-tick'`);
+    assert.equal(done.rows[0]?.cleaned, "done");
+    assert.equal(existsSync(`${run}/tool-catalog.json`), false);
+    assert.equal(await ledgerCount(client, userId), 0);
+  } finally {
+    client.release();
+    await pool.end();
+    rmSync(run, { recursive: true, force: true });
+    rmSync(capsuleRoot, { recursive: true, force: true });
   }
 });
