@@ -4888,7 +4888,7 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box detached tool chain can finish with worker_complete while the local journal leaf stays unknown if the user does not retry. The shared-leader stop probe treated that proof as pending, so the seat, capsule and per-request usage were not closed.",
       "rootFixCommit": "d9879ab2",
-      "coverageCommits": ["d9879ab2", "cee76e0c", "990dd064"],
+      "coverageCommits": ["d9879ab2", "cee76e0c", "990dd064", "78906790"],
       "regressions": [
         {
           "layer": "unit",
@@ -4914,6 +4914,36 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxStagedCatalogRead.test.ts",
           "assertion": "near-1MiB catalog frames in chunks and a changed chunk identity is rejected"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "third-round unknown closes once and settles each original request"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "two connections racing completeToolChain leave one terminal leaf"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "a real catalog read plus a capsule write failure does not settle or clean"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "a real capsule followed by a stop CAS does not bill or delete the remote catalog"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "cancel intent survives a second tick and cleanup retries on the temp journal"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "unknown worker_complete closed through reconcileBatch to a readable capsule and this-round usage"
         },
         {
           "layer": "deploy-gate",
