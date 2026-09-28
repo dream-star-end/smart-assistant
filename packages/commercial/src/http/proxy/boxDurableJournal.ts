@@ -165,6 +165,38 @@ export interface BoxStoppedFailureProbeCandidate {
   readonly leaseEpoch: string;
   readonly linked: boolean;
 }
+export type BoxRecoveryRejectReason =
+  | "BOX_RECOVERY_NOT_UNKNOWN_LEAF"
+  | "BOX_RECOVERY_CHAIN_INVALID"
+  | "BOX_RECOVERY_ROOT_PERMIT_MISSING"
+  | "BOX_RECOVERY_PARENT_HASHES_MISSING"
+  | "BOX_RECOVERY_REVISION_MISMATCH"
+  | "BOX_RECOVERY_MODEL_UNMAPPED"
+  | "BOX_RECOVERY_EVIDENCE_MISSING";
+export interface BoxDetachedUnknownRecovery {
+  readonly requestId: string;
+  readonly uid: bigint;
+  readonly accountId: bigint;
+  readonly runNonce: string;
+  readonly leaseEpoch: string;
+  readonly sessionId: string;
+  readonly turnKey: string;
+  readonly model: "box-api-claude-opus-5-5";
+  readonly upstreamModel: "claude-opus-5-5";
+  readonly roundNo: number;
+  readonly spoolOffset: number;
+  readonly catalogHash: string;
+  readonly detachedRunnerHash: string;
+  readonly rootRequestId: string;
+  readonly rootLaunchPermit: true;
+  readonly resultHashes: readonly { modelToolUseId: string; contentHash: string;
+    isError: boolean }[] | null;
+}
+export interface BoxRecoveryWinner {
+  readonly state: string;
+  readonly boxState: string;
+  readonly proofReason: string | null;
+}
 
 /** Cleanup never promotes a stopped failure to a successful model result. */
 function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): boolean {
@@ -303,6 +335,26 @@ async function lockChainSession(client: PoolClient, uid: bigint,
   }
   await lock(client, [`box:session:${uid}:${sessionId}`]);
   return sessionId;
+}
+
+function parseRecoveryResultHashes(raw: unknown):
+  BoxDetachedUnknownRecovery["resultHashes"] | null {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 32
+    || raw.some((item, index) => !Object.hasOwn(raw, index))) return null;
+  if (raw.some((item) => !item || typeof item !== "object" || Array.isArray(item)
+    || Object.keys(item).sort().join(",") !== "contentHash,isError,modelToolUseId"
+    || typeof (item as { modelToolUseId?: unknown }).modelToolUseId !== "string"
+    || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test((item as { modelToolUseId: string }).modelToolUseId)
+    || typeof (item as { contentHash?: unknown }).contentHash !== "string"
+    || !/^[a-f0-9]{64}$/.test((item as { contentHash: string }).contentHash)
+    || typeof (item as { isError?: unknown }).isError !== "boolean")) return null;
+  const hashes = raw.map((item) => {
+    const row = item as { modelToolUseId: string; contentHash: string; isError: boolean };
+    return { modelToolUseId: row.modelToolUseId, contentHash: row.contentHash,
+      isError: row.isError };
+  });
+  if (new Set(hashes.map((item) => item.modelToolUseId)).size !== hashes.length) return null;
+  return hashes;
 }
 
 export class BoxDurableJournal implements BoxJournalPort {
@@ -2016,6 +2068,163 @@ export class BoxDurableJournal implements BoxJournalPort {
       [input.requestId, input.uid.toString(), input.accountId.toString(),
         input.runNonce, input.leaseEpoch, input.linked]);
     return changed.rowCount === 1;
+  }
+
+  /** Read-only chain evidence for one already selected unknown leaf.
+   * Does not admit, launch, or copy prompt bytes. resultHashes come from the
+   * direct parent row, never from the leaf. */
+  async readDetachedUnknownRecovery(input: BoxStoppedFailureProbeCandidate):
+    Promise<{ ok: true; evidence: BoxDetachedUnknownRecovery }
+      | { ok: false; reason: BoxRecoveryRejectReason }> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)) {
+      return { ok: false, reason: "BOX_RECOVERY_EVIDENCE_MISSING" };
+    }
+    type Row = { request_id: string; state: string; ctx: Record<string, unknown> };
+    const load = async (requestId: string): Promise<Row | null> => {
+      const found = await this.pool.query<Row>(
+        `SELECT request_id,state,ctx FROM request_finalize_journal
+          WHERE request_id=$1 AND user_id=$2`,
+        [requestId, input.uid.toString()]);
+      return found.rowCount === 1 ? found.rows[0] ?? null : null;
+    };
+    const leaf = await load(input.requestId);
+    if (!leaf?.ctx) return { ok: false, reason: "BOX_RECOVERY_NOT_UNKNOWN_LEAF" };
+    const ctx = leaf.ctx;
+    if (ctx.boxAccountId !== input.accountId.toString()
+      || ctx.boxRunNonce !== input.runNonce || ctx.boxLeaseEpoch !== input.leaseEpoch) {
+      return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
+    }
+    if (leaf.state !== "inflight" || ctx.boxInvocationMode !== "detached_tool"
+      || ctx.boxState !== "unknown" || ctx.boxInvocationRecovery !== "v1"
+      || ctx.boxResumeRequestId !== undefined || ctx.boxToolHandoff !== undefined
+      || ctx.boxReplayMessage !== undefined || ctx.boxTerminalProof !== undefined) {
+      return { ok: false, reason: "BOX_RECOVERY_NOT_UNKNOWN_LEAF" };
+    }
+    if (ctx.model !== "box-api-claude-opus-5-5"
+      || (ctx.boxUpstreamModel !== undefined && ctx.boxUpstreamModel !== "claude-opus-5-5")) {
+      return { ok: false, reason: "BOX_RECOVERY_MODEL_UNMAPPED" };
+    }
+    if (typeof ctx.boxSessionId !== "string" || ctx.boxSessionId.length < 1
+      || typeof ctx.boxTurnKey !== "string" || !/^[a-f0-9]{64}$/.test(ctx.boxTurnKey)
+      || typeof ctx.boxCatalogHash !== "string" || !/^[a-f0-9]{64}$/.test(ctx.boxCatalogHash)
+      || typeof ctx.boxDetachedRunnerHash !== "string"
+      || !/^[a-f0-9]{64}$/.test(ctx.boxDetachedRunnerHash)) {
+      return { ok: false, reason: "BOX_RECOVERY_EVIDENCE_MISSING" };
+    }
+    const rows: Row[] = [];
+    const seen = new Set<string>();
+    let cursor: string | null = leaf.request_id;
+    while (cursor !== null) {
+      if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) {
+        return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
+      }
+      seen.add(cursor);
+      const row: Row | null = cursor === leaf.request_id ? leaf : await load(cursor);
+      if (!row?.ctx || row.ctx.boxInvocationRecovery !== "v1"
+        || row.ctx.boxInvocationMode !== "detached_tool"
+        || row.ctx.boxAccountId !== ctx.boxAccountId
+        || row.ctx.boxRunNonce !== ctx.boxRunNonce
+        || row.ctx.boxLeaseEpoch !== ctx.boxLeaseEpoch
+        || row.ctx.boxSessionId !== ctx.boxSessionId
+        || row.ctx.boxTurnKey !== ctx.boxTurnKey
+        || row.ctx.model !== "box-api-claude-opus-5-5"
+        || (row.ctx.boxUpstreamModel !== undefined
+          && row.ctx.boxUpstreamModel !== "claude-opus-5-5")) {
+        return { ok: false, reason: row?.ctx?.model !== undefined
+          && row.ctx.model !== "box-api-claude-opus-5-5"
+          ? "BOX_RECOVERY_MODEL_UNMAPPED" : "BOX_RECOVERY_CHAIN_INVALID" };
+      }
+      rows.push(row);
+      const owner: unknown = row.ctx.boxOwnerRequestId;
+      if (owner === undefined) cursor = null;
+      else if (typeof owner === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(owner)) cursor = owner;
+      else return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
+    }
+    const root = rows[rows.length - 1]!;
+    if (root.ctx.boxLaunchPermit !== true) {
+      return { ok: false, reason: "BOX_RECOVERY_ROOT_PERMIT_MISSING" };
+    }
+    const roundNo = ctx.boxRoundNo === undefined
+      ? (rows.length === 1 ? 1 : Number.NaN) : ctx.boxRoundNo;
+    if (!Number.isSafeInteger(roundNo) || Number(roundNo) < 1
+      || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== Number(roundNo)) {
+      return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
+    }
+    const spoolOffset = Number(roundNo) === 1 ? 0 : ctx.boxResumeSpoolOffset;
+    if (!Number.isSafeInteger(spoolOffset) || Number(spoolOffset) < 0
+      || Number(spoolOffset) > BOX_TOOL_SPOOL_MAX_BYTES
+      || (Number(roundNo) === 1 && spoolOffset !== 0)
+      || (Number(roundNo) > 1 && Number(spoolOffset) < 1)) {
+      return { ok: false, reason: "BOX_RECOVERY_EVIDENCE_MISSING" };
+    }
+    let resultHashes: BoxDetachedUnknownRecovery["resultHashes"] = null;
+    if (Number(roundNo) > 1) {
+      const parent = rows[1]!;
+      const parsed = parseRecoveryResultHashes(parent.ctx.boxResumeResultHashes);
+      if (!parsed) return { ok: false, reason: "BOX_RECOVERY_PARENT_HASHES_MISSING" };
+      resultHashes = parsed;
+    }
+    for (let index = 1; index < rows.length; index++) {
+      const child = rows[index - 1]!, parent = rows[index]!;
+      const handoff = parseBoxStoredToolHandoff(parent.ctx.boxToolHandoff);
+      if (!handoff || handoff.roundNo !== Number(roundNo) - index
+        || handoff.catalogHash !== ctx.boxCatalogHash
+        || handoff.detachedRunnerHash !== ctx.boxDetachedRunnerHash) {
+        return { ok: false, reason: "BOX_RECOVERY_CHAIN_INVALID" };
+      }
+      if (parent.ctx.boxResumeRequestId !== child.request_id
+        || typeof parent.ctx.boxResumeRevision !== "string"
+        || typeof child.ctx.boxParentResumeRevision !== "string"
+        || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) {
+        return { ok: false, reason: "BOX_RECOVERY_REVISION_MISMATCH" };
+      }
+    }
+    return { ok: true, evidence: {
+      requestId: leaf.request_id, uid: input.uid, accountId: input.accountId,
+      runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
+      sessionId: ctx.boxSessionId as string, turnKey: ctx.boxTurnKey as string,
+      model: "box-api-claude-opus-5-5", upstreamModel: "claude-opus-5-5",
+      roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
+      catalogHash: ctx.boxCatalogHash as string,
+      detachedRunnerHash: ctx.boxDetachedRunnerHash as string,
+      rootRequestId: root.request_id, rootLaunchPermit: true, resultHashes } };
+  }
+
+  /** Same-identity reread after a lost CAS. Not a second admission.
+   * request_finalize_journal.state is settlement, not the Box terminal. */
+  async readRecoveryWinner(input: Pick<BoxDetachedUnknownRecovery,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"
+    | "sessionId" | "turnKey" | "model" | "roundNo">):
+    Promise<BoxRecoveryWinner | null> {
+    const found = await this.pool.query<{ state: string; ctx: Record<string, unknown> }>(
+      `SELECT state,ctx FROM request_finalize_journal
+        WHERE request_id=$1 AND user_id=$2`,
+      [input.requestId, input.uid.toString()]);
+    const row = found.rows[0];
+    if (found.rowCount !== 1 || !row?.ctx
+      || row.ctx.boxAccountId !== input.accountId.toString()
+      || row.ctx.boxRunNonce !== input.runNonce
+      || row.ctx.boxLeaseEpoch !== input.leaseEpoch
+      || row.ctx.boxSessionId !== input.sessionId
+      || row.ctx.boxTurnKey !== input.turnKey
+      || row.ctx.model !== input.model
+      || input.model !== "box-api-claude-opus-5-5"
+      || row.ctx.boxInvocationRecovery !== "v1"
+      || row.ctx.boxInvocationMode !== "detached_tool") return null;
+    const storedRound = row.ctx.boxRoundNo === undefined ? 1 : row.ctx.boxRoundNo;
+    if (storedRound !== input.roundNo) return null;
+    let proofReason: string | null = null;
+    if (row.ctx.boxTerminalProof !== undefined) {
+      try {
+        proofReason = parseBoxTerminalProof(
+          JSON.stringify(row.ctx.boxTerminalProof) + "\n",
+          { runNonce: input.runNonce, leaseEpoch: input.leaseEpoch }).reason;
+      } catch { proofReason = null; }
+    }
+    const boxState = typeof row.ctx.boxState === "string" ? row.ctx.boxState : "";
+    return { state: row.state, boxState, proofReason };
   }
 
   /** After a durable user stop, locate the one current HTTP leaf. The caller

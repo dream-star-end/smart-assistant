@@ -153,6 +153,32 @@ if (!boxCache.includes('function bareHookBeforeBudget(')
   throw new Error('[box-multitool-continuation] unwrapped hook-plus-budget fold missing')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof')
+// INC-20260928-BOX-TOOL-SUCCESS-RECOVERY source regression guard, not end-to-end proof.
+// Chunked catalog reads and the terminal-only winner check are source locks.
+// They are not a live Box call, a browser journey, or a production ledger proof.
+const boxCatalogRead = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxStagedCatalogRead.ts'), 'utf8')
+const boxTerminalRecovery = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolTerminalRecovery.ts'), 'utf8')
+const boxCleanup = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRemoteCleanupWorker.ts'), 'utf8')
+const boxIndex = readFileSync(join(root, 'packages/commercial/src/index.ts'), 'utf8')
+if (!boxCatalogRead.includes('const CHUNK_BYTES = 262_144')
+  || !boxCatalogRead.includes('const FILE_MAX_BYTES = 1_048_576')
+  || !boxCatalogRead.includes('os.O_NOFOLLOW')
+  || boxCatalogRead.includes('maxResponseBytes: 2_097_152')) {
+  throw new Error('[box-tool-success-recovery] catalog read no longer uses a bounded chunk under the 1MiB frame cap')
+}
+if (!boxTerminalRecovery.includes('winner.boxState === "terminal" && winner.proofReason === "worker_complete"')
+  || !boxTerminalRecovery.includes('winner.proofReason !== "worker_complete"')) {
+  throw new Error('[box-tool-success-recovery] winner check no longer requires a parsed Box terminal proof')
+}
+if (!boxCleanup.includes('allowWakeIfHibernated: false')
+  || !boxCleanup.includes('readBoxStagedToolCatalog')
+  || !boxIndex.includes('writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT)')) {
+  throw new Error('[box-tool-success-recovery] cleanup worker no longer reuses the no-wake recovery writer')
+}
+console.log('INC-20260928-BOX-TOOL-SUCCESS-RECOVERY source regression guard, not end-to-end proof')
 
 // INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
 // The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
