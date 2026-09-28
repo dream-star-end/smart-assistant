@@ -4904,7 +4904,7 @@
       "preparedBehaviorGate": {
         "path": "scripts/check-v5-box-continuation.ts",
         "wired": false,
-        "note": "Formal gate requires --expect-sha and runs on a gitless archive. It does not accept --fault. Negatives are scripts/check-v5-box-continuation.negative.ts. Not a deploy-gate proof until deploy-v5.sh or scripts/v5-selfhost-master-release-lib.sh runs the candidate node/tsx on this script. The source guard above is not that proof."
+        "note": "Formal root is an external supervisor: required --expect-sha, no unknown args, worker in its own process group, 60s deadline from before spawn, exit 0 only with the business receipt. Not an in-process timer. Not a deploy-gate proof until deploy-v5.sh or scripts/v5-selfhost-master-release-lib.sh runs the candidate node/tsx on this script. The source guard above is not that proof."
       }
     }
   ]

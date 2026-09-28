@@ -4,25 +4,26 @@
  * From the candidate root, with that tree's node or tsx:
  *   tsx scripts/check-v5-box-continuation.ts --expect-sha <40-hex>
  *   node scripts/check-v5-box-continuation.ts --expect-sha <40-hex>
- * Node 22 re-execs with --experimental-transform-types. --expect-sha is required
- * and is the builder archive SHA, not this process's git HEAD. Unknown
- * arguments fail. A tree with no .git still runs. Fault mutations are not
- * accepted here; they live in check-v5-box-continuation.negative.ts.
+ * The process that parses arguments is only a supervisor. It uses node
+ * builtins, starts the worker in a new process group, and enforces LIMIT_MS
+ * from before that spawn. A synchronous worker cannot postpone the deadline.
+ * There is no CLI switch that skips the deadline or the business receipt.
+ * Node 22 receives --experimental-transform-types on the worker spawn, not
+ * via a re-exec that runs before supervision. --expect-sha is required and
+ * is the builder archive SHA. Unknown arguments fail. A tree with no .git
+ * still runs. Fault mutations live in check-v5-box-continuation.negative.ts.
  */
-import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { register } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
-import {
-  annotationCounts, chain, composedRejects, historicalBudgetOnly, HOOK, legalWrapped,
-  legalWrappedBytes, matchedTails, PROGRESS, rewrites, unknownMarker, unknownText, WRAPPED,
-} from "./check-v5-box-continuation-fixture.ts";
 
 const LIMIT_MS = 60_000;
+const RECEIPT = "ocv5-b1-continuation-pass";
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = realpathSync(join(CANDIDATE, "packages/commercial/src/http/proxy"));
 const SELF = realpathSync(fileURLToPath(import.meta.url));
@@ -41,8 +42,24 @@ type Api = {
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
 };
 type Digest = Array<{ path: string; sha256: string }>;
+type Fixture = {
+  annotationCounts: Array<{ progress: number; hook: number; wrapped: number }>;
+  chain: Array<Record<string, unknown>>;
+  composedRejects: Array<{ id: string; input: string; body: Record<string, unknown> }>;
+  historicalBudgetOnly: Record<string, unknown>;
+  HOOK: string;
+  legalWrapped: Record<string, unknown>;
+  legalWrappedBytes: string;
+  matchedTails: Array<{ step: number; id: string; input: string; content: unknown }>;
+  PROGRESS: string;
+  rewrites: Array<{ from: number; to: number; cached: unknown; historical: { content?: unknown } }>;
+  unknownMarker: Record<string, unknown>;
+  unknownText: Record<string, unknown>;
+  WRAPPED: string;
+};
 
 let scratch = "";
+let fx: Fixture;
 function fail(message: string): never {
   throw new Error(message);
 }
@@ -69,14 +86,6 @@ function parseArgs(argv: string[]): { expectSha: string } {
   }
   if (!expectSha) fail("EXPECT_SHA_REQUIRED");
   return { expectSha };
-}
-function ensureNodeTransform(): void {
-  if (underTsx()) return;
-  const major = Number(process.versions.node.split(".")[0]);
-  if (major < 22 || process.execArgv.includes("--experimental-transform-types")) return;
-  const child = spawnSync(process.execPath,
-    ["--experimental-transform-types", ...process.argv.slice(1)], { stdio: "inherit" });
-  process.exit(child.status === null ? 1 : child.status);
 }
 function installResolveHook(): void {
   if (underTsx()) return;
@@ -143,19 +152,40 @@ function digest(): Digest {
     sha256: sha256(readFileSync(file)),
   }));
 }
-function gitCrossCheck(expectSha: string): "absent" | "match" {
-  if (!existsSync(join(CANDIDATE, ".git"))) return "absent";
-  const status = spawnSync("git", ["-C", CANDIDATE, "rev-parse", "HEAD"], {
-    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+function gitCrossCheck(expectSha: string): Promise<"absent" | "match"> {
+  if (!existsSync(join(CANDIDATE, ".git"))) return Promise.resolve("absent");
+  return new Promise((resolveGit, rejectGit) => {
+    const child = spawn("git", ["-C", CANDIDATE, "rev-parse", "HEAD"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error: Error | null, value?: "match"): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) rejectGit(error);
+      else resolveGit(value ?? "match");
+    };
+    timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      finish(new Error("GIT_CROSSCHECK_TIMEOUT"));
+    }, 5_000);
+    child.stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+    child.on("error", () => finish(new Error("GIT_CROSSCHECK_FAILED")));
+    child.on("close", (code) => {
+      if (settled) return;
+      if (code !== 0) { finish(new Error("GIT_CROSSCHECK_FAILED")); return; }
+      const value = out.trim();
+      if (!/^[0-9a-f]{40}$/.test(value)) finish(new Error("GIT_HEAD_INVALID"));
+      else if (value !== expectSha) finish(new Error("GIT_SHA_MISMATCH"));
+      else finish(null, "match");
+    });
   });
-  if (status.status !== 0) fail("GIT_CROSSCHECK_FAILED");
-  const value = (status.stdout ?? "").trim();
-  if (!/^[0-9a-f]{40}$/.test(value)) fail("GIT_HEAD_INVALID");
-  if (value !== expectSha) fail("GIT_SHA_MISMATCH");
-  return "match";
 }
 function isolate(dir: string): void {
-  for (const name of ["home", "state", "tmp"]) mkdirSync(join(dir, name));
+  for (const name of ["home", "state", "tmp"]) mkdirSync(join(dir, name), { recursive: true });
   const kept: NodeJS.ProcessEnv = {};
   for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "SystemRoot"]) {
     if (process.env[key] !== undefined) kept[key] = process.env[key];
@@ -203,6 +233,8 @@ function expectCode(run: () => unknown, code: string): void {
   fail(`EXPECTED_THROW_${code}`);
 }
 function checks(api: Api): void {
+  const { annotationCounts, chain, composedRejects, historicalBudgetOnly, HOOK, legalWrapped,
+    legalWrappedBytes, matchedTails, PROGRESS, rewrites, unknownMarker, unknownText, WRAPPED } = fx;
   if (chain.length !== 6 || annotationCounts.length !== 6) fail("CHAIN_COUNT");
   const normalized = chain.map((body) => {
     const snapshot = JSON.stringify(body);
@@ -281,44 +313,166 @@ function checks(api: Api): void {
   }
 }
 
-function cleanup(): void {
-  if (scratch) rmSync(scratch, { recursive: true, force: true });
+function procField(pid: number, index: number): string {
+  const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[index] ?? "";
 }
-process.on("SIGTERM", () => { cleanup(); process.exit(1); });
-process.on("SIGINT", () => { cleanup(); process.exit(1); });
-
-async function main(): Promise<void> {
-  ensureNodeTransform();
-  const timer = setTimeout(() => { cleanup(); process.exit(1); }, LIMIT_MS);
-  const { expectSha } = parseArgs(process.argv);
-  const git = gitCrossCheck(expectSha);
-  scratch = mkdtempSync(join(tmpdir(), "ocv5-b1-home-"));
-  try {
-    isolate(scratch);
-    installResolveHook();
-    const before = digest();
-    const api = await load();
-    const after = digest();
-    if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
-    checks(api);
-    const end = digest();
-    if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");
-    const runtime = before.filter((item) => item.path.startsWith(`packages${sep}commercial${sep}src${sep}http${sep}proxy${sep}`));
-    console.log(JSON.stringify({
-      ok: true, wired: false, expectSha, candidate: CANDIDATE, git,
-      runtimeModules: runtime.length, modules: before.length, digest: before,
-      node: process.version, execPath: realpathSync(process.execPath),
-      homeIsolated: process.env.HOME === join(scratch, "home"),
-      database: process.env.DATABASE_URL !== undefined,
-    }));
-  } finally {
-    clearTimeout(timer);
-    cleanup();
+function groupAlive(pgid: number): boolean {
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      if (Number(procField(Number(name), 2)) === pgid) return true;
+    } catch { /* process exited while scanning */ }
+  }
+  return false;
+}
+function signalGroup(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pid, signal); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
   }
 }
+function workerLaunch(expectSha: string): { cmd: string; args: string[] } {
+  const args = process.execArgv.filter((arg) => arg !== "-e" && !arg.startsWith("--eval"));
+  const tsx = args.some((arg) => arg.includes("/tsx/"));
+  const major = Number(process.versions.node.split(".")[0]);
+  if (!tsx && major >= 22 && !args.includes("--experimental-transform-types")) {
+    args.push("--experimental-transform-types");
+  }
+  args.push(SELF, "--expect-sha", expectSha);
+  return { cmd: process.execPath, args };
+}
+function whitelist(dir: string, token: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "SystemRoot"]) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.HOME = join(dir, "home");
+  env.OPENCLAUDE_HOME = join(dir, "state");
+  env.TMPDIR = join(dir, "tmp");
+  env.TEMP = env.TMPDIR;
+  env.TMP = env.TMPDIR;
+  env.NO_COLOR = "1";
+  env.OC_B1_SUPERVISED = "1";
+  env.OC_B1_PARENT_PID = String(process.pid);
+  env.OC_B1_SCRATCH = dir;
+  env.OC_B1_WORKER_TOKEN = token;
+  env.OC_B1_WORKER_TOKEN_FILE = join(dir, "token");
+  return env;
+}
+function acceptReceipt(stdout: string, expectSha: string): boolean {
+  const line = stdout.trim().split("\n").filter(Boolean).at(-1) ?? "";
+  try {
+    const body = JSON.parse(line) as { ok?: boolean; wired?: boolean; expectSha?: string;
+      receipt?: string; runtimeModules?: number; homeIsolated?: boolean; database?: boolean };
+    return body.ok === true && body.wired === false && body.expectSha === expectSha
+      && body.receipt === RECEIPT && (body.runtimeModules ?? 0) >= 9
+      && body.homeIsolated === true && body.database === false;
+  } catch { return false; }
+}
+async function supervise(expectSha: string): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-b1-home-"));
+  for (const name of ["home", "state", "tmp"]) mkdirSync(join(dir, name), { recursive: true });
+  const token = randomBytes(32).toString("hex");
+  writeFileSync(join(dir, "token"), token, { mode: 0o600 });
+  const started = Date.now();
+  let worker = 0;
+  let reason: string | null = null;
+  let closed = false;
+  const stop = (next: string): void => {
+    if (reason || closed) return;
+    reason = next;
+    if (!worker) return;
+    signalGroup(worker, "SIGTERM");
+    setTimeout(() => signalGroup(worker, "SIGKILL"), 1_000);
+  };
+  const onSignal = (): void => stop("SUPERVISOR_SIGNAL");
+  process.on("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+  const timer = setTimeout(() => stop("SUPERVISOR_TIMEOUT"), LIMIT_MS);
+  let stdout = "";
+  let stderr = "";
+  let bytes = 0;
+  let code = 1;
+  try {
+  const launch = workerLaunch(expectSha);
+  const child = spawn(launch.cmd, launch.args, {
+    cwd: CANDIDATE, env: whitelist(dir, token), detached: true, stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (child.pid === undefined) fail("SUPERVISOR_SPAWN");
+  worker = child.pid;
+  const starttime = procField(worker, 19);
+  process.stderr.write(`OC_B1_SUPERVISOR worker=${worker} pgid=${worker} starttime=${starttime} start=${started} scratch=${dir}\n`);
+  const capture = (target: "stdout" | "stderr", chunk: Buffer): void => {
+    bytes += chunk.length;
+    if (bytes > 1_000_000) { stop("SUPERVISOR_OUTPUT"); return; }
+    const text = chunk.toString("utf8");
+    if (target === "stdout") stdout += text;
+    else { stderr += text; process.stderr.write(text); }
+  };
+  child.stdout.on("data", (chunk: Buffer) => capture("stdout", chunk));
+  child.stderr.on("data", (chunk: Buffer) => capture("stderr", chunk));
+  child.on("error", () => stop("SUPERVISOR_SPAWN"));
+  code = await new Promise<number>((resolveCode) => {
+    child.on("close", (status) => { closed = true; resolveCode(status ?? 1); });
+  });
+  child.stdout.destroy();
+  child.stderr.destroy();
+  } finally {
+  clearTimeout(timer);
+  process.off("SIGTERM", onSignal);
+  process.off("SIGINT", onSignal);
+  if (worker && groupAlive(worker)) {
+    signalGroup(worker, "SIGKILL");
+    const end = Date.now() + 1_000;
+    while (Date.now() < end && groupAlive(worker)) await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  rmSync(dir, { recursive: true, force: true });
+  }
+  if (worker && groupAlive(worker)) fail("SUPERVISOR_ORPHAN");
+  if (reason) fail(reason);
+  if (code !== 0 || !acceptReceipt(stdout, expectSha)) {
+    fail(code !== 0 ? "SUPERVISOR_WORKER_FAILED" : "SUPERVISOR_MISSING_RECEIPT");
+  }
+  process.stdout.write(stdout.endsWith("\n") ? stdout : `${stdout}\n`);
+}
+async function workerMain(expectSha: string): Promise<void> {
+  const token = process.env.OC_B1_WORKER_TOKEN ?? "";
+  const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
+  const parent = Number(process.env.OC_B1_PARENT_PID ?? "");
+  if (process.env.OC_B1_SUPERVISED !== "1" || process.ppid !== parent
+    || !/^[0-9a-f]{64}$/.test(token) || readFileSync(tokenFile, "utf8") !== token) {
+    fail("WORKER_TOKEN_MISMATCH");
+  }
+  scratch = process.env.OC_B1_SCRATCH ?? "";
+  if (!scratch) fail("WORKER_SCRATCH");
+  isolate(scratch);
+  installResolveHook();
+  fx = await import("./check-v5-box-continuation-fixture.ts");
+  const git = await gitCrossCheck(expectSha);
+  const before = digest();
+  const api = await load();
+  const after = digest();
+  if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
+  checks(api);
+  const end = digest();
+  if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");
+  const runtime = before.filter((item) => item.path.startsWith(`packages${sep}commercial${sep}src${sep}http${sep}proxy${sep}`));
+  console.log(JSON.stringify({
+    ok: true, wired: false, receipt: RECEIPT, expectSha, candidate: CANDIDATE, git,
+    runtimeModules: runtime.length, modules: before.length, digest: before,
+    node: process.version, execPath: realpathSync(process.execPath),
+    homeIsolated: process.env.HOME === join(scratch, "home"),
+    database: process.env.DATABASE_URL !== undefined,
+  }));
+}
 
-main().catch((error: unknown) => {
-  cleanup();
+async function entry(): Promise<void> {
+  const { expectSha } = parseArgs(process.argv);
+  if (process.env.OC_B1_SUPERVISED === "1") await workerMain(expectSha);
+  else await supervise(expectSha);
+}
+entry().catch((error: unknown) => {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 });

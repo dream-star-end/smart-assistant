@@ -4,9 +4,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SOURCE = fileURLToPath(new URL("..", import.meta.url));
@@ -79,6 +79,195 @@ function patch(kind: string, source: string): string {
   assert.equal(source.includes(needle), true);
   return source.replace(needle, "function rejectIfUnapprovedBoundary(message: Record<string, unknown>): void {\n  return;\n  if (unapprovedCollapsibleBoundary(message)) {");
 }
+
+const EVIDENCE = "/home/agent/.openclaude/generated/ocv5-294-b1-supervisor-evidence.jsonl";
+const OLD = "d8beef1f4051196ced1d880bb5a151144dc41608";
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function procInfo(pid: number): { pid: number; ppid: number; pgrp: number; starttime: number } | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return { pid, ppid: Number(rest[1]), pgrp: Number(rest[2]), starttime: Number(rest[19]) };
+  } catch { return null; }
+}
+function members(pgid: number): number[] {
+  const found: number[] = [];
+  for (const name of readdirSync("/proc")) {
+    if (!/^\d+$/.test(name)) continue;
+    const info = procInfo(Number(name));
+    if (info?.pgrp === pgid) found.push(info.pid);
+  }
+  return found;
+}
+function note(row: Record<string, unknown>): void {
+  appendFileSync(EVIDENCE, `${JSON.stringify(row)}\n`);
+}
+function blockNormalize(source: string, hold: boolean): string {
+  const needle = "export function normalizeBoxSemanticBody(";
+  assert.equal(source.includes(needle), true);
+  const prelude = hold ? "import { spawn as __holdSpawn } from \"node:child_process\";\n" : "";
+  const call = hold
+    ? "__holdSpawn(process.execPath, [\"-e\", \"process.on('SIGTERM',()=>{});setInterval(()=>{},1e9);\"], {stdio:'ignore'});\n  "
+    : "";
+  return prelude + source.replace(needle,
+    "export function normalizeBoxSemanticBody(body: ProxyBody, _options?: { collapseSingleText?: boolean }): ProxyBody {\n  "
+    + `${call}const until = Date.now() + 120_000;\n  while (Date.now() < until) {}\n  return body;\n}\nfunction normalizeBoxSemanticBodyUnused(`);
+}
+function launched(dir: string, args: string[], env: NodeJS.ProcessEnv = process.env) {
+  const bin = loader();
+  let stderr = "";
+  let stdout = "";
+  const child = spawn(bin.cmd, [...bin.args, join(dir, "scripts/check-v5-box-continuation.ts"), ...args], {
+    cwd: dir, env, stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+  return { child, text: () => ({ stdout, stderr }) };
+}
+async function closed(child: ReturnType<typeof spawn>, ms: number): Promise<number> {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("WAIT_TIMEOUT")), ms);
+    child.on("close", (status) => { clearTimeout(timer); resolve(status ?? 1); });
+  });
+}
+const oldFiles = spawnSync("git", ["-C", SOURCE, "cat-file", "-e", `${OLD}:scripts/check-v5-box-continuation.ts`]);
+
+test("d8beef sync normalize is still running when an external guard stops it", { skip: oldFiles.status !== 0 }, async () => {
+  const dir = stage((source) => blockNormalize(source, false));
+  try {
+    for (const rel of SCRIPT_FILES) {
+      const shown = spawnSync("git", ["-C", SOURCE, "show", `${OLD}:${rel}`], { encoding: "utf8" });
+      assert.equal(shown.status, 0, shown.stderr);
+      writeFileSync(join(dir, rel), shown.stdout);
+    }
+    const bin = loader();
+    const child = spawn(bin.cmd, [...bin.args, join(dir, "scripts/check-v5-box-continuation.ts"), "--expect-sha", SHA], {
+      cwd: dir, detached: true, stdio: "ignore",
+    });
+    const info = procInfo(child.pid ?? 0);
+    await delay(2_000);
+    const later = procInfo(child.pid ?? 0);
+    note({ case: "d8beef-hang", pid: child.pid, pgid: info?.pgrp, starttime: info?.starttime,
+      aliveAtMs: 2_000, selfExited: later === null, guardMs: 2_000, waitedFullLimit: false });
+    assert.notEqual(later, null, "old gate exited by itself inside the 2s external guard");
+    assert.equal(info?.starttime, later?.starttime);
+    process.kill(-(child.pid ?? 0), "SIGKILL");
+    await closed(child, 3_000);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("supervisor reaps a worker blocked in product normalize", async () => {
+  const dir = stage((source) => blockNormalize(source, false));
+  let run: ReturnType<typeof launched> | undefined;
+  try {
+    const gate = join(dir, "scripts/check-v5-box-continuation.ts");
+    const original = readFileSync(join(SOURCE, "scripts/check-v5-box-continuation.ts"), "utf8");
+    assert.match(original, /const LIMIT_MS = 60_000;/);
+    assert.doesNotMatch(original, /--limit-ms/);
+    writeFileSync(gate, readFileSync(gate, "utf8").replace("const LIMIT_MS = 60_000;", "const LIMIT_MS = 2_500;"));
+    const begun = Date.now();
+    run = launched(dir, ["--expect-sha", SHA]);
+    let mark: RegExpMatchArray | null = null;
+    for (let i = 0; i < 160 && !mark; i++) {
+      mark = run.text().stderr.match(/OC_B1_SUPERVISOR worker=(\d+) pgid=(\d+) starttime=(\d+) start=\d+ scratch=(\S+)/);
+      if (!mark) await delay(50);
+    }
+    assert.ok(mark, `${run.text().stderr}\n${run.text().stdout}`);
+    const worker = Number(mark[1]);
+    const live = procInfo(worker);
+    assert.equal(live?.pgrp, Number(mark[2]));
+    assert.equal(String(live?.starttime), mark[3]);
+    const code = await closed(run.child, 12_000);
+    const scratch = mark[4] ?? "";
+    note({ case: "supervisor-hang", pid: worker, pgid: Number(mark[2]), starttime: live?.starttime,
+      code, elapsedMs: Date.now() - begun, waitedFullLimit: false, limitMs: 2_500 });
+    assert.notEqual(code, 0);
+    assert.match(run.text().stderr, /SUPERVISOR_TIMEOUT/);
+    assert.equal(procInfo(worker), null);
+    assert.deepEqual(members(Number(mark[2])), []);
+    assert.equal(existsSync(scratch), false);
+    assert.ok(Date.now() - begun < 12_000);
+  } finally {
+    try { run?.child.kill("SIGKILL"); } catch { /* already gone */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stuck git command is killed inside the worker and leaves nothing", async () => {
+  const dir = stage();
+  const bin = mkdtempSync(join(tmpdir(), "ocv5-b1-git-"));
+  let run: ReturnType<typeof launched> | undefined;
+  try {
+    writeFileSync(join(bin, "git"), "#!/usr/bin/env node\nprocess.on('SIGTERM',()=>{});setInterval(()=>{},1e9);\n");
+    chmodSync(join(bin, "git"), 0o755);
+    writeFileSync(join(dir, ".git"), "gitdir: /nowhere\n");
+    const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ""}` };
+    const begun = Date.now();
+    run = launched(dir, ["--expect-sha", SHA], env);
+    let mark: RegExpMatchArray | null = null;
+    for (let i = 0; i < 160 && !mark; i++) {
+      mark = run.text().stderr.match(/OC_B1_SUPERVISOR worker=(\d+) pgid=(\d+) starttime=(\d+) start=\d+ scratch=(\S+)/);
+      if (!mark) await delay(50);
+    }
+    assert.ok(mark, `${run.text().stderr}\n${run.text().stdout}`);
+    const code = await closed(run.child, 15_000);
+    note({ case: "git-stuck", pid: Number(mark[1]), pgid: Number(mark[2]), starttime: Number(mark[3]),
+      code, elapsedMs: Date.now() - begun, waitedFullLimit: false });
+    assert.notEqual(code, 0);
+    assert.match(run.text().stderr, /GIT_CROSSCHECK_TIMEOUT/);
+    assert.equal(procInfo(Number(mark[1])), null);
+    assert.deepEqual(members(Number(mark[2])), []);
+    assert.equal(existsSync(mark[4] ?? ""), false);
+    assert.equal(members(Number(mark[2])).includes(Number(mark[1])), false);
+  } finally {
+    try { run?.child.kill("SIGKILL"); } catch { /* already gone */ }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("SIGTERM reaps a worker and the descendant that ignores the signal", async () => {
+  const dir = stage((source) => blockNormalize(source, true));
+  let run: ReturnType<typeof launched> | undefined;
+  try {
+    run = launched(dir, ["--expect-sha", SHA]);
+    let mark: RegExpMatchArray | null = null;
+    for (let i = 0; i < 160 && !mark; i++) {
+      mark = run.text().stderr.match(/OC_B1_SUPERVISOR worker=(\d+) pgid=(\d+) starttime=(\d+) start=\d+ scratch=(\S+)/);
+      if (!mark) await delay(50);
+    }
+    assert.ok(mark, `${run.text().stderr}\n${run.text().stdout}`);
+    const worker = Number(mark[1]);
+    let holder: number | null = null;
+    for (let i = 0; i < 80 && holder === null; i++) {
+      for (const name of readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        const info = procInfo(Number(name));
+        if (info?.ppid === worker) holder = info.pid;
+      }
+      if (holder === null) await delay(50);
+    }
+    assert.notEqual(holder, null);
+    const holderInfo = procInfo(holder ?? 0);
+    note({ case: "signal-hold", worker, workerStart: Number(mark[3]), holder, holderStart: holderInfo?.starttime,
+      pgid: Number(mark[2]) });
+    run.child.kill("SIGTERM");
+    const code = await closed(run.child, 8_000);
+    assert.notEqual(code, 0);
+    assert.match(run.text().stderr, /SUPERVISOR_SIGNAL/);
+    assert.equal(procInfo(worker), null);
+    assert.equal(procInfo(holder ?? 0), null);
+    assert.deepEqual(members(Number(mark[2])), []);
+    assert.equal(existsSync(mark[4] ?? ""), false);
+  } finally {
+    try { run?.child.kill("SIGKILL"); } catch { /* already gone */ }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("archive without git passes only with a strict expect-sha", () => {
   const dir = stage();
