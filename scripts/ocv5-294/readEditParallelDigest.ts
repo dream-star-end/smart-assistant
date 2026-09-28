@@ -52,9 +52,12 @@ const rows = (wire.sent ?? []).map((sent) => {
     id: sent.id, name: sent.name, copies: found.length,
     sentHash, echoHash, hashEqual: echoHash === sentHash,
     keys: keys.map((key) => {
-      const left = sha(sent.input[key]);
-      const right = echo ? sha(echo.input[key]) : null;
-      return { key, same: right !== null && left.sha256 === right.sha256, sent: left, echo: right };
+      const hasSent = Object.hasOwn(sent.input, key);
+      const hasEcho = !!echo && Object.hasOwn(echo.input, key);
+      const left = hasSent ? sha(sent.input[key]) : null;
+      const right = hasEcho ? sha(echo.input[key]) : null;
+      return { key, sentPresent: hasSent, echoPresent: hasEcho,
+        same: !!left && !!right && left.sha256 === right.sha256, sent: left, echo: right };
     }),
   };
 });

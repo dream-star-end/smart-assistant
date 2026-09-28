@@ -133,10 +133,22 @@ async function main(): Promise<void> {
   const news = [String(editA.new_string), String(editB.new_string)];
   writeFileSync(target, `${olds[0]}\n${olds[1]}\nGAMMA_KEEP_LINE\n`, { mode: 0o600 });
   const readInput = { file_path: target, limit: 3 };
+  const omitReplaceAll = process.argv.includes("--omit-replace-all");
+  const dropReplace = (input: Record<string, unknown>): Record<string, unknown> => {
+    const copy = { ...input };
+    delete copy.replace_all;
+    return copy;
+  };
+  const sentA = omitReplaceAll ? dropReplace(editA) : editA;
+  const sentB = omitReplaceAll ? dropReplace(editB) : editB;
   const allow = { tuples: [
     { name: "Read", input: readInput },
-    { name: "Edit", input: editA },
-    { name: "Edit", input: editB },
+    { name: "Edit", input: sentA },
+    { name: "Edit", input: sentB },
+    ...(omitReplaceAll ? [
+      { name: "Edit", input: { ...sentA, replace_all: false } },
+      { name: "Edit", input: { ...sentB, replace_all: false } },
+    ] : []),
   ] };
   const allowPath = join(dir, "allow.json");
   writeFileSync(allowPath, JSON.stringify(allow), { mode: 0o600 });
@@ -190,10 +202,10 @@ async function main(): Promise<void> {
     } else if (round === 2) {
       const idA = `toolu_re_${run}_ed1`;
       const idB = `toolu_re_${run}_ed2`;
-      sent.push({ id: idA, name: "Edit", input: editA }, { id: idB, name: "Edit", input: editB });
+      sent.push({ id: idA, name: "Edit", input: sentA }, { id: idB, name: "Edit", input: sentB });
       openMessage(res, `msg_re_${run}_2`, model);
-      toolBlock(res, 0, idA, "Edit", editA);
-      toolBlock(res, 1, idB, "Edit", editB);
+      toolBlock(res, 0, idA, "Edit", sentA);
+      toolBlock(res, 1, idB, "Edit", sentB);
       closeTools(res);
     } else if (round === 3) {
       const text = `PARALLEL_NONCE:${nonce}`;
@@ -246,7 +258,9 @@ async function main(): Promise<void> {
   const hostWire = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-parallel-wire-${run}.json`;
   const hostOffline = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-parallel-offline-${run}.json`;
   exclusiveWrite(wireContainer, `${JSON.stringify({
-    labeled: sceneEditsFound ? "native-ccb-loopback-scene-params" : "native-ccb-loopback",
+    labeled: omitReplaceAll ? "native-omit-replace-all" : sceneEditsFound
+      ? "native-ccb-loopback-scene-params" : "native-ccb-loopback",
+    sentMeans: "sse-upstream-before-cli-echo", omitReplaceAll,
     head, productBase: FIXED, scriptHash, run, raws,
     rawSha256: raws.map((raw) => createHash("sha256").update(raw).digest("hex")),
     bodies, sent,
@@ -256,17 +270,51 @@ async function main(): Promise<void> {
   ], { encoding: "utf8", timeout: 60_000 });
   if (verified.status !== 0) fail("OFFLINE_FAILED");
   exclusiveWrite(offlineContainer, verified.stdout.trim().split("\n").filter((line) => line.startsWith("{")).at(-1) ?? "{}\n");
+  const digestContainer = `/home/agent/.openclaude/generated/ocv5-294-parallel-digest-${run}.json`;
+  const hostDigest = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-parallel-digest-${run}.json`;
+  const digested = spawnSync(HOST, [
+    `cd ${HOST_WT} && NODE_PATH=/opt/openclaude/openclaude-v5-selfhost/node_modules /usr/bin/tsx scripts/ocv5-294/readEditParallelDigest.ts --wire ${hostWire}`,
+  ], { encoding: "utf8", timeout: 60_000 });
+  const digestLine = digested.stdout.trim().split("\n").filter((line) => line.startsWith("{")).at(-1) ?? "";
+  let digest: { editMatch?: { matchCode?: string | null }; rows?: Array<{ name?: string; hashEqual?: boolean;
+    keys?: Array<{ key?: string; sentPresent?: boolean; echoPresent?: boolean; same?: boolean;
+      echo?: { type?: string; len?: number; sha256?: string } | null }> }> } | null = null;
+  try { digest = JSON.parse(digestLine); }
+  catch { fail("DIGEST_OUTPUT"); }
+  if (digested.status !== 0) fail("DIGEST_FAILED");
+  exclusiveWrite(digestContainer, `${digestLine || "{}"}\n`);
+  const falseSha = createHash("sha256").update("false").digest("hex");
+  const edits = (digest?.rows ?? []).filter((row) => row.name === "Edit");
+  const defaultFalseRed = omitReplaceAll && digest?.editMatch?.matchCode === "BOX_TOOL_RESULT_HISTORY_MISMATCH"
+    && edits.length === 2 && edits.every((row) => {
+      const flagKey = row.keys?.find((item) => item.key === "replace_all");
+      const rest = row.keys?.filter((item) => item.key !== "replace_all") ?? [];
+      return flagKey?.sentPresent === false && flagKey.echoPresent === true
+        && flagKey.echo?.type === "boolean" && flagKey.echo.sha256 === falseSha
+        && rest.every((item) => item.same);
+    });
+  const businessGreen = digest?.editMatch?.matchCode === null
+    && edits.length === 2 && edits.every((row) => row.hashEqual === true);
+  const clean = firstFailure === null && exitCode === 0 && fileOk;
+  const outcome = clean && defaultFalseRed ? "red-captured"
+    : clean && businessGreen ? "business-green" : "unexpected";
   const pinsAfter = productPins();
   if (pinsAfter.some((pin, index) => pin.blob !== pinsBefore[index]?.blob || !pin.same)) {
     fail("PRODUCT_BLOB_CHANGED");
   }
+  let guardLog: unknown[] = [];
+  try {
+    guardLog = readFileSync(join(dir, "guard.jsonl"), "utf8").split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as unknown);
+  } catch { guardLog = []; }
   const receipt = {
-    success: firstFailure === null && exitCode === 0, head, productBase: FIXED,
+    outcome, cliExit: exitCode, head, productBase: FIXED,
     headIsNotProductIdentity: true, scriptHash, pins: pinsBefore.map((pin) => pin.blob),
-    version, run, exitCode, firstFailure, scene: Boolean(sceneEditsFound),
+    version, run, firstFailure, scene: Boolean(sceneEditsFound), omitReplaceAll,
+    priorExit1WasStdoutBug: "088884d875452936",
     http: bodies.length, sent: sent.map((item) => ({ id: item.id, name: item.name,
       inputKeys: Object.keys(item.input).sort() })),
-    fileOk, wireContainer, offlineContainer, hostWire, hostOffline,
+    guardLog, fileOk, wireContainer, offlineContainer, digestContainer, hostWire, hostOffline, hostDigest,
     configDelta: {
       liveWeb: "subprocessRunner writes settings with only PreToolUse Bash|Shell efficiency hook; permissionMode comes from the agent and may include bypass. This probe did not read that live value.",
       probe: "isolated CLAUDE_CONFIG_DIR keeps that Bash|Shell hook and adds a matcher .* guard. No --allowedTools, no --dangerously-skip-permissions, no real user.md.",
@@ -274,9 +322,10 @@ async function main(): Promise<void> {
     stderrTail: stderr.slice(-500),
   };
   exclusiveWrite(outPath, `${JSON.stringify(receipt)}\n`);
-  process.stdout.write(`${JSON.stringify({ success: receipt.success, head, run, exitCode,
-    firstFailure, http: bodies.length, outPath, wireContainer, offlineContainer })}\n`);
-  process.exit(receipt.success ? 0 : 2);
+  const probeExit = outcome === "red-captured" ? 3 : outcome === "business-green" ? 0 : 2;
+  process.stdout.write(`${JSON.stringify({ outcome, probeExit, cliExit: exitCode, head, run,
+    firstFailure, http: bodies.length, outPath, wireContainer, digestContainer })}\n`);
+  process.exit(probeExit);
 }
 
 if ((process.argv[1] ?? "").includes("readEditParallelProbe")) {
