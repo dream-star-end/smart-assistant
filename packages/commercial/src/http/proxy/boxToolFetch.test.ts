@@ -134,9 +134,11 @@ test("same internal model fetch streams first handoff then next final without to
   assert.equal(disposed, false, "remote CLI remains owned across HTTP boundary");
   const hookedNext = { ...nextBody, messages: [nextBody.messages[0]!,
     { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_A",
-      content: "local result" }, { type: "text",
+      content: "local result" }] },
+    { role: "system", content: [{ type: "text",
       text: "<system-reminder>\nPreToolUse:Bash hook additional context: "
-        + "Use Read rather than cat.\n</system-reminder>" }], },
+        + "Use Read rather than cat.\n</system-reminder>",
+      cache_control: { type: "ephemeral" } }] },
     nextBody.messages[2]!] } as ProxyBody;
   const second = await service.fetch(call(hookedNext));
   assert.match(await second.text(), /event: message_stop/);

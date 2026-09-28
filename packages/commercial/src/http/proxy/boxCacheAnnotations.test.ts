@@ -192,6 +192,44 @@ test("two CCB hook-context tool rounds preserve bytes and the next context hash"
   { type: "text", text: dottedHook });
 });
 
+test("CCB-generated system hook is preserved as tool-result text before budget removal", () => {
+  const hook = "<system-reminder>\nPreToolUse:Bash hook additional context: "
+    + "Use Read rather than cat.\n</system-reminder>";
+  const assistant = { role: "assistant", content: [{ type: "tool_use",
+    id: "toolu_system_hook", name: "local_echo", input: { value: "ping" } }] };
+  const result = { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_system_hook", content: "pong" }] };
+  const systemHook = { role: "system", content: [{ type: "text", text: hook,
+    cache_control: marker }] };
+  const budget = { role: "system", content: [{ type: "text",
+    text: "<total_tokens>14998460 tokens left</total_tokens>",
+    cache_control: marker }] };
+  const request = { ...first, messages: [first.messages[0], assistant, result,
+    systemHook, budget] } as ProxyBody;
+  const normalized = normalizeBoxSemanticBody(request);
+  assert.deepEqual((normalized.messages as Array<{ role: string }>).map((message) => message.role),
+    ["user", "assistant", "user"]);
+  assert.deepEqual(matchBoxToolResults(request, [{ id: "toolu_system_hook",
+    clientName: "local_echo", boxName: "mcp__ocbridge__t0",
+    input: { value: "ping" } }])[0]?.content, [
+    { type: "text", text: "pong" }, { type: "text", text: hook },
+  ]);
+  const withoutBudget = { ...request,
+    messages: request.messages.slice(0, -1) } as ProxyBody;
+  assert.equal(deriveBoxCallFingerprint(3n, request).replayFingerprint,
+    deriveBoxCallFingerprint(3n, withoutBudget).replayFingerprint);
+  const historicalHook = { role: "system", content: [{ type: "text", text: hook }] };
+  const next = { ...request, messages: [first.messages[0], assistant, result,
+    historicalHook, budget, { role: "assistant", content: [{ type: "tool_use",
+      id: "toolu_system_hook_2", name: "local_echo", input: { value: "next" } }] },
+    { role: "user", content: [{ type: "tool_result",
+      tool_use_id: "toolu_system_hook_2", content: "pong-2" }] }, systemHook,
+    budget] } as ProxyBody;
+  assert.deepEqual((normalizeBoxSemanticBody(next).messages as Array<{ role: string }>)
+    .map((message) => message.role), ["user", "assistant", "user", "assistant", "user"]);
+  assert.equal(deriveBoxContextHash(next, true), deriveBoxContextHash(request));
+});
+
 test("CCB budget is a no-op beside or inside tool results", () => {
   const assistant = { role: "assistant", content: [{ type: "tool_use",
     id: "toolu_meta", name: "local_echo", input: { value: "ping" } }] };

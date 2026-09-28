@@ -86,6 +86,12 @@ const HOOK_CONTEXT = /^<system-reminder>\n(?:PreToolUse|PostToolUse|PostToolUseF
 // CCB 2.1.280 emits this as a meta user text block. Unlike a hook it is
 // local token-budget telemetry, not a tool result or a new user instruction.
 const USER_BUDGET = /^<system-reminder>\n<total_tokens>(?:0|[1-9][0-9]{0,15}|Infinite) tokens left<\/total_tokens>\n<\/system-reminder>\n?(?:\[id:[0-9a-z]{1,6}\])?$/;
+function denseArray(value: unknown[]): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (!Object.hasOwn(value, i)) return false;
+  }
+  return true;
+}
 function generatedToolMeta(text: string): { hook?: string; budget: boolean } | null {
   if (USER_BUDGET.test(text)) return { budget: true };
   return HOOK_CONTEXT.test(text) ? { hook: text, budget: false } : null;
@@ -179,7 +185,56 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
     changed = true;
     return { ...message, content: folded };
   });
-  return changed ? { ...body, messages } as ProxyBody : body;
+  // CCB 2.1.280 also emits a PreToolUse hook as a *system* message after
+  // user(tool_result), with an ephemeral cache hint. This was observed in the
+  // actual CCB wire body, not inferred from the stored attachment order.
+  // Keep the generated instruction bytes inside that result for the held CLI;
+  // remove only this exact transport envelope so the following budget hint
+  // again sits directly after assistant(tool_use) -> user(tool_result).
+  const folded: typeof messages = [];
+  for (const message of messages) {
+    if (object(message) && message.role === "system"
+      && Object.keys(message).sort().join(",") === "content,role"
+      && Array.isArray(message.content) && message.content.length === 1
+      && Object.hasOwn(message.content, 0)) {
+      const part = message.content[0];
+      const keys = object(part) ? Object.keys(part).sort().join(",") : "";
+      const marker = object(part) ? part.cache_control : null;
+      if (object(part) && part.type === "text" && typeof part.text === "string"
+        && HOOK_CONTEXT.test(part.text)
+        && (keys === "text,type" || (keys === "cache_control,text,type"
+          && object(marker) && Object.keys(marker).join(",") === "type"
+          && marker.type === "ephemeral"))) {
+        const result = folded.at(-1);
+        const assistant = folded.at(-2);
+        if (object(result) && result.role === "user" && Array.isArray(result.content)
+          && denseArray(result.content)
+          && result.content.length > 0
+          && result.content.every((block: unknown) => object(block)
+            && block.type === "tool_result")
+          && object(assistant) && assistant.role === "assistant"
+          && Array.isArray(assistant.content)
+          && assistant.content.some((block: unknown) => object(block)
+            && block.type === "tool_use")) {
+          const results = [...result.content];
+          const last = results.at(-1);
+          const previous = object(last) ? last.content : null;
+          if (typeof previous === "string" || Array.isArray(previous)
+            && denseArray(previous)) {
+            const content = typeof previous === "string"
+              ? [{ type: "text", text: previous }] : [...previous];
+            results[results.length - 1] = { ...last,
+              content: [...content, { type: "text", text: part.text }] };
+            folded[folded.length - 1] = { ...result, content: results };
+            changed = true;
+            continue;
+          }
+        }
+      }
+    }
+    folded.push(message);
+  }
+  return changed ? { ...body, messages: folded } as ProxyBody : body;
 }
 /** CCB2.1.280 appends this budget telemetry *after each* tool_result user
  * message. The held inner Claude Code CLI independently emits its own
