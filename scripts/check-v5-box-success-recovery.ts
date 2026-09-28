@@ -12,7 +12,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readFileSync, realpathSync, rmSync, writeFileSync, writeSync,
+  readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,9 +23,10 @@ const TEMP = "/tmp";
 const DEADLINE_MS = 90_000;
 const SENTINEL_KEY = "OC_V5_BOX_GATE_SENTINEL";
 const HOLD_KEY = "OC_V5_BOX_GATE_HOLD_MARKER";
+const HOLD_SIGNALS_KEY = "OC_V5_BOX_GATE_HOLD_SIGNALS";
 const FAULT_KEY = "OC_V5_BOX_GATE_FAULT";
 const ALLOWED_ENV = ["HOME", "NODE_ENV", "OPENCLAUDE_HOME", "PATH", "TEST_DATABASE_URL"];
-const EXTRA_ENV = new Set([HOLD_KEY, FAULT_KEY]);
+const EXTRA_ENV = new Set([HOLD_KEY, HOLD_SIGNALS_KEY, FAULT_KEY]);
 const FORBIDDEN_KEYS = [
   "DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE",
   "PGSERVICE", "PGOPTIONS", "PGSSLMODE", "REDIS_URL", "NODE_OPTIONS", "NODE_PATH",
@@ -46,10 +47,14 @@ const BEHAVIOR = [
   "intermediate handoff stayed pending without capsule or CAS",
 ];
 const HOLD_PY = [
-  "import os, sys, time",
-  "path = sys.argv[1]",
+  "import os, signal, sys, time",
+  "path, mode = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else 'default')",
+  "if mode == 'ignore-term':",
+  "    signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+  "stat = open('/proc/self/stat').read()",
+  "rest = stat[stat.rfind(')') + 2:].split()",
   "fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
-  "os.write(fd, str(os.getpid()).encode())",
+  "os.write(fd, (str(os.getpid()) + chr(10) + rest[19] + chr(10) + str(os.getpgid(0)) + chr(10)).encode())",
   "os.fsync(fd)",
   "os.close(fd)",
   "while True:",
@@ -166,25 +171,40 @@ function readLedger(ledger: string): string[] {
   } catch { return []; }
 }
 
-async function killGroup(pid: number): Promise<void> {
-  const signal = (sig: NodeJS.Signals): void => {
-    try { process.kill(-pid, sig); } catch { /* already gone */ }
-  };
-  const gone = (): boolean => {
-    try { process.kill(-pid, 0); return false; } catch { return true; }
-  };
-  const wait = async (limitMs: number): Promise<void> => {
-    const started = Date.now();
-    while (!gone() && Date.now() - started < limitMs) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  };
-  signal("SIGTERM");
-  await wait(1_000);
-  if (!gone()) {
-    signal("SIGKILL");
-    await wait(1_000);
+function runningMembers(pgid: number): number[] {
+  const found: number[] = [];
+  let names: string[] = [];
+  try { names = readdirSync("/proc"); } catch { return found; }
+  for (const name of names) {
+    if (!/^[0-9]+$/.test(name)) continue;
+    try {
+      const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const state = rest[0] ?? "";
+      if (Number(rest[2]) !== pgid) continue;
+      if (state.startsWith("Z") || state.startsWith("X")) continue;
+      found.push(Number(name));
+    } catch { /* process exited while scanning */ }
   }
+  return found;
+}
+
+async function killGroup(pid: number): Promise<void> {
+  const running = (): number[] => runningMembers(pid);
+  const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const untilQuiet = async (limitMs: number): Promise<void> => {
+    const started = Date.now();
+    while (running().length > 0 && Date.now() - started < limitMs) await pause(50);
+  };
+  if (running().length === 0) return;
+  try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+  await untilQuiet(1_000);
+  if (running().length > 0) {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+    await untilQuiet(1_000);
+  }
+  const left = running();
+  if (left.length > 0) throw new Error(`BOX_SUCCESS_GATE_KILL_GROUP ${left.join(",")}`);
 }
 
 function assertPinnedModules(root: string): void {
@@ -223,6 +243,7 @@ function digestLine(root: string): string {
 function assertWorkerEnv(home: string): void {
   const allowed = new Set<string>(ALLOWED_ENV);
   if (process.env[HOLD_KEY]) allowed.add(HOLD_KEY);
+  if (process.env[HOLD_SIGNALS_KEY]) allowed.add(HOLD_SIGNALS_KEY);
   if (process.env[FAULT_KEY]) allowed.add(FAULT_KEY);
   const keys = Object.keys(process.env).sort();
   for (const key of keys) {
@@ -238,6 +259,10 @@ function assertWorkerEnv(home: string): void {
   if (process.env.NODE_ENV !== "test") throw new Error("BOX_SUCCESS_GATE_NODE_ENV");
   const fault = process.env[FAULT_KEY];
   if (fault && fault !== "second-write") throw new Error("BOX_SUCCESS_GATE_FAULT");
+  const signals = process.env[HOLD_SIGNALS_KEY];
+  if (signals && signals !== "default" && signals !== "ignore-term") {
+    throw new Error("BOX_SUCCESS_GATE_HOLD_SIGNALS");
+  }
   emit("box success recovery gate: env-isolated sentinel=absent");
   emit(`box success recovery gate: env-keys ${keys.join(",")}`);
 }
@@ -246,7 +271,8 @@ function holdGrandchild(marker: string): never {
   if (!/^\/tmp\/ocv5-hold-[A-Za-z0-9_-]{1,40}$/.test(marker)) {
     throw new Error("BOX_SUCCESS_GATE_HOLD_MARKER");
   }
-  const child = spawn("/usr/bin/python3", ["-c", HOLD_PY, marker], { stdio: "ignore" });
+  const mode = process.env[HOLD_SIGNALS_KEY] === "ignore-term" ? "ignore-term" : "default";
+  const child = spawn("/usr/bin/python3", ["-c", HOLD_PY, marker, mode], { stdio: "ignore" });
   const started = Date.now();
   while (!existsSync(marker)) {
     if (child.exitCode !== null || Date.now() - started > 2_000) {
@@ -322,14 +348,55 @@ export async function supervise(opts: SuperviseOptions): Promise<{ stdout: strin
     stderr += text;
     writeSync(2, text);
   });
-  let settled = false;
-  let timedOut = false;
-  let failure = "";
+  // close/error/deadline/signal all join this drain. A close event must not
+  // settle, or process.exit, before SIGKILL and the running-member check finish.
+  let stopReason = "";
+  let killFailure = "";
+  let spawnError: Error | undefined;
+  let closed: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  let drainTask: Promise<void> | undefined;
+  let releaseWait: (() => void) | undefined;
+  const childClosed = new Promise<void>((resolve) => {
+    child.once("close", (code, signal) => {
+      closed = { code, signal };
+      resolve();
+      if (!stopReason) {
+        stopReason = "close";
+        releaseWait?.();
+      }
+    });
+  });
+  child.once("error", (error: Error) => {
+    spawnError = error;
+    if (!stopReason) {
+      stopReason = "error";
+      releaseWait?.();
+    }
+  });
+  const timer = setTimeout(() => {
+    if (stopReason) return;
+    stopReason = "deadline";
+    emitErr("box success recovery gate: DEADLINE");
+    releaseWait?.();
+  }, deadline);
+  const drain = (): Promise<void> => {
+    if (!drainTask) {
+      drainTask = (async () => {
+        clearTimeout(timer);
+        try {
+          if (child.pid) await killGroup(child.pid);
+        } catch (error) {
+          killFailure = error instanceof Error ? error.message : String(error);
+        }
+        await Promise.race([childClosed, new Promise((resolve) => setTimeout(resolve, 500))]);
+      })();
+    }
+    return drainTask;
+  };
   const onSignal = (sig: NodeJS.Signals): void => {
-    if (settled) return;
-    settled = true;
+    if (!stopReason) stopReason = "signal";
     void (async () => {
-      if (child.pid) await killGroup(child.pid);
+      await drain();
       cleanupOnce();
       emitErr(`box success recovery gate: signal ${sig}`);
       process.exit(1);
@@ -338,41 +405,21 @@ export async function supervise(opts: SuperviseOptions): Promise<{ stdout: strin
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
   try {
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        timedOut = true;
-        emitErr("box success recovery gate: DEADLINE");
-        void (async () => {
-          if (child.pid) await killGroup(child.pid);
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error("BOX_SUCCESS_GATE_DEADLINE"));
-        })();
-      }, deadline);
-      child.once("error", (error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.once("close", (code, signal) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (timedOut) reject(new Error("BOX_SUCCESS_GATE_DEADLINE"));
-        else if (code === 0 && signal === null) resolve();
-        else reject(new Error(`BOX_SUCCESS_GATE_WORKER code=${code} signal=${signal ?? "none"}`));
-      });
+    await new Promise<void>((resolve) => {
+      releaseWait = () => { void drain().then(resolve); };
+      if (stopReason) releaseWait();
     });
-  } catch (error) {
-    failure = error instanceof Error ? error.message : String(error);
   } finally {
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
   }
-  if (!settled && child.pid && child.exitCode === null) await killGroup(child.pid);
   const owned = cleanupOnce();
+  let failure = killFailure;
+  if (!failure && stopReason === "deadline") failure = "BOX_SUCCESS_GATE_DEADLINE";
+  else if (!failure && spawnError) failure = spawnError.message;
+  else if (!failure && !(closed && closed.code === 0 && closed.signal === null)) {
+    failure = `BOX_SUCCESS_GATE_WORKER code=${closed?.code ?? "null"} signal=${closed?.signal ?? "none"}`;
+  }
   if (failure) throw new GateFailure(failure, info(owned));
   if (!stdout.includes("box success recovery gate: env-isolated sentinel=absent")) {
     throw new GateFailure("BOX_SUCCESS_GATE_ENV_UNPROVEN", info(owned));

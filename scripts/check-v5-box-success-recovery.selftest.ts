@@ -43,6 +43,17 @@ function fail(message: string): never {
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
+function holdInfo(marker: string): { pid: number; start: string; pgid: number } {
+  const [pid, start, pgid] = readFileSync(marker, "utf8").trim().split("\n");
+  return { pid: Number(pid), start: start ?? "", pgid: Number(pgid) };
+}
+function sameLive(pid: number, start: string): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return !rest[0]?.startsWith("Z") && !rest[0]?.startsWith("X") && rest[19] === start;
+  } catch { return false; }
+}
 function procIds(pid: number): { ppid: number; pgrp: number } {
   const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
   const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
@@ -105,7 +116,8 @@ async function holdAndSignal(): Promise<void> {
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  const pid = Number(readFileSync(marker, "utf8"));
+  const recorded = holdInfo(marker);
+  const pid = recorded.pid;
   const ids = procIds(pid);
   if (!alive(pid) || !alive(ids.ppid)) fail("grandchild or its parent was not running");
   if (ids.ppid === child.pid || ids.pgrp !== ids.ppid) fail(`expected worker-group grandchild ppid=${ids.ppid} pgrp=${ids.pgrp} supervisor=${child.pid}`);
@@ -149,7 +161,8 @@ async function holdDeadline(): Promise<void> {
   });
   try {
     await waitFor(marker, 10_000);
-    const pid = Number(readFileSync(marker, "utf8"));
+    const recorded = holdInfo(marker);
+    const pid = recorded.pid;
     const ids = procIds(pid);
     if (ids.ppid === process.pid || ids.pgrp !== ids.ppid) fail("deadline grandchild is not in the worker group");
     let caught: GateFailure | undefined;
@@ -267,14 +280,55 @@ async function pgHang(): Promise<void> {
   }
 }
 
+async function holdIgnoreExit(): Promise<void> {
+  const marker = `/tmp/ocv5-hold-${randomBytes(4).toString("hex")}`;
+  let out = "";
+  const child = spawn(process.execPath, ["--import", LOADER, SELF, "--supervise-hold", "4000", marker, "ignore-term"], {
+    detached: true,
+    env: { ...baseEnv(), TEST_DATABASE_URL: DUMMY },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout?.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+  child.stderr?.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+  let recorded = { pid: 0, start: "", pgid: 0 };
+  try {
+    const started = Date.now();
+    while (!existsSync(marker)) {
+      if (Date.now() - started > 15_000 || child.exitCode !== null) fail(`ignore-term marker missing out=${out}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    recorded = holdInfo(marker);
+    if (!sameLive(recorded.pid, recorded.start)) fail("ignore-term grandchild was not alive before the deadline");
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => resolve(null), 20_000);
+      child.once("close", (status) => { clearTimeout(timer); resolve(status); });
+    });
+    const home = homeOf(out);
+    if (code === 0 || code === null) fail(`ignore-term exit ${code}`);
+    if (sameLive(recorded.pid, recorded.start)) fail("ignore-term grandchild still running after supervisor exit");
+    if (!home || existsSync(home)) fail(`ignore-term home residue ${home}`);
+    if (!out.includes("DEADLINE") || out.includes("PASS candidate") || out.includes(SUCCESS)) {
+      fail("ignore-term did not stop on the deadline drain");
+    }
+    process.stdout.write("box success recovery selftest: PASS ignore-term-grandchild\n");
+  } finally {
+    if (recorded.pid && sameLive(recorded.pid, recorded.start)) {
+      try { process.kill(recorded.pid, "SIGKILL"); } catch { /* already gone */ }
+      try { process.kill(-recorded.pgid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "--local";
   if (mode === "--supervise-hold") {
     plantParentLeak();
+    const extra: Record<string, string> = { OC_V5_BOX_GATE_HOLD_MARKER: process.argv[4] ?? "" };
+    if (process.argv[5] === "ignore-term") extra.OC_V5_BOX_GATE_HOLD_SIGNALS = "ignore-term";
     try {
       await supervise({
         deadlineMs: Number(process.argv[3]), candidateSha: SHA, databaseUrl: DUMMY,
-        extraWorkerEnv: { OC_V5_BOX_GATE_HOLD_MARKER: process.argv[4] ?? "" },
+        extraWorkerEnv: extra,
       });
       fail("hold supervisor returned");
     } catch (error) {
@@ -306,7 +360,8 @@ async function main(): Promise<void> {
   formalRejects();
   await holdDeadline();
   await holdAndSignal();
-  process.stdout.write("box success recovery selftest: PASS local cases=3\n");
+  await holdIgnoreExit();
+  process.stdout.write("box success recovery selftest: PASS local cases=4\n");
 }
 
 main().catch((error: unknown) => {
