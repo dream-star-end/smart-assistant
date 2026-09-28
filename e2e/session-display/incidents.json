@@ -4888,22 +4888,30 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box detached tool chain can finish with worker_complete while the local journal leaf stays unknown if the user does not retry. The shared-leader stop probe treated that proof as pending, so the seat, capsule and per-request usage were not closed.",
       "rootFixCommit": "d9879ab229ad3d0bcc6ce609c12c0342e5625974",
-      "coverageCommits": ["d9879ab229ad3d0bcc6ce609c12c0342e5625974"],
+      "coverageCommits": [
+        "d9879ab229ad3d0bcc6ce609c12c0342e5625974",
+        "cee76e0c05b389659d40e00c6473b82338f847b7"
+      ],
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
-          "assertion": "terminal-only recovery does not write a handoff and a real capsule reader loads the final message"
+          "assertion": "terminal-only recovery does not write a handoff or skip to a later final"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "journal state committed with boxState handoff is not a terminal winner"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxDurableJournal.recovery.test.ts",
-          "assertion": "TEMP journal recovery reads parent result hashes and requires the root launch permit"
+          "assertion": "recovery evidence reads parent hashes, root permit, and fixed model mapping"
         },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxStagedCatalogRead.test.ts",
-          "assertion": "nonce-pinned catalog read rejects symlink, loose mode and invalid utf-8"
+          "assertion": "chunked catalog read stays inside one Connect frame and still closes"
         }
       ]
     }
