@@ -1,0 +1,21 @@
+{
+  "note": "Synthetic third HTTP tail from CCB 2.1.280 after the fixed sed command. The preceding system prompt is omitted here; the full body is ocv5-294-captured-wire.json and is not committed.",
+  "lastUser": {
+    "role": "user",
+    "content": [{
+      "type": "tool_result",
+      "tool_use_id": "toolu_ocv5_294_sed",
+      "is_error": false,
+      "contentKind": "string"
+    }]
+  },
+  "trailingSystem": {
+    "role": "system",
+    "content": [{
+      "type": "text",
+      "cache_control": { "type": "ephemeral" },
+      "text": "PreToolUse:Bash hook additional context: 本容器内文件请用原生 Read/Grep/Glob,不要 `sed -n` 隔空读。host 读宿主文件可以保留。 替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`\n\n<total_tokens>14999985 tokens left</total_tokens>"
+    }]
+  },
+  "gate": "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION"
+}
