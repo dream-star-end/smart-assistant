@@ -271,9 +271,17 @@ export class BoxTextFetch {
         throw new BoxTextFetchError("BOX_BUDGET_EXHAUSTED");
       }
       const leaseSessionId = args.sessionId ?? args.requestId;
-      lease = this.deps.registry.open({ uid: args.uid, sessionId: leaseSessionId,
-        accountId: resolved.accountId, leaseMs: remaining(),
-        onRemoteStopped: () => this.disposeTarget(resolved!) });
+      try {
+        lease = this.deps.registry.open({ uid: args.uid, sessionId: leaseSessionId,
+          accountId: resolved.accountId, leaseMs: remaining(),
+          onRemoteStopped: () => this.disposeTarget(resolved!) });
+      } catch (error) {
+        if (error instanceof Error && ["BOX_USER_CAPACITY_FULL",
+          "BOX_ACCOUNT_CAPACITY_FULL", "BOX_SESSION_BUSY"].includes(error.message)) {
+          throw new BoxTextFetchError("BOX_CAPACITY_HELD");
+        }
+        throw error;
+      }
       const currentLease = lease;
       clientLeaseListener = () => {
         // Once detached launch is acknowledged, the remote keeper must be
@@ -292,9 +300,12 @@ export class BoxTextFetch {
             upstreamModel: plan.expectedModel } : {}),
           runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
         journalAdmitted = true;
-      } catch {
+      } catch (error) {
         // No Box command has started, so the acquired target is safe to close.
         this.deps.registry.confirmRemoteStopped(lease);
+        if (error instanceof Error && error.message === "BOX_CAPACITY_HELD") {
+          throw new BoxTextFetchError("BOX_CAPACITY_HELD");
+        }
         throw new BoxTextFetchError("BOX_JOURNAL_ADMISSION_FAILED");
       }
 

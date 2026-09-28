@@ -67,9 +67,9 @@ import { ModelCatalogSnapshot, type ModelCatalogEntry,
   type ModelCatalogPricing } from "../billing/modelCatalog.js";
 import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "../http/proxy/modelAuthorityGate.js";
 import { deriveBoxCallFingerprint } from "../http/proxy/boxCallFingerprint.js";
-import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
-import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
-import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
+import { BoxTextFetch, BoxTextFetchError } from "../http/proxy/boxTextFetch.js";
+import { BoxInvocationRegistry, BoxInvocationConflict } from "../http/proxy/boxInvocationRegistry.js";
+import { BoxDurableJournal, BoxDurableJournalError } from "../http/proxy/boxDurableJournal.js";
 import { writeBoxReplayMessage } from "../http/proxy/boxReplayMessageFile.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
@@ -991,6 +991,33 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       else process.env.OC_BOX_MODEL_API = old;
     }
   });
+
+  for (const rejected of [
+        new BoxTextFetchError("BOX_CAPACITY_HELD"),
+        new BoxDurableJournalError("BOX_CAPACITY_HELD"),
+        new BoxInvocationConflict("BOX_USER_CAPACITY_FULL"),
+        new BoxInvocationConflict("BOX_ACCOUNT_CAPACITY_FULL"),
+        new BoxInvocationConflict("BOX_SESSION_BUSY"),
+      ]) {
+    test(`Box ${rejected.message} reaches the client as non-5xx busy`, async () => {
+      const old = process.env.OC_BOX_MODEL_API;
+      try {
+        process.env.OC_BOX_MODEL_API = "1";
+        const { h, headers } = boxRouteHarness();
+        h.deps.boxModel = { async fetch() { throw rejected; } };
+        const request = { ...minBody(BOX_API_MODEL), metadata: { user_id: JSON.stringify({
+          session_id: `web-box-busy-${rejected.message}`, oc_turn_key: "a".repeat(64),
+        }) } };
+        const response = await h.run(request, headers);
+        assert.equal(response.statusCode, 409, response.bodyText());
+        assert.match(response.bodyText(), /BOX_CAPACITY_HELD/);
+        assert.doesNotMatch(response.bodyText(), /CAPACITY_FULL|BOX_SESSION_BUSY|internal error|upstream/i);
+      } finally {
+        if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+        else process.env.OC_BOX_MODEL_API = old;
+      }
+    });
+  }
 
   test("tool bridge requires its own flag and reuses the authenticated proxy finalizer", async () => {
     const oldModel = process.env.OC_BOX_MODEL_API;

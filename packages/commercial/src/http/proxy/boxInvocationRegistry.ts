@@ -46,6 +46,8 @@ export class BoxInvocationRegistry {
     maxPerUser: number;
     maxPerAccount: number;
     leaseMs: number;
+    /** Same selfhost-only exception used by the durable account admission. */
+    allowSecond?: (uid: bigint, accountId: bigint) => boolean;
   }, private readonly now: () => number = Date.now) {
     if (!Number.isSafeInteger(limits.maxPerUser) || limits.maxPerUser < 1
       || !Number.isSafeInteger(limits.maxPerAccount) || limits.maxPerAccount < 1
@@ -70,10 +72,11 @@ export class BoxInvocationRegistry {
     const key = this.key(input.uid, input.sessionId);
     if (input.accountId <= 0n) throw new BoxInvocationConflict("BOX_ACCOUNT_ID_INVALID");
     if (this.active.has(key)) throw new BoxInvocationConflict("BOX_SESSION_BUSY");
-    if ((this.userCounts.get(input.uid) ?? 0) >= this.limits.maxPerUser) {
+    const extra = this.limits.allowSecond?.(input.uid, input.accountId) ? 1 : 0;
+    if ((this.userCounts.get(input.uid) ?? 0) >= this.limits.maxPerUser + extra) {
       throw new BoxInvocationConflict("BOX_USER_CAPACITY_FULL");
     }
-    if ((this.accountCounts.get(input.accountId) ?? 0) >= this.limits.maxPerAccount) {
+    if ((this.accountCounts.get(input.accountId) ?? 0) >= this.limits.maxPerAccount + extra) {
       throw new BoxInvocationConflict("BOX_ACCOUNT_CAPACITY_FULL");
     }
     const leaseMs = input.leaseMs ?? this.limits.leaseMs;

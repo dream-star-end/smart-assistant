@@ -246,7 +246,14 @@ export async function startEgress(): Promise<void> {
   // Missing staged assets make egress refuse startup when explicitly enabled.
   const boxResolver = process.env.OC_BOX_MODEL_API === "1"
     ? createProductionBoxAccountResolver() : null;
-  const boxJournal = boxResolver ? new BoxDurableJournal(getPool()) : null;
+  // One qualified Box account serves this personal instance. Two independent
+  // sessions may run there; the durable journal remains the cross-process cap.
+  const allowSecondBoxRun = (uid: bigint, accountId: bigint): boolean =>
+    process.env.OC_INSTANCE_ID === "v5-selfhost-sg"
+    && process.env.SELFHOST_CURSOR_EGRESS === "1"
+    && uid === 3n && accountId === 20n;
+  const boxJournal = boxResolver ? new BoxDurableJournal(getPool(),
+    (uid, accountId) => allowSecondBoxRun(uid, accountId) ? 2 : 1) : null;
   // The Box model route has no independent feature flag for private response
   // capsules. Its already-injected platform state root gives this instance a
   // durable sibling directory; commercial instances with Box off create none.
@@ -301,7 +308,7 @@ export async function startEgress(): Promise<void> {
     keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
     detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
     registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
-      leaseMs: 900_000 }),
+      leaseMs: 900_000, allowSecond: allowSecondBoxRun }),
     journal: boxJournal,
     writeMessage: boxReplayWriter,
     maxOutputTokensForModel: (model) =>

@@ -37,8 +37,25 @@ async function main(): Promise<void> {
       || result.stdout.trim() !== `probe-${index}`)) {
       throw new Error("BOX_PARALLEL_PROBE_RESULT_INVALID");
     }
+    // A concurrent account resolver calls Get/Ensure while an existing Exec is
+    // alive. It must not restart or interrupt that already-running command.
+    const held = targets[0]!.exec.run({ command: "/usr/bin/python3",
+      args: ["-I", "-c", "import time;time.sleep(4);print('held-alive')"],
+      cwd: "/tmp", environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } },
+    { timeoutMs: 10_000, maxResponseBytes: 1024, signal: abort.signal });
+    void held.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const ensured = await resolver.resolve({ uid: 3n, sessionId: null,
+      requestId: "box-parallel-exec-probe-ensure", upstreamModel: "claude-opus-5-5",
+      requiredAccountId: 20n, allowWakeIfHibernated: false, signal: abort.signal });
+    targets.push(ensured);
+    const heldResult = await held;
+    if (ensured.accountId !== 20n || heldResult.exitCode !== 0
+      || heldResult.stdout.trim() !== "held-alive") {
+      throw new Error("BOX_PARALLEL_ENSURE_DISRUPTED_EXEC");
+    }
     process.stdout.write(JSON.stringify({ accountId: "20", execCount: 2,
-      readyMs, overlappedExecMs: elapsedMs, paidCliCalls: 0,
+      readyMs, overlappedExecMs: elapsedMs, ensureDuringExec: "passed", paidCliCalls: 0,
       promptsSent: 0 }) + "\n");
   } finally {
     clearTimeout(timer);

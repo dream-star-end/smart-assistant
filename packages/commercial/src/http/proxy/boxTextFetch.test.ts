@@ -60,14 +60,18 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
   badAssetManifest?: boolean; writeMessage?: boolean; detached?: boolean;
-  cleanupClaimedElsewhere?: boolean; consumeBudgetAtWrite?: boolean } = {}) {
+  cleanupClaimedElsewhere?: boolean; consumeBudgetAtWrite?: boolean;
+  parallel?: boolean } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
   const stages: string[] = [], unknowns: string[] = [], journalCalls: string[] = [];
   let journalUsage: unknown = null, journalPointer: unknown = null;
   let cleanupDone = false;
-  const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }, () => now);
+  const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1,
+    leaseMs: 600_000,
+    ...(opts.parallel ? { allowSecond: (uid: bigint, accountId: bigint) =>
+      uid === 3n && accountId === 20n } : {}) }, () => now);
   const runner: Runner = { async run(request: BoxCcExecRequest,
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
     active++; maxActive = Math.max(maxActive, active);
@@ -187,6 +191,25 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
     getMaxActive: () => maxActive,
     advance: (ms: number) => { now += ms; }, releaseModel: () => releaseModel() };
 }
+
+test("text admission rejects a third session and a duplicate session before paid staging", async () => {
+  const f = fixture({ parallel: true });
+  const a = f.registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n });
+  const b = f.registry.open({ uid: 3n, sessionId: "session-b", accountId: 20n });
+  const request = (sessionId: string) => ({ ...input, sessionId,
+    requestId: `req-${sessionId}`, canonicalBody: { ...body,
+      metadata: { user_id: JSON.stringify({ oc_turn_key: "a".repeat(64),
+        session_id: sessionId }) } } });
+  for (const sessionId of ["session-c", "session-a"]) {
+    await assert.rejects(() => f.service.fetch(request(sessionId)),
+      (error: unknown) => error instanceof BoxTextFetchError
+        && error.code === "BOX_CAPACITY_HELD");
+  }
+  assert.deepEqual(f.journalCalls, []);
+  assert.deepEqual(f.stages, [], "no Box staging or paid CLI can run");
+  f.registry.confirmRemoteStopped(a);
+  f.registry.confirmRemoteStopped(b);
+});
 
 test("one authenticated proxy fetch stages serially, returns billable SSE, then releases capacity", async () => {
   const f = fixture();
