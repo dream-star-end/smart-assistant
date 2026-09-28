@@ -2482,6 +2482,11 @@ cmd_cutover() {
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
   assert_master_release_tsx_selfcheck "$rel"
+  cutover_clog "  行为门: 在候选 release 上跑 Box success recovery(显式 loopback *_test,不读生产 DSN)"
+  if ! (cd "$rel" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+      npx --no-install tsx scripts/check-v5-box-success-recovery.ts); then
+    die "行为门: Box success recovery 候选探测失败。尚未翻转。"
+  fi
   expected_build="$(dist_oc_build "$rel")"
   cutover_clog "  dist oc-build=$expected_build"
   cutover_clog "  从已过 digest 的候选快照 unit(危险窗口不再读工作树)"
