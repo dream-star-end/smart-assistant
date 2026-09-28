@@ -36,8 +36,10 @@ const KNOWN = new Set(["--expect-sha"]);
 type Api = {
   normalize: (body: Record<string, unknown>) => { messages: unknown[] };
   gate: (body: Record<string, unknown>, enabled: boolean) => string | null;
-  match: (body: Record<string, unknown>, expected: readonly Record<string, unknown>[]) =>
+  match: (body: Record<string, unknown>, expected: readonly Record<string, unknown>[],
+    catalog?: unknown) =>
     readonly { modelToolUseId: string; content: ReadonlyArray<{ type?: string; text?: string }>; isError: boolean }[];
+  proveEditDefault: () => void;
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
 };
@@ -209,12 +211,22 @@ async function load(): Promise<Api> {
   const norm = await import(pathToFileURL(join(PROXY, "boxCacheAnnotations.ts")).href);
   const match = await import(pathToFileURL(join(PROXY, "boxToolResultMatcher.ts")).href);
   const finger = await import(pathToFileURL(join(PROXY, "boxCallFingerprint.ts")).href);
+  const catalogMod = await import(pathToFileURL(join(PROXY, "boxToolCatalog.ts")).href);
+  const hashMod = await import(pathToFileURL(join(PROXY, "boxToolInputHash.ts")).href);
+  const echoMod = await import(pathToFileURL(join(PROXY, "boxToolInputEcho.ts")).href);
   return {
     normalize: norm.normalizeBoxSemanticBody,
     gate: gate.validateBoxRequest,
     match: match.matchBoxToolResults,
     context: finger.deriveBoxContextHash,
     fingerprint: finger.deriveBoxCallFingerprint,
+    proveEditDefault: () => proveEditDefault({
+      match: match.matchBoxToolResults,
+      compile: catalogMod.compileBoxToolCatalog,
+      hashInput: hashMod.hashBoxToolInput,
+      project: echoMod.comparableAssistantContent,
+      views: finger.hashAssistantClaimViews,
+    }),
   };
 }
 function countText(value: unknown, needle: string): number {
@@ -270,6 +282,62 @@ function sliceThroughTool(body: Record<string, unknown>, id: string): Record<str
   if (messages[userIndex + 1]?.role === "system") end = userIndex + 1;
   return { ...body, messages: messages.slice(0, end + 1) };
 }
+function proveEditDefault(api: {
+  match: Api["match"];
+  compile: (tools: unknown) => { bindingSha256: string };
+  hashInput: (input: unknown) => string;
+  project: (content: unknown, digests: readonly { clientName: string; inputHash: string }[],
+    catalog: unknown) => unknown[];
+  views: (content: unknown) => { full: string; noCaller: string; echo: string };
+}): void {
+  const edit = {
+    name: "Edit", description: "edit a file",
+    input_schema: { type: "object", required: ["file_path", "old_string", "new_string"],
+      properties: { file_path: { type: "string" }, old_string: { type: "string" },
+        new_string: { type: "string" }, replace_all: { type: "boolean", default: false } } },
+  };
+  const read = { name: "Read", description: "read a file",
+    input_schema: { type: "object", required: ["file_path"],
+      properties: { file_path: { type: "string" }, limit: { type: "integer" } } } };
+  const catalog = api.compile([read, edit]);
+  const plain = { file_path: "/tmp/ocv5-edit-default/sample.txt", old_string: "OLD", new_string: "NEW" };
+  const explicit = { ...plain, replace_all: false };
+  const stored = [api.hashInput(plain), api.hashInput(explicit)];
+  const echoed = [
+    { type: "tool_use", id: "toolu_edit_omit", name: "Edit", input: explicit },
+    { type: "tool_use", id: "toolu_edit_false", name: "Edit", input: explicit },
+  ];
+  const body = { model: "box-api-claude-opus-5-5", messages: [
+    { role: "user", content: "go" },
+    { role: "assistant", content: echoed },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_edit_omit", content: "ok" },
+      { type: "tool_result", tool_use_id: "toolu_edit_false", content: "ok" },
+    ] },
+  ] };
+  const expected = [
+    { id: "toolu_edit_omit", clientName: "Edit", inputHash: stored[0] },
+    { id: "toolu_edit_false", clientName: "Edit", inputHash: stored[1] },
+  ];
+  const snapshot = JSON.stringify(body);
+  const matched = api.match(body, expected, catalog);
+  if (matched.length !== 2 || JSON.stringify(body) !== snapshot) fail("EDIT_DEFAULT_MATCH");
+  const storedContent = [
+    { ...echoed[0], input: plain },
+    echoed[1],
+  ];
+  const view = api.project(echoed, expected, catalog);
+  const got = api.views(view);
+  const want = api.views(storedContent);
+  if (got.full !== want.full || got.noCaller !== want.noCaller || got.echo !== want.echo) {
+    fail("EDIT_DEFAULT_ASSISTANT");
+  }
+  expectCode(() => api.match(body, [
+    { id: "toolu_edit_omit", clientName: "Edit", inputHash: stored[0] },
+    { id: "toolu_edit_false", clientName: "Edit", inputHash: api.hashInput({ ...explicit, replace_all: true }) },
+  ], catalog), "BOX_TOOL_RESULT_HISTORY_MISMATCH");
+}
+
 function checks(api: Api): void {
   const { annotationCounts, chain, composedRejects, continuationResults, historicalBudgetOnly, HOOK,
     legalWrapped, legalWrappedBytes, openingResult, PROGRESS, rewriteProofs, rewrites, unknownMarker,
@@ -362,6 +430,7 @@ function checks(api: Api): void {
     } catch { /* stable rejection has no second hash */ }
     if (drifted) fail("C2_DRIFT");
   }
+  api.proveEditDefault();
 }
 
 function procField(pid: number, index: number): string {

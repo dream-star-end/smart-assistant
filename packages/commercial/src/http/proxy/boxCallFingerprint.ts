@@ -146,6 +146,18 @@ export function hashBoxAssistantEchoContent(content: unknown): string {
   return hashBoxAssistantContent(echo);
 }
 
+/** Three existing assistant hashes of one already-selected comparison view.
+ * The hash functions themselves still emit their original bytes. */
+export function hashAssistantClaimViews(content: unknown): {
+  full: string; noCaller: string; echo: string;
+} {
+  return {
+    full: hashBoxAssistantContent(content),
+    noCaller: hashBoxAssistantNoCallerContent(content),
+    echo: hashBoxAssistantEchoContent(content),
+  };
+}
+
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
   if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");

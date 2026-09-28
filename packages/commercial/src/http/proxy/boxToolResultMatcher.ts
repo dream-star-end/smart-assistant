@@ -7,6 +7,8 @@ import type { ProxyBody } from "./shared.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import { normalizeBoxSemanticBody, normalizeBoxToolResultBlock } from "./boxCacheAnnotations.js";
+import type { BoxToolCatalog } from "./boxToolCatalog.js";
+import { inputSchemaFor, selectStoredToolInput } from "./boxToolInputEcho.js";
 
 const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 // Leave room for the sidecar result envelope under its 8 MiB frame bound.
@@ -61,7 +63,8 @@ function content(value: unknown): McpContent[] {
 }
 
 export function matchBoxToolResults(body: ProxyBody,
-  expected: readonly (BoxToolUse | BoxToolUseDigest)[]): readonly BoxMatchedToolResult[] {
+  expected: readonly (BoxToolUse | BoxToolUseDigest)[],
+  catalog?: BoxToolCatalog): readonly BoxMatchedToolResult[] {
   const effective = normalizeBoxSemanticBody(body);
   if (!Array.isArray(expected) || expected.length < 1 || expected.length > 32
     || !Array.isArray(effective.messages) || effective.messages.length < 2) {
@@ -83,7 +86,9 @@ export function matchBoxToolResults(body: ProxyBody,
     let sameInput = false;
     if (record(use)) {
       try { sameInput = "inputHash" in prior
-        ? hashBoxToolInput(use.input) === prior.inputHash
+        ? (hashBoxToolInput(use.input) === prior.inputHash || (catalog !== undefined
+          && selectStoredToolInput(use.input, prior.inputHash, prior.clientName,
+            inputSchemaFor(catalog, prior.clientName)) !== null))
         : isDeepStrictEqual(use.input, prior.input); }
       catch { sameInput = false; }
     }

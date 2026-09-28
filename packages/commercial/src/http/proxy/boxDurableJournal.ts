@@ -10,7 +10,8 @@ import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  deriveBoxFallbackAlias, hashBoxAssistantContent } from "./boxCallFingerprint.js";
+  deriveBoxFallbackAlias, hashAssistantClaimViews, hashBoxAssistantContent } from "./boxCallFingerprint.js";
+import { comparableAssistantContent } from "./boxToolInputEcho.js";
 import { matchBoxToolResults, type BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
@@ -1594,8 +1595,10 @@ export class BoxDurableJournal implements BoxJournalPort {
         || priorIds.includes(handoff.messageId)) {
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
       }
+      let boundCatalog;
       try {
-        if (compileBoxToolCatalog(input.canonicalBody.tools).bindingSha256 !== handoff.catalogHash) {
+        boundCatalog = compileBoxToolCatalog(input.canonicalBody.tools);
+        if (boundCatalog.bindingSha256 !== handoff.catalogHash) {
           throw new BoxDurableJournalError("BOX_TOOL_CATALOG_CHANGED");
         }
       } catch (error) {
@@ -1611,24 +1614,28 @@ export class BoxDurableJournal implements BoxJournalPort {
       const digests = handoff.toolUses;
       let results: readonly BoxMatchedToolResult[];
       try { results = matchBoxToolResults(input.canonicalBody,
-        digests); }
+        digests, boundCatalog); }
       catch { throw new BoxDurableJournalError("BOX_TOOL_RESULT_MISMATCH"); }
       try {
         const assistant = effectiveBody.messages.at(-2) as
           { content?: unknown } | undefined;
         if (!assistant) throw new Error("assistant message missing");
-        const fullHash = hashBoxAssistantContent(assistant.content);
-        const echoed = Array.isArray(assistant.content)
-          && assistant.content.every((block: unknown) => {
+        const view = comparableAssistantContent(assistant.content, digests, boundCatalog);
+        const claimHashes = hashAssistantClaimViews(view);
+        const fullHash = claimHashes.full;
+        const echoed = Array.isArray(view)
+          && view.every((block: unknown) => {
             if (!block || typeof block !== "object" || Array.isArray(block)) return true;
             const type = (block as Record<string, unknown>).type;
             return type !== "thinking" && type !== "redacted_thinking";
           });
         if (fullHash !== handoff.assistantContentHash
           && !(handoff.assistantNoCallerHash
-            && fullHash === handoff.assistantNoCallerHash)
+            && (fullHash === handoff.assistantNoCallerHash
+              || claimHashes.noCaller === handoff.assistantNoCallerHash))
           && !(echoed && handoff.assistantEchoHash
-            && fullHash === handoff.assistantEchoHash)) {
+            && (fullHash === handoff.assistantEchoHash
+              || claimHashes.echo === handoff.assistantEchoHash))) {
           throw new Error("assistant message changed");
         }
       } catch {
