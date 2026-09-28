@@ -4018,10 +4018,16 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  # KL has no 127.0.0.1:55432. Do not ssh this probe there and do not read
-  # DATABASE_URL. The candidate is a git archive of full_sha plus npm ci
-  # inside that directory. Workspace packages stay inside the archive.
-  # A checkout or an older release node_modules is not a substitute.
+  # KL has no 127.0.0.1:55432. Do not ssh this probe and do not read
+  # DATABASE_URL. Commercial does not assume the controller fixture.
+  # The candidate is a git archive of full_sha; the gate hashes that tree.
+  # Do not write flavor.manifest.json and do not borrow checkout/donor deps.
+  box_dsn="${OC_V5_PROOF_TEST_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
+  if [[ -z "$box_dsn" ]]; then
+    echo "✗ box success recovery: explicit test DSN required (OC_V5_PROOF_TEST_DATABASE_URL or TEST_DATABASE_URL); no commercial default fixture" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)"
   if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
     echo "✗ box success recovery: git archive $full_sha failed" >&2
@@ -4029,15 +4035,15 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  printf '{"sourceCommit":"%s"}\n' "$full_sha" > "$box_cand/flavor.manifest.json"
   if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
     echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
     rm -rf "$box_cand"
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  if ! (cd "$box_cand" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
-      npx --no-install tsx scripts/check-v5-box-success-recovery.ts); then
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha"); then
     echo "✗ pinned box success recovery behavioral gate failed" >&2
     rm -rf "$box_cand"
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
