@@ -3,6 +3,8 @@
 import { hostname } from "node:os";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { makeBoxDetachedRunAccess } from
@@ -14,7 +16,7 @@ import { readBoxTerminalProof } from
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 
 function requireValue(ok: unknown): asserts ok { if (!ok) throw new Error("BOX_READ_BOUNDARY_INVALID"); }
-async function main(): Promise<void> {
+export async function inspectStaleRun() {
   requireValue(hostname() === "v3-dev-sg" && getRuntimeChannel() === "v5"
     && process.env.OC_USER_ID === "3"
     && process.env.OCV5_291_READ_ACK === "1");
@@ -164,19 +166,23 @@ async function main(): Promise<void> {
     }
     requireValue(currentMessage === null && finalUsage !== null
       && Object.entries(summed).every(([key, value]) => finalUsage![key] === value));
-    process.stdout.write(JSON.stringify({ requestId, proofReason: proof.reason,
+    return { requestId, proofReason: proof.reason,
       proofRevision: proof.revision, spoolBytes: offset, spoolSha256, rows, eof,
       incompleteTailBytes: Buffer.byteLength(tail), types, afterHandoff,
       toolUseBlocks, toolResultBlocks, finalUsage, summed, messages, last,
-      paidLaunches: 0, toolWrites: 0 }) + "\n");
+      paidLaunches: 0, toolWrites: 0 };
   } finally {
     clearTimeout(timer);
     if (target) await Promise.race([Promise.resolve().then(() => target!.dispose?.())
       .catch(() => {}), new Promise((resolve) => setTimeout(resolve, 2_000))]);
   }
 }
-void main().catch((error: unknown) => {
-  process.stderr.write(error instanceof Error && /^BOX_[A-Z0-9_]+$/.test(error.message)
-    ? error.message + "\n" : "BOX_READ_FAILED\n");
-  process.exitCode = 1;
-});
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  void inspectStaleRun().then((evidence) => {
+    process.stdout.write(JSON.stringify(evidence) + "\n");
+  }, (error: unknown) => {
+    process.stderr.write(error instanceof Error && /^BOX_[A-Z0-9_]+$/.test(error.message)
+      ? error.message + "\n" : "BOX_READ_FAILED\n");
+    process.exitCode = 1;
+  });
+}
