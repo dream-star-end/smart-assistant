@@ -4881,6 +4881,31 @@
           "assertion": "cold UI login waits for a delayed real button rather than bypassing login"
         }
       ]
+    },
+    {
+      "id": "INC-20260928-BOX-MULTITOOL-CONTINUATION",
+      "occurredAt": "2026-09-28",
+      "severity": "P1",
+      "symptom": "V5 selfhost Box 在第二次 Bash 的效率 PreToolUse additionalContext 与 total_tokens 被 CCB 2.1.280 合成同一条无 system-reminder 包装的 system 消息后，第三跳被 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝。",
+      "rootFixCommit": "6f559fec",
+      "coverageCommits": ["bcae6f63", "400d418d", "1a7a6fa3", "c26f0005"],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "unwrapped CCB hook plus budget system tail stays one continuation"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof"
+        }
+      ],
+      "preparedBehaviorGate": {
+        "path": "scripts/check-v5-box-continuation.ts",
+        "wired": false,
+        "note": "Formal root is an external supervisor: required --expect-sha, no unknown args, worker in its own process group, 60s deadline from before spawn, exit 0 only with the business receipt. Not an in-process timer. Not a deploy-gate proof until deploy-v5.sh or scripts/v5-selfhost-master-release-lib.sh runs the candidate node/tsx on this script. The source guard above is not that proof."
+      }
     }
   ]
 }

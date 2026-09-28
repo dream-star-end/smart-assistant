@@ -144,6 +144,16 @@ if (stripAt < 0 || stripEnd <= stripAt || foldAt <= stripAt
 }
 console.log('INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof')
 
+// INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof.
+if (!boxCache.includes('function bareHookBeforeBudget(')
+  || !boxCache.includes('const BARE_HOOK =')
+  || !boxCache.includes('const BARE_BUDGET =')
+  || !boxCache.includes('const PROGRESS_SENTENCE =')
+  || !boxCache.includes('function rejectUnapprovedToolBoundary(')) {
+  throw new Error('[box-multitool-continuation] unwrapped hook-plus-budget fold missing')
+}
+console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof')
+
 // INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
 // The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
 const mediaStore = readFileSync(join(root, 'packages/commercial/src/media-generation/store.ts'), 'utf8')
