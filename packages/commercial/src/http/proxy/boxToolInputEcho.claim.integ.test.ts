@@ -190,12 +190,29 @@ test("temp journal tables on one connection are pg_temp", { skip: !allowed }, as
   await withDb(async ({ client, query }) => {
     await query("SELECT 1 FROM request_finalize_journal WHERE false");
     await query("SELECT 1 FROM usage_records WHERE false");
-    const names = await client.query<{ nspname: string }>(
-      `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE c.relname IN ('request_finalize_journal','usage_records')
-          AND n.nspname = ANY (current_schemas(true))`);
-    assert.ok(names.rows.length >= 2);
-    assert.ok(names.rows.every((row) => row.nspname.startsWith("pg_temp")));
+    const resolvedSql = `SELECT n.nspname FROM pg_class c
+      JOIN pg_namespace n ON n.oid=c.relnamespace
+      WHERE c.oid IN (to_regclass('request_finalize_journal'), to_regclass('usage_records'))`;
+    await client.query("BEGIN");
+    try {
+      await client.query("CREATE SCHEMA ocv5_294_c1_shadow");
+      await client.query("CREATE TABLE ocv5_294_c1_shadow.request_finalize_journal (request_id text)");
+      await client.query("CREATE TABLE ocv5_294_c1_shadow.usage_records (request_id text)");
+      await client.query("SET LOCAL search_path TO pg_temp, ocv5_294_c1_shadow");
+      const broad = await client.query<{ nspname: string }>(
+        `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE c.relname IN ('request_finalize_journal','usage_records')
+            AND n.nspname = ANY (current_schemas(true))`);
+      assert.ok(broad.rows.some((row) => row.nspname === "ocv5_294_c1_shadow"));
+      const resolved = await client.query<{ nspname: string }>(resolvedSql);
+      assert.equal(resolved.rows.length, 2);
+      assert.ok(resolved.rows.every((row) => row.nspname.startsWith("pg_temp")));
+    } finally {
+      await client.query("ROLLBACK");
+    }
+    const after = await client.query<{ nspname: string }>(resolvedSql);
+    assert.equal(after.rows.length, 2);
+    assert.ok(after.rows.every((row) => row.nspname.startsWith("pg_temp")));
   });
 });
 
@@ -285,16 +302,19 @@ test("stored noCaller echo claims and a changed caller does not advance", { skip
     const stored = [{ type: "tool_use", id: "toolu_caller", name: "Edit", input: plain,
       caller: { type: "direct" }, provider_meta: "keep" }];
     const hashes = storedHashes(stored);
-    const echoed = [{ type: "tool_use", id: "toolu_caller", name: "Edit", input: plain,
+    const selected = [{ type: "tool_use", id: "toolu_caller", name: "Edit", input: plain,
       provider_meta: "keep" }];
-    assert.equal(hashBoxAssistantContent(echoed), hashes.assistantNoCallerHash);
+    const echoed = [{ ...selected[0], input: explicit }];
+    assert.notEqual(hashBoxToolInput(explicit), hashBoxToolInput(plain));
+    assert.notEqual(hashBoxAssistantContent(echoed), hashes.assistantNoCallerHash);
+    assert.equal(hashBoxAssistantContent(selected), hashes.assistantNoCallerHash);
     assert.notEqual(hashBoxAssistantContent(echoed), hashes.assistantContentHash);
     assert.notEqual(hashBoxAssistantContent(echoed), hashes.assistantEchoHash);
     const seeded = await seed(handle, "nocaller", tools, stored,
       [{ id: "toolu_caller", input: plain }], [{ id: "toolu_caller", text: "ok" }]);
     const who = JSON.parse(String(seeded.body.metadata!.user_id));
     const changed = bodyOf(who.session_id, who.oc_turn_key, tools,
-      [{ ...echoed[0], caller: { type: "tampered" } }], [{ id: "toolu_caller", text: "ok" }]);
+      [{ ...selected[0], caller: { type: "tampered" } }], [{ id: "toolu_caller", text: "ok" }]);
     await expectCode(() => handle.journal.claimToolResume({
       requestId: seeded.child, uid: 3n, canonicalModel: model, canonicalBody: changed }),
     "BOX_TOOL_ASSISTANT_CHANGED");
@@ -392,6 +412,16 @@ test("true, unknown key and wrong id order fail closed", { skip: !allowed }, asy
       requestId: seeded.child, uid: 3n, canonicalModel: model, canonicalBody: swapped }),
     "BOX_TOOL_RESULT_MISMATCH");
     await parked(handle.client, seeded.owner, seeded.child);
+    const truthyInput = { ...plain, replace_all: true as const };
+    assert.notEqual(hashBoxToolInput(truthyInput), hashBoxToolInput(plain));
+    assert.notEqual(hashBoxToolInput(truthyInput), hashBoxToolInput(explicit));
+    const truthyStored = [{ type: "tool_use", id: "toolu_trueok", name: "Edit", input: truthyInput }];
+    const truthySeed = await seed(handle, "trueok", tools, truthyStored,
+      [{ id: "toolu_trueok", input: truthyInput }], [{ id: "toolu_trueok", text: "ok" }]);
+    const truthyClaim = await handle.journal.claimToolResume({
+      requestId: truthySeed.child, uid: 3n, canonicalModel: model, canonicalBody: truthySeed.body });
+    assert.equal(resultText(truthyClaim.results[0]?.content), "ok");
+    await keptDigests(handle.client, truthySeed.owner, truthySeed.hashes, [hashBoxToolInput(truthyInput)]);
   });
 });
 
@@ -426,17 +456,32 @@ test("next handoff and claim continue the client history context", { skip: !allo
   await withDb(async (handle) => {
     const tools = [editTool()];
     const catalog = compileBoxToolCatalog(tools);
-    const assistant = [{ type: "tool_use", id: "toolu_cont", name: "Edit", input: explicit }];
-    const seeded = await seed(handle, "cont", tools, assistant,
-      [{ id: "toolu_cont", input: explicit }], [{ id: "toolu_cont", text: "ok" }]);
+    const storedHash = hashBoxToolInput(plain);
+    const clientHash = hashBoxToolInput(explicit);
+    assert.notEqual(storedHash, clientHash);
+    const storedAssistant = [{ type: "tool_use", id: "toolu_cont", name: "Edit", input: plain }];
+    const seeded = await seed(handle, "cont", tools, storedAssistant,
+      [{ id: "toolu_cont", input: plain }], [{ id: "toolu_cont", text: "ok" }]);
+    const who = JSON.parse(String(seeded.body.metadata!.user_id));
+    const clientBody = bodyOf(who.session_id, who.oc_turn_key, tools,
+      [{ type: "tool_use", id: "toolu_cont", name: "Edit", input: explicit }],
+      [{ id: "toolu_cont", text: "ok" }]);
+    const clientBaseline = { raw: JSON.stringify(clientBody),
+      replay: deriveBoxCallFingerprint(3n, clientBody).replayFingerprint,
+      request: deriveBoxCallFingerprint(3n, clientBody).requestHash,
+      full: deriveBoxContextHash(clientBody), tail: deriveBoxContextHash(clientBody, true) };
+    assert.equal(clientBaseline.tail, seeded.baseline.tail);
+    assert.notEqual(clientBaseline.full, seeded.baseline.full);
     const first = await handle.journal.claimToolResume({
-      requestId: seeded.child, uid: 3n, canonicalModel: model, canonicalBody: seeded.body });
+      requestId: seeded.child, uid: 3n, canonicalModel: model, canonicalBody: clientBody });
     assert.equal(resultText(first.results[0]?.content), "ok");
-    sameBody(seeded.body, seeded.baseline);
+    sameBody(clientBody, clientBaseline);
+    await keptDigests(handle.client, seeded.owner, seeded.hashes, [storedHash]);
     const linked = await handle.client.query<{ hash: string }>(
       `SELECT ctx->>'boxContextHash' AS hash FROM request_finalize_journal WHERE request_id=$1`,
       [seeded.child]);
-    assert.equal(linked.rows[0]?.hash, seeded.baseline.full);
+    assert.equal(linked.rows[0]?.hash, clientBaseline.full);
+    assert.notEqual(linked.rows[0]?.hash, seeded.baseline.full);
     await handle.client.query(`UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxLaunchPermit":true}'::jsonb WHERE request_id=$1`, [seeded.owner]);
     const nextInput = { file_path: "/tmp/ocv5-edit-default/next.txt", old_string: "A",
@@ -459,10 +504,10 @@ test("next handoff and claim continue the client history context", { skip: !allo
       VALUES ($1,3,'inflight',$2::jsonb)`, [grandId, JSON.stringify({
       model, boxInvocationRecovery: "v1", billingPricing: billing.billingPricing,
       boxBillingContext: billing.boxBillingContext })]);
-    const who = JSON.parse(String(seeded.body.metadata!.user_id));
     const nextBody = bodyOf(who.session_id, who.oc_turn_key, tools, nextContent,
       [{ id: "toolu_next", text: "next-ok" }]);
-    nextBody.messages = [...seeded.body.messages, ...nextBody.messages.slice(1)];
+    nextBody.messages = [...clientBody.messages, ...nextBody.messages.slice(1)];
+    assert.equal(deriveBoxContextHash(nextBody, true), clientBaseline.full);
     const broken = "b".repeat(64);
     await handle.client.query(`UPDATE request_finalize_journal
       SET ctx=jsonb_set(ctx,'{boxContextHash}',to_jsonb($2::text)) WHERE request_id=$1`,
@@ -480,7 +525,7 @@ test("next handoff and claim continue the client history context", { skip: !allo
     assert.equal(ownerStill.rows[0]?.state, "handoff");
     await handle.client.query(`UPDATE request_finalize_journal
       SET ctx=jsonb_set(ctx,'{boxContextHash}',to_jsonb($2::text)) WHERE request_id=$1`,
-    [seeded.child, seeded.baseline.full]);
+    [seeded.child, clientBaseline.full]);
     const second = await handle.journal.claimToolResume({
       requestId: grandId, uid: 3n, canonicalModel: model, canonicalBody: nextBody });
     assert.equal(second.ownerRequestId, seeded.child);
