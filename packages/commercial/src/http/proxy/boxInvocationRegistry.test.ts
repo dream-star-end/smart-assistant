@@ -8,6 +8,22 @@ function rejected(fn: () => unknown, code: string): void {
 }
 
 describe("Box cross-HTTP invocation ownership", () => {
+  it("permits two independent selfhost sessions without freeing each other's slot", () => {
+    const registry = new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
+      leaseMs: 1000, allowSecond: (uid, accountId) => uid === 3n && accountId === 20n });
+    const a = registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n });
+    const b = registry.open({ uid: 3n, sessionId: "session-b", accountId: 20n });
+    assert.deepEqual(registry.counts(3n, 20n), { user: 2, account: 2 });
+    rejected(() => registry.open({ uid: 3n, sessionId: "session-c", accountId: 20n }),
+      "BOX_USER_CAPACITY_FULL");
+    rejected(() => registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n }),
+      "BOX_SESSION_BUSY");
+    registry.confirmRemoteStopped(a);
+    assert.deepEqual(registry.counts(3n, 20n), { user: 1, account: 1 });
+    const c = registry.open({ uid: 3n, sessionId: "session-c", accountId: 20n });
+    registry.confirmRemoteStopped(b);
+    registry.confirmRemoteStopped(c);
+  });
   it("keeps the same remote CLI alive after tool_use HTTP response ends", () => {
     const registry = new BoxInvocationRegistry(limits);
     const lease = registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n });

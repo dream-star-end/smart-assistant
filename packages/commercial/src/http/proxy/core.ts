@@ -61,6 +61,9 @@ import {
 import { recordProviderHealthSample } from "./providerHealthSink.js";
 import { recordUpstreamPerformance } from "../../ws/turnPerformance.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
+import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { BoxTextFetchError } from "./boxTextFetch.js";
+import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
 import {
   clearProviderQuotaBlock,
   isMoonshotBillingQuotaExhausted,
@@ -580,9 +583,17 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
     else incrAnthropicProxySettle("aborted");
   } catch (err) {
+    const boxCapacityHeld = body.model === "box-api-claude-opus-5-5"
+      && ((err instanceof BoxDurableJournalError
+        || err instanceof BoxTextFetchError) && err.code === "BOX_CAPACITY_HELD"
+        || err instanceof BoxInvocationConflict
+          && ["BOX_USER_CAPACITY_FULL", "BOX_ACCOUNT_CAPACITY_FULL",
+            "BOX_SESSION_BUSY"].includes(err.code));
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
-    if (isClientAbort(err)) {
+    if (boxCapacityHeld) {
+      await finalize.failClient(observed, err, "INVALID_REQUEST");
+    } else if (isClientAbort(err)) {
       await finalize.failClient(observed, err, "CLIENT_ABORT");
       recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除
     } else {
@@ -604,7 +615,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     );
     // 字节是否已 flush 决定怎么发错误
     if (!res.headersSent) {
-      sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+      if (boxCapacityHeld) {
+        sendJsonError(res, 409, "BOX_CAPACITY_HELD", "Box slot busy", requestId);
+      } else sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
     } else {
       try {
         res.end();

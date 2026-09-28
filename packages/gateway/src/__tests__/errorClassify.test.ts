@@ -5,6 +5,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { supportsAutomaticTurnRecovery } from '@openclaude/protocol'
 import {
   classifiedMessageForCode,
   classifyDelegateOutputError,
@@ -12,6 +13,12 @@ import {
 } from '../errorClassify.js'
 
 describe('classifyRunError', () => {
+  it('Box local slot 409 is not a model-capacity or upstream retry', () => {
+    const raw = 'API Error: 409 {"error":{"code":"BOX_CAPACITY_HELD","message":"Box slot busy"}}'
+    const classified = classifyRunError(raw)
+    assert.equal(classified.code, 'unknown')
+    assert.equal(supportsAutomaticTurnRecovery(classified.code), false)
+  })
   it('model_config_changed_retry_turn: production model-authority 409', () => {
     const raw =
       'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn"},"request_id":"req-1"}'

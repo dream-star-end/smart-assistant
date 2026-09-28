@@ -306,7 +306,8 @@ async function lockChainSession(client: PoolClient, uid: bigint,
 }
 
 export class BoxDurableJournal implements BoxJournalPort {
-  constructor(private readonly pool: Pick<Pool, "connect" | "query">) {}
+  constructor(private readonly pool: Pick<Pool, "connect" | "query">,
+    private readonly maxAccountRuns: (uid: bigint, accountId: bigint) => number = () => 1) {}
 
   /** An older pointer cannot be reused after an intervening uncached turn. */
   async findNativeCandidate(input: { uid: bigint; sessionId: string;
@@ -756,13 +757,46 @@ export class BoxDurableJournal implements BoxJournalPort {
              OR ctx->>'boxFallbackAlias' = $2 LIMIT 1`,
         [input.fingerprint.replayFingerprint, fallbackAlias ?? null]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
-      const occupied = await client.query(
-        `SELECT 1 FROM request_finalize_journal
-          WHERE ctx->>'boxState' = ANY($1::text[])
-            AND (ctx->>'boxAccountId' = $2 OR
-              (user_id = $3 AND ctx->>'boxSessionId' = $4)) LIMIT 1`,
-        [ACTIVE, input.accountId.toString(), input.uid.toString(), input.fingerprint.sessionId]);
-      if (occupied.rowCount) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      const maxRuns = this.maxAccountRuns(input.uid, input.accountId);
+      if (!Number.isSafeInteger(maxRuns) || maxRuns < 1 || maxRuns > 2) {
+        throw new BoxDurableJournalError("BOX_CAPACITY_POLICY_INVALID");
+      }
+      // Linked HTTP rows of one tool chain share a remote run. Count remote
+      // identities, not journal rows; malformed active evidence fails closed.
+      const occupied = await client.query<{ user_id: string;
+        session_id: string | null; account_id: string | null;
+        run_nonce: string | null; lease_epoch: string | null }>(
+        `SELECT user_id, ctx->>'boxSessionId' AS session_id,
+           ctx->>'boxAccountId' AS account_id,
+           ctx->>'boxRunNonce' AS run_nonce,
+           ctx->>'boxLeaseEpoch' AS lease_epoch
+         FROM request_finalize_journal
+         WHERE ctx->>'boxState' = ANY($1::text[])
+           AND (ctx->>'boxAccountId' = $2 OR
+             (user_id = $3 AND ctx->>'boxSessionId' = $4)) LIMIT 1024`,
+        [ACTIVE, input.accountId.toString(), input.uid.toString(),
+          input.fingerprint.sessionId]);
+      // A 128-round tool chain can itself have >128 linked HTTP rows. Bound
+      // the read well above both allowed chains; overflow still fails closed.
+      if ((occupied.rowCount ?? occupied.rows.length) >= 1024) {
+        throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      }
+      const accountRuns = new Set<string>();
+      for (const row of occupied.rows) {
+        if (String(row.user_id) === input.uid.toString()
+          && row.session_id === input.fingerprint.sessionId) {
+          throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+        }
+        if (row.account_id !== input.accountId.toString()) continue;
+        if (!/^[a-f0-9]{24}$/.test(row.run_nonce ?? "")
+          || !/^[a-f0-9]{32}$/.test(row.lease_epoch ?? "")) {
+          throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+        }
+        accountRuns.add(`${row.run_nonce}:${row.lease_epoch}`);
+      }
+      if (accountRuns.size >= maxRuns) {
+        throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      }
       if (native) {
         // The remote preflight happens before these locks. A pointer can expire
         // while waiting for another account/session transaction; never commit
