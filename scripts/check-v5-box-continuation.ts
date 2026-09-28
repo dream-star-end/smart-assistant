@@ -1,34 +1,36 @@
-/** Semantic continuation gate for INC-20260928-BOX-MULTITOOL-CONTINUATION.
- * Zero network. Loads this candidate's real gate, normalizer, matcher, and
- * context modules. Does not start CCB and does not read capture files.
+/** Formal continuation gate for INC-20260928-BOX-MULTITOOL-CONTINUATION.
+ * Not a deploy-gate proof. wired stays false until a release script calls it.
  *
- * Not a deploy-gate proof until a release script calls it. The source-text
- * guard in check-v5-session-unavailable-rootfix.ts is not this proof.
- *
- * Integration contract, from the candidate root:
- *   /usr/bin/tsx scripts/check-v5-box-continuation.ts --expect-sha <40-hex HEAD>
- * Exit 0 only when that tree passes and three isolated fault copies
- * (progress, keep-budget, promote-wrapper) each fail the same assertions.
- * Wire it beside check-v5-session-unavailable-rootfix.ts in deploy-v5.sh and
- * scripts/v5-selfhost-master-release-lib.sh. Do not claim the incident proof
- * layer closed before that call exists.
+ * From the candidate root, with that tree's node or tsx:
+ *   tsx scripts/check-v5-box-continuation.ts --expect-sha <40-hex>
+ *   node scripts/check-v5-box-continuation.ts --expect-sha <40-hex>
+ * Node 22 re-execs with --experimental-transform-types. --expect-sha is required
+ * and is the builder archive SHA, not this process's git HEAD. Unknown
+ * arguments fail. A tree with no .git still runs. Fault mutations are not
+ * accepted here; they live in check-v5-box-continuation.negative.ts.
  */
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { register } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
-import { pathToFileURL, fileURLToPath } from "node:url";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import {
   annotationCounts, chain, composedRejects, historicalBudgetOnly, HOOK, legalWrapped,
   legalWrappedBytes, matchedTails, PROGRESS, rewrites, unknownMarker, unknownText, WRAPPED,
 } from "./check-v5-box-continuation-fixture.ts";
 
-const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const PROXY = join(ROOT, "packages/commercial/src/http/proxy");
+const LIMIT_MS = 60_000;
+const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
+const PROXY = realpathSync(join(CANDIDATE, "packages/commercial/src/http/proxy"));
+const SELF = realpathSync(fileURLToPath(import.meta.url));
+const FIXTURE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-fixture.ts", import.meta.url)));
+const LOADER = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-resolve.mjs", import.meta.url)));
 const ENTRIES = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts",
   "boxCallFingerprint.ts"];
+const KNOWN = new Set(["--expect-sha"]);
 
 type Api = {
   normalize: (body: Record<string, unknown>) => { messages: unknown[] };
@@ -38,71 +40,141 @@ type Api = {
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
 };
+type Digest = Array<{ path: string; sha256: string }>;
 
+let scratch = "";
 function fail(message: string): never {
   throw new Error(message);
-}
-function flag(name: string): string {
-  const index = process.argv.indexOf(name);
-  return index >= 0 ? process.argv[index + 1] ?? "" : "";
 }
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
-function inside(dir: string, file: string): boolean {
-  const rel = relative(dir, file);
-  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`);
+function underTsx(): boolean {
+  return process.execArgv.some((arg) => arg.includes("/tsx/"));
 }
-function localSpecs(source: string): Array<{ spec: string; typeOnly: boolean }> {
-  return [...source.matchAll(/import\s+(type\s+)?(?:[^'";]*?\s+from\s+)?["'](\.[^"']+)["']/g)]
-    .map((match) => ({ typeOnly: Boolean(match[1]), spec: match[2]! }));
+function contained(file: string): boolean {
+  const rel = relative(CANDIDATE, file);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
-function resolveSpec(fromFile: string, spec: string): string {
+function parseArgs(argv: string[]): { expectSha: string } {
+  let expectSha = "";
+  for (let i = 2; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (!KNOWN.has(arg)) fail(`UNKNOWN_ARG ${arg}`);
+    const value = argv[++i];
+    if (value === undefined || value.startsWith("--")) fail("EXPECT_SHA_REQUIRED");
+    if (expectSha) fail("EXPECT_SHA_DUPLICATE");
+    if (!/^[0-9a-f]{40}$/.test(value)) fail("EXPECT_SHA_INVALID");
+    expectSha = value;
+  }
+  if (!expectSha) fail("EXPECT_SHA_REQUIRED");
+  return { expectSha };
+}
+function ensureNodeTransform(): void {
+  if (underTsx()) return;
+  const major = Number(process.versions.node.split(".")[0]);
+  if (major < 22 || process.execArgv.includes("--experimental-transform-types")) return;
+  const child = spawnSync(process.execPath,
+    ["--experimental-transform-types", ...process.argv.slice(1)], { stdio: "inherit" });
+  process.exit(child.status === null ? 1 : child.status);
+}
+function installResolveHook(): void {
+  if (underTsx()) return;
+  register(pathToFileURL(LOADER).href);
+}
+function typeOnlyClause(prefix: string | undefined, clause: string): boolean {
+  if (prefix) return true;
+  const body = clause.trim();
+  if (!body.startsWith("{")) return false;
+  const inside = body.slice(1, body.lastIndexOf("}"));
+  const parts = inside.split(",").map((part) => part.trim()).filter(Boolean);
+  return parts.length > 0 && parts.every((part) => part.startsWith("type "));
+}
+function parseSpecs(source: string): Array<{ spec: string; typeOnly: boolean }> {
+  const out: Array<{ spec: string; typeOnly: boolean }> = [];
+  const re = /(^|\n)\s*import\s+(type\s+)?([\s\S]*?)\sfrom\s+["']([^"']+)["']/g;
+  for (const match of source.matchAll(re)) {
+    const clause = match[3] ?? "";
+    if (clause.includes(";") || /\n\s*import\s/.test(clause)) continue;
+    const spec = match[4]!;
+    if (!spec.startsWith(".")) continue;
+    out.push({ spec, typeOnly: typeOnlyClause(match[2], clause) });
+  }
+  return out;
+}
+function resolveLocal(fromFile: string, spec: string): string | null {
   const base = resolve(dirname(fromFile), spec);
   const candidates = spec.endsWith(".js")
-    ? [base.slice(0, -3) + ".ts", base.slice(0, -3) + ".tsx", base]
+    ? [`${base.slice(0, -3)}.ts`, `${base.slice(0, -3)}.tsx`, base]
     : [base, `${base}.ts`, `${base}.tsx`];
   for (const candidate of candidates) {
-    if (existsSync(candidate) && statSync(candidate).isFile()) return candidate;
+    if (existsSync(candidate) && statSync(candidate).isFile()) return realpathSync(candidate);
   }
-  return fail(`UNRESOLVED ${spec} from ${fromFile}`);
+  return null;
 }
-function closure(dir: string): string[] {
-  const pending = ENTRIES.map((name) => join(dir, name));
+function digest(): Digest {
+  const pending = ENTRIES.map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
+  const files = new Set<string>([SELF, FIXTURE, LOADER]);
   while (pending.length > 0) {
     const file = pending.pop()!;
     if (seen.has(file)) continue;
-    if (!inside(dir, file)) fail(`DEP_ESCAPE ${file}`);
+    if (!contained(file)) fail(`DEP_ESCAPE ${file}`);
     seen.add(file);
-    for (const item of localSpecs(readFileSync(file, "utf8"))) {
-      const next = resolveSpec(file, item.spec);
-      if (!inside(dir, next)) {
-        const entry = ENTRIES.some((name) => file.endsWith(`${sep}${name}`));
-        if (entry && !item.typeOnly) fail(`DEP_ESCAPE ${next}`);
+    files.add(file);
+    for (const item of parseSpecs(readFileSync(file, "utf8"))) {
+      const next = resolveLocal(file, item.spec);
+      if (item.typeOnly) {
+        if (next && contained(next)) files.add(next);
         continue;
       }
+      if (!next) fail(`UNRESOLVED ${item.spec} from ${file}`);
+      if (!contained(next)) fail(`DEP_ESCAPE ${next}`);
       pending.push(next);
     }
   }
-  for (const name of ENTRIES) {
-    if (![...seen].some((file) => file.endsWith(`${sep}${name}`))) fail(`MANIFEST_MISSING_${name}`);
+  const proxyCount = [...files].filter((file) => file.startsWith(`${PROXY}${sep}`)).length;
+  if (proxyCount < 9) fail(`RUNTIME_MODULES_${proxyCount}`);
+  for (const file of files) {
+    if (!contained(file)) fail(`DEP_ESCAPE ${file}`);
   }
-  return [...seen].sort();
+  return [...files].sort().map((file) => ({
+    path: relative(CANDIDATE, file),
+    sha256: sha256(readFileSync(file)),
+  }));
 }
-function digest(dir: string): Array<{ path: string; sha256: string }> {
-  return closure(dir).map((file) => ({ path: relative(dir, file), sha256: sha256(readFileSync(file)) }));
+function gitCrossCheck(expectSha: string): "absent" | "match" {
+  if (!existsSync(join(CANDIDATE, ".git"))) return "absent";
+  const status = spawnSync("git", ["-C", CANDIDATE, "rev-parse", "HEAD"], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (status.status !== 0) fail("GIT_CROSSCHECK_FAILED");
+  const value = (status.stdout ?? "").trim();
+  if (!/^[0-9a-f]{40}$/.test(value)) fail("GIT_HEAD_INVALID");
+  if (value !== expectSha) fail("GIT_SHA_MISMATCH");
+  return "match";
 }
-function head(): string {
-  const value = execFileSync("git", ["-C", ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  if (!/^[0-9a-f]{40}$/.test(value)) fail("HEAD_INVALID");
-  return value;
+function isolate(dir: string): void {
+  for (const name of ["home", "state", "tmp"]) mkdirSync(join(dir, name));
+  const kept: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "SystemRoot"]) {
+    if (process.env[key] !== undefined) kept[key] = process.env[key];
+  }
+  for (const key of Object.keys(process.env)) delete process.env[key];
+  Object.assign(process.env, kept, {
+    HOME: join(dir, "home"),
+    OPENCLAUDE_HOME: join(dir, "state"),
+    TMPDIR: join(dir, "tmp"),
+    TEMP: join(dir, "tmp"),
+    TMP: join(dir, "tmp"),
+    NO_COLOR: "1",
+  });
 }
-async function load(dir: string): Promise<Api> {
-  const gate = await import(pathToFileURL(join(dir, "boxRequestGate.ts")).href);
-  const norm = await import(pathToFileURL(join(dir, "boxCacheAnnotations.ts")).href);
-  const match = await import(pathToFileURL(join(dir, "boxToolResultMatcher.ts")).href);
-  const finger = await import(pathToFileURL(join(dir, "boxCallFingerprint.ts")).href);
+async function load(): Promise<Api> {
+  const gate = await import(pathToFileURL(join(PROXY, "boxRequestGate.ts")).href);
+  const norm = await import(pathToFileURL(join(PROXY, "boxCacheAnnotations.ts")).href);
+  const match = await import(pathToFileURL(join(PROXY, "boxToolResultMatcher.ts")).href);
+  const finger = await import(pathToFileURL(join(PROXY, "boxCallFingerprint.ts")).href);
   return {
     normalize: norm.normalizeBoxSemanticBody,
     gate: gate.validateBoxRequest,
@@ -208,67 +280,45 @@ function checks(api: Api): void {
     if (drifted) fail("C2_DRIFT");
   }
 }
-function patch(source: string, fault: string): string {
-  if (fault === "progress") {
-    const needle = "function bareHookBeforeBudget(text: string): string | null {\n";
-    if (!source.includes(needle)) fail("FAULT_ANCHOR_PROGRESS");
-    return source.replace(needle, `${needle}  if (text.startsWith(PROGRESS_SENTENCE)) return null;\n`);
-  }
-  if (fault === "keep-budget") {
-    const needle = "function historicalBudgetString(text: string): boolean {\n  return exactMatch(BARE_BUDGET, text);\n}";
-    if (!source.includes(needle)) fail("FAULT_ANCHOR_BUDGET");
-    return source.replace(needle,
-      "function historicalBudgetString(text: string): boolean {\n  return false && exactMatch(BARE_BUDGET, text);\n}");
-  }
-  if (fault === "promote-wrapper") {
-    const needle = "function rejectIfUnapprovedBoundary(message: Record<string, unknown>): void {\n  if (unapprovedCollapsibleBoundary(message)) {";
-    if (!source.includes(needle)) fail("FAULT_ANCHOR_WRAPPER");
-    return source.replace(needle,
-      "function rejectIfUnapprovedBoundary(message: Record<string, unknown>): void {\n  return;\n  if (unapprovedCollapsibleBoundary(message)) {");
-  }
-  return fail(`UNKNOWN_FAULT_${fault}`);
+
+function cleanup(): void {
+  if (scratch) rmSync(scratch, { recursive: true, force: true });
 }
-async function faultIsRed(name: string): Promise<void> {
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-294-b1-gate-"));
-  try {
-    for (const file of closure(PROXY)) copyFileSync(file, join(dir, relative(PROXY, file)));
-    const target = join(dir, "boxCacheAnnotations.ts");
-    const next = patch(readFileSync(target, "utf8"), name);
-    if (sha256(next) === sha256(readFileSync(join(PROXY, "boxCacheAnnotations.ts")))) fail("FAULT_NOT_ISOLATED");
-    writeFileSync(target, next);
-    let red = false;
-    try { checks(await load(dir)); }
-    catch { red = true; }
-    if (!red) fail(`FAULT_STILL_GREEN_${name}`);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
+process.on("SIGTERM", () => { cleanup(); process.exit(1); });
+process.on("SIGINT", () => { cleanup(); process.exit(1); });
 
 async function main(): Promise<void> {
-  const expectSha = flag("--expect-sha");
-  const onlyFault = flag("--fault");
-  const boundHead = head();
-  if (expectSha && expectSha !== boundHead) fail("HEAD_MISMATCH");
-  if (onlyFault) {
-    await faultIsRed(onlyFault);
-    console.log(JSON.stringify({ ok: true, faultRed: onlyFault, head: boundHead }));
-    return;
+  ensureNodeTransform();
+  const timer = setTimeout(() => { cleanup(); process.exit(1); }, LIMIT_MS);
+  const { expectSha } = parseArgs(process.argv);
+  const git = gitCrossCheck(expectSha);
+  scratch = mkdtempSync(join(tmpdir(), "ocv5-b1-home-"));
+  try {
+    isolate(scratch);
+    installResolveHook();
+    const before = digest();
+    const api = await load();
+    const after = digest();
+    if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
+    checks(api);
+    const end = digest();
+    if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");
+    const runtime = before.filter((item) => item.path.startsWith(`packages${sep}commercial${sep}src${sep}http${sep}proxy${sep}`));
+    console.log(JSON.stringify({
+      ok: true, wired: false, expectSha, candidate: CANDIDATE, git,
+      runtimeModules: runtime.length, modules: before.length, digest: before,
+      node: process.version, execPath: realpathSync(process.execPath),
+      homeIsolated: process.env.HOME === join(scratch, "home"),
+      database: process.env.DATABASE_URL !== undefined,
+    }));
+  } finally {
+    clearTimeout(timer);
+    cleanup();
   }
-  const before = digest(PROXY);
-  const api = await load(PROXY);
-  const after = digest(PROXY);
-  if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT");
-  checks(api);
-  for (const name of ["progress", "keep-budget", "promote-wrapper"]) await faultIsRed(name);
-  if (!existsSync(join(ROOT, "scripts/check-v5-box-continuation-fixture.ts"))) fail("FIXTURE_MISSING");
-  console.log(JSON.stringify({
-    ok: true, head: boundHead, modules: before.length, wired: false,
-    annotations: sha256(readFileSync(join(PROXY, "boxCacheAnnotations.ts"))),
-  }));
 }
 
 main().catch((error: unknown) => {
+  cleanup();
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 });

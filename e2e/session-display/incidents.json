@@ -4904,7 +4904,7 @@
       "preparedBehaviorGate": {
         "path": "scripts/check-v5-box-continuation.ts",
         "wired": false,
-        "note": "Semantic continuation gate is prepared and measured. It is not a deploy-gate proof until deploy-v5.sh or scripts/v5-selfhost-master-release-lib.sh calls it on the pinned candidate. The source guard above is not that proof."
+        "note": "Formal gate requires --expect-sha and runs on a gitless archive. It does not accept --fault. Negatives are scripts/check-v5-box-continuation.negative.ts. Not a deploy-gate proof until deploy-v5.sh or scripts/v5-selfhost-master-release-lib.sh runs the candidate node/tsx on this script. The source guard above is not that proof."
       }
     }
   ]
