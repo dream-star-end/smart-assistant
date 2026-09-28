@@ -2,22 +2,30 @@
  * terminal-proof journal candidate may reach remote Exec; no CLI launch,
  * tool publication or paid retry exists in this worker. */
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
-import type { BoxDurableJournal, BoxRemoteCleanupCandidate } from "./boxDurableJournal.js";
+import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
+  BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { readBoxTerminalProof } from "./boxTerminalProof.js";
+import { readBoxStagedToolCatalog } from "./boxStagedCatalogRead.js";
+import { rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
+import { observeBoxToolTerminalOnly } from "./boxToolTerminalRecovery.js";
+import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 
 type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
     "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
-    "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure">>;
+    "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" |
+    "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
+    "readRecoveryWinner">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 
 export class BoxRemoteCleanupWorker {
   private readonly orphaned = new Map<BoxResolvedTarget,
     { pending: Promise<void> | null; failed: boolean }>();
-  constructor(private readonly deps: { journal: Journal; resolver: Resolver }) {}
+  constructor(private readonly deps: { journal: Journal; resolver: Resolver;
+    writeRecoveryMessage?: BoxReplayMessageWriter }) {}
 
   private async resolvePinned(candidate: Pick<BoxRemoteCleanupCandidate,
     "uid" | "requestId" | "accountId">): Promise<BoxResolvedTarget> {
@@ -25,7 +33,7 @@ export class BoxRemoteCleanupWorker {
     const pending = this.deps.resolver.resolve({ uid: candidate.uid,
       sessionId: null, requestId: candidate.requestId,
       upstreamModel: "claude-opus-5-5", requiredAccountId: candidate.accountId,
-      signal: abort.signal });
+      allowWakeIfHibernated: false, signal: abort.signal });
     let abandoned = false;
     let completed: BoxResolvedTarget | null = null;
     void pending.then((target) => {
@@ -94,7 +102,11 @@ export class BoxRemoteCleanupWorker {
             }),
           ]);
         } finally { if (timer) clearTimeout(timer); }
-        if (proof.reason === "worker_complete") { pending++; continue; }
+        if (proof.reason === "worker_complete") {
+          const closed = await this.recoverProvedSuccess(candidate, target);
+          if (!closed) pending++;
+          continue;
+        }
         const stop = { requestId: candidate.requestId, uid: candidate.uid,
           leaseEpoch: candidate.leaseEpoch, proof };
         if (candidate.linked) await journal.markToolChainStoppedFailure(stop);
@@ -104,6 +116,37 @@ export class BoxRemoteCleanupWorker {
       finally { if (target) await this.closeLocal(target); }
     }
     return { recovered, pending };
+  }
+
+  /** worker_complete is not a failure. Close one final round only when the
+   * writer, chain evidence, catalog binding and capsule all exist. */
+  private async recoverProvedSuccess(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget): Promise<boolean> {
+    const journal = this.deps.journal;
+    const write = this.deps.writeRecoveryMessage;
+    if (!write || !journal.readDetachedUnknownRecovery || !journal.complete
+      || !journal.completeToolChain || !journal.readRecoveryWinner) return false;
+    const loaded = await journal.readDetachedUnknownRecovery({
+      requestId: candidate.requestId, uid: candidate.uid,
+      accountId: candidate.accountId, runNonce: candidate.runNonce,
+      leaseEpoch: candidate.leaseEpoch, linked: candidate.linked === true });
+    if (!loaded.ok) return false;
+    let json: string;
+    try {
+      json = (await readBoxStagedToolCatalog({ exec: target.exec,
+        runNonce: candidate.runNonce })).json;
+    } catch { return false; }
+    let catalog;
+    try { catalog = rehydrateBoxToolCatalog(json); }
+    catch { return false; }
+    if (catalog.bindingSha256 !== loaded.evidence.catalogHash) return false;
+    const outcome = await observeBoxToolTerminalOnly({
+      evidence: loaded.evidence, catalog, target }, {
+      journal: { complete: journal.complete.bind(journal),
+        completeToolChain: journal.completeToolChain.bind(journal),
+        readRecoveryWinner: journal.readRecoveryWinner.bind(journal) },
+      writeMessage: write });
+    return outcome.status === "committed";
   }
 
   async reconcileBatch(limit = 10): Promise<{ cleaned: number; pending: number;

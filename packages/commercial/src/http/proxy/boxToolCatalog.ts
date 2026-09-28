@@ -100,6 +100,57 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
     bindingSha256: createHash("sha256").update(bindingJson).digest("hex"), json };
 }
 
+const STAGED_NAME_PREFIX = "OpenClaude tool name: ";
+const CLIENT_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
+
+/** Rebuild the admitted catalog from the exact staged JSON. The raw bytes must
+ * round-trip through compileBoxToolCatalog; nothing is trimmed or rewritten. */
+export function rehydrateBoxToolCatalog(rawJson: string): BoxToolCatalog {
+  if (typeof rawJson !== "string" || rawJson.length < 2
+    || Buffer.byteLength(rawJson) > 1_048_576) {
+    throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(rawJson); }
+  catch { throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID"); }
+  if (!record(parsed) || Object.keys(parsed).length !== 1
+    || !Object.hasOwn(parsed, "tools") || !Array.isArray(parsed.tools)
+    || parsed.tools.length < 1 || parsed.tools.length > 128) {
+    throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+  }
+  const declarations = parsed.tools.map((item, index) => {
+    if (!record(item) || Object.keys(item).sort().join(",") !== "description,inputSchema,name"
+      || item.name !== `t${index}` || typeof item.description !== "string"
+      || !item.description.startsWith(STAGED_NAME_PREFIX)
+      || !record(item.inputSchema)) {
+      throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+    }
+    const rest = item.description.slice(STAGED_NAME_PREFIX.length);
+    const cut = rest.indexOf(". ");
+    const name = cut > 0 ? rest.slice(0, cut) : "";
+    if (!CLIENT_NAME.test(name)) {
+      throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+    }
+    const description = rest.slice(cut + 2);
+    if (Buffer.byteLength(description) > 16_384) {
+      throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+    }
+    return { name, description, input_schema: item.inputSchema };
+  });
+  let compiled: BoxToolCatalog;
+  try { compiled = compileBoxToolCatalog(declarations); }
+  catch (error) {
+    if (error instanceof BoxToolCatalogError) {
+      throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+    }
+    throw error;
+  }
+  if (compiled.json !== rawJson) {
+    throw new BoxToolCatalogError("BOX_TOOL_CATALOG_BINDING_MISMATCH");
+  }
+  return compiled;
+}
+
 /** Current real Claude Code 2.1.280 sends adaptive (display omitted) + medium.
  * The API makes display optional for adaptive thinking; on Opus 5.5 the
  * omitted display maps to the same CLI behavior as explicit "omitted".

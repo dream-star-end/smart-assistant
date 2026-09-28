@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BoxToolCatalogError, compileBoxToolCatalog, mapBoxCliEffort } from "./boxToolCatalog.js";
+import { BoxToolCatalogError, compileBoxToolCatalog, mapBoxCliEffort,
+  rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
 
 // Names observed from an isolated real Claude Code 2.1.280 Messages request;
 // descriptions and schemas here are synthetic, not a captured user request.
@@ -68,6 +69,28 @@ test("duplicate, malformed, oversized and dangerous tool declarations fail close
     cursor.child = next; cursor = next;
   }
   rejects([{ ...tool("Bash"), input_schema: deep }], "BOX_TOOL_SCHEMA_TOO_DEEP");
+});
+
+test("staged catalog rehydrates through compile and rejects a drifted byte", () => {
+  const source = [
+    { name: "foo.bar", description: "中文说明", input_schema: { type: "object",
+      properties: { q: { type: "string" } } } },
+    { name: "mcp__name", description: "synthetic", input_schema: { type: "object" } },
+  ];
+  const compiled = compileBoxToolCatalog(source);
+  const restored = rehydrateBoxToolCatalog(compiled.json);
+  assert.equal(restored.json, compiled.json);
+  assert.equal(restored.bindingSha256, compiled.bindingSha256);
+  assert.equal(restored.clientNameByBoxName.get("mcp__ocbridge__t0"), "foo.bar");
+  assert.throws(() => rehydrateBoxToolCatalog(compiled.json.replace('"t0"', '"t9"')),
+    (error: unknown) => error instanceof BoxToolCatalogError
+      && error.code === "BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+  assert.throws(() => rehydrateBoxToolCatalog(compiled.json.replace('{"tools"', '{ "tools"')),
+    (error: unknown) => error instanceof BoxToolCatalogError
+      && error.code === "BOX_TOOL_CATALOG_BINDING_MISMATCH");
+  assert.throws(() => rehydrateBoxToolCatalog(compiled.json.trim() === compiled.json
+    ? compiled.json.slice(0, -1) : compiled.json),
+    (error: unknown) => error instanceof BoxToolCatalogError);
 });
 
 test("default real CCB adaptive-medium effort maps exactly, unsupported settings reject", () => {

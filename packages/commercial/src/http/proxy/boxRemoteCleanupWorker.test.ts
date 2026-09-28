@@ -105,6 +105,32 @@ test("restart worker proves a stopped linked failure before cleaning private fil
     "clean-claim", "remote-clean", "clean-done", "dispose"]);
 });
 
+test("worker_complete without a recovery writer stays pending and does not complete", async () => {
+  let completes = 0;
+  const probe = { requestId: "box-success", uid: 3n, accountId: 20n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: false };
+  const worker = new BoxRemoteCleanupWorker({
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      markFirstRoundStoppedFailure: async () => { throw new Error("not a failure"); },
+      markToolChainStoppedFailure: async () => { throw new Error("not a failure"); },
+      readDetachedUnknownRecovery: async () => { throw new Error("must not read"); },
+      complete: async () => { completes++; },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => false,
+      markRemoteCleaned: async () => { throw new Error("must not clean"); } } as never,
+    resolver: { resolve: async (args: { allowWakeIfHibernated?: boolean }) => {
+      assert.equal(args.allowWakeIfHibernated, false);
+      return { accountId: 20n, exec: { run: async () => ({ stdout: JSON.stringify({
+        runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch,
+        keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 }) + "\n",
+      stderrBytes: 0, exitCode: 0 as const }) }, dispose: async () => {} } as never;
+    } } as never,
+  });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.equal(completes, 0);
+});
+
 test("missing terminal marker leaves unknown Box run fenced and never cleans", async () => {
   let stopped = 0, cleaned = 0;
   const probe = { requestId: "box-unknown", uid: 3n, accountId: 20n,
