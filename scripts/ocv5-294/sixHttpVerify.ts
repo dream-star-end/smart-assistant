@@ -1,6 +1,7 @@
 /** Offline check of six saved CCB bodies against this worktree's gate and matcher.
  * Raw messages are never rewritten. A missing server turnKey is hashed only on
  * a labeled synthetic auth-envelope copy. */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -31,20 +32,32 @@ function flag(name: string): string {
   return index >= 0 ? process.argv[index + 1] ?? "" : "";
 }
 
+function headNow(): string {
+  const result = spawnSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", timeout: 30_000 });
+  return result.status === 0 ? result.stdout.trim() : "";
+}
+
 async function main(): Promise<void> {
   const wirePath = flag("--wire");
   const reportPath = flag("--report");
+  const expectPath = flag("--expect");
   let firstError: string | null = null;
   const fail = (message: string): void => { firstError ??= message; };
+  const expected = expectPath
+    ? JSON.parse(readFileSync(expectPath, "utf8")) as { head?: string; manifest?: ManifestEntry[] }
+    : null;
   const before = candidateManifest();
+  if (expected?.manifest && manifestDrift(expected.manifest, before)) fail("MANIFEST_BEFORE");
+  if (expected?.head && headNow() !== expected.head) fail("HEAD_BEFORE");
   const gateMod = await import(proxyFileUrl("boxRequestGate.ts").href);
   const normMod = await import(proxyFileUrl("boxCacheAnnotations.ts").href);
   const matchMod = await import(proxyFileUrl("boxToolResultMatcher.ts").href);
   const catalogMod = await import(proxyFileUrl("boxToolCatalog.ts").href);
   const fingerMod = await import(proxyFileUrl("boxCallFingerprint.ts").href);
   const after = candidateManifest();
-  const drift = manifestDrift(before, after);
-  if (drift) fail(drift);
+  const drift = manifestDrift(expected?.manifest ?? before, after);
+  if (drift) fail(expected ? "MANIFEST_AFTER" : drift);
+  if (expected?.head && headNow() !== expected.head) fail("HEAD_AFTER");
   const gate: Array<{ index: number; raw: string | null; normalized: string | null; error: string | null }> = [];
   const matched: string[] = [];
   const contentOracle: Array<string | null> = [];
@@ -127,10 +140,13 @@ async function main(): Promise<void> {
     }
   } catch (err) { fail(err instanceof Error ? err.message : "VERIFY_THROW"); }
   manifest = candidateManifest();
-  if (manifestDrift(before, manifest)) fail("MANIFEST_DRIFT_FINAL");
+  const finalExpect = expected?.manifest ?? before;
+  if (manifestDrift(finalExpect, manifest)) fail(expected ? "MANIFEST_FINAL" : "MANIFEST_DRIFT_FINAL");
+  if (expected?.head && headNow() !== expected.head) fail("HEAD_FINAL");
   const report = { module: fileURLToPath(import.meta.url), manifest, gate, contextOk,
     fingerprintOk, syntheticAuthEnvelope: true, matched, contentOracle, firstError,
-    manifestStable: manifestDrift(before, manifest) === null };
+    boundHead: expected?.head ?? null,
+    manifestStable: manifestDrift(finalExpect, manifest) === null };
   const text = `${JSON.stringify(report)}\n`;
   if (reportPath) exclusiveWrite(reportPath, text);
   process.stdout.write(text);

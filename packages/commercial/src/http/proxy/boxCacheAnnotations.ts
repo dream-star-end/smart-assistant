@@ -338,7 +338,8 @@ function rejectUnapprovedToolBoundary(body: ProxyBody): void {
   for (let index = 2; index < body.messages.length; index++) {
     if (!handoffNeighbors(body, index)) continue;
     const tail = body.messages[index];
-    if (!object(tail) || Object.keys(tail).sort().join(",") !== "content,role") continue;
+    if (!object(tail) || tail.role !== "system"
+      || Object.keys(tail).sort().join(",") !== "content,role") continue;
     const text = boundaryText(tail);
     if (text === null || (!exactMatch(BARE_BUDGET, text) && bareHookBeforeBudget(text) === null)) continue;
     if (typeof tail.content === "string") continue;

@@ -8,7 +8,7 @@ import { constants, closeSync, fsyncSync, mkdirSync, openSync, readFileSync,
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { candidateManifest } from "./candidateManifest.ts";
+import { candidateManifest, manifestDrift } from "./candidateManifest.ts";
 import { buildFinalFromFifthResult, decideRun, toolResultText } from "./sixHttpBuilder.ts";
 import { reapOwnedGroup } from "./ownedGroup.ts";
 
@@ -110,7 +110,8 @@ async function main(): Promise<void> {
   if (version !== "2.1.280 (Claude Code)") throw new Error("CC_VERSION_UNEXPECTED");
   const sha = hostText(`git -C ${HOST_WT} rev-parse HEAD`, 30_000);
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("SHA_UNAVAILABLE");
-  const manifestPaths = candidateManifest().map((item) =>
+  const startManifest = candidateManifest();
+  const manifestPaths = startManifest.map((item) =>
     `packages/commercial/src/http/proxy/${item.path}`).join(" ");
   const dirty = hostText(`git -C ${HOST_WT} status --porcelain -- ${manifestPaths}`, 30_000);
   if (dirty !== "") throw new Error("CANDIDATE_DIRTY");
@@ -269,12 +270,17 @@ async function main(): Promise<void> {
   const expectedNonce = fifth ? readFileSync(paths[4]!, "utf8") : "";
   if (!fifth || createHash("sha256").update(expectedNonce).digest("hex") !== fifth.sha256) fail("MCP_FIFTH");
   const hostWire = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-six-http-wire-${run}.json`;
+  const expectContainer = `/home/agent/.openclaude/generated/ocv5-294-six-http-expect-${run}.json`;
+  const expectHost = `/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-294-six-http-expect-${run}.json`;
+  exclusiveWrite(expectContainer, `${JSON.stringify({ head: sha, manifest: startManifest })}\n`);
+  const endSha = hostText(`git -C ${HOST_WT} rev-parse HEAD`, 30_000);
+  if (endSha !== sha || manifestDrift(startManifest, candidateManifest())) fail("CANDIDATE_CHANGED");
   const wire = { sha, raws,
     rawSha256: raws.map((raw) => createHash("sha256").update(raw).digest("hex")),
     bodies, sent, mcp: mcpRows };
   exclusiveWrite(wireContainer, `${JSON.stringify(wire)}\n`);
   const verified = spawnSync(HOST, [
-    `cd ${HOST_WT} && /usr/bin/tsx scripts/ocv5-294/sixHttpVerify.ts --wire ${hostWire}`,
+    `cd ${HOST_WT} && /usr/bin/tsx scripts/ocv5-294/sixHttpVerify.ts --wire ${hostWire} --expect ${expectHost}`,
   ], { encoding: "utf8", timeout: 120_000 });
   if (verified.error?.code === "ETIMEDOUT") fail("VERIFY_TIMEOUT");
   let verify: { firstError?: string | null } | null = null;

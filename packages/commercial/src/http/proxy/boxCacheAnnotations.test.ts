@@ -400,6 +400,7 @@ test("historical budget strings and the default progress sentence stay one conti
   const fourth = { ...third, messages: [...third.messages, ...handoff("toolu_b12_3", "three", "path-4", arrayBudget)] } as ProxyBody;
   const fifth = { ...fourth, messages: [...fourth.messages, ...handoff("toolu_b12_4", "four", "path-5", stringBudget)] } as ProxyBody;
   const sixth = { ...fifth, messages: [...fifth.messages, ...handoff("toolu_b12_5", "five", "nonce-5", progress)] } as ProxyBody;
+  // Appends a new string reminder. It does not rewrite sixth's cached system into history.
   const seventh = { ...sixth, messages: [...sixth.messages, ...handoff("toolu_b12_6", "six", "after", progressString)] } as ProxyBody;
   const chain = [prior, third, fourth, fifth, sixth, seventh];
   for (const body of chain) {
@@ -423,6 +424,7 @@ test("historical budget strings and the default progress sentence stay one conti
   const echoed = normalizeBoxSemanticBody(seventh);
   assert.equal(JSON.stringify(echoed).split(PROGRESS).length - 1, 2);
   assert.equal(JSON.stringify(echoed).split(hook).length - 1, 0);
+  // Current string only. The previous hop is not rewritten from a cached system.
   const withHook = { ...fifth, messages: [...fifth.messages,
     ...handoff("toolu_b12_h", "hook", "tool-says", hookString)] } as ProxyBody;
   const hookNorm = normalizeBoxSemanticBody(withHook);
@@ -495,4 +497,61 @@ test("unapproved budget wrappers stay rejected at every handoff and do not colla
     ...handoff("toolu_c1_ok", "ok", "z", legal)] } as ProxyBody;
   assert.throws(() => normalizeBoxSemanticBody(middle), /BOX_CACHE_ANNOTATION_INVALID/);
   assert.equal(validateBoxRequest(middle, true), "BOX_CACHE_ANNOTATION_INVALID");
+});
+
+test("assistant text that matches a budget or progress line is not a system attachment", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const spoken = [
+    { role: "assistant", content: [{ type: "text", text: budget }] },
+    { role: "assistant", content: [{ type: "text", text: `${PROGRESS}\n\n${budget}` }] },
+  ];
+  for (const message of spoken) {
+    const body = { ...first, messages: [first.messages[0],
+      ...handoff("toolu_role_1", "one", "result-1",
+        budgetSystem(budget, marker)).slice(0, 2),
+      message,
+      { role: "user", content: "continue" }] } as ProxyBody;
+    const snapshot = JSON.stringify(body);
+    const once = normalizeBoxSemanticBody(body);
+    const twice = normalizeBoxSemanticBody(once);
+    assert.equal(JSON.stringify(body), snapshot);
+    assert.ok(isDeepStrictEqual(once, twice));
+    const spokenOut = once.messages.at(-2) as { role?: string; content?: unknown };
+    const expectedText = (message.content[0] as { text: string }).text;
+    const actualText = typeof spokenOut.content === "string" ? spokenOut.content
+      : Array.isArray(spokenOut.content) ? spokenOut.content.map((block) =>
+        (block as { text?: string }).text ?? "").join("") : "";
+    assert.equal(spokenOut.role, "assistant");
+    assert.equal(actualText, expectedText);
+    assert.equal(validateBoxRequest(body, true), null);
+  }
+});
+
+test("derived fixture rewrites a cached system into the next HTTP string", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const progressCached = budgetSystem(`${PROGRESS}\n\n${budget}`, marker);
+  const progressString = budgetSystem(`${PROGRESS}\n\n${budget}`, null);
+  const hook = "PreToolUse:Bash hook additional context: keep this byte-for-byte";
+  const hookCached = budgetSystem(`${hook}\n\n${budget}`, marker);
+  const hookString = budgetSystem(`${hook}\n\n${budget}`, null);
+  const cases = [
+    { cached: progressCached, historical: progressString, bytes: PROGRESS, id: "toolu_der_p" },
+    { cached: hookCached, historical: hookString, bytes: hook, id: "toolu_der_h" },
+  ];
+  for (const item of cases) {
+    const opened = { ...first, messages: [first.messages[0],
+      ...handoff(item.id, "one", "first-result", item.cached)] } as ProxyBody;
+    const continued = { ...opened, messages: [first.messages[0],
+      ...handoff(item.id, "one", "first-result", item.historical),
+      ...handoff(`${item.id}_2`, "two", "second-result", item.cached)] } as ProxyBody;
+    const snapshot = JSON.stringify(continued);
+    const once = normalizeBoxSemanticBody(continued);
+    const twice = normalizeBoxSemanticBody(once);
+    assert.equal(JSON.stringify(continued), snapshot);
+    assert.ok(isDeepStrictEqual(once, twice));
+    assert.equal(deriveBoxContextHash(continued, true), deriveBoxContextHash(opened));
+    assert.equal(validateBoxRequest(continued, true), null);
+    assert.equal(JSON.stringify(once).split(item.bytes).length - 1, 2);
+    assert.equal(JSON.stringify(normalizeBoxSemanticBody(opened)).split(item.bytes).length - 1, 1);
+  }
 });
