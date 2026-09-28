@@ -8,7 +8,9 @@ import { constants, closeSync, fsyncSync, mkdirSync, openSync, readFileSync,
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { candidateManifest } from "./candidateManifest.ts";
 import { buildFinalFromFifthResult, decideRun, toolResultText } from "./sixHttpBuilder.ts";
+import { reapOwnedGroup } from "./ownedGroup.ts";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const HOST = "/home/agent/.local/bin/host";
@@ -27,12 +29,14 @@ function exclusiveWrite(path: string, text: string): void {
   finally { closeSync(fd); }
 }
 function assertFresh(path: string): void {
-  if (path.endsWith("ocv5-294-captured-wire.json") || path.includes("/fixture/captured-wire.json")) {
-    throw new Error("REFUSING_CAPTURE_OVERWRITE");
+  if (path.endsWith("ocv5-294-captured-wire.json") || path.includes("/fixture/captured-wire.json")
+    || path.includes("bcaf4fba7bcf111c")) {
+    throw new Error("REFUSING_SEALED_EVIDENCE");
   }
 }
-function hostText(command: string): string {
-  const result = spawnSync(HOST, [command], { encoding: "utf8" });
+function hostText(command: string, timeout: number): string {
+  const result = spawnSync(HOST, [command], { encoding: "utf8", timeout });
+  if (result.error) throw new Error(result.error.code === "ETIMEDOUT" ? "HOST_TIMEOUT" : "HOST_COMMAND_FAILED");
   if (result.status !== 0) throw new Error("HOST_COMMAND_FAILED");
   return result.stdout.trim();
 }
@@ -72,12 +76,12 @@ function toolSse(res: ServerResponse, id: string, path: string, model: string): 
     usage: { output_tokens: 8 } });
   sse(res, "message_stop", { type: "message_stop" });
 }
-function killGroup(child: ChildProcess): void {
-  if (child.pid === undefined || child.exitCode !== null) return;
+function armGroup(child: ChildProcess): void {
+  if (child.pid === undefined || child.pid <= 1) return;
   try { process.kill(-child.pid, "SIGTERM"); } catch { /* already gone */ }
+  const pgid = child.pid;
   const timer = setTimeout(() => {
-    try { if (child.exitCode === null && child.pid !== undefined) process.kill(-child.pid, "SIGKILL"); }
-    catch { /* already gone */ }
+    try { process.kill(-pgid, "SIGKILL"); } catch { /* already gone */ }
   }, 2000);
   timer.unref();
 }
@@ -104,9 +108,11 @@ function cliToolNames(stdout: string): string[] | null {
 async function main(): Promise<void> {
   const version = spawnSync("/usr/local/bin/claude", ["--version"], { encoding: "utf8" }).stdout.trim();
   if (version !== "2.1.280 (Claude Code)") throw new Error("CC_VERSION_UNEXPECTED");
-  const sha = hostText(`git -C ${HOST_WT} rev-parse HEAD`);
+  const sha = hostText(`git -C ${HOST_WT} rev-parse HEAD`, 30_000);
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("SHA_UNAVAILABLE");
-  const dirty = hostText(`git -C ${HOST_WT} status --porcelain -- packages/commercial/src/http/proxy/boxCacheAnnotations.ts packages/commercial/src/http/proxy/boxRequestGate.ts packages/commercial/src/http/proxy/boxToolResultMatcher.ts`);
+  const manifestPaths = candidateManifest().map((item) =>
+    `packages/commercial/src/http/proxy/${item.path}`).join(" ");
+  const dirty = hostText(`git -C ${HOST_WT} status --porcelain -- ${manifestPaths}`, 30_000);
   if (dirty !== "") throw new Error("CANDIDATE_DIRTY");
   const run = randomBytes(8).toString("hex");
   const dir = join(tmpdir(), `ocv5-six-${run}`);
@@ -212,26 +218,31 @@ async function main(): Promise<void> {
   let stdout = "", stderr = "";
   child.stdout.on("data", (chunk: Buffer) => {
     stdout += chunk.toString("utf8");
-    if (stdout.length > 2_000_000) { fail("STDOUT_CAP"); killGroup(child); }
+    if (stdout.length > 2_000_000) { fail("STDOUT_CAP"); armGroup(child); }
   });
   child.stderr.on("data", (chunk: Buffer) => {
     stderr += chunk.toString("utf8");
-    if (stderr.length > 500_000) { fail("STDERR_CAP"); killGroup(child); }
+    if (stderr.length > 500_000) { fail("STDERR_CAP"); armGroup(child); }
   });
-  const timer = setTimeout(() => { fail("TIMEOUT"); killGroup(child); }, 150_000);
+  const timer = setTimeout(() => { fail("TIMEOUT"); armGroup(child); }, 150_000);
   let exitCode = 1;
   try {
     exitCode = await new Promise((done, reject) => {
       child.once("error", reject);
-      child.once("close", (code) => done(code ?? 1));
+      child.once("exit", (code) => done(code ?? 1));
     });
   } finally {
     clearTimeout(timer);
-    killGroup(child);
+    if (child.pid !== undefined && child.pid > 1) {
+      const reapedGroup = await reapOwnedGroup(child.pid, 400);
+      if (reapedGroup === "stuck") fail("GROUP_STUCK");
+    }
+    child.stdout?.destroy();
+    child.stderr?.destroy();
     server.closeAllConnections();
     await new Promise<void>((done) => server.close(() => done()));
   }
-  await new Promise((done) => setTimeout(done, 400));
+  await new Promise((done) => setTimeout(done, 200));
   const reaped = spawnSync("pgrep", ["-f", `readLinkMcp.mjs ${allow}`], { encoding: "utf8" });
   if (reaped.error || (reaped.status !== 0 && reaped.status !== 1)) fail("MCP_REAP_UNAVAILABLE");
   else if (reaped.status === 0) {
@@ -264,7 +275,8 @@ async function main(): Promise<void> {
   exclusiveWrite(wireContainer, `${JSON.stringify(wire)}\n`);
   const verified = spawnSync(HOST, [
     `cd ${HOST_WT} && /usr/bin/tsx scripts/ocv5-294/sixHttpVerify.ts --wire ${hostWire}`,
-  ], { encoding: "utf8" });
+  ], { encoding: "utf8", timeout: 120_000 });
+  if (verified.error?.code === "ETIMEDOUT") fail("VERIFY_TIMEOUT");
   let verify: { firstError?: string | null } | null = null;
   const verifyLine = verified.stdout.trim().split("\n").filter((item) => item.startsWith("{")).at(-1) ?? "";
   try { verify = JSON.parse(verifyLine) as { firstError?: string | null }; }
