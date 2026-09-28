@@ -218,7 +218,8 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
         && (keys === "text,type" || (keys === "cache_control,text,type"
           && object(marker) && Object.keys(marker).join(",") === "type"
           && marker.type === "ephemeral"));
-      const bare = !wrapped && keys === "cache_control,text,type"
+      const bare = !wrapped && object(part) && part.type === "text"
+        && keys === "cache_control,text,type"
         && object(marker) && Object.keys(marker).join(",") === "type"
         && marker.type === "ephemeral" && typeof part.text === "string"
         ? bareHookBeforeBudget(part.text) : null;

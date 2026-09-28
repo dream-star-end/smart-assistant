@@ -343,7 +343,29 @@ test("unwrapped CCB hook plus budget system tail stays one continuation", () => 
   assert.equal(detachedSystem.role, "system");
   assert.equal(JSON.stringify(detachedSystem.content).includes(hook), true);
   assert.equal(JSON.stringify(detachedSystem.content).includes(budget), true);
-  assert.throws(() => matchBoxToolResults({ ...raw, messages: [...raw.messages.slice(0, -1),
-    { ...result, content: [{ type: "tool_result", tool_use_id: "toolu_other", content: "x" }] },
-    system] } as ProxyBody, expected), /BOX_TOOL_RESULT_/);
+  const imageTail = { role: "system", content: [{ type: "image",
+    text: `${hook}\n\n${budget}`, cache_control: marker }] };
+  const imageBody = { ...raw, messages: [first.messages[0], assistant, result, imageTail] } as ProxyBody;
+  const imageOut = normalizeBoxSemanticBody(imageBody);
+  assert.equal((imageOut.messages.at(-1) as { role?: string }).role, "system");
+  const imageResult = imageOut.messages.at(-2) as { content?: Array<{ content?: unknown }> };
+  assert.equal(imageResult.content?.[0]?.content, "ocv5-294-sed-line\n");
+  assert.equal(validateBoxRequest(imageBody, true), "BOX_SYSTEM_UNSUPPORTED");
+  const wrongId = { ...raw, messages: [first.messages[0], assistant,
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_other",
+      is_error: false, content: "x" }] }, system] } as ProxyBody;
+  assert.deepEqual((wrongId.messages as Array<{ role: string }>).map((message) => message.role),
+    ["user", "assistant", "user", "system"]);
+  assert.throws(() => matchBoxToolResults(wrongId, expected), /BOX_TOOL_RESULT_/);
+  const changedInput = { ...raw, messages: [first.messages[0],
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_ocv5_294_sed",
+      name: "local_echo", input: { value: "other" } }] }, result, system] } as ProxyBody;
+  assert.throws(() => matchBoxToolResults(changedInput, expected), /BOX_TOOL_RESULT_/);
+  const changedText = { ...raw, messages: [first.messages[0],
+    { role: "assistant", content: [{ type: "text", text: "not the same tool turn" },
+      { type: "tool_use", id: "toolu_ocv5_294_sed", name: "local_echo",
+        input: { value: "sed" } }] }, result, system] } as ProxyBody;
+  assert.notEqual(deriveBoxContextHash(changedText), deriveBoxContextHash(raw));
+  assert.notEqual(deriveBoxCallFingerprint(3n, changedText).replayFingerprint,
+    deriveBoxCallFingerprint(3n, raw).replayFingerprint);
 });
