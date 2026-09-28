@@ -4888,7 +4888,7 @@
       "severity": "P1",
       "symptom": "V5 selfhost Box 在第二次 Bash 的效率 PreToolUse additionalContext 与 total_tokens 被 CCB 2.1.280 合成同一条无 system-reminder 包装的 system 消息后，第三跳被 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝。",
       "rootFixCommit": "6f559fec",
-      "coverageCommits": ["bcae6f63", "400d418d", "1a7a6fa3"],
+      "coverageCommits": ["bcae6f63", "400d418d", "1a7a6fa3", "c26f0005"],
       "regressions": [
         {
           "layer": "unit",
