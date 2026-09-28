@@ -65,35 +65,58 @@ function blockShape(body: ProxyBody): unknown {
   });
 }
 
+type GateFns = {
+  validateBoxRequest: (body: ProxyBody, enabled: boolean) => string | null };
+type StripFns = { stripBoxCcbToolBudgetTail: (body: ProxyBody) => ProxyBody };
+export type GateObservation = { index: number; code: string | null; error: string | null;
+  strippedRoles: string[] | null };
+
+function thrown(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
+/** Gate and strip failures are both kept. A later throw cannot clear an earlier one. */
+export function observeGateBody(index: number, body: ProxyBody, gate: GateFns,
+  norm: StripFns): GateObservation {
+  const errors: string[] = [];
+  let code: string | null = null;
+  try { code = gate.validateBoxRequest(body, true); }
+  catch (err) { errors.push(`gate: ${thrown(err, "gate-threw")}`); }
+  let strippedRoles: string[] | null = null;
+  try {
+    const stripped = norm.stripBoxCcbToolBudgetTail(body);
+    strippedRoles = (stripped.messages ?? []).map((message) => {
+      const item = message as { role?: string };
+      return item.role ?? "<missing>";
+    });
+  } catch (err) { errors.push(`strip: ${thrown(err, "strip-threw")}`); }
+  return { index, code, error: errors.length === 0 ? null : errors.join("; "),
+    strippedRoles };
+}
+
+/** Success is exactly three observations, each with a null code and a null error. */
+export function gateSequenceExit(requests: number,
+  results: readonly GateObservation[]): number {
+  const ok = requests === 3 && results.length === 3
+    && results.every((item, index) => item.index === index
+      && item.code === null && item.error === null);
+  return ok ? 0 : 2;
+}
+
 async function runGate(capturePath: string): Promise<void> {
   const captured = JSON.parse(readFileSync(capturePath, "utf8")) as {
-    bodies: ProxyBody[] };
-  const gate = await import("../../packages/commercial/src/http/proxy/boxRequestGate.js") as {
-    validateBoxRequest: (body: ProxyBody, enabled: boolean) => string | null };
-  const norm = await import("../../packages/commercial/src/http/proxy/boxCacheAnnotations.js") as {
-    stripBoxCcbToolBudgetTail: (body: ProxyBody) => ProxyBody };
-  const results = captured.bodies.map((body, index) => {
-    let code: string | null = null;
-    let error: string | null = null;
-    try { code = gate.validateBoxRequest(body, true); }
-    catch (err) { error = err instanceof Error ? err.message : "gate-threw"; }
-    let strippedRoles: string[] | null = null;
-    try {
-      const stripped = norm.stripBoxCcbToolBudgetTail(body);
-      strippedRoles = (stripped.messages ?? []).map((message) => {
-        const item = message as { role?: string };
-        return item.role ?? "<missing>";
-      });
-    } catch (err) { error = err instanceof Error ? err.message : "strip-threw"; }
-    return { index, code, error, strippedRoles, shape: blockShape(body) };
-  });
-  const actual = results.map((item) => item.code);
-  process.stdout.write(`${JSON.stringify({ gate: results, actual }, null, 2)}\n`);
-  const expected = [null, null, null];
-  if (actual.length !== expected.length
-    || actual.some((code, index) => code !== expected[index])) {
-    process.exitCode = 2;
-  }
+    requests?: number; bodies: ProxyBody[] };
+  const gate = await import("../../packages/commercial/src/http/proxy/boxRequestGate.js") as GateFns;
+  const norm = await import("../../packages/commercial/src/http/proxy/boxCacheAnnotations.js") as StripFns;
+  const bodies = Array.isArray(captured.bodies) ? captured.bodies : [];
+  const requests = captured.requests ?? bodies.length;
+  const results = bodies.map((body, index) => observeGateBody(index, body, gate, norm));
+  const sequence = results.map((item) => ({ index: item.index, code: item.code,
+    error: item.error }));
+  const exitCode = gateSequenceExit(requests, results);
+  process.stdout.write(`${JSON.stringify({ requests, sequence, exitCode,
+    gate: results }, null, 2)}\n`);
+  process.exitCode = exitCode;
 }
 
 function sse(res: import("node:http").ServerResponse, event: string, data: unknown): void {
@@ -193,9 +216,10 @@ async function capture(): Promise<void> {
   process.stdout.write(`${JSON.stringify({ captured: bodies.length, exitCode, capture: CAPTURE, pub })}\n`);
 }
 
-const gateFlag = process.argv.indexOf("--gate");
-if (gateFlag >= 0) {
-  await runGate(process.argv[gateFlag + 1] ?? CAPTURE);
-} else {
-  await capture();
+const invoked = process.argv[1] ?? "";
+if (invoked.endsWith("ccbEfficiencyHookShapeProbe.ts")
+  || invoked.endsWith("ccbEfficiencyHookShapeProbe.js")) {
+  const gateFlag = process.argv.indexOf("--gate");
+  if (gateFlag >= 0) await runGate(process.argv[gateFlag + 1] ?? CAPTURE);
+  else await capture();
 }
