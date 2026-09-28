@@ -4018,21 +4018,32 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  # KL has no 127.0.0.1:55432 hermetic fixture. Do not ssh this probe there
-  # and do not read DATABASE_URL. The controller runs the pinned checkout
-  # (HEAD == full_sha) against the explicit loopback test database. Selfhost
-  # cutover runs the same script inside the candidate release directory.
-  if [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" != "$full_sha" ]]; then
-    echo "✗ box success recovery gate: REPO_ROOT HEAD != pinned $full_sha" >&2
+  # KL has no 127.0.0.1:55432. Do not ssh this probe there and do not read
+  # DATABASE_URL. The candidate is a git archive of full_sha plus npm ci
+  # inside that directory. Workspace packages stay inside the archive.
+  # A checkout or an older release node_modules is not a substitute.
+  box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)"
+  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
+    echo "✗ box success recovery: git archive $full_sha failed" >&2
+    rm -rf "$box_cand"
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+  printf '{"sourceCommit":"%s"}\n' "$full_sha" > "$box_cand/flavor.manifest.json"
+  if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
+    echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
       npx --no-install tsx scripts/check-v5-box-success-recovery.ts); then
     echo "✗ pinned box success recovery behavioral gate failed" >&2
+    rm -rf "$box_cand"
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
     echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
