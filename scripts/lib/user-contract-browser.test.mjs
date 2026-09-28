@@ -29,29 +29,33 @@ async function fixture(status) {
 test("cold UI login waits for a delayed real button rather than bypassing login",
   { timeout: 75_000 }, async () => {
     const { server, base } = await fixture(200);
-    const browser = await launchJourneyBrowser();
+    let browser;
     try {
+      browser = await launchJourneyBrowser();
       const context = await browser.newContext({ serviceWorkers: "block" });
       const page = await context.newPage();
       page.setDefaultTimeout(20_000);
       await coldUiLogin(page, { base, email: "canary@example.invalid" }, "synthetic");
       assert.equal(await page.locator("textarea").count(), 1);
     } finally {
-      await browser.close();
-      server.close();
+      await browser?.close().catch(() => {});
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
     }
   });
 
 test("cold UI login fails immediately on a non-200 landing page", async () => {
   const { server, base } = await fixture(503);
-  const browser = await launchJourneyBrowser();
+  let browser;
   try {
+    browser = await launchJourneyBrowser();
     const page = await browser.newPage();
     await assert.rejects(() => coldUiLogin(page,
       { base, email: "canary@example.invalid" }, "synthetic"),
     /Cold landing HTTP 503/);
   } finally {
-    await browser.close();
-    server.close();
+    await browser?.close().catch(() => {});
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
