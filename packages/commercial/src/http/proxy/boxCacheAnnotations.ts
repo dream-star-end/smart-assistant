@@ -96,6 +96,9 @@ function exactMatch(pattern: RegExp, text: string): boolean {
   const match = pattern.exec(text);
   return match !== null && match[0].length === text.length;
 }
+function historicalBudgetString(text: string): boolean {
+  return exactMatch(BARE_BUDGET, text);
+}
 function bareHookBeforeBudget(text: string): string | null {
   const seam = "\n\n";
   const at = text.lastIndexOf(seam);
@@ -217,7 +220,7 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
       && Object.keys(message).sort().join(",") === "content,role"
       && typeof message.content === "string") {
       const kept = bareHookBeforeBudget(message.content);
-      const budget = exactMatch(BARE_BUDGET, message.content);
+      const budget = historicalBudgetString(message.content);
       if (kept !== null || budget) {
         const result = folded.at(-1);
         const assistant = folded.at(-2);
@@ -226,22 +229,23 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
           && result.content.every((block: unknown) => object(block) && block.type === "tool_result")
           && object(assistant) && assistant.role === "assistant" && Array.isArray(assistant.content)
           && assistant.content.some((block: unknown) => object(block) && block.type === "tool_use");
-        if (!boundary || !object(result) || !Array.isArray(result.content)) {
-          folded.push(message); continue;
+        // A non-dense handoff still reaches the shared walk below. Pushing here
+        // would hide a later wrapper behind a budget this pass has not judged.
+        if (boundary && object(result) && Array.isArray(result.content)) {
+          if (kept !== null) {
+            const results = [...result.content];
+            const last = results.at(-1);
+            const previous = object(last) ? last.content : null;
+            if (typeof previous === "string" || Array.isArray(previous) && denseArray(previous)) {
+              const content = typeof previous === "string"
+                ? [{ type: "text", text: previous }] : [...previous];
+              results[results.length - 1] = { ...last, content: [...content, { type: "text", text: kept }] };
+              folded[folded.length - 1] = { ...result, content: results };
+            } else { folded.push(message); continue; }
+          }
+          changed = true;
+          continue;
         }
-        if (kept !== null) {
-          const results = [...result.content];
-          const last = results.at(-1);
-          const previous = object(last) ? last.content : null;
-          if (typeof previous === "string" || Array.isArray(previous) && denseArray(previous)) {
-            const content = typeof previous === "string"
-              ? [{ type: "text", text: previous }] : [...previous];
-            results[results.length - 1] = { ...last, content: [...content, { type: "text", text: kept }] };
-            folded[folded.length - 1] = { ...result, content: results };
-          } else { folded.push(message); continue; }
-        }
-        changed = true;
-        continue;
       }
     }
     if (object(message) && message.role === "system"
@@ -290,6 +294,16 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
         }
       }
     }
+    // Same walk as the hook fold: judge the message against the tail left after
+    // earlier hook folds and pure-budget drops, before generic cache collapse.
+    const envelope = systemEnvelope(message);
+    if (envelope && handoffPair(folded.at(-1), folded.at(-2))) {
+      if (approvedPureBudget(envelope)) {
+        changed = true;
+        continue;
+      }
+      rejectIfUnapprovedBoundary(envelope);
+    }
     folded.push(message);
   }
   return changed ? { ...body, messages: folded } as ProxyBody : body;
@@ -302,6 +316,14 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
  * system message stays in the body and fails the resume gate if misplaced. */
 function opusModel(body: ProxyBody): boolean {
   return body.model === "box-api-claude-opus-5-5" || body.model === "claude-opus-5-5";
+}
+function handoffPair(result: unknown, assistant: unknown): boolean {
+  return object(result) && result.role === "user"
+    && Array.isArray(result.content) && result.content.length > 0
+    && result.content.every((part: unknown) => object(part) && part.type === "tool_result")
+    && object(assistant) && assistant.role === "assistant"
+    && Array.isArray(assistant.content)
+    && assistant.content.some((part: unknown) => object(part) && part.type === "tool_use");
 }
 function handoffNeighbors(body: ProxyBody, index: number): boolean {
   if (!opusModel(body) || !Array.isArray(body.messages) || index < 2 || index >= body.messages.length) {
@@ -332,26 +354,46 @@ function boundaryText(tail: Record<string, unknown>): string | null {
   if (!Array.isArray(tail.content) || tail.content.length !== 1 || !object(tail.content[0])) return null;
   return typeof tail.content[0].text === "string" ? tail.content[0].text : null;
 }
+function systemEnvelope(message: unknown): Record<string, unknown> | null {
+  if (!object(message) || message.role !== "system") return null;
+  if (Object.keys(message).sort().join(",") !== "content,role") return null;
+  return message;
+}
+function approvedPureBudget(message: Record<string, unknown>): boolean {
+  if (typeof message.content === "string") return historicalBudgetString(message.content);
+  if (!Array.isArray(message.content) || message.content.length !== 1 || !object(message.content[0])) {
+    return false;
+  }
+  const block = message.content[0];
+  return approvedBudgetMarker(block) && typeof block.text === "string"
+    && historicalBudgetString(block.text);
+}
+/** True only for a collapsible system wrapper that would become a legal budget string. */
+function unapprovedCollapsibleBoundary(message: Record<string, unknown>): boolean {
+  if (message.role !== "system" || Object.keys(message).sort().join(",") !== "content,role") return false;
+  const text = boundaryText(message);
+  if (text === null || (!historicalBudgetString(text) && bareHookBeforeBudget(text) === null)) return false;
+  if (typeof message.content === "string") return false;
+  const block = Array.isArray(message.content) ? message.content[0] : null;
+  if (object(block) && approvedBudgetMarker(block)) return false;
+  if (!Array.isArray(message.content) || message.content.length !== 1 || !object(block)
+    || block.type !== "text") return false;
+  const rest = Object.keys(block).filter((key) => key !== "cache_control").sort().join(",");
+  const markerOk = !Object.hasOwn(block, "cache_control") || validMarker(block.cache_control);
+  return rest === "text,type" && markerOk;
+}
+function rejectIfUnapprovedBoundary(message: Record<string, unknown>): void {
+  if (unapprovedCollapsibleBoundary(message)) {
+    throw new BoxCacheAnnotationError("BOX_CACHE_ANNOTATION_INVALID");
+  }
+}
 /** An unapproved wrapper must not collapse into the legal historical string. */
 function rejectUnapprovedToolBoundary(body: ProxyBody): void {
   if (!opusModel(body) || !Array.isArray(body.messages)) return;
   for (let index = 2; index < body.messages.length; index++) {
     if (!handoffNeighbors(body, index)) continue;
     const tail = body.messages[index];
-    if (!object(tail) || tail.role !== "system"
-      || Object.keys(tail).sort().join(",") !== "content,role") continue;
-    const text = boundaryText(tail);
-    if (text === null || (!exactMatch(BARE_BUDGET, text) && bareHookBeforeBudget(text) === null)) continue;
-    if (typeof tail.content === "string") continue;
-    const block = Array.isArray(tail.content) ? tail.content[0] : null;
-    if (object(block) && approvedBudgetMarker(block)) continue;
-    if (!Array.isArray(tail.content) || tail.content.length !== 1 || !object(block)
-      || block.type !== "text") continue;
-    const rest = Object.keys(block).filter((key) => key !== "cache_control").sort().join(",");
-    const markerOk = !Object.hasOwn(block, "cache_control") || validMarker(block.cache_control);
-    if (rest === "text,type" && markerOk) {
-      throw new BoxCacheAnnotationError("BOX_CACHE_ANNOTATION_INVALID");
-    }
+    if (object(tail)) rejectIfUnapprovedBoundary(tail);
   }
 }
 function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
@@ -359,7 +401,7 @@ function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
   const tail = body.messages[index];
   if (!object(tail) || tail.role !== "system"
     || Object.keys(tail).sort().join(",") !== "content,role") return false;
-  if (typeof tail.content === "string") return exactMatch(BARE_BUDGET, tail.content);
+  if (typeof tail.content === "string") return historicalBudgetString(tail.content);
   if (!Array.isArray(tail.content) || tail.content.length !== 1
     || !Object.hasOwn(tail.content, 0)) return false;
   const block = tail.content[0];
@@ -367,9 +409,21 @@ function isBoxCcbToolBudgetAt(body: ProxyBody, index: number): boolean {
     && typeof block.text === "string" && exactMatch(BARE_BUDGET, block.text);
 }
 export function isBoxCcbToolBudgetTail(body: ProxyBody): boolean {
-  const effective = foldBoxCcbHookContext(body);
-  return Array.isArray(effective.messages)
-    && isBoxCcbToolBudgetAt(effective, effective.messages.length - 1);
+  if (!Array.isArray(body.messages) || body.messages.length === 0) return false;
+  for (let i = 0; i < body.messages.length; i++) {
+    if (!Object.hasOwn(body.messages, i)) return false;
+  }
+  const tail = body.messages[body.messages.length - 1];
+  if (!object(tail) || typeof tail.content === "string" || !approvedPureBudget(tail)) return false;
+  const prefix = { ...body, messages: body.messages.slice(0, -1) } as ProxyBody;
+  let folded: ProxyBody;
+  try { folded = foldBoxCcbHookContext(prefix); }
+  catch (error) {
+    if (error instanceof BoxCacheAnnotationError) return false;
+    throw error;
+  }
+  return Array.isArray(folded.messages)
+    && handoffPair(folded.messages.at(-1), folded.messages.at(-2));
 }
 export function stripBoxCcbToolBudgetTail(body: ProxyBody): ProxyBody {
   if (!Array.isArray(body.messages)) return body;

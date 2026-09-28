@@ -555,3 +555,78 @@ test("derived fixture rewrites a cached system into the next HTTP string", () =>
     assert.equal(JSON.stringify(normalizeBoxSemanticBody(opened)).split(item.bytes).length - 1, 1);
   }
 });
+
+test("hook fold or budget removal does not promote the next unapproved wrapper", () => {
+  const budget = "<total_tokens>14999989 tokens left</total_tokens>";
+  const wrappedText = "<system-reminder>\nPreToolUse:Bash hook additional context: keep annotation.\n</system-reminder>";
+  const bare = "PreToolUse:Bash hook additional context: keep annotation.";
+  const wrapped = { role: "system", content: [{ type: "text", text: wrappedText, cache_control: marker }] };
+  const bareCombo = budgetSystem(`${bare}\n\n${budget}`, marker);
+  const legalArray = budgetSystem(budget, marker);
+  const legalString = budgetSystem(budget, null);
+  const badMarkers: Array<Record<string, unknown> | null> = [
+    { type: "ephemeral", ttl: "1h" },
+    { type: "ephemeral", scope: "global" },
+    null,
+  ];
+  const badBudget = (cache: Record<string, unknown> | null) => cache === null
+    ? { role: "system", content: [{ type: "text", text: budget }] }
+    : budgetSystem(budget, cache);
+  const openings = [
+    [wrapped],
+    [bareCombo],
+    [legalArray],
+    [legalString],
+    [legalArray, legalString],
+  ];
+  const pair = (id: string, input: string, text: string) => [
+    { role: "assistant", content: [{ type: "tool_use", id, name: "local_echo", input: { value: input } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] },
+  ];
+  const reject = (body: ProxyBody, id: string, input: string) => {
+    const snapshot = JSON.stringify(body);
+    assert.equal(validateBoxRequest(body, true), "BOX_CACHE_ANNOTATION_INVALID");
+    assert.throws(() => normalizeBoxSemanticBody(body), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => normalizeBoxSemanticBody(structuredClone(body)), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => deriveBoxContextHash(body), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.throws(() => matchBoxToolResults(body, [{ id, clientName: "local_echo",
+      boxName: "mcp__ocbridge__t0", input: { value: input } }]), /BOX_CACHE_ANNOTATION_INVALID/);
+    assert.equal(JSON.stringify(body), snapshot);
+    assert.notEqual(validateBoxRequest(body, true), null);
+  };
+  for (const opening of openings) {
+    for (const cache of badMarkers) {
+      const bad = badBudget(cache);
+      const current = { ...first, messages: [first.messages[0],
+        ...pair("toolu_c2_now", "now", "current"), ...opening, bad] } as ProxyBody;
+      reject(current, "toolu_c2_now", "now");
+      const historical = { ...first, messages: [first.messages[0],
+        ...pair("toolu_c2_old", "old", "history"), ...opening, bad,
+        ...pair("toolu_c2_new", "new", "next"), legalArray] } as ProxyBody;
+      reject(historical, "toolu_c2_new", "new");
+    }
+  }
+  const legal = { ...first, messages: [first.messages[0],
+    ...pair("toolu_c2_ok", "ok", "kept"), wrapped, legalArray] } as ProxyBody;
+  const snapshot = JSON.stringify(legal);
+  const once = normalizeBoxSemanticBody(legal);
+  const twice = normalizeBoxSemanticBody(once);
+  assert.equal(JSON.stringify(legal), snapshot);
+  assert.ok(isDeepStrictEqual(once, twice));
+  assert.equal(validateBoxRequest(legal, true), null);
+  assert.equal(validateBoxRequest(once, true), null);
+  const kept = (once.messages.at(-1) as { content: Array<{ content: unknown }> }).content[0]?.content;
+  assert.deepEqual(kept, [
+    { type: "text", text: "kept" },
+    { type: "text", text: wrappedText },
+  ]);
+  assert.equal(JSON.stringify(once).includes("<total_tokens>"), false);
+  assert.equal(deriveBoxCallFingerprint(3n, legal).replayFingerprint,
+    deriveBoxCallFingerprint(3n, once).replayFingerprint);
+  const afterBudget = { ...first, messages: [first.messages[0],
+    ...pair("toolu_c2_budget", "b", "row"), legalArray, legalString, legalArray] } as ProxyBody;
+  const budgetOnce = normalizeBoxSemanticBody(afterBudget);
+  assert.ok(isDeepStrictEqual(budgetOnce, normalizeBoxSemanticBody(budgetOnce)));
+  assert.equal(validateBoxRequest(afterBudget, true), null);
+  assert.equal((budgetOnce.messages as Array<{ role: string }>).some((message) => message.role === "system"), false);
+});
