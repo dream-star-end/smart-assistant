@@ -6,6 +6,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { hostname } from "node:os";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { constants, closeSync, fsyncSync, lstatSync, mkdirSync, openSync,
   fchownSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import type { Pool } from "pg";
@@ -71,11 +73,11 @@ const EVIDENCE_PARENT = "/var/lib/openclaude";
 const EVIDENCE_DIR = `${EVIDENCE_PARENT}/ocv5-289-box-operator`;
 const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-20.json`;
 const OPERATOR_MUTEX = `${EVIDENCE_DIR}/account-20.mutex`;
-type Event = { event: string; data: Record<string, unknown> };
+export type Event = { event: string; data: Record<string, unknown> };
 function assertion(ok: unknown, code: string): asserts ok {
   if (!ok) throw new Error(code);
 }
-async function readEvents(response: Response): Promise<Event[]> {
+export async function readEvents(response: Response): Promise<Event[]> {
   assertion(response.status === 200 && response.body, "BOX_TOOL_PROBE_HTTP_INVALID");
   const reader = response.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -96,7 +98,7 @@ async function readEvents(response: Response): Promise<Event[]> {
     "BOX_TOOL_PROBE_SSE_INCOMPLETE");
   return events;
 }
-function assistantContent(events: Event[]): Array<Record<string, unknown>> {
+export function assistantContent(events: Event[]): Array<Record<string, unknown>> {
   const blocks: Array<Record<string, unknown>> = [];
   const partial = new Map<number, string>();
   for (const { event, data } of events) {
@@ -180,7 +182,7 @@ function boundedControlShape(value: unknown): unknown {
     ? summary : "<summary-too-large>";
 }
 
-async function startSignedLoopback(args: { pool: Pool; redis: Redis;
+export async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   boxModel: AnthropicProxyDeps["boxModel"]; price: ModelPricing;
   containerId: number; bindHost?: string; containerInboundIp?: string;
   listenPort?: number; assignedRequestIds?: readonly string[];
@@ -305,7 +307,10 @@ async function startSignedLoopback(args: { pool: Pool; redis: Redis;
           const parsed = JSON.parse(Buffer.concat(parts).toString("utf8")) as ProxyBody;
           const effective = normalizeBoxSemanticBody(parsed);
           messageRoles = effective.messages.slice(0, 64).map((item) =>
-            ["user", "assistant", "system"].includes(item.role) ? item.role : "<other>");
+            item && typeof item === "object" && !Array.isArray(item)
+              && "role" in item && typeof item.role === "string"
+              && ["user", "assistant", "system"].includes(item.role)
+              ? item.role : "<other>");
           const content = (effective.messages.at(-2) as { content?: unknown } | undefined)?.content;
           if (!Array.isArray(content)) throw new Error("ASSISTANT_NOT_ARRAY");
           assistantHash = hashBoxAssistantContent(content);
@@ -1317,8 +1322,10 @@ async function main(): Promise<void> {
     await closePool();
   }
 }
-void main().then(() => process.exit(0), (error: unknown) => {
-  const code = error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message)
-    ? error.message : "BOX_TOOL_PROBE_FAILED";
-  process.stderr.write(code + "\n"); process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main().then(() => process.exit(0), (error: unknown) => {
+    const code = error instanceof Error && /^[A-Z][A-Z0-9_]{0,79}$/.test(error.message)
+      ? error.message : "BOX_TOOL_PROBE_FAILED";
+    process.stderr.write(code + "\n"); process.exit(1);
+  });
+}
