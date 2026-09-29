@@ -4,6 +4,7 @@ import { parseCapabilityProfile } from "../../billing/modelCatalog.js";
 import {
   BOX_NATIVE_CONTEXT_ROUTE_READY,
   getBoxNativeContextOwner,
+  selectBoxNativeByteBudget,
   signedCcbCapability,
 } from "./boxNativeContextOwner.js";
 
@@ -90,11 +91,35 @@ describe("box native context owner", () => {
         capabilityProfile: { ccb: { contextOwner: "box-native-v1" } },
       },
     };
-    assert.equal(getBoxNativeContextOwner(
-      { ...declaredGate, authorityKind: "local_catalog", verifiedSignedContextOwner: null },
-      { kind: "box" },
-      true,
-    ), null);
+    const localGate = { ...declaredGate, authorityKind: "local_catalog" as const, verifiedSignedContextOwner: null };
+    assert.equal(getBoxNativeContextOwner(localGate, { kind: "box" }, true), null);
+    const localBudget = {
+      authorityKind: "local_catalog" as const,
+      routeKind: "box",
+      canonicalModel: "box-api-claude-opus-5-5",
+      providerId: "box_cli",
+      declaredContextOwner: "box-native-v1",
+      verifiedSignedContextOwner: null,
+      routeReady: true,
+      containerId: 7n,
+      externalApiKey: false,
+      transportConfigured: true,
+    };
+    assert.equal(selectBoxNativeByteBudget(localBudget), "box-native-v1");
+    assert.equal(selectBoxNativeByteBudget({ ...localBudget, routeReady: false }), "legacy");
+    assert.equal(selectBoxNativeByteBudget({ ...localBudget, externalApiKey: true }), "legacy");
+    assert.equal(selectBoxNativeByteBudget({ ...localBudget, containerId: null }), "legacy");
+    assert.equal(selectBoxNativeByteBudget({ ...localBudget, transportConfigured: false }), "legacy");
+    assert.equal(selectBoxNativeByteBudget({ ...localBudget, declaredContextOwner: "client-said" }), "legacy");
+    assert.equal(selectBoxNativeByteBudget({ ...localBudget, providerId: "ark" }), "legacy");
+    assert.equal(selectBoxNativeByteBudget({
+      ...localBudget,
+      verifiedSignedContextOwner: "box-native-v1",
+    }), "box-native-v1");
+    assert.equal(getBoxNativeContextOwner({
+      ...localGate,
+      verifiedSignedContextOwner: "box-native-v1",
+    }, { kind: "box" }, true), null);
     assert.equal(getBoxNativeContextOwner(
       { ...declaredGate, authorityKind: "bridge_signed", verifiedSignedContextOwner: null },
       { kind: "box" },

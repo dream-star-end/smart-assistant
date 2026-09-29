@@ -8,15 +8,15 @@
  * injected transport runs the real makeBoxTextPlan stage with local Python,
  * then returns a legal SSE terminal. It does not fake HTTP 200.
  *
- * Default command runs ready-off, lease-only, the hard byte rejects, the
- * 6k control, and 64 rounds. Upper bound, the stdin cap, and 2-concurrent
- * stay behind OC_V5_296_PIPELINE_MATRIX=1. A skip or not-run is not PASS.
+ * Default command runs every scenario and does not skip. Set
+ * OC_V5_296_PIPELINE_SUBSET=core,seam to omit matrix; omitted phases are
+ * reported not-run and are not PASS.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -38,18 +38,22 @@ import {
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import Redis from "ioredis";
 import pg from "pg";
+import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "./modelAuthorityGate.js";
 
 const MODEL = "box-api-claude-opus-5-5";
 const CHUNK = 128 * 1024;
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_cpipe_${randomBytes(3).toString("hex")}`;
-const REDIS_URL = "redis://127.0.0.1:56379/15";
+const REDIS_URL = "redis://127.0.0.1:56379/14";
 const READY_FALSE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;";
 const READY_TRUE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;";
 const CHECKOUT_PROXY = dirname(fileURLToPath(import.meta.url));
 const CHECKOUT_COMMERCIAL = join(CHECKOUT_PROXY, "../../..");
 const CHECKOUT_ROOT = join(CHECKOUT_COMMERCIAL, "../..");
-const MATRIX = process.env.OC_V5_296_PIPELINE_MATRIX === "1";
+const SUBSET = new Set((process.env.OC_V5_296_PIPELINE_SUBSET ?? "all").split(",").map((part) => part.trim()).filter(Boolean));
+function phaseOn(name: "core" | "matrix" | "seam"): boolean {
+  return SUBSET.has("all") || SUBSET.has(name);
+}
 
 function buildCandidate(): {
   root: string;
@@ -112,9 +116,7 @@ function buildCandidate(): {
 }
 
 function mkdtempOwned(): string {
-  const root = join(tmpdir(), `ocv5-296-cand-${randomBytes(4).toString("hex")}`);
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  return root;
+  return mkdtempSync(join(tmpdir(), "ocv5-296-cand-"));
 }
 
 const { privateKey, publicKey } = generateKeyPairSync("ed25519");
@@ -156,33 +158,26 @@ function textBody(messages: unknown[]): Record<string, unknown> {
   };
 }
 
-function signLease(): string {
+function signAuthority(over: {
+  uid?: number;
+  containerId?: number;
+  authorityTurnId?: string;
+  canonicalModel?: string;
+  securityEpoch?: number;
+  connectionChallenge?: string;
+  expiresAt?: number;
+  auxModels?: string[];
+} = {}): string {
   const now = Date.now();
-  const lease: TurnLease = {
-    v: MODEL_AUTHORITY_VERSION,
-    keyId: KEY_ID,
-    uid: 3,
-    containerId: 7,
-    authorityTurnId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-    canonicalModel: MODEL,
-    securityEpoch: EPOCH,
-    connectionChallenge: "chal-budget",
-    issuedAt: now,
-    expiresAt: now + 30 * 60_000,
-  };
-  return encodeTurnLeaseEnvelope(lease, cryptoSign(null, turnLeaseSigningInput(lease), privateKey));
-}
-
-function signAuthority(): string {
-  const now = Date.now();
+  const expiresAt = over.expiresAt ?? now + AUTHORITY_TTL_MS;
   const payload: ModelAuthorityPayload = {
     v: MODEL_AUTHORITY_VERSION,
     keyId: KEY_ID,
-    uid: 3,
-    containerId: 7,
-    authorityTurnId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
-    connectionChallenge: "chal-budget",
-    canonicalModel: MODEL,
+    uid: over.uid ?? 3,
+    containerId: over.containerId ?? 7,
+    authorityTurnId: over.authorityTurnId ?? "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    connectionChallenge: over.connectionChallenge ?? "chal-budget",
+    canonicalModel: over.canonicalModel ?? MODEL,
     engine: "ccb",
     executionDescriptor: {
       capabilityProfile: {
@@ -196,14 +191,51 @@ function signAuthority(): string {
       supportsVision: false,
     },
     executionRevision: "b".repeat(64),
-    securityEpoch: EPOCH,
-    issuedAt: now,
-    expiresAt: now + AUTHORITY_TTL_MS,
+    securityEpoch: over.securityEpoch ?? EPOCH,
+    ...(over.auxModels ? { auxModels: over.auxModels } : {}),
+    issuedAt: expiresAt - AUTHORITY_TTL_MS,
+    expiresAt,
   };
   return encodeAuthorityEnvelope(payload, cryptoSign(null, authoritySigningInput(payload), privateKey));
 }
 
-function catalog() {
+function signLease(over: {
+  uid?: number;
+  containerId?: number;
+  authorityTurnId?: string;
+  canonicalModel?: string;
+  securityEpoch?: number;
+  connectionChallenge?: string;
+  expiresAt?: number;
+  auxModels?: string[];
+} = {}): string {
+  const now = Date.now();
+  const lease: TurnLease = {
+    v: MODEL_AUTHORITY_VERSION,
+    keyId: KEY_ID,
+    uid: over.uid ?? 3,
+    containerId: over.containerId ?? 7,
+    authorityTurnId: over.authorityTurnId ?? "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    canonicalModel: over.canonicalModel ?? MODEL,
+    securityEpoch: over.securityEpoch ?? EPOCH,
+    connectionChallenge: over.connectionChallenge ?? "chal-budget",
+    ...(over.auxModels ? { auxModels: over.auxModels } : {}),
+    issuedAt: now - 60_000,
+    expiresAt: over.expiresAt ?? now + 30 * 60_000,
+  };
+  return encodeTurnLeaseEnvelope(lease, cryptoSign(null, turnLeaseSigningInput(lease), privateKey));
+}
+
+function localToken(over: { securityEpoch?: string; projectionRevision?: string } = {}): string {
+  return encodeLocalCatalogToken({
+    v: 1,
+    kind: "local_catalog",
+    projectionRevision: over.projectionRevision ?? "d".repeat(64),
+    securityEpoch: over.securityEpoch ?? String(EPOCH),
+  });
+}
+
+function catalog(canUse = true) {
   const descriptor = {
     canonicalModel: MODEL,
     engine: "ccb",
@@ -239,7 +271,7 @@ function catalog() {
     billingRevision: "c".repeat(64),
     aliasToCanonical: (model: string) => model,
     resolve: (model: string) => (model === MODEL ? descriptor : null),
-    canUseModel: () => true,
+    canUseModel: () => canUse,
     billingPricingFor: (model: string) => (model === MODEL ? pricing : null),
     projectionRevisionFor: () => "d".repeat(64),
   };
@@ -504,23 +536,29 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
     const redisPing = await redis.ping();
     assert.equal(redisPing, "PONG");
     const redisDb = await redis.call("CLIENT", "INFO") as string;
-    // logical DB 15 is the private namespace; key shape stays the production precheck prefix.
+    assert.equal(typeof redisDb === "string" && redisDb.includes("db=14"), true, String(redisDb));
     await redis.del("precheck:u:{3}:locks", "precheck:u:{3}:amounts");
 
     candidateDb.setPoolOverride(pool);
     const billingRedis = candidatePre.wrapIoredisForPreCheck(redis);
-    const makeDeps = (fetchImpl: (args: Record<string, unknown>) => Promise<Response>) => ({
+    const makeDeps = (fetchImpl: (args: Record<string, unknown>) => Promise<Response>, opts: { canUse?: boolean; apiKey?: boolean } = {}) => ({
       pgPool: pool,
       pricing: { get: () => null },
       preCheckRedis: billingRedis,
       scheduler: {},
       identity: {
-        async resolve() { return { uid: 3n, containerId: 7n }; },
+        async resolve() {
+          return {
+            uid: 3n,
+            containerId: 7n,
+            ...(opts.apiKey ? { apiKey: { id: 1n, creditLimit: null, spentCredits: 0n } } : {}),
+          };
+        },
         async authorize() {},
       },
       loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set<string>() }),
       rateLimitRedis: { async incr() { return 1; }, async expire() { return 1; } },
-      modelCatalog: catalog(),
+      modelCatalog: catalog(opts.canUse !== false),
       modelAuthorityEnforce: true,
       authorityKeyring: () => keyring,
       boxModel: { fetch: fetchImpl },
@@ -657,9 +695,92 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
     assert.equal(wide.rows[0]?.state, "committed");
     assert.equal(wide.rows.filter((row) => row.ledger_id).length, 1);
 
-    if (!MATRIX) {
+    if (!phaseOn("seam")) {
+      for (const phase of ["expired-lease-64", "gate-rejects", "local-64", "local-negatives"]) {
+        phases.push({ phase, status: "not-run", countsAsPass: false, reason: "OC_V5_296_PIPELINE_SUBSET omitted seam; not PASS" });
+      }
+    } else {
+      const stageFetch = (counter: { n: number }) => async (args: Record<string, unknown>) => {
+        counter.n += 1;
+        const plan = candidatePlan.makeBoxTextPlan({
+          body: (args as { canonicalBody: unknown }).canonicalBody,
+          upstreamModel: (args as { upstreamModel: string }).upstreamModel,
+          maxOutputTokensLimit: 8192,
+          supervisorAsset: supervisor,
+          keeperAsset: keeper,
+        });
+        await execStage(plan);
+        return sseResponse();
+      };
+      const expiredCount = { n: 0 };
+      const expiredHandler = candidateMod.makeAnthropicProxyHandler(makeDeps(stageFetch(expiredCount)) as never);
+      const expiredHit = await call(expiredHandler, history64(), {
+        "x-request-id": "ocv5-296-expired-auth",
+        "x-oc-model-authority": signAuthority({ expiresAt: Date.now() - 5_000 }),
+        "x-oc-turn-lease": signLease(),
+      }, async () => { throw new Error("unused"); });
+      const expiredJournal = await pool.query("SELECT state FROM request_finalize_journal WHERE request_id = 'ocv5-296-expired-auth'");
+      phases.push({ phase: "expired-lease-64", ...expiredHit, fetches: expiredCount.n, journal: expiredJournal.rows });
+      assert.equal(expiredHit.status, 200, JSON.stringify(expiredHit));
+      assert.equal(expiredHit.sse, true);
+      assert.equal(expiredCount.n, 1);
+      assert.equal(expiredJournal.rows[0]?.state, "committed");
+
+      const small = textBody([{ role: "user", content: "hi" }]);
+      const rejectHandler = candidateMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("reject-fetch"); }) as never);
+      const rejects: Array<{ id: string; headers: Record<string, string>; status: number }> = [
+        { id: "bad-uid", status: 403, headers: { "x-oc-model-authority": signAuthority({ uid: 9 }), "x-oc-turn-lease": signLease({ uid: 9 }) } },
+        { id: "bad-container", status: 403, headers: { "x-oc-model-authority": signAuthority({ containerId: 9 }), "x-oc-turn-lease": signLease({ containerId: 9 }) } },
+        { id: "bad-model", status: 403, headers: { "x-oc-model-authority": signAuthority({ canonicalModel: "claude-sonnet-4-6" }), "x-oc-turn-lease": signLease({ canonicalModel: "claude-sonnet-4-6" }) } },
+        { id: "bad-epoch", status: 409, headers: { "x-oc-model-authority": signAuthority({ securityEpoch: 99 }), "x-oc-turn-lease": signLease({ securityEpoch: 99 }) } },
+        { id: "bad-challenge", status: 403, headers: { "x-oc-model-authority": signAuthority({ connectionChallenge: "chal-budget" }), "x-oc-turn-lease": signLease({ connectionChallenge: "chal-other" }) } },
+        { id: "bad-aux", status: 403, headers: { "x-oc-model-authority": signAuthority({ auxModels: ["deepseek-v4-flash"] }), "x-oc-turn-lease": signLease() } },
+        { id: "cross-turn", status: 403, headers: { "x-oc-model-authority": signAuthority(), "x-oc-turn-lease": signLease({ authorityTurnId: "b".repeat(32) }) } },
+        { id: "expired-lease", status: 403, headers: { "x-oc-model-authority": signAuthority(), "x-oc-turn-lease": signLease({ expiresAt: Date.now() - 5_000 }) } },
+      ];
+      const rejectResults = [];
+      for (const item of rejects) {
+        const hit = await call(rejectHandler, small, { "x-request-id": `ocv5-296-${item.id}`, ...item.headers }, async () => { throw new Error("unused"); });
+        const journal = await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE request_id = $1", [`ocv5-296-${item.id}`]);
+        assert.equal(hit.status, item.status, `${item.id} ${JSON.stringify(hit)}`);
+        assert.equal(journal.rows[0].n, 0, item.id);
+        rejectResults.push({ id: item.id, status: hit.status, code: hit.code, journal: journal.rows[0].n });
+      }
+      phases.push({ phase: "gate-rejects", results: rejectResults });
+
+      const localCount = { n: 0 };
+      const localHandler = candidateMod.makeAnthropicProxyHandler(makeDeps(stageFetch(localCount)) as never);
+      const localHit = await call(localHandler, history64(), {
+        "x-request-id": "ocv5-296-local-64",
+        [LOCAL_CATALOG_HEADER]: localToken(),
+      }, async () => { throw new Error("unused"); });
+      const localJournal = await pool.query("SELECT state FROM request_finalize_journal WHERE request_id = 'ocv5-296-local-64'");
+      phases.push({ phase: "local-64", ...localHit, fetches: localCount.n, journal: localJournal.rows });
+      assert.equal(localHit.status, 200, JSON.stringify(localHit));
+      assert.equal(localCount.n, 1);
+      assert.equal(localJournal.rows[0]?.state, "committed");
+
+      const localNegatives = [];
+      const negativeCases: Array<{ id: string; status: number; run: () => Promise<{ status: number; code: string | null }> }> = [
+        { id: "local-epoch", status: 409, run: () => call(localHandler, small, { "x-request-id": "ocv5-296-local-epoch", [LOCAL_CATALOG_HEADER]: localToken({ securityEpoch: "99" }) }, async () => { throw new Error("unused"); }) },
+        { id: "local-projection", status: 409, run: () => call(localHandler, small, { "x-request-id": "ocv5-296-local-projection", [LOCAL_CATALOG_HEADER]: localToken({ projectionRevision: "e".repeat(64) }) }, async () => { throw new Error("unused"); }) },
+        { id: "local-revoked", status: 403, run: () => call(candidateMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("revoked-fetch"); }, { canUse: false }) as never), small, { "x-request-id": "ocv5-296-local-revoked", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
+        { id: "local-apikey", status: 413, run: () => call(candidateMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("apikey-fetch"); }, { apiKey: true }) as never), history64(), { "x-request-id": "ocv5-296-local-apikey", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
+        { id: "local-ready-off", status: 413, run: () => call(productMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("ready-fetch"); }) as never), history64(), { "x-request-id": "ocv5-296-local-ready-off", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
+      ];
+      for (const item of negativeCases) {
+        const hit = await item.run();
+        const journal = await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE request_id = $1", [`ocv5-296-${item.id}`]);
+        assert.equal(hit.status, item.status, `${item.id} ${JSON.stringify(hit)}`);
+        assert.equal(journal.rows[0].n, 0, item.id);
+        localNegatives.push({ id: item.id, status: hit.status, code: hit.code, journal: journal.rows[0].n });
+      }
+      phases.push({ phase: "local-negatives", results: localNegatives });
+    }
+
+    if (!phaseOn("matrix")) {
       for (const phase of ["upper-messages", "stdin-8MiB-cap", "concurrent-2x9MiB"]) {
-        phases.push({ phase, status: "not-run", countsAsPass: false, reason: "OC_V5_296_PIPELINE_MATRIX is unset; not PASS" });
+        phases.push({ phase, status: "not-run", countsAsPass: false, reason: "OC_V5_296_PIPELINE_SUBSET omitted matrix; not PASS" });
       }
     } else {
     const historySized = (target: number): { body: Record<string, unknown>; messageBytes: number } => {
@@ -734,11 +855,12 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
     const redisLeft = await redis.exists("precheck:u:{3}:locks", "precheck:u:{3}:amounts");
     const report = {
       source: "checkout-copy",
-      matrix: MATRIX ? "ran" : "not-run",
+      groups: { core: "ran", matrix: phaseOn("matrix") ? "ran" : "not-run", seam: phaseOn("seam") ? "ran" : "not-run" },
       schema: SCHEMA,
       database: "openclaude_test",
       port: 55432,
-      redis: "127.0.0.1:56379 db 15",
+      redis: "127.0.0.1:56379 db 14",
+      subset: [...SUBSET],
       productReadyHash: productHash,
       candidateReadyHash: candidateHash,
       candidateDiff: "BOX_NATIVE_CONTEXT_ROUTE_READY false -> true",
@@ -762,22 +884,20 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
       return { phase: row.phase, status: row.http?.status ?? row.status, code: row.http?.code, fetches: row.fetches, journal: row.journal };
     }) }));
   } finally {
+    const cleanupErrors: string[] = [];
+    const fail = async (label: string, fn: () => Promise<void> | void) => {
+      try { await fn(); } catch (error) { cleanupErrors.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+    };
     if (previousBox === undefined) delete process.env.OC_BOX_MODEL_API;
     else process.env.OC_BOX_MODEL_API = previousBox;
-    await redis.del("precheck:u:{3}:locks", "precheck:u:{3}:amounts").catch(() => undefined);
-    await redis.quit().catch(() => undefined);
-    await candidateDb.resetPool().catch(() => undefined);
-    await pool.end().catch(() => undefined);
-    await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`).catch(() => undefined);
-    await admin.end().catch(() => undefined);
-    rmSync(candidateRoot, { recursive: true, force: true });
-    assert.equal(existsSync(candidateRoot), false);
-    assert.equal(existsSync(join(CHECKOUT_ROOT, "node_modules/pg")), true);
+    await fail("redis-del", () => redis.del("precheck:u:{3}:locks", "precheck:u:{3}:amounts"));
+    await fail("redis-quit", () => redis.quit());
+    await fail("reset-pool", () => candidateDb.resetPool());
+    await fail("drop-schema", () => admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`));
+    await fail("admin-end", () => admin.end());
+    await fail("candidate-rm", () => { rmSync(candidateRoot, { recursive: true, force: true }); });
+    if (existsSync(candidateRoot)) cleanupErrors.push("candidate-rm: directory still exists");
+    if (!existsSync(join(CHECKOUT_ROOT, "node_modules/pg"))) cleanupErrors.push("checkout pg missing after cleanup");
+    if (cleanupErrors.length > 0) throw new Error(cleanupErrors.join("; "));
   }
-});
-
-test("upper bound, stdin cap, and 2-concurrent", {
-  skip: "not the default command. Set OC_V5_296_PIPELINE_MATRIX=1 to run them inside the checkout candidate test. This skip is not PASS",
-}, () => {
-  throw new Error("skipped test must not count as PASS");
 });

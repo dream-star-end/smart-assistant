@@ -118,7 +118,7 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
-import { BOX_NATIVE_CONTEXT_ROUTE_READY, verifiedBoxNativeContextOwner } from "./boxNativeContextOwner.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./boxNativeContextOwner.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
 import { prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
@@ -835,8 +835,9 @@ export function makeAnthropicProxyHandler(
           ? route.provider.supportsVision === true
           : route.kind !== "box";
       // Same ready bit issuance uses (default false). OC_BOX_MODEL_API only arms
-      // the transport; it does not prove the signed capability.
-      const contextOwner = verifiedBoxNativeContextOwner({
+      // the transport; it does not prove the signed capability. Local catalog
+      // can select the limited budget without becoming a live-chain owner.
+      const byteBudget = selectBoxNativeByteBudget({
         authorityKind: gate?.authorityKind,
         routeKind: route.kind,
         canonicalModel: gate?.descriptor.canonicalModel,
@@ -844,10 +845,12 @@ export function makeAnthropicProxyHandler(
         declaredContextOwner: gate?.descriptor.capabilityProfile.ccb.contextOwner,
         verifiedSignedContextOwner: gate?.verifiedSignedContextOwner ?? null,
         routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
-      });
-      const byteBudget = contextOwner === null
-        ? PROXY_BYTE_BUDGET_LEGACY
-        : PROXY_BYTE_BUDGET_BOX_NATIVE_V1;
+        containerId: containerIdBig,
+        externalApiKey: identity.apiKey != null,
+        transportConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
+      }) === "box-native-v1"
+        ? PROXY_BYTE_BUDGET_BOX_NATIVE_V1
+        : PROXY_BYTE_BUDGET_LEGACY;
       if (deferLegacyUntilVerifiedBox && rejectOverBudget(byteBudget)) return;
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A

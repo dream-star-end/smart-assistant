@@ -103,8 +103,43 @@ export function verifiedBoxNativeContextOwner(input: {
 }
 
 /**
+ * Byte-budget eligibility. This is not live-chain ownership.
+ * Bridge still needs the signed contextOwner. A verified local_catalog gate
+ * can select the same limited budget for an exact ready Box route, but
+ * `getBoxNativeContextOwner` stays null and `verifiedSignedContextOwner`
+ * must remain null. Local is not idle-only: any authorized container request
+ * on this route gets the same ceiling.
+ */
+export function selectBoxNativeByteBudget(input: {
+  authorityKind?: string | null;
+  routeKind?: string | null;
+  canonicalModel?: string | null;
+  providerId?: string | null;
+  declaredContextOwner?: string;
+  verifiedSignedContextOwner?: string | null;
+  routeReady: boolean;
+  containerId?: bigint | null;
+  externalApiKey?: boolean;
+  transportConfigured?: boolean;
+}): "legacy" | "box-native-v1" {
+  if (verifiedBoxNativeContextOwner(input) !== null) return "box-native-v1";
+  if (input.authorityKind !== "local_catalog") return "legacy";
+  if (input.containerId == null || input.externalApiKey === true) return "legacy";
+  if (input.transportConfigured !== true) return "legacy";
+  if (input.routeKind !== "box") return "legacy";
+  const declared = issueBoxNativeContextOwner({
+    canonicalModel: input.canonicalModel ?? "",
+    providerId: input.providerId ?? null,
+    declared: input.declaredContextOwner,
+    routeReady: input.routeReady,
+  });
+  return declared === BOX_NATIVE_CONTEXT_OWNER ? "box-native-v1" : "legacy";
+}
+
+/**
  * Read API aligned with ModelAuthorityDecision. Default `routeReady` is the
  * production constant (false). Does not read body or env.
+ * local_catalog never returns the live-chain token.
  */
 export function getBoxNativeContextOwner(
   gate: BoxNativeContextGate,
