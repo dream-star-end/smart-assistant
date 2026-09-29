@@ -49,6 +49,7 @@ let summaryRequested = false;
 let growthActive = false;
 let growthRound = 0;
 let growthStopRound = 60;
+let growthTarget = GROW_TARGET;
 let toolsPerRound = 1;
 let growthChars = GROW_CHARS;
 let executionLogPath = "";
@@ -135,7 +136,7 @@ function restoreEnv(name: string, previous: string | undefined): void {
   else process.env[name] = previous;
 }
 
-async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth"): Promise<void> {
+async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam"): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
@@ -154,6 +155,8 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
   let restoreLocalAuth: (() => void) | undefined;
   const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT };
   let holdNextSettlement = false;
+  let holdSummaryCommit = false;
+  let preIdleCaptured = false;
   const heldRequestIds: string[] = [];
   const heldCommits: Array<() => void> = [];
   const releaseHeldCommits = () => {
@@ -443,7 +446,10 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         },
       },
     });
-    const proof = candidateProof.makeBoxIdleProofHandler({ identity, journal });
+    const proof = candidateProof.makeBoxIdleProofHandler({
+      identity, journal,
+      readCapsule: (pointer: { sha256: string; bytes: number }) => replayMod.readBoxReplayMessage(replayDir, pointer),
+    });
     const catalogHttp = await import(pathToFileURL(join(CHECKOUT, "packages/commercial/src/http/internalModelCatalog.ts")).href);
     const identityMod = await import(pathToFileURL(join(CHECKOUT, "packages/commercial/src/auth/containerIdentity.ts")).href);
     const catalogHandler = catalogHttp.makeModelCatalogHandler({
@@ -548,6 +554,15 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         localAuthBodyPath = join(rawDir, "ocv5-296-idle-local-catalog-request.json");
         writeFileSync(localAuthBodyPath, text);
       }
+      if (summaryRequested && (mode === "grow2" || mode === "seam") && !preIdleCaptured) {
+        preIdleCaptured = true;
+        report.preIdle = capturePreIdleTranscript(mode === "grow2" ? "r22" : "seam");
+      }
+      if (holdSummaryCommit && summaryRequested) {
+        holdNextSettlement = true;
+        holdSummaryCommit = false;
+        report.summaryCommitHeld = true;
+      }
       current = {
         url: path, status: 0, bytes: raw.length,
         summary: summaryRequested, keptPrefix: raw.includes("OCV5296_OLD_PREFIX"), shape,
@@ -596,7 +611,22 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       defaults: { permissionMode: "bypassPermissions" },
     } as never;
     report.case = mode;
-    report.liveGrowthNotRun = { reason: "deferred-tools 409 waits for B; this run does not repeat it", targetBytes: GROW_TARGET };
+    report.liveGrowthNotRun = { reason: "not the 45-round chain", targetBytes: GROW_TARGET };
+    const armCatalog = (disableAutoCompact: boolean) => {
+      const previousFlag = process.env.OC_MODEL_AUTHORITY;
+      const previousAuto = process.env.DISABLE_AUTO_COMPACT;
+      const previousToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      process.env.OC_MODEL_AUTHORITY = "1";
+      if (disableAutoCompact) process.env.DISABLE_AUTO_COMPACT = "1";
+      process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = CATALOG_TOKEN;
+      restoreLocalAuth = () => {
+        restoreEnv("OC_MODEL_AUTHORITY", previousFlag);
+        restoreEnv("DISABLE_AUTO_COMPACT", previousAuto);
+        restoreEnv("OPENCLAUDE_V3_CONTAINER_TOKEN", previousToken);
+        _setModelCatalogClientForTests(null);
+      };
+      resetCatalogClient(true);
+    };
     const sm = new SessionManager({
       version: 1,
       gateway: { bind: "127.0.0.1", port: 0, accessToken: "" },
@@ -897,19 +927,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         assert.equal(row.turn_key, freshBooks[0]!.turn_key);
       }
     } else if (mode === "localAuth") {
-      const previousFlag = process.env.OC_MODEL_AUTHORITY;
-      const previousAuto = process.env.DISABLE_AUTO_COMPACT;
-      const previousToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
-      process.env.OC_MODEL_AUTHORITY = "1";
-      process.env.DISABLE_AUTO_COMPACT = "1";
-      process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = CATALOG_TOKEN;
-      restoreLocalAuth = () => {
-        restoreEnv("OC_MODEL_AUTHORITY", previousFlag);
-        restoreEnv("DISABLE_AUTO_COMPACT", previousAuto);
-        restoreEnv("OPENCLAUDE_V3_CONTAINER_TOKEN", previousToken);
-        _setModelCatalogClientForTests(null);
-      };
-      resetCatalogClient(true);
+      armCatalog(true);
       report.liveChainProof = false;
       report.authFixture = "OC_MODEL_AUTHORITY=1; real catalog handler; egress snapshot unchanged except negative faults";
       const sourceKey = "agent:main:webchat:dm:idle-auth-source";
@@ -1014,13 +1032,31 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       report.journalAuthority = journals.rows;
       const sourceUsage = usage.rows.find((row) => row.request_id === sourceHit.requestId);
       const idleUsage = usage.rows.find((row) => row.request_id === idleHit.requestId);
-      if (sourceUsage) assert.equal(sourceUsage.authority_kind, "bridge_signed");
-      if (idleUsage) {
-        assert.equal(idleUsage.authority_kind, "local_catalog");
-        assert.equal(idleUsage.projection_revision, PROJECTION_OK);
-        assert.equal(idleUsage.security_epoch, "12");
-        if (idleUsage.turn_key) assert.equal(idleUsage.turn_key, idleTurnKey);
+      assert.equal(usage.rows.filter((row) => row.request_id === sourceHit.requestId).length, 1);
+      assert.equal(usage.rows.filter((row) => row.request_id === idleHit.requestId).length, 1);
+      assert.ok(sourceUsage, "source usage row missing");
+      assert.equal(sourceUsage!.authority_kind, "bridge_signed");
+      assert.ok(idleUsage, "idle usage row missing");
+      assert.equal(idleUsage!.authority_kind, "local_catalog");
+      assert.equal(idleUsage!.projection_revision, PROJECTION_OK);
+      assert.equal(idleUsage!.security_epoch, "12");
+      assert.equal(idleUsage!.turn_key, idleTurnKey);
+      const authBooks = await pool.query<{ request_id: string; ledger_id: string; delta: string; balance_after: string }>(
+        `SELECT u.request_id, l.id::text AS ledger_id, l.delta::text, l.balance_after::text
+           FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
+          WHERE u.request_id = $1 OR u.request_id = $2 ORDER BY l.id`,
+        [sourceHit.requestId, idleHit.requestId]);
+      assert.equal(authBooks.rows.length, 2, JSON.stringify(authBooks.rows));
+      assert.equal(new Set(authBooks.rows.map((row) => row.ledger_id)).size, 2);
+      let authRunning = 50_000_000n;
+      const allBooks = await pool.query<{ delta: string; balance_after: string; ledger_id: string }>(
+        `SELECT l.id::text AS ledger_id, l.delta::text, l.balance_after::text
+           FROM credit_ledger l WHERE l.user_id = 3 ORDER BY l.id`);
+      for (const row of allBooks.rows) {
+        authRunning += BigInt(row.delta);
+        assert.equal(BigInt(row.balance_after), authRunning, row.ledger_id);
       }
+      report.authBalance = authRunning.toString();
       const idleJournal = journals.rows.find((row) => row.request_id === idleHit.requestId);
       if (idleJournal) {
         assert.equal(idleJournal.kind, "local_catalog");
@@ -1103,18 +1139,23 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       report.epochGets = epochGets;
       report.notRun = ["typed-summary success", "three crash windows", "same-session second idle", "45-round chain"];
     } else {
-      const growing = mode === "grow2";
+      const growing = mode === "grow2" || mode === "seam";
+      const seam = mode === "seam";
+      if (growing) {
+        armCatalog(false);
+      }
       growthActive = true;
       growthRound = 0;
-      growthStopRound = growing ? 60 : 1;
+      growthStopRound = seam ? 8 : growing ? 60 : 1;
+      growthTarget = seam ? 900_000 : GROW_TARGET;
       toolsPerRound = growing ? 8 : 1;
       growthChars = growing ? 25_000 : GROW_CHARS;
-      growthBodyPrefix = growing ? "ocv5-296-r20-cal" : "ocv5-296-r19-live";
+      growthBodyPrefix = seam ? "ocv5-296-r22-seam" : growing ? "ocv5-296-r22-grow" : "ocv5-296-r19-live";
       executionLogPath = growing ? join(work, "execution-log") : "";
       mcpSerial = 0;
       pendingById.clear();
       growthBodies.length = 0;
-      const liveKey = growing ? "agent:main:webchat:dm:idle-grow2" : "agent:main:webchat:dm:idle-live2";
+      const liveKey = seam ? "agent:main:webchat:dm:idle-seam" : growing ? "agent:main:webchat:dm:idle-grow2" : "agent:main:webchat:dm:idle-live2";
       const liveAdapter = new CcbAdapter({
         sessionKey: liveKey,
         agentId: "main",
@@ -1184,7 +1225,12 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         assert.equal(new Set(logged).size, logged.length);
         const retained = Math.max(...liveHits.map((hit) => (hit.digest as { contentBytes?: number } | undefined)?.contentBytes ?? 0));
         report.retainedBytes = retained;
-        assert.ok(retained >= GROW_TARGET, `retained ${retained} after ${growthRound} rounds`);
+        if (seam) {
+          assert.ok(retained >= 700_000 && retained < GROW_TARGET, `seam retained ${retained}`);
+          report.notLiveChain = true;
+        } else {
+          assert.ok(retained >= GROW_TARGET, `retained ${retained} after ${growthRound} rounds`);
+        }
       } else {
       assert.equal(growthRound, 1);
       const toolUses = growthBodies.flatMap((body) => {
@@ -1217,8 +1263,26 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       }
       assert.equal(liveError, "");
       if (growing) {
-        report.preIdle = capturePreIdleTranscript("grow2");
         growthActive = false;
+        if (seam && heldCommits.length > 0) {
+          const blockedAt = hits.filter((hit) => hit.url === "/v1/messages").length;
+          let blocked = "";
+          try {
+            await sm.submit(liveSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+          } catch (error) {
+            blocked = error instanceof Error ? error.message : String(error);
+          }
+          report.blockedError = blocked;
+          assert.equal(blocked.includes("IDLE_HISTORY_PENDING"), true, blocked);
+          assert.equal(hits.filter((hit) => hit.url === "/v1/messages").length, blockedAt);
+          const idleId = hits.find((hit) => hit.kind === "idle-summary")?.requestId ?? "";
+          releaseHeldCommits();
+          for (let attempt = 0; attempt < 80 && idleId; attempt += 1) {
+            const row = await pool.query<{ state: string }>("SELECT state FROM request_finalize_journal WHERE request_id = $1", [idleId]);
+            if (row.rows[0]?.state === "committed") break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
         const beforeNext = hits.length;
         let nextError = "";
         for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -1307,8 +1371,10 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         : mode === "localAuth"
           ? "ocv5-296-idle-local-catalog-raw.json"
           : mode === "grow2"
-            ? "ocv5-296-idle-pipeline-r20-cal-raw.json"
-            : "ocv5-296-idle-pipeline-r19-live2-raw.json";
+            ? "ocv5-296-idle-pipeline-r22-raw.json"
+            : mode === "seam"
+              ? "ocv5-296-idle-seam-r22-raw.json"
+              : "ocv5-296-idle-pipeline-r19-live2-raw.json";
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, rawName);
     if (/ocv5-296-(idle-pipeline-r\d+-raw|r17-growth-)/.test(path)) {
@@ -1338,6 +1404,7 @@ queueIdle("fresh stock summary and business roots short-close through terminal_s
 test("live tool continuation keeps the persisted deferred-tools announcement", { timeout: 300_000 }, () => runIdleCase("live2"));
 test("live bash rounds grow outer history through idle summary", { timeout: 3_600_000 }, () => runIdleCase("grow2"));
 test("local catalog fixture accepts a dedicated idle request and rejects drift", { timeout: 600_000 }, () => runIdleCase("localAuth"));
+test("prepared idle summary commits on its own turn then applies", { timeout: 600_000 }, () => runIdleCase("seam"));
 
 type MessageDigest = {
   messages: number;
@@ -1653,7 +1720,7 @@ function prepareModelSpool(raw: string): void {
   const bashIndex = (parsed.tools ?? []).findIndex((tool) => tool.name === "Bash");
   const size = toolResultBytes(parsed.messages ?? []);
   const prior = classified.kind === "live-continuation" ? toolResultsIn(parsed.messages ?? []) : [];
-  const retainedEnough = size >= GROW_TARGET || growthRound >= growthStopRound;
+  const retainedEnough = size >= growthTarget || growthRound >= growthStopRound;
   const truncated = toolsPerRound > 1 && prior.length > 0 && size < growthRound * toolsPerRound * growthChars * 0.5;
   const finish = retainedEnough || truncated;
   if (bashIndex < 0 || finish) {
