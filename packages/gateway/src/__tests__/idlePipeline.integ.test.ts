@@ -44,6 +44,7 @@ let growthActive = false;
 let growthRound = 0;
 let spoolBuf = Buffer.alloc(0);
 let pendingStdout: string | null = null;
+const growthBodies: string[] = [];
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
@@ -385,6 +386,12 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
       const digest = messageDigest(raw.toString("utf8"));
       const classified = classifyRequest(raw.toString("utf8"));
       prepareModelSpool(raw.toString("utf8"));
+      if (growthActive && growthBodies.length < 3) {
+        const text = raw.toString("utf8");
+        growthBodies.push(text);
+        const rawDir = process.env.OC_V5_296_IDLE_RAW ? dirname(process.env.OC_V5_296_IDLE_RAW) : tmpdir();
+        writeFileSync(join(rawDir, `ocv5-296-r17-growth-${growthBodies.length}.json`), text);
+      }
       current = {
         url: path, status: 0, bytes: raw.length,
         summary: summaryRequested, keptPrefix: raw.includes("OCV5296_OLD_PREFIX"), shape,
@@ -585,7 +592,8 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     });
     if (!grown) {
       const last = growthHits.at(-1);
-      throw new Error(`live tool chain stopped at ${largest} bytes before 8.45MiB; rounds=${growthRound}; last=${last?.status ?? "none"} ${last?.kind ?? ""} ${growthError}`);
+      report.contextDiff = await explainContextMismatch(growthBodies, CHECKOUT);
+      throw new Error(`live tool chain stopped at ${largest} bytes before 8.45MiB; rounds=${growthRound}; last=${last?.status ?? "none"} ${last?.kind ?? ""} ${growthError}; diff=${JSON.stringify(report.contextDiff).slice(0, 1500)}`);
     }
     const heldIds = growthHits.map((hit) => hit.requestId).filter((id): id is string => Boolean(id));
     report.growthRequestIds = heldIds;
@@ -769,6 +777,89 @@ function seedOuterHistory(configDir: string, cwd: string, opts: { sessionId?: st
   const file = join(project, `${sessionId}.jsonl`);
   writeFileSync(file, `${lines.join("\n")}\n`);
   return { bytes: statSync(file).size, marker, sessionId, project };
+}
+
+function clip(value: unknown): unknown {
+  if (typeof value === "string") return value.length > 120 ? `${value.slice(0, 120)}…(${value.length})` : value;
+  if (typeof value === "number" || typeof value === "boolean" || value == null) return value;
+  const text = JSON.stringify(value);
+  return text.length > 160 ? `${text.slice(0, 160)}…(${text.length})` : value;
+}
+
+function walkDiff(left: unknown, right: unknown, path: string, out: Array<Record<string, unknown>>, limit: number): void {
+  if (out.length >= limit || Object.is(left, right)) return;
+  const leftObj = left !== null && typeof left === "object";
+  const rightObj = right !== null && typeof right === "object";
+  if (!leftObj || !rightObj || Array.isArray(left) !== Array.isArray(right)) {
+    out.push({ path, left: clip(left), right: clip(right) });
+    return;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    if (left.length !== right.length) out.push({ path, leftLength: left.length, rightLength: right.length });
+    const count = Math.min(left.length, right.length);
+    for (let index = 0; index < count && out.length < limit; index += 1) {
+      walkDiff(left[index], right[index], `${path}[${index}]`, out, limit);
+    }
+    return;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  for (const key of [...new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])].sort()) {
+    if (out.length >= limit) return;
+    if (!Object.hasOwn(leftRecord, key)) out.push({ path: `${path}.${key}`, missing: "first" });
+    else if (!Object.hasOwn(rightRecord, key)) out.push({ path: `${path}.${key}`, missing: "prefix" });
+    else walkDiff(leftRecord[key], rightRecord[key], `${path}.${key}`, out, limit);
+  }
+}
+
+function messageOutline(body: { messages?: Array<Record<string, unknown>> }): unknown[] {
+  return (body.messages ?? []).map((message, index) => {
+    const content = message.content;
+    const blocks = Array.isArray(content) ? content as Array<Record<string, unknown>> : [];
+    return {
+      index, role: message.role ?? null, id: message.id ?? null,
+      types: Array.isArray(content) ? blocks.map((block) => block.type ?? typeof block) : typeof content,
+      ids: blocks.map((block) => block.id ?? block.tool_use_id ?? null).filter((id) => id != null),
+      chars: typeof content === "string" ? content.length : JSON.stringify(content ?? "").length,
+    };
+  });
+}
+
+async function explainContextMismatch(bodies: string[], checkout: string): Promise<Record<string, unknown>> {
+  if (bodies.length < 2) return { error: "need two bodies", count: bodies.length };
+  const finger = await import(pathToFileURL(join(checkout, "packages/commercial/src/http/proxy/boxCallFingerprint.ts")).href) as {
+    deriveBoxContextHash: (body: unknown, completedToolTail?: boolean) => string;
+  };
+  const cache = await import(pathToFileURL(join(checkout, "packages/commercial/src/http/proxy/boxCacheAnnotations.ts")).href) as {
+    normalizeBoxSemanticBody: (body: unknown) => { messages: unknown[]; metadata?: unknown; system?: unknown; tools?: unknown; model?: unknown; max_tokens?: unknown };
+  };
+  const first = JSON.parse(bodies[0]!) as { messages?: Array<Record<string, unknown>> };
+  const second = JSON.parse(bodies[1]!) as { messages?: Array<Record<string, unknown>> };
+  const firstHash = finger.deriveBoxContextHash(first);
+  const prefixHash = finger.deriveBoxContextHash(second, true);
+  const left = cache.normalizeBoxSemanticBody(first);
+  const right = cache.normalizeBoxSemanticBody(second);
+  const { metadata: leftMeta, ...leftModel } = left;
+  const { metadata: rightMeta, messages: rightMessages, ...rightModel } = right;
+  const prefix = { ...rightModel, messages: rightMessages.slice(0, -2) };
+  const changes: Array<Record<string, unknown>> = [];
+  walkDiff(leftModel, prefix, "$", changes, 40);
+  const top = ["model", "max_tokens", "system", "tools", "thinking", "output_config", "tool_choice", "stream"] as const;
+  const topLevel: Record<string, unknown> = {};
+  for (const key of top) {
+    const a = JSON.stringify((first as Record<string, unknown>)[key] ?? null);
+    const b = JSON.stringify((second as Record<string, unknown>)[key] ?? null);
+    topLevel[key] = a === b ? "same" : { first: a.slice(0, 180), second: b.slice(0, 180) };
+  }
+  return {
+    firstHash, prefixHash, equal: firstHash === prefixHash,
+    firstRoles: messageOutline(first),
+    secondRoles: messageOutline(second),
+    normalizedFirstCount: left.messages.length,
+    normalizedPrefixCount: rightMessages.length - 2,
+    topLevel, changes,
+    metadataSame: JSON.stringify(leftMeta ?? null) === JSON.stringify(rightMeta ?? null),
+  };
 }
 
 function classifyRequest(raw: string): { kind: string; reasons: string[] } {
