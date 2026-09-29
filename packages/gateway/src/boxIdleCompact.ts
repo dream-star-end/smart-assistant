@@ -179,6 +179,7 @@ export interface IdleNativeFile {
   sessionId: string
   summaryText?: string
   modelCalls: number
+  applied?: boolean
   frozenTail: IdleFrozenTail[]
   attachments: IdleAttachment[]
 }
@@ -211,6 +212,44 @@ export function writeIdleNative(home: string, file: IdleNativeFile): void {
   const tmp = `${path}.${process.pid}.tmp`
   writeFileSync(tmp, JSON.stringify(file))
   renameSync(tmp, path)
+}
+
+export interface IdleSourceCandidate {
+  v: 1
+  sessionKey: string
+  sessionId: string
+  turnKey: string
+}
+
+function candidatePath(dir: string, sessionKey: string): string {
+  return join(dir, 'idle-candidates', `${encodeURIComponent(sessionKey)}.json`)
+}
+
+/** Written before the proof read, so a pending finalizer still blocks the next user. */
+export function writeIdleCandidate(dir: string, candidate: IdleSourceCandidate): void {
+  const path = candidatePath(dir, candidate.sessionKey)
+  mkdirSync(join(path, '..'), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(candidate))
+  renameSync(tmp, path)
+}
+
+export function readIdleCandidate(dir: string, sessionKey: string): IdleSourceCandidate | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(candidatePath(dir, sessionKey), 'utf8')) as IdleSourceCandidate
+    if (parsed.v !== 1 || parsed.sessionKey !== sessionKey) return undefined
+    return parsed
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+  }
+}
+
+export function clearIdleCandidate(dir: string, sessionKey: string): void {
+  try { renameSync(candidatePath(dir, sessionKey), `${candidatePath(dir, sessionKey)}.done`) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
 }
 
 /**

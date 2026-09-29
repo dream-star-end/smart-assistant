@@ -7,8 +7,11 @@ import {
   advanceIdleOp,
   assembleIdleArtifact,
   IDLE_COMPACT_PROMPT,
+  clearIdleCandidate,
   idleOpSettled,
+  readIdleCandidate,
   readPendingIdle,
+  writeIdleCandidate,
   startIdleOp,
   writeIdleOp,
 } from '../boxIdleCompact.js'
@@ -138,5 +141,15 @@ describe('idle artifact recovery', () => {
     const pending = readPendingIdle(dir, 'pending-session')
     assert.equal(pending?.revision, proof.revision)
     assert.equal(pending?.artifact, undefined)
+  })
+
+  test('a proof that is still pending keeps the source candidate', () => {
+    const home = join(tmpdir(), `idle-candidate-${process.pid}`)
+    writeIdleCandidate(home, {
+      v: 1, sessionKey: 's', sessionId: 'native', turnKey: 'ab'.repeat(32),
+    })
+    assert.equal(readIdleCandidate(home, 's')?.sessionId, 'native')
+    clearIdleCandidate(home, 's')
+    assert.equal(readIdleCandidate(home, 's'), undefined)
   })
 })

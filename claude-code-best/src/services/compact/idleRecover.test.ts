@@ -6,7 +6,6 @@ import { after, test } from 'node:test'
 import { assembleIdleArtifact } from '../../../../packages/gateway/src/boxIdleCompact.ts'
 import {
   applyIdleTranscript,
-  archiveIdleNativeFile,
   findIdleNativeFile,
   projectIdleArtifact,
   resumeIdleSummary,
@@ -74,7 +73,7 @@ test('three crash cuts keep one summary and the same tail', async () => {
   }
   seed(home, base)
   const messages = [
-    { type: 'user', uuid: 'tail-1', message: { role: 'user', content: 'kept tail' } },
+    { type: 'user', uuid: 'tail-1', message: { role: 'user', content: 'kept tail'.padEnd(170_000 * 4, 'x') } },
     { type: 'user', uuid: 'cmd', message: { role: 'user', content: '/compact preserve' } },
   ] as never
   let calls = 0
@@ -115,7 +114,7 @@ test('three crash cuts keep one summary and the same tail', async () => {
     load: async () => ({ messages: artifact.messages.map((item) => ({ ...item, message: { role: 'user', content: 'rewritten' } })) as never }),
   }), /IDLE_ARTIFACT_MISSING/)
   await assert.rejects(applyIdleTranscript({
-    sessionId, artifact, messages: [],
+    sessionId, artifact, messages: artifact.messages as never,
     record: async () => {}, flush: async () => {},
     load: async () => ({ messages: [] }),
   }), /IDLE_ARTIFACT_MISSING/)
@@ -129,9 +128,9 @@ test('a second idle in the same session is not hidden by the finished file', () 
     frozenTail: [], attachments: [],
   }
   const second: IdleNativeFile = { ...first, opId: 'cd'.repeat(32), revision: 'rev-2', summaryText: undefined }
-  seed(home, first)
+  seed(home, { ...first, applied: true })
   seed(home, second)
-  assert.equal(findIdleNativeFile(sessionId, home), undefined)
-  archiveIdleNativeFile(join(home, 'idle-native', encodeURIComponent(sessionId), 'rev-1.json'))
   assert.equal(findIdleNativeFile(sessionId, home)?.endsWith('rev-2.json'), true)
+  seed(home, { ...first, applied: false, revision: 'rev-3', opId: 'ee'.repeat(32) })
+  assert.throws(() => findIdleNativeFile(sessionId, home), /IDLE_HISTORY_PENDING/)
 })

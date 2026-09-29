@@ -4,11 +4,17 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { UUID } from 'crypto'
 import type { Message, UserMessage } from '../../types/message.js'
 import type { CompactionResult } from './compact.js'
 
 export const IDLE_COMPACT_INSTRUCTIONS =
   'preserve the user goal, decisions, constraints, current work, files, errors, and next steps'
+
+/** Outer transcript size, not the inner leaf's post-compact token count. */
+export function outerHistoryNeedsCompact(messages: readonly unknown[]): boolean {
+  return JSON.stringify(messages).length / 4 >= 167_000
+}
 
 export interface IdleFrozenTail {
   uuid: string
@@ -29,6 +35,8 @@ export interface IdleNativeFile {
   summaryText?: string
   modelCalls: number
   modelStarted?: boolean
+  /** Loader receipt stored. The file stays readable; it is not the active op. */
+  applied?: boolean
   frozenTail: IdleFrozenTail[]
   attachments: IdleFrozenAttachment[]
 }
@@ -95,21 +103,26 @@ export function writeIdleNativeFile(path: string, file: IdleNativeFile): void {
   renameSync(tmp, path)
 }
 
-export function findIdleNativeFile(sessionId: string, home = idleNativeHome()): string | undefined {
+export function listIdleNativeFiles(sessionId: string, home = idleNativeHome()): string[] {
   let names: string[] = []
-  try { names = readdirSync(nativeDir(sessionId, home)) } catch { return undefined }
-  const pending = names.filter((name) => name.endsWith('.json')
-    && !name.endsWith('.done.json') && !name.endsWith('.tmp'))
-  if (pending.length !== 1) return undefined
-  return join(nativeDir(sessionId, home), pending[0]!)
+  try { names = readdirSync(nativeDir(sessionId, home)) } catch { return [] }
+  return names
+    .filter((name) => name.endsWith('.json') && !name.endsWith('.tmp') && !name.endsWith('.done.json'))
+    .map((name) => join(nativeDir(sessionId, home), name))
 }
 
-export function archiveIdleNativeFile(path: string): void {
-  if (!path.endsWith('.json') || path.endsWith('.done.json')) return
-  try { renameSync(path, path.replace(/\.json$/, '.done.json')) }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
+/** Active op only. Applied files stay on disk for receipt recovery. Ambiguous → throw. */
+export function findIdleNativeFile(sessionId: string, home = idleNativeHome()): string | undefined {
+  const paths = listIdleNativeFiles(sessionId, home)
+  if (paths.length === 0) return undefined
+  const active = paths.filter((path) => !readIdleNativeFile(path).applied)
+  if (active.length === 1) return active[0]
+  if (active.length === 0) return undefined
+  throw new Error('IDLE_HISTORY_PENDING')
+}
+
+export function readIdleNativeByOp(sessionId: string, opId: string, home = idleNativeHome()): string | undefined {
+  return listIdleNativeFiles(sessionId, home).find((path) => readIdleNativeFile(path).opId === opId)
 }
 
 export function messageText(message: Message): string {
@@ -140,14 +153,19 @@ export function selectIdlePreserve(messages: readonly Message[]): {
     const text = messageText(message)
     return !text.startsWith('/compact') && !text.startsWith(IDLE_COMPACT_INSTRUCTIONS)
   })
-  return {
-    tail: conversational.slice(-6).map((message) => ({
-      uuid: message.uuid,
-      parentUuid: (message as { parentUuid?: string | null }).parentUuid ?? null,
-      message: cloneMessage(message),
-    })),
-    attachments,
-  }
+  let previous: string | null = null
+  const tail = conversational.map((message) => {
+    const copy = cloneMessage(message)
+    const parent = (copy as { parentUuid?: string | null }).parentUuid
+    if (!parent && previous) (copy as { parentUuid?: string | null }).parentUuid = previous
+    previous = copy.uuid
+    return {
+      uuid: copy.uuid,
+      parentUuid: (copy as { parentUuid?: string | null }).parentUuid ?? null,
+      message: copy,
+    }
+  })
+  return { tail, attachments }
 }
 
 function userMessage(uuid: string, text: string, summary = false): UserMessage {
@@ -162,7 +180,9 @@ function userMessage(uuid: string, text: string, summary = false): UserMessage {
   } as UserMessage
 }
 
-export function buildIdleCompactionResult(file: IdleNativeFile, _messages: readonly Message[]): {
+export function buildIdleCompactionResult(file: IdleNativeFile, _messages: readonly Message[],
+  annotate: (boundary: CompactionResult['boundaryMarker'], anchor: UUID, kept: readonly Message[]) =>
+    CompactionResult['boundaryMarker'] = (boundary) => boundary): {
   result: CompactionResult
   artifact: IdleArtifact
 } {
@@ -175,34 +195,30 @@ export function buildIdleCompactionResult(file: IdleNativeFile, _messages: reado
   })
   const boundaryUuid = artifact.messages[0]!.uuid as string
   const summaryUuid = artifact.messages[1]!.uuid as string
-  const anchor = file.frozenTail[file.frozenTail.length - 1]?.uuid
   const summaryMessage = userMessage(summaryUuid, file.summaryText, true)
-  ;(summaryMessage as { parentUuid?: string }).parentUuid = boundaryUuid
-  let previous = summaryUuid
-  const kept = file.frozenTail.map((item) => {
-    const message = JSON.parse(JSON.stringify(item.message)) as Message
-    ;(message as { parentUuid?: string }).parentUuid = previous
-    previous = message.uuid
-    return message
+  const kept = file.frozenTail.map((item) => JSON.parse(JSON.stringify(item.message)) as Message)
+  const base = Date.parse('2026-01-01T00:00:00.000Z')
+  ;(summaryMessage as { timestamp: string }).timestamp = new Date(base + 1000).toISOString()
+  kept.forEach((message, index) => {
+    ;(message as { timestamp: string }).timestamp = new Date(base + 2000 + index * 1000).toISOString()
   })
+  const boundary = annotate({
+    type: 'system',
+    subtype: 'compact_boundary',
+    content: 'Conversation compacted',
+    isMeta: false,
+    timestamp: new Date(base).toISOString(),
+    uuid: boundaryUuid as UUID,
+    level: 'info',
+    compactMetadata: {
+      trigger: 'manual',
+      preTokens: 0,
+      idleReceiptDigest: artifact.digest,
+      idleOpId: file.opId,
+    },
+  } as CompactionResult['boundaryMarker'], summaryUuid as UUID, kept)
   const result: CompactionResult = {
-    boundaryMarker: {
-      type: 'system',
-      subtype: 'compact_boundary',
-      content: 'Conversation compacted',
-      isMeta: false,
-      timestamp: '1970-01-01T00:00:00.000Z',
-      uuid: boundaryUuid,
-      level: 'info',
-      parentUuid: null,
-      logicalParentUuid: anchor,
-      compactMetadata: {
-        trigger: 'manual',
-        preTokens: 0,
-        idleReceiptDigest: artifact.digest,
-        idleOpId: file.opId,
-      },
-    } as CompactionResult['boundaryMarker'],
+    boundaryMarker: boundary,
     summaryMessages: [summaryMessage],
     messagesToKeep: kept,
     attachments: file.attachments.map((item) => item.message) as CompactionResult['attachments'],
@@ -229,15 +245,13 @@ export async function applyIdleTranscript(input: {
   const stable = (message: Message | Record<string, unknown>) => ({
     uuid: message.uuid,
     type: message.type ?? null,
-    parentUuid: (message as { parentUuid?: unknown }).parentUuid
-      ?? (message as { logicalParentUuid?: unknown }).logicalParentUuid ?? null,
     role: (message as { message?: { role?: unknown } }).message?.role ?? null,
     content: (message as { message?: { content?: unknown } }).message?.content
       ?? (message as { content?: unknown }).content ?? null,
     attachment: (message as { attachment?: unknown }).attachment ?? null,
     subtype: (message as { subtype?: unknown }).subtype ?? null,
   })
-  const expected = input.artifact.messages.map((item) => stable(item))
+  const expected = input.messages.map((item) => stable(item as Message))
   const loadedById = new Map(loaded.messages.map((message) => [message.uuid, message]))
   const ordered = expected.map((item) => loadedById.get(String(item.uuid)))
   if (ordered.some((item) => !item)) throw new Error('IDLE_ARTIFACT_MISSING')
@@ -268,6 +282,11 @@ export async function resumeIdleSummary(input: {
     file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
     writeIdleNativeFile(path, file)
   }
+  if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages)) {
+    file = { ...file, applied: true }
+    writeIdleNativeFile(path, file)
+    return { path, file }
+  }
   if (!file.summaryText) {
     if (file.modelStarted || !input.summarize) throw new Error('IDLE_HISTORY_PENDING')
     file = { ...file, modelStarted: true }
@@ -289,15 +308,19 @@ export async function runIdleCompact(input: {
   messages: Message[]
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
-  record: (messages: Message[]) => Promise<unknown>
+  record: (messages: Message[], preserveTimestamp?: boolean) => Promise<unknown>
   flush: () => Promise<void>
   load: (sessionId: string) => Promise<{ messages: Message[] } | null>
-}): Promise<CompactionResult | undefined> {
+}): Promise<CompactionResult | 'short' | undefined> {
   const resumed = await resumeIdleSummary(input)
   if (!resumed) return undefined
-  const { buildPostCompactMessages } = await import('./compact.js')
-  const built = buildIdleCompactionResult(resumed.file, input.messages)
+  if (resumed.file.applied && !resumed.file.summaryText) return 'short'
+  const { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } = await import('./compact.js')
+  const built = buildIdleCompactionResult(resumed.file, input.messages, annotateBoundaryWithPreservedSegment)
   const messages = buildPostCompactMessages(built.result)
+  const keptIds = new Set((built.result.messagesToKeep ?? []).map((message) => message.uuid))
+  await input.record(messages.filter((message) => !keptIds.has(message.uuid)), true)
+  await input.record(built.result.messagesToKeep ?? [], true)
   await applyIdleTranscript({
     sessionId: input.sessionId,
     messages,
@@ -306,6 +329,6 @@ export async function runIdleCompact(input: {
     flush: input.flush,
     load: input.load,
   })
-  archiveIdleNativeFile(resumed.path)
+  writeIdleNativeFile(resumed.path, { ...resumed.file, applied: true })
   return built.result
 }

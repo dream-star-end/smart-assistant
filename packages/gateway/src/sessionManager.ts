@@ -39,10 +39,13 @@ import {
   boxTurnMayIdle,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
+  clearIdleCandidate,
+  readIdleCandidate,
   readIdleNative,
   readIdleOp,
   readPendingIdle,
   startIdleOp,
+  writeIdleCandidate,
   writeIdleNative,
   writeIdleOp,
 } from './boxIdleCompact.js'
@@ -4657,9 +4660,19 @@ export class SessionManager {
   }, recoveryDir: string = paths.home): Promise<void> {
     if (session._idleRunning) return
     const pending = readPendingIdle(recoveryDir, session.sessionKey)
-    if (!pending && !boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) return
+    const mayIdle = boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })
+    if (!pending && !mayIdle && !readIdleCandidate(recoveryDir, session.sessionKey)) return
+    if (mayIdle) {
+      writeIdleCandidate(recoveryDir, {
+        v: 1, sessionKey: session.sessionKey, sessionId: source.sessionId, turnKey: source.turnKey,
+      })
+    }
     const proof = await fetchBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
-    if (proof.status !== 'terminal' || !proof.compactRequired) return
+    if (proof.status === 'not_found') {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
+    }
+    if (proof.status !== 'terminal') return
     const started = startIdleOp({
       dir: recoveryDir,
       sessionKey: session.sessionKey,
@@ -4715,6 +4728,7 @@ export class SessionManager {
         const summary = settled?.nativeCompactionSummary?.trim() ?? ''
         const receipt = settled?.nativeIdleReceipt
         const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+        if (after?.applied && !after.summaryText) clearIdleCandidate(recoveryDir, session.sessionKey)
         const mergedSummary = step.op.summaryText || after?.summaryText || summary
         if (mergedSummary) {
           step = advanceIdleOp({
@@ -4733,6 +4747,7 @@ export class SessionManager {
         if (receipt && receipt.opId === step.op.idleTurnKey && step.op.artifact
           && receipt.digest === step.op.artifact.digest) {
           step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
+          clearIdleCandidate(recoveryDir, session.sessionKey)
         }
       } finally {
         session._idleRunning = false
@@ -5117,13 +5132,17 @@ export class SessionManager {
     try {
       await prev
       const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
-      if (pendingIdle && opts?.modelSwitchInternal === undefined) {
+      const idleCandidate = readIdleCandidate(paths.home, session.sessionKey)
+      if ((pendingIdle || idleCandidate) && opts?.modelSwitchInternal === undefined) {
         await this.finishIdleUnderLock(session, {
-          sessionId: pendingIdle.sourceSessionId,
-          turnKey: pendingIdle.sourceTurnKey,
+          sessionId: pendingIdle?.sourceSessionId ?? idleCandidate!.sessionId,
+          turnKey: pendingIdle?.sourceTurnKey ?? idleCandidate!.turnKey,
         })
-        const recovered = readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
-        if (!recovered?.artifact || recovered.receiptDigest !== recovered.artifact.digest) {
+        const still = readIdleCandidate(paths.home, session.sessionKey)
+        const recovered = pendingIdle
+          ? readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
+          : undefined
+        if (still || (pendingIdle && (!recovered?.artifact || recovered.receiptDigest !== recovered.artifact.digest))) {
           throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
         }
       }
