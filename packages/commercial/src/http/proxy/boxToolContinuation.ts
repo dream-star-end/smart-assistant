@@ -3,6 +3,7 @@
  * message. The caller retains the Box target until terminal cleanup. */
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
+import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
@@ -92,8 +93,11 @@ export async function runBoxToolContinuation(input: {
       || claim.roundNo > BOX_TOOL_MAX_ROUNDS) {
       throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_BINDING_INVALID");
     }
+    const progress: BoxToolProgressBinding | undefined = claim.nativeSessionId
+      ? { toolUses: claim.toolUses, nativeSessionId: claim.nativeSessionId, catalog }
+      : undefined;
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
-      { alreadyInitialized: true, allowFinal: true });
+      { alreadyInitialized: true, allowFinal: true, ...(progress ? { progress } : {}) });
     const echo = new BoxToolResultEcho(claim.results);
     let modelStarted = false;
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access,

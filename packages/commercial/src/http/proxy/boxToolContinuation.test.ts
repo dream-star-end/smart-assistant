@@ -253,3 +253,244 @@ test("missing tool-result echo blocks both next tool and final model rounds", as
     assert.equal(f.retained, true);
   }
 });
+
+const NATIVE = "12345678-1234-4123-8123-123456789abc";
+const OUTER = "a95915c9-b92f-4980-8c7a-d339e54e5767";
+const heartbeat = (parent: string, name: string, elapsed: number, session = NATIVE,
+  index = 0, extra?: Record<string, unknown>) => ({
+  type: "tool_progress", tool_use_id: `${parent}-heartbeat-${index}`, tool_name: name,
+  parent_tool_use_id: parent, elapsed_time_seconds: elapsed, heartbeat: true,
+  session_id: session, uuid: "22222222-2222-4222-8222-222222222222", ...extra });
+
+test("long tool heartbeats before between and after echoes do not advance handoff offset", async () => {
+  const tools = [
+    { name: "local_echo", description: "synthetic local tool",
+      input_schema: { type: "object", properties: { value: { type: "string" } } } },
+    { name: "local_read", description: "synthetic second tool",
+      input_schema: { type: "object", properties: { value: { type: "string" } } } },
+  ];
+  const localCatalog = compileBoxToolCatalog(tools);
+  const priorA = "toolu_prior_a", priorB = "toolu_prior_b", nextId = "toolu_next_c";
+  const nameA = "mcp__ocbridge__t0", nameB = "mcp__ocbridge__t1";
+  const textA = "alpha", textB = "beta";
+  const hashOf = (text: string, isError = false) => createHash("sha256").update(JSON.stringify({
+    content: [{ type: "text", text }], isError })).digest("hex");
+  const echo = (id: string, text: string, isError = false) => ({ type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: id,
+      content: text, ...(isError ? { is_error: true } : {}) }] } });
+  const message = [
+    event({ type: "message_start", message: { id: "msg_tool_next", model,
+      role: "assistant", content: [], usage } }),
+    event({ type: "content_block_start", index: 0,
+      content_block: { type: "tool_use", id: nextId, name: nameA, input: {} } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "input_json_delta", partial_json: '{"value":"x"}' } }),
+    { type: "assistant", message: { id: "msg_tool_next", model, role: "assistant",
+      content: [{ type: "tool_use", id: nextId, name: nameA, input: { value: "x" } }] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "message_delta", delta: { stop_reason: "tool_use" },
+      usage: { input_tokens: 2, output_tokens: 4 } }),
+    event({ type: "message_stop" }),
+  ];
+  const nextHeartbeat = heartbeat(nextId, nameA, 30, NATIVE, 0);
+  const records = [
+    heartbeat(priorA, nameA, 30),
+    heartbeat(priorA, nameA, 60, NATIVE, 1),
+    echo(priorA, textA),
+    heartbeat(priorB, nameB, 540, NATIVE, 2),
+    echo(priorB, textB, true),
+    heartbeat(priorA, nameA, 90, NATIVE, 3),
+    ...message,
+    nextHeartbeat,
+  ];
+  const lines = records.map((record) => Buffer.from(JSON.stringify(record) + "\n"));
+  const stopAt = lines.slice(0, records.length - 1).reduce((sum, line) => sum + line.length, 0);
+  const bytes = Buffer.concat(lines);
+  const spoolOffset = 5000;
+  const sequence: string[] = [];
+  const emitted: string[] = [];
+  let settled = 0;
+  let retained = false;
+  const claim = { ownerRequestId: "box-owner", accountId: 20n,
+    runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), spoolOffset, roundNo: 2,
+    detachedRunnerHash: "c".repeat(64), catalogHash: localCatalog.bindingSha256,
+    durableRevision: "synthetic-revision",
+    toolUses: [
+      { id: priorA, boxName: nameA, clientName: "local_echo", inputHash: "f".repeat(64) },
+      { id: priorB, boxName: nameB, clientName: "local_read", inputHash: "e".repeat(64) },
+    ],
+    results: [
+      { modelToolUseId: priorA, content: [{ type: "text", text: textA }],
+        isError: false, contentHash: hashOf(textA) },
+      { modelToolUseId: priorB, content: [{ type: "text", text: textB }],
+        isError: true, contentHash: hashOf(textB, true) },
+    ],
+    nativeSessionId: NATIVE, nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}` };
+  const access = makeBoxDetachedRunAccess({ runNonce: claim.runNonce,
+    detachedRunnerHash: claim.detachedRunnerHash });
+  const execFor = (source: Buffer, chunk: number) => async (request: { args: string[] }) => {
+    const args = request.args;
+    if (args[5] === "--read") {
+      sequence.push("spool-read");
+      const offset = Number(args[7]);
+      const start = Math.max(0, offset - spoolOffset);
+      const part = source.subarray(start, start + chunk);
+      return { stdout: JSON.stringify({ offset: offset + part.length,
+        data: part.toString("base64") }), stderrBytes: 0, exitCode: 0 as const };
+    }
+    if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
+      sequence.push("pending-read");
+      return { stdout: JSON.stringify({ version: 1, modelToolUseId: nextId,
+        mcpRequestId: 7, name: "t0", arguments: { value: "x" } }),
+      stderrBytes: 0, exitCode: 0 as const };
+    }
+    sequence.push("unexpected-remote");
+    throw new Error("must not read proof, publish, or settle");
+  };
+  const deps = { budgetMs: 2000, journal: {
+    recordToolHandoff: async (evidence: { spoolOffset: number }) => {
+      sequence.push("durable-handoff");
+      assert.equal(evidence.spoolOffset, spoolOffset + stopAt);
+      return { durableRevision: "revision-next", journaledToolUseIds: [nextId],
+        verifiedPendingToolUseIds: [nextId] };
+    }, completeToolChain: async () => { sequence.push("terminal-journal"); settled += 1; },
+    markUnknown: async () => { sequence.push("unknown"); },
+  } as never, retainUnknownTarget: () => { retained = true; sequence.push("retain"); },
+  onUnknown: async () => { sequence.push("notify"); } };
+  const inputFor = (source: Buffer, chunk: number) => ({
+    published: { claim, target: { accountId: 20n, exec: { run: execFor(source, chunk) } },
+      access } as never,
+    uid: 3n, requestId: "box-next", canonicalBody: { ...body, tools },
+    upstreamModel: model, emit: (sse: string) => { sequence.push("emit"); emitted.push(sse); },
+  });
+  const result = await runBoxToolContinuation(inputFor(bytes, 65536), deps);
+  assert.deepEqual(result, { kind: "tool_handoff", spoolOffset: spoolOffset + stopAt });
+  assert.equal(bytes.subarray(stopAt).toString("utf8").includes(nextId + "-heartbeat-0"), true);
+  assert.ok(!emitted.join("").includes("heartbeat"));
+  assert.equal(settled, 0);
+  assert.equal(retained, false);
+  assert.ok(!sequence.includes("unknown"));
+  sequence.length = 0; emitted.length = 0; retained = false;
+  const split = await runBoxToolContinuation(inputFor(bytes, 1), deps);
+  assert.equal(split.kind, "tool_handoff");
+  if (split.kind === "tool_handoff") assert.equal(split.spoolOffset, spoolOffset + stopAt);
+  const crlf = Buffer.concat(records.map((record) => Buffer.from(JSON.stringify(record) + "\r\n")));
+  const crlfStop = records.slice(0, -1).reduce((sum, record) =>
+    sum + Buffer.byteLength(JSON.stringify(record) + "\r\n"), 0);
+  sequence.length = 0;
+  const crlfResult = await runBoxToolContinuation(inputFor(crlf, 65536), {
+    budgetMs: 2000, retainUnknownTarget: () => { retained = true; },
+    onUnknown: async () => { sequence.push("notify"); },
+    journal: { recordToolHandoff: async (evidence: { spoolOffset: number }) => {
+      assert.equal(evidence.spoolOffset, spoolOffset + crlfStop);
+      return { durableRevision: "revision-next", journaledToolUseIds: [nextId],
+        verifiedPendingToolUseIds: [nextId] };
+    }, completeToolChain: async () => { settled += 1; },
+    markUnknown: async () => { sequence.push("unknown"); } } as never });
+  assert.equal(crlfResult.kind, "tool_handoff");
+  if (crlfResult.kind === "tool_handoff") assert.equal(crlfResult.spoolOffset, spoolOffset + crlfStop);
+  assert.notEqual(OUTER, NATIVE);
+});
+
+test("heartbeat-only progress does not complete echo or settle", async () => {
+  const only = [heartbeat("toolu_prior_a", boxName, 30),
+    event({ type: "message_start", message: { id: "msg_tool_next", model,
+      role: "assistant", content: [], usage } })];
+  const bytes = Buffer.from(only.map((record) => JSON.stringify(record) + "\n").join(""));
+  const sequence: string[] = [];
+  const claim = { ownerRequestId: "box-owner", accountId: 20n,
+    runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), spoolOffset: 10, roundNo: 2,
+    detachedRunnerHash: "c".repeat(64), catalogHash: catalog.bindingSha256,
+    durableRevision: "synthetic-revision",
+    toolUses: [{ id: "toolu_prior_a", boxName, clientName: "local_echo",
+      inputHash: "f".repeat(64) }],
+    results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: localResult }],
+      isError: false, contentHash: echoHash }], nativeSessionId: NATIVE,
+    nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}` };
+  await assert.rejects(() => runBoxToolContinuation({
+    published: { claim, target: { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+      const offset = Number(request.args[7]);
+      const part = bytes.subarray(Math.max(0, offset - 10));
+      return { stdout: JSON.stringify({ offset: offset + part.length,
+        data: part.toString("base64") }), stderrBytes: 0, exitCode: 0 as const };
+    } } }, access: makeBoxDetachedRunAccess({ runNonce: claim.runNonce,
+      detachedRunnerHash: claim.detachedRunnerHash }) } as never,
+    uid: 3n, requestId: "box-next", canonicalBody: body, upstreamModel: model, emit: () => {},
+  }, { budgetMs: 1000, journal: { recordToolHandoff: async () => { sequence.push("handoff"); },
+    completeToolChain: async () => { sequence.push("settle"); },
+    markUnknown: async () => { sequence.push("unknown"); } } as never,
+  retainUnknownTarget: () => { sequence.push("retain"); },
+  onUnknown: async () => { sequence.push("notify"); } }), /BOX_TOOL_ECHO_INCOMPLETE/);
+  assert.deepEqual(sequence.filter((item) => item !== "unknown" && item !== "retain"
+    && item !== "notify"), []);
+});
+
+test("wrong parent, tool name, outer session, missing binding, and late phase stay rejected", async () => {
+  const cases = [
+    heartbeat("toolu_other", boxName, 30),
+    heartbeat("toolu_prior_a", "mcp__ocbridge__t9", 30),
+    heartbeat("toolu_prior_a", boxName, 30, OUTER),
+    heartbeat("toolu_prior_a", boxName, 30, NATIVE, 0, { usage: { input_tokens: 1 } }),
+  ];
+  for (const record of cases) {
+    const f = fixture("tool", false, false, false, false, true);
+    const published = f.input.published as { claim: { nativeSessionId?: string };
+      access: unknown };
+    const prefix = Buffer.from(JSON.stringify(record) + "\n");
+    const bytes = Buffer.concat([prefix, Buffer.from([echoRecord, ...toolRecords]
+      .map((item) => JSON.stringify(item) + "\n").join(""))]);
+    const sequence: string[] = [];
+    await assert.rejects(() => runBoxToolContinuation({
+      published: { claim: { ...published.claim, nativeSessionId: NATIVE },
+        target: { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+          if (request.args[5] !== "--read") throw new Error("must not continue");
+          const offset = Number(request.args[7]);
+          const part = bytes.subarray(Math.max(0, offset - 1234));
+          return { stdout: JSON.stringify({ offset: offset + part.length,
+            data: part.toString("base64") }), stderrBytes: 0, exitCode: 0 as const };
+        } } }, access: published.access } as never,
+      uid: 3n, requestId: "box-next", canonicalBody: body, upstreamModel: model,
+      emit: () => { sequence.push("emit"); },
+    }, { budgetMs: 1000, journal: { recordToolHandoff: async () => { sequence.push("handoff"); },
+      completeToolChain: async () => { sequence.push("settle"); },
+      markUnknown: async () => { sequence.push("unknown"); } } as never,
+    retainUnknownTarget: () => {}, onUnknown: async () => {} }), /BOX_TOOL_RECORD_INVALID/);
+    assert.ok(!sequence.includes("handoff"));
+    assert.ok(!sequence.includes("settle"));
+    assert.ok(!sequence.includes("emit"));
+  }
+  const f = fixture("tool");
+  const plain = f.input.published as { claim: unknown; access: unknown };
+  const bytes = Buffer.concat([Buffer.from(JSON.stringify(heartbeat("toolu_prior_a", boxName, 30)) + "\n"),
+    Buffer.from([echoRecord, ...toolRecords].map((item) => JSON.stringify(item) + "\n").join(""))]);
+  await assert.rejects(() => runBoxToolContinuation({
+    published: { claim: plain.claim, target: { accountId: 20n,
+      exec: { run: async (request: { args: string[] }) => {
+        const offset = Number(request.args[7]);
+        const part = bytes.subarray(Math.max(0, offset - 1234));
+        return { stdout: JSON.stringify({ offset: offset + part.length,
+          data: part.toString("base64") }), stderrBytes: 0, exitCode: 0 as const };
+      } } }, access: plain.access } as never,
+    uid: 3n, requestId: "box-next", canonicalBody: body, upstreamModel: model, emit: () => {},
+  }, { budgetMs: 1000, journal: { recordToolHandoff: async () => { throw new Error("handoff"); },
+    completeToolChain: async () => { throw new Error("settle"); },
+    markUnknown: async () => {} } as never,
+  retainUnknownTarget: () => {}, onUnknown: async () => {} }), /BOX_TOOL_RECORD_INVALID/);
+  const late = Buffer.from([echoRecord, toolRecords[0], heartbeat("toolu_prior_a", boxName, 30)]
+    .map((item) => JSON.stringify(item) + "\n").join(""));
+  const bound = fixture("tool", false, false, false, false, true);
+  const boundPublished = bound.input.published as { claim: unknown; access: unknown };
+  await assert.rejects(() => runBoxToolContinuation({
+    published: { claim: boundPublished.claim, target: { accountId: 20n,
+      exec: { run: async (request: { args: string[] }) => {
+        const offset = Number(request.args[7]);
+        const part = late.subarray(Math.max(0, offset - 1234));
+        return { stdout: JSON.stringify({ offset: offset + part.length,
+          data: part.toString("base64") }), stderrBytes: 0, exitCode: 0 as const };
+      } } }, access: boundPublished.access } as never,
+    uid: 3n, requestId: "box-next", canonicalBody: body, upstreamModel: model, emit: () => {},
+  }, { budgetMs: 1000, journal: { recordToolHandoff: async () => { throw new Error("handoff"); },
+    completeToolChain: async () => { throw new Error("settle"); },
+    markUnknown: async () => {} } as never,
+  retainUnknownTarget: () => {}, onUnknown: async () => {} }), /BOX_TOOL_RECORD_INVALID/);
+});

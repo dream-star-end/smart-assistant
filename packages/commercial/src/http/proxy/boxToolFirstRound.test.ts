@@ -72,7 +72,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   failAssetStage?: number; failInputStage?: number;
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
-  nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer } } = {}) {
+  nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer };
+  spoolPrefix?: Buffer } = {}) {
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
@@ -114,9 +115,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         && args[5] === "--read") {
         sequence.push("spool-read");
         const offset = Number(args[7]);
-        const spool = options.directFinal
+        const body = options.directFinal
           ? options.finalTrailing ? Buffer.concat([finalRaw, Buffer.from("bad-after-success\n")])
             : finalRaw : raw;
+        const spool = options.spoolPrefix ? Buffer.concat([options.spoolPrefix, body]) : body;
         const bytes = spool.subarray(offset);
         return { stdout: JSON.stringify({ data: bytes.toString("base64"),
           offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 as const };
@@ -617,4 +619,17 @@ test("downstream SSE failure after paid launch retains unknown without replay", 
   assert.ok(f.sequence.includes("unknown"));
   assert.equal(f.disposed, false);
   assert.equal(f.retained, true);
+});
+
+test("first round rejects a catalog-matching heartbeat", async () => {
+  const prefix = Buffer.from(JSON.stringify({ type: "tool_progress",
+    tool_use_id: `${toolId}-heartbeat-0`, tool_name: boxName,
+    parent_tool_use_id: toolId, elapsed_time_seconds: 30, heartbeat: true,
+    session_id: "12345678-1234-4123-8123-123456789abc",
+    uuid: "22222222-2222-4222-8222-222222222222" }) + "\n");
+  const f = fixture({ spoolPrefix: prefix });
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps), /BOX_TOOL_RECORD_INVALID/);
+  assert.equal(f.launches, 1);
+  assert.ok(!f.sequence.includes("durable-handoff"));
+  assert.ok(f.sequence.includes("unknown"));
 });

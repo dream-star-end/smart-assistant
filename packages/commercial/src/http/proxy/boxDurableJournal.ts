@@ -138,6 +138,11 @@ export interface BoxReplayIdentity {
   readonly upstreamModel?: string;
   readonly resultHashes?: readonly { modelToolUseId: string;
     contentHash: string; isError: boolean }[];
+  /** Immediate previous owner's stored tool digests. Omitted unless that
+   * handoff matches this row's catalog, round, runner, and spool offset. */
+  readonly priorToolUses?: readonly BoxToolUseDigest[];
+  /** CLI session stored on the admitted root run. Not the outer CCB session. */
+  readonly nativeSessionId?: string;
 }
 export interface BoxRemoteCleanupCandidate {
   readonly requestId: string;
@@ -634,6 +639,19 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       let row = matched;
       const seen = new Set<string>();
+      let priorToolUses: BoxReplayIdentity["priorToolUses"];
+      let projectedNative: string | undefined;
+      let nativeConflict = false;
+      const noteNative = (ctx: Record<string, unknown>): void => {
+        if (!Object.hasOwn(ctx, "boxNativeSessionId")) return;
+        const value = ctx.boxNativeSessionId;
+        if (typeof value !== "string" || !UUID_V4.test(value)) {
+          nativeConflict = true;
+          return;
+        }
+        if (projectedNative === undefined) projectedNative = value;
+        else if (projectedNative !== value) nativeConflict = true;
+      };
       for (let hop = 0; hop < BOX_TOOL_MAX_ROUNDS; hop++) {
         if (seen.has(row.request_id)
           || row.ctx.boxInvocationRecovery !== "v1"
@@ -656,9 +674,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         });
         if (!bound.ok) throw new BoxDurableJournalError(bound.code);
         seen.add(row.request_id);
+        noteNative(row.ctx);
         const owner = row.ctx.boxOwnerRequestId;
         if (owner === undefined) {
           await client.query("COMMIT"); committed = true;
+          if (nativeConflict) projectedNative = undefined;
           return { requestId: matched.request_id, rootRequestId: row.request_id,
             uid: input.uid, accountId: BigInt(accountId), runNonce, leaseEpoch,
             invocationMode: mode, state: original.boxState as string,
@@ -668,7 +688,9 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(detachedRunnerHash ? { detachedRunnerHash } : {}),
              ...(catalogHash ? { catalogHash } : {}),
              ...(typeof upstreamModel === "string" ? { upstreamModel } : {}),
-             ...(resultHashes ? { resultHashes } : {}) };
+             ...(resultHashes ? { resultHashes } : {}),
+             ...(priorToolUses ? { priorToolUses } : {}),
+             ...(projectedNative ? { nativeSessionId: projectedNative } : {}) };
         }
         if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) {
           throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -700,6 +722,16 @@ export class BoxDurableJournal implements BoxJournalPort {
           }
           resultHashes = raw.map((item) => ({ modelToolUseId: item.modelToolUseId,
             contentHash: item.contentHash, isError: item.isError }));
+          if (mode === "detached_tool" && Number(roundNo) > 1
+            && typeof catalogHash === "string" && typeof detachedRunnerHash === "string") {
+            const stored = parseBoxStoredToolHandoff(parentCtx.boxToolHandoff);
+            if (stored && stored.catalogHash === catalogHash
+              && stored.detachedRunnerHash === detachedRunnerHash
+              && stored.roundNo + 1 === Number(roundNo)
+              && stored.spoolOffset === Number(spoolOffset)) {
+              priorToolUses = stored.toolUses;
+            }
+          }
         }
         row = parent.rows[0];
       }

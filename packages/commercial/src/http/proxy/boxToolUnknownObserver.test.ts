@@ -182,3 +182,64 @@ test("root final requires remote completion proof and exact spool EOF", async ()
   assert.equal(result, "committed");
   assert.equal(committed, true);
 });
+
+test("observer skips a bound heartbeat and still rejects the outer session", async () => {
+  const native = "11111111-1111-4111-8111-111111111111";
+  const outer = "a95915c9-b92f-4980-8c7a-d339e54e5767";
+  const echo = { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: use.id, content: "ok" }] } };
+  const hash = createHash("sha256").update(JSON.stringify({
+    content: [{ type: "text", text: "ok" }], isError: false })).digest("hex");
+  const beat = (session: string) => ({ type: "tool_progress",
+    tool_use_id: `${use.id}-heartbeat-0`, tool_name: use.name,
+    parent_tool_use_id: use.id, elapsed_time_seconds: 30, heartbeat: true,
+    session_id: session, uuid: "22222222-2222-4222-8222-222222222222" });
+  const linked = { ...identity, requestId: "linked-request", roundNo: 2, spoolOffset: 80,
+    resultHashes: [{ modelToolUseId: use.id, contentHash: hash, isError: false }],
+    priorToolUses: [{ id: use.id, boxName: use.name, clientName: "local_echo",
+      inputHash: "ab".repeat(32) }], nativeSessionId: native };
+  const raw = Buffer.from([beat(native), echo, ...common.slice(1)]
+    .map((item) => JSON.stringify(item) + "\n").join(""));
+  let settled = 0;
+  const target = { accountId: 20n, dispose: () => {},
+    exec: { run: async (req: { args: string[] }) => {
+      if (req.args[5] === "--read") {
+        const offset = Number(req.args[7]);
+        const bytes = raw.subarray(Math.max(0, offset - linked.spoolOffset));
+        return { stdout: JSON.stringify({ data: bytes.toString("base64"),
+          offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 };
+      }
+      if (req.args[2]?.includes("pending.")) return { stdout: JSON.stringify({
+        version: 1, modelToolUseId: use.id, mcpRequestId: 7,
+        name: "t0", arguments: { value: "x" } }), stderrBytes: 0, exitCode: 0 };
+      throw new Error("paid or unexpected remote operation");
+    } } };
+  const deps = { resolveTarget: async () => target as never,
+    writeMessage: async (id: { uid: string; requestId: string; runNonce: string;
+      leaseEpoch: string; roundNo: number }) => ({ version: 1 as const, ...id,
+      bytes: 123, sha256: "d".repeat(64) }),
+    journal: { recordToolHandoff: async () => ({ durableRevision: "synthetic",
+      journaledToolUseIds: [use.id], verifiedPendingToolUseIds: [use.id] }),
+    completeToolChain: async () => { settled += 1; } } as never };
+  const ok = await observeBoxToolUnknown({ identity: linked, canonicalBody: body,
+    upstreamModel: model }, deps);
+  assert.equal(ok, "committed");
+  assert.equal(settled, 0);
+  const wrong = Buffer.from([beat(outer), echo, ...common.slice(1)]
+    .map((item) => JSON.stringify(item) + "\n").join(""));
+  const wrongTarget = { ...target, exec: { run: async (req: { args: string[] }) => {
+    if (req.args[5] === "--read") {
+      const offset = Number(req.args[7]);
+      const bytes = wrong.subarray(Math.max(0, offset - linked.spoolOffset));
+      return { stdout: JSON.stringify({ data: bytes.toString("base64"),
+        offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 };
+    }
+    throw new Error("must not read pending after a rejected heartbeat");
+  } } };
+  await assert.rejects(() => observeBoxToolUnknown({ identity: linked, canonicalBody: body,
+    upstreamModel: model }, { ...deps, resolveTarget: async () => wrongTarget as never }),
+  /BOX_TOOL_RECORD_INVALID/);
+  const unbound = { ...linked, nativeSessionId: undefined, priorToolUses: undefined };
+  await assert.rejects(() => observeBoxToolUnknown({ identity: unbound, canonicalBody: body,
+    upstreamModel: model }, deps), /BOX_TOOL_RECORD_INVALID/);
+});

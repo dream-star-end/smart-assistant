@@ -4,6 +4,7 @@
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
+import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { BoxDurableJournalError, type BoxDurableJournal,
@@ -84,8 +85,13 @@ export async function observeBoxToolUnknown(input: {
     if (target.accountId !== id.accountId || abort.signal.aborted) return "pending";
     const access = makeBoxDetachedRunAccess({ runNonce: id.runNonce,
       detachedRunnerHash: id.detachedRunnerHash });
+    const progress: BoxToolProgressBinding | undefined = id.roundNo > 1
+      && id.priorToolUses && id.nativeSessionId
+      ? { toolUses: id.priorToolUses, nativeSessionId: id.nativeSessionId, catalog }
+      : undefined;
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
-      { alreadyInitialized: id.roundNo > 1, allowFinal: true });
+      { alreadyInitialized: id.roundNo > 1, allowFinal: true,
+        ...(progress ? { progress } : {}) });
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;
     let modelStarted = false;
     try {

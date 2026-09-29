@@ -14,6 +14,7 @@ packages/commercial/src/__tests__/ocrStore.integ.test.ts
 packages/commercial/src/__tests__/mediaGeneration.integ.test.ts
 packages/commercial/src/__tests__/finalizeJournalReconciler.integ.test.ts
 packages/commercial/src/http/proxy/boxDurableJournal.integ.test.ts
+packages/commercial/src/http/proxy/boxDurableJournal.progress.integ.test.ts
 packages/commercial/src/http/proxy/boxToolInputEcho.claim.integ.test.ts
 packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts
 packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts

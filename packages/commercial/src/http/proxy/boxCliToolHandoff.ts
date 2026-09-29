@@ -6,6 +6,8 @@
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
+import { acceptBoxToolProgress, classifyBoxToolProgress,
+  type BoxToolProgressBinding } from "./boxToolProgress.js";
 import { isDeepStrictEqual } from "node:util";
 
 export class BoxCliToolHandoffError extends Error {
@@ -128,7 +130,8 @@ export class BoxCliToolHandoffDecoder {
 
   constructor(private readonly expectedModel: string,
     private readonly catalog: BoxToolCatalog,
-    private readonly options: { alreadyInitialized?: boolean; allowFinal?: boolean } = {}) {
+    private readonly options: { alreadyInitialized?: boolean; allowFinal?: boolean;
+      progress?: BoxToolProgressBinding } = {}) {
     if (!/^claude-[a-z0-9-]{3,64}$/.test(expectedModel)
       || catalog.tools.length < 1) {
       throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_INVALID");
@@ -259,6 +262,19 @@ export class BoxCliToolHandoffDecoder {
   private record(record: Obj): string {
     if (this.candidate || this.finalCandidate) {
       throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
+    }
+    const progress = classifyBoxToolProgress(record);
+    if (progress.kind === "malformed") {
+      throw new BoxCliToolHandoffError("BOX_TOOL_RECORD_INVALID");
+    }
+    if (progress.kind === "heartbeat") {
+      // Previous-tool telemetry is only valid before this message starts.
+      // No SSE, usage, tool id, or modelStarted flag is produced.
+      if (this.started || this.sawStop || !acceptBoxToolProgress(
+        progress.heartbeat, this.options.progress)) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_RECORD_INVALID");
+      }
+      return "";
     }
     if (record.type === "system" && record.subtype === "init") {
       if (this.initSeen || this.started || !Array.isArray(record.tools)

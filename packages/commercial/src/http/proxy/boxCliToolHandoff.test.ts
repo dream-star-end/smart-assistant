@@ -493,3 +493,27 @@ test("success result followed by same-chunk or later bytes cannot release final 
     }
   }
 });
+
+test("same chunk stops at message_stop and leaves the next heartbeat", () => {
+  const parent = "toolu_prior_a";
+  const next = "toolu_next_c";
+  const progress = { toolUses: [{ id: parent, boxName, clientName: "Bash" }],
+    nativeSessionId: "11111111-1111-4111-8111-111111111111", catalog };
+  const prior = { type: "tool_progress", tool_use_id: `${parent}-heartbeat-0`,
+    tool_name: boxName, parent_tool_use_id: parent, elapsed_time_seconds: 30,
+    heartbeat: true, session_id: progress.nativeSessionId,
+    uuid: "22222222-2222-4222-8222-222222222222" };
+  const later = { ...prior, tool_use_id: `${next}-heartbeat-0`,
+    parent_tool_use_id: next, elapsed_time_seconds: 60 };
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog,
+    { alreadyInitialized: true, progress });
+  const chunk = [prior, ...records().slice(1), later].map((item) => JSON.stringify(item) + "\n").join("");
+  const decoded = decoder.push(chunk);
+  assert.ok(decoded.candidate);
+  assert.deepEqual(decoded.candidate?.toolUses.map((use) => use.id),
+    ["toolu_parallel_a", "toolu_parallel_b"]);
+  assert.equal(decoder.takeRemainder(), JSON.stringify(later) + "\n");
+  assert.equal(decoded.sse.includes("heartbeat"), false);
+  const unbound = new BoxCliToolHandoffDecoder(model, catalog, { alreadyInitialized: true });
+  assert.throws(() => unbound.push(JSON.stringify(prior) + "\n"), /BOX_TOOL_RECORD_INVALID/);
+});
