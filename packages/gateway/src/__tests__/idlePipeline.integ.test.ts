@@ -1414,6 +1414,13 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         const business = nextHits.filter((hit) => hit.status === 200 && hit.kind === "business");
         assert.equal(business.length, 1, JSON.stringify(report.nextHits));
         assert.ok(((business[0]?.digest as { contentBytes?: number } | undefined)?.contentBytes ?? 1e9) < 1_000_000, JSON.stringify(report.nextHits));
+        const summaryId = summaries[0]?.requestId;
+        const nextId = nextHits.find((hit) => hit.kind === "business")?.requestId;
+        for (let attempt = 0; attempt < 50 && nextId; attempt += 1) {
+          const seen = await pool.query("SELECT 1 FROM usage_records WHERE request_id = $1", [nextId]);
+          if (seen.rowCount) break;
+          await sleep(100);
+        }
         const books = await pool.query<{ request_id: string; turn_key: string; ledger_id: string; delta: string; balance_after: string }>(
           `SELECT u.request_id, u.turn_key, l.id::text AS ledger_id, l.delta::text, l.balance_after::text
              FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
@@ -1429,8 +1436,6 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         const credits = BigInt((await pool.query("SELECT credits::text AS credits FROM users WHERE id = 3")).rows[0].credits);
         report.credits = { after: credits.toString(), ledgerSum: (running - 50_000_000n).toString() };
         assert.equal(credits, running);
-        const summaryId = summaries[0]?.requestId;
-        const nextId = nextHits.find((hit) => hit.kind === "business")?.requestId;
         const keys = await pool.query<{ request_id: string; turn_key: string }>(
           "SELECT request_id, turn_key FROM usage_records WHERE request_id = $1 OR request_id = $2 OR request_id = $3",
           [liveHits[0]?.requestId, summaryId, nextId]);
@@ -1443,10 +1448,16 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         const summaryHttpBeforeSecond = hits.filter((hit) => hit.kind === "idle-summary").length;
         const beforeSecond = hits.length;
         let secondError = "";
-        try {
-          await sm.submit(liveSession, "second-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-        } catch (error) {
-          secondError = error instanceof Error ? error.message : String(error);
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          try {
+            await sm.submit(liveSession, "second-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+            secondError = "";
+            break;
+          } catch (error) {
+            secondError = error instanceof Error ? error.message : String(error);
+            if (!secondError.includes("IDLE_HISTORY_PENDING")) break;
+            await sleep(300);
+          }
         }
         const secondHits = hits.slice(beforeSecond).filter((hit) => hit.url === "/v1/messages");
         const opsAfterSecond = listJson(join(HOME, "idle-ops")).map((file) => JSON.parse(readFileSync(file, "utf8")) as { idleTurnKey?: string; sourceTurnKey?: string; revision?: string; disposition?: string; summaryText?: string });
