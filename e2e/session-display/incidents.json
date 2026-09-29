@@ -5176,7 +5176,12 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/boxIdleCompact.test.ts",
-          "assertion": "terminal summary is stored before apply, and recovery does not infer again"
+          "assertion": "same capsule and frozen tail rebuild one artifact without a model call"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResourceEnvelope.test.ts",
+          "assertion": "lease-only has no capability"
         },
         {
           "layer": "deploy-gate",
@@ -5189,7 +5194,9 @@
         "dc44ba859",
         "8c3c2a28",
         "44c20717",
-        "3085e958"
+        "3085e958",
+        "bc7ee813",
+        "1a9bad21"
       ]
     }
   ]
