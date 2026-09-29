@@ -156,6 +156,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
   const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT };
   let holdNextSettlement = false;
   let holdSummaryCommit = false;
+  let summaryResponseEnded = false;
   let preIdleCaptured = false;
   const heldRequestIds: string[] = [];
   const heldCommits: Array<() => void> = [];
@@ -228,7 +229,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         const run = () => c !== undefined ? query(a as never, b as never, c as never)
           : b !== undefined ? query(a as never, b as never)
           : query(a as never);
-        if (verb.startsWith("COMMIT") && holdNextSettlement && (sawUsageInsert || sawJournalWrite)) {
+        if (verb.startsWith("COMMIT") && holdNextSettlement && summaryResponseEnded && (sawUsageInsert || sawJournalWrite)) {
           holdNextSettlement = false;
           if (usageRequestId) heldRequestIds.push(usageRequestId);
           return new Promise((resolve, reject) => {
@@ -489,6 +490,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           current.body = responseBody.slice(0, 400);
           const requestId = res.getHeader("x-request-id");
           if (typeof requestId === "string" && requestId) current.requestId = requestId;
+          if (current.summary && (res.statusCode || 0) > 0) summaryResponseEnded = true;
         }
         return end(chunk as never);
       }) as typeof res.end;
