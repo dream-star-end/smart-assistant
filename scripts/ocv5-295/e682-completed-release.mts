@@ -14,9 +14,9 @@ export const PINNED_RELEASE_REALPATH =
 export const PINNED_JOURNAL_SHA256 =
   "072584c7aedb7e64df7a07c3985c846c5ef589dc97ea8528668fa3e06cfaae61";
 export const EXPECTED_MANIFEST_SHA256 =
-  "5ef4e3c0de7eee044bedf64f067e73776dfa621f0e7b95f86b49cfd0953914e5";
+  "2cd4d42290c331d6fd72c6a82d1ea17d373b27a757aa4707ff123f4e15347e5c";
 export const EXPECTED_SCRIPT_SHA256 =
-  "f04a206c0799f66ba7481316ae4b217dfc3ab4694b2364d4b65e36c085f4e56f";
+  "2fe183bd6d3fbe63614c664a597b5948fce9ffccb41a79d6d4ef1df4cc749c68";
 export const ABANDON_STATE = "operator_completed_abandoned";
 export const REQUIRED_AUTHORIZATION = "旧运行该停就停";
 export const TARGET_NONCE = "e682271820b159b147bbf767";
@@ -88,7 +88,38 @@ export interface RunManifest {
   spool: { bytes: number; sha256: string };
   reuseCancelIntent: false;
 }
-export interface ContrastPin { nonce: string; rowCount: number; sha256: string }
+export const CONTRAST_CLOCK_KEYS = ["boxStopProbeAfterMs", "boxStopProbeLastAttemptMs"] as const;
+export const CONTRAST_CLOCK_GAP_MS = 120_000;
+export const CONTRAST_LEAF_REQUEST_ID = "a50c01dcc2307bb7698278d41029f345";
+export interface ContrastRowPin {
+  requestId: string;
+  userId: string;
+  containerId: string | null;
+  state: string;
+  pre: string | null;
+  fin: string | null;
+  led: string | null;
+  use: string | null;
+  epoch: string;
+  sessionId: string;
+  turnKey: string | null;
+  owner: string | null;
+  resume: string | null;
+  boxState: string;
+  businessCtxSha256: string;
+}
+export interface ContrastPin {
+  nonce: string;
+  rowCount: number;
+  /** Legacy full-ctx aggregate. Synthetic tests only; not a live gate once rows exist. */
+  sha256?: string;
+  leafRequestId?: string;
+  clockKeys?: readonly [typeof CONTRAST_CLOCK_KEYS[0], typeof CONTRAST_CLOCK_KEYS[1]];
+  clockGapMs?: number;
+  historicalAggregateSha256?: string;
+  clockFloor?: { boxStopProbeAfterMs: number; boxStopProbeLastAttemptMs: number };
+  rows?: ContrastRowPin[];
+}
 export interface ReleaseManifest {
   v: 1;
   sourceCommit: typeof PINNED_SOURCE_COMMIT;
@@ -183,11 +214,14 @@ export function table(schema: SchemaName, name: "request_finalize_journal" | "us
   return `${quoteIdent(schema)}.${name}`;
 }
 
-export function advisoryKeys(input: { accountId: string; fingerprints: string[]; uid: string; sessionId: string }): string[] {
+export function advisoryKeys(input: {
+  accountId: string; fingerprints: string[]; uid: string; sessionId?: string; sessionIds?: string[];
+}): string[] {
+  const sessions = [...new Set(input.sessionIds ?? (input.sessionId ? [input.sessionId] : []))];
   return [
     `box:account:${input.accountId}`,
     ...[...input.fingerprints].sort().map((fingerprint) => `box:fingerprint:${fingerprint}`),
-    `box:session:${input.uid}:${input.sessionId}`,
+    ...sessions.sort().map((session) => `box:session:${input.uid}:${session}`),
   ];
 }
 
@@ -414,7 +448,94 @@ async function assertUsage(client: QueryClient, schema: SchemaName, run: RunMani
   }
 }
 
+function businessCtx(ctx: Ctx, leaf: boolean): Ctx {
+  if (!leaf) return ctx;
+  const copy = { ...ctx };
+  delete copy.boxStopProbeAfterMs;
+  delete copy.boxStopProbeLastAttemptMs;
+  return copy;
+}
+
+function clockPair(ctx: Ctx, floor: { boxStopProbeAfterMs: number; boxStopProbeLastAttemptMs: number }) {
+  const after = ctx.boxStopProbeAfterMs;
+  const last = ctx.boxStopProbeLastAttemptMs;
+  if (typeof after !== "number" || typeof last !== "number"
+    || !Number.isSafeInteger(after) || !Number.isSafeInteger(last)
+    || !/^[0-9]{13}$/.test(String(after)) || !/^[0-9]{13}$/.test(String(last))
+    || after - last !== CONTRAST_CLOCK_GAP_MS
+    || after < floor.boxStopProbeAfterMs || last < floor.boxStopProbeLastAttemptMs) {
+    throw new ReleaseError("CONTRAST_CHANGED");
+  }
+}
+
+function contrastRowMatches(row: JournalRow, pin: ContrastRowPin, leaf: boolean): boolean {
+  return row.request_id === pin.requestId
+    && row.user_id === pin.userId
+    && (row.container_id ?? null) === (pin.containerId ?? null)
+    && row.state === pin.state
+    && sameMoney(row.precheck_credits, pin.pre)
+    && sameMoney(row.final_credits, pin.fin)
+    && sameMoney(row.ledger_id, pin.led)
+    && sameMoney(row.usage_id, pin.use)
+    && row.ctx.boxLeaseEpoch === pin.epoch
+    && row.ctx.boxSessionId === pin.sessionId
+    && (row.ctx.boxTurnKey ?? null) === pin.turnKey
+    && (row.ctx.boxOwnerRequestId ?? null) === pin.owner
+    && (row.ctx.boxResumeRequestId ?? null) === pin.resume
+    && row.ctx.boxState === pin.boxState
+    && sha256(canonicalJson(businessCtx(row.ctx, leaf))) === pin.businessCtxSha256;
+}
+
+function spectatorView(row: JournalRow) {
+  return {
+    requestId: row.request_id, userId: row.user_id, containerId: row.container_id,
+    state: row.state, pre: row.precheck_credits, fin: row.final_credits,
+    led: row.ledger_id, use: row.usage_id, ctx: row.ctx,
+  };
+}
+
+async function selectNonces(client: QueryClient, schema: SchemaName, uid: string, accountId: string,
+  nonces: string[], lock: boolean): Promise<JournalRow[]> {
+  const found = await client.query<JournalRow>(
+    `${ROW_SQL} FROM ${table(schema, "request_finalize_journal")}
+      WHERE user_id = $1 AND ctx->>'boxAccountId' = $2 AND ctx->>'boxRunNonce' = ANY($3::text[])
+      ORDER BY request_id${lock ? " FOR UPDATE" : ""}`,
+    [uid, accountId, nonces]);
+  return found.rows;
+}
+
+function assertContrastBaseline(rows: JournalRow[], manifest: ReleaseManifest) {
+  const pin = manifest.contrast;
+  const expected = pin.rows;
+  const floor = pin.clockFloor;
+  if (!expected || expected.length !== pin.rowCount || !floor || pin.leafRequestId !== CONTRAST_LEAF_REQUEST_ID
+    || pin.clockGapMs !== CONTRAST_CLOCK_GAP_MS
+    || pin.historicalAggregateSha256 !== "729cfefb106000bd79a92994697b750583a4b9f4ad4e8fa4d21322584f64b599") {
+    throw new ReleaseError("CONTRAST_CHANGED");
+  }
+  if (rows.length !== expected.length) throw new ReleaseError("CONTRAST_CHANGED");
+  const byId = new Map(rows.map((row) => [row.request_id, row]));
+  if (byId.size !== rows.length) throw new ReleaseError("CONTRAST_CHANGED");
+  for (const item of expected) {
+    const row = byId.get(item.requestId);
+    const leaf = item.requestId === pin.leafRequestId;
+    if (!row || !contrastRowMatches(row, item, leaf)) throw new ReleaseError("CONTRAST_CHANGED");
+    if (leaf) clockPair(row.ctx, floor);
+  }
+}
+
+async function assertNoReverseSet(client: QueryClient, schema: SchemaName, uid: string, ids: string[]) {
+  const found = await client.query(
+    `SELECT request_id FROM ${table(schema, "request_finalize_journal")}
+      WHERE user_id = $1 AND NOT (request_id = ANY($2::text[]))
+        AND (ctx->>'boxOwnerRequestId' = ANY($2::text[]) OR ctx->>'boxResumeRequestId' = ANY($2::text[]))
+      FOR UPDATE`,
+    [uid, ids]);
+  if ((found.rowCount ?? found.rows.length) !== 0) throw new ReleaseError("SUCCESSOR_PRESENT");
+}
+
 async function assertContrast(client: QueryClient, schema: SchemaName, manifest: ReleaseManifest) {
+  if (manifest.contrast.rows) return;
   const digest = await contrastDigest(client, schema, manifest.run.uid, manifest.contrast.nonce);
   const count = await client.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM ${table(schema, "request_finalize_journal")}
@@ -545,23 +666,46 @@ export async function applyRun(client: QueryClient, schema: SchemaName, manifest
     await client.query(`SET LOCAL search_path TO ${quoteIdent(schema)}`);
     await client.query("SET LOCAL lock_timeout = '5s'");
     await client.query("SET LOCAL statement_timeout = '30s'");
+    const baseline = manifest.contrast.rows;
+    const sessionIds = baseline
+      ? [...new Set([run.sessionId, ...baseline.map((item) => item.sessionId)])]
+      : [run.sessionId];
     const keys = advisoryKeys({
       accountId: run.accountId, fingerprints: [run.replayFingerprint],
-      uid: run.uid, sessionId: run.sessionId,
+      uid: run.uid, sessionIds,
     });
     const expectedOrder = [...keys].sort();
     if (keys.some((key, index) => key !== expectedOrder[index])) throw new ReleaseError("LOCK_ORDER");
     for (const key of expectedOrder) {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [key]);
     }
-    const locked = await selectRun(client, schema, run, true);
+    const lockedAll = baseline
+      ? await selectNonces(client, schema, run.uid, run.accountId, [run.nonce, manifest.contrast.nonce], true)
+      : await selectRun(client, schema, run, true);
+    const locked = baseline ? lockedAll.filter((item) => item.ctx.boxRunNonce === run.nonce) : lockedAll;
+    const contrastRows = baseline ? lockedAll.filter((item) => item.ctx.boxRunNonce === manifest.contrast.nonce) : [];
     if (locked.length !== 1) throw new ReleaseError(locked.length > 1 ? "SUCCESSOR_PRESENT" : "IDENTITY_MISMATCH");
     const row = locked[0]!;
-    await assertNoReverse(client, schema, run);
-    await assertContrast(client, schema, manifest);
+    if (baseline) {
+      assertContrastBaseline(contrastRows, manifest);
+      await assertNoReverseSet(client, schema, run.uid, [run.requestId, ...baseline.map((item) => item.requestId)]);
+    } else {
+      await assertNoReverse(client, schema, run);
+      await assertContrast(client, schema, manifest);
+    }
+    const spectators = baseline ? canonicalJson(contrastRows.map(spectatorView)) : "";
+    const sameSpectators = async () => {
+      if (!baseline) {
+        await assertContrast(client, schema, manifest);
+        return;
+      }
+      const again = await selectNonces(client, schema, run.uid, run.accountId, [manifest.contrast.nonce], true);
+      if (canonicalJson(again.map(spectatorView)) !== spectators) throw new ReleaseError("CONTRAST_CHANGED");
+    };
     await assertUsage(client, schema, run);
     if (Object.hasOwn(row.ctx, "durableBillingRecovery")) throw new ReleaseError("DURABLE_MARKER");
     if (alreadyApplied(row, run, approval.operationId, fresh)) {
+      await sameSpectators();
       await client.query("COMMIT");
       committed = true;
       return { nonce: run.nonce, status: "already_applied", requestId: row.request_id };
@@ -610,7 +754,7 @@ export async function applyRun(client: QueryClient, schema: SchemaName, manifest
     if (changed.rowCount !== 1) throw new ReleaseError("CAS_LOST");
     const after = (await selectRun(client, schema, run, true))[0];
     if (!after || !postcondition(after, row, run, approval.operationId, fresh)) throw new ReleaseError("CAS_LOST");
-    await assertContrast(client, schema, manifest);
+    await sameSpectators();
     await assertUsage(client, schema, run);
     await opts.writeReceipt?.({
       operationId: approval.operationId, nonce: run.nonce, sourceCommit: PINNED_SOURCE_COMMIT,
@@ -646,7 +790,9 @@ export function loadPrivateManifest(path: string): ReleaseManifest {
   const digest = createHash("sha256").update(bytes).digest("hex");
   if (digest !== EXPECTED_MANIFEST_SHA256) throw new ReleaseError("RELEASE_MISMATCH");
   const parsed = JSON.parse(bytes.toString("utf8")) as ReleaseManifest;
-  if (parsed.run?.nonce !== TARGET_NONCE || parsed.contrast?.rowCount !== 46 || !parsed.run.originalCtx) {
+  if (parsed.run?.nonce !== TARGET_NONCE || parsed.contrast?.rowCount !== 46 || !parsed.run.originalCtx
+    || parsed.contrast.rows?.length !== 46 || parsed.contrast.leafRequestId !== CONTRAST_LEAF_REQUEST_ID
+    || parsed.contrast.historicalAggregateSha256 !== "729cfefb106000bd79a92994697b750583a4b9f4ad4e8fa4d21322584f64b599") {
     throw new ReleaseError("IDENTITY_MISMATCH");
   }
   if (sha256(canonicalJson(parsed.run.originalCtx)) !== parsed.run.originalCtxSha256) {

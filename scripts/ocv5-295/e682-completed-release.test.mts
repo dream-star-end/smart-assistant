@@ -10,7 +10,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import {
-  ABANDON_STATE, EXPECTED_MANIFEST_SHA256, EXPECTED_SCRIPT_SHA256, PINNED_JOURNAL_SHA256,
+  ABANDON_STATE, CONTRAST_CLOCK_GAP_MS, CONTRAST_LEAF_REQUEST_ID, EXPECTED_MANIFEST_SHA256,
+  EXPECTED_SCRIPT_SHA256, PINNED_JOURNAL_SHA256,
   PINNED_RELEASE_REALPATH, PINNED_SOURCE_COMMIT, REQUIRED_AUTHORIZATION, TARGET_NONCE,
   advisoryKeys, applyRun, canonicalJson, contrastDigest, loadPrivateManifest, loadRelease,
   nestTransaction, productionResolveArgs, readPinnedProductionProof, sha256, verifyPins,
@@ -18,7 +19,7 @@ import {
 } from "./e682-completed-release.mts";
 
 const RELEASE = PINNED_RELEASE_REALPATH;
-const MANIFEST = "/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-295-e682-prod-identity.json";
+const MANIFEST = "/var/lib/docker/volumes/oc-v5-data-u3/_data/generated/ocv5-295-e682-prod-identity-contrast-v2.json";
 const RECONCILER = join(RELEASE, "packages/commercial/src/billing/finalizeJournalReconciler.ts");
 const SCRIPT = new URL("./e682-completed-release.mts", import.meta.url);
 
@@ -219,6 +220,10 @@ test("pins match the ae5 release, script, and private manifest", async () => {
   assert.equal(manifest.run.requestId, "ed263edbf8dd0f8ff393adc20935d95f");
   assert.equal(manifest.run.containerId, "534");
   assert.equal(manifest.contrast.rowCount, 46);
+  assert.equal(manifest.contrast.leafRequestId, CONTRAST_LEAF_REQUEST_ID);
+  assert.equal(manifest.contrast.historicalAggregateSha256, "729cfefb106000bd79a92994697b750583a4b9f4ad4e8fa4d21322584f64b599");
+  assert.equal(manifest.contrast.clockFloor?.boxStopProbeAfterMs! - manifest.contrast.clockFloor?.boxStopProbeLastAttemptMs!, CONTRAST_CLOCK_GAP_MS);
+  assert.equal(manifest.contrast.rows?.length, 46);
   assert.equal(manifest.proof.reason, "worker_complete");
   assert.equal(manifest.proof.cliPid, 297203);
   assert.equal(manifest.proof.keeperPid, 297201);
@@ -742,6 +747,160 @@ test("pinned reconciler SQL and native GC leave the abandoned row alone", { time
       pointer: { accountId: "20", cliCwd: made.ctx.boxNativeCliCwd, nativeSessionId: made.ctx.boxNativeSessionId,
         expiresAtMs: 1, upstreamModel: "claude-opus-5-5" },
     }), false);
+  });
+});
+
+const HISTORICAL_AGGREGATE = "729cfefb106000bd79a92994697b750583a4b9f4ad4e8fa4d21322584f64b599";
+
+async function seedContrast(db: Db, schema: "pg_temp" | `ocv5_295_${string}`, clocks = { last: 1790674483965, after: 1790674603965 }) {
+  const made = makeRun("clk");
+  const contrastNonce = randomBytes(12).toString("hex");
+  const epoch = randomBytes(16).toString("hex");
+  const sessionId = "session-watch";
+  const leafCtx = {
+    boxAccountId: "20", boxRunNonce: contrastNonce, boxLeaseEpoch: epoch, boxSessionId: sessionId,
+    boxTurnKey: "cd".repeat(32), boxState: "unknown",
+    boxStopProbeLastAttemptMs: clocks.last, boxStopProbeAfterMs: clocks.after,
+  };
+  await db.query(
+    `INSERT INTO request_finalize_journal(request_id, user_id, container_id, state, ctx)
+     VALUES ($1, 3, 77, 'inflight', $2::jsonb)`,
+    [CONTRAST_LEAF_REQUEST_ID, JSON.stringify(leafCtx)]);
+  for (let i = 0; i < 45; i += 1) {
+    await db.query(
+      `INSERT INTO request_finalize_journal(request_id, user_id, container_id, state, ctx, precheck_credits, final_credits)
+       VALUES ($1, 3, 77, 'committed', $2::jsonb, 3, 4)`,
+      [randomBytes(16).toString("hex"), JSON.stringify({
+        boxAccountId: "20", boxRunNonce: contrastNonce, boxLeaseEpoch: epoch, boxSessionId: sessionId,
+        boxTurnKey: "cd".repeat(32), boxState: "terminal", n: i,
+      })]);
+  }
+  await insertTarget(db, made);
+  const found = await db.query(
+    `SELECT request_id, user_id::text AS user_id, container_id::text AS container_id, state,
+            precheck_credits::text AS pre, final_credits::text AS fin, ledger_id::text AS led,
+            usage_id::text AS use, ctx
+       FROM request_finalize_journal WHERE ctx->>'boxRunNonce' = $1 ORDER BY request_id`,
+    [contrastNonce]);
+  const rows = found.rows.map((row) => {
+    const ctx = { ...row.ctx };
+    if (row.request_id === CONTRAST_LEAF_REQUEST_ID) {
+      delete ctx.boxStopProbeAfterMs;
+      delete ctx.boxStopProbeLastAttemptMs;
+    }
+    return {
+      requestId: row.request_id, userId: row.user_id, containerId: row.container_id, state: row.state,
+      pre: row.pre, fin: row.fin, led: row.led, use: row.use,
+      epoch: row.ctx.boxLeaseEpoch, sessionId: row.ctx.boxSessionId, turnKey: row.ctx.boxTurnKey ?? null,
+      owner: row.ctx.boxOwnerRequestId ?? null, resume: row.ctx.boxResumeRequestId ?? null,
+      boxState: row.ctx.boxState, businessCtxSha256: sha256(canonicalJson(ctx)),
+    };
+  });
+  const manifest = await manifestOf(db, schema, made, contrastNonce, 46);
+  manifest.contrast = {
+    nonce: contrastNonce, rowCount: 46, leafRequestId: CONTRAST_LEAF_REQUEST_ID,
+    clockKeys: ["boxStopProbeAfterMs", "boxStopProbeLastAttemptMs"], clockGapMs: CONTRAST_CLOCK_GAP_MS,
+    historicalAggregateSha256: HISTORICAL_AGGREGATE,
+    clockFloor: { boxStopProbeAfterMs: clocks.after, boxStopProbeLastAttemptMs: clocks.last },
+    rows,
+  };
+  return { made, manifest, contrastNonce };
+}
+
+test("contrast clock tail allows only the witnessed leaf pair to move", { timeout: 120_000 }, async () => {
+  await withTemp(async (db) => {
+    const seeded = await seedContrast(db, "pg_temp");
+    const before = await db.query("SELECT md5(ctx::text) AS ctx FROM request_finalize_journal WHERE request_id=$1", [seeded.made.run.requestId]);
+    await db.query(
+      `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object(
+         'boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint)
+       WHERE request_id = $1`,
+      [CONTRAST_LEAF_REQUEST_ID, 1790674483965 + 120_000, 1790674603965 + 120_000]);
+    const applied = await applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof });
+    assert.equal(applied.status, "applied");
+    assert.equal((await db.query("SELECT ctx->>'boxState' AS box FROM request_finalize_journal WHERE request_id=$1", [seeded.made.run.requestId])).rows[0].box, ABANDON_STATE);
+    const leaf = await db.query("SELECT ctx->>'boxStopProbeLastAttemptMs' AS last FROM request_finalize_journal WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]);
+    assert.equal(leaf.rows[0].last, String(1790674483965 + 120_000));
+    const frozen = await db.query(
+      "SELECT count(*)::int AS n FROM request_finalize_journal WHERE ctx->>'boxRunNonce'=$1 AND request_id <> $2 AND final_credits::text <> '4'",
+      [seeded.manifest.contrast.nonce, CONTRAST_LEAF_REQUEST_ID]);
+    assert.equal(frozen.rows[0].n, 0);
+    void before;
+  });
+  const rejects: Array<(db: Db, nonce: string) => Promise<void>> = [
+    async (db) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx || '{\"n\":99}'::jsonb WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]); },
+    async (db, nonce) => { await db.query("UPDATE request_finalize_journal SET final_credits = 9 WHERE ctx->>'boxRunNonce'=$1 AND request_id <> $2", [nonce, CONTRAST_LEAF_REQUEST_ID]); },
+    async (db) => { await db.query("UPDATE request_finalize_journal SET state='aborted' WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]); },
+    async (db, nonce) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxStopProbeLastAttemptMs', 1, 'boxStopProbeAfterMs', 2) WHERE ctx->>'boxRunNonce'=$1 AND request_id <> $2", [nonce, CONTRAST_LEAF_REQUEST_ID]); },
+    async (db) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx - 'boxStopProbeAfterMs' WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]); },
+    async (db) => { await db.query("UPDATE request_finalize_journal SET ctx = jsonb_set(ctx, '{boxStopProbeLastAttemptMs}', '\"1790674483965\"') WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]); },
+    async (db) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint) WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID, 1790674483965 - 120_000, 1790674603965 - 120_000]); },
+    async (db) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint) WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID, 1790674483965 + 10, 1790674603965 + 9]); },
+  ];
+  for (const mutate of rejects) {
+    await withTemp(async (db) => {
+      const seeded = await seedContrast(db, "pg_temp");
+      await mutate(db, seeded.manifest.contrast.nonce);
+      await assert.rejects(() => applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof }),
+        (error: unknown) => codeOf(error) === "CONTRAST_CHANGED");
+      assert.equal((await db.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE ctx ? 'boxCancelIntent'")).rows[0].n, 0);
+    });
+  }
+});
+
+test("contrast set, reverse edge, and in-transaction probe wait", { timeout: 120_000 }, async () => {
+  await withTemp(async (db) => {
+    const seeded = await seedContrast(db, "pg_temp");
+    await db.query(
+      `INSERT INTO request_finalize_journal(request_id, user_id, container_id, state, ctx)
+       VALUES ('extra-row', 3, 77, 'inflight', $1::jsonb)`,
+      [JSON.stringify({ boxAccountId: "20", boxRunNonce: seeded.manifest.contrast.nonce, boxState: "unknown",
+        boxLeaseEpoch: "ab".repeat(16), boxSessionId: "session-watch" })]);
+    await assert.rejects(() => applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof }),
+      (error: unknown) => codeOf(error) === "CONTRAST_CHANGED");
+    await db.query("DELETE FROM request_finalize_journal WHERE request_id='extra-row'");
+    await db.query("DELETE FROM request_finalize_journal WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]);
+    await assert.rejects(() => applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof }),
+      (error: unknown) => codeOf(error) === "CONTRAST_CHANGED");
+  });
+  await withTemp(async (db) => {
+    const seeded = await seedContrast(db, "pg_temp");
+    await db.query(
+      `INSERT INTO request_finalize_journal(request_id, user_id, container_id, state, ctx)
+       VALUES ('outside-child', 3, 77, 'committed', $1::jsonb)`,
+      [JSON.stringify({ boxAccountId: "20", boxRunNonce: "ee".repeat(12), boxOwnerRequestId: CONTRAST_LEAF_REQUEST_ID, boxState: "linked" })]);
+    await assert.rejects(() => applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof }),
+      (error: unknown) => codeOf(error) === "SUCCESSOR_PRESENT");
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE ctx ? 'boxCancelIntent'")).rows[0].n, 0);
+  });
+  await withSchema(async (schema) => {
+    const a = await pgClient();
+    const b = await pgClient();
+    try {
+      await a.query(`SET search_path TO ${schema}`);
+      await b.query(`SET search_path TO ${schema}`);
+      await b.query("SET lock_timeout = '400ms'");
+      const seeded = await seedContrast(a, schema as `ocv5_295_${string}`);
+      let held = false;
+      const result = await applyRun(a, schema as "pg_temp", seeded.manifest, approvalFor(seeded.made.run), {
+        freshProof: seeded.made.proof,
+        afterIntent: async () => {
+          held = true;
+          await assert.rejects(() => b.query(
+            `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object(
+               'boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint) WHERE request_id=$1`,
+            [CONTRAST_LEAF_REQUEST_ID, 1790674483965 + 240_000, 1790674603965 + 240_000]));
+          const during = await a.query("SELECT ctx->>'boxStopProbeLastAttemptMs' AS last FROM request_finalize_journal WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID]);
+          assert.equal(during.rows[0].last, "1790674483965");
+        },
+      });
+      assert.equal(held, true);
+      assert.equal(result.status, "applied");
+      assert.equal((await a.query("SELECT ctx->>'boxStopProbeLastAttemptMs' AS last FROM request_finalize_journal WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID])).rows[0].last, "1790674483965");
+    } finally {
+      await a.end();
+      await b.end();
+    }
   });
 });
 
