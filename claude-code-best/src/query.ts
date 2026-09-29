@@ -591,6 +591,7 @@ async function* queryLoop(
     const remoteContextDelegated = boxNativeRemoteContextOwnsHistory({
       model: toolUseContext.options.mainLoopModel,
       querySource,
+      messages: messagesForQuery,
     })
 
     let snipTokensFreed = 0

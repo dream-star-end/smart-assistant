@@ -1240,6 +1240,9 @@ function runHeadlessStreaming(
         | string
         | ContentBlockParam[],
       uuid: randomUUID(),
+      // interrupted_turn's continuation is already isMeta. A real user prompt
+      // that never got a response is not, and must stay a fresh business input.
+      isMeta: turnInterruptionState.message.isMeta === true,
     })
   }
 
