@@ -42,6 +42,7 @@ const GROW_TARGET = 8_860_467;
 let summaryRequested = false;
 let growthActive = false;
 let growthRound = 0;
+let growthStopRound = 60;
 let spoolBuf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
 let pendingStdout: string | null = null;
 const growthBodies: string[] = [];
@@ -49,7 +50,7 @@ const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
 
-async function runIdleCase(mode: "short" | "fresh"): Promise<void> {
+async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
@@ -411,8 +412,10 @@ async function runIdleCase(mode: "short" | "fresh"): Promise<void> {
       if (growthActive && growthBodies.length < 3) {
         const text = raw.toString("utf8");
         growthBodies.push(text);
-        const rawDir = process.env.OC_V5_296_IDLE_RAW ? dirname(process.env.OC_V5_296_IDLE_RAW) : tmpdir();
-        writeFileSync(join(rawDir, `ocv5-296-r17-growth-${growthBodies.length}.json`), text);
+        const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
+        const bodyName = `ocv5-296-r19-live-${growthBodies.length}.json`;
+        if (bodyName.includes("r17-growth")) throw new Error("refusing to overwrite r17");
+        writeFileSync(join(rawDir, bodyName), text);
       }
       const text = raw.toString("utf8");
       current = {
@@ -588,7 +591,7 @@ async function runIdleCase(mode: "short" | "fresh"): Promise<void> {
       assert.ok(BigInt(row.delta) < 0n);
     }
 
-    } else {
+    } else if (mode === "fresh") {
       const seeded = seedOuterHistory(process.env.CLAUDE_CONFIG_DIR!, work);
       report.seededBytes = seeded.bytes;
       const freshKey = "agent:main:webchat:dm:idle-fresh-r18";
@@ -762,6 +765,96 @@ async function runIdleCase(mode: "short" | "fresh"): Promise<void> {
         assert.equal(row.box_state, "terminal");
         assert.equal(row.turn_key, freshBooks[0]!.turn_key);
       }
+    } else {
+      growthActive = true;
+      growthRound = 0;
+      growthStopRound = 1;
+      growthBodies.length = 0;
+      const liveKey = "agent:main:webchat:dm:idle-live2";
+      const liveAdapter = new CcbAdapter({
+        sessionKey: liveKey,
+        agentId: "main",
+        agentBaseDir: work,
+        config: adapterConfig,
+        model: MODEL,
+        permissionMode: "bypassPermissions",
+        harness: "ccb",
+        executionTarget: { kind: "local" },
+      });
+      adapterShutdown = () => liveAdapter.shutdown();
+      const liveSession = {
+        sessionKey: liveKey,
+        agentId: "main",
+        channel: "webchat",
+        peerId: "idle-live2",
+        title: "Idle",
+        startedAt: Date.now(),
+        runner: liveAdapter,
+        model: MODEL,
+        lock: Promise.resolve(),
+        lastUsedAt: 0,
+        totalCostUSD: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        turns: 0,
+        _lastCcbCumulativeCost: 0,
+        toolUseIdToName: new Map(),
+        executionTarget: { kind: "local" },
+        providerTag: "ccb",
+      } as never;
+      const before = hits.length;
+      let liveError = "";
+      try {
+        await sm.submit(liveSession, "grow", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+      } catch (error) {
+        liveError = error instanceof Error ? error.message : String(error);
+      }
+      const liveHits = hits.slice(before).filter((hit) => hit.url === "/v1/messages");
+      report.liveError = liveError || null;
+      report.liveHits = liveHits.map((hit) => ({
+        status: hit.status, bytes: hit.bytes, kind: hit.kind, reasons: hit.reasons,
+        requestId: hit.requestId, summary: hit.summary, body: hit.body,
+      }));
+      report.execLog = localExec.log;
+      report.pendingCount = localExec.log.filter((line) => line === "synthetic-pending").length;
+      const continuation = liveHits.filter((hit) => hit.kind === "live-continuation");
+      const rejected = liveHits.filter((hit) => hit.status === 409 || (hit.body ?? "").includes("BOX_TOOL_CONTEXT_CHANGED"));
+      if (rejected.length > 0 || continuation.length === 0 || continuation.some((hit) => hit.status !== 200)) {
+        report.contextDiff = await explainContextMismatch(growthBodies, CHECKOUT);
+        throw new Error(`live continuation red: ${liveError || "no 200 continuation"} hits=${JSON.stringify(report.liveHits).slice(0, 1200)} diff=${JSON.stringify(report.contextDiff).slice(0, 1500)}`);
+      }
+      assert.equal(localExec.log.filter((line) => line === "synthetic-launch").length, 1, JSON.stringify(localExec.log));
+      assert.equal(growthRound, 1);
+      const toolUses = growthBodies.flatMap((body) => {
+        try {
+          const parsed = JSON.parse(body) as { messages?: Array<{ content?: unknown }> };
+          return (parsed.messages ?? []).flatMap((message) => Array.isArray(message.content)
+            ? message.content.filter((block): block is { type?: string; id?: string } => Boolean(block) && typeof block === "object" && (block as { type?: string }).type === "tool_use").map((block) => block.id)
+            : []);
+        } catch { return []; }
+      });
+      report.toolUses = toolUses;
+      assert.deepEqual(toolUses, ["toolu_grow_1"]);
+      assert.equal(liveHits.filter((hit) => hit.kind === "idle-summary").length, 0);
+      report.contextDiff = await explainContextMismatch(growthBodies, CHECKOUT);
+      assert.equal((report.contextDiff as { equal?: boolean }).equal, true, JSON.stringify(report.contextDiff).slice(0, 800));
+      const ids = continuation.map((hit) => hit.requestId).filter((id): id is string => Boolean(id));
+      const firstId = liveHits.find((hit) => hit.kind !== "live-continuation" && hit.status === 200)?.requestId;
+      assert.equal(typeof firstId, "string");
+      const linked = await pool.query<{ request_id: string; state: string; owner: string | null; resume: string | null }>(
+        `SELECT request_id, state, ctx->>'boxOwnerRequestId' AS owner, ctx->>'boxResumeRequestId' AS resume
+           FROM request_finalize_journal WHERE request_id = $1 OR request_id = $2`,
+        [firstId, ids[0]]);
+      report.liveJournal = linked.rows;
+      assert.equal(linked.rows.length, 2, JSON.stringify(linked.rows));
+      for (const row of linked.rows) assert.equal(row.state, "committed", row.request_id);
+      const resumes = linked.rows.map((row) => row.resume).filter((value): value is string => Boolean(value));
+      const owners = linked.rows.map((row) => row.owner).filter((value): value is string => Boolean(value));
+      assert.equal(owners.includes(firstId!), true, JSON.stringify(linked.rows));
+      assert.equal(resumes.includes(ids[0]!), true, JSON.stringify(linked.rows));
+      assert.equal(liveError, "");
     }
   } finally {
     releaseHeldCommits();
@@ -793,7 +886,9 @@ async function runIdleCase(mode: "short" | "fresh"): Promise<void> {
     rmSync(HOME, { recursive: true, force: true });
     const rawName = mode === "short"
       ? "ocv5-296-idle-pipeline-r18-short-raw.json"
-      : "ocv5-296-fresh-set-r18-raw.json";
+      : mode === "fresh"
+        ? "ocv5-296-fresh-set-r18-raw.json"
+        : "ocv5-296-idle-pipeline-r19-live2-raw.json";
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, rawName);
     if (/ocv5-296-(idle-pipeline-r\d+-raw|r17-growth-)/.test(path)) {
@@ -820,6 +915,7 @@ function queueIdle(name: string, timeout: number, mode: "short" | "fresh"): void
 
 queueIdle("real submit reaches a short idle no-op without a summary HTTP", 300_000, "short");
 queueIdle("fresh stock summary and business roots short-close through terminal_set", 900_000, "fresh");
+test("live tool continuation keeps the persisted deferred-tools announcement", { timeout: 300_000 }, () => runIdleCase("live2"));
 
 type MessageDigest = {
   messages: number;
@@ -1120,12 +1216,12 @@ function prepareModelSpool(raw: string): void {
   const bashIndex = (parsed.tools ?? []).findIndex((tool) => tool.name === "Bash");
   const size = toolResultBytes(parsed.messages ?? []);
   const prior = classified.kind === "live-continuation" ? lastToolResult(parsed.messages ?? []) : null;
-  const finish = size >= GROW_TARGET || growthRound >= 60;
+  const finish = size >= GROW_TARGET || growthRound >= growthStopRound;
   if (bashIndex < 0 || finish) {
     const final = textSpool(prior ? [] : initTools);
     const echo = prior ? echoChunk(prior.id, prior.content, prior.isError) : Buffer.alloc(0);
     spoolBuf = prior ? Buffer.concat([spoolBuf, echo, stripInit(final)]) : final;
-    pendingStdout = null;
+    if (!prior) pendingStdout = null;
     return;
   }
   growthRound += 1;
