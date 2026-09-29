@@ -58,6 +58,54 @@ test("offset replay and altered final hash cannot publish a partial file", () =>
   }
 });
 
+test("trusted snapshot ceiling stages above 8 MiB and still rejects other paths", () => {
+  const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const project = `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}`;
+  const sid = "12345678-1234-4123-8123-123456789abc";
+  const raw = Buffer.alloc(9 * 1024 * 1024, 0x63);
+  assert.throws(() => makeBoxStageFiles({ cwd, project, files: [
+    { path: `${project}/${sid}.jsonl`, raw, hash: sha(raw) },
+  ] }), (error: unknown) => error instanceof BoxStageError && error.code === "BOX_STAGE_FILE_INVALID");
+  assert.throws(() => makeBoxStageFiles({
+    cwd, project, snapshotMaxBytes: 24 * 1024 * 1024,
+    files: [{ path: `${cwd}/stdin.jsonl`, raw, hash: sha(raw) }],
+  }), (error: unknown) => error instanceof BoxStageError && error.code === "BOX_STAGE_FILE_INVALID");
+  const over = Buffer.alloc(24 * 1024 * 1024 + 1, 0x64);
+  let spawned = 0;
+  assert.throws(() => makeBoxStageFiles({
+    cwd, project, snapshotMaxBytes: 24 * 1024 * 1024,
+    files: [{ path: `${project}/${sid}.jsonl`, raw: over, hash: sha(over) }],
+  }), (error: unknown) => error instanceof BoxStageError && error.code === "BOX_STAGE_FILE_INVALID");
+  assert.equal(spawned, 0);
+  const upper = Buffer.alloc(24 * 1024 * 1024 - 1, 0x65);
+  const plan = makeBoxStageFiles({
+    cwd, project, snapshotMaxBytes: 24 * 1024 * 1024,
+    files: [{ path: `${project}/${sid}.jsonl`, raw: upper, hash: sha(upper) }],
+  });
+  const root = `/tmp/ocv5-296-upper-${randomBytes(4).toString("hex")}`;
+  mkdirSync(root, { mode: 0o700 });
+  const local = (step: BoxCcExecRequest) => {
+    const args = step.args.map((arg) => arg.replaceAll("/home/box/.claude/projects", root));
+    return spawnSync(step.command, args, {
+      cwd: step.cwd, env: step.environment, encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 60_000,
+    });
+  };
+  try {
+    for (const step of plan.requests) {
+      const result = local(step);
+      assert.equal(result.status, 0, result.stderr);
+    }
+    const published = readFileSync(`${root}/${cwd.replaceAll("/", "-")}/${sid}.jsonl`);
+    assert.equal(published.length, upper.length);
+    assert.equal(sha(published), sha(upper));
+  } finally {
+    const cleanup = local(plan.cleanup);
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+    rmSync(root, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("builder rejects unowned path and wrong digest before any Exec", () => {
   const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
   const raw = Buffer.from("x");

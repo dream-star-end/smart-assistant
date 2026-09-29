@@ -9,13 +9,19 @@ export const BOX_NATIVE_CONTEXT_MODEL = "box-api-claude-opus-5-5";
  */
 export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;
 
+/** Real gate fields. `kind` / `profile` are not on ModelAuthorityDecision. */
 export interface BoxNativeContextGate {
-  kind: string;
-  profile?: {
-    ccb?: {
-      contextOwner?: string;
-    };
-  };
+  authorityKind?: string | null;
+  /**
+   * Copied from a verified full authority envelope only.
+   * Null on lease-only: that credential does not carry capabilityProfile.
+   */
+  verifiedSignedContextOwner?: string | null;
+  descriptor?: {
+    canonicalModel?: string;
+    providerId?: string | null;
+    capabilityProfile?: { ccb?: { contextOwner?: string } };
+  } | null;
 }
 
 export interface BoxNativeContextRoute {
@@ -70,15 +76,48 @@ export function signedCcbCapability(input: {
 }
 
 /**
- * Read API for the later envelope gate. True only for a bridge-signed profile
- * that already carries the exact token and a box route. Does not read body or env.
+ * Budget grant. Issuance rules stay in `issueBoxNativeContextOwner`.
+ * Catalog declaration alone is not enough: the full authority envelope must
+ * have carried the same token. Lease-only leaves `verifiedSignedContextOwner`
+ * null and stays legacy. `routeReady` is the issuance constant, not
+ * `OC_BOX_MODEL_API`.
+ */
+export function verifiedBoxNativeContextOwner(input: {
+  authorityKind?: string | null;
+  routeKind?: string | null;
+  canonicalModel?: string | null;
+  providerId?: string | null;
+  declaredContextOwner?: string;
+  verifiedSignedContextOwner?: string | null;
+  routeReady: boolean;
+}): BoxNativeContextOwner | null {
+  if (input.authorityKind !== "bridge_signed") return null;
+  if (input.routeKind !== "box") return null;
+  if (input.verifiedSignedContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return null;
+  return issueBoxNativeContextOwner({
+    canonicalModel: input.canonicalModel ?? "",
+    providerId: input.providerId ?? null,
+    declared: input.declaredContextOwner,
+    routeReady: input.routeReady,
+  }) ?? null;
+}
+
+/**
+ * Read API aligned with ModelAuthorityDecision. Default `routeReady` is the
+ * production constant (false). Does not read body or env.
  */
 export function getBoxNativeContextOwner(
   gate: BoxNativeContextGate,
   route: BoxNativeContextRoute,
+  routeReady: boolean = BOX_NATIVE_CONTEXT_ROUTE_READY,
 ): BoxNativeContextOwner | null {
-  if (gate.kind !== "bridge_signed") return null;
-  if (gate.profile?.ccb?.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) return null;
-  if (route.kind !== "box") return null;
-  return BOX_NATIVE_CONTEXT_OWNER;
+  return verifiedBoxNativeContextOwner({
+    authorityKind: gate.authorityKind,
+    routeKind: route.kind,
+    canonicalModel: gate.descriptor?.canonicalModel,
+    providerId: gate.descriptor?.providerId,
+    declaredContextOwner: gate.descriptor?.capabilityProfile?.ccb?.contextOwner,
+    verifiedSignedContextOwner: gate.verifiedSignedContextOwner,
+    routeReady,
+  });
 }

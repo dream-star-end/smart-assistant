@@ -97,9 +97,9 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_UID,
   MAX_BODY_BYTES_DEFAULT,
   MAX_BODY_BYTES_HARD_CEILING,
+  PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
   PROXY_BYTE_BUDGET_LEGACY,
   proxyBodySchema,
-  budgetFromVerifiedGate,
   enforcePreAuthByteCeiling,
   enforceVerifiedProxyBudget,
   estimateInputTokens,
@@ -118,6 +118,7 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, verifiedBoxNativeContextOwner } from "./boxNativeContextOwner.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
 import { prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
@@ -833,15 +834,21 @@ export function makeAnthropicProxyHandler(
         : route.kind === "static"
           ? route.provider.supportsVision === true
           : route.kind !== "box";
-      // Box transport arming matches validateUpstreamConfig. Not a client header.
-      const serverRouteReady = route.kind === "box"
-        && process.env.OC_BOX_MODEL_API === "1"
-        && deps.boxModel !== undefined;
-      let byteBudget = PROXY_BYTE_BUDGET_LEGACY;
-      if (deferLegacyUntilVerifiedBox) {
-        byteBudget = budgetFromVerifiedGate(gate, route.kind, serverRouteReady);
-        if (rejectOverBudget(byteBudget)) return;
-      }
+      // Same ready bit issuance uses (default false). OC_BOX_MODEL_API only arms
+      // the transport; it does not prove the signed capability.
+      const contextOwner = verifiedBoxNativeContextOwner({
+        authorityKind: gate?.authorityKind,
+        routeKind: route.kind,
+        canonicalModel: gate?.descriptor.canonicalModel,
+        providerId: gate?.descriptor.providerId,
+        declaredContextOwner: gate?.descriptor.capabilityProfile.ccb.contextOwner,
+        verifiedSignedContextOwner: gate?.verifiedSignedContextOwner ?? null,
+        routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
+      });
+      const byteBudget = contextOwner === null
+        ? PROXY_BYTE_BUDGET_LEGACY
+        : PROXY_BYTE_BUDGET_BOX_NATIVE_V1;
+      if (deferLegacyUntilVerifiedBox && rejectOverBudget(byteBudget)) return;
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A
       // disabled Box launch flag does not erase already completed capsules.
