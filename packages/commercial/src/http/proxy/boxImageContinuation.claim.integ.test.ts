@@ -2,11 +2,16 @@
  * The second request is built from the original history, not from normalized output.
  * Loopback 55432 / openclaude_test only. */
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
 import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { prepareBoxContinuation } from "./boxPreparedContinuation.js";
+import { publishBoxToolResume } from "./boxToolResumePublish.js";
+import { BoxToolResultEcho } from "./boxToolResultEcho.js";
+import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash, hashBoxAssistantContent,
   hashBoxAssistantEchoContent, hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
@@ -309,5 +314,265 @@ test("TEMP authority mismatch and a second request id do not publish twice", asy
     outsider.release();
     await pool.end();
     await other.end();
+  }
+});
+
+test("raw image sibling publishes once, then final and a new user gain no second publish", async () => {
+  assert.match(url, /^postgres:\/\/test:test@127\.0\.0\.1:55432\/openclaude_test$/);
+  const pool = new Pool({ connectionString: url, max: 1 });
+  const client = await pool.connect();
+  const localNonce = randomBytes(12).toString("hex");
+  const runDir = `/tmp/ocv5-289-run-${localNonce}`;
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (
+      request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
+      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      error_msg text, failure_code text, final_credits bigint)`);
+    await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
+    const located = await client.query<{ nspname: string }>(
+      `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.oid IN (to_regclass('request_finalize_journal'), to_regclass('usage_records'))`);
+    assert.equal(located.rows.length, 2);
+    assert.ok(located.rows.every((row) => row.nspname.startsWith("pg_temp")));
+    const journal = new BoxDurableJournal({ connect: async () => ({
+      query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as never);
+    const hex = randomBytes(4).toString("hex");
+    const session = `imgfin-${hex}`;
+    const turn = randomBytes(32).toString("hex");
+    const owner = `ownf-${hex}`;
+    const child = `chf-${hex}`;
+    const grand = `grf-${hex}`;
+    const first = request(session, turn, originalBoundary());
+    const catalog = compileBoxToolCatalog(tools);
+    const assistant = firstAssistant();
+    const handoff = { version: 1, roundNo: 1, messageId: `msg_${hex}`,
+      assistantContentHash: hashBoxAssistantContent(assistant),
+      assistantNoCallerHash: hashBoxAssistantNoCallerContent(assistant),
+      assistantEchoHash: hashBoxAssistantEchoContent(assistant), spoolOffset: 8,
+      detachedRunnerHash: runner, catalogHash: catalog.bindingSha256,
+      toolUses: [
+        { id: "toolu_img_claim", boxName: "mcp__ocbridge__t0", clientName: "Read",
+          inputHash: hashBoxToolInput({ file_path: "a.png" }) },
+        { id: "toolu_note_claim", boxName: "mcp__ocbridge__t1", clientName: "Note",
+          inputHash: hashBoxToolInput({ file_path: "a.md" }) },
+      ],
+      verifiedPendingToolUseIds: ["toolu_img_claim", "toolu_note_claim"],
+      usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    const pricing = { v: 1, modelId: model, displayName: "Opus", inputPerMtok: "1",
+      outputPerMtok: "1", cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" };
+    const billing = { v: 1, sessionId: session, mode: "chat", parentSessionId: null,
+      delegateAgentId: null, turnKey: turn, parentTurnKey: null, authority: null,
+      dispatchId: null, attemptNo: null, verificationSponsorship: null, apiKeyId: null };
+    const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: model, rawBody: first,
+      authorityKind: "local_catalog", authorityTurnId: null });
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'committed',$2::jsonb)`, [owner, JSON.stringify({ model,
+      boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool", boxAccountId: "20",
+      boxRunNonce: localNonce, boxLeaseEpoch: epoch,
+      boxContextHash: prepared.priorContextHash, boxHandoffRevision: "rev-1",
+      boxToolHandoff: handoff, boxState: "handoff", boxSessionId: session, boxTurnKey: turn,
+      billingPricing: pricing, boxBillingContext: billing,
+      boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      boxNativeCliCwd: runDir })]);
+    const childBasis = { model, boxInvocationRecovery: "v1", billingPricing: pricing,
+      boxBillingContext: billing };
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [child, JSON.stringify(childBasis)]);
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    for (const [id, name, args] of [
+      ["toolu_img_claim", "t0", { file_path: "a.png" }],
+      ["toolu_note_claim", "t1", { file_path: "a.md" }],
+    ] as const) {
+      writeFileSync(`${runDir}/pending.${id}.json`, JSON.stringify({
+        version: 1, modelToolUseId: id, mcpRequestId: 1, name, arguments: args }), { mode: 0o600 });
+    }
+    let finishes = 0;
+    const published = await publishBoxToolResume({
+      uid: 3n, sessionId: session, requestId: child, canonicalModel: model, canonicalBody: first,
+      upstreamModel: "claude-opus-5-5", url: BOX_INTERNAL_ENDPOINT,
+      init: { method: "POST", body: JSON.stringify({ ...first, model: "claude-opus-5-5" }) },
+      prepared,
+    }, { journal, resolveTarget: async () => ({ accountId: 20n, exec: { run: async (command: {
+      command: string; args: string[]; cwd: string; environment?: Record<string, string> }) => {
+      if (command.command !== "/usr/bin/python3" || command.args[0] !== "-I") {
+        throw new Error("BOX_TEST_EXEC_NOT_PYTHON");
+      }
+      const ran = spawnSync(command.command, command.args, { cwd: command.cwd,
+        env: { ...process.env, ...command.environment }, encoding: "utf8", timeout: 5000 });
+      if (ran.status !== 0) throw new Error(ran.stderr || "python plan failed");
+      if (command.args.some((arg) => arg.includes("os.link("))) finishes += 1;
+      return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""),
+        exitCode: 0 as const };
+    } } }) as never,
+      retainUnknownTarget: () => { throw new Error("owner must not be marked unknown"); },
+      onUnknown: async () => { throw new Error("owner must not be marked unknown"); } });
+    assert.equal(finishes, 2);
+    assert.equal(published.claim.nativeSessionId, "12345678-1234-4123-8123-123456789abc");
+    const imageFile = JSON.parse(readFileSync(`${runDir}/result.toolu_img_claim.json`, "utf8")) as {
+      modelToolUseId: string; content: Array<{ type: string; text?: string; data?: string }>; isError: boolean };
+    assert.equal(imageFile.modelToolUseId, "toolu_img_claim");
+    assert.equal(imageFile.content.some((part) => part.text === caption), true);
+    const imageHash = createHash("sha256").update(JSON.stringify({
+      content: imageFile.content, isError: false })).digest("hex");
+    const echo = new BoxToolResultEcho([{ modelToolUseId: "toolu_img_claim", contentHash: imageHash, isError: false }]);
+    echo.accept({ type: "user", message: { role: "user", content: [{ type: "tool_result",
+      tool_use_id: "toolu_img_claim", content: imageFile.content.map((part) => part.type === "text"
+        ? { type: "text", text: part.text } : { type: "image", source: { type: "base64",
+          media_type: "image/png", data: part.data } }) }] } });
+    echo.assertComplete();
+    const rawStill = JSON.stringify(first.messages);
+    assert.equal(rawStill.includes(caption), true, "publish must not normalize the client history");
+    const secondAssistant = [{ type: "tool_use", id: "toolu_next_claim", name: "Note",
+      input: { file_path: "b.md" } }];
+    const second = request(session, turn, [
+      ...originalBoundary(),
+      { role: "assistant", content: secondAssistant },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_next_claim",
+        content: "next-bytes" }] },
+      budget(90),
+    ]);
+    assert.equal(JSON.stringify(second.messages).includes(caption), true);
+    assert.equal(deriveBoxContextHash(second, true), deriveBoxContextHash(first));
+    await journal.recordToolHandoff({ requestId: child, uid: 3n, leaseEpoch: epoch,
+      roundNo: 2, spoolOffset: 16, detachedRunnerHash: runner, catalogHash: catalog.bindingSha256,
+      verifiedPendingToolUseIds: ["toolu_next_claim"],
+      candidate: { messageId: `msg2_${hex}`, toolUses: [{ id: "toolu_next_claim",
+        boxName: "mcp__ocbridge__t1", clientName: "Note", input: { file_path: "b.md" } }],
+        assistantContentHash: hashBoxAssistantContent(secondAssistant),
+        assistantNoCallerHash: hashBoxAssistantNoCallerContent(secondAssistant),
+        assistantEchoHash: hashBoxAssistantEchoContent(secondAssistant),
+        inputTokens: 2, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [grand, JSON.stringify(childBasis)]);
+    const nextPrepared = prepareBoxContinuation({ uid: 3n, canonicalModel: model, rawBody: second,
+      authorityKind: "local_catalog", authorityTurnId: null });
+    const next = await journal.claimToolResume({ requestId: grand, uid: 3n, canonicalModel: model,
+      canonicalBody: second, prepared: nextPrepared });
+    assert.equal(next.ownerRequestId, child);
+    assert.equal(JSON.stringify(second.messages).includes(caption), true, "next claim does not backfill normalize");
+    await journal.completeToolChain({ requestId: grand, uid: 3n, leaseEpoch: epoch,
+      proof: { runNonce: localNonce, leaseEpoch: epoch, keeperPid: 1, cliPid: 2,
+        reason: "worker_complete", revision: 1 },
+      usage: { inputTokens: 3, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    const terminal = await client.query<{ state: string }>(
+      "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
+    assert.equal(terminal.rows[0]?.state, "terminal");
+    const ordinary = request(session, turn, [
+      ...originalBoundary(),
+      { role: "user", content: "thanks, the caption stayed" },
+    ]);
+    const fresh = prepareBoxContinuation({ uid: 3n, canonicalModel: model, rawBody: ordinary,
+      authorityKind: "local_catalog", authorityTurnId: null });
+    assert.equal(fresh.classification, "fresh");
+    const filesBefore = readdirSync(runDir).filter((name) => name.startsWith("result.")).sort();
+    const rebuilt = new BoxDurableJournal({ connect: async () => ({
+      query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as never);
+    assert.equal(rebuilt instanceof BoxDurableJournal, true);
+    assert.notEqual(rebuilt, journal, "a new Journal object is not an OS restart");
+    const again = await rebuilt.decideToolResume({ requestId: `new-${hex}`, uid: 3n,
+      canonicalModel: model, canonicalBody: first, prepared });
+    assert.notEqual(again.kind, "new_claim");
+    assert.deepEqual(readdirSync(runDir).filter((name) => name.startsWith("result.")).sort(), filesBefore);
+    const ownerAfter = await client.query<{ state: string }>(
+      "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
+    assert.equal(ownerAfter.rows[0]?.state, "terminal");
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+    client.release();
+    await pool.end();
+  }
+});
+
+test("commit failure, lost ack, and a rebuilt journal do not gain a publish", async () => {
+  assert.match(url, /^postgres:\/\/test:test@127\.0\.0\.1:55432\/openclaude_test$/);
+  const pool = new Pool({ connectionString: url, max: 1 });
+  const client = await pool.connect();
+  const localNonce = randomBytes(12).toString("hex");
+  const runDir = `/tmp/ocv5-289-run-${localNonce}`;
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (
+      request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
+      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
+    await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
+    const journal = new BoxDurableJournal({ connect: async () => ({
+      query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as never);
+    const hex = randomBytes(3).toString("hex");
+    const session = `fail-${hex}`;
+    const turn = randomBytes(32).toString("hex");
+    const first = request(session, turn, originalBoundary());
+    const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: model, rawBody: first,
+      authorityKind: "local_catalog", authorityTurnId: null });
+    const catalog = compileBoxToolCatalog(tools);
+    const assistant = firstAssistant();
+    const handoff = { version: 1, roundNo: 1, messageId: `msg_${hex}`,
+      assistantContentHash: hashBoxAssistantContent(assistant),
+      assistantNoCallerHash: hashBoxAssistantNoCallerContent(assistant),
+      assistantEchoHash: hashBoxAssistantEchoContent(assistant), spoolOffset: 8,
+      detachedRunnerHash: runner, catalogHash: catalog.bindingSha256,
+      toolUses: [
+        { id: "toolu_img_claim", boxName: "mcp__ocbridge__t0", clientName: "Read",
+          inputHash: hashBoxToolInput({ file_path: "a.png" }) },
+        { id: "toolu_note_claim", boxName: "mcp__ocbridge__t1", clientName: "Note",
+          inputHash: hashBoxToolInput({ file_path: "a.md" }) },
+      ],
+      verifiedPendingToolUseIds: ["toolu_img_claim", "toolu_note_claim"],
+      usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    const pricing = { v: 1, modelId: model, displayName: "Opus", inputPerMtok: "1",
+      outputPerMtok: "1", cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" };
+    const billing = { v: 1, sessionId: session, mode: "chat", parentSessionId: null,
+      delegateAgentId: null, turnKey: turn, parentTurnKey: null, authority: null,
+      dispatchId: null, attemptNo: null, verificationSponsorship: null, apiKeyId: null };
+    const owner = `ownx-${hex}`;
+    const child = `chx-${hex}`;
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'committed',$2::jsonb)`, [owner, JSON.stringify({ model,
+      boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool", boxAccountId: "20",
+      boxRunNonce: localNonce, boxLeaseEpoch: epoch, boxContextHash: prepared.priorContextHash,
+      boxHandoffRevision: "rev-1", boxToolHandoff: handoff, boxState: "handoff",
+      boxSessionId: session, boxTurnKey: turn, billingPricing: pricing, boxBillingContext: billing,
+      boxNativeSessionId: "12345678-1234-4123-8123-123456789abc", boxNativeCliCwd: runDir })]);
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [child, JSON.stringify({ model,
+      boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing })]);
+    journal.resumeLookupBarrier = async () => { throw new Error("COMMIT_BEFORE_FAILURE"); };
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    await assert.rejects(() => journal.decideToolResume({ requestId: child, uid: 3n,
+      canonicalModel: model, canonicalBody: first, prepared }), /COMMIT_BEFORE_FAILURE/);
+    assert.equal(readdirSync(runDir).filter((name) => name.startsWith("result.")).length, 0);
+    const rolled = await client.query<{ state: string }>(
+      "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
+    assert.equal(rolled.rows[0]?.state, "handoff");
+    journal.resumeLookupBarrier = null;
+    const claimed = await journal.decideToolResume({ requestId: child, uid: 3n,
+      canonicalModel: model, canonicalBody: first, prepared });
+    assert.equal(claimed.kind, "new_claim");
+    assert.equal(readdirSync(runDir).filter((name) => name.startsWith("result.")).length, 0,
+      "a committed claim without a publisher call writes no file");
+    const rebuilt = new BoxDurableJournal({ connect: async () => ({
+      query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as never);
+    const rival = `rival-${hex}`;
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [rival, JSON.stringify({ model,
+      boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing })]);
+    const lostAck = await rebuilt.decideToolResume({ requestId: rival, uid: 3n,
+      canonicalModel: model, canonicalBody: first, prepared });
+    assert.equal(lostAck.kind, "in_progress_or_unknown");
+    assert.notEqual(process.pid, 0);
+    const ownerState = await client.query<{ state: string }>(
+      "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
+    assert.equal(ownerState.rows[0]?.state, "resuming");
+    const exploding = new BoxDurableJournal({ connect: async () => ({
+      query: async () => { throw new Error("relation exploded"); }, release() {} }),
+      query: async () => { throw new Error("relation exploded"); } } as never);
+    await assert.rejects(() => exploding.decideToolResume({ requestId: rival, uid: 3n,
+      canonicalModel: model, canonicalBody: first, prepared }), /relation exploded/);
+  } finally {
+    rmSync(runDir, { recursive: true, force: true });
+    client.release();
+    await pool.end();
   }
 });

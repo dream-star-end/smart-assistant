@@ -588,6 +588,62 @@ function provePrepared(api: Api): void {
   if (publishes !== 1) fail("DUPLICATE_PUBLISH");
 }
 
+async function provePublisher(): Promise<void> {
+  const publishMod = await import(pathToFileURL(join(PROXY, "boxToolResumePublish.ts")).href);
+  const hashMod = await import(pathToFileURL(join(PROXY, "boxToolInputHash.ts")).href);
+  const nonce = publishDir.slice("/tmp/ocv5-289-run-".length);
+  const id = "toolu_pub_once";
+  const text = "b1-once";
+  writeFileSync(`${publishDir}/pending.${id}.json`, JSON.stringify({
+    version: 1, modelToolUseId: id, mcpRequestId: 3, name: "t0",
+    arguments: { value: "ping" } }), { mode: 0o600 });
+  const content = [{ type: "text", text }];
+  const contentHash = createHash("sha256").update(JSON.stringify({ content, isError: false })).digest("hex");
+  const canonicalBody = { model: "box-api-claude-opus-5-5", max_tokens: 64, stream: true,
+    tools: [{ name: "local_echo", description: "synthetic",
+      input_schema: { type: "object", properties: { value: { type: "string" } } } }],
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id, name: "local_echo", input: { value: "ping" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] },
+    ], metadata: { user_id: JSON.stringify({ session_id: "b1-publish", oc_turn_key: "a".repeat(64) }) } };
+  let finishes = 0;
+  const claim = { ownerRequestId: "box-owner", accountId: 20n, runNonce: nonce,
+    leaseEpoch: "b".repeat(32), spoolOffset: 8, roundNo: 2, detachedRunnerHash: "c".repeat(64),
+    catalogHash: "d".repeat(64), durableRevision: "b1-publish",
+    toolUses: [{ id, boxName: "mcp__ocbridge__t0", clientName: "local_echo",
+      inputHash: hashMod.hashBoxToolInput({ value: "ping" }) }],
+    results: [{ modelToolUseId: id, content, isError: false, contentHash }] };
+  const exec = { run: async (request: { command: string; args: string[]; cwd: string;
+    environment?: Record<string, string> }) => {
+    if (request.command !== "/usr/bin/python3") fail("DUPLICATE_PUBLISH");
+    const ran = spawnSync(request.command, request.args, { cwd: request.cwd,
+      env: { ...process.env, ...request.environment }, encoding: "utf8", timeout: 5000 });
+    if (ran.status === 0 && request.args.some((arg) => typeof arg === "string" && arg.includes("os.link("))) {
+      finishes += 1;
+    }
+    if (ran.status !== 0) fail("DUPLICATE_PUBLISH");
+    return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""), exitCode: 0 as const };
+  } };
+  try {
+    await publishMod.publishBoxToolResume({
+      uid: 3n, sessionId: "b1-publish", requestId: "box-next", canonicalModel: canonicalBody.model,
+      canonicalBody, upstreamModel: "claude-opus-5-5",
+      url: "box-cli://messages", init: { method: "POST", body: JSON.stringify({ ...canonicalBody,
+        model: "claude-opus-5-5" }) },
+    }, { journal: { claimToolResume: async () => claim, markUnknown: async () => fail("DUPLICATE_PUBLISH"),
+      decideToolResume: async () => ({ kind: "new_claim", claim }) },
+      resolveTarget: async () => ({ accountId: 20n, exec }),
+      retainUnknownTarget: () => fail("DUPLICATE_PUBLISH"),
+      onUnknown: async () => fail("DUPLICATE_PUBLISH") });
+  } catch {
+    fail("DUPLICATE_PUBLISH");
+  }
+  const file = JSON.parse(readFileSync(`${publishDir}/result.${id}.json`, "utf8")) as {
+    modelToolUseId?: string; content?: Array<{ text?: string }> };
+  if (file.modelToolUseId !== id || file.content?.[0]?.text !== text) fail("DUPLICATE_PUBLISH");
+  if (finishes !== 1) fail("DUPLICATE_PUBLISH");
+}
+
 function imageFixture(): { oracle: ImageOracle; png: string } {
   const raw = readFileSync(IMAGE_FILE);
   const oracle = JSON.parse(readFileSync(ORACLE_FILE, "utf8")) as ImageOracle;
@@ -870,16 +926,17 @@ async function workerMain(expectSha: string): Promise<void> {
   const after = digest();
   if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
   checks(api);
+  await provePublisher();
   const end = digest();
   if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");
   const runtime = before.filter((item) => item.path.startsWith(`packages${sep}commercial${sep}src${sep}http${sep}proxy${sep}`));
-  console.log(JSON.stringify({
+  process.stdout.write(`${JSON.stringify({
     ok: true, wired: true, receipt: RECEIPT, expectSha, candidate: CANDIDATE, git,
     runtimeModules: runtime.length, modules: before.length, digest: before,
     node: process.version, execPath: realpathSync(process.execPath),
     homeIsolated: process.env.HOME === join(scratch, "home"),
     database: process.env.DATABASE_URL !== undefined,
-  }));
+  })}\n`);
 }
 
 async function entry(): Promise<void> {

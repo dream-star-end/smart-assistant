@@ -72,6 +72,7 @@ export function isContinuationConflict(code: string): boolean {
     || code === "BOX_TOOL_CATALOG_CHANGED"
     || code === "BOX_TOOL_ASSISTANT_CHANGED"
     || code === "BOX_TOOL_RESUME_FENCE_LOST"
+    || code === "BOX_TOOL_OWNER_UNKNOWN"
     || code === "BOX_CACHE_ANNOTATION_INVALID";
 }
 

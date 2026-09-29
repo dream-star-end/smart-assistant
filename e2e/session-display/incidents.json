@@ -4989,6 +4989,26 @@
           "assertion": "continuation conflict is 409 from core and does not insert usage"
         },
         {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "two HTTP requests race one handoff through the proxy and publish once"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "real replay identity rejects before settle and consumes one committed capsule"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "raw image sibling publishes once, then final and a new user gain no second publish"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "commit failure, lost ack, and a rebuilt journal do not gain a publish"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "prepared route, authority, and single publish"

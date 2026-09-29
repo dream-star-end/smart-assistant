@@ -1,18 +1,18 @@
-/** Two real sessions race one handoff. pg_temp is invisible across connections,
- * so this uses the same private-schema fixture as boxToolSuccessRecovery.integ,
- * never a public business table. Loopback 55432 / openclaude_test only.
+/** Publisher-level race, not two HTTP requests. pg_temp is invisible across
+ * connections, so this uses the reviewed private-schema fixture. The exec
+ * adapter runs the real Python plan. Loopback 55432 / openclaude_test only.
  */
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { Pool } from "pg";
 import { BoxDurableJournal } from "./boxDurableJournal.js";
 import { prepareBoxContinuation } from "./boxPreparedContinuation.js";
 import { publishBoxToolResume } from "./boxToolResumePublish.js";
 import { BoxContinuationDecisionError } from "./boxPreparedContinuation.js";
+import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
 import { hashBoxToolInput } from "./boxToolInputHash.js";
@@ -46,7 +46,7 @@ test("two concurrent journal claims publish one local file and add no usage row"
   const schema = `ocv5_294_race_${randomBytes(4).toString("hex")}`;
   const client = await admin.connect();
   const raw = new Pool({ connectionString: url, max: 2 });
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-294-race-"));
+  const runDir = `/tmp/ocv5-289-run-${nonce}`;
   try {
     const where = await client.query<{ db: string; port: number }>(
       "SELECT current_database() AS db, inet_server_port() AS port");
@@ -128,16 +128,23 @@ test("two concurrent journal claims publish one local file and add no usage row"
       held = true;
       await hold;
     };
-    let writes = 0;
-    const target = { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
-      const args = request.args;
-      if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
-        return { stdout: JSON.stringify({ version: 1, modelToolUseId: toolId, mcpRequestId: 1,
-          name: "t0", arguments: { file_path: "a.txt" } }), stderrBytes: 0, exitCode: 0 as const };
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    writeFileSync(`${runDir}/pending.${toolId}.json`, JSON.stringify({
+      version: 1, modelToolUseId: toolId, mcpRequestId: 1, name: "t0",
+      arguments: { file_path: "a.txt" } }), { mode: 0o600 });
+    let dispatches = 0;
+    const target = { accountId: 20n, exec: { run: async (request: {
+      command: string; args: string[]; cwd: string; environment?: Record<string, string> }) => {
+      if (request.command !== "/usr/bin/python3" || request.args[0] !== "-I") {
+        throw new Error("BOX_TEST_EXEC_NOT_PYTHON");
       }
-      writes += 1;
-      writeFileSync(join(dir, `result-${writes}.json`), args.at(-1) ?? "written");
-      return { stdout: `${args.at(-1) ?? "written"}\n`, stderrBytes: 0, exitCode: 0 as const };
+      dispatches += 1;
+      const ran = spawnSync(request.command, request.args, {
+        cwd: request.cwd, env: { ...process.env, ...request.environment },
+        encoding: "utf8", timeout: 5000 });
+      if (ran.status !== 0) throw new Error(ran.stderr || "python plan failed");
+      return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""),
+        exitCode: 0 as const };
     } } };
     const publish = (requestId: string) => publishBoxToolResume({
       uid: 3n, sessionId: session, requestId, canonicalModel: model, canonicalBody: request,
@@ -167,8 +174,20 @@ test("two concurrent journal claims publish one local file and add no usage row"
     const error = (lost[0] as PromiseRejectedResult).reason;
     assert.equal(error instanceof BoxContinuationDecisionError, true);
     assert.equal(error.decision, "in_progress_or_unknown");
-    assert.ok(writes >= 1);
-    assert.equal(readdirSync(dir).length, writes);
+    const resultFiles = readdirSync(runDir).filter((name) => name.startsWith("result."));
+    assert.deepEqual(resultFiles, [`result.${toolId}.json`]);
+    const published = JSON.parse(readFileSync(`${runDir}/result.${toolId}.json`, "utf8")) as {
+      modelToolUseId: string; content: Array<{ type: string; text: string }>; isError: boolean };
+    assert.equal(published.modelToolUseId, toolId);
+    assert.equal(published.isError, false);
+    assert.equal(published.content[0]?.text, "bytes");
+    const contentHash = createHash("sha256").update(JSON.stringify({
+      content: published.content, isError: false })).digest("hex");
+    const echo = new BoxToolResultEcho([{ modelToolUseId: toolId, contentHash, isError: false }]);
+    echo.accept({ type: "user", message: { role: "user", content: [{
+      type: "tool_result", tool_use_id: toolId, content: "bytes" }] } });
+    echo.assertComplete();
+    assert.ok(dispatches >= 2, "pending read plus the plan write");
     const states = await client.query<{ id: string; state: string | null }>(
       `SELECT request_id AS id, ctx->>'boxState' AS state FROM request_finalize_journal
         WHERE request_id = ANY($1::text[]) ORDER BY request_id`, [[owner, childA, childB]]);
@@ -184,7 +203,8 @@ test("two concurrent journal claims publish one local file and add no usage row"
       canonicalModel: model, canonicalBody: request, prepared,
       trustedAuthority: prepared.authority });
     assert.equal(again.kind, "in_progress_or_unknown");
-    assert.equal(readdirSync(dir).length, writes, "restart does not publish another file");
+    assert.deepEqual(readdirSync(runDir).filter((name) => name.startsWith("result.")),
+      [`result.${toolId}.json`], "restart does not publish another file");
     const ownerAfter = await client.query<{ state: string }>(
       "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
     assert.equal(ownerAfter.rows[0]?.state, "resuming");
@@ -201,6 +221,6 @@ test("two concurrent journal claims publish one local file and add no usage row"
     client.release();
     await admin.end();
     await raw.end();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(runDir, { recursive: true, force: true });
   }
 });

@@ -4,7 +4,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,15 +39,41 @@ function loader(): { cmd: string; args: string[] } {
 }
 function stage(mutate?: (source: string) => string): string {
   const dir = mkdtempSync(join(tmpdir(), "ocv5-b1-archive-"));
-  for (const name of PROXY_FILES) {
+  for (const name of readdirSync(join(SOURCE, "packages/commercial/src/http/proxy"))) {
+    if (!name.endsWith(".ts") || name.endsWith(".test.ts")) continue;
     const rel = join("packages/commercial/src/http/proxy", name);
     mkdirSync(dirname(join(dir, rel)), { recursive: true });
     copyFileSync(join(SOURCE, rel), join(dir, rel));
+  }
+  const modules = join(dir, "node_modules/@openclaude");
+  mkdirSync(modules, { recursive: true });
+  const linked = join(SOURCE, "node_modules/@openclaude");
+  if (existsSync(linked)) {
+    for (const name of readdirSync(linked)) {
+      const target = join(linked, name);
+      symlinkSync(lstatSync(target).isSymbolicLink() ? realpathSync(target) : target, join(modules, name));
+    }
   }
   for (const rel of [...SCRIPT_FILES, ...FIXTURE_FILES]) {
     mkdirSync(dirname(join(dir, rel)), { recursive: true });
     copyFileSync(join(SOURCE, rel), join(dir, rel));
   }
+  // Publisher imports upstream, which imports commercial siblings. Symlink
+  // those real files; copied proxy sources stay the staged mutations.
+  const linkUnder = (rel: string): void => {
+    const source = join(SOURCE, rel);
+    const dest = join(dir, rel);
+    if (!existsSync(source) || existsSync(dest)) {
+      if (existsSync(source) && existsSync(dest) && lstatSync(source).isDirectory()
+        && !lstatSync(dest).isSymbolicLink()) {
+        for (const name of readdirSync(source)) linkUnder(join(rel, name));
+      }
+      return;
+    }
+    mkdirSync(dirname(dest), { recursive: true });
+    symlinkSync(source, dest);
+  };
+  linkUnder("packages/commercial/src");
   if (mutate) {
     const target = join(dir, "packages/commercial/src/http/proxy/boxCacheAnnotations.ts");
     writeFileSync(target, mutate(readFileSync(target, "utf8")));
@@ -525,9 +551,9 @@ test("wrong route, authority bypass, and duplicate publish are business-red", ()
       from: "  if (left.kind === \"malformed\" || right.kind === \"malformed\") {",
       to: "  return { ok: true };\n  if (left.kind === \"malformed\" || right.kind === \"malformed\") {",
       expect: /AUTHORITY_BYPASS/ },
-    { file: "boxPreparedContinuation.ts",
-      from: 'return decision.kind === "new_claim";',
-      to: "return true;",
+    { file: "boxToolResumePublish.ts",
+      from: "for (let j = 0; j < staged.requests.length; j++) {",
+      to: "for (let pass = 0; pass < 2; pass += 1) for (let j = 0; j < staged.requests.length; j++) {",
       expect: /DUPLICATE_PUBLISH/ },
   ];
   for (const fault of faults) {
