@@ -1720,6 +1720,7 @@ async function* queryModel(
     const contextManagement = boxNativeRemoteContextOwnsHistory({
       model: options.model,
       querySource: options.querySource,
+      messages,
     })
       ? undefined
       : getAPIContextManagement({ hasThinking })
