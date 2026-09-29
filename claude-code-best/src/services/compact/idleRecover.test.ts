@@ -121,6 +121,38 @@ test('three crash cuts keep one summary and the same tail', async () => {
   assert.equal(calls, 1)
 })
 
+test('a long outer transcript keeps a bounded tail and the trailing tool pair', () => {
+  const prefix = Array.from({ length: 8 }, (_, index) => ({
+    type: 'user' as const,
+    uuid: `old-${index}`,
+    message: { role: 'user', content: `old-${index}`.padEnd(200_000, 'x') },
+  }))
+  const tool = {
+    type: 'assistant' as const,
+    uuid: 'keep-tool',
+    message: { role: 'assistant', content: [
+      { type: 'text', text: 'reading' },
+      { type: 'tool_use', id: 'toolu_keep', name: 'Read', input: { file_path: 'a.ts' } },
+    ] },
+  }
+  const image = {
+    type: 'user' as const,
+    uuid: 'keep-image',
+    message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'toolu_keep', content: 'file body' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aaaa' } },
+    ] },
+  }
+  const input = [...prefix, tool, image]
+  const preserved = selectIdlePreserve(input as never)
+  const keptBytes = JSON.stringify(preserved.tail).length
+  assert.ok(keptBytes < JSON.stringify(input).length / 2)
+  assert.equal(preserved.tail.some((item) => item.uuid === 'old-0'), false)
+  assert.equal(preserved.tail.some((item) => item.uuid === 'keep-tool'), true)
+  assert.equal(preserved.tail.some((item) => item.uuid === 'keep-image'), true)
+  assert.equal(JSON.stringify(preserved.tail).includes('aaaa'), true)
+})
+
 test('a second idle in the same session is not hidden by the finished file', () => {
   const home = join(tmpdir(), `idle-twice-${process.pid}`)
   const first: IdleNativeFile = {

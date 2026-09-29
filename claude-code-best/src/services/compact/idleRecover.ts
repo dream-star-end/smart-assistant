@@ -7,13 +7,33 @@ import { join } from 'node:path'
 import type { UUID } from 'crypto'
 import type { Message, UserMessage } from '../../types/message.js'
 import type { CompactionResult } from './compact.js'
+import { groupMessagesByApiRound } from './grouping.js'
 
 export const IDLE_COMPACT_INSTRUCTIONS =
   'preserve the user goal, decisions, constraints, current work, files, errors, and next steps'
 
 /** Outer transcript size, not the inner leaf's post-compact token count. */
+export const IDLE_OUTER_TOKEN_FLOOR = 167_000
+/** Same budget as session-memory tail retention. String bodies count. */
+const IDLE_TAIL_MAX_TOKENS = 40_000
+const IDLE_TAIL_MIN_TOKENS = 10_000
+const IDLE_TAIL_MIN_TEXT = 5
+
 export function outerHistoryNeedsCompact(messages: readonly unknown[]): boolean {
-  return JSON.stringify(messages).length / 4 >= 167_000
+  return JSON.stringify(messages).length / 4 >= IDLE_OUTER_TOKEN_FLOOR
+}
+
+export function trustedIdleOpId(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.CLAUDE_CODE_EXTRA_METADATA
+  if (!raw) return undefined
+  try {
+    const parsed = JSON.parse(raw) as { oc_turn_key?: unknown }
+    return typeof parsed.oc_turn_key === 'string' && /^[0-9a-f]{64}$/.test(parsed.oc_turn_key)
+      ? parsed.oc_turn_key
+      : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export interface IdleFrozenTail {
@@ -37,6 +57,8 @@ export interface IdleNativeFile {
   modelStarted?: boolean
   /** Loader receipt stored. The file stays readable; it is not the active op. */
   applied?: boolean
+  /** Digest of the post-compact projection this process wrote. */
+  artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleFrozenAttachment[]
 }
@@ -139,32 +161,102 @@ function cloneMessage(message: Message): Message {
   return JSON.parse(JSON.stringify(message)) as Message
 }
 
-/** Keep real messages. Attachments stay attachments. Nothing is reduced to text. */
+function messageTokens(message: Message): number {
+  return Math.max(1, Math.ceil(JSON.stringify(message).length / 4))
+}
+
+function blockIds(message: Message, kind: 'tool_use' | 'tool_result'): string[] {
+  const content = (message as UserMessage).message?.content
+  if (!Array.isArray(content)) return []
+  return content.flatMap((block) => {
+    const row = block as { type?: string; id?: string; tool_use_id?: string }
+    if (kind === 'tool_use' && row.type === 'tool_use' && row.id) return [row.id]
+    if (kind === 'tool_result' && row.type === 'tool_result' && row.tool_use_id) return [row.tool_use_id]
+    return []
+  })
+}
+
+/** Complete tool groups, then single messages. A result stays with its tool_use.
+ *  A long user prefix stays splittable so pairing cannot copy it all back. */
+function atomicGroups(messages: readonly Message[]): Message[][] {
+  const rounds = groupMessagesByApiRound([...messages])
+  const groups: Message[][] = []
+  const open = new Map<string, number>()
+  for (const round of rounds) {
+    const roundTokens = round.reduce((sum, message) => sum + messageTokens(message), 0)
+    if (roundTokens <= IDLE_TAIL_MAX_TOKENS) {
+      groups.push(round)
+      continue
+    }
+    for (const message of round) {
+      const joined = blockIds(message, 'tool_result')
+        .map((id) => open.get(id))
+        .find((index) => index !== undefined)
+      if (joined !== undefined) {
+        groups[joined]!.push(message)
+        continue
+      }
+      groups.push([message])
+      const index = groups.length - 1
+      for (const id of blockIds(message, 'tool_use')) open.set(id, index)
+    }
+  }
+  return groups
+}
+
+function boundedTail(messages: readonly Message[]): Message[] {
+  const groups = atomicGroups(messages)
+  const kept: Message[][] = []
+  let tokens = 0
+  let textCount = 0
+  for (let index = groups.length - 1; index >= 0; index--) {
+    const group = groups[index]!
+    const groupTokens = group.reduce((sum, message) => sum + messageTokens(message), 0)
+    if (kept.length > 0 && tokens >= IDLE_TAIL_MAX_TOKENS) break
+    if (kept.length > 0 && tokens + groupTokens > IDLE_TAIL_MAX_TOKENS
+      && tokens >= IDLE_TAIL_MIN_TOKENS && textCount >= IDLE_TAIL_MIN_TEXT) break
+    kept.unshift(group)
+    tokens += groupTokens
+    textCount += group.filter((message) => messageText(message).length > 0).length
+    if (tokens >= IDLE_TAIL_MAX_TOKENS) break
+    if (tokens >= IDLE_TAIL_MIN_TOKENS && textCount >= IDLE_TAIL_MIN_TEXT) break
+  }
+  return kept.flat()
+}
+
+/** Keep a bounded tail and the attachments that belong to it.
+ *  Parents already on disk are not rewritten. */
 export function selectIdlePreserve(messages: readonly Message[]): {
   tail: IdleFrozenTail[]
   attachments: IdleFrozenAttachment[]
 } {
-  const attachments = messages.filter((message) => message.type === 'attachment').map((message) => ({
-    uuid: message.uuid,
-    message: cloneMessage(message),
-  }))
-  const conversational = messages.filter((message) => {
-    if (message.type !== 'user' && message.type !== 'assistant') return false
+  const conversational: Array<{ index: number; message: Message }> = []
+  const attachmentRows: Array<{ index: number; message: Message }> = []
+  messages.forEach((message, index) => {
+    if (message.type === 'attachment') {
+      attachmentRows.push({ index, message })
+      return
+    }
+    if (message.type !== 'user' && message.type !== 'assistant') return
     const text = messageText(message)
-    return !text.startsWith('/compact') && !text.startsWith(IDLE_COMPACT_INSTRUCTIONS)
+    if (text.startsWith('/compact') || text.startsWith(IDLE_COMPACT_INSTRUCTIONS)) return
+    conversational.push({ index, message })
   })
-  let previous: string | null = null
-  const tail = conversational.map((message) => {
+  const kept = boundedTail(conversational.map((row) => row.message))
+  const keptIds = new Set(kept.map((message) => message.uuid))
+  const first = conversational.find((row) => keptIds.has(row.message.uuid))
+  const start = first?.index ?? Number.POSITIVE_INFINITY
+  const tail = kept.map((message) => {
     const copy = cloneMessage(message)
-    const parent = (copy as { parentUuid?: string | null }).parentUuid
-    if (!parent && previous) (copy as { parentUuid?: string | null }).parentUuid = previous
-    previous = copy.uuid
     return {
       uuid: copy.uuid,
       parentUuid: (copy as { parentUuid?: string | null }).parentUuid ?? null,
       message: copy,
     }
   })
+  const attachments = attachmentRows
+    .filter((row) => row.index >= start)
+    .map((row) => ({ uuid: row.message.uuid, message: cloneMessage(row.message) }))
   return { tail, attachments }
 }
 
@@ -172,12 +264,25 @@ function userMessage(uuid: string, text: string, summary = false): UserMessage {
   return {
     type: 'user',
     uuid: uuid as UserMessage['uuid'],
-    timestamp: '1970-01-01T00:00:00.000Z',
     isMeta: summary ? true : undefined,
     isCompactSummary: summary ? true : undefined,
     isVisibleInTranscriptOnly: summary ? true : undefined,
     message: { role: 'user', content: text },
   } as UserMessage
+}
+
+/** Newest chain participant. Its clock is the real write time plus the same
+ *  100ms resume margin stock /compact uses. The preserved tail is not restamped. */
+function resumeLeaf(opId: string): Message {
+  return {
+    type: 'system',
+    subtype: 'informational',
+    content: 'Conversation compacted',
+    isMeta: true,
+    level: 'info',
+    uuid: idleUuid(opId, 'resume-leaf'),
+    timestamp: new Date(Date.now() + 100).toISOString(),
+  } as Message
 }
 
 export function buildIdleCompactionResult(file: IdleNativeFile, _messages: readonly Message[],
@@ -197,17 +302,12 @@ export function buildIdleCompactionResult(file: IdleNativeFile, _messages: reado
   const summaryUuid = artifact.messages[1]!.uuid as string
   const summaryMessage = userMessage(summaryUuid, file.summaryText, true)
   const kept = file.frozenTail.map((item) => JSON.parse(JSON.stringify(item.message)) as Message)
-  const base = Date.parse('2026-01-01T00:00:00.000Z')
-  ;(summaryMessage as { timestamp: string }).timestamp = new Date(base + 1000).toISOString()
-  kept.forEach((message, index) => {
-    ;(message as { timestamp: string }).timestamp = new Date(base + 2000 + index * 1000).toISOString()
-  })
   const boundary = annotate({
     type: 'system',
     subtype: 'compact_boundary',
     content: 'Conversation compacted',
     isMeta: false,
-    timestamp: new Date(base).toISOString(),
+    timestamp: new Date().toISOString(),
     uuid: boundaryUuid as UUID,
     level: 'info',
     compactMetadata: {
@@ -273,10 +373,13 @@ export async function resumeIdleSummary(input: {
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
 }): Promise<{ path: string; file: IdleNativeFile } | undefined> {
-  const path = findIdleNativeFile(input.sessionId, input.home)
+  const opId = trustedIdleOpId()
+  const path = (opId ? readIdleNativeByOp(input.sessionId, opId, input.home) : undefined)
+    ?? findIdleNativeFile(input.sessionId, input.home)
   if (!path) return undefined
   let file = readIdleNativeFile(path)
   if (file.sessionId !== input.sessionId) throw new Error('IDLE_RECOVERY_CORRUPT')
+  if (file.applied && !file.summaryText) return { path, file }
   if (file.frozenTail.length === 0 && file.attachments.length === 0) {
     const preserved = selectIdlePreserve(input.messages)
     file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
@@ -308,7 +411,13 @@ export async function runIdleCompact(input: {
   messages: Message[]
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
-  record: (messages: Message[], preserveTimestamp?: boolean) => Promise<unknown>
+  record: (
+    messages: Message[],
+    teamInfo?: { teamName?: string; agentName?: string },
+    startingParentUuid?: string,
+    allMessages?: readonly Message[],
+    preserveMessageTimestamp?: boolean,
+  ) => Promise<unknown>
   flush: () => Promise<void>
   load: (sessionId: string) => Promise<{ messages: Message[] } | null>
 }): Promise<CompactionResult | 'short' | undefined> {
@@ -317,18 +426,21 @@ export async function runIdleCompact(input: {
   if (resumed.file.applied && !resumed.file.summaryText) return 'short'
   const { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } = await import('./compact.js')
   const built = buildIdleCompactionResult(resumed.file, input.messages, annotateBoundaryWithPreservedSegment)
-  const messages = buildPostCompactMessages(built.result)
-  const keptIds = new Set((built.result.messagesToKeep ?? []).map((message) => message.uuid))
-  await input.record(messages.filter((message) => !keptIds.has(message.uuid)), true)
-  await input.record(built.result.messagesToKeep ?? [], true)
+  const result: CompactionResult = resumed.file.frozenTail.length === 0
+    ? built.result
+    : { ...built.result, hookResults: [resumeLeaf(resumed.file.opId) as CompactionResult['hookResults'][number]] }
+  const messages = buildPostCompactMessages(result)
+  // recordTranscript's 5th argument preserves the leaf clock. true in the
+  // 2nd argument is teamInfo and would stamp the leaf with now().
+  await input.record(messages, undefined, undefined, undefined, true)
   await applyIdleTranscript({
     sessionId: input.sessionId,
     messages,
     artifact: built.artifact,
-    record: input.record,
+    record: (rows) => input.record(rows),
     flush: input.flush,
     load: input.load,
   })
-  writeIdleNativeFile(resumed.path, { ...resumed.file, applied: true })
-  return built.result
+  writeIdleNativeFile(resumed.path, { ...resumed.file, applied: true, artifact: built.artifact })
+  return result
 }

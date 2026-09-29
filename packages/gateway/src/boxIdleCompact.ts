@@ -50,6 +50,8 @@ export interface IdleOp {
   capsuleSha256?: string
   artifact?: IdleArtifact
   receiptDigest?: string
+  /** Native saw a short outer transcript and did not summarize. */
+  disposition?: 'short'
 }
 
 export function idleUuid(opId: string, role: string): string {
@@ -94,8 +96,9 @@ function opPath(dir: string, op: { sessionKey: string; revision: string }): stri
   return join(dir, 'idle-ops', encodeURIComponent(op.sessionKey), `${op.revision}.json`)
 }
 
-/** Done only when a full artifact exists and the loader receipt matches it. */
+/** Done when the loader receipt matches the artifact, or native skipped a short transcript. */
 export function idleOpSettled(op: IdleOp): boolean {
+  if (op.disposition === 'short') return true
   return Boolean(op.artifact && op.receiptDigest === op.artifact.digest)
 }
 
@@ -180,6 +183,7 @@ export interface IdleNativeFile {
   summaryText?: string
   modelCalls: number
   applied?: boolean
+  artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
   attachments: IdleAttachment[]
 }
@@ -294,8 +298,10 @@ export function advanceIdleOp(input: {
     break
   }
   if (op.artifact && op.receiptDigest === op.artifact.digest) return { op, callModel: false }
+  // The inner leaf's compactRequired is not the outer transcript. Native
+  // measures that history after this dispatch and skips a short one.
   if (input.allowDispatch && !op.summaryText && input.proof.status === 'terminal'
-    && input.proof.compactRequired && input.proof.revision === op.revision) {
+    && input.proof.revision === op.revision) {
     return { op, callModel: true }
   }
   return { op, callModel: false }

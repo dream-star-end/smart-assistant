@@ -1,4 +1,6 @@
-/** Real store + loader. Not an in-memory stand-in. */
+/** Existing history → compact command → native loader.
+ * Does not call buildIdleCompactionResult or recordTranscript's 5th argument itself.
+ */
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,70 +9,119 @@ import { createHash, randomUUID } from 'node:crypto'
 const root = mkdtempSync(join(tmpdir(), 'idle-loader-'))
 process.env.CLAUDE_CONFIG_DIR = join(root, 'config')
 process.env.HOME = root
+process.env.USER_TYPE = 'ant'
 process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
 
 const { switchSession } = await import('../../bootstrap/state.js')
-const { recordTranscript, flushSessionStorage } = await import('../../utils/sessionStorage.js')
+const { flushSessionStorage } = await import('../../utils/sessionStorage.js')
 const { loadConversationForResume } = await import('../../utils/conversationRecovery.js')
-const { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } = await import('./compact.js')
-const { buildIdleCompactionResult, selectIdlePreserve, writeIdleNativeFile } = await import('./idleRecover.js')
+const { readIdleNativeFile, writeIdleNativeFile, IDLE_COMPACT_INSTRUCTIONS } = await import('./idleRecover.js')
+const { call } = await import('../../commands/compact/compact.js')
 
-const sessionId = randomUUID()
-switchSession(sessionId, join(root, 'config', 'projects', 'p'))
-const user = {
-  type: 'user' as const, uuid: randomUUID(),
-  message: { role: 'user', content: 'keep the image and the tool' },
-}
-const tool = {
-  type: 'assistant' as const, uuid: randomUUID(), parentUuid: user.uuid,
-  message: { role: 'assistant', content: [
-    { type: 'text', text: 'reading' },
-    { type: 'tool_use', id: 'toolu_native', name: 'Read', input: { file_path: 'a.ts' } },
-  ] },
-}
-const result = {
-  type: 'user' as const, uuid: randomUUID(), parentUuid: tool.uuid,
-  sourceToolAssistantUUID: tool.uuid,
-  message: { role: 'user', content: [
-    { type: 'tool_result', tool_use_id: 'toolu_native', content: 'file body' },
-    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aaaa' } },
-  ] },
-}
-const preserved = selectIdlePreserve([user, tool, result])
 const home = join(root, 'idle-home')
-const opId = createHash('sha256').update('op').digest('hex')
-writeIdleNativeFile(join(home, 'idle-native', encodeURIComponent(sessionId), 'rev.json'), {
-  v: 1, opId, revision: 'rev', sessionId, summaryText: 'native summary', modelCalls: 1,
-  frozenTail: preserved.tail, attachments: preserved.attachments,
-})
-const built = buildIdleCompactionResult({
-  v: 1, opId, revision: 'rev', sessionId, summaryText: 'native summary', modelCalls: 1,
-  frozenTail: preserved.tail, attachments: preserved.attachments,
-}, [user, tool, result], annotateBoundaryWithPreservedSegment)
-if (!built.result.boundaryMarker.compactMetadata.preservedSegment) throw new Error('NO_SEGMENT')
-const post = buildPostCompactMessages(built.result)
-const keptIds = new Set((built.result.messagesToKeep ?? []).map((message) => message.uuid))
-await recordTranscript(post.filter((message) => !keptIds.has(message.uuid)), undefined, undefined, undefined, true)
-await recordTranscript(built.result.messagesToKeep ?? [], undefined, undefined, undefined, true)
-await flushSessionStorage()
-const loaded = await loadConversationForResume(sessionId, undefined)
-if (!loaded) throw new Error('LOAD_EMPTY')
-const byId = new Map(loaded.messages.map((message) => [message.uuid, message]))
-const missing = post.filter((message) => !byId.has(message.uuid)).map((message) => message.uuid)
-if (missing.length) {
-  console.log(JSON.stringify({ missing, loaded: loaded.messages.map((m) => ({ uuid: m.uuid, type: m.type })) }, null, 2))
-  throw new Error('LOADER_MISSING')
-}
-for (const message of post) {
-  const found = byId.get(message.uuid)!
-  const want = JSON.stringify(message.message?.content ?? message.content ?? null)
-  const got = JSON.stringify(found.message?.content ?? found.content ?? null)
-  if (want !== got) {
-    console.log(JSON.stringify({ uuid: message.uuid, want, got }))
-    throw new Error('LOADER_CONTENT')
+process.env.OPENCLAUDE_HOME = home
+
+function message(uuid: string, content: string | Array<Record<string, unknown>>, role: 'user' | 'assistant' = 'user') {
+  return {
+    type: role === 'assistant' ? 'assistant' as const : 'user' as const,
+    uuid,
+    message: { role, content },
   }
 }
-const order = loaded.messages.filter((message) => post.some((item) => item.uuid === message.uuid)).map((message) => message.uuid)
-if (order.join() !== post.map((message) => message.uuid).join()) throw new Error('LOADER_ORDER')
-console.log(JSON.stringify({ ok: true, messages: post.length }))
+
+async function runCase(sessionId: string, messages: ReturnType<typeof message>[], summary: string | undefined) {
+  switchSession(sessionId, join(root, 'config', 'projects', 'p'))
+  const { recordTranscript } = await import('../../utils/sessionStorage.js')
+  await recordTranscript(messages as never)
+  await flushSessionStorage()
+  const opId = createHash('sha256').update(sessionId).digest('hex')
+  writeIdleNativeFile(join(home, 'idle-native', encodeURIComponent(sessionId), 'rev.json'), {
+    v: 1,
+    opId,
+    revision: 'rev',
+    sessionId,
+    ...(summary ? { summaryText: summary } : {}),
+    modelCalls: summary ? 1 : 0,
+    frozenTail: [],
+    attachments: [],
+  })
+  const context = {
+    messages,
+    abortController: new AbortController(),
+    options: { verbose: true, mainLoopModel: 'test', tools: [], mcpClients: [] },
+    getAppState: () => ({ toolPermissionContext: { additionalWorkingDirectories: new Map() } }),
+    setAppState: () => {},
+    readFileState: new Map(),
+  }
+  const result = await call(IDLE_COMPACT_INSTRUCTIONS, context as never)
+  return { result, opId, sessionId }
+}
+
+const prefixId = randomUUID()
+const toolId = randomUUID()
+const imageId = randomUUID()
+const chunk = 'x'.repeat(128 * 1024)
+const history = [
+  message(prefixId, chunk),
+  ...Array.from({ length: 63 }, () => message(randomUUID(), chunk)),
+  message(randomUUID(), 'recent note '.repeat(20)),
+  message(toolId, [
+    { type: 'text', text: 'reading' },
+    { type: 'tool_use', id: 'toolu_native', name: 'Read', input: { file_path: 'a.ts' } },
+  ], 'assistant'),
+  message(imageId, [
+    { type: 'tool_result', tool_use_id: 'toolu_native', content: 'file body' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aaaa' } },
+  ]),
+]
+const before = JSON.stringify(history).length
+const largeSession = randomUUID()
+const large = await runCase(largeSession, history, 'native summary')
+if (large.result.type !== 'compact') throw new Error(`LARGE_${large.result.type}`)
+await flushSessionStorage()
+const loaded = await loadConversationForResume(largeSession, undefined)
+if (!loaded) throw new Error('LOAD_EMPTY')
+const ids = new Set(loaded.messages.map((row) => row.uuid))
+if (ids.has(prefixId)) throw new Error('PREFIX_KEPT')
+if (!ids.has(toolId) || !ids.has(imageId)) throw new Error('TAIL_MISSING')
+const image = loaded.messages.find((row) => row.uuid === imageId)
+const imageJson = JSON.stringify(image?.message?.content ?? null)
+if (!imageJson.includes('aaaa') || !imageJson.includes('toolu_native')) throw new Error('IMAGE_BYTES')
+const tool = loaded.messages.find((row) => row.uuid === toolId)
+if (tool?.type !== 'assistant') throw new Error('TOOL_ROLE')
+const summary = loaded.messages.find((row) => row.isCompactSummary)
+if (!summary) throw new Error('SUMMARY_MISSING')
+const after = JSON.stringify(loaded.messages).length
+if (after >= before / 2) throw new Error(`NOT_SHRUNK ${before} ${after}`)
+const file = readIdleNativeFile(join(home, 'idle-native', encodeURIComponent(largeSession), 'rev.json'))
+if (!file.applied || file.modelCalls !== 1) throw new Error('APPLIED')
+
+process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({ oc_turn_key: large.opId })
+const again = await call(IDLE_COMPACT_INSTRUCTIONS, {
+  messages: history,
+  abortController: new AbortController(),
+  options: { verbose: true, mainLoopModel: 'test', tools: [], mcpClients: [] },
+  getAppState: () => ({ toolPermissionContext: { additionalWorkingDirectories: new Map() } }),
+  setAppState: () => {},
+  readFileState: new Map(),
+} as never)
+if (again.type !== 'compact') throw new Error(`RETRY_${again.type}`)
+const reread = readIdleNativeFile(join(home, 'idle-native', encodeURIComponent(largeSession), 'rev.json'))
+if (reread.modelCalls !== 1) throw new Error('RESUMMARIZED')
+
+delete process.env.CLAUDE_CODE_EXTRA_METADATA
+const shortSession = randomUUID()
+const short = await runCase(shortSession, [message(randomUUID(), 'only six thousand '.repeat(40))], undefined)
+if (short.result.type !== 'skip') throw new Error(`SHORT_${short.result.type}`)
+const shortFile = readIdleNativeFile(join(home, 'idle-native', encodeURIComponent(shortSession), 'rev.json'))
+if (!shortFile.applied || shortFile.summaryText) throw new Error('SHORT_PENDING')
+
+console.log(JSON.stringify({
+  ok: true,
+  before,
+  after,
+  loaded: loaded.messages.length,
+  keptTail: file.frozenTail.length,
+  short: short.result.type,
+}))
 process.exit(0)

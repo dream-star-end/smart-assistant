@@ -143,6 +143,38 @@ describe('idle artifact recovery', () => {
     assert.equal(pending?.artifact, undefined)
   })
 
+  test('low inner leaf still dispatches so the outer transcript can compact', () => {
+    const op = {
+      v: 1 as const,
+      sessionKey: 'outer',
+      sourceSessionId: proof.sessionId,
+      sourceTurnKey: proof.turnKey,
+      revision: proof.revision,
+      idleTurnKey: 'ab'.repeat(32),
+      frozenTail: [],
+      attachments: [],
+    }
+    const stepped = advanceIdleOp({
+      op,
+      proof: { ...proof, compactRequired: false, summaryText: undefined },
+      allowDispatch: true,
+    })
+    assert.equal(stepped.callModel, true)
+    assert.equal(stepped.op.summaryText, undefined)
+  })
+
+  test('a short native no-op is not a permanent pending op', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'idle-short-'))
+    const started = startIdleOp({
+      dir, sessionKey: 'short-session', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: proof.revision, idleTurnKey: 'ab'.repeat(32), frozenTail: [], attachments: [],
+    })
+    const skipped = { ...started.op, disposition: 'short' as const }
+    writeIdleOp(dir, skipped)
+    assert.equal(idleOpSettled(skipped), true)
+    assert.equal(readPendingIdle(dir, 'short-session'), undefined)
+  })
+
   test('a proof that is still pending keeps the source candidate', () => {
     const home = join(tmpdir(), `idle-candidate-${process.pid}`)
     writeIdleCandidate(home, {

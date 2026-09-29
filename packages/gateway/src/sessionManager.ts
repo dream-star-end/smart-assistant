@@ -39,6 +39,7 @@ import {
   boxTurnMayIdle,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
+  idleOpSettled,
   clearIdleCandidate,
   readIdleCandidate,
   readIdleNative,
@@ -4728,16 +4729,19 @@ export class SessionManager {
         const summary = settled?.nativeCompactionSummary?.trim() ?? ''
         const receipt = settled?.nativeIdleReceipt
         const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
-        if (after?.applied && !after.summaryText) clearIdleCandidate(recoveryDir, session.sessionKey)
+        if (after?.applied && !after.summaryText) {
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+          step = { ...step, op: { ...step.op, disposition: 'short' } }
+        }
         const mergedSummary = step.op.summaryText || after?.summaryText || summary
-        if (mergedSummary) {
+        if (mergedSummary && step.op.disposition !== 'short') {
           step = advanceIdleOp({
             op: {
               ...step.op,
               summaryText: mergedSummary,
               frozenTail: after?.frozenTail.length ? after.frozenTail : step.op.frozenTail,
               attachments: after?.attachments ?? step.op.attachments,
-              artifact: undefined,
+              artifact: after?.artifact,
               receiptDigest: undefined,
             },
             proof,
@@ -5142,7 +5146,7 @@ export class SessionManager {
         const recovered = pendingIdle
           ? readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
           : undefined
-        if (still || (pendingIdle && (!recovered?.artifact || recovered.receiptDigest !== recovered.artifact.digest))) {
+        if (still || (pendingIdle && !idleOpSettled(recovered ?? pendingIdle))) {
           throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
         }
       }

@@ -59,6 +59,40 @@ export const call: LocalCommandCall = async (args, context) => {
   const customInstructions = args.trim()
 
   try {
+    // Box idle is selected before session memory, reactive, and microcompact.
+    // A normal /compact (any other instruction, or this prompt with no idle
+    // file) keeps the path below.
+    if (customInstructions === IDLE_COMPACT_INSTRUCTIONS) {
+      const idleResult = await runIdleCompact({
+        sessionId: getSessionId(),
+        messages,
+        summarize: async (msgs) => summarizeMessagesForIdle(
+          msgs,
+          context,
+          await getCacheSharingParams(context, msgs),
+          customInstructions,
+        ),
+        record: recordTranscript,
+        flush: flushSessionStorage,
+        load: async (id) => loadConversationForResume(id, undefined),
+      })
+      if (idleResult === 'short') return { type: 'skip' }
+      if (idleResult) {
+        setLastSummarizedMessageId(undefined)
+        suppressCompactWarning()
+        getUserContext.cache.clear?.()
+        runPostCompactCleanup()
+        return {
+          type: 'compact',
+          compactionResult: idleResult,
+          displayText: buildDisplayText(context, idleResult.userDisplayMessage, {
+            pre: idleResult.preCompactTokenCount,
+            post: idleResult.truePostCompactTokenCount,
+          }),
+        }
+      }
+    }
+
     // Try session memory compaction first if no custom instructions
     // (session memory compaction doesn't support custom instructions)
     if (!customInstructions) {
@@ -107,37 +141,6 @@ export const call: LocalCommandCall = async (args, context) => {
     // Run microcompact first to reduce tokens before summarization
     const microcompactResult = await microcompactMessages(messages, context)
     const messagesForCompact = microcompactResult.messages
-
-    if (customInstructions === IDLE_COMPACT_INSTRUCTIONS) {
-      const idleResult = await runIdleCompact({
-        sessionId: getSessionId(),
-        messages: messagesForCompact,
-        summarize: async (msgs) => summarizeMessagesForIdle(
-          msgs,
-          context,
-          await getCacheSharingParams(context, msgs),
-          customInstructions,
-        ),
-        record: recordTranscript,
-        flush: flushSessionStorage,
-        load: async (id) => loadConversationForResume(id, undefined),
-      })
-      if (idleResult === 'short') return { type: 'skip' }
-      if (idleResult) {
-        setLastSummarizedMessageId(undefined)
-        suppressCompactWarning()
-        getUserContext.cache.clear?.()
-        runPostCompactCleanup()
-        return {
-          type: 'compact',
-          compactionResult: idleResult,
-          displayText: buildDisplayText(context, idleResult.userDisplayMessage, {
-            pre: idleResult.preCompactTokenCount,
-            post: idleResult.truePostCompactTokenCount,
-          }),
-        }
-      }
-    }
 
     const result = await compactConversation(
       messagesForCompact,
