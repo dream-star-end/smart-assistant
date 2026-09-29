@@ -1371,16 +1371,16 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         : mode === "localAuth"
           ? "ocv5-296-idle-local-catalog-raw.json"
           : mode === "grow2"
-            ? "ocv5-296-idle-pipeline-r22-raw.json"
+            ? "ocv5-296-idle-grow-r22-raw.json"
             : mode === "seam"
               ? "ocv5-296-idle-seam-r22-raw.json"
               : "ocv5-296-idle-pipeline-r19-live2-raw.json";
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, rawName);
-    if (/ocv5-296-(idle-pipeline-r\d+-raw|r17-growth-)/.test(path)) {
+    report.cleanupErrors = cleanupErrors;
+    if (/ocv5-296-(idle-pipeline-r1[7-9]|idle-pipeline-r20|r17-growth)/.test(path)) {
       throw new Error(`refusing to overwrite historical raw ${path}`);
     }
-    report.cleanupErrors = cleanupErrors;
     writeFileSync(path, JSON.stringify(report, null, 2));
     console.log(JSON.stringify({ event: "ocv5-296-idle", case: mode, report: path, summaryHttp: report.summaryHttp, firstError: report.firstError, cleanup: cleanupErrors.length }));
     if (cleanupErrors.length > 0) throw new Error(`cleanup failed: ${cleanupErrors.join(" | ")}`);
