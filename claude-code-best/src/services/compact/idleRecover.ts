@@ -176,48 +176,54 @@ function blockIds(message: Message, kind: 'tool_use' | 'tool_result'): string[] 
   })
 }
 
-/** Complete tool groups, then single messages. A result stays with its tool_use.
- *  A long user prefix stays splittable so pairing cannot copy it all back. */
-function atomicGroups(messages: readonly Message[]): Message[][] {
-  const rounds = groupMessagesByApiRound([...messages])
-  const groups: Message[][] = []
-  const open = new Map<string, number>()
-  for (const round of rounds) {
-    const roundTokens = round.reduce((sum, message) => sum + messageTokens(message), 0)
-    if (roundTokens <= IDLE_TAIL_MAX_TOKENS) {
-      groups.push(round)
-      continue
-    }
-    for (const message of round) {
-      const joined = blockIds(message, 'tool_result')
-        .map((id) => open.get(id))
-        .find((index) => index !== undefined)
-      if (joined !== undefined) {
-        groups[joined]!.push(message)
-        continue
-      }
-      groups.push([message])
-      const index = groups.length - 1
-      for (const id of blockIds(message, 'tool_use')) open.set(id, index)
-    }
+/** Suffix of one API round. Pairing only moves the start index backward,
+ *  so tool_use / tool_result stay in their original order. */
+function contiguousSuffix(round: readonly Message[]): Message[] {
+  let start = round.length
+  let tokens = 0
+  for (let index = round.length - 1; index >= 0; index--) {
+    const cost = messageTokens(round[index]!)
+    if (start < round.length && tokens + cost > IDLE_TAIL_MAX_TOKENS && tokens > 0) break
+    start = index
+    tokens += cost
+    if (tokens >= IDLE_TAIL_MAX_TOKENS) break
   }
-  return groups
+  for (let guard = 0; guard < round.length; guard++) {
+    const needed = new Set<string>()
+    for (let index = start; index < round.length; index++) {
+      for (const id of blockIds(round[index]!, 'tool_result')) needed.add(id)
+      for (const id of blockIds(round[index]!, 'tool_use')) needed.delete(id)
+    }
+    if (needed.size === 0) break
+    let next = start
+    for (let index = start - 1; index >= 0; index--) {
+      if (blockIds(round[index]!, 'tool_use').some((id) => needed.has(id))) next = index
+    }
+    if (next === start) break
+    start = next
+  }
+  return round.slice(start)
 }
 
 function boundedTail(messages: readonly Message[]): Message[] {
-  const groups = atomicGroups(messages)
+  const rounds = groupMessagesByApiRound([...messages])
   const kept: Message[][] = []
   let tokens = 0
   let textCount = 0
-  for (let index = groups.length - 1; index >= 0; index--) {
-    const group = groups[index]!
-    const groupTokens = group.reduce((sum, message) => sum + messageTokens(message), 0)
+  for (let index = rounds.length - 1; index >= 0; index--) {
+    let round = rounds[index]!
+    const whole = round.reduce((sum, message) => sum + messageTokens(message), 0)
+    if (whole > IDLE_TAIL_MAX_TOKENS && (kept.length === 0 || tokens < IDLE_TAIL_MIN_TOKENS)) {
+      round = contiguousSuffix(round)
+    }
+    const groupTokens = round.reduce((sum, message) => sum + messageTokens(message), 0)
     if (kept.length > 0 && tokens >= IDLE_TAIL_MAX_TOKENS) break
     if (kept.length > 0 && tokens + groupTokens > IDLE_TAIL_MAX_TOKENS
       && tokens >= IDLE_TAIL_MIN_TOKENS && textCount >= IDLE_TAIL_MIN_TEXT) break
-    kept.unshift(group)
+    if (kept.length > 0 && groupTokens > IDLE_TAIL_MAX_TOKENS) break
+    kept.unshift(round)
     tokens += groupTokens
-    textCount += group.filter((message) => messageText(message).length > 0).length
+    textCount += round.filter((message) => messageText(message).length > 0).length
     if (tokens >= IDLE_TAIL_MAX_TOKENS) break
     if (tokens >= IDLE_TAIL_MIN_TOKENS && textCount >= IDLE_TAIL_MIN_TEXT) break
   }

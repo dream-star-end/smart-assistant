@@ -31,7 +31,8 @@ function message(uuid: string, content: string | Array<Record<string, unknown>>,
 
 async function runCase(sessionId: string, messages: ReturnType<typeof message>[], summary: string | undefined) {
   switchSession(sessionId, join(root, 'config', 'projects', 'p'))
-  const { recordTranscript } = await import('../../utils/sessionStorage.js')
+  const { recordTranscript, resetSessionFilePointer } = await import('../../utils/sessionStorage.js')
+  await resetSessionFilePointer()
   await recordTranscript(messages as never)
   await flushSessionStorage()
   const opId = createHash('sha256').update(sessionId).digest('hex')
@@ -116,6 +117,47 @@ if (short.result.type !== 'skip') throw new Error(`SHORT_${short.result.type}`)
 const shortFile = readIdleNativeFile(join(home, 'idle-native', encodeURIComponent(shortSession), 'rev.json'))
 if (!shortFile.applied || shortFile.summaryText) throw new Error('SHORT_PENDING')
 
+const parallelPrefix = randomUUID()
+const parallelA = randomUUID()
+const parallelB = randomUUID()
+const parallelAr = randomUUID()
+const parallelBr = randomUUID()
+const parallel = [
+  message(parallelPrefix, 'long user context '.repeat(45_000)),
+  {
+    type: 'assistant' as const, uuid: parallelA,
+    message: { role: 'assistant' as const, id: 'same-api-response', content: [
+      { type: 'tool_use', id: 'toolA', name: 'Read', input: { file_path: 'a' } },
+    ] },
+  },
+  {
+    type: 'assistant' as const, uuid: parallelB,
+    message: { role: 'assistant' as const, id: 'same-api-response', content: [
+      { type: 'tool_use', id: 'toolB', name: 'Read', input: { file_path: 'b' } },
+    ] },
+  },
+  message(parallelAr, [
+    { type: 'tool_result', tool_use_id: 'toolA', content: 'x'.repeat(200_000) },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'bbbb' } },
+  ]),
+  message(parallelBr, [
+    { type: 'tool_result', tool_use_id: 'toolB', content: 'small result' },
+  ]),
+]
+const parallelRun = await runCase(randomUUID(), parallel, 'saved parallel summary')
+if (parallelRun.result.type !== 'compact') throw new Error(`PARALLEL_${parallelRun.result.type}`)
+await flushSessionStorage()
+const parallelLoaded = await loadConversationForResume(parallelRun.sessionId, undefined)
+if (!parallelLoaded) throw new Error('PARALLEL_LOAD_EMPTY')
+const parallelIds = parallelLoaded.messages.map((row) => row.uuid)
+if (parallelIds.includes(parallelPrefix)) throw new Error('PARALLEL_PREFIX_KEPT')
+const parallelOrder = [parallelA, parallelB, parallelAr, parallelBr].filter((id) => parallelIds.includes(id))
+if (parallelOrder.join() !== [parallelA, parallelB, parallelAr, parallelBr].join()) {
+  throw new Error(`PARALLEL_ORDER ${parallelOrder.join(',')}`)
+}
+const parallelImage = JSON.stringify(parallelLoaded.messages.find((row) => row.uuid === parallelAr)?.message?.content ?? null)
+if (!parallelImage.includes('bbbb') || !parallelImage.includes('toolA')) throw new Error('PARALLEL_BYTES')
+
 console.log(JSON.stringify({
   ok: true,
   before,
@@ -123,5 +165,6 @@ console.log(JSON.stringify({
   loaded: loaded.messages.length,
   keptTail: file.frozenTail.length,
   short: short.result.type,
+  parallel: parallelOrder.length,
 }))
 process.exit(0)

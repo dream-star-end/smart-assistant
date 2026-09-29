@@ -39,7 +39,8 @@ import {
   boxTurnMayIdle,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
-  idleOpSettled,
+  idleHistoryStillBlocked,
+  nativeShortForOp,
   clearIdleCandidate,
   readIdleCandidate,
   readIdleNative,
@@ -4686,6 +4687,15 @@ export class SessionManager {
     })
     let op = started.op
     const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+    if (nativeShortForOp(native, {
+      idleTurnKey: op.idleTurnKey,
+      revision: proof.revision,
+      sourceSessionId: source.sessionId,
+    })) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeIdleOp(recoveryDir, { ...op, disposition: 'short' })
+      return
+    }
     if (native?.frozenTail.length) op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
     if (!op.summaryText && native?.summaryText) {
       op = { ...op, summaryText: native.summaryText }
@@ -4729,7 +4739,11 @@ export class SessionManager {
         const summary = settled?.nativeCompactionSummary?.trim() ?? ''
         const receipt = settled?.nativeIdleReceipt
         const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
-        if (after?.applied && !after.summaryText) {
+        if (nativeShortForOp(after, {
+          idleTurnKey: step.op.idleTurnKey,
+          revision: proof.revision,
+          sourceSessionId: source.sessionId,
+        })) {
           clearIdleCandidate(recoveryDir, session.sessionKey)
           step = { ...step, op: { ...step.op, disposition: 'short' } }
         }
@@ -5146,7 +5160,7 @@ export class SessionManager {
         const recovered = pendingIdle
           ? readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
           : undefined
-        if (still || (pendingIdle && !idleOpSettled(recovered ?? pendingIdle))) {
+        if (idleHistoryStillBlocked({ candidate: still, pending: pendingIdle, recovered })) {
           throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
         }
       }

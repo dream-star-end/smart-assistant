@@ -153,6 +153,34 @@ test('a long outer transcript keeps a bounded tail and the trailing tool pair', 
   assert.equal(JSON.stringify(preserved.tail).includes('aaaa'), true)
 })
 
+test('parallel tool results stay in arrival order while the long prefix is dropped', () => {
+  const prefix = {
+    type: 'user' as const, uuid: 'prefix',
+    message: { role: 'user', content: 'long user context '.repeat(45_000) },
+  }
+  const tool = (uuid: string, id: string) => ({
+    type: 'assistant' as const,
+    uuid,
+    message: {
+      role: 'assistant', id: 'same-api-response',
+      content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: id } }],
+    },
+  })
+  const result = (uuid: string, id: string, body: string) => ({
+    type: 'user' as const,
+    uuid,
+    message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: id, content: body },
+      ...(id === 'toolA' ? [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'bbbb' } }] : []),
+    ] },
+  })
+  const input = [prefix, tool('A', 'toolA'), tool('B', 'toolB'), result('AR', 'toolA', 'x'.repeat(200_000)), result('BR', 'toolB', 'small result')]
+  const preserved = selectIdlePreserve(input as never)
+  assert.deepEqual(preserved.tail.map((item) => item.uuid), ['A', 'B', 'AR', 'BR'])
+  assert.equal(JSON.stringify(preserved.tail).includes('bbbb'), true)
+  assert.equal(preserved.tail.some((item) => item.uuid === 'prefix'), false)
+})
+
 test('a second idle in the same session is not hidden by the finished file', () => {
   const home = join(tmpdir(), `idle-twice-${process.pid}`)
   const first: IdleNativeFile = {

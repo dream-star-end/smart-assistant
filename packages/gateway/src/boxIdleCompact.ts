@@ -102,6 +102,29 @@ export function idleOpSettled(op: IdleOp): boolean {
   return Boolean(op.artifact && op.receiptDigest === op.artifact.digest)
 }
 
+/** This revision's native file is the short terminal for this op, not some other applied file. */
+export function nativeShortForOp(native: IdleNativeFile | undefined, op: {
+  idleTurnKey: string
+  revision: string
+  sourceSessionId: string
+}): boolean {
+  return !!native
+    && native.applied === true
+    && !native.summaryText
+    && native.opId === op.idleTurnKey
+    && native.revision === op.revision
+    && native.sessionId === op.sourceSessionId
+}
+
+/** Same predicate submit() uses after finishIdleUnderLock. */
+export function idleHistoryStillBlocked(input: {
+  candidate: IdleSourceCandidate | undefined
+  pending: IdleOp | undefined
+  recovered: IdleOp | undefined
+}): boolean {
+  return Boolean(input.candidate || (input.pending && !idleOpSettled(input.recovered ?? input.pending)))
+}
+
 export function readPendingIdle(dir: string, sessionKey: string): IdleOp | undefined {
   const folder = join(dir, 'idle-ops', encodeURIComponent(sessionKey))
   let names: string[] = []
