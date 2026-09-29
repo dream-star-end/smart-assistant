@@ -13,7 +13,7 @@
  * is the builder archive SHA. Unknown arguments fail. A tree with no .git
  * still runs. Fault mutations live in check-v5-box-continuation.negative.ts.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { register } from "node:module";
@@ -30,7 +30,15 @@ const SELF = realpathSync(fileURLToPath(import.meta.url));
 const FIXTURE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-fixture.ts", import.meta.url)));
 const LOADER = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-resolve.mjs", import.meta.url)));
 const ENTRIES = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts",
-  "boxCallFingerprint.ts"];
+  "boxCallFingerprint.ts", "boxToolResultPlan.ts", "boxToolResultEcho.ts"];
+const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
+const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
+const SEALED_IMAGE_SHA = "a9491d8d9cb458b11d4ac6c5fc4b5c2d4d370a1d9b6f7960cc5dffae678538a0";
+const SEALED_CAPTION = "[Image: original 80x2200, displayed at 73x2000. Multiply coordinates by 1.10 to map to original image.]";
+const SEALED_CAPTION_SHA = "0fffd83f1a3c5d2e5f9f19d4c034008715f2d6bbc4c5689e4c635695326f77cb";
+const SEALED_CONTENT_HASH = "bbf51fecfe97c9c846f25efd38c7198f4faf0adcc5e17f764c15623f9ddc4eae";
+const SEALED_ID = "toolu_img_b1";
+const SEALED_NOTE = "toolu_note_b1";
 const KNOWN = new Set(["--expect-sha"]);
 
 type Api = {
@@ -42,9 +50,22 @@ type Api = {
   proveEditDefault: () => void;
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
-  echoAccept: (hash: string, raw: unknown) => void;
+  echoAccept: (id: string, hash: string, raw: unknown) => void;
+  publishImage: (row: PublishedMatch) => PublishedFile;
 };
-type Digest = Array<{ path: string; sha256: string }>;
+type Digest = Array<{ path: string; realpath: string; sha256: string }>;
+type ImageOracle = {
+  id: string; noteId: string; imageSha256: string; caption: string;
+  captionSha256: string; contentHash: string;
+};
+type PublishedPart = { type?: string; data?: string; mimeType?: string; text?: string };
+type PublishedFile = { modelToolUseId?: unknown; isError?: unknown; content?: PublishedPart[] };
+type PublishedMatch = {
+  modelToolUseId: string;
+  content: ReadonlyArray<PublishedPart>;
+  isError: boolean;
+  contentHash: string;
+};
 type Fixture = {
   annotationCounts: Array<{ progress: number; hook: number; wrapped: number }>;
   chain: Array<Record<string, unknown>>;
@@ -70,7 +91,7 @@ let fx: Fixture;
 function fail(message: string): never {
   throw new Error(message);
 }
-function sha256(text: string): string {
+function sha256(text: string | Buffer): string {
   return createHash("sha256").update(text).digest("hex");
 }
 function underTsx(): boolean {
@@ -131,7 +152,7 @@ function resolveLocal(fromFile: string, spec: string): string | null {
 function digest(): Digest {
   const pending = ENTRIES.map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
-  const files = new Set<string>([SELF, FIXTURE, LOADER]);
+  const files = new Set<string>([SELF, FIXTURE, LOADER, IMAGE_FILE, ORACLE_FILE]);
   while (pending.length > 0) {
     const file = pending.pop()!;
     if (seen.has(file)) continue;
@@ -156,6 +177,7 @@ function digest(): Digest {
   }
   return [...files].sort().map((file) => ({
     path: relative(CANDIDATE, file),
+    realpath: file,
     sha256: sha256(readFileSync(file)),
   }));
 }
@@ -216,6 +238,7 @@ async function load(): Promise<Api> {
   const hashMod = await import(pathToFileURL(join(PROXY, "boxToolInputHash.ts")).href);
   const echoMod = await import(pathToFileURL(join(PROXY, "boxToolInputEcho.ts")).href);
   const resultEcho = await import(pathToFileURL(join(PROXY, "boxToolResultEcho.ts")).href);
+  const planMod = await import(pathToFileURL(join(PROXY, "boxToolResultPlan.ts")).href);
   return {
     normalize: norm.normalizeBoxSemanticBody,
     gate: gate.validateBoxRequest,
@@ -232,11 +255,33 @@ async function load(): Promise<Api> {
       hashNoCaller: finger.hashBoxAssistantNoCallerContent,
       hashEcho: finger.hashBoxAssistantEchoContent,
     }),
-    echoAccept: (hash: string, raw: unknown) => {
-      const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: "toolu_img_b1",
+    echoAccept: (id: string, hash: string, raw: unknown) => {
+      const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: id,
         contentHash: hash, isError: false }]);
       verifier.accept(raw);
       verifier.assertComplete();
+    },
+    publishImage: (row) => {
+      const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+      mkdirSync(cwd, { mode: 0o700 });
+      try {
+        const plan = planMod.makeBoxToolResultPlan({ cwd,
+          expected: { id: row.modelToolUseId, clientName: "Read", boxName: "mcp__ocbridge__t0",
+            input: { file_path: "a.png" } },
+          pending: { version: 1, modelToolUseId: row.modelToolUseId, mcpRequestId: 1,
+            name: "t0", arguments: { file_path: "a.png" } },
+          matched: row });
+        if (plan.requests.length < 1) fail("IMAGE_PUBLISH_EMPTY");
+        for (const request of plan.requests) {
+          const ran = spawnSync(request.command, request.args, {
+            cwd: request.cwd, env: request.environment, encoding: "utf8",
+          });
+          if (ran.status !== 0) fail(`IMAGE_PUBLISH_${ran.status ?? "SPAWN"}`);
+        }
+        return JSON.parse(readFileSync(plan.path, "utf8")) as PublishedFile;
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
     },
   };
 }
@@ -497,9 +542,38 @@ function checks(api: Api): void {
   proveImageCaption(api);
 }
 
+function imageFixture(): { oracle: ImageOracle; png: string } {
+  const raw = readFileSync(IMAGE_FILE);
+  const oracle = JSON.parse(readFileSync(ORACLE_FILE, "utf8")) as ImageOracle;
+  if (sha256(raw) !== SEALED_IMAGE_SHA || oracle.imageSha256 !== SEALED_IMAGE_SHA) fail("IMAGE_FIXTURE_SHA");
+  if (oracle.caption !== SEALED_CAPTION || sha256(oracle.caption) !== SEALED_CAPTION_SHA
+    || oracle.captionSha256 !== SEALED_CAPTION_SHA) fail("IMAGE_FIXTURE_CAPTION");
+  if (oracle.id !== SEALED_ID || oracle.noteId !== SEALED_NOTE) fail("IMAGE_FIXTURE_ID");
+  if (oracle.contentHash !== SEALED_CONTENT_HASH) fail("IMAGE_ORACLE_HASH");
+  const png = raw.toString("base64");
+  const locked = sha256(JSON.stringify({ content: [
+    { type: "image", data: png, mimeType: "image/png" },
+    { type: "text", text: SEALED_CAPTION },
+  ], isError: false }));
+  if (locked !== SEALED_CONTENT_HASH) fail("IMAGE_ORACLE_HASH");
+  return { oracle, png };
+}
+function publishedEcho(file: PublishedFile): unknown {
+  if (!Array.isArray(file.content)) fail("IMAGE_PUBLISHED_SHAPE");
+  const content = file.content.map((part) => {
+    if (part.type === "image") {
+      return { type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } };
+    }
+    if (part.type === "text") return { type: "text", text: part.text };
+    return fail("IMAGE_PUBLISHED_SHAPE");
+  });
+  const block: Record<string, unknown> = { type: "tool_result", tool_use_id: file.modelToolUseId, content };
+  if (file.isError === true) block.is_error = true;
+  return { type: "user", message: { role: "user", content: [block] } };
+}
 function proveImageCaption(api: Api): void {
-  const caption = "[Image: original 80x2200, displayed at 73x2000. Multiply coordinates by 1.10 to map to original image.]";
-  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const { oracle, png } = imageFixture();
+  const caption = oracle.caption;
   const image = { type: "image", source: { type: "base64", media_type: "image/png", data: png } };
   const hook = "<system-reminder>\nPreToolUse:Read hook additional context: b1 figure.\n</system-reminder>";
   const base = { model: "box-api-claude-opus-5-5", stream: true, max_tokens: 64,
@@ -508,12 +582,12 @@ function proveImageCaption(api: Api): void {
     messages: [
       { role: "user", content: "look" },
       { role: "assistant", content: [
-        { type: "tool_use", id: "toolu_img_b1", name: "Read", input: { file_path: "a.png" } },
-        { type: "tool_use", id: "toolu_note_b1", name: "Note", input: { file_path: "a.md" } },
+        { type: "tool_use", id: SEALED_ID, name: "Read", input: { file_path: "a.png" } },
+        { type: "tool_use", id: SEALED_NOTE, name: "Note", input: { file_path: "a.md" } },
       ] },
       { role: "user", content: [
-        { type: "tool_result", tool_use_id: "toolu_img_b1", content: [image] },
-        { type: "tool_result", tool_use_id: "toolu_note_b1", content: "note" },
+        { type: "tool_result", tool_use_id: SEALED_ID, content: [image] },
+        { type: "tool_result", tool_use_id: SEALED_NOTE, content: "note" },
         { type: "text", text: caption },
         { type: "text", text: hook },
       ] },
@@ -530,30 +604,31 @@ function proveImageCaption(api: Api): void {
     || encoded.split(hook.replaceAll("\n", "\\n")).length - 1 !== 1) fail("IMAGE_COUNTS");
   if (encoded.includes("<total_tokens>")) fail("IMAGE_BUDGET");
   const user = (once.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1)!;
-  const owned = user.content.find((part) => part.tool_use_id === "toolu_img_b1");
-  const note = user.content.find((part) => part.tool_use_id === "toolu_note_b1");
+  const owned = user.content.find((part) => part.tool_use_id === SEALED_ID);
+  const note = user.content.find((part) => part.tool_use_id === SEALED_NOTE);
   if (!owned || JSON.stringify(owned).split(caption).length - 1 !== 1) fail("IMAGE_OWNER");
   if (!note || JSON.stringify(note).includes(caption)) fail("IMAGE_NOT_LAST");
-  const oracle = sha256(JSON.stringify({ content: [
-    { type: "image", data: png, mimeType: "image/png" },
-    { type: "text", text: caption },
-  ], isError: false }));
   const matched = api.match(base, [
-    { id: "toolu_img_b1", clientName: "Read", boxName: "mcp__ocbridge__t0", input: { file_path: "a.png" } },
-    { id: "toolu_note_b1", clientName: "Note", boxName: "mcp__ocbridge__t0", input: { file_path: "a.md" } },
+    { id: SEALED_ID, clientName: "Read", boxName: "mcp__ocbridge__t0", input: { file_path: "a.png" } },
+    { id: SEALED_NOTE, clientName: "Note", boxName: "mcp__ocbridge__t0", input: { file_path: "a.md" } },
   ]);
-  const row = matched.find((item) => item.modelToolUseId === "toolu_img_b1");
+  const row = matched.find((item) => item.modelToolUseId === SEALED_ID) as PublishedMatch | undefined;
   if (!row || JSON.stringify(row.content) !== JSON.stringify([
     { type: "image", data: png, mimeType: "image/png" }, { type: "text", text: caption }])) {
     fail("IMAGE_MATCH_BYTES");
   }
-  api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{ type: "tool_result",
-    tool_use_id: "toolu_img_b1", content: [image, { type: "text", text: caption }] }] } });
-  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
-    type: "tool_result", tool_use_id: "toolu_img_b1", content: [image] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  if (row.modelToolUseId !== SEALED_ID || !/^[a-f0-9]{64}$/.test(row.contentHash)) fail("IMAGE_MATCH_BYTES");
+  const published = api.publishImage(row);
+  api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, publishedEcho(published));
+  if (JSON.stringify(published).split(caption).length - 1 !== 1) fail("IMAGE_PUBLISHED_CAPTION");
+  if (published.modelToolUseId !== SEALED_ID) fail("IMAGE_PUBLISHED_ID");
+  const stored = published.content?.find((part) => part.type === "image");
+  if (!stored?.data || sha256(Buffer.from(stored.data, "base64")) !== SEALED_IMAGE_SHA) fail("IMAGE_PUBLISHED_SHA");
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID, content: [image] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
   const nudged = `${caption.slice(0, -2)}X]`;
-  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
-    type: "tool_result", tool_use_id: "toolu_img_b1",
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID,
     content: [image, { type: "text", text: nudged }] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
   const flipped = Buffer.from(png, "base64");
   flipped[flipped.length - 1] ^= 0xff;
@@ -561,16 +636,16 @@ function proveImageCaption(api: Api): void {
     data: flipped.toString("base64") } };
   if (api.gate({ ...base, messages: base.messages.map((message, index) => index === 2
     ? { ...message, content: [
-      { type: "tool_result", tool_use_id: "toolu_img_b1", content: [flippedImage] },
-      { type: "tool_result", tool_use_id: "toolu_note_b1", content: "note" },
+      { type: "tool_result", tool_use_id: SEALED_ID, content: [flippedImage] },
+      { type: "tool_result", tool_use_id: SEALED_NOTE, content: "note" },
       { type: "text", text: caption }, { type: "text", text: hook }] } : message) }, true) !== null) {
     fail("IMAGE_BYTE_STILL_CANONICAL");
   }
-  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
-    type: "tool_result", tool_use_id: "toolu_img_b1",
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID,
     content: [flippedImage, { type: "text", text: caption }] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
-  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
-    type: "tool_result", tool_use_id: "toolu_note_b1",
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_NOTE,
     content: [image, { type: "text", text: caption }] }] } }), "BOX_TOOL_ECHO_");
   const dropped = JSON.parse(snapshot) as typeof base;
   (dropped.messages[2] as { content: unknown[] }).content =
