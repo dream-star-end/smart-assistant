@@ -5,8 +5,9 @@
 import { createHash } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
 import { BoxCacheAnnotationError, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
-import { deriveBoxCallFingerprint, deriveBoxContextHash,
-  deriveBoxFallbackAlias, type BoxCallFingerprint } from "./boxCallFingerprint.js";
+import { deriveBoxCallFingerprint, deriveBoxContextHash, deriveBoxFallbackAlias,
+  fingerprintOfPrepared, type BoxCallFingerprint } from "./boxCallFingerprint.js";
+import { compileBoxToolCatalog, type BoxToolCatalog } from "./boxToolCatalog.js";
 
 export const PREPARED_CONTINUATION_VERSION = 1 as const;
 const AUTHORITY_TURN_ID = /^[0-9a-f]{32}$/;
@@ -42,10 +43,19 @@ export interface PreparedContinuation {
   readonly nextContextHash: string | null;
   readonly fingerprint: BoxCallFingerprint | null;
   readonly fallbackAlias: string | null;
+  /** Compiled once from the raw tool list. Null unless this request can resume. */
+  readonly catalog: BoxToolCatalog | null;
+  /** Assistant content frozen for the existing comparison projection. */
+  readonly assistantContent: unknown;
 }
 
 export function decisionMayPublish(decision: { readonly kind: string }): boolean {
   return decision.kind === "new_claim";
+}
+
+/** Sole publish predicate shared by the publisher and the formal gate. */
+export function resumeMayPublish(decision: { readonly kind: string }): boolean {
+  return decisionMayPublish(decision);
 }
 
 export function isContinuationConflict(code: string): boolean {
@@ -67,6 +77,34 @@ export function isContinuationConflict(code: string): boolean {
 
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function freezeDeep(value: unknown): void {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return;
+  Object.freeze(value);
+  if (value instanceof Map || value instanceof Set) {
+    for (const item of value.values()) freezeDeep(item);
+    return;
+  }
+  for (const item of Object.values(value as Record<string, unknown>)) freezeDeep(item);
+}
+
+export class PreparedConsumptionError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = "PreparedConsumptionError";
+  }
+}
+
+export interface PreparedConsumption {
+  readonly prepared: PreparedContinuation;
+  readonly fingerprint: BoxCallFingerprint;
+  readonly fallbackAlias: string;
+  readonly priorContextHash: string | null;
+  readonly nextContextHash: string | null;
+  readonly catalog: BoxToolCatalog | null;
+  readonly assistantContent: unknown;
+  readonly effectiveBody: ProxyBody | null;
 }
 
 function stableJson(value: unknown): string {
@@ -232,6 +270,21 @@ export function prepareBoxContinuation(input: {
   } catch { /* fresh admission still reports its own identity error */ }
   let classification = classified.classification;
   let rejectCode = classified.rejectCode;
+  let catalog: BoxToolCatalog | null = null;
+  let assistantContent: unknown = null;
+  if (classification === "continuation_candidate" && classified.effectiveBody) {
+    try {
+      catalog = compileBoxToolCatalog(structuredClone(input.rawBody.tools));
+      const assistant = classified.effectiveBody.messages.at(-2);
+      assistantContent = record(assistant) ? structuredClone(assistant.content) : null;
+      if (assistantContent == null) throw new Error("assistant missing");
+    } catch {
+      classification = "reject";
+      rejectCode = "BOX_PREPARED_REJECT";
+      catalog = null;
+      assistantContent = null;
+    }
+  }
   if (authority.kind === "malformed" && classification !== "reject") {
     classification = "reject";
     rejectCode = "BOX_AUTHORITY_MALFORMED";
@@ -240,22 +293,89 @@ export function prepareBoxContinuation(input: {
     classification = "reject";
     rejectCode = "BOX_PREPARED_REJECT";
   }
-  return Object.freeze({
+  const prepared: PreparedContinuation = {
     version: PREPARED_CONTINUATION_VERSION,
     uid: input.uid,
     canonicalModel: input.canonicalModel,
     sessionId, turnKey, authority,
     rawBoundarySha256: rawBoundarySha256(input.rawBody),
     classification, rejectCode,
-    effectiveBody: classified.effectiveBody,
-    toolIds: classified.toolIds,
+    effectiveBody: classified.effectiveBody ? structuredClone(classified.effectiveBody) : null,
+    toolIds: Object.freeze([...classified.toolIds]),
     priorContextHash: classified.priorContextHash,
     nextContextHash: classified.nextContextHash,
-    fingerprint, fallbackAlias,
-  });
+    fingerprint: fingerprint ? structuredClone(fingerprint) : null,
+    fallbackAlias,
+    catalog: catalog ? structuredClone(catalog) : null,
+    assistantContent,
+  };
+  freezeDeep(prepared);
+  return prepared;
 }
 
 export function preparedMatchesBody(prepared: Pick<PreparedContinuation, "rawBoundarySha256">,
   body: ProxyBody): boolean {
   return prepared.rawBoundarySha256 === rawBoundarySha256(body);
+}
+
+/** Non-streaming replay flips only `stream` on a clone. Messages stay the prepared raw. */
+export function preparedMatchesReplayBody(prepared: Pick<PreparedContinuation, "rawBoundarySha256">,
+  body: ProxyBody): boolean {
+  if (preparedMatchesBody(prepared, body)) return true;
+  if (body.stream !== false) return false;
+  if (preparedMatchesBody(prepared, { ...body, stream: true })) return true;
+  const { stream: _stream, ...omitted } = body;
+  return preparedMatchesBody(prepared, omitted as ProxyBody);
+}
+
+/** Use the prepared view. A missing one is prepared once for old callers, never twice. */
+export function consumePrepared(input: {
+  uid: bigint;
+  canonicalModel: string;
+  canonicalBody: ProxyBody;
+  prepared?: PreparedContinuation;
+  trustedAuthority?: AuthorityProjection;
+  allowPrepareOnce: boolean;
+  replayAlias?: boolean;
+}): PreparedConsumption {
+  let prepared = input.prepared;
+  if (!prepared) {
+    if (!input.allowPrepareOnce) throw new PreparedConsumptionError("BOX_PREPARED_STALE");
+    const authority = input.trustedAuthority;
+    prepared = prepareBoxContinuation({
+      uid: input.uid,
+      canonicalModel: input.canonicalModel,
+      rawBody: input.canonicalBody,
+      authorityKind: !authority || authority.kind === "legacy_unsigned" ? "local_catalog" : "bridge_signed",
+      authorityTurnId: authority?.kind === "bridge_signed" ? authority.authorityTurnId
+        : authority?.kind === "malformed" ? "short" : null,
+    });
+  }
+  if (prepared.uid !== input.uid || prepared.canonicalModel !== input.canonicalModel) {
+    throw new PreparedConsumptionError("BOX_AUTHORITY_REJECTED");
+  }
+  const matches = input.replayAlias
+    ? preparedMatchesReplayBody(prepared, input.canonicalBody)
+    : preparedMatchesBody(prepared, input.canonicalBody);
+  if (!matches) throw new PreparedConsumptionError("BOX_PREPARED_STALE");
+  if (input.trustedAuthority) {
+    const bound = authoritiesBind(prepared.authority, input.trustedAuthority);
+    if (!bound.ok) throw new PreparedConsumptionError(bound.code);
+  }
+  if (prepared.authority.kind === "malformed") {
+    throw new PreparedConsumptionError("BOX_AUTHORITY_MALFORMED");
+  }
+  if (!prepared.fingerprint || !prepared.fallbackAlias) {
+    throw new PreparedConsumptionError("BOX_PREPARED_REJECT");
+  }
+  return {
+    prepared,
+    fingerprint: fingerprintOfPrepared(prepared),
+    fallbackAlias: prepared.fallbackAlias,
+    priorContextHash: prepared.priorContextHash,
+    nextContextHash: prepared.nextContextHash,
+    catalog: prepared.catalog,
+    assistantContent: prepared.assistantContent,
+    effectiveBody: prepared.effectiveBody,
+  };
 }

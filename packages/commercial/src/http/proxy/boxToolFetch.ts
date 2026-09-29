@@ -10,7 +10,7 @@ import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResu
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { makeBoxNativeGcDelete, parseBoxNativeGcResult } from "./boxNativeGcFile.js";
-import { classifyBoxContinuation, preparedMatchesBody,
+import { prepareBoxContinuation, preparedMatchesBody,
   BoxContinuationDecisionError, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { makeBoxPrelaunchCleanup } from "./boxPrelaunchControl.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -25,11 +25,13 @@ type Publish = typeof publishBoxToolResume;
 type Continue = typeof runBoxToolContinuation;
 
 function routeClass(args: FetchArgs): PreparedContinuation["classification"] {
-  const prepared = args.prepared ?? null;
-  if (prepared && !preparedMatchesBody(prepared, args.canonicalBody)) {
+  if (args.prepared && !preparedMatchesBody(args.prepared, args.canonicalBody)) {
     throw new BoxContinuationDecisionError("reject", "BOX_PREPARED_STALE");
   }
-  const view = prepared ?? classifyBoxContinuation(args.canonicalBody);
+  const view = args.prepared ?? prepareBoxContinuation({
+    uid: args.uid, canonicalModel: args.canonicalModel, rawBody: args.canonicalBody,
+    authorityKind: "local_catalog", authorityTurnId: null,
+  });
   if (view.classification === "reject") {
     throw new BoxContinuationDecisionError("reject",
       ("rejectCode" in view ? view.rejectCode : null) ?? "BOX_PREPARED_REJECT");

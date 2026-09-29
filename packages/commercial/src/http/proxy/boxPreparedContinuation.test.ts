@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { authoritiesBind, classifyBoxContinuation, decisionMayPublish,
-  prepareBoxContinuation, preparedMatchesBody, projectAuthority,
+import { authoritiesBind, classifyBoxContinuation, consumePrepared, decisionMayPublish,
+  prepareBoxContinuation, preparedMatchesBody, projectAuthority, resumeMayPublish,
   trustedIdentitiesBind } from "./boxPreparedContinuation.js";
+import { fingerprintOfPrepared } from "./boxCallFingerprint.js";
+import { matchPreparedToolResults } from "./boxToolResultMatcher.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -100,4 +102,28 @@ test("signed authority is equal only both ways, and one side cannot downgrade", 
   assert.equal(decisionMayPublish({ kind: "new_claim" }), true);
   assert.equal(decisionMayPublish({ kind: "in_progress_or_unknown" }), false);
   assert.equal(decisionMayPublish({ kind: "reject" }), false);
+  assert.equal(resumeMayPublish({ kind: "new_claim" }), true);
+  assert.equal(resumeMayPublish({ kind: "in_progress_or_unknown" }), false);
+});
+
+test("one prepared view stays stable and is what claim would consume", () => {
+  const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: imageTurn.model,
+    rawBody: imageTurn, authorityKind: "bridge_signed", authorityTurnId: "ab".repeat(16) });
+  assert.equal(prepared.classification, "continuation_candidate");
+  assert.ok(prepared.catalog);
+  assert.ok(prepared.assistantContent);
+  assert.equal(fingerprintOfPrepared(prepared).replayFingerprint, prepared.fingerprint?.replayFingerprint);
+  const original = structuredClone(imageTurn);
+  const before = JSON.stringify(prepared.effectiveBody);
+  const live = imageTurn.messages as Array<{ content?: unknown }>;
+  live[0]!.content = "mutated-after-prepare";
+  assert.equal(JSON.stringify(prepared.effectiveBody), before);
+  assert.equal(preparedMatchesBody(prepared, imageTurn), false);
+  const consumed = consumePrepared({ uid: 3n, canonicalModel: imageTurn.model,
+    canonicalBody: original, prepared, trustedAuthority: prepared.authority,
+    allowPrepareOnce: false });
+  assert.equal(consumed.catalog, prepared.catalog);
+  assert.equal(consumed.fingerprint, prepared.fingerprint);
+  assert.throws(() => matchPreparedToolResults({ effectiveBody: null }, []),
+    /BOX_TOOL_RESULT_CONTEXT_INVALID/);
 });

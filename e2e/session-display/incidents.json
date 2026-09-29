@@ -4978,6 +4978,16 @@
           "assertion": "TEMP authority mismatch and a second request id do not publish twice"
         },
         {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts",
+          "assertion": "two concurrent journal claims publish one local file and add no usage row"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "continuation conflict is 409 from core and does not insert usage"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "prepared route, authority, and single publish"

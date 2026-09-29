@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import test from "node:test";
 import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
+import { prepareBoxContinuation } from "./boxPreparedContinuation.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash, hashBoxAssistantContent,
   hashBoxAssistantEchoContent, hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
@@ -69,10 +70,12 @@ test("second TEMP claim keeps the client sibling and does not advance on failure
       state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
-    const located = await client.query<{ nspname: string }>(
-      `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE c.oid = to_regclass('request_finalize_journal')`);
-    assert.ok(located.rows[0]?.nspname.startsWith("pg_temp"));
+    const located = await client.query<{ name: string; nspname: string }>(
+      `SELECT c.relname AS name, n.nspname FROM pg_class c
+         JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.oid IN (to_regclass('request_finalize_journal'), to_regclass('usage_records'))`);
+    assert.equal(located.rows.length, 2);
+    assert.ok(located.rows.every((row) => row.nspname.startsWith("pg_temp")));
     const journal = new BoxDurableJournal({ connect: async () => ({
       query: client.query.bind(client), release: () => {} }),
       query: client.query.bind(client) } as never);
@@ -115,14 +118,21 @@ test("second TEMP claim keeps the client sibling and does not advance on failure
       boxBillingContext: billing };
     await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
       VALUES ($1,3,'inflight',$2::jsonb)`, [child, JSON.stringify(childBasis)]);
+    const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: model, rawBody: first,
+      authorityKind: "local_catalog", authorityTurnId: null });
+    const usageBefore = await client.query<{ n: string }>(
+      "SELECT COUNT(*)::text AS n FROM usage_records");
     const claimed = await journal.claimToolResume({ requestId: child, uid: 3n,
-      canonicalModel: model, canonicalBody: first });
+      canonicalModel: model, canonicalBody: first, prepared });
     assert.equal(claimed.results.find((item) => item.modelToolUseId === "toolu_img_claim")
       ?.content.some((part) => part.type === "text" && part.text === caption), true);
     const storedNext = await client.query<{ hash: string }>(
       "SELECT ctx->>'boxContextHash' AS hash FROM request_finalize_journal WHERE request_id=$1",
       [child]);
-    assert.equal(storedNext.rows[0]?.hash, deriveBoxContextHash(first));
+    assert.equal(storedNext.rows[0]?.hash, prepared.nextContextHash);
+    const usageAfter = await client.query<{ n: string }>(
+      "SELECT COUNT(*)::text AS n FROM usage_records");
+    assert.equal(usageAfter.rows[0]?.n, usageBefore.rows[0]?.n);
     const secondAssistant = [{ type: "tool_use", id: "toolu_next_claim", name: "Note",
       input: { file_path: "b.md" } }];
     const second = request(session, turn, [
@@ -193,10 +203,12 @@ test("TEMP authority mismatch and a second request id do not publish twice", asy
       state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
-    const located = await client.query<{ nspname: string }>(
-      `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE c.oid = to_regclass('request_finalize_journal')`);
-    assert.ok(located.rows[0]?.nspname.startsWith("pg_temp"));
+    const located = await client.query<{ name: string; nspname: string }>(
+      `SELECT c.relname AS name, n.nspname FROM pg_class c
+         JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.oid IN (to_regclass('request_finalize_journal'), to_regclass('usage_records'))`);
+    assert.equal(located.rows.length, 2);
+    assert.ok(located.rows.every((row) => row.nspname.startsWith("pg_temp")));
     const journal = new BoxDurableJournal({ connect: async () => ({
       query: client.query.bind(client), release: () => {} }),
       query: client.query.bind(client) } as never);
@@ -289,8 +301,9 @@ test("TEMP authority mismatch and a second request id do not publish twice", asy
     assert.equal(states.rows.find((row) => row.id === rival)?.state ?? null, null);
     const stillTemp = await client.query<{ nspname: string }>(
       `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE c.oid = to_regclass('request_finalize_journal')`);
-    assert.ok(stillTemp.rows[0]?.nspname.startsWith("pg_temp"));
+        WHERE c.oid IN (to_regclass('request_finalize_journal'), to_regclass('usage_records'))`);
+    assert.equal(stillTemp.rows.length, 2);
+    assert.ok(stillTemp.rows.every((row) => row.nspname.startsWith("pg_temp")));
   } finally {
     client.release();
     outsider.release();

@@ -70,6 +70,7 @@ import { deriveBoxCallFingerprint } from "../http/proxy/boxCallFingerprint.js";
 import { BoxTextFetch, BoxTextFetchError } from "../http/proxy/boxTextFetch.js";
 import { BoxInvocationRegistry, BoxInvocationConflict } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal, BoxDurableJournalError } from "../http/proxy/boxDurableJournal.js";
+import { BoxContinuationDecisionError, prepareBoxContinuation } from "../http/proxy/boxPreparedContinuation.js";
 import { writeBoxReplayMessage } from "../http/proxy/boxReplayMessageFile.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
@@ -1398,6 +1399,121 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("wrong signed replay identity is rejected before reservation or settle", async () => {
+    const { h, headers } = boxRouteHarness();
+    let lookups = 0;
+    let settled = 0;
+    h.deps.boxReplay = { lookup: async (input: { prepared?: { authority: { kind: string };
+      rawBoundarySha256: string }; canonicalBody: { model: string } }) => {
+      lookups += 1;
+      assert.equal(input.prepared?.authority.kind, "legacy_unsigned");
+      assert.equal(input.canonicalBody.model, BOX_API_MODEL);
+      settled += 1;
+      throw new BoxDurableJournalError("BOX_AUTHORITY_REJECTED");
+    } } as never;
+    const response = await h.run({ ...minBody(BOX_API_MODEL), stream: false, metadata: {
+      user_id: JSON.stringify({ session_id: "web-box-auth", oc_turn_key: "ab".repeat(32) }) } },
+      headers);
+    assert.equal(response.statusCode, 409, response.bodyText());
+    assert.match(response.bodyText(), /BOX_AUTHORITY_REJECTED/);
+    assert.equal(lookups, 1);
+    assert.equal(settled, 1, "lookup itself ran; the handler must stop before a delivery settle");
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+      .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+  });
+
+  test("legal exact replay returns the capsule and does not debit this request", async () => {
+    const { h, headers } = boxRouteHarness();
+    const replayed = { type: "message", id: "msg_exact", role: "assistant", model: "claude-opus-5-5",
+      content: [{ type: "text", text: "kept" }] };
+    h.deps.boxReplay = { lookup: async (input: { prepared?: { classification: string } }) => {
+      assert.equal(input.prepared?.classification, "fresh");
+      return { kind: "ready", identity: {} as never, response: new Response(JSON.stringify(replayed), {
+        status: 200, headers: { "content-type": "application/json" } }) };
+    } } as never;
+    const response = await h.run({ ...minBody(BOX_API_MODEL), stream: false, metadata: {
+      user_id: JSON.stringify({ session_id: "web-box-exact", oc_turn_key: "cd".repeat(32) }) } },
+      headers);
+    assert.equal(response.statusCode, 200, response.bodyText());
+    assert.equal(JSON.parse(response.bodyText()).id, "msg_exact");
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+      .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+  });
+
+  test("unknown current tool text is rejected before precheck", async () => {
+    const oldApi = process.env.OC_BOX_MODEL_API;
+    const oldBridge = process.env.OC_BOX_TOOL_BRIDGE;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      process.env.OC_BOX_TOOL_BRIDGE = "1";
+      const { h, headers } = boxRouteHarness();
+      let launches = 0;
+      h.deps.boxModel = { toolBridgeReady: true, async fetch() { launches += 1;
+        throw new Error("SHOULD_NOT_LAUNCH"); } };
+      h.deps.boxReplay = { lookup: async () => ({ kind: "missing" }) } as never;
+      const response = await h.run({ ...minBody(BOX_API_MODEL), tools: [{ name: "Read",
+        description: "read", input_schema: { type: "object", properties: {} } }],
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_http_unknown",
+            name: "Read", input: { file_path: "a.txt" } }] },
+          { role: "user", content: [
+            { type: "tool_result", tool_use_id: "toolu_http_unknown", content: "ok" },
+            { type: "text", text: "please also change the plan" },
+          ] },
+        ], metadata: { user_id: JSON.stringify({ session_id: "web-box-unknown",
+          oc_turn_key: "ef".repeat(32) }) } }, headers);
+      assert.equal(response.statusCode, 409, response.bodyText());
+      assert.match(response.bodyText(), /BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION/);
+      assert.equal(launches, 0);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    } finally {
+      if (oldApi === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = oldApi;
+      if (oldBridge === undefined) delete process.env.OC_BOX_TOOL_BRIDGE;
+      else process.env.OC_BOX_TOOL_BRIDGE = oldBridge;
+    }
+  });
+
+  test("continuation conflict is 409 from core and does not insert usage", async () => {
+    const oldApi = process.env.OC_BOX_MODEL_API;
+    const oldBridge = process.env.OC_BOX_TOOL_BRIDGE;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      process.env.OC_BOX_TOOL_BRIDGE = "1";
+      const { h, headers } = boxRouteHarness();
+      const turn = "a".repeat(64);
+      const request = { ...minBody(BOX_API_MODEL), max_tokens: 128, tools: [{ name: "Read",
+        description: "read", input_schema: { type: "object", properties: { file_path: { type: "string" } } } }],
+        messages: [
+          { role: "user", content: "look" },
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_http_claim", name: "Read",
+            input: { file_path: "a.txt" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_http_claim",
+            content: "ok" }] },
+        ], metadata: { user_id: JSON.stringify({ session_id: "web-box-claim", oc_turn_key: turn }) } };
+      h.deps.boxReplay = { lookup: async () => ({ kind: "missing" }) } as never;
+      h.deps.boxModel = { toolBridgeReady: true, fetch: async (args: { prepared?: ReturnType<
+        typeof prepareBoxContinuation> }) => {
+        assert.equal(args.prepared?.classification, "continuation_candidate");
+        assert.ok(args.prepared?.catalog);
+        assert.equal(args.prepared?.toolIds[0], "toolu_http_claim");
+        throw new BoxContinuationDecisionError("in_progress_or_unknown", "BOX_RESUME_IN_PROGRESS");
+      } };
+      const response = await h.run(request, headers);
+      assert.equal(response.statusCode, 409, response.bodyText());
+      assert.match(response.bodyText(), /BOX_RESUME_IN_PROGRESS/);
+      assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+        .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+    } finally {
+      if (oldApi === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = oldApi;
+      if (oldBridge === undefined) delete process.env.OC_BOX_TOOL_BRIDGE;
+      else process.env.OC_BOX_TOOL_BRIDGE = oldBridge;
     }
   });
 });

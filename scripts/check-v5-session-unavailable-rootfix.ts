@@ -170,16 +170,26 @@ const preparedEgress = readFileSync(join(root,
   'packages/commercial/src/egress/main.ts'), 'utf8')
 for (const marker of [
   'export function decisionMayPublish',
+  'export function resumeMayPublish',
   'export function authoritiesBind',
   'export function classifyBoxContinuation',
+  'export function consumePrepared',
 ]) {
   if (!preparedSrc.includes(marker)) {
     throw new Error(`[box-prepared-continuation] missing ${marker}`)
   }
 }
+const preparedPublish = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolResumePublish.ts'), 'utf8')
+const preparedJournal = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
 if (!preparedGate.includes('classifyBoxContinuation')
   || !preparedFetch.includes('continuation_candidate')
-  || !preparedEgress.includes('continuation_candidate')) {
+  || !preparedEgress.includes('continuation_candidate')
+  || !preparedPublish.includes('resumeMayPublish(')
+  || !preparedJournal.includes('matchPreparedToolResults(')
+  || !preparedJournal.includes('consumePrepared(')
+  || !preparedSrc.includes('fingerprintOfPrepared')) {
   throw new Error('[box-prepared-continuation] gate, fetch, or egress does not consume the prepared class')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')

@@ -885,7 +885,8 @@ export function makeAnthropicProxyHandler(
           return;
         }
         const unsupported = validateBoxRequest(body,
-          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true);
+          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true,
+          boxPrepared);
         if (unsupported) {
           userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
           incrAnthropicProxyReject("bad_body");

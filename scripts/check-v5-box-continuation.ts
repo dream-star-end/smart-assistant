@@ -60,7 +60,10 @@ type Api = {
   classify: (body: Record<string, unknown>) => { classification: string; rejectCode: string | null };
   projectAuthority: (kind: unknown, authorityTurnId: unknown) => { kind: string };
   bindAuthority: (left: { kind: string }, right: { kind: string }) => { ok: boolean };
-  mayPublish: (decision: { kind: string }) => boolean;
+  bindIdentity: (left: { uid: bigint; sessionId: string; canonicalModel: string; turnKey: string;
+    authority: { kind: string } }, right: { uid: bigint; sessionId: string; canonicalModel: string;
+    turnKey: string; authority: { kind: string } }) => { ok: boolean };
+  resumeMayPublish: (decision: { kind: string }) => boolean;
 };
 type Digest = Array<{ path: string; realpath: string; sha256: string }>;
 type ImageOracle = {
@@ -275,7 +278,8 @@ async function load(): Promise<Api> {
     classify: prepared.classifyBoxContinuation,
     projectAuthority: prepared.projectAuthority,
     bindAuthority: prepared.authoritiesBind,
-    mayPublish: prepared.decisionMayPublish,
+    bindIdentity: prepared.trustedIdentitiesBind,
+    resumeMayPublish: prepared.resumeMayPublish,
     publishImage: (row) => {
       const cwd = publishDir;
       if (!PUBLISH_DIR.test(cwd) || !existsSync(cwd)) fail("IMAGE_PUBLISH_DIR");
@@ -556,24 +560,30 @@ function checks(api: Api): void {
 
 // prepared route, authority, and single publish
 function provePrepared(api: Api): void {
-  const current = api.classify(fx.chain[1] ?? {});
-  if (current.classification !== "continuation_candidate") fail("WRONG_ROUTE");
-  const unknown = api.classify(fx.unknownText);
-  if (unknown.classification !== "reject") fail("WRONG_ROUTE");
+  const currentBody = fx.chain[1] ?? {};
+  if (api.gate(currentBody, true) !== null) fail("WRONG_ROUTE");
+  if (api.classify(currentBody).classification !== "continuation_candidate") fail("WRONG_ROUTE");
+  if (api.gate(fx.unknownText, true) !== "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION") fail("WRONG_ROUTE");
   const signed = api.projectAuthority("bridge_signed", "ab".repeat(16));
   const other = api.projectAuthority("bridge_signed", "cd".repeat(16));
   const legacy = api.projectAuthority("local_catalog", null);
   const broken = api.projectAuthority("bridge_signed", "short");
-  if (api.bindAuthority(signed, other).ok || api.bindAuthority(signed, legacy).ok
+  const base = { uid: 3n, sessionId: "sess-prepared", canonicalModel: "box-api-claude-opus-5-5",
+    turnKey: "ab".repeat(32), authority: signed };
+  if (api.bindIdentity(base, { ...base, authority: other }).ok
+    || api.bindIdentity(base, { ...base, authority: legacy }).ok
+    || api.bindIdentity(base, { ...base, sessionId: "other-session" }).ok
     || broken.kind !== "malformed" || api.bindAuthority(broken, legacy).ok) {
     fail("AUTHORITY_BYPASS");
   }
-  if (!api.bindAuthority(signed, signed).ok || !api.bindAuthority(legacy, legacy).ok) {
+  if (!api.bindIdentity(base, base).ok || !api.bindIdentity(
+    { ...base, authority: legacy }, { ...base, authority: legacy }).ok) {
     fail("AUTHORITY_BYPASS");
   }
   let publishes = 0;
   for (const decision of [{ kind: "new_claim" }, { kind: "in_progress_or_unknown" }, { kind: "reject" }]) {
-    if (api.mayPublish(decision)) publishes += 1;
+    if (!api.resumeMayPublish(decision)) continue;
+    publishes += 1;
   }
   if (publishes !== 1) fail("DUPLICATE_PUBLISH");
 }

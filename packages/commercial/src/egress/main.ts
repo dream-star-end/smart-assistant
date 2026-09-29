@@ -38,7 +38,7 @@ import {
 } from "../billing/modelCatalogRuntime.js";
 import { releasePreCheck, wrapIoredisForPreCheck } from "../billing/preCheck.js";
 import { settleBoxReplayBeforeDelivery } from "../billing/boxBillingRecovery.js";
-import { prepareBoxContinuation, BoxContinuationDecisionError } from "../http/proxy/boxPreparedContinuation.js";
+import { BoxContinuationDecisionError, type PreparedContinuation } from "../http/proxy/boxPreparedContinuation.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "../account-pool/health.js";
 import { AccountScheduler } from "../account-pool/scheduler.js";
@@ -337,12 +337,12 @@ export async function startEgress(): Promise<void> {
   const boxModel = boxTextModel ? {
     toolBridgeReady: boxToolModel !== undefined,
     fetch: (args: Parameters<BoxTextFetch["fetch"]>[0] & {
-      prepared?: ReturnType<typeof prepareBoxContinuation>;
+      prepared?: PreparedContinuation;
     }) => {
-      const prepared = args.prepared ?? prepareBoxContinuation({
-        uid: args.uid, canonicalModel: args.canonicalModel, rawBody: args.canonicalBody,
-        authorityKind: "local_catalog", authorityTurnId: null,
-      });
+      if (!args.prepared) {
+        throw new BoxContinuationDecisionError("reject", "BOX_PREPARED_STALE");
+      }
+      const prepared = args.prepared;
       if (prepared.classification === "reject") {
         throw new BoxContinuationDecisionError("reject",
           prepared.rejectCode ?? "BOX_PREPARED_REJECT");
