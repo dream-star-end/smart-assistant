@@ -9,12 +9,15 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign as cryptoSign } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { IDLE_COMPACT_PROMPT, writeIdleNative } from "../boxIdleCompact.js";
+import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
 
 const HOME = mkdtempSync(join(tmpdir(), "ocv5-296-idle-home-"));
 process.env.OPENCLAUDE_HOME = HOME;
@@ -33,6 +36,9 @@ for (const key of Object.keys(process.env)) {
 
 const CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
 const MODEL = "box-api-claude-opus-5-5";
+const CATALOG_SECRET = "a".repeat(64);
+const CATALOG_TOKEN = `oc-v3.7.${CATALOG_SECRET}`;
+const PROJECTION_OK = "d".repeat(64);
 const READY_FALSE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;";
 const READY_TRUE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;";
 const SUMMARY_MARK = "preserve the user goal, decisions, constraints";
@@ -47,6 +53,7 @@ let toolsPerRound = 1;
 let growthChars = GROW_CHARS;
 let executionLogPath = "";
 let growthBodyPrefix = "ocv5-296-r19-live";
+let largestGrowthRequest = "";
 let spoolBuf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
 const pendingById = new Map<string, string>();
 let mcpSerial = 0;
@@ -55,12 +62,85 @@ const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
 
-async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise<void> {
+type LocalClaims = { v: number; kind: string; securityEpoch: string; projectionRevision: string };
+type CredentialProof = {
+  hasAuthority: boolean;
+  hasLease: boolean;
+  hasLocal: boolean;
+  localSha256: string | null;
+  claims: LocalClaims | null;
+  claimsError: string | null;
+  ocTurnKey: string | null;
+};
+
+function headerOne(headers: IncomingHttpHeaders, name: string): { value: string | null; duplicate: boolean } {
+  const raw = headers[name];
+  if (Array.isArray(raw)) return { value: null, duplicate: raw.length > 0 };
+  if (typeof raw === "string" && raw.trim() !== "") return { value: raw.trim(), duplicate: false };
+  return { value: null, duplicate: false };
+}
+
+function credentialProof(headers: IncomingHttpHeaders, raw: string): CredentialProof {
+  const authority = headerOne(headers, "x-oc-model-authority");
+  const lease = headerOne(headers, "x-oc-turn-lease");
+  const local = headerOne(headers, "x-oc-local-catalog");
+  let claims: LocalClaims | null = null;
+  let claimsError: string | null = null;
+  if (local.duplicate) claimsError = "duplicate-local-header";
+  else if (local.value) {
+    try {
+      const decoded = JSON.parse(Buffer.from(local.value, "base64url").toString("utf8")) as Partial<LocalClaims>;
+      claims = {
+        v: Number(decoded.v),
+        kind: String(decoded.kind),
+        securityEpoch: String(decoded.securityEpoch),
+        projectionRevision: String(decoded.projectionRevision),
+      };
+    } catch (error) {
+      claimsError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  return {
+    hasAuthority: authority.duplicate || authority.value !== null,
+    hasLease: lease.duplicate || lease.value !== null,
+    hasLocal: local.duplicate || local.value !== null,
+    localSha256: local.value ? createHash("sha256").update(local.value).digest("hex") : null,
+    claims,
+    claimsError,
+    ocTurnKey: ocTurnKeyOf(raw),
+  };
+}
+
+function ocTurnKeyOf(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as { metadata?: { user_id?: unknown }; oc_turn_key?: unknown };
+    if (typeof parsed.oc_turn_key === "string") return parsed.oc_turn_key;
+    const userId = parsed.metadata?.user_id;
+    const meta = typeof userId === "string"
+      ? JSON.parse(userId) as { oc_turn_key?: unknown }
+      : userId as { oc_turn_key?: unknown } | undefined;
+    return typeof meta?.oc_turn_key === "string" ? meta.oc_turn_key : null;
+  } catch {
+    return null;
+  }
+}
+
+function resetCatalogClient(dropLkg: boolean): void {
+  _setModelCatalogClientForTests(null);
+  if (dropLkg) rmSync(join(HOME, "model-catalog-lkg.json"), { force: true });
+}
+
+function restoreEnv(name: string, previous: string | undefined): void {
+  if (previous === undefined) delete process.env[name];
+  else process.env[name] = previous;
+}
+
+async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth"): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
   const keyring = new Map<string, Uint8Array>([[keyId, new Uint8Array(publicRaw)]]);
-  const hits: Array<{ url: string; status: number; bytes: number; summary: boolean; body?: string; keptPrefix?: boolean; shape?: unknown; digest?: unknown; kind?: string; reasons?: string[]; requestId?: string; mentions?: { leaf: boolean; next: boolean; idle: boolean } }> = [];
+  const hits: Array<{ url: string; status: number; bytes: number; summary: boolean; body?: string; keptPrefix?: boolean; shape?: unknown; digest?: unknown; kind?: string; reasons?: string[]; requestId?: string; mentions?: { leaf: boolean; next: boolean; idle: boolean }; cred?: CredentialProof }> = [];
   let wantSummary = false;
   const events: string[] = [];
   let candidate = "";
@@ -71,6 +151,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
   let adminEnd: (() => Promise<void>) | undefined;
   let poolEnd: (() => Promise<void>) | undefined;
   let redisQuit: (() => Promise<void>) | undefined;
+  let restoreLocalAuth: (() => void) | undefined;
   const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT };
   let holdNextSettlement = false;
   const heldRequestIds: string[] = [];
@@ -266,18 +347,34 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       cache_read_per_mtok: 1n, cache_write_per_mtok: 1n, multiplier: "1.000", enabled: true,
       sort_order: 0, visibility: "public", extra_system_prompt: null, default_effort: null, updated_at: new Date(),
     };
-    const catalog = {
-      async assertFresh() {
-        return {
-          securityEpoch: 12n, executionRevision: "b".repeat(64), billingRevision: "c".repeat(64),
-          aliasToCanonical: (model: string) => model,
-          resolve: (model: string) => (model === MODEL ? descriptor : null),
-          canUseModel: () => true,
-          billingPricingFor: (model: string) => (model === MODEL ? pricing : null),
-          projectionRevisionFor: () => "d".repeat(64),
-        };
-      },
+    const projectionRow = () => ({
+      modelId: MODEL, displayName: "Box", engine: "ccb" as const, providerId: "box_cli",
+      contextWindow: 200_000, supportedEfforts: [] as string[], supportsVision: false,
+      capabilityZero: true, supportsThinking: false, defaultEffort: null as string | null, sortOrder: 0,
+    });
+    // Egress fence stays on this object. Catalog HTTP uses it too, except the
+    // three negative faults, which diverge on purpose.
+    const proxySnapshot = {
+      securityEpoch: 12n, executionRevision: "b".repeat(64), billingRevision: "c".repeat(64),
+      aliasToCanonical: (model: string) => model,
+      resolve: (model: string) => (model === MODEL ? descriptor : null),
+      canUseModel: () => true,
+      billingPricingFor: (model: string) => (model === MODEL ? pricing : null),
+      projectionRevisionFor: () => PROJECTION_OK,
+      listForUser: () => [projectionRow()],
+      aliasesForUser: () => ({} as Record<string, string>),
     };
+    let catalogFault: "none" | "epoch" | "projection" | "model" = "none";
+    const catalogSnapshot = () => {
+      if (catalogFault === "epoch") return { ...proxySnapshot, securityEpoch: 99n };
+      if (catalogFault === "projection") return { ...proxySnapshot, projectionRevisionFor: () => "e".repeat(64) };
+      if (catalogFault === "model") return { ...proxySnapshot, listForUser: () => [] as Array<ReturnType<typeof projectionRow>> };
+      return proxySnapshot;
+    };
+    const catalog = { async assertFresh() { return proxySnapshot; } };
+    let catalogGets = 0;
+    let epochGets = 0;
+    let localAuthBodyPath = "";
     const identity = {
       async resolve() { return { uid: 3n, containerId: 7n }; },
       async authorize() {},
@@ -347,6 +444,23 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       },
     });
     const proof = candidateProof.makeBoxIdleProofHandler({ identity, journal });
+    const catalogHttp = await import(pathToFileURL(join(CHECKOUT, "packages/commercial/src/http/internalModelCatalog.ts")).href);
+    const identityMod = await import(pathToFileURL(join(CHECKOUT, "packages/commercial/src/auth/containerIdentity.ts")).href);
+    const catalogHandler = catalogHttp.makeModelCatalogHandler({
+      identityRepo: {
+        async findActiveByHostAndBoundIp(hostUuid: string, boundIp: string) {
+          if (hostUuid !== "ocv5-296-idle" || boundIp !== "127.0.0.1") return null;
+          return {
+            id: 7, user_id: 3, bound_ip: boundIp, host_uuid: hostUuid,
+            secret_hash: identityMod.hashSecret(CATALOG_SECRET),
+          };
+        },
+      },
+      catalog: { async assertFresh() { return catalogSnapshot(); } },
+      loadUserModelAuthz: async () => ({ role: "admin", grantedModelIds: new Set<string>() }),
+      readEpoch: async () => catalogSnapshot().securityEpoch,
+      loadRoutingAvailability: async () => ({ unavailableProviderIds: new Set<string>(), revision: "availability-idle" }),
+    } as never);
     const server = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -374,6 +488,12 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       replay.url = req.url;
       replay.headers = req.headers;
       const path = (req.url ?? "").split("?")[0];
+      if (path === catalogHttp.MODEL_CATALOG_PATH || path === catalogHttp.MODEL_CATALOG_EPOCH_PATH) {
+        if (path === catalogHttp.MODEL_CATALOG_EPOCH_PATH) epochGets += 1;
+        else catalogGets += 1;
+        await catalogHandler(replay, res, { hostUuid: "ocv5-296-idle", boundIp: "127.0.0.1" });
+        return;
+      }
       if (path === "/internal/v3/marketplace/sync") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ identityCompat: { schema: 1, userId: "3", profiles: [] } }));
@@ -414,18 +534,24 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       const digest = messageDigest(raw.toString("utf8"));
       const classified = classifyRequest(raw.toString("utf8"));
       prepareModelSpool(raw.toString("utf8"));
+      const text = raw.toString("utf8");
+      if (growthActive && text.length >= largestGrowthRequest.length) largestGrowthRequest = text;
       if (growthActive && growthBodies.length < 3) {
-        const text = raw.toString("utf8");
         growthBodies.push(text);
         const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
         const bodyName = `${growthBodyPrefix}-${growthBodies.length}.json`;
         if (bodyName.includes("r17-growth")) throw new Error("refusing to overwrite r17");
         writeFileSync(join(rawDir, bodyName), text);
       }
-      const text = raw.toString("utf8");
+      if (mode === "localAuth" && summaryRequested && !localAuthBodyPath) {
+        const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
+        localAuthBodyPath = join(rawDir, "ocv5-296-idle-local-catalog-request.json");
+        writeFileSync(localAuthBodyPath, text);
+      }
       current = {
         url: path, status: 0, bytes: raw.length,
         summary: summaryRequested, keptPrefix: raw.includes("OCV5296_OLD_PREFIX"), shape,
+        cred: credentialProof(req.headers, text),
         digest, kind: classified.kind, reasons: classified.reasons,
         mentions: { leaf: text.includes("ordinary leaf"), next: text.includes("ordinary next"), idle: text.includes(SUMMARY_MARK) },
       };
@@ -770,6 +896,212 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
         assert.equal(row.box_state, "terminal");
         assert.equal(row.turn_key, freshBooks[0]!.turn_key);
       }
+    } else if (mode === "localAuth") {
+      const previousFlag = process.env.OC_MODEL_AUTHORITY;
+      const previousAuto = process.env.DISABLE_AUTO_COMPACT;
+      const previousToken = process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
+      process.env.OC_MODEL_AUTHORITY = "1";
+      process.env.DISABLE_AUTO_COMPACT = "1";
+      process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = CATALOG_TOKEN;
+      restoreLocalAuth = () => {
+        restoreEnv("OC_MODEL_AUTHORITY", previousFlag);
+        restoreEnv("DISABLE_AUTO_COMPACT", previousAuto);
+        restoreEnv("OPENCLAUDE_V3_CONTAINER_TOKEN", previousToken);
+        _setModelCatalogClientForTests(null);
+      };
+      resetCatalogClient(true);
+      report.liveChainProof = false;
+      report.authFixture = "OC_MODEL_AUTHORITY=1; real catalog handler; egress snapshot unchanged except negative faults";
+      const sourceKey = "agent:main:webchat:dm:idle-auth-source";
+      const sourceAdapter = new CcbAdapter({
+        sessionKey: sourceKey, agentId: "main", agentBaseDir: work, config: adapterConfig,
+        model: MODEL, permissionMode: "bypassPermissions", harness: "ccb", executionTarget: { kind: "local" },
+      });
+      const sourceSession = {
+        sessionKey: sourceKey, agentId: "main", channel: "webchat", peerId: "idle-auth-source",
+        title: "Idle", startedAt: Date.now(), runner: sourceAdapter, model: MODEL, lock: Promise.resolve(),
+        lastUsedAt: 0, totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0, turns: 0, _lastCcbCumulativeCost: 0, toolUseIdToName: new Map(),
+        executionTarget: { kind: "local" }, providerTag: "ccb",
+      } as never;
+      adapterShutdown = () => sourceAdapter.shutdown();
+      await sm.submit(sourceSession, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+      const sourceHit = hits.find((hit) => hit.url === "/v1/messages");
+      report.sourceCred = sourceHit?.cred ?? null;
+      report.sourceStatus = sourceHit?.status ?? null;
+      if (!sourceHit || sourceHit.status !== 200 || !sourceHit.cred?.hasAuthority || !sourceHit.cred.hasLease || sourceHit.cred.hasLocal) {
+        throw new Error(`source authority contract failed status=${sourceHit?.status ?? "missing"} cred=${JSON.stringify(sourceHit?.cred ?? null)}`);
+      }
+      await sourceAdapter.shutdown();
+      const seeded = seedOuterHistory(process.env.CLAUDE_CONFIG_DIR!, work, { rounds: 8, marker: "OCV5296_AUTH_SEED" });
+      assert.ok(seeded.bytes >= 700_000, `synthetic seed ${seeded.bytes} is under the idle floor`);
+      const seedFile = join(seeded.project, `${seeded.sessionId}.jsonl`);
+      const seedBytes = readFileSync(seedFile);
+      const seedCopy = join(process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir(), "ocv5-296-pre-idle-local-auth-seed.jsonl");
+      writeFileSync(seedCopy, seedBytes);
+      const revision = createHash("sha256").update(`ocv5-296-local-auth:${seeded.sessionId}`).digest("hex");
+      const idleKey = "agent:main:webchat:dm:idle-auth-idle";
+      const idleTurnKey = createHash("sha256").update(`${idleKey}:${revision}`).digest("hex");
+      writeIdleNative(HOME, {
+        v: 1, opId: idleTurnKey, revision, sessionId: seeded.sessionId, modelCalls: 0, frozenTail: [], attachments: [],
+      });
+      report.preIdle = {
+        synthetic: true, notLiveChain: true, seedBytes: seedBytes.length,
+        seedSha256: createHash("sha256").update(seedBytes).digest("hex"), seedCopy,
+        sessionId: seeded.sessionId, idleTurnKey, revision,
+      };
+      const idleAdapter = new CcbAdapter({
+        sessionKey: idleKey, agentId: "main", agentBaseDir: work, resumeSessionId: seeded.sessionId,
+        config: adapterConfig, model: MODEL, permissionMode: "bypassPermissions", harness: "ccb",
+        executionTarget: { kind: "local" },
+      });
+      adapterShutdown = () => idleAdapter.shutdown();
+      const idleSession = {
+        sessionKey: idleKey, agentId: "main", channel: "webchat", peerId: "idle-auth-idle",
+        title: "Idle", startedAt: Date.now(), runner: idleAdapter, model: MODEL, lock: Promise.resolve(),
+        lastUsedAt: 0, totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0, turns: 0, _lastCcbCumulativeCost: 0, toolUseIdToName: new Map(),
+        executionTarget: { kind: "local" }, providerTag: "ccb",
+      } as never;
+      const beforeIdle = hits.length;
+      const idleRun = idleAdapter.submitTurn({
+        input: IDLE_COMPACT_PROMPT, turnKey: idleTurnKey, onEvent, sessionTotals: idleSession, toolUseIdToName: new Map(),
+      });
+      await idleRun.submitted;
+      const idleSummary = await Promise.race([
+        idleRun.summary,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 180_000)),
+      ]);
+      const idleHits = hits.slice(beforeIdle).filter((hit) => hit.url === "/v1/messages");
+      const idleHit = idleHits.find((hit) => hit.cred?.ocTurnKey === idleTurnKey && hit.summary)
+        ?? idleHits.find((hit) => hit.cred?.ocTurnKey === idleTurnKey);
+      report.catalogGets = catalogGets;
+      report.epochGets = epochGets;
+      report.idleRequestPath = localAuthBodyPath || null;
+      report.idleHits = idleHits.map((hit) => ({
+        status: hit.status, bytes: hit.bytes, kind: hit.kind, summary: hit.summary, cred: hit.cred, body: (hit.body ?? "").slice(0, 180),
+      }));
+      report.idleTurnFinished = idleSummary !== null;
+      if (!idleHit?.cred) throw new Error(`no dedicated idle HTTP ${JSON.stringify(report.idleHits).slice(0, 900)}`);
+      const cred = idleHit.cred;
+      if (!cred.hasLocal || cred.hasAuthority || cred.hasLease || cred.ocTurnKey !== idleTurnKey) {
+        throw new Error(`idle credential contract failed ${JSON.stringify(cred)}`);
+      }
+      if (cred.claims?.v !== 1 || cred.claims.kind !== "local_catalog" || cred.claims.securityEpoch !== "12" || cred.claims.projectionRevision !== PROJECTION_OK) {
+        throw new Error(`idle claims failed ${JSON.stringify({ claims: cred.claims, claimsError: cred.claimsError })}`);
+      }
+      if (idleHit.status !== 200) {
+        throw new Error(`legitimate local catalog not accepted status=${idleHit.status} body=${idleHit.body ?? ""}`);
+      }
+      assert.equal(catalogGets >= 1, true, "catalog handler was not fetched");
+      report.nativeObserved = listJson(join(HOME, "idle-native")).map((file) => {
+        const row = JSON.parse(readFileSync(file, "utf8")) as { applied?: boolean; modelCalls?: number; modelStarted?: boolean; summaryText?: string; opId?: string };
+        return {
+          applied: row.applied === true, modelCalls: row.modelCalls ?? null, modelStarted: row.modelStarted === true,
+          summaryPrefix: typeof row.summaryText === "string" ? row.summaryText.slice(0, 80) : null, opId: row.opId ?? null,
+        };
+      });
+      report.compactSuccessNotClaimed = true;
+      const usage = await pool.query<{ request_id: string; authority_kind: string | null; projection_revision: string | null; security_epoch: string | null; turn_key: string | null }>(
+        `SELECT request_id, authority_kind, projection_revision, security_epoch::text AS security_epoch, turn_key
+           FROM usage_records WHERE request_id = $1 OR request_id = $2`,
+        [sourceHit.requestId ?? "", idleHit.requestId ?? ""]);
+      report.usageAuthority = usage.rows;
+      const journals = await pool.query<{ request_id: string; kind: string | null; has_turn: boolean }>(
+        `SELECT request_id, ctx->>'authorityKind' AS kind, (ctx ? 'authorityTurnId') AS has_turn
+           FROM request_finalize_journal WHERE request_id = $1 OR request_id = $2`,
+        [sourceHit.requestId ?? "", idleHit.requestId ?? ""]);
+      report.journalAuthority = journals.rows;
+      const sourceUsage = usage.rows.find((row) => row.request_id === sourceHit.requestId);
+      const idleUsage = usage.rows.find((row) => row.request_id === idleHit.requestId);
+      if (sourceUsage) assert.equal(sourceUsage.authority_kind, "bridge_signed");
+      if (idleUsage) {
+        assert.equal(idleUsage.authority_kind, "local_catalog");
+        assert.equal(idleUsage.projection_revision, PROJECTION_OK);
+        assert.equal(idleUsage.security_epoch, "12");
+        if (idleUsage.turn_key) assert.equal(idleUsage.turn_key, idleTurnKey);
+      }
+      const idleJournal = journals.rows.find((row) => row.request_id === idleHit.requestId);
+      if (idleJournal) {
+        assert.equal(idleJournal.kind, "local_catalog");
+        assert.equal(idleJournal.has_turn, false);
+      }
+      const fingerprint = async () => {
+        const locks = [...((await redis.zrange("precheck:u:{3}:locks", 0, -1)) as string[])].sort();
+        const amounts = await redis.hgetall("precheck:u:{3}:amounts");
+        const rows = await pool.query<{ request_id: string }>("SELECT request_id FROM usage_records ORDER BY request_id");
+        return { locks, amounts, usage: rows.rows.map((row) => row.request_id) };
+      };
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (Number(await redis.zcard("precheck:u:{3}:locks")) === 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      const baseline = await fingerprint();
+      report.precheckBaseline = { locks: baseline.locks.length, usage: baseline.usage.length };
+      // A new process. The compact turn's trailing stdout must not finish the next parser.
+      await idleAdapter.shutdown();
+      const probeKey = "agent:main:webchat:dm:idle-auth-probe";
+      const probeAdapter = new CcbAdapter({
+        sessionKey: probeKey, agentId: "main", agentBaseDir: work, config: adapterConfig,
+        model: MODEL, permissionMode: "bypassPermissions", harness: "ccb", executionTarget: { kind: "local" },
+      });
+      adapterShutdown = () => probeAdapter.shutdown();
+      const probeSession = {
+        sessionKey: probeKey, agentId: "main", channel: "webchat", peerId: "idle-auth-probe",
+        title: "Idle", startedAt: Date.now(), runner: probeAdapter, model: MODEL, lock: Promise.resolve(),
+        lastUsedAt: 0, totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0, turns: 0, _lastCcbCumulativeCost: 0, toolUseIdToName: new Map(),
+        executionTarget: { kind: "local" }, providerTag: "ccb",
+      } as never;
+      const probe = async (fault: "epoch" | "projection" | "model", textLabel: string) => {
+        catalogFault = fault;
+        resetCatalogClient(fault !== "epoch");
+        const before = hits.length;
+        const epochBefore = epochGets;
+        const turnKey = createHash("sha256").update(`ocv5-296-${fault}`).digest("hex");
+        const run = probeAdapter.submitTurn({
+          input: textLabel, turnKey, onEvent, sessionTotals: probeSession, toolUseIdToName: new Map(),
+        });
+        if (fault === "model") {
+          await assert.rejects(run.submitted, /missing from current projection/);
+          assert.equal(hits.length, before, "wrong model reached egress");
+          assert.deepEqual(await fingerprint(), baseline);
+          return { fault, status: null as number | null, http: false };
+        }
+        await run.submitted;
+        const done = await Promise.race([
+          run.summary,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 90_000)),
+        ]);
+        const added = hits.slice(before).filter((hit) => hit.url === "/v1/messages");
+        if (added.length === 0 || done === null) {
+          throw new Error(`${fault} produced no gate HTTP hits=${added.length} finished=${done !== null}`);
+        }
+        for (const hit of added) {
+          assert.equal(hit.status, 409, `${fault} ${hit.status} ${hit.body ?? ""}`);
+          assert.equal(hit.cred?.hasLocal, true, fault);
+          assert.equal(hit.cred?.hasAuthority, false, fault);
+          assert.equal(hit.cred?.hasLease, false, fault);
+        }
+        if (fault === "epoch") {
+          assert.equal(added.some((hit) => hit.cred?.claims?.securityEpoch === "99"), true, JSON.stringify(added[0]?.cred?.claims));
+          assert.ok(epochGets > epochBefore, "epoch revocation did not read the epoch endpoint");
+        }
+        if (fault === "projection") {
+          assert.equal(added.some((hit) => hit.cred?.claims?.projectionRevision === "e".repeat(64)), true, JSON.stringify(added[0]?.cred?.claims));
+        }
+        assert.deepEqual(await fingerprint(), baseline, `${fault} precheck changed`);
+        return { fault, status: added[0]?.status ?? null, http: true, localSha256: added[0]?.cred?.localSha256 ?? null };
+      };
+      report.negatives = [
+        await probe("epoch", "epoch revoke probe"),
+        await probe("projection", "projection mismatch probe"),
+        await probe("model", "wrong model probe"),
+      ];
+      catalogFault = "none";
+      report.catalogGets = catalogGets;
+      report.epochGets = epochGets;
+      report.notRun = ["typed-summary success", "three crash windows", "same-session second idle", "45-round chain"];
     } else {
       const growing = mode === "grow2";
       growthActive = true;
@@ -885,6 +1217,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       }
       assert.equal(liveError, "");
       if (growing) {
+        report.preIdle = capturePreIdleTranscript("grow2");
         growthActive = false;
         const beforeNext = hits.length;
         let nextError = "";
@@ -939,6 +1272,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       }
     }
   } finally {
+    restoreLocalAuth?.();
     releaseHeldCommits();
     if (adapterShutdown) await adapterShutdown().catch(() => undefined);
     if (serverClose) await serverClose();
@@ -970,9 +1304,11 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise
       ? "ocv5-296-idle-pipeline-r18-short-raw.json"
       : mode === "fresh"
         ? "ocv5-296-fresh-set-r18-raw.json"
-        : mode === "grow2"
-          ? "ocv5-296-idle-pipeline-r20-cal-raw.json"
-          : "ocv5-296-idle-pipeline-r19-live2-raw.json";
+        : mode === "localAuth"
+          ? "ocv5-296-idle-local-catalog-raw.json"
+          : mode === "grow2"
+            ? "ocv5-296-idle-pipeline-r20-cal-raw.json"
+            : "ocv5-296-idle-pipeline-r19-live2-raw.json";
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, rawName);
     if (/ocv5-296-(idle-pipeline-r\d+-raw|r17-growth-)/.test(path)) {
@@ -1001,6 +1337,7 @@ queueIdle("real submit reaches a short idle no-op without a summary HTTP", 300_0
 queueIdle("fresh stock summary and business roots short-close through terminal_set", 900_000, "fresh");
 test("live tool continuation keeps the persisted deferred-tools announcement", { timeout: 300_000 }, () => runIdleCase("live2"));
 test("live bash rounds grow outer history through idle summary", { timeout: 3_600_000 }, () => runIdleCase("grow2"));
+test("local catalog fixture accepts a dedicated idle request and rejects drift", { timeout: 600_000 }, () => runIdleCase("localAuth"));
 
 type MessageDigest = {
   messages: number;
@@ -1426,6 +1763,42 @@ function makeLocalPythonExec(toolNames: () => string[]): {
       return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""), exitCode: 0 as const };
     },
   };
+}
+
+function capturePreIdleTranscript(label: string): { files: Array<{ file: string; bytes: number; sha256: string }> } {
+  const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
+  const saved: Array<{ file: string; bytes: number; sha256: string }> = [];
+  const jsonl: string[] = [];
+  const walk = (dir: string) => {
+    let names: string[] = [];
+    try { names = readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      const path = join(dir, name);
+      let info;
+      try { info = statSync(path); } catch { continue; }
+      if (info.isDirectory()) walk(path);
+      else if (name.endsWith(".jsonl")) jsonl.push(path);
+    }
+  };
+  if (process.env.CLAUDE_CONFIG_DIR) walk(process.env.CLAUDE_CONFIG_DIR);
+  jsonl.sort().forEach((file, index) => {
+    const dest = join(rawDir, `ocv5-296-pre-idle-${label}-${index}.jsonl`);
+    if (dest.includes("r17") || existsSync(dest)) return;
+    const buf = readFileSync(file);
+    writeFileSync(dest, buf);
+    saved.push({ file: dest, bytes: buf.length, sha256: createHash("sha256").update(buf).digest("hex") });
+  });
+  if (label === "grow2" && largestGrowthRequest) {
+    const dest = join(rawDir, "ocv5-296-pre-idle-grow2-last-request.json");
+    if (!existsSync(dest)) {
+      writeFileSync(dest, largestGrowthRequest);
+      saved.push({
+        file: dest, bytes: Buffer.byteLength(largestGrowthRequest),
+        sha256: createHash("sha256").update(largestGrowthRequest).digest("hex"),
+      });
+    }
+  }
+  return { files: saved };
 }
 
 function listJson(dir: string): string[] {
