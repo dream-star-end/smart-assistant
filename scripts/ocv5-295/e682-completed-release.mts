@@ -16,7 +16,7 @@ export const PINNED_JOURNAL_SHA256 =
 export const EXPECTED_MANIFEST_SHA256 =
   "2cd4d42290c331d6fd72c6a82d1ea17d373b27a757aa4707ff123f4e15347e5c";
 export const EXPECTED_SCRIPT_SHA256 =
-  "2fe183bd6d3fbe63614c664a597b5948fce9ffccb41a79d6d4ef1df4cc749c68";
+  "0ff1c272e165258bf4166a3d8e4fd2dfabc4908c42a980682832bc81e287b9a1";
 export const ABANDON_STATE = "operator_completed_abandoned";
 export const REQUIRED_AUTHORIZATION = "旧运行该停就停";
 export const TARGET_NONCE = "e682271820b159b147bbf767";
@@ -401,12 +401,55 @@ function moneyMatches(row: JournalRow, run: RunManifest): boolean {
     && sameMoney(snap.usageId, run.financial.usageId);
 }
 
+export function isPinnedE682Target(run: Pick<RunManifest, "uid" | "accountId" | "nonce" | "epoch" | "requestId" | "containerId" | "sessionId" | "turnKey">): boolean {
+  return run.uid === "3" && run.accountId === "20"
+    && run.nonce === TARGET_NONCE
+    && run.epoch === "576099aacf2ed8fc91080de887ef5769"
+    && run.requestId === "ed263edbf8dd0f8ff393adc20935d95f"
+    && run.containerId === "534"
+    && run.sessionId === "c1bc63cb-09bb-44ea-a48a-575a533c3940"
+    && run.turnKey === "c25fbc11ede9e1667ccbf9af1481342c24a33207a2eed783d2d87f9f731ac5eb";
+}
+
+function stripTargetClocks(ctx: Ctx): Ctx {
+  const copy = { ...ctx };
+  delete copy.boxStopProbeAfterMs;
+  delete copy.boxStopProbeLastAttemptMs;
+  return copy;
+}
+
+function targetClockPair(ctx: Ctx): { boxStopProbeAfterMs: number; boxStopProbeLastAttemptMs: number } | null {
+  const after = ctx.boxStopProbeAfterMs;
+  const last = ctx.boxStopProbeLastAttemptMs;
+  if (typeof after !== "number" || typeof last !== "number"
+    || !Number.isSafeInteger(after) || !Number.isSafeInteger(last)
+    || !/^[0-9]{13}$/.test(String(after)) || !/^[0-9]{13}$/.test(String(last))
+    || after - last !== CONTRAST_CLOCK_GAP_MS) return null;
+  return { boxStopProbeAfterMs: after, boxStopProbeLastAttemptMs: last };
+}
+
+/** Exact hash, or the pinned e682 row with only a legal probe-clock advance. */
+function approvedCtxMatches(actual: Ctx, run: RunManifest): boolean {
+  if (sha256(canonicalJson(actual)) === run.originalCtxSha256) return true;
+  if (!isPinnedE682Target(run) || !run.originalCtx) return false;
+  if (sha256(canonicalJson(run.originalCtx)) !== run.originalCtxSha256) return false;
+  const approved = targetClockPair(run.originalCtx);
+  const live = targetClockPair(actual);
+  if (!approved || !live) return false;
+  if (live.boxStopProbeAfterMs < approved.boxStopProbeAfterMs
+    || live.boxStopProbeLastAttemptMs < approved.boxStopProbeLastAttemptMs) return false;
+  const advanced = live.boxStopProbeAfterMs !== approved.boxStopProbeAfterMs
+    || live.boxStopProbeLastAttemptMs !== approved.boxStopProbeLastAttemptMs;
+  if (advanced && live.boxStopProbeLastAttemptMs < approved.boxStopProbeAfterMs) return false;
+  return canonicalJson(stripTargetClocks(actual)) === canonicalJson(stripTargetClocks(run.originalCtx));
+}
+
 function readyHandoff(row: JournalRow, run: RunManifest): boolean {
   const handoff = row.ctx.boxToolHandoff as { roundNo?: unknown } | undefined;
   return row.request_id === run.requestId && row.user_id === run.uid
     && row.container_id === run.containerId && row.state === "committed"
     && row.ctx.boxState === "handoff" && sharedIdentity(row.ctx, run) && moneyMatches(row, run)
-    && sha256(canonicalJson(row.ctx)) === run.originalCtxSha256
+    && approvedCtxMatches(row.ctx, run)
     && row.ctx.boxOwnerRequestId === undefined && row.ctx.boxResumeRequestId === undefined
     && row.ctx.boxHandoffRevision === run.handoffRevision
     && !!handoff && !Array.isArray(handoff) && handoff.roundNo === run.handoffRound
@@ -577,7 +620,8 @@ function postcondition(row: JournalRow, before: JournalRow, run: RunManifest, op
     && !Object.hasOwn(row.ctx, "durableBillingRecovery")
     && validIntent(row.ctx.boxCancelIntent, run.requestId)
     && audit.originalCtxSha256 === sha256(canonicalJson(before.ctx))
-    && audit.originalCtxSha256 === run.originalCtxSha256
+    && audit.actualBeforeCtxSha256 === audit.originalCtxSha256
+    && audit.approvedOriginalCtxSha256 === run.originalCtxSha256
     && canonicalJson(audit.proof) === canonicalJson(proof)
     && unsettled?.preserved === true && unsettled.backfill === false && unsettled.exempt === false
     && sameMoney(financial?.precheckCredits, snapshot.precheckCredits)
@@ -585,13 +629,38 @@ function postcondition(row: JournalRow, before: JournalRow, run: RunManifest, op
     && sameMoney(financial?.ledgerId, snapshot.ledgerId)
     && sameMoney(financial?.usageId, snapshot.usageId)
     && moneyMatches(row, run)
-    && sha256(canonicalJson(rebuildOriginal(row))) === run.originalCtxSha256;
+    && sha256(canonicalJson(rebuildOriginal(row))) === sha256(canonicalJson(before.ctx))
+    && targetReleaseStillMatches(row, before.ctx, run);
+}
+
+function targetReleaseStillMatches(row: JournalRow, before: Ctx, run: RunManifest): boolean {
+  if (!isPinnedE682Target(run) || !run.originalCtx) return true;
+  const restored = rebuildOriginal(row);
+  const approved = targetClockPair(run.originalCtx);
+  const actual = targetClockPair(before);
+  const recorded = auditClocks(row.ctx.boxOperatorAudit);
+  if (!approved || !actual || !recorded) return false;
+  if (canonicalJson(stripTargetClocks(restored)) !== canonicalJson(stripTargetClocks(run.originalCtx))) return false;
+  return recorded.boxStopProbeAfterMs === actual.boxStopProbeAfterMs
+    && recorded.boxStopProbeLastAttemptMs === actual.boxStopProbeLastAttemptMs
+    && targetClockPair(restored)?.boxStopProbeAfterMs === actual.boxStopProbeAfterMs
+    && targetClockPair(restored)?.boxStopProbeLastAttemptMs === actual.boxStopProbeLastAttemptMs;
+}
+
+function auditClocks(audit: unknown): { boxStopProbeAfterMs: number; boxStopProbeLastAttemptMs: number } | null {
+  if (!audit || typeof audit !== "object") return null;
+  return targetClockPair({ ...(audit as { actualBeforeClocks?: Ctx }).actualBeforeClocks });
 }
 
 function alreadyApplied(row: JournalRow, run: RunManifest, operationId: string, proof: ProofShape): boolean {
   if (row.state !== "committed" || row.ctx.boxState !== ABANDON_STATE) return false;
   const restored = rebuildOriginal(row);
-  if (sha256(canonicalJson(restored)) !== run.originalCtxSha256) return false;
+  const audit = row.ctx.boxOperatorAudit as {
+    originalCtxSha256?: string; actualBeforeCtxSha256?: string; approvedOriginalCtxSha256?: string;
+  } | undefined;
+  const actual = audit?.actualBeforeCtxSha256 ?? audit?.originalCtxSha256;
+  if (!actual || sha256(canonicalJson(restored)) !== actual) return false;
+  if (audit?.approvedOriginalCtxSha256 !== run.originalCtxSha256) return false;
   return postcondition(row, { ...row, ctx: restored }, run, operationId, proof);
 }
 
@@ -614,6 +683,9 @@ function buildCtx(row: JournalRow, before: Ctx, run: RunManifest, operationId: s
     },
     movedPointers: moved,
     originalCtxSha256: sha256(canonicalJson(before)),
+    actualBeforeCtxSha256: sha256(canonicalJson(before)),
+    approvedOriginalCtxSha256: run.originalCtxSha256,
+    ...(targetClockPair(before) ? { actualBeforeClocks: targetClockPair(before) } : {}),
     financial: financialSnapshot(row),
     spool: run.spool,
     capacityReleased: true, cleanupEligible: false, deliverySucceeded: false,
@@ -758,7 +830,10 @@ export async function applyRun(client: QueryClient, schema: SchemaName, manifest
     await assertUsage(client, schema, run);
     await opts.writeReceipt?.({
       operationId: approval.operationId, nonce: run.nonce, sourceCommit: PINNED_SOURCE_COMMIT,
-      proof: fresh, financial: financialSnapshot(after), originalCtxSha256: run.originalCtxSha256,
+      proof: fresh, financial: financialSnapshot(after),
+      originalCtxSha256: sha256(canonicalJson(row.ctx)),
+      actualBeforeCtxSha256: sha256(canonicalJson(row.ctx)),
+      approvedOriginalCtxSha256: run.originalCtxSha256,
       originalCtx: row.ctx, unsettledPreserved: true, receiptIsNotCommit: true,
       productionWrite: "journal-capacity-only",
     });

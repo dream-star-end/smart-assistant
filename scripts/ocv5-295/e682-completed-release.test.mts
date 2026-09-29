@@ -904,6 +904,141 @@ test("contrast set, reverse edge, and in-transaction probe wait", { timeout: 120
   });
 });
 
+function pinnedTarget(advance: boolean) {
+  const made = makeRun("pin");
+  const nonce = TARGET_NONCE;
+  const epoch = "576099aacf2ed8fc91080de887ef5769";
+  const requestId = "ed263edbf8dd0f8ff393adc20935d95f";
+  const sessionId = "c1bc63cb-09bb-44ea-a48a-575a533c3940";
+  const turnKey = "c25fbc11ede9e1667ccbf9af1481342c24a33207a2eed783d2d87f9f731ac5eb";
+  const historical = { boxStopProbeLastAttemptMs: 1790674363970, boxStopProbeAfterMs: 1790674483970 };
+  const approved = {
+    ...made.ctx,
+    boxRunNonce: nonce, boxLeaseEpoch: epoch, boxSessionId: sessionId, boxTurnKey: turnKey,
+    boxBillingContext: { ...made.ctx.boxBillingContext, sessionId, turnKey },
+    boxReplayMessage: { ...made.ctx.boxReplayMessage, requestId, runNonce: nonce, leaseEpoch: epoch },
+    boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}`,
+    ...historical,
+  };
+  const live = advance ? {
+    ...approved,
+    boxStopProbeLastAttemptMs: historical.boxStopProbeAfterMs,
+    boxStopProbeAfterMs: historical.boxStopProbeAfterMs + CONTRAST_CLOCK_GAP_MS,
+  } : approved;
+  made.ctx = live;
+  made.run = {
+    ...made.run, nonce, epoch, requestId, sessionId, turnKey, containerId: "534",
+    originalCtx: approved, originalCtxSha256: sha256(canonicalJson(approved)),
+  };
+  made.proof = proofFor(nonce, epoch);
+  return made;
+}
+
+test("e682 target clocks may advance once before release and then stay fixed", { timeout: 120_000 }, async () => {
+  await withTemp(async (db) => {
+    const made = pinnedTarget(true);
+    const contrastNonce = await insertContrast(db, 1);
+    await insertTarget(db, made);
+    const manifest = await manifestOf(db, "pg_temp", made, contrastNonce, 1);
+    manifest.run = made.run;
+    const applied = await applyRun(db, "pg_temp", manifest, approvalFor(made.run), { freshProof: made.proof });
+    assert.equal(applied.status, "applied");
+    const audit = await db.query<{ actual: string; approved: string; last: string; after: string }>(
+      `SELECT ctx->'boxOperatorAudit'->>'actualBeforeCtxSha256' AS actual,
+              ctx->'boxOperatorAudit'->>'approvedOriginalCtxSha256' AS approved,
+              ctx->'boxOperatorAudit'->'actualBeforeClocks'->>'boxStopProbeLastAttemptMs' AS last,
+              ctx->'boxOperatorAudit'->'actualBeforeClocks'->>'boxStopProbeAfterMs' AS after
+         FROM request_finalize_journal WHERE request_id = $1`, [made.run.requestId]);
+    assert.equal(audit.rows[0].approved, made.run.originalCtxSha256);
+    assert.notEqual(audit.rows[0].actual, made.run.originalCtxSha256);
+    assert.equal(audit.rows[0].actual, sha256(canonicalJson(made.ctx)));
+    assert.equal(audit.rows[0].last, String(made.ctx.boxStopProbeLastAttemptMs));
+    assert.equal(audit.rows[0].after, String(made.ctx.boxStopProbeAfterMs));
+    const again = await applyRun(db, "pg_temp", manifest, approvalFor(made.run), { freshProof: made.proof });
+    assert.equal(again.status, "already_applied");
+    await db.query(
+      `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object(
+         'boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint) WHERE request_id=$1`,
+      [made.run.requestId, Number(made.ctx.boxStopProbeLastAttemptMs) + CONTRAST_CLOCK_GAP_MS,
+        Number(made.ctx.boxStopProbeAfterMs) + CONTRAST_CLOCK_GAP_MS]);
+    await assert.rejects(() => applyRun(db, "pg_temp", manifest, approvalFor(made.run), { freshProof: made.proof }));
+    await assert.rejects(() => applyRun(db, "pg_temp", manifest, {
+      ...approvalFor(made.run), operationId: "ocv5-295-ffffffffffffffff",
+    }, { freshProof: made.proof }));
+  });
+  const bad: Array<(db: Db, requestId: string) => Promise<void>> = [
+    async (db, requestId) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx || '{\"extra\":1}'::jsonb WHERE request_id=$1", [requestId]); },
+    async (db, requestId) => { await db.query("UPDATE request_finalize_journal SET final_credits = 1 WHERE request_id=$1", [requestId]); },
+    async (db, requestId) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx - 'boxStopProbeAfterMs' WHERE request_id=$1", [requestId]); },
+    async (db, requestId) => { await db.query("UPDATE request_finalize_journal SET ctx = jsonb_set(ctx, '{boxStopProbeLastAttemptMs}', '\"1790674363970\"') WHERE request_id=$1", [requestId]); },
+    async (db, requestId) => { await db.query("UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint) WHERE request_id=$1", [requestId, 1790674363970 + 1, 1790674483970 + 1]); },
+  ];
+  for (const mutate of bad) {
+    await withTemp(async (db) => {
+      const made = pinnedTarget(true);
+      const contrastNonce = await insertContrast(db, 1);
+      await insertTarget(db, made);
+      await mutate(db, made.run.requestId);
+      const manifest = await manifestOf(db, "pg_temp", made, contrastNonce, 1);
+      manifest.run = made.run;
+      await assert.rejects(() => applyRun(db, "pg_temp", manifest, approvalFor(made.run), { freshProof: made.proof }),
+        (error: unknown) => codeOf(error) === "IDENTITY_MISMATCH" || codeOf(error) === "ACCOUNTING_MISMATCH");
+      assert.equal((await db.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE ctx ? 'boxCancelIntent'")).rows[0].n, 0);
+    });
+  }
+});
+
+test("e682 commit check uses the actual before hash, and a later probe does not write", { timeout: 120_000 }, async () => {
+  await withSchema(async (schema) => {
+    const a = await pgClient();
+    const reader = await pgClient();
+    try {
+      await a.query(`SET search_path TO ${schema}`);
+      await reader.query(`SET search_path TO ${schema}`);
+      const made = pinnedTarget(true);
+      const contrastNonce = await insertContrast(a, 1);
+      await insertTarget(a, made);
+      const manifest = await manifestOf(a, schema as `ocv5_295_${string}`, made, contrastNonce, 1);
+      manifest.run = made.run;
+      const wrapped = {
+        async query(sql: string, params?: unknown[]) {
+          if (sql === "COMMIT") {
+            await a.query("COMMIT");
+            throw new Error("response lost");
+          }
+          return a.query(sql, params);
+        },
+      };
+      const lost = await applyRun(wrapped, schema as "pg_temp", manifest, approvalFor(made.run), {
+        freshProof: made.proof,
+        readIndependently: async () => (await reader.query(
+          `SELECT request_id, user_id::text, container_id::text, state,
+             precheck_credits::text, final_credits::text, ledger_id::text, usage_id::text, ctx
+           FROM request_finalize_journal WHERE ctx->>'boxRunNonce' = $1`, [made.run.nonce])).rows,
+      });
+      assert.equal(lost.verifiedAfterCommitError, true);
+      assert.equal(lost.status, "already_applied");
+      const loaded = await loadRelease();
+      const journal = new loaded.mod.BoxDurableJournal({
+        connect: async () => ({ query: reader.query.bind(reader), release() {} }),
+        query: reader.query.bind(reader),
+      });
+      const probed = await journal.claimStoppedFailureProbe({
+        requestId: made.run.requestId, uid: 3n, accountId: 20n,
+        runNonce: made.run.nonce, leaseEpoch: made.run.epoch, linked: false,
+      });
+      assert.equal(probed, false);
+      const clocks = await reader.query(
+        "SELECT ctx->>'boxStopProbeLastAttemptMs' AS last FROM request_finalize_journal WHERE request_id=$1",
+        [made.run.requestId]);
+      assert.equal(clocks.rows[0].last, String(made.ctx.boxStopProbeLastAttemptMs));
+    } finally {
+      await a.end();
+      await reader.end();
+    }
+  });
+});
+
 test("dry-run does not apply; unconfirmed apply exits 2", { timeout: 120_000 }, async () => {
   const tsx = join(RELEASE, "node_modules/.bin/tsx");
   const dry = spawnSync(tsx, [SCRIPT.pathname], { encoding: "utf8" });
