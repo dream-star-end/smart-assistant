@@ -355,7 +355,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private readonly runner: SubprocessRunner
-  private readonly harness: 'ccb' | 'official-cc'
+  private harness: 'ccb' | 'official-cc'
   private readonly authorityEngine: 'ccb' | 'cursor'
 
   /**
@@ -432,6 +432,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
+    if (params.modelAuthority) {
+      const pinned = this.runner.pinBoxNativeHarness(params.modelAuthority.executionDescriptor)
+      if (pinned === 'ccb') this.harness = 'ccb'
+    }
     const telemetry = new TelemetryChannel()
     let nativeCompactionSummary: string | undefined
     let resolveSummary!: (s: TurnSummary | null) => void

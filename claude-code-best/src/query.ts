@@ -111,6 +111,7 @@ import { StreamingToolExecutor } from './services/tools/StreamingToolExecutor.js
 import { queryCheckpoint } from './utils/queryProfiler.js'
 import { runTools } from './services/tools/toolOrchestration.js'
 import { applyToolResultBudget } from './utils/toolResultStorage.js'
+import { boxNativeRemoteContextOwnsHistory } from './utils/model/boxNativeRemoteContext.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import { buildQueryConfig } from './query/config.js'
@@ -587,25 +588,34 @@ async function* queryLoop(
     // snipTokensFreed is plumbed to autocompact so its threshold check reflects
     // what snip removed; tokenCountWithEstimation alone can't see it (reads usage
     // from the protected-tail assistant, which survives snip unchanged).
+    const remoteContextDelegated = boxNativeRemoteContextOwnsHistory({
+      model: toolUseContext.options.mainLoopModel,
+      querySource,
+    })
+
     let snipTokensFreed = 0
     if (feature('HISTORY_SNIP')) {
-      queryCheckpoint('query_snip_start')
-      const snipResult = snipModule!.snipCompactIfNeeded(messagesForQuery)
-      messagesForQuery = snipResult.messages
-      snipTokensFreed = snipResult.tokensFreed
-      if (snipResult.boundaryMessage) {
-        yield snipResult.boundaryMessage
+      if (!remoteContextDelegated) {
+        queryCheckpoint('query_snip_start')
+        const snipResult = snipModule!.snipCompactIfNeeded(messagesForQuery)
+        messagesForQuery = snipResult.messages
+        snipTokensFreed = snipResult.tokensFreed
+        if (snipResult.boundaryMessage) {
+          yield snipResult.boundaryMessage
+        }
+        queryCheckpoint('query_snip_end')
       }
-      queryCheckpoint('query_snip_end')
     }
 
     // Apply microcompact before autocompact
     queryCheckpoint('query_microcompact_start')
-    const microcompactResult = await deps.microcompact(
-      messagesForQuery,
-      toolUseContext,
-      querySource,
-    )
+    const microcompactResult = remoteContextDelegated
+      ? { messages: messagesForQuery }
+      : await deps.microcompact(
+          messagesForQuery,
+          toolUseContext,
+          querySource,
+        )
     messagesForQuery = microcompactResult.messages
     // Release original strings from contentReplacementState.replacements for
     // tool results whose content was replaced with the cleared message.
@@ -637,7 +647,7 @@ async function* queryLoop(
     // Within a turn, the view flows forward via state.messages at the
     // continue site (query.ts:1192), and the next projectView() no-ops
     // because the archived messages are already gone from its input.
-    if (feature('CONTEXT_COLLAPSE') && contextCollapse) {
+    if (feature('CONTEXT_COLLAPSE') && contextCollapse && !remoteContextDelegated) {
       const collapseResult = await contextCollapse.applyCollapsesIfNeeded(
         messagesForQuery,
         toolUseContext,
@@ -651,7 +661,9 @@ async function* queryLoop(
     )
 
     queryCheckpoint('query_autocompact_start')
-    const { compactionResult, consecutiveFailures } = await deps.autocompact(
+    const { compactionResult, consecutiveFailures } = remoteContextDelegated
+      ? { compactionResult: null, consecutiveFailures: undefined }
+      : await deps.autocompact(
       messagesForQuery,
       toolUseContext,
       {
@@ -826,6 +838,7 @@ async function* queryLoop(
     const mediaRecoveryEnabled =
       reactiveCompact?.isReactiveCompactEnabled() ?? false
     if (
+      !remoteContextDelegated &&
       !compactionResult &&
       querySource !== 'compact' &&
       querySource !== 'session_memory' &&
@@ -851,7 +864,7 @@ async function* queryLoop(
     // us past the context window. Uses effectiveContextWindow directly
     // (without the autocompact buffer) to avoid double-reserving with
     // getAutoCompactThreshold which already subtracts buffer.
-    if (!compactionResult && isAutoCompactEnabled()) {
+    if (!remoteContextDelegated && !compactionResult && isAutoCompactEnabled()) {
       const model = toolUseContext.options.mainLoopModel
       const currentTokens =
         tokenCountWithEstimation(messagesForQuery) - snipTokensFreed
@@ -1052,7 +1065,7 @@ async function* queryLoop(
             // tree-shaking constraint), so the collapse check is nested
             // rather than composed.
             let withheld = false
-            if (feature('CONTEXT_COLLAPSE')) {
+            if (!remoteContextDelegated && feature('CONTEXT_COLLAPSE')) {
               if (
                 contextCollapse?.isWithheldPromptTooLong(
                   message as Message,
@@ -1063,10 +1076,14 @@ async function* queryLoop(
                 withheld = true
               }
             }
-            if (reactiveCompact?.isWithheldPromptTooLong(message as Message)) {
+            if (
+              !remoteContextDelegated &&
+              reactiveCompact?.isWithheldPromptTooLong(message as Message)
+            ) {
               withheld = true
             }
             if (
+              !remoteContextDelegated &&
               mediaRecoveryEnabled &&
               reactiveCompact?.isWithheldMediaSizeError(message as Message)
             ) {
@@ -1184,7 +1201,7 @@ async function* queryLoop(
             // Thinking signatures are model-bound: replaying a protected-thinking
             // block (e.g. capybara) to an unprotected fallback (e.g. opus) 400s.
             // Strip before retry so the fallback model gets clean history.
-            if (process.env.USER_TYPE === 'ant') {
+            if (!remoteContextDelegated && process.env.USER_TYPE === 'ant') {
               messagesForQuery = stripSignatureBlocks(messagesForQuery)
             }
 
@@ -1371,7 +1388,10 @@ async function* queryLoop(
       const isWithheldMedia =
         mediaRecoveryEnabled &&
         reactiveCompact?.isWithheldMediaSizeError(lastMessage as Message)
-      if (isWithheld413) {
+      if (remoteContextDelegated && (isWithheld413 || isWithheldMedia)) {
+        return { reason: isWithheldMedia ? 'image_error' : 'prompt_too_long' }
+      }
+      if (!remoteContextDelegated && isWithheld413) {
         // First: drain all staged context-collapses. Gated on the PREVIOUS
         // transition not being collapse_drain_retry — if we already drained
         // and the retry still 413'd, fall through to reactive compact.
@@ -1405,7 +1425,7 @@ async function* queryLoop(
           }
         }
       }
-      if ((isWithheld413 || isWithheldMedia) && reactiveCompact) {
+      if (!remoteContextDelegated && (isWithheld413 || isWithheldMedia) && reactiveCompact) {
         const compacted = await reactiveCompact.tryReactiveCompact({
           hasAttempted: hasAttemptedReactiveCompact,
           querySource,

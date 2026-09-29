@@ -9,6 +9,7 @@ export interface AuthorityModelCapabilities {
   supportsThinking: boolean
   supportsVision: boolean
   supportedEfforts: string[]
+  contextOwner?: 'box-native-v1'
 }
 
 /**
@@ -43,8 +44,14 @@ export function getAuthorityModelCapabilities(
   ) {
     throw new Error('OC_MODEL_EXECUTION_DESCRIPTOR has invalid shape')
   }
+  const contextOwner = (d as { contextOwner?: unknown }).contextOwner
+  if (contextOwner !== undefined && contextOwner !== 'box-native-v1') {
+    throw new Error('OC_MODEL_EXECUTION_DESCRIPTOR has invalid shape')
+  }
   if (d.canonicalModel.trim().toLowerCase() !== model.trim().toLowerCase()) return undefined
-  return d as AuthorityModelCapabilities
+  const parsed = d as AuthorityModelCapabilities
+  if (contextOwner === 'box-native-v1') parsed.contextOwner = 'box-native-v1'
+  return parsed
 }
 
 // CCB 侧「静态 key 文本 provider」本地镜像表。

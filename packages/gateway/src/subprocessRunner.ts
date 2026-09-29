@@ -500,6 +500,9 @@ export function finalizeCcbSpawnEnv(input: {
 const REQUIRE_AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
 export const MODEL_EXECUTION_DESCRIPTOR_ENV = 'OC_MODEL_EXECUTION_DESCRIPTOR'
 
+export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
+export const BOX_NATIVE_CONTEXT_MODEL = 'box-api-claude-opus-5-5'
+
 export interface CcbExecutionDescriptor {
   readonly canonicalModel: string
   readonly contextWindow: number | null
@@ -507,6 +510,7 @@ export interface CcbExecutionDescriptor {
   readonly supportsThinking: boolean
   readonly supportsVision: boolean
   readonly supportedEfforts: readonly string[]
+  readonly contextOwner?: typeof BOX_NATIVE_CONTEXT_OWNER
 }
 
 export function shouldRecycleForVisionCapability(
@@ -1061,6 +1065,64 @@ export function resolveCcbHarness(
   return ccbOfficialCcEnabled(env) ? 'official-cc' : 'ccb'
 }
 
+export class BoxNativeHarnessError extends Error {
+  constructor(readonly code: 'BOX_NATIVE_CONTEXT_MISMATCH' | 'BOX_NATIVE_HARNESS_LOCKED') {
+    super(code)
+    this.name = 'BoxNativeHarnessError'
+  }
+}
+
+/** Project the signed profile into the env descriptor. Does not read body or env. */
+export function projectCcbExecutionDescriptor(input: {
+  canonicalModel: string
+  contextWindow: number | null
+  supportsVision: boolean
+  supportedEfforts: readonly string[]
+  capabilityProfile: Readonly<Record<string, unknown>>
+}): CcbExecutionDescriptor {
+  const raw = input.capabilityProfile.ccb
+  const ccb = raw !== null && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+  if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
+  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && input.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
+  return {
+    canonicalModel: input.canonicalModel,
+    contextWindow: input.contextWindow,
+    capabilityZero: ccb.capabilityZero === true,
+    supportsThinking: ccb.supportsThinking === true,
+    supportsVision: input.supportsVision,
+    supportedEfforts: [...input.supportedEfforts],
+    ...(ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER ? { contextOwner: BOX_NATIVE_CONTEXT_OWNER } : {}),
+  }
+}
+
+/**
+ * A new runner with a valid signed Box context owner explicitly selects the
+ * CCB fork. An already-spawned official process is not swapped. Missing the
+ * token leaves the caller harness, including OC_CCB_OFFICIAL_CC, unchanged.
+ */
+export function applyBoxNativeHarness(input: {
+  model: string | undefined
+  descriptor: CcbExecutionDescriptor | undefined
+  harness: 'ccb' | 'official-cc' | undefined
+  spawned: boolean
+}): 'ccb' | 'official-cc' | undefined {
+  if (input.descriptor?.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) return input.harness
+  if (
+    input.model !== BOX_NATIVE_CONTEXT_MODEL ||
+    input.descriptor.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL
+  ) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
+  if (input.spawned && resolveCcbHarness(input.harness) !== 'ccb') {
+    throw new BoxNativeHarnessError('BOX_NATIVE_HARNESS_LOCKED')
+  }
+  return 'ccb'
+}
+
 /** Fail-closed spawn gates for official-cc. Cursor still requires the Sand
  * loopback override; engine=ccb uses the same Anthropic proxy as CCB.
  * Hermetic advisor and remote-ssh stay on CCB. */
@@ -1368,6 +1430,21 @@ export class SubprocessRunner extends EventEmitter {
   private spawnedOfficialHeaderFingerprint: string | undefined
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
+
+  /** Explicit ccb harness for a not-yet-spawned runner that carries the signed token. */
+  pinBoxNativeHarness(descriptor: CcbExecutionDescriptor | undefined): 'ccb' | 'official-cc' {
+    const next = applyBoxNativeHarness({
+      model: this.opts.model,
+      descriptor,
+      harness: this.opts.harness,
+      spawned: this.proc !== null,
+    })
+    if (descriptor?.contextOwner === BOX_NATIVE_CONTEXT_OWNER) {
+      if (next !== 'ccb') throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+      this.opts.harness = 'ccb'
+    }
+    return resolveCcbHarness(this.opts.harness)
+  }
 
   constructor(private opts: SubprocessRunnerOpts) {
     super()
@@ -2210,6 +2287,7 @@ export class SubprocessRunner extends EventEmitter {
       process.env,
       this.opts.authorityEngine ?? 'ccb',
     )
+    this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
         lock: this.opts.advisorExecutionLock,

@@ -208,6 +208,7 @@ import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, signedCcbCapability } from "../http/proxy/boxNativeContextOwner.js";
 import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
 import type { AgentModelResolver } from "./agentModelAuthority.js";
@@ -844,10 +845,21 @@ function toProtocolDescriptor(
         supported: [...profile.reasoning.supported],
         codexModelDefault: profile.reasoning.codexModelDefault,
       },
-      ccb: {
-        capabilityZero: profile.ccb.capabilityZero,
-        supportsThinking: profile.ccb.supportsThinking,
-      },
+      ccb: (() => {
+        const ccb = signedCcbCapability({
+          canonicalModel: d.canonicalModel,
+          providerId: d.providerId,
+          capabilityZero: profile.ccb.capabilityZero,
+          supportsThinking: profile.ccb.supportsThinking,
+          declaredContextOwner: profile.ccb.contextOwner,
+          routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
+        });
+        return {
+          capabilityZero: ccb.capabilityZero,
+          supportsThinking: ccb.supportsThinking,
+          ...(ccb.contextOwner === undefined ? {} : { contextOwner: ccb.contextOwner }),
+        };
+      })(),
     },
     capabilitySchemaVersion: d.capabilitySchemaVersion,
     contextWindow: d.contextWindow,

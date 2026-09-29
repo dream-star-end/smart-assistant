@@ -572,7 +572,7 @@ import {
   mergeOnDemandToolsets,
   resolveDelegateToolsets,
 } from './toolsetIntent.js'
-import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
+import { projectCcbExecutionDescriptor, resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import {
   handleV3CodexRelayLocal,
   readV3CodexRelayConfig,
@@ -22201,18 +22201,13 @@ export class Gateway {
             modelAuthority: {
               authorityEnvelope: turnAuthority.authorityEnvelope,
               leaseEnvelope: turnAuthority.leaseEnvelope,
-              executionDescriptor: {
+              executionDescriptor: projectCcbExecutionDescriptor({
                 canonicalModel: turnAuthority.canonicalModel,
                 contextWindow: turnAuthority.contextWindow,
-                capabilityZero:
-                  (turnAuthority.capabilityProfile.ccb as { capabilityZero?: unknown } | undefined)
-                    ?.capabilityZero === true,
-                supportsThinking:
-                  (turnAuthority.capabilityProfile.ccb as { supportsThinking?: unknown } | undefined)
-                    ?.supportsThinking === true,
                 supportsVision: turnAuthority.supportsVision,
-                supportedEfforts: [...turnAuthority.supportedEfforts],
-              },
+                supportedEfforts: turnAuthority.supportedEfforts,
+                capabilityProfile: turnAuthority.capabilityProfile,
+              }),
             },
           }
         : {}),
