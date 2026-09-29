@@ -42,6 +42,7 @@ type Api = {
   proveEditDefault: () => void;
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
+  echoAccept: (hash: string, raw: unknown) => void;
 };
 type Digest = Array<{ path: string; sha256: string }>;
 type Fixture = {
@@ -214,6 +215,7 @@ async function load(): Promise<Api> {
   const catalogMod = await import(pathToFileURL(join(PROXY, "boxToolCatalog.ts")).href);
   const hashMod = await import(pathToFileURL(join(PROXY, "boxToolInputHash.ts")).href);
   const echoMod = await import(pathToFileURL(join(PROXY, "boxToolInputEcho.ts")).href);
+  const resultEcho = await import(pathToFileURL(join(PROXY, "boxToolResultEcho.ts")).href);
   return {
     normalize: norm.normalizeBoxSemanticBody,
     gate: gate.validateBoxRequest,
@@ -230,6 +232,12 @@ async function load(): Promise<Api> {
       hashNoCaller: finger.hashBoxAssistantNoCallerContent,
       hashEcho: finger.hashBoxAssistantEchoContent,
     }),
+    echoAccept: (hash: string, raw: unknown) => {
+      const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: "toolu_img_b1",
+        contentHash: hash, isError: false }]);
+      verifier.accept(raw);
+      verifier.assertComplete();
+    },
   };
 }
 function countText(value: unknown, needle: string): number {
@@ -486,6 +494,96 @@ function checks(api: Api): void {
     if (drifted) fail("C2_DRIFT");
   }
   api.proveEditDefault();
+  proveImageCaption(api);
+}
+
+function proveImageCaption(api: Api): void {
+  const caption = "[Image: original 80x2200, displayed at 73x2000. Multiply coordinates by 1.10 to map to original image.]";
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: png } };
+  const hook = "<system-reminder>\nPreToolUse:Read hook additional context: b1 figure.\n</system-reminder>";
+  const base = { model: "box-api-claude-opus-5-5", stream: true, max_tokens: 64,
+    tools: [{ name: "Read", description: "read", input_schema: { type: "object", properties: {} } },
+      { name: "Note", description: "note", input_schema: { type: "object", properties: {} } }],
+    messages: [
+      { role: "user", content: "look" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: "toolu_img_b1", name: "Read", input: { file_path: "a.png" } },
+        { type: "tool_use", id: "toolu_note_b1", name: "Note", input: { file_path: "a.md" } },
+      ] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_img_b1", content: [image] },
+        { type: "tool_result", tool_use_id: "toolu_note_b1", content: "note" },
+        { type: "text", text: caption },
+        { type: "text", text: hook },
+      ] },
+      { role: "system", content: [{ type: "text", text: "<total_tokens>12 tokens left</total_tokens>",
+        cache_control: { type: "ephemeral" } }] },
+    ] };
+  const snapshot = JSON.stringify(base);
+  if (api.gate(base, true) !== null) fail("IMAGE_GATE");
+  const once = api.normalize(base);
+  if (!isDeepStrictEqual(once, api.normalize(once as unknown as Record<string, unknown>))) fail("IMAGE_IDEMPOTENT");
+  if (JSON.stringify(base) !== snapshot) fail("IMAGE_RAW");
+  const encoded = JSON.stringify(once);
+  if (encoded.split(caption).length - 1 !== 1
+    || encoded.split(hook.replaceAll("\n", "\\n")).length - 1 !== 1) fail("IMAGE_COUNTS");
+  if (encoded.includes("<total_tokens>")) fail("IMAGE_BUDGET");
+  const user = (once.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1)!;
+  const owned = user.content.find((part) => part.tool_use_id === "toolu_img_b1");
+  const note = user.content.find((part) => part.tool_use_id === "toolu_note_b1");
+  if (!owned || JSON.stringify(owned).split(caption).length - 1 !== 1) fail("IMAGE_OWNER");
+  if (!note || JSON.stringify(note).includes(caption)) fail("IMAGE_NOT_LAST");
+  const oracle = sha256(JSON.stringify({ content: [
+    { type: "image", data: png, mimeType: "image/png" },
+    { type: "text", text: caption },
+  ], isError: false }));
+  const matched = api.match(base, [
+    { id: "toolu_img_b1", clientName: "Read", boxName: "mcp__ocbridge__t0", input: { file_path: "a.png" } },
+    { id: "toolu_note_b1", clientName: "Note", boxName: "mcp__ocbridge__t0", input: { file_path: "a.md" } },
+  ]);
+  const row = matched.find((item) => item.modelToolUseId === "toolu_img_b1");
+  if (!row || JSON.stringify(row.content) !== JSON.stringify([
+    { type: "image", data: png, mimeType: "image/png" }, { type: "text", text: caption }])) {
+    fail("IMAGE_MATCH_BYTES");
+  }
+  api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_img_b1", content: [image, { type: "text", text: caption }] }] } });
+  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: "toolu_img_b1", content: [image] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  const nudged = `${caption.slice(0, -2)}X]`;
+  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: "toolu_img_b1",
+    content: [image, { type: "text", text: nudged }] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  const flipped = Buffer.from(png, "base64");
+  flipped[flipped.length - 1] ^= 0xff;
+  const flippedImage = { type: "image", source: { type: "base64", media_type: "image/png",
+    data: flipped.toString("base64") } };
+  if (api.gate({ ...base, messages: base.messages.map((message, index) => index === 2
+    ? { ...message, content: [
+      { type: "tool_result", tool_use_id: "toolu_img_b1", content: [flippedImage] },
+      { type: "tool_result", tool_use_id: "toolu_note_b1", content: "note" },
+      { type: "text", text: caption }, { type: "text", text: hook }] } : message) }, true) !== null) {
+    fail("IMAGE_BYTE_STILL_CANONICAL");
+  }
+  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: "toolu_img_b1",
+    content: [flippedImage, { type: "text", text: caption }] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  expectCode(() => api.echoAccept(oracle, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: "toolu_note_b1",
+    content: [image, { type: "text", text: caption }] }] } }), "BOX_TOOL_ECHO_");
+  const dropped = JSON.parse(snapshot) as typeof base;
+  (dropped.messages[2] as { content: unknown[] }).content =
+    (dropped.messages[2] as { content: unknown[] }).content.filter((part) =>
+      !(part && typeof part === "object" && (part as { text?: string }).text === caption));
+  if (encoded.split(caption).length - 1 === JSON.stringify(api.normalize(dropped)).split(caption).length - 1) {
+    fail("IMAGE_DROPPED_STILL_PRESENT");
+  }
+  const oneByte = JSON.parse(snapshot) as typeof base;
+  const sibling = ((oneByte.messages[2] as { content: Array<{ text?: string }> }).content)
+    .find((part) => part.text === caption)!;
+  sibling.text = nudged;
+  if (api.gate(oneByte, true) === null) fail("IMAGE_ONE_BYTE_GATE");
 }
 
 function procField(pid: number, index: number): string {
