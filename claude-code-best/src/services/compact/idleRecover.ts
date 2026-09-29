@@ -378,14 +378,14 @@ export async function resumeIdleSummary(input: {
   messages: readonly Message[]
   home?: string
   summarize?: (messages: Message[]) => Promise<string>
-}): Promise<{ path: string; file: IdleNativeFile } | undefined> {
+}): Promise<{ path: string; file: IdleNativeFile; freshSummary: boolean } | undefined> {
   const opId = trustedIdleOpId()
   const path = (opId ? readIdleNativeByOp(input.sessionId, opId, input.home) : undefined)
     ?? findIdleNativeFile(input.sessionId, input.home)
   if (!path) return undefined
   let file = readIdleNativeFile(path)
   if (file.sessionId !== input.sessionId) throw new Error('IDLE_RECOVERY_CORRUPT')
-  if (file.applied && !file.summaryText) return { path, file }
+  if (file.applied && !file.summaryText) return { path, file, freshSummary: false }
   if (file.frozenTail.length === 0 && file.attachments.length === 0) {
     const preserved = selectIdlePreserve(input.messages)
     file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
@@ -394,8 +394,9 @@ export async function resumeIdleSummary(input: {
   if (!file.summaryText && !file.modelStarted && !outerHistoryNeedsCompact(input.messages)) {
     file = { ...file, applied: true }
     writeIdleNativeFile(path, file)
-    return { path, file }
+    return { path, file, freshSummary: false }
   }
+  let freshSummary = false
   if (!file.summaryText) {
     if (file.modelStarted || !input.summarize) throw new Error('IDLE_HISTORY_PENDING')
     file = { ...file, modelStarted: true }
@@ -404,8 +405,9 @@ export async function resumeIdleSummary(input: {
     if (!summaryText) throw new Error('IDLE_HISTORY_PENDING')
     file = { ...file, summaryText, modelCalls: file.modelCalls + 1 }
     writeIdleNativeFile(path, file)
+    freshSummary = true
   }
-  return { path, file }
+  return { path, file, freshSummary }
 }
 
 /**
@@ -426,10 +428,14 @@ export async function runIdleCompact(input: {
   ) => Promise<unknown>
   flush: () => Promise<void>
   load: (sessionId: string) => Promise<{ messages: Message[] } | null>
-}): Promise<CompactionResult | 'short' | undefined> {
+}): Promise<CompactionResult | 'short' | 'prepared' | undefined> {
   const resumed = await resumeIdleSummary(input)
   if (!resumed) return undefined
   if (resumed.file.applied && !resumed.file.summaryText) return 'short'
+  // The summary is durable, but the transcript stays untouched until the
+  // idle turn's own committed capsule matches. A later call applies it.
+  if (resumed.freshSummary) return 'prepared'
+  if (!resumed.file.summaryText) throw new Error('IDLE_HISTORY_PENDING')
   const { annotateBoundaryWithPreservedSegment, buildPostCompactMessages } = await import('./compact.js')
   const built = buildIdleCompactionResult(resumed.file, input.messages, annotateBoundaryWithPreservedSegment)
   const result: CompactionResult = resumed.file.frozenTail.length === 0

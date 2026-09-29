@@ -205,6 +205,8 @@ export interface IdleNativeFile {
   sessionId: string
   summaryText?: string
   modelCalls: number
+  /** Set before the summary request. A later entry must not send another one. */
+  modelStarted?: boolean
   applied?: boolean
   artifact?: IdleArtifact
   frozenTail: IdleFrozenTail[]
@@ -277,6 +279,22 @@ export function clearIdleCandidate(dir: string, sessionKey: string): void {
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
+}
+
+/** The idle turn's own committed capsule, not the source business proof.
+ * A prepared native summary must match that text. With no native summary,
+ * the capsule itself is the recovered text. A set, pending, or mismatch is not ready. */
+export function idleSummaryAccepted(proof: IdleProofResponse, input: {
+  sessionId: string
+  idleTurnKey: string
+  nativeSummary?: string
+}): { summaryText: string; capsuleSha256: string } | undefined {
+  if (proof.status !== 'terminal') return undefined
+  if (proof.sessionId !== input.sessionId || proof.turnKey !== input.idleTurnKey) return undefined
+  if (typeof proof.summaryText !== 'string' || proof.summaryText.length === 0) return undefined
+  if (!/^[a-f0-9]{64}$/.test(proof.capsuleSha256)) return undefined
+  if (input.nativeSummary !== undefined && proof.summaryText !== input.nativeSummary) return undefined
+  return { summaryText: proof.summaryText, capsuleSha256: proof.capsuleSha256 }
 }
 
 /**

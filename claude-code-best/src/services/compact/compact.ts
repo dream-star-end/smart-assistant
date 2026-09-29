@@ -105,6 +105,7 @@ import {
 } from '../api/claude.js'
 import {
   getPromptTooLongTokenGap,
+  isPromptTooLongMessage,
   PROMPT_TOO_LONG_ERROR_MESSAGE,
   startsWithApiErrorPrefix,
 } from '../api/errors.js'
@@ -821,19 +822,25 @@ export async function summarizeMessagesForIdle(
       preCompactTokenCount,
       cacheSafeParams: retryCacheSafeParams,
     })
+    // Identity before text. A real summary may quote 403 / API Error / PTL.
+    if (isPromptTooLongMessage(summaryResponse)) {
+      ptlAttempts++
+      const truncated =
+        ptlAttempts <= MAX_PTL_RETRIES
+          ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
+          : null
+      if (!truncated) throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
+      messagesToSummarize = truncated
+      retryCacheSafeParams = { ...retryCacheSafeParams, forkContextMessages: truncated }
+      continue
+    }
+    if (summaryResponse.isApiErrorMessage) throw new Error('IDLE_SUMMARY_REJECTED')
+    if (context.abortController.signal.aborted) throw new Error(ERROR_MESSAGE_USER_ABORT)
+    if (!summaryResponse.message?.stop_reason) throw new Error(ERROR_MESSAGE_INCOMPLETE_RESPONSE)
     summary = getAssistantMessageText(summaryResponse)
-    if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
-    ptlAttempts++
-    const truncated =
-      ptlAttempts <= MAX_PTL_RETRIES
-        ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
-        : null
-    if (!truncated) throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
-    messagesToSummarize = truncated
-    retryCacheSafeParams = { ...retryCacheSafeParams, forkContextMessages: truncated }
+    break
   }
   if (!summary) throw new Error('Failed to generate conversation summary - response did not contain valid text content')
-  if (startsWithApiErrorPrefix(summary)) throw new Error(summary)
   return summary
 }
 
@@ -1288,6 +1295,9 @@ async function streamCompactSummary({
         const assistantText = assistantMsg
           ? getAssistantMessageText(assistantMsg)
           : null
+        // A typed API error, including abort, is the result. Do not fall
+        // through into a second streaming request that could keep partial text.
+        if (assistantMsg?.isApiErrorMessage) return assistantMsg
         // Guard isApiErrorMessage: query() catches API errors (including
         // APIUserAbortError on ESC) and yields them as synthetic assistant
         // messages. Without this check, an aborted compact "succeeds" with
@@ -1454,9 +1464,14 @@ async function streamCompactSummary({
         next = await streamIter.next()
       }
 
-      if (response) {
-        return response
+      if (context.abortController.signal.aborted) {
+        throw new Error(ERROR_MESSAGE_USER_ABORT)
       }
+      // An error after partial text replaces the partial. An assistant that
+      // never reached stop_reason is not a summary.
+      if (response?.isApiErrorMessage) return response
+      if (response?.message?.stop_reason) return response
+      response = undefined
 
       if (attempt < maxAttempts) {
         logEvent('tengu_compact_streaming_retry', {

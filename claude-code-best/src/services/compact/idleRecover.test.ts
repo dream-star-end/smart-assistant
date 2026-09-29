@@ -9,6 +9,7 @@ import {
   findIdleNativeFile,
   projectIdleArtifact,
   resumeIdleSummary,
+  runIdleCompact,
   selectIdlePreserve,
   writeIdleNativeFile,
   type IdleNativeFile,
@@ -193,4 +194,35 @@ test('a second idle in the same session is not hidden by the finished file', () 
   assert.equal(findIdleNativeFile(sessionId, home)?.endsWith('rev-2.json'), true)
   seed(home, { ...first, applied: false, revision: 'rev-3', opId: 'ee'.repeat(32) })
   assert.throws(() => findIdleNativeFile(sessionId, home), /IDLE_HISTORY_PENDING/)
+})
+
+test('a typed summary failure keeps the fence and does not store the error', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'idle-reject-'))
+  after(async () => { await rm(home, { recursive: true, force: true }) })
+  process.env.CLAUDE_CODE_EXTRA_METADATA = JSON.stringify({ oc_turn_key: opId })
+  seed(home, {
+    v: 1, opId, revision: 'rev-1', sessionId, modelCalls: 0, frozenTail: [], attachments: [],
+  })
+  const messages = [
+    { type: 'user', uuid: 'tail-1', message: { role: 'user', content: 'kept goal'.padEnd(170_000 * 4, 'x') } },
+  ] as never
+  await assert.rejects(runIdleCompact({
+    sessionId, home, messages,
+    summarize: async () => { throw new Error('IDLE_SUMMARY_REJECTED') },
+    record: async () => { throw new Error('recorded') },
+    flush: async () => {},
+    load: async () => null,
+  }), /IDLE_SUMMARY_REJECTED/)
+  const raw = (await import('node:fs')).readFileSync(findIdleNativeFile(sessionId, home)!, 'utf8')
+  assert.equal(raw.includes('"modelStarted":true'), true)
+  assert.equal(raw.includes('summaryText'), false)
+  assert.equal(raw.includes('"applied":true'), false)
+  await assert.rejects(runIdleCompact({
+    sessionId, home, messages,
+    summarize: async () => 'again',
+    record: async () => { throw new Error('recorded') },
+    flush: async () => {},
+    load: async () => null,
+  }), /IDLE_HISTORY_PENDING/)
+  delete process.env.CLAUDE_CODE_EXTRA_METADATA
 })

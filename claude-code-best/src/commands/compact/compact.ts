@@ -76,7 +76,7 @@ export const call: LocalCommandCall = async (args, context) => {
         flush: flushSessionStorage,
         load: async (id) => loadConversationForResume(id, undefined),
       })
-      if (idleResult === 'short') return { type: 'skip' }
+      if (idleResult === 'short' || idleResult === 'prepared') return { type: 'skip' }
       if (idleResult) {
         setLastSummarizedMessageId(undefined)
         suppressCompactWarning()

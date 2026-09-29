@@ -40,6 +40,7 @@ import {
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
   idleHistoryStillBlocked,
+  idleSummaryAccepted,
   nativeShortForOp,
   clearIdleCandidate,
   readIdleCandidate,
@@ -4697,26 +4698,33 @@ export class SessionManager {
       return
     }
     if (native?.frozenTail.length) op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
-    if (!op.summaryText && native?.summaryText) {
-      op = { ...op, summaryText: native.summaryText }
-    }
-    if (!op.summaryText && !started.ownedDispatch) {
-      const compactProof = await fetchBoxIdleProof({
-        sessionId: source.sessionId, turnKey: op.idleTurnKey,
-      })
-      const recovered = advanceIdleOp({
-        op, proof: compactProof, useProofSummary: true, allowDispatch: false,
-      })
-      op = recovered.op
-      if (op.summaryText) {
+    const summaryProof = await fetchBoxIdleProof({
+      sessionId: source.sessionId, turnKey: op.idleTurnKey,
+    })
+    const accepted = idleSummaryAccepted(summaryProof, {
+      sessionId: source.sessionId,
+      idleTurnKey: op.idleTurnKey,
+      nativeSummary: native?.summaryText,
+    })
+    if (accepted) {
+      op = {
+        ...op,
+        summaryText: accepted.summaryText,
+        capsuleSha256: accepted.capsuleSha256,
+      }
+      if (!native?.summaryText) {
         writeIdleNative(recoveryDir, {
           v: 1, opId: op.idleTurnKey, revision: op.revision, sessionId: source.sessionId,
-          summaryText: op.summaryText, modelCalls: native?.modelCalls ?? 1,
+          summaryText: accepted.summaryText, modelCalls: native?.modelCalls ?? 1, modelStarted: true,
           frozenTail: op.frozenTail, attachments: op.attachments,
         })
       }
     }
-    let step = advanceIdleOp({ op, proof, allowDispatch: started.ownedDispatch && !op.summaryText })
+    let step = advanceIdleOp({
+      op,
+      proof,
+      allowDispatch: started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
+    })
     const needsApply = Boolean(step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest)
     if ((step.callModel || needsApply) && session.runner.submitTurn) {
       if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
@@ -4736,7 +4744,6 @@ export class SessionManager {
           toolUseIdToName: session.toolUseIdToName ?? new Map(),
         })
         const settled = await run.summary
-        const summary = settled?.nativeCompactionSummary?.trim() ?? ''
         const receipt = settled?.nativeIdleReceipt
         const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
         if (nativeShortForOp(after, {
@@ -4746,21 +4753,44 @@ export class SessionManager {
         })) {
           clearIdleCandidate(recoveryDir, session.sessionKey)
           step = { ...step, op: { ...step.op, disposition: 'short' } }
-        }
-        const mergedSummary = step.op.summaryText || after?.summaryText || summary
-        if (mergedSummary && step.op.disposition !== 'short') {
-          step = advanceIdleOp({
-            op: {
-              ...step.op,
-              summaryText: mergedSummary,
-              frozenTail: after?.frozenTail.length ? after.frozenTail : step.op.frozenTail,
-              attachments: after?.attachments ?? step.op.attachments,
-              artifact: after?.artifact,
-              receiptDigest: undefined,
-            },
-            proof,
-            allowDispatch: false,
+        } else if (!step.op.summaryText && after?.summaryText) {
+          const again = await fetchBoxIdleProof({
+            sessionId: source.sessionId, turnKey: step.op.idleTurnKey,
           })
+          const confirmed = idleSummaryAccepted(again, {
+            sessionId: source.sessionId,
+            idleTurnKey: step.op.idleTurnKey,
+            nativeSummary: after.summaryText,
+          })
+          if (confirmed && session.runner.submitTurn) {
+            step = advanceIdleOp({
+              op: {
+                ...step.op,
+                summaryText: confirmed.summaryText,
+                capsuleSha256: confirmed.capsuleSha256,
+                frozenTail: after.frozenTail.length ? after.frozenTail : step.op.frozenTail,
+                attachments: after.attachments,
+              },
+              proof,
+              allowDispatch: false,
+            })
+            if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
+              const apply = session.runner.submitTurn({
+                input: IDLE_COMPACT_PROMPT,
+                turnKey: step.op.idleTurnKey,
+                onEvent: () => {},
+                sessionTotals: session,
+                toolUseIdToName: session.toolUseIdToName ?? new Map(),
+              })
+              const applied = await apply.summary
+              const applyReceipt = applied?.nativeIdleReceipt
+              if (applyReceipt && applyReceipt.opId === step.op.idleTurnKey
+                && applyReceipt.digest === step.op.artifact.digest) {
+                step = { ...step, op: { ...step.op, receiptDigest: applyReceipt.digest } }
+                clearIdleCandidate(recoveryDir, session.sessionKey)
+              }
+            }
+          }
         }
         if (receipt && receipt.opId === step.op.idleTurnKey && step.op.artifact
           && receipt.digest === step.op.artifact.digest) {

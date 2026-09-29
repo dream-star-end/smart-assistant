@@ -6,6 +6,7 @@ import { after, describe, test } from 'node:test'
 import { fetchBoxIdleProof } from '../engine/boxIdleProofClient.js'
 import {
   advanceIdleOp,
+  idleSummaryAccepted,
   assembleIdleArtifact,
   IDLE_COMPACT_PROMPT,
   clearIdleCandidate,
@@ -231,5 +232,31 @@ describe('idle artifact recovery', () => {
     assert.equal(readIdleCandidate(home, 's')?.sessionId, 'native')
     clearIdleCandidate(home, 's')
     assert.equal(readIdleCandidate(home, 's'), undefined)
+  })
+
+  test('only the idle turn capsule can confirm a prepared summary', () => {
+    const turn = 'ab'.repeat(32)
+    const capsule = 'cd'.repeat(32)
+    const ready = {
+      status: 'terminal' as const, sessionId: 'native-session', turnKey: turn,
+      requestId: 'leaf', revision: 'ef'.repeat(32), compactRequired: false,
+      capsuleSha256: capsule, summaryText: 'kept goal',
+    }
+    assert.deepEqual(idleSummaryAccepted(ready, {
+      sessionId: 'native-session', idleTurnKey: turn, nativeSummary: 'kept goal',
+    }), { summaryText: 'kept goal', capsuleSha256: capsule })
+    assert.equal(idleSummaryAccepted(ready, {
+      sessionId: 'native-session', idleTurnKey: turn, nativeSummary: 'Failed to authenticate. API Error: 403',
+    }), undefined)
+    assert.equal(idleSummaryAccepted({ status: 'pending', reason: 'unsettled' }, {
+      sessionId: 'native-session', idleTurnKey: turn, nativeSummary: 'kept goal',
+    }), undefined)
+    assert.equal(idleSummaryAccepted({
+      status: 'terminal_set', sessionId: 'native-session', turnKey: turn,
+      revision: 'ef'.repeat(32), requestIds: ['a', 'b'],
+    }, { sessionId: 'native-session', idleTurnKey: turn }), undefined)
+    assert.equal(idleSummaryAccepted({ status: 'not_found' }, {
+      sessionId: 'native-session', idleTurnKey: turn,
+    }), undefined)
   })
 })
