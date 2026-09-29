@@ -2,19 +2,28 @@
  * OCV5-296 C pipeline proof.
  *
  * Production BOX_NATIVE_CONTEXT_ROUTE_READY stays false. The positive
- * control loads a git-archive copy of 35238e2b whose only source change is
- * that constant set to true. Remote Claude argv (plan.run) is not executed;
- * the injected transport runs the real makeBoxTextPlan stage with local
- * Python, then returns a legal SSE terminal. It does not fake HTTP 200.
+ * control copies this checkout's commercial sources into an exclusive temp
+ * directory and flips only that constant. It does not read a prebuilt
+ * candidate tree. Remote Claude argv (plan.run) is not executed; the
+ * injected transport runs the real makeBoxTextPlan stage with local Python,
+ * then returns a legal SSE terminal. It does not fake HTTP 200.
+ *
+ * Default command runs ready-off, lease-only, the hard byte rejects, the
+ * 6k control, and 64 rounds. Upper bound, the stdin cap, and 2-concurrent
+ * stay behind OC_V5_296_PIPELINE_MATRIX=1. A skip or not-run is not PASS.
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   AUTHORITY_TTL_MS,
@@ -32,19 +41,81 @@ import pg from "pg";
 
 const MODEL = "box-api-claude-opus-5-5";
 const CHUNK = 128 * 1024;
-const SHA = "35238e2b1956d13e981e75c1360179d5fb49e48c";
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_cpipe_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/15";
-const CANDIDATE = [
-  process.env.OC_V5_296_CANDIDATE,
-  "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-296-ready-352",
-  "/home/agent/.openclaude/workspace/ocv5-296-ready-352",
-].find((path) => path && existsSync(`${path}/packages/commercial/src/http/proxy/index.ts`));
-const GENERATED = [
-  "/var/lib/docker/volumes/oc-v5-data-u3/_data/generated",
-  "/home/agent/.openclaude/generated",
-].find((path) => existsSync(path));
+const READY_FALSE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;";
+const READY_TRUE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;";
+const CHECKOUT_PROXY = dirname(fileURLToPath(import.meta.url));
+const CHECKOUT_COMMERCIAL = join(CHECKOUT_PROXY, "../../..");
+const CHECKOUT_ROOT = join(CHECKOUT_COMMERCIAL, "../..");
+const MATRIX = process.env.OC_V5_296_PIPELINE_MATRIX === "1";
+
+function buildCandidate(): {
+  root: string;
+  owner: string;
+  resolution: Record<string, string | boolean>;
+} {
+  const root = mkdtempOwned();
+  try {
+  const dest = join(root, "packages/commercial");
+  mkdirSync(dest, { recursive: true });
+  cpSync(join(CHECKOUT_COMMERCIAL, "package.json"), join(dest, "package.json"));
+  cpSync(join(CHECKOUT_COMMERCIAL, "src"), join(dest, "src"), { recursive: true });
+  const owner = join(dest, "src/http/proxy/boxNativeContextOwner.ts");
+  const product = readFileSync(join(CHECKOUT_PROXY, "boxNativeContextOwner.ts"), "utf8");
+  const copied = readFileSync(owner, "utf8");
+  assert.equal(copied, product);
+  assert.equal(copied.split(READY_FALSE).length, 2);
+  writeFileSync(owner, copied.replace(READY_FALSE, READY_TRUE));
+  const nodeModules = join(CHECKOUT_ROOT, "node_modules");
+  assert.equal(existsSync(join(nodeModules, "pg")), true, "checkout lock is missing pg");
+  symlinkSync(nodeModules, join(root, "node_modules"));
+  assert.equal(lstatSync(join(root, "node_modules")).isSymbolicLink(), true);
+  const requireFrom = createRequire(join(dest, "package.json"));
+  const protocol = realpathSync(requireFrom.resolve("@openclaude/protocol"));
+  const pgPath = realpathSync(requireFrom.resolve("pg"));
+  const ioredis = realpathSync(requireFrom.resolve("ioredis"));
+  const commercialEntry = realpathSync(requireFrom.resolve("@openclaude/commercial"));
+  const checkoutReal = realpathSync(CHECKOUT_ROOT);
+  assert.equal(protocol.startsWith(`${checkoutReal}/packages/protocol`), true, protocol);
+  assert.equal(commercialEntry, realpathSync(join(root, "packages/commercial/src/index.ts")));
+  assert.notEqual(commercialEntry, realpathSync(join(CHECKOUT_COMMERCIAL, "src/index.ts")));
+  const linkedPg = realpathSync(join(nodeModules, "pg"));
+  const linkedIoredis = realpathSync(join(nodeModules, "ioredis"));
+  assert.equal(pgPath.startsWith(`${linkedPg}/`), true, pgPath);
+  assert.equal(ioredis.startsWith(`${linkedIoredis}/`), true, ioredis);
+  assert.equal(pgPath.includes(`${root}/`), false);
+  assert.equal(ioredis.includes(`${root}/`), false);
+  return {
+    root,
+    owner,
+    resolution: {
+      candidateRoot: root,
+      checkoutRoot: checkoutReal,
+      sourceCommercial: realpathSync(CHECKOUT_COMMERCIAL),
+      protocol,
+      pg: pgPath,
+      pgPackage: linkedPg,
+      ioredis,
+      ioredisPackage: linkedIoredis,
+      commercialEntry,
+      commercialEntryIsOwnedCopy: true,
+      nodeModulesIsSymlinkToCheckoutLock: true,
+      readyFlippedOnlyInCandidateCopy: true,
+    },
+  };
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function mkdtempOwned(): string {
+  const root = join(tmpdir(), `ocv5-296-cand-${randomBytes(4).toString("hex")}`);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  return root;
+}
 
 const { privateKey, publicKey } = generateKeyPairSync("ed25519");
 const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
@@ -331,27 +402,24 @@ async function withPeak<T>(fn: () => Promise<T>): Promise<{
   }
 }
 
-test("candidate full chain admits 64x128KiB; ready-off and lease-only stay legacy", { timeout: 900_000 }, async () => {
-  assert.ok(CANDIDATE, "isolated ready candidate missing");
+test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy", { timeout: 900_000 }, async () => {
   assert.equal(/^[a-z0-9_]+$/.test(SCHEMA), true);
-  const ownerPath = "packages/commercial/src/http/proxy/boxNativeContextOwner.ts";
+  const built = buildCandidate();
+  const candidateRoot = built.root;
   const productOwner = readFileSync(new URL(`./boxNativeContextOwner.ts`, import.meta.url), "utf8");
-  const candidateOwner = readFileSync(`${CANDIDATE}/${ownerPath}`, "utf8");
-  assert.equal(productOwner.includes("export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;"), true);
-  assert.equal(candidateOwner.replace(
-    "export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;",
-    "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;",
-  ), productOwner);
+  const candidateOwner = readFileSync(built.owner, "utf8");
+  assert.equal(productOwner.includes(READY_FALSE), true);
+  assert.equal(candidateOwner.replace(READY_TRUE, READY_FALSE), productOwner);
   const productHash = createHash("sha256").update(productOwner).digest("hex");
   const candidateHash = createHash("sha256").update(candidateOwner).digest("hex");
 
   const productMod = await import("./index.js");
   const productOwnerMod = await import("./boxNativeContextOwner.js");
-  const candidateMod = await import(`${CANDIDATE}/packages/commercial/src/http/proxy/index.ts`);
-  const candidateOwnerMod = await import(`${CANDIDATE}/packages/commercial/src/http/proxy/boxNativeContextOwner.ts`);
-  const candidatePlan = await import(`${CANDIDATE}/packages/commercial/src/http/proxy/boxTextPlan.ts`);
-  const candidateDb = await import(`${CANDIDATE}/packages/commercial/src/db/index.ts`);
-  const candidatePre = await import(`${CANDIDATE}/packages/commercial/src/billing/preCheck.ts`);
+  const candidateMod = await import(join(candidateRoot, "packages/commercial/src/http/proxy/index.ts"));
+  const candidateOwnerMod = await import(join(candidateRoot, "packages/commercial/src/http/proxy/boxNativeContextOwner.ts"));
+  const candidatePlan = await import(join(candidateRoot, "packages/commercial/src/http/proxy/boxTextPlan.ts"));
+  const candidateDb = await import(join(candidateRoot, "packages/commercial/src/db/index.ts"));
+  const candidatePre = await import(join(candidateRoot, "packages/commercial/src/billing/preCheck.ts"));
   assert.equal(productOwnerMod.BOX_NATIVE_CONTEXT_ROUTE_READY, false);
   assert.equal(candidateOwnerMod.BOX_NATIVE_CONTEXT_ROUTE_READY, true);
 
@@ -589,6 +657,11 @@ test("candidate full chain admits 64x128KiB; ready-off and lease-only stay legac
     assert.equal(wide.rows[0]?.state, "committed");
     assert.equal(wide.rows.filter((row) => row.ledger_id).length, 1);
 
+    if (!MATRIX) {
+      for (const phase of ["upper-messages", "stdin-8MiB-cap", "concurrent-2x9MiB"]) {
+        phases.push({ phase, status: "not-run", countsAsPass: false, reason: "OC_V5_296_PIPELINE_MATRIX is unset; not PASS" });
+      }
+    } else {
     const historySized = (target: number): { body: Record<string, unknown>; messageBytes: number } => {
       const tail = { role: "user", content: [{ type: "text", text: "continue" }] };
       const messages: unknown[] = [{ role: "user", content: "start" }];
@@ -656,10 +729,12 @@ test("candidate full chain admits 64x128KiB; ready-off and lease-only stay legac
     assert.equal(concurrent.value[1].http.status, 200, JSON.stringify(concurrent.value[1].http));
     assert.equal(concurrent.value[0].rows[0]?.state, "committed");
     assert.equal(concurrent.value[1].rows[0]?.state, "committed");
+    }
 
     const redisLeft = await redis.exists("precheck:u:{3}:locks", "precheck:u:{3}:amounts");
     const report = {
-      sha: SHA,
+      source: "checkout-copy",
+      matrix: MATRIX ? "ran" : "not-run",
       schema: SCHEMA,
       database: "openclaude_test",
       port: 55432,
@@ -670,9 +745,18 @@ test("candidate full chain admits 64x128KiB; ready-off and lease-only stay legac
       autoCompactChanged: false,
       redisClientInfoHasDb: typeof redisDb === "string" ? redisDb.includes("db=15") : null,
       redisKeysRemaining: redisLeft,
+      resolution: built.resolution,
       phases,
     };
-    if (GENERATED) writeFileSync(`${GENERATED}/ocv5-296-c-pipeline-raw.json`, JSON.stringify(report, (_k, v) => typeof v === "bigint" ? v.toString() : v, 2));
+    const explicit = process.env.OC_V5_296_PIPELINE_REPORT;
+    if (explicit && explicit.endsWith("ocv5-296-c-pipeline-raw.json")) {
+      throw new Error("refusing to overwrite the historical raw receipt");
+    }
+    const reportFile = explicit && explicit.length > 0
+      ? explicit
+      : join(tmpdir(), `ocv5-296-pipeline-${randomBytes(3).toString("hex")}.json`);
+    writeFileSync(reportFile, JSON.stringify(report, (_k, v) => typeof v === "bigint" ? v.toString() : v, 2));
+    console.log(JSON.stringify({ event: "ocv5-296-pipeline-report", reportFile }));
     console.log(JSON.stringify({ event: "ocv5-296-pipeline-summary", phases: phases.map((phase) => {
       const row = phase as { phase?: string; http?: { status?: number; code?: string }; status?: number; fetches?: number; journal?: number };
       return { phase: row.phase, status: row.http?.status ?? row.status, code: row.http?.code, fetches: row.fetches, journal: row.journal };
@@ -686,5 +770,14 @@ test("candidate full chain admits 64x128KiB; ready-off and lease-only stay legac
     await pool.end().catch(() => undefined);
     await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`).catch(() => undefined);
     await admin.end().catch(() => undefined);
+    rmSync(candidateRoot, { recursive: true, force: true });
+    assert.equal(existsSync(candidateRoot), false);
+    assert.equal(existsSync(join(CHECKOUT_ROOT, "node_modules/pg")), true);
   }
+});
+
+test("upper bound, stdin cap, and 2-concurrent", {
+  skip: "not the default command. Set OC_V5_296_PIPELINE_MATRIX=1 to run them inside the checkout candidate test. This skip is not PASS",
+}, () => {
+  throw new Error("skipped test must not count as PASS");
 });
