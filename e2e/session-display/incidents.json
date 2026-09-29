@@ -5169,6 +5169,16 @@
           "assertion": "ready signed box model issues box-native-v1 and the default route is off"
         },
         {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResourceEnvelope.test.ts",
+          "assertion": "64x128KiB passes only the verified messages budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleCompact.test.ts",
+          "assertion": "terminal summary is stored before apply, and recovery does not infer again"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo"
@@ -5177,7 +5187,9 @@
       "coverageCommits": [
         "edbe08e84",
         "dc44ba859",
-        "8c3c2a28"
+        "8c3c2a28",
+        "44c20717",
+        "3085e958"
       ]
     }
   ]
