@@ -5168,6 +5168,9 @@
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo"
         }
+      ],
+      "coverageCommits": [
+        "edbe08e84"
       ]
     }
   ]
