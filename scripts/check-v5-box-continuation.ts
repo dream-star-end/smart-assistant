@@ -7,7 +7,11 @@
  * The process that parses arguments is only a supervisor. It uses node
  * builtins, starts the worker in a new process group, and enforces LIMIT_MS
  * from before that spawn. A synchronous worker cannot postpone the deadline.
- * There is no CLI switch that skips the deadline or the business receipt.
+ * Before spawn the supervisor exclusively creates one /tmp/ocv5-289-run-<24 hex>
+ * directory, passes that path to the worker, and removes it only after the
+ * worker process group has drained. The worker does not create or delete it.
+ * A path that already exists is left untouched. There is no CLI switch that
+ * skips the deadline or the business receipt.
  * Node 22 receives --experimental-transform-types on the worker spawn, not
  * via a re-exec that runs before supervision. --expect-sha is required and
  * is the builder archive SHA. Unknown arguments fail. A tree with no .git
@@ -23,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const LIMIT_MS = 60_000;
+const PUBLISH_DIR = /^\/tmp\/ocv5-289-run-[0-9a-f]{24}$/;
 const RECEIPT = "ocv5-b1-continuation-pass";
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = realpathSync(join(CANDIDATE, "packages/commercial/src/http/proxy"));
@@ -87,6 +92,7 @@ type Fixture = {
 };
 
 let scratch = "";
+let publishDir = "";
 let fx: Fixture;
 function fail(message: string): never {
   throw new Error(message);
@@ -262,26 +268,22 @@ async function load(): Promise<Api> {
       verifier.assertComplete();
     },
     publishImage: (row) => {
-      const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
-      mkdirSync(cwd, { mode: 0o700 });
-      try {
-        const plan = planMod.makeBoxToolResultPlan({ cwd,
-          expected: { id: row.modelToolUseId, clientName: "Read", boxName: "mcp__ocbridge__t0",
-            input: { file_path: "a.png" } },
-          pending: { version: 1, modelToolUseId: row.modelToolUseId, mcpRequestId: 1,
-            name: "t0", arguments: { file_path: "a.png" } },
-          matched: row });
-        if (plan.requests.length < 1) fail("IMAGE_PUBLISH_EMPTY");
-        for (const request of plan.requests) {
-          const ran = spawnSync(request.command, request.args, {
-            cwd: request.cwd, env: request.environment, encoding: "utf8",
-          });
-          if (ran.status !== 0) fail(`IMAGE_PUBLISH_${ran.status ?? "SPAWN"}`);
-        }
-        return JSON.parse(readFileSync(plan.path, "utf8")) as PublishedFile;
-      } finally {
-        rmSync(cwd, { recursive: true, force: true });
+      const cwd = publishDir;
+      if (!PUBLISH_DIR.test(cwd) || !existsSync(cwd)) fail("IMAGE_PUBLISH_DIR");
+      const plan = planMod.makeBoxToolResultPlan({ cwd,
+        expected: { id: row.modelToolUseId, clientName: "Read", boxName: "mcp__ocbridge__t0",
+          input: { file_path: "a.png" } },
+        pending: { version: 1, modelToolUseId: row.modelToolUseId, mcpRequestId: 1,
+          name: "t0", arguments: { file_path: "a.png" } },
+        matched: row });
+      if (plan.requests.length < 1) fail("IMAGE_PUBLISH_EMPTY");
+      for (const request of plan.requests) {
+        const ran = spawnSync(request.command, request.args, {
+          cwd: request.cwd, env: request.environment, encoding: "utf8",
+        });
+        if (ran.status !== 0) fail(`IMAGE_PUBLISH_${ran.status ?? "SPAWN"}`);
       }
+      return JSON.parse(readFileSync(plan.path, "utf8")) as PublishedFile;
     },
   };
 }
@@ -690,7 +692,7 @@ function workerLaunch(expectSha: string): { cmd: string; args: string[] } {
   args.push(SELF, "--expect-sha", expectSha);
   return { cmd: process.execPath, args };
 }
-function whitelist(dir: string, token: string): NodeJS.ProcessEnv {
+function whitelist(dir: string, token: string, publish: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "SystemRoot"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -704,9 +706,24 @@ function whitelist(dir: string, token: string): NodeJS.ProcessEnv {
   env.OC_B1_SUPERVISED = "1";
   env.OC_B1_PARENT_PID = String(process.pid);
   env.OC_B1_SCRATCH = dir;
+  env.OC_B1_PUBLISH_DIR = publish;
   env.OC_B1_WORKER_TOKEN = token;
   env.OC_B1_WORKER_TOKEN_FILE = join(dir, "token");
   return env;
+}
+function claimPublishDir(record: (dir: string) => void): string {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const claimed = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+    try {
+      mkdirSync(claimed, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+    record(claimed);
+    return claimed;
+  }
+  fail("IMAGE_PUBLISH_CLAIM");
 }
 function acceptReceipt(stdout: string, expectSha: string): boolean {
   const line = stdout.trim().split("\n").filter(Boolean).at(-1) ?? "";
@@ -725,6 +742,7 @@ async function supervise(expectSha: string): Promise<void> {
   writeFileSync(join(dir, "token"), token, { mode: 0o600 });
   const started = Date.now();
   let worker = 0;
+  let ownedRun = "";
   let reason: string | null = null;
   let closed = false;
   const stop = (next: string): void => {
@@ -743,14 +761,15 @@ async function supervise(expectSha: string): Promise<void> {
   let bytes = 0;
   let code = 1;
   try {
+  const publish = claimPublishDir((claimed) => { ownedRun = claimed; });
   const launch = workerLaunch(expectSha);
   const child = spawn(launch.cmd, launch.args, {
-    cwd: CANDIDATE, env: whitelist(dir, token), detached: true, stdio: ["ignore", "pipe", "pipe"],
+    cwd: CANDIDATE, env: whitelist(dir, token, publish), detached: true, stdio: ["ignore", "pipe", "pipe"],
   });
   if (child.pid === undefined) fail("SUPERVISOR_SPAWN");
   worker = child.pid;
   const starttime = procField(worker, 19);
-  process.stderr.write(`OC_B1_SUPERVISOR worker=${worker} pgid=${worker} starttime=${starttime} start=${started} scratch=${dir}\n`);
+  process.stderr.write(`OC_B1_SUPERVISOR worker=${worker} pgid=${worker} starttime=${starttime} start=${started} scratch=${dir} publish=${publish}\n`);
   const capture = (target: "stdout" | "stderr", chunk: Buffer): void => {
     bytes += chunk.length;
     if (bytes > 1_000_000) { stop("SUPERVISOR_OUTPUT"); return; }
@@ -775,6 +794,7 @@ async function supervise(expectSha: string): Promise<void> {
     const end = Date.now() + 1_000;
     while (Date.now() < end && groupAlive(worker)) await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
+  if (ownedRun && PUBLISH_DIR.test(ownedRun)) rmSync(ownedRun, { recursive: true, force: true });
   rmSync(dir, { recursive: true, force: true });
   }
   if (worker && groupAlive(worker)) fail("SUPERVISOR_ORPHAN");
@@ -792,9 +812,12 @@ async function workerMain(expectSha: string): Promise<void> {
     || !/^[0-9a-f]{64}$/.test(token) || readFileSync(tokenFile, "utf8") !== token) {
     fail("WORKER_TOKEN_MISMATCH");
   }
+  publishDir = process.env.OC_B1_PUBLISH_DIR ?? "";
+  if (!PUBLISH_DIR.test(publishDir)) fail("IMAGE_PUBLISH_DIR");
   scratch = process.env.OC_B1_SCRATCH ?? "";
   if (!scratch) fail("WORKER_SCRATCH");
   isolate(scratch);
+  if (process.env.OC_B1_PUBLISH_DIR !== undefined) fail("IMAGE_PUBLISH_DIR");
   installResolveHook();
   fx = await import("./check-v5-box-continuation-fixture.ts");
   const git = await gitCrossCheck(expectSha);

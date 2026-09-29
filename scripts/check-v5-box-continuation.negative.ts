@@ -276,6 +276,85 @@ test("SIGTERM reaps a worker and the descendant that ignores the signal", async 
   }
 });
 
+
+const SERIALIZE_ANCHOR = '  const raw = Buffer.from(JSON.stringify(result), "utf8");';
+function holdBeforeSerialize(source: string): string {
+  assert.equal(source.includes("PROBE_RUN"), false);
+  assert.equal(source.includes(SERIALIZE_ANCHOR), true);
+  const inject = "  process.stderr.write(`PROBE_RUN=${input.cwd}\\n`);\n"
+    + "  const holdUntil = Date.now() + 120_000;\n"
+    + "  while (Date.now() < holdUntil) {}\n";
+  return source.replace(SERIALIZE_ANCHOR, inject + SERIALIZE_ANCHOR);
+}
+function armPublishHold(dir: string, shorten: boolean): void {
+  const planPath = join(dir, "packages/commercial/src/http/proxy/boxToolResultPlan.ts");
+  const sourcePlan = readFileSync(join(SOURCE, "packages/commercial/src/http/proxy/boxToolResultPlan.ts"), "utf8");
+  assert.equal(sourcePlan.includes("PROBE_RUN"), false);
+  writeFileSync(planPath, holdBeforeSerialize(readFileSync(planPath, "utf8")));
+  const gatePath = join(dir, "scripts/check-v5-box-continuation.ts");
+  const sourceGate = readFileSync(join(SOURCE, "scripts/check-v5-box-continuation.ts"), "utf8");
+  assert.match(sourceGate, /const LIMIT_MS = 60_000;/);
+  assert.doesNotMatch(sourceGate, /--limit-ms/);
+  if (!shorten) return;
+  const staged = readFileSync(gatePath, "utf8");
+  assert.equal(staged.includes("const LIMIT_MS = 60_000;"), true);
+  writeFileSync(gatePath, staged.replace("const LIMIT_MS = 60_000;", "const LIMIT_MS = 15_000;"));
+}
+async function waitPublishHold(run: ReturnType<typeof launched>): Promise<{
+  publish: string; scratch: string; worker: number; pgid: number; starttime: string;
+}> {
+  for (let i = 0; i < 400; i++) {
+    const text = run.text();
+    const mark = text.stderr.match(/OC_B1_SUPERVISOR worker=(\d+) pgid=(\d+) starttime=(\d+) start=\d+ scratch=(\S+) publish=(\S+)/);
+    const probe = text.stderr.match(/PROBE_RUN=(\/tmp\/ocv5-289-run-[0-9a-f]{24})/);
+    if (mark && probe && probe[1] === mark[5] && run.child.exitCode === null && existsSync(probe[1] ?? "")) {
+      return { publish: probe[1] ?? "", scratch: mark[4] ?? "", worker: Number(mark[1]),
+        pgid: Number(mark[2]), starttime: mark[3] ?? "" };
+    }
+    if (run.child.exitCode !== null) assert.fail(`supervisor exited before the publish hold\n${text.stderr}\n${text.stdout}`);
+    await delay(50);
+  }
+  assert.fail(`publish hold not observed\n${run.text().stderr}\n${run.text().stdout}`);
+}
+async function publishInterrupt(kind: "deadline" | "signal"): Promise<void> {
+  const dir = stage();
+  let run: ReturnType<typeof launched> | undefined;
+  let leaked: string | null = null;
+  try {
+    armPublishHold(dir, kind === "deadline");
+    const begun = Date.now();
+    run = launched(dir, ["--expect-sha", SHA]);
+    const seen = await waitPublishHold(run);
+    leaked = seen.publish;
+    assert.equal(run.child.exitCode, null);
+    assert.equal(existsSync(seen.publish), true);
+    assert.equal(existsSync(join(seen.scratch, "home")), true);
+    if (kind === "signal") run.child.kill("SIGTERM");
+    const code = await closed(run.child, kind === "deadline" ? 22_000 : 8_000);
+    note({ case: `publish-${kind}`, pid: seen.worker, pgid: seen.pgid, starttime: seen.starttime,
+      publish: seen.publish, code, elapsedMs: Date.now() - begun, waitedFullLimit: false,
+      limitMs: kind === "deadline" ? 15_000 : 60_000 });
+    assert.notEqual(code, 0);
+    assert.match(run.text().stderr, kind === "deadline" ? /SUPERVISOR_TIMEOUT/ : /SUPERVISOR_SIGNAL/);
+    assert.equal(procInfo(seen.worker), null);
+    assert.deepEqual(members(seen.pgid), []);
+    assert.equal(existsSync(seen.publish), false);
+    assert.equal(existsSync(seen.scratch), false);
+    assert.equal(existsSync(join(seen.scratch, "home")), false);
+    leaked = null;
+  } finally {
+    try { run?.child.kill("SIGKILL"); } catch { /* already gone */ }
+    if (leaked && existsSync(leaked)) rmSync(leaked, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+test("deadline cleans a publish directory while the product holds", async () => {
+  await publishInterrupt("deadline");
+});
+test("SIGTERM cleans a publish directory while the product holds", async () => {
+  await publishInterrupt("signal");
+});
+
 test("archive without git passes only with a strict expect-sha", () => {
   const dir = stage();
   try {
