@@ -3,6 +3,8 @@
  * sidecar pending IDs and durable cross-HTTP journal are verified by caller.
  * This is a protocol primitive, not the production bridge by itself.
  */
+import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
+  isBoxCliSyntheticUser } from "./boxCliCompaction.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
@@ -127,16 +129,19 @@ export class BoxCliToolHandoffDecoder {
   private finalStreamChecked = false;
   private expectedToolIds: readonly string[] = [];
   private remainder = "";
+  private compaction: BoxCliCompaction | null = null;
 
   constructor(private readonly expectedModel: string,
     private readonly catalog: BoxToolCatalog,
     private readonly options: { alreadyInitialized?: boolean; allowFinal?: boolean;
-      progress?: BoxToolProgressBinding } = {}) {
+      progress?: BoxToolProgressBinding; trustedNativeSessionId?: string } = {}) {
     if (!/^claude-[a-z0-9-]{3,64}$/.test(expectedModel)
       || catalog.tools.length < 1) {
       throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_INVALID");
     }
     this.initSeen = options.alreadyInitialized === true;
+    this.compaction = options.trustedNativeSessionId
+      ? new BoxCliCompaction(options.trustedNativeSessionId) : null;
   }
 
   push(chunk: string): { sse: string; candidate: BoxToolHandoffCandidate | null;
@@ -245,6 +250,13 @@ export class BoxCliToolHandoffDecoder {
 
   /** Call only after nonce/epoch-bound remote stop AND an exact spool EOF read. */
   finishFinal(): void {
+    if (this.compaction) {
+      try { this.compaction.assertSettled(); }
+      catch (error) {
+        if (error instanceof BoxCliCompactionError) throw new BoxCliToolHandoffError(error.code);
+        throw error;
+      }
+    }
     if (this.failed || this.committed || !this.finalCandidate
       || this.pending.length !== 0 || this.remainder.length !== 0
       || this.splitHighSurrogate.length !== 0) {
@@ -262,6 +274,18 @@ export class BoxCliToolHandoffDecoder {
   private record(record: Obj): string {
     if (this.candidate || this.finalCandidate) {
       throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
+    }
+    if (this.compaction) {
+      try {
+        if (this.compaction.take(record)) return "";
+      } catch (error) {
+        if (error instanceof BoxCliCompactionError) {
+          throw new BoxCliToolHandoffError(error.code);
+        }
+        throw error;
+      }
+    } else if (isBoxCliCompactBoundary(record) || isBoxCliSyntheticUser(record)) {
+      throw new BoxCliToolHandoffError("BOX_CLI_COMPACT_UNBOUND");
     }
     const progress = classifyBoxToolProgress(record);
     if (progress.kind === "malformed") {

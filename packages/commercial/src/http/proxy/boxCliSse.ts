@@ -1,3 +1,6 @@
+import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
+  isBoxCliSyntheticUser } from "./boxCliCompaction.js";
+
 /** Convert a completed, supervised Claude CLI stream-json call back to
  * Anthropic Messages SSE. Visible block indexes are renumbered only after
  * the reconstructed visible text matches the final CLI assistant snapshot.
@@ -46,7 +49,8 @@ export interface BoxCliSseResult {
  * mistake a partial/failed CLI invocation for a completed billable response.
  * Each push returns only newly validated SSE frames; it never replays a prefix.
  */
-export function createBoxCliSseDecoder(expectedModel: string): {
+export function createBoxCliSseDecoder(expectedModel: string,
+  trustedNativeSessionId?: string): {
   push: (chunk: string) => string;
   finish: () => BoxCliSseResult & { tailSse: string };
   completedMessage: () => ObjectValue;
@@ -54,6 +58,8 @@ export function createBoxCliSseDecoder(expectedModel: string): {
   if (!expectedModel) {
     throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
   }
+  const compaction = trustedNativeSessionId
+    ? new BoxCliCompaction(trustedNativeSessionId) : null;
   let started = false, stopped = false, resultSeen = false, initSeen = false;
   let inputTokens: number | null = null, outputTokens: number | null = null;
   let cacheRead = 0, cacheCreation = 0, nextVisibleIndex = 0, lastOriginalIndex = -1;
@@ -77,6 +83,16 @@ export function createBoxCliSseDecoder(expectedModel: string): {
     try { record = object(JSON.parse(line)); }
     catch { throw new BoxCliSseError("BOX_CLI_STREAM_INVALID"); }
     if (resultSeen) throw new BoxCliSseError("BOX_CLI_RECORD_AFTER_RESULT");
+    if (compaction) {
+      try {
+        if (compaction.take(record)) return "";
+      } catch (error) {
+        if (error instanceof BoxCliCompactionError) throw new BoxCliSseError(error.code);
+        throw error;
+      }
+    } else if (isBoxCliCompactBoundary(record) || isBoxCliSyntheticUser(record)) {
+      throw new BoxCliSseError("BOX_CLI_COMPACT_UNBOUND");
+    }
     const kind = record.type;
     if (kind === "stream_event") {
       const event = object(record.event);
@@ -282,6 +298,13 @@ export function createBoxCliSseDecoder(expectedModel: string): {
     if (bytes > 1_048_576) throw new BoxCliSseError("BOX_CLI_STREAM_INVALID");
     let tailSse = pending ? processLine(pending) : "";
     pending = "";
+    if (compaction) {
+      try { compaction.assertSettled(); }
+      catch (error) {
+        if (error instanceof BoxCliCompactionError) throw new BoxCliSseError(error.code);
+        throw error;
+      }
+    }
     if (!started || !stopped || !resultSeen || inputTokens === null || outputTokens === null) {
       throw new BoxCliSseError("BOX_CLI_STREAM_INCOMPLETE");
     }

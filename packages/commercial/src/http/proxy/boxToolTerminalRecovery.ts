@@ -1,6 +1,7 @@
 /** Background success close for one already proved final model round.
  * A new tool handoff is out of scope: this function never writes a handoff
  * or skips ahead to a later result. The caller owns the pinned target. */
+import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { BoxDurableJournalError, type BoxDetachedUnknownRecovery,
@@ -70,6 +71,7 @@ export async function observeBoxToolTerminalOnly(input: {
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
         ...(progress ? { progress } : {}) });
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;
+    const compaction = id.nativeSessionId ? new BoxCliCompaction(id.nativeSessionId) : null;
     let modelStarted = false;
     let endOffset = id.spoolOffset;
     for await (const line of pollBoxSpoolLines({ exec: input.target.exec, access,
@@ -78,6 +80,16 @@ export async function observeBoxToolTerminalOnly(input: {
       let record: unknown;
       try { record = JSON.parse(line.text); }
       catch { return { status: "pending", reason: "BOX_RECOVERY_RECORD_INVALID" }; }
+      if (compaction) {
+        try {
+          if (compaction.take(record)) continue;
+        } catch (error) {
+          if (error instanceof BoxCliCompactionError) {
+            return { status: "pending", reason: error.code };
+          }
+          throw error;
+        }
+      }
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "user") {
         if (!echo || modelStarted) {

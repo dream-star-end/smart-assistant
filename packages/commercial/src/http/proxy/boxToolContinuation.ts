@@ -7,6 +7,7 @@ import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
+import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
@@ -98,6 +99,7 @@ export async function runBoxToolContinuation(input: {
       : undefined;
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
       { alreadyInitialized: true, allowFinal: true, ...(progress ? { progress } : {}) });
+    const compaction = claim.nativeSessionId ? new BoxCliCompaction(claim.nativeSessionId) : null;
     const echo = new BoxToolResultEcho(claim.results);
     let modelStarted = false;
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access,
@@ -105,6 +107,16 @@ export async function runBoxToolContinuation(input: {
       let record: unknown;
       try { record = JSON.parse(line.text); }
       catch { throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_RECORD_INVALID"); }
+      if (compaction) {
+        try {
+          if (compaction.take(record)) continue;
+        } catch (error) {
+          if (error instanceof BoxCliCompactionError) {
+            throw new BoxToolContinuationError(error.code);
+          }
+          throw error;
+        }
+      }
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "user") {
         if (modelStarted) throw new BoxToolContinuationError("BOX_TOOL_ECHO_AFTER_MODEL");

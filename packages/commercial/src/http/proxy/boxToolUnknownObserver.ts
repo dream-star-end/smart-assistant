@@ -1,6 +1,7 @@
 /** Read an existing detached CLI's spool after an ambiguous HTTP outcome.
  * This path never stages input, launches Claude, publishes tool results or
  * settles billing. It may only commit evidence to the original journal row. */
+import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
@@ -93,6 +94,7 @@ export async function observeBoxToolUnknown(input: {
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
         ...(progress ? { progress } : {}) });
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;
+    const compaction = id.nativeSessionId ? new BoxCliCompaction(id.nativeSessionId) : null;
     let modelStarted = false;
     try {
       for await (const line of pollBoxSpoolLines({ exec: target.exec, access,
@@ -101,6 +103,16 @@ export async function observeBoxToolUnknown(input: {
         let record: unknown;
         try { record = JSON.parse(line.text); }
         catch { throw new BoxToolUnknownObserverError("BOX_OBSERVER_RECORD_INVALID"); }
+        if (compaction) {
+          try {
+            if (compaction.take(record)) continue;
+          } catch (error) {
+            if (error instanceof BoxCliCompactionError) {
+              throw new BoxToolUnknownObserverError(error.code);
+            }
+            throw error;
+          }
+        }
         if (record && typeof record === "object" && !Array.isArray(record)
           && (record as { type?: unknown }).type === "user") {
           if (!echo || modelStarted) {

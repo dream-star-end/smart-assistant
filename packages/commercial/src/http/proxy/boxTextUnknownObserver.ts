@@ -71,7 +71,9 @@ export async function observeBoxTextUnknown(input: {
       detachedRunnerHash: id.detachedRunnerHash });
     let observed: Awaited<ReturnType<typeof observeBoxDetachedText>>;
     try { observed = await observeBoxDetachedText({ target, access,
-      expectedModel: id.upstreamModel, runNonce: id.runNonce,
+      expectedModel: id.upstreamModel,
+      ...(id.nativeSessionId ? { trustedNativeSessionId: id.nativeSessionId } : {}),
+      runNonce: id.runNonce,
       leaseEpoch: id.leaseEpoch, deadlineMs: budget, signal: pollAbort.signal }); }
     catch {
       // A keeper may have proved failure without ever producing a valid

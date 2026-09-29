@@ -404,7 +404,8 @@ export class BoxTextFetch {
       }
       const stream = new ReadableStream<Uint8Array>({
         start: (controller) => {
-          const decoder = createBoxCliSseDecoder(plan.expectedModel);
+          const decoder = createBoxCliSseDecoder(plan.expectedModel,
+            plan.nativePersistence ? plan.sessionId : undefined);
           let remoteTerminalKnown = false;
           let terminalProof: BoxTerminalProof | null = null;
           let deliveryClosed = false;
@@ -426,6 +427,7 @@ export class BoxTextFetch {
                     detachedRunnerHash: detached.detachedRunnerHash });
                   const observed = await observeBoxDetachedText({ target: resolved!,
                     access, expectedModel: plan.expectedModel,
+                    ...(plan.nativePersistence ? { trustedNativeSessionId: plan.sessionId } : {}),
                     runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
                     signal: currentLease.signal, deadlineMs: Math.max(1, remaining()),
                     emit });

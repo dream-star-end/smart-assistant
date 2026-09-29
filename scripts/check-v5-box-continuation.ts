@@ -40,6 +40,9 @@ const ENTRIES = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMa
  * relative value-import walk as ENTRIES. Type-only imports stay non-recursive.
  * This is not a full-repo manifest. */
 const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as const;
+/** Direct runtime module for the OCV5-296 compact carrier. No oracle or graph edit. */
+const COMPACTION_SOURCE = ["boxCliCompaction.ts"] as const;
+const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
 const SEALED_IMAGE_SHA = "a9491d8d9cb458b11d4ac6c5fc4b5c2d4d370a1d9b6f7960cc5dffae678538a0";
@@ -167,7 +170,8 @@ function resolveLocal(fromFile: string, spec: string): string | null {
   return null;
 }
 function digest(): Digest {
-  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT].map((name) => realpathSync(join(PROXY, name)));
+  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT, ...COMPACTION_SOURCE]
+    .map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
   const files = new Set<string>([SELF, FIXTURE, LOADER, IMAGE_FILE, ORACLE_FILE]);
   while (pending.length > 0) {
@@ -926,6 +930,10 @@ async function workerMain(expectSha: string): Promise<void> {
   fx = await import("./check-v5-box-continuation-fixture.ts");
   const git = await gitCrossCheck(expectSha);
   const before = digest();
+  const compaction = await import(pathToFileURL(join(PROXY, "boxCliCompaction.ts")).href) as {
+    assertOcv5296CompactionBinding: () => void };
+  compaction.assertOcv5296CompactionBinding();
+  if (!COMPACTION_BINDING.startsWith("[ocv5-296-compaction] PASS")) fail("COMPACTION_BINDING");
   const api = await load();
   const after = digest();
   if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");

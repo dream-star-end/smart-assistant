@@ -16,6 +16,7 @@ export async function observeBoxDetachedText(input: {
   target: { accountId: bigint; exec: Pick<BoxExecTransport, "run"> };
   access: Pick<BoxDetachedRunAccess, "readSpool">;
   expectedModel: string;
+  trustedNativeSessionId?: string;
   runNonce: string; leaseEpoch: string;
   signal?: AbortSignal; deadlineMs: number;
   emit?: (sse: string) => void;
@@ -32,7 +33,7 @@ export async function observeBoxDetachedText(input: {
   if (input.signal?.aborted) abort.abort();
   const deadlineAt = Date.now() + input.deadlineMs;
   const timer = setTimeout(() => abort.abort(), input.deadlineMs);
-  const decoder = createBoxCliSseDecoder(input.expectedModel);
+  const decoder = createBoxCliSseDecoder(input.expectedModel, input.trustedNativeSessionId);
   try {
   for await (const line of pollBoxSpoolLines({ exec: input.target.exec,
     access: input.access, startOffset: 0, deadlineMs: input.deadlineMs,
