@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createServer, type Server } from 'node:http'
+import type { Socket } from 'node:net'
 import { getDefaultAppState } from '../../state/AppStateStore.ts'
 import { enableConfigs } from '../../utils/config.ts'
 import { createFileStateCacheWithSizeLimit } from '../../utils/fileStateCache.ts'
@@ -53,11 +54,22 @@ function sse(res: import('node:http').ServerResponse, text: string) {
   res.end()
 }
 
-async function listen(mode: Mode): Promise<{ server: Server; url: string; hits: () => number }> {
+const ABORT_HANG_MS = 8000
+const ABORT_REPEATS = 5
+
+async function listen(
+  mode: Mode,
+  onRequest?: () => void,
+): Promise<{ url: string; hits: () => number; close: () => void }> {
   let hits = 0
-  const server = createServer((req, res) => {
+  const sockets = new Set<Socket>()
+  const server: Server = createServer((req, res) => {
     hits += 1
-    if (mode === 'abort') return
+    req.resume()
+    if (mode === 'abort') {
+      onRequest?.()
+      return
+    }
     if (mode === 'transient' && hits === 1) {
       res.writeHead(403, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'status 403' } }))
@@ -81,10 +93,21 @@ async function listen(mode: Mode): Promise<{ server: Server; url: string; hits: 
       : 'The log says API Error: 403 but the goal remains.'
     sse(res, text)
   })
+  server.on('connection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   const address = server.address()
   if (!address || typeof address === 'string') throw new Error('no port')
-  return { server, url: `http://127.0.0.1:${address.port}`, hits: () => hits }
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    hits: () => hits,
+    close() {
+      for (const socket of sockets) socket.destroy()
+      server.close()
+    },
+  }
 }
 
 const messages = [
@@ -94,11 +117,12 @@ const messages = [
 ] as never
 
 async function run(mode: Mode, kind: 'full' | 'partial', history: typeof messages = messages) {
-  const listener = await listen(mode)
+  const ctx = context()
+  const listener = await listen(mode, () => {
+    if (mode === 'abort') ctx.abortController.abort()
+  })
   delete process.env.NODE_ENV
   process.env.ANTHROPIC_BASE_URL = listener.url
-  const ctx = context()
-  if (mode === 'abort') setTimeout(() => ctx.abortController.abort(), 30)
   const params = {
     systemPrompt: [] as never,
     userContext: {},
@@ -106,15 +130,28 @@ async function run(mode: Mode, kind: 'full' | 'partial', history: typeof message
     toolUseContext: ctx as never,
     forkContextMessages: history as never,
   }
+  let hang: ReturnType<typeof setTimeout> | undefined
   try {
-    const summary = kind === 'full'
-      ? await compactConversation(history, ctx as never, params, false, 'preserve goal', true)
-      : await partialCompactConversation(history, 1, ctx as never, params, 'preserve goal', 'from')
+    const pending = kind === 'full'
+      ? compactConversation(history, ctx as never, params, false, 'preserve goal', true)
+      : partialCompactConversation(history, 1, ctx as never, params, 'preserve goal', 'from')
+    const summary = mode === 'abort'
+      ? await Promise.race([
+          pending,
+          new Promise<never>((_, reject) => {
+            hang = setTimeout(
+              () => reject(new Error('abort fixture hung waiting for the request')),
+              ABORT_HANG_MS,
+            )
+          }),
+        ])
+      : await pending
     return { summary, hits: listener.hits(), error: undefined as unknown, cached: ctx.readFileState.has('/tmp/kept.ts') }
   } catch (error) {
     return { summary: undefined, hits: listener.hits(), error, cached: ctx.readFileState.has('/tmp/kept.ts') }
   } finally {
-    listener.server.close()
+    if (hang) clearTimeout(hang)
+    listener.close()
   }
 }
 
@@ -173,10 +210,12 @@ describe('ordinary compact rejects a typed error before a boundary', () => {
   })
 
   test('abort does not compact or send a second summary', async () => {
-    const result = await run('abort', 'full')
-    expect(result.hits).toBe(1)
-    expect(result.summary).toBeUndefined()
-    expect(result.cached).toBe(true)
-    expect(String(result.error)).toContain('aborted')
+    for (let attempt = 0; attempt < ABORT_REPEATS; attempt++) {
+      const result = await run('abort', 'full')
+      expect(result.hits).toBe(1)
+      expect(result.summary).toBeUndefined()
+      expect(result.cached).toBe(true)
+      expect(String(result.error)).toContain('aborted')
+    }
   })
 })
