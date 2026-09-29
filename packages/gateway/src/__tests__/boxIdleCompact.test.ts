@@ -7,6 +7,8 @@ import {
   advanceIdleOp,
   assembleIdleArtifact,
   IDLE_COMPACT_PROMPT,
+  idleOpSettled,
+  readPendingIdle,
   startIdleOp,
   writeIdleOp,
 } from '../boxIdleCompact.js'
@@ -47,7 +49,7 @@ describe('idle artifact recovery', () => {
     assert.equal(ignored.op.summaryText, undefined)
     const stepped = advanceIdleOp({ op: started.op, proof, useProofSummary: true })
     assert.equal(stepped.callModel, false)
-    assert.equal(stepped.op.artifact?.messages[1]?.text, 'kept goal')
+    assert.deepEqual(stepped.op.artifact?.messages[1]?.message, { role: 'user', content: 'kept goal' })
     const direct = assembleIdleArtifact({
       opId: started.op.idleTurnKey, summaryText: 'kept goal',
       tail: started.op.frozenTail, attachments: started.op.attachments,
@@ -123,5 +125,18 @@ describe('idle artifact recovery', () => {
     assert.equal(assembled.callModel, false)
     assert.ok(assembled.op.artifact)
     assert.equal(assembled.op.artifact?.messages.some((message) => message.text === 'kept tail'), true)
+  })
+
+  test('a new op with no artifact is still pending for the next user', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'idle-pending-'))
+    const started = startIdleOp({
+      dir, sessionKey: 'pending-session', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: proof.revision, idleTurnKey: 'ab'.repeat(32), frozenTail: [], attachments: [],
+    })
+    assert.equal(started.ownedDispatch, true)
+    assert.equal(idleOpSettled(started.op), false)
+    const pending = readPendingIdle(dir, 'pending-session')
+    assert.equal(pending?.revision, proof.revision)
+    assert.equal(pending?.artifact, undefined)
   })
 })

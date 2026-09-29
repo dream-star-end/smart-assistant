@@ -21,12 +21,15 @@ export class IdleCompactRejected extends Error {
 export interface IdleFrozenTail {
   uuid: string
   parentUuid: string | null
-  text: string
+  text?: string
+  /** Original message. Present messages are not rewritten into user text. */
+  message?: Record<string, unknown>
 }
 
 export interface IdleAttachment {
   uuid: string
-  text: string
+  text?: string
+  message?: Record<string, unknown>
 }
 
 export interface IdleArtifact {
@@ -64,11 +67,18 @@ export function assembleIdleArtifact(input: {
   const boundary = idleUuid(input.opId, 'boundary')
   const summary = idleUuid(input.opId, 'summary')
   const anchor = input.tail[input.tail.length - 1]?.uuid ?? null
+  const kept = (item: { uuid: string; parentUuid: string | null; text?: string; message?: Record<string, unknown> }) =>
+    item.message
+      ? { ...item.message, uuid: item.uuid, parentUuid: item.message.parentUuid ?? item.parentUuid }
+      : { uuid: item.uuid, parentUuid: item.parentUuid, type: 'user', text: item.text }
   const messages: Array<Record<string, unknown>> = [
     { uuid: boundary, type: 'system', subtype: 'compact_boundary', parentUuid: anchor },
-    { uuid: summary, type: 'user', isSynthetic: true, parentUuid: boundary, text: input.summaryText },
-    ...input.tail.map((item) => ({ uuid: item.uuid, parentUuid: item.parentUuid, type: 'user', text: item.text })),
-    ...input.attachments.map((item) => ({ uuid: item.uuid, type: 'attachment', parentUuid: summary, text: item.text })),
+    { uuid: summary, type: 'user', isSynthetic: true, parentUuid: boundary,
+      message: { role: 'user', content: input.summaryText } },
+    ...input.tail.map(kept),
+    ...input.attachments.map((item) => item.message
+      ? { ...item.message, uuid: item.uuid, parentUuid: item.message.parentUuid ?? summary }
+      : { uuid: item.uuid, type: 'attachment', parentUuid: summary, text: item.text }),
   ]
   return {
     messages,
@@ -84,6 +94,11 @@ function opPath(dir: string, op: { sessionKey: string; revision: string }): stri
   return join(dir, 'idle-ops', encodeURIComponent(op.sessionKey), `${op.revision}.json`)
 }
 
+/** Done only when a full artifact exists and the loader receipt matches it. */
+export function idleOpSettled(op: IdleOp): boolean {
+  return Boolean(op.artifact && op.receiptDigest === op.artifact.digest)
+}
+
 export function readPendingIdle(dir: string, sessionKey: string): IdleOp | undefined {
   const folder = join(dir, 'idle-ops', encodeURIComponent(sessionKey))
   let names: string[] = []
@@ -91,7 +106,7 @@ export function readPendingIdle(dir: string, sessionKey: string): IdleOp | undef
   for (const name of names) {
     if (!name.endsWith('.json') || name.endsWith('.tmp')) continue
     const op = readIdleOp(dir, sessionKey, name.slice(0, -'.json'.length))
-    if (op && op.receiptDigest !== op.artifact?.digest) return op
+    if (op && !idleOpSettled(op)) return op
   }
   return undefined
 }

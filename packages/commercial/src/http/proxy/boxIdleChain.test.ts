@@ -62,6 +62,34 @@ test("unsettled leaf, unknown, and a second open chain stay pending", () => {
   if (open.status === "pending") assert.equal(open.reason, "other_chain");
 });
 
+test("only the leaf prompt counts toward the window, and a foreign nonce stays pending", () => {
+  const parentHeavy = row("parent", {
+    boxToolHandoff: { roundNo: 1 },
+    boxResumeRequestId: "leaf",
+    boxResumeRevision: "11111111-1111-4111-8111-111111111111",
+    boxTerminalProof: { reason: "worker_complete", runNonce: "a".repeat(24) },
+    boxUsage: { inputTokens: 200_000, cacheReadTokens: 0 },
+    boxRunNonce: "a".repeat(24),
+  });
+  const lightLeaf = row("leaf", {
+    boxTerminalProof: { reason: "worker_complete", runNonce: "a".repeat(24) },
+    boxReplayMessage: capsule,
+    boxUsage: { inputTokens: 20, cacheReadTokens: 0 },
+    boxOwnerRequestId: "parent",
+    boxParentResumeRevision: "11111111-1111-4111-8111-111111111111",
+    boxRunNonce: "a".repeat(24),
+    boxRoundNo: 2,
+  });
+  const proof = projectBoxIdleChain({ sessionId, turnKey, rows: [lightLeaf, parentHeavy] });
+  assert.equal(proof.status, "terminal");
+  if (proof.status === "terminal") assert.equal(proof.compactRequired, false);
+  const foreign = projectBoxIdleChain({ sessionId, turnKey, rows: [{
+    ...lightLeaf, ctx: { ...lightLeaf.ctx, boxRunNonce: "b".repeat(24) },
+  }, parentHeavy] });
+  assert.equal(foreign.status, "pending");
+  if (foreign.status === "pending") assert.equal(foreign.reason, "identity");
+});
+
 test("short usage does not require another summary charge", () => {
   const small = row("only", {
     boxTerminalProof: { reason: "worker_complete" },

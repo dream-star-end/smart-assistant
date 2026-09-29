@@ -116,12 +116,31 @@ export function projectBoxIdleChain(input: {
   }
   const open = (input.otherOpenRequestIds ?? []).filter((id) => !byId.has(id));
   if (open.length > 0) return { status: "pending", reason: "other_chain" };
-  let tokens = 0;
-  for (const row of chain) {
-    const usage = row.ctx.boxUsage as { inputTokens?: unknown; cacheReadTokens?: unknown } | undefined;
-    if (typeof usage?.inputTokens === "number") tokens += usage.inputTokens;
-    if (typeof usage?.cacheReadTokens === "number") tokens += usage.cacheReadTokens;
+  const proof = leaf.ctx.boxTerminalProof as { runNonce?: unknown; leaseEpoch?: unknown } | undefined;
+  if (typeof leaf.ctx.boxRunNonce === "string" && leaf.ctx.boxRunNonce !== proof?.runNonce) {
+    return { status: "pending", reason: "identity" };
   }
+  if (typeof leaf.ctx.boxLeaseEpoch === "string" && leaf.ctx.boxLeaseEpoch !== proof?.leaseEpoch) {
+    return { status: "pending", reason: "identity" };
+  }
+  if (typeof leaf.ctx.boxRoundNo === "number" && leaf.ctx.boxRoundNo !== chain.length) {
+    return { status: "pending", reason: "identity" };
+  }
+  for (const row of chain) {
+    if (typeof row.ctx.boxRunNonce === "string" && row.ctx.boxRunNonce !== leaf.ctx.boxRunNonce
+      && typeof leaf.ctx.boxRunNonce === "string") {
+      return { status: "pending", reason: "identity" };
+    }
+    if (typeof row.ctx.boxAccountId === "string" && typeof leaf.ctx.boxAccountId === "string"
+      && row.ctx.boxAccountId !== leaf.ctx.boxAccountId) {
+      return { status: "pending", reason: "identity" };
+    }
+  }
+  // The leaf call's input+cache is the prompt that call actually sent. Earlier
+  // rounds already include prior context, so summing them is not the current window.
+  const usage = leaf.ctx.boxUsage as { inputTokens?: unknown; cacheReadTokens?: unknown } | undefined;
+  const tokens = (typeof usage?.inputTokens === "number" ? usage.inputTokens : 0)
+    + (typeof usage?.cacheReadTokens === "number" ? usage.cacheReadTokens : 0);
   const ids = [...chain].reverse().map((row) => row.requestId);
   const revision = sha({
     sessionId: input.sessionId,

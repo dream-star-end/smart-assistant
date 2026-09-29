@@ -13,12 +13,12 @@ export const IDLE_COMPACT_INSTRUCTIONS =
 export interface IdleFrozenTail {
   uuid: string
   parentUuid: string | null
-  text: string
+  message: Message
 }
 
 export interface IdleFrozenAttachment {
   uuid: string
-  text: string
+  message: Message
 }
 
 export interface IdleNativeFile {
@@ -53,11 +53,21 @@ export function projectIdleArtifact(input: {
   const boundary = idleUuid(input.opId, 'boundary')
   const summary = idleUuid(input.opId, 'summary')
   const anchor = input.tail[input.tail.length - 1]?.uuid ?? null
+  const kept = (item: IdleFrozenTail) => ({
+    ...item.message,
+    uuid: item.uuid,
+    parentUuid: (item.message as { parentUuid?: string | null }).parentUuid ?? item.parentUuid,
+  })
   const messages: Array<Record<string, unknown>> = [
     { uuid: boundary, type: 'system', subtype: 'compact_boundary', parentUuid: anchor },
-    { uuid: summary, type: 'user', isSynthetic: true, parentUuid: boundary, text: input.summaryText },
-    ...input.tail.map((item) => ({ uuid: item.uuid, parentUuid: item.parentUuid, type: 'user', text: item.text })),
-    ...input.attachments.map((item) => ({ uuid: item.uuid, type: 'attachment', parentUuid: summary, text: item.text })),
+    { uuid: summary, type: 'user', isSynthetic: true, parentUuid: boundary,
+      message: { role: 'user', content: input.summaryText } },
+    ...input.tail.map((item) => kept(item)),
+    ...input.attachments.map((item) => ({
+      ...item.message,
+      uuid: item.uuid,
+      parentUuid: (item.message as { parentUuid?: string | null }).parentUuid ?? summary,
+    })),
   ]
   return { messages, digest: createHash('sha256').update(JSON.stringify(messages)).digest('hex') }
 }
@@ -88,9 +98,18 @@ export function writeIdleNativeFile(path: string, file: IdleNativeFile): void {
 export function findIdleNativeFile(sessionId: string, home = idleNativeHome()): string | undefined {
   let names: string[] = []
   try { names = readdirSync(nativeDir(sessionId, home)) } catch { return undefined }
-  const pending = names.filter((name) => name.endsWith('.json') && !name.endsWith('.tmp'))
+  const pending = names.filter((name) => name.endsWith('.json')
+    && !name.endsWith('.done.json') && !name.endsWith('.tmp'))
   if (pending.length !== 1) return undefined
   return join(nativeDir(sessionId, home), pending[0]!)
+}
+
+export function archiveIdleNativeFile(path: string): void {
+  if (!path.endsWith('.json') || path.endsWith('.done.json')) return
+  try { renameSync(path, path.replace(/\.json$/, '.done.json')) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
 }
 
 export function messageText(message: Message): string {
@@ -103,18 +122,32 @@ export function messageText(message: Message): string {
   }).join('')
 }
 
-export function selectIdleTail(messages: readonly Message[]): IdleFrozenTail[] {
-  const kept = messages.filter((message) => {
+function cloneMessage(message: Message): Message {
+  return JSON.parse(JSON.stringify(message)) as Message
+}
+
+/** Keep real messages. Attachments stay attachments. Nothing is reduced to text. */
+export function selectIdlePreserve(messages: readonly Message[]): {
+  tail: IdleFrozenTail[]
+  attachments: IdleFrozenAttachment[]
+} {
+  const attachments = messages.filter((message) => message.type === 'attachment').map((message) => ({
+    uuid: message.uuid,
+    message: cloneMessage(message),
+  }))
+  const conversational = messages.filter((message) => {
     if (message.type !== 'user' && message.type !== 'assistant') return false
     const text = messageText(message)
-    return text.trim().length > 0 && !text.startsWith('/compact')
-      && !text.startsWith(IDLE_COMPACT_INSTRUCTIONS)
+    return !text.startsWith('/compact') && !text.startsWith(IDLE_COMPACT_INSTRUCTIONS)
   })
-  return kept.slice(-6).map((message) => ({
-    uuid: message.uuid,
-    parentUuid: (message as { parentUuid?: string | null }).parentUuid ?? null,
-    text: messageText(message),
-  }))
+  return {
+    tail: conversational.slice(-6).map((message) => ({
+      uuid: message.uuid,
+      parentUuid: (message as { parentUuid?: string | null }).parentUuid ?? null,
+      message: cloneMessage(message),
+    })),
+    attachments,
+  }
 }
 
 function userMessage(uuid: string, text: string, summary = false): UserMessage {
@@ -129,7 +162,7 @@ function userMessage(uuid: string, text: string, summary = false): UserMessage {
   } as UserMessage
 }
 
-export function buildIdleCompactionResult(file: IdleNativeFile, messages: readonly Message[]): {
+export function buildIdleCompactionResult(file: IdleNativeFile, _messages: readonly Message[]): {
   result: CompactionResult
   artifact: IdleArtifact
 } {
@@ -142,8 +175,16 @@ export function buildIdleCompactionResult(file: IdleNativeFile, messages: readon
   })
   const boundaryUuid = artifact.messages[0]!.uuid as string
   const summaryUuid = artifact.messages[1]!.uuid as string
-  const originals = new Map(messages.map((message) => [message.uuid, message]))
   const anchor = file.frozenTail[file.frozenTail.length - 1]?.uuid
+  const summaryMessage = userMessage(summaryUuid, file.summaryText, true)
+  ;(summaryMessage as { parentUuid?: string }).parentUuid = boundaryUuid
+  let previous = summaryUuid
+  const kept = file.frozenTail.map((item) => {
+    const message = JSON.parse(JSON.stringify(item.message)) as Message
+    ;(message as { parentUuid?: string }).parentUuid = previous
+    previous = message.uuid
+    return message
+  })
   const result: CompactionResult = {
     boundaryMarker: {
       type: 'system',
@@ -153,6 +194,7 @@ export function buildIdleCompactionResult(file: IdleNativeFile, messages: readon
       timestamp: '1970-01-01T00:00:00.000Z',
       uuid: boundaryUuid,
       level: 'info',
+      parentUuid: null,
       logicalParentUuid: anchor,
       compactMetadata: {
         trigger: 'manual',
@@ -161,14 +203,9 @@ export function buildIdleCompactionResult(file: IdleNativeFile, messages: readon
         idleOpId: file.opId,
       },
     } as CompactionResult['boundaryMarker'],
-    summaryMessages: [userMessage(summaryUuid, file.summaryText, true)],
-    messagesToKeep: file.frozenTail.map((item) => originals.get(item.uuid) ?? userMessage(item.uuid, item.text)),
-    attachments: file.attachments.map((item) => ({
-      type: 'attachment',
-      uuid: item.uuid,
-      timestamp: '1970-01-01T00:00:00.000Z',
-      attachment: { type: 'idle', text: item.text },
-    })) as CompactionResult['attachments'],
+    summaryMessages: [summaryMessage],
+    messagesToKeep: kept,
+    attachments: file.attachments.map((item) => item.message) as CompactionResult['attachments'],
     hookResults: [],
     preCompactTokenCount: 0,
     truePostCompactTokenCount: 0,
@@ -189,13 +226,26 @@ export async function applyIdleTranscript(input: {
   await input.flush()
   const loaded = await input.load(input.sessionId)
   if (!loaded) throw new Error('IDLE_ARTIFACT_MISSING')
-  const byId = new Map(loaded.messages.map((message) => [message.uuid, message]))
-  for (const item of input.artifact.messages) {
-    const found = byId.get(String(item.uuid))
-    if (!found) throw new Error('IDLE_ARTIFACT_MISSING')
-    if (typeof item.text === 'string' && !messageText(found).includes(item.text)) {
-      throw new Error('IDLE_ARTIFACT_MISSING')
-    }
+  const stable = (message: Message | Record<string, unknown>) => ({
+    uuid: message.uuid,
+    type: message.type ?? null,
+    parentUuid: (message as { parentUuid?: unknown }).parentUuid
+      ?? (message as { logicalParentUuid?: unknown }).logicalParentUuid ?? null,
+    role: (message as { message?: { role?: unknown } }).message?.role ?? null,
+    content: (message as { message?: { content?: unknown } }).message?.content
+      ?? (message as { content?: unknown }).content ?? null,
+    attachment: (message as { attachment?: unknown }).attachment ?? null,
+    subtype: (message as { subtype?: unknown }).subtype ?? null,
+  })
+  const expected = input.artifact.messages.map((item) => stable(item))
+  const loadedById = new Map(loaded.messages.map((message) => [message.uuid, message]))
+  const ordered = expected.map((item) => loadedById.get(String(item.uuid)))
+  if (ordered.some((item) => !item)) throw new Error('IDLE_ARTIFACT_MISSING')
+  const got = ordered.map((item) => stable(item as Message))
+  if (JSON.stringify(got) !== JSON.stringify(expected)) throw new Error('IDLE_ARTIFACT_MISSING')
+  const seen = loaded.messages.filter((message) => expected.some((item) => item.uuid === message.uuid))
+  if (seen.map((message) => message.uuid).join() !== expected.map((item) => item.uuid).join()) {
+    throw new Error('IDLE_ARTIFACT_MISSING')
   }
 }
 
@@ -213,8 +263,9 @@ export async function resumeIdleSummary(input: {
   if (!path) return undefined
   let file = readIdleNativeFile(path)
   if (file.sessionId !== input.sessionId) throw new Error('IDLE_RECOVERY_CORRUPT')
-  if (file.frozenTail.length === 0) {
-    file = { ...file, frozenTail: selectIdleTail(input.messages) }
+  if (file.frozenTail.length === 0 && file.attachments.length === 0) {
+    const preserved = selectIdlePreserve(input.messages)
+    file = { ...file, frozenTail: preserved.tail, attachments: preserved.attachments }
     writeIdleNativeFile(path, file)
   }
   if (!file.summaryText) {
@@ -255,5 +306,6 @@ export async function runIdleCompact(input: {
     flush: input.flush,
     load: input.load,
   })
+  archiveIdleNativeFile(resumed.path)
   return built.result
 }

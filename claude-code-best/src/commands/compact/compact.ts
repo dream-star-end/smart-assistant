@@ -112,7 +112,7 @@ export const call: LocalCommandCall = async (args, context) => {
       const idleResult = await runIdleCompact({
         sessionId: getSessionId(),
         messages: messagesForCompact,
-        summarize: (msgs) => summarizeMessagesForIdle(
+        summarize: async (msgs) => summarizeMessagesForIdle(
           msgs,
           context,
           await getCacheSharingParams(context, msgs),
