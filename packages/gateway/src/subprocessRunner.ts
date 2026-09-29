@@ -596,14 +596,38 @@ export function _buildUpdateEnvStdinLine(vars: Record<string, string>): string {
 /**
  * 本 turn 的上游凭据(单一收口 —— 所有 CCB submit 都经此,任何调用方都不可能漏清位)。
  *
- *   - bridge turn(有 descriptor)      → 只挂长命 lease。短 authority 已由 gateway 在
- *     开始执行前验签 + 单次消费;若继续把它挂到每个 CCB 请求,2min 后它过期会让仍有效的
- *     lease 一起被 egress 拒绝;
+ *   - bridge turn(有 descriptor)      → 默认只挂长命 lease。egress 在同 turn 有效
+ *     lease 下仍接受已过期的短 authority(OCV5-242),所以已验签 Box 主 turn
+ *     (expectedEngine=ccb、执行模型与 descriptor 都是 box-api-claude-opus-5-5、
+ *     contextOwner=box-native-v1)保留原始 authority+lease 双头。其它模型、缺 cap、
+ *     cursor、local 仍只投影原有那一张,不重签。
  *   - 本地路径 turn(cron/synthetic/delegate)且 flag 开 → 现取 `x-oc-local-catalog` token
  *     (**每 turn 现取**:它携带 epoch,缓存下来会在安全变更后带旧 epoch 撞 fence);
  *     取不到(master 不可达 / epoch 验不出)→ 抛 → **拒新 turn**(方案 §3:无 baked 回落);
  *   - flag 未开 / 个人版 / 非托管容器   → undefined → 写空串(egress 侧 gate 未装配,零行为变化)。
  */
+function boxNativeDualHeaderTurn(
+  authority: TurnModelAuthority,
+  model: string | undefined,
+  expectedEngine: 'ccb' | 'cursor',
+): boolean {
+  return expectedEngine === 'ccb'
+    && model === BOX_NATIVE_CONTEXT_MODEL
+    && authority.executionDescriptor.canonicalModel === BOX_NATIVE_CONTEXT_MODEL
+    && authority.executionDescriptor.contextOwner === BOX_NATIVE_CONTEXT_OWNER
+}
+
+/** Renewal replaces the lease on the current turn bundle. Non-Box bundles stay lease-only. */
+function renewTurnHeaderBundle(
+  current: TurnUpstreamHeaders | undefined,
+  leaseEnvelope: string,
+): TurnUpstreamHeaders {
+  if (current?.authority !== undefined) {
+    return { authority: current.authority, lease: leaseEnvelope }
+  }
+  return { lease: leaseEnvelope }
+}
+
 async function resolveTurnRuntime(
   authority: TurnModelAuthority | undefined,
   model: string | undefined,
@@ -611,10 +635,10 @@ async function resolveTurnRuntime(
   expectedEngine: 'ccb' | 'cursor' = 'ccb',
 ): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
-    return {
-      headers: { lease: authority.leaseEnvelope },
-      descriptor: authority.executionDescriptor,
-    }
+    const headers: TurnUpstreamHeaders = boxNativeDualHeaderTurn(authority, model, expectedEngine)
+      ? { authority: authority.authorityEnvelope, lease: authority.leaseEnvelope }
+      : { lease: authority.leaseEnvelope }
+    return { headers, descriptor: authority.executionDescriptor }
   }
   if (env[REQUIRE_AUTHORITY_ENV] !== '1') return {}
   const client = getModelCatalogClient()
@@ -1376,6 +1400,8 @@ export class SubprocessRunner extends EventEmitter {
   /** 本 turn 解析后的 descriptor；首次 spawn 也必须看到，不能等 stdin 才补。 */
   private currentExecutionDescriptorEnv = ''
   private currentExecutionDescriptor: CcbExecutionDescriptor | undefined
+  /** Header bundle last written for the current turn. Cleared on shutdown. */
+  private currentTurnHeaders: TurnUpstreamHeaders | undefined
   private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
   private stdoutBuf = ''
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
@@ -2324,6 +2350,7 @@ export class SubprocessRunner extends EventEmitter {
       }
       this.pendingOfficialSpawnEnv = spawnEnv
     }
+    this.currentTurnHeaders = runtime.headers
     const envUpdateLine = harness === 'ccb'
       ? _buildUpdateEnvStdinLine(
           {
@@ -2385,9 +2412,12 @@ export class SubprocessRunner extends EventEmitter {
       if (this.opts.authorityEngine === 'cursor') {
         throw new Error('OFFICIAL_CC_LEASE_NOOP_OUTSIDE_CURSOR_SAND')
       }
-      // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the new lease
-      // and invalidate the spawn fingerprint so the next submit recycles.
-      const headerEnv = _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope })
+      // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the renewed
+      // bundle and invalidate the spawn fingerprint so the next submit recycles.
+      // Box keeps the same-turn authority; every other turn stays lease-only.
+      const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
+      this.currentTurnHeaders = renewed
+      const headerEnv = _buildAnthropicCustomHeadersEnv(renewed)
       this.pendingOfficialSpawnEnv = {
         ...(this.pendingOfficialSpawnEnv ?? {}),
         ...headerEnv,
@@ -2395,8 +2425,10 @@ export class SubprocessRunner extends EventEmitter {
       this.spawnedOfficialHeaderFingerprint = undefined
       return
     }
+    const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
+    this.currentTurnHeaders = renewed
     const envUpdateLine = _buildUpdateEnvStdinLine(
-      _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope }),
+      _buildAnthropicCustomHeadersEnv(renewed),
     )
     if (!this.proc) throw new Error('cannot renew turn lease without a running CCB subprocess')
     await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
@@ -3005,6 +3037,7 @@ export class SubprocessRunner extends EventEmitter {
   }
 
   async shutdown(): Promise<void> {
+    this.currentTurnHeaders = undefined
     // Drop shared in-flight start so a hung preheat cannot be reused by submit().
     this._startEpoch += 1
     this._startPromise = null
