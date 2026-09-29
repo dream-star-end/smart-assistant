@@ -6,7 +6,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
-import type { ProxyBody } from "./shared.js";
+import { currentVerifiedProxyByteBudget, type ProxyBody } from "./shared.js";
 import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { validateBoxTextRequest } from "./boxRequestGate.js";
 import { makeBoxStageFiles, type BoxStageFile } from "./boxStageFiles.js";
@@ -193,7 +193,10 @@ export function makeBoxTextPlan(input: {
   const snapshot = Buffer.from(hasHistory ? mapped.snapshotJsonl : "");
   const stdin = Buffer.from(mapped.stdinJsonl);
   const system = Buffer.from(mapped.systemPrompt);
-  if (snapshot.length > 8 * 1024 * 1024 || stdin.length > 8 * 1024 * 1024
+  // History snapshot follows the verified envelope. The current-turn stdin file
+  // and the system file stay at the original 8 MiB plan cap.
+  const snapshotCeiling = currentVerifiedProxyByteBudget().snapshot;
+  if (snapshot.length > snapshotCeiling || stdin.length > 8 * 1024 * 1024
     || system.length > 8 * 1024 * 1024) throw new BoxTextPlanError("BOX_TEXT_INPUT_TOO_LARGE");
   const snapshotHash = hasHistory ? sha(snapshot) : null;
   const stdinHash = sha(stdin), systemHash = sha(system);

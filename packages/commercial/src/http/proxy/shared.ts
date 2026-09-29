@@ -26,6 +26,7 @@
  *  10. preCheck 释放兜底:Redis TTL=300s,即使 finalize 漏调也自动清
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
@@ -216,8 +217,132 @@ export const SIZE_LIMITS = {
   tools: 2 * 1024 * 1024,
 } as const;
 
-/** 总 body 上限(JSON 全文 byteLength)。超过 → 413。 */
+/** 总 body 上限(JSON 全文 byteLength)。超过 → 413。未验签 / 非 Box 仍用这个值。 */
 export const MAX_BODY_BYTES_DEFAULT = 16 * 1024 * 1024;
+
+/**
+ * OCV5-296 资源包络。`legacy` 是原预算。`box-native-v1` 只在验签后的精确 Box
+ * 路由上生效,不能由 body.model 或请求头自报。
+ *
+ * 读取分配:身份通过后、签名判定前,HTTP 正文最多分配
+ * `MAX_BODY_BYTES_HARD_CEILING`(24 MiB,服务器常量)。这不是“未分配”。
+ * 签后按所选包络再卡总 body / messages;不合格请求最终仍受 legacy。
+ * system / tools 两档都是 2 MiB。2000 条消息上限不在这里放宽。
+ */
+export type ProxyByteBudgetId = "legacy" | "box-native-v1";
+export interface ProxyByteBudget {
+  readonly id: ProxyByteBudgetId;
+  readonly messages: number;
+  readonly system: number;
+  readonly tools: number;
+  readonly totalBody: number;
+  /** Stable context / request fingerprint JSON, not the assistant-content hash. */
+  readonly contextHash: number;
+  /** Box text-plan history snapshot only. stdin / system files stay 8 MiB. */
+  readonly snapshot: number;
+}
+export const PROXY_BYTE_BUDGET_LEGACY: ProxyByteBudget = {
+  id: "legacy",
+  messages: SIZE_LIMITS.messages,
+  system: SIZE_LIMITS.system,
+  tools: SIZE_LIMITS.tools,
+  totalBody: MAX_BODY_BYTES_DEFAULT,
+  contextHash: 16 * 1024 * 1024,
+  snapshot: 8 * 1024 * 1024,
+};
+export const PROXY_BYTE_BUDGET_BOX_NATIVE_V1: ProxyByteBudget = {
+  id: "box-native-v1",
+  messages: 16 * 1024 * 1024,
+  system: SIZE_LIMITS.system,
+  tools: SIZE_LIMITS.tools,
+  totalBody: 24 * 1024 * 1024,
+  contextHash: 24 * 1024 * 1024,
+  snapshot: 24 * 1024 * 1024,
+};
+/** Fixed pre-signature read ceiling. Allocated up to this many bytes. */
+export const MAX_BODY_BYTES_HARD_CEILING = PROXY_BYTE_BUDGET_BOX_NATIVE_V1.totalBody;
+export const BOX_NATIVE_CONTEXT_OWNER = "box-native-v1";
+
+const verifiedProxyByteBudget = new AsyncLocalStorage<ProxyByteBudget>();
+
+/** Legacy unless the handler entered `runWithVerifiedProxyByteBudget`. */
+export function currentVerifiedProxyByteBudget(): ProxyByteBudget {
+  return verifiedProxyByteBudget.getStore() ?? PROXY_BYTE_BUDGET_LEGACY;
+}
+
+export function runWithVerifiedProxyByteBudget<T>(
+  budget: ProxyByteBudget,
+  fn: () => T,
+): T {
+  return verifiedProxyByteBudget.run(budget, fn);
+}
+
+/**
+ * Strict read of `capabilityProfile.ccb.contextOwner`. Absent or any other
+ * value is not this envelope. Does not look at headers or body.model.
+ * Author B owns the shared catalog type; this reads the live object as unknown
+ * so a later `contextOwner` field is visible without editing that type.
+ * `parseCapabilityProfile` currently drops unknown ccb keys, so a real catalog
+ * row stays legacy until that parser keeps `contextOwner`.
+ */
+export function readBoxNativeContextOwner(
+  capabilityProfile: unknown,
+): typeof BOX_NATIVE_CONTEXT_OWNER | null {
+  if (!capabilityProfile || typeof capabilityProfile !== "object" || Array.isArray(capabilityProfile)) {
+    return null;
+  }
+  const ccb = (capabilityProfile as Record<string, unknown>).ccb;
+  if (!ccb || typeof ccb !== "object" || Array.isArray(ccb)) return null;
+  const owner = (ccb as Record<string, unknown>).contextOwner;
+  return owner === BOX_NATIVE_CONTEXT_OWNER ? BOX_NATIVE_CONTEXT_OWNER : null;
+}
+
+export interface VerifiedBoxEnvelopeInput {
+  /** `gate.authorityKind` after signature verification. Not a header. */
+  authorityKind: string | null | undefined;
+  /** `selectUpstreamRoute().kind`. Not body.model. */
+  routeKind: string | null | undefined;
+  /** `gate.descriptor.capabilityProfile`. */
+  capabilityProfile: unknown;
+  /**
+   * Server route readiness: catalog route is box AND `OC_BOX_MODEL_API=1`
+   * AND the Box transport is injected. Same arming condition as
+   * `validateUpstreamConfig`'s boxConfigured check. Client input cannot set this.
+   * Align with author B's ready bit at main merge if that bit is narrower.
+   */
+  serverRouteReady: boolean;
+}
+
+/** Enlarged envelope only when every verified condition holds. Otherwise legacy. */
+export function selectVerifiedBoxByteBudget(input: VerifiedBoxEnvelopeInput): ProxyByteBudget {
+  if (input.serverRouteReady !== true) return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.authorityKind !== "bridge_signed") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.routeKind !== "box") return PROXY_BYTE_BUDGET_LEGACY;
+  if (readBoxNativeContextOwner(input.capabilityProfile) !== BOX_NATIVE_CONTEXT_OWNER) {
+    return PROXY_BYTE_BUDGET_LEGACY;
+  }
+  return PROXY_BYTE_BUDGET_BOX_NATIVE_V1;
+}
+
+/**
+ * Adapter from the production gate object. Does not invent a signature or a
+ * capability. `serverRouteReady` is computed by the handler, not the client.
+ */
+export function budgetFromVerifiedGate(
+  gate: {
+    authorityKind?: string | null;
+    descriptor?: { capabilityProfile?: unknown } | null;
+  } | null,
+  routeKind: string | null | undefined,
+  serverRouteReady: boolean,
+): ProxyByteBudget {
+  return selectVerifiedBoxByteBudget({
+    authorityKind: gate?.authorityKind,
+    routeKind,
+    capabilityProfile: gate?.descriptor?.capabilityProfile,
+    serverRouteReady,
+  });
+}
 
 /** messages / tools 数量上限。
  *
@@ -343,8 +468,16 @@ export function applyModelDefaultEffort(
  * 用 Buffer.byteLength(JSON.stringify(...), 'utf8'):base64 image 自然计入,符合 R3 口径。
  * 任意维超限 → throw HttpError(413, "BODY_FIELD_TOO_LARGE", ...)。
  */
-export function enforceFieldByteBudgets(body: ProxyBody): void {
-  const checks: Array<[keyof typeof SIZE_LIMITS, unknown]> = [
+export function enforceFieldByteBudgets(
+  body: ProxyBody,
+  budget: ProxyByteBudget = PROXY_BYTE_BUDGET_LEGACY,
+): void {
+  const limits = {
+    messages: budget.messages,
+    system: budget.system,
+    tools: budget.tools,
+  } as const;
+  const checks: Array<[keyof typeof limits, unknown]> = [
     ["messages", body.messages],
     ["system", body.system],
     ["tools", body.tools],
@@ -352,7 +485,7 @@ export function enforceFieldByteBudgets(body: ProxyBody): void {
   for (const [field, value] of checks) {
     if (value === undefined) continue;
     const bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
-    const limit = SIZE_LIMITS[field];
+    const limit = limits[field];
     if (bytes > limit) {
       throw new HttpError(
         413,
@@ -361,6 +494,36 @@ export function enforceFieldByteBudgets(body: ProxyBody): void {
       );
     }
   }
+}
+
+/** Raw HTTP body length against the selected envelope. Does not shrink a buffer already read. */
+export function enforceTotalBodyBudget(byteLength: number, budget: ProxyByteBudget): void {
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > budget.totalBody) {
+    throw new HttpError(
+      413,
+      "PAYLOAD_TOO_LARGE",
+      `request body exceeds ${budget.totalBody} bytes`,
+    );
+  }
+}
+
+/**
+ * Pre-signature ceiling: reject only what even the largest server envelope
+ * cannot admit. Does not grant that envelope.
+ */
+export function enforcePreAuthByteCeiling(body: ProxyBody, rawBodyBytes: number): void {
+  enforceTotalBodyBudget(rawBodyBytes, PROXY_BYTE_BUDGET_BOX_NATIVE_V1);
+  enforceFieldByteBudgets(body, PROXY_BYTE_BUDGET_BOX_NATIVE_V1);
+}
+
+/** Post-signature subdivision. Unqualified requests pass the legacy budget. */
+export function enforceVerifiedProxyBudget(
+  body: ProxyBody,
+  rawBodyBytes: number,
+  budget: ProxyByteBudget,
+): void {
+  enforceTotalBodyBudget(rawBodyBytes, budget);
+  enforceFieldByteBudgets(body, budget);
 }
 
 /**
@@ -1715,7 +1878,10 @@ export interface AnthropicProxyHandler {
 
 // ─── 小工具:body 读 + JSON parse(带上限) ──────────────────────────────
 
-export async function readBoundedJson(req: IncomingMessage, maxBytes: number): Promise<unknown> {
+export async function readBoundedJsonMeasured(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<{ value: unknown; byteLength: number }> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -1731,10 +1897,14 @@ export async function readBoundedJson(req: IncomingMessage, maxBytes: number): P
   }
   const text = Buffer.concat(chunks, total).toString("utf-8");
   try {
-    return JSON.parse(text);
+    return { value: JSON.parse(text), byteLength: total };
   } catch (err) {
     throw new HttpError(400, "INVALID_JSON", `body is not valid JSON: ${(err as Error).message}`);
   }
+}
+
+export async function readBoundedJson(req: IncomingMessage, maxBytes: number): Promise<unknown> {
+  return (await readBoundedJsonMeasured(req, maxBytes)).value;
 }
 
 // ─── err response helper(不走 router 的 sendError,因为 proxy 不走 router) ──
