@@ -5164,6 +5164,11 @@
           "assertion": "trusted classic-2 boundary and synthetic summary are not billed as the message"
         },
         {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxNativeContextOwner.test.ts",
+          "assertion": "ready signed box model issues box-native-v1 and the default route is off"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo"
@@ -5171,7 +5176,8 @@
       ],
       "coverageCommits": [
         "edbe08e84",
-        "dc44ba859"
+        "dc44ba859",
+        "8c3c2a28"
       ]
     }
   ]
