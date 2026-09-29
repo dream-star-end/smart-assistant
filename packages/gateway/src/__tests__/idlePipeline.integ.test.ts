@@ -36,8 +36,14 @@ const MODEL = "box-api-claude-opus-5-5";
 const READY_FALSE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;";
 const READY_TRUE = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;";
 const SUMMARY_MARK = "preserve the user goal, decisions, constraints";
-const MAX_HTTP = 16;
+const MAX_HTTP = 80;
+const GROW_CHARS = 180_000;
+const GROW_TARGET = 8_860_467;
 let summaryRequested = false;
+let growthActive = false;
+let growthRound = 0;
+let spoolBuf = Buffer.alloc(0);
+let pendingStdout: string | null = null;
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
@@ -47,7 +53,7 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
   const keyring = new Map<string, Uint8Array>([[keyId, new Uint8Array(publicRaw)]]);
-  const hits: Array<{ url: string; status: number; bytes: number; summary: boolean; body?: string; keptPrefix?: boolean; shape?: unknown; digest?: unknown }> = [];
+  const hits: Array<{ url: string; status: number; bytes: number; summary: boolean; body?: string; keptPrefix?: boolean; shape?: unknown; digest?: unknown; kind?: string; reasons?: string[]; requestId?: string }> = [];
   let wantSummary = false;
   const events: string[] = [];
   let candidate = "";
@@ -329,6 +335,8 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
         if (current) {
           current.status = res.statusCode || current.status;
           current.body = responseBody.slice(0, 400);
+          const requestId = res.getHeader("x-request-id");
+          if (typeof requestId === "string" && requestId) current.requestId = requestId;
         }
         return end(chunk as never);
       }) as typeof res.end;
@@ -374,10 +382,13 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
       } catch { shape = { parse: false }; }
       summaryRequested = raw.includes(SUMMARY_MARK);
       wantSummary = summaryRequested;
+      const digest = messageDigest(raw.toString("utf8"));
+      const classified = classifyRequest(raw.toString("utf8"));
+      prepareModelSpool(raw.toString("utf8"));
       current = {
         url: path, status: 0, bytes: raw.length,
         summary: summaryRequested, keptPrefix: raw.includes("OCV5296_OLD_PREFIX"), shape,
-        digest: messageDigest(raw.toString("utf8")),
+        digest, kind: classified.kind, reasons: classified.reasons,
       };
       hits.push(current);
       await handler(replay, res, { hostUuid: "ocv5-296-idle", boundIp: "127.0.0.1" });
@@ -532,240 +543,102 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
          JOIN credit_ledger l ON l.id = u.ledger_id
         ORDER BY u.id`);
     report.ledgers = ledgers.rows;
-    assert.ok(ledgers.rows.length >= 1);
-    assert.ok(ledgers.rows.every((row: { delta: string }) => BigInt(row.delta) < 0n));
-
-    await adapter.shutdown();
-    const seeded = seedOuterHistory(process.env.CLAUDE_CONFIG_DIR!, work);
-    report.seededBytes = seeded.bytes;
-    report.seededProject = seeded.project;
-    const largeSessionId = seeded.sessionId;
-    const largeKey = "agent:main:webchat:dm:idle-large";
-    const largeAdapter = new CcbAdapter({
-      sessionKey: largeKey,
-      agentId: "main",
-      agentBaseDir: work,
-      resumeSessionId: largeSessionId,
-      config: {
-        version: 1,
-        gateway: { bind: "127.0.0.1", port: 0, accessToken: "" },
-        auth: { mode: "subscription", claudeCodePath: join(candidate, "claude-code-best"), claudeCodeEntry: "src/entrypoints/cli.tsx", claudeCodeRuntime: "bun" },
-        terminal: { type: "local" },
-        sessions: { dbPath: join(HOME, "sessions.db") },
-        defaults: { permissionMode: "bypassPermissions" },
-      } as never,
-      model: MODEL,
-      permissionMode: "bypassPermissions",
-      harness: "ccb",
-      executionTarget: { kind: "local" },
-    });
-    adapterShutdown = () => largeAdapter.shutdown();
-    const largeSession = {
-      ...session,
-      sessionKey: largeKey,
-      peerId: "idle-large",
-      runner: largeAdapter,
-      lock: Promise.resolve(),
-      turns: 0,
-      toolUseIdToName: new Map(),
-      _currentTurnKey: undefined,
-      _boxContextOwner: undefined,
-    };
-    const committedBefore = Number((await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE state = 'committed'")).rows[0].n);
-    const creditsBeforeLeaf = BigInt((await pool.query("SELECT credits::text AS credits FROM users WHERE id = 3")).rows[0].credits);
-    holdNextSettlement = true;
-    const beforeLarge = hits.length;
-    await sm.submit(largeSession, "leaf", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-    const leafHits = hits.slice(beforeLarge).filter((hit) => hit.url === "/v1/messages");
-    report.largeHits = leafHits.map((hit) => ({ status: hit.status, bytes: hit.bytes, summary: hit.summary, keptPrefix: hit.keptPrefix, digest: hit.digest, shape: hit.shape }));
-    const leaf = leafHits.find((hit) => hit.status === 200 && !hit.summary);
-    const leafBytes = (leaf?.digest as { contentBytes?: number } | undefined)?.contentBytes ?? 0;
-    if (!leaf || leafBytes < 7_000_000) {
-      releaseHeldCommits();
-      throw new Error(`history not loaded into the leaf HTTP ${JSON.stringify(report.largeHits)}`);
-    }
-    assert.equal(leafHits.filter((hit) => hit.summary).length, 0);
-    const candidateFile = join(HOME, "idle-candidates", `${encodeURIComponent(largeKey)}.json`);
-    assert.equal(existsSync(candidateFile), true, "pending candidate must survive an uncommitted settlement");
-    const blockedAt = hits.filter((hit) => hit.url === "/v1/messages").length;
-    let blockedError = "";
-    try {
-      await sm.submit(largeSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-    } catch (error) {
-      blockedError = error instanceof Error ? error.message : String(error);
-    }
-    report.blockedError = blockedError;
-    assert.equal(blockedError.includes("IDLE_HISTORY_PENDING"), true, blockedError);
-    assert.equal(hits.filter((hit) => hit.url === "/v1/messages").length, blockedAt);
-    assert.equal(existsSync(candidateFile), true);
-    const hiddenUsage = await pool.query("SELECT count(*)::int AS n FROM usage_records u WHERE NOT EXISTS (SELECT 1 FROM credit_ledger l WHERE l.id = u.ledger_id)");
-    report.uncommittedUsageVisible = hiddenUsage.rows[0].n;
-    const committedAtRelease = Number((await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE state = 'committed'")).rows[0].n);
-    releaseHeldCommits();
-    let committed = committedAtRelease;
-    let stillOpen = 1;
-    for (let attempt = 0; attempt < 50 && (committed <= committedAtRelease || stillOpen > 0); attempt += 1) {
-      committed = Number((await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE state = 'committed'")).rows[0].n);
-      stillOpen = Number((await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE state IN ('inflight','finalizing')")).rows[0].n);
-      if (committed <= committedAtRelease || stillOpen > 0) await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    assert.ok(committed > committedAtRelease && stillOpen === 0, "releasing the settlement COMMIT did not commit the leaf");
-    const continuation = leafHits.find((hit) => JSON.stringify(hit.digest ?? "").includes("continued from a previous conversation"));
-    if (continuation) {
-      report.leafJournal = (await pool.query(
-        `SELECT request_id, state, ctx->>'boxTurnKey' AS turn_key, ctx->>'boxOwnerRequestId' AS owner,
-                ctx->>'boxResumeRequestId' AS resume, ctx->>'boxState' AS box_state
-           FROM request_finalize_journal ORDER BY updated_at`,
-      )).rows;
-      throw new Error("PRODUCT_RED 8.45MiB HTTP 200 then an unlinked autocompact continuation; idle proof stays pending/leaf; summary HTTP, shrink, and crash windows were not reached");
-    }
-    report.leafJournal = (await pool.query(
-      `SELECT request_id, state, ctx->>'boxTurnKey' AS turn_key, ctx->>'boxOwnerRequestId' AS owner,
-              ctx->>'boxResumeRequestId' AS resume, ctx->>'boxState' AS box_state,
-              ctx->'boxTerminalProof'->>'reason' AS proof
-         FROM request_finalize_journal ORDER BY updated_at`,
-    )).rows;
-    const beforeRecover = hits.length;
-    let recoverError: unknown;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      try {
-        await sm.submit(largeSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-        recoverError = undefined;
-        break;
-      } catch (error) {
-        recoverError = error;
-        const message = error instanceof Error ? error.message : String(error);
-        if (!message.includes("IDLE_HISTORY_PENDING")) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 200));
-      }
-    }
-    if (recoverError) throw recoverError;
-    const recoveredHits = hits.slice(beforeRecover).filter((hit) => hit.url === "/v1/messages");
-    report.recoveredHits = recoveredHits.map((hit) => ({ status: hit.status, bytes: hit.bytes, summary: hit.summary, keptPrefix: hit.keptPrefix, digest: hit.digest }));
-    assert.equal(recoveredHits.filter((hit) => hit.summary && hit.status === 200).length, 1, JSON.stringify(report.recoveredHits));
-    const recoveredUser = recoveredHits.filter((hit) => hit.status === 200 && !hit.summary);
-    assert.equal(recoveredUser.length, 1);
-    assert.equal(recoveredUser[0]?.keptPrefix, false);
-    const nativeRows = listJson(join(HOME, "idle-native")).map((file) => ({ file, body: JSON.parse(readFileSync(file, "utf8")) as { modelCalls?: number; summaryText?: string; applied?: boolean; sessionId?: string; opId?: string; artifact?: { digest?: string; messages?: unknown[] } } }));
-    report.largeNative = nativeRows.map((row) => ({ modelCalls: row.body.modelCalls, applied: row.body.applied, summary: row.body.summaryText?.slice(0, 80), sessionId: row.body.sessionId, opId: row.body.opId, artifact: row.body.artifact?.digest }));
-    const summarized = nativeRows.find((row) => row.body.sessionId === largeSessionId && row.body.modelCalls === 1 && row.body.applied && row.body.summaryText?.includes("outer-history-summary"));
-    assert.ok(summarized, JSON.stringify(report.largeNative));
-    assert.equal(JSON.stringify(summarized.body.artifact).includes("tool_use"), true);
-    const afterFile = join(seeded.project, `${largeSessionId}.jsonl`);
-    const afterBytes = statSync(afterFile).size;
-    report.afterBytes = afterBytes;
-    const afterText = readFileSync(afterFile, "utf8");
-    assert.equal(afterText.includes(seeded.marker), false);
-    assert.ok(afterBytes < seeded.bytes / 2, `${afterBytes} vs ${seeded.bytes}`);
-    const artifactDigest = summarized.body.artifact?.digest;
-    const artifactMessages = summarized.body.artifact?.messages ?? [];
-    const summaryCount = () => hits.filter((hit) => hit.url === "/v1/messages" && hit.summary && hit.status === 200).length;
-    const recover = async (label: string, mutate: () => void) => {
-      const beforeSummary = summaryCount();
-      const beforeLedger = Number((await pool.query("SELECT count(*)::int AS n FROM credit_ledger")).rows[0].n);
-      mutate();
-      await sm.submit(largeSession, label, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-      assert.equal(summaryCount(), beforeSummary, label);
-      const ledgerNow = Number((await pool.query("SELECT count(*)::int AS n FROM credit_ledger")).rows[0].n);
-      assert.equal(ledgerNow, beforeLedger + 1, `${label} ledger ${ledgerNow} vs ${beforeLedger}`);
-    };
-    await recover("window-summary-before-artifact", () => {
-      const body = JSON.parse(readFileSync(summarized.file, "utf8")) as Record<string, unknown>;
-      delete body.applied;
-      delete body.artifact;
-      writeFileSync(summarized.file, JSON.stringify(body));
-      clearReceipt(largeKey);
-    });
-    await recover("window-artifact-before-applied", () => {
-      const body = JSON.parse(readFileSync(summarized.file, "utf8")) as Record<string, unknown>;
-      delete body.applied;
-      body.artifact = summarized.body.artifact;
-      writeFileSync(summarized.file, JSON.stringify(body));
-      clearReceipt(largeKey);
-    });
-    await recover("window-applied-before-receipt", () => {
-      const body = JSON.parse(readFileSync(summarized.file, "utf8")) as Record<string, unknown>;
-      body.applied = true;
-      body.artifact = summarized.body.artifact;
-      writeFileSync(summarized.file, JSON.stringify(body));
-      clearReceipt(largeKey);
-    });
-    const reread = JSON.parse(readFileSync(summarized.file, "utf8")) as { applied?: boolean; artifact?: { digest?: string; messages?: unknown[] }; modelCalls?: number };
-    assert.equal(reread.applied, true);
-    assert.equal(reread.modelCalls, 1);
-    assert.equal(reread.artifact?.digest, artifactDigest);
-    assert.equal(JSON.stringify(reread.artifact?.messages), JSON.stringify(artifactMessages));
-    const second = seedOuterHistory(process.env.CLAUDE_CONFIG_DIR!, work, { rounds: 12, marker: "OCV5296_SECOND_OP" });
-    report.secondSeededBytes = second.bytes;
-    const secondKey = "agent:main:webchat:dm:idle-second";
-    const secondConfig = {
-      version: 1,
-      gateway: { bind: "127.0.0.1", port: 0, accessToken: "" },
-      auth: { mode: "subscription", claudeCodePath: join(candidate, "claude-code-best"), claudeCodeEntry: "src/entrypoints/cli.tsx", claudeCodeRuntime: "bun" },
-      terminal: { type: "local" },
-      sessions: { dbPath: join(HOME, "sessions.db") },
-      defaults: { permissionMode: "bypassPermissions" },
-    } as never;
-    const secondAdapter = new CcbAdapter({
-      sessionKey: secondKey,
-      agentId: "main",
-      agentBaseDir: work,
-      resumeSessionId: second.sessionId,
-      config: secondConfig,
-      model: MODEL,
-      permissionMode: "bypassPermissions",
-      harness: "ccb",
-      executionTarget: { kind: "local" },
-    });
-    adapterShutdown = async () => {
-      await secondAdapter.shutdown();
-      await largeAdapter.shutdown();
-    };
-    const secondSession = {
-      ...largeSession,
-      sessionKey: secondKey,
-      peerId: "idle-second",
-      runner: secondAdapter,
-      lock: Promise.resolve(),
-      turns: 0,
-      toolUseIdToName: new Map(),
-      _currentTurnKey: undefined,
-    };
-    const beforeSecondIdle = hits.length;
-    await sm.submit(secondSession, "leaf", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-    let secondMessages = hits.slice(beforeSecondIdle).filter((hit) => hit.url === "/v1/messages");
-    if (!secondMessages.some((hit) => hit.summary && hit.status === 200)) {
-      const follow = hits.length;
-      await sm.submit(secondSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-      secondMessages = secondMessages.concat(hits.slice(follow).filter((hit) => hit.url === "/v1/messages"));
-    }
-    report.secondIdleHits = secondMessages.map((hit) => ({ status: hit.status, bytes: hit.bytes, summary: hit.summary, keptPrefix: hit.keptPrefix, digest: hit.digest }));
-    assert.equal(secondMessages.filter((hit) => hit.summary && hit.status === 200).length, 1, JSON.stringify(report.secondIdleHits));
-    assert.equal(secondMessages.some((hit) => hit.status === 200 && !hit.summary && hit.keptPrefix), false);
-    const secondNative = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ sessionId?: string; opId?: string; modelCalls?: number; applied?: boolean }>;
-    const secondRow = secondNative.find((row) => row.sessionId === second.sessionId && row.modelCalls === 1 && row.applied);
-    assert.ok(secondRow, JSON.stringify(secondNative.map((row) => ({ sessionId: row.sessionId, opId: row.opId, modelCalls: row.modelCalls }))));
-    assert.notEqual(secondRow.opId, summarized.body.opId);
-    const secondFile = join(second.project, `${second.sessionId}.jsonl`);
-    assert.equal(readFileSync(secondFile, "utf8").includes(second.marker), false);
-    const finalLedgers = await pool.query(
-      `SELECT u.request_id, u.turn_key, u.cost_credits::text, l.id::text AS ledger_id, l.delta::text
-         FROM usage_records u
-         JOIN credit_ledger l ON l.id = u.ledger_id
-        ORDER BY u.id`);
-    report.ledgers = finalLedgers.rows;
     const seenRequests = new Set<string>();
     const seenTurns = new Set<string>();
-    for (const row of finalLedgers.rows as Array<{ request_id: string; turn_key: string; delta: string }>) {
+    for (const row of ledgers.rows as Array<{ request_id: string; turn_key: string; delta: string }>) {
       assert.equal(seenRequests.has(row.request_id), false, row.request_id);
       seenRequests.add(row.request_id);
       assert.equal(seenTurns.has(row.turn_key), false, row.turn_key);
       seenTurns.add(row.turn_key);
       assert.ok(BigInt(row.delta) < 0n);
     }
+
+    growthActive = true;
+    growthRound = 0;
+    const beforeGrowth = hits.length;
+    const creditsBeforeGrowth = BigInt((await pool.query("SELECT credits::text AS credits FROM users WHERE id = 3")).rows[0].credits);
+    let growthError = "";
+    try {
+      await sm.submit(session, "grow", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+    } catch (error) {
+      growthError = error instanceof Error ? error.message : String(error);
+    }
+    const growthHits = hits.slice(beforeGrowth).filter((hit) => hit.url === "/v1/messages");
+    report.growthError = growthError || null;
+    report.growthHits = growthHits.map((hit) => ({
+      status: hit.status, bytes: hit.bytes, kind: hit.kind, reasons: hit.reasons,
+      requestId: hit.requestId, summary: hit.summary,
+      digest: hit.digest,
+    }));
+    const bashSeen = growthHits.some((hit) => JSON.stringify(hit.shape ?? "").includes("Bash")
+      || JSON.stringify(hit.digest ?? "").includes("\"Bash\""));
+    report.growthRounds = growthRound;
+    const live = growthHits.filter((hit) => hit.kind === "live-continuation" && hit.status === 200);
+    const largest = growthHits.reduce((best, hit) => Math.max(best, hit.bytes), 0);
+    report.largestGrowthBytes = largest;
+    if (!bashSeen && live.length === 0 && largest < GROW_TARGET) {
+      throw new Error(`live growth did not start: ${growthError || "no Bash continuation"} hits=${JSON.stringify(report.growthHits).slice(0, 1200)}`);
+    }
+    const grown = growthHits.some((hit) => {
+      const digest = hit.digest as { contentBytes?: number } | undefined;
+      return (digest?.contentBytes ?? 0) >= GROW_TARGET || hit.bytes >= GROW_TARGET;
+    });
+    if (!grown) {
+      const last = growthHits.at(-1);
+      throw new Error(`live tool chain stopped at ${largest} bytes before 8.45MiB; rounds=${growthRound}; last=${last?.status ?? "none"} ${last?.kind ?? ""} ${growthError}`);
+    }
+    const heldIds = growthHits.map((hit) => hit.requestId).filter((id): id is string => Boolean(id));
+    report.growthRequestIds = heldIds;
+    const finalId = growthHits.filter((hit) => hit.kind !== "live-continuation").at(-1)?.requestId
+      ?? growthHits.at(-1)?.requestId;
+    if (finalId) {
+      const hidden = await pool.query(
+        `SELECT request_id, state FROM request_finalize_journal WHERE request_id = $1`,
+        [finalId]);
+      const usage = await pool.query(
+        `SELECT request_id FROM usage_records WHERE request_id = $1`,
+        [finalId]);
+      report.heldRequest = { id: finalId, journal: hidden.rows, usageVisible: usage.rows.length };
+    }
+    const summaryDuringGrowth = growthHits.filter((hit) => hit.kind === "idle-summary" && hit.status === 200);
+    if (summaryDuringGrowth.length === 1 && !growthError) {
+      report.summaryDuringGrowth = true;
+    }
+    const beforeNext = hits.length;
+    let nextError = "";
+    try {
+      await sm.submit(session, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+    } catch (error) {
+      nextError = error instanceof Error ? error.message : String(error);
+    }
+    report.nextError = nextError || null;
+    const nextHits = hits.slice(beforeNext).filter((hit) => hit.url === "/v1/messages");
+    report.nextHits = nextHits.map((hit) => ({
+      status: hit.status, bytes: hit.bytes, kind: hit.kind, reasons: hit.reasons, summary: hit.summary,
+    }));
+    const summaries = [...growthHits, ...nextHits].filter((hit) => hit.kind === "idle-summary" && hit.status === 200);
+    report.idleSummaryCount = summaries.length;
+    if (summaries.length !== 1) {
+      throw new Error(`idle summary HTTP count ${summaries.length}; growthError=${growthError}; nextError=${nextError}; kinds=${growthHits.map((hit) => hit.kind).join(",")}`);
+    }
+    const businessNext = nextHits.filter((hit) => hit.kind === "business" && hit.status === 200);
+    assert.equal(businessNext.length >= 1, true, JSON.stringify(report.nextHits));
+    const finalLedgers = await pool.query(
+      `SELECT u.request_id, u.turn_key, u.cost_credits::text, l.id::text AS ledger_id, l.delta::text
+         FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id ORDER BY u.id`);
+    report.ledgers = finalLedgers.rows;
+    const ids = new Set<string>();
+    const turns = new Set<string>();
+    for (const row of finalLedgers.rows as Array<{ request_id: string; turn_key: string; delta: string }>) {
+      assert.equal(ids.has(row.request_id), false, row.request_id);
+      ids.add(row.request_id);
+      assert.equal(turns.has(row.turn_key), false, row.turn_key);
+      turns.add(row.turn_key);
+      assert.ok(BigInt(row.delta) < 0n);
+    }
     const creditsAfter = BigInt((await pool.query("SELECT credits::text AS credits FROM users WHERE id = 3")).rows[0].credits);
-    const spent = finalLedgers.rows.reduce((sum: bigint, row: { delta: string }) => sum + BigInt(row.delta), 0n);
-    report.credits = { beforeLeaf: creditsBeforeLeaf.toString(), after: creditsAfter.toString(), ledgerSum: spent.toString() };
+    const spent = (finalLedgers.rows as Array<{ delta: string }>).reduce((sum, row) => sum + BigInt(row.delta), 0n);
+    report.credits = { beforeGrowth: creditsBeforeGrowth.toString(), after: creditsAfter.toString(), ledgerSum: spent.toString() };
     assert.equal(creditsAfter, 50_000_000n + spent);
   } finally {
     releaseHeldCommits();
@@ -805,6 +678,7 @@ function messageDigest(raw: string): { messages: number; contentBytes: number; m
   try {
     const parsed = JSON.parse(raw) as {
       messages?: Array<{ content?: unknown }>;
+      tools?: Array<{ name?: string }>;
       context_management?: unknown; stop_sequences?: unknown; temperature?: unknown;
       top_p?: unknown; top_k?: unknown; service_tier?: unknown;
     };
@@ -830,6 +704,7 @@ function messageDigest(raw: string): { messages: number; contentBytes: number; m
       top_p: parsed.top_p ?? null,
       top_k: parsed.top_k ?? null,
       service_tier: parsed.service_tier ?? null,
+      tools: (parsed.tools ?? []).map((tool) => tool.name).slice(0, 24),
       first: preview(messages[0]),
       last: preview(messages[messages.length - 1]),
       small: contentBytes < 5000 ? messages.map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")).join("\n---\n") : undefined,
@@ -896,6 +771,133 @@ function seedOuterHistory(configDir: string, cwd: string, opts: { sessionId?: st
   return { bytes: statSync(file).size, marker, sessionId, project };
 }
 
+function classifyRequest(raw: string): { kind: string; reasons: string[] } {
+  const reasons: string[] = [];
+  if (raw.includes(SUMMARY_MARK)) reasons.push("idle-prompt-mark");
+  if (raw.includes("continued from a previous conversation") || raw.includes("This session is being continued")) {
+    reasons.push("stock-continuation-phrase");
+  }
+  let lastIsToolResult = false;
+  try {
+    const parsed = JSON.parse(raw) as { messages?: Array<{ role?: string; content?: unknown }> };
+    const last = parsed.messages?.at(-1);
+    const text = JSON.stringify(last?.content ?? "");
+    lastIsToolResult = last?.role === "user" && text.includes("tool_result");
+    if (lastIsToolResult) reasons.push("last-user-is-tool-result");
+  } catch { reasons.push("unparsed"); }
+  if (reasons.includes("idle-prompt-mark")) return { kind: "idle-summary", reasons };
+  if (reasons.includes("stock-continuation-phrase") && !lastIsToolResult) return { kind: "stock-auto-summary", reasons };
+  if (lastIsToolResult) return { kind: "live-continuation", reasons };
+  reasons.push("ordinary-user");
+  return { kind: "business", reasons };
+}
+
+function toolResultBytes(messages: Array<{ content?: unknown }>): number {
+  let total = 0;
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (!block || typeof block !== "object" || (block as { type?: string }).type !== "tool_result") continue;
+      const content = (block as { content?: unknown }).content;
+      total += typeof content === "string" ? content.length : JSON.stringify(content ?? "").length;
+    }
+  }
+  return total;
+}
+
+function lastToolResult(messages: Array<{ content?: unknown }>): { id: string; content: unknown; isError: boolean } | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const content = messages[index]?.content;
+    if (!Array.isArray(content)) continue;
+    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
+      const block = content[blockIndex] as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
+      if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
+        return { id: block.tool_use_id, content: block.content, isError: block.is_error === true };
+      }
+    }
+  }
+  return null;
+}
+
+function ndjson(rows: unknown[]): Buffer {
+  return Buffer.from(rows.map((row) => JSON.stringify(row) + "\n").join(""));
+}
+
+function streamEvent(value: unknown): { type: string; event: unknown } {
+  return { type: "stream_event", event: value };
+}
+
+function handoffChunk(id: string, boxName: string, input: Record<string, unknown>, initTools: string[] | null): Buffer {
+  const usage = { input_tokens: 20, output_tokens: 0 };
+  const use = { type: "tool_use", id, name: boxName, input };
+  const rows: unknown[] = [];
+  if (initTools) rows.push({ type: "system", subtype: "init", tools: initTools, mcp_servers: [{}] });
+  rows.push(
+    streamEvent({ type: "message_start", message: { id: `msg_${id}`, model: "claude-opus-5-5", role: "assistant", content: [], usage } }),
+    streamEvent({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: boxName, input: {} } }),
+    streamEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }),
+    { type: "assistant", message: { id: `msg_${id}`, model: "claude-opus-5-5", role: "assistant", content: [use] } },
+    streamEvent({ type: "content_block_stop", index: 0 }),
+    streamEvent({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { input_tokens: 20, output_tokens: 4 } }),
+    streamEvent({ type: "message_stop" }),
+  );
+  return ndjson(rows);
+}
+
+function echoChunk(id: string, content: unknown, isError: boolean): Buffer {
+  const block: Record<string, unknown> = { type: "tool_result", tool_use_id: id, content };
+  if (isError) block.is_error = true;
+  return ndjson([{ type: "user", message: { role: "user", content: [block] } }]);
+}
+
+function prepareModelSpool(raw: string): void {
+  const names = Array.from({ length: 0 });
+  void names;
+  let parsed: { messages?: Array<{ role?: string; content?: unknown }>; tools?: Array<{ name?: string }> } = {};
+  try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+  const classified = classifyRequest(raw);
+  const initTools = (() => {
+    try {
+      const count = parsed.tools?.length ?? 0;
+      return Array.from({ length: count }, (_, index) => `mcp__ocbridge__t${index}`);
+    } catch { return ["mcp__ocbridge__t0"]; }
+  })();
+  if (!growthActive || classified.kind === "idle-summary") {
+    spoolBuf = textSpool(initTools);
+    pendingStdout = null;
+    return;
+  }
+  const bashIndex = (parsed.tools ?? []).findIndex((tool) => tool.name === "Bash");
+  const size = toolResultBytes(parsed.messages ?? []);
+  const prior = classified.kind === "live-continuation" ? lastToolResult(parsed.messages ?? []) : null;
+  const finish = size >= GROW_TARGET || growthRound >= 60;
+  if (bashIndex < 0 || finish) {
+    const final = textSpool(prior ? [] : initTools);
+    const echo = prior ? echoChunk(prior.id, prior.content, prior.isError) : Buffer.alloc(0);
+    spoolBuf = prior ? Buffer.concat([spoolBuf, echo, stripInit(final)]) : final;
+    pendingStdout = null;
+    return;
+  }
+  growthRound += 1;
+  const id = `toolu_grow_${growthRound}`;
+  const input = { command: `python3 -c 'print("y"*${GROW_CHARS}, end="")'` };
+  const boxName = `mcp__ocbridge__t${bashIndex}`;
+  const chunk = handoffChunk(id, boxName, input, prior ? null : initTools);
+  const echo = prior ? echoChunk(prior.id, prior.content, prior.isError) : Buffer.alloc(0);
+  spoolBuf = prior ? Buffer.concat([spoolBuf, echo, chunk]) : chunk;
+  pendingStdout = JSON.stringify({
+    version: 1, modelToolUseId: id, mcpRequestId: growthRound,
+    name: `t${bashIndex}`, arguments: input,
+  });
+}
+
+function stripInit(buffer: Buffer): Buffer {
+  const text = buffer.toString("utf8");
+  const newline = text.indexOf("\n");
+  if (newline < 0 || !text.startsWith("{\"type\":\"system\"")) return buffer;
+  return Buffer.from(text.slice(newline + 1));
+}
+
 function textSpool(tools: string[]): Buffer {
   const model = "claude-opus-5-5";
   const text = summaryRequested ? "outer-history-summary" : "DONE-6K";
@@ -920,7 +922,6 @@ function makeLocalPythonExec(toolNames: () => string[]): {
   run: (request: { command: string; args: string[]; cwd?: string; environment?: Record<string, string> }) => Promise<{ stdout: string; stderrBytes: number; exitCode: 0 }>;
 } {
   const log: string[] = [];
-  let spool = textSpool(["mcp__ocbridge__t0"]);
   let runNonce = "";
   let leaseEpoch = "";
   return {
@@ -939,9 +940,14 @@ function makeLocalPythonExec(toolNames: () => string[]): {
       if (args[5] === "--read") {
         log.push("synthetic-spool");
         const offset = Number(args[7] ?? 0);
-        if (offset === 0 && toolNames().length > 0) spool = textSpool(toolNames());
-        const part = spool.subarray(Math.min(Number.isFinite(offset) ? offset : 0, spool.length));
-        return { stdout: JSON.stringify({ data: part.toString("base64"), offset: (Number.isFinite(offset) ? offset : 0) + part.length }), stderrBytes: 0, exitCode: 0 as const };
+        const source = spoolBuf.length > 0 ? spoolBuf : textSpool(toolNames());
+        const start = Math.min(Number.isFinite(offset) ? offset : 0, source.length);
+        const part = source.subarray(start);
+        return { stdout: JSON.stringify({ data: part.toString("base64"), offset: start + part.length }), stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (script.includes("pending.") && pendingStdout) {
+        log.push("synthetic-pending");
+        return { stdout: pendingStdout, stderrBytes: 0, exitCode: 0 as const };
       }
       if (script.includes("terminal.json")) {
         log.push("synthetic-terminal-proof");
