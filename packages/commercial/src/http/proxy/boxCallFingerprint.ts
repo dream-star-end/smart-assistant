@@ -5,7 +5,7 @@
  * genuine per-call ID transport. Never use this alone to enable the route.
  */
 import { createHash } from "node:crypto";
-import type { ProxyBody } from "./shared.js";
+import { currentVerifiedProxyByteBudget, type ProxyBody } from "./shared.js";
 import { normalizeBoxAssistantContent, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 
 export class BoxCallFingerprintError extends Error {
@@ -72,9 +72,10 @@ export function deriveBoxContextHash(body: ProxyBody,
   const messages = completedToolTail ? normalized.messages.slice(0, -2) : normalized.messages;
   const hasher = createHash("sha256").update("ocv5-box-context-v1\0");
   let bytes = 0;
+  const hashCeiling = currentVerifiedProxyByteBudget().contextHash;
   updateStableJson({ ...modelBody, messages }, (part) => {
     bytes += Buffer.byteLength(part);
-    if (bytes > 16 * 1024 * 1024) {
+    if (bytes > hashCeiling) {
       throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
     }
     hasher.update(part);
@@ -205,9 +206,10 @@ export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallF
   const { metadata: _tracking, ...modelBody } = normalizeBoxSemanticBody(body);
   const hasher = createHash("sha256");
   let bytes = 0;
+  const hashCeiling = currentVerifiedProxyByteBudget().contextHash;
   updateStableJson(modelBody, (part) => {
     bytes += Buffer.byteLength(part);
-    if (bytes > 16 * 1024 * 1024) {
+    if (bytes > hashCeiling) {
       throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
     }
     hasher.update(part);

@@ -96,14 +96,19 @@ import {
   DEFAULT_PROXY_RATE_LIMIT,
   DEFAULT_MAX_CONCURRENT_PER_UID,
   MAX_BODY_BYTES_DEFAULT,
+  MAX_BODY_BYTES_HARD_CEILING,
+  PROXY_BYTE_BUDGET_LEGACY,
   proxyBodySchema,
-  enforceFieldByteBudgets,
+  budgetFromVerifiedGate,
+  enforcePreAuthByteCeiling,
+  enforceVerifiedProxyBudget,
   estimateInputTokens,
   estimateContextInputTokens,
   estimateMaxCostBothSides,
   extractUsageAttribution,
   stripUsageAttributionKeys,
-  readBoundedJson,
+  readBoundedJsonMeasured,
+  runWithVerifiedProxyByteBudget,
   sendJsonError,
   stripNonTextContentBlocks,
   errMessageShort,
@@ -295,7 +300,14 @@ export function makeAnthropicProxyHandler(
   const fallbackCap = Math.max(1, Math.floor(rateLimitCfg.max / 3));
   const fallbackLimiter = deps.fallbackLimiter
     ?? new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
+  // count_tokens stays on the legacy 16 MiB cap. /v1/messages may buffer the
+  // fixed 24 MiB ceiling before signature, then subdivides. An explicit
+  // deps.maxBodyBytes never raises the ceiling above 24 MiB.
   const maxBodyBytes = deps.maxBodyBytes ?? MAX_BODY_BYTES_DEFAULT;
+  const messageReadCeiling = Math.min(
+    deps.maxBodyBytes ?? MAX_BODY_BYTES_HARD_CEILING,
+    MAX_BODY_BYTES_HARD_CEILING,
+  );
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -440,11 +452,15 @@ export function makeAnthropicProxyHandler(
     }
 
     try {
-      // 4) 读 + parse + 校验 body
+      // 4) 读 + parse + 校验 body.
+      // 身份已过、签名未过:这里按固定硬上限分配,不看能力头,也不看 body.model。
+      // 超硬上限在读完前 413。签后才把 8/16 与 16/24 分开。
       let body: ProxyBody;
+      let rawBodyBytes = 0;
       try {
-        const raw = await readBoundedJson(req, maxBodyBytes);
-        const parsed = proxyBodySchema.safeParse(raw);
+        const measured = await readBoundedJsonMeasured(req, messageReadCeiling);
+        rawBodyBytes = measured.byteLength;
+        const parsed = proxyBodySchema.safeParse(measured.value);
         if (!parsed.success) {
           userLog.warn("proxy_body_schema_failed", { issues: parsed.error.issues });
           incrAnthropicProxyReject("bad_body");
@@ -452,7 +468,7 @@ export function makeAnthropicProxyHandler(
           return;
         }
         body = parsed.data;
-        enforceFieldByteBudgets(body);
+        enforcePreAuthByteCeiling(body, rawBodyBytes);
       } catch (err) {
         if (err instanceof HttpError) {
           userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
@@ -462,6 +478,28 @@ export function makeAnthropicProxyHandler(
         }
         throw err;
       }
+
+      // `box-api-` 前缀不是放行。它只让可能走受信 Box 的请求先活过 legacy
+      // 8/16,好把签名和 catalog 路由判完。判完仍不是 Box / 无能力 / 未就绪
+      // 的,下面会按 legacy 拒绝。其它模型在进 gate 前就受原预算。
+      const deferLegacyUntilVerifiedBox = deps.modelCatalog != null
+        && deps.modelAuthorityEnforce === true
+        && body.model.startsWith("box-api-");
+      const rejectOverBudget = (budget: typeof PROXY_BYTE_BUDGET_LEGACY): boolean => {
+        try {
+          enforceVerifiedProxyBudget(body, rawBodyBytes, budget);
+          return false;
+        } catch (err) {
+          if (err instanceof HttpError) {
+            userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
+            incrAnthropicProxyReject(httpErrToReject(err));
+            sendJsonError(res, err.status, err.code, err.message, requestId);
+            return true;
+          }
+          throw err;
+        }
+      };
+      if (!deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
 
       // A non-streaming request is never a fresh paid model dispatch. Only
       // Box can use it to retrieve the exact prior round; reject it before
@@ -586,6 +624,7 @@ export function makeAnthropicProxyHandler(
           });
         } catch (err) {
           if (err instanceof ModelGateReject) {
+            if (deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
             userLog.warn("proxy_model_authority_rejected", {
               kind: err.kind,
               code: err.code,
@@ -744,6 +783,7 @@ export function makeAnthropicProxyHandler(
         );
       } catch (err) {
         if (err instanceof UnroutableProviderError) {
+          if (deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
           // 配置事故:catalog 里写了本进程不认识的 provider 机制。静默回落 OAuth 会把它发到
           // Anthropic 账号池上烧真钱 → 响亮 503 + error 日志(运维必须去修 catalog 行)。
           userLog.error("proxy_unroutable_provider", {
@@ -793,16 +833,25 @@ export function makeAnthropicProxyHandler(
         : route.kind === "static"
           ? route.provider.supportsVision === true
           : route.kind !== "box";
+      // Box transport arming matches validateUpstreamConfig. Not a client header.
+      const serverRouteReady = route.kind === "box"
+        && process.env.OC_BOX_MODEL_API === "1"
+        && deps.boxModel !== undefined;
+      let byteBudget = PROXY_BYTE_BUDGET_LEGACY;
+      if (deferLegacyUntilVerifiedBox) {
+        byteBudget = budgetFromVerifiedGate(gate, route.kind, serverRouteReady);
+        if (rejectOverBudget(byteBudget)) return;
+      }
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A
       // disabled Box launch flag does not erase already completed capsules.
       let boxPrepared: PreparedContinuation | undefined;
       if (route.kind === "box") {
-        boxPrepared = prepareBoxContinuation({
+        boxPrepared = runWithVerifiedProxyByteBudget(byteBudget, () => prepareBoxContinuation({
           uid, canonicalModel: body.model, rawBody: body,
           authorityKind: gate?.authorityKind ?? "local_catalog",
           authorityTurnId: gate?.authorityTurnId ?? null,
-        });
+        }));
         if (deps.boxReplay) {
           let replay: Awaited<ReturnType<NonNullable<typeof deps.boxReplay>["lookup"]>>;
           try {
@@ -811,9 +860,11 @@ export function makeAnthropicProxyHandler(
             // stream:true shape may proceed to a fresh Box launch.
             const replayBody = structuredClone(body);
             if (replayBody.stream !== true) replayBody.stream = false;
-            replay = await deps.boxReplay.lookup({ uid, canonicalModel: body.model,
+            replay = await runWithVerifiedProxyByteBudget(byteBudget, () => deps.boxReplay!.lookup({
+              uid, canonicalModel: body.model,
               canonicalBody: replayBody, upstreamModel: route.upstreamModel,
-              trustedAuthority: boxPrepared.authority, prepared: boxPrepared });
+              trustedAuthority: boxPrepared!.authority, prepared: boxPrepared,
+            }));
           } catch (error) {
             if (error instanceof BoxDurableJournalError
               && (error.code === "BOX_AUTHORITY_REJECTED"
@@ -884,9 +935,9 @@ export function makeAnthropicProxyHandler(
           sendJsonError(res, 403, "NOT_AUTHORIZED", "model not authorized", requestId);
           return;
         }
-        const unsupported = validateBoxRequest(body,
+        const unsupported = runWithVerifiedProxyByteBudget(byteBudget, () => validateBoxRequest(body,
           process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true,
-          boxPrepared);
+          boxPrepared));
         if (unsupported) {
           userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
           incrAnthropicProxyReject("bad_body");
@@ -1013,7 +1064,7 @@ export function makeAnthropicProxyHandler(
       // 故此 cap 是粗 guardrail：防超模型上下文窗(如 glm-5.1 200k / MiniMax-M3 512k)无声进更贵档。
       // **supportsVision provider(MiniMax-M3)跳过此 cap**:vision 请求含大 base64 image，
       // JSON.length/4 会把图当文本 token 严重高估(2MB 图≈725k「token」)而误撞文本 context cap →
-      // understand_image 永远 413。图请求的真正体积上限由下游 enforceFieldByteBudgets(messages 8MB)兜底。
+      // understand_image 永远 413。图请求的真正体积上限由字段字节预算兜底。
       if (
         route.kind === "static" &&
         !modelSupportsVision &&
@@ -1583,12 +1634,14 @@ export function makeAnthropicProxyHandler(
         pgPool: deps.pgPool,
         fetchFn: route.kind === "box"
           ? ((url: string, init: RequestInit) => {
-              if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel || !boxCanonicalBody) {
-                throw new Error("BOX_FETCH_NOT_CONFIGURED");
-              }
-              return deps.boxModel.fetch({ uid, sessionId, requestId,
-                canonicalModel: boxCanonicalBody.model, canonicalBody: boxCanonicalBody,
-                upstreamModel: session.upstreamModel, url, init, prepared: boxPrepared });
+              return runWithVerifiedProxyByteBudget(byteBudget, () => {
+                if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel || !boxCanonicalBody) {
+                  throw new Error("BOX_FETCH_NOT_CONFIGURED");
+                }
+                return deps.boxModel.fetch({ uid, sessionId, requestId,
+                  canonicalModel: boxCanonicalBody.model, canonicalBody: boxCanonicalBody,
+                  upstreamModel: session.upstreamModel, url, init, prepared: boxPrepared });
+              });
             }) as typeof fetch
           : fetchFn,
         appendCostCredits: deps.appendCostCredits,
