@@ -107,7 +107,6 @@ import {
   getPromptTooLongTokenGap,
   isPromptTooLongMessage,
   PROMPT_TOO_LONG_ERROR_MESSAGE,
-  startsWithApiErrorPrefix,
 } from '../api/errors.js'
 import { notifyCompaction } from '../api/promptCacheBreakDetection.js'
 import { getRetryDelay } from '../api/withRetry.js'
@@ -303,6 +302,25 @@ export const ERROR_MESSAGE_USER_ABORT = 'API Error: Request was aborted.'
 export const ERROR_MESSAGE_INCOMPLETE_RESPONSE =
   'Compaction interrupted · This may be due to network issues — please try again.'
 
+/** Shared by full, partial, and idle. Typed PTL is the only retry.
+ *  Other typed errors, aborts, and unfinished streams fail before text. */
+function takeCompactSummary(
+  response: AssistantMessage,
+  aborted: boolean,
+): string | 'ptl' {
+  if (isPromptTooLongMessage(response)) return 'ptl'
+  if (aborted) throw new Error(ERROR_MESSAGE_USER_ABORT)
+  if (response.isApiErrorMessage) throw new Error('IDLE_SUMMARY_REJECTED')
+  if (!response.message?.stop_reason) throw new Error(ERROR_MESSAGE_INCOMPLETE_RESPONSE)
+  const text = getAssistantMessageText(response)
+  if (!text) {
+    throw new Error(
+      'Failed to generate conversation summary - response did not contain valid text content',
+    )
+  }
+  return text
+}
+
 export interface CompactionResult {
   boundaryMarker: SystemMessage
   summaryMessages: UserMessage[]
@@ -483,8 +501,14 @@ export async function compactConversation(
         preCompactTokenCount,
         cacheSafeParams: retryCacheSafeParams,
       })
-      summary = getAssistantMessageText(summaryResponse)
-      if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+      const taken = takeCompactSummary(
+        summaryResponse,
+        context.abortController.signal.aborted,
+      )
+      if (taken !== 'ptl') {
+        summary = taken
+        break
+      }
 
       // CC-1180: compact request itself hit prompt-too-long. Truncate the
       // oldest API-round groups and retry rather than leaving the user stuck.
@@ -531,14 +555,6 @@ export async function compactConversation(
       throw new Error(
         `Failed to generate conversation summary - response did not contain valid text content`,
       )
-    } else if (startsWithApiErrorPrefix(summary)) {
-      logEvent('tengu_compact_failed', {
-        reason:
-          'api_error' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-        preCompactTokenCount,
-        promptCacheSharingEnabled,
-      })
-      throw new Error(summary)
     }
 
     // Store the current file state before clearing
@@ -822,23 +838,22 @@ export async function summarizeMessagesForIdle(
       preCompactTokenCount,
       cacheSafeParams: retryCacheSafeParams,
     })
-    // Identity before text. A real summary may quote 403 / API Error / PTL.
-    if (isPromptTooLongMessage(summaryResponse)) {
-      ptlAttempts++
-      const truncated =
-        ptlAttempts <= MAX_PTL_RETRIES
-          ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
-          : null
-      if (!truncated) throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
-      messagesToSummarize = truncated
-      retryCacheSafeParams = { ...retryCacheSafeParams, forkContextMessages: truncated }
-      continue
+    const taken = takeCompactSummary(
+      summaryResponse,
+      context.abortController.signal.aborted,
+    )
+    if (taken !== 'ptl') {
+      summary = taken
+      break
     }
-    if (summaryResponse.isApiErrorMessage) throw new Error('IDLE_SUMMARY_REJECTED')
-    if (context.abortController.signal.aborted) throw new Error(ERROR_MESSAGE_USER_ABORT)
-    if (!summaryResponse.message?.stop_reason) throw new Error(ERROR_MESSAGE_INCOMPLETE_RESPONSE)
-    summary = getAssistantMessageText(summaryResponse)
-    break
+    ptlAttempts++
+    const truncated =
+      ptlAttempts <= MAX_PTL_RETRIES
+        ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
+        : null
+    if (!truncated) throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
+    messagesToSummarize = truncated
+    retryCacheSafeParams = { ...retryCacheSafeParams, forkContextMessages: truncated }
   }
   if (!summary) throw new Error('Failed to generate conversation summary - response did not contain valid text content')
   return summary
@@ -950,8 +965,14 @@ export async function partialCompactConversation(
         preCompactTokenCount,
         cacheSafeParams: retryCacheSafeParams,
       })
-      summary = getAssistantMessageText(summaryResponse)
-      if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+      const taken = takeCompactSummary(
+        summaryResponse,
+        context.abortController.signal.aborted,
+      )
+      if (taken !== 'ptl') {
+        summary = taken
+        break
+      }
 
       ptlAttempts++
       const truncated =
@@ -988,13 +1009,6 @@ export async function partialCompactConversation(
       throw new Error(
         'Failed to generate conversation summary - response did not contain valid text content',
       )
-    } else if (startsWithApiErrorPrefix(summary)) {
-      logEvent('tengu_partial_compact_failed', {
-        reason:
-          'api_error' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-        ...failureMetadata,
-      })
-      throw new Error(summary)
     }
 
     // Store the current file state before clearing
@@ -1298,11 +1312,8 @@ async function streamCompactSummary({
         // A typed API error, including abort, is the result. Do not fall
         // through into a second streaming request that could keep partial text.
         if (assistantMsg?.isApiErrorMessage) return assistantMsg
-        // Guard isApiErrorMessage: query() catches API errors (including
-        // APIUserAbortError on ESC) and yields them as synthetic assistant
-        // messages. Without this check, an aborted compact "succeeds" with
-        // "Request was aborted." as the summary — the text doesn't start with
-        // "API Error" so the caller's startsWithApiErrorPrefix guard misses it.
+        // Success text only. takeCompactSummary rejects this typed error
+        // before a boundary; a real summary may still quote "API Error".
         if (assistantMsg && assistantText && !assistantMsg.isApiErrorMessage) {
           // Skip success logging for PTL error text — it's returned so the
           // caller's retry loop catches it, but it's not a successful summary.
