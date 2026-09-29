@@ -10,7 +10,8 @@ import { publishBoxToolResume, type BoxToolPublishedResume } from "./boxToolResu
 import { runBoxToolContinuation } from "./boxToolContinuation.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { makeBoxNativeGcDelete, parseBoxNativeGcResult } from "./boxNativeGcFile.js";
-import { stripBoxCcbToolBudgetTail } from "./boxCacheAnnotations.js";
+import { classifyBoxContinuation, preparedMatchesBody,
+  BoxContinuationDecisionError, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { makeBoxPrelaunchCleanup } from "./boxPrelaunchControl.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
@@ -18,19 +19,22 @@ import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 
 type FetchArgs = { uid: bigint; sessionId: string | null; requestId: string;
   canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
-  url: string; init: RequestInit };
+  url: string; init: RequestInit; prepared?: PreparedContinuation };
 type First = typeof runBoxToolFirstRound;
 type Publish = typeof publishBoxToolResume;
 type Continue = typeof runBoxToolContinuation;
 
-function resumeShape(body: ProxyBody): boolean {
-  const messages = stripBoxCcbToolBudgetTail(body).messages;
-  const last = Array.isArray(messages) ? messages.at(-1) : null;
-  if (!last || typeof last !== "object" || !("role" in last)
-    || last.role !== "user" || !("content" in last)
-    || !Array.isArray(last.content) || last.content.length < 1) return false;
-  return last.content.every((block) => block && typeof block === "object"
-    && "type" in block && block.type === "tool_result");
+function routeClass(args: FetchArgs): PreparedContinuation["classification"] {
+  const prepared = args.prepared ?? null;
+  if (prepared && !preparedMatchesBody(prepared, args.canonicalBody)) {
+    throw new BoxContinuationDecisionError("reject", "BOX_PREPARED_STALE");
+  }
+  const view = prepared ?? classifyBoxContinuation(args.canonicalBody);
+  if (view.classification === "reject") {
+    throw new BoxContinuationDecisionError("reject",
+      ("rejectCode" in view ? view.rejectCode : null) ?? "BOX_PREPARED_REJECT");
+  }
+  return view.classification;
 }
 
 export class BoxToolFetch {
@@ -405,7 +409,7 @@ export class BoxToolFetch {
           if (sse) controller.enqueue(Buffer.from(sse, "utf8"));
         };
         void (async () => {
-          if (resumeShape(args.canonicalBody)) {
+          if (routeClass(args) === "continuation_candidate") {
             const published: BoxToolPublishedResume = await (this.deps.publishResume
               ?? publishBoxToolResume)({ ...args, init }, {
               journal: this.deps.journal,
@@ -421,7 +425,7 @@ export class BoxToolFetch {
             const result = await (this.deps.runContinuation ?? runBoxToolContinuation)({
               published, uid: args.uid, requestId: args.requestId,
               canonicalBody: args.canonicalBody, upstreamModel: args.upstreamModel,
-              signal: abort.signal, emit,
+              signal: abort.signal, emit, prepared: args.prepared,
             }, { journal: this.deps.journal,
               writeMessage: this.deps.writeMessage,
               retainUnknownTarget: ({ published: held }) =>

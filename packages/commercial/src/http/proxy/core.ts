@@ -62,6 +62,7 @@ import { recordProviderHealthSample } from "./providerHealthSink.js";
 import { recordUpstreamPerformance } from "../../ws/turnPerformance.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPreparedContinuation.js";
 import { BoxTextFetchError } from "./boxTextFetch.js";
 import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
 import {
@@ -583,6 +584,8 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
     else incrAnthropicProxySettle("aborted");
   } catch (err) {
+    const continuationConflict = err instanceof BoxContinuationDecisionError
+      || (err instanceof BoxDurableJournalError && isContinuationConflict(err.code));
     const boxCapacityHeld = body.model === "box-api-claude-opus-5-5"
       && ((err instanceof BoxDurableJournalError
         || err instanceof BoxTextFetchError) && err.code === "BOX_CAPACITY_HELD"
@@ -591,7 +594,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             "BOX_SESSION_BUSY"].includes(err.code));
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
-    if (boxCapacityHeld) {
+    if (continuationConflict) {
+      await finalize.failClient(observed, err, "INVALID_REQUEST");
+    } else if (boxCapacityHeld) {
       await finalize.failClient(observed, err, "INVALID_REQUEST");
     } else if (isClientAbort(err)) {
       await finalize.failClient(observed, err, "CLIENT_ABORT");
@@ -610,12 +615,16 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         model: body.model,
         ttftMs: null,
         streamMs: null,
-        outcome: isClientAbort(err) ? "aborted" : "error",
+        outcome: continuationConflict || isClientAbort(err) ? "aborted" : "error",
       },
     );
     // 字节是否已 flush 决定怎么发错误
     if (!res.headersSent) {
-      if (boxCapacityHeld) {
+      if (continuationConflict) {
+        const code = err instanceof BoxContinuationDecisionError || err instanceof BoxDurableJournalError
+          ? err.code : "BOX_PREPARED_REJECT";
+        sendJsonError(res, 409, code, "continuation not republished", requestId);
+      } else if (boxCapacityHeld) {
         sendJsonError(res, 409, "BOX_CAPACITY_HELD", "Box slot busy", requestId);
       } else sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
     } else {

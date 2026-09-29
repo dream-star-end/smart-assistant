@@ -20,6 +20,8 @@ import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES,
   reserveBoxToolEcho } from "./boxToolCapacity.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { authoritiesBind, authorityFromJournalCtx, isContinuationConflict,
+  type AuthorityProjection } from "./boxPreparedContinuation.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import { parseBoxReplayMessagePointer,
@@ -113,6 +115,10 @@ export interface BoxToolResumeClaim {
   readonly nativeSessionId?: string;
   readonly nativeCliCwd?: string;
 }
+export type BoxResumeDecision =
+  | { readonly kind: "new_claim"; readonly claim: BoxToolResumeClaim }
+  | { readonly kind: "in_progress_or_unknown"; readonly code: string }
+  | { readonly kind: "reject"; readonly code: string };
 /** A matched HTTP request is observable, never permission to launch it again. */
 export interface BoxReplayIdentity {
   readonly requestId: string;
@@ -359,6 +365,9 @@ function parseRecoveryResultHashes(raw: unknown):
 }
 
 export class BoxDurableJournal implements BoxJournalPort {
+  /** Test seam. Production leaves this null. Held inside the claim transaction
+   * after the fingerprint lookup and before the owner mutation. */
+  resumeLookupBarrier: (() => Promise<void>) | null = null;
   constructor(private readonly pool: Pick<Pool, "connect" | "query">,
     private readonly maxAccountRuns: (uid: bigint, accountId: bigint) => number = () => 1) {}
 
@@ -538,8 +547,11 @@ export class BoxDurableJournal implements BoxJournalPort {
    * reads committed evidence; the caller must separately observe the pinned
    * spool/proof or load a completed Message before returning any answer. */
   async findReplayIdentity(input: { uid: bigint; canonicalModel: string;
-    canonicalBody: ProxyBody }): Promise<BoxReplayIdentity | null> {
+    canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection }): Promise<BoxReplayIdentity | null> {
     const stream = (input.canonicalBody as { stream?: boolean }).stream;
+    if (input.trustedAuthority?.kind === "malformed") {
+      throw new BoxDurableJournalError("BOX_AUTHORITY_MALFORMED");
+    }
     if (input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel
       || (stream !== true && stream !== false)) {
       throw new BoxDurableJournalError("BOX_REPLAY_IDENTITY_INVALID");
@@ -621,6 +633,10 @@ export class BoxDurableJournal implements BoxJournalPort {
           || row.ctx.boxTurnKey !== fingerprint.turnKey
           || row.ctx.model !== input.canonicalModel) {
           throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
+        }
+        if (input.trustedAuthority) {
+          const bound = authoritiesBind(input.trustedAuthority, authorityFromJournalCtx(row.ctx));
+          if (!bound.ok) throw new BoxDurableJournalError(bound.code);
         }
         seen.add(row.request_id);
         const owner = row.ctx.boxOwnerRequestId;
@@ -1525,8 +1541,24 @@ export class BoxDurableJournal implements BoxJournalPort {
   /** Claim the next HTTP request against a previous model tool message.
    * This transaction runs BEFORE any pending result file is published. If its
    * outcome is ambiguous, no tool result or model call is automatically retried. */
+  async decideToolResume(input: { requestId: string; uid: bigint;
+    canonicalModel: string; canonicalBody: ProxyBody;
+    trustedAuthority?: AuthorityProjection }): Promise<BoxResumeDecision> {
+    try {
+      return { kind: "new_claim", claim: await this.claimToolResume(input) };
+    } catch (error) {
+      if (error instanceof BoxDurableJournalError && isContinuationConflict(error.code)) {
+        const kind = error.code === "BOX_CALL_AMBIGUOUS" || error.code === "BOX_RESUME_IN_PROGRESS"
+          ? "in_progress_or_unknown" : "reject";
+        return { kind, code: error.code };
+      }
+      throw error;
+    }
+  }
+
   async claimToolResume(input: { requestId: string; uid: bigint;
-    canonicalModel: string; canonicalBody: ProxyBody }): Promise<BoxToolResumeClaim> {
+    canonicalModel: string; canonicalBody: ProxyBody;
+    trustedAuthority?: AuthorityProjection }): Promise<BoxToolResumeClaim> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId)
       || input.uid <= 0n || input.canonicalBody.model !== input.canonicalModel) {
       throw new BoxDurableJournalError("BOX_TOOL_RESUME_IDENTITY_INVALID");
@@ -1554,13 +1586,25 @@ export class BoxDurableJournal implements BoxJournalPort {
              OR ctx->>'boxFallbackAlias'=$2 LIMIT 1`,
         [fingerprint.replayFingerprint, fallbackAlias]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
+      if (this.resumeLookupBarrier) await this.resumeLookupBarrier();
       const owners = await client.query<{ request_id: string; ctx: Record<string, unknown> }>(
         `SELECT request_id,ctx FROM request_finalize_journal
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
             AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
             AND state IN ('inflight','finalizing','committed') FOR UPDATE`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
-      if (owners.rows.length !== 1) throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
+      if (owners.rows.length !== 1) {
+        const consumed = await client.query(
+          `SELECT 1 FROM request_finalize_journal
+            WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
+              AND ctx->>'model'=$4
+              AND ctx->>'boxState' IN ('resuming','unknown','linked')
+            LIMIT 1`,
+          [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
+            input.canonicalModel]);
+        if (consumed.rowCount) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
+        throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
+      }
       const owner = owners.rows[0]!, ctx = owner.ctx;
       const nativeSessionId = ctx.boxNativeSessionId;
       const nativeCliCwd = ctx.boxNativeCliCwd;
@@ -1631,6 +1675,24 @@ export class BoxDurableJournal implements BoxJournalPort {
         reserveBoxToolEcho(handoff.spoolOffset, effectiveBody.messages.at(-1));
       } catch {
         throw new BoxDurableJournalError("BOX_TOOL_SPOOL_CAPACITY_EXCEEDED");
+      }
+      const child = await client.query<{ ctx: Record<string, unknown> }>(
+        `SELECT ctx FROM request_finalize_journal
+          WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+        [input.requestId, input.uid.toString()]);
+      const childCtx = child.rows[0]?.ctx;
+      if (child.rowCount !== 1 || !childCtx) {
+        throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
+      }
+      const ownerAuth = authorityFromJournalCtx(ctx);
+      const childAuth = authorityFromJournalCtx(childCtx);
+      const pairs = [[ownerAuth, childAuth] as const];
+      if (input.trustedAuthority) {
+        pairs.push([input.trustedAuthority, childAuth], [input.trustedAuthority, ownerAuth]);
+      }
+      for (const [left, right] of pairs) {
+        const bound = authoritiesBind(left, right);
+        if (!bound.ok) throw new BoxDurableJournalError(bound.code);
       }
       const durableRevision = randomUUID();
       const resultHashes = results.map((result) => ({

@@ -5,6 +5,7 @@ import type { BoxDurableJournal, BoxReplayIdentity } from "./boxDurableJournal.j
 import type { BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { boxReplayMessageToSse } from "./boxReplayMessageSse.js";
 import type { ProxyBody } from "./shared.js";
+import type { AuthorityProjection } from "./boxPreparedContinuation.js";
 
 export class BoxReplayCompletedError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxReplayCompletedError"; }
@@ -17,6 +18,7 @@ export type BoxReplayLookup =
 export async function findCompletedBoxReplay(input: {
   uid: bigint; canonicalModel: string; canonicalBody: ProxyBody;
   upstreamModel: string;
+  trustedAuthority?: AuthorityProjection;
 }, deps: {
   journal: Pick<BoxDurableJournal, "findReplayIdentity">;
   readMessage: (pointer: BoxReplayMessagePointer) => Promise<unknown>;

@@ -114,6 +114,8 @@ import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.
 
 import { runUpstreamRoundTrip } from "./core.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
+import { prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
+import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
@@ -794,7 +796,13 @@ export function makeAnthropicProxyHandler(
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A
       // disabled Box launch flag does not erase already completed capsules.
+      let boxPrepared: PreparedContinuation | undefined;
       if (route.kind === "box") {
+        boxPrepared = prepareBoxContinuation({
+          uid, canonicalModel: body.model, rawBody: body,
+          authorityKind: gate?.authorityKind ?? "local_catalog",
+          authorityTurnId: gate?.authorityTurnId ?? null,
+        });
         if (deps.boxReplay) {
           let replay: Awaited<ReturnType<NonNullable<typeof deps.boxReplay>["lookup"]>>;
           try {
@@ -804,8 +812,15 @@ export function makeAnthropicProxyHandler(
             const replayBody = structuredClone(body);
             if (replayBody.stream !== true) replayBody.stream = false;
             replay = await deps.boxReplay.lookup({ uid, canonicalModel: body.model,
-              canonicalBody: replayBody, upstreamModel: route.upstreamModel });
+              canonicalBody: replayBody, upstreamModel: route.upstreamModel,
+              trustedAuthority: boxPrepared.authority, prepared: boxPrepared });
           } catch (error) {
+            if (error instanceof BoxDurableJournalError
+              && (error.code === "BOX_AUTHORITY_REJECTED"
+                || error.code === "BOX_AUTHORITY_MALFORMED")) {
+              sendJsonError(res, 409, error.code, "authority binding rejected", requestId);
+              return;
+            }
             userLog.warn("proxy_box_replay_unavailable", { err: errSummary(error) });
             sendJsonError(res, 503, "BOX_REPLAY_UNAVAILABLE",
               "previous Box response unavailable", requestId);
@@ -828,6 +843,11 @@ export function makeAnthropicProxyHandler(
         if (body.stream !== true) {
           sendJsonError(res, 409, "BOX_REPLAY_NOT_FOUND",
             "previous Box call not found", requestId);
+          return;
+        }
+        if (boxPrepared.classification === "reject") {
+          sendJsonError(res, 409, boxPrepared.rejectCode ?? "BOX_PREPARED_REJECT",
+            "continuation rejected", requestId);
           return;
         }
       }
@@ -1567,7 +1587,7 @@ export function makeAnthropicProxyHandler(
               }
               return deps.boxModel.fetch({ uid, sessionId, requestId,
                 canonicalModel: boxCanonicalBody.model, canonicalBody: boxCanonicalBody,
-                upstreamModel: session.upstreamModel, url, init });
+                upstreamModel: session.upstreamModel, url, init, prepared: boxPrepared });
             }) as typeof fetch
           : fetchFn,
         appendCostCredits: deps.appendCostCredits,

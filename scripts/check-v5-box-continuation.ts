@@ -57,6 +57,10 @@ type Api = {
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
   echoAccept: (id: string, hash: string, raw: unknown) => void;
   publishImage: (row: PublishedMatch) => PublishedFile;
+  classify: (body: Record<string, unknown>) => { classification: string; rejectCode: string | null };
+  projectAuthority: (kind: unknown, authorityTurnId: unknown) => { kind: string };
+  bindAuthority: (left: { kind: string }, right: { kind: string }) => { ok: boolean };
+  mayPublish: (decision: { kind: string }) => boolean;
 };
 type Digest = Array<{ path: string; realpath: string; sha256: string }>;
 type ImageOracle = {
@@ -245,6 +249,7 @@ async function load(): Promise<Api> {
   const echoMod = await import(pathToFileURL(join(PROXY, "boxToolInputEcho.ts")).href);
   const resultEcho = await import(pathToFileURL(join(PROXY, "boxToolResultEcho.ts")).href);
   const planMod = await import(pathToFileURL(join(PROXY, "boxToolResultPlan.ts")).href);
+  const prepared = await import(pathToFileURL(join(PROXY, "boxPreparedContinuation.ts")).href);
   return {
     normalize: norm.normalizeBoxSemanticBody,
     gate: gate.validateBoxRequest,
@@ -267,6 +272,10 @@ async function load(): Promise<Api> {
       verifier.accept(raw);
       verifier.assertComplete();
     },
+    classify: prepared.classifyBoxContinuation,
+    projectAuthority: prepared.projectAuthority,
+    bindAuthority: prepared.authoritiesBind,
+    mayPublish: prepared.decisionMayPublish,
     publishImage: (row) => {
       const cwd = publishDir;
       if (!PUBLISH_DIR.test(cwd) || !existsSync(cwd)) fail("IMAGE_PUBLISH_DIR");
@@ -542,6 +551,31 @@ function checks(api: Api): void {
   }
   api.proveEditDefault();
   proveImageCaption(api);
+  provePrepared(api);
+}
+
+// prepared route, authority, and single publish
+function provePrepared(api: Api): void {
+  const current = api.classify(fx.chain[1] ?? {});
+  if (current.classification !== "continuation_candidate") fail("WRONG_ROUTE");
+  const unknown = api.classify(fx.unknownText);
+  if (unknown.classification !== "reject") fail("WRONG_ROUTE");
+  const signed = api.projectAuthority("bridge_signed", "ab".repeat(16));
+  const other = api.projectAuthority("bridge_signed", "cd".repeat(16));
+  const legacy = api.projectAuthority("local_catalog", null);
+  const broken = api.projectAuthority("bridge_signed", "short");
+  if (api.bindAuthority(signed, other).ok || api.bindAuthority(signed, legacy).ok
+    || broken.kind !== "malformed" || api.bindAuthority(broken, legacy).ok) {
+    fail("AUTHORITY_BYPASS");
+  }
+  if (!api.bindAuthority(signed, signed).ok || !api.bindAuthority(legacy, legacy).ok) {
+    fail("AUTHORITY_BYPASS");
+  }
+  let publishes = 0;
+  for (const decision of [{ kind: "new_claim" }, { kind: "in_progress_or_unknown" }, { kind: "reject" }]) {
+    if (api.mayPublish(decision)) publishes += 1;
+  }
+  if (publishes !== 1) fail("DUPLICATE_PUBLISH");
 }
 
 function imageFixture(): { oracle: ImageOracle; png: string } {

@@ -1517,12 +1517,15 @@ export interface AnthropicProxyDeps {
     toolBridgeReady?: boolean;
     fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
       canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
-      url: string; init: RequestInit }): Promise<Response>;
+      url: string; init: RequestInit;
+      prepared?: import("./boxPreparedContinuation.js").PreparedContinuation }): Promise<Response>;
   };
   /** Read-only same-round capsule replay, independent of the Box launch flag. */
   boxReplay?: {
     lookup(args: { uid: bigint; canonicalModel: string; canonicalBody: ProxyBody;
-      upstreamModel: string }): Promise<import("./boxReplayCompleted.js").BoxReplayLookup>;
+      upstreamModel: string;
+      trustedAuthority?: import("./boxPreparedContinuation.js").AuthorityProjection;
+      prepared?: import("./boxPreparedContinuation.js").PreparedContinuation }): Promise<import("./boxReplayCompleted.js").BoxReplayLookup>;
   };
   /** 上游 endpoint;默认 api.anthropic.com */
   upstreamEndpoint?: string;

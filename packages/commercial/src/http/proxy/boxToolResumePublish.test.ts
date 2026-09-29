@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { publishBoxToolResume } from "./boxToolResumePublish.js";
+import { BoxContinuationDecisionError } from "./boxPreparedContinuation.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import { hashBoxToolInput } from "./boxToolInputHash.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -66,6 +67,21 @@ function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean } =
   return { input, deps, sequence, target, claim,
     get writes() { return writes; }, get retained() { return retained; } };
 }
+
+test("an in-progress decision does not publish or mark the owner unknown", async () => {
+  const f = fixture();
+  let marked = 0;
+  const journal = { claimToolResume: async () => { throw new Error("claim must not run"); },
+    decideToolResume: async () => ({ kind: "in_progress_or_unknown", code: "BOX_RESUME_IN_PROGRESS" }),
+    markUnknown: async () => { marked += 1; } };
+  await assert.rejects(() => publishBoxToolResume(f.input, { ...f.deps, journal: journal as never }),
+    (error: unknown) => error instanceof BoxContinuationDecisionError
+      && error.decision === "in_progress_or_unknown"
+      && error.code === "BOX_RESUME_IN_PROGRESS");
+  assert.equal(marked, 0);
+  assert.equal(f.sequence.includes("resolve"), false);
+  assert.equal(f.writes, 0);
+});
 
 test("resume CAS precedes one result publication through pinned account", async () => {
   const f = fixture();

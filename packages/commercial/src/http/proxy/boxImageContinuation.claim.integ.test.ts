@@ -176,3 +176,125 @@ test("second TEMP claim keeps the client sibling and does not advance on failure
     await pool.end();
   }
 });
+
+test("TEMP authority mismatch and a second request id do not publish twice", async () => {
+  assert.match(url, /^postgres:\/\/test:test@127\.0\.0\.1:55432\/openclaude_test$/);
+  const pool = new Pool({ connectionString: url, max: 1 });
+  const other = new Pool({ connectionString: url, max: 1 });
+  const client = await pool.connect();
+  const outsider = await other.connect();
+  try {
+    const where = await client.query<{ db: string; port: number }>(
+      "SELECT current_database() AS db, inet_server_port() AS port");
+    assert.equal(where.rows[0]?.db, "openclaude_test");
+    assert.equal(Number(where.rows[0]?.port), 55432);
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (
+      request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
+      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      error_msg text, failure_code text, final_credits bigint)`);
+    await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
+    const located = await client.query<{ nspname: string }>(
+      `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.oid = to_regclass('request_finalize_journal')`);
+    assert.ok(located.rows[0]?.nspname.startsWith("pg_temp"));
+    const journal = new BoxDurableJournal({ connect: async () => ({
+      query: client.query.bind(client), release: () => {} }),
+      query: client.query.bind(client) } as never);
+    const hex = randomBytes(4).toString("hex");
+    const session = `race-${hex}`;
+    const turn = randomBytes(32).toString("hex");
+    const owner = `own2-${hex}`;
+    const child = `chA-${hex}`;
+    const rival = `chB-${hex}`;
+    const signed = "ab".repeat(16);
+    const first = request(session, turn, originalBoundary());
+    const catalog = compileBoxToolCatalog(tools);
+    const assistant = firstAssistant();
+    const handoff = { version: 1, roundNo: 1, messageId: `msg_${hex}`,
+      assistantContentHash: hashBoxAssistantContent(assistant),
+      assistantNoCallerHash: hashBoxAssistantNoCallerContent(assistant),
+      assistantEchoHash: hashBoxAssistantEchoContent(assistant), spoolOffset: 8,
+      detachedRunnerHash: runner, catalogHash: catalog.bindingSha256,
+      toolUses: [
+        { id: "toolu_img_claim", boxName: "mcp__ocbridge__t0", clientName: "Read",
+          inputHash: hashBoxToolInput({ file_path: "a.png" }) },
+        { id: "toolu_note_claim", boxName: "mcp__ocbridge__t1", clientName: "Note",
+          inputHash: hashBoxToolInput({ file_path: "a.md" }) },
+      ],
+      verifiedPendingToolUseIds: ["toolu_img_claim", "toolu_note_claim"],
+      usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    const pricing = { v: 1, modelId: model, displayName: "Opus", inputPerMtok: "1",
+      outputPerMtok: "1", cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" };
+    const billing = { v: 1, sessionId: session, mode: "chat", parentSessionId: null,
+      delegateAgentId: null, turnKey: turn, parentTurnKey: null, authority: null,
+      dispatchId: null, attemptNo: null, verificationSponsorship: null, apiKeyId: null };
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'committed',$2::jsonb)`, [owner, JSON.stringify({ model,
+      authorityKind: "bridge_signed", authorityTurnId: signed,
+      boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool", boxAccountId: "20",
+      boxRunNonce: nonce, boxLeaseEpoch: epoch, boxContextHash: deriveBoxContextHash(first, true),
+      boxHandoffRevision: "rev-1", boxToolHandoff: handoff, boxState: "handoff",
+      boxSessionId: session, boxTurnKey: turn, billingPricing: pricing, boxBillingContext: billing,
+      boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}` })]);
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [child, JSON.stringify({ model,
+      authorityKind: "bridge_signed", authorityTurnId: "cd".repeat(16),
+      boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing })]);
+    const ownerBefore = await client.query<{ state: string }>(
+      "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
+    await assert.rejects(() => journal.claimToolResume({ requestId: child, uid: 3n,
+      canonicalModel: model, canonicalBody: first,
+      trustedAuthority: { kind: "bridge_signed", authorityTurnId: "cd".repeat(16) } }),
+    (error: unknown) => error instanceof BoxDurableJournalError && error.code === "BOX_AUTHORITY_REJECTED");
+    const ownerAfter = await client.query<{ state: string; child: string | null }>(
+      `SELECT ctx->>'boxState' AS state, ctx->>'boxResumeRequestId' AS child
+        FROM request_finalize_journal WHERE request_id=$1`, [owner]);
+    assert.equal(ownerAfter.rows[0]?.state, ownerBefore.rows[0]?.state);
+    assert.equal(ownerAfter.rows[0]?.child ?? null, null);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx = ctx || '{"authorityTurnId":"${signed}"}'::jsonb WHERE request_id=$1`, [child]);
+    let entered!: () => void;
+    let release!: () => void;
+    const opened = new Promise<void>((resolve) => { entered = resolve; });
+    const closed = new Promise<void>((resolve) => { release = resolve; });
+    journal.resumeLookupBarrier = async () => { entered(); await closed; };
+    const pending = journal.decideToolResume({ requestId: child, uid: 3n,
+      canonicalModel: model, canonicalBody: first,
+      trustedAuthority: { kind: "bridge_signed", authorityTurnId: signed } });
+    await opened;
+    await outsider.query("BEGIN");
+    await outsider.query("SET LOCAL lock_timeout = '400ms'");
+    await assert.rejects(() => outsider.query(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+      [`box:session:3:${session}`]), /lock timeout|canceling statement due to lock timeout/i);
+    await outsider.query("ROLLBACK");
+    release();
+    const decision = await pending;
+    assert.equal(decision.kind, "new_claim");
+    journal.resumeLookupBarrier = null;
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [rival, JSON.stringify({ model,
+      authorityKind: "bridge_signed", authorityTurnId: signed,
+      boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing })]);
+    const again = await journal.decideToolResume({ requestId: rival, uid: 3n,
+      canonicalModel: model, canonicalBody: first,
+      trustedAuthority: { kind: "bridge_signed", authorityTurnId: signed } });
+    assert.equal(again.kind, "in_progress_or_unknown");
+    const states = await client.query<{ id: string; state: string | null }>(
+      `SELECT request_id AS id, ctx->>'boxState' AS state FROM request_finalize_journal
+        WHERE request_id = ANY($1::text[]) ORDER BY request_id`, [[owner, child, rival]]);
+    assert.equal(states.rows.find((row) => row.id === owner)?.state, "resuming");
+    assert.equal(states.rows.find((row) => row.id === child)?.state, "linked");
+    assert.equal(states.rows.find((row) => row.id === rival)?.state ?? null, null);
+    const stillTemp = await client.query<{ nspname: string }>(
+      `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE c.oid = to_regclass('request_finalize_journal')`);
+    assert.ok(stillTemp.rows[0]?.nspname.startsWith("pg_temp"));
+  } finally {
+    client.release();
+    outsider.release();
+    await pool.end();
+    await other.end();
+  }
+});

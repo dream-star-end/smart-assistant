@@ -4967,6 +4967,21 @@
           "assertion": "second TEMP claim keeps the client sibling and does not advance on failure"
         },
         {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPreparedContinuation.test.ts",
+          "assertion": "current image and hook tail is a continuation, not a fresh launch"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "TEMP authority mismatch and a second request id do not publish twice"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "prepared route, authority, and single publish"
+        },
+        {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-session-unavailable-rootfix.ts",
           "assertion": "INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary"

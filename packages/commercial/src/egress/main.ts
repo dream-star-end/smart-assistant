@@ -38,6 +38,7 @@ import {
 } from "../billing/modelCatalogRuntime.js";
 import { releasePreCheck, wrapIoredisForPreCheck } from "../billing/preCheck.js";
 import { settleBoxReplayBeforeDelivery } from "../billing/boxBillingRecovery.js";
+import { prepareBoxContinuation, BoxContinuationDecisionError } from "../http/proxy/boxPreparedContinuation.js";
 import { wrapIoredis } from "../middleware/rateLimit.js";
 import { AccountHealthTracker, wrapIoredisForHealth } from "../account-pool/health.js";
 import { AccountScheduler } from "../account-pool/scheduler.js";
@@ -335,9 +336,26 @@ export async function startEgress(): Promise<void> {
     }) : undefined;
   const boxModel = boxTextModel ? {
     toolBridgeReady: boxToolModel !== undefined,
-    fetch: (args: Parameters<BoxTextFetch["fetch"]>[0]) =>
-      args.canonicalBody.tools?.length && boxToolModel
-        ? boxToolModel.fetch(args) : boxTextModel.fetch(args),
+    fetch: (args: Parameters<BoxTextFetch["fetch"]>[0] & {
+      prepared?: ReturnType<typeof prepareBoxContinuation>;
+    }) => {
+      const prepared = args.prepared ?? prepareBoxContinuation({
+        uid: args.uid, canonicalModel: args.canonicalModel, rawBody: args.canonicalBody,
+        authorityKind: "local_catalog", authorityTurnId: null,
+      });
+      if (prepared.classification === "reject") {
+        throw new BoxContinuationDecisionError("reject",
+          prepared.rejectCode ?? "BOX_PREPARED_REJECT");
+      }
+      if (prepared.classification === "continuation_candidate") {
+        if (!boxToolModel) {
+          throw new BoxContinuationDecisionError("reject", "BOX_PREPARED_BRIDGE_REQUIRED");
+        }
+        return boxToolModel.fetch({ ...args, prepared });
+      }
+      return args.canonicalBody.tools?.length && boxToolModel
+        ? boxToolModel.fetch({ ...args, prepared }) : boxTextModel.fetch(args);
+    },
   } : undefined;
   // The resolver retains failed private ProxyAgent closes across requests;
   // retry only these proven pre-invocation orphans, never a remote unknown CLI.

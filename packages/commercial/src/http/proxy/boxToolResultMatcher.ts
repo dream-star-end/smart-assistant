@@ -54,6 +54,13 @@ function content(value: unknown): McpContent[] {
   return out;
 }
 
+export function matchPreparedToolResults(prepared: { effectiveBody: ProxyBody | null },
+  expected: readonly (BoxToolUse | BoxToolUseDigest)[],
+  catalog?: BoxToolCatalog): readonly BoxMatchedToolResult[] {
+  if (!prepared.effectiveBody) throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
+  return matchBoxToolResults(prepared.effectiveBody, expected, catalog);
+}
+
 export function matchBoxToolResults(body: ProxyBody,
   expected: readonly (BoxToolUse | BoxToolUseDigest)[],
   catalog?: BoxToolCatalog): readonly BoxMatchedToolResult[] {

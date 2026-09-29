@@ -15,6 +15,7 @@ const PROXY_FILES = [
   "boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts", "boxCallFingerprint.ts",
   "boxMessagesMapper.ts", "boxToolCatalog.ts", "boxToolInputHash.ts", "boxCliToolHandoff.ts", "shared.ts",
   "boxToolResultPlan.ts", "boxToolResultEcho.ts", "boxStageFiles.ts", "boxToolInputEcho.ts",
+  "boxPreparedContinuation.ts",
 ];
 const SCRIPT_FILES = [
   "scripts/check-v5-box-continuation.ts",
@@ -25,7 +26,7 @@ const FIXTURE_FILES = [
   "scripts/check-v5-box-continuation-859.png",
   "scripts/check-v5-box-continuation-859.oracle.json",
 ];
-const BUSINESS = /PROGRESS_COUNT_|HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL|C2_GATE|C2_DRIFT|CONTEXT_|HOOK_COUNT_|HOOK_CURRENT_|WRAPPED_|UNKNOWN_|CONTINUATION_|OPENING_|REWRITE_|EXPECTED_|BOX_TOOL_ECHO_|IMAGE_PUBLISH_|IMAGE_PUBLISHED_|IMAGE_MATCH_|IMAGE_FIXTURE_|IMAGE_ORACLE_|IMAGE_OWNER|IMAGE_NOT_LAST|IMAGE_COUNTS|IMAGE_GATE|IMAGE_RAW|IMAGE_IDEMPOTENT|IMAGE_BUDGET|IMAGE_DROPPED|IMAGE_ONE_BYTE|IMAGE_BYTE/;
+const BUSINESS = /PROGRESS_COUNT_|HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL|C2_GATE|C2_DRIFT|CONTEXT_|HOOK_COUNT_|HOOK_CURRENT_|WRAPPED_|UNKNOWN_|CONTINUATION_|OPENING_|REWRITE_|EXPECTED_|BOX_TOOL_ECHO_|IMAGE_PUBLISH_|IMAGE_PUBLISHED_|IMAGE_MATCH_|IMAGE_FIXTURE_|IMAGE_ORACLE_|IMAGE_OWNER|IMAGE_NOT_LAST|IMAGE_COUNTS|IMAGE_GATE|IMAGE_RAW|IMAGE_IDEMPOTENT|IMAGE_BUDGET|IMAGE_DROPPED|IMAGE_ONE_BYTE|IMAGE_BYTE|WRONG_ROUTE|AUTHORITY_BYPASS|DUPLICATE_PUBLISH/;
 const LOADER = /Cannot find module|ERR_MODULE|ERR_UNSUPPORTED|UNRESOLVED|DEP_ESCAPE|SyntaxError|RUNTIME_MODULES_/;
 
 function loader(): { cmd: string; args: string[] } {
@@ -513,6 +514,40 @@ for (const kind of ["drop", "text", "image", "id"] as const) {
     }
   });
 }
+
+test("wrong route, authority bypass, and duplicate publish are business-red", () => {
+  const faults: Array<{ file: string; from: string; to: string; expect: RegExp }> = [
+    { file: "boxPreparedContinuation.ts",
+      from: 'return { classification: "continuation_candidate", rejectCode: null, effectiveBody: effective,',
+      to: 'return { classification: "fresh", rejectCode: null, effectiveBody: effective,',
+      expect: /GATE_NOT_NULL|WRONG_ROUTE/ },
+    { file: "boxPreparedContinuation.ts",
+      from: "  if (left.kind === \"malformed\" || right.kind === \"malformed\") {",
+      to: "  return { ok: true };\n  if (left.kind === \"malformed\" || right.kind === \"malformed\") {",
+      expect: /AUTHORITY_BYPASS/ },
+    { file: "boxPreparedContinuation.ts",
+      from: 'return decision.kind === "new_claim";',
+      to: "return true;",
+      expect: /DUPLICATE_PUBLISH/ },
+  ];
+  for (const fault of faults) {
+    const dir = stage();
+    try {
+      const green = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(green), "green", green.stderr);
+      const target = join(dir, "packages/commercial/src/http/proxy", fault.file);
+      const before = readFileSync(target, "utf8");
+      assert.equal(before.includes(fault.from), true, fault.from);
+      writeFileSync(target, before.replace(fault.from, fault.to));
+      const red = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(red), "business", `${red.stderr}\n${red.stdout}`);
+      assert.match(red.stderr, fault.expect);
+      assert.doesNotMatch(red.stderr, LOADER);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 const AUDITOR_FAULT = "/home/agent/.openclaude/generated/ocv5-294-b1-gate-audit-hook-byte-negative/packages/commercial/src/http/proxy/boxCacheAnnotations.ts";
 function bytePatch(kind: "hook-space" | "wrapped-byte", source: string): string {

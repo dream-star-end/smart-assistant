@@ -138,8 +138,8 @@ const foldAt = boxCache.indexOf('const effective = foldBoxCcbHookContext(body);'
 const budgetAt = boxCache.indexOf('const kept = effective.messages.filter(', foldAt)
 if (stripAt < 0 || stripEnd <= stripAt || foldAt <= stripAt
   || foldAt >= stripEnd || budgetAt <= foldAt || budgetAt >= stripEnd
-  || !boxGate.includes('const effective = stripBoxCcbToolBudgetTail(body);')
-  || !boxFetch.includes('const messages = stripBoxCcbToolBudgetTail(body).messages;')) {
+  || !boxGate.includes('classifyBoxContinuation(body)')
+  || !boxFetch.includes('continuation_candidate')) {
   throw new Error('[box-hook-resume] shared fold-before-budget continuation path missing')
 }
 console.log('INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof')
@@ -159,6 +159,28 @@ if (!boxCache.includes('function foldProvenImageCaption(')
   || !boxCache.includes('1290x2796>923x2000@1.40')
   || !boxCache.includes('export function strictBoxImageBlock(')) {
   throw new Error('[box-image-continuation] proven caption fold is not on the shared hook path')
+}
+const preparedSrc = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxPreparedContinuation.ts'), 'utf8')
+const preparedGate = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRequestGate.ts'), 'utf8')
+const preparedFetch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolFetch.ts'), 'utf8')
+const preparedEgress = readFileSync(join(root,
+  'packages/commercial/src/egress/main.ts'), 'utf8')
+for (const marker of [
+  'export function decisionMayPublish',
+  'export function authoritiesBind',
+  'export function classifyBoxContinuation',
+]) {
+  if (!preparedSrc.includes(marker)) {
+    throw new Error(`[box-prepared-continuation] missing ${marker}`)
+  }
+}
+if (!preparedGate.includes('classifyBoxContinuation')
+  || !preparedFetch.includes('continuation_candidate')
+  || !preparedEgress.includes('continuation_candidate')) {
+  throw new Error('[box-prepared-continuation] gate, fetch, or egress does not consume the prepared class')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')
 const editEcho = readFileSync(join(root,
