@@ -9,8 +9,9 @@
  *   stdin `update_environment_variables` → CCB `process.env.ANTHROPIC_CUSTOM_HEADERS`
  *   → 每请求现读(client.ts getCustomHeaders,client 每请求新建)→ `/v1/messages` header。
  *
- * 所以本文件的断言全部落在**写进 stdin 的字节序列**上 —— 那是 gateway 侧唯一可观测、
- * 也是唯一有意义的 ground truth:
+ * 本文件断言落在 runner 写进 stdin 的控制行，以及一个自写的 node -e 适配进程。
+ * 那个进程自己解析 header 并自己发 HTTP，不是 claude-code-best。
+ * 真实 CLI 消费见 ccbRealCliHeaders.integ.test.ts。
  *   ① env 更新必须**先于** user message(同一管道按行处理 ⇒ 本 turn 首个上游请求必带新票);
  *   ② bridge turn → 只投影长 lease,短 authority / local catalog 均不出容器;
  *   ③ 无票的 turn → **写空串清位**(上一 turn 的 lease 绝不允许泄漏到下一 turn);
@@ -152,6 +153,7 @@ function parseEnvLine(line: string): Record<string, string> {
 }
 
 /** `ANTHROPIC_CUSTOM_HEADERS` 串 → header map(逐字节复刻 CCB getCustomHeaders 的解析)。 */
+/** Adapter only: this process parses headers itself. It is not claude-code-best. */
 const FORK_SCRIPT = `
 const http = require('http')
 const readline = require('readline')
@@ -341,7 +343,7 @@ describe('CCB authority headers — bridge turn', () => {
     assert.ok(!(LOCAL_CATALOG_HEADER in headers))
   })
 
-  it('已验签 Box 主 turn 的控制行经真实 fork 保留双头,renew 只换 lease,下一 turn 清位', async () => {
+  it('适配进程消费 Box 控制行:双头、renew 只换 lease、下一 turn 清位(不是 claude-code-best)', async () => {
     const box = {
       canonicalModel: 'box-api-claude-opus-5-5',
       contextWindow: 200_000,
