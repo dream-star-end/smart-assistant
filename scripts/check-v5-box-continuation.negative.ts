@@ -407,6 +407,7 @@ test("archive without git passes only with a strict expect-sha", () => {
     assert.ok(body.digest.some((item: { path: string }) => item.path.endsWith("check-v5-box-continuation-fixture.ts")));
     assert.equal(body.digest.some((item: { path: string }) => item.path.startsWith("..")), false);
     for (const name of ["boxToolResultPlan.ts", "boxToolResultEcho.ts", "boxStageFiles.ts",
+      "boxToolResumePublish.ts", "boxToolInputHash.ts", "upstream.ts",
       "check-v5-box-continuation-859.png", "check-v5-box-continuation-859.oracle.json"]) {
       const item = body.digest.find((row: { path: string; realpath?: string; sha256?: string }) => row.path.endsWith(name));
       assert.ok(item, name);
@@ -415,6 +416,25 @@ test("archive without git passes only with a strict expect-sha", () => {
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("publisher linked outside the candidate is source-rejected", () => {
+  const dir = stage();
+  const outside = mkdtempSync(join(tmpdir(), "ocv5-b1-publisher-escape-"));
+  try {
+    const inside = join(dir, "packages/commercial/src/http/proxy/boxToolResumePublish.ts");
+    const leaked = join(outside, "boxToolResumePublish.ts");
+    copyFileSync(inside, leaked);
+    rmSync(inside);
+    symlinkSync(leaked, inside);
+    const red = run(dir, ["--expect-sha", SHA]);
+    assert.notEqual(red.code, 0);
+    assert.match(red.stderr, /DEP_ESCAPE/);
+    assert.doesNotMatch(red.stdout, /"ok":true/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 

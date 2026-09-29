@@ -10,6 +10,10 @@ import { Pool } from "pg";
 import { BoxDurableJournal, BoxDurableJournalError } from "./boxDurableJournal.js";
 import { prepareBoxContinuation } from "./boxPreparedContinuation.js";
 import { publishBoxToolResume } from "./boxToolResumePublish.js";
+import { runBoxToolContinuation } from "./boxToolContinuation.js";
+import { runBoxToolFirstRound } from "./boxToolFirstRound.js";
+import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
+import { matchesBoxNativeHistory } from "./boxNativeHistory.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
@@ -323,6 +327,7 @@ test("raw image sibling publishes once, then final and a new user gain no second
   const client = await pool.connect();
   const localNonce = randomBytes(12).toString("hex");
   const runDir = `/tmp/ocv5-289-run-${localNonce}`;
+  const fast = process.env.OC_BOX_FAST_NATIVE;
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
@@ -451,21 +456,198 @@ test("raw image sibling publishes once, then final and a new user gain no second
       canonicalBody: second, prepared: nextPrepared });
     assert.equal(next.ownerRequestId, child);
     assert.equal(JSON.stringify(second.messages).includes(caption), true, "next claim does not backfill normalize");
-    await journal.completeToolChain({ requestId: grand, uid: 3n, leaseEpoch: epoch,
-      proof: { runNonce: localNonce, leaseEpoch: epoch, keeperPid: 1, cliPid: 2,
-        reason: "worker_complete", revision: 1 },
-      usage: { inputTokens: 3, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    process.env.OC_BOX_FAST_NATIVE = "1";
+    const cliModel = "claude-opus-5-5";
+    const streamEvent = (value: unknown) => ({ type: "stream_event", event: value });
+    const finalText = "done";
+    const spool = Buffer.from([
+      { type: "user", message: { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_next_claim", content: "next-bytes" }] } },
+      streamEvent({ type: "message_start", message: { id: "msg_final_img", model: cliModel,
+        role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+      streamEvent({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      streamEvent({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: finalText } }),
+      { type: "assistant", message: { id: "msg_final_img", model: cliModel, role: "assistant",
+        content: [{ type: "text", text: finalText }] } },
+      streamEvent({ type: "content_block_stop", index: 0 }),
+      streamEvent({ type: "message_delta", delta: { stop_reason: "end_turn" },
+        usage: { input_tokens: 2, output_tokens: 4 } }),
+      streamEvent({ type: "message_stop" }),
+      { type: "result", subtype: "success", is_error: false,
+        usage: { input_tokens: 2, output_tokens: 4 } },
+    ].map((row) => JSON.stringify(row) + "\n").join(""));
+    const transcriptSha = "ab".repeat(32);
+    const contExec = { run: async (command: { args: string[] }) => {
+      const args = command.args;
+      if (args[5] === "--read") {
+        const offset = Number(args[7]);
+        const part = spool.subarray(Math.max(0, offset - next.spoolOffset));
+        return { stdout: JSON.stringify({ offset: offset + part.length, data: part.toString("base64") }),
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("print(json.dumps({'sha256':actual")) {
+        return { stdout: JSON.stringify({ sha256: transcriptSha, size: spool.length }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      return { stdout: JSON.stringify({ runNonce: localNonce, leaseEpoch: epoch, keeperPid: 101,
+        cliPid: 102, reason: "worker_complete", revision: 1 }) + "\n",
+        stderrBytes: 0, exitCode: 0 as const };
+    } };
+    const continued = await runBoxToolContinuation({
+      published: { claim: next, target: { accountId: 20n, exec: contExec },
+        access: makeBoxDetachedRunAccess({ runNonce: next.runNonce,
+          detachedRunnerHash: next.detachedRunnerHash }) },
+      uid: 3n, requestId: grand, canonicalBody: second, upstreamModel: cliModel,
+      emit: () => {}, prepared: nextPrepared,
+    }, { journal, retainUnknownTarget: () => { throw new Error("owner must not be marked unknown"); },
+      onUnknown: async () => { throw new Error("owner must not be marked unknown"); } });
+    assert.equal(continued.kind, "final");
+    if (continued.kind !== "final") return;
+    assert.equal(continued.nativePointer?.nativeSessionId, "12345678-1234-4123-8123-123456789abc");
+    assert.equal(continued.nativePointer?.cliCwd, runDir);
+    assert.equal(continued.nativePointer?.transcriptSha256, transcriptSha);
+    const storedPointer = await client.query<{ pointer: { nativeSessionId?: string; cliCwd?: string } | null }>(
+      "SELECT ctx->'boxNativePointer' AS pointer FROM request_finalize_journal WHERE request_id=$1",
+      [grand]);
+    assert.equal(storedPointer.rows[0]?.pointer?.nativeSessionId, continued.nativePointer?.nativeSessionId);
+    assert.equal(storedPointer.rows[0]?.pointer?.cliCwd, runDir);
     const terminal = await client.query<{ state: string }>(
       "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
     assert.equal(terminal.rows[0]?.state, "terminal");
-    const ordinary = request(session, turn, [
-      ...originalBoundary(),
-      { role: "user", content: "thanks, the caption stayed" },
+    const nextTurn = randomBytes(32).toString("hex");
+    const nextPrompt = "thanks, the caption stayed";
+    const ordinary = request(session, nextTurn, [
+      ...second.messages,
+      { role: "assistant", content: [{ type: "text", text: finalText }] },
+      { role: "user", content: nextPrompt },
     ]);
+    assert.equal(JSON.stringify(ordinary.messages).includes(caption), true);
+    assert.equal(ordinary.messages.some((message) => JSON.stringify(message).includes(caption)
+      && JSON.stringify(message) === JSON.stringify(second.messages.find((item) =>
+        JSON.stringify(item).includes(caption)))), true, "caption bytes stay the raw sibling");
     const fresh = prepareBoxContinuation({ uid: 3n, canonicalModel: model, rawBody: ordinary,
       authorityKind: "local_catalog", authorityTurnId: null });
     assert.equal(fresh.classification, "fresh");
+    const nextId = `nat-${hex}`;
+    const candidate = await journal.findNativeCandidate({ uid: 3n, sessionId: session,
+      currentRequestId: nextId, canonicalModel: model });
+    assert.ok(candidate, "the continuation pointer is the native candidate");
+    assert.equal(candidate?.pointer.cliCwd, runDir);
+    assert.equal(matchesBoxNativeHistory(ordinary, candidate!.pointer), true,
+      "next raw history must match the persisted pointer");
+    assert.equal(candidate!.pointer.catalogHash, compileBoxToolCatalog(ordinary.tools).bindingSha256);
+    const parsedTools = (JSON.parse(JSON.stringify({ ...ordinary, model: cliModel })) as { tools: unknown }).tools;
+    assert.equal(compileBoxToolCatalog(parsedTools).bindingSha256, candidate!.pointer.catalogHash);
+    assert.equal(candidate!.pointer.upstreamModel, cliModel);
+    assert.equal(candidate!.pointer.accountId, "20");
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'inflight',$2::jsonb)`, [nextId, JSON.stringify({ model,
+      boxInvocationRecovery: "v1", billingPricing: pricing,
+      boxBillingContext: { ...billing, turnKey: nextTurn } })]);
+    const seenLaunch: { args: string[]; cwd: string; staged: string } = { args: [], cwd: "", staged: "" };
+    let controlHash = "";
+    let nativeInspects = 0;
+    let nextNonce = localNonce;
+    let nextEpoch = epoch;
+    const nativeExec = { run: async (command: { args: string[]; cwd: string }) => {
+      const args = command.args;
+      if (args[2]?.includes("identity['identityHash']")) {
+        const manifest = { accountId: args[5], controlDev: "2049", controlId: args[6],
+          controlIno: "9001", leaseEpoch: args[4], lockDev: "2049", lockIno: "9002",
+          runNonce: args[3], version: 2 };
+        nextNonce = String(args[3]);
+        nextEpoch = String(args[4]);
+        controlHash = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+        return { stdout: JSON.stringify({ ...manifest, identityHash: controlHash }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("def clean_dir(parent_path,name,allowed):")) {
+        return { stdout: `cleaned:${controlHash}\n`, stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("print(json.dumps({'sha256':actual")) {
+        nativeInspects += 1;
+        assert.equal(args[3], runDir);
+        assert.equal(args[4], "12345678-1234-4123-8123-123456789abc");
+        return { stdout: JSON.stringify({ sha256: transcriptSha, size: spool.length }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("print('staged:'+str(len(steps)))")) {
+        const decoded = Buffer.from(args[3]!, "base64").toString("utf8");
+        seenLaunch.staged = decoded;
+        for (const match of decoded.matchAll(/[A-Za-z0-9+/]{40,}={0,2}/g)) {
+          try { seenLaunch.staged += Buffer.from(match[0], "base64").toString("utf8"); }
+          catch { /* not a payload */ }
+        }
+        const steps = JSON.parse(decoded) as unknown[];
+        return { stdout: `staged:${steps.length}\n`, stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("sys.argv=[p,*argv]")
+        && args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-") && args[5] !== "--read") {
+        seenLaunch.args = args;
+        seenLaunch.cwd = command.cwd;
+        return { stdout: "launched\n", stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[5] === "--read") {
+        const offset = Number(args[7]);
+        const nextSpool = Buffer.from([
+          { type: "system", subtype: "init", tools: ["mcp__ocbridge__t0", "mcp__ocbridge__t1"],
+            mcp_servers: [{}] },
+          streamEvent({ type: "message_start", message: { id: "msg_native_next", model: cliModel,
+            role: "assistant", content: [], usage: { input_tokens: 1, output_tokens: 0 } } }),
+          streamEvent({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+          streamEvent({ type: "content_block_delta", index: 0,
+            delta: { type: "text_delta", text: "native-next" } }),
+          { type: "assistant", message: { id: "msg_native_next", model: cliModel, role: "assistant",
+            content: [{ type: "text", text: "native-next" }] } },
+          streamEvent({ type: "content_block_stop", index: 0 }),
+          streamEvent({ type: "message_delta", delta: { stop_reason: "end_turn" },
+            usage: { input_tokens: 1, output_tokens: 4 } }),
+          streamEvent({ type: "message_stop" }),
+          { type: "result", subtype: "success", is_error: false,
+            usage: { input_tokens: 1, output_tokens: 4 } },
+        ].map((row) => JSON.stringify(row) + "\n").join(""));
+        const part = nextSpool.subarray(Math.min(offset, nextSpool.length));
+        return { stdout: JSON.stringify({ data: part.toString("base64"), offset: offset + part.length }),
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[2]?.includes("terminal.json")) {
+        return { stdout: JSON.stringify({ runNonce: nextNonce, leaseEpoch: nextEpoch,
+          keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 }) + "\n",
+          stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[3]?.startsWith("/tmp/ocv5-289-") && !args[3]?.startsWith("/tmp/ocv5-289-run-")) {
+        const manifest = Array.from({ length: (args.length - 3) / 4 }, (_, i) => args[5 + i * 4]).join(",");
+        return { stdout: `${manifest}\n`, stderrBytes: 0, exitCode: 0 as const };
+      }
+      return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
+    } };
     const filesBefore = readdirSync(runDir).filter((name) => name.startsWith("result.")).sort();
+    const imageBefore = readFileSync(`${runDir}/result.toolu_img_claim.json`);
+    await runBoxToolFirstRound({
+      uid: 3n, sessionId: session, requestId: nextId, canonicalModel: model,
+      canonicalBody: ordinary, upstreamModel: cliModel, url: BOX_INTERNAL_ENDPOINT,
+      init: { method: "POST", body: JSON.stringify({ ...ordinary, model: cliModel }) },
+      emit: () => {},
+    }, {
+      supervisorAsset: Buffer.from("print('supervisor')\n"),
+      keeperAsset: Buffer.from("print('keeper')\n"),
+      virtualMcpAsset: Buffer.from("print('virtual')\n"),
+      detachedRunnerAsset: Buffer.from("print('runner')\n"),
+      journal, maxOutputTokensForModel: () => 128,
+      resolveTarget: async () => ({ accountId: 20n, exec: nativeExec, dispose: async () => {} }) as never,
+      onUnknown: async () => { seenLaunch.staged += "\nUNKNOWN"; },
+      retainUnknownTarget: () => { seenLaunch.staged += "\nRETAIN"; },
+      retainCleanupTarget: () => {},
+    });
+    assert.ok(nativeInspects >= 1, "native preflight must run before the resume launch");
+    const cliCwdAt = seenLaunch.args.indexOf("--cli-cwd");
+    const resumeAt = seenLaunch.args.indexOf("--resume");
+    assert.equal(seenLaunch.args[cliCwdAt + 1], runDir);
+    assert.equal(seenLaunch.args[resumeAt + 1], "12345678-1234-4123-8123-123456789abc");
+    assert.equal(seenLaunch.args.includes("--session-id"), false);
+    assert.equal(seenLaunch.staged.includes(nextPrompt), true);
+    assert.deepEqual(readdirSync(runDir).filter((name) => name.startsWith("result.")).sort(), filesBefore);
+    assert.equal(readFileSync(`${runDir}/result.toolu_img_claim.json`).equals(imageBefore), true);
     const rebuilt = new BoxDurableJournal({ connect: async () => ({
       query: client.query.bind(client), release: () => {} }),
       query: client.query.bind(client) } as never);
@@ -479,6 +661,8 @@ test("raw image sibling publishes once, then final and a new user gain no second
       "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1", [owner]);
     assert.equal(ownerAfter.rows[0]?.state, "terminal");
   } finally {
+    if (fast === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = fast;
     rmSync(runDir, { recursive: true, force: true });
     client.release();
     await pool.end();
