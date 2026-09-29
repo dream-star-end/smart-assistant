@@ -10,6 +10,7 @@ import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof } from "./boxTerminalProof.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
+import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 
@@ -60,8 +61,14 @@ export async function observeBoxToolTerminalOnly(input: {
   try {
     const access = makeBoxDetachedRunAccess({ runNonce: id.runNonce,
       detachedRunnerHash: id.detachedRunnerHash });
+    const progress: BoxToolProgressBinding | undefined = id.roundNo > 1
+      && id.priorToolUses && id.nativeSessionId
+      ? { toolUses: id.priorToolUses, nativeSessionId: id.nativeSessionId,
+        catalog: input.catalog }
+      : undefined;
     const decoder = new BoxCliToolHandoffDecoder(id.upstreamModel, input.catalog,
-      { alreadyInitialized: id.roundNo > 1, allowFinal: true });
+      { alreadyInitialized: id.roundNo > 1, allowFinal: true,
+        ...(progress ? { progress } : {}) });
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;
     let modelStarted = false;
     let endOffset = id.spoolOffset;

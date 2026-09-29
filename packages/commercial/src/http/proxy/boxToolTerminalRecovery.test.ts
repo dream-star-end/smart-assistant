@@ -181,6 +181,79 @@ test("journal state committed with boxState unknown is not a terminal winner", a
   assert.deepEqual(outcome, { status: "pending", reason: "BOX_TOOL_CHAIN_INVALID" });
 });
 
+test("bound heartbeat still needs a real final proof and exact EOF", async () => {
+  const { createHash } = await import("node:crypto");
+  const native = "11111111-1111-4111-8111-111111111111";
+  const outer = "a95915c9-b92f-4980-8c7a-d339e54e5767";
+  const parent = use.id;
+  const echo = { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: parent, content: "ok" }] } };
+  const hash = createHash("sha256").update(JSON.stringify({
+    content: [{ type: "text", text: "ok" }], isError: false })).digest("hex");
+  const beat = (session: string, patch: Record<string, unknown> = {}) => ({
+    type: "tool_progress", tool_use_id: `${parent}-heartbeat-0`, tool_name: use.name,
+    parent_tool_use_id: parent, elapsed_time_seconds: 30, heartbeat: true,
+    session_id: session, uuid: "22222222-2222-4222-8222-222222222222", ...patch });
+  const bound = { ...evidence, roundNo: 2, spoolOffset: 0,
+    resultHashes: [{ modelToolUseId: parent, contentHash: hash, isError: false }],
+    priorToolUses: [{ id: parent, boxName: use.name, clientName: "local_echo",
+      inputHash: "f".repeat(64) }],
+    nativeSessionId: native };
+  const finalBody = finalRecords.slice(1);
+  const run = async (records: unknown[], execPatch?: (args: string[]) => unknown) => {
+    let writes = 0, completes = 0;
+    const outcome = await observeBoxToolTerminalOnly({
+      evidence: bound, catalog, budgetMs: 1000,
+      target: { accountId: 20n, exec: { run: async (req: { args: string[] }) => {
+        const custom = execPatch?.(req.args);
+        if (custom) return custom;
+        return spool(records).exec.run(req);
+      } } } as never }, {
+      writeMessage: async (id) => { writes++; return { version: 1 as const, ...id,
+        bytes: 8, sha256: "e".repeat(64) }; },
+      journal: { complete: async () => { throw new Error("not root"); },
+        completeToolChain: async () => { completes++; },
+        readRecoveryWinner: async () => null } as never });
+    return { outcome, writes, completes };
+  };
+  const plain = await run([echo, ...finalBody]);
+  assert.equal(plain.outcome.status, "committed");
+  assert.equal(plain.writes, 1);
+  assert.equal(plain.completes, 1);
+  const prefixed = await run([{ type: "rate_limit_event" }, beat(native), echo, ...finalBody]);
+  assert.equal(prefixed.outcome.status, "committed");
+  assert.equal(prefixed.writes, 1);
+  assert.equal(prefixed.completes, 1);
+  for (const records of [
+    [beat(outer), echo, ...finalBody],
+    [beat(native, { parent_tool_use_id: "toolu_other", tool_use_id: "toolu_other-heartbeat-0" }),
+      echo, ...finalBody],
+    [beat(native, { tool_name: "mcp__ocbridge__t9" }), echo, ...finalBody],
+    [beat(native)],
+  ]) {
+    const rejected = await run(records);
+    assert.equal(rejected.outcome.status, "pending");
+    assert.equal(rejected.writes, 0);
+    assert.equal(rejected.completes, 0);
+  }
+  const unbound = await observeBoxToolTerminalOnly({
+    evidence: { ...bound, priorToolUses: undefined, nativeSessionId: undefined },
+    catalog, budgetMs: 1000,
+    target: spool([beat(native), echo, ...finalBody]) as never }, {
+    writeMessage: async () => { throw new Error("must not write"); },
+    journal: { complete: async () => { throw new Error("must not complete"); },
+      completeToolChain: async () => { throw new Error("must not complete"); },
+      readRecoveryWinner: async () => null } as never });
+  assert.deepEqual(unbound, { status: "pending", reason: "BOX_TOOL_RECORD_INVALID" });
+  const noProof = await run([beat(native), echo, ...finalBody], (args) => {
+    if (args[2]?.includes("terminal.json")) throw new Error("proof unread");
+    return undefined;
+  });
+  assert.equal(noProof.outcome.status, "pending");
+  assert.equal(noProof.writes, 0);
+  assert.equal(noProof.completes, 0);
+});
+
 test("journal state committed with boxState handoff is not a terminal winner", async () => {
   const echo = { type: "user", message: { role: "user", content: [{
     type: "tool_result", tool_use_id: use.id, content: "ok" }] } };

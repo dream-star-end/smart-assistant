@@ -5049,6 +5049,21 @@
           "layer": "integration",
           "path": "packages/commercial/src/http/proxy/boxDurableJournal.progress.integ.test.ts",
           "assertion": "TEMP owner chain projects prior tool uses and the root native session"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.progress.integ.test.ts",
+          "assertion": "three-row owner projects the immediate tool and not a child session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "bound heartbeat still needs a real final proof and exact EOF"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolProgress.test.ts",
+          "assertion": "root cli session is the only progress authority"
         }
       ],
       "preparedBehaviorGate": {

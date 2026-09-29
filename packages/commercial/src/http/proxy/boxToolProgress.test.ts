@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { acceptBoxToolProgress, classifyBoxToolProgress } from "./boxToolProgress.js";
+import { acceptBoxToolProgress, classifyBoxToolProgress,
+  projectRootCliSession } from "./boxToolProgress.js";
 
 const catalog = compileBoxToolCatalog([{ name: "Bash", description: "synthetic",
   input_schema: { type: "object", properties: {} } }]);
@@ -53,4 +54,14 @@ test("strict heartbeat shape accepts 30 60 540 and rejects malformed progress", 
   assert.equal(acceptBoxToolProgress({ ...ok.heartbeat, toolName: "mcp__ocbridge__t1" }, binding), false);
   assert.equal(acceptBoxToolProgress(ok.heartbeat, { ...binding,
     toolUses: [{ id: parent, boxName, clientName: "Read" }] }), false);
+});
+
+test("root cli session is the only progress authority", () => {
+  const root = "a3672b03-820a-4834-8d6a-c644d0f0df10";
+  const child = "11111111-1111-4111-8111-111111111111";
+  assert.equal(projectRootCliSession(root, [root, root]), root);
+  assert.equal(projectRootCliSession(undefined, [child]), undefined);
+  assert.equal(projectRootCliSession("not-a-uuid", [child]), undefined);
+  assert.equal(projectRootCliSession(root, [child]), undefined);
+  assert.equal(projectRootCliSession(root, ["not-a-uuid"]), undefined);
 });

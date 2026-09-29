@@ -92,6 +92,22 @@ test("TEMP owner chain projects prior tool uses and the root native session",
       [["toolu_prior_a", "mcp__ocbridge__t2", "Bash"]]);
     assert.equal(found?.nativeSessionId, native);
     assert.notEqual(found?.nativeSessionId, outer);
+    const recovered = await journal.readDetachedUnknownRecovery({
+      requestId: "prog-child", uid: 3n, accountId: 20n,
+      runNonce: "1".repeat(24), leaseEpoch: "2".repeat(32), linked: true });
+    assert.equal(recovered.ok, true);
+    if (recovered.ok) {
+      assert.deepEqual(recovered.evidence.priorToolUses?.map((use) => use.id), ["toolu_prior_a"]);
+      assert.equal(recovered.evidence.nativeSessionId, native);
+    }
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx-'boxNativeSessionId' WHERE request_id='prog-root'`);
+    const childCannotCertify = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: body.model, canonicalBody: body });
+    assert.equal(childCannotCertify?.nativeSessionId, undefined);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxNativeSessionId}',to_jsonb($1::text))
+      WHERE request_id='prog-root'`, [native]);
     await client.query(`UPDATE request_finalize_journal
       SET ctx=jsonb_set(ctx,'{boxToolHandoff,catalogHash}',to_jsonb($1::text))
       WHERE request_id='prog-root'`, ["0".repeat(64)]);
@@ -105,6 +121,53 @@ test("TEMP owner chain projects prior tool uses and the root native session",
     const conflicted = await journal.findReplayIdentity({ uid: 3n, canonicalModel: body.model,
       canonicalBody: body });
     assert.equal(conflicted?.nativeSessionId, undefined);
+    const body3 = { ...body, metadata: { user_id: JSON.stringify({
+      session_id: "session-outer-3", oc_turn_key: "b".repeat(64) }) } } as ProxyBody;
+    const view3 = consumePrepared({ uid: 3n, canonicalModel: body3.model,
+      canonicalBody: body3, allowPrepareOnce: true, replayAlias: true });
+    const revOwner = "33333333-3333-4333-8333-333333333333";
+    const revLeaf = "44444444-4444-4444-8444-444444444444";
+    const rootHandoff = { ...handoff, spoolOffset: 100, toolUses: [{
+      id: "toolu_root_only", boxName: "mcp__ocbridge__t2", clientName: "Bash",
+      inputHash: "1".repeat(64) }], verifiedPendingToolUseIds: ["toolu_root_only"] };
+    const ownerHandoff = { ...handoff, roundNo: 2, spoolOffset: 200, toolUses: [{
+      id: "toolu_immediate", boxName: "mcp__ocbridge__t2", clientName: "Bash",
+      inputHash: "2".repeat(64) }], verifiedPendingToolUseIds: ["toolu_immediate"] };
+    const chain = { ...shared, boxSessionId: view3.fingerprint.sessionId,
+      boxTurnKey: view3.fingerprint.turnKey };
+    await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+      VALUES ($1,3,'committed',$2::jsonb), ($3,3,'committed',$4::jsonb),
+             ($5,3,'inflight',$6::jsonb)`, [
+      "prog3-root", JSON.stringify({ ...chain, boxState: "resuming", boxLaunchPermit: true,
+        boxToolHandoff: rootHandoff, boxResumeRequestId: "prog3-owner",
+        boxResumeRevision: revOwner, boxResumeResultHashes: [{
+          modelToolUseId: "toolu_root_only", contentHash: "9".repeat(64), isError: false }] }),
+      "prog3-owner", JSON.stringify({ ...chain, boxState: "resuming", boxRoundNo: 2,
+        boxResumeSpoolOffset: 100, boxOwnerRequestId: "prog3-root",
+        boxParentResumeRevision: revOwner, boxToolHandoff: ownerHandoff,
+        boxResumeRequestId: "prog3-leaf", boxResumeRevision: revLeaf,
+        boxResumeResultHashes: [{ modelToolUseId: "toolu_immediate",
+          contentHash: "8".repeat(64), isError: false }] }),
+      "prog3-leaf", JSON.stringify({ ...chain, boxState: "unknown", boxRoundNo: 3,
+        boxResumeSpoolOffset: 200, boxOwnerRequestId: "prog3-owner",
+        boxParentResumeRevision: revLeaf,
+        boxReplayFingerprint: view3.fingerprint.replayFingerprint })]);
+    const three = await journal.findReplayIdentity({ uid: 3n, canonicalModel: body3.model,
+      canonicalBody: body3 });
+    assert.deepEqual(three?.priorToolUses?.map((use) => use.id), ["toolu_immediate"],
+      "three-row owner projects the immediate tool and not a child session");
+    assert.equal(three?.nativeSessionId, native);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=jsonb_set(ctx,'{boxToolHandoff,catalogHash}',to_jsonb($1::text))
+      WHERE request_id='prog3-owner'`, ["0".repeat(64)]);
+    const noFallback = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: body3.model, canonicalBody: body3 });
+    assert.equal(noFallback?.priorToolUses, undefined);
+    await client.query(`UPDATE request_finalize_journal
+      SET ctx=ctx-'boxNativeSessionId' WHERE request_id='prog3-root'`);
+    const rootMissing = await journal.findReplayIdentity({ uid: 3n,
+      canonicalModel: body3.model, canonicalBody: body3 });
+    assert.equal(rootMissing?.nativeSessionId, undefined);
     const publicAfter = await publicRel();
     assert.deepEqual(publicAfter, publicBefore);
     assert.equal(publicAfter.n, "0");

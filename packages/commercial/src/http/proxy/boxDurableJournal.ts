@@ -16,6 +16,7 @@ import { matchPreparedToolResults, type BoxMatchedToolResult } from "./boxToolRe
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
+import { projectRootCliSession } from "./boxToolProgress.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES,
   reserveBoxToolEcho } from "./boxToolCapacity.js";
 import { authorityFromJournalCtx, consumePrepared, isContinuationConflict,
@@ -203,6 +204,11 @@ export interface BoxDetachedUnknownRecovery {
   readonly rootLaunchPermit: true;
   readonly resultHashes: readonly { modelToolUseId: string; contentHash: string;
     isError: boolean }[] | null;
+  /** Immediate owner's stored tool digests. Not persisted and not taken from
+   * the HTTP body. Omitted when that handoff does not match this leaf. */
+  readonly priorToolUses?: readonly BoxToolUseDigest[];
+  /** Valid root CLI session only. A child value never fills a missing root. */
+  readonly nativeSessionId?: string;
 }
 export interface BoxRecoveryWinner {
   readonly state: string;
@@ -367,6 +373,28 @@ function parseRecoveryResultHashes(raw: unknown):
   });
   if (new Set(hashes.map((item) => item.modelToolUseId)).size !== hashes.length) return null;
   return hashes;
+}
+
+/** Read-only progress binding for one already validated recovery chain.
+ * Tool digests come from the immediate owner. The CLI session comes only
+ * from the root row. Nothing here is written back. */
+function recoveryProgress(rows: readonly { ctx: Record<string, unknown> }[],
+  roundNo: number, spoolOffset: number, catalogHash: unknown, runnerHash: unknown):
+  Pick<BoxDetachedUnknownRecovery, "priorToolUses" | "nativeSessionId"> {
+  const root = rows[rows.length - 1];
+  const nativeSessionId = root ? projectRootCliSession(root.ctx.boxNativeSessionId,
+    rows.slice(0, -1).flatMap((row) => Object.hasOwn(row.ctx, "boxNativeSessionId")
+      ? [row.ctx.boxNativeSessionId] : [])) : undefined;
+  let priorToolUses: BoxDetachedUnknownRecovery["priorToolUses"];
+  if (roundNo > 1 && rows[1]) {
+    const stored = parseBoxStoredToolHandoff(rows[1].ctx.boxToolHandoff);
+    if (stored && stored.catalogHash === catalogHash && stored.detachedRunnerHash === runnerHash
+      && stored.roundNo + 1 === roundNo && stored.spoolOffset === spoolOffset) {
+      priorToolUses = stored.toolUses;
+    }
+  }
+  return { ...(priorToolUses ? { priorToolUses } : {}),
+    ...(nativeSessionId ? { nativeSessionId } : {}) };
 }
 
 export class BoxDurableJournal implements BoxJournalPort {
@@ -640,18 +668,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       let row = matched;
       const seen = new Set<string>();
       let priorToolUses: BoxReplayIdentity["priorToolUses"];
-      let projectedNative: string | undefined;
-      let nativeConflict = false;
-      const noteNative = (ctx: Record<string, unknown>): void => {
-        if (!Object.hasOwn(ctx, "boxNativeSessionId")) return;
-        const value = ctx.boxNativeSessionId;
-        if (typeof value !== "string" || !UUID_V4.test(value)) {
-          nativeConflict = true;
-          return;
-        }
-        if (projectedNative === undefined) projectedNative = value;
-        else if (projectedNative !== value) nativeConflict = true;
-      };
+      const descendantSessions: unknown[] = [];
       for (let hop = 0; hop < BOX_TOOL_MAX_ROUNDS; hop++) {
         if (seen.has(row.request_id)
           || row.ctx.boxInvocationRecovery !== "v1"
@@ -674,11 +691,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         });
         if (!bound.ok) throw new BoxDurableJournalError(bound.code);
         seen.add(row.request_id);
-        noteNative(row.ctx);
         const owner = row.ctx.boxOwnerRequestId;
         if (owner === undefined) {
           await client.query("COMMIT"); committed = true;
-          if (nativeConflict) projectedNative = undefined;
+          const nativeSessionId = projectRootCliSession(
+            row.ctx.boxNativeSessionId, descendantSessions);
           return { requestId: matched.request_id, rootRequestId: row.request_id,
             uid: input.uid, accountId: BigInt(accountId), runNonce, leaseEpoch,
             invocationMode: mode, state: original.boxState as string,
@@ -690,7 +707,10 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(typeof upstreamModel === "string" ? { upstreamModel } : {}),
              ...(resultHashes ? { resultHashes } : {}),
              ...(priorToolUses ? { priorToolUses } : {}),
-             ...(projectedNative ? { nativeSessionId: projectedNative } : {}) };
+             ...(nativeSessionId ? { nativeSessionId } : {}) };
+        }
+        if (Object.hasOwn(row.ctx, "boxNativeSessionId")) {
+          descendantSessions.push(row.ctx.boxNativeSessionId);
         }
         if (typeof owner !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(owner)) {
           throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -2312,7 +2332,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
       catalogHash: ctx.boxCatalogHash as string,
       detachedRunnerHash: ctx.boxDetachedRunnerHash as string,
-      rootRequestId: root.request_id, rootLaunchPermit: true, resultHashes } };
+      rootRequestId: root.request_id, rootLaunchPermit: true, resultHashes,
+      ...recoveryProgress(rows, Number(roundNo), Number(spoolOffset),
+        ctx.boxCatalogHash, ctx.boxDetachedRunnerHash) } };
   }
 
   /** Same-identity reread after a lost CAS. Not a second admission.

@@ -76,3 +76,14 @@ export function acceptBoxToolProgress(heartbeat: BoxToolProgressHeartbeat,
   const clientName = binding.catalog.clientNameByBoxName.get(heartbeat.toolName);
   return clientName !== undefined && clientName === match.clientName;
 }
+
+/** Only a valid root CLI session authorizes progress. Descendants may match
+ * that value; a missing or illegal root cannot be replaced by a child. */
+export function projectRootCliSession(rootValue: unknown,
+  descendantValues: readonly unknown[]): string | undefined {
+  if (typeof rootValue !== "string" || !UUID_V4.test(rootValue)) return undefined;
+  for (const value of descendantValues) {
+    if (value !== rootValue) return undefined;
+  }
+  return rootValue;
+}
