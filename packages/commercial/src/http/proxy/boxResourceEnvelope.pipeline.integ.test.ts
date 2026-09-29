@@ -361,13 +361,19 @@ async function runStep(step: BoxCcExecRequest, from: string, root: string): Prom
   });
 }
 
+type StageReceipt = {
+  execs: number;
+  claudeRunSpawned: boolean;
+  publication: { files: number; bytes: number; sha256: string } | null;
+};
+
 async function execStage(plan: {
   cwd: string;
   snapshotHash: string | null;
   stageInputs: readonly BoxCcExecRequest[];
   run: BoxCcExecRequest;
   cleanup: BoxCcExecRequest;
-}): Promise<{ execs: number; claudeRunSpawned: boolean; publication: { files: number; bytes: number; sha256: string } | null }> {
+}): Promise<StageReceipt> {
   const root = `/tmp/ocv5-296-pipe-${randomBytes(4).toString("hex")}`;
   const from = "/home/box/.claude/projects";
   mkdirSync(root, { mode: 0o700 });
@@ -459,7 +465,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
   const pool = new pg.Pool({
     connectionString: TEST_DB,
     max: 4,
-    applicationName: "ocv5-296-c-pipeline",
+    application_name: "ocv5-296-c-pipeline",
     options: `-c search_path=${SCHEMA}`,
   });
   const redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 1, enableReadyCheck: true });
@@ -611,8 +617,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
 
     async function positive(requestId: string, payload: Record<string, unknown> | Buffer) {
       let fetches = 0;
-      let stage: Awaited<ReturnType<typeof execStage>> | null = null;
-      let stageError: string | null = null;
+      const stageBox: { stage: StageReceipt | null; stageError: string | null } = { stage: null, stageError: null };
       const handler = candidateMod.makeAnthropicProxyHandler(makeDeps(async (args) => {
         fetches += 1;
         const plan = candidatePlan.makeBoxTextPlan({
@@ -622,7 +627,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
           supervisorAsset: supervisor,
           keeperAsset: keeper,
         });
-        stage = await execStage(plan);
+        stageBox.stage = await execStage(plan);
         return sseResponse();
       }) as never);
       const measured = await withPeak(() => call(
@@ -639,7 +644,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
           LEFT JOIN usage_records ur ON ur.request_id = j.request_id AND ur.user_id = j.user_id
           LEFT JOIN credit_ledger cl ON cl.id = ur.ledger_id
          WHERE j.request_id = $1`, [requestId]);
-      return { requestId, http: measured.value, fetches, stage, stageError, measured: {
+      return { requestId, http: measured.value, fetches, stage: stageBox.stage, stageError: stageBox.stageError, measured: {
         elapsedMs: measured.elapsedMs, sampledPeakRss: measured.sampledPeakRss, endRss: measured.endRss,
         maxRssKbBefore: measured.maxRssKbBefore, maxRssKbAfter: measured.maxRssKbAfter,
       }, rows: rows.rows };
@@ -885,7 +890,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
     }) }));
   } finally {
     const cleanupErrors: string[] = [];
-    const fail = async (label: string, fn: () => Promise<void> | void) => {
+    const fail = async (label: string, fn: () => unknown) => {
       try { await fn(); } catch (error) { cleanupErrors.push(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
     };
     if (previousBox === undefined) delete process.env.OC_BOX_MODEL_API;
