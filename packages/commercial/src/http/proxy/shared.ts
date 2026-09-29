@@ -280,10 +280,8 @@ export function runWithVerifiedProxyByteBudget<T>(
 /**
  * Strict read of `capabilityProfile.ccb.contextOwner`. Absent or any other
  * value is not this envelope. Does not look at headers or body.model.
- * Author B owns the shared catalog type; this reads the live object as unknown
- * so a later `contextOwner` field is visible without editing that type.
- * `parseCapabilityProfile` currently drops unknown ccb keys, so a real catalog
- * row stays legacy until that parser keeps `contextOwner`.
+ * Catalog declaration alone does not select the enlarged budget; the handler
+ * also requires the issuance ready bit and the verified signed envelope.
  */
 export function readBoxNativeContextOwner(
   capabilityProfile: unknown,
@@ -302,46 +300,26 @@ export interface VerifiedBoxEnvelopeInput {
   authorityKind: string | null | undefined;
   /** `selectUpstreamRoute().kind`. Not body.model. */
   routeKind: string | null | undefined;
-  /** `gate.descriptor.capabilityProfile`. */
-  capabilityProfile: unknown;
-  /**
-   * Server route readiness: catalog route is box AND `OC_BOX_MODEL_API=1`
-   * AND the Box transport is injected. Same arming condition as
-   * `validateUpstreamConfig`'s boxConfigured check. Client input cannot set this.
-   * Align with author B's ready bit at main merge if that bit is narrower.
-   */
-  serverRouteReady: boolean;
+  canonicalModel?: string | null;
+  providerId?: string | null;
+  /** Catalog declaration. Not sufficient by itself. */
+  declaredContextOwner?: string | null;
+  /** Full authority envelope only. Null means lease-only or local catalog. */
+  verifiedSignedContextOwner?: string | null;
+  /** Issuance `BOX_NATIVE_CONTEXT_ROUTE_READY`. Not `OC_BOX_MODEL_API`. */
+  routeReady: boolean;
 }
 
-/** Enlarged envelope only when every verified condition holds. Otherwise legacy. */
+/** Mirrors `issueBoxNativeContextOwner` plus the verified signed token. */
 export function selectVerifiedBoxByteBudget(input: VerifiedBoxEnvelopeInput): ProxyByteBudget {
-  if (input.serverRouteReady !== true) return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.routeReady !== true) return PROXY_BYTE_BUDGET_LEGACY;
   if (input.authorityKind !== "bridge_signed") return PROXY_BYTE_BUDGET_LEGACY;
   if (input.routeKind !== "box") return PROXY_BYTE_BUDGET_LEGACY;
-  if (readBoxNativeContextOwner(input.capabilityProfile) !== BOX_NATIVE_CONTEXT_OWNER) {
-    return PROXY_BYTE_BUDGET_LEGACY;
-  }
+  if (input.providerId !== "box_cli") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.canonicalModel !== "box-api-claude-opus-5-5") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.declaredContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.verifiedSignedContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return PROXY_BYTE_BUDGET_LEGACY;
   return PROXY_BYTE_BUDGET_BOX_NATIVE_V1;
-}
-
-/**
- * Adapter from the production gate object. Does not invent a signature or a
- * capability. `serverRouteReady` is computed by the handler, not the client.
- */
-export function budgetFromVerifiedGate(
-  gate: {
-    authorityKind?: string | null;
-    descriptor?: { capabilityProfile?: unknown } | null;
-  } | null,
-  routeKind: string | null | undefined,
-  serverRouteReady: boolean,
-): ProxyByteBudget {
-  return selectVerifiedBoxByteBudget({
-    authorityKind: gate?.authorityKind,
-    routeKind,
-    capabilityProfile: gate?.descriptor?.capabilityProfile,
-    serverRouteReady,
-  });
 }
 
 /** messages / tools 数量上限。

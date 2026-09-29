@@ -207,6 +207,7 @@ export function makeBoxTextPlan(input: {
     { asset: input.keeperAsset, path: keeperPath },
   ]);
   const staged = makeBoxStageFiles({ cwd, project,
+    snapshotMaxBytes: snapshotCeiling,
     files: [
       ...(hasHistory ? [{ path: snapshotPath, raw: snapshot, hash: snapshotHash! }] : []),
       { path: stdinPath, raw: stdin, hash: stdinHash },

@@ -11,7 +11,9 @@ const PYTHON = "/usr/bin/python3";
 const ENV = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" };
 const RAW_CHUNK_BYTES = 48 * 1024;
 const CHUNKS_PER_EXEC = 4;
-const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
+/** Snapshot jsonl only. Other staged paths stay at 8 MiB. */
+const SNAPSHOT_MAX_FILE_BYTES = 24 * 1024 * 1024;
 
 export class BoxStageError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxStageError"; }
@@ -124,10 +126,26 @@ finally:
  for fd in fds.values():os.close(fd)
 print('clean')`;
 
+function isSnapshotPath(project: string, path: string): boolean {
+  return project !== ""
+    && new RegExp(`^${project.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[0-9a-f-]{36}\\.jsonl$`).test(path);
+}
+
+/** 8 MiB script stays byte-identical. A larger baked limit is only for a snapshot. */
+function scriptWithLimit(source: string, maxBytes: number): string {
+  if (maxBytes === DEFAULT_MAX_FILE_BYTES) return source;
+  return source.replace("8*1024*1024", String(maxBytes));
+}
+
 export function makeBoxStageFiles(input: {
   cwd: string; project: string; files: readonly BoxStageFile[];
   /** Existing owner-0700 run directory; never create it a second time. */
   initialize?: boolean;
+  /**
+   * Ceiling for the project snapshot jsonl only. Omitted = 8 MiB.
+   * stdin, system, catalog and tool-result paths ignore this and stay at 8 MiB.
+   */
+  snapshotMaxBytes?: number;
 }): { requests: BoxCcExecRequest[]; cleanup: BoxCcExecRequest;
   cleanupPreservingNative: BoxCcExecRequest } {
   if (!/^\/tmp\/ocv5-289-run-[0-9a-f]{24}$/.test(input.cwd)
@@ -135,19 +153,30 @@ export function makeBoxStageFiles(input: {
       `/home/box/.claude/projects/${input.cwd.replaceAll("/", "-")}`)) {
     throw new BoxStageError("BOX_STAGE_PATH_INVALID");
   }
+  const snapshotMaxBytes = input.snapshotMaxBytes ?? DEFAULT_MAX_FILE_BYTES;
+  if (!Number.isSafeInteger(snapshotMaxBytes)
+    || snapshotMaxBytes < DEFAULT_MAX_FILE_BYTES
+    || snapshotMaxBytes > SNAPSHOT_MAX_FILE_BYTES) {
+    throw new BoxStageError("BOX_STAGE_FILE_INVALID");
+  }
   const paths = new Set<string>();
+  const limitByPath = new Map<string, number>();
   for (const file of input.files) {
     const allowedPath = file.path === `${input.cwd}/stdin.jsonl`
       || file.path === `${input.cwd}/system.txt`
       || file.path === `${input.cwd}/tool-catalog.json`
       || new RegExp(`^${input.cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/result\\.toolu_[A-Za-z0-9_-]{1,120}\\.json$`).test(file.path)
-      || (input.project !== "" && new RegExp(`^${input.project.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/[0-9a-f-]{36}\\.jsonl$`).test(file.path));
+      || isSnapshotPath(input.project, file.path);
+    const limit = isSnapshotPath(input.project, file.path)
+      ? snapshotMaxBytes
+      : DEFAULT_MAX_FILE_BYTES;
     if (!allowedPath || paths.has(file.path) || !Buffer.isBuffer(file.raw)
-      || file.raw.length > MAX_FILE_BYTES || !/^[0-9a-f]{64}$/.test(file.hash)
+      || file.raw.length > limit || !/^[0-9a-f]{64}$/.test(file.hash)
       || createHash("sha256").update(file.raw).digest("hex") !== file.hash) {
       throw new BoxStageError("BOX_STAGE_FILE_INVALID");
     }
     paths.add(file.path);
+    limitByPath.set(file.path, limit);
   }
   const fixed = (script: string, args: string[]): BoxCcExecRequest => ({
     command: PYTHON, args: ["-I", "-c", script, ...args], cwd: "/tmp", environment: ENV,
@@ -160,14 +189,15 @@ export function makeBoxStageFiles(input: {
       chunks.push(file.raw.subarray(offset, offset + RAW_CHUNK_BYTES).toString("base64"));
     }
     if (chunks.length === 0) chunks.push("");
+    const limit = limitByPath.get(file.path) ?? DEFAULT_MAX_FILE_BYTES;
     let offset = 0;
     for (let i = 0; i < chunks.length; i += CHUNKS_PER_EXEC) {
       const batch = chunks.slice(i, i + CHUNKS_PER_EXEC);
-      requests.push(fixed(WRITE, [input.cwd, input.project, file.path,
+      requests.push(fixed(scriptWithLimit(WRITE, limit), [input.cwd, input.project, file.path,
         String(offset), String(file.raw.length), ...batch]));
       offset += batch.reduce((total, encoded) => total + Buffer.from(encoded, "base64").length, 0);
     }
-    requests.push(fixed(FINISH, [input.cwd, input.project, file.path,
+    requests.push(fixed(scriptWithLimit(FINISH, limit), [input.cwd, input.project, file.path,
       String(file.raw.length), file.hash]));
   }
   const cleanupArgs = [input.cwd, input.project, ...input.files.map((file) => file.path)];

@@ -42,13 +42,17 @@ describe("box native context owner", () => {
       supportsThinking: true,
       contextOwner: "box-native-v1",
     });
-    assert.equal(
-      getBoxNativeContextOwner(
-        { kind: "bridge_signed", profile: { ccb: { contextOwner: on.contextOwner } } },
-        { kind: "box" },
-      ),
-      "box-native-v1",
-    );
+    const gate = {
+      authorityKind: "bridge_signed" as const,
+      verifiedSignedContextOwner: on.contextOwner,
+      descriptor: {
+        canonicalModel: "box-api-claude-opus-5-5",
+        providerId: "box_cli",
+        capabilityProfile: { ccb: { contextOwner: on.contextOwner } },
+      },
+    };
+    assert.equal(getBoxNativeContextOwner(gate, { kind: "box" }), null);
+    assert.equal(getBoxNativeContextOwner(gate, { kind: "box" }, true), "box-native-v1");
   });
 
   it("wrong model, provider, fake token, and non-box route do not issue or read", () => {
@@ -78,17 +82,41 @@ describe("box native context owner", () => {
       providerId: "box_cli",
       declaredContextOwner: undefined,
     }).contextOwner, undefined);
+    const declaredGate = {
+      verifiedSignedContextOwner: "box-native-v1" as const,
+      descriptor: {
+        canonicalModel: "box-api-claude-opus-5-5",
+        providerId: "box_cli",
+        capabilityProfile: { ccb: { contextOwner: "box-native-v1" } },
+      },
+    };
     assert.equal(getBoxNativeContextOwner(
-      { kind: "local_catalog", profile: { ccb: { contextOwner: "box-native-v1" } } },
+      { ...declaredGate, authorityKind: "local_catalog", verifiedSignedContextOwner: null },
       { kind: "box" },
+      true,
     ), null);
     assert.equal(getBoxNativeContextOwner(
-      { kind: "bridge_signed", profile: { ccb: { contextOwner: "box-native-v1" } } },
+      { ...declaredGate, authorityKind: "bridge_signed", verifiedSignedContextOwner: null },
+      { kind: "box" },
+      true,
+    ), null);
+    assert.equal(getBoxNativeContextOwner(
+      { ...declaredGate, authorityKind: "bridge_signed" },
       { kind: "static" },
+      true,
     ), null);
     assert.equal(getBoxNativeContextOwner(
-      { kind: "bridge_signed", profile: { ccb: { contextOwner: "fake" } } },
+      {
+        authorityKind: "bridge_signed",
+        verifiedSignedContextOwner: "box-native-v1",
+        descriptor: {
+          canonicalModel: "box-api-claude-opus-5-5",
+          providerId: "box_cli",
+          capabilityProfile: { ccb: { contextOwner: "fake" } },
+        },
+      },
       { kind: "box" },
+      true,
     ), null);
   });
 });

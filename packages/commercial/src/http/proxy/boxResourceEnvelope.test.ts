@@ -5,20 +5,27 @@
  * as a terminal model turn.
  */
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign as cryptoSign } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import test from "node:test";
 
 import {
+  AUTHORITY_TTL_MS,
   MODEL_AUTHORITY_VERSION,
+  authoritySigningInput,
+  encodeAuthorityEnvelope,
   encodeTurnLeaseEnvelope,
   turnLeaseSigningInput,
+  type ModelAuthorityPayload,
   type TurnLease,
 } from "@openclaude/protocol";
+import type { BoxCcExecRequest } from "@openclaude/gateway";
 
+import { makeBoxStageFiles } from "./boxStageFiles.js";
 import { makeBoxTextPlan, BoxTextPlanError } from "./boxTextPlan.js";
 import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import {
@@ -30,14 +37,13 @@ import {
 import { prepareBoxContinuation } from "./boxPreparedContinuation.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { makeAnthropicProxyHandler } from "./index.js";
-import { TURN_LEASE_HEADER } from "./modelAuthorityGate.js";
+import { AUTHORITY_HEADER, TURN_LEASE_HEADER } from "./modelAuthorityGate.js";
 import {
   BOX_NATIVE_CONTEXT_OWNER,
   HttpError,
   MAX_BODY_BYTES_HARD_CEILING,
   PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
   PROXY_BYTE_BUDGET_LEGACY,
-  budgetFromVerifiedGate,
   enforceFieldByteBudgets,
   readBoxNativeContextOwner,
   runWithVerifiedProxyByteBudget,
@@ -98,12 +104,16 @@ test("envelope selector ignores model text and headers", () => {
   assert.equal(readBoxNativeContextOwner({ ccb: { contextOwner: "box-native-v2" } }), null);
   assert.equal(readBoxNativeContextOwner({ ccb: { context_owner: BOX_NATIVE_CONTEXT_OWNER } }), null);
   assert.equal(readBoxNativeContextOwner({ ccb: "box-native-v1" }), null);
-  const granted = selectVerifiedBoxByteBudget({
-    authorityKind: "bridge_signed",
-    routeKind: "box",
-    capabilityProfile: profile,
-    serverRouteReady: true,
-  });
+  const grantedInput = {
+    authorityKind: "bridge_signed" as const,
+    routeKind: "box" as const,
+    canonicalModel: MODEL,
+    providerId: "box_cli",
+    declaredContextOwner: BOX_NATIVE_CONTEXT_OWNER,
+    verifiedSignedContextOwner: BOX_NATIVE_CONTEXT_OWNER,
+    routeReady: true,
+  };
+  const granted = selectVerifiedBoxByteBudget(grantedInput);
   assert.equal(granted.id, "box-native-v1");
   assert.equal(granted.messages, 16 * 1024 * 1024);
   assert.equal(granted.totalBody, 24 * 1024 * 1024);
@@ -115,20 +125,16 @@ test("envelope selector ignores model text and headers", () => {
     { authorityKind: "local_catalog" },
     { routeKind: "oauth" },
     { routeKind: "static" },
-    { serverRouteReady: false },
-    { capabilityProfile: { ccb: { capabilityZero: false } } },
-    { authorityKind: "bridge_signed", routeKind: "box", serverRouteReady: true,
-      capabilityProfile: { ccb: { contextOwner: "client-said-so" } } },
-  ] as const) {
-    assert.equal(selectVerifiedBoxByteBudget({
-      authorityKind: "bridge_signed",
-      routeKind: "box",
-      capabilityProfile: profile,
-      serverRouteReady: true,
-      ...broken,
-    }).id, "legacy");
+    { routeReady: false },
+    { providerId: "ark" },
+    { canonicalModel: "claude-opus-5-5" },
+    { declaredContextOwner: undefined },
+    { verifiedSignedContextOwner: null },
+    { declaredContextOwner: "client-said-so" },
+  ]) {
+    assert.equal(selectVerifiedBoxByteBudget({ ...grantedInput, ...broken }).id, "legacy");
   }
-  assert.equal(budgetFromVerifiedGate(null, "box", true).id, "legacy");
+  assert.equal(profile.ccb.contextOwner, BOX_NATIVE_CONTEXT_OWNER);
   assert.equal(BOX_TOOL_MAX_ROUNDS, 128);
   assert.equal(BOX_TOOL_MAX_WALL_MS, 4 * 60 * 60 * 1000);
 });
@@ -220,14 +226,46 @@ test("64 completed rounds reach Prepared and a real text plan, not a fake 200", 
   };
   assert.throws(() => makeBoxTextPlan(planInput), (error: unknown) =>
     error instanceof BoxTextPlanError && error.code === "BOX_TEXT_INPUT_TOO_LARGE");
-  // Snapshot ceiling is raised, but boxStageFiles.ts still rejects a single
-  // staged file above 8 MiB. That file is outside this change set. The 64-round
-  // history therefore stops at BOX_STAGE_FILE_INVALID and does not build argv.
-  assert.throws(() => runWithVerifiedProxyByteBudget(
+  const plan = runWithVerifiedProxyByteBudget(
     PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
     () => makeBoxTextPlan(planInput),
-  ), (error: unknown) => error instanceof Error && "code" in error
-    && (error as { code: string }).code === "BOX_STAGE_FILE_INVALID");
+  );
+  assert.ok(plan.snapshotHash && /^[a-f0-9]{64}$/.test(plan.snapshotHash));
+  assert.ok(plan.stageInputs.length > 0);
+  assert.equal(plan.run.args.includes("--output-format"), true);
+  const root = `/tmp/ocv5-296-stage-${randomBytes(4).toString("hex")}`;
+  const from = "/home/box/.claude/projects";
+  mkdirSync(root, { mode: 0o700 });
+  const started = process.hrtime.bigint();
+  const run = (step: BoxCcExecRequest) => spawnSync(
+    step.command,
+    step.args.map((arg) => arg.replaceAll(from, root)),
+    { cwd: step.cwd, env: step.environment, encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 60_000 },
+  );
+  try {
+    for (const step of plan.stageInputs) {
+      const result = run(step);
+      assert.equal(result.status, 0, result.stderr);
+    }
+    const projectDir = `${root}/${plan.cwd.replaceAll("/", "-")}`;
+    const snapName = readdirSync(projectDir).find((name) => name.endsWith(".jsonl"));
+    assert.ok(snapName);
+    const published = readFileSync(`${projectDir}/${snapName}`);
+    assert.equal(createHash("sha256").update(published).digest("hex"), plan.snapshotHash);
+    assert.ok(published.length > 8 * 1024 * 1024, `published ${published.length}`);
+    const cleaned = run(plan.cleanup);
+    assert.equal(cleaned.status, 0, cleaned.stderr);
+    console.log(JSON.stringify({
+      event: "ocv5-296-stage-exec",
+      snapshotBytes: published.length,
+      stageSteps: plan.stageInputs.length,
+      elapsedMs: Math.round(Number(process.hrtime.bigint() - started) / 1e6),
+      claudeArgvExecuted: false,
+    }));
+  } finally {
+    rmSync(plan.cwd, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
   const smallHistory = rounds(40);
   smallHistory.push({ role: "user", content: [{ type: "text", text: "continue" }] });
   const smallPlan = makeBoxTextPlan({ ...planInput, body: bodyOf(smallHistory) });
@@ -249,36 +287,62 @@ test("64 completed rounds reach Prepared and a real text plan, not a fake 200", 
   })), (error: unknown) => error instanceof BoxTextPlanError && error.code === "BOX_TEXT_INPUT_TOO_LARGE");
 });
 
-test("24MiB candidate memory is measured, not declared safe", async () => {
-  const filler = 23 * 1024 * 1024;
-  const payload = Buffer.concat([
-    Buffer.from('{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"'),
-    Buffer.alloc(filler, 0x61),
-    Buffer.from('"}]}'),
-  ]);
-  assert.ok(payload.length < MAX_BODY_BYTES_HARD_CEILING);
-  assert.ok(payload.length > 16 * 1024 * 1024);
+function runStep(step: BoxCcExecRequest, from: string, to: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(step.command, step.args.map((arg) => arg.replaceAll(from, to)), {
+      cwd: step.cwd, env: step.environment,
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr || `exit ${code}`)));
+  });
+}
+
+test("two concurrent snapshot stages record RSS and time", async () => {
+  const raw = Buffer.alloc(9 * 1024 * 1024, 0x71);
+  const hash = createHash("sha256").update(raw).digest("hex");
+  const jobs = [0, 1].map((index) => {
+    const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+    const project = `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}`;
+    const sid = "12345678-1234-4123-8123-123456789abc";
+    const plan = makeBoxStageFiles({
+      cwd, project, snapshotMaxBytes: 24 * 1024 * 1024,
+      files: [{ path: `${project}/${sid}.jsonl`, raw, hash }],
+    });
+    const root = `/tmp/ocv5-296-conc-${index}-${randomBytes(3).toString("hex")}`;
+    return { cwd, sid, plan, root };
+  });
   const before = process.memoryUsage();
   const started = process.hrtime.bigint();
-  const parsed = await Promise.all([0, 1].map(async () => JSON.parse(payload.toString("utf8")) as { messages: unknown[] }));
+  const results = await Promise.all(jobs.map(async (job) => {
+    mkdirSync(job.root, { mode: 0o700 });
+    try {
+      for (const step of job.plan.requests) {
+        await runStep(step, "/home/box/.claude/projects", job.root);
+      }
+      const published = readFileSync(`${job.root}/${job.cwd.replaceAll("/", "-")}/${job.sid}.jsonl`);
+      return published.length;
+    } finally {
+      rmSync(job.cwd, { recursive: true, force: true });
+      rmSync(job.root, { recursive: true, force: true });
+    }
+  }));
   const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
   const after = process.memoryUsage();
-  assert.equal(parsed.length, 2);
-  assert.equal(parsed[0].messages.length, 1);
-  assert.equal(parsed[1].messages.length, 1);
-  const rssDelta = after.rss - before.rss;
+  assert.deepEqual(results, [raw.length, raw.length]);
   console.log(JSON.stringify({
     event: "ocv5-296-memory",
-    payloadBytes: payload.length,
-    concurrentParses: 2,
+    kind: "two-concurrent-9MiB-snapshot-stage",
+    payloadBytes: raw.length,
+    concurrent: 2,
     elapsedMs: Math.round(elapsedMs),
     rssBefore: before.rss,
     rssAfter: after.rss,
-    rssDelta,
+    rssDelta: after.rss - before.rss,
     heapUsedDelta: after.heapUsed - before.heapUsed,
-    externalDelta: after.external - before.external,
   }));
-  assert.ok(Number.isFinite(rssDelta));
 });
 
 const { privateKey, publicKey } = generateKeyPairSync("ed25519");
@@ -302,6 +366,36 @@ function signLease(canonicalModel = MODEL): string {
     expiresAt: now + 30 * 60_000,
   };
   return encodeTurnLeaseEnvelope(lease, cryptoSign(null, turnLeaseSigningInput(lease), privateKey));
+}
+
+function signAuthorityWithOwner(): string {
+  const now = Date.now();
+  const payload: ModelAuthorityPayload = {
+    v: MODEL_AUTHORITY_VERSION,
+    keyId: KEY_ID,
+    uid: 3,
+    containerId: 7,
+    authorityTurnId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    connectionChallenge: "chal-budget",
+    canonicalModel: MODEL,
+    engine: "ccb",
+    executionDescriptor: {
+      capabilityProfile: {
+        supportsVision: false,
+        reasoning: { supported: [], codexModelDefault: null },
+        ccb: { capabilityZero: false, supportsThinking: true, contextOwner: "box-native-v1" },
+      },
+      capabilitySchemaVersion: 1,
+      contextWindow: 200_000,
+      supportedEfforts: [],
+      supportsVision: false,
+    },
+    executionRevision: "b".repeat(64),
+    securityEpoch: EPOCH,
+    issuedAt: now,
+    expiresAt: now + AUTHORITY_TTL_MS,
+  };
+  return encodeAuthorityEnvelope(payload, cryptoSign(null, authoritySigningInput(payload), privateKey));
 }
 
 function profile(owner: string | null): Record<string, unknown> {
@@ -474,17 +568,31 @@ test("production handler keeps legacy and hard ceilings, and does not launch", a
   assert.equal(tooRaw.res.json().error?.code, "PAYLOAD_TOO_LARGE");
 });
 
-test("production handler admits the verified envelope and still rejects bad sig, non-box, and missing capability", async () => {
+test("production handler keeps the enlarged envelope off while route-ready is false", async () => {
   const nine = bodyOf([{ role: "user", content: "n".repeat(9 * 1024 * 1024) }]);
   const lease = signLease();
-  const admitted = await call(nine, {
+  const leaseOnly = await call(nine, {
     catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),
     box: true,
     lease,
   }, { [TURN_LEASE_HEADER]: lease });
-  assert.equal(admitted.launches, 0, "fetch must not run");
-  assert.notEqual(admitted.res.statusCode, 413, admitted.res.body || String(admitted.thrown));
-  assert.ok(admitted.thrown instanceof Error, `expected pre-launch failure, status=${admitted.res.statusCode} body=${admitted.res.body}`);
+  assert.equal(leaseOnly.launches, 0);
+  assert.equal(leaseOnly.res.statusCode, 413, "lease-only has no capability");
+
+  const signedCap = await call(nine, {
+    catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),
+    box: true,
+  }, { [AUTHORITY_HEADER]: signAuthorityWithOwner() });
+  assert.equal(signedCap.launches, 0);
+  assert.equal(signedCap.res.statusCode, 413, "signed token does not override route-ready false");
+
+  const withinLegacy = await call(bodyOf([{ role: "user", content: "hi" }]), {
+    catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),
+    box: true,
+  }, { [TURN_LEASE_HEADER]: lease });
+  assert.equal(withinLegacy.launches, 0);
+  assert.notEqual(withinLegacy.res.statusCode, 413);
+  assert.ok(withinLegacy.thrown instanceof Error, "within legacy still stops before Box fetch");
 
   const badSig = await call(nine, {
     catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),
