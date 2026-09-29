@@ -153,6 +153,14 @@ if (!boxCache.includes('function bareHookBeforeBudget(')
   throw new Error('[box-multitool-continuation] unwrapped hook-plus-budget fold missing')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof')
+if (!boxCache.includes('function foldProvenImageCaption(')
+  || !boxCache.includes('const current = foldProvenImageCaption(message, assistant);')
+  || !boxCache.includes('80x2200>73x2000@1.10')
+  || !boxCache.includes('1290x2796>923x2000@1.40')
+  || !boxCache.includes('export function strictBoxImageBlock(')) {
+  throw new Error('[box-image-continuation] proven caption fold is not on the shared hook path')
+}
+console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')
 const editEcho = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolInputEcho.ts'), 'utf8')
 const editJournal = readFileSync(join(root,
