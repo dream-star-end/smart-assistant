@@ -43,14 +43,19 @@ let summaryRequested = false;
 let growthActive = false;
 let growthRound = 0;
 let growthStopRound = 60;
+let toolsPerRound = 1;
+let growthChars = GROW_CHARS;
+let executionLogPath = "";
+let growthBodyPrefix = "ocv5-296-r19-live";
 let spoolBuf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-let pendingStdout: string | null = null;
+const pendingById = new Map<string, string>();
+let mcpSerial = 0;
 const growthBodies: string[] = [];
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
 
-async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
+async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2"): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
@@ -413,7 +418,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
         const text = raw.toString("utf8");
         growthBodies.push(text);
         const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
-        const bodyName = `ocv5-296-r19-live-${growthBodies.length}.json`;
+        const bodyName = `${growthBodyPrefix}-${growthBodies.length}.json`;
         if (bodyName.includes("r17-growth")) throw new Error("refusing to overwrite r17");
         writeFileSync(join(rawDir, bodyName), text);
       }
@@ -766,11 +771,18 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
         assert.equal(row.turn_key, freshBooks[0]!.turn_key);
       }
     } else {
+      const growing = mode === "grow2";
       growthActive = true;
       growthRound = 0;
-      growthStopRound = 1;
+      growthStopRound = growing ? 60 : 1;
+      toolsPerRound = growing ? 8 : 1;
+      growthChars = growing ? 25_000 : GROW_CHARS;
+      growthBodyPrefix = growing ? "ocv5-296-r20-cal" : "ocv5-296-r19-live";
+      executionLogPath = growing ? join(work, "execution-log") : "";
+      mcpSerial = 0;
+      pendingById.clear();
       growthBodies.length = 0;
-      const liveKey = "agent:main:webchat:dm:idle-live2";
+      const liveKey = growing ? "agent:main:webchat:dm:idle-grow2" : "agent:main:webchat:dm:idle-live2";
       const liveAdapter = new CcbAdapter({
         sessionKey: liveKey,
         agentId: "main",
@@ -786,7 +798,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
         sessionKey: liveKey,
         agentId: "main",
         channel: "webchat",
-        peerId: "idle-live2",
+        peerId: growing ? "idle-grow2" : "idle-live2",
         title: "Idle",
         startedAt: Date.now(),
         runner: liveAdapter,
@@ -815,7 +827,9 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
       report.liveError = liveError || null;
       report.liveHits = liveHits.map((hit) => ({
         status: hit.status, bytes: hit.bytes, kind: hit.kind, reasons: hit.reasons,
-        requestId: hit.requestId, summary: hit.summary, body: hit.body,
+        requestId: hit.requestId, summary: hit.summary,
+        contentBytes: (hit.digest as { contentBytes?: number } | undefined)?.contentBytes ?? null,
+        body: (hit.body ?? "").slice(0, 180),
       }));
       report.execLog = localExec.log;
       report.pendingCount = localExec.log.filter((line) => line === "synthetic-pending").length;
@@ -826,6 +840,20 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
         throw new Error(`live continuation red: ${liveError || "no 200 continuation"} hits=${JSON.stringify(report.liveHits).slice(0, 1200)} diff=${JSON.stringify(report.contextDiff).slice(0, 1500)}`);
       }
       assert.equal(localExec.log.filter((line) => line === "synthetic-launch").length, 1, JSON.stringify(localExec.log));
+      if (growing) {
+        const logged = readFileSync(executionLogPath, "utf8").trim().split("\n").filter(Boolean);
+        const expectedIds: string[] = [];
+        for (let round = 1; round <= growthRound; round += 1) {
+          for (let index = 0; index < toolsPerRound; index += 1) expectedIds.push(`toolu_g${round}_${index}`);
+        }
+        report.executionLogCount = logged.length;
+        report.growthRound = growthRound;
+        assert.deepEqual([...logged].sort(), [...expectedIds].sort());
+        assert.equal(new Set(logged).size, logged.length);
+        const retained = Math.max(...liveHits.map((hit) => (hit.digest as { contentBytes?: number } | undefined)?.contentBytes ?? 0));
+        report.retainedBytes = retained;
+        assert.ok(retained >= GROW_TARGET, `retained ${retained} after ${growthRound} rounds`);
+      } else {
       assert.equal(growthRound, 1);
       const toolUses = growthBodies.flatMap((body) => {
         try {
@@ -836,7 +864,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
         } catch { return []; }
       });
       report.toolUses = toolUses;
-      assert.deepEqual(toolUses, ["toolu_grow_1"]);
+      if (!growing) assert.deepEqual(toolUses, ["toolu_grow_1"]);
       assert.equal(liveHits.filter((hit) => hit.kind === "idle-summary").length, 0);
       report.contextDiff = await explainContextMismatch(growthBodies, CHECKOUT);
       assert.equal((report.contextDiff as { equal?: boolean }).equal, true, JSON.stringify(report.contextDiff).slice(0, 800));
@@ -854,7 +882,61 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
       const owners = linked.rows.map((row) => row.owner).filter((value): value is string => Boolean(value));
       assert.equal(owners.includes(firstId!), true, JSON.stringify(linked.rows));
       assert.equal(resumes.includes(ids[0]!), true, JSON.stringify(linked.rows));
+      }
       assert.equal(liveError, "");
+      if (growing) {
+        growthActive = false;
+        const beforeNext = hits.length;
+        let nextError = "";
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          try {
+            await sm.submit(liveSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+            nextError = "";
+            break;
+          } catch (error) {
+            nextError = error instanceof Error ? error.message : String(error);
+            if (!nextError.includes("IDLE_HISTORY_PENDING")) break;
+            await new Promise((resolve) => setTimeout(resolve, 300));
+          }
+        }
+        report.nextError = nextError || null;
+        const nextHits = hits.slice(beforeNext).filter((hit) => hit.url === "/v1/messages");
+        report.nextHits = nextHits.map((hit) => ({
+          status: hit.status, bytes: hit.bytes, kind: hit.kind, summary: hit.summary,
+          requestId: hit.requestId,
+          contentBytes: (hit.digest as { contentBytes?: number } | undefined)?.contentBytes ?? null,
+        }));
+        const summaries = [...liveHits, ...nextHits].filter((hit) => hit.kind === "idle-summary" && hit.status === 200);
+        report.idleSummaryCount = summaries.length;
+        report.nativeFiles = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8")));
+        report.opFiles = listJson(join(HOME, "idle-ops")).map((file) => JSON.parse(readFileSync(file, "utf8")));
+        if (nextError) throw new Error(nextError);
+        assert.equal(summaries.length, 1, JSON.stringify(report.nextHits));
+        const business = nextHits.filter((hit) => hit.status === 200 && hit.kind === "business");
+        assert.equal(business.length, 1, JSON.stringify(report.nextHits));
+        assert.ok(((business[0]?.digest as { contentBytes?: number } | undefined)?.contentBytes ?? 1e9) < 1_000_000, JSON.stringify(report.nextHits));
+        const books = await pool.query<{ request_id: string; turn_key: string; ledger_id: string; delta: string; balance_after: string }>(
+          `SELECT u.request_id, u.turn_key, l.id::text AS ledger_id, l.delta::text, l.balance_after::text
+             FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
+            WHERE u.user_id = 3 ORDER BY l.id`);
+        report.ledgerCount = books.rows.length;
+        assert.equal(new Set(books.rows.map((row) => row.request_id)).size, books.rows.length);
+        assert.equal(new Set(books.rows.map((row) => row.ledger_id)).size, books.rows.length);
+        let running = 50_000_000n;
+        for (const row of books.rows) {
+          running += BigInt(row.delta);
+          assert.equal(BigInt(row.balance_after), running, row.request_id);
+        }
+        const credits = BigInt((await pool.query("SELECT credits::text AS credits FROM users WHERE id = 3")).rows[0].credits);
+        report.credits = { after: credits.toString(), ledgerSum: (running - 50_000_000n).toString() };
+        assert.equal(credits, running);
+        const summaryId = summaries[0]?.requestId;
+        const nextId = nextHits.find((hit) => hit.kind === "business")?.requestId;
+        const keys = await pool.query<{ request_id: string; turn_key: string }>(
+          "SELECT request_id, turn_key FROM usage_records WHERE request_id = $1 OR request_id = $2 OR request_id = $3",
+          [liveHits[0]?.requestId, summaryId, nextId]);
+        report.turnKeys = keys.rows;
+      }
     }
   } finally {
     releaseHeldCommits();
@@ -888,7 +970,9 @@ async function runIdleCase(mode: "short" | "fresh" | "live2"): Promise<void> {
       ? "ocv5-296-idle-pipeline-r18-short-raw.json"
       : mode === "fresh"
         ? "ocv5-296-fresh-set-r18-raw.json"
-        : "ocv5-296-idle-pipeline-r19-live2-raw.json";
+        : mode === "grow2"
+          ? "ocv5-296-idle-pipeline-r20-cal-raw.json"
+          : "ocv5-296-idle-pipeline-r19-live2-raw.json";
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
     const path = join(rawDir, rawName);
     if (/ocv5-296-(idle-pipeline-r\d+-raw|r17-growth-)/.test(path)) {
@@ -916,6 +1000,7 @@ function queueIdle(name: string, timeout: number, mode: "short" | "fresh"): void
 queueIdle("real submit reaches a short idle no-op without a summary HTTP", 300_000, "short");
 queueIdle("fresh stock summary and business roots short-close through terminal_set", 900_000, "fresh");
 test("live tool continuation keeps the persisted deferred-tools announcement", { timeout: 300_000 }, () => runIdleCase("live2"));
+test("live bash rounds grow outer history through idle summary", { timeout: 3_600_000 }, () => runIdleCase("grow2"));
 
 type MessageDigest = {
   messages: number;
@@ -1151,18 +1236,20 @@ function toolResultBytes(messages: Array<{ content?: unknown }>): number {
   return total;
 }
 
-function lastToolResult(messages: Array<{ content?: unknown }>): { id: string; content: unknown; isError: boolean } | null {
+function toolResultsIn(messages: Array<{ role?: string; content?: unknown }>): Array<{ id: string; content: unknown; isError: boolean }> {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const content = messages[index]?.content;
-    if (!Array.isArray(content)) continue;
-    for (let blockIndex = content.length - 1; blockIndex >= 0; blockIndex -= 1) {
-      const block = content[blockIndex] as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
-      if (block?.type === "tool_result" && typeof block.tool_use_id === "string") {
-        return { id: block.tool_use_id, content: block.content, isError: block.is_error === true };
+    const message = messages[index];
+    if (!message || message.role !== "user" || !Array.isArray(message.content)) continue;
+    const found: Array<{ id: string; content: unknown; isError: boolean }> = [];
+    for (const block of message.content) {
+      const item = block as { type?: string; tool_use_id?: string; content?: unknown; is_error?: boolean };
+      if (item?.type === "tool_result" && typeof item.tool_use_id === "string") {
+        found.push({ id: item.tool_use_id, content: item.content, isError: item.is_error === true });
       }
     }
+    if (found.length > 0) return found;
   }
-  return null;
+  return [];
 }
 
 function ndjson(rows: unknown[]): Buffer {
@@ -1173,27 +1260,40 @@ function streamEvent(value: unknown): { type: string; event: unknown } {
   return { type: "stream_event", event: value };
 }
 
-function handoffChunk(id: string, boxName: string, input: Record<string, unknown>, initTools: string[] | null): Buffer {
+function handoffChunk(uses: Array<{ id: string; boxName: string; input: Record<string, unknown> }>, initTools: string[] | null): Buffer {
   const usage = { input_tokens: 20, output_tokens: 0 };
-  const use = { type: "tool_use", id, name: boxName, input };
+  const content = uses.map((use) => ({ type: "tool_use", id: use.id, name: use.boxName, input: use.input }));
   const rows: unknown[] = [];
   if (initTools) rows.push({ type: "system", subtype: "init", tools: initTools, mcp_servers: [{}] });
+  rows.push(streamEvent({ type: "message_start", message: { id: `msg_${uses[0]?.id ?? "grow"}`, model: "claude-opus-5-5", role: "assistant", content: [], usage } }));
+  uses.forEach((use, index) => {
+    rows.push(
+      streamEvent({ type: "content_block_start", index, content_block: { type: "tool_use", id: use.id, name: use.boxName, input: {} } }),
+      streamEvent({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(use.input) } }),
+      streamEvent({ type: "content_block_stop", index }),
+    );
+  });
   rows.push(
-    streamEvent({ type: "message_start", message: { id: `msg_${id}`, model: "claude-opus-5-5", role: "assistant", content: [], usage } }),
-    streamEvent({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: boxName, input: {} } }),
-    streamEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }),
-    { type: "assistant", message: { id: `msg_${id}`, model: "claude-opus-5-5", role: "assistant", content: [use] } },
-    streamEvent({ type: "content_block_stop", index: 0 }),
+    { type: "assistant", message: { id: `msg_${uses[0]?.id ?? "grow"}`, model: "claude-opus-5-5", role: "assistant", content } },
     streamEvent({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { input_tokens: 20, output_tokens: 4 } }),
     streamEvent({ type: "message_stop" }),
   );
   return ndjson(rows);
 }
 
-function echoChunk(id: string, content: unknown, isError: boolean): Buffer {
-  const block: Record<string, unknown> = { type: "tool_result", tool_use_id: id, content };
-  if (isError) block.is_error = true;
-  return ndjson([{ type: "user", message: { role: "user", content: [block] } }]);
+function echoChunk(results: Array<{ id: string; content: unknown; isError: boolean }>): Buffer {
+  const blocks = results.map((result) => {
+    const block: Record<string, unknown> = { type: "tool_result", tool_use_id: result.id, content: result.content };
+    if (result.isError) block.is_error = true;
+    return block;
+  });
+  return ndjson([{ type: "user", message: { role: "user", content: blocks } }]);
+}
+
+function growthCommand(id: string): string {
+  if (!executionLogPath) return `python3 -c 'print("y"*${growthChars}, end="")'`;
+  const script = `import pathlib; p=pathlib.Path(${JSON.stringify(executionLogPath)}); p.parent.mkdir(parents=True, exist_ok=True); p.open('a').write(${JSON.stringify(id + "\n")}); print('y'*${growthChars}, end='')`;
+  return `python3 -c ${JSON.stringify(script)}`;
 }
 
 function prepareModelSpool(raw: string): void {
@@ -1210,31 +1310,36 @@ function prepareModelSpool(raw: string): void {
   })();
   if (!growthActive || classified.kind === "idle-summary") {
     spoolBuf = textSpool(initTools);
-    pendingStdout = null;
+    if (!growthActive) pendingById.clear();
     return;
   }
   const bashIndex = (parsed.tools ?? []).findIndex((tool) => tool.name === "Bash");
   const size = toolResultBytes(parsed.messages ?? []);
-  const prior = classified.kind === "live-continuation" ? lastToolResult(parsed.messages ?? []) : null;
-  const finish = size >= GROW_TARGET || growthRound >= growthStopRound;
+  const prior = classified.kind === "live-continuation" ? toolResultsIn(parsed.messages ?? []) : [];
+  const retainedEnough = size >= GROW_TARGET || growthRound >= growthStopRound;
+  const truncated = toolsPerRound > 1 && prior.length > 0 && size < growthRound * toolsPerRound * growthChars * 0.5;
+  const finish = retainedEnough || truncated;
   if (bashIndex < 0 || finish) {
-    const final = textSpool(prior ? [] : initTools);
-    const echo = prior ? echoChunk(prior.id, prior.content, prior.isError) : Buffer.alloc(0);
-    spoolBuf = prior ? Buffer.concat([spoolBuf, echo, stripInit(final)]) : final;
-    if (!prior) pendingStdout = null;
+    const final = textSpool(prior.length > 0 ? [] : initTools);
+    const echo = prior.length > 0 ? echoChunk(prior) : Buffer.alloc(0);
+    spoolBuf = prior.length > 0 ? Buffer.concat([spoolBuf, echo, stripInit(final)]) : final;
     return;
   }
   growthRound += 1;
-  const id = `toolu_grow_${growthRound}`;
-  const input = { command: `python3 -c 'print("y"*${GROW_CHARS}, end="")'` };
   const boxName = `mcp__ocbridge__t${bashIndex}`;
-  const chunk = handoffChunk(id, boxName, input, prior ? null : initTools);
-  const echo = prior ? echoChunk(prior.id, prior.content, prior.isError) : Buffer.alloc(0);
-  spoolBuf = prior ? Buffer.concat([spoolBuf, echo, chunk]) : chunk;
-  pendingStdout = JSON.stringify({
-    version: 1, modelToolUseId: id, mcpRequestId: growthRound,
-    name: `t${bashIndex}`, arguments: input,
+  const uses = Array.from({ length: toolsPerRound }, (_, index) => {
+    const id = toolsPerRound === 1 ? `toolu_grow_${growthRound}` : `toolu_g${growthRound}_${index}`;
+    const input = { command: growthCommand(id) };
+    mcpSerial += 1;
+    pendingById.set(id, JSON.stringify({
+      version: 1, modelToolUseId: id, mcpRequestId: mcpSerial,
+      name: `t${bashIndex}`, arguments: input,
+    }));
+    return { id, boxName, input };
   });
+  const chunk = handoffChunk(uses, prior.length > 0 ? null : initTools);
+  const echo = prior.length > 0 ? echoChunk(prior) : Buffer.alloc(0);
+  spoolBuf = prior.length > 0 ? Buffer.concat([spoolBuf, echo, chunk]) : chunk;
 }
 
 function stripInit(buffer: Buffer): Buffer {
@@ -1286,14 +1391,19 @@ function makeLocalPythonExec(toolNames: () => string[]): {
       if (args[5] === "--read") {
         log.push("synthetic-spool");
         const offset = Number(args[7] ?? 0);
+        const limit = Number(args[8] ?? 65536);
         const source = spoolBuf.length > 0 ? spoolBuf : textSpool(toolNames());
         const start = Math.min(Number.isFinite(offset) ? offset : 0, source.length);
-        const part = source.subarray(start);
+        const cap = Number.isFinite(limit) && limit > 0 ? Math.min(limit, 65536) : 65536;
+        const part = source.subarray(start, Math.min(source.length, start + cap));
         return { stdout: JSON.stringify({ data: part.toString("base64"), offset: start + part.length }), stderrBytes: 0, exitCode: 0 as const };
       }
-      if (script.includes("pending.") && pendingStdout) {
-        log.push("synthetic-pending");
-        return { stdout: pendingStdout, stderrBytes: 0, exitCode: 0 as const };
+      if (script.includes("pending.")) {
+        const toolId = args[4] ?? "";
+        const pending = pendingById.get(toolId);
+        if (!pending) throw new Error(`BOX_TEST_PENDING_MISSING ${toolId}`);
+        log.push(`synthetic-pending:${toolId}`);
+        return { stdout: pending, stderrBytes: 0, exitCode: 0 as const };
       }
       if (script.includes("terminal.json")) {
         log.push("synthetic-terminal-proof");
