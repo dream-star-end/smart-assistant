@@ -1039,6 +1039,44 @@ test("e682 commit check uses the actual before hash, and a later probe does not 
   });
 });
 
+test("spectator clock must be due, and a same-nonce other account is in the set", { timeout: 120_000 }, async () => {
+  const floor = { last: 1790674483965, after: 1790674603965 };
+  await withTemp(async (db) => {
+    const seeded = await seedContrast(db, "pg_temp", floor);
+    await db.query(
+      `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object(
+         'boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint)
+       WHERE request_id = $1`,
+      [CONTRAST_LEAF_REQUEST_ID, floor.last + 1, floor.after + 1]);
+    await assert.rejects(() => applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof }),
+      (error: unknown) => codeOf(error) === "CONTRAST_CHANGED");
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE ctx ? 'boxCancelIntent'")).rows[0].n, 0);
+  });
+  await withTemp(async (db) => {
+    const seeded = await seedContrast(db, "pg_temp", floor);
+    await db.query(
+      `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object(
+         'boxStopProbeLastAttemptMs', $2::bigint, 'boxStopProbeAfterMs', $3::bigint)
+       WHERE request_id = $1`,
+      [CONTRAST_LEAF_REQUEST_ID, floor.after, floor.after + CONTRAST_CLOCK_GAP_MS]);
+    const applied = await applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof });
+    assert.equal(applied.status, "applied");
+    assert.equal((await db.query("SELECT ctx->>'boxStopProbeLastAttemptMs' AS last FROM request_finalize_journal WHERE request_id=$1", [CONTRAST_LEAF_REQUEST_ID])).rows[0].last, String(floor.after));
+  });
+  await withTemp(async (db) => {
+    const seeded = await seedContrast(db, "pg_temp", floor);
+    await db.query(
+      `INSERT INTO request_finalize_journal(request_id, user_id, container_id, state, ctx)
+       VALUES ('acct-21-extra', 3, 77, 'committed', $1::jsonb)`,
+      [JSON.stringify({ boxAccountId: "21", boxRunNonce: seeded.manifest.contrast.nonce, boxState: "terminal",
+        boxLeaseEpoch: "ab".repeat(16), boxSessionId: "session-other" })]);
+    await assert.rejects(() => applyRun(db, "pg_temp", seeded.manifest, approvalFor(seeded.made.run), { freshProof: seeded.made.proof }),
+      (error: unknown) => codeOf(error) === "CONTRAST_CHANGED");
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE ctx ? 'boxCancelIntent'")).rows[0].n, 0);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE request_id='acct-21-extra'")).rows[0].n, 1);
+  });
+});
+
 test("dry-run does not apply; unconfirmed apply exits 2", { timeout: 120_000 }, async () => {
   const tsx = join(RELEASE, "node_modules/.bin/tsx");
   const dry = spawnSync(tsx, [SCRIPT.pathname], { encoding: "utf8" });

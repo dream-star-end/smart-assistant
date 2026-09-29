@@ -16,7 +16,7 @@ export const PINNED_JOURNAL_SHA256 =
 export const EXPECTED_MANIFEST_SHA256 =
   "2cd4d42290c331d6fd72c6a82d1ea17d373b27a757aa4707ff123f4e15347e5c";
 export const EXPECTED_SCRIPT_SHA256 =
-  "0ff1c272e165258bf4166a3d8e4fd2dfabc4908c42a980682832bc81e287b9a1";
+  "5d4db088d6fd871b55bb149936676f3f936ad511b974265e0d60f999243101a2";
 export const ABANDON_STATE = "operator_completed_abandoned";
 export const REQUIRED_AUTHORIZATION = "旧运行该停就停";
 export const TARGET_NONCE = "e682271820b159b147bbf767";
@@ -509,6 +509,8 @@ function clockPair(ctx: Ctx, floor: { boxStopProbeAfterMs: number; boxStopProbeL
     || after < floor.boxStopProbeAfterMs || last < floor.boxStopProbeLastAttemptMs) {
     throw new ReleaseError("CONTRAST_CHANGED");
   }
+  const same = after === floor.boxStopProbeAfterMs && last === floor.boxStopProbeLastAttemptMs;
+  if (!same && last < floor.boxStopProbeAfterMs) throw new ReleaseError("CONTRAST_CHANGED");
 }
 
 function contrastRowMatches(row: JournalRow, pin: ContrastRowPin, leaf: boolean): boolean {
@@ -537,13 +539,13 @@ function spectatorView(row: JournalRow) {
   };
 }
 
-async function selectNonces(client: QueryClient, schema: SchemaName, uid: string, accountId: string,
+async function selectNonces(client: QueryClient, schema: SchemaName, uid: string,
   nonces: string[], lock: boolean): Promise<JournalRow[]> {
   const found = await client.query<JournalRow>(
     `${ROW_SQL} FROM ${table(schema, "request_finalize_journal")}
-      WHERE user_id = $1 AND ctx->>'boxAccountId' = $2 AND ctx->>'boxRunNonce' = ANY($3::text[])
+      WHERE user_id = $1 AND ctx->>'boxRunNonce' = ANY($2::text[])
       ORDER BY request_id${lock ? " FOR UPDATE" : ""}`,
-    [uid, accountId, nonces]);
+    [uid, nonces]);
   return found.rows;
 }
 
@@ -562,7 +564,8 @@ function assertContrastBaseline(rows: JournalRow[], manifest: ReleaseManifest) {
   for (const item of expected) {
     const row = byId.get(item.requestId);
     const leaf = item.requestId === pin.leafRequestId;
-    if (!row || !contrastRowMatches(row, item, leaf)) throw new ReleaseError("CONTRAST_CHANGED");
+    if (!row || String(row.ctx.boxAccountId ?? "") !== manifest.run.accountId
+      || !contrastRowMatches(row, item, leaf)) throw new ReleaseError("CONTRAST_CHANGED");
     if (leaf) clockPair(row.ctx, floor);
   }
 }
@@ -752,7 +755,7 @@ export async function applyRun(client: QueryClient, schema: SchemaName, manifest
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", [key]);
     }
     const lockedAll = baseline
-      ? await selectNonces(client, schema, run.uid, run.accountId, [run.nonce, manifest.contrast.nonce], true)
+      ? await selectNonces(client, schema, run.uid, [run.nonce, manifest.contrast.nonce], true)
       : await selectRun(client, schema, run, true);
     const locked = baseline ? lockedAll.filter((item) => item.ctx.boxRunNonce === run.nonce) : lockedAll;
     const contrastRows = baseline ? lockedAll.filter((item) => item.ctx.boxRunNonce === manifest.contrast.nonce) : [];
@@ -771,7 +774,13 @@ export async function applyRun(client: QueryClient, schema: SchemaName, manifest
         await assertContrast(client, schema, manifest);
         return;
       }
-      const again = await selectNonces(client, schema, run.uid, run.accountId, [manifest.contrast.nonce], true);
+      const againAll = await selectNonces(client, schema, run.uid, [run.nonce, manifest.contrast.nonce], true);
+      const again = againAll.filter((item) => item.ctx.boxRunNonce === manifest.contrast.nonce);
+      const againTarget = againAll.filter((item) => item.ctx.boxRunNonce === run.nonce);
+      assertContrastBaseline(again, manifest);
+      if (againTarget.length !== 1 || againTarget[0]?.request_id !== run.requestId) {
+        throw new ReleaseError("CONTRAST_CHANGED");
+      }
       if (canonicalJson(again.map(spectatorView)) !== spectators) throw new ReleaseError("CONTRAST_CHANGED");
     };
     await assertUsage(client, schema, run);
