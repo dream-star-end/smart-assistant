@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SOURCE = fileURLToPath(new URL("..", import.meta.url));
@@ -37,6 +37,46 @@ function loader(): { cmd: string; args: string[] } {
   if (existsSync(pinned)) return { cmd: process.execPath, args: [pinned] };
   return { cmd: "/usr/bin/tsx", args: [] };
 }
+function copyValueClosure(dir: string): void {
+  const proxy = join(SOURCE, "packages/commercial/src/http/proxy");
+  const roots = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts",
+    "boxCallFingerprint.ts", "boxToolResultPlan.ts", "boxToolResultEcho.ts",
+    "boxToolResumePublish.ts", "boxToolInputHash.ts"];
+  const pending = roots.map((name) => realpathSync(join(proxy, name)));
+  const seen = new Set<string>();
+  const importRe = /(^|\n)\s*import\s+(type\s+)?([\s\S]*?)\sfrom\s+["']([^"']+)["']/g;
+  while (pending.length > 0) {
+    const file = pending.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const rel = relative(SOURCE, file);
+    const dest = join(dir, rel);
+    if (!existsSync(dest)) {
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(file, dest);
+    }
+    const text = readFileSync(file, "utf8");
+    for (const match of text.matchAll(importRe)) {
+      const clause = match[3] ?? "";
+      if (clause.includes(";") || /\n\s*import\s/.test(clause)) continue;
+      const spec = match[4] ?? "";
+      if (!spec.startsWith(".")) continue;
+      const prefix = match[2];
+      const body = clause.trim();
+      const inside = body.startsWith("{") ? body.slice(1, body.lastIndexOf("}")) : "";
+      const parts = inside.split(",").map((part) => part.trim()).filter(Boolean);
+      const typeOnly = Boolean(prefix) || (body.startsWith("{") && parts.length > 0
+        && parts.every((part) => part.startsWith("type ")));
+      if (typeOnly) continue;
+      const base = resolve(dirname(file), spec);
+      const candidates = spec.endsWith(".js")
+        ? [`${base.slice(0, -3)}.ts`, `${base.slice(0, -3)}.tsx`, base]
+        : [base, `${base}.ts`, `${base}.tsx`];
+      const next = candidates.find((candidate) => existsSync(candidate) && lstatSync(candidate).isFile());
+      if (next) pending.push(realpathSync(next));
+    }
+  }
+}
 function stage(mutate?: (source: string) => string): string {
   const dir = mkdtempSync(join(tmpdir(), "ocv5-b1-archive-"));
   for (const name of readdirSync(join(SOURCE, "packages/commercial/src/http/proxy"))) {
@@ -58,22 +98,10 @@ function stage(mutate?: (source: string) => string): string {
     mkdirSync(dirname(join(dir, rel)), { recursive: true });
     copyFileSync(join(SOURCE, rel), join(dir, rel));
   }
-  // Publisher imports upstream, which imports commercial siblings. Symlink
-  // those real files; copied proxy sources stay the staged mutations.
-  const linkUnder = (rel: string): void => {
-    const source = join(SOURCE, rel);
-    const dest = join(dir, rel);
-    if (!existsSync(source) || existsSync(dest)) {
-      if (existsSync(source) && existsSync(dest) && lstatSync(source).isDirectory()
-        && !lstatSync(dest).isSymbolicLink()) {
-        for (const name of readdirSync(source)) linkUnder(join(rel, name));
-      }
-      return;
-    }
-    mkdirSync(dirname(dest), { recursive: true });
-    symlinkSync(source, dest);
-  };
-  linkUnder("packages/commercial/src");
+  // Value imports reached from the publisher must be real files inside this
+  // candidate. A symlink back to the source tree is outside and must not be
+  // used to make the positive control green.
+  copyValueClosure(dir);
   if (mutate) {
     const target = join(dir, "packages/commercial/src/http/proxy/boxCacheAnnotations.ts");
     writeFileSync(target, mutate(readFileSync(target, "utf8")));
@@ -408,6 +436,7 @@ test("archive without git passes only with a strict expect-sha", () => {
     assert.equal(body.digest.some((item: { path: string }) => item.path.startsWith("..")), false);
     for (const name of ["boxToolResultPlan.ts", "boxToolResultEcho.ts", "boxStageFiles.ts",
       "boxToolResumePublish.ts", "boxToolInputHash.ts", "upstream.ts",
+      "staticProviderMeta.ts", "platformDefaults.ts",
       "check-v5-box-continuation-859.png", "check-v5-box-continuation-859.oracle.json"]) {
       const item = body.digest.find((row: { path: string; realpath?: string; sha256?: string }) => row.path.endsWith(name));
       assert.ok(item, name);
@@ -416,6 +445,28 @@ test("archive without git passes only with a strict expect-sha", () => {
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("static provider meta linked outside the candidate is source-rejected", () => {
+  const dir = stage();
+  const outside = mkdtempSync(join(tmpdir(), "ocv5-b1-static-meta-escape-"));
+  try {
+    const inside = join(dir, "packages/commercial/src/http/proxy/staticProviderMeta.ts");
+    const leaked = join(outside, "staticProviderMeta.ts");
+    copyFileSync(inside, leaked);
+    appendFileSync(leaked, "\nconsole.error('AUDIT_R4_EXTERNAL_STATIC_PROVIDER_EXECUTED')\n");
+    rmSync(inside);
+    symlinkSync(leaked, inside);
+    const red = run(dir, ["--expect-sha", SHA]);
+    assert.notEqual(red.code, 0);
+    assert.match(red.stderr, /DEP_ESCAPE/);
+    assert.match(red.stderr, /staticProviderMeta\.ts/);
+    assert.doesNotMatch(`${red.stdout}\n${red.stderr}`, /AUDIT_R4_EXTERNAL_STATIC_PROVIDER_EXECUTED/);
+    assert.doesNotMatch(red.stdout, /"ok":true/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 

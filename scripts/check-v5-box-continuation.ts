@@ -36,8 +36,9 @@ const FIXTURE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-
 const LOADER = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-resolve.mjs", import.meta.url)));
 const ENTRIES = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts",
   "boxCallFingerprint.ts", "boxToolResultPlan.ts", "boxToolResultEcho.ts"];
-/** Dynamic product entries loaded by provePublisher. Direct relative imports
- * join the same contained/digest/drift check. This is not a full-repo manifest. */
+/** Dynamic product entries loaded by provePublisher. They join the same
+ * relative value-import walk as ENTRIES. Type-only imports stay non-recursive.
+ * This is not a full-repo manifest. */
 const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as const;
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
@@ -165,21 +166,8 @@ function resolveLocal(fromFile: string, spec: string): string | null {
   }
   return null;
 }
-function addDirectProduct(file: string, files: Set<string>): void {
-  if (!contained(file)) fail(`DEP_ESCAPE ${file}`);
-  files.add(file);
-  for (const item of parseSpecs(readFileSync(file, "utf8"))) {
-    const next = resolveLocal(file, item.spec);
-    if (!next) {
-      if (!item.typeOnly) fail(`UNRESOLVED ${item.spec} from ${file}`);
-      continue;
-    }
-    if (!contained(next)) fail(`DEP_ESCAPE ${next}`);
-    files.add(next);
-  }
-}
 function digest(): Digest {
-  const pending = ENTRIES.map((name) => realpathSync(join(PROXY, name)));
+  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT].map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
   const files = new Set<string>([SELF, FIXTURE, LOADER, IMAGE_FILE, ORACLE_FILE]);
   while (pending.length > 0) {
@@ -199,7 +187,6 @@ function digest(): Digest {
       pending.push(next);
     }
   }
-  for (const name of DYNAMIC_PRODUCT) addDirectProduct(realpathSync(join(PROXY, name)), files);
   const proxyCount = [...files].filter((file) => file.startsWith(`${PROXY}${sep}`)).length;
   if (proxyCount < 9) fail(`RUNTIME_MODULES_${proxyCount}`);
   for (const file of files) {
