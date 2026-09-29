@@ -67,6 +67,7 @@ import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
 import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
+import { makeBoxIdleProofHandler } from "../http/proxy/boxIdleProofHandler.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
@@ -422,6 +423,8 @@ export async function startEgress(): Promise<void> {
   const boxStopHandler = makeBoxUserStopHandler({ identity: identityStrategy,
     journal: boxStopJournal,
     coordinator: boxStopCoordinator });
+  const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
+    journal: boxStopJournal, readCapsule: boxReplayReader });
   const boxStopCleanupTimer = setInterval(() => {
     void boxStopCoordinator.retryFailedLocal().catch(() =>
       log.error("box_stop_local_cleanup_failed"));
@@ -547,6 +550,19 @@ export async function startEgress(): Promise<void> {
   const server = createHttpServer((req, res) => {
     const path = (req.url ?? "/").split("?")[0];
     const peerIp = req.socket.remoteAddress ?? "";
+    if (path === "/internal/box/idle-proof") {
+      Promise.resolve(boxIdleProofHandler(req, res, {
+        hostUuid: selfHostUuid, boundIp: peerIp,
+      })).catch((err) => {
+        log.error("box_idle_proof_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 503;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ status: "pending", reason: "unavailable" }));
+        } else try { res.destroy(); } catch { /* */ }
+      });
+      return;
+    }
     if (path === "/internal/box/stop") {
       Promise.resolve(boxStopHandler(req, res, {
         hostUuid: selfHostUuid, boundIp: peerIp,

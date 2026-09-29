@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import type { Pool, PoolClient } from "pg";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
+import { projectBoxIdleChain, withVerifiedCapsule, type BoxIdleProof } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
@@ -2448,6 +2449,51 @@ export class BoxDurableJournal implements BoxJournalPort {
     return { requestId: row.request_id, uid: input.uid,
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
       leaseEpoch: ctx.boxLeaseEpoch };
+  }
+
+  /** Read-only chain projection for idle. Does not settle, stop, or touch a remote run. */
+  async readIdleProof(input: { uid: bigint; containerId: bigint;
+    sessionId: string; turnKey: string },
+    readCapsule?: (pointer: BoxReplayMessagePointer) => Promise<unknown>): Promise<BoxIdleProof> {
+    if (input.uid <= 0n || input.containerId <= 0n
+      || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[a-f0-9]{64}$/.test(input.turnKey)) {
+      throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      const found = await client.query<{ request_id: string; state: string;
+        ctx: Record<string, unknown> }>(
+        `SELECT request_id,state,ctx FROM request_finalize_journal
+          WHERE user_id=$1 AND container_id=$2
+            AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
+            AND ctx->>'model'='box-api-claude-opus-5-5'
+            AND ctx->>'boxInvocationRecovery'='v1'`,
+        [input.uid.toString(), input.containerId.toString(), input.sessionId, input.turnKey]);
+      const open = await client.query<{ request_id: string }>(
+        `SELECT request_id FROM request_finalize_journal
+          WHERE user_id=$1 AND container_id=$2
+            AND ctx->>'boxSessionId'=$3
+            AND ctx->>'boxInvocationRecovery'='v1'
+            AND COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped')`,
+        [input.uid.toString(), input.containerId.toString(), input.sessionId]);
+      await client.query("COMMIT");
+      const proof = projectBoxIdleChain({
+        sessionId: input.sessionId,
+        turnKey: input.turnKey,
+        rows: found.rows.map((row) => ({ requestId: row.request_id, state: row.state, ctx: row.ctx })),
+        otherOpenRequestIds: open.rows.map((row) => row.request_id),
+      });
+      if (!readCapsule || proof.status !== "terminal") return proof;
+      const leaf = found.rows.find((row) => row.request_id === proof.requestId);
+      return withVerifiedCapsule(proof, leaf?.ctx.boxReplayMessage, readCapsule);
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   /** Restart-safe privacy cleanup selection. Corrupt terminal evidence is

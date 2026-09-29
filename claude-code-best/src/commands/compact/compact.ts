@@ -13,7 +13,12 @@ import {
   ERROR_MESSAGE_NOT_ENOUGH_MESSAGES,
   ERROR_MESSAGE_USER_ABORT,
   mergeHookInstructions,
+  summarizeMessagesForIdle,
 } from '../../services/compact/compact.js'
+import { IDLE_COMPACT_INSTRUCTIONS, runIdleCompact } from '../../services/compact/idleRecover.js'
+import { getSessionId } from '../../bootstrap/state.js'
+import { loadConversationForResume } from '../../utils/conversationRecovery.js'
+import { flushSessionStorage, recordTranscript } from '../../utils/sessionStorage.js'
 import { suppressCompactWarning } from '../../services/compact/compactWarningState.js'
 import { microcompactMessages } from '../../services/compact/microCompact.js'
 import { runPostCompactCleanup } from '../../services/compact/postCompactCleanup.js'
@@ -102,6 +107,36 @@ export const call: LocalCommandCall = async (args, context) => {
     // Run microcompact first to reduce tokens before summarization
     const microcompactResult = await microcompactMessages(messages, context)
     const messagesForCompact = microcompactResult.messages
+
+    if (customInstructions === IDLE_COMPACT_INSTRUCTIONS) {
+      const idleResult = await runIdleCompact({
+        sessionId: getSessionId(),
+        messages: messagesForCompact,
+        summarize: (msgs) => summarizeMessagesForIdle(
+          msgs,
+          context,
+          await getCacheSharingParams(context, msgs),
+          customInstructions,
+        ),
+        record: recordTranscript,
+        flush: flushSessionStorage,
+        load: async (id) => loadConversationForResume(id, undefined),
+      })
+      if (idleResult) {
+        setLastSummarizedMessageId(undefined)
+        suppressCompactWarning()
+        getUserContext.cache.clear?.()
+        runPostCompactCleanup()
+        return {
+          type: 'compact',
+          compactionResult: idleResult,
+          displayText: buildDisplayText(context, idleResult.userDisplayMessage, {
+            pre: idleResult.preCompactTokenCount,
+            post: idleResult.truePostCompactTokenCount,
+          }),
+        }
+      }
+    }
 
     const result = await compactConversation(
       messagesForCompact,

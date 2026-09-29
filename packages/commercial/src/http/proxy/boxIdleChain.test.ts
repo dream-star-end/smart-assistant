@@ -1,0 +1,97 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { projectBoxIdleChain, withVerifiedCapsule, type IdleChainRow } from "./boxIdleChain.js";
+
+const sessionId = "ccb-session";
+const turnKey = "ab".repeat(32);
+const capsule = { version: 1, sha256: "c".repeat(64) };
+
+function row(id: string, extra: Record<string, unknown>, state = "committed"): IdleChainRow {
+  return {
+    requestId: id,
+    state,
+    ctx: {
+      boxSessionId: sessionId,
+      boxTurnKey: turnKey,
+      model: "box-api-claude-opus-5-5",
+      boxInvocationRecovery: "v1",
+      boxState: "terminal",
+      ...extra,
+    },
+  };
+}
+
+const leaf = row("leaf", {
+  boxTerminalProof: { reason: "worker_complete", runNonce: "a".repeat(24) },
+  boxReplayMessage: capsule,
+  boxUsage: { inputTokens: 170_000 },
+  boxOwnerRequestId: "parent",
+  boxParentResumeRevision: "11111111-1111-4111-8111-111111111111",
+});
+const parent = row("parent", {
+  boxToolHandoff: { roundNo: 1 },
+  boxResumeRequestId: "leaf",
+  boxResumeRevision: "11111111-1111-4111-8111-111111111111",
+  boxTerminalProof: { reason: "worker_complete", runNonce: "a".repeat(24) },
+});
+
+test("consumed historical handoff still projects one terminal revision", () => {
+  const first = projectBoxIdleChain({ sessionId, turnKey, rows: [leaf, parent] });
+  const second = projectBoxIdleChain({ sessionId, turnKey, rows: [parent, leaf] });
+  assert.equal(first.status, "terminal");
+  assert.equal(second.status, "terminal");
+  if (first.status === "terminal" && second.status === "terminal") {
+    assert.equal(first.revision, second.revision);
+    assert.equal(first.compactRequired, true);
+    assert.equal(first.requestId, "leaf");
+  }
+});
+
+test("unsettled leaf, unknown, and a second open chain stay pending", () => {
+  assert.equal(projectBoxIdleChain({
+    sessionId, turnKey, rows: [{ ...leaf, state: "finalizing" }, parent],
+  }).status, "pending");
+  assert.equal(projectBoxIdleChain({
+    sessionId, turnKey,
+    rows: [leaf, { ...parent, ctx: { ...parent.ctx, boxState: "unknown" } }],
+  }).status, "pending");
+  const open = projectBoxIdleChain({
+    sessionId, turnKey, rows: [leaf, parent], otherOpenRequestIds: ["other"],
+  });
+  assert.equal(open.status, "pending");
+  if (open.status === "pending") assert.equal(open.reason, "other_chain");
+});
+
+test("short usage does not require another summary charge", () => {
+  const small = row("only", {
+    boxTerminalProof: { reason: "worker_complete" },
+    boxReplayMessage: capsule,
+    boxUsage: { inputTokens: 20 },
+  });
+  const proof = projectBoxIdleChain({ sessionId, turnKey, rows: [small] });
+  assert.equal(proof.status, "terminal");
+  if (proof.status === "terminal") assert.equal(proof.compactRequired, false);
+});
+
+test("verified capsule text is attached and a hash miss stays pending", async () => {
+  const proof = projectBoxIdleChain({ sessionId, turnKey, rows: [leaf, parent] });
+  assert.equal(proof.status, "terminal");
+  if (proof.status !== "terminal") return;
+  const pointer = {
+    version: 1, uid: "3", requestId: "leaf", runNonce: "a".repeat(24),
+    leaseEpoch: "b".repeat(32), roundNo: 1, bytes: 11, sha256: proof.capsuleSha256,
+  };
+  const attached = await withVerifiedCapsule(proof, pointer, async () => ({
+    type: "message", role: "assistant", content: [{ type: "text", text: "kept goal" }],
+  }));
+  assert.equal(attached.status, "terminal");
+  if (attached.status === "terminal") assert.equal(attached.summaryText, "kept goal");
+  const missed = await withVerifiedCapsule(proof, { ...pointer, sha256: "d".repeat(64) },
+    async () => { throw new Error("unread"); });
+  assert.deepEqual(missed, { status: "pending", reason: "capsule" });
+});
+
+test("wrong turn is not found", () => {
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey: "ff".repeat(32), rows: [leaf, parent] }),
+    { status: "not_found" });
+});

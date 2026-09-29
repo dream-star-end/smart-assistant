@@ -73,7 +73,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
   nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer };
-  spoolPrefix?: Buffer } = {}) {
+  spoolPrefix?: Buffer;
+  compactUsingLaunchSession?: boolean } = {}) {
+  let launchedSession = "";
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
   const emitted: string[] = [];
@@ -105,6 +107,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         && args[2]?.includes("sys.argv=[p,*argv]")
         && args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-")
         && args[5] !== "--read") {
+        const sessionFlag = args.indexOf("--session-id");
+        if (sessionFlag >= 0 && typeof args[sessionFlag + 1] === "string") {
+          launchedSession = args[sessionFlag + 1]!;
+        }
         sequence.push("launch"); launches++;
         if (options.ambiguousLaunch) throw new BoxExecTransportError("synthetic", false);
         return { stdout: "launched\n", stderrBytes: 0, exitCode: 0 as const };
@@ -118,7 +124,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         const body = options.directFinal
           ? options.finalTrailing ? Buffer.concat([finalRaw, Buffer.from("bad-after-success\n")])
             : finalRaw : raw;
-        const spool = options.spoolPrefix ? Buffer.concat([options.spoolPrefix, body]) : body;
+        const prefix = options.compactUsingLaunchSession
+          ? compactPrefix(launchedSession) : options.spoolPrefix;
+        const spool = prefix ? Buffer.concat([prefix, body]) : body;
         const bytes = spool.subarray(offset);
         return { stdout: JSON.stringify({ data: bytes.toString("base64"),
           offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 as const };
@@ -671,6 +679,23 @@ test("persisted native resume accepts that session compact and still finishes", 
     assert.equal(result.kind, "final");
     assert.equal(f.launches, 1);
     if (result.kind === "final") assert.equal(result.plan.sessionId, sessionId);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
+test("new native start binds the admitted session id", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const f = fixture({ directFinal: true, compactUsingLaunchSession: true });
+    const result = await runBoxToolFirstRound(f.input, f.deps);
+    assert.equal(result.kind, "final");
+    assert.equal(f.launches, 1);
+    if (result.kind === "final") {
+      assert.equal((f.admittedStart as { sessionId: string }).sessionId, result.plan.sessionId);
+    }
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
     else process.env.OC_BOX_FAST_NATIVE = previous;

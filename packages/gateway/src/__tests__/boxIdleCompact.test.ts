@@ -3,129 +3,125 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, test } from 'node:test'
-import { SessionManager, type AgentSession } from '../sessionManager.js'
 import {
+  advanceIdleOp,
+  assembleIdleArtifact,
   IDLE_COMPACT_PROMPT,
-  IdleCompactRejected,
-  type BoxChainTerminalProof,
-  runIdleCompact,
+  startIdleOp,
+  writeIdleOp,
 } from '../boxIdleCompact.js'
 
-const proof = (): BoxChainTerminalProof => ({
-  kind: 'box-chain-terminal-v1',
-  sessionId: 'box-session',
-  revision: 'rev-9',
-  requestId: 'req-terminal',
-  contextOwner: 'box-native-v1',
-  canonicalModel: 'box-api-claude-opus-5-5',
-  rows: [{
-    requestId: 'req-terminal',
-    boxState: 'terminal',
-    committed: true,
-    hasHandoff: false,
-    hasUnknown: false,
-  }],
-})
+const proof = {
+  status: 'terminal' as const,
+  sessionId: 'ccb-session',
+  turnKey: 'ab'.repeat(32),
+  requestId: 'leaf',
+  revision: 'rev-1',
+  compactRequired: true,
+  capsuleSha256: 'c'.repeat(64),
+  summaryText: 'kept goal',
+}
 
-describe('idle compact', () => {
+describe('idle artifact recovery', () => {
   let dir = ''
-  after(async () => {
-    if (dir) await rm(dir, { recursive: true, force: true })
-  })
+  after(async () => { if (dir) await rm(dir, { recursive: true, force: true }) })
 
-  test('unknown chain and a busy session do not call the model', async () => {
-    dir = await mkdtemp(join(tmpdir(), 'idle-compact-'))
-    let calls = 0
-    const unknown = proof()
-    unknown.rows = [{ ...unknown.rows[0], boxState: 'unknown', hasUnknown: true, committed: false }]
-    await assert.rejects(runIdleCompact({
-      sessionKey: 's',
-      activeTurns: 0,
-      activeClients: 0,
-      proof: unknown,
-      idleRequestId: 'idle-1',
-      recoveryDir: dir,
-      submit: async () => { calls += 1 },
-      readSummary: () => 'unused',
-    }), (error: unknown) => error instanceof IdleCompactRejected && error.code === 'IDLE_UNKNOWN_CHAIN')
-    await assert.rejects(runIdleCompact({
-      sessionKey: 's',
-      activeTurns: 1,
-      activeClients: 0,
-      proof: proof(),
-      idleRequestId: 'idle-1',
-      recoveryDir: dir,
-      submit: async () => { calls += 1 },
-      readSummary: () => 'unused',
-    }), (error: unknown) => error instanceof IdleCompactRejected && error.code === 'IDLE_SESSION_BUSY')
-    assert.equal(calls, 0)
-  })
-
-  test('terminal summary is stored before apply, and recovery does not infer again', async () => {
-    dir = await mkdtemp(join(tmpdir(), 'idle-compact-'))
-    const prompts: string[] = []
-    const once = await runIdleCompact({
-      sessionKey: 's',
-      activeTurns: 0,
-      activeClients: 0,
-      proof: proof(),
-      idleRequestId: 'idle-1',
-      recoveryDir: dir,
-      submit: async (prompt) => { prompts.push(prompt) },
-      readSummary: () => 'kept goal',
+  test('same capsule and frozen tail rebuild one artifact without a model call', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'idle-art-'))
+    const started = startIdleOp({
+      dir, sessionKey: 's', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: proof.revision, idleTurnKey: 'ab'.repeat(32),
+      frozenTail: [{ uuid: 'tail-1', parentUuid: null, text: 'kept tail' }],
+      attachments: [{ uuid: 'att-1', text: 'hook-once' }],
     })
-    assert.deepEqual(prompts, [IDLE_COMPACT_PROMPT])
-    assert.equal(once.applied, true)
-    assert.equal(once.nativeMiss, true)
-    assert.equal(once.summaryText, 'kept goal')
-    const stored = JSON.parse(await import('node:fs').then((fs) => fs.readFileSync(join(dir, 'idle-compact-recovery.json'), 'utf8'))) as {
-      sessions: { s: { applied: boolean } }
-    }
-    stored.sessions.s.applied = false
-    await import('node:fs').then((fs) => fs.writeFileSync(join(dir, 'idle-compact-recovery.json'), JSON.stringify(stored)))
-    const recovered = await runIdleCompact({
-      sessionKey: 's',
-      activeTurns: 0,
-      activeClients: 0,
-      proof: proof(),
-      idleRequestId: 'idle-2',
-      recoveryDir: dir,
-      submit: async () => { prompts.push('again') },
-      readSummary: () => { throw new Error('must not read a new summary') },
+    const again = startIdleOp({
+      dir, sessionKey: 's', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: proof.revision, idleTurnKey: 'cd'.repeat(32),
+      frozenTail: [], attachments: [],
     })
-    assert.equal(recovered.applied, true)
-    assert.equal(recovered.summaryText, 'kept goal')
-    assert.deepEqual(prompts, [IDLE_COMPACT_PROMPT])
+    assert.equal(started.ownedDispatch, true)
+    assert.equal(again.ownedDispatch, false)
+    assert.equal(again.op.idleTurnKey, started.op.idleTurnKey)
+    const ignored = advanceIdleOp({ op: started.op, proof, allowDispatch: false })
+    assert.equal(ignored.callModel, false)
+    assert.equal(ignored.op.summaryText, undefined)
+    const stepped = advanceIdleOp({ op: started.op, proof, useProofSummary: true })
+    assert.equal(stepped.callModel, false)
+    assert.equal(stepped.op.artifact?.messages[1]?.text, 'kept goal')
+    const direct = assembleIdleArtifact({
+      opId: started.op.idleTurnKey, summaryText: 'kept goal',
+      tail: started.op.frozenTail, attachments: started.op.attachments,
+    })
+    assert.equal(stepped.op.artifact?.digest, direct.digest)
+    const verified = advanceIdleOp({
+      op: stepped.op,
+      proof: { status: 'pending', reason: 'settled' },
+      loadDigest: (artifact) => artifact.digest,
+    })
+    assert.equal(verified.callModel, false)
+    assert.equal(verified.op.receiptDigest, direct.digest)
+    const lostReceipt = advanceIdleOp({
+      op: { ...stepped.op, receiptDigest: undefined },
+      proof: { status: 'pending', reason: 'settled' },
+      loadDigest: (artifact) => artifact.digest,
+    })
+    assert.equal(lostReceipt.op.receiptDigest, direct.digest)
+    assert.equal(lostReceipt.callModel, false)
   })
 
-  test('session manager sends /compact without a model switch and records native miss', async () => {
-    dir = await mkdtemp(join(tmpdir(), 'idle-compact-'))
-    const sm = new SessionManager({
-      version: 1,
-      gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
-      auth: { mode: 'subscription', claudeCodePath: '' },
-      sessions: { dbPath: '' },
-      defaults: { model: 'box-api-claude-opus-5-5' },
-    } as never)
-    const seen: Array<{ prompt: string; switchId?: string }> = []
-    const session = {
-      sessionKey: 'agent:main:webchat:dm:idle-peer',
-      model: 'box-api-claude-opus-5-5',
-      _activeTurnCount: 0,
-      _activeClientTurnCount: 0,
-      _lastNativeCompactionSummary: undefined,
-      _idleNativeMiss: undefined,
-    } as AgentSession
-    sm.submit = async (_session, prompt, _onEvent, _effort, _model, _requestId, _trace, _mode, opts) => {
-      seen.push({ prompt: String(prompt), switchId: opts?.modelSwitchInternal })
-      session._lastNativeCompactionSummary = 'idle summary'
+  test('pending proof and a missing artifact do not call the model or count as applied', () => {
+    const op = {
+      v: 1 as const,
+      sessionKey: 's',
+      sourceSessionId: 'ccb-session',
+      sourceTurnKey: proof.turnKey,
+      revision: 'rev-1',
+      idleTurnKey: 'turn-key-1',
+      frozenTail: [],
+      attachments: [],
     }
-    const record = await sm.prepareIdleCompact(session, proof(), 'idle-req', dir)
-    assert.equal(seen.length, 1)
-    assert.equal(seen[0]?.prompt, IDLE_COMPACT_PROMPT)
-    assert.equal(seen[0]?.switchId, undefined)
-    assert.equal(record.nativeMiss, true)
-    assert.equal(session._idleNativeMiss, true)
-    assert.equal(record.sourceRequestId, 'req-terminal')
+    const pending = advanceIdleOp({ op, proof: { status: 'pending', reason: 'unsettled' } })
+    assert.equal(pending.callModel, false)
+    assert.equal(pending.op.artifact, undefined)
+    const stored = advanceIdleOp({
+      op: { ...op, summaryText: 'kept goal' },
+      proof: { status: 'pending', reason: 'unsettled' },
+    })
+    assert.equal(stored.callModel, false)
+    assert.ok(stored.op.artifact)
+    assert.throws(() => advanceIdleOp({
+      op: stored.op,
+      proof: { status: 'pending', reason: 'unsettled' },
+      loadDigest: () => 'different',
+    }))
+    assert.equal(IDLE_COMPACT_PROMPT.startsWith('/compact '), true)
+  })
+
+  test('a second submit of the same op does not ask for another compact', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'idle-art-'))
+    const started = startIdleOp({
+      dir, sessionKey: 's2', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: proof.revision, idleTurnKey: 'ab'.repeat(32),
+      frozenTail: [{ uuid: 'tail-1', parentUuid: null, text: 'kept tail' }], attachments: [],
+    })
+    const bare = { ...proof, summaryText: undefined }
+    const first = advanceIdleOp({ op: started.op, proof: bare, allowDispatch: started.ownedDispatch })
+    assert.equal(first.callModel, true)
+    writeIdleOp(dir, first.op)
+    const recovered = startIdleOp({
+      dir, sessionKey: 's2', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: proof.revision, idleTurnKey: 'ff'.repeat(32),
+      frozenTail: [], attachments: [],
+    })
+    const second = advanceIdleOp({ op: recovered.op, proof: bare, allowDispatch: recovered.ownedDispatch })
+    assert.equal(recovered.ownedDispatch, false)
+    assert.equal(second.callModel, false)
+    const assembled = advanceIdleOp({
+      op: { ...recovered.op, summaryText: 'kept goal' },
+      proof: { status: 'pending', reason: 'unsettled' },
+    })
+    assert.equal(assembled.callModel, false)
+    assert.ok(assembled.op.artifact)
+    assert.equal(assembled.op.artifact?.messages.some((message) => message.text === 'kept tail'), true)
   })
 })

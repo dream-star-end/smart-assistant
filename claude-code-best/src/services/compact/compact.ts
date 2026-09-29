@@ -313,6 +313,8 @@ export interface CompactionResult {
   postCompactTokenCount?: number
   truePostCompactTokenCount?: number
   compactionUsage?: ReturnType<typeof getTokenUsage>
+  /** Idle recovery already built the stable post-compact messages. */
+  idleStable?: boolean
 }
 
 /**
@@ -789,6 +791,50 @@ export async function compactConversation(
     context.onCompactProgress?.({ type: 'compact_end' })
     context.setSDKStatus?.('' as SDKStatus)
   }
+}
+
+/**
+ * Summary HTTP only. Idle recovery calls this at most once, then stores the
+ * text before any artifact or hook. It does not run compact hooks.
+ */
+export async function summarizeMessagesForIdle(
+  messages: Message[],
+  context: ToolUseContext,
+  cacheSafeParams: CacheSafeParams,
+  customInstructions?: string,
+): Promise<string> {
+  const preCompactTokenCount = tokenCountWithEstimation(messages)
+  const appState = context.getAppState()
+  const summaryRequest = createUserMessage({
+    content: getCompactPrompt(customInstructions),
+  })
+  let messagesToSummarize = messages
+  let retryCacheSafeParams = cacheSafeParams
+  let summary: string | null = null
+  let ptlAttempts = 0
+  for (;;) {
+    const summaryResponse = await streamCompactSummary({
+      messages: messagesToSummarize,
+      summaryRequest,
+      appState,
+      context,
+      preCompactTokenCount,
+      cacheSafeParams: retryCacheSafeParams,
+    })
+    summary = getAssistantMessageText(summaryResponse)
+    if (!summary?.startsWith(PROMPT_TOO_LONG_ERROR_MESSAGE)) break
+    ptlAttempts++
+    const truncated =
+      ptlAttempts <= MAX_PTL_RETRIES
+        ? truncateHeadForPTLRetry(messagesToSummarize, summaryResponse)
+        : null
+    if (!truncated) throw new Error(ERROR_MESSAGE_PROMPT_TOO_LONG)
+    messagesToSummarize = truncated
+    retryCacheSafeParams = { ...retryCacheSafeParams, forkContextMessages: truncated }
+  }
+  if (!summary) throw new Error('Failed to generate conversation summary - response did not contain valid text content')
+  if (startsWithApiErrorPrefix(summary)) throw new Error(summary)
+  return summary
 }
 
 /**

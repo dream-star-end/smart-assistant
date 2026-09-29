@@ -228,6 +228,7 @@ function buildTurnSummary(
   telemetry: TelemetryChannel,
   nativeCompactionSummary?: string,
   creditExhausted = false,
+  nativeIdleReceipt?: { opId: string; digest: string },
 ): TurnSummary {
   if (creditExhausted) {
     // Our own interrupt lands as CCB's cooperative-abort diagnostic (an
@@ -254,6 +255,7 @@ function buildTurnSummary(
       numTurns: result.numTurns,
       isError: true,
       ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
+      ...(nativeIdleReceipt ? { nativeIdleReceipt } : {}),
       errorKind: 'other',
       errorClass: 'insufficient_credits',
       errorDetail: CREDIT_EXHAUSTED_DETAIL,
@@ -286,6 +288,7 @@ function buildTurnSummary(
     numTurns: result.numTurns,
     isError: result.isError,
     ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
+    ...(nativeIdleReceipt ? { nativeIdleReceipt } : {}),
     ...(errorKind ? { errorKind } : {}),
     // 审计 R3:与 codexAdapter 对称,把 TurnResult.errorClass 复制到 TurnSummary。
     // CCB result 帧不产 errorClass(恒 undefined,不落),此处仅保证映射对称、不丢字段。
@@ -438,6 +441,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     }
     const telemetry = new TelemetryChannel()
     let nativeCompactionSummary: string | undefined
+    let nativeIdleReceipt: { opId: string; digest: string } | undefined
     let resolveSummary!: (s: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((res) => {
       resolveSummary = res
@@ -498,6 +502,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       },
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
       onNativeCompactionSummary: (summaryText) => { nativeCompactionSummary = summaryText },
+      onIdleArtifactReceipt: (receipt) => { nativeIdleReceipt = receipt },
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
       onFinish: (result) => {
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
@@ -511,6 +516,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
                 telemetry,
                 nativeCompactionSummary,
                 ctx.creditGuard.isExhausted,
+                nativeIdleReceipt,
               )
             : null,
         )

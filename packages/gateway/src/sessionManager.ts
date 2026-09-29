@@ -35,12 +35,18 @@ import {
 // PartialSnapshot)。ccbAdapter / codexAdapter 的 import 兼有 registry 注册副作用
 // ('ccb' / 'codex' factory)。
 import {
-  assertNextUserMayStart,
-  readIdleRecovery,
-  runIdleCompact,
-  type BoxChainTerminalProof,
-  type IdleCompactRecord,
+  advanceIdleOp,
+  boxTurnMayIdle,
+  IDLE_COMPACT_PROMPT,
+  IdleCompactRejected,
+  readIdleNative,
+  readIdleOp,
+  readPendingIdle,
+  startIdleOp,
+  writeIdleNative,
+  writeIdleOp,
 } from './boxIdleCompact.js'
+import { fetchBoxIdleProof } from './engine/boxIdleProofClient.js'
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
@@ -984,8 +990,10 @@ export interface AgentSession {
     expiresAt?: number
   }
   _lastNativeCompactionSummary?: string
-  /** Set when an applied idle summary changed the outer history. Not a native claim. */
-  _idleNativeMiss?: boolean
+  /** Signed context owner for the turn that currently holds session.lock. */
+  _boxContextOwner?: string
+  /** Set while the lock-held idle path is inside runner.submitTurn. */
+  _idleRunning?: boolean
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   /** Set by onFinish when the CCB result row signals a stale --resume session
@@ -4639,45 +4647,98 @@ export class SessionManager {
   }
 
   /**
-   * Terminal-only idle compact. Shares session.lock via submit, sends the
-   * native /compact command, and does not set modelSwitchInternal.
-   * A stored summary that was not applied is finished from disk with no
-   * second model call.
+   * Idle while this submit already owns session.lock. Never calls public submit.
+   * The op file is the dispatch claim: only its creator may send one summary.
+   * A later call applies a stored capsule and does not reserve another turn.
    */
-  async prepareIdleCompact(
-    session: AgentSession,
-    proof: BoxChainTerminalProof,
-    idleRequestId: string,
-    recoveryDir: string = paths.home,
-  ): Promise<IdleCompactRecord> {
-    let submitted = false
-    const record = await runIdleCompact({
+  private async finishIdleUnderLock(session: AgentSession, source: {
+    sessionId: string
+    turnKey: string
+  }, recoveryDir: string = paths.home): Promise<void> {
+    if (session._idleRunning) return
+    const pending = readPendingIdle(recoveryDir, session.sessionKey)
+    if (!pending && !boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) return
+    const proof = await fetchBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
+    if (proof.status !== 'terminal' || !proof.compactRequired) return
+    const started = startIdleOp({
+      dir: recoveryDir,
       sessionKey: session.sessionKey,
-      activeTurns: session._activeTurnCount ?? 0,
-      activeClients: session._activeClientTurnCount ?? 0,
-      proof,
-      idleRequestId,
-      recoveryDir,
-      submit: async (prompt) => {
-        submitted = true
-        session._lastNativeCompactionSummary = undefined
-        await this.submit(
-          session,
-          prompt,
-          () => {},
-          undefined,
-          session.model,
-          idleRequestId,
-          undefined,
-          undefined,
-          { idleCompactRequestId: idleRequestId },
-        )
-      },
-      readSummary: () => session._lastNativeCompactionSummary,
+      sourceSessionId: source.sessionId,
+      sourceTurnKey: source.turnKey,
+      revision: proof.revision,
+      idleTurnKey: createHash('sha256').update(`${session.sessionKey}:${proof.revision}`).digest('hex'),
+      frozenTail: [],
+      attachments: [],
     })
-    if (!submitted) session._idleNativeMiss = true
-    else session._idleNativeMiss = record.nativeMiss
-    return record
+    let op = started.op
+    const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+    if (native?.frozenTail.length) op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
+    if (!op.summaryText && native?.summaryText) {
+      op = { ...op, summaryText: native.summaryText }
+    }
+    if (!op.summaryText && !started.ownedDispatch) {
+      const compactProof = await fetchBoxIdleProof({
+        sessionId: source.sessionId, turnKey: op.idleTurnKey,
+      })
+      const recovered = advanceIdleOp({
+        op, proof: compactProof, useProofSummary: true, allowDispatch: false,
+      })
+      op = recovered.op
+      if (op.summaryText) {
+        writeIdleNative(recoveryDir, {
+          v: 1, opId: op.idleTurnKey, revision: op.revision, sessionId: source.sessionId,
+          summaryText: op.summaryText, modelCalls: native?.modelCalls ?? 1,
+          frozenTail: op.frozenTail, attachments: op.attachments,
+        })
+      }
+    }
+    let step = advanceIdleOp({ op, proof, allowDispatch: started.ownedDispatch && !op.summaryText })
+    const needsApply = Boolean(step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest)
+    if ((step.callModel || needsApply) && session.runner.submitTurn) {
+      if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
+        writeIdleNative(recoveryDir, {
+          v: 1, opId: step.op.idleTurnKey, revision: step.op.revision, sessionId: source.sessionId,
+          ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
+          modelCalls: 0, frozenTail: step.op.frozenTail, attachments: step.op.attachments,
+        })
+      }
+      session._idleRunning = true
+      try {
+        const run = session.runner.submitTurn({
+          input: IDLE_COMPACT_PROMPT,
+          turnKey: step.op.idleTurnKey,
+          onEvent: () => {},
+          sessionTotals: session,
+          toolUseIdToName: session.toolUseIdToName ?? new Map(),
+        })
+        const settled = await run.summary
+        const summary = settled?.nativeCompactionSummary?.trim() ?? ''
+        const receipt = settled?.nativeIdleReceipt
+        const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+        const mergedSummary = step.op.summaryText || after?.summaryText || summary
+        if (mergedSummary) {
+          step = advanceIdleOp({
+            op: {
+              ...step.op,
+              summaryText: mergedSummary,
+              frozenTail: after?.frozenTail.length ? after.frozenTail : step.op.frozenTail,
+              attachments: after?.attachments ?? step.op.attachments,
+              artifact: undefined,
+              receiptDigest: undefined,
+            },
+            proof,
+            allowDispatch: false,
+          })
+        }
+        if (receipt && receipt.opId === step.op.idleTurnKey && step.op.artifact
+          && receipt.digest === step.op.artifact.digest) {
+          step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
+        }
+      } finally {
+        session._idleRunning = false
+      }
+    }
+    writeIdleOp(recoveryDir, step.op)
   }
 
   cancelModelSwitch(session: AgentSession, switchId: string): boolean {
@@ -4902,8 +4963,6 @@ export class SessionManager {
       modelSwitchId?: string
       /** Native compact command authored by prepareModelSwitch itself. */
       modelSwitchInternal?: string
-      /** Set only by prepareIdleCompact. Never a model-switch bypass. */
-      idleCompactRequestId?: string
     },
   ): Promise<void> {
     // Resolve/rebuild a warm legacy runner under the existing creation gate,
@@ -5057,9 +5116,21 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
-      const idleRow = readIdleRecovery(paths.home, session.sessionKey)
-      if (opts?.idleCompactRequestId === undefined) assertNextUserMayStart(idleRow)
-      if (idleRow?.applied && idleRow.nativeMiss) session._idleNativeMiss = true
+      const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
+      if (pendingIdle && opts?.modelSwitchInternal === undefined) {
+        await this.finishIdleUnderLock(session, {
+          sessionId: pendingIdle.sourceSessionId,
+          turnKey: pendingIdle.sourceTurnKey,
+        })
+        const recovered = readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
+        if (!recovered?.artifact || recovered.receiptDigest !== recovered.artifact.digest) {
+          throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
+        }
+      }
+      session._boxContextOwner = opts?.modelAuthority?.executionDescriptor &&
+        typeof (opts.modelAuthority.executionDescriptor as { contextOwner?: unknown }).contextOwner === 'string'
+        ? (opts.modelAuthority.executionDescriptor as { contextOwner: string }).contextOwner
+        : undefined
       // A deferred dispatch can be cancelled while its predecessor owns the lock.
       // Fence it before resume promotion / runner reconfiguration, not only before
       // submitTurn. This read does not replace the final queued -> running CAS:
@@ -5764,6 +5835,18 @@ export class SessionManager {
           }
           if (session._externalTurnAbort === logicalTurnAbort) {
             session._externalTurnAbort = undefined
+          }
+          const idleSessionId = session.runner.nativeSessionId ?? undefined
+          const idleTurnKey = session._currentTurnKey
+          if (unhandledTurnError === undefined && idleSessionId && idleTurnKey
+            && opts?.modelSwitchInternal === undefined) {
+            try {
+              await this.finishIdleUnderLock(session, { sessionId: idleSessionId, turnKey: idleTurnKey })
+            } catch (idleErr) {
+              if (!(idleErr instanceof IdleCompactRejected)) {
+                log.warn('idle compact failed closed', { sessionKey: session.sessionKey }, idleErr)
+              }
+            }
           }
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined

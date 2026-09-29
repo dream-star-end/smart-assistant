@@ -1,192 +1,248 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER } from '@openclaude/protocol'
+import type { IdleProofResponse } from './engine/boxIdleProofClient.js'
 
-
-
-/** Same native command the model-switch path already sends. Idle does not reuse that switch. */
 export const IDLE_COMPACT_PROMPT =
   '/compact preserve the user goal, decisions, constraints, current work, files, errors, and next steps'
 
-const CLOSED = new Set(['terminal'])
-const OPEN = new Set(['unknown', 'handoff', 'resuming', 'reserved', 'linked', 'prestart_stopped'])
-
-export interface BoxChainTerminalRow {
-  requestId: string
-  boxState: string
-  committed: boolean
-  hasHandoff: boolean
-  hasUnknown: boolean
-}
-
-/**
- * Caller-supplied projection of the Box journal chain.
- * Gateway re-checks every row. A bare boolean is not a proof.
- * The commercial read that fills this object is not in this package.
- */
-export interface BoxChainTerminalProof {
-  kind: 'box-chain-terminal-v1'
-  sessionId: string
-  revision: string
-  requestId: string
-  contextOwner: string
-  canonicalModel: string
-  rows: readonly BoxChainTerminalRow[]
-}
-
-export interface IdleCompactRecord {
-  v: 1
-  sessionKey: string
-  revision: string
-  sourceRequestId: string
-  idleRequestId: string
-  summaryText: string
-  applied: boolean
-  /** Next user must not reuse the pre-idle native pointer. */
-  nativeMiss: true
-}
-
 export class IdleCompactRejected extends Error {
   constructor(readonly code:
-    | 'IDLE_SESSION_BUSY'
-    | 'IDLE_NOT_TERMINAL'
-    | 'IDLE_UNKNOWN_CHAIN'
-    | 'IDLE_CONTEXT_OWNER'
-    | 'IDLE_SUMMARY_MISSING'
     | 'IDLE_HISTORY_PENDING'
+    | 'IDLE_ARTIFACT_MISSING'
     | 'IDLE_RECOVERY_CORRUPT'
-    | 'PROTOCOL_CONTEXT_OWNER_UNRESOLVED') {
+    | 'IDLE_NOT_BOX') {
     super(code)
     this.name = 'IdleCompactRejected'
   }
 }
 
-async function authorityContract(): Promise<{ owner: string; model: string }> {
-  const read = (mod: Record<string, unknown>) =>
-    mod.BOX_NATIVE_CONTEXT_OWNER === 'box-native-v1' && mod.BOX_NATIVE_CONTEXT_MODEL === 'box-api-claude-opus-5-5'
-      ? { owner: 'box-native-v1', model: 'box-api-claude-opus-5-5' }
-      : undefined
-  const packaged = read(await import('@openclaude/protocol') as Record<string, unknown>)
-  if (packaged) return packaged
-  // This worktree's node_modules link still resolves the pre-B snapshot.
-  // Load the protocol source that belongs to the same commit instead of a second token.
-  const source = new URL('../../protocol/src/modelAuthority.ts', import.meta.url).href
-  const local = read(await import(source) as Record<string, unknown>)
-  if (!local) throw new IdleCompactRejected('PROTOCOL_CONTEXT_OWNER_UNRESOLVED')
-  return local
+export interface IdleFrozenTail {
+  uuid: string
+  parentUuid: string | null
+  text: string
 }
 
-export async function assertIdleAdmission(input: {
-  proof: BoxChainTerminalProof
-  activeTurns: number
-  activeClients: number
-}): Promise<void> {
-  if (input.activeTurns > 0 || input.activeClients > 0) {
-    throw new IdleCompactRejected('IDLE_SESSION_BUSY')
-  }
-  const proof = input.proof
-  if (!Array.isArray(proof.rows) || proof.rows.length === 0 || !proof.rows.some((row) => row.requestId === proof.requestId)) {
-    throw new IdleCompactRejected('IDLE_NOT_TERMINAL')
-  }
-  for (const row of proof.rows) {
-    if (row.hasUnknown || row.boxState === 'unknown' || OPEN.has(row.boxState)) {
-      throw new IdleCompactRejected('IDLE_UNKNOWN_CHAIN')
-    }
-    if (row.hasHandoff || !row.committed || !CLOSED.has(row.boxState)) {
-      throw new IdleCompactRejected('IDLE_NOT_TERMINAL')
-    }
-  }
-  const contract = await authorityContract()
-  if (
-    proof.kind !== 'box-chain-terminal-v1' ||
-    proof.contextOwner !== contract.owner ||
-    proof.canonicalModel !== contract.model ||
-    proof.revision.trim() === '' ||
-    proof.requestId.trim() === '' ||
-    proof.sessionId.trim() === ''
-  ) {
-    throw new IdleCompactRejected('IDLE_CONTEXT_OWNER')
+export interface IdleAttachment {
+  uuid: string
+  text: string
+}
+
+export interface IdleArtifact {
+  messages: Array<Record<string, unknown>>
+  digest: string
+}
+
+export interface IdleOp {
+  v: 1
+  sessionKey: string
+  sourceSessionId: string
+  sourceTurnKey: string
+  revision: string
+  idleTurnKey: string
+  frozenTail: IdleFrozenTail[]
+  attachments: IdleAttachment[]
+  summaryText?: string
+  capsuleSha256?: string
+  artifact?: IdleArtifact
+  receiptDigest?: string
+}
+
+export function idleUuid(opId: string, role: string): string {
+  const hex = createHash('sha256').update(`${opId}:${role}`).digest('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
+}
+
+/** Pure assembly. Same op, summary, tail, and attachments always yield the same digest. */
+export function assembleIdleArtifact(input: {
+  opId: string
+  summaryText: string
+  tail: readonly IdleFrozenTail[]
+  attachments: readonly IdleAttachment[]
+}): IdleArtifact {
+  const boundary = idleUuid(input.opId, 'boundary')
+  const summary = idleUuid(input.opId, 'summary')
+  const anchor = input.tail[input.tail.length - 1]?.uuid ?? null
+  const messages: Array<Record<string, unknown>> = [
+    { uuid: boundary, type: 'system', subtype: 'compact_boundary', parentUuid: anchor },
+    { uuid: summary, type: 'user', isSynthetic: true, parentUuid: boundary, text: input.summaryText },
+    ...input.tail.map((item) => ({ uuid: item.uuid, parentUuid: item.parentUuid, type: 'user', text: item.text })),
+    ...input.attachments.map((item) => ({ uuid: item.uuid, type: 'attachment', parentUuid: summary, text: item.text })),
+  ]
+  return {
+    messages,
+    digest: createHash('sha256').update(JSON.stringify(messages)).digest('hex'),
   }
 }
 
-function fileFor(dir: string): string {
-  return join(dir, 'idle-compact-recovery.json')
+export function boxTurnMayIdle(input: { model?: string; contextOwner?: string }): boolean {
+  return input.model === BOX_NATIVE_CONTEXT_MODEL && input.contextOwner === BOX_NATIVE_CONTEXT_OWNER
 }
 
-function readAll(dir: string): Record<string, IdleCompactRecord> {
-  const path = fileFor(dir)
+function opPath(dir: string, op: { sessionKey: string; revision: string }): string {
+  return join(dir, 'idle-ops', encodeURIComponent(op.sessionKey), `${op.revision}.json`)
+}
+
+export function readPendingIdle(dir: string, sessionKey: string): IdleOp | undefined {
+  const folder = join(dir, 'idle-ops', encodeURIComponent(sessionKey))
+  let names: string[] = []
+  try { names = readdirSync(folder) } catch { return undefined }
+  for (const name of names) {
+    if (!name.endsWith('.json') || name.endsWith('.tmp')) continue
+    const op = readIdleOp(dir, sessionKey, name.slice(0, -'.json'.length))
+    if (op && op.receiptDigest !== op.artifact?.digest) return op
+  }
+  return undefined
+}
+
+export function readIdleOp(dir: string, sessionKey: string, revision: string): IdleOp | undefined {
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { sessions?: Record<string, IdleCompactRecord> }
-    return parsed.sessions ?? {}
+    const parsed = JSON.parse(readFileSync(opPath(dir, { sessionKey, revision }), 'utf8')) as IdleOp
+    if (parsed.v !== 1 || parsed.sessionKey !== sessionKey || parsed.revision !== revision) {
+      throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+    }
+    return parsed
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return {}
+    if (error instanceof IdleCompactRejected) throw error
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
     throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
   }
 }
 
-function writeAll(dir: string, sessions: Record<string, IdleCompactRecord>): void {
-  mkdirSync(dir, { recursive: true })
-  const path = fileFor(dir)
+export function writeIdleOp(dir: string, op: IdleOp): void {
+  const path = opPath(dir, op)
+  mkdirSync(join(path, '..'), { recursive: true })
   const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, JSON.stringify({ v: 1, sessions }))
+  writeFileSync(tmp, JSON.stringify(op))
   renameSync(tmp, path)
 }
 
-export function readIdleRecovery(dir: string, sessionKey: string): IdleCompactRecord | undefined {
-  const row = readAll(dir)[sessionKey]
-  if (!row) return undefined
-  if (row.v !== 1 || typeof row.summaryText !== 'string' || typeof row.applied !== 'boolean') {
-    throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
-  }
-  return row
-}
-
-export function assertNextUserMayStart(row: IdleCompactRecord | undefined): void {
-  if (row && !row.applied) throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
-}
-
-export function applyStoredIdleSummary(dir: string, sessionKey: string): IdleCompactRecord {
-  const row = readIdleRecovery(dir, sessionKey)
-  if (!row) throw new IdleCompactRejected('IDLE_SUMMARY_MISSING')
-  if (row.applied) return row
-  const applied: IdleCompactRecord = { ...row, applied: true, nativeMiss: true }
-  const all = readAll(dir)
-  all[sessionKey] = applied
-  writeAll(dir, all)
-  return applied
-}
-
-export async function runIdleCompact(input: {
+/**
+ * Create the op file once. The creator is the only caller allowed to send
+ * the summary request. A later process sees the file and must not send again.
+ */
+export function startIdleOp(input: {
+  dir: string
   sessionKey: string
-  activeTurns: number
-  activeClients: number
-  proof: BoxChainTerminalProof
-  idleRequestId: string
-  recoveryDir: string
-  submit: (prompt: string) => Promise<void>
-  readSummary: () => string | undefined
-}): Promise<IdleCompactRecord> {
-  const pending = readIdleRecovery(input.recoveryDir, input.sessionKey)
-  if (pending && !pending.applied) {
-    if (pending.revision !== input.proof.revision) throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
-    return applyStoredIdleSummary(input.recoveryDir, input.sessionKey)
-  }
-  await assertIdleAdmission(input)
-  await input.submit(IDLE_COMPACT_PROMPT)
-  const summaryText = input.readSummary()?.trim()
-  if (!summaryText) throw new IdleCompactRejected('IDLE_SUMMARY_MISSING')
-  const stored: IdleCompactRecord = {
+  sourceSessionId: string
+  sourceTurnKey: string
+  revision: string
+  idleTurnKey: string
+  frozenTail: IdleFrozenTail[]
+  attachments: IdleAttachment[]
+}): { op: IdleOp; ownedDispatch: boolean } {
+  const existing = readIdleOp(input.dir, input.sessionKey, input.revision)
+  if (existing) return { op: existing, ownedDispatch: false }
+  const op: IdleOp = {
     v: 1,
     sessionKey: input.sessionKey,
-    revision: input.proof.revision,
-    sourceRequestId: input.proof.requestId,
-    idleRequestId: input.idleRequestId,
-    summaryText,
-    applied: false,
-    nativeMiss: true,
+    sourceSessionId: input.sourceSessionId,
+    sourceTurnKey: input.sourceTurnKey,
+    revision: input.revision,
+    idleTurnKey: input.idleTurnKey,
+    frozenTail: input.frozenTail,
+    attachments: input.attachments,
   }
-  const all = readAll(input.recoveryDir)
-  all[input.sessionKey] = stored
-  writeAll(input.recoveryDir, all)
-  return applyStoredIdleSummary(input.recoveryDir, input.sessionKey)
+  const path = opPath(input.dir, op)
+  mkdirSync(join(path, '..'), { recursive: true })
+  try {
+    writeFileSync(path, JSON.stringify(op), { flag: 'wx' })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    const raced = readIdleOp(input.dir, input.sessionKey, input.revision)
+    if (!raced) throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+    return { op: raced, ownedDispatch: false }
+  }
+  return { op, ownedDispatch: true }
+}
+
+export interface IdleNativeFile {
+  v: 1
+  opId: string
+  revision: string
+  sessionId: string
+  summaryText?: string
+  modelCalls: number
+  frozenTail: IdleFrozenTail[]
+  attachments: IdleAttachment[]
+}
+
+export function idleNativeDir(home: string, sessionId: string): string {
+  return join(home, 'idle-native', encodeURIComponent(sessionId))
+}
+
+export function idleNativePath(home: string, sessionId: string, revision: string): string {
+  return join(idleNativeDir(home, sessionId), `${revision}.json`)
+}
+
+export function readIdleNative(home: string, sessionId: string, revision: string): IdleNativeFile | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(idleNativePath(home, sessionId, revision), 'utf8')) as IdleNativeFile
+    if (parsed.v !== 1 || parsed.revision !== revision || parsed.sessionId !== sessionId) {
+      throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+    }
+    return parsed
+  } catch (error) {
+    if (error instanceof IdleCompactRejected) throw error
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+  }
+}
+
+export function writeIdleNative(home: string, file: IdleNativeFile): void {
+  const path = idleNativePath(home, file.sessionId, file.revision)
+  mkdirSync(join(path, '..'), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(file))
+  renameSync(tmp, path)
+}
+
+/**
+ * Advance one stored op without reserving a new turn.
+ * `useProofSummary` is only for the compact request's own proof, never the
+ * source user-turn leaf. `allowDispatch` is only the process that created the op.
+ */
+export function advanceIdleOp(input: {
+  op: IdleOp
+  proof: IdleProofResponse
+  allowDispatch?: boolean
+  useProofSummary?: boolean
+  loadDigest?: (artifact: IdleArtifact) => string | undefined
+}): { op: IdleOp; callModel: boolean } {
+  let op = input.op
+  for (let step = 0; step < 4; step++) {
+    if (op.artifact && op.receiptDigest === op.artifact.digest) return { op, callModel: false }
+    if (op.artifact && !op.receiptDigest) {
+      if (!input.loadDigest) return { op, callModel: false }
+      const loaded = input.loadDigest(op.artifact)
+      if (loaded !== op.artifact.digest) throw new IdleCompactRejected('IDLE_ARTIFACT_MISSING')
+      op = { ...op, receiptDigest: loaded }
+      continue
+    }
+    if (op.summaryText && !op.artifact) {
+      op = {
+        ...op,
+        artifact: assembleIdleArtifact({
+          opId: op.idleTurnKey,
+          summaryText: op.summaryText,
+          tail: op.frozenTail,
+          attachments: op.attachments,
+        }),
+      }
+      continue
+    }
+    if (!op.summaryText && input.useProofSummary && input.proof.status === 'terminal'
+      && input.proof.summaryText && input.proof.capsuleSha256) {
+      op = { ...op, summaryText: input.proof.summaryText, capsuleSha256: input.proof.capsuleSha256 }
+      continue
+    }
+    break
+  }
+  if (op.artifact && op.receiptDigest === op.artifact.digest) return { op, callModel: false }
+  if (input.allowDispatch && !op.summaryText && input.proof.status === 'terminal'
+    && input.proof.compactRequired && input.proof.revision === op.revision) {
+    return { op, callModel: true }
+  }
+  return { op, callModel: false }
 }

@@ -411,9 +411,7 @@ export async function runBoxToolFirstRound(input: {
     }
     input.onLaunchAck?.();
     const decoder = new BoxCliToolHandoffDecoder(plan.expectedModel, plan.catalog,
-      { allowFinal: true, ...(nativeClaim
-        ? { trustedNativeSessionId: nativeClaim.pointer.nativeSessionId }
-        : {}) });
+      { allowFinal: true, ...(nativeEnabled ? { trustedNativeSessionId: plan.sessionId } : {}) });
     for await (const line of pollBoxSpoolLines({ exec: target.exec, access: plan,
       startOffset: 0, deadlineMs: Math.max(1, remaining()), signal })) {
       const decoded = decoder.push(line.text);
