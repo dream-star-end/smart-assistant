@@ -9,7 +9,7 @@ import { observeBoxDetachedText } from "./boxDetachedTextObserve.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { observeBoxToolUnknown } from "./boxToolUnknownObserver.js";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import type { BoxDurableJournal, BoxReplayIdentity } from "./boxDurableJournal.js";
+import type { BoxReplayIdentity } from "./boxDurableJournal.js";
 import type { ProxyBody } from "./shared.js";
 import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
 
@@ -213,7 +213,7 @@ test("unknown tool observer bills the post-compact tool message, not the summary
     journal: { recordToolHandoff: async (value: { candidate: { inputTokens: number } }) => {
       usage = value.candidate;
       return { durableRevision: "synthetic", journaledToolUseIds: [use.id], verifiedPendingToolUseIds: [use.id] };
-    } } as unknown as Pick<BoxDurableJournal, "recordToolHandoff">,
+    } } as never,
   });
   assert.equal(outcome, "committed");
   assert.equal(usage?.inputTokens, 50);
