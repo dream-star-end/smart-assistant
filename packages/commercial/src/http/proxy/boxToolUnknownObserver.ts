@@ -105,7 +105,7 @@ export async function observeBoxToolUnknown(input: {
         catch { throw new BoxToolUnknownObserverError("BOX_OBSERVER_RECORD_INVALID"); }
         if (compaction) {
           try {
-            if (compaction.take(record)) continue;
+            if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
           } catch (error) {
             if (error instanceof BoxCliCompactionError) {
               throw new BoxToolUnknownObserverError(error.code);

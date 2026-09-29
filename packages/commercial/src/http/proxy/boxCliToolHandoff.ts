@@ -277,7 +277,7 @@ export class BoxCliToolHandoffDecoder {
     }
     if (this.compaction) {
       try {
-        if (this.compaction.take(record)) return "";
+        if (this.compaction.take(record, this.started ? "in-model" : "pre-model")) return "";
       } catch (error) {
         if (error instanceof BoxCliCompactionError) {
           throw new BoxCliToolHandoffError(error.code);

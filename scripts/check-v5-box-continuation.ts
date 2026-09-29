@@ -41,7 +41,7 @@ const ENTRIES = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMa
  * This is not a full-repo manifest. */
 const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as const;
 /** Direct runtime module for the OCV5-296 compact carrier. No oracle or graph edit. */
-const COMPACTION_SOURCE = ["boxCliCompaction.ts"] as const;
+const COMPACTION_SOURCE = ["boxCliSse.ts"] as const;
 const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
@@ -912,6 +912,60 @@ async function supervise(expectSha: string): Promise<void> {
   }
   process.stdout.write(stdout.endsWith("\n") ? stdout : `${stdout}\n`);
 }
+async function proveCompactionConsumer(): Promise<void> {
+  const sse = await import(pathToFileURL(join(PROXY, "boxCliSse.ts")).href) as {
+    createBoxCliSseDecoder: (model: string, session?: string) => {
+      push: (chunk: string) => string;
+      finish: () => { inputTokens: number; outputTokens: number; sse: string };
+    };
+    BoxCliSseError: new (code: string) => Error & { code: string };
+  };
+  const session = "e37f0afa-e659-40ba-84e4-fa90bf465945";
+  const anchor = "991406f8-0097-4e91-a2f1-b732812e36fe";
+  const head = "86b0b5b4-2fc6-40a3-a33c-3185d1655975";
+  const tail = "1216440c-7345-45a9-ba11-8262fd3450c3";
+  const boundary = { type: "system", subtype: "compact_boundary",
+    uuid: "adc44006-42e8-4ee0-92c6-6e9fc1412da8", session_id: session,
+    logical_parent_uuid: tail, compact_metadata: { trigger: "auto", pre_tokens: 200000,
+      post_tokens: 369, cumulative_dropped_tokens: 1, duration_ms: 1,
+      preserved_segment: { head_uuid: head, anchor_uuid: anchor, tail_uuid: tail },
+      preserved_messages: { anchor_uuid: anchor, uuids: [head, tail], all_uuids: [head, tail] } } };
+  const summary = { type: "user", isSynthetic: true, parent_tool_use_id: null, session_id: session,
+    uuid: anchor, timestamp: "2026-09-29T13:35:53.708Z",
+    message: { role: "user", content: [{ type: "text", text: "x".repeat(9000) }] } };
+  const model = "claude-opus-5-5";
+  const billed = [
+    { type: "system", subtype: "init", tools: [], mcp_servers: [] },
+    boundary, summary,
+    { type: "stream_event", event: { type: "message_start", message: { id: "msg_gate", type: "message",
+      role: "assistant", model, content: [], usage: { input_tokens: 222, output_tokens: 0 } } } },
+    { type: "stream_event", event: { type: "content_block_start", index: 0,
+      content_block: { type: "text", text: "" } } },
+    { type: "stream_event", event: { type: "content_block_delta", index: 0,
+      delta: { type: "text_delta", text: "ready" } } },
+    { type: "stream_event", event: { type: "content_block_stop", index: 0 } },
+    { type: "stream_event", event: { type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 5 } } },
+    { type: "stream_event", event: { type: "message_stop" } },
+    { type: "assistant", message: { id: "msg_gate", model, role: "assistant",
+      content: [{ type: "text", text: "ready" }] } },
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 222, output_tokens: 5 } },
+  ];
+  const decoder = sse.createBoxCliSseDecoder(model, session);
+  const emitted = decoder.push(billed.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  const finished = decoder.finish();
+  if (finished.inputTokens !== 222 || finished.outputTokens !== 5
+    || emitted.includes("x".repeat(9000)) || finished.sse.includes("x".repeat(9000))) {
+    fail("COMPACTION_CONSUMER");
+  }
+  const mid = sse.createBoxCliSseDecoder(model, session);
+  try {
+    mid.push(JSON.stringify(billed[0]) + "\n" + JSON.stringify(billed[3]) + "\n" + JSON.stringify(boundary) + "\n");
+    fail("COMPACTION_PHASE");
+  } catch (error) {
+    if (!(error instanceof sse.BoxCliSseError) || error.code !== "BOX_CLI_COMPACT_PHASE") throw error;
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -930,9 +984,7 @@ async function workerMain(expectSha: string): Promise<void> {
   fx = await import("./check-v5-box-continuation-fixture.ts");
   const git = await gitCrossCheck(expectSha);
   const before = digest();
-  const compaction = await import(pathToFileURL(join(PROXY, "boxCliCompaction.ts")).href) as {
-    assertOcv5296CompactionBinding: () => void };
-  compaction.assertOcv5296CompactionBinding();
+  await proveCompactionConsumer();
   if (!COMPACTION_BINDING.startsWith("[ocv5-296-compaction] PASS")) fail("COMPACTION_BINDING");
   const api = await load();
   const after = digest();

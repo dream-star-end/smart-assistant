@@ -109,7 +109,7 @@ export async function runBoxToolContinuation(input: {
       catch { throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_RECORD_INVALID"); }
       if (compaction) {
         try {
-          if (compaction.take(record)) continue;
+          if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
         } catch (error) {
           if (error instanceof BoxCliCompactionError) {
             throw new BoxToolContinuationError(error.code);

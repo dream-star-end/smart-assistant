@@ -85,7 +85,7 @@ export function createBoxCliSseDecoder(expectedModel: string,
     if (resultSeen) throw new BoxCliSseError("BOX_CLI_RECORD_AFTER_RESULT");
     if (compaction) {
       try {
-        if (compaction.take(record)) return "";
+        if (compaction.take(record, started ? "in-model" : "pre-model")) return "";
       } catch (error) {
         if (error instanceof BoxCliCompactionError) throw new BoxCliSseError(error.code);
         throw error;

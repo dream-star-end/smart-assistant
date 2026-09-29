@@ -276,3 +276,37 @@ test("journal state committed with boxState handoff is not a terminal winner", a
     } as never });
   assert.deepEqual(outcome, { status: "pending", reason: "BOX_TOOL_CHAIN_INVALID" });
 });
+
+test("terminal recovery bills the final message after a pre-model compact and rejects a mid-message insert", async () => {
+  const session = "e37f0afa-e659-40ba-84e4-fa90bf465945";
+  const anchor = "991406f8-0097-4e91-a2f1-b732812e36fe";
+  const boundary = { type: "system", subtype: "compact_boundary",
+    uuid: "adc44006-42e8-4ee0-92c6-6e9fc1412da8", session_id: session,
+    compact_metadata: { trigger: "auto", pre_tokens: 1, post_tokens: 1,
+      cumulative_dropped_tokens: 1, duration_ms: 1,
+      preserved_segment: { head_uuid: "86b0b5b4-2fc6-40a3-a33c-3185d1655975",
+        anchor_uuid: anchor, tail_uuid: "1216440c-7345-45a9-ba11-8262fd3450c3" },
+      preserved_messages: { anchor_uuid: anchor,
+        uuids: ["86b0b5b4-2fc6-40a3-a33c-3185d1655975", "1216440c-7345-45a9-ba11-8262fd3450c3"],
+        all_uuids: ["86b0b5b4-2fc6-40a3-a33c-3185d1655975", "1216440c-7345-45a9-ba11-8262fd3450c3"] } } };
+  const summary = { type: "user", isSynthetic: true, parent_tool_use_id: null, session_id: session,
+    uuid: anchor, message: { role: "user", content: [{ type: "text", text: "kept" }] } };
+  let usage: { inputTokens: number } | undefined;
+  const outcome = await observeBoxToolTerminalOnly({
+    evidence: { ...evidence, nativeSessionId: session }, catalog,
+    target: spool([finalRecords[0], boundary, summary, ...finalRecords.slice(1)]) as never }, {
+    writeMessage: async (id) => ({ version: 1 as const, ...id, bytes: 1, sha256: "e".repeat(64) }),
+    journal: { complete: async (input: { usage: { inputTokens: number } }) => { usage = input.usage; },
+      completeToolChain: async () => { throw new Error("root uses complete"); },
+      readRecoveryWinner: async () => null } as never });
+  assert.equal(outcome.status, "committed");
+  assert.equal(usage?.inputTokens, 3);
+  const mid = await observeBoxToolTerminalOnly({
+    evidence: { ...evidence, nativeSessionId: session }, catalog,
+    target: spool([finalRecords[0], finalRecords[1], boundary]) as never }, {
+    writeMessage: async () => { throw new Error("must not write"); },
+    journal: { complete: async () => { throw new Error("must not complete"); },
+      completeToolChain: async () => { throw new Error("must not complete"); },
+      readRecoveryWinner: async () => null } as never });
+  assert.deepEqual(mid, { status: "pending", reason: "BOX_CLI_COMPACT_PHASE" });
+});

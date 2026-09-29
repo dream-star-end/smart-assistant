@@ -82,7 +82,7 @@ export async function observeBoxToolTerminalOnly(input: {
       catch { return { status: "pending", reason: "BOX_RECOVERY_RECORD_INVALID" }; }
       if (compaction) {
         try {
-          if (compaction.take(record)) continue;
+          if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
         } catch (error) {
           if (error instanceof BoxCliCompactionError) {
             return { status: "pending", reason: error.code };
