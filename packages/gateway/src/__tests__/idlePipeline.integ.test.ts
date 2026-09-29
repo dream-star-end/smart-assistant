@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -186,7 +186,7 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
       capabilityProfile: {
         supportsVision: false,
         reasoning: { supported: [], codexModelDefault: null },
-        ccb: { capabilityZero: false, supportsThinking: true, contextOwner: "box-native-v1" },
+        ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" },
       },
       capabilitySchemaVersion: 1, defaultEffort: null,
     };
@@ -213,27 +213,40 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     };
     let fetches = 0;
     const journal = new candidateJournal.BoxDurableJournal(pool);
+    const replayDir = join(HOME, "box-replay");
+    mkdirSync(replayDir, { mode: 0o700 });
+    const replayMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxReplayMessageFile.ts")).href);
+    const writeMessage = (identity: unknown, message: unknown) => replayMod.writeBoxReplayMessage(replayDir, identity, message);
     const toolFetchMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxToolFetch.ts")).href);
     const textFetchMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxTextFetch.ts")).href);
     const registryMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxInvocationRegistry.ts")).href);
     const preparedMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxPreparedContinuation.ts")).href);
-    const localExec = makeLocalPythonExec();
+    const boxProjects = "/home/box/.claude/projects";
+    if (!existsSync(boxProjects)) mkdirSync(boxProjects, { recursive: true, mode: 0o755 });
+    const boxStat = statSync(boxProjects);
+    if (!boxStat.isDirectory() || boxStat.uid !== (process.getuid?.() ?? 0)) {
+      throw new Error(`fixture needs ${boxProjects} owned by uid ${process.getuid?.() ?? 0}`);
+    }
+    report.boxProjects = boxProjects;
+    const toolNames: string[] = [];
+    const localExec = makeLocalPythonExec(() => toolNames);
     const onUnknown = async () => { localExec.unknowns += 1; };
     const textFetch = new textFetchMod.BoxTextFetch({
       supervisorAsset: supervisor, keeperAsset: keeper, detachedRunnerAsset: detachedRunner,
       registry: new registryMod.BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 900_000 }),
-      journal, maxOutputTokensForModel: (model: string) => model === MODEL ? 128_000 : null,
+      journal, writeMessage, maxOutputTokensForModel: (model: string) => model === MODEL ? 128_000 : null,
       resolveTarget: async () => ({ accountId: 20n, exec: localExec, dispose: async () => {} }),
       onUnknown,
     });
     const toolFetch = new toolFetchMod.BoxToolFetch({
       supervisorAsset: supervisor, keeperAsset: keeper, virtualMcpAsset: virtualMcp,
-      detachedRunnerAsset: detachedRunner, journal,
+      detachedRunnerAsset: detachedRunner, journal, writeMessage,
       maxOutputTokensForModel: (model: string) => model === MODEL ? 128_000 : null,
       resolveTarget: async () => ({ accountId: 20n, exec: localExec, dispose: async () => {} }),
       onUnknown,
     });
     report.transport = "BoxTextFetch+BoxToolFetch; python3 -I is local; launch/spool/terminal.json are the synthetic model stream";
+    report.capability = { capabilityZero: true, supportsThinking: false, supportsVision: false, contextWindow: 200_000, contextOwner: "box-native-v1", source: "live catalog plus contextOwner only" };
     const handler = candidateProxy.makeAnthropicProxyHandler({
       pgPool: pool,
       pricing: { get: () => null },
@@ -309,11 +322,13 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
         const parsed = JSON.parse(raw.toString("utf8")) as {
           thinking?: unknown; output_config?: unknown; tool_choice?: unknown; tools?: unknown[];
         };
+        const count = Array.isArray(parsed.tools) ? parsed.tools.length : 0;
+        toolNames.splice(0, toolNames.length, ...Array.from({ length: count }, (_, i) => `mcp__ocbridge__t${i}`));
         shape = {
           thinking: parsed.thinking ?? null,
           output_config: parsed.output_config ?? null,
           tool_choice: parsed.tool_choice ?? null,
-          toolCount: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
+          toolCount: count,
         };
       } catch { shape = { parse: false }; }
       await handler(replay, res, { hostUuid: "ocv5-296-idle", boundIp: "127.0.0.1" });
@@ -400,8 +415,8 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
       authorityEnvelope: authority.authority,
       leaseEnvelope: authority.lease,
       executionDescriptor: {
-        canonicalModel: MODEL, contextWindow: 200_000, capabilityZero: false,
-        supportsThinking: true, supportsVision: false, supportedEfforts: [],
+        canonicalModel: MODEL, contextWindow: 200_000, capabilityZero: true,
+        supportsThinking: false, supportsVision: false, supportedEfforts: [],
         contextOwner: "box-native-v1" as const,
       },
     };
@@ -422,7 +437,9 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     report.opFiles = opFiles.map((file) => JSON.parse(readFileSync(file, "utf8")));
     report.journal = (await pool.query(
       `SELECT request_id, state, ctx->>'boxSessionId' AS box_session, ctx->>'boxTurnKey' AS box_turn,
-              ctx->>'boxInvocationRecovery' AS recovery, ctx->>'boxState' AS box_state
+              ctx->>'boxInvocationRecovery' AS recovery, ctx->>'boxState' AS box_state,
+              ctx->'boxTerminalProof'->>'reason' AS proof_reason,
+              (ctx ? 'boxReplayMessage') AS has_capsule
          FROM request_finalize_journal ORDER BY updated_at`,
     )).rows;
     const summaryHttp = hits.filter((hit) => hit.url === "/v1/messages" && hit.summary).length;
@@ -474,11 +491,11 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
   }
 });
 
-function textSpool(): Buffer {
+function textSpool(tools: string[]): Buffer {
   const model = "claude-opus-5-5";
   const event = (value: unknown) => ({ type: "stream_event", event: value });
   const rows = [
-    { type: "system", subtype: "init", tools: ["mcp__ocbridge__t0"], mcp_servers: [{}] },
+    { type: "system", subtype: "init", tools, mcp_servers: [{}] },
     event({ type: "message_start", message: { id: "msg_idle_6k", model, role: "assistant", content: [], usage: { input_tokens: 20, output_tokens: 0 } } }),
     event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
     event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "DONE-6K" } }),
@@ -491,13 +508,13 @@ function textSpool(): Buffer {
   return Buffer.from(rows.map((row) => JSON.stringify(row) + "\n").join(""));
 }
 
-function makeLocalPythonExec(): {
+function makeLocalPythonExec(toolNames: () => string[]): {
   log: string[];
   unknowns: number;
   run: (request: { command: string; args: string[]; cwd?: string; environment?: Record<string, string> }) => Promise<{ stdout: string; stderrBytes: number; exitCode: 0 }>;
 } {
   const log: string[] = [];
-  const spool = textSpool();
+  let spool = textSpool(["mcp__ocbridge__t0"]);
   let runNonce = "";
   let leaseEpoch = "";
   return {
@@ -516,6 +533,7 @@ function makeLocalPythonExec(): {
       if (args[5] === "--read") {
         log.push("synthetic-spool");
         const offset = Number(args[7] ?? 0);
+        if (offset === 0 && toolNames().length > 0) spool = textSpool(toolNames());
         const part = spool.subarray(Math.min(Number.isFinite(offset) ? offset : 0, spool.length));
         return { stdout: JSON.stringify({ data: part.toString("base64"), offset: (Number.isFinite(offset) ? offset : 0) + part.length }), stderrBytes: 0, exitCode: 0 as const };
       }
@@ -525,7 +543,7 @@ function makeLocalPythonExec(): {
       }
       log.push("python");
       const ran = spawnSync(request.command, request.args, {
-        cwd: request.cwd && request.cwd.startsWith("/tmp") ? request.cwd : "/tmp",
+        cwd: request.cwd && existsSync(request.cwd) ? request.cwd : "/tmp",
         env: { ...process.env, ...request.environment },
         encoding: "utf8",
         timeout: 20_000,
@@ -621,7 +639,7 @@ function signAuthority(protocol: {
       capabilityProfile: {
         supportsVision: false,
         reasoning: { supported: [], codexModelDefault: null },
-        ccb: { capabilityZero: false, supportsThinking: true, contextOwner: "box-native-v1" },
+        ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" },
       },
       capabilitySchemaVersion: 1, contextWindow: 200_000, supportedEfforts: [], supportsVision: false,
     },
