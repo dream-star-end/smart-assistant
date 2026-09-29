@@ -49,6 +49,8 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
   const hits: Array<{ url: string; status: number; bytes: number; summary: boolean; body?: string }> = [];
   const events: string[] = [];
   let candidate = "";
+  let schemaOwned = false;
+  const cleanupErrors: string[] = [];
   let serverClose: (() => Promise<void>) | undefined;
   let adapterShutdown: (() => Promise<void>) | undefined;
   let adminEnd: (() => Promise<void>) | undefined;
@@ -96,8 +98,8 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     assert.equal(Number(ident.rows[0].port), 55432);
     const publicUsers = await admin.query("SELECT to_regclass('public.users') AS reg");
     assert.equal(publicUsers.rows[0].reg, null);
-    await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
+    schemaOwned = true;
     await admin.query(`
       CREATE TABLE ${SCHEMA}.users (id bigint PRIMARY KEY, credits bigint NOT NULL);
       CREATE TABLE ${SCHEMA}.user_subscriptions (
@@ -150,7 +152,11 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
         SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE c.oid = to_regclass(name)
       ) AS schema
-      FROM unnest(ARRAY['users','credit_ledger','usage_records','request_finalize_journal']) AS name`);
+      FROM unnest(ARRAY[
+        'users','user_subscriptions','credit_ledger','usage_records','request_finalize_journal',
+        'authority_turn_dispatches','turn_dispatches','org_memberships','orgs','org_subscriptions',
+        'client_sessions','chat_projects','turn_waivers','pending_usage_patches','turn_upstream_performance'
+      ]) AS name`);
     for (const row of regs.rows) assert.equal(row.schema, SCHEMA, row.name);
     const redisInfo = String(await redis.call("CLIENT", "INFO"));
     assert.equal(redisInfo.includes("db=12"), true, redisInfo);
@@ -168,9 +174,12 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     assert.equal(candidateOwner.BOX_NATIVE_CONTEXT_ROUTE_READY, true);
     candidateDb.setPoolOverride(pool);
     process.env.OC_BOX_MODEL_API = "1";
+    process.env.OC_BOX_TOOL_BRIDGE = "1";
     const billingRedis = candidatePre.wrapIoredisForPreCheck(redis);
     const supervisor = readFileSync(join(CHECKOUT, "scripts/ocv5-289/box_supervisor.py"));
     const keeper = readFileSync(join(CHECKOUT, "scripts/ocv5-289/box_keeper.py"));
+    const virtualMcp = readFileSync(join(CHECKOUT, "scripts/ocv5-289/box_virtual_mcp.py"));
+    const detachedRunner = readFileSync(join(CHECKOUT, "scripts/ocv5-289/box_detached_runner.py"));
     const descriptor = {
       canonicalModel: MODEL, engine: "ccb", providerId: "box_cli", upstreamModelId: "claude-opus-5-5",
       contextWindow: 200_000,
@@ -203,6 +212,28 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
       async authorize() {},
     };
     let fetches = 0;
+    const journal = new candidateJournal.BoxDurableJournal(pool);
+    const toolFetchMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxToolFetch.ts")).href);
+    const textFetchMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxTextFetch.ts")).href);
+    const registryMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxInvocationRegistry.ts")).href);
+    const preparedMod = await import(pathToFileURL(join(candidate, "packages/commercial/src/http/proxy/boxPreparedContinuation.ts")).href);
+    const localExec = makeLocalPythonExec();
+    const onUnknown = async () => { localExec.unknowns += 1; };
+    const textFetch = new textFetchMod.BoxTextFetch({
+      supervisorAsset: supervisor, keeperAsset: keeper, detachedRunnerAsset: detachedRunner,
+      registry: new registryMod.BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 900_000 }),
+      journal, maxOutputTokensForModel: (model: string) => model === MODEL ? 128_000 : null,
+      resolveTarget: async () => ({ accountId: 20n, exec: localExec, dispose: async () => {} }),
+      onUnknown,
+    });
+    const toolFetch = new toolFetchMod.BoxToolFetch({
+      supervisorAsset: supervisor, keeperAsset: keeper, virtualMcpAsset: virtualMcp,
+      detachedRunnerAsset: detachedRunner, journal,
+      maxOutputTokensForModel: (model: string) => model === MODEL ? 128_000 : null,
+      resolveTarget: async () => ({ accountId: 20n, exec: localExec, dispose: async () => {} }),
+      onUnknown,
+    });
+    report.transport = "BoxTextFetch+BoxToolFetch; python3 -I is local; launch/spool/terminal.json are the synthetic model stream";
     const handler = candidateProxy.makeAnthropicProxyHandler({
       pgPool: pool,
       pricing: { get: () => null },
@@ -215,21 +246,23 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
       modelAuthorityEnforce: true,
       authorityKeyring: () => keyring,
       boxModel: {
-        async fetch(args: { canonicalBody: unknown; upstreamModel: string }) {
+        toolBridgeReady: true,
+        fetch: (args: { prepared?: { classification: string; rejectCode?: string }; canonicalBody: { tools?: unknown[] } }) => {
           fetches += 1;
           if (fetches > MAX_HTTP) throw new Error("HTTP_CAP");
-          const plan = candidatePlan.makeBoxTextPlan({
-            body: args.canonicalBody, upstreamModel: args.upstreamModel, maxOutputTokensLimit: 8192,
-            supervisorAsset: supervisor, keeperAsset: keeper,
-          });
-          await execStage(plan);
-          return sse("DONE-6K");
+          const prepared = args.prepared;
+          if (!prepared) throw new preparedMod.BoxContinuationDecisionError("reject", "BOX_PREPARED_STALE");
+          if (prepared.classification === "reject") {
+            throw new preparedMod.BoxContinuationDecisionError("reject", prepared.rejectCode ?? "BOX_PREPARED_REJECT");
+          }
+          if (prepared.classification === "continuation_candidate" || args.canonicalBody.tools?.length) {
+            return toolFetch.fetch(args);
+          }
+          return textFetch.fetch(args);
         },
       },
     });
-    const proof = candidateProof.makeBoxIdleProofHandler({
-      identity, journal: new candidateJournal.BoxDurableJournal(pool),
-    });
+    const proof = candidateProof.makeBoxIdleProofHandler({ identity, journal });
     const server = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -271,10 +304,23 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
         res.end();
         return;
       }
+      let shape: Record<string, unknown> = {};
+      try {
+        const parsed = JSON.parse(raw.toString("utf8")) as {
+          thinking?: unknown; output_config?: unknown; tool_choice?: unknown; tools?: unknown[];
+        };
+        shape = {
+          thinking: parsed.thinking ?? null,
+          output_config: parsed.output_config ?? null,
+          tool_choice: parsed.tool_choice ?? null,
+          toolCount: Array.isArray(parsed.tools) ? parsed.tools.length : 0,
+        };
+      } catch { shape = { parse: false }; }
       await handler(replay, res, { hostUuid: "ocv5-296-idle", boundIp: "127.0.0.1" });
       hits.push({
         url: path, status: res.statusCode, bytes: raw.length,
         summary: raw.includes(SUMMARY_MARK), body: responseBody.slice(0, 400),
+        shape,
       });
     });
     await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", () => resolveListen()));
@@ -368,6 +414,7 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     const nativeFiles = listJson(join(HOME, "idle-native"));
     const opFiles = listJson(join(HOME, "idle-ops"));
     report.fetches = fetches;
+    report.execLog = localExec.log;
     report.hits = hits;
     report.events = events.slice(0, 40);
     report.firstError = firstError ?? null;
@@ -383,7 +430,7 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     if (firstError) throw new Error(`submit failed: ${firstError}`);
     const modelHit = hits.find((hit) => hit.url === "/v1/messages");
     if (!modelHit || modelHit.status !== 200) {
-      throw new Error(`PRODUCT_RED first model HTTP ${modelHit?.status ?? "missing"} ${modelHit?.body ?? ""} fetches=${fetches}`);
+      throw new Error(`FIXTURE_OR_PRODUCT first model HTTP ${modelHit?.status ?? "missing"} ${modelHit?.body ?? ""} fetches=${fetches} exec=${localExec.log.join(",")}`);
     }
     assert.equal(summaryHttp, 0);
     const short = (report.nativeFiles as Array<{ applied?: boolean; summaryText?: string }>).some((file) => file.applied && !file.summaryText);
@@ -398,10 +445,16 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     if (adapterShutdown) await adapterShutdown().catch(() => undefined);
     if (serverClose) await serverClose();
     if (poolEnd) await poolEnd().catch(() => undefined);
-    if (adminEnd) {
+    if (schemaOwned) {
       const pg = (await import("pg")).default;
       const admin = new pg.Pool({ connectionString: TEST_DB, max: 1 });
-      await admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`).catch(() => undefined);
+      try {
+        await admin.query(`DROP SCHEMA ${SCHEMA} CASCADE`);
+        const gone = await admin.query("SELECT to_regclass($1) AS rel", [`${SCHEMA}.users`]);
+        if (gone.rows[0].rel) cleanupErrors.push("schema users still registered");
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error.message : String(error));
+      }
       await admin.end();
     }
     if (redisQuit) await redisQuit().catch(() => undefined);
@@ -414,10 +467,80 @@ test("real submit reaches a short idle no-op without a summary HTTP", { timeout:
     rmSync(HOME, { recursive: true, force: true });
     const path = process.env.OC_V5_296_IDLE_RAW
       ?? join(tmpdir(), `ocv5-296-idle-${randomBytes(3).toString("hex")}.json`);
+    report.cleanupErrors = cleanupErrors;
     writeFileSync(path, JSON.stringify(report, null, 2));
-    console.log(JSON.stringify({ event: "ocv5-296-idle", report: path, summaryHttp: report.summaryHttp, firstError: report.firstError }));
+    console.log(JSON.stringify({ event: "ocv5-296-idle", report: path, summaryHttp: report.summaryHttp, firstError: report.firstError, cleanup: cleanupErrors.length }));
+    if (cleanupErrors.length > 0) throw new Error(`cleanup failed: ${cleanupErrors.join(" | ")}`);
   }
 });
+
+function textSpool(): Buffer {
+  const model = "claude-opus-5-5";
+  const event = (value: unknown) => ({ type: "stream_event", event: value });
+  const rows = [
+    { type: "system", subtype: "init", tools: ["mcp__ocbridge__t0"], mcp_servers: [{}] },
+    event({ type: "message_start", message: { id: "msg_idle_6k", model, role: "assistant", content: [], usage: { input_tokens: 20, output_tokens: 0 } } }),
+    event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "DONE-6K" } }),
+    { type: "assistant", message: { id: "msg_idle_6k", model, role: "assistant", content: [{ type: "text", text: "DONE-6K" }] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 20, output_tokens: 4 } }),
+    event({ type: "message_stop" }),
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 20, output_tokens: 4 } },
+  ];
+  return Buffer.from(rows.map((row) => JSON.stringify(row) + "\n").join(""));
+}
+
+function makeLocalPythonExec(): {
+  log: string[];
+  unknowns: number;
+  run: (request: { command: string; args: string[]; cwd?: string; environment?: Record<string, string> }) => Promise<{ stdout: string; stderrBytes: number; exitCode: 0 }>;
+} {
+  const log: string[] = [];
+  const spool = textSpool();
+  let runNonce = "";
+  let leaseEpoch = "";
+  return {
+    log,
+    unknowns: 0,
+    async run(request) {
+      if (request.command !== "/usr/bin/python3" || request.args[0] !== "-I") {
+        throw new Error(`BOX_TEST_EXEC_NOT_PYTHON ${request.command} ${request.args[0] ?? ""}`);
+      }
+      const args = request.args;
+      const script = args[2] ?? "";
+      if (args[1] === "-c" && script.includes("sys.argv=[p,*argv]") && (args[3] ?? "").startsWith("/tmp/ocv5-289-v2-detached-runner-") && args[5] !== "--read") {
+        log.push("synthetic-launch");
+        return { stdout: "launched\n", stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (args[5] === "--read") {
+        log.push("synthetic-spool");
+        const offset = Number(args[7] ?? 0);
+        const part = spool.subarray(Math.min(Number.isFinite(offset) ? offset : 0, spool.length));
+        return { stdout: JSON.stringify({ data: part.toString("base64"), offset: (Number.isFinite(offset) ? offset : 0) + part.length }), stderrBytes: 0, exitCode: 0 as const };
+      }
+      if (script.includes("terminal.json")) {
+        log.push("synthetic-terminal-proof");
+        return { stdout: JSON.stringify({ runNonce, leaseEpoch, keeperPid: 1, cliPid: 2, reason: "worker_complete", revision: 1 }) + "\n", stderrBytes: 0, exitCode: 0 as const };
+      }
+      log.push("python");
+      const ran = spawnSync(request.command, request.args, {
+        cwd: request.cwd && request.cwd.startsWith("/tmp") ? request.cwd : "/tmp",
+        env: { ...process.env, ...request.environment },
+        encoding: "utf8",
+        timeout: 20_000,
+      });
+      if (ran.status !== 0) throw new Error((ran.stderr || ran.stdout || `python exit ${ran.status}`).slice(0, 500));
+      if (script.includes("identity['identityHash']")) {
+        const parsed = JSON.parse(ran.stdout) as { runNonce?: string; leaseEpoch?: string };
+        runNonce = parsed.runNonce ?? runNonce;
+        leaseEpoch = parsed.leaseEpoch ?? leaseEpoch;
+        log.push("python-prelaunch");
+      }
+      return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""), exitCode: 0 as const };
+    },
+  };
+}
 
 function listJson(dir: string): string[] {
   const out: string[] = [];
