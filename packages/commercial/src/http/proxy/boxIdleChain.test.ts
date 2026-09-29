@@ -119,6 +119,52 @@ test("verified capsule text is attached and a hash miss stays pending", async ()
   assert.deepEqual(missed, { status: "pending", reason: "capsule" });
 });
 
+test("two committed roots are a ready set and not a summary", () => {
+  const summary = row("sum", {
+    boxTerminalProof: { reason: "worker_complete", runNonce: "a".repeat(24) },
+    boxReplayMessage: capsule,
+    boxUsage: { inputTokens: 200_000 },
+    boxRunNonce: "a".repeat(24),
+    boxAccountId: "1",
+  });
+  const business = row("biz", {
+    boxTerminalProof: { reason: "worker_complete", runNonce: "b".repeat(24) },
+    boxReplayMessage: { version: 1, sha256: "d".repeat(64) },
+    boxUsage: { inputTokens: 30 },
+    boxRunNonce: "b".repeat(24),
+    boxAccountId: "2",
+  });
+  const forward = projectBoxIdleChain({ sessionId, turnKey, rows: [summary, business] });
+  const reverse = projectBoxIdleChain({ sessionId, turnKey, rows: [business, summary] });
+  assert.equal(forward.status, "terminal_set");
+  assert.equal(reverse.status, "terminal_set");
+  if (forward.status !== "terminal_set" || reverse.status !== "terminal_set") return;
+  assert.equal(forward.revision, reverse.revision);
+  assert.deepEqual(forward.requestIds, ["biz", "sum"]);
+  assert.equal("summaryText" in forward, false);
+  assert.equal("requestId" in forward, false);
+  assert.equal("capsuleSha256" in forward, false);
+  const changed = projectBoxIdleChain({ sessionId, turnKey, rows: [summary, {
+    ...business, ctx: { ...business.ctx, boxReplayMessage: { version: 1, sha256: "e".repeat(64) } },
+  }] });
+  assert.equal(changed.status, "terminal_set");
+  if (changed.status === "terminal_set") assert.notEqual(changed.revision, forward.revision);
+  const withHandoff = projectBoxIdleChain({ sessionId, turnKey, rows: [leaf, parent, business] });
+  assert.equal(withHandoff.status, "terminal_set");
+  const unsettled = projectBoxIdleChain({
+    sessionId, turnKey, rows: [summary, { ...business, state: "inflight" }],
+  });
+  assert.equal(unsettled.status, "pending");
+  if (unsettled.status === "pending") assert.equal(unsettled.reason, "unsettled");
+  const fork = projectBoxIdleChain({ sessionId, turnKey, rows: [
+    summary,
+    row("c1", { boxOwnerRequestId: "sum", boxTerminalProof: { reason: "worker_complete" }, boxReplayMessage: capsule }),
+    row("c2", { boxOwnerRequestId: "sum", boxTerminalProof: { reason: "worker_complete" }, boxReplayMessage: capsule }),
+  ] });
+  assert.equal(fork.status, "pending");
+  if (fork.status === "pending") assert.equal(fork.reason, "fork");
+});
+
 test("wrong turn is not found", () => {
   assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey: "ff".repeat(32), rows: [leaf, parent] }),
     { status: "not_found" });

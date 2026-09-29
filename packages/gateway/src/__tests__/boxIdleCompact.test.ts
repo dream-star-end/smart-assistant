@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, test } from 'node:test'
+import { fetchBoxIdleProof } from '../engine/boxIdleProofClient.js'
 import {
   advanceIdleOp,
   assembleIdleArtifact,
@@ -173,6 +174,53 @@ describe('idle artifact recovery', () => {
     writeIdleOp(dir, skipped)
     assert.equal(idleOpSettled(skipped), true)
     assert.equal(readPendingIdle(dir, 'short-session'), undefined)
+  })
+
+  test('a ready set can start idle and cannot be used as a summary', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'idle-set-'))
+    const set = {
+      status: 'terminal_set' as const,
+      sessionId: proof.sessionId,
+      turnKey: proof.turnKey,
+      revision: 'ab'.repeat(32),
+      requestIds: ['biz', 'sum'],
+    }
+    const started = startIdleOp({
+      dir, sessionKey: 'set-session', sourceSessionId: proof.sessionId, sourceTurnKey: proof.turnKey,
+      revision: set.revision, idleTurnKey: 'ab'.repeat(32), frozenTail: [], attachments: [],
+    })
+    const dispatched = advanceIdleOp({ op: started.op, proof: set, allowDispatch: true })
+    assert.equal(dispatched.callModel, true)
+    assert.equal(dispatched.op.summaryText, undefined)
+    const rejected = advanceIdleOp({
+      op: started.op, proof: set, useProofSummary: true, allowDispatch: true,
+    })
+    assert.equal(rejected.callModel, false)
+    assert.equal(rejected.op.summaryText, undefined)
+    const revision = 'cd'.repeat(32)
+    const turn = 'a'.repeat(64)
+    const env = {
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:9/',
+      OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:9/',
+      OPENCLAUDE_V3_CONTAINER_TOKEN: 'oc-v3.test-token',
+    } as NodeJS.ProcessEnv
+    const accepted = await fetchBoxIdleProof({ sessionId: 'native-session', turnKey: turn }, {
+      env,
+      fetchImpl: async () => new Response(JSON.stringify({
+        status: 'terminal_set', sessionId: 'native-session', turnKey: turn,
+        revision, requestIds: ['biz', 'sum'],
+      }), { status: 200 }),
+    })
+    assert.equal(accepted.status, 'terminal_set')
+    if (accepted.status === 'terminal_set') assert.deepEqual(accepted.requestIds, ['biz', 'sum'])
+    const leaked = await fetchBoxIdleProof({ sessionId: 'native-session', turnKey: turn }, {
+      env,
+      fetchImpl: async () => new Response(JSON.stringify({
+        status: 'terminal_set', sessionId: 'native-session', turnKey: turn,
+        revision, requestIds: ['biz', 'sum'], summaryText: 'nope',
+      }), { status: 200 }),
+    })
+    assert.deepEqual(leaked, { status: 'pending', reason: 'body' })
   })
 
   test('a proof that is still pending keeps the source candidate', () => {

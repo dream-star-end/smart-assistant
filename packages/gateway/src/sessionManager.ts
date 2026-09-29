@@ -4674,7 +4674,7 @@ export class SessionManager {
       clearIdleCandidate(recoveryDir, session.sessionKey)
       return
     }
-    if (proof.status !== 'terminal') return
+    if (proof.status !== 'terminal' && proof.status !== 'terminal_set') return
     const started = startIdleOp({
       dir: recoveryDir,
       sessionKey: session.sessionKey,

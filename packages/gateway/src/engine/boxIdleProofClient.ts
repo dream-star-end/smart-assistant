@@ -19,6 +19,13 @@ export type IdleProofResponse =
       capsuleSha256: string
       summaryText?: string
     }
+  | {
+      status: 'terminal_set'
+      sessionId: string
+      turnKey: string
+      revision: string
+      requestIds: string[]
+    }
 
 export async function fetchBoxIdleProof(input: { sessionId: string; turnKey: string },
   deps: { env?: NodeJS.ProcessEnv; fetchImpl?: Fetcher;
@@ -58,6 +65,25 @@ export async function fetchBoxIdleProof(input: { sessionId: string; turnKey: str
   if (!body || typeof body !== 'object' || Array.isArray(body)) return { status: 'pending', reason: 'body' }
   const row = body as Record<string, unknown>
   if (row.status === 'pending') return { status: 'pending', reason: typeof row.reason === 'string' ? row.reason : 'pending' }
+  if (row.status === 'terminal_set') {
+    const ids = row.requestIds
+    if (row.sessionId !== input.sessionId || row.turnKey !== input.turnKey
+      || typeof row.revision !== 'string' || !/^[a-f0-9]{64}$/.test(row.revision)
+      || !Array.isArray(ids) || ids.length < 2
+      || ids.some((id) => typeof id !== 'string' || id.length === 0)
+      || new Set(ids).size !== ids.length
+      || [...ids].sort().join('\0') !== ids.join('\0')
+      || 'requestId' in row || 'capsuleSha256' in row || 'summaryText' in row || 'compactRequired' in row) {
+      return { status: 'pending', reason: 'body' }
+    }
+    return {
+      status: 'terminal_set',
+      sessionId: input.sessionId,
+      turnKey: input.turnKey,
+      revision: row.revision,
+      requestIds: ids as string[],
+    }
+  }
   if (row.status !== 'terminal' || row.sessionId !== input.sessionId || row.turnKey !== input.turnKey
     || typeof row.requestId !== 'string' || typeof row.revision !== 'string'
     || typeof row.compactRequired !== 'boolean' || typeof row.capsuleSha256 !== 'string') {

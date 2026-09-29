@@ -6,7 +6,8 @@ import { isDeepStrictEqual } from "node:util";
 import type { Pool, PoolClient } from "pg";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
-import { projectBoxIdleChain, withVerifiedCapsule, type BoxIdleProof } from "./boxIdleChain.js";
+import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, withVerifiedCapsule,
+  type BoxIdleProof, type IdleChainRow } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
 import type { BoxToolHandoffCandidate, BoxToolHandoffProof } from "./boxCliToolHandoff.js";
@@ -2476,18 +2477,40 @@ export class BoxDurableJournal implements BoxJournalPort {
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'boxSessionId'=$3
             AND ctx->>'boxInvocationRecovery'='v1'
-            AND COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped')`,
+            AND (
+              COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped')
+              OR (ctx->>'boxState'='terminal' AND state <> 'committed')
+            )`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId]);
       await client.query("COMMIT");
+      const rows: IdleChainRow[] = found.rows.map((row) => ({
+        requestId: row.request_id, state: row.state, ctx: row.ctx,
+      }));
       const proof = projectBoxIdleChain({
         sessionId: input.sessionId,
         turnKey: input.turnKey,
-        rows: found.rows.map((row) => ({ requestId: row.request_id, state: row.state, ctx: row.ctx })),
+        rows,
         otherOpenRequestIds: open.rows.map((row) => row.request_id),
       });
-      if (!readCapsule || proof.status !== "terminal") return proof;
-      const leaf = found.rows.find((row) => row.request_id === proof.requestId);
-      return withVerifiedCapsule(proof, leaf?.ctx.boxReplayMessage, readCapsule);
+      if (!readCapsule) return proof;
+      if (proof.status === "terminal") {
+        const leaf = found.rows.find((row) => row.request_id === proof.requestId);
+        return withVerifiedCapsule(proof, leaf?.ctx.boxReplayMessage, readCapsule);
+      }
+      if (proof.status !== "terminal_set") return proof;
+      for (const id of idleSetLeafIds(rows, proof.requestIds)) {
+        const row = rows.find((item) => item.requestId === id);
+        const parsed = parseBoxReplayMessagePointer(row?.ctx.boxReplayMessage);
+        if (!parsed) return { status: "pending", reason: "capsule" };
+        try {
+          if (!capsuleSummaryText(await readCapsule(parsed))) {
+            return { status: "pending", reason: "capsule" };
+          }
+        } catch {
+          return { status: "pending", reason: "capsule" };
+        }
+      }
+      return proof;
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       throw error;

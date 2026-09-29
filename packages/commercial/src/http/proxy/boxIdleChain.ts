@@ -22,6 +22,13 @@ export type BoxIdleProof =
       compactRequired: boolean;
       capsuleSha256: string;
       summaryText?: string;
+    }
+  | {
+      status: "terminal_set";
+      sessionId: string;
+      turnKey: string;
+      revision: string;
+      requestIds: string[];
     };
 
 function textOf(message: unknown): string | undefined {
@@ -47,10 +54,91 @@ function sha(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+type ChainFailure = { ok: false; reason: string };
+type ChainOk = { ok: true; chain: IdleChainRow[] };
+
+/** One owner-linked component. The single-chain revision below stays on this shape. */
+function projectOneChain(leafId: string, byId: Map<string, IdleChainRow>): ChainOk | ChainFailure {
+  const chain: IdleChainRow[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined = leafId;
+  while (cursor) {
+    if (seen.has(cursor) || chain.length >= 128) return { ok: false, reason: "cycle" };
+    const row = byId.get(cursor);
+    if (!row) return { ok: false, reason: "gap" };
+    seen.add(cursor);
+    chain.push(row);
+    const parent = row.ctx.boxOwnerRequestId;
+    cursor = typeof parent === "string" ? parent : undefined;
+  }
+  const leaf = chain[0]!;
+  if (leaf.state !== "committed" || leaf.ctx.boxState !== "terminal"
+    || proofReason(leaf.ctx) !== "worker_complete") {
+    return { ok: false, reason: "unsettled" };
+  }
+  const pointer = leaf.ctx.boxReplayMessage as { sha256?: unknown } | undefined;
+  if (!pointer || typeof pointer.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(pointer.sha256)) {
+    return { ok: false, reason: "capsule" };
+  }
+  for (let i = 1; i < chain.length; i++) {
+    const parent = chain[i]!;
+    const child = chain[i - 1]!;
+    if (parent.state !== "committed" || parent.ctx.boxState === "unknown" || parent.ctx.boxState === "resuming") {
+      return { ok: false, reason: "ancestor" };
+    }
+    if (parent.ctx.boxState !== "terminal") return { ok: false, reason: "ancestor" };
+    if (parent.ctx.boxToolHandoff !== undefined) {
+      if (parent.ctx.boxResumeRequestId !== child.requestId
+        || typeof parent.ctx.boxResumeRevision !== "string"
+        || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) {
+        return { ok: false, reason: "handoff" };
+      }
+    }
+  }
+  const proof = leaf.ctx.boxTerminalProof as { runNonce?: unknown; leaseEpoch?: unknown } | undefined;
+  if (typeof leaf.ctx.boxRunNonce === "string" && leaf.ctx.boxRunNonce !== proof?.runNonce) {
+    return { ok: false, reason: "identity" };
+  }
+  if (typeof leaf.ctx.boxLeaseEpoch === "string" && leaf.ctx.boxLeaseEpoch !== proof?.leaseEpoch) {
+    return { ok: false, reason: "identity" };
+  }
+  if (typeof leaf.ctx.boxRoundNo === "number" && leaf.ctx.boxRoundNo !== chain.length) {
+    return { ok: false, reason: "identity" };
+  }
+  for (const row of chain) {
+    if (typeof row.ctx.boxRunNonce === "string" && row.ctx.boxRunNonce !== leaf.ctx.boxRunNonce
+      && typeof leaf.ctx.boxRunNonce === "string") {
+      return { ok: false, reason: "identity" };
+    }
+    if (typeof row.ctx.boxAccountId === "string" && typeof leaf.ctx.boxAccountId === "string"
+      && row.ctx.boxAccountId !== leaf.ctx.boxAccountId) {
+      return { ok: false, reason: "identity" };
+    }
+  }
+  return { ok: true, chain };
+}
+
+function singleRevision(input: { sessionId: string; turnKey: string }, chain: IdleChainRow[]): string {
+  const leaf = chain[0]!;
+  const pointer = leaf.ctx.boxReplayMessage as { sha256: string };
+  const ids = [...chain].reverse().map((row) => row.requestId);
+  return sha({
+    sessionId: input.sessionId,
+    turnKey: input.turnKey,
+    ids,
+    proof: chain.map((row) => ({
+      id: row.requestId,
+      reason: proofReason(row.ctx) ?? null,
+      nonce: (row.ctx.boxTerminalProof as { runNonce?: unknown } | undefined)?.runNonce ?? null,
+    })),
+    capsule: pointer.sha256,
+  });
+}
+
 /**
  * Project one authenticated session/turn snapshot.
- * Historical handoff fields are allowed once the child consumed them.
- * Settlement `committed` is required separately from boxState terminal.
+ * One complete chain keeps the original terminal result. Several independent
+ * complete chains are a ready set, not a summary.
  */
 export function projectBoxIdleChain(input: {
   sessionId: string;
@@ -65,6 +153,7 @@ export function projectBoxIdleChain(input: {
     && row.ctx.model === "box-api-claude-opus-5-5"
     && row.ctx.boxInvocationRecovery === "v1");
   if (scoped.length === 0) return { status: "not_found" };
+  if (scoped.length > 128) return { status: "pending", reason: "cycle" };
   const byId = new Map(scoped.map((row) => [row.requestId, row]));
   if (byId.size !== scoped.length) return { status: "pending", reason: "fork" };
   const children = new Map<string, string>();
@@ -77,96 +166,77 @@ export function projectBoxIdleChain(input: {
     children.set(parent, row.requestId);
   }
   const leaves = scoped.filter((row) => !children.has(row.requestId) && row.ctx.boxResumeRequestId === undefined);
-  if (leaves.length !== 1) return { status: "pending", reason: "leaf" };
-  const chain: IdleChainRow[] = [];
-  const seen = new Set<string>();
-  let cursor: string | undefined = leaves[0]!.requestId;
-  while (cursor) {
-    if (seen.has(cursor) || chain.length >= 128) return { status: "pending", reason: "cycle" };
-    const row = byId.get(cursor);
-    if (!row) return { status: "pending", reason: "gap" };
-    seen.add(cursor);
-    chain.push(row);
-    const parent = row.ctx.boxOwnerRequestId;
-    cursor = typeof parent === "string" ? parent : undefined;
-  }
-  const leaf = chain[0]!;
-  if (leaf.state !== "committed" || leaf.ctx.boxState !== "terminal"
-    || proofReason(leaf.ctx) !== "worker_complete") {
-    return { status: "pending", reason: "unsettled" };
-  }
-  const pointer = leaf.ctx.boxReplayMessage as { sha256?: unknown } | undefined;
-  if (!pointer || typeof pointer.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(pointer.sha256)) {
-    return { status: "pending", reason: "capsule" };
-  }
-  for (let i = 1; i < chain.length; i++) {
-    const parent = chain[i]!;
-    const child = chain[i - 1]!;
-    if (parent.state !== "committed" || parent.ctx.boxState === "unknown" || parent.ctx.boxState === "resuming") {
-      return { status: "pending", reason: "ancestor" };
+  if (leaves.length === 0) return { status: "pending", reason: "leaf" };
+  const chains: IdleChainRow[][] = [];
+  const covered = new Set<string>();
+  for (const leafRow of leaves) {
+    const built = projectOneChain(leafRow.requestId, byId);
+    if (!built.ok) return { status: "pending", reason: built.reason };
+    for (const row of built.chain) {
+      if (covered.has(row.requestId)) return { status: "pending", reason: "fork" };
+      covered.add(row.requestId);
     }
-    if (parent.ctx.boxState !== "terminal") return { status: "pending", reason: "ancestor" };
-    if (parent.ctx.boxToolHandoff !== undefined) {
-      if (parent.ctx.boxResumeRequestId !== child.requestId
-        || typeof parent.ctx.boxResumeRevision !== "string"
-        || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) {
-        return { status: "pending", reason: "handoff" };
-      }
-    }
+    chains.push(built.chain);
   }
+  if (covered.size !== scoped.length) return { status: "pending", reason: "gap" };
   const open = (input.otherOpenRequestIds ?? []).filter((id) => !byId.has(id));
   if (open.length > 0) return { status: "pending", reason: "other_chain" };
-  const proof = leaf.ctx.boxTerminalProof as { runNonce?: unknown; leaseEpoch?: unknown } | undefined;
-  if (typeof leaf.ctx.boxRunNonce === "string" && leaf.ctx.boxRunNonce !== proof?.runNonce) {
-    return { status: "pending", reason: "identity" };
+  if (chains.length === 1) {
+    const chain = chains[0]!;
+    const leaf = chain[0]!;
+    const pointer = leaf.ctx.boxReplayMessage as { sha256: string };
+    // The leaf call's input+cache is the prompt that call actually sent. Earlier
+    // rounds already include prior context, so summing them is not the current window.
+    const usage = leaf.ctx.boxUsage as { inputTokens?: unknown; cacheReadTokens?: unknown } | undefined;
+    const tokens = (typeof usage?.inputTokens === "number" ? usage.inputTokens : 0)
+      + (typeof usage?.cacheReadTokens === "number" ? usage.cacheReadTokens : 0);
+    return {
+      status: "terminal",
+      sessionId: input.sessionId,
+      turnKey: input.turnKey,
+      requestId: leaf.requestId,
+      revision: singleRevision(input, chain),
+      compactRequired: tokens >= IDLE_COMPACT_USAGE_FLOOR,
+      capsuleSha256: pointer.sha256,
+      ...(input.verifiedSummaryText !== undefined ? { summaryText: input.verifiedSummaryText } : {}),
+    };
   }
-  if (typeof leaf.ctx.boxLeaseEpoch === "string" && leaf.ctx.boxLeaseEpoch !== proof?.leaseEpoch) {
-    return { status: "pending", reason: "identity" };
-  }
-  if (typeof leaf.ctx.boxRoundNo === "number" && leaf.ctx.boxRoundNo !== chain.length) {
-    return { status: "pending", reason: "identity" };
-  }
-  for (const row of chain) {
-    if (typeof row.ctx.boxRunNonce === "string" && row.ctx.boxRunNonce !== leaf.ctx.boxRunNonce
-      && typeof leaf.ctx.boxRunNonce === "string") {
-      return { status: "pending", reason: "identity" };
-    }
-    if (typeof row.ctx.boxAccountId === "string" && typeof leaf.ctx.boxAccountId === "string"
-      && row.ctx.boxAccountId !== leaf.ctx.boxAccountId) {
-      return { status: "pending", reason: "identity" };
-    }
-  }
-  // The leaf call's input+cache is the prompt that call actually sent. Earlier
-  // rounds already include prior context, so summing them is not the current window.
-  const usage = leaf.ctx.boxUsage as { inputTokens?: unknown; cacheReadTokens?: unknown } | undefined;
-  const tokens = (typeof usage?.inputTokens === "number" ? usage.inputTokens : 0)
-    + (typeof usage?.cacheReadTokens === "number" ? usage.cacheReadTokens : 0);
-  const ids = [...chain].reverse().map((row) => row.requestId);
-  const revision = sha({
-    sessionId: input.sessionId,
-    turnKey: input.turnKey,
-    ids,
-    proof: chain.map((row) => ({
-      id: row.requestId,
-      reason: proofReason(row.ctx) ?? null,
-      nonce: (row.ctx.boxTerminalProof as { runNonce?: unknown } | undefined)?.runNonce ?? null,
-    })),
-    capsule: pointer.sha256,
-  });
+  const members = chains.map((chain) => {
+    const leaf = chain[0]!;
+    const pointer = leaf.ctx.boxReplayMessage as { sha256: string };
+    return {
+      ids: [...chain].reverse().map((row) => row.requestId),
+      proof: chain.map((row) => ({
+        id: row.requestId,
+        reason: proofReason(row.ctx) ?? null,
+        nonce: (row.ctx.boxTerminalProof as { runNonce?: unknown } | undefined)?.runNonce ?? null,
+      })),
+      capsule: pointer.sha256,
+    };
+  }).sort((left, right) => left.ids.join("\0").localeCompare(right.ids.join("\0")));
   return {
-    status: "terminal",
+    status: "terminal_set",
     sessionId: input.sessionId,
     turnKey: input.turnKey,
-    requestId: leaf.requestId,
-    revision,
-    compactRequired: tokens >= IDLE_COMPACT_USAGE_FLOOR,
-    capsuleSha256: pointer.sha256,
-    ...(input.verifiedSummaryText !== undefined ? { summaryText: input.verifiedSummaryText } : {}),
+    revision: sha({ sessionId: input.sessionId, turnKey: input.turnKey, members }),
+    requestIds: [...covered].sort(),
   };
 }
 
 export function capsuleSummaryText(message: unknown): string | undefined {
   return textOf(message);
+}
+
+/** Leaves of a ready set: members that no other member names as its owner. */
+export function idleSetLeafIds(rows: readonly IdleChainRow[], requestIds: readonly string[]): string[] {
+  const allowed = new Set(requestIds);
+  const parents = new Set<string>();
+  for (const row of rows) {
+    if (!allowed.has(row.requestId)) continue;
+    const parent = row.ctx.boxOwnerRequestId;
+    if (typeof parent === "string") parents.add(parent);
+  }
+  return requestIds.filter((id) => !parents.has(id));
 }
 
 /** Attach text only after the replay reader has checked the capsule hash.

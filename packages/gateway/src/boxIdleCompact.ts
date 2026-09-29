@@ -320,10 +320,14 @@ export function advanceIdleOp(input: {
     }
     break
   }
+  if (input.useProofSummary && input.proof.status === 'terminal_set') {
+    return { op, callModel: false }
+  }
   if (op.artifact && op.receiptDigest === op.artifact.digest) return { op, callModel: false }
   // The inner leaf's compactRequired is not the outer transcript. Native
   // measures that history after this dispatch and skips a short one.
-  if (input.allowDispatch && !op.summaryText && input.proof.status === 'terminal'
+  if (input.allowDispatch && !op.summaryText
+    && (input.proof.status === 'terminal' || input.proof.status === 'terminal_set')
     && input.proof.revision === op.revision) {
     return { op, callModel: true }
   }
