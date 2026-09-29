@@ -42,6 +42,8 @@
 import { describe, test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID, createHash, createCipheriv, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,11 +68,19 @@ import { PricingCache, type ModelPricing } from "../billing/pricing.js";
 import { ModelCatalogSnapshot, type ModelCatalogEntry,
   type ModelCatalogPricing } from "../billing/modelCatalog.js";
 import { LOCAL_CATALOG_HEADER, encodeLocalCatalogToken } from "../http/proxy/modelAuthorityGate.js";
-import { deriveBoxCallFingerprint } from "../http/proxy/boxCallFingerprint.js";
+import { deriveBoxCallFingerprint, deriveBoxContextHash, hashBoxAssistantContent,
+  hashBoxAssistantEchoContent, hashBoxAssistantNoCallerContent } from "../http/proxy/boxCallFingerprint.js";
 import { BoxTextFetch, BoxTextFetchError } from "../http/proxy/boxTextFetch.js";
 import { BoxInvocationRegistry, BoxInvocationConflict } from "../http/proxy/boxInvocationRegistry.js";
 import { BoxDurableJournal, BoxDurableJournalError } from "../http/proxy/boxDurableJournal.js";
-import { writeBoxReplayMessage } from "../http/proxy/boxReplayMessageFile.js";
+import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
+import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
+import { recoverBoxBillingRequest, settleBoxReplayBeforeDelivery } from "../billing/boxBillingRecovery.js";
+import { compileBoxToolCatalog } from "../http/proxy/boxToolCatalog.js";
+import { hashBoxToolInput } from "../http/proxy/boxToolInputHash.js";
+import { BoxContinuationDecisionError, prepareBoxContinuation } from "../http/proxy/boxPreparedContinuation.js";
+import { BoxToolResultEcho } from "../http/proxy/boxToolResultEcho.js";
+import { readBoxReplayMessage, writeBoxReplayMessage } from "../http/proxy/boxReplayMessageFile.js";
 import { createLogger } from "../logging/logger.js";
 import { setPoolOverride, resetPool } from "../db/index.js";
 import {
@@ -1398,6 +1408,514 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
     } finally {
       if (old === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
+  test("wrong signed replay identity is rejected before reservation or settle", async () => {
+    const { h, headers } = boxRouteHarness();
+    let lookups = 0;
+    let settled = 0;
+    h.deps.boxReplay = { lookup: async (input: { prepared?: { authority: { kind: string };
+      rawBoundarySha256: string }; canonicalBody: { model: string } }) => {
+      lookups += 1;
+      assert.equal(input.prepared?.authority.kind, "legacy_unsigned");
+      assert.equal(input.canonicalBody.model, BOX_API_MODEL);
+      settled += 1;
+      throw new BoxDurableJournalError("BOX_AUTHORITY_REJECTED");
+    } } as never;
+    const response = await h.run({ ...minBody(BOX_API_MODEL), stream: false, metadata: {
+      user_id: JSON.stringify({ session_id: "web-box-auth", oc_turn_key: "ab".repeat(32) }) } },
+      headers);
+    assert.equal(response.statusCode, 409, response.bodyText());
+    assert.match(response.bodyText(), /BOX_AUTHORITY_REJECTED/);
+    assert.equal(lookups, 1);
+    assert.equal(settled, 1, "lookup itself ran; the handler must stop before a delivery settle");
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+      .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+  });
+
+  test("legal exact replay returns the capsule and does not debit this request", async () => {
+    const { h, headers } = boxRouteHarness();
+    const replayed = { type: "message", id: "msg_exact", role: "assistant", model: "claude-opus-5-5",
+      content: [{ type: "text", text: "kept" }] };
+    h.deps.boxReplay = { lookup: async (input: { prepared?: { classification: string } }) => {
+      assert.equal(input.prepared?.classification, "fresh");
+      return { kind: "ready", identity: {} as never, response: new Response(JSON.stringify(replayed), {
+        status: 200, headers: { "content-type": "application/json" } }) };
+    } } as never;
+    const response = await h.run({ ...minBody(BOX_API_MODEL), stream: false, metadata: {
+      user_id: JSON.stringify({ session_id: "web-box-exact", oc_turn_key: "cd".repeat(32) }) } },
+      headers);
+    assert.equal(response.statusCode, 200, response.bodyText());
+    assert.equal(JSON.parse(response.bodyText()).id, "msg_exact");
+    assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+      .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+  });
+
+  test("unknown current tool text is rejected before precheck", async () => {
+    const oldApi = process.env.OC_BOX_MODEL_API;
+    const oldBridge = process.env.OC_BOX_TOOL_BRIDGE;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      process.env.OC_BOX_TOOL_BRIDGE = "1";
+      const { h, headers } = boxRouteHarness();
+      let launches = 0;
+      h.deps.boxModel = { toolBridgeReady: true, async fetch() { launches += 1;
+        throw new Error("SHOULD_NOT_LAUNCH"); } };
+      h.deps.boxReplay = { lookup: async () => ({ kind: "missing" }) } as never;
+      const response = await h.run({ ...minBody(BOX_API_MODEL), tools: [{ name: "Read",
+        description: "read", input_schema: { type: "object", properties: {} } }],
+        messages: [
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_http_unknown",
+            name: "Read", input: { file_path: "a.txt" } }] },
+          { role: "user", content: [
+            { type: "tool_result", tool_use_id: "toolu_http_unknown", content: "ok" },
+            { type: "text", text: "please also change the plan" },
+          ] },
+        ], metadata: { user_id: JSON.stringify({ session_id: "web-box-unknown",
+          oc_turn_key: "ef".repeat(32) }) } }, headers);
+      assert.equal(response.statusCode, 409, response.bodyText());
+      assert.match(response.bodyText(), /BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION/);
+      assert.equal(launches, 0);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+    } finally {
+      if (oldApi === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = oldApi;
+      if (oldBridge === undefined) delete process.env.OC_BOX_TOOL_BRIDGE;
+      else process.env.OC_BOX_TOOL_BRIDGE = oldBridge;
+    }
+  });
+
+  test("continuation conflict is 409 from core and does not insert usage", async () => {
+    const oldApi = process.env.OC_BOX_MODEL_API;
+    const oldBridge = process.env.OC_BOX_TOOL_BRIDGE;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      process.env.OC_BOX_TOOL_BRIDGE = "1";
+      const { h, headers } = boxRouteHarness();
+      const turn = "a".repeat(64);
+      const request = { ...minBody(BOX_API_MODEL), max_tokens: 128, tools: [{ name: "Read",
+        description: "read", input_schema: { type: "object", properties: { file_path: { type: "string" } } } }],
+        messages: [
+          { role: "user", content: "look" },
+          { role: "assistant", content: [{ type: "tool_use", id: "toolu_http_claim", name: "Read",
+            input: { file_path: "a.txt" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_http_claim",
+            content: "ok" }] },
+        ], metadata: { user_id: JSON.stringify({ session_id: "web-box-claim", oc_turn_key: turn }) } };
+      h.deps.boxReplay = { lookup: async () => ({ kind: "missing" }) } as never;
+      h.deps.boxModel = { toolBridgeReady: true, fetch: async (args: { prepared?: ReturnType<
+        typeof prepareBoxContinuation> }) => {
+        assert.equal(args.prepared?.classification, "continuation_candidate");
+        assert.ok(args.prepared?.catalog);
+        assert.equal(args.prepared?.toolIds[0], "toolu_http_claim");
+        throw new BoxContinuationDecisionError("in_progress_or_unknown", "BOX_RESUME_IN_PROGRESS");
+      } };
+      const response = await h.run(request, headers);
+      assert.equal(response.statusCode, 409, response.bodyText());
+      assert.match(response.bodyText(), /BOX_RESUME_IN_PROGRESS/);
+      assert.equal(h.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+        .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+    } finally {
+      if (oldApi === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = oldApi;
+      if (oldBridge === undefined) delete process.env.OC_BOX_TOOL_BRIDGE;
+      else process.env.OC_BOX_TOOL_BRIDGE = oldBridge;
+    }
+  });
+
+  test("two HTTP requests race one handoff through the proxy and publish once", { timeout: 30_000 }, async () => {
+    const oldApi = process.env.OC_BOX_MODEL_API;
+    const oldBridge = process.env.OC_BOX_TOOL_BRIDGE;
+    const db = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+    const admin = new PgPool({ connectionString: db, max: 1 });
+    const raw = new PgPool({ connectionString: db, max: 4 });
+    const schema = `ocv5_294_http_${randomBytes(3).toString("hex")}`;
+    const nonce = randomBytes(12).toString("hex");
+    const runDir = `/tmp/ocv5-289-run-${nonce}`;
+    const client = await admin.connect();
+    let dropped = false;
+    try {
+      assert.match(db, /^postgres:\/\/test:test@127\.0\.0\.1:55432\/openclaude_test$/);
+      await client.query(`CREATE SCHEMA ${schema}`);
+      await client.query(`CREATE TABLE ${schema}.request_finalize_journal (
+        request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
+        state text NOT NULL, ctx jsonb NOT NULL, precheck_credits bigint,
+        dispatch_id text, attempt_no integer, updated_at timestamptz NOT NULL DEFAULT now(),
+        error_msg text, failure_code text, final_credits bigint, ledger_id bigint, usage_id bigint)`);
+      await client.query(`CREATE TABLE ${schema}.usage_records (
+        id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        request_id text NOT NULL, user_id bigint NOT NULL,
+        cost_credits bigint NOT NULL DEFAULT 0, status text)`);
+      await client.query(`CREATE TABLE ${schema}.credit_ledger (
+        id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        user_id bigint, delta bigint, reason text, ref_type text, ref_id text)`);
+      await client.query(`CREATE TABLE ${schema}.users (
+        id bigint PRIMARY KEY, credits bigint NOT NULL)`);
+      await client.query(`CREATE TABLE ${schema}.user_subscriptions (
+        user_id bigint, status text, period_credits bigint, period_end timestamptz)`);
+      await client.query(`CREATE TABLE ${schema}.org_memberships (
+        org_id bigint, user_id bigint, status text, billing_enabled boolean)`);
+      await client.query(`CREATE TABLE ${schema}.orgs (
+        id bigint, credits bigint, status text)`);
+      await client.query(`CREATE TABLE ${schema}.org_subscriptions (
+        org_id bigint, status text, period_credits bigint, period_end timestamptz)`);
+      await client.query(`CREATE TABLE ${schema}.turn_upstream_performance (
+        request_id text PRIMARY KEY, user_id bigint, dispatch_id text, model text,
+        ttft_ms integer, stream_ms integer, outcome text,
+        control_plane_release text, control_plane_commit text, observed_at timestamptz)`);
+      await client.query(`INSERT INTO ${schema}.users(id, credits) VALUES ($1, 1000000)`,
+        [FIXED_USER_ID]);
+      await client.query(`SET search_path TO ${schema}`);
+      const located = await client.query<{ name: string; nspname: string }>(
+        `SELECT c.relname AS name, n.nspname FROM pg_class c
+           JOIN pg_namespace n ON n.oid=c.relnamespace
+          WHERE c.oid IN (to_regclass('request_finalize_journal'),
+            to_regclass('usage_records'), to_regclass('credit_ledger'),
+            to_regclass('users'), to_regclass('user_subscriptions'),
+            to_regclass('org_memberships'), to_regclass('orgs'),
+            to_regclass('org_subscriptions'))
+          ORDER BY 1`);
+      assert.deepEqual(located.rows.map((row) => row.name), [
+        "credit_ledger", "org_memberships", "org_subscriptions", "orgs",
+        "request_finalize_journal", "usage_records", "user_subscriptions", "users"]);
+      assert.ok(located.rows.every((row) => row.nspname === schema));
+      const turn = randomBytes(32).toString("hex");
+      const session = `http-race-${nonce.slice(0, 8)}`;
+      const toolId = "toolu_http_race";
+      const requestBody = { ...minBody(BOX_API_MODEL), model: BOX_API_MODEL, max_tokens: 128,
+        tools: [{ name: "Read", description: "read",
+          input_schema: { type: "object", properties: { file_path: { type: "string" } } } }],
+        messages: [
+          { role: "user", content: "look" },
+          { role: "assistant", content: [{ type: "tool_use", id: toolId, name: "Read",
+            input: { file_path: "a.txt" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: toolId, content: "bytes" }] },
+        ],
+        metadata: { user_id: JSON.stringify({ session_id: session, oc_turn_key: turn }) } };
+      const catalog = compileBoxToolCatalog(requestBody.tools);
+      const assistant = [{ type: "tool_use", id: toolId, name: "Read", input: { file_path: "a.txt" } }];
+      const pricing = { v: 1, modelId: BOX_API_MODEL, displayName: "Box", inputPerMtok: "1",
+        outputPerMtok: "1", cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" };
+      const billing = { v: 1, sessionId: session, mode: "chat", parentSessionId: null,
+        delegateAgentId: null, turnKey: turn, parentTurnKey: null, authority: null,
+        dispatchId: null, attemptNo: null, verificationSponsorship: null, apiKeyId: null };
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx) VALUES ($1,$2,'committed',$3::jsonb)`, [
+        `own-${nonce.slice(0, 8)}`, String(FIXED_USER_ID), JSON.stringify({
+          model: BOX_API_MODEL, boxInvocationRecovery: "v1", boxInvocationMode: "detached_tool",
+          boxAccountId: "20", boxRunNonce: nonce, boxLeaseEpoch: "b".repeat(32),
+          boxContextHash: deriveBoxContextHash(requestBody, true),
+          boxHandoffRevision: "rev-http", boxState: "handoff", boxSessionId: session, boxTurnKey: turn,
+          boxToolHandoff: { version: 1, roundNo: 1, messageId: `msg_${nonce.slice(0, 8)}`,
+            assistantContentHash: hashBoxAssistantContent(assistant),
+            assistantNoCallerHash: hashBoxAssistantNoCallerContent(assistant),
+            assistantEchoHash: hashBoxAssistantEchoContent(assistant),
+            spoolOffset: 8, detachedRunnerHash: "c".repeat(64), catalogHash: catalog.bindingSha256,
+            toolUses: [{ id: toolId, boxName: "mcp__ocbridge__t0", clientName: "Read",
+              inputHash: hashBoxToolInput({ file_path: "a.txt" }) }],
+            verifiedPendingToolUseIds: [toolId],
+            usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+          billingPricing: pricing, boxBillingContext: billing,
+          boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
+          boxNativeCliCwd: runDir })]);
+      const wrapped = { connect: async () => {
+        const held = await raw.connect();
+        await held.query(`SET search_path TO ${schema}`);
+        const seen = await held.query<{ nspname: string }>(
+          `SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE c.oid = to_regclass('request_finalize_journal')`);
+        if (seen.rows[0]?.nspname !== schema) { held.release(); throw new Error("BOX_TEST_SCHEMA_LEAK"); }
+        return { query: held.query.bind(held), release: () => held.release() };
+      }, query: async (sql: string, params?: unknown[]) => {
+        const held = await raw.connect();
+        try {
+          await held.query(`SET search_path TO ${schema}`);
+          return await held.query(sql, params);
+        } finally { held.release(); }
+      }, async end() {} } as unknown as Pool;
+      const journal = new BoxDurableJournal(wrapped);
+      let releaseHold!: () => void;
+      const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+      let held = false;
+      journal.resumeLookupBarrier = async () => {
+        if (held) return;
+        held = true;
+        await hold;
+      };
+      mkdirSync(runDir, { recursive: true, mode: 0o700 });
+      writeFileSync(`${runDir}/pending.${toolId}.json`, JSON.stringify({
+        version: 1, modelToolUseId: toolId, mcpRequestId: 1, name: "t0",
+        arguments: { file_path: "a.txt" } }), { mode: 0o600 });
+      let finishes = 0;
+      const fetchBox = new BoxToolFetch({
+        supervisorAsset: Buffer.alloc(0), keeperAsset: Buffer.alloc(0),
+        virtualMcpAsset: Buffer.alloc(0), detachedRunnerAsset: Buffer.alloc(0),
+        journal, maxOutputTokensForModel: () => 128,
+        resolveTarget: async () => ({ accountId: 20n, exec: { run: async (request: {
+          command: string; args: string[]; cwd: string; environment?: Record<string, string> }) => {
+          if (request.command !== "/usr/bin/python3" || request.args[0] !== "-I") {
+            throw new Error("BOX_TEST_EXEC_NOT_PYTHON");
+          }
+          const ran = spawnSync(request.command, request.args, { cwd: request.cwd,
+            env: { ...process.env, ...request.environment }, encoding: "utf8", timeout: 5000 });
+          if (ran.status !== 0) throw new Error(ran.stderr || "python plan failed");
+          if (request.args.some((arg) => arg.includes("os.link("))) finishes += 1;
+          return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""),
+            exitCode: 0 as const };
+        } } }) as never,
+        onUnknown: async () => { throw new Error("owner must not be marked unknown"); },
+        runContinuation: async () => ({ kind: "tool_handoff" as const, spoolOffset: 8 }),
+      });
+      process.env.OC_BOX_MODEL_API = "1";
+      process.env.OC_BOX_TOOL_BRIDGE = "1";
+      const { h, headers } = boxRouteHarness();
+      await resetPool();
+      h.deps.pgPool = wrapped;
+      setPoolOverride(wrapped);
+      h.deps.boxReplay = { lookup: async () => ({ kind: "missing" }) } as never;
+      h.deps.boxModel = { toolBridgeReady: true, fetch: (args) => fetchBox.fetch(args) };
+      const one = h.run(requestBody, { ...headers, "x-request-id": `httpA${nonce.slice(0, 8)}` });
+      const two = h.run(requestBody, { ...headers, "x-request-id": `httpB${nonce.slice(0, 8)}` });
+      const started = Date.now();
+      while (!held && Date.now() - started < 8000) await new Promise((r) => setTimeout(r, 15));
+      assert.equal(held, true, "first claim reached the post-lookup barrier");
+      releaseHold();
+      const [left, right] = await Promise.all([one, two]);
+      const statuses = [left.statusCode, right.statusCode].sort();
+      assert.equal(statuses.filter((code) => code === 200).length, 1, `${left.bodyText()}\n${right.bodyText()}`);
+      assert.equal(statuses.filter((code) => code !== 200).length, 1);
+      assert.equal(finishes, 1, "the plan's os.link write runs once; a second dispatch is red");
+      assert.deepEqual(readdirSync(runDir).filter((name) => name.startsWith("result.")),
+        [`result.${toolId}.json`]);
+      const published = JSON.parse(readFileSync(`${runDir}/result.${toolId}.json`, "utf8")) as {
+        modelToolUseId: string; content: Array<{ type: string; text: string }>; isError: boolean };
+      assert.equal(published.modelToolUseId, toolId);
+      assert.equal(published.isError, false);
+      assert.equal(published.content[0]?.text, "bytes");
+      const contentHash = createHash("sha256").update(JSON.stringify({
+        content: published.content, isError: false })).digest("hex");
+      const echo = new BoxToolResultEcho([{ modelToolUseId: toolId, contentHash, isError: false }]);
+      echo.accept({ type: "user", message: { role: "user", content: [{
+        type: "tool_result", tool_use_id: toolId, content: "bytes" }] } });
+      echo.assertComplete();
+      const loser = left.statusCode === 200 ? right : left;
+      assert.match(loser.bodyText(), /BOX_CALL_AMBIGUOUS|BOX_RESUME_IN_PROGRESS/);
+      const owner = await client.query<{ state: string }>(
+        "SELECT ctx->>'boxState' AS state FROM request_finalize_journal WHERE request_id=$1",
+        [`own-${nonce.slice(0, 8)}`]);
+      assert.equal(owner.rows[0]?.state, "resuming");
+      assert.notEqual(owner.rows[0]?.state, "unknown");
+    } finally {
+      rmSync(runDir, { recursive: true, force: true });
+      const droppedResult = await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch((error: unknown) => error);
+      dropped = !(droppedResult instanceof Error);
+      if (!dropped) throw droppedResult;
+      const gone = await client.query<{ rel: string | null }>(
+        "SELECT to_regclass($1)::text AS rel", [`${schema}.request_finalize_journal`]);
+      assert.equal(gone.rows[0]?.rel ?? null, null);
+      client.release();
+      await admin.end();
+      await raw.end();
+      if (oldApi === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = oldApi;
+      if (oldBridge === undefined) delete process.env.OC_BOX_TOOL_BRIDGE;
+      else process.env.OC_BOX_TOOL_BRIDGE = oldBridge;
+    }
+  });
+
+  test("real replay identity rejects before settle and consumes one committed capsule", { timeout: 30_000 }, async () => {
+    const db = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+    assert.match(db, /^postgres:\/\/test:test@127\.0\.0\.1:55432\/openclaude_test$/);
+    const pool = new PgPool({ connectionString: db, max: 1 });
+    const client = await pool.connect();
+    const capsuleDir = await mkdtemp(join(tmpdir(), "ocv5-294-replay-"));
+    try {
+      const where = await client.query<{ db: string; port: number }>(
+        "SELECT current_database() AS db, inet_server_port() AS port");
+      assert.equal(where.rows[0]?.db, "openclaude_test");
+      assert.equal(Number(where.rows[0]?.port), 55432);
+      await client.query(readFileSync(new URL("../billing/boxBillingRecoveryTempSchema.sql", import.meta.url), "utf8"));
+      await client.query("CREATE TEMP SEQUENCE box_294_usage_id_seq");
+      await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_294_usage_id_seq'::regclass)");
+      await client.query("CREATE TEMP SEQUENCE box_294_ledger_id_seq");
+      await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_294_ledger_id_seq'::regclass)");
+      const shadow = await client.query<{ only_temp: boolean }>(`SELECT
+        'request_finalize_journal'::regclass='pg_temp.request_finalize_journal'::regclass
+        AND 'usage_records'::regclass='pg_temp.usage_records'::regclass
+        AND 'users'::regclass='pg_temp.users'::regclass
+        AND 'credit_ledger'::regclass='pg_temp.credit_ledger'::regclass
+        AND 'org_memberships'::regclass='pg_temp.org_memberships'::regclass AS only_temp`);
+      assert.equal(shadow.rows[0]?.only_temp, true);
+      const same = { connect: async () => ({ query: client.query.bind(client), release() {} }),
+        query: client.query.bind(client) } as unknown as Pool;
+      const journal = new BoxDurableJournal(same);
+      const uid = BigInt(FIXED_USER_ID);
+      await client.query(`INSERT INTO users(id,email,password_hash,credits)
+        VALUES ($1,$2,'temp-only',1000)`,
+        [uid.toString(), `replay-${randomBytes(4).toString("hex")}@example.invalid`]);
+      const turnA = "ab".repeat(16);
+      const turnB = "cd".repeat(16);
+      const nonce = "e".repeat(24);
+      const epoch = "f".repeat(32);
+      const usageCount = async () => Number((await client.query<{ n: string }>(
+        "SELECT COUNT(*)::text AS n FROM usage_records")).rows[0]?.n ?? "0");
+      const ledgerCount = async () => Number((await client.query<{ n: string }>(
+        "SELECT COUNT(*)::text AS n FROM credit_ledger")).rows[0]?.n ?? "0");
+      function replayBody(session: string, turn: string): Record<string, unknown> {
+        return { ...minBody(BOX_API_MODEL), stream: false, max_tokens: 128,
+          messages: [{ role: "user", content: `hi ${session}` }],
+          metadata: { user_id: JSON.stringify({ session_id: session, oc_turn_key: turn }) } };
+      }
+      async function seed(id: string, session: string, turn: string,
+        authority: { authorityKind: string; authorityTurnId: string } | null) {
+        const body = replayBody(session, turn);
+        const prepared = prepareBoxContinuation({ uid, canonicalModel: BOX_API_MODEL,
+          rawBody: body as never,
+          authorityKind: authority?.authorityKind ?? "local_catalog",
+          authorityTurnId: authority?.authorityTurnId ?? null });
+        await client.query(`INSERT INTO request_finalize_journal
+          (request_id,user_id,state,ctx,precheck_credits)
+          VALUES ($1,$2,'committed',$3::jsonb,0)`, [id, uid.toString(), JSON.stringify({
+          model: BOX_API_MODEL, ...(authority ?? {}),
+          boxInvocationRecovery: "v1", boxInvocationMode: "text", boxAccountId: "20",
+          boxRunNonce: nonce, boxLeaseEpoch: epoch, boxState: "terminal",
+          boxSessionId: session, boxTurnKey: turn, boxRoundNo: 1,
+          boxReplayFingerprint: prepared.fingerprint?.replayFingerprint,
+          boxFallbackAlias: prepared.fallbackAlias })]);
+        return { body, prepared };
+      }
+      const before = await usageCount();
+      let settleCalls = 0;
+      const mismatch = await seed("id-mismatch", "sess-mismatch", "11".repeat(32),
+        { authorityKind: "bridge_signed", authorityTurnId: turnB });
+      const signedPrepared = prepareBoxContinuation({ uid, canonicalModel: BOX_API_MODEL,
+        rawBody: mismatch.body as never, authorityKind: "bridge_signed", authorityTurnId: turnA });
+      await assert.rejects(() => journal.findReplayIdentity({ uid, canonicalModel: BOX_API_MODEL,
+        canonicalBody: mismatch.body as never, prepared: signedPrepared,
+        trustedAuthority: signedPrepared.authority }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_AUTHORITY_REJECTED");
+      const oneSided = await seed("id-oneside", "sess-oneside", "22".repeat(32), null);
+      const signedOnly = prepareBoxContinuation({ uid, canonicalModel: BOX_API_MODEL,
+        rawBody: oneSided.body as never, authorityKind: "bridge_signed", authorityTurnId: turnA });
+      await assert.rejects(() => findCompletedBoxReplay({ uid, canonicalModel: BOX_API_MODEL,
+        canonicalBody: oneSided.body as never, upstreamModel: "claude-opus-5-5",
+        prepared: signedOnly, trustedAuthority: signedOnly.authority },
+      { journal, readMessage: async () => { throw new Error("observer must not run"); } }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_AUTHORITY_REJECTED");
+      const malformed = await seed("id-malformed", "sess-malformed", "33".repeat(32),
+        { authorityKind: "bridge_signed", authorityTurnId: "short" });
+      await assert.rejects(() => journal.findReplayIdentity({ uid, canonicalModel: BOX_API_MODEL,
+        canonicalBody: malformed.body as never, prepared: malformed.prepared,
+        trustedAuthority: malformed.prepared.authority }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_AUTHORITY_MALFORMED");
+      const legacy = await seed("id-legacy", "sess-legacy", "44".repeat(32), null);
+      const legacyHit = await findCompletedBoxReplay({ uid, canonicalModel: BOX_API_MODEL,
+        canonicalBody: legacy.body as never, upstreamModel: "claude-opus-5-5",
+        prepared: legacy.prepared, trustedAuthority: legacy.prepared.authority },
+      { journal, readMessage: async () => { throw new Error("legacy positive has no capsule yet"); } });
+      assert.equal(legacyHit.kind, "pending");
+      if (legacyHit.kind === "pending") assert.equal(legacyHit.identity.requestId, "id-legacy");
+      assert.equal(settleCalls, 0);
+      assert.equal(await usageCount(), before, "identity rejection must not settle");
+
+      const httpSession = "sess-http-side";
+      const httpTurn = "55".repeat(32);
+      const httpBody = replayBody(httpSession, httpTurn);
+      const httpPrepared = prepareBoxContinuation({ uid, canonicalModel: BOX_API_MODEL,
+        rawBody: httpBody as never, authorityKind: "local_catalog", authorityTurnId: null });
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,precheck_credits) VALUES ($1,$2,'committed',$3::jsonb,0)`,
+      ["id-http-side", uid.toString(), JSON.stringify({
+        model: BOX_API_MODEL, authorityKind: "bridge_signed", authorityTurnId: turnA,
+        boxInvocationRecovery: "v1", boxInvocationMode: "text", boxAccountId: "20",
+        boxRunNonce: nonce, boxLeaseEpoch: epoch, boxState: "terminal",
+        boxSessionId: httpSession, boxTurnKey: httpTurn, boxRoundNo: 1,
+        boxReplayFingerprint: httpPrepared.fingerprint?.replayFingerprint,
+        boxFallbackAlias: httpPrepared.fallbackAlias })]);
+      await resetPool();
+      const { h, headers } = boxRouteHarness();
+      h.deps.boxReplay = { lookup: (input: Parameters<typeof findCompletedBoxReplay>[0]) =>
+        findCompletedBoxReplay(input, { journal, readMessage: async () => {
+          throw new Error("observer must not run");
+        } }) } as never;
+      const rejected = await h.run(httpBody, headers);
+      assert.equal(rejected.statusCode, 409, rejected.bodyText());
+      assert.match(rejected.bodyText(), /BOX_AUTHORITY_REJECTED/);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(await usageCount(), before);
+
+      const legalSession = "sess-legal";
+      const legalTurn = "66".repeat(32);
+      const legalBody = replayBody(legalSession, legalTurn);
+      const legalPrepared = prepareBoxContinuation({ uid, canonicalModel: BOX_API_MODEL,
+        rawBody: legalBody as never, authorityKind: "local_catalog", authorityTurnId: null });
+      const legalId = "id-legal";
+      const message = { type: "message", id: "msg_exact_replay", role: "assistant",
+        model: "claude-opus-5-5", content: [{ type: "text", text: "kept" }],
+        stop_reason: "end_turn", usage: { input_tokens: 2, output_tokens: 3 } };
+      const pointer = await writeBoxReplayMessage(capsuleDir, {
+        uid: uid.toString(), requestId: legalId, runNonce: nonce, leaseEpoch: epoch, roundNo: 1,
+      }, message);
+      await client.query(`INSERT INTO request_finalize_journal
+        (request_id,user_id,state,ctx,precheck_credits,updated_at)
+        VALUES ($1,$2,'inflight',$3::jsonb,0,NOW()-INTERVAL '10 minutes')`,
+      [legalId, uid.toString(), JSON.stringify({
+        model: BOX_API_MODEL,
+        boxInvocationRecovery: "v1", boxInvocationMode: "text", boxAccountId: "20",
+        boxRunNonce: nonce, boxLeaseEpoch: epoch, boxState: "terminal",
+        boxSessionId: legalSession, boxTurnKey: legalTurn, boxRoundNo: 1,
+        boxReplayFingerprint: legalPrepared.fingerprint?.replayFingerprint,
+        boxFallbackAlias: legalPrepared.fallbackAlias,
+        boxReplayRequired: true, boxReplayMessage: pointer,
+        boxTerminalProof: { runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
+          reason: "worker_complete", revision: 1 },
+        boxUsage: { inputTokens: 2, outputTokens: 3, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        billingPricing: { v: 1, modelId: BOX_API_MODEL, displayName: "Opus",
+          inputPerMtok: "100000000", outputPerMtok: "100000000",
+          cacheReadPerMtok: "100000000", cacheWritePerMtok: "100000000", multiplier: "1" },
+        boxBillingContext: { v: 1, sessionId: legalSession, mode: "chat", parentSessionId: null,
+          delegateAgentId: null, turnKey: legalTurn, parentTurnKey: null, authority: null,
+          dispatchId: null, attemptNo: null, verificationSponsorship: null, apiKeyId: null },
+      })]);
+      assert.equal(await recoverBoxBillingRequest(same, legalId, uid), "settled");
+      const settledUsage = await usageCount();
+      const settledLedger = await ledgerCount();
+      assert.equal(settledUsage, before + 1);
+      assert.ok(settledLedger >= 1);
+      settleCalls += 1;
+      assert.equal(await settleBoxReplayBeforeDelivery(same, { uid, pointer }), true);
+      assert.equal(await usageCount(), settledUsage);
+      assert.equal(await ledgerCount(), settledLedger);
+      const retryId = "retryLegal01";
+      await resetPool();
+      const { h: legalH, headers: legalHeaders } = boxRouteHarness();
+      legalH.deps.boxReplay = { lookup: (input: Parameters<typeof findCompletedBoxReplay>[0]) =>
+        findCompletedBoxReplay(input, { journal,
+          readMessage: (stored) => readBoxReplayMessage(capsuleDir, stored) }) } as never;
+      const delivered = await legalH.run(legalBody, { ...legalHeaders, "x-request-id": retryId });
+      assert.equal(delivered.statusCode, 200, delivered.bodyText());
+      assert.equal(JSON.parse(delivered.bodyText()).id, "msg_exact_replay");
+      assert.equal(legalH.preCheckSpy.reserveCalls.length, 0);
+      assert.equal(legalH.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+        .startsWith("INSERT INTO REQUEST_FINALIZE_JOURNAL")).length, 0);
+      assert.equal(legalH.pool.queries.filter((query) => query.sql.trim().toUpperCase()
+        .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
+      const retryUsage = await client.query<{ n: string }>(
+        "SELECT COUNT(*)::text AS n FROM usage_records WHERE request_id=$1", [retryId]);
+      assert.equal(retryUsage.rows[0]?.n, "0");
+      assert.equal(await usageCount(), settledUsage);
+      assert.equal(await ledgerCount(), settledLedger);
+      assert.equal(settleCalls, 1);
+    } finally {
+      client.release();
+      await pool.end();
+      await rm(capsuleDir, { recursive: true, force: true });
     }
   });
 });

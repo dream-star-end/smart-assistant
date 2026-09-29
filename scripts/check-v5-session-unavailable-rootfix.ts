@@ -138,8 +138,8 @@ const foldAt = boxCache.indexOf('const effective = foldBoxCcbHookContext(body);'
 const budgetAt = boxCache.indexOf('const kept = effective.messages.filter(', foldAt)
 if (stripAt < 0 || stripEnd <= stripAt || foldAt <= stripAt
   || foldAt >= stripEnd || budgetAt <= foldAt || budgetAt >= stripEnd
-  || !boxGate.includes('const effective = stripBoxCcbToolBudgetTail(body);')
-  || !boxFetch.includes('const messages = stripBoxCcbToolBudgetTail(body).messages;')) {
+  || !boxGate.includes('classifyBoxContinuation(body)')
+  || !boxFetch.includes('continuation_candidate')) {
   throw new Error('[box-hook-resume] shared fold-before-budget continuation path missing')
 }
 console.log('INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof')
@@ -153,6 +153,46 @@ if (!boxCache.includes('function bareHookBeforeBudget(')
   throw new Error('[box-multitool-continuation] unwrapped hook-plus-budget fold missing')
 }
 console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof')
+if (!boxCache.includes('function foldProvenImageCaption(')
+  || !boxCache.includes('const current = foldProvenImageCaption(message, assistant);')
+  || !boxCache.includes('80x2200>73x2000@1.10')
+  || !boxCache.includes('1290x2796>923x2000@1.40')
+  || !boxCache.includes('export function strictBoxImageBlock(')) {
+  throw new Error('[box-image-continuation] proven caption fold is not on the shared hook path')
+}
+const preparedSrc = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxPreparedContinuation.ts'), 'utf8')
+const preparedGate = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRequestGate.ts'), 'utf8')
+const preparedFetch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolFetch.ts'), 'utf8')
+const preparedEgress = readFileSync(join(root,
+  'packages/commercial/src/egress/main.ts'), 'utf8')
+for (const marker of [
+  'export function decisionMayPublish',
+  'export function resumeMayPublish',
+  'export function authoritiesBind',
+  'export function classifyBoxContinuation',
+  'export function consumePrepared',
+]) {
+  if (!preparedSrc.includes(marker)) {
+    throw new Error(`[box-prepared-continuation] missing ${marker}`)
+  }
+}
+const preparedPublish = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolResumePublish.ts'), 'utf8')
+const preparedJournal = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+if (!preparedGate.includes('classifyBoxContinuation')
+  || !preparedFetch.includes('continuation_candidate')
+  || !preparedEgress.includes('continuation_candidate')
+  || !preparedPublish.includes('resumeMayPublish(')
+  || !preparedJournal.includes('matchPreparedToolResults(')
+  || !preparedJournal.includes('consumePrepared(')
+  || !preparedSrc.includes('fingerprintOfPrepared')) {
+  throw new Error('[box-prepared-continuation] gate, fetch, or egress does not consume the prepared class')
+}
+console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')
 const editEcho = readFileSync(join(root,
   'packages/commercial/src/http/proxy/boxToolInputEcho.ts'), 'utf8')
 const editJournal = readFileSync(join(root,

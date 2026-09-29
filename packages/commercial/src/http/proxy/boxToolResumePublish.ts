@@ -11,6 +11,9 @@ import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
+import { resumeMayPublish, BoxContinuationDecisionError,
+  type PreparedContinuation } from "./boxPreparedContinuation.js";
+import type { BoxResumeDecision } from "./boxDurableJournal.js";
 
 export class BoxToolResumePublishError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolResumePublishError"; }
@@ -31,8 +34,12 @@ export async function publishBoxToolResume(input: {
   upstreamModel: string;
   url: string;
   init: RequestInit;
+  prepared?: PreparedContinuation;
 }, deps: {
-  journal: Journal;
+  journal: Journal & { decideToolResume?: (input: { requestId: string; uid: bigint;
+    canonicalModel: string; canonicalBody: ProxyBody;
+    trustedAuthority?: PreparedContinuation["authority"];
+    prepared?: PreparedContinuation }) => Promise<BoxResumeDecision> };
   resolveTarget: (args: { uid: bigint; sessionId: string | null;
     requestId: string; upstreamModel: string; requiredAccountId: bigint;
     signal: AbortSignal }) => Promise<BoxResolvedTarget>;
@@ -97,9 +104,22 @@ export async function publishBoxToolResume(input: {
     if (signal.aborted) throw new BoxToolResumePublishError("BOX_TOOL_RESUME_ABORTED");
     // This is the only mutation before sidecar publication. An ambiguous CAS
     // response fails closed; it is never reissued by this coordinator.
-    claim = await race(deps.journal.claimToolResume({ requestId: input.requestId,
-      uid: input.uid, canonicalModel: input.canonicalModel,
-      canonicalBody: input.canonicalBody }));
+    const claimInput = { requestId: input.requestId, uid: input.uid,
+      canonicalModel: input.canonicalModel, canonicalBody: input.canonicalBody,
+      ...(input.prepared ? { prepared: input.prepared,
+        trustedAuthority: input.prepared.authority } : {}) };
+    const decision = deps.journal.decideToolResume
+      ? await race(deps.journal.decideToolResume(claimInput))
+      : { kind: "new_claim" as const, claim: await race(deps.journal.claimToolResume(claimInput)) };
+    if (!resumeMayPublish(decision)) {
+      throw new BoxContinuationDecisionError(
+        decision.kind === "reject" ? "reject" : "in_progress_or_unknown",
+        "code" in decision ? decision.code : "BOX_RESUME_IN_PROGRESS");
+    }
+    if (decision.kind !== "new_claim") {
+      throw new BoxToolResumePublishError("BOX_TOOL_RESUME_DECISION_UNBOUND");
+    }
+    claim = decision.claim;
     const access = makeBoxDetachedRunAccess({ runNonce: claim.runNonce,
       detachedRunnerHash: claim.detachedRunnerHash });
     const pendingTarget = deps.resolveTarget({ uid: input.uid,

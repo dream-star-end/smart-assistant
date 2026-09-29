@@ -119,6 +119,130 @@ function generatedToolMeta(text: string): { hook?: string; budget: boolean } | n
   if (USER_BUDGET.test(text)) return { budget: true };
   return HOOK_CONTEXT.test(text) ? { hook: text, budget: false } : null;
 }
+// CCB 2.1.280 prints this sibling after a scaled Read image. Only the two
+// dimension tuples below were observed (HTTP 80x2200 and JSONL 1290x2796).
+// Other sizes stay unfolded. The scale string is kept verbatim.
+const IMAGE_CAPTION = /^\[Image: original ([1-9][0-9]*)x([1-9][0-9]*), displayed at ([1-9][0-9]*)x([1-9][0-9]*)\. Multiply coordinates by ([0-9]+\.[0-9]{2}) to map to original image\.\]$/;
+const PROVEN_IMAGE_CAPTIONS = new Set(["80x2200>73x2000@1.10", "1290x2796>923x2000@1.40"]);
+const TOOL_RESULT_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024 - 4096;
+function exactCaption(text: string): RegExpExecArray | null {
+  const match = IMAGE_CAPTION.exec(text);
+  return match !== null && match[0].length === text.length ? match : null;
+}
+function provenCaption(text: string): boolean {
+  const match = exactCaption(text);
+  return match !== null && PROVEN_IMAGE_CAPTIONS.has(
+    `${match[1]}x${match[2]}>${match[3]}x${match[4]}@${match[5]}`);
+}
+function captionShaped(text: string): boolean {
+  return exactCaption(text) !== null;
+}
+/** Strict nested image block shared by the matcher and the historical mapper.
+ * Extra keys, unknown sources, and non-canonical base64 are not images. */
+export function strictBoxImageBlock(block: unknown): { data: string; mimeType: string } | null {
+  if (!object(block) || block.type !== "image") return null;
+  if (Object.keys(block).sort().join(",") !== "source,type" || !object(block.source)) return null;
+  const source = block.source;
+  if (Object.keys(source).sort().join(",") !== "data,media_type,type") return null;
+  if (source.type !== "base64" || typeof source.data !== "string"
+    || typeof source.media_type !== "string"
+    || !["image/png", "image/jpeg", "image/gif", "image/webp"].includes(source.media_type)) {
+    return null;
+  }
+  const raw = Buffer.from(source.data, "base64");
+  if (raw.length > MAX_IMAGE_BYTES || raw.toString("base64") !== source.data) return null;
+  return { data: source.data, mimeType: source.media_type };
+}
+function inspectResultContent(content: unknown): { ok: boolean; images: number; captions: number } {
+  if (typeof content === "string") {
+    return { ok: true, images: 0, captions: captionShaped(content) ? 1 : 0 };
+  }
+  if (!Array.isArray(content) || !denseArray(content)) return { ok: false, images: 0, captions: 0 };
+  let images = 0, captions = 0;
+  for (const part of content) {
+    if (!object(part)) return { ok: false, images: 0, captions: 0 };
+    if (part.type === "text" && Object.keys(part).sort().join(",") === "text,type"
+      && typeof part.text === "string") {
+      if (captionShaped(part.text)) captions += 1;
+      continue;
+    }
+    if (strictBoxImageBlock(part)) { images += 1; continue; }
+    return { ok: false, images: 0, captions: 0 };
+  }
+  return { ok: true, images, captions };
+}
+function legalToolResult(part: Record<string, unknown>): boolean {
+  if (part.type !== "tool_result" || typeof part.tool_use_id !== "string"
+    || !TOOL_RESULT_ID.test(part.tool_use_id)) return false;
+  if (part.is_error !== undefined && typeof part.is_error !== "boolean") return false;
+  return Object.keys(part).every((key) => key === "type" || key === "tool_use_id"
+    || key === "content" || key === "is_error");
+}
+function toolUseIds(assistant: Record<string, unknown>): string[] | null {
+  if (!Array.isArray(assistant.content) || !denseArray(assistant.content)) return null;
+  const ids: string[] = [];
+  for (const part of assistant.content) {
+    if (!object(part) || part.type !== "tool_use") continue;
+    if (typeof part.id !== "string" || !TOOL_RESULT_ID.test(part.id)) return null;
+    ids.push(part.id);
+  }
+  if (ids.length < 1 || new Set(ids).size !== ids.length) return null;
+  return ids;
+}
+/** Move one proven coordinate sentence into the single image's tool_result.
+ * Unknown shapes, conflicts, and non-unique images are left untouched. */
+function foldProvenImageCaption(message: Record<string, unknown>,
+  assistant: Record<string, unknown>): Record<string, unknown> {
+  if (!Array.isArray(message.content) || !denseArray(message.content)) return message;
+  const content = message.content as unknown[];
+  let lastResult = -1;
+  for (let index = 0; index < content.length; index++) {
+    const part = content[index];
+    if (object(part) && part.type === "tool_result") {
+      if (index !== lastResult + 1) return message;
+      lastResult = index;
+    }
+  }
+  if (lastResult < 0) return message;
+  const results = content.slice(0, lastResult + 1);
+  const trailing = content.slice(lastResult + 1);
+  if (trailing.length === 0) return message;
+  const captions: string[] = [];
+  for (const part of trailing) {
+    if (!object(part) || Object.keys(part).sort().join(",") !== "text,type"
+      || part.type !== "text" || typeof part.text !== "string") return message;
+    if (provenCaption(part.text)) captions.push(part.text);
+    else if (!generatedToolMeta(part.text)) return message;
+  }
+  if (captions.length !== 1) return message;
+  const useIds = toolUseIds(assistant);
+  if (!useIds) return message;
+  const resultIds: string[] = [];
+  let images = 0, imageIndex = -1, insideCaptions = 0;
+  for (let index = 0; index < results.length; index++) {
+    const part = results[index];
+    if (!object(part) || !legalToolResult(part)) return message;
+    resultIds.push(part.tool_use_id as string);
+    const inspected = inspectResultContent(part.content);
+    if (!inspected.ok) return message;
+    insideCaptions += inspected.captions;
+    if (inspected.images > 0) { images += inspected.images; imageIndex = index; }
+  }
+  if (images !== 1 || imageIndex < 0 || insideCaptions !== 0) return message;
+  if (resultIds.length !== useIds.length || new Set(resultIds).size !== resultIds.length) return message;
+  const expected = new Set(useIds);
+  if (resultIds.some((id) => !expected.has(id))) return message;
+  const imageResult = results[imageIndex];
+  if (!object(imageResult) || !Array.isArray(imageResult.content)
+    || !denseArray(imageResult.content)) return message;
+  const caption = captions[0]!;
+  const nextResults = results.slice();
+  nextResults[imageIndex] = { ...imageResult, content: [...imageResult.content,
+    { type: "text", text: caption }] };
+  const keptTrailing = trailing.filter((part) => object(part) && part.text !== caption);
+  return { ...message, content: [...nextResults, ...keptTrailing] };
+}
 /** CCB's default mergeUserContentBlocks folds generated meta into the LAST
  * tool_result.content with a two-newline seam. Only remove an exact terminal
  * budget wrapper; an ordinary result, including embedded reminder-like text,
@@ -163,29 +287,32 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
       || !assistant.content.some((part: unknown) => object(part) && part.type === "tool_use")) {
       return message;
     }
+    const current = foldProvenImageCaption(message, assistant);
+    if (current !== message) changed = true;
     const results: Record<string, unknown>[] = [];
     const reminders: string[] = [];
     let removedBudget = false;
-    for (let i = 0; i < message.content.length; i++) {
-      if (!Object.hasOwn(message.content, i)) return message;
-      const part = message.content[i];
+    if (!Array.isArray(current.content)) return current;
+    for (let i = 0; i < current.content.length; i++) {
+      if (!Object.hasOwn(current.content, i)) return current;
+      const part = current.content[i];
       if (object(part) && part.type === "tool_result") {
         results.push(part);
         continue;
       }
       const text = block(part, ["text"]);
       if (!object(text) || Object.keys(text).sort().join(",") !== "text,type"
-        || text.type !== "text" || typeof text.text !== "string") return message;
+        || text.type !== "text" || typeof text.text !== "string") return current;
       const meta = generatedToolMeta(text.text);
-      if (!meta) return message;
+      if (!meta) return current;
       if (meta.hook !== undefined) reminders.push(meta.hook);
       if (meta.budget) removedBudget = true;
     }
     const last = results.at(-1)!;
-    if (!last) return message;
+    if (!last) return current;
     const stripped = stripEmbeddedBudget(last);
     const embeddedChanged = stripped !== last;
-    if (reminders.length === 0 && !removedBudget && !embeddedChanged) return message;
+    if (reminders.length === 0 && !removedBudget && !embeddedChanged) return current;
     if (reminders.length === 0) {
       const folded = [...results];
       folded[folded.length - 1] = stripped;
@@ -193,10 +320,10 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
       return { ...message, content: folded };
     }
     const previous = stripped.content;
-    if (typeof previous !== "string" && !Array.isArray(previous)) return message;
+    if (typeof previous !== "string" && !Array.isArray(previous)) return current;
     if (Array.isArray(previous)) {
       for (let i = 0; i < previous.length; i++) {
-        if (!Object.hasOwn(previous, i)) return message;
+        if (!Object.hasOwn(previous, i)) return current;
       }
     }
     const content = typeof previous === "string"

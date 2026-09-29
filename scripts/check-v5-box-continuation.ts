@@ -7,13 +7,17 @@
  * The process that parses arguments is only a supervisor. It uses node
  * builtins, starts the worker in a new process group, and enforces LIMIT_MS
  * from before that spawn. A synchronous worker cannot postpone the deadline.
- * There is no CLI switch that skips the deadline or the business receipt.
+ * Before spawn the supervisor exclusively creates one /tmp/ocv5-289-run-<24 hex>
+ * directory, passes that path to the worker, and removes it only after the
+ * worker process group has drained. The worker does not create or delete it.
+ * A path that already exists is left untouched. There is no CLI switch that
+ * skips the deadline or the business receipt.
  * Node 22 receives --experimental-transform-types on the worker spawn, not
  * via a re-exec that runs before supervision. --expect-sha is required and
  * is the builder archive SHA. Unknown arguments fail. A tree with no .git
  * still runs. Fault mutations live in check-v5-box-continuation.negative.ts.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { register } from "node:module";
@@ -23,6 +27,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 const LIMIT_MS = 60_000;
+const PUBLISH_DIR = /^\/tmp\/ocv5-289-run-[0-9a-f]{24}$/;
 const RECEIPT = "ocv5-b1-continuation-pass";
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = realpathSync(join(CANDIDATE, "packages/commercial/src/http/proxy"));
@@ -30,7 +35,19 @@ const SELF = realpathSync(fileURLToPath(import.meta.url));
 const FIXTURE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-fixture.ts", import.meta.url)));
 const LOADER = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-resolve.mjs", import.meta.url)));
 const ENTRIES = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts",
-  "boxCallFingerprint.ts"];
+  "boxCallFingerprint.ts", "boxToolResultPlan.ts", "boxToolResultEcho.ts"];
+/** Dynamic product entries loaded by provePublisher. They join the same
+ * relative value-import walk as ENTRIES. Type-only imports stay non-recursive.
+ * This is not a full-repo manifest. */
+const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as const;
+const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
+const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
+const SEALED_IMAGE_SHA = "a9491d8d9cb458b11d4ac6c5fc4b5c2d4d370a1d9b6f7960cc5dffae678538a0";
+const SEALED_CAPTION = "[Image: original 80x2200, displayed at 73x2000. Multiply coordinates by 1.10 to map to original image.]";
+const SEALED_CAPTION_SHA = "0fffd83f1a3c5d2e5f9f19d4c034008715f2d6bbc4c5689e4c635695326f77cb";
+const SEALED_CONTENT_HASH = "bbf51fecfe97c9c846f25efd38c7198f4faf0adcc5e17f764c15623f9ddc4eae";
+const SEALED_ID = "toolu_img_b1";
+const SEALED_NOTE = "toolu_note_b1";
 const KNOWN = new Set(["--expect-sha"]);
 
 type Api = {
@@ -42,8 +59,29 @@ type Api = {
   proveEditDefault: () => void;
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
+  echoAccept: (id: string, hash: string, raw: unknown) => void;
+  publishImage: (row: PublishedMatch) => PublishedFile;
+  classify: (body: Record<string, unknown>) => { classification: string; rejectCode: string | null };
+  projectAuthority: (kind: unknown, authorityTurnId: unknown) => { kind: string };
+  bindAuthority: (left: { kind: string }, right: { kind: string }) => { ok: boolean };
+  bindIdentity: (left: { uid: bigint; sessionId: string; canonicalModel: string; turnKey: string;
+    authority: { kind: string } }, right: { uid: bigint; sessionId: string; canonicalModel: string;
+    turnKey: string; authority: { kind: string } }) => { ok: boolean };
+  resumeMayPublish: (decision: { kind: string }) => boolean;
 };
-type Digest = Array<{ path: string; sha256: string }>;
+type Digest = Array<{ path: string; realpath: string; sha256: string }>;
+type ImageOracle = {
+  id: string; noteId: string; imageSha256: string; caption: string;
+  captionSha256: string; contentHash: string;
+};
+type PublishedPart = { type?: string; data?: string; mimeType?: string; text?: string };
+type PublishedFile = { modelToolUseId?: unknown; isError?: unknown; content?: PublishedPart[] };
+type PublishedMatch = {
+  modelToolUseId: string;
+  content: ReadonlyArray<PublishedPart>;
+  isError: boolean;
+  contentHash: string;
+};
 type Fixture = {
   annotationCounts: Array<{ progress: number; hook: number; wrapped: number }>;
   chain: Array<Record<string, unknown>>;
@@ -65,11 +103,12 @@ type Fixture = {
 };
 
 let scratch = "";
+let publishDir = "";
 let fx: Fixture;
 function fail(message: string): never {
   throw new Error(message);
 }
-function sha256(text: string): string {
+function sha256(text: string | Buffer): string {
   return createHash("sha256").update(text).digest("hex");
 }
 function underTsx(): boolean {
@@ -128,9 +167,9 @@ function resolveLocal(fromFile: string, spec: string): string | null {
   return null;
 }
 function digest(): Digest {
-  const pending = ENTRIES.map((name) => realpathSync(join(PROXY, name)));
+  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT].map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
-  const files = new Set<string>([SELF, FIXTURE, LOADER]);
+  const files = new Set<string>([SELF, FIXTURE, LOADER, IMAGE_FILE, ORACLE_FILE]);
   while (pending.length > 0) {
     const file = pending.pop()!;
     if (seen.has(file)) continue;
@@ -155,6 +194,7 @@ function digest(): Digest {
   }
   return [...files].sort().map((file) => ({
     path: relative(CANDIDATE, file),
+    realpath: file,
     sha256: sha256(readFileSync(file)),
   }));
 }
@@ -214,6 +254,9 @@ async function load(): Promise<Api> {
   const catalogMod = await import(pathToFileURL(join(PROXY, "boxToolCatalog.ts")).href);
   const hashMod = await import(pathToFileURL(join(PROXY, "boxToolInputHash.ts")).href);
   const echoMod = await import(pathToFileURL(join(PROXY, "boxToolInputEcho.ts")).href);
+  const resultEcho = await import(pathToFileURL(join(PROXY, "boxToolResultEcho.ts")).href);
+  const planMod = await import(pathToFileURL(join(PROXY, "boxToolResultPlan.ts")).href);
+  const prepared = await import(pathToFileURL(join(PROXY, "boxPreparedContinuation.ts")).href);
   return {
     normalize: norm.normalizeBoxSemanticBody,
     gate: gate.validateBoxRequest,
@@ -230,6 +273,35 @@ async function load(): Promise<Api> {
       hashNoCaller: finger.hashBoxAssistantNoCallerContent,
       hashEcho: finger.hashBoxAssistantEchoContent,
     }),
+    echoAccept: (id: string, hash: string, raw: unknown) => {
+      const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: id,
+        contentHash: hash, isError: false }]);
+      verifier.accept(raw);
+      verifier.assertComplete();
+    },
+    classify: prepared.classifyBoxContinuation,
+    projectAuthority: prepared.projectAuthority,
+    bindAuthority: prepared.authoritiesBind,
+    bindIdentity: prepared.trustedIdentitiesBind,
+    resumeMayPublish: prepared.resumeMayPublish,
+    publishImage: (row) => {
+      const cwd = publishDir;
+      if (!PUBLISH_DIR.test(cwd) || !existsSync(cwd)) fail("IMAGE_PUBLISH_DIR");
+      const plan = planMod.makeBoxToolResultPlan({ cwd,
+        expected: { id: row.modelToolUseId, clientName: "Read", boxName: "mcp__ocbridge__t0",
+          input: { file_path: "a.png" } },
+        pending: { version: 1, modelToolUseId: row.modelToolUseId, mcpRequestId: 1,
+          name: "t0", arguments: { file_path: "a.png" } },
+        matched: row });
+      if (plan.requests.length < 1) fail("IMAGE_PUBLISH_EMPTY");
+      for (const request of plan.requests) {
+        const ran = spawnSync(request.command, request.args, {
+          cwd: request.cwd, env: request.environment, encoding: "utf8",
+        });
+        if (ran.status !== 0) fail(`IMAGE_PUBLISH_${ran.status ?? "SPAWN"}`);
+      }
+      return JSON.parse(readFileSync(plan.path, "utf8")) as PublishedFile;
+    },
   };
 }
 function countText(value: unknown, needle: string): number {
@@ -486,6 +558,213 @@ function checks(api: Api): void {
     if (drifted) fail("C2_DRIFT");
   }
   api.proveEditDefault();
+  proveImageCaption(api);
+  provePrepared(api);
+}
+
+// prepared route, authority, and single publish
+function provePrepared(api: Api): void {
+  const currentBody = fx.chain[1] ?? {};
+  if (api.gate(currentBody, true) !== null) fail("WRONG_ROUTE");
+  if (api.classify(currentBody).classification !== "continuation_candidate") fail("WRONG_ROUTE");
+  if (api.gate(fx.unknownText, true) !== "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION") fail("WRONG_ROUTE");
+  const signed = api.projectAuthority("bridge_signed", "ab".repeat(16));
+  const other = api.projectAuthority("bridge_signed", "cd".repeat(16));
+  const legacy = api.projectAuthority("local_catalog", null);
+  const broken = api.projectAuthority("bridge_signed", "short");
+  const base = { uid: 3n, sessionId: "sess-prepared", canonicalModel: "box-api-claude-opus-5-5",
+    turnKey: "ab".repeat(32), authority: signed };
+  if (api.bindIdentity(base, { ...base, authority: other }).ok
+    || api.bindIdentity(base, { ...base, authority: legacy }).ok
+    || api.bindIdentity(base, { ...base, sessionId: "other-session" }).ok
+    || broken.kind !== "malformed" || api.bindAuthority(broken, legacy).ok) {
+    fail("AUTHORITY_BYPASS");
+  }
+  if (!api.bindIdentity(base, base).ok || !api.bindIdentity(
+    { ...base, authority: legacy }, { ...base, authority: legacy }).ok) {
+    fail("AUTHORITY_BYPASS");
+  }
+  let publishes = 0;
+  for (const decision of [{ kind: "new_claim" }, { kind: "in_progress_or_unknown" }, { kind: "reject" }]) {
+    if (!api.resumeMayPublish(decision)) continue;
+    publishes += 1;
+  }
+  if (publishes !== 1) fail("DUPLICATE_PUBLISH");
+}
+
+async function provePublisher(): Promise<void> {
+  const publishMod = await import(pathToFileURL(join(PROXY, DYNAMIC_PRODUCT[0])).href);
+  const hashMod = await import(pathToFileURL(join(PROXY, DYNAMIC_PRODUCT[1])).href);
+  const nonce = publishDir.slice("/tmp/ocv5-289-run-".length);
+  const id = "toolu_pub_once";
+  const text = "b1-once";
+  writeFileSync(`${publishDir}/pending.${id}.json`, JSON.stringify({
+    version: 1, modelToolUseId: id, mcpRequestId: 3, name: "t0",
+    arguments: { value: "ping" } }), { mode: 0o600 });
+  const content = [{ type: "text", text }];
+  const contentHash = createHash("sha256").update(JSON.stringify({ content, isError: false })).digest("hex");
+  const canonicalBody = { model: "box-api-claude-opus-5-5", max_tokens: 64, stream: true,
+    tools: [{ name: "local_echo", description: "synthetic",
+      input_schema: { type: "object", properties: { value: { type: "string" } } } }],
+    messages: [
+      { role: "assistant", content: [{ type: "tool_use", id, name: "local_echo", input: { value: "ping" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: text }] },
+    ], metadata: { user_id: JSON.stringify({ session_id: "b1-publish", oc_turn_key: "a".repeat(64) }) } };
+  let finishes = 0;
+  const claim = { ownerRequestId: "box-owner", accountId: 20n, runNonce: nonce,
+    leaseEpoch: "b".repeat(32), spoolOffset: 8, roundNo: 2, detachedRunnerHash: "c".repeat(64),
+    catalogHash: "d".repeat(64), durableRevision: "b1-publish",
+    toolUses: [{ id, boxName: "mcp__ocbridge__t0", clientName: "local_echo",
+      inputHash: hashMod.hashBoxToolInput({ value: "ping" }) }],
+    results: [{ modelToolUseId: id, content, isError: false, contentHash }] };
+  const exec = { run: async (request: { command: string; args: string[]; cwd: string;
+    environment?: Record<string, string> }) => {
+    if (request.command !== "/usr/bin/python3") fail("DUPLICATE_PUBLISH");
+    const ran = spawnSync(request.command, request.args, { cwd: request.cwd,
+      env: { ...process.env, ...request.environment }, encoding: "utf8", timeout: 5000 });
+    if (ran.status === 0 && request.args.some((arg) => typeof arg === "string" && arg.includes("os.link("))) {
+      finishes += 1;
+    }
+    if (ran.status !== 0) fail("DUPLICATE_PUBLISH");
+    return { stdout: ran.stdout ?? "", stderrBytes: Buffer.byteLength(ran.stderr ?? ""), exitCode: 0 as const };
+  } };
+  try {
+    await publishMod.publishBoxToolResume({
+      uid: 3n, sessionId: "b1-publish", requestId: "box-next", canonicalModel: canonicalBody.model,
+      canonicalBody, upstreamModel: "claude-opus-5-5",
+      url: "box-cli://messages", init: { method: "POST", body: JSON.stringify({ ...canonicalBody,
+        model: "claude-opus-5-5" }) },
+    }, { journal: { claimToolResume: async () => claim, markUnknown: async () => fail("DUPLICATE_PUBLISH"),
+      decideToolResume: async () => ({ kind: "new_claim", claim }) },
+      resolveTarget: async () => ({ accountId: 20n, exec }),
+      retainUnknownTarget: () => fail("DUPLICATE_PUBLISH"),
+      onUnknown: async () => fail("DUPLICATE_PUBLISH") });
+  } catch {
+    fail("DUPLICATE_PUBLISH");
+  }
+  const file = JSON.parse(readFileSync(`${publishDir}/result.${id}.json`, "utf8")) as {
+    modelToolUseId?: string; content?: Array<{ text?: string }> };
+  if (file.modelToolUseId !== id || file.content?.[0]?.text !== text) fail("DUPLICATE_PUBLISH");
+  if (finishes !== 1) fail("DUPLICATE_PUBLISH");
+}
+
+function imageFixture(): { oracle: ImageOracle; png: string } {
+  const raw = readFileSync(IMAGE_FILE);
+  const oracle = JSON.parse(readFileSync(ORACLE_FILE, "utf8")) as ImageOracle;
+  if (sha256(raw) !== SEALED_IMAGE_SHA || oracle.imageSha256 !== SEALED_IMAGE_SHA) fail("IMAGE_FIXTURE_SHA");
+  if (oracle.caption !== SEALED_CAPTION || sha256(oracle.caption) !== SEALED_CAPTION_SHA
+    || oracle.captionSha256 !== SEALED_CAPTION_SHA) fail("IMAGE_FIXTURE_CAPTION");
+  if (oracle.id !== SEALED_ID || oracle.noteId !== SEALED_NOTE) fail("IMAGE_FIXTURE_ID");
+  if (oracle.contentHash !== SEALED_CONTENT_HASH) fail("IMAGE_ORACLE_HASH");
+  const png = raw.toString("base64");
+  const locked = sha256(JSON.stringify({ content: [
+    { type: "image", data: png, mimeType: "image/png" },
+    { type: "text", text: SEALED_CAPTION },
+  ], isError: false }));
+  if (locked !== SEALED_CONTENT_HASH) fail("IMAGE_ORACLE_HASH");
+  return { oracle, png };
+}
+function publishedEcho(file: PublishedFile): unknown {
+  if (!Array.isArray(file.content)) fail("IMAGE_PUBLISHED_SHAPE");
+  const content = file.content.map((part) => {
+    if (part.type === "image") {
+      return { type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } };
+    }
+    if (part.type === "text") return { type: "text", text: part.text };
+    return fail("IMAGE_PUBLISHED_SHAPE");
+  });
+  const block: Record<string, unknown> = { type: "tool_result", tool_use_id: file.modelToolUseId, content };
+  if (file.isError === true) block.is_error = true;
+  return { type: "user", message: { role: "user", content: [block] } };
+}
+function proveImageCaption(api: Api): void {
+  const { oracle, png } = imageFixture();
+  const caption = oracle.caption;
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: png } };
+  const hook = "<system-reminder>\nPreToolUse:Read hook additional context: b1 figure.\n</system-reminder>";
+  const base = { model: "box-api-claude-opus-5-5", stream: true, max_tokens: 64,
+    tools: [{ name: "Read", description: "read", input_schema: { type: "object", properties: {} } },
+      { name: "Note", description: "note", input_schema: { type: "object", properties: {} } }],
+    messages: [
+      { role: "user", content: "look" },
+      { role: "assistant", content: [
+        { type: "tool_use", id: SEALED_ID, name: "Read", input: { file_path: "a.png" } },
+        { type: "tool_use", id: SEALED_NOTE, name: "Note", input: { file_path: "a.md" } },
+      ] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: SEALED_ID, content: [image] },
+        { type: "tool_result", tool_use_id: SEALED_NOTE, content: "note" },
+        { type: "text", text: caption },
+        { type: "text", text: hook },
+      ] },
+      { role: "system", content: [{ type: "text", text: "<total_tokens>12 tokens left</total_tokens>",
+        cache_control: { type: "ephemeral" } }] },
+    ] };
+  const snapshot = JSON.stringify(base);
+  if (api.gate(base, true) !== null) fail("IMAGE_GATE");
+  const once = api.normalize(base);
+  if (!isDeepStrictEqual(once, api.normalize(once as unknown as Record<string, unknown>))) fail("IMAGE_IDEMPOTENT");
+  if (JSON.stringify(base) !== snapshot) fail("IMAGE_RAW");
+  const encoded = JSON.stringify(once);
+  if (encoded.split(caption).length - 1 !== 1
+    || encoded.split(hook.replaceAll("\n", "\\n")).length - 1 !== 1) fail("IMAGE_COUNTS");
+  if (encoded.includes("<total_tokens>")) fail("IMAGE_BUDGET");
+  const user = (once.messages as Array<{ content: Array<Record<string, unknown>> }>).at(-1)!;
+  const owned = user.content.find((part) => part.tool_use_id === SEALED_ID);
+  const note = user.content.find((part) => part.tool_use_id === SEALED_NOTE);
+  if (!owned || JSON.stringify(owned).split(caption).length - 1 !== 1) fail("IMAGE_OWNER");
+  if (!note || JSON.stringify(note).includes(caption)) fail("IMAGE_NOT_LAST");
+  const matched = api.match(base, [
+    { id: SEALED_ID, clientName: "Read", boxName: "mcp__ocbridge__t0", input: { file_path: "a.png" } },
+    { id: SEALED_NOTE, clientName: "Note", boxName: "mcp__ocbridge__t0", input: { file_path: "a.md" } },
+  ]);
+  const row = matched.find((item) => item.modelToolUseId === SEALED_ID) as PublishedMatch | undefined;
+  if (!row || JSON.stringify(row.content) !== JSON.stringify([
+    { type: "image", data: png, mimeType: "image/png" }, { type: "text", text: caption }])) {
+    fail("IMAGE_MATCH_BYTES");
+  }
+  if (row.modelToolUseId !== SEALED_ID || !/^[a-f0-9]{64}$/.test(row.contentHash)) fail("IMAGE_MATCH_BYTES");
+  const published = api.publishImage(row);
+  api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, publishedEcho(published));
+  if (JSON.stringify(published).split(caption).length - 1 !== 1) fail("IMAGE_PUBLISHED_CAPTION");
+  if (published.modelToolUseId !== SEALED_ID) fail("IMAGE_PUBLISHED_ID");
+  const stored = published.content?.find((part) => part.type === "image");
+  if (!stored?.data || sha256(Buffer.from(stored.data, "base64")) !== SEALED_IMAGE_SHA) fail("IMAGE_PUBLISHED_SHA");
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID, content: [image] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  const nudged = `${caption.slice(0, -2)}X]`;
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID,
+    content: [image, { type: "text", text: nudged }] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  const flipped = Buffer.from(png, "base64");
+  flipped[flipped.length - 1] ^= 0xff;
+  const flippedImage = { type: "image", source: { type: "base64", media_type: "image/png",
+    data: flipped.toString("base64") } };
+  if (api.gate({ ...base, messages: base.messages.map((message, index) => index === 2
+    ? { ...message, content: [
+      { type: "tool_result", tool_use_id: SEALED_ID, content: [flippedImage] },
+      { type: "tool_result", tool_use_id: SEALED_NOTE, content: "note" },
+      { type: "text", text: caption }, { type: "text", text: hook }] } : message) }, true) !== null) {
+    fail("IMAGE_BYTE_STILL_CANONICAL");
+  }
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID,
+    content: [flippedImage, { type: "text", text: caption }] }] } }), "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  expectCode(() => api.echoAccept(SEALED_ID, SEALED_CONTENT_HASH, { type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_NOTE,
+    content: [image, { type: "text", text: caption }] }] } }), "BOX_TOOL_ECHO_");
+  const dropped = JSON.parse(snapshot) as typeof base;
+  (dropped.messages[2] as { content: unknown[] }).content =
+    (dropped.messages[2] as { content: unknown[] }).content.filter((part) =>
+      !(part && typeof part === "object" && (part as { text?: string }).text === caption));
+  if (encoded.split(caption).length - 1 === JSON.stringify(api.normalize(dropped)).split(caption).length - 1) {
+    fail("IMAGE_DROPPED_STILL_PRESENT");
+  }
+  const oneByte = JSON.parse(snapshot) as typeof base;
+  const sibling = ((oneByte.messages[2] as { content: Array<{ text?: string }> }).content)
+    .find((part) => part.text === caption)!;
+  sibling.text = nudged;
+  if (api.gate(oneByte, true) === null) fail("IMAGE_ONE_BYTE_GATE");
 }
 
 function procField(pid: number, index: number): string {
@@ -517,7 +796,7 @@ function workerLaunch(expectSha: string): { cmd: string; args: string[] } {
   args.push(SELF, "--expect-sha", expectSha);
   return { cmd: process.execPath, args };
 }
-function whitelist(dir: string, token: string): NodeJS.ProcessEnv {
+function whitelist(dir: string, token: string, publish: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of ["PATH", "LANG", "LC_ALL", "TZ", "SystemRoot"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -531,9 +810,24 @@ function whitelist(dir: string, token: string): NodeJS.ProcessEnv {
   env.OC_B1_SUPERVISED = "1";
   env.OC_B1_PARENT_PID = String(process.pid);
   env.OC_B1_SCRATCH = dir;
+  env.OC_B1_PUBLISH_DIR = publish;
   env.OC_B1_WORKER_TOKEN = token;
   env.OC_B1_WORKER_TOKEN_FILE = join(dir, "token");
   return env;
+}
+function claimPublishDir(record: (dir: string) => void): string {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const claimed = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+    try {
+      mkdirSync(claimed, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+      throw error;
+    }
+    record(claimed);
+    return claimed;
+  }
+  fail("IMAGE_PUBLISH_CLAIM");
 }
 function acceptReceipt(stdout: string, expectSha: string): boolean {
   const line = stdout.trim().split("\n").filter(Boolean).at(-1) ?? "";
@@ -552,6 +846,7 @@ async function supervise(expectSha: string): Promise<void> {
   writeFileSync(join(dir, "token"), token, { mode: 0o600 });
   const started = Date.now();
   let worker = 0;
+  let ownedRun = "";
   let reason: string | null = null;
   let closed = false;
   const stop = (next: string): void => {
@@ -570,14 +865,15 @@ async function supervise(expectSha: string): Promise<void> {
   let bytes = 0;
   let code = 1;
   try {
+  const publish = claimPublishDir((claimed) => { ownedRun = claimed; });
   const launch = workerLaunch(expectSha);
   const child = spawn(launch.cmd, launch.args, {
-    cwd: CANDIDATE, env: whitelist(dir, token), detached: true, stdio: ["ignore", "pipe", "pipe"],
+    cwd: CANDIDATE, env: whitelist(dir, token, publish), detached: true, stdio: ["ignore", "pipe", "pipe"],
   });
   if (child.pid === undefined) fail("SUPERVISOR_SPAWN");
   worker = child.pid;
   const starttime = procField(worker, 19);
-  process.stderr.write(`OC_B1_SUPERVISOR worker=${worker} pgid=${worker} starttime=${starttime} start=${started} scratch=${dir}\n`);
+  process.stderr.write(`OC_B1_SUPERVISOR worker=${worker} pgid=${worker} starttime=${starttime} start=${started} scratch=${dir} publish=${publish}\n`);
   const capture = (target: "stdout" | "stderr", chunk: Buffer): void => {
     bytes += chunk.length;
     if (bytes > 1_000_000) { stop("SUPERVISOR_OUTPUT"); return; }
@@ -602,6 +898,7 @@ async function supervise(expectSha: string): Promise<void> {
     const end = Date.now() + 1_000;
     while (Date.now() < end && groupAlive(worker)) await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
+  if (ownedRun && PUBLISH_DIR.test(ownedRun)) rmSync(ownedRun, { recursive: true, force: true });
   rmSync(dir, { recursive: true, force: true });
   }
   if (worker && groupAlive(worker)) fail("SUPERVISOR_ORPHAN");
@@ -619,9 +916,12 @@ async function workerMain(expectSha: string): Promise<void> {
     || !/^[0-9a-f]{64}$/.test(token) || readFileSync(tokenFile, "utf8") !== token) {
     fail("WORKER_TOKEN_MISMATCH");
   }
+  publishDir = process.env.OC_B1_PUBLISH_DIR ?? "";
+  if (!PUBLISH_DIR.test(publishDir)) fail("IMAGE_PUBLISH_DIR");
   scratch = process.env.OC_B1_SCRATCH ?? "";
   if (!scratch) fail("WORKER_SCRATCH");
   isolate(scratch);
+  if (process.env.OC_B1_PUBLISH_DIR !== undefined) fail("IMAGE_PUBLISH_DIR");
   installResolveHook();
   fx = await import("./check-v5-box-continuation-fixture.ts");
   const git = await gitCrossCheck(expectSha);
@@ -630,16 +930,17 @@ async function workerMain(expectSha: string): Promise<void> {
   const after = digest();
   if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
   checks(api);
+  await provePublisher();
   const end = digest();
   if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");
   const runtime = before.filter((item) => item.path.startsWith(`packages${sep}commercial${sep}src${sep}http${sep}proxy${sep}`));
-  console.log(JSON.stringify({
+  process.stdout.write(`${JSON.stringify({
     ok: true, wired: true, receipt: RECEIPT, expectSha, candidate: CANDIDATE, git,
     runtimeModules: runtime.length, modules: before.length, digest: before,
     node: process.version, execPath: realpathSync(process.execPath),
     homeIsolated: process.env.HOME === join(scratch, "home"),
     database: process.env.DATABASE_URL !== undefined,
-  }));
+  })}\n`);
 }
 
 async function entry(): Promise<void> {

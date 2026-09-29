@@ -165,6 +165,11 @@ export function incomingAssistantAccepted(content: unknown, stored: {
     || (echoed && !!stored.assistantEchoHash && fullHash === stored.assistantEchoHash);
 }
 
+export function fingerprintOfPrepared(prepared: { fingerprint: BoxCallFingerprint | null }): BoxCallFingerprint {
+  if (!prepared.fingerprint) throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
+  return prepared.fingerprint;
+}
+
 export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
   if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
     throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");

@@ -4,9 +4,9 @@
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { delimiter, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SOURCE = fileURLToPath(new URL("..", import.meta.url));
@@ -14,32 +14,94 @@ const SHA = "a".repeat(40);
 const PROXY_FILES = [
   "boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts", "boxCallFingerprint.ts",
   "boxMessagesMapper.ts", "boxToolCatalog.ts", "boxToolInputHash.ts", "boxCliToolHandoff.ts", "shared.ts",
+  "boxToolResultPlan.ts", "boxToolResultEcho.ts", "boxStageFiles.ts", "boxToolInputEcho.ts",
+  "boxPreparedContinuation.ts",
 ];
 const SCRIPT_FILES = [
   "scripts/check-v5-box-continuation.ts",
   "scripts/check-v5-box-continuation-fixture.ts",
   "scripts/check-v5-box-continuation-resolve.mjs",
 ];
-const BUSINESS = /PROGRESS_COUNT_|HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL|C2_GATE|C2_DRIFT|CONTEXT_|HOOK_COUNT_|HOOK_CURRENT_|WRAPPED_|UNKNOWN_|CONTINUATION_|OPENING_|REWRITE_|EXPECTED_/;
+const FIXTURE_FILES = [
+  "scripts/check-v5-box-continuation-859.png",
+  "scripts/check-v5-box-continuation-859.oracle.json",
+];
+const BUSINESS = /PROGRESS_COUNT_|HISTORICAL_BUDGET_KEPT|BUDGET_RETAINED|GATE_NOT_NULL|C2_GATE|C2_DRIFT|CONTEXT_|HOOK_COUNT_|HOOK_CURRENT_|WRAPPED_|UNKNOWN_|CONTINUATION_|OPENING_|REWRITE_|EXPECTED_|BOX_TOOL_ECHO_|IMAGE_PUBLISH_|IMAGE_PUBLISHED_|IMAGE_MATCH_|IMAGE_FIXTURE_|IMAGE_ORACLE_|IMAGE_OWNER|IMAGE_NOT_LAST|IMAGE_COUNTS|IMAGE_GATE|IMAGE_RAW|IMAGE_IDEMPOTENT|IMAGE_BUDGET|IMAGE_DROPPED|IMAGE_ONE_BYTE|IMAGE_BYTE|WRONG_ROUTE|AUTHORITY_BYPASS|DUPLICATE_PUBLISH/;
 const LOADER = /Cannot find module|ERR_MODULE|ERR_UNSUPPORTED|UNRESOLVED|DEP_ESCAPE|SyntaxError|RUNTIME_MODULES_/;
 
 function loader(): { cmd: string; args: string[] } {
   if (process.execArgv.includes("--experimental-transform-types")) {
     return { cmd: process.execPath, args: ["--experimental-transform-types"] };
   }
+  const pinned = join(SOURCE, "node_modules/tsx/dist/cli.mjs");
+  if (existsSync(pinned)) return { cmd: process.execPath, args: [pinned] };
   return { cmd: "/usr/bin/tsx", args: [] };
+}
+function copyValueClosure(dir: string): void {
+  const proxy = join(SOURCE, "packages/commercial/src/http/proxy");
+  const roots = ["boxRequestGate.ts", "boxCacheAnnotations.ts", "boxToolResultMatcher.ts",
+    "boxCallFingerprint.ts", "boxToolResultPlan.ts", "boxToolResultEcho.ts",
+    "boxToolResumePublish.ts", "boxToolInputHash.ts"];
+  const pending = roots.map((name) => realpathSync(join(proxy, name)));
+  const seen = new Set<string>();
+  const importRe = /(^|\n)\s*import\s+(type\s+)?([\s\S]*?)\sfrom\s+["']([^"']+)["']/g;
+  while (pending.length > 0) {
+    const file = pending.pop()!;
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const rel = relative(SOURCE, file);
+    const dest = join(dir, rel);
+    if (!existsSync(dest)) {
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(file, dest);
+    }
+    const text = readFileSync(file, "utf8");
+    for (const match of text.matchAll(importRe)) {
+      const clause = match[3] ?? "";
+      if (clause.includes(";") || /\n\s*import\s/.test(clause)) continue;
+      const spec = match[4] ?? "";
+      if (!spec.startsWith(".")) continue;
+      const prefix = match[2];
+      const body = clause.trim();
+      const inside = body.startsWith("{") ? body.slice(1, body.lastIndexOf("}")) : "";
+      const parts = inside.split(",").map((part) => part.trim()).filter(Boolean);
+      const typeOnly = Boolean(prefix) || (body.startsWith("{") && parts.length > 0
+        && parts.every((part) => part.startsWith("type ")));
+      if (typeOnly) continue;
+      const base = resolve(dirname(file), spec);
+      const candidates = spec.endsWith(".js")
+        ? [`${base.slice(0, -3)}.ts`, `${base.slice(0, -3)}.tsx`, base]
+        : [base, `${base}.ts`, `${base}.tsx`];
+      const next = candidates.find((candidate) => existsSync(candidate) && lstatSync(candidate).isFile());
+      if (next) pending.push(realpathSync(next));
+    }
+  }
 }
 function stage(mutate?: (source: string) => string): string {
   const dir = mkdtempSync(join(tmpdir(), "ocv5-b1-archive-"));
-  for (const name of PROXY_FILES) {
+  for (const name of readdirSync(join(SOURCE, "packages/commercial/src/http/proxy"))) {
+    if (!name.endsWith(".ts") || name.endsWith(".test.ts")) continue;
     const rel = join("packages/commercial/src/http/proxy", name);
     mkdirSync(dirname(join(dir, rel)), { recursive: true });
     copyFileSync(join(SOURCE, rel), join(dir, rel));
   }
-  for (const rel of SCRIPT_FILES) {
+  const modules = join(dir, "node_modules/@openclaude");
+  mkdirSync(modules, { recursive: true });
+  const linked = join(SOURCE, "node_modules/@openclaude");
+  if (existsSync(linked)) {
+    for (const name of readdirSync(linked)) {
+      const target = join(linked, name);
+      symlinkSync(lstatSync(target).isSymbolicLink() ? realpathSync(target) : target, join(modules, name));
+    }
+  }
+  for (const rel of [...SCRIPT_FILES, ...FIXTURE_FILES]) {
     mkdirSync(dirname(join(dir, rel)), { recursive: true });
     copyFileSync(join(SOURCE, rel), join(dir, rel));
   }
+  // Value imports reached from the publisher must be real files inside this
+  // candidate. A symlink back to the source tree is outside and must not be
+  // used to make the positive control green.
+  copyValueClosure(dir);
   if (mutate) {
     const target = join(dir, "packages/commercial/src/http/proxy/boxCacheAnnotations.ts");
     writeFileSync(target, mutate(readFileSync(target, "utf8")));
@@ -269,6 +331,85 @@ test("SIGTERM reaps a worker and the descendant that ignores the signal", async 
   }
 });
 
+
+const SERIALIZE_ANCHOR = '  const raw = Buffer.from(JSON.stringify(result), "utf8");';
+function holdBeforeSerialize(source: string): string {
+  assert.equal(source.includes("PROBE_RUN"), false);
+  assert.equal(source.includes(SERIALIZE_ANCHOR), true);
+  const inject = "  process.stderr.write(`PROBE_RUN=${input.cwd}\\n`);\n"
+    + "  const holdUntil = Date.now() + 120_000;\n"
+    + "  while (Date.now() < holdUntil) {}\n";
+  return source.replace(SERIALIZE_ANCHOR, inject + SERIALIZE_ANCHOR);
+}
+function armPublishHold(dir: string, shorten: boolean): void {
+  const planPath = join(dir, "packages/commercial/src/http/proxy/boxToolResultPlan.ts");
+  const sourcePlan = readFileSync(join(SOURCE, "packages/commercial/src/http/proxy/boxToolResultPlan.ts"), "utf8");
+  assert.equal(sourcePlan.includes("PROBE_RUN"), false);
+  writeFileSync(planPath, holdBeforeSerialize(readFileSync(planPath, "utf8")));
+  const gatePath = join(dir, "scripts/check-v5-box-continuation.ts");
+  const sourceGate = readFileSync(join(SOURCE, "scripts/check-v5-box-continuation.ts"), "utf8");
+  assert.match(sourceGate, /const LIMIT_MS = 60_000;/);
+  assert.doesNotMatch(sourceGate, /--limit-ms/);
+  if (!shorten) return;
+  const staged = readFileSync(gatePath, "utf8");
+  assert.equal(staged.includes("const LIMIT_MS = 60_000;"), true);
+  writeFileSync(gatePath, staged.replace("const LIMIT_MS = 60_000;", "const LIMIT_MS = 15_000;"));
+}
+async function waitPublishHold(run: ReturnType<typeof launched>): Promise<{
+  publish: string; scratch: string; worker: number; pgid: number; starttime: string;
+}> {
+  for (let i = 0; i < 400; i++) {
+    const text = run.text();
+    const mark = text.stderr.match(/OC_B1_SUPERVISOR worker=(\d+) pgid=(\d+) starttime=(\d+) start=\d+ scratch=(\S+) publish=(\S+)/);
+    const probe = text.stderr.match(/PROBE_RUN=(\/tmp\/ocv5-289-run-[0-9a-f]{24})/);
+    if (mark && probe && probe[1] === mark[5] && run.child.exitCode === null && existsSync(probe[1] ?? "")) {
+      return { publish: probe[1] ?? "", scratch: mark[4] ?? "", worker: Number(mark[1]),
+        pgid: Number(mark[2]), starttime: mark[3] ?? "" };
+    }
+    if (run.child.exitCode !== null) assert.fail(`supervisor exited before the publish hold\n${text.stderr}\n${text.stdout}`);
+    await delay(50);
+  }
+  assert.fail(`publish hold not observed\n${run.text().stderr}\n${run.text().stdout}`);
+}
+async function publishInterrupt(kind: "deadline" | "signal"): Promise<void> {
+  const dir = stage();
+  let run: ReturnType<typeof launched> | undefined;
+  let leaked: string | null = null;
+  try {
+    armPublishHold(dir, kind === "deadline");
+    const begun = Date.now();
+    run = launched(dir, ["--expect-sha", SHA]);
+    const seen = await waitPublishHold(run);
+    leaked = seen.publish;
+    assert.equal(run.child.exitCode, null);
+    assert.equal(existsSync(seen.publish), true);
+    assert.equal(existsSync(join(seen.scratch, "home")), true);
+    if (kind === "signal") run.child.kill("SIGTERM");
+    const code = await closed(run.child, kind === "deadline" ? 22_000 : 8_000);
+    note({ case: `publish-${kind}`, pid: seen.worker, pgid: seen.pgid, starttime: seen.starttime,
+      publish: seen.publish, code, elapsedMs: Date.now() - begun, waitedFullLimit: false,
+      limitMs: kind === "deadline" ? 15_000 : 60_000 });
+    assert.notEqual(code, 0);
+    assert.match(run.text().stderr, kind === "deadline" ? /SUPERVISOR_TIMEOUT/ : /SUPERVISOR_SIGNAL/);
+    assert.equal(procInfo(seen.worker), null);
+    assert.deepEqual(members(seen.pgid), []);
+    assert.equal(existsSync(seen.publish), false);
+    assert.equal(existsSync(seen.scratch), false);
+    assert.equal(existsSync(join(seen.scratch, "home")), false);
+    leaked = null;
+  } finally {
+    try { run?.child.kill("SIGKILL"); } catch { /* already gone */ }
+    if (leaked && existsSync(leaked)) rmSync(leaked, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+test("deadline cleans a publish directory while the product holds", async () => {
+  await publishInterrupt("deadline");
+});
+test("SIGTERM cleans a publish directory while the product holds", async () => {
+  await publishInterrupt("signal");
+});
+
 test("archive without git passes only with a strict expect-sha", () => {
   const dir = stage();
   try {
@@ -293,8 +434,58 @@ test("archive without git passes only with a strict expect-sha", () => {
     assert.ok(body.digest.some((item: { path: string }) => item.path.endsWith("check-v5-box-continuation.ts")));
     assert.ok(body.digest.some((item: { path: string }) => item.path.endsWith("check-v5-box-continuation-fixture.ts")));
     assert.equal(body.digest.some((item: { path: string }) => item.path.startsWith("..")), false);
+    for (const name of ["boxToolResultPlan.ts", "boxToolResultEcho.ts", "boxStageFiles.ts",
+      "boxToolResumePublish.ts", "boxToolInputHash.ts", "upstream.ts",
+      "staticProviderMeta.ts", "platformDefaults.ts",
+      "check-v5-box-continuation-859.png", "check-v5-box-continuation-859.oracle.json"]) {
+      const item = body.digest.find((row: { path: string; realpath?: string; sha256?: string }) => row.path.endsWith(name));
+      assert.ok(item, name);
+      assert.equal(item.sha256?.length, 64);
+      assert.equal(item.realpath?.endsWith(item.path), true);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("static provider meta linked outside the candidate is source-rejected", () => {
+  const dir = stage();
+  const outside = mkdtempSync(join(tmpdir(), "ocv5-b1-static-meta-escape-"));
+  try {
+    const inside = join(dir, "packages/commercial/src/http/proxy/staticProviderMeta.ts");
+    const leaked = join(outside, "staticProviderMeta.ts");
+    copyFileSync(inside, leaked);
+    appendFileSync(leaked, "\nconsole.error('AUDIT_R4_EXTERNAL_STATIC_PROVIDER_EXECUTED')\n");
+    rmSync(inside);
+    symlinkSync(leaked, inside);
+    const red = run(dir, ["--expect-sha", SHA]);
+    assert.notEqual(red.code, 0);
+    assert.match(red.stderr, /DEP_ESCAPE/);
+    assert.match(red.stderr, /staticProviderMeta\.ts/);
+    assert.doesNotMatch(`${red.stdout}\n${red.stderr}`, /AUDIT_R4_EXTERNAL_STATIC_PROVIDER_EXECUTED/);
+    assert.doesNotMatch(red.stdout, /"ok":true/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("publisher linked outside the candidate is source-rejected", () => {
+  const dir = stage();
+  const outside = mkdtempSync(join(tmpdir(), "ocv5-b1-publisher-escape-"));
+  try {
+    const inside = join(dir, "packages/commercial/src/http/proxy/boxToolResumePublish.ts");
+    const leaked = join(outside, "boxToolResumePublish.ts");
+    copyFileSync(inside, leaked);
+    rmSync(inside);
+    symlinkSync(leaked, inside);
+    const red = run(dir, ["--expect-sha", SHA]);
+    assert.notEqual(red.code, 0);
+    assert.match(red.stderr, /DEP_ESCAPE/);
+    assert.doesNotMatch(red.stdout, /"ok":true/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 
@@ -388,6 +579,73 @@ test("a real git tree cross-checks the builder sha", { skip: sourceGit.ok ? fals
   assert.equal(JSON.parse(match.stdout).git, "match");
 });
 
+const PLAN_ANCHOR = '  const raw = Buffer.from(JSON.stringify(result), "utf8");';
+function planPatch(kind: "drop" | "text" | "image" | "id", source: string): string {
+  const faults: Record<"drop" | "text" | "image" | "id", string> = {
+    drop: 'result.content = result.content.filter((part) => part.type !== "text");\n',
+    text: 'result.content = result.content.map((part) => part.type === "text" ? { ...part, text: part.text.slice(0, -1) + "X" } : part);\n',
+    image: 'result.content = result.content.map((part) => { if (part.type !== "image") return part; const bytes = Buffer.from(part.data, "base64"); bytes[bytes.length - 1] ^= 255; return { ...part, data: bytes.toString("base64") }; });\n',
+    id: 'result.modelToolUseId = "toolu_note_b1";\n',
+  };
+  assert.equal(source.includes(PLAN_ANCHOR), true, "publisher anchor missing");
+  return source.replace(PLAN_ANCHOR, faults[kind] + PLAN_ANCHOR);
+}
+for (const kind of ["drop", "text", "image", "id"] as const) {
+  const expected = kind === "id" ? /BOX_TOOL_ECHO_ID_INVALID/ : /BOX_TOOL_ECHO_CONTENT_MISMATCH/;
+  test(`publisher ${kind} mutation is business-red at echo`, () => {
+    const dir = stage();
+    try {
+      const green = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(green), "green", green.stderr + "\n" + green.stdout);
+      const target = join(dir, "packages/commercial/src/http/proxy/boxToolResultPlan.ts");
+      const before = readFileSync(target, "utf8");
+      const after = planPatch(kind, before);
+      assert.notEqual(after, before);
+      writeFileSync(target, after);
+      const red = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(red), "business", red.stderr + "\n" + red.stdout);
+      assert.match(red.stderr, expected);
+      assert.doesNotMatch(red.stderr, LOADER);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("wrong route, authority bypass, and duplicate publish are business-red", () => {
+  const faults: Array<{ file: string; from: string; to: string; expect: RegExp }> = [
+    { file: "boxPreparedContinuation.ts",
+      from: 'return { classification: "continuation_candidate", rejectCode: null, effectiveBody: effective,',
+      to: 'return { classification: "fresh", rejectCode: null, effectiveBody: effective,',
+      expect: /GATE_NOT_NULL|WRONG_ROUTE/ },
+    { file: "boxPreparedContinuation.ts",
+      from: "  if (left.kind === \"malformed\" || right.kind === \"malformed\") {",
+      to: "  return { ok: true };\n  if (left.kind === \"malformed\" || right.kind === \"malformed\") {",
+      expect: /AUTHORITY_BYPASS/ },
+    { file: "boxToolResumePublish.ts",
+      from: "for (let j = 0; j < staged.requests.length; j++) {",
+      to: "for (let pass = 0; pass < 2; pass += 1) for (let j = 0; j < staged.requests.length; j++) {",
+      expect: /DUPLICATE_PUBLISH/ },
+  ];
+  for (const fault of faults) {
+    const dir = stage();
+    try {
+      const green = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(green), "green", green.stderr);
+      const target = join(dir, "packages/commercial/src/http/proxy", fault.file);
+      const before = readFileSync(target, "utf8");
+      assert.equal(before.includes(fault.from), true, fault.from);
+      writeFileSync(target, before.replace(fault.from, fault.to));
+      const red = run(dir, ["--expect-sha", SHA]);
+      assert.equal(classify(red), "business", `${red.stderr}\n${red.stdout}`);
+      assert.match(red.stderr, fault.expect);
+      assert.doesNotMatch(red.stderr, LOADER);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
 const AUDITOR_FAULT = "/home/agent/.openclaude/generated/ocv5-294-b1-gate-audit-hook-byte-negative/packages/commercial/src/http/proxy/boxCacheAnnotations.ts";
 function bytePatch(kind: "hook-space" | "wrapped-byte", source: string): string {
   if (kind === "hook-space") {
@@ -418,7 +676,11 @@ for (const kind of ["hook-space", "wrapped-byte"] as const) {
     }
   });
 }
-test("auditor hook-space tree is business-red under this gate", { skip: existsSync(AUDITOR_FAULT) ? false : "auditor fault tree absent" }, () => {
+const auditorSnapshotCurrent = existsSync(AUDITOR_FAULT)
+  && readFileSync(AUDITOR_FAULT, "utf8").includes("export function strictBoxImageBlock");
+test("auditor hook-space tree is business-red under this gate", {
+  skip: auditorSnapshotCurrent ? false : "auditor snapshot predates strictBoxImageBlock; current hook-space case covers it",
+}, () => {
   const dir = stage();
   try {
     const green = run(dir, ["--expect-sha", SHA]);

@@ -12,6 +12,7 @@ import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { preparedMatchesBody, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
@@ -37,6 +38,7 @@ export async function runBoxToolContinuation(input: {
   upstreamModel: string;
   signal?: AbortSignal;
   emit: (sse: string) => void;
+  prepared?: PreparedContinuation;
 }, deps: {
   journal: Journal;
   writeMessage?: BoxReplayMessageWriter;
@@ -195,7 +197,11 @@ export async function runBoxToolContinuation(input: {
               accountId: claim.accountId.toString(), upstreamModel: input.upstreamModel,
               cliVersion: "2.1.280", nativeSessionId: claim.nativeSessionId,
               cliCwd: claim.nativeCliCwd, transcriptSha256: file.sha256,
-              contextHashBeforeFinal: deriveBoxContextHash(input.canonicalBody),
+              contextHashBeforeFinal: input.prepared
+                && preparedMatchesBody(input.prepared, input.canonicalBody)
+                && input.prepared.nextContextHash
+                ? input.prepared.nextContextHash
+                : deriveBoxContextHash(input.canonicalBody),
               assistantContentHash: final.assistantContentHash,
               catalogHash: claim.catalogHash,
               expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });

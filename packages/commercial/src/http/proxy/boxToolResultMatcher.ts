@@ -6,7 +6,8 @@ import { isDeepStrictEqual } from "node:util";
 import type { ProxyBody } from "./shared.js";
 import type { BoxToolUse } from "./boxCliToolHandoff.js";
 import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
-import { normalizeBoxSemanticBody, normalizeBoxToolResultBlock } from "./boxCacheAnnotations.js";
+import { normalizeBoxSemanticBody, normalizeBoxToolResultBlock,
+  strictBoxImageBlock } from "./boxCacheAnnotations.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { inputSchemaFor, selectStoredToolInput } from "./boxToolInputEcho.js";
 
@@ -40,18 +41,9 @@ function content(value: unknown): McpContent[] {
       out.push({ type: "text", text: block.text });
       continue;
     }
-    if (block.type === "image" && Object.keys(block).sort().join(",") === "source,type"
-      && record(block.source)
-      && Object.keys(block.source).sort().join(",") === "data,media_type,type"
-      && block.source.type === "base64" && typeof block.source.data === "string"
-      && typeof block.source.media_type === "string"
-      && ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(block.source.media_type)) {
-      const raw = Buffer.from(block.source.data, "base64");
-      if (raw.length > MAX_RESULT_BYTES || raw.toString("base64") !== block.source.data) {
-        throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTENT_INVALID");
-      }
-      out.push({ type: "image", data: block.source.data,
-        mimeType: block.source.media_type });
+    const image = strictBoxImageBlock(block);
+    if (image) {
+      out.push({ type: "image", data: image.data, mimeType: image.mimeType });
       continue;
     }
     throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTENT_INVALID");
@@ -60,6 +52,13 @@ function content(value: unknown): McpContent[] {
     throw new BoxToolResultMatchError("BOX_TOOL_RESULT_TOO_LARGE");
   }
   return out;
+}
+
+export function matchPreparedToolResults(prepared: { effectiveBody: ProxyBody | null },
+  expected: readonly (BoxToolUse | BoxToolUseDigest)[],
+  catalog?: BoxToolCatalog): readonly BoxMatchedToolResult[] {
+  if (!prepared.effectiveBody) throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
+  return matchBoxToolResults(prepared.effectiveBody, expected, catalog);
 }
 
 export function matchBoxToolResults(body: ProxyBody,

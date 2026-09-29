@@ -6,7 +6,8 @@
  */
 import { randomUUID } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
-import { BoxCacheAnnotationError, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { BoxCacheAnnotationError, normalizeBoxSemanticBody,
+  strictBoxImageBlock } from "./boxCacheAnnotations.js";
 
 export class BoxMessagesShapeError extends Error {
   constructor(readonly code: string) {
@@ -56,7 +57,9 @@ function validateContent(content: unknown, role: "user" | "assistant"): void {
       && (typeof block.content === "string"
         || (Array.isArray(block.content) && block.content.length > 0
           && block.content.every((part) => part !== null && typeof part === "object"
-            && !Array.isArray(part) && part.type === "text" && typeof part.text === "string")))) continue;
+            && !Array.isArray(part)
+            && ((part.type === "text" && typeof part.text === "string")
+              || strictBoxImageBlock(part) !== null))))) continue;
     // Preserve signed completed thinking history exactly. It is not rendered
     // as plaintext or treated as a new model request; malformed signatures
     // and unsupported extra fields still fail closed.
