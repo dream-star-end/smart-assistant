@@ -621,6 +621,62 @@ test("downstream SSE failure after paid launch retains unknown without replay", 
   assert.equal(f.retained, true);
 });
 
+function compactPrefix(sessionId: string): Buffer {
+  const anchor = "991406f8-0097-4e91-a2f1-b732812e36fe";
+  const boundary = { type: "system", subtype: "compact_boundary",
+    uuid: "adc44006-42e8-4ee0-92c6-6e9fc1412da8", session_id: sessionId,
+    compact_metadata: { trigger: "auto", pre_tokens: 1, post_tokens: 1,
+      cumulative_dropped_tokens: 1, duration_ms: 1,
+      preserved_segment: { head_uuid: anchor, anchor_uuid: anchor, tail_uuid: anchor },
+      preserved_messages: { anchor_uuid: anchor, uuids: [anchor], all_uuids: [anchor] } } };
+  const summary = { type: "user", isSynthetic: true, parent_tool_use_id: null,
+    session_id: sessionId, uuid: anchor, timestamp: "2026-09-29T13:35:53.708Z",
+    message: { role: "user", content: [{ type: "text", text: "persisted native summary" }] } };
+  return Buffer.from(`${JSON.stringify(boundary)}\n${JSON.stringify(summary)}\n`);
+}
+
+test("non-native first round does not trust a planned session id for compact", async () => {
+  const f = fixture({ directFinal: true, spoolPrefix: compactPrefix("12345678-1234-4123-8123-123456789abc") });
+  await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === "BOX_CLI_COMPACT_UNBOUND");
+  assert.equal(f.launches, 1);
+});
+
+test("persisted native resume accepts that session compact and still finishes", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const priorBody = { ...canonicalBody,
+      messages: [{ role: "user", content: "prior question" }] } as ProxyBody;
+    const basis = makeBoxNativeHistoryBasis(priorBody,
+      [{ type: "text", text: "READY" }]);
+    const sessionId = "12345678-1234-4123-8123-123456789abc";
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: model, cliVersion: "2.1.280", nativeSessionId: sessionId,
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "f".repeat(64), ...basis,
+      catalogHash: compileBoxToolCatalog(canonicalBody.tools).bindingSha256,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const f = fixture({ directFinal: true, spoolPrefix: compactPrefix(sessionId),
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const next = { ...canonicalBody, messages: [
+      { role: "user", content: "prior question" },
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "new question" },
+    ] } as ProxyBody;
+    const input = { ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } };
+    const result = await runBoxToolFirstRound(input, f.deps);
+    assert.equal(result.kind, "final");
+    assert.equal(f.launches, 1);
+    if (result.kind === "final") assert.equal(result.plan.sessionId, sessionId);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
 test("first round rejects a catalog-matching heartbeat", async () => {
   const prefix = Buffer.from(JSON.stringify({ type: "tool_progress",
     tool_use_id: `${toolId}-heartbeat-0`, tool_name: boxName,

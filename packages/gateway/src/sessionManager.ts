@@ -34,6 +34,13 @@ import {
 // 本文件只消费 engine 中立契约(EngineAdapter / EngineEvent / TurnSummary /
 // PartialSnapshot)。ccbAdapter / codexAdapter 的 import 兼有 registry 注册副作用
 // ('ccb' / 'codex' factory)。
+import {
+  assertNextUserMayStart,
+  readIdleRecovery,
+  runIdleCompact,
+  type BoxChainTerminalProof,
+  type IdleCompactRecord,
+} from './boxIdleCompact.js'
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
@@ -977,6 +984,8 @@ export interface AgentSession {
     expiresAt?: number
   }
   _lastNativeCompactionSummary?: string
+  /** Set when an applied idle summary changed the outer history. Not a native claim. */
+  _idleNativeMiss?: boolean
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   /** Set by onFinish when the CCB result row signals a stale --resume session
@@ -4629,6 +4638,48 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Terminal-only idle compact. Shares session.lock via submit, sends the
+   * native /compact command, and does not set modelSwitchInternal.
+   * A stored summary that was not applied is finished from disk with no
+   * second model call.
+   */
+  async prepareIdleCompact(
+    session: AgentSession,
+    proof: BoxChainTerminalProof,
+    idleRequestId: string,
+    recoveryDir: string = paths.home,
+  ): Promise<IdleCompactRecord> {
+    let submitted = false
+    const record = await runIdleCompact({
+      sessionKey: session.sessionKey,
+      activeTurns: session._activeTurnCount ?? 0,
+      activeClients: session._activeClientTurnCount ?? 0,
+      proof,
+      idleRequestId,
+      recoveryDir,
+      submit: async (prompt) => {
+        submitted = true
+        session._lastNativeCompactionSummary = undefined
+        await this.submit(
+          session,
+          prompt,
+          () => {},
+          undefined,
+          session.model,
+          idleRequestId,
+          undefined,
+          undefined,
+          { idleCompactRequestId: idleRequestId },
+        )
+      },
+      readSummary: () => session._lastNativeCompactionSummary,
+    })
+    if (!submitted) session._idleNativeMiss = true
+    else session._idleNativeMiss = record.nativeMiss
+    return record
+  }
+
   cancelModelSwitch(session: AgentSession, switchId: string): boolean {
     const transition = session._modelSwitchTransition
     if (!transition || transition.id !== switchId || transition.state === 'consuming') return false
@@ -4851,6 +4902,8 @@ export class SessionManager {
       modelSwitchId?: string
       /** Native compact command authored by prepareModelSwitch itself. */
       modelSwitchInternal?: string
+      /** Set only by prepareIdleCompact. Never a model-switch bypass. */
+      idleCompactRequestId?: string
     },
   ): Promise<void> {
     // Resolve/rebuild a warm legacy runner under the existing creation gate,
@@ -5004,6 +5057,9 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      const idleRow = readIdleRecovery(paths.home, session.sessionKey)
+      if (opts?.idleCompactRequestId === undefined) assertNextUserMayStart(idleRow)
+      if (idleRow?.applied && idleRow.nativeMiss) session._idleNativeMiss = true
       // A deferred dispatch can be cancelled while its predecessor owns the lock.
       // Fence it before resume promotion / runner reconfiguration, not only before
       // submitTurn. This read does not replace the final queued -> running CAS:
