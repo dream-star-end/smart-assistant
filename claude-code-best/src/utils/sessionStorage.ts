@@ -30,6 +30,7 @@ import {
   isSessionPersistenceDisabled,
   switchSession,
 } from '../bootstrap/state.js'
+import { processTrustsBoxDeferredAnnouncement } from './model/boxDeferredAnnouncement.js'
 import { builtInCommandNames } from '../commands.js'
 import { COMMAND_NAME_TAG, TICK_TAG } from '../constants/xml.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
@@ -4497,6 +4498,15 @@ export function isLoggableMessage(m: Message): boolean {
   // When enabled, we allow hook_additional_context through since it contains
   // user-configured hook output that is useful for session context on resume.
   if (m.type === 'attachment' && getUserType() !== 'ant') {
+    // External transcripts drop attachments. A trusted Box process is the
+    // exception for deferred_tools_delta: the announcement is caller history,
+    // and the ephemeral API prepend is off for that same descriptor.
+    if (
+      m.attachment?.type === 'deferred_tools_delta' &&
+      processTrustsBoxDeferredAnnouncement()
+    ) {
+      return true
+    }
     if (
       m.attachment!.type === 'hook_additional_context' &&
       isEnvTruthy(process.env.CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT)

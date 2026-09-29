@@ -1388,7 +1388,7 @@ async function* queryModel(
   // When the delta attachment is enabled, deferred tools are announced
   // via persisted deferred_tools_delta attachments instead of this
   // ephemeral prepend (which busts cache whenever the pool changes).
-  if (useSearchExtraTools && !isDeferredToolsDeltaEnabled()) {
+  if (useSearchExtraTools && !isDeferredToolsDeltaEnabled(options.model)) {
     // Diff current deferred tools against what's already been announced in
     // prior <available-deferred-tools> injections. Only re-inject when new
     // tools appear (e.g. MCP server connects mid-session).

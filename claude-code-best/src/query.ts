@@ -13,6 +13,8 @@ import {
   type AutoCompactTrackingState,
 } from './services/compact/autoCompact.js'
 import { buildPostCompactMessages } from './services/compact/compact.js'
+import { getDeferredToolsDeltaAttachment } from './utils/attachments.js'
+import { isTrustedBoxDeferredAnnouncement } from './utils/model/boxDeferredAnnouncement.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
 const reactiveCompact = feature('REACTIVE_COMPACT')
   ? (require('./services/compact/reactiveCompact.js') as typeof import('./services/compact/reactiveCompact.js'))
@@ -900,6 +902,19 @@ async function* queryLoop(
               }
             : tracking
         }
+      }
+    }
+
+    if (isTrustedBoxDeferredAnnouncement(currentModel)) {
+      for (const att of getDeferredToolsDeltaAttachment(
+        toolUseContext.options.tools,
+        currentModel,
+        messagesForQuery,
+        { callSite: 'attachments_main', querySource },
+      )) {
+        const message = createAttachmentMessage(att)
+        messagesForQuery.push(message)
+        yield message
       }
     }
 
