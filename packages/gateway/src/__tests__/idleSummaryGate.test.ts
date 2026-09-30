@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -16,6 +17,9 @@ import {
   writeIdleNative,
 } from '../boxIdleCompact.js'
 import { SessionManager } from '../sessionManager.js'
+import { CcbAdapter } from '../engine/ccbAdapter.js'
+import type { EngineCreateOpts } from '../engine/registry.js'
+import type { SubprocessRunner } from '../subprocessRunner.js'
 
 const finish = (SessionManager.prototype as unknown as {
   finishIdleUnderLock: (
@@ -90,8 +94,10 @@ test('a prepared summary waits for its own committed capsule', async () => {
     sessionKey,
     model: BOX_NATIVE_CONTEXT_MODEL,
     _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER,
-    runner: {
+    runner: Object.assign(new EventEmitter(), {
       submitTurn: () => ({
+        submitted: Promise.resolve(),
+        end: () => {},
         summary: (async () => {
           submits += 1
           const native = readIdleNative(dir, sessionId, revision)
@@ -111,7 +117,7 @@ test('a prepared summary waits for its own committed capsule', async () => {
           return { nativeIdleReceipt: { opId: idleTurn, digest: artifact.digest } }
         })(),
       }),
-    },
+    }),
   }
   const source = { sessionId, turnKey: sourceTurn }
   await finish.call({}, session, source, dir)
@@ -176,8 +182,10 @@ test('a summary error does not dispatch again or clear the candidate', async () 
     sessionKey: 'summary-error',
     model: BOX_NATIVE_CONTEXT_MODEL,
     _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER,
-    runner: {
+    runner: Object.assign(new EventEmitter(), {
       submitTurn: () => ({
+        submitted: Promise.resolve(),
+        end: () => {},
         summary: (async () => {
           submits += 1
           writeIdleNative(dir, {
@@ -188,7 +196,7 @@ test('a summary error does not dispatch again or clear the candidate', async () 
           return { nativeCompactionSummary: 'Failed to authenticate. API Error: 403' }
         })(),
       }),
-    },
+    }),
   }
   await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
   await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
@@ -199,3 +207,81 @@ test('a summary error does not dispatch again or clear the candidate', async () 
   assert.equal(native?.applied, undefined)
   assert.ok(readIdleCandidate(dir, 'summary-error'))
 })
+
+for (const stage of ['prepare', 'apply'] as const) {
+  test(`real adapter ${stage} crash releases idle execution but retains the same recovery claim`, { timeout: 5000 }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'idle-crash-gate-'))
+    let prepared = false
+    let calls = 0
+    let summaries = 0
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', chunk => chunks.push(chunk as Buffer))
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { oc_turn_key: string }
+        res.setHeader('content-type', 'application/json')
+        const source = body.oc_turn_key === sourceTurn
+        res.end(JSON.stringify(source || prepared ? {
+          status: 'terminal', sessionId, turnKey: source ? sourceTurn : idleTurn,
+          requestId: source ? 'source' : 'summary', revision, compactRequired: source,
+          capsuleSha256: 'ee'.repeat(32), summaryText: source ? 'business' : 'kept goal',
+        } : { status: 'pending', reason: 'unsettled' }))
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    assert.ok(address && typeof address !== 'string')
+    const keys = ['ANTHROPIC_BASE_URL', 'OPENCLAUDE_V3_MASTER_BASE_URL', 'OPENCLAUDE_V3_CONTAINER_TOKEN'] as const
+    const before = keys.map(key => process.env[key])
+    process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${address.port}/`
+    process.env.OPENCLAUDE_V3_MASTER_BASE_URL = process.env.ANTHROPIC_BASE_URL
+    process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'oc-v3.test-token'
+    class Transport extends EventEmitter {
+      model = BOX_NATIVE_CONTEXT_MODEL
+      sessionId = 'native-session'
+      setConsultTurn(): void {}
+      async submit(): Promise<void> {
+        calls++
+        const native = readIdleNative(dir, sessionId, revision)!
+        if (!native.modelStarted) {
+          summaries++
+          prepared = stage === 'apply'
+          writeIdleNative(dir, { ...native, modelStarted: true, modelCalls: 1,
+            ...(prepared ? { summaryText: 'kept goal' } : {}) })
+          if (prepared) {
+            this.emit('message', { type: 'result', is_error: false, num_turns: 1,
+              total_cost_usd: 0, usage: { input_tokens: 1, output_tokens: 1 } })
+            return
+          }
+        }
+        this.emit('exit', { code: null, signal: 'SIGKILL', crashed: true })
+      }
+    }
+    const transport = new Transport()
+    const runner = new CcbAdapter({ harness: 'ccb' } as EngineCreateOpts, transport as unknown as SubprocessRunner)
+    const session = { sessionKey, model: BOX_NATIVE_CONTEXT_MODEL,
+      _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER, runner, _idleRunning: false }
+    try {
+      await assert.rejects(finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir), /IDLE_TURN_EXIT/)
+      assert.equal(session._idleRunning, false)
+      assert.ok(readIdleCandidate(dir, sessionKey))
+      assert.ok(readPendingIdle(dir, sessionKey))
+      assert.equal(readIdleNative(dir, sessionId, revision)?.modelStarted, true)
+      assert.equal(readIdleNative(dir, sessionId, revision)?.applied, undefined)
+      assert.equal(readIdleOp(dir, sessionKey, revision)?.receiptDigest, undefined)
+      assert.equal(calls, stage === 'prepare' ? 1 : 2)
+      assert.equal(summaries, 1)
+      // Re-entry never authorizes another model summary. An apply can retry
+      // only the same already prepared artifact; this fake transport exits again.
+      if (stage === 'prepare') await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
+      else await assert.rejects(finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir), /IDLE_TURN_EXIT/)
+      assert.equal(summaries, 1)
+      assert.equal(runner.listenerCount('exit'), 0)
+      assert.equal(runner.listenerCount('error'), 0)
+    } finally {
+      keys.forEach((key, i) => { if (before[i] === undefined) delete process.env[key]; else process.env[key] = before[i] })
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+}

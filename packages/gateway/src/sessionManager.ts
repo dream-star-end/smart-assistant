@@ -53,6 +53,7 @@ import {
   writeIdleOp,
 } from './boxIdleCompact.js'
 import { fetchBoxIdleProof } from './engine/boxIdleProofClient.js'
+import { runBoxIdleTurn } from './boxIdleTurn.js'
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
@@ -4736,14 +4737,13 @@ export class SessionManager {
       }
       session._idleRunning = true
       try {
-        const run = session.runner.submitTurn({
+        const settled = await runBoxIdleTurn(session.runner, {
           input: IDLE_COMPACT_PROMPT,
           turnKey: step.op.idleTurnKey,
           onEvent: () => {},
           sessionTotals: session,
           toolUseIdToName: session.toolUseIdToName ?? new Map(),
         })
-        const settled = await run.summary
         const receipt = settled?.nativeIdleReceipt
         const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
         if (nativeShortForOp(after, {
@@ -4775,14 +4775,13 @@ export class SessionManager {
               allowDispatch: false,
             })
             if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
-              const apply = session.runner.submitTurn({
+              const applied = await runBoxIdleTurn(session.runner, {
                 input: IDLE_COMPACT_PROMPT,
                 turnKey: step.op.idleTurnKey,
                 onEvent: () => {},
                 sessionTotals: session,
                 toolUseIdToName: session.toolUseIdToName ?? new Map(),
               })
-              const applied = await apply.summary
               const applyReceipt = applied?.nativeIdleReceipt
               if (applyReceipt && applyReceipt.opId === step.op.idleTurnKey
                 && applyReceipt.digest === step.op.artifact.digest) {
