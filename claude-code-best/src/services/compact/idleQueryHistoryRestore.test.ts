@@ -27,15 +27,15 @@ function idleUuid(opId: string, role: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`
 }
 
-function row(entry: Record<string, unknown>): string {
+function row(index: number, entry: Record<string, unknown>): string {
   return JSON.stringify({
     isSidechain: false,
     userType: 'external',
     entrypoint: 'sdk-cli',
     version: '2.1.888',
-    timestamp: '2026-09-30T00:00:00.000Z',
     sessionId: SESSION,
     ...entry,
+    timestamp: new Date(Date.UTC(2026, 8, 30, 0, 0, index)).toISOString(),
   })
 }
 
@@ -97,22 +97,22 @@ async function listen(): Promise<{ url: string; calls: () => Array<{ path: strin
 }
 
 describe('local idle compact replaces the shared query history', () => {
-  test('string and text-block inputs keep the same op across owner transitions', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'ocv5-296-r26-'))
-    const api = await listen()
-    const failures: string[] = []
-    try {
-      for (const shape of ['text-block', 'string'] as const) {
+  for (const shape of ['text-block', 'string'] as const) {
+    test(`${shape} input keeps the same op across the owner transition`, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'ocv5-296-r27-'))
+      const api = await listen()
+      let failed = false
+      try {
         await runShape(root, api.url, api.calls, shape)
+      } catch (error) {
+        failed = true
+        throw error
+      } finally {
+        await api.close()
+        if (!failed) await rm(root, { recursive: true, force: true })
       }
-    } catch (error) {
-      failures.push(error instanceof Error ? error.stack ?? error.message : String(error))
-      throw error
-    } finally {
-      await api.close()
-      if (failures.length === 0) await rm(root, { recursive: true, force: true })
-    }
-  }, 240_000)
+    }, 180_000)
+  }
 })
 
 async function runShape(
@@ -121,7 +121,7 @@ async function runShape(
   calls: () => Array<{ path: string; body: string }>,
   shape: 'text-block' | 'string',
 ): Promise<void> {
-  const before = calls().length
+  const before = messageCalls(calls()).length
   const home = join(root, shape)
   const work = join(home, 'work')
   const marker = join(work, 'execution-log')
@@ -131,14 +131,14 @@ async function runShape(
   const transcript = join(project, `${SESSION}.jsonl`)
   const big = 'x'.repeat(700_000)
   const lines = [
-    row({ parentUuid: null, type: 'user', uuid: GROW, message: { role: 'user', content: `goal ${big}` } }),
-    row({
+    row(0, { parentUuid: null, type: 'user', uuid: GROW, message: { role: 'user', content: `goal ${big}` } }),
+    row(1, {
       parentUuid: GROW,
       type: 'attachment',
       uuid: ANNOUNCEMENT,
       attachment: { type: 'deferred_tools_delta', addedNames: ['Bash'], addedLines: ['Bash'], removedNames: [] },
     }),
-    row({
+    row(2, {
       parentUuid: ANNOUNCEMENT,
       type: 'assistant',
       uuid: OLD_TOOL,
@@ -148,13 +148,13 @@ async function runShape(
         usage: { input_tokens: 1, output_tokens: 1 },
       },
     }),
-    row({
+    row(3, {
       parentUuid: OLD_TOOL,
       type: 'user',
       uuid: OLD_RESULT,
       message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_old', content: 'old-ok' }] },
     }),
-    row({
+    row(4, {
       parentUuid: OLD_RESULT,
       type: 'assistant',
       uuid: KEPT_TOOL,
@@ -164,7 +164,7 @@ async function runShape(
         usage: { input_tokens: 1, output_tokens: 1 },
       },
     }),
-    row({
+    row(5, {
       parentUuid: KEPT_TOOL,
       type: 'user',
       uuid: KEPT_IMAGE,
@@ -189,6 +189,8 @@ async function runShape(
     ],
     attachments: [],
   }))
+  const seeded = await coldLoad(home, work, transcript, 'seed')
+  assertSeedLoaded(shape, seeded)
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     HOME: home,
@@ -229,6 +231,9 @@ async function runShape(
     expect(next.is_error, `${shape} next ${String(next.result).slice(0, 300)}`).toBe(false)
     expect(messageCalls(calls()).length, `${shape} next http`).toBe(before + 2)
     const nextBody = messageCalls(calls()).at(-1)?.body ?? ''
+    const afterNext = await coldLoad(home, work, transcript, 'next')
+    await assertCompactSurvived(shape, 'next', afterNext, transcript, nextText)
+
     expect(nextBody.includes('toolu_old'), `${shape} old tool resent`).toBe(false)
     expect(nextBody.includes('toolu_kept'), `${shape} kept tool missing`).toBe(true)
     expect(nextBody.includes('aaaa'), `${shape} image missing`).toBe(true)
@@ -255,20 +260,8 @@ async function runShape(
     const failedText = await readFile(transcript, 'utf8')
     expect(failedText.includes('"subtype":"compact_boundary"') || failedText.includes('compact_boundary'), `${shape} failure cleared the boundary`).toBe(true)
 
-    const loaded = await coldLoad(home, work, transcript)
-    const boundary = loaded.find((message) => message.subtype === 'compact_boundary' && message.compactMetadata?.idleOpId === OP)
-    expect(boundary, `${shape} boundary`).toBeTruthy()
-    expect(loaded.some((message) => message.isCompactSummary && message.message?.content === 'synthetic-prepared-summary'), `${shape} summary`).toBe(true)
-    const kept = loaded.filter((message) => message.uuid === KEPT_TOOL || message.uuid === KEPT_IMAGE)
-    expect(kept.map((message) => message.uuid), `${shape} order`).toEqual([KEPT_TOOL, KEPT_IMAGE])
-    expect(JSON.stringify(kept).includes('aaaa'), `${shape} image content`).toBe(true)
-    expect(JSON.stringify(kept).includes('toolu_kept'), `${shape} paired tool`).toBe(true)
-    const nextUser = loaded.find((message) => JSON.stringify(message.message?.content ?? '').includes(nextText))
-    expect(nextUser, `${shape} next user missing from cold load`).toBeTruthy()
-    const physical = (await readFile(transcript, 'utf8')).split('\n').filter((line) => line.includes(nextText)).map((line) => JSON.parse(line) as { type?: string; parentUuid?: string }).filter((entry) => entry.type === 'user')
-    expect(physical.at(-1)?.parentUuid, `${shape} parent`).toBe(idleUuid(OP, 'resume-leaf'))
-    expect(physical.at(-1)?.parentUuid, `${shape} old announcement parent`).not.toBe(ANNOUNCEMENT)
-    expect(await countUuid(transcript, ANNOUNCEMENT), `${shape} announcement rewritten`).toBe(1)
+    const loaded = await coldLoad(home, work, transcript, 'final')
+    await assertCompactSurvived(shape, 'final', loaded, transcript, nextText)
     expect(await fileExists(marker), `${shape} old tool executed`).toBe(false)
   } finally {
     await stop(child)
@@ -356,18 +349,84 @@ async function turn(
   throw new Error(`result timeout exit=${child.exitCode}`)
 }
 
-async function coldLoad(home: string, work: string, transcript: string): Promise<Array<Record<string, any>>> {
-  const script = join(home, 'load.ts')
-  const output = join(home, 'loaded.json')
-  await writeFile(script, `
+type Loaded = { default: Array<Record<string, any>>; explicit: Array<Record<string, any>> }
+
+function stableMessage(message: Record<string, any>): Record<string, unknown> {
+  return {
+    uuid: message.uuid ?? null,
+    type: message.type ?? null,
+    subtype: message.subtype ?? null,
+    role: message.message?.role ?? null,
+    content: message.message?.content ?? message.content ?? null,
+    attachment: message.attachment ?? null,
+    isCompactSummary: message.isCompactSummary ?? null,
+    idleOpId: message.compactMetadata?.idleOpId ?? null,
+  }
+}
+
+const SEED_CHAIN = [GROW, ANNOUNCEMENT, OLD_TOOL, OLD_RESULT, KEPT_TOOL, KEPT_IMAGE]
+
+function comparable(messages: Array<Record<string, any>>): Array<Record<string, unknown>> {
+  return messages.flatMap((message) => {
+    const text = JSON.stringify(message.message?.content ?? message.content ?? '')
+    const kept =
+      SEED_CHAIN.includes(message.uuid) ||
+      message.subtype === 'compact_boundary' ||
+      message.subtype === 'informational' ||
+      message.isCompactSummary === true ||
+      text.includes('NEXT-USER-REAL-QUERY') ||
+      text.includes('NEXT-REAL-QUERY')
+    return kept ? [stableMessage(message)] : []
+  })
+}
+
+function assertSeedLoaded(shape: string, loaded: Loaded): void {
+  for (const mode of ['default', 'explicit'] as const) {
+    const messages = loaded[mode]
+    expect(messages.slice(0, SEED_CHAIN.length).map((message) => message.uuid), `${shape} ${mode} seed chain`).toEqual(SEED_CHAIN)
+    const announcement = messages.find((message) => message.uuid === ANNOUNCEMENT)
+    expect(announcement?.type, `${shape} ${mode} old announcement`).toBe('attachment')
+    expect(announcement?.attachment?.type, `${shape} ${mode} old announcement kind`).toBe('deferred_tools_delta')
+    const tail = messages.filter((message) => message.uuid === KEPT_TOOL || message.uuid === KEPT_IMAGE)
+    expect(tail.map((message) => message.uuid), `${shape} ${mode} seed tail`).toEqual([KEPT_TOOL, KEPT_IMAGE])
+    expect(JSON.stringify(tail).includes('toolu_kept'), `${shape} ${mode} seed tool`).toBe(true)
+    expect(JSON.stringify(tail).includes('aaaa'), `${shape} ${mode} seed image`).toBe(true)
+  }
+  expect(comparable(loaded.default), `${shape} seed default/explicit`).toEqual(comparable(loaded.explicit))
+}
+
+async function assertCompactSurvived(shape: string, stage: string, loaded: Loaded, transcript: string, nextText: string): Promise<void> {
+  for (const mode of ['default', 'explicit'] as const) {
+    const messages = loaded[mode]
+    const boundary = messages.find((message) => message.subtype === 'compact_boundary' && message.compactMetadata?.idleOpId === OP)
+    expect(boundary, `${shape} ${mode} ${stage} summary missing`).toBeTruthy()
+    expect(messages.some((message) => message.isCompactSummary && message.message?.content === 'synthetic-prepared-summary'), `${shape} ${mode} ${stage} summary missing`).toBe(true)
+    const kept = messages.filter((message) => message.uuid === KEPT_TOOL || message.uuid === KEPT_IMAGE)
+    expect(kept.map((message) => message.uuid), `${shape} ${mode} ${stage} order`).toEqual([KEPT_TOOL, KEPT_IMAGE])
+    expect(JSON.stringify(kept).includes('aaaa'), `${shape} ${mode} ${stage} image`).toBe(true)
+    expect(JSON.stringify(kept).includes('toolu_kept'), `${shape} ${mode} ${stage} paired tool`).toBe(true)
+    expect(messages.some((message) => JSON.stringify(message.message?.content ?? '').includes(nextText)), `${shape} ${mode} ${stage} next user`).toBe(true)
+  }
+  expect(comparable(loaded.default), `${shape} ${stage} default/explicit`).toEqual(comparable(loaded.explicit))
+  const physical = (await readFile(transcript, 'utf8')).split('\n').filter((line) => line.includes(nextText)).map((line) => JSON.parse(line) as { type?: string; parentUuid?: string }).filter((entry) => entry.type === 'user')
+  expect(physical.at(-1)?.parentUuid, `${shape} ${stage} old announcement chain break`).toBe(idleUuid(OP, 'resume-leaf'))
+  expect(physical.at(-1)?.parentUuid, `${shape} ${stage} old announcement chain break`).not.toBe(ANNOUNCEMENT)
+  expect(await countUuid(transcript, ANNOUNCEMENT), `${shape} ${stage} old announcement rewritten`).toBe(1)
+}
+
+async function coldLoad(home: string, work: string, transcript: string, tag: string): Promise<Loaded> {
+  const script = join(home, `load-${tag}.ts`)
+  const loaded = {} as Loaded
+  for (const mode of ['default', 'explicit'] as const) {
+    const output = join(home, `loaded-${tag}-${mode}.json`)
+    await writeFile(script, `
 import { writeFileSync } from 'node:fs';
 const { loadConversationForResume } = await import(${JSON.stringify(RECOVERY)});
 const explicit = process.argv[2] === 'explicit';
 const result = await loadConversationForResume(${JSON.stringify(SESSION)}, explicit ? ${JSON.stringify(transcript)} : undefined);
-if (!result || result.sessionId !== ${JSON.stringify(SESSION)}) throw new Error('loader missed session');
+if (!result || result.sessionId !== ${JSON.stringify(SESSION)}) throw new Error('loader missed session ' + process.argv[2]);
 writeFileSync(${JSON.stringify(output)}, JSON.stringify(result.messages));
 `)
-  for (const mode of ['default', 'explicit']) {
     const child = spawn('bun', [script, mode], {
       cwd: work,
       env: {
@@ -383,9 +442,10 @@ writeFileSync(${JSON.stringify(output)}, JSON.stringify(result.messages));
       const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('loader timeout')) }, 40_000)
       child.on('exit', (status) => { clearTimeout(timer); resolve(status ?? 1) })
     })
-    if (code !== 0) throw new Error(`${mode} loader ${code} ${Buffer.concat(stderr).toString('utf8').slice(-800)}`)
+    if (code !== 0) throw new Error(`${tag} ${mode} loader ${code} ${Buffer.concat(stderr).toString('utf8').slice(-800)}`)
+    loaded[mode] = JSON.parse(await readFile(output, 'utf8'))
   }
-  return JSON.parse(await readFile(output, 'utf8'))
+  return loaded
 }
 
 async function stop(child: ChildProcess): Promise<void> {
