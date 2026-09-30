@@ -6,6 +6,7 @@
  * remote CLI. No user content or account credential is held here.
  */
 import { rootLogger } from "../../logging/logger.js";
+import { validRunCapacity } from "./boxCapacityPolicy.js";
 
 const log = rootLogger.child({ subsys: "box-invocation" });
 export type BoxInvocationState =
@@ -46,11 +47,9 @@ export class BoxInvocationRegistry {
     maxPerUser: number;
     maxPerAccount: number;
     leaseMs: number;
-    /** Same selfhost-only exception used by the durable account admission. */
-    allowSecond?: (uid: bigint, accountId: bigint) => boolean;
   }, private readonly now: () => number = Date.now) {
-    if (!Number.isSafeInteger(limits.maxPerUser) || limits.maxPerUser < 1
-      || !Number.isSafeInteger(limits.maxPerAccount) || limits.maxPerAccount < 1
+    // Same BoxCapacityPolicy values as the durable journal admission cap.
+    if (!validRunCapacity(limits.maxPerUser) || !validRunCapacity(limits.maxPerAccount)
       || !Number.isSafeInteger(limits.leaseMs) || limits.leaseMs < 1000
       || limits.leaseMs > 900_000) {
       throw new BoxInvocationConflict("BOX_LEASE_LIMIT_INVALID");
@@ -72,11 +71,10 @@ export class BoxInvocationRegistry {
     const key = this.key(input.uid, input.sessionId);
     if (input.accountId <= 0n) throw new BoxInvocationConflict("BOX_ACCOUNT_ID_INVALID");
     if (this.active.has(key)) throw new BoxInvocationConflict("BOX_SESSION_BUSY");
-    const extra = this.limits.allowSecond?.(input.uid, input.accountId) ? 1 : 0;
-    if ((this.userCounts.get(input.uid) ?? 0) >= this.limits.maxPerUser + extra) {
+    if ((this.userCounts.get(input.uid) ?? 0) >= this.limits.maxPerUser) {
       throw new BoxInvocationConflict("BOX_USER_CAPACITY_FULL");
     }
-    if ((this.accountCounts.get(input.accountId) ?? 0) >= this.limits.maxPerAccount + extra) {
+    if ((this.accountCounts.get(input.accountId) ?? 0) >= this.limits.maxPerAccount) {
       throw new BoxInvocationConflict("BOX_ACCOUNT_CAPACITY_FULL");
     }
     const leaseMs = input.leaseMs ?? this.limits.leaseMs;

@@ -8,22 +8,30 @@ function rejected(fn: () => unknown, code: string): void {
 }
 
 describe("Box cross-HTTP invocation ownership", () => {
-  it("permits two independent selfhost sessions without freeing each other's slot", () => {
-    const registry = new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
-      leaseMs: 1000, allowSecond: (uid, accountId) => uid === 3n && accountId === 20n });
-    const a = registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n });
-    const b = registry.open({ uid: 3n, sessionId: "session-b", accountId: 20n });
-    assert.deepEqual(registry.counts(3n, 20n), { user: 2, account: 2 });
-    rejected(() => registry.open({ uid: 3n, sessionId: "session-c", accountId: 20n }),
+  it("admits ten independent sessions on one account without freeing each other's slot", () => {
+    const registry = new BoxInvocationRegistry({ maxPerUser: 10, maxPerAccount: 10, leaseMs: 1000 });
+    const leases = Array.from({ length: 10 }, (_, i) =>
+      registry.open({ uid: 3n, sessionId: `session-${i}`, accountId: 20n }));
+    assert.deepEqual(registry.counts(3n, 20n), { user: 10, account: 10 });
+    rejected(() => registry.open({ uid: 3n, sessionId: "session-x", accountId: 20n }),
       "BOX_USER_CAPACITY_FULL");
-    rejected(() => registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n }),
+    rejected(() => registry.open({ uid: 3n, sessionId: "session-0", accountId: 20n }),
       "BOX_SESSION_BUSY");
-    registry.confirmRemoteStopped(a);
-    assert.deepEqual(registry.counts(3n, 20n), { user: 1, account: 1 });
-    const c = registry.open({ uid: 3n, sessionId: "session-c", accountId: 20n });
-    registry.confirmRemoteStopped(b);
-    registry.confirmRemoteStopped(c);
+    registry.confirmRemoteStopped(leases[0]!);
+    assert.deepEqual(registry.counts(3n, 20n), { user: 9, account: 9 });
+    const next = registry.open({ uid: 3n, sessionId: "session-x", accountId: 20n });
+    for (const lease of [...leases.slice(1), next]) registry.confirmRemoteStopped(lease);
+    assert.deepEqual(registry.counts(3n, 20n), { user: 0, account: 0 });
   });
+
+  it("caps configured limits at the shared ceiling", () => {
+    assert.doesNotThrow(() => new BoxInvocationRegistry({ maxPerUser: 16, maxPerAccount: 16, leaseMs: 1000 }));
+    rejected(() => new BoxInvocationRegistry({ maxPerUser: 17, maxPerAccount: 1, leaseMs: 1000 }),
+      "BOX_LEASE_LIMIT_INVALID");
+    rejected(() => new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 0, leaseMs: 1000 }),
+      "BOX_LEASE_LIMIT_INVALID");
+  });
+
   it("keeps the same remote CLI alive after tool_use HTTP response ends", () => {
     const registry = new BoxInvocationRegistry(limits);
     const lease = registry.open({ uid: 3n, sessionId: "session-a", accountId: 20n });

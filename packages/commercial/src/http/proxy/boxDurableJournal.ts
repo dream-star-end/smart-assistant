@@ -4,6 +4,8 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { Pool, PoolClient } from "pg";
+import { rootLogger } from "../../logging/logger.js";
+import { BOX_RUNS_CEILING, validRunCapacity, type BoxRunCapacity } from "./boxCapacityPolicy.js";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, withVerifiedCapsule,
@@ -30,6 +32,7 @@ import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer
 import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 
+const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 
 export class BoxDurableJournalError extends Error {
@@ -403,8 +406,10 @@ export class BoxDurableJournal implements BoxJournalPort {
   /** Test seam. Production leaves this null. Held inside the claim transaction
    * after the fingerprint lookup and before the owner mutation. */
   resumeLookupBarrier: (() => Promise<void>) | null = null;
+  /** `capacity` returns the BoxCapacityPolicy run caps. A bare number is the
+   * legacy per-account cap and leaves the per-user cap at the ceiling. */
   constructor(private readonly pool: Pick<Pool, "connect" | "query">,
-    private readonly maxAccountRuns: (uid: bigint, accountId: bigint) => number = () => 1) {}
+    private readonly capacity: (uid: bigint, accountId: bigint) => number | BoxRunCapacity = () => 1) {}
 
   /** An older pointer cannot be reused after an intervening uncached turn. */
   async findNativeCandidate(input: { uid: bigint; sessionId: string;
@@ -887,54 +892,68 @@ export class BoxDurableJournal implements BoxJournalPort {
     let committed = false;
     try {
       await client.query("BEGIN");
+      // The user lock serializes cross-account admissions of one user so the
+      // per-user cap below cannot be passed by two accounts at once. lock()
+      // sorts keys, so every path takes these in the same order.
       await lock(client, [
         `box:account:${input.accountId}`, `box:fingerprint:${input.fingerprint.replayFingerprint}`,
-        `box:session:${input.uid}:${input.fingerprint.sessionId}`,
+        `box:session:${input.uid}:${input.fingerprint.sessionId}`, `box:user:${input.uid}`,
       ]);
+      // Fingerprint and fallback alias are both derived from the uid, so the
+      // user filter keeps the check exact and lets it use idx_rfj_user_time.
       const duplicate = await client.query(
         `SELECT 1 FROM request_finalize_journal
-          WHERE ctx->>'boxReplayFingerprint' = $1
-             OR ctx->>'boxFallbackAlias' = $2 LIMIT 1`,
-        [input.fingerprint.replayFingerprint, fallbackAlias ?? null]);
+          WHERE user_id = $3 AND ctx->>'boxInvocationRecovery' = 'v1'
+            AND (ctx->>'boxReplayFingerprint' = $1
+             OR ctx->>'boxFallbackAlias' = $2) LIMIT 1`,
+        [input.fingerprint.replayFingerprint, fallbackAlias ?? null, input.uid.toString()]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
-      const maxRuns = this.maxAccountRuns(input.uid, input.accountId);
-      if (!Number.isSafeInteger(maxRuns) || maxRuns < 1 || maxRuns > 2) {
+      const policy = this.capacity(input.uid, input.accountId);
+      const caps: BoxRunCapacity = typeof policy === "number"
+        ? { maxRunsPerAccount: policy, maxRunsPerUser: BOX_RUNS_CEILING } : policy;
+      if (!validRunCapacity(caps.maxRunsPerAccount) || !validRunCapacity(caps.maxRunsPerUser)) {
         throw new BoxDurableJournalError("BOX_CAPACITY_POLICY_INVALID");
       }
-      // Linked HTTP rows of one tool chain share a remote run. Count remote
-      // identities, not journal rows; malformed active evidence fails closed.
-      const occupied = await client.query<{ user_id: string;
-        session_id: string | null; account_id: string | null;
-        run_nonce: string | null; lease_epoch: string | null }>(
-        `SELECT user_id, ctx->>'boxSessionId' AS session_id,
-           ctx->>'boxAccountId' AS account_id,
-           ctx->>'boxRunNonce' AS run_nonce,
-           ctx->>'boxLeaseEpoch' AS lease_epoch
-         FROM request_finalize_journal
-         WHERE ctx->>'boxState' = ANY($1::text[])
-           AND (ctx->>'boxAccountId' = $2 OR
-             (user_id = $3 AND ctx->>'boxSessionId' = $4)) LIMIT 1024`,
+      // Linked HTTP rows of one tool chain share a remote run: valid rows are
+      // counted once per nonce:epoch. A malformed active row cannot be proven
+      // to share a run, so it occupies one slot by itself (never NULL, never
+      // merged) instead of blocking the whole account.
+      const occupied = await client.query<{ same_session: boolean;
+        account_occupied: string; user_occupied: string; malformed_ids: string[] | null }>(
+        `WITH active AS (
+           SELECT request_id, user_id,
+             ctx->>'boxSessionId' AS session_id, ctx->>'boxAccountId' AS account_id,
+             CASE WHEN COALESCE(ctx->>'boxRunNonce','') ~ '^[a-f0-9]{24}$'
+                    AND COALESCE(ctx->>'boxLeaseEpoch','') ~ '^[a-f0-9]{32}$'
+                    AND ctx->>'boxAccountId' IS NOT NULL
+                    AND ctx->>'boxSessionId' IS NOT NULL
+                  THEN 'run:' || (ctx->>'boxRunNonce') || ':' || (ctx->>'boxLeaseEpoch')
+                  ELSE 'row:' || request_id END AS run_key,
+             NOT (COALESCE(ctx->>'boxRunNonce','') ~ '^[a-f0-9]{24}$'
+                    AND COALESCE(ctx->>'boxLeaseEpoch','') ~ '^[a-f0-9]{32}$'
+                    AND ctx->>'boxAccountId' IS NOT NULL
+                    AND ctx->>'boxSessionId' IS NOT NULL) AS malformed
+           FROM request_finalize_journal
+           WHERE ctx->>'boxState' = ANY($1::text[])
+             AND (ctx->>'boxAccountId' = $2 OR user_id = $3))
+         SELECT
+           COALESCE(bool_or(user_id = $3 AND session_id = $4), false) AS same_session,
+           COUNT(DISTINCT run_key) FILTER (WHERE account_id = $2) AS account_occupied,
+           COUNT(DISTINCT run_key) FILTER (WHERE user_id = $3) AS user_occupied,
+           (array_agg(request_id ORDER BY request_id) FILTER (WHERE malformed))[1:5] AS malformed_ids
+         FROM active`,
         [ACTIVE, input.accountId.toString(), input.uid.toString(),
           input.fingerprint.sessionId]);
-      // A 128-round tool chain can itself have >128 linked HTTP rows. Bound
-      // the read well above both allowed chains; overflow still fails closed.
-      if ((occupied.rowCount ?? occupied.rows.length) >= 1024) {
-        throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      const usage = occupied.rows[0];
+      if (!usage || usage.same_session) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
+      if (usage.malformed_ids?.length) {
+        journalLog.warn("box_capacity_malformed_active_rows", {
+          uid: input.uid.toString(), accountId: input.accountId.toString(),
+          requestIds: usage.malformed_ids,
+        });
       }
-      const accountRuns = new Set<string>();
-      for (const row of occupied.rows) {
-        if (String(row.user_id) === input.uid.toString()
-          && row.session_id === input.fingerprint.sessionId) {
-          throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
-        }
-        if (row.account_id !== input.accountId.toString()) continue;
-        if (!/^[a-f0-9]{24}$/.test(row.run_nonce ?? "")
-          || !/^[a-f0-9]{32}$/.test(row.lease_epoch ?? "")) {
-          throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
-        }
-        accountRuns.add(`${row.run_nonce}:${row.lease_epoch}`);
-      }
-      if (accountRuns.size >= maxRuns) {
+      if (Number(usage.account_occupied) >= caps.maxRunsPerAccount
+        || Number(usage.user_occupied) >= caps.maxRunsPerUser) {
         throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       }
       if (native) {
@@ -2489,8 +2508,10 @@ export class BoxDurableJournal implements BoxJournalPort {
             AND ctx->>'boxSessionId'=$3
             AND ctx->>'boxInvocationRecovery'='v1'
             AND (
-              COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped')
+              COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped','prestart_stopped')
               OR (ctx->>'boxState'='terminal' AND state <> 'committed')
+              -- A prestart stop is closed only under its own fence (never launched).
+              OR (ctx->>'boxState'='prestart_stopped' AND ctx ? 'boxLaunchPermit')
             )`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId]);
       await client.query("COMMIT");

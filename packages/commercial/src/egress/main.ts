@@ -58,6 +58,7 @@ import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProvid
 import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
 import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
+import { resolveBoxCapacityPolicy } from "../http/proxy/boxCapacityPolicy.js";
 import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
 import { createBoxReplayReader, createBoxReplayRecoveryWriter,
   createBoxReplayWriter } from "./boxReplaySetup.js";
@@ -239,6 +240,14 @@ export async function startEgress(): Promise<void> {
   });
 
   const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
+  // OCV5-297: one capacity policy feeds the registry, the durable journal cap
+  // and the Box proxy pool/rate. Commercial defaults leave all three unchanged.
+  const boxCapacity = resolveBoxCapacityPolicy(process.env);
+  const boxProxyConcurrency = boxCapacity.proxyConcurrency === null ? undefined
+    : new ConcurrencyLimiter(boxCapacity.proxyConcurrency);
+  const boxProxyRateLimit = boxCapacity.proxyRatePerMinute === null ? undefined
+    : { ...DEFAULT_PROXY_RATE_LIMIT, scope: "proxy_uid_box", windowSeconds: 60,
+      max: boxCapacity.proxyRatePerMinute };
   const sharedProxyFallback = new FallbackRateLimiter(
     DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
     Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
@@ -248,14 +257,13 @@ export async function startEgress(): Promise<void> {
   // Missing staged assets make egress refuse startup when explicitly enabled.
   const boxResolver = process.env.OC_BOX_MODEL_API === "1"
     ? createProductionBoxAccountResolver() : null;
-  // One qualified Box account serves this personal instance. Two independent
-  // sessions may run there; the durable journal remains the cross-process cap.
-  const allowSecondBoxRun = (uid: bigint, accountId: bigint): boolean =>
-    process.env.OC_INSTANCE_ID === "v5-selfhost-sg"
-    && process.env.SELFHOST_CURSOR_EGRESS === "1"
-    && uid === 3n && accountId === 20n;
-  const boxJournal = boxResolver ? new BoxDurableJournal(getPool(),
-    (uid, accountId) => allowSecondBoxRun(uid, accountId) ? 2 : 1) : null;
+  // The in-process registry and the durable journal share the same caps; the
+  // journal remains the cross-process (A/B slot) authority.
+  if (boxResolver) log.info("box_capacity_policy", { ...boxCapacity });
+  const boxJournal = boxResolver ? new BoxDurableJournal(getPool(), () => ({
+    maxRunsPerAccount: boxCapacity.maxRunsPerAccount,
+    maxRunsPerUser: boxCapacity.maxRunsPerUser,
+  })) : null;
   // The Box model route has no independent feature flag for private response
   // capsules. Its already-injected platform state root gives this instance a
   // durable sibling directory; commercial instances with Box off create none.
@@ -309,8 +317,8 @@ export async function startEgress(): Promise<void> {
     supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
     keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
     detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
-    registry: new BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1,
-      leaseMs: 900_000, allowSecond: allowSecondBoxRun }),
+    registry: new BoxInvocationRegistry({ maxPerUser: boxCapacity.maxRunsPerUser,
+      maxPerAccount: boxCapacity.maxRunsPerAccount, leaseMs: 900_000 }),
     journal: boxJournal,
     writeMessage: boxReplayWriter,
     maxOutputTokensForModel: (model) =>
@@ -440,6 +448,8 @@ export async function startEgress(): Promise<void> {
     rateLimitRedis,
     concurrencyLimiter: sharedProxyConcurrency,
     fallbackLimiter: sharedProxyFallback,
+    ...(boxProxyConcurrency ? { boxConcurrencyLimiter: boxProxyConcurrency } : {}),
+    ...(boxProxyRateLimit ? { boxRateLimit: boxProxyRateLimit } : {}),
     boxModel,
     boxReplay,
     modelCatalog,

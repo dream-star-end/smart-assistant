@@ -68,10 +68,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   const stages: string[] = [], unknowns: string[] = [], journalCalls: string[] = [];
   let journalUsage: unknown = null, journalPointer: unknown = null;
   let cleanupDone = false;
-  const registry = new SpyRegistry({ maxPerUser: 1, maxPerAccount: 1,
-    leaseMs: 600_000,
-    ...(opts.parallel ? { allowSecond: (uid: bigint, accountId: bigint) =>
-      uid === 3n && accountId === 20n } : {}) }, () => now);
+  const registry = new SpyRegistry({ maxPerUser: opts.parallel ? 2 : 1,
+    maxPerAccount: opts.parallel ? 2 : 1, leaseMs: 600_000 }, () => now);
   const runner: Runner = { async run(request: BoxCcExecRequest,
     options: Parameters<Runner["run"]>[1]): Promise<BoxExecResult> {
     active++; maxActive = Math.max(maxActive, active);
