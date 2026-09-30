@@ -19,7 +19,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { IDLE_COMPACT_PROMPT, writeIdleCandidate, writeIdleNative } from "../boxIdleCompact.js";
 import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
 import { installIdleFaultFixture, armIdleFault, saveIdleCheckpoint, restoreIdleCheckpoint,
-  readRecoveredConversation, assertRecoveredContent, type IdleCheckpoint } from "./fixtures/idleCrashFixture.js";
+   captureIdleTranscript, readRecoveredConversation, assertRecoveredContent, type IdleCheckpoint } from "./fixtures/idleCrashFixture.js";
 
 const HOME = mkdtempSync(join(tmpdir(), "ocv5-296-idle-home-"));
 process.env.OPENCLAUDE_HOME = HOME;
@@ -1593,7 +1593,11 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           // window independent of graceful shutdown bookkeeping, not of history.
           restoreIdleCheckpoint(atFault);
           await coldRunner();
-          await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+          try {
+            await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+          } finally {
+            captureIdleTranscript(HOME, nativeId, join(rawDir, `ocv5-296-post-user-${windowName}-${SCHEMA.slice(-6)}`));
+          }
           const added = hits.slice(startHits).filter((hit) => hit.url === "/v1/messages");
           assert.equal(added.filter((hit) => hit.summary).length, 0, "recovery sent a second summary");
           assert.equal(added.length, 1, "only the new user may call the model");

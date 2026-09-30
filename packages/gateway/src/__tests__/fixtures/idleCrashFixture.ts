@@ -97,19 +97,58 @@ export function restoreIdleCheckpoint(snapshot: IdleCheckpoint): void {
   }
 }
 
+/** Evidence only: copy exactly this synthetic session, before cleanup can erase
+ * a failed next-user chain. Never select a different session or repair a leaf. */
+export function captureIdleTranscript(home: string, nativeId: string, output: string): string[] {
+  assert.match(nativeId, /^[a-zA-Z0-9-]+$/);
+  mkdirSync(output, { recursive: true });
+  const paths: string[] = [];
+  const walk = (dir: string): void => {
+    if (!existsSync(dir)) return;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const file = join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else if (entry.isFile() && entry.name === `${nativeId}.jsonl`) paths.push(file);
+    }
+  };
+  walk(join(home, "claude-config"));
+  const files = paths.map((path, i) => {
+    const bytes = readFileSync(path);
+    const copy = join(output, `${i}-${nativeId}.jsonl`);
+    writeFileSync(copy, bytes);
+    const rows = bytes.toString("utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+    return { path, copy, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+      chain: rows.filter(row => row.uuid).map(row => ({ uuid: row.uuid, parentUuid: row.parentUuid,
+        type: row.type, subtype: row.subtype, timestamp: row.timestamp, isCompactSummary: row.isCompactSummary,
+        compactMetadata: row.compactMetadata, messageId: row.message?.id, role: row.message?.role,
+        contentSha256: createHash("sha256").update(JSON.stringify(row.message?.content ?? row.content ?? null)).digest("hex") })) };
+  });
+  writeFileSync(join(output, "manifest.json"), JSON.stringify({ home, nativeId, files }, null, 2));
+  return paths;
+}
+
 export function readRecoveredConversation(candidate: string, home: string, nativeId: string, cwd: string, output: string): Array<Record<string, any>> {
-  const script = join(dirname(output), "load-recovered.ts");
+  const paths = captureIdleTranscript(home, nativeId, `${output}.transcripts`);
+  assert.equal(paths.length, 1, "capture must find exactly the target session transcript");
+  const script = `${output}.loader.ts`;
   writeFileSync(script, `
 import { writeFileSync } from 'node:fs';
 const { loadConversationForResume } = await import(${JSON.stringify(join(candidate, "claude-code-best/src/utils/conversationRecovery.ts"))});
-const result = await loadConversationForResume(${JSON.stringify(nativeId)}, undefined);
+const explicit = process.argv[2] === 'explicit';
+const result = await loadConversationForResume(${JSON.stringify(nativeId)}, explicit ? ${JSON.stringify(paths[0])} : undefined);
 if (!result || result.sessionId !== ${JSON.stringify(nativeId)}) throw new Error('loader did not return the exact native session');
-writeFileSync(${JSON.stringify(output)}, JSON.stringify(result.messages));
+const output = ${JSON.stringify(output)} + (explicit ? '.explicit.json' : '');
+writeFileSync(output, JSON.stringify(result.messages));
+writeFileSync(output + '.meta.json', JSON.stringify({ cwd: process.cwd(), config: process.env.CLAUDE_CONFIG_DIR,
+  sessionId: result.sessionId, fullPath: result.fullPath, explicit, requestedPath: ${JSON.stringify(paths[0])} }));
 process.exit(0);
 `);
-  const child = spawnSync("bun", [script], { cwd, encoding: "utf8", timeout: 30_000,
-    env: { ...process.env, OPENCLAUDE_HOME: home, CLAUDE_CONFIG_DIR: join(home, "claude-config") } });
-  assert.equal(child.status, 0, `${child.error ?? ""} ${child.stderr}`);
+  for (const mode of ['default', 'explicit']) {
+    const child = spawnSync("bun", [script, mode], { cwd, encoding: "utf8", timeout: 30_000,
+      env: { ...process.env, OPENCLAUDE_HOME: home, CLAUDE_CONFIG_DIR: join(home, "claude-config") } });
+    assert.equal(child.status, 0, `${mode}: ${child.error ?? ""} ${child.stderr}`);
+  }
+  captureIdleTranscript(home, nativeId, `${output}.after-loader.transcripts`);
   return JSON.parse(readFileSync(output, "utf8"));
 }
 
