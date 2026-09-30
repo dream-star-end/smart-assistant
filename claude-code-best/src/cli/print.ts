@@ -1,7 +1,7 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle'
 import { readFile, stat } from 'fs/promises'
-import { dirname } from 'path'
+import { dirname, resolve } from 'path'
 import {
   downloadUserSettings,
   redownloadUserSettings,
@@ -209,6 +209,8 @@ import {
   hydrateRemoteSession,
   hydrateFromCCRv2InternalEvents,
   resetSessionFilePointer,
+  adoptResumedSessionFile,
+  getTranscriptPath,
   doesMessageExistInSession,
   findUnresolvedToolUse,
   recordAttributionSnapshot,
@@ -5182,6 +5184,31 @@ type LoadInitialMessagesResult = {
   agentSetting?: string
 }
 
+/**
+ * Print --continue/--resume loaded an existing transcript, then
+ * resetSessionFilePointer nulled sessionFile. A later system-only resume
+ * leaf (compact boundary, summary, and tail already on disk) stays in
+ * pendingEntries: materialize waits for a new user/assistant message, and
+ * flush does not drain that buffer, so idle recovery cannot see the leaf.
+ *
+ * Adopt only when this process already switched onto that same session and
+ * the derived transcript path is the file just loaded. Fork, disabled
+ * persistence, a missing path, or any other path must not take the file
+ * over or create a different one.
+ */
+export function adoptLoadedPrintSessionFile(opts: {
+  forkSession: boolean | undefined
+  persistSession: boolean
+  sessionId: string | undefined
+  fullPath: string | undefined
+}): void {
+  if (opts.forkSession || !opts.persistSession) return
+  if (!opts.sessionId || !opts.fullPath) return
+  if (getSessionId() !== opts.sessionId) return
+  if (resolve(getTranscriptPath()) !== resolve(opts.fullPath)) return
+  adoptResumedSessionFile()
+}
+
 async function loadInitialMessages(
   setAppState: (f: (prev: AppState) => AppState) => void,
   options: {
@@ -5254,6 +5281,12 @@ async function loadInitialMessages(
             ? { ...result, worktreeSession: undefined }
             : result,
         )
+        adoptLoadedPrintSessionFile({
+          forkSession: options.forkSession,
+          persistSession,
+          sessionId: result.sessionId,
+          fullPath: result.fullPath,
+        })
 
         // Write mode entry for the resumed session
         if (feature('COORDINATOR_MODE') && coordinatorModeModule) {
@@ -5454,6 +5487,12 @@ async function loadInitialMessages(
           ? { ...result, worktreeSession: undefined }
           : result,
       )
+      adoptLoadedPrintSessionFile({
+        forkSession: options.forkSession,
+        persistSession,
+        sessionId: result.sessionId,
+        fullPath: result.fullPath,
+      })
 
       // Write mode entry for the resumed session
       if (feature('COORDINATOR_MODE') && coordinatorModeModule) {
