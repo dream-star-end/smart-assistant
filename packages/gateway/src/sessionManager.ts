@@ -4727,7 +4727,7 @@ export class SessionManager {
       allowDispatch: started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
     })
     const needsApply = Boolean(step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest)
-    if ((step.callModel || needsApply) && session.runner.submitTurn) {
+    if (step.callModel || needsApply) {
       if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
         writeIdleNative(recoveryDir, {
           v: 1, opId: step.op.idleTurnKey, revision: step.op.revision, sessionId: source.sessionId,
