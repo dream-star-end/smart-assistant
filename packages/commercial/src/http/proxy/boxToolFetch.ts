@@ -70,6 +70,8 @@ export class BoxToolFetch {
     runContinuation?: Continue;
     /** Test-only shortening of the bounded restart-cleanup resolver wait. */
     cleanupResolveTimeoutMs?: number;
+    /** OCV5-299: explicit stop for a locally rejected first-round stream. */
+    stopRejectedRun?: Parameters<First>[1]["stopRejectedRun"];
   }) {}
 
   private own(nonce: string, target: BoxResolvedTarget, uid: bigint,
@@ -457,6 +459,7 @@ export class BoxToolFetch {
               retainUnknownTarget: ({ target, plan }) => this.own(plan.runNonce,
                 target, args.uid, plan.leaseEpoch),
               retainCleanupTarget: (handle) => this.retainCleanup(handle),
+              ...(this.deps.stopRejectedRun ? { stopRejectedRun: this.deps.stopRejectedRun } : {}),
             });
             acknowledge(); // injected completed runner compatibility; live path acks at launch
             this.own(outcome.plan.runNonce, outcome.target,

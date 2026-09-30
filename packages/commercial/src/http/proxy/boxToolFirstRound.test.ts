@@ -74,6 +74,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   badAssetManifest?: boolean;
   nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer };
   spoolPrefix?: Buffer;
+  spoolBody?: Buffer;
   compactUsingLaunchSession?: boolean } = {}) {
   let launchedSession = "";
   const sequence: string[] = [];
@@ -121,9 +122,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
         && args[5] === "--read") {
         sequence.push("spool-read");
         const offset = Number(args[7]);
-        const body = options.directFinal
+        const body = options.spoolBody ?? (options.directFinal
           ? options.finalTrailing ? Buffer.concat([finalRaw, Buffer.from("bad-after-success\n")])
-            : finalRaw : raw;
+            : finalRaw : raw);
         const prefix = options.compactUsingLaunchSession
           ? compactPrefix(launchedSession) : options.spoolPrefix;
         const spool = prefix ? Buffer.concat([prefix, body]) : body;
@@ -712,5 +713,65 @@ test("first round rejects a catalog-matching heartbeat", async () => {
   await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps), /BOX_TOOL_RECORD_INVALID/);
   assert.equal(f.launches, 1);
   assert.ok(!f.sequence.includes("durable-handoff"));
+  assert.ok(f.sequence.includes("unknown"));
+});
+
+// OCV5-299: a continued session in which the model called a client-named tool
+// (e.g. `Bash`) that this invocation's CLI does not expose.
+const unknownNameRecords = records.map((record) => {
+  const text = JSON.stringify(record).replaceAll(`"name":"${boxName}"`, '"name":"Bash"');
+  return JSON.parse(text) as unknown;
+});
+unknownNameRecords[0] = records[0];
+const unknownNameRaw = Buffer.from(unknownNameRecords.map((record) => JSON.stringify(record) + "\n").join(""));
+
+test("a locally rejected tool name is stopped and settled, not left unknown", async () => {
+  const f = fixture({ spoolBody: unknownNameRaw });
+  const stops: unknown[] = [];
+  const deps = { ...f.deps, stopRejectedRun: async (identity: unknown) => {
+    stops.push(identity); f.sequence.push("explicit-stop"); return "stopped_proven" as const; } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => error instanceof Error
+      && (error as { code?: string }).code === "BOX_TOOL_NAME_UNAVAILABLE");
+  assert.equal(f.launches, 1);
+  assert.equal(stops.length, 1);
+  const identity = stops[0] as { requestId: string; uid: bigint; accountId: bigint;
+    runNonce: string; leaseEpoch: string };
+  assert.equal(identity.requestId, "box-synthetic");
+  assert.equal(identity.uid, 3n);
+  assert.equal(identity.accountId, 20n);
+  assert.match(identity.runNonce, /^[a-f0-9]{24}$/);
+  assert.match(identity.leaseEpoch, /^[a-f0-9]{32}$/);
+  assert.ok(!f.sequence.includes("unknown"), "no unknown row pins the session");
+  assert.ok(!f.sequence.includes("durable-handoff"), "nothing is handed to the client");
+  assert.equal(f.retained, false);
+  assert.equal(f.disposed, true, "the local target is released after the proven stop");
+});
+
+test("an unproven stop of a rejected stream stays on the fail-closed unknown path", async () => {
+  for (const outcome of ["pending", "completed_unsettled"] as const) {
+    const f = fixture({ spoolBody: unknownNameRaw });
+    const deps = { ...f.deps, stopRejectedRun: async () => outcome };
+    await assert.rejects(() => runBoxToolFirstRound(f.input, deps), /BOX_TOOL_ID_OR_NAME_INVALID/);
+    assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+    assert.equal(f.retained, true);
+  }
+  const f = fixture({ spoolBody: unknownNameRaw });
+  const deps = { ...f.deps, stopRejectedRun: async () => { throw new Error("stop transport down"); } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps), /BOX_TOOL_ID_OR_NAME_INVALID/);
+  assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+});
+
+test("other decoder failures never trigger the explicit stop", async () => {
+  const prefix = Buffer.from(JSON.stringify({ type: "tool_progress",
+    tool_use_id: `${toolId}-heartbeat-0`, tool_name: boxName,
+    parent_tool_use_id: toolId, elapsed_time_seconds: 30, heartbeat: true,
+    session_id: "12345678-1234-4123-8123-123456789abc",
+    uuid: "22222222-2222-4222-8222-222222222222" }) + "\n");
+  const f = fixture({ spoolPrefix: prefix });
+  let stops = 0;
+  const deps = { ...f.deps, stopRejectedRun: async () => { stops++; return "stopped_proven" as const; } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps), /BOX_TOOL_RECORD_INVALID/);
+  assert.equal(stops, 0);
   assert.ok(f.sequence.includes("unknown"));
 });

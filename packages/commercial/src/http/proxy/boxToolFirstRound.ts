@@ -4,7 +4,8 @@
 import { isDeepStrictEqual } from "node:util";
 import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { makeBoxDetachedToolPlan, type BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
-import { BoxCliToolHandoffDecoder, type BoxToolHandoffCandidate } from "./boxCliToolHandoff.js";
+import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
+  type BoxToolHandoffCandidate } from "./boxCliToolHandoff.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
@@ -49,6 +50,10 @@ type Journal = Pick<BoxDurableJournal, "admit" |
   "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
   & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer">>;
 
+/** Decoder rejections that are a deterministic property of this stream (not a
+ * transport or service failure) and may be stopped and settled explicitly. */
+const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID"]);
+
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
   sessionId: string | null;
@@ -80,6 +85,13 @@ export async function runBoxToolFirstRound(input: {
   retainCleanupTarget: (handle: { target: BoxResolvedTarget;
     pending: Promise<void>; uid: bigint; requestId: string; phase: string }) => void;
   budgetMs?: number;
+  /** OCV5-299: stop a launched run whose stream this decoder deterministically
+   * rejected (e.g. a tool name outside this invocation's catalog). Returns the
+   * explicit-stop outcome; only "stopped_proven" means the row is now a proven
+   * failed_stopped (no usage billed) instead of an unknown that pins the
+   * session. Anything else keeps the fail-closed unknown path. */
+  stopRejectedRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
+    runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
 }): Promise<BoxToolFirstHandoff | BoxToolFirstFinal> {
   if (input.url !== BOX_INTERNAL_ENDPOINT || input.init.method !== "POST"
     || typeof input.init.body !== "string") {
@@ -511,6 +523,24 @@ export async function runBoxToolFirstRound(input: {
     }
     throw new BoxToolFirstRoundError("BOX_TOOL_STREAM_INCOMPLETE");
   } catch (error) {
+    if (launchAttempted && admitted && target && deps.stopRejectedRun
+      && error instanceof BoxCliToolHandoffError
+      && BOX_LOCALLY_REJECTED_STREAM.has(error.code)) {
+      // The CLI is still alive (it answers the bad call itself and keeps
+      // going). Stop it now through the same explicit-stop path as a user
+      // Stop; a proven stop settles the row as failed_stopped so the session
+      // is not pinned by an unknown row and its idle proof reads `failed`.
+      let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
+      try {
+        outcome = await deps.stopRejectedRun({ requestId: input.requestId, uid: input.uid,
+          accountId: target.accountId, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch });
+      } catch { outcome = "pending"; }
+      if (outcome === "stopped_proven") {
+        await closeBounded(target, "rejected_stream_dispose").catch(() => {});
+        throw new BoxToolFirstRoundError(error.code === "BOX_TOOL_ID_OR_NAME_INVALID"
+          ? "BOX_TOOL_NAME_UNAVAILABLE" : error.code);
+      }
+    }
     if (launchAttempted) await unknown("first_round_unknown");
     if ((!admitted || prestartClosed) && target) {
       await closeBounded(target, "prestart_dispose").catch(() => {});

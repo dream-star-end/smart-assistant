@@ -342,6 +342,10 @@ export async function startEgress(): Promise<void> {
         model === "box-api-claude-opus-5-5" ? 128_000 : null,
       resolveTarget: (args) => boxResolver.resolve(args),
       onUnknown: reportBoxUnknown,
+      // OCV5-299: a locally rejected first-round stream is stopped through the
+      // same explicit-stop coordinator as a user Stop (declared below; only
+      // called at request time, after startup).
+      stopRejectedRun: (identity) => boxStopCoordinator.requestStop(identity),
     }) : undefined;
   const boxModel = boxTextModel ? {
     toolBridgeReady: boxToolModel !== undefined,
