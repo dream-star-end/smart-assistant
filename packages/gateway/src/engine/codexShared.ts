@@ -14,6 +14,7 @@ import { copyFile, mkdir } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import {
   isCodexLongContextModel,
+  codexTransportModelId,
   modelReasoningPolicy,
   type PlatformReasoningEffort,
 } from '@openclaude/protocol'
@@ -132,9 +133,18 @@ export function buildCodexModelCatalogArgs(modelId: string | undefined): string[
   return ['-c', `model_catalog_json=${JSON.stringify(QWEN38_CODEX_MODEL_CATALOG)}`]
 }
 
-/** GPT 1M twins: per-spawn window only. Never persist ~/.codex/config.toml. */
+/**
+ * GPT 1M twins: per-spawn window only. Never persist ~/.codex/config.toml.
+ *
+ * GPT-6 / 6.1 already advertise a 1.05M window. Codex 0.159.2 treats an
+ * explicit model_context_window on a fresh app-server as a new workspace
+ * route and fails the turn with "workspace routing discovery failed".
+ * The 1M catalog id stays a billing tier; transport still uses the standard slug.
+ */
 export function buildCodexLongContextArgs(modelId: string | undefined): string[] {
   if (!isCodexLongContextModel(modelId)) return []
+  const transport = codexTransportModelId(modelId)
+  if (typeof transport === 'string' && transport.startsWith('gpt-6')) return []
   return [
     '-c',
     'model_context_window=1000000',

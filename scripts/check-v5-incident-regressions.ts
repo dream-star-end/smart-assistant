@@ -416,6 +416,10 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // fix(v5) shipped without Incident trailer). Freeze this tip only; cherry-picks
   // after it still go through the trailer gate (OCV5-224 registered separately).
   "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
+  // 2026-10-01: 197735db7 was pushed to feat/v5-selfhost before the trailer
+  // gate ran. Shared branch forbids rewriting it. Deploy failed before it
+  // became live. Freeze this tip only; later commits still go through the gate.
+  "197735db77dfbf05280c526963ae04846544cabe",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
