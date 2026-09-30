@@ -16,6 +16,23 @@ export interface BoxToolPlan extends BoxTextPlan {
   readonly catalog: BoxToolCatalog;
 }
 
+/**
+ * OCV5-299: the OpenClaude-side instructions name tools by their plain client
+ * names (Bash, Read, ExecuteExtraTool, …) while this CLI can only call the
+ * virtual-MCP aliases. Observed live: the model first calls the plain name,
+ * gets "No such tool available", and only then finds the alias. State the
+ * mapping once in the system prompt so the first call already uses the alias,
+ * as a native Claude Code session calls its own tool names directly.
+ */
+export function boxToolAliasNotice(catalog: Pick<BoxToolCatalog, "boxNameByClientName">): string {
+  const lines = [...catalog.boxNameByClientName].map(([client, box]) => `- ${client} → ${box}`);
+  return ["<tool-naming>",
+    "In this session every tool is provided by the MCP server \"ocbridge\" under an alias.",
+    "Wherever the instructions, tool descriptions or earlier messages name a tool by its plain name,",
+    "call its alias instead. Plain names are not callable here and fail with \"No such tool available\".",
+    ...lines, "</tool-naming>"].join("\n");
+}
+
 export function makeBoxToolPlan(input: {
   body: ProxyBody;
   upstreamModel: string;
@@ -49,7 +66,9 @@ export function makeBoxToolPlan(input: {
       extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],
        runNonce, leaseEpoch: input.leaseEpoch,
        supervisorDeadlineSeconds: BOX_TOOL_MAX_WALL_MS / 1000,
-       nativePersistence: input.nativePersistence, nativeResume: input.nativeResume });
+       nativePersistence: input.nativePersistence, nativeResume: input.nativeResume,
+       toolAliases: catalog.boxNameByClientName,
+       systemSuffix: boxToolAliasNotice(catalog) });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;

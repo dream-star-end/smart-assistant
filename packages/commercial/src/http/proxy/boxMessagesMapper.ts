@@ -96,10 +96,59 @@ export interface BoxCliSyntheticTurn {
   systemPrompt: string;
 }
 
+function resultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    const item = part as { type?: unknown; text?: unknown };
+    return item?.type === "text" && typeof item.text === "string" ? item.text : "[image]";
+  }).join("\n");
+}
+
+/**
+ * OCV5-299: the CLI only exposes this invocation's virtual-MCP aliases
+ * (mcp__ocbridge__tN). Completed history arrives with the OpenClaude client
+ * names (Bash, Read, …). Staged verbatim, the model imitates those names on a
+ * continued session, the CLI answers "No such tool available", and the run is
+ * lost. Rename every historical call to the alias of the same client tool in
+ * this catalog; a call whose tool is absent from this catalog (or any call in
+ * a tool-less text turn) becomes plain text together with its result, so no
+ * uncallable name remains in the transcript. Only the staged snapshot changes;
+ * the canonical body, fingerprints and hashes are untouched.
+ */
+function aliasHistory(history: Message[], aliases: ReadonlyMap<string, string>): Message[] {
+  const demoted = new Map<string, string>();
+  return history.map((message) => {
+    if (typeof message.content === "string") return message;
+    const content = blocks(message.content).map((block): Block => {
+      if (message.role === "assistant" && block.type === "tool_use") {
+        const name = block.name as string;
+        const alias = aliases.get(name);
+        if (alias) return { ...block, name: alias };
+        demoted.set(block.id as string, name);
+        // Full fidelity: nothing is truncated; the snapshot byte ceiling still applies.
+        return { type: "text", text: `[Earlier call to tool "${name}", not available in this turn. `
+          + `Input: ${JSON.stringify(block.input)}]` };
+      }
+      if (message.role === "user" && block.type === "tool_result"
+        && demoted.has(block.tool_use_id as string)) {
+        const name = demoted.get(block.tool_use_id as string)!;
+        return { type: "text", text: `[Result of earlier "${name}" call${block.is_error === true ? " (error)" : ""}: `
+          + `${resultText(block.content)}]` };
+      }
+      return block;
+    });
+    return { ...message, content };
+  });
+}
+
 export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   cwd: string;
   cliVersion: string;
   sessionId?: string;
+  /** Client tool name -> CLI-visible alias for this invocation. When given,
+   * history is staged with callable names only (see aliasHistory). */
+  toolAliases?: ReadonlyMap<string, string>;
 }): BoxCliSyntheticTurn {
   if (!/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(args.cwd)
     || args.cliVersion !== "2.1.280") {
@@ -153,10 +202,11 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     }
   }
   if (pending.size) throw new BoxMessagesShapeError("BOX_PENDING_TOOL_REQUIRES_LIVE_INVOCATION");
+  const staged = args.toolAliases ? aliasHistory(history, args.toolAliases) : history;
 
   const timestamp = new Date().toISOString();
   let parentUuid: string | null = null;
-  const records = history.map((message) => {
+  const records = staged.map((message) => {
     const uuid = randomUUID();
     const base = { parentUuid, isSidechain: false, type: message.role, uuid,
       timestamp, cwd: args.cwd, sessionId, version: args.cliVersion };

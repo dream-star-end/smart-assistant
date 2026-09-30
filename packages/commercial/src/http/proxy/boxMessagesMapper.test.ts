@@ -117,3 +117,78 @@ describe("Box Messages → Claude CLI synthetic session boundary", () => {
       && error.code === "BOX_RUN_IDENTITY_INVALID");
   });
 });
+
+describe("OCV5-299 historical tool names are staged callable-only", () => {
+  const history = [
+    { role: "user", content: "check the environment" },
+    { role: "assistant", content: [
+      { type: "text", text: "Checking." },
+      { type: "tool_use", id: "toolu_hist_bash", name: "Bash", input: { command: "hostname" } },
+      { type: "tool_use", id: "toolu_hist_gone", name: "LegacyTool", input: { q: "x" } },
+    ] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_hist_bash", content: "v3-dev-sg" },
+      { type: "tool_result", tool_use_id: "toolu_hist_gone", is_error: true,
+        content: [{ type: "text", text: "boom" }] },
+    ] },
+    { role: "assistant", content: [{ type: "text", text: "Host is v3-dev-sg." }] },
+    { role: "user", content: "继续" },
+  ];
+  const snapshot = (aliases?: ReadonlyMap<string, string>) =>
+    compileBoxCliSyntheticTurn(body(history), { ...args, ...(aliases ? { toolAliases: aliases } : {}) })
+      .snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line) as {
+        message: { role: string; content: unknown; stop_reason?: string } });
+
+  it("renames a call of a catalog tool to this invocation's alias and keeps its result paired", () => {
+    const records = snapshot(new Map([["Bash", "mcp__ocbridge__t4"]]));
+    const call = records[1]!.message.content as Array<Record<string, unknown>>;
+    assert.equal(call[1]!.type, "tool_use");
+    assert.equal(call[1]!.name, "mcp__ocbridge__t4");
+    assert.equal(call[1]!.id, "toolu_hist_bash");
+    assert.deepEqual(call[1]!.input, { command: "hostname" });
+    assert.equal(records[1]!.message.stop_reason, "tool_use");
+    const results = records[2]!.message.content as Array<Record<string, unknown>>;
+    assert.deepEqual(results[0], { type: "tool_result", tool_use_id: "toolu_hist_bash", content: "v3-dev-sg" });
+    // No client name the CLI cannot call survives anywhere in the transcript.
+    const text = JSON.stringify(records);
+    assert.ok(!text.includes('"name":"Bash"'));
+    assert.ok(!text.includes('"name":"LegacyTool"'));
+  });
+
+  it("demotes a call of a tool outside the catalog, and its result, to plain text", () => {
+    const records = snapshot(new Map([["Bash", "mcp__ocbridge__t4"]]));
+    const call = records[1]!.message.content as Array<Record<string, unknown>>;
+    assert.equal(call[2]!.type, "text");
+    assert.match(String(call[2]!.text), /Earlier call to tool "LegacyTool", not available in this turn/);
+    assert.match(String(call[2]!.text), /"q":"x"/);
+    const results = records[2]!.message.content as Array<Record<string, unknown>>;
+    assert.equal(results[1]!.type, "text");
+    assert.match(String(results[1]!.text), /Result of earlier "LegacyTool" call \(error\): boom/);
+  });
+
+  it("a tool-less text turn stages every historical call as text", () => {
+    const records = snapshot(new Map());
+    const text = JSON.stringify(records);
+    assert.ok(!text.includes('"type":"tool_use"'));
+    assert.ok(!text.includes('"type":"tool_result"'));
+    assert.equal(records[1]!.message.stop_reason, "end_turn");
+    assert.match(text, /Earlier call to tool \\"Bash\\"/);
+    assert.match(text, /v3-dev-sg/);
+  });
+
+  it("without aliases the staged history is unchanged (request-gate validation path)", () => {
+    const records = snapshot();
+    const call = records[1]!.message.content as Array<Record<string, unknown>>;
+    assert.equal(call[1]!.name, "Bash");
+    assert.equal(call[2]!.name, "LegacyTool");
+  });
+
+  it("the current user turn and the canonical body are never rewritten", () => {
+    const input = body(history);
+    const before = JSON.stringify(input);
+    const output = compileBoxCliSyntheticTurn(input, { ...args, toolAliases: new Map() });
+    assert.equal(JSON.stringify(input), before);
+    assert.equal(output.stdinJsonl.trim(), JSON.stringify({ type: "user",
+      message: { role: "user", content: "继续" } }));
+  });
+});

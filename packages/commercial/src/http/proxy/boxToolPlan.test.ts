@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { makeBoxToolPlan } from "./boxToolPlan.js";
+import { boxToolAliasNotice, makeBoxToolPlan } from "./boxToolPlan.js";
 import type { ProxyBody } from "./shared.js";
 
 const supervisorAsset = readFileSync(new URL("../../../../../scripts/ocv5-289/box_supervisor.py", import.meta.url));
@@ -93,4 +93,25 @@ test("tool catalog is actually staged into a private run dir and removed after k
     assert.equal(cleaned.stdout.trim(), "clean");
   }
   assert.equal(existsSync(plan.cwd), false);
+});
+
+test("OCV5-299: the staged system prompt maps every plain tool name to its alias", () => {
+  const withHistory = { ...body, system: "Use Bash for shell commands.", messages: [
+    { role: "user", content: "run it" },
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_hist_1", name: "local_echo",
+      input: { value: "a" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_hist_1", content: "a" }] },
+    { role: "user", content: "继续" },
+  ] } as ProxyBody;
+  const plan = makeBoxToolPlan({ ...assets, body: withHistory });
+  const notice = boxToolAliasNotice(plan.catalog);
+  assert.match(notice, /^<tool-naming>/);
+  assert.match(notice, /- local_echo → mcp__ocbridge__t0/);
+  const staged = plan.stageInputs.flatMap((step) => step.args).map((arg) => {
+    try { return Buffer.from(arg, "base64").toString("utf8"); } catch { return ""; }
+  }).join("\n");
+  assert.ok(staged.includes("<tool-naming>"), "alias table is staged with the system prompt");
+  assert.ok(staged.includes("Use Bash for shell commands."), "original system prompt is kept first");
+  assert.ok(staged.includes('"name":"mcp__ocbridge__t0"'), "history call is staged under its alias");
+  assert.ok(!staged.includes('"name":"local_echo"'), "no plain historical call name is staged");
 });

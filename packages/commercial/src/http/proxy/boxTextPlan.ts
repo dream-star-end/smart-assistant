@@ -143,6 +143,10 @@ export function makeBoxTextPlan(input: {
    * belongs to the caller; this builder only emits the pinned CLI plan. */
   nativePersistence?: boolean;
   nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
+  /** Client tool name -> virtual-MCP alias of this invocation (tool plan only). */
+  toolAliases?: ReadonlyMap<string, string>;
+  /** Appended to the staged system prompt (tool plan: the alias table). */
+  systemSuffix?: string;
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body);
   if (unsupported) throw new BoxTextPlanError(unsupported);
@@ -180,8 +184,11 @@ export function makeBoxTextPlan(input: {
     throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   }
   const proofDir = `/tmp/ocv5-289-proof-${runNonce}`;
+  // A text-only turn exposes no tools, so every historical call is staged as
+  // text; the tool plan passes its catalog aliases instead (OCV5-299).
   const mapped = compileBoxCliSyntheticTurn({ ...input.body, model: input.upstreamModel },
-    { cwd, cliVersion: "2.1.280", sessionId: input.nativeResume?.sessionId });
+    { cwd, cliVersion: "2.1.280", sessionId: input.nativeResume?.sessionId,
+      toolAliases: input.toolAliases ?? new Map() });
   const supervisorHash = sha(input.supervisorAsset);
   const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${supervisorHash.slice(0, 16)}.py`;
   const keeperHash = sha(input.keeperAsset);
@@ -192,7 +199,8 @@ export function makeBoxTextPlan(input: {
   const stdinPath = `${cwd}/stdin.jsonl`, systemPath = `${cwd}/system.txt`;
   const snapshot = Buffer.from(hasHistory ? mapped.snapshotJsonl : "");
   const stdin = Buffer.from(mapped.stdinJsonl);
-  const system = Buffer.from(mapped.systemPrompt);
+  const system = Buffer.from(input.systemSuffix
+    ? [mapped.systemPrompt, input.systemSuffix].filter(Boolean).join("\n\n") : mapped.systemPrompt);
   // History snapshot follows the verified envelope. The current-turn stdin file
   // and the system file stay at the original 8 MiB plan cap.
   const snapshotCeiling = currentVerifiedProxyByteBudget().snapshot;
