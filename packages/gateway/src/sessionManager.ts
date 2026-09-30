@@ -4762,7 +4762,7 @@ export class SessionManager {
             idleTurnKey: step.op.idleTurnKey,
             nativeSummary: after.summaryText,
           })
-          if (confirmed && session.runner.submitTurn) {
+          if (confirmed) {
             step = advanceIdleOp({
               op: {
                 ...step.op,
