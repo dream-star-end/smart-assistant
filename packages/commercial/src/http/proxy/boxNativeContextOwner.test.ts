@@ -15,8 +15,8 @@ const base = {
 };
 
 describe("box native context owner", () => {
-  it("ready signed box model issues box-native-v1 and the default route is off", () => {
-    assert.equal(BOX_NATIVE_CONTEXT_ROUTE_READY, false);
+  it("explicit route on issues box-native-v1 and explicit route off does not", () => {
+    assert.equal(BOX_NATIVE_CONTEXT_ROUTE_READY, true);
     const declared = parseCapabilityProfile("box-api-claude-opus-5-5", {
       ...base,
       ccb: { ...base.ccb, context_owner: "box-native-v1" },
@@ -28,8 +28,17 @@ describe("box native context owner", () => {
       capabilityZero: false,
       supportsThinking: true,
       declaredContextOwner: declared.ccb.contextOwner,
+      routeReady: false,
     });
     assert.equal(off.contextOwner, undefined);
+    const bySourceDefault = signedCcbCapability({
+      canonicalModel: "box-api-claude-opus-5-5",
+      providerId: "box_cli",
+      capabilityZero: false,
+      supportsThinking: true,
+      declaredContextOwner: declared.ccb.contextOwner,
+    });
+    assert.equal(bySourceDefault.contextOwner, "box-native-v1");
     const on = signedCcbCapability({
       canonicalModel: "box-api-claude-opus-5-5",
       providerId: "box_cli",
@@ -52,8 +61,14 @@ describe("box native context owner", () => {
         capabilityProfile: { ccb: { contextOwner: on.contextOwner } },
       },
     };
-    assert.equal(getBoxNativeContextOwner(gate, { kind: "box" }), null);
+    assert.equal(getBoxNativeContextOwner(gate, { kind: "box" }, false), null);
     assert.equal(getBoxNativeContextOwner(gate, { kind: "box" }, true), "box-native-v1");
+    assert.equal(getBoxNativeContextOwner(gate, { kind: "box" }), "box-native-v1");
+    assert.equal(getBoxNativeContextOwner({
+      ...gate,
+      authorityKind: "local_catalog",
+      verifiedSignedContextOwner: null,
+    }, { kind: "box" }, true), null);
   });
 
   it("wrong model, provider, fake token, and non-box route do not issue or read", () => {

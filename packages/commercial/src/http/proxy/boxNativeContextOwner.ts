@@ -4,10 +4,11 @@ export type BoxNativeContextOwner = typeof BOX_NATIVE_CONTEXT_OWNER;
 export const BOX_NATIVE_CONTEXT_MODEL = "box-api-claude-opus-5-5";
 
 /**
- * Production route-ready projection. Default off.
+ * Source route-ready projection. True lets a verified gate issue the owner
+ * and the limited budget. This is not a deploy, catalog write, or live flag.
  * Callers must pass this constant; request body and process env are not a source.
  */
-export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;
+export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;
 
 /** Real gate fields. `kind` / `profile` are not on ModelAuthorityDecision. */
 export interface BoxNativeContextGate {
@@ -138,7 +139,7 @@ export function selectBoxNativeByteBudget(input: {
 
 /**
  * Read API aligned with ModelAuthorityDecision. Default `routeReady` is the
- * production constant (false). Does not read body or env.
+ * source constant. Does not read body or env.
  * local_catalog never returns the live-chain token.
  */
 export function getBoxNativeContextOwner(

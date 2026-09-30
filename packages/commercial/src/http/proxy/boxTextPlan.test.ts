@@ -4,7 +4,13 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError } from "./boxTextPlan.js";
-import type { ProxyBody } from "./shared.js";
+import { makeBoxToolPlan } from "./boxToolPlan.js";
+import {
+  PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
+  PROXY_BYTE_BUDGET_LEGACY,
+  runWithVerifiedProxyByteBudget,
+  type ProxyBody,
+} from "./shared.js";
 
 const supervisor = readFileSync(new URL("../../../../../scripts/ocv5-289/box_supervisor.py", import.meta.url));
 const keeper = readFileSync(new URL("../../../../../scripts/ocv5-289/box_keeper.py", import.meta.url));
@@ -113,6 +119,46 @@ test("native completed-turn resume stages only current input and keeps one CLI U
   assert.ok(fresh.run.args.includes("--session-id"));
   assert.ok(!fresh.run.args.includes("--no-session-persistence"));
   assert.equal(fresh.run.environment.DISABLE_AUTO_COMPACT, "1");
+  const trustedFresh = runWithVerifiedProxyByteBudget(PROXY_BYTE_BUDGET_BOX_NATIVE_V1, () =>
+    makeBoxTextPlan({ body: body([user("initial")]),
+      upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+      maxOutputTokensLimit: 128_000, nativePersistence: true,
+      runNonce: "d".repeat(24) }));
+  assert.equal(trustedFresh.run.environment.DISABLE_AUTO_COMPACT, "0");
+  const trustedResume = runWithVerifiedProxyByteBudget(PROXY_BYTE_BUDGET_BOX_NATIVE_V1, () =>
+    makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
+      supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
+      nativeResume: { cliCwd, sessionId, expectedSha256: "e".repeat(64) },
+      runNonce: "e".repeat(24) }));
+  assert.equal(trustedResume.run.environment.DISABLE_AUTO_COMPACT, "0");
+  const stillLegacy = runWithVerifiedProxyByteBudget(PROXY_BYTE_BUDGET_LEGACY, () =>
+    makeBoxTextPlan({ body: body([user("initial")]),
+      upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+      maxOutputTokensLimit: 128_000, nativePersistence: true,
+      runNonce: "f".repeat(24) }));
+  assert.equal(stillLegacy.run.environment.DISABLE_AUTO_COMPACT, "1");
+  const nonPersistent = runWithVerifiedProxyByteBudget(PROXY_BYTE_BUDGET_BOX_NATIVE_V1, () =>
+    makeBoxTextPlan({ body: body([user("initial")]),
+      upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+      maxOutputTokensLimit: 128_000, nativePersistence: false,
+      runNonce: "a".repeat(24) }));
+  assert.equal(nonPersistent.run.environment.DISABLE_AUTO_COMPACT, undefined);
+  const virtualMcp = readFileSync(new URL("../../../../../scripts/ocv5-289/box_virtual_mcp.py", import.meta.url));
+  const toolOn = runWithVerifiedProxyByteBudget(PROXY_BYTE_BUDGET_BOX_NATIVE_V1, () =>
+    makeBoxToolPlan({
+      body: { ...body([user("initial")]), tools: [{ name: "take_pending", description: "t", input_schema: { type: "object", properties: {} } }] },
+      upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+      virtualMcpAsset: virtualMcp, maxOutputTokensLimit: 128_000, nativePersistence: true,
+      runNonce: "1".repeat(24),
+    }));
+  assert.equal(toolOn.run.environment.DISABLE_AUTO_COMPACT, "0");
+  const toolOff = makeBoxToolPlan({
+    body: { ...body([user("initial")]), tools: [{ name: "take_pending", description: "t", input_schema: { type: "object", properties: {} } }] },
+    upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
+    virtualMcpAsset: virtualMcp, maxOutputTokensLimit: 128_000, nativePersistence: true,
+    runNonce: "2".repeat(24),
+  });
+  assert.equal(toolOff.run.environment.DISABLE_AUTO_COMPACT, "1");
   const resumed = makeBoxTextPlan({ body: history, upstreamModel: "claude-opus-5",
     supervisorAsset: supervisor, keeperAsset: keeper, maxOutputTokensLimit: 128_000,
     nativeResume: { cliCwd, sessionId, expectedSha256: "e".repeat(64) },
