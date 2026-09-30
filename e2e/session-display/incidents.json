@@ -5156,7 +5156,7 @@
       "occurredAt": "2026-09-29",
       "severity": "P1",
       "symptom": "内层官方 CLI 2.1.280 的 compact_boundary 与紧随的 synthetic summary 被固定 decoder 当成未知记录或工具 echo。本批只让受信 session 的这一对记录不发 SSE、不进 echo、不计本轮 message usage。生产 DISABLE_AUTO_COMPACT=1 未解除，跨层活工具链仍未闭合。",
-      "rootFixCommit": "098ff858f",
+      "rootFixCommit": "098ff858",
       "regressions": [
         {
           "layer": "unit",
