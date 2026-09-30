@@ -1774,11 +1774,22 @@ export class BoxDurableJournal implements BoxJournalPort {
         authority: authorityFromJournalCtx(ctx),
       });
       if (!ownerBound.ok) throw new BoxDurableJournalError(ownerBound.code);
+      const ownerBilling = parseBoxBillingContext(ctx.boxBillingContext);
       const childBilling = parseBoxBillingContext(childCtx.boxBillingContext);
-      if (!childBilling?.sessionId || !childBilling.turnKey) {
+      if (!ownerBilling?.sessionId || !ownerBilling.turnKey
+        || !childBilling?.sessionId || !childBilling.turnKey) {
         throw new BoxDurableJournalError("BOX_TOOL_RESUME_JOURNAL_INVALID");
       }
-      const childBound = trustedIdentitiesBind(preparedIdentity, {
+      // The prepared/owner session above is the native CLI identity. Billing
+      // is frozen from the server dispatch and may use a different UI session.
+      // Bind each namespace independently; null dispatches are exact, not wildcards.
+      if (ownerBilling.turnKey !== preparedIdentity.turnKey
+        || ownerBilling.dispatchId !== childBilling.dispatchId
+        || ownerBilling.attemptNo !== childBilling.attemptNo) {
+        throw new BoxDurableJournalError("BOX_AUTHORITY_REJECTED");
+      }
+      const childBound = trustedIdentitiesBind({ ...preparedIdentity,
+        sessionId: ownerBilling.sessionId }, {
         uid: input.uid, sessionId: childBilling.sessionId,
         canonicalModel: String(childCtx.model ?? ""), turnKey: childBilling.turnKey,
         authority: authorityFromJournalCtx(childCtx),
