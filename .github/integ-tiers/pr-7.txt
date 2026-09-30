@@ -1,0 +1,12 @@
+# PR 门 · 分片 7 —— OCV5-296 idle grow2（同一条活链，未在本轮重跑）
+#
+# R30 记录 grow 1 pass / 约 28min（16 核，name-filter，6 skip，不能当全文件
+# 零 skip，也不是 2 核）。28min 不能证明 2 核会在 30min 内跑完，所以不放进
+# pr-1/2/3，也不把 max-minutes 写成 30。用例自身 timeout=3600000。CI 对本片
+# 把 OC_INTEG_TEST_TIMEOUT_MS 对齐到 3600000。job 90min = 该用例上限 60min
+# 加安装余量，仍然不是 2 核实测，待审定。min-tests=1 只表示注册了 1 个用例，
+# 本轮未测。
+#
+# min-tests: 1
+# max-minutes: 90
+packages/gateway/src/__tests__/idlePipeline.grow2.integ.test.ts

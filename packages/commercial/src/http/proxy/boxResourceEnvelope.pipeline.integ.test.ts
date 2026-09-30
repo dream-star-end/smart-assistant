@@ -1,19 +1,21 @@
 /**
  * OCV5-296 C pipeline proof.
  *
- * Production BOX_NATIVE_CONTEXT_ROUTE_READY stays false. The positive
- * control copies this checkout's commercial sources into an exclusive temp
- * directory and flips only that constant. It does not read a prebuilt
- * candidate tree. Remote Claude argv (plan.run) is not executed; the
- * injected transport runs the real makeBoxTextPlan stage with local Python,
- * then returns a legal SSE terminal. It does not fake HTTP 200.
+ * On and off candidates are unpacked from one `git archive HEAD` of this
+ * checkout. After normalizing the ready literal, commercial source bytes
+ * match except that literal. Product files are not modified and are not
+ * required to be false. The off phases import the off module. Plan bytes
+ * stay the archived bytes (autoCompactSourceUnchanged). Remote Claude argv
+ * (plan.run) is not executed; the injected transport runs the real
+ * makeBoxTextPlan stage with local Python, then returns a legal SSE
+ * terminal. It does not fake HTTP 200. The SSE is synthetic.
  *
  * Default command runs every scenario and does not skip. Set
  * OC_V5_296_PIPELINE_SUBSET=core,seam to omit matrix; omitted phases are
  * reported not-run and are not PASS.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -55,28 +57,103 @@ function phaseOn(name: "core" | "matrix" | "seam"): boolean {
   return SUBSET.has("all") || SUBSET.has(name);
 }
 
+function projectReady(source: string, ready: boolean): string {
+  const want = ready ? READY_TRUE : READY_FALSE;
+  const other = ready ? READY_FALSE : READY_TRUE;
+  const wantCount = source.split(want).length - 1;
+  const otherCount = source.split(other).length - 1;
+  assert.equal(wantCount + otherCount, 1, "official archive owner must contain exactly one ready literal");
+  return otherCount === 1 ? source.replace(other, want) : source;
+}
+
+function maskReady(source: string): string {
+  const token = "export const BOX_NATIVE_CONTEXT_ROUTE_READY = <ready>;";
+  return source.replaceAll(READY_TRUE, token).replaceAll(READY_FALSE, token);
+}
+
+function listFiles(root: string): string[] {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) walk(path);
+      else out.push(path);
+    }
+  };
+  walk(root);
+  return out;
+}
+
 function buildCandidate(): {
   root: string;
+  offRoot: string;
   owner: string;
+  offOwner: string;
+  autoCompactChanged: boolean;
+  autoCompactSourceUnchanged: boolean;
+  archiveOwnerHash: string;
+  onOwnerHash: string;
+  offOwnerHash: string;
   resolution: Record<string, string | boolean>;
 } {
   const root = mkdtempOwned();
+  const offRoot = mkdtempOwned();
   try {
-  const dest = join(root, "packages/commercial");
-  mkdirSync(dest, { recursive: true });
-  cpSync(join(CHECKOUT_COMMERCIAL, "package.json"), join(dest, "package.json"));
-  cpSync(join(CHECKOUT_COMMERCIAL, "src"), join(dest, "src"), { recursive: true });
-  const owner = join(dest, "src/http/proxy/boxNativeContextOwner.ts");
-  const product = readFileSync(join(CHECKOUT_PROXY, "boxNativeContextOwner.ts"), "utf8");
-  const copied = readFileSync(owner, "utf8");
-  assert.equal(copied, product);
-  assert.equal(copied.split(READY_FALSE).length, 2);
-  writeFileSync(owner, copied.replace(READY_FALSE, READY_TRUE));
+  const archived = spawnSync("git", [
+    "-c", `safe.directory=${CHECKOUT_ROOT}`,
+    "-C", CHECKOUT_ROOT,
+    "archive", "--format=tar", "HEAD",
+    "packages/commercial/package.json",
+    "packages/commercial/src",
+  ], { maxBuffer: 256 * 1024 * 1024 });
+  assert.equal(archived.status, 0, archived.stderr?.toString("utf8").slice(0, 500) || "git archive failed");
+  for (const dest of [root, offRoot]) {
+    const unpacked = spawnSync("tar", ["-x", "-C", dest], { input: archived.stdout });
+    assert.equal(unpacked.status, 0, unpacked.stderr?.toString("utf8").slice(0, 500) || "tar extract failed");
+  }
+  const ownerRel = "packages/commercial/src/http/proxy/boxNativeContextOwner.ts";
+  const planRel = "packages/commercial/src/http/proxy/boxTextPlan.ts";
+  const productOwnerPath = join(CHECKOUT_PROXY, "boxNativeContextOwner.ts");
+  const productPlanPath = join(CHECKOUT_PROXY, "boxTextPlan.ts");
+  const productOwnerBefore = readFileSync(productOwnerPath);
+  const productPlanBefore = readFileSync(productPlanPath);
+  const officialOwner = readFileSync(join(root, ownerRel), "utf8");
+  const officialPlan = readFileSync(join(root, planRel), "utf8");
+  assert.equal(readFileSync(join(offRoot, ownerRel), "utf8"), officialOwner);
+  assert.equal(readFileSync(join(offRoot, planRel), "utf8"), officialPlan);
+  const onOwnerText = projectReady(officialOwner, true);
+  const offOwnerText = projectReady(officialOwner, false);
+  assert.equal(maskReady(onOwnerText), maskReady(offOwnerText));
+  assert.equal(maskReady(onOwnerText), maskReady(officialOwner));
+  assert.notEqual(onOwnerText, offOwnerText);
+  const owner = join(root, ownerRel);
+  const offOwner = join(offRoot, ownerRel);
+  writeFileSync(owner, onOwnerText);
+  writeFileSync(offOwner, offOwnerText);
+  const diffs: string[] = [];
+  const onBase = join(root, "packages/commercial");
+  const offBase = join(offRoot, "packages/commercial");
+  for (const file of listFiles(onBase)) {
+    const rel = file.slice(onBase.length + 1);
+    const other = join(offBase, rel);
+    assert.equal(existsSync(other), true, rel);
+    if (!readFileSync(file).equals(readFileSync(other))) diffs.push(rel);
+  }
+  diffs.sort();
+  assert.deepEqual(diffs, ["src/http/proxy/boxNativeContextOwner.ts"]);
+  const onPlan = readFileSync(join(root, planRel), "utf8");
+  const offPlan = readFileSync(join(offRoot, planRel), "utf8");
+  const autoCompactSourceUnchanged = onPlan === officialPlan && offPlan === officialPlan;
+  assert.equal(autoCompactSourceUnchanged, true);
+  assert.equal(readFileSync(productOwnerPath).equals(productOwnerBefore), true);
+  assert.equal(readFileSync(productPlanPath).equals(productPlanBefore), true);
   const nodeModules = join(CHECKOUT_ROOT, "node_modules");
   assert.equal(existsSync(join(nodeModules, "pg")), true, "checkout lock is missing pg");
-  symlinkSync(nodeModules, join(root, "node_modules"));
-  assert.equal(lstatSync(join(root, "node_modules")).isSymbolicLink(), true);
-  const requireFrom = createRequire(join(dest, "package.json"));
+  for (const dest of [root, offRoot]) {
+    symlinkSync(nodeModules, join(dest, "node_modules"));
+    assert.equal(lstatSync(join(dest, "node_modules")).isSymbolicLink(), true);
+  }
+  const requireFrom = createRequire(join(root, "packages/commercial/package.json"));
   const protocol = realpathSync(requireFrom.resolve("@openclaude/protocol"));
   const pgPath = realpathSync(requireFrom.resolve("pg"));
   const ioredis = realpathSync(requireFrom.resolve("ioredis"));
@@ -85,6 +162,9 @@ function buildCandidate(): {
   assert.equal(protocol.startsWith(`${checkoutReal}/packages/protocol`), true, protocol);
   assert.equal(commercialEntry, realpathSync(join(root, "packages/commercial/src/index.ts")));
   assert.notEqual(commercialEntry, realpathSync(join(CHECKOUT_COMMERCIAL, "src/index.ts")));
+  const offEntry = realpathSync(createRequire(join(offRoot, "packages/commercial/package.json")).resolve("@openclaude/commercial"));
+  assert.equal(offEntry, realpathSync(join(offRoot, "packages/commercial/src/index.ts")));
+  assert.notEqual(offEntry, commercialEntry);
   const linkedPg = realpathSync(join(nodeModules, "pg"));
   const linkedIoredis = realpathSync(join(nodeModules, "ioredis"));
   assert.equal(pgPath.startsWith(`${linkedPg}/`), true, pgPath);
@@ -93,24 +173,35 @@ function buildCandidate(): {
   assert.equal(ioredis.includes(`${root}/`), false);
   return {
     root,
+    offRoot,
     owner,
+    offOwner,
+    autoCompactChanged: false,
+    autoCompactSourceUnchanged,
+    archiveOwnerHash: createHash("sha256").update(officialOwner).digest("hex"),
+    onOwnerHash: createHash("sha256").update(onOwnerText).digest("hex"),
+    offOwnerHash: createHash("sha256").update(offOwnerText).digest("hex"),
     resolution: {
       candidateRoot: root,
+      offRoot,
       checkoutRoot: checkoutReal,
-      sourceCommercial: realpathSync(CHECKOUT_COMMERCIAL),
+      source: "git-archive-HEAD",
       protocol,
       pg: pgPath,
       pgPackage: linkedPg,
       ioredis,
       ioredisPackage: linkedIoredis,
       commercialEntry,
+      offEntry,
       commercialEntryIsOwnedCopy: true,
+      offEntryIsOwnedCopy: true,
       nodeModulesIsSymlinkToCheckoutLock: true,
-      readyFlippedOnlyInCandidateCopy: true,
+      readyLiteralOnlyBetweenOnAndOff: true,
     },
   };
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
+    rmSync(offRoot, { recursive: true, force: true });
     throw error;
   }
 }
@@ -444,22 +535,19 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
   assert.equal(/^[a-z0-9_]+$/.test(SCHEMA), true);
   const built = buildCandidate();
   const candidateRoot = built.root;
-  const productOwner = readFileSync(new URL(`./boxNativeContextOwner.ts`, import.meta.url), "utf8");
-  const candidateOwner = readFileSync(built.owner, "utf8");
-  assert.equal(productOwner.includes(READY_FALSE), true);
-  assert.equal(candidateOwner.replace(READY_TRUE, READY_FALSE), productOwner);
-  const productHash = createHash("sha256").update(productOwner).digest("hex");
-  const candidateHash = createHash("sha256").update(candidateOwner).digest("hex");
+  const offRoot = built.offRoot;
 
-  const productMod = await import("./index.js");
-  const productOwnerMod = await import("./boxNativeContextOwner.js");
   const candidateMod = await import(join(candidateRoot, "packages/commercial/src/http/proxy/index.ts"));
   const candidateOwnerMod = await import(join(candidateRoot, "packages/commercial/src/http/proxy/boxNativeContextOwner.ts"));
   const candidatePlan = await import(join(candidateRoot, "packages/commercial/src/http/proxy/boxTextPlan.ts"));
   const candidateDb = await import(join(candidateRoot, "packages/commercial/src/db/index.ts"));
   const candidatePre = await import(join(candidateRoot, "packages/commercial/src/billing/preCheck.ts"));
-  assert.equal(productOwnerMod.BOX_NATIVE_CONTEXT_ROUTE_READY, false);
+  const offMod = await import(join(offRoot, "packages/commercial/src/http/proxy/index.ts"));
+  const offOwnerMod = await import(join(offRoot, "packages/commercial/src/http/proxy/boxNativeContextOwner.ts"));
+  const offDb = await import(join(offRoot, "packages/commercial/src/db/index.ts"));
+  assert.equal(offOwnerMod.BOX_NATIVE_CONTEXT_ROUTE_READY, false);
   assert.equal(candidateOwnerMod.BOX_NATIVE_CONTEXT_ROUTE_READY, true);
+  assert.notEqual(offOwnerMod, candidateOwnerMod);
 
   const admin = new pg.Pool({ connectionString: TEST_DB, max: 1, application_name: "ocv5-296-c-admin" });
   const pool = new pg.Pool({
@@ -546,6 +634,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
     await redis.del("precheck:u:{3}:locks", "precheck:u:{3}:amounts");
 
     candidateDb.setPoolOverride(pool);
+    offDb.setPoolOverride(pool);
     const billingRedis = candidatePre.wrapIoredisForPreCheck(redis);
     const makeDeps = (fetchImpl: (args: Record<string, unknown>) => Promise<Response>, opts: { canUse?: boolean; apiKey?: boolean } = {}) => ({
       pgPool: pool,
@@ -581,17 +670,17 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
 
     const authority = signAuthority();
     const lease = signLease();
-    let productFetches = 0;
-    const productHandler = productMod.makeAnthropicProxyHandler(makeDeps(async () => {
-      productFetches += 1;
-      throw new Error("product-fetch");
+    let offFetches = 0;
+    const offHandler = offMod.makeAnthropicProxyHandler(makeDeps(async () => {
+      offFetches += 1;
+      throw new Error("off-fetch");
     }) as never);
-    const readyOff = await call(productHandler, history64(), { "x-request-id": "ocv5-296-ready-off", "x-oc-model-authority": authority }, async () => { throw new Error("unused"); });
+    const readyOff = await call(offHandler, history64(), { "x-request-id": "ocv5-296-ready-off", "x-oc-model-authority": authority }, async () => { throw new Error("unused"); });
     const readyOffJournal = await pool.query("SELECT count(*)::int AS n FROM request_finalize_journal WHERE request_id = 'ocv5-296-ready-off'");
-    phases.push({ phase: "ready-off-64", ...readyOff, fetches: productFetches, journal: readyOffJournal.rows[0].n });
+    phases.push({ phase: "ready-off-64", ...readyOff, fetches: offFetches, journal: readyOffJournal.rows[0].n });
     assert.equal(readyOff.status, 413);
     assert.equal(readyOff.code, "BODY_FIELD_TOO_LARGE");
-    assert.equal(productFetches, 0);
+    assert.equal(offFetches, 0);
     assert.equal(readyOffJournal.rows[0].n, 0);
 
     let leaseFetches = 0;
@@ -771,7 +860,7 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
         { id: "local-projection", status: 409, run: () => call(localHandler, small, { "x-request-id": "ocv5-296-local-projection", [LOCAL_CATALOG_HEADER]: localToken({ projectionRevision: "e".repeat(64) }) }, async () => { throw new Error("unused"); }) },
         { id: "local-revoked", status: 403, run: () => call(candidateMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("revoked-fetch"); }, { canUse: false }) as never), small, { "x-request-id": "ocv5-296-local-revoked", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
         { id: "local-apikey", status: 413, run: () => call(candidateMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("apikey-fetch"); }, { apiKey: true }) as never), history64(), { "x-request-id": "ocv5-296-local-apikey", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
-        { id: "local-ready-off", status: 413, run: () => call(productMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("ready-fetch"); }) as never), history64(), { "x-request-id": "ocv5-296-local-ready-off", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
+        { id: "local-ready-off", status: 413, run: () => call(offMod.makeAnthropicProxyHandler(makeDeps(async () => { throw new Error("ready-fetch"); }) as never), history64(), { "x-request-id": "ocv5-296-local-ready-off", [LOCAL_CATALOG_HEADER]: localToken() }, async () => { throw new Error("unused"); }) },
       ];
       for (const item of negativeCases) {
         const hit = await item.run();
@@ -859,17 +948,20 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
 
     const redisLeft = await redis.exists("precheck:u:{3}:locks", "precheck:u:{3}:amounts");
     const report = {
-      source: "checkout-copy",
+      source: "git-archive-HEAD",
       groups: { core: "ran", matrix: phaseOn("matrix") ? "ran" : "not-run", seam: phaseOn("seam") ? "ran" : "not-run" },
       schema: SCHEMA,
       database: "openclaude_test",
       port: 55432,
       redis: "127.0.0.1:56379 db 14",
       subset: [...SUBSET],
-      productReadyHash: productHash,
-      candidateReadyHash: candidateHash,
-      candidateDiff: "BOX_NATIVE_CONTEXT_ROUTE_READY false -> true",
-      autoCompactChanged: false,
+      archiveOwnerHash: built.archiveOwnerHash,
+      onOwnerHash: built.onOwnerHash,
+      offOwnerHash: built.offOwnerHash,
+      offModuleReady: offOwnerMod.BOX_NATIVE_CONTEXT_ROUTE_READY,
+      candidateDiff: "ready literal only",
+      autoCompactChanged: built.autoCompactChanged,
+      autoCompactSourceUnchanged: built.autoCompactSourceUnchanged,
       redisClientInfoHasDb: typeof redisDb === "string" ? redisDb.includes("db=15") : null,
       redisKeysRemaining: redisLeft,
       resolution: built.resolution,
@@ -901,7 +993,9 @@ test("checkout candidate admits 64x128KiB; ready-off and lease-only stay legacy"
     await fail("drop-schema", () => admin.query(`DROP SCHEMA IF EXISTS ${SCHEMA} CASCADE`));
     await fail("admin-end", () => admin.end());
     await fail("candidate-rm", () => { rmSync(candidateRoot, { recursive: true, force: true }); });
+    await fail("off-rm", () => { rmSync(offRoot, { recursive: true, force: true }); });
     if (existsSync(candidateRoot)) cleanupErrors.push("candidate-rm: directory still exists");
+    if (existsSync(offRoot)) cleanupErrors.push("off-rm: directory still exists");
     if (!existsSync(join(CHECKOUT_ROOT, "node_modules/pg"))) cleanupErrors.push("checkout pg missing after cleanup");
     if (cleanupErrors.length > 0) throw new Error(cleanupErrors.join("; "));
   }

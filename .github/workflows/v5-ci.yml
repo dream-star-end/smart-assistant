@@ -351,12 +351,22 @@ jobs:
           # timeout 与 .github/integ-tiers/<shard>.txt 的 max-minutes 对齐。
           # 本机(16 核)实测:pr-1 16.5min / pr-2 6.0min / pr-3 4.3min。
           # 2 核 runner 更慢,pr-1 是长杆 —— 超预算就**拆片**,不要调大这里。
+          # pr-1/2/3 的 timeout 保持原值。下面新片的 timeout 对齐各自
+          # integ-tiers max-minutes，且都不是 2 核实测（见清单头注释，待审定）。
           - shard: pr-1
             timeout: 30
           - shard: pr-2
             timeout: 20
           - shard: pr-3
             timeout: 20
+          - shard: pr-4
+            timeout: 20
+          - shard: pr-5
+            timeout: 70
+          - shard: pr-6
+            timeout: 40
+          - shard: pr-7
+            timeout: 90
 
     # 2026-07-26 门禁审计:110 个 *.integ.test.ts / 1549 个用例在 CI、deploy、
     # playbook 三处都不跑,而单测层白纸黑字把"SQL 真行为"delegate 给它们
@@ -411,6 +421,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Setup Bun
+        if: contains(fromJSON('["pr-4","pr-5","pr-6","pr-7"]'), matrix.shard)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install CCB from lockfile
+        if: contains(fromJSON('["pr-4","pr-5","pr-6","pr-7"]'), matrix.shard)
+        working-directory: claude-code-best
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Prepare idle box project directory
+        if: contains(fromJSON('["pr-5","pr-6","pr-7"]'), matrix.shard)
+        run: sudo mkdir -p /home/box/.claude/projects
+
       - name: Tier manifest drift gate
         # 清单是判绿下界的权威;先证明它跟磁盘一致,再谈跑没跑。
         run: npm run lint:integ-tiers
@@ -446,14 +471,35 @@ jobs:
         env:
           TAP_OUT: commercial-integ-${{ matrix.shard }}.tap
         run: |
-          sudo env \
-            "PATH=$PATH" \
-            "CI=$CI" \
-            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
-            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
-            "TEST_REDIS_URL=$TEST_REDIS_URL" \
-            "TAP_OUT=$TAP_OUT" \
-            npm run test:commercial:integ:shard -- '${{ matrix.shard }}'
+          set -euo pipefail
+          pass=(
+            "PATH=$PATH"
+            "CI=$CI"
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB"
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL"
+            "TEST_REDIS_URL=$TEST_REDIS_URL"
+            "TAP_OUT=$TAP_OUT"
+          )
+          # 父测试 --test-timeout 不会被子用例 timeout 抬高。只给新长片对齐
+          # 已声明的用例超时；pr-1/2/3 仍走 gate 默认 180000。G1–G4 不改。
+          case '${{ matrix.shard }}' in
+            pr-4)
+              pass+=("BUN_BIN=$(command -v bun)")
+              ;;
+            pr-5)
+              pass+=("BUN_BIN=$(command -v bun)")
+              pass+=("OC_INTEG_TEST_TIMEOUT_MS=3000000")
+              ;;
+            pr-6)
+              pass+=("BUN_BIN=$(command -v bun)")
+              pass+=("OC_INTEG_TEST_TIMEOUT_MS=1200000")
+              ;;
+            pr-7)
+              pass+=("BUN_BIN=$(command -v bun)")
+              pass+=("OC_INTEG_TEST_TIMEOUT_MS=3600000")
+              ;;
+          esac
+          sudo env "${pass[@]}" npm run test:commercial:integ:shard -- '${{ matrix.shard }}'
 
       - name: Upload TAP output
         if: always()

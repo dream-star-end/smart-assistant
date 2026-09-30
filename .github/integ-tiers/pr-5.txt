@@ -1,0 +1,15 @@
+# PR 门 · 分片 5 —— OCV5-296 idle 其余 5 例（不含 grow2/seam）
+#
+# short / fresh / live2 / localAuth / barriers 仍在同一文件、同一清理语义。
+# grow2 与 seam 拆到 pr-7 / pr-6，避免一条活链被 name filter 跳过。
+#
+# 文件级 --test-timeout 默认 180000 是父测试超时，不会被子用例 timeout 抬高。
+# 2026-09-30 宿主 16 核 / node 20 完整零 skip：tests 5 / pass 5 / fail 0 / skipped 0，
+# 用例时长合计 615136ms（short 131s、fresh 149s、live2 48s、localAuth 104s、barriers 182s），
+# 墙钟约 625s。短于 180s 的默认父超时会在第二例之前掐断，所以 CI 只对本片设置
+# OC_INTEG_TEST_TIMEOUT_MS=3000000（五个声明超时之和），不改 gate 默认，不改 G1–G4。
+# max-minutes 70 = 该父超时加安装余量，不是 2 核实测，待审定。不把本片写成 30 分钟能跑完。
+#
+# min-tests: 5
+# max-minutes: 70
+packages/gateway/src/__tests__/idlePipeline.integ.test.ts
