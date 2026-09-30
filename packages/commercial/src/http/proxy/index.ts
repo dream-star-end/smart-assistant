@@ -50,7 +50,7 @@ import {
   type VerificationSponsorshipSnapshot,
 } from "../../billing/verificationSponsorship.js";
 import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
-import { checkRateLimit } from "../../middleware/rateLimit.js";
+import { checkRateLimit, type RateLimitConfig } from "../../middleware/rateLimit.js";
 import {
   UnroutableProviderError,
   checkCapabilityWithinCeiling,
@@ -298,9 +298,24 @@ export function makeAnthropicProxyHandler(
   // 2026-04-21 安全审计 HIGH#3:Redis 抖动时的兜底限流(cap = Redis cap 的 1/3,
   // 向下取整至少 1;窗口同 Redis 以便行为连续)。Redis 正常时这个 map 始终空,
   // 不占资源;Redis 异常时它是最后一道防线。
-  const fallbackCap = Math.max(1, Math.floor(rateLimitCfg.max / 3));
+  // OCV5-297: with a Box rate configured, the pre-body check is only a coarse
+  // ceiling (shared + Box). After route selection each class is counted on
+  // its own key so general traffic cannot consume the Box budget and vice
+  // versa. Without a Box rate this is exactly the previous single check.
+  const boxRateCfg = deps.boxRateLimit;
+  const preReadRateCfg: RateLimitConfig = boxRateCfg
+    ? { ...rateLimitCfg, max: rateLimitCfg.max + boxRateCfg.max } : rateLimitCfg;
+  const generalRateCfg: RateLimitConfig = { ...rateLimitCfg, scope: `${rateLimitCfg.scope}_general` };
+  const fallbackCap = Math.max(1, Math.floor(preReadRateCfg.max / 3));
   const fallbackLimiter = deps.fallbackLimiter
-    ?? new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
+    ?? new FallbackRateLimiter(preReadRateCfg.windowSeconds, fallbackCap);
+  const boxFallbackLimiter = boxRateCfg
+    ? new FallbackRateLimiter(boxRateCfg.windowSeconds, Math.max(1, Math.floor(boxRateCfg.max / 3)))
+    : null;
+  const generalFallbackLimiter = boxRateCfg
+    ? new FallbackRateLimiter(rateLimitCfg.windowSeconds, Math.max(1, Math.floor(rateLimitCfg.max / 3)))
+    : null;
+  const boxConcurrency = deps.boxConcurrencyLimiter;
   // count_tokens stays on the legacy 16 MiB cap. /v1/messages may buffer the
   // fixed 24 MiB ceiling before signature, then subdivides. An explicit
   // deps.maxBodyBytes never raises the ceiling above 24 MiB.
@@ -403,7 +418,7 @@ export function makeAnthropicProxyHandler(
     try {
       const decision = await checkRateLimit(
         deps.rateLimitRedis,
-        rateLimitCfg,
+        preReadRateCfg,
         `uid:${uid.toString()}`,
       );
       if (!decision.allowed) {
@@ -437,20 +452,43 @@ export function makeAnthropicProxyHandler(
           "RATE_LIMITED",
           "rate limit fallback engaged (redis degraded)",
           requestId,
-          { "Retry-After": String(rateLimitCfg.windowSeconds) },
+          { "Retry-After": String(preReadRateCfg.windowSeconds) },
         );
         return;
       }
     }
 
+    /** Post-route class rate check. Returns false after sending 429. */
+    const passClassRate = async (cfg: RateLimitConfig,
+      fallback: FallbackRateLimiter, label: string): Promise<boolean> => {
+      try {
+        const decision = await checkRateLimit(deps.rateLimitRedis, cfg, `uid:${uid.toString()}`);
+        if (decision.allowed) return true;
+        userLog.warn("proxy_rate_limited", { count: decision.count, class: label });
+        incrAnthropicProxyReject("rate_limited");
+        sendJsonError(res, 429, "RATE_LIMITED", "too many requests, slow down", requestId,
+          { "Retry-After": String(decision.retryAfterSeconds) });
+        return false;
+      } catch (err) {
+        userLog.error("proxy_rate_limit_redis_failed", { err: errSummary(err), class: label });
+        if (fallback.tryAcquire(`uid:${uid.toString()}`)) return true;
+        incrAnthropicProxyReject("rate_limited");
+        sendJsonError(res, 429, "RATE_LIMITED", "rate limit fallback engaged (redis degraded)",
+          requestId, { "Retry-After": String(cfg.windowSeconds) });
+        return false;
+      }
+    };
+
     // 3) per-uid 并发上限
-    const releaseSlot = concurrency.acquire(`uid:${uid.toString()}`);
-    if (!releaseSlot) {
+    // Replaced by the Box pool slot once the route is known to be Box.
+    const sharedSlot = concurrency.acquire(`uid:${uid.toString()}`);
+    if (!sharedSlot) {
       userLog.warn("proxy_concurrency_full", { max: deps.maxConcurrentPerUid ?? DEFAULT_MAX_CONCURRENT_PER_UID });
       incrAnthropicProxyReject("concurrency");
       sendJsonError(res, 429, "CONCURRENT_LIMIT", "too many concurrent requests", requestId);
       return;
     }
+    let releaseSlot: () => void = sharedSlot;
 
     try {
       // 4) 读 + parse + 校验 body.
@@ -852,6 +890,26 @@ export function makeAnthropicProxyHandler(
         ? PROXY_BYTE_BUDGET_BOX_NATIVE_V1
         : PROXY_BYTE_BUDGET_LEGACY;
       if (deferLegacyUntilVerifiedBox && rejectOverBudget(byteBudget)) return;
+      // OCV5-297: a Box request holds its slot for the whole remote run, so it
+      // moves from the shared per-uid pool (sized for short requests) to the
+      // Box pool. Without an injected Box pool nothing changes.
+      if (route.kind === "box" && boxConcurrency) {
+        const releaseBox = boxConcurrency.acquire(`box:uid:${uid.toString()}`);
+        if (!releaseBox) {
+          userLog.warn("proxy_box_concurrency_full", { max: boxConcurrency.maxPerKey });
+          incrAnthropicProxyReject("concurrency");
+          sendJsonError(res, 429, "CONCURRENT_LIMIT", "too many concurrent requests", requestId);
+          return;
+        }
+        releaseSlot();
+        releaseSlot = releaseBox;
+      }
+      if (boxRateCfg && boxFallbackLimiter && generalFallbackLimiter) {
+        const passed = route.kind === "box"
+          ? await passClassRate(boxRateCfg, boxFallbackLimiter, "box")
+          : await passClassRate(generalRateCfg, generalFallbackLimiter, "general");
+        if (!passed) return;
+      }
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A
       // disabled Box launch flag does not erase already completed capsules.

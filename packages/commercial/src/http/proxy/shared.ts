@@ -1646,6 +1646,13 @@ export interface AnthropicProxyDeps {
    * concurrencyLimiter.
    */
   fallbackLimiter?: FallbackRateLimiter;
+  /** OCV5-297: per-uid pool for Box-routed requests (from BoxCapacityPolicy).
+   * A Box request moves from the shared slot to this pool once the route is
+   * known. Omitted → Box stays on the shared per-uid pool (commercial). */
+  boxConcurrencyLimiter?: ConcurrencyLimiter;
+  /** OCV5-297: Box-route rate limit, counted on its own key after routing.
+   * Omitted → single shared rate limit, unchanged. */
+  boxRateLimit?: RateLimitConfig;
   /** identity authorize 与 model-authority gate 共用的 epoch-aware 权威加载器。 */
   loadUserModelAuthz: import("../../auth/userModelAuthz.js").UserModelAuthzLoader;
   rateLimitRedis: RateLimitRedis;
