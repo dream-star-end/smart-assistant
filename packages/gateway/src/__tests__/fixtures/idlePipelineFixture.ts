@@ -1107,6 +1107,9 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         };
       });
       report.compactSuccessNotClaimed = true;
+      // HTTP/native completion precedes billing COMMIT; read only after both exact requests settle.
+      await waitForCommitted(admin, SCHEMA, sourceHit.requestId!);
+      await waitForCommitted(admin, SCHEMA, idleHit.requestId!);
       const usage = await pool.query<{ request_id: string; authority_kind: string | null; projection_revision: string | null; security_epoch: string | null; turn_key: string | null }>(
         `SELECT request_id, authority_kind, projection_revision, security_epoch::text AS security_epoch, turn_key
            FROM usage_records WHERE request_id = $1 OR request_id = $2`,
