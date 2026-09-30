@@ -56,10 +56,11 @@ export interface IdleOp {
    * never saw it after the grace window, or an operator reset replaced the
    * native session). Both settle the op. */
   disposition?: 'short' | 'abandoned'
-  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'operator_reset' | 'source_gone'
-  /** Epoch ms when this process's idle CCB turn ended without a result
-   * (timeout, crash or error). After that no new compact request can be sent. */
-  idleStoppedAt?: number
+  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'operator_reset'
+  /** Epoch ms when this process shut the CCB runner down after its idle turn
+   * ended without a result (shutdown() returned). From then on that child
+   * cannot send a compact request. */
+  runnerKilledAt?: number
 }
 
 export function idleUuid(opId: string, role: string): string {
@@ -363,8 +364,8 @@ export function advanceIdleOp(input: {
 
 // ── OCV5-297: dispatch gate, abandonment, rotation, operator reset ─────────
 
-/** After the idle CCB turn ended, egress must have seen any request it sent
- * within this window; a later `not_found` proves nothing was sent. */
+/** After the idle CCB runner was shut down, egress must have seen any
+ * request it sent within this window; a later `not_found` proves nothing was. */
 export const IDLE_STOPPED_GRACE_MS = 120_000
 /** Settled op files kept per session (newest by mtime). */
 export const IDLE_OPS_KEEP = 3
@@ -393,8 +394,8 @@ export function idleAbandonReason(op: IdleOp, idleProof: IdleProofResponse,
   now: number = Date.now()): IdleOp['abandonReason'] | undefined {
   if (idleOpSettled(op) || op.summaryText) return undefined
   if (idleProof.status === 'failed') return 'idle_turn_failed'
-  if (idleProof.status === 'not_found' && typeof op.idleStoppedAt === 'number'
-    && now - op.idleStoppedAt >= IDLE_STOPPED_GRACE_MS) return 'idle_turn_never_sent'
+  if (idleProof.status === 'not_found' && typeof op.runnerKilledAt === 'number'
+    && now - op.runnerKilledAt >= IDLE_STOPPED_GRACE_MS) return 'idle_turn_never_sent'
   return undefined
 }
 

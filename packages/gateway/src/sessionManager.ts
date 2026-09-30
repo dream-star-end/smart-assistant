@@ -71,13 +71,14 @@ const IDLE_DRAIN_RETRY_MS = 30_000
 
 // OCV5-297 idle helpers: module level so finishIdleUnderLock needs no `this` state.
 /** Source proof is gone but an op is unfinished: only its own idle-turn
- * evidence may settle it. Never dispatches. */
+ * evidence (egress failed, or runner shut down + unseen past grace) settles
+ * it. Never dispatches. */
 async function settleStrandedIdleOp(session: AgentSession, op: IdleOp, recoveryDir: string): Promise<void> {
   if (op.summaryText || readIdleNative(recoveryDir, op.sourceSessionId, op.revision)?.summaryText) return
   const idleProof = await fetchBoxIdleProof({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey })
+  // Same authoritative evidence as a live op; a missing native file alone
+  // does not prove nothing was sent. Otherwise only the operator reset exits.
   const reason = idleAbandonReason(op, idleProof)
-    ?? (idleProof.status === 'not_found' && !readIdleNative(recoveryDir, op.sourceSessionId, op.revision)
-      ? 'source_gone' : undefined)
   if (!reason) return
   log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason })
   writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: reason })
@@ -4778,13 +4779,6 @@ export class SessionManager {
     const summaryProof = await fetchBoxIdleProof({
       sessionId: source.sessionId, turnKey: op.idleTurnKey,
     })
-    if (!started.ownedDispatch && op.idleStoppedAt === undefined && summaryProof.status === 'not_found') {
-      // We hold session.lock and are not running an idle turn, so no idle CCB
-      // turn of this op is alive in this process (a previous process's child
-      // died with it). Start the grace clock now; never a dispatch.
-      op = { ...op, idleStoppedAt: Date.now() }
-      writeIdleOp(recoveryDir, op)
-    }
     const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
     if (abandon) {
       log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason: abandon })
@@ -4888,14 +4882,20 @@ export class SessionManager {
           clearIdleCandidate(recoveryDir, session.sessionKey)
         }
       } catch (idleErr) {
-        // Timeout, crash or error: this CCB idle turn is over (timeout also
-        // interrupts and, if needed, shuts the child down). Record when, so a
-        // later `not_found` past the grace window can prove nothing was sent.
-        // Never a result and never a re-dispatch (ownedDispatch is one-shot).
-        step = { ...step, op: { ...step.op, idleStoppedAt: Date.now() } }
+        // Timeout, crash or error: never a result and never a re-dispatch
+        // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
+        // runner is recorded as evidence that it can no longer send the
+        // compact request; a later `not_found` past the grace window then
+        // proves nothing was sent. Without it the op waits for egress proof
+        // or the operator reset.
+        let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
+        if (!killed && typeof session.runner.shutdown === 'function') {
+          killed = await session.runner.shutdown().then(() => true, () => false)
+        }
+        if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
         log.warn('box idle turn ended without result', {
           sessionKey: session.sessionKey, revision: step.op.revision,
-          timeout: idleErr instanceof IdleTurnTimeoutError, killed: idleErr instanceof IdleTurnTimeoutError && idleErr.killed,
+          timeout: idleErr instanceof IdleTurnTimeoutError, runnerKilled: killed,
         }, idleErr)
       } finally {
         session._idleRunning = false
@@ -4907,12 +4907,18 @@ export class SessionManager {
 
   /**
    * Run durable idle work after the user turn released session.lock. Queued
-   * behind the lock like recycle; while running it is counted as an internal
-   * turn (not a client turn and not _activeTurnCount, so the prompt-queue
-   * admission invariant is untouched). Rereads disk state under the lock, so a
-   * submit that took the lock first has already handled or superseded it.
+   * behind the lock like recycle; from scheduling to release it is counted as
+   * an internal turn (not a client turn and not _activeTurnCount, so the
+   * prompt-queue admission invariant is untouched). Rereads disk state under
+   * the lock, so a submit that took the lock first has already handled or
+   * superseded it.
    */
   private scheduleIdleDrain(session: AgentSession, attempt = 0): void {
+    // Counted from the moment the drain joins the lock chain (like submit()
+    // counts _activeTurnCount before `await prev`) until it releases, so
+    // recycle / model switch / preheat never see this runner as idle while a
+    // drain is waiting, reading proof, or running the idle turn.
+    session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
     void (async () => {
       const prev = session.lock
       let release!: () => void
@@ -4932,6 +4938,7 @@ export class SessionManager {
           log.warn('idle background drain failed', { sessionKey: session.sessionKey }, err)
         }
       } finally {
+        session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
         release()
       }
       if (again && attempt < IDLE_DRAIN_RETRIES) {

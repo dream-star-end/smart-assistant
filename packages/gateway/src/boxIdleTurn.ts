@@ -6,8 +6,9 @@ export const BOX_IDLE_TURN_TIMEOUT_MS = 180_000
 /** After interrupt, how long the child may take to stop before it is shut down. */
 export const BOX_IDLE_TURN_KILL_GRACE_MS = 5_000
 
-/** The idle turn ran out of time. `killed` = the CCB child was shut down, so
- * it can no longer send the compact request. Timeout never proves a result. */
+/** The idle turn ran out of time. The CCB child is always shut down after
+ * the interrupt grace, so `killed` is true once shutdown() returned: the
+ * child can no longer send a compact request. Timeout never proves a result. */
 export class IdleTurnTimeoutError extends Error {
   constructor(readonly killed: boolean) {
     super('IDLE_TURN_TIMEOUT')
@@ -72,12 +73,11 @@ export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams,
     const first = await within(run.summary, timeoutMs)
     if (first === TIMEOUT) {
       runner.interrupt('system')
-      const late = await within(run.summary, killGraceMs)
-      let killed = false
-      if (late === TIMEOUT) {
-        killed = true
-        await runner.shutdown().catch(() => {})
-      }
+      await within(run.summary, killGraceMs)
+      // A turn that stopped on interrupt is not proof the child stopped
+      // sending: shut it down unconditionally before reporting.
+      let killed = true
+      await runner.shutdown().catch(() => { killed = false })
       // An interrupted or late result is never treated as the compact result;
       // an exit caused by the shutdown is reported as this timeout.
       throw new IdleTurnTimeoutError(killed)

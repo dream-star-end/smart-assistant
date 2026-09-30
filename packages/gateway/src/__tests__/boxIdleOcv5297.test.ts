@@ -121,11 +121,11 @@ describe('dispatch gate and authoritative abandonment (pure)', () => {
     assert.equal(idleAbandonReason(op(), { status: 'failed', sessionId, turnKey: 'ff'.repeat(32), requestIds: ['x'] }, now),
       'idle_turn_failed')
     assert.equal(idleAbandonReason(op(), { status: 'not_found' }, now), undefined, 'no stop evidence')
-    assert.equal(idleAbandonReason(op({ idleStoppedAt: now - IDLE_STOPPED_GRACE_MS + 1 }), { status: 'not_found' }, now),
+    assert.equal(idleAbandonReason(op({ runnerKilledAt: now - IDLE_STOPPED_GRACE_MS + 1 }), { status: 'not_found' }, now),
       undefined, 'inside grace')
-    assert.equal(idleAbandonReason(op({ idleStoppedAt: now - IDLE_STOPPED_GRACE_MS }), { status: 'not_found' }, now),
+    assert.equal(idleAbandonReason(op({ runnerKilledAt: now - IDLE_STOPPED_GRACE_MS }), { status: 'not_found' }, now),
       'idle_turn_never_sent')
-    assert.equal(idleAbandonReason(op({ idleStoppedAt: 0 }), { status: 'pending', reason: 'unsettled' }, now),
+    assert.equal(idleAbandonReason(op({ runnerKilledAt: 0 }), { status: 'pending', reason: 'unsettled' }, now),
       undefined, 'an egress row exists: wait for it')
     assert.equal(idleAbandonReason(op({ summaryText: 's' }), { status: 'failed', sessionId, turnKey: 'x', requestIds: ['x'] }, now),
       undefined, 'a prepared summary is never abandoned')
@@ -222,7 +222,7 @@ describe('finishIdleUnderLock (OCV5-297)', () => {
     } finally { await server2.close() }
   })
 
-  test('an inherited op starts the grace clock and settles only after it (never_sent)', async () => {
+  test('an op settles as never_sent only after a confirmed runner shutdown and the grace window', async () => {
     const dir = await tempDir()
     const key = 'inherited'
     const idleTurn = createHash('sha256').update(`${key}:${revision}`).digest('hex')
@@ -238,9 +238,12 @@ describe('finishIdleUnderLock (OCV5-297)', () => {
       const session = fakeSession(key, () => { submits++ })
       await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
       const first = readIdleOp(dir, key, revision)
-      assert.equal(typeof first?.idleStoppedAt, 'number', 'grace clock started')
-      assert.equal(first?.disposition, undefined, 'not settled on the first sighting')
-      writeIdleOp(dir, { ...first!, idleStoppedAt: Date.now() - IDLE_STOPPED_GRACE_MS - 1 })
+      assert.equal(first?.runnerKilledAt, undefined, 'no shutdown evidence: no clock, no settlement')
+      assert.equal(first?.disposition, undefined)
+      writeIdleOp(dir, { ...first!, runnerKilledAt: Date.now() - 1000 })
+      await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
+      assert.equal(readIdleOp(dir, key, revision)?.disposition, undefined, 'inside grace')
+      writeIdleOp(dir, { ...first!, runnerKilledAt: Date.now() - IDLE_STOPPED_GRACE_MS - 1 })
       await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
       assert.equal(readIdleOp(dir, key, revision)?.abandonReason, 'idle_turn_never_sent')
       assert.equal(submits, 0)
@@ -325,10 +328,17 @@ describe('runBoxIdleTurn timeout', () => {
     assert.equal(runner.listenerCount('error'), 0)
   })
 
-  test('a turn that stops on interrupt is not shut down', { timeout: 3000 }, async () => {
+  test('a turn that stops on interrupt is still shut down before the timeout is reported', { timeout: 3000 }, async () => {
     const { runner, events } = runnerThat({ stopOnInterrupt: true })
     await assert.rejects(runBoxIdleTurn(runner as never, params as never, { timeoutMs: 30, killGraceMs: 200 }),
+      (error: unknown) => error instanceof IdleTurnTimeoutError && error.killed === true)
+    assert.deepEqual(events, { interrupts: 1, shutdowns: 1 })
+  })
+
+  test('a failed shutdown is reported as not killed', { timeout: 3000 }, async () => {
+    const { runner } = runnerThat({ stopOnInterrupt: false })
+    runner.shutdown = async () => { throw new Error('shutdown failed') }
+    await assert.rejects(runBoxIdleTurn(runner as never, params as never, { timeoutMs: 20, killGraceMs: 10 }),
       (error: unknown) => error instanceof IdleTurnTimeoutError && error.killed === false)
-    assert.deepEqual(events, { interrupts: 1, shutdowns: 0 })
   })
 })

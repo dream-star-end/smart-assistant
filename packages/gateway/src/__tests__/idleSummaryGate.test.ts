@@ -267,9 +267,9 @@ for (const stage of ['prepare', 'apply'] as const) {
       _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER, runner, _idleRunning: false }
     try {
       writeIdleCandidate(dir, { v: 1, sessionKey, sessionId, turnKey: sourceTurn })
-      // OCV5-297: a crashed idle turn is recorded (idleStoppedAt), not thrown.
+      // OCV5-297: a crashed idle turn is logged, not thrown, and never settles the op.
       await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
-      assert.equal(typeof readIdleOp(dir, sessionKey, revision)?.idleStoppedAt, 'number')
+      assert.equal(readIdleOp(dir, sessionKey, revision)?.disposition, undefined)
       assert.equal(session._idleRunning, false)
       assert.ok(readIdleCandidate(dir, sessionKey))
       assert.ok(readPendingIdle(dir, sessionKey))
