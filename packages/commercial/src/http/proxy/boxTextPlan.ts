@@ -232,7 +232,13 @@ export function makeBoxTextPlan(input: {
       LANG: "C.UTF-8", CLAUDE_CODE_MAX_RETRIES: "0",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(input.body.max_tokens),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-      ...(nativePersistence ? { DISABLE_AUTO_COMPACT: "1" } : {}) },
+      // Explicit 0 or 1. Omitting the key would inherit an outer "1".
+      // Only the verified box-native-v1 budget, already chosen by the proxy
+      // gate, may enable inner auto-compact. Legacy native stays disabled.
+      // Non-persistent plans keep the previous omission.
+      ...(nativePersistence ? {
+        DISABLE_AUTO_COMPACT: currentVerifiedProxyByteBudget().id === "box-native-v1" ? "0" : "1",
+      } : {}) },
   };
   const cleanup = nativePersistence && !input.nativeResume
     ? staged.cleanupPreservingNative : staged.cleanup;
