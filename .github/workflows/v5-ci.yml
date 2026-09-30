@@ -337,9 +337,30 @@ jobs:
         if: always()
         run: node .github/scripts/check-known-failures-policy.mjs
 
+  integ-budget:
+    name: integ-budget
+    needs: [ci-queue-sentinel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      include: ${{ steps.budget.outputs.include }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Emit integ shard matrix
+        id: budget
+        run: npx tsx .github/scripts/integ-shard-budget.ts check-workflow .github/workflows/v5-ci.yml .github/integ-tiers
+
   commercial-integ:
     name: commercial-integ (${{ matrix.shard }})
-    needs: [ci-queue-sentinel]
+    needs: [ci-queue-sentinel, integ-budget]
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
 
@@ -480,25 +501,10 @@ jobs:
             "TEST_REDIS_URL=$TEST_REDIS_URL"
             "TAP_OUT=$TAP_OUT"
           )
-          # 父测试 --test-timeout 不会被子用例 timeout 抬高。只给新长片对齐
-          # 已声明的用例超时；pr-1/2/3 仍走 gate 默认 180000。G1–G4 不改。
-          case '${{ matrix.shard }}' in
-            pr-4)
-              pass+=("BUN_BIN=$(command -v bun)")
-              ;;
-            pr-5)
-              pass+=("BUN_BIN=$(command -v bun)")
-              pass+=("OC_INTEG_TEST_TIMEOUT_MS=3000000")
-              ;;
-            pr-6)
-              pass+=("BUN_BIN=$(command -v bun)")
-              pass+=("OC_INTEG_TEST_TIMEOUT_MS=1200000")
-              ;;
-            pr-7)
-              pass+=("BUN_BIN=$(command -v bun)")
-              pass+=("OC_INTEG_TEST_TIMEOUT_MS=3600000")
-              ;;
-          esac
+          # 父超时和 mutex 只来自清单解析器。这里不再写第二套数字。
+          if command -v bun >/dev/null 2>&1; then
+            pass+=("BUN_BIN=$(command -v bun)")
+          fi
           sudo env "${pass[@]}" npm run test:commercial:integ:shard -- '${{ matrix.shard }}'
 
       - name: Upload TAP output

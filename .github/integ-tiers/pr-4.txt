@@ -9,8 +9,12 @@
 # 父超时保持 180000：单文件都短于 180s。max-minutes 20 含 CI 的 npm ci
 # 与 Bun 1.3.14/CCB lockfile 安装，不是 2 核实测，待审定。不把 grow 算进本片。
 #
+# 4 个文件串行，每个父超时 180000ms。mutex 900s 覆盖 4*180s+120s 清理。
+# job 20min 再留安装余量。这些是拟上界，不是 2 核实测。
 # min-tests: 4
 # max-minutes: 20
+# file-timeout-ms: 180000
+# mutex-timeout-seconds: 900
 packages/commercial/src/http/proxy/boxIdleProof.integ.test.ts
 packages/commercial/src/http/proxy/boxIdleSet.integ.test.ts
 packages/commercial/src/http/proxy/boxResourceEnvelope.pipeline.integ.test.ts
