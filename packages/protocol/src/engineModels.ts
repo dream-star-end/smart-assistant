@@ -51,9 +51,11 @@ export const AGENT_MODEL_AUTO = 'auto'
  * `DEFAULT_CODEX_ENGINE_MODEL`(gpt-6-astra),不靠本表顺序。
  *
  * GPT-6 Sol / Luna(2026-09-22,Codex CLI 0.155.1 `debug models` 可见,
- * slug `gpt-6-sol` / `gpt-6-luna`,supported_in_api)。1M 孪生沿用 0238 的
- * 1.5× 长上下文契约,cliModel 指标准 id。GPT-5.6 仍留在本表里供在途会话
- * 解析,选择器家族已摘掉(迁移 0288 下线 catalog)。
+ * slug `gpt-6-sol` / `gpt-6-luna`)。GPT-6.1 Sol(2026-09-30,Codex CLI 0.159.2
+ * `debug models` 可见,slug `gpt-6.1-sol`,supported_in_api)。官方 API 默认
+ * 思考深度是 medium;CLI 报 low,平台仍显式送 medium。1M 孪生沿用 0238 的
+ * 1.5× 长上下文契约,cliModel 指标准 id。GPT-5.6 与 GPT-6 Sol 仍留在本表里
+ * 供在途会话解析,选择器家族已摘掉(0288 / 0292 下线 catalog)。
  */
 export const CODEX_ENGINE_MODELS = [
   { id: 'gpt-5.6-sol', displayName: 'GPT-5.6-Sol', defaultReasoningEffort: 'xhigh', longContext: false },
@@ -88,6 +90,14 @@ export const CODEX_ENGINE_MODELS = [
     cliModel: 'gpt-6-astra',
     longContext: true,
   },
+  { id: 'gpt-6.1-sol', displayName: 'GPT-6.1-Sol', defaultReasoningEffort: 'medium', longContext: false },
+  {
+    id: 'gpt-6.1-sol-1m',
+    displayName: 'GPT-6.1-Sol',
+    defaultReasoningEffort: 'medium',
+    cliModel: 'gpt-6.1-sol',
+    longContext: true,
+  },
   { id: 'gpt-6-sol', displayName: 'GPT-6-Sol', defaultReasoningEffort: 'medium', longContext: false },
   {
     id: 'gpt-6-sol-1m',
@@ -120,8 +130,8 @@ export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 
 /**
  * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
- * 收进「更多 GPT 模型」折叠组。2026-09-23 起 GPT-5.6 退出选择器(catalog 由 0288 下线);
- * GPT-6 Astra / Sol / Luna 都直接展示,Luna 不进「更多」。切流冒烟 C2 选可见模型,
+ * 收进「更多 GPT 模型」折叠组。GPT-5.6(0288)与 GPT-6 Sol(0292)退出选择器;
+ * GPT-6 Astra / GPT-6.1 Sol / Luna 都直接展示,不进「更多」。切流冒烟 C2 选可见模型,
  * 不再依赖折叠组。当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
  */
 export const CONTEXT_TIER_FAMILIES = [
@@ -133,10 +143,10 @@ export const CONTEXT_TIER_FAMILIES = [
     collapsedByDefault: false,
   },
   {
-    family: 'gpt-6-sol',
-    familyLabel: 'GPT-6-Sol',
-    standardId: 'gpt-6-sol',
-    longId: 'gpt-6-sol-1m',
+    family: 'gpt-6.1-sol',
+    familyLabel: 'GPT-6.1-Sol',
+    standardId: 'gpt-6.1-sol',
+    longId: 'gpt-6.1-sol-1m',
     collapsedByDefault: false,
   },
   {

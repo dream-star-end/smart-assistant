@@ -34,7 +34,7 @@ describe('0288_gpt6_sol_luna_retire_gpt56', () => {
     for (const id of NEW_IDS) {
       assert.equal(CODEX_ENGINE_MODELS.some((m) => m.id === id), true, id)
     }
-    assert.equal(contextFamilyByModelId('gpt-6-sol')?.longId, 'gpt-6-sol-1m')
+    assert.equal(contextFamilyByModelId('gpt-6-sol'), undefined)
     assert.equal(contextFamilyByModelId('gpt-6-luna')?.longId, 'gpt-6-luna-1m')
     assert.equal(contextFamilyByModelId('gpt-5.6-sol'), undefined)
     assert.equal(contextFamilyByModelId('gpt-5.6-terra'), undefined)

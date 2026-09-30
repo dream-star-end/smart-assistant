@@ -22,7 +22,7 @@ const metadataPath = path.resolve(here, '../../../../deploy/v5/release-metadata.
 describe('0289_luna_x04_opus55_match_retire_opus5', () => {
   test('GPT-6 Luna is not in the collapsed picker group', () => {
     assert.equal(contextFamilyCollapsedByDefault('gpt-6-luna'), false)
-    assert.equal(contextFamilyCollapsedByDefault('gpt-6-sol'), false)
+    assert.equal(contextFamilyCollapsedByDefault('gpt-6.1-sol'), false)
   })
 
   test('release metadata lists 0289 after 0288', async () => {

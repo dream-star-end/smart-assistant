@@ -219,40 +219,40 @@ describe('cursorModelPicker', () => {
 
 describe('longContextCostConfirmationRequired', () => {
   it('warns whenever a non-1M source resolves to a selectable 1M target', () => {
-    expect(longContextCostConfirmationRequired('gpt-6-sol', 'gpt-6-sol-1m')).toBe(true)
+    expect(longContextCostConfirmationRequired('gpt-6.1-sol', 'gpt-6.1-sol-1m')).toBe(true)
     expect(longContextCostConfirmationRequired(undefined, 'kimi-k3')).toBe(true)
     expect(longContextCostConfirmationRequired('glm-5.3', 'gpt-6-luna-1m')).toBe(true)
   })
 
   it('does not re-warn across 1M families or when leaving/staying standard', () => {
-    expect(longContextCostConfirmationRequired('gpt-6-sol-1m', 'gpt-6-luna-1m')).toBe(false)
-    expect(longContextCostConfirmationRequired('gpt-6-sol-1m', 'gpt-6-sol')).toBe(false)
-    expect(longContextCostConfirmationRequired('gpt-6-sol', 'gpt-6-luna')).toBe(false)
+    expect(longContextCostConfirmationRequired('gpt-6.1-sol-1m', 'gpt-6-luna-1m')).toBe(false)
+    expect(longContextCostConfirmationRequired('gpt-6.1-sol-1m', 'gpt-6.1-sol')).toBe(false)
+    expect(longContextCostConfirmationRequired('gpt-6.1-sol', 'gpt-6-luna')).toBe(false)
   })
 })
 
 describe('context family picker', () => {
   const MODELS: PublicModel[] = [
     { id: 'glm-5.3', display_name: 'GLM-5.3' },
-    { id: 'gpt-6-sol', display_name: 'GPT-6-Sol' },
-    { id: 'gpt-6-sol-1m', display_name: 'GPT-6-Sol' },
+    { id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' },
+    { id: 'gpt-6.1-sol-1m', display_name: 'GPT-6.1-Sol' },
     { id: 'k3-256k', display_name: 'Kimi K3 256K' },
     { id: 'kimi-k3', display_name: 'Kimi K3' },
   ]
 
   it('collapses GPT and Kimi context twins into one row each', () => {
     const rows = modelPickerRows(MODELS)
-    expect(rows.map(rowKey)).toEqual(['glm-5.3', 'gpt-6-sol', 'kimi-k3'])
+    expect(rows.map(rowKey)).toEqual(['glm-5.3', 'gpt-6.1-sol', 'kimi-k3'])
   })
 
   it('defaults GPT/Kimi to the standard window', () => {
     const gpt: PublicModel[] = [
-      { id: 'gpt-6-sol', display_name: 'GPT-6-Sol' },
-      { id: 'gpt-6-sol-1m', display_name: 'GPT-6-Sol' },
+      { id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' },
+      { id: 'gpt-6.1-sol-1m', display_name: 'GPT-6.1-Sol' },
     ]
-    const spec = CONTEXT_TIER_FAMILIES.find((family) => family.family === 'gpt-6-sol')
+    const spec = CONTEXT_TIER_FAMILIES.find((family) => family.family === 'gpt-6.1-sol')
     expect(spec).toBeDefined()
-    expect(resolveContextPickerSelection(gpt, spec!, 'glm-5.3')).toBe('gpt-6-sol')
+    expect(resolveContextPickerSelection(gpt, spec!, 'glm-5.3')).toBe('gpt-6.1-sol')
     const kimi = MODELS.filter((m) => m.id === 'k3-256k' || m.id === 'kimi-k3')
     const kimiSpec = {
       family: 'kimi-k3',
@@ -271,7 +271,7 @@ describe('context family picker', () => {
     ]
     const spec = CONTEXT_TIER_FAMILIES.find((family) => family.family === 'gpt-6-luna')
     expect(spec).toBeDefined()
-    expect(resolveContextPickerSelection(luna, spec!, 'gpt-6-sol-1m')).toBe('gpt-6-luna-1m')
+    expect(resolveContextPickerSelection(luna, spec!, 'gpt-6.1-sol-1m')).toBe('gpt-6-luna-1m')
   })
 })
 
@@ -291,8 +291,8 @@ describe('collapsed GPT family group (2026-09-05)', () => {
   it('keeps GPT-6 families expanded and does not group retired GPT-5.6 rows', () => {
     const rows = modelPickerRows([
       ...MODELS,
-      { id: 'gpt-6-sol', display_name: 'GPT-6-Sol' },
-      { id: 'gpt-6-sol-1m', display_name: 'GPT-6-Sol' },
+      { id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' },
+      { id: 'gpt-6.1-sol-1m', display_name: 'GPT-6.1-Sol' },
       { id: 'gpt-6-luna', display_name: 'GPT-6-Luna' },
       { id: 'gpt-6-luna-1m', display_name: 'GPT-6-Luna' },
     ])
@@ -301,7 +301,7 @@ describe('collapsed GPT family group (2026-09-05)', () => {
       .map((row) => (row.kind === 'context-family' ? [row.row.family, row.row.collapsed] : []))
     expect(flags).toEqual([
       ['gpt-6-astra', false],
-      ['gpt-6-sol', false],
+      ['gpt-6.1-sol', false],
       ['gpt-6-luna', false],
     ])
   })
