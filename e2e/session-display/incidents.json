@@ -5189,7 +5189,7 @@
           "assertion": "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo"
         },
         {
-          "layer": "integ",
+          "layer": "integration",
           "path": "packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts",
           "assertion": "native and billing session namespaces bind independently before publication"
         }
