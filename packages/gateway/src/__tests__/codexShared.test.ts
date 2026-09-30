@@ -94,6 +94,9 @@ describe('buildCodexLongContextArgs', () => {
     ])
     assert.deepEqual(buildCodexLongContextArgs('gpt-5.6-sol'), [])
     assert.deepEqual(buildCodexLongContextArgs('gpt-5.6-terra'), [])
+    assert.deepEqual(buildCodexLongContextArgs('gpt-6.1-sol-1m'), [])
+    assert.deepEqual(buildCodexLongContextArgs('gpt-6-astra-1m'), [])
+    assert.deepEqual(buildCodexLongContextArgs('gpt-6-luna-1m'), [])
   })
 })
 
