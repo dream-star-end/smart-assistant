@@ -16,8 +16,10 @@ import { Readable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { IDLE_COMPACT_PROMPT, assembleIdleArtifact, writeIdleCandidate, writeIdleNative } from "../boxIdleCompact.js";
+import { IDLE_COMPACT_PROMPT, writeIdleCandidate, writeIdleNative } from "../boxIdleCompact.js";
 import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
+import { installIdleFaultFixture, armIdleFault, saveIdleCheckpoint, restoreIdleCheckpoint,
+  readRecoveredConversation, assertRecoveredContent, type IdleCheckpoint } from "./fixtures/idleCrashFixture.js";
 
 const HOME = mkdtempSync(join(tmpdir(), "ocv5-296-idle-home-"));
 process.env.OPENCLAUDE_HOME = HOME;
@@ -136,7 +138,7 @@ function restoreEnv(name: string, previous: string | undefined): void {
   else process.env[name] = previous;
 }
 
-async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam"): Promise<void> {
+async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam" | "barriers"): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
@@ -156,8 +158,13 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
   const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT };
   let holdNextSettlement = false;
   let holdSummaryCommit = false;
+  let holdSourceCommit = false;
+  let sourceRequestId = "";
+  const heldKinds: string[] = [];
   let summaryResponseEnded = false;
   let preIdleCaptured = false;
+  let preparedCheckpoint: IdleCheckpoint | undefined;
+  const faultControl = join(HOME, "idle-fault");
   const heldRequestIds: string[] = [];
   const heldCommits: Array<() => void> = [];
   const releaseHeldCommits = () => {
@@ -188,6 +195,10 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
     report.candidate = candidate;
     report.readyFlipOnly = true;
     report.autoCompactSourceUnchanged = true;
+    if (mode === "seam" || mode === "grow2") {
+      report.readyFlipOnly = false;
+      report.testOnlyFaultHooks = installIdleFaultFixture(candidate, faultControl);
+    }
     report.cli = join(candidate, "claude-code-best/src/entrypoints/cli.tsx");
 
     const pg = (await import("pg")).default;
@@ -229,8 +240,13 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         const run = () => c !== undefined ? query(a as never, b as never, c as never)
           : b !== undefined ? query(a as never, b as never)
           : query(a as never);
-        if (verb.startsWith("COMMIT") && holdNextSettlement && summaryResponseEnded && (sawUsageInsert || sawJournalWrite)) {
-          holdNextSettlement = false;
+        const sourceCommit = holdSourceCommit && usageRequestId !== "" && usageRequestId === sourceRequestId;
+        const summaryCommit = holdNextSettlement && summaryResponseEnded && usageRequestId !== "" &&
+          hits.some((hit) => hit.summary && hit.requestId === usageRequestId);
+        if (verb.startsWith("COMMIT") && (sourceCommit || summaryCommit) && sawUsageInsert) {
+          if (sourceCommit) holdSourceCommit = false;
+          else holdNextSettlement = false;
+          heldKinds.push(sourceCommit ? "source" : "summary");
           if (usageRequestId) heldRequestIds.push(usageRequestId);
           return new Promise((resolve, reject) => {
             heldCommits.push(() => { Promise.resolve(run()).then(resolve, reject); });
@@ -491,6 +507,12 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           const requestId = res.getHeader("x-request-id");
           if (typeof requestId === "string" && requestId) current.requestId = requestId;
           if (current.summary && (res.statusCode || 0) > 0) summaryResponseEnded = true;
+          if (holdSourceCommit && !current.summary && current.requestId &&
+            responseBody.split("\n").some((line) => {
+              if (!line.startsWith("data: ")) return false;
+              try { const event = JSON.parse(line.slice(6)); return event.type === "message_delta" && event.delta?.stop_reason === "end_turn"; }
+              catch { return false; }
+            })) sourceRequestId = current.requestId;
         }
         return end(chunk as never);
       }) as typeof res.end;
@@ -559,7 +581,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         localAuthBodyPath = join(rawDir, "ocv5-296-idle-local-catalog-request.json");
         writeFileSync(localAuthBodyPath, text);
       }
-      if (summaryRequested && (mode === "grow2" || mode === "seam") && !preIdleCaptured) {
+      if (summaryRequested && (mode === "grow2" || mode === "seam" || mode === "barriers") && !preIdleCaptured) {
         preIdleCaptured = true;
         const stageLabel = mode === "grow2" ? "r22" : "seam";
         report.preIdle = capturePreIdleTranscript(stageLabel);
@@ -1146,8 +1168,8 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       report.epochGets = epochGets;
       report.notRun = ["typed-summary success", "three crash windows", "same-session second idle", "45-round chain"];
     } else {
-      const growing = mode === "grow2" || mode === "seam";
-      const seam = mode === "seam";
+      const growing = mode === "grow2" || mode === "seam" || mode === "barriers";
+      const seam = mode === "seam" || mode === "barriers";
       if (growing) {
         armCatalog(false);
       }
@@ -1163,7 +1185,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       pendingById.clear();
       growthBodies.length = 0;
       const liveKey = seam ? "agent:main:webchat:dm:idle-seam" : growing ? "agent:main:webchat:dm:idle-grow2" : "agent:main:webchat:dm:idle-live2";
-      const liveAdapter = new CcbAdapter({
+      let liveAdapter = new CcbAdapter({
         sessionKey: liveKey,
         agentId: "main",
         agentBaseDir: work,
@@ -1196,7 +1218,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         executionTarget: { kind: "local" },
         providerTag: "ccb",
       } as never;
-      if (growing) holdSummaryCommit = true;
+      if (growing) { holdSummaryCommit = true; holdSourceCommit = true; }
       const before = hits.length;
       let liveError = "";
       let submitDone = false;
@@ -1209,6 +1231,41 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
       const waitStart = Date.now();
       while (!submitDone && heldCommits.length === 0 && Date.now() - waitStart < waitCap) {
         await sleep(200);
+      }
+      if (growing) {
+        assert.equal(heldKinds.at(-1), "source", "source finalizer COMMIT was not intercepted");
+        // The source is allowed to return while billing is pending. Record its
+        // real proof, rather than assuming return means an idle was dispatched.
+        await withDeadline(submitPromise, 30_000, "source submit while COMMIT held");
+        const sourceRow = (await admin.query<{ state: string }>(
+          `SELECT state FROM ${SCHEMA}.request_finalize_journal WHERE request_id=$1`, [sourceRequestId])).rows[0];
+        const candidateFile = join(HOME, "idle-candidates", `${encodeURIComponent(liveKey)}.json`);
+        assert.ok(existsSync(candidateFile), "source pending candidate missing");
+        const sourceCandidate = JSON.parse(readFileSync(candidateFile, "utf8"));
+        const proofResponses = hits.filter((hit) => hit.url === "/internal/box/idle-proof");
+        report.sourceBarrier = { requestId: sourceRequestId, state: sourceRow?.state,
+          candidate: sourceCandidate, proof: proofResponses.at(-1)?.body,
+          summaryHttp: hits.filter((hit) => hit.summary).length };
+        assert.notEqual(sourceRow?.state, "committed");
+        assert.equal(hits.filter((hit) => hit.summary).length, 0);
+        const beforeSourceBlocked = hits.length;
+        let sourceBlocked = "";
+        try { await sm.submit(liveSession, "source-pending-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority }); }
+        catch (error) { sourceBlocked = error instanceof Error ? error.message : String(error); }
+        assert.match(sourceBlocked, /IDLE_HISTORY_PENDING/);
+        assert.equal(hits.slice(beforeSourceBlocked).filter((hit) => hit.url === "/v1/messages").length, 0);
+        releaseHeldCommits();
+        await waitForCommitted(admin, SCHEMA, sourceRequestId);
+        report.sourceCommitted = sourceRequestId;
+        // Re-enter through the normal same-session consumer. No helper call to
+        // finishIdleUnderLock and no hand-written op or summary.
+        const recovery = sm.submit(liveSession, "resume-after-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority })
+          .then(() => "ok", (error) => error instanceof Error ? error.message : String(error));
+        await until(() => heldCommits.length > 0, 120_000, "summary COMMIT after source recovery");
+        assert.equal(heldKinds.at(-1), "summary");
+        const recoveryResult = await withDeadline(recovery, 30_000, "prepared recovery return");
+        report.preparedRecoveryResult = recoveryResult;
+        assert.match(recoveryResult, /IDLE_HISTORY_PENDING/);
       }
       if (growing && heldCommits.length > 0) {
         const summaryHit = [...hits].reverse().find((hit) => hit.kind === "idle-summary");
@@ -1256,7 +1313,19 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         assert.equal(nativeHeld.some((file) => file.applied === true), false, "history applied before summary COMMIT");
         assert.equal(httpDelta, 0, "new user reached the model while summary commit is held");
         assert.equal(blockedNow === "still-waiting" || blockedNow.includes("IDLE_HISTORY_PENDING"), true, blockedNow);
+        if (mode === "seam" || mode === "grow2") {
+          const prepared = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8")))
+            .find((file) => file.summaryText === "outer-history-summary");
+          assert.ok(prepared && !prepared.applied && !prepared.artifact && prepared.modelCalls === 1);
+          // Flush and close the real runner before freezing the pending state.
+          // The summary's COMMIT is still held, so apply cannot have happened.
+          await liveAdapter.shutdown();
+          const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
+          preparedCheckpoint = saveIdleCheckpoint(HOME, join(rawDir, `ocv5-296-prepared-r23-${SCHEMA.slice(-6)}`), liveKey, prepared.sessionId);
+          report.preparedCheckpoint = preparedCheckpoint;
+        }
         releaseHeldCommits();
+        await waitForCommitted(admin, SCHEMA, summaryId);
         const barrierUser = await Promise.race([
           blockedPromise,
           sleep(180_000).then(() => "barrier-user-timeout"),
@@ -1440,6 +1509,10 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           "SELECT request_id, turn_key FROM usage_records WHERE request_id = $1 OR request_id = $2 OR request_id = $3",
           [liveHits[0]?.requestId, summaryId, nextId]);
         report.turnKeys = keys.rows;
+        if (mode === "barriers") {
+          report.scope = "source and summary COMMIT barriers, apply and next-user only; crash windows not executed";
+          return;
+        }
         const appliedStage = copyStage(mode === "grow2" ? "r22-applied" : "seam-applied");
         const appliedNative = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8")) as { opId?: string; modelCalls?: number; summaryText?: string; applied?: boolean; artifact?: { digest?: string; messages?: unknown[] } });
         const appliedOps = listJson(join(HOME, "idle-ops")).map((file) => JSON.parse(readFileSync(file, "utf8")) as { idleTurnKey?: string; sourceSessionId?: string; sourceTurnKey?: string; revision?: string; summaryText?: string; receiptDigest?: string });
@@ -1479,69 +1552,77 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         const oldNative = nativeAfterSecond.find((file) => file.opId === firstOp?.idleTurnKey);
         const oldNativeBefore = appliedNative.find((file) => file.opId === firstOp?.idleTurnKey);
         assert.equal(oldNative?.modelCalls ?? null, oldNativeBefore?.modelCalls ?? null);
-        let usageCursor = Number((await pool.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n);
-        const windows = [];
-        for (const windowName of ["before-artifact", "native-half", "receipt-lost"] as const) {
-          restoreIdle(appliedStage);
-          const candidate = { v: 1 as const, sessionKey: liveKey, sessionId: firstOp!.sourceSessionId!, turnKey: firstOp!.sourceTurnKey! };
-          if (windowName === "before-artifact") {
-            mutateOp(liveKey, (op) => { delete op.artifact; delete op.receiptDigest; });
-            mutateNative((file) => { delete file.artifact; file.applied = false; });
-            writeIdleCandidate(HOME, candidate);
-          } else if (windowName === "native-half") {
-            truncateNative();
-            mutateOp(liveKey, (op) => { delete op.receiptDigest; });
-            writeIdleCandidate(HOME, candidate);
-          } else {
-            mutateOp(liveKey, (op) => { delete op.receiptDigest; });
-            writeIdleCandidate(HOME, candidate);
-          }
-          const httpBefore = hits.filter((hit) => hit.url === "/v1/messages").length;
-          const summaryBefore = hits.filter((hit) => hit.kind === "idle-summary").length;
-          let windowError = "";
-          try {
-            await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
-          } catch (error) {
-            windowError = error instanceof Error ? error.message : String(error);
-          }
-          const added = hits.slice(httpBefore).filter((hit) => hit.url === "/v1/messages");
-          const usageAfter = Number((await pool.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n);
-          const usageDelta = usageAfter - usageCursor;
-          usageCursor = usageAfter;
-          const nativeNow = listJson(join(HOME, "idle-native")).map((file) => {
-            try { return JSON.parse(readFileSync(file, "utf8")) as { modelCalls?: number; artifact?: { messages?: Array<{ uuid?: string; type?: string; message?: { role?: string } }> } }; }
-            catch { return { parse: false }; }
-          });
-          windows.push({
-            window: windowName,
-            error: windowError || null,
-            newSummary: hits.filter((hit) => hit.kind === "idle-summary").length - summaryBefore,
-            newHttp: added.map((hit) => hit.kind),
-            usageDelta,
-            modelCalls: nativeNow.map((file) => "modelCalls" in file ? file.modelCalls ?? null : "unreadable"),
-          });
-        }
+        assert.ok(preparedCheckpoint, "genuine prepared checkpoint required for crash matrix");
+        const nativeRel = preparedCheckpoint.files.find((file) => file.relative.startsWith("idle-native/"))!.relative;
+        const nativeId = JSON.parse(readFileSync(join(preparedCheckpoint.root, nativeRel), "utf8")).sessionId as string;
+        const coldRunner = async () => {
+          await liveAdapter.shutdown();
+          liveAdapter = new CcbAdapter({ sessionKey: liveKey, agentId: "main", agentBaseDir: work,
+            config: adapterConfig, model: MODEL, permissionMode: "bypassPermissions", harness: "ccb", executionTarget: { kind: "local" } });
+          liveAdapter.setResumeSessionId(nativeId);
+          Object.assign(liveSession, { runner: liveAdapter, ccbSessionId: nativeId });
+        };
+        const windows: Array<Record<string, unknown>> = [];
         report.windows = windows;
-        report.appliedStage = appliedStage;
-        for (const windowRow of windows) {
-          assert.equal(windowRow.newSummary, 0, JSON.stringify(windowRow));
-          assert.ok(windowRow.usageDelta <= 1, JSON.stringify(windowRow));
-          if (windowRow.window !== "native-half") assert.equal(windowRow.error, null, JSON.stringify(windowRow));
-        }
-        const restored = JSON.parse(readFileSync(listJson(join(appliedStage, "idle-native"))[0] ?? "/dev/null", "utf8")) as { artifact?: { digest?: string; messages?: Array<{ uuid?: string; type?: string; message?: { role?: string; content?: string } }> }; summaryText?: string; opId?: string };
-        if (restored.artifact?.messages && restored.summaryText && restored.opId) {
-          const expected = assembleIdleArtifact({ opId: restored.opId, summaryText: restored.summaryText, tail: [], attachments: [] });
-          report.artifactImage = {
-            actualDigest: restored.artifact.digest ?? null,
-            roles: restored.artifact.messages.map((message) => ({ uuid: message.uuid ?? null, type: message.type ?? null, role: message.message?.role ?? null })),
-            expectedDigest: expected.digest,
-            sameShape: restored.artifact.messages[0]?.type === "system" && restored.artifact.messages[1]?.type === "user",
-          };
-          assert.equal((report.artifactImage as { sameShape: boolean }).sameShape, true, JSON.stringify(report.artifactImage));
+        for (const windowName of ["before-artifact", "native-half", "receipt-lost"] as const) {
+          await liveAdapter.shutdown();
+          restoreIdleCheckpoint(preparedCheckpoint);
+          armIdleFault(faultControl, windowName);
+          await coldRunner();
+          const startHits = hits.length;
+          const usageBefore = Number((await pool.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n);
+          const interrupted = sm.submit(liveSession, `crash-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority })
+            .then(() => "unexpected-success", (error) => error instanceof Error ? error.message : String(error));
+          await until(() => existsSync(join(faultControl, "reached.json")), 90_000, `real ${windowName} cut point`);
+          const reached = JSON.parse(readFileSync(join(faultControl, "reached.json"), "utf8"));
+          const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
+          const atFault = saveIdleCheckpoint(HOME, join(rawDir, `ocv5-296-fault-${windowName}-${SCHEMA.slice(-6)}`), liveKey, nativeId);
+          // Stop the old process. No file/state is edited to manufacture recovery.
+          await liveAdapter.shutdown();
+          const interruptedResult = await withDeadline(interrupted, 30_000, `old runner exit ${windowName}`);
+          armIdleFault(faultControl, null);
+          // The checkpoint is the actual event state; restoring it makes each
+          // window independent of graceful shutdown bookkeeping, not of history.
+          restoreIdleCheckpoint(atFault);
+          await coldRunner();
+          await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+          const added = hits.slice(startHits).filter((hit) => hit.url === "/v1/messages");
+          assert.equal(added.filter((hit) => hit.summary).length, 0, "recovery sent a second summary");
+          assert.equal(added.length, 1, "only the new user may call the model");
+          assert.equal(added[0]?.status, 200);
+          const requestId = added[0]!.requestId!;
+          await waitForCommitted(admin, SCHEMA, requestId);
+          const billed = (await pool.query(`SELECT u.request_id, u.turn_key, l.id AS ledger_id
+            FROM usage_records u JOIN credit_ledger l ON l.id=u.ledger_id WHERE u.request_id=$1`, [requestId])).rows;
+          assert.equal(billed.length, 1, "exactly one new-user usage/ledger pair");
+          const usageAfter = Number((await pool.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n);
+          assert.equal(usageAfter - usageBefore, 1, "no recovery/summary charge");
+          const native = JSON.parse(readFileSync(join(HOME, nativeRel), "utf8"));
+          const loaderPath = join(rawDir, `ocv5-296-recovered-${windowName}-${SCHEMA.slice(-6)}.json`);
+          const loaded = readRecoveredConversation(candidate, HOME, nativeId, work, loaderPath);
+          assertRecoveredContent(loaded, native);
+          const op = listJson(join(HOME, "idle-ops", encodeURIComponent(liveKey)))
+            .map(file => JSON.parse(readFileSync(file, "utf8")) as { idleTurnKey: string; receiptDigest?: string })
+            .find(op => op.idleTurnKey === native.opId);
+          assert.equal(op?.receiptDigest, native.artifact.digest, "exact op receipt after cold recovery");
+          windows.push({ window: windowName, reached, interruptedResult, requestId,
+            turnKey: billed[0].turn_key, usageDelta: 1, newSummary: 0, loaderPath,
+            modelCalls: native.modelCalls, receiptDigest: op?.receiptDigest, checkpoint: atFault });
         }
       }
     }
+  } catch (error) {
+    report.failure = error instanceof Error ? { message: error.message, stack: error.stack } : String(error);
+    throw error;
   } finally {
+    report.hits = hits;
+    report.heldKinds = heldKinds;
+    report.idleStateAtExit = ["idle-candidates", "idle-ops", "idle-native"].map((dir) => ({
+      dir, files: listJson(join(HOME, dir)).map((file) => {
+        try { return { file, value: JSON.parse(readFileSync(file, "utf8")) }; }
+        catch { return { file, unreadable: true }; }
+      }),
+    }));
     restoreLocalAuth?.();
     releaseHeldCommits();
     if (adapterShutdown) {
@@ -1577,24 +1658,10 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
     }
     if (adminEnd) await adminEnd().catch(() => undefined);
     rmSync(HOME, { recursive: true, force: true });
-    const rawName = mode === "short"
-      ? "ocv5-296-idle-pipeline-r18-short-raw.json"
-      : mode === "fresh"
-        ? "ocv5-296-fresh-set-r18-raw.json"
-        : mode === "localAuth"
-          ? "ocv5-296-idle-local-catalog-raw.json"
-          : mode === "grow2"
-            ? "ocv5-296-idle-grow-r22-raw.json"
-            : mode === "seam"
-              ? "ocv5-296-idle-seam-r22-raw.json"
-              : "ocv5-296-idle-pipeline-r19-live2-raw.json";
     const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
-    const path = join(rawDir, rawName);
+    const path = join(rawDir, `ocv5-296-idle-${mode}-r23-${SCHEMA.slice(-6)}-raw.json`);
     report.cleanupErrors = cleanupErrors;
-    if (/ocv5-296-(idle-pipeline-r1[7-9]|idle-pipeline-r20|r17-growth)/.test(path)) {
-      throw new Error(`refusing to overwrite historical raw ${path}`);
-    }
-    writeFileSync(path, JSON.stringify(report, null, 2));
+    writeFileSync(path, JSON.stringify(report, null, 2), { flag: "wx" });
     console.log(JSON.stringify({ event: "ocv5-296-idle", case: mode, report: path, summaryHttp: report.summaryHttp, firstError: report.firstError, cleanup: cleanupErrors.length }));
     if (cleanupErrors.length > 0) throw new Error(`cleanup failed: ${cleanupErrors.join(" | ")}`);
   }
@@ -1617,6 +1684,7 @@ queueIdle("fresh stock summary and business roots short-close through terminal_s
 test("live tool continuation keeps the persisted deferred-tools announcement", { timeout: 300_000 }, () => runIdleCase("live2"));
 test("live bash rounds grow outer history through idle summary", { timeout: 3_600_000 }, () => runIdleCase("grow2"));
 test("local catalog fixture accepts a dedicated idle request and rejects drift", { timeout: 600_000 }, () => runIdleCase("localAuth"));
+test("source and summary COMMIT barriers reach apply and next user", { timeout: 900_000 }, () => runIdleCase("barriers"));
 test("prepared idle summary commits on its own turn then applies", { timeout: 1_200_000 }, () => runIdleCase("seam"));
 
 type MessageDigest = {
@@ -2045,6 +2113,30 @@ function makeLocalPythonExec(toolNames: () => string[]): {
   };
 }
 
+async function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms);
+    })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+async function until(check: () => boolean | Promise<boolean>, ms: number, label: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!(await check())) {
+    if (Date.now() >= deadline) throw new Error(`timeout: ${label}`);
+    await sleep(50);
+  }
+}
+
+async function waitForCommitted(pool: { query: (text: string, values: string[]) => Promise<{ rows: Array<{ state: string }> }> }, schema: string, requestId: string): Promise<void> {
+  assert.match(schema, /^ocv5_296_idle_[0-9a-f]+$/);
+  assert.ok(requestId);
+  await until(async () => (await pool.query(`SELECT state FROM ${schema}.request_finalize_journal WHERE request_id=$1`, [requestId])).rows[0]?.state === "committed",
+    30_000, `finalizer COMMIT ${requestId}`);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2060,45 +2152,6 @@ function copyStage(label: string): string {
     cpSync(src, join(dest, rel), { recursive: true });
   }
   return dest;
-}
-
-function restoreIdle(stage: string): void {
-  for (const rel of ["idle-ops", "idle-native", "idle-candidates"]) {
-    rmSync(join(HOME, rel), { recursive: true, force: true });
-    const src = join(stage, rel);
-    if (existsSync(src)) cpSync(src, join(HOME, rel), { recursive: true });
-  }
-}
-
-function mutateOp(sessionKey: string, change: (op: Record<string, unknown>) => void): void {
-  const folder = join(HOME, "idle-ops", encodeURIComponent(sessionKey));
-  for (const name of readdirSync(folder)) {
-    if (!name.endsWith(".json")) continue;
-    const path = join(folder, name);
-    const op = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    if (op.summaryText !== "outer-history-summary") continue;
-    change(op);
-    writeFileSync(path, JSON.stringify(op));
-  }
-}
-
-function mutateNative(change: (file: Record<string, unknown>) => void): void {
-  for (const path of listJson(join(HOME, "idle-native"))) {
-    const file = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    if (file.summaryText !== "outer-history-summary") continue;
-    change(file);
-    writeFileSync(path, JSON.stringify(file));
-  }
-}
-
-function truncateNative(): void {
-  for (const path of listJson(join(HOME, "idle-native"))) {
-    const buf = readFileSync(path);
-    let summary = "";
-    try { summary = (JSON.parse(buf.toString("utf8")) as { summaryText?: string }).summaryText ?? ""; } catch { continue; }
-    if (summary !== "outer-history-summary") continue;
-    writeFileSync(path, buf.subarray(0, Math.max(1, Math.floor(buf.length / 2))));
-  }
 }
 
 function capturePreIdleTranscript(label: string): { files: Array<{ file: string; bytes: number; sha256: string }> } {
