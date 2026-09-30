@@ -14,6 +14,7 @@ import {
   readIdleNative,
   readIdleOp,
   readPendingIdle,
+  writeIdleCandidate,
   writeIdleNative,
 } from '../boxIdleCompact.js'
 import { SessionManager } from '../sessionManager.js'
@@ -120,6 +121,8 @@ test('a prepared summary waits for its own committed capsule', async () => {
     }),
   }
   const source = { sessionId, turnKey: sourceTurn }
+  // OCV5-297: the source turn's submit writes the candidate while it holds the lock.
+  writeIdleCandidate(dir, { v: 1, sessionKey, sessionId, turnKey: sourceTurn })
   await finish.call({}, session, source, dir)
   assert.equal(submits, 1)
   assert.equal(readIdleNative(dir, sessionId, revision)?.applied, undefined)
@@ -198,6 +201,7 @@ test('a summary error does not dispatch again or clear the candidate', async () 
       }),
     }),
   }
+  writeIdleCandidate(dir, { v: 1, sessionKey: 'summary-error', sessionId, turnKey: sourceTurn })
   await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
   await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
   assert.equal(submits, 1)
@@ -262,7 +266,10 @@ for (const stage of ['prepare', 'apply'] as const) {
     const session = { sessionKey, model: BOX_NATIVE_CONTEXT_MODEL,
       _boxContextOwner: BOX_NATIVE_CONTEXT_OWNER, runner, _idleRunning: false }
     try {
-      await assert.rejects(finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir), /IDLE_TURN_EXIT/)
+      writeIdleCandidate(dir, { v: 1, sessionKey, sessionId, turnKey: sourceTurn })
+      // OCV5-297: a crashed idle turn is recorded (idleStoppedAt), not thrown.
+      await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
+      assert.equal(typeof readIdleOp(dir, sessionKey, revision)?.idleStoppedAt, 'number')
       assert.equal(session._idleRunning, false)
       assert.ok(readIdleCandidate(dir, sessionKey))
       assert.ok(readPendingIdle(dir, sessionKey))
@@ -273,9 +280,9 @@ for (const stage of ['prepare', 'apply'] as const) {
       assert.equal(summaries, 1)
       // Re-entry never authorizes another model summary. An apply can retry
       // only the same already prepared artifact; this fake transport exits again.
-      if (stage === 'prepare') await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
-      else await assert.rejects(finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir), /IDLE_TURN_EXIT/)
+      await finish.call({}, session, { sessionId, turnKey: sourceTurn }, dir)
       assert.equal(summaries, 1)
+      assert.ok(readPendingIdle(dir, sessionKey), 'a crash is not a settlement')
       assert.equal(runner.listenerCount('exit'), 0)
       assert.equal(runner.listenerCount('error'), 0)
     } finally {

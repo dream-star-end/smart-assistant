@@ -29,6 +29,15 @@ export type BoxIdleProof =
       turnKey: string;
       revision: string;
       requestIds: string[];
+    }
+  /** OCV5-297: the whole chain ended in a proven stop with no model result.
+   * Only the exact failure shapes written by the journal state machine
+   * qualify; anything unknown or malformed stays pending. */
+  | {
+      status: "failed";
+      sessionId: string;
+      turnKey: string;
+      requestIds: string[];
     };
 
 function textOf(message: unknown): string | undefined {
@@ -52,6 +61,61 @@ function proofReason(ctx: Record<string, unknown>): string | undefined {
 
 function sha(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+const FAILED_PROOF_REASONS = new Set(["keeper_stopped", "worker_failed"]);
+const RESUMABLE_STATES = new Set(["inflight", "finalizing", "committed"]);
+
+/**
+ * One owner-linked chain that ended in a proven failure, mirroring
+ * markToolChainStoppedFailure / CLEANUP_PROOF_FENCE (failed branch) and the
+ * prestart stop fences. Returns null for every other shape.
+ */
+function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): IdleChainRow[] | null {
+  const chain: IdleChainRow[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined = leafId;
+  while (cursor) {
+    if (seen.has(cursor) || chain.length >= 128) return null;
+    const row = byId.get(cursor);
+    if (!row) return null;
+    seen.add(cursor);
+    chain.push(row);
+    const parent = row.ctx.boxOwnerRequestId;
+    if (parent !== undefined && typeof parent !== "string") return null;
+    cursor = parent;
+  }
+  const leaf = chain[0]!;
+  const ctx = leaf.ctx;
+  if (ctx.boxState === "prestart_stopped") {
+    // Prestart fences only apply before any launch permit; never launched.
+    return chain.length === 1 && !Object.hasOwn(ctx, "boxLaunchPermit")
+      && ctx.boxOwnerRequestId === undefined && ctx.boxResumeRequestId === undefined
+      ? chain : null;
+  }
+  if (ctx.boxState !== "failed_stopped") return null;
+  const proof = ctx.boxTerminalProof as { reason?: unknown; runNonce?: unknown; leaseEpoch?: unknown } | undefined;
+  if (!proof || typeof proof !== "object" || typeof proof.reason !== "string"
+    || !FAILED_PROOF_REASONS.has(proof.reason)
+    || typeof proof.runNonce !== "string" || typeof proof.leaseEpoch !== "string") return null;
+  const hasHandoff = ctx.boxToolHandoff !== undefined;
+  if (hasHandoff ? !RESUMABLE_STATES.has(leaf.state) : leaf.state !== "aborted") return null;
+  if (ctx.boxResumeRequestId !== undefined) return null;
+  for (const row of chain) {
+    if (row.ctx.boxRunNonce !== proof.runNonce || row.ctx.boxLeaseEpoch !== proof.leaseEpoch) return null;
+    if (row.ctx.boxAccountId !== ctx.boxAccountId || row.ctx.boxSessionId !== ctx.boxSessionId
+      || row.ctx.boxTurnKey !== ctx.boxTurnKey || row.ctx.model !== ctx.model) return null;
+  }
+  for (let i = 1; i < chain.length; i++) {
+    const parent = chain[i]!;
+    const child = chain[i - 1]!;
+    if (parent.ctx.boxState !== "failed_stopped" || parent.ctx.boxStopOutcome !== "failed"
+      || parent.ctx.boxToolHandoff === undefined || !RESUMABLE_STATES.has(parent.state)
+      || parent.ctx.boxResumeRequestId !== child.requestId
+      || typeof parent.ctx.boxResumeRevision !== "string"
+      || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) return null;
+  }
+  return chain;
 }
 
 type ChainFailure = { ok: false; reason: string };
@@ -171,7 +235,17 @@ export function projectBoxIdleChain(input: {
   const covered = new Set<string>();
   for (const leafRow of leaves) {
     const built = projectOneChain(leafRow.requestId, byId);
-    if (!built.ok) return { status: "pending", reason: built.reason };
+    if (!built.ok) {
+      // Tried only after the success projection failed, for a single chain
+      // that covers every scoped row with no other open chain.
+      const failed = leaves.length === 1 ? projectFailedChain(leafRow.requestId, byId) : null;
+      const open = (input.otherOpenRequestIds ?? []).filter((id) => !byId.has(id));
+      if (failed && failed.length === scoped.length && open.length === 0) {
+        return { status: "failed", sessionId: input.sessionId, turnKey: input.turnKey,
+          requestIds: failed.map((row) => row.requestId).sort() };
+      }
+      return { status: "pending", reason: built.reason };
+    }
     for (const row of built.chain) {
       if (covered.has(row.requestId)) return { status: "pending", reason: "fork" };
       covered.add(row.requestId);

@@ -169,3 +169,54 @@ test("wrong turn is not found", () => {
   assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey: "ff".repeat(32), rows: [leaf, parent] }),
     { status: "not_found" });
 });
+
+// ── OCV5-297: proven failure is a terminal `failed`, anything else stays pending ──
+const NONCE = "a".repeat(24);
+const EPOCH = "b".repeat(32);
+const REV = "22222222-2222-4222-8222-222222222222";
+const failedProof = { reason: "worker_failed", runNonce: NONCE, leaseEpoch: EPOCH };
+const failedText = row("f-text", {
+  boxState: "failed_stopped", boxTerminalProof: failedProof, boxAccountId: "20",
+  boxRunNonce: NONCE, boxLeaseEpoch: EPOCH,
+}, "aborted");
+const failedLeaf = row("f-leaf", {
+  boxState: "failed_stopped", boxTerminalProof: failedProof, boxAccountId: "20",
+  boxRunNonce: NONCE, boxLeaseEpoch: EPOCH, boxToolHandoff: { roundNo: 2 },
+  boxOwnerRequestId: "f-parent", boxParentResumeRevision: REV,
+}, "committed");
+const failedParent = row("f-parent", {
+  boxState: "failed_stopped", boxStopOutcome: "failed", boxAccountId: "20",
+  boxRunNonce: NONCE, boxLeaseEpoch: EPOCH, boxToolHandoff: { roundNo: 1 },
+  boxResumeRequestId: "f-leaf", boxResumeRevision: REV,
+}, "committed");
+
+test("a proven stopped text run and a proven stopped tool chain project failed", () => {
+  const text = projectBoxIdleChain({ sessionId, turnKey, rows: [failedText] });
+  assert.deepEqual(text, { status: "failed", sessionId, turnKey, requestIds: ["f-text"] });
+  const chain = projectBoxIdleChain({ sessionId, turnKey, rows: [failedParent, failedLeaf] });
+  assert.deepEqual(chain, { status: "failed", sessionId, turnKey, requestIds: ["f-leaf", "f-parent"] });
+  const prestart = row("p", { boxState: "prestart_stopped" }, "inflight");
+  assert.equal(projectBoxIdleChain({ sessionId, turnKey, rows: [prestart] }).status, "failed");
+});
+
+test("unknown, contradictory or incomplete failure shapes stay pending", () => {
+  const pendingOf = (rows: IdleChainRow[], other: string[] = []) =>
+    projectBoxIdleChain({ sessionId, turnKey, rows, otherOpenRequestIds: other }).status;
+  // prestart after a launch permit is not a never-launched proof
+  assert.equal(pendingOf([row("p", { boxState: "prestart_stopped", boxLaunchPermit: true }, "inflight")]), "pending");
+  // no-handoff failure must be journal-aborted
+  assert.equal(pendingOf([{ ...failedText, state: "committed" }]), "pending");
+  // unknown proof reason / missing epoch / nonce mismatch
+  assert.equal(pendingOf([{ ...failedText, ctx: { ...failedText.ctx,
+    boxTerminalProof: { ...failedProof, reason: "worker_complete" } } }]), "pending");
+  assert.equal(pendingOf([{ ...failedText, ctx: { ...failedText.ctx, boxLeaseEpoch: undefined } }]), "pending");
+  assert.equal(pendingOf([failedParent, { ...failedLeaf, ctx: { ...failedLeaf.ctx, boxRunNonce: "c".repeat(24) } }]),
+    "pending");
+  // ancestor must be failed_stopped (not terminal) with a matching resume link
+  assert.equal(pendingOf([{ ...failedParent, ctx: { ...failedParent.ctx, boxState: "terminal" } }, failedLeaf]), "pending");
+  assert.equal(pendingOf([{ ...failedParent, ctx: { ...failedParent.ctx, boxResumeRevision: "x" } }, failedLeaf]), "pending");
+  // missing boxState, another open chain, or a second leaf
+  assert.equal(pendingOf([row("x", { boxState: undefined }, "aborted")]), "pending");
+  assert.equal(pendingOf([failedText], ["elsewhere"]), "pending");
+  assert.equal(pendingOf([failedText, { ...failedText, requestId: "f-text-2" }]), "pending");
+});

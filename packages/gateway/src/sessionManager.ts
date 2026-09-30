@@ -35,8 +35,18 @@ import {
 // PartialSnapshot)。ccbAdapter / codexAdapter 的 import 兼有 registry 注册副作用
 // ('ccb' / 'codex' factory)。
 import {
+  abandonAllIdle,
   advanceIdleOp,
   boxTurnMayIdle,
+  consumeIdleReset,
+  currentIdleSource,
+  idleAbandonReason,
+  idleOpSettled,
+  idleProofWaitMs,
+  pruneIdleOps,
+  readIdleReset,
+  sourceNeedsIdleOp,
+  type IdleOp,
   IDLE_COMPACT_PROMPT,
   IdleCompactRejected,
   idleHistoryStillBlocked,
@@ -52,8 +62,45 @@ import {
   writeIdleNative,
   writeIdleOp,
 } from './boxIdleCompact.js'
-import { fetchBoxIdleProof } from './engine/boxIdleProofClient.js'
-import { runBoxIdleTurn } from './boxIdleTurn.js'
+import { fetchBoxIdleProof, type IdleProofResponse } from './engine/boxIdleProofClient.js'
+import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
+
+/** Background idle drain re-arms while proof stays pending (egress settling). */
+const IDLE_DRAIN_RETRIES = 6
+const IDLE_DRAIN_RETRY_MS = 30_000
+
+// OCV5-297 idle helpers: module level so finishIdleUnderLock needs no `this` state.
+/** Source proof is gone but an op is unfinished: only its own idle-turn
+ * evidence may settle it. Never dispatches. */
+async function settleStrandedIdleOp(session: AgentSession, op: IdleOp, recoveryDir: string): Promise<void> {
+  if (op.summaryText || readIdleNative(recoveryDir, op.sourceSessionId, op.revision)?.summaryText) return
+  const idleProof = await fetchBoxIdleProof({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey })
+  const reason = idleAbandonReason(op, idleProof)
+    ?? (idleProof.status === 'not_found' && !readIdleNative(recoveryDir, op.sourceSessionId, op.revision)
+      ? 'source_gone' : undefined)
+  if (!reason) return
+  log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason })
+  writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: reason })
+}
+
+/** Persist an op; once settled, rotate old settled files for the session. */
+function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
+  writeIdleOp(recoveryDir, op)
+  if (idleOpSettled(op)) pruneIdleOps(recoveryDir, op.sessionKey)
+}
+
+/** Bounded wait on a pending proof (1s, 2s, 4s, … within the budget). */
+async function waitBoxIdleProof(input: { sessionId: string; turnKey: string }): Promise<IdleProofResponse> {
+  const deadline = Date.now() + idleProofWaitMs()
+  let delay = 1000
+  for (;;) {
+    const proof = await fetchBoxIdleProof(input)
+    if (proof.status !== 'pending' || Date.now() + delay > deadline) return proof
+    await new Promise((resolve) => setTimeout(resolve, delay))
+    delay = Math.min(delay * 2, 8000)
+  }
+}
+
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
@@ -1001,6 +1048,10 @@ export interface AgentSession {
   _boxContextOwner?: string
   /** Set while the lock-held idle path is inside runner.submitTurn. */
   _idleRunning?: boolean
+  /** OCV5-297: internal idle compact turns currently using the runner. Not a
+   * client turn and not _activeTurnCount (prompt-queue admission asserts that
+   * one); lifecycle gates (recycle drain, model switch, preheat) read it. */
+  _idleInternalTurns?: number
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   /** Set by onFinish when the CCB result row signals a stale --resume session
@@ -2436,6 +2487,7 @@ export class SessionManager {
     for (const session of this.sessions.values()) {
       activeTurns += Math.max(0, session._activeTurnCount ?? 0)
       activeTurns += Math.max(0, session._activeClientTurnCount ?? 0)
+      activeTurns += Math.max(0, session._idleInternalTurns ?? 0)
     }
     if (activeTurns > 0) this.releaseRuntimeRecycleDrain()
     return { accepted: activeTurns === 0, activeTurns }
@@ -4590,7 +4642,8 @@ export class SessionManager {
     switchId: string,
   ): Promise<{ sourceModel: string; targetModel: string }> {
     if (!/^[A-Za-z0-9:_-]{8,128}$/.test(switchId)) throw new Error('MODEL_SWITCH_ID_INVALID')
-    if ((session._activeTurnCount ?? 0) > 0 || (session._activeClientTurnCount ?? 0) > 0) {
+    if ((session._activeTurnCount ?? 0) > 0 || (session._activeClientTurnCount ?? 0) > 0
+      || (session._idleInternalTurns ?? 0) > 0) {
       throw new Error('MODEL_SWITCH_SESSION_BUSY')
     }
     const sourceModel = session.model ?? session.runner.model
@@ -4654,9 +4707,15 @@ export class SessionManager {
   }
 
   /**
-   * Idle while this submit already owns session.lock. Never calls public submit.
+   * Idle while the caller owns session.lock. Never calls public submit.
    * The op file is the dispatch claim: only its creator may send one summary.
    * A later call applies a stored capsule and does not reserve another turn.
+   *
+   * OCV5-297: works only from durable state (candidate / pending op) — the
+   * candidate itself is written by the source turn's submit. Nothing here
+   * settles on wall-clock alone; an op is abandoned only on authoritative
+   * evidence (egress `failed`, or the CCB idle turn ended and egress still
+   * has no row after IDLE_STOPPED_GRACE_MS).
    */
   private async finishIdleUnderLock(session: AgentSession, source: {
     sessionId: string
@@ -4664,19 +4723,32 @@ export class SessionManager {
   }, recoveryDir: string = paths.home): Promise<void> {
     if (session._idleRunning) return
     const pending = readPendingIdle(recoveryDir, session.sessionKey)
-    const mayIdle = boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })
-    if (!pending && !mayIdle && !readIdleCandidate(recoveryDir, session.sessionKey)) return
-    if (mayIdle) {
-      writeIdleCandidate(recoveryDir, {
-        v: 1, sessionKey: session.sessionKey, sessionId: source.sessionId, turnKey: source.turnKey,
+    if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
+    const proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
+    if (proof.status === 'skipped') {
+      // Not configured / invalid identity. Safe to drop only a bare candidate:
+      // no op exists, so no summary was dispatched and nothing can arrive late.
+      log.error('box idle proof unavailable', {
+        sessionKey: session.sessionKey, reason: proof.reason, pendingOp: Boolean(pending),
       })
+      if (!pending) clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
     }
-    const proof = await fetchBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
-    if (proof.status === 'not_found') {
+    if (proof.status === 'not_found' || proof.status === 'failed') {
+      // The source turn produced no Box result: nothing to compact.
       clearIdleCandidate(recoveryDir, session.sessionKey)
+      if (!pending) return
+      await settleStrandedIdleOp(session, pending, recoveryDir)
       return
     }
     if (proof.status !== 'terminal' && proof.status !== 'terminal_set') return
+    // Dispatch gate: a new op is created only when the leaf says the real
+    // context needs it (or OC_BOX_IDLE_COMPACT_ALWAYS=1). An op that already
+    // exists for this revision is always driven to settlement.
+    if (!readIdleOp(recoveryDir, session.sessionKey, proof.revision) && !sourceNeedsIdleOp(proof)) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
+    }
     const started = startIdleOp({
       dir: recoveryDir,
       sessionKey: session.sessionKey,
@@ -4688,6 +4760,10 @@ export class SessionManager {
       attachments: [],
     })
     let op = started.op
+    if (idleOpSettled(op)) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
+    }
     const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
     if (nativeShortForOp(native, {
       idleTurnKey: op.idleTurnKey,
@@ -4695,13 +4771,27 @@ export class SessionManager {
       sourceSessionId: source.sessionId,
     })) {
       clearIdleCandidate(recoveryDir, session.sessionKey)
-      writeIdleOp(recoveryDir, { ...op, disposition: 'short' })
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'short' })
       return
     }
     if (native?.frozenTail.length) op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
     const summaryProof = await fetchBoxIdleProof({
       sessionId: source.sessionId, turnKey: op.idleTurnKey,
     })
+    if (!started.ownedDispatch && op.idleStoppedAt === undefined && summaryProof.status === 'not_found') {
+      // We hold session.lock and are not running an idle turn, so no idle CCB
+      // turn of this op is alive in this process (a previous process's child
+      // died with it). Start the grace clock now; never a dispatch.
+      op = { ...op, idleStoppedAt: Date.now() }
+      writeIdleOp(recoveryDir, op)
+    }
+    const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
+    if (abandon) {
+      log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason: abandon })
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
+      return
+    }
     const accepted = idleSummaryAccepted(summaryProof, {
       sessionId: source.sessionId,
       idleTurnKey: op.idleTurnKey,
@@ -4736,6 +4826,7 @@ export class SessionManager {
         })
       }
       session._idleRunning = true
+      session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
       try {
         const settled = await runBoxIdleTurn(session.runner, {
           input: IDLE_COMPACT_PROMPT,
@@ -4796,11 +4887,84 @@ export class SessionManager {
           step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
           clearIdleCandidate(recoveryDir, session.sessionKey)
         }
+      } catch (idleErr) {
+        // Timeout, crash or error: this CCB idle turn is over (timeout also
+        // interrupts and, if needed, shuts the child down). Record when, so a
+        // later `not_found` past the grace window can prove nothing was sent.
+        // Never a result and never a re-dispatch (ownedDispatch is one-shot).
+        step = { ...step, op: { ...step.op, idleStoppedAt: Date.now() } }
+        log.warn('box idle turn ended without result', {
+          sessionKey: session.sessionKey, revision: step.op.revision,
+          timeout: idleErr instanceof IdleTurnTimeoutError, killed: idleErr instanceof IdleTurnTimeoutError && idleErr.killed,
+        }, idleErr)
       } finally {
         session._idleRunning = false
+        session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
       }
     }
-    writeIdleOp(recoveryDir, step.op)
+    writeSettledIdleOp(recoveryDir, step.op)
+  }
+
+  /**
+   * Run durable idle work after the user turn released session.lock. Queued
+   * behind the lock like recycle; while running it is counted as an internal
+   * turn (not a client turn and not _activeTurnCount, so the prompt-queue
+   * admission invariant is untouched). Rereads disk state under the lock, so a
+   * submit that took the lock first has already handled or superseded it.
+   */
+  private scheduleIdleDrain(session: AgentSession, attempt = 0): void {
+    void (async () => {
+      const prev = session.lock
+      let release!: () => void
+      session.lock = new Promise<void>((resolve) => (release = resolve))
+      let again = false
+      try {
+        await prev
+        if (this.sessions.get(session.sessionKey) !== session
+          || session._plannedTeardown || session._replacing) return
+        const source = currentIdleSource(paths.home, session.sessionKey)
+        if (!source) return
+        await this.finishIdleUnderLock(session, source)
+        again = currentIdleSource(paths.home, session.sessionKey) !== undefined
+      } catch (err) {
+        again = true
+        if (!(err instanceof IdleCompactRejected)) {
+          log.warn('idle background drain failed', { sessionKey: session.sessionKey }, err)
+        }
+      } finally {
+        release()
+      }
+      if (again && attempt < IDLE_DRAIN_RETRIES) {
+        const timer = setTimeout(() => this.scheduleIdleDrain(session, attempt + 1), IDLE_DRAIN_RETRY_MS)
+        timer.unref?.()
+      }
+    })()
+  }
+
+  /** Operator exit (requestIdleReset): replace the native session, then
+   * abandon this session's unfinished idle work. Caller owns session.lock. */
+  private async applyIdleResetIfRequested(session: AgentSession): Promise<void> {
+    const marker = readIdleReset(paths.home, session.sessionKey)
+    if (!marker) return
+    if (marker === 'corrupt') {
+      log.error('box idle reset marker invalid; ignored', { sessionKey: session.sessionKey })
+      return
+    }
+    if (session.runner.isRunning) await session.runner.shutdown().catch(() => {})
+    const sessionKey = session.sessionKey
+    this._resumeMap.delete(sessionKey)
+    this._resumeMapTimestamps.delete(sessionKey)
+    this._resumeMapProvider.delete(sessionKey)
+    this._resumeMapLastCost.delete(sessionKey)
+    this._resumeMapCostImprecise.delete(sessionKey)
+    this._resumeMapHistory.delete(sessionKey)
+    session.ccbSessionId = null
+    session.runner.clearSessionId?.()
+    this._saveResumeMap()
+    const abandoned = abandonAllIdle(paths.home, sessionKey)
+    consumeIdleReset(paths.home, sessionKey)
+    pruneIdleOps(paths.home, sessionKey)
+    log.warn('box idle reset applied: native session replaced', { sessionKey, abandoned })
   }
 
   cancelModelSwitch(session: AgentSession, switchId: string): boolean {
@@ -4841,7 +5005,8 @@ export class SessionManager {
     const runner = session.runner
     if (typeof runner.preheat !== 'function') return 'skipped_engine'
     if (runner.isRunning) return 'already_running'
-    if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+    if ((session._activeTurnCount ?? 0) > 0 || (session._idleInternalTurns ?? 0) > 0
+      || this._promptQueueHolds(session)) {
       return 'skipped_busy'
     }
     const existing = this._preheatInFlight.get(session.sessionKey)
@@ -4860,7 +5025,8 @@ export class SessionManager {
         // Re-check under the lock: a turn/teardown may have landed meanwhile.
         if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
         if (session.runner.isRunning) return 'already_running'
-        if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+        if ((session._activeTurnCount ?? 0) > 0 || (session._idleInternalTurns ?? 0) > 0
+          || this._promptQueueHolds(session)) {
           return 'skipped_busy'
         }
         const deadlineMs = resolveEnginePreheatDeadlineMs()
@@ -5178,6 +5344,7 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
       const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
       const idleCandidate = readIdleCandidate(paths.home, session.sessionKey)
       if ((pendingIdle || idleCandidate) && opts?.modelSwitchInternal === undefined) {
@@ -5904,10 +6071,20 @@ export class SessionManager {
           }
           const idleSessionId = session.runner.nativeSessionId ?? undefined
           const idleTurnKey = session._currentTurnKey
+          // OCV5-297: only record the durable candidate while holding the lock
+          // (cheap, and it blocks a following submit until handled). Proof,
+          // compaction and settlement run after release in scheduleIdleDrain.
+          let idleFollowUp = false
           if (unhandledTurnError === undefined && idleSessionId && idleTurnKey
             && opts?.modelSwitchInternal === undefined) {
             try {
-              await this.finishIdleUnderLock(session, { sessionId: idleSessionId, turnKey: idleTurnKey })
+              if (boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) {
+                writeIdleCandidate(paths.home, {
+                  v: 1, sessionKey: session.sessionKey, sessionId: idleSessionId, turnKey: idleTurnKey,
+                  createdAt: Date.now(),
+                })
+              }
+              idleFollowUp = currentIdleSource(paths.home, session.sessionKey) !== undefined
             } catch (idleErr) {
               if (!(idleErr instanceof IdleCompactRejected)) {
                 log.warn('idle compact failed closed', { sessionKey: session.sessionKey }, idleErr)
@@ -5924,6 +6101,7 @@ export class SessionManager {
             this._promptQueueExecutionKeys.delete(session.sessionKey)
           }
           release()
+          if (idleFollowUp) this.scheduleIdleDrain(session)
         }
       }
     }

@@ -1,9 +1,48 @@
 import type { EngineAdapter, EngineTurnRun, TurnParams } from './engine/engineAdapter.js'
 import type { TurnSummary } from './engine/engineEvents.js'
 
+/** Default wall-clock budget for one internal idle compact turn. */
+export const BOX_IDLE_TURN_TIMEOUT_MS = 180_000
+/** After interrupt, how long the child may take to stop before it is shut down. */
+export const BOX_IDLE_TURN_KILL_GRACE_MS = 5_000
+
+/** The idle turn ran out of time. `killed` = the CCB child was shut down, so
+ * it can no longer send the compact request. Timeout never proves a result. */
+export class IdleTurnTimeoutError extends Error {
+  constructor(readonly killed: boolean) {
+    super('IDLE_TURN_TIMEOUT')
+    this.name = 'IdleTurnTimeoutError'
+  }
+}
+
+export interface IdleTurnLimits {
+  timeoutMs?: number
+  killGraceMs?: number
+}
+
+const TIMEOUT = Symbol('timeout')
+
+function within<T>(promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    promise,
+    new Promise<typeof TIMEOUT>((resolve) => { timer = setTimeout(() => resolve(TIMEOUT), ms) }),
+  ]).finally(() => clearTimeout(timer))
+}
+
+export function boxIdleTurnTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.OC_BOX_IDLE_TURN_TIMEOUT_MS)
+  return Number.isSafeInteger(raw) && raw >= 10_000 && raw <= 900_000 ? raw : BOX_IDLE_TURN_TIMEOUT_MS
+}
+
 /** Internal idle turns own the same end-on-failure duty as ordinary turns.
- * CCB exit is already stdout-drained; no timer or model retry belongs here. */
-export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams): Promise<TurnSummary> {
+ * CCB exit is already stdout-drained; no model retry belongs here. A hung
+ * turn is bounded: interrupt, then shut the child down, so session.lock is
+ * always released. */
+export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams,
+  limits: IdleTurnLimits = {}): Promise<TurnSummary> {
+  const timeoutMs = limits.timeoutMs ?? boxIdleTurnTimeoutMs()
+  const killGraceMs = limits.killGraceMs ?? BOX_IDLE_TURN_KILL_GRACE_MS
   let run: EngineTurnRun | undefined
   let closed = false
   let failure: Error | undefined
@@ -30,7 +69,20 @@ export async function runBoxIdleTurn(runner: EngineAdapter, params: TurnParams):
     // A real result finalized synchronously wins over a following exit, but
     // our own end() never manufactures success: failure is claimed first.
     if (earlyFailure) fail(earlyFailure)
-    const summary = await run.summary
+    const first = await within(run.summary, timeoutMs)
+    if (first === TIMEOUT) {
+      runner.interrupt('system')
+      const late = await within(run.summary, killGraceMs)
+      let killed = false
+      if (late === TIMEOUT) {
+        killed = true
+        await runner.shutdown().catch(() => {})
+      }
+      // An interrupted or late result is never treated as the compact result;
+      // an exit caused by the shutdown is reported as this timeout.
+      throw new IdleTurnTimeoutError(killed)
+    }
+    const summary = first
     if (failure) throw failure
     if (!summary) throw new Error('IDLE_TURN_NO_RESULT')
     return summary

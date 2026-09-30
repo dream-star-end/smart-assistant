@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER } from '@openclaude/protocol'
 import type { IdleProofResponse } from './engine/boxIdleProofClient.js'
@@ -50,8 +50,16 @@ export interface IdleOp {
   capsuleSha256?: string
   artifact?: IdleArtifact
   receiptDigest?: string
-  /** Native saw a short outer transcript and did not summarize. */
-  disposition?: 'short'
+  /** `short`: native saw a short outer transcript and did not summarize.
+   * `abandoned`: authoritative evidence that the idle turn cannot produce or
+   * deliver a result (egress proved failure, the CCB turn is over and egress
+   * never saw it after the grace window, or an operator reset replaced the
+   * native session). Both settle the op. */
+  disposition?: 'short' | 'abandoned'
+  abandonReason?: 'idle_turn_failed' | 'idle_turn_never_sent' | 'operator_reset' | 'source_gone'
+  /** Epoch ms when this process's idle CCB turn ended without a result
+   * (timeout, crash or error). After that no new compact request can be sent. */
+  idleStoppedAt?: number
 }
 
 export function idleUuid(opId: string, role: string): string {
@@ -98,7 +106,7 @@ function opPath(dir: string, op: { sessionKey: string; revision: string }): stri
 
 /** Done when the loader receipt matches the artifact, or native skipped a short transcript. */
 export function idleOpSettled(op: IdleOp): boolean {
-  if (op.disposition === 'short') return true
+  if (op.disposition === 'short' || op.disposition === 'abandoned') return true
   return Boolean(op.artifact && op.receiptDigest === op.artifact.digest)
 }
 
@@ -248,6 +256,7 @@ export interface IdleSourceCandidate {
   sessionKey: string
   sessionId: string
   turnKey: string
+  createdAt?: number
 }
 
 function candidatePath(dir: string, sessionKey: string): string {
@@ -350,4 +359,158 @@ export function advanceIdleOp(input: {
     return { op, callModel: true }
   }
   return { op, callModel: false }
+}
+
+// ── OCV5-297: dispatch gate, abandonment, rotation, operator reset ─────────
+
+/** After the idle CCB turn ended, egress must have seen any request it sent
+ * within this window; a later `not_found` proves nothing was sent. */
+export const IDLE_STOPPED_GRACE_MS = 120_000
+/** Settled op files kept per session (newest by mtime). */
+export const IDLE_OPS_KEEP = 3
+
+/** Restores the pre-OCV5-297 behavior: dispatch an idle turn after every
+ * terminal Box turn regardless of the leaf's compactRequired. */
+export function idleCompactAlways(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OC_BOX_IDLE_COMPACT_ALWAYS === '1'
+}
+
+/** Bounded wait for a pending proof within one call. */
+export function idleProofWaitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.OC_BOX_IDLE_PROOF_WAIT_MS)
+  return Number.isSafeInteger(raw) && raw >= 0 && raw <= 120_000 ? raw : 15_000
+}
+
+/** A source proof only asks for a new idle op when it can use one. */
+export function sourceNeedsIdleOp(proof: IdleProofResponse, always = idleCompactAlways()): boolean {
+  if (proof.status === 'terminal_set') return true
+  if (proof.status !== 'terminal') return false
+  return always || proof.compactRequired
+}
+
+/** Idle-turn evidence that settles an unfinished op without a summary. */
+export function idleAbandonReason(op: IdleOp, idleProof: IdleProofResponse,
+  now: number = Date.now()): IdleOp['abandonReason'] | undefined {
+  if (idleOpSettled(op) || op.summaryText) return undefined
+  if (idleProof.status === 'failed') return 'idle_turn_failed'
+  if (idleProof.status === 'not_found' && typeof op.idleStoppedAt === 'number'
+    && now - op.idleStoppedAt >= IDLE_STOPPED_GRACE_MS) return 'idle_turn_never_sent'
+  return undefined
+}
+
+export function abandonIdleOp(dir: string, op: IdleOp, reason: NonNullable<IdleOp['abandonReason']>): IdleOp {
+  const abandoned: IdleOp = { ...op, disposition: 'abandoned', abandonReason: reason }
+  writeIdleOp(dir, abandoned)
+  return abandoned
+}
+
+/** Current durable idle work for a session, if any. */
+export function currentIdleSource(dir: string, sessionKey: string):
+  { sessionId: string; turnKey: string } | undefined {
+  const pending = readPendingIdle(dir, sessionKey)
+  if (pending) return { sessionId: pending.sourceSessionId, turnKey: pending.sourceTurnKey }
+  const candidate = readIdleCandidate(dir, sessionKey)
+  return candidate ? { sessionId: candidate.sessionId, turnKey: candidate.turnKey } : undefined
+}
+
+function mtimeOf(path: string): number {
+  try { return statSync(path).mtimeMs } catch { return 0 }
+}
+
+/**
+ * Keep the per-session op directory small so readPendingIdle stays O(1)-ish.
+ * Only settled ops are removed (newest IDLE_OPS_KEEP kept); unsettled ops are
+ * never touched. The native file of a removed revision goes with it. Stale
+ * temp files older than an hour are cleaned too. Best effort, never throws.
+ */
+export function pruneIdleOps(dir: string, sessionKey: string, keep: number = IDLE_OPS_KEEP,
+  now: number = Date.now()): number {
+  const folder = join(dir, 'idle-ops', encodeURIComponent(sessionKey))
+  let names: string[]
+  try { names = readdirSync(folder) } catch { return 0 }
+  let removed = 0
+  const settled: Array<{ path: string; mtime: number; op: IdleOp }> = []
+  for (const name of names) {
+    const path = join(folder, name)
+    if (name.endsWith('.tmp')) {
+      if (now - mtimeOf(path) > 3_600_000) {
+        try { rmSync(path, { force: true }); removed++ } catch { /* best effort */ }
+      }
+      continue
+    }
+    if (!name.endsWith('.json')) continue
+    let op: IdleOp | undefined
+    try { op = readIdleOp(dir, sessionKey, name.slice(0, -'.json'.length)) } catch { continue }
+    if (op && idleOpSettled(op)) settled.push({ path, mtime: mtimeOf(path), op })
+  }
+  settled.sort((a, b) => b.mtime - a.mtime)
+  for (const item of settled.slice(Math.max(0, keep))) {
+    try {
+      rmSync(item.path, { force: true })
+      rmSync(idleNativePath(dir, item.op.sourceSessionId, item.op.revision), { force: true })
+      removed++
+    } catch { /* best effort */ }
+  }
+  return removed
+}
+
+export interface IdleResetMarker {
+  v: 1
+  sessionKey: string
+  requestedAt: number
+}
+
+const SESSION_KEY = /^[A-Za-z0-9._:-]{1,256}$/
+
+export function idleResetPath(dir: string, sessionKey: string): string {
+  return join(dir, 'idle-reset', `${encodeURIComponent(sessionKey)}.json`)
+}
+
+/** Operator exit: ask the next submit to replace the native session and
+ * abandon this session's unfinished idle work. */
+export function requestIdleReset(dir: string, sessionKey: string, now: number = Date.now()): string {
+  if (!SESSION_KEY.test(sessionKey)) throw new IdleCompactRejected('IDLE_RECOVERY_CORRUPT')
+  const path = idleResetPath(dir, sessionKey)
+  mkdirSync(join(path, '..'), { recursive: true })
+  const tmp = `${path}.${process.pid}.tmp`
+  const marker: IdleResetMarker = { v: 1, sessionKey, requestedAt: now }
+  writeFileSync(tmp, JSON.stringify(marker))
+  renameSync(tmp, path)
+  return path
+}
+
+/** `corrupt` = a marker exists but does not name exactly this session. */
+export function readIdleReset(dir: string, sessionKey: string): IdleResetMarker | 'corrupt' | undefined {
+  let raw: string
+  try { raw = readFileSync(idleResetPath(dir, sessionKey), 'utf8') } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    return 'corrupt'
+  }
+  try {
+    const parsed = JSON.parse(raw) as IdleResetMarker
+    if (parsed?.v !== 1 || parsed.sessionKey !== sessionKey
+      || !Number.isSafeInteger(parsed.requestedAt)) return 'corrupt'
+    return parsed
+  } catch { return 'corrupt' }
+}
+
+export function consumeIdleReset(dir: string, sessionKey: string): void {
+  const path = idleResetPath(dir, sessionKey)
+  try { renameSync(path, `${path}.done`) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+}
+
+/** Settle every unfinished op of this session as operator_reset and drop the
+ * candidate. Only valid after the native session has been replaced. */
+export function abandonAllIdle(dir: string, sessionKey: string): number {
+  let count = 0
+  for (let guard = 0; guard < 1024; guard++) {
+    const pending = readPendingIdle(dir, sessionKey)
+    if (!pending) break
+    abandonIdleOp(dir, pending, 'operator_reset')
+    count++
+  }
+  clearIdleCandidate(dir, sessionKey)
+  return count
 }
