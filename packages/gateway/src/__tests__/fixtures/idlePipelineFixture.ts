@@ -36,6 +36,8 @@ delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN;
 for (const key of Object.keys(process.env)) {
   if (/(_API_KEY|_SECRET|_PASSWORD|_DSN|DATABASE_URL)$/i.test(key)) delete process.env[key];
 }
+// Native CI startup requires an API key; only synthetic loopback credentials belong here.
+process.env.ANTHROPIC_API_KEY = "fixture-only-dummy-key";
 
 const CHECKOUT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../..");
 const MODEL = "box-api-claude-opus-5-5";
