@@ -2,6 +2,7 @@
  * Normal paths are unchanged. A fault stops at a real durable consumer boundary;
  * it never manufactures summary/applied/receipt state or truncates a JSON file. */
 import assert from "node:assert/strict";
+import { assembleIdleArtifact } from "../../boxIdleCompact.js";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -20,7 +21,7 @@ function testIdleFaultArmed(point: string): boolean {
 }
 async function testIdleFault(point: string, evidence: unknown): Promise<void> {
   if (!testIdleFaultArmed(point)) return
-  writeFileSync(${reached}, JSON.stringify({ point, evidence }))
+  writeFileSync(${reached}, JSON.stringify({ point, evidence, pid: process.pid }))
   await new Promise<never>(() => {})
 }
 `;
@@ -112,11 +113,17 @@ process.exit(0);
   return JSON.parse(readFileSync(output, "utf8"));
 }
 
-export function assertRecoveredContent(messages: Array<Record<string, any>>, native: Record<string, any>): void {
+export function assertRecoveredContent(messages: Array<Record<string, any>>, native: Record<string, any>, frozen: Record<string, any>): void {
   assert.equal(native.applied, true);
   assert.equal(native.modelCalls, 1);
   assert.ok(native.artifact?.digest);
-  const expected = [...native.frozenTail, ...native.attachments].map((row: any) => row.message);
+  for (const key of ["opId", "sessionId", "revision", "summaryText", "modelCalls", "frozenTail", "attachments"]) {
+    assert.deepEqual(native[key], frozen[key], `immutable prepared ${key}`);
+  }
+  const artifact = assembleIdleArtifact({ opId: frozen.opId, summaryText: frozen.summaryText,
+    tail: frozen.frozenTail, attachments: frozen.attachments });
+  assert.deepEqual(native.artifact, artifact, "artifact from immutable prepared input");
+  const expected = [...frozen.frozenTail, ...frozen.attachments].map((row: any) => row.message);
   const ids = expected.map((row: any) => row.uuid);
   const actual = messages.filter(row => ids.includes(row.uuid));
   assert.deepEqual(actual.map(row => row.uuid), ids, "preserved UUIDs/order");

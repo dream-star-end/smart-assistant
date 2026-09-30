@@ -241,12 +241,14 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           : b !== undefined ? query(a as never, b as never)
           : query(a as never);
         const sourceCommit = holdSourceCommit && usageRequestId !== "" && usageRequestId === sourceRequestId;
+        const freshCommit = mode === "fresh" && holdNextSettlement && usageRequestId !== "" &&
+          hits.some((hit) => !hit.summary && hit.requestId === usageRequestId && hit.status === 200);
         const summaryCommit = holdNextSettlement && summaryResponseEnded && usageRequestId !== "" &&
           hits.some((hit) => hit.summary && hit.requestId === usageRequestId);
-        if (verb.startsWith("COMMIT") && (sourceCommit || summaryCommit) && sawUsageInsert) {
+        if (verb.startsWith("COMMIT") && (sourceCommit || freshCommit || summaryCommit) && sawUsageInsert) {
           if (sourceCommit) holdSourceCommit = false;
           else holdNextSettlement = false;
-          heldKinds.push(sourceCommit ? "source" : "summary");
+          heldKinds.push(sourceCommit ? "source" : freshCommit ? "fresh" : "summary");
           if (usageRequestId) heldRequestIds.push(usageRequestId);
           return new Promise((resolve, reject) => {
             heldCommits.push(() => { Promise.resolve(run()).then(resolve, reject); });
@@ -1326,18 +1328,12 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         }
         releaseHeldCommits();
         await waitForCommitted(admin, SCHEMA, summaryId);
-        const barrierUser = await Promise.race([
-          blockedPromise,
-          sleep(180_000).then(() => "barrier-user-timeout"),
-        ]);
+        const barrierUser = await withDeadline(blockedPromise, 180_000, "barrier user");
         report.barrierUser = barrierUser;
         if (barrierUser === "barrier-user-timeout") throw new Error("barrier user did not settle after the summary commit was released");
       }
       if (!submitDone) {
-        const finished = await Promise.race([
-          submitPromise.then(() => true, () => true),
-          sleep(180_000).then(() => false),
-        ]);
+        const finished = await withDeadline(submitPromise.then(() => true, () => true), 180_000, "source submit completion");
         if (!finished) {
           releaseHeldCommits();
           throw new Error("SessionManager.submit stayed blocked after the summary commit was released");
@@ -1554,7 +1550,11 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
         assert.equal(oldNative?.modelCalls ?? null, oldNativeBefore?.modelCalls ?? null);
         assert.ok(preparedCheckpoint, "genuine prepared checkpoint required for crash matrix");
         const nativeRel = preparedCheckpoint.files.find((file) => file.relative.startsWith("idle-native/"))!.relative;
-        const nativeId = JSON.parse(readFileSync(join(preparedCheckpoint.root, nativeRel), "utf8")).sessionId as string;
+        const frozenNative = JSON.parse(readFileSync(join(preparedCheckpoint.root, nativeRel), "utf8"));
+        const nativeId = frozenNative.sessionId as string;
+        for (const hit of secondHits) {
+          if (hit.requestId) await waitForCommitted(admin, SCHEMA, hit.requestId);
+        }
         const coldRunner = async () => {
           await liveAdapter.shutdown();
           liveAdapter = new CcbAdapter({ sessionKey: liveKey, agentId: "main", agentBaseDir: work,
@@ -1577,9 +1577,17 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           const reached = JSON.parse(readFileSync(join(faultControl, "reached.json"), "utf8"));
           const rawDir = process.env.OC_V5_296_IDLE_RAW_DIR || tmpdir();
           const atFault = saveIdleCheckpoint(HOME, join(rawDir, `ocv5-296-fault-${windowName}-${SCHEMA.slice(-6)}`), liveKey, nativeId);
-          // Stop the old process. No file/state is edited to manufacture recovery.
-          await liveAdapter.shutdown();
+          // Kill the actual isolated native process group before requesting
+          // orderly adapter shutdown (which intentionally suppresses turn errors).
+          assert.ok(Number.isInteger(reached.pid) && reached.pid > 1);
+          const childCmdline = readFileSync(`/proc/${reached.pid}/cmdline`, "utf8");
+          assert.ok(childCmdline.includes(candidate), "fault pid must belong to this isolated candidate");
+          const childStat = readFileSync(`/proc/${reached.pid}/stat`, "utf8");
+          assert.equal(Number(childStat.slice(childStat.lastIndexOf(") ") + 2).split(" ")[2]), reached.pid,
+            "only this detached fixture process group may be killed");
+          process.kill(-reached.pid, "SIGKILL");
           const interruptedResult = await withDeadline(interrupted, 30_000, `old runner exit ${windowName}`);
+          await liveAdapter.shutdown();
           armIdleFault(faultControl, null);
           // The checkpoint is the actual event state; restoring it makes each
           // window independent of graceful shutdown bookkeeping, not of history.
@@ -1600,7 +1608,7 @@ async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localA
           const native = JSON.parse(readFileSync(join(HOME, nativeRel), "utf8"));
           const loaderPath = join(rawDir, `ocv5-296-recovered-${windowName}-${SCHEMA.slice(-6)}.json`);
           const loaded = readRecoveredConversation(candidate, HOME, nativeId, work, loaderPath);
-          assertRecoveredContent(loaded, native);
+          assertRecoveredContent(loaded, native, frozenNative);
           const op = listJson(join(HOME, "idle-ops", encodeURIComponent(liveKey)))
             .map(file => JSON.parse(readFileSync(file, "utf8")) as { idleTurnKey: string; receiptDigest?: string })
             .find(op => op.idleTurnKey === native.opId);
