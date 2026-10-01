@@ -4065,7 +4065,7 @@ describe('v5 release safety lanes', () => {
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
-      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.5 (test)}"',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.13 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',

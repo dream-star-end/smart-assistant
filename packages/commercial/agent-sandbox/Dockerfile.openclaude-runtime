@@ -356,7 +356,7 @@ COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/cod
 # native binary under $GROK_HOME; copy that verified binary to /usr/local/bin so
 # per-user persistent homes do not each receive a ~100 MB duplicate.
 ARG OC_INCLUDE_GROK=0
-ARG OC_GROK_VERSION=1.0.5
+ARG OC_GROK_VERSION=1.0.13
 RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
       npm install -g "@xai-official/grok@${OC_GROK_VERSION}" --no-audit --no-fund; \
       grok --version | grep -q "^grok ${OC_GROK_VERSION} "; \

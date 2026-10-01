@@ -312,7 +312,7 @@ export function makeGrokWebSearchHandler(deps: GrokWebSearchHandlerDeps): GrokWe
           "x-authenticateresponse": "authenticate-response",
           "x-grok-model-override": "grok-build",
           "x-grok-client-mode": "headless",
-          "x-grok-client-version": "1.0.5",
+          "x-grok-client-version": "1.0.13",
           "x-grok-client-identifier": "openclaude-search",
         },
         body: searchBody(searchQuery),
