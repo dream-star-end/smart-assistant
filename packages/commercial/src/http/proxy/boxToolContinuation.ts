@@ -131,6 +131,7 @@ export async function runBoxToolContinuation(input: {
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "stream_event"
         && (record as { event?: { type?: unknown } }).event?.type === "message_start") {
+        await echo.verifyDeferred();
         echo.assertComplete();
         modelStarted = true;
       }

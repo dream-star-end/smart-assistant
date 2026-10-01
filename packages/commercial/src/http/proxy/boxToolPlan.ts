@@ -33,6 +33,9 @@ export function boxToolAliasNotice(catalog: Pick<BoxToolCatalog, "boxNameByClien
     ...lines, "</tool-naming>"].join("\n");
 }
 
+/** OCV5-302: effectively disables Claude Code's MCP output truncation. */
+export const BOX_MCP_OUTPUT_TOKENS = "4000000";
+
 export function makeBoxToolPlan(input: {
   body: ProxyBody;
   upstreamModel: string;
@@ -97,7 +100,12 @@ export function makeBoxToolPlan(input: {
   const allowed = catalog.tools.map((tool) => `mcp__ocbridge__${tool.name}`).join(",");
   args.splice(configAt, 0, "--allowedTools", allowed);
   if (effort !== null) args.splice(configAt, 0, "--effort", effort);
-  const run: BoxCcExecRequest = { ...base.run, args };
+  // OCV5-302: the client already bounded this result exactly as native Claude
+  // Code does. The CLI's own MCP truncation/large-output layer would replace
+  // it with a preview of a file on the Box the model cannot read, and break
+  // the result echo bind.
+  const run: BoxCcExecRequest = { ...base.run, args,
+    environment: { ...base.run.environment, MAX_MCP_OUTPUT_TOKENS: BOX_MCP_OUTPUT_TOKENS } };
   return { ...base, stageVirtualMcp, virtualMcpHash, catalog, run,
     stageAssets: assetBatch.request, assetManifest: assetBatch.manifest };
 }

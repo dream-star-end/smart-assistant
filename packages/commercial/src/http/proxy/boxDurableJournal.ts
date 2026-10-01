@@ -32,6 +32,7 @@ import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer
 import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
+import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
@@ -1844,6 +1845,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       try { results = matchPreparedToolResults({ effectiveBody },
         digests, boundCatalog); }
       catch { throw new BoxDurableJournalError("BOX_TOOL_RESULT_MISMATCH"); }
+      // OCV5-302: publish (and hash) images the way the Box CLI keeps them, so
+      // its echo is byte-identical on the live and every recovery path.
+      results = await normalizeBoxResultImagesForCli(results);
       try {
         const compared = comparableAssistantContent(assistantContent, digests, boundCatalog);
         if (!incomingAssistantAccepted(compared, handoff)) {

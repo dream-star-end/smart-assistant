@@ -18,6 +18,7 @@ import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { ProxyBody } from "./shared.js";
+import { withPublishedBoxResults } from "./boxPublishedResults.js";
 
 export class BoxToolUnknownObserverError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolUnknownObserverError"; }
@@ -95,7 +96,10 @@ export async function observeBoxToolUnknown(input: {
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
         ...(progress ? { progress } : {}) });
-    const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;
+    // OCV5-302: with the hash-verified published results the echo can tell
+    // Claude Code's exact rewrites (image resize, empty, persisted) apart.
+    const echo = id.roundNo > 1 ? new BoxToolResultEcho(await withPublishedBoxResults(
+      target.exec, access.cwd, id.resultHashes!, abort.signal)) : null;
     const compaction = id.nativeSessionId ? new BoxCliCompaction(id.nativeSessionId) : null;
     let modelStarted = false;
     try {
@@ -127,6 +131,7 @@ export async function observeBoxToolUnknown(input: {
         if (record && typeof record === "object" && !Array.isArray(record)
           && (record as { type?: unknown }).type === "stream_event"
           && (record as { event?: { type?: unknown } }).event?.type === "message_start") {
+          await echo?.verifyDeferred();
           echo?.assertComplete(); modelStarted = true;
         }
         const decoded = decoder.push(line.text);

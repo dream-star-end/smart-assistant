@@ -14,6 +14,7 @@ import { boxCatalogMatching, type BoxToolCatalog } from "./boxToolCatalog.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
+import { withPublishedBoxResults } from "./boxPublishedResults.js";
 
 const LOST_RACE = new Set(["BOX_JOURNAL_COMPLETE_FENCE_LOST", "BOX_TOOL_CHAIN_FENCE_LOST",
   "BOX_TOOL_CHAIN_INVALID"]);
@@ -72,7 +73,9 @@ export async function observeBoxToolTerminalOnly(input: {
     const decoder = new BoxCliToolHandoffDecoder(id.upstreamModel, catalog,
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
         ...(progress ? { progress } : {}) });
-    const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;
+    // OCV5-302: see boxPublishedResults — evidence, never authority.
+    const echo = id.roundNo > 1 ? new BoxToolResultEcho(await withPublishedBoxResults(
+      input.target.exec, access.cwd, id.resultHashes!, abort.signal)) : null;
     const compaction = id.nativeSessionId ? new BoxCliCompaction(id.nativeSessionId) : null;
     let modelStarted = false;
     let endOffset = id.spoolOffset;
@@ -104,6 +107,7 @@ export async function observeBoxToolTerminalOnly(input: {
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "stream_event"
         && (record as { event?: { type?: unknown } }).event?.type === "message_start") {
+        await echo?.verifyDeferred();
         echo?.assertComplete();
         modelStarted = true;
       }
