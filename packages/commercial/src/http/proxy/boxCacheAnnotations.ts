@@ -614,6 +614,80 @@ function rejectIfUnapprovedBoundary(message: Record<string, unknown>): void {
   }
 }
 /** An unapproved wrapper must not collapse into the legal historical string. */
+/** OCV5-303: Claude Code's Skill tool answers `Launching skill: <name>` and
+ * injects the skill body (SKILL.md, "Base directory for this skill: ...") as
+ * isMeta user text after that tool_result, in the same user message or the
+ * next one. The continuation classifier requires a pure tool_result message,
+ * so every Box Claude turn that used a skill ended with 409
+ * BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION ("模型服务暂时中断"). The Box CLI
+ * can receive client output only through tool results, so the body joins the
+ * Skill result it belongs to: the model sees the same content in the same
+ * turn, as native Claude Code does. Anchored to exactly one Skill call whose
+ * result is exactly its launch line; anything else stays untouched. */
+const SKILL_LAUNCH = /^Launching skill: [A-Za-z0-9][A-Za-z0-9:_.\/@-]{0,127}$/;
+function skillLaunchText(content: unknown): string | null {
+  if (typeof content === "string") return SKILL_LAUNCH.test(content) ? content : null;
+  if (Array.isArray(content) && content.length === 1 && object(content[0])
+    && content[0].type === "text" && typeof content[0].text === "string"
+    && Object.keys(content[0]).sort().join(",") === "text,type"
+    && SKILL_LAUNCH.test(content[0].text)) return content[0].text;
+  return null;
+}
+function skillBodyBlocks(content: unknown): Array<{ type: "text"; text: string }> | null {
+  const parts = typeof content === "string" ? [{ type: "text", text: content }] : content;
+  if (!Array.isArray(parts) || parts.length < 1 || !denseArray(parts)) return null;
+  const out: Array<{ type: "text"; text: string }> = [];
+  for (const part of parts) {
+    const bare = bareTrailingText(part);
+    if (!bare || (bare.text as string).length === 0) return null;
+    out.push({ type: "text", text: bare.text as string });
+  }
+  return out;
+}
+export function foldBoxCcbSkillBody(body: ProxyBody): ProxyBody {
+  if (!opusModel(body) || !Array.isArray(body.messages) || !denseArray(body.messages)) return body;
+  const messages: unknown[] = [];
+  let changed = false;
+  for (let i = 0; i < body.messages.length; i++) {
+    const message = body.messages[i];
+    const assistant = messages.at(-1);
+    if (!object(message) || message.role !== "user" || !Array.isArray(message.content)
+      || !denseArray(message.content) || !object(assistant) || assistant.role !== "assistant"
+      || !Array.isArray(assistant.content)) { messages.push(message); continue; }
+    const content = message.content as unknown[];
+    let cut = 0;
+    while (cut < content.length && object(content[cut]) && (content[cut] as Record<string, unknown>).type === "tool_result") cut++;
+    if (cut === 0) { messages.push(message); continue; }
+    const skills = (assistant.content as unknown[]).filter((part) => object(part)
+      && part.type === "tool_use" && part.name === "Skill");
+    if (skills.length !== 1 || !object(skills[0]) || typeof skills[0].id !== "string") {
+      messages.push(message); continue;
+    }
+    const skillId = skills[0].id;
+    const at = content.slice(0, cut).findIndex((part) => object(part) && part.tool_use_id === skillId);
+    const launch = at >= 0 ? skillLaunchText((content[at] as Record<string, unknown>).content) : null;
+    // Same-message body, or the very next user message made only of text.
+    let trailing = content.slice(cut);
+    const next = body.messages[i + 1];
+    let consumedNext = false;
+    if (trailing.length === 0 && object(next) && next.role === "user"
+      && Object.keys(next).sort().join(",") === "content,role" && skillBodyBlocks(next.content)) {
+      trailing = typeof next.content === "string" ? [next.content] : next.content as unknown[];
+      consumedNext = true;
+    }
+    const bodyBlocks = trailing.length > 0
+      ? skillBodyBlocks(trailing.length === 1 && typeof trailing[0] === "string" ? trailing[0] : trailing) : null;
+    if (!launch || !bodyBlocks) { messages.push(message); continue; }
+    const results = content.slice(0, cut).map((part, index) => index !== at ? part : {
+      ...(part as Record<string, unknown>),
+      content: [{ type: "text", text: launch }, ...bodyBlocks] });
+    messages.push({ ...message, content: results });
+    changed = true;
+    if (consumedNext) i++;
+  }
+  return changed ? { ...body, messages } as ProxyBody : body;
+}
+
 function rejectUnapprovedToolBoundary(body: ProxyBody): void {
   if (!opusModel(body) || !Array.isArray(body.messages)) return;
   for (let index = 2; index < body.messages.length; index++) {
@@ -673,7 +747,7 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
     const { context_management: _hint, ...rest } = body;
     semanticBody = rest as ProxyBody;
   }
-  semanticBody = stripBoxCcbToolBudgetTail(semanticBody);
+  semanticBody = foldBoxCcbSkillBody(stripBoxCcbToolBudgetTail(semanticBody));
   // Opus 5.5 defaults adaptive display to "omitted". The actual Box CLI plan
   // maps both request forms to the same effort and response behavior; normalize
   // only this verified equivalence so a retry/continuation cannot evade its
