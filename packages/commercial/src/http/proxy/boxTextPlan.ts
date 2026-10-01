@@ -150,7 +150,8 @@ export function makeBoxTextPlan(input: {
   /** Appended to the staged system prompt (tool plan: the alias table). */
   systemSuffix?: string;
 }): BoxTextPlan {
-  const unsupported = validateBoxTextRequest(input.body);
+  const unsupported = validateBoxTextRequest(input.body,
+    input.resumeToolResults ? { resumeToolResults: true } : {});
   if (unsupported) throw new BoxTextPlanError(unsupported);
   if (!/^claude-[a-z0-9-]{3,64}$/.test(input.upstreamModel)
     || input.supervisorAsset.length === 0 || input.supervisorAsset.length > 32768

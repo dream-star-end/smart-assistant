@@ -70,5 +70,18 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
     // once that Stop is proven, the exchange may be recovered
     await q(`UPDATE request_finalize_journal SET ctx = ctx || '{"boxState":"failed_stopped"}'::jsonb WHERE request_id='box-old'`);
     assert.equal(await journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: "box-recover-3" }), true);
+    // an unknown claimer is never presumed gone
+    assert.equal((await find(["toolu_S"])).kind, "claimed");
+    // a claimer that ended before any Box admission leaves a stale claim a later recovery takes over
+    await q(`INSERT INTO request_finalize_journal VALUES ('box-recover-3',3,'aborted','{}'::jsonb)`);
+    const stale = await find(["toolu_S"]);
+    assert.equal(stale.kind === "orphan" && stale.staleClaim, "box-recover-3");
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: "box-recover-4" }), false,
+      "a stale claim is only replaced by naming it");
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: "box-recover-4",
+      replacing: "box-recover-3" }), true);
+    // an admitted claimer keeps it
+    await q(`INSERT INTO request_finalize_journal VALUES ('box-recover-4',3,'inflight','{"boxState":"running"}'::jsonb)`);
+    assert.equal((await find(["toolu_S"])).kind, "claimed");
   } finally { client.release(); await pool.end(); }
 });

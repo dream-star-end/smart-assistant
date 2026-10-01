@@ -9,7 +9,8 @@ import { isBoxNoopContextManagement } from "./boxCacheAnnotations.js";
 import { classifyBoxContinuation, preparedMatchesBody,
   type PreparedContinuation } from "./boxPreparedContinuation.js";
 
-export function validateBoxTextRequest(body: ProxyBody): string | null {
+export function validateBoxTextRequest(body: ProxyBody,
+  options: { resumeToolResults?: boolean } = {}): string | null {
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
   if (body.tools?.length || body.tool_choice !== undefined) return "BOX_TOOLS_REQUIRE_LIVE_BRIDGE";
   if (body.thinking !== undefined || body.output_config !== undefined) return "BOX_EFFORT_UNMAPPED";
@@ -25,6 +26,8 @@ export function validateBoxTextRequest(body: ProxyBody): string | null {
     compileBoxCliSyntheticTurn(body, {
       cwd: "/tmp/ocv5-289-run-000000000000000000000000",
       cliVersion: "2.1.280",
+      // OCV5-304: the plan for a recovered tool exchange validates the same shape it stages.
+      ...(options.resumeToolResults ? { resumeToolResults: true } : {}),
     });
   } catch (error) {
     return error instanceof BoxMessagesShapeError ? error.code : "BOX_REQUEST_INVALID";

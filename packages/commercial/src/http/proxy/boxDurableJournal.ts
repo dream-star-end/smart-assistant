@@ -429,8 +429,8 @@ export class BoxDurableJournal implements BoxJournalPort {
    */
   async findOrphanToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
     toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" } | { kind: "claimed" }
-    | { kind: "orphan"; stopped: boolean; identity: { requestId: string; uid: bigint;
-      accountId: bigint; runNonce: string; leaseEpoch: string } }> {
+    | { kind: "orphan"; stopped: boolean; staleClaim?: string; identity: { requestId: string;
+      uid: bigint; accountId: bigint; runNonce: string; leaseEpoch: string } }> {
     if (input.toolIds.length < 1 || input.toolIds.length > 32
       || input.toolIds.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))) return { kind: "none" };
     const want = [...input.toolIds].sort().join(",");
@@ -448,7 +448,21 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length === 0) return { kind: "none" };
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
-    if (ctx.boxRecoveredBy !== undefined) return { kind: "claimed" };
+    // A claim is stale only when its recovery request ended before it was
+    // ever admitted to a Box run (e.g. it failed while planning); then a later
+    // recovery may take it over. Any admitted claimer keeps it.
+    let staleClaim: string | undefined;
+    if (ctx.boxRecoveredBy !== undefined) {
+      if (typeof ctx.boxRecoveredBy !== "string") return { kind: "claimed" };
+      const claimer = await this.pool.query<{ state: string; ctx: Record<string, unknown> }>(
+        `SELECT state, ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2`,
+        [ctx.boxRecoveredBy, input.uid.toString()]);
+      const holder = claimer.rows[0];
+      if (!holder || holder.state !== "aborted" || holder.ctx.boxState !== undefined) {
+        return { kind: "claimed" };
+      }
+      staleClaim = ctx.boxRecoveredBy;
+    }
     const stopped = ctx.boxState === "failed_stopped";
     // A Stop already in flight (cancel intent, not yet proven) is not ours.
     if (!stopped && ctx.boxCancelIntent !== undefined) return { kind: "live" };
@@ -463,7 +477,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2`,
       [input.uid.toString(), billing.dispatchId]);
     if (dispatch.rows[0]?.status !== "terminal") return { kind: "live" };
-    return { kind: "orphan", stopped, identity: { requestId: row.request_id, uid: input.uid,
+    return { kind: "orphan", stopped, ...(staleClaim ? { staleClaim } : {}),
+      identity: { requestId: row.request_id, uid: input.uid,
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
   }
 
@@ -471,7 +486,8 @@ export class BoxDurableJournal implements BoxJournalPort {
    * under the same session advisory lock as recordUserCancelIntent, so a
    * user Stop that lands first wins: a waiting handoff with a cancel intent is
    * never claimed (an exchange already proven stopped may be). */
-  async claimOrphanRecovery(input: { requestId: string; uid: bigint; by: string }): Promise<boolean> {
+  async claimOrphanRecovery(input: { requestId: string; uid: bigint; by: string;
+    replacing?: string }): Promise<boolean> {
     const client = await this.pool.connect();
     let committed = false;
     try {
@@ -489,10 +505,10 @@ export class BoxDurableJournal implements BoxJournalPort {
         `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
             updated_at=NOW()
           WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxSessionId'=$4
-            AND NOT (ctx ? 'boxRecoveredBy')
+            AND (NOT (ctx ? 'boxRecoveredBy') OR ctx->>'boxRecoveredBy' = $5)
             AND (ctx->>'boxState'='failed_stopped'
               OR (ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')))`,
-        [input.requestId, input.uid.toString(), input.by, sessionId]);
+        [input.requestId, input.uid.toString(), input.by, sessionId, input.replacing ?? null]);
       await client.query("COMMIT"); committed = true;
       return changed.rowCount === 1;
     } finally {

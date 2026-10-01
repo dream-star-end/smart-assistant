@@ -103,7 +103,8 @@ export class BoxToolFetch {
     if (orphan.kind === "claimed") throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
     if (orphan.kind !== "orphan") return false;
     const claim = { requestId: orphan.identity.requestId, uid: args.uid, by: args.requestId };
-    if (!(await journal.claimOrphanRecovery(claim))) {
+    if (!(await journal.claimOrphanRecovery({ ...claim,
+      ...(orphan.staleClaim ? { replacing: orphan.staleClaim } : {}) }))) {
       throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
     }
     if (orphan.stopped) return true;
