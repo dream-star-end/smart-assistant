@@ -163,6 +163,65 @@ function provenCaption(text: string): boolean {
   return match !== null && PROVEN_IMAGE_CAPTIONS.has(
     `${match[1]}x${match[2]}>${match[3]}x${match[4]}@${match[5]}`);
 }
+/** OCV5-302: pixel size from the image header (PNG/JPEG/GIF/WEBP). */
+function boxImageDimensions(data: string): { width: number; height: number } | null {
+  const b = Buffer.from(data, "base64");
+  if (b.length >= 24 && b.readUInt32BE(0) === 0x89504e47) {
+    return { width: b.readUInt32BE(16), height: b.readUInt32BE(20) };
+  }
+  if (b.length >= 10 && b.toString("latin1", 0, 3) === "GIF") {
+    return { width: b.readUInt16LE(6), height: b.readUInt16LE(8) };
+  }
+  if (b.length >= 30 && b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") {
+    const kind = b.toString("latin1", 12, 16);
+    if (kind === "VP8X") return { width: 1 + b.readUIntLE(24, 3), height: 1 + b.readUIntLE(27, 3) };
+    if (kind === "VP8L") {
+      const bits = b.readUInt32LE(21);
+      return { width: 1 + (bits & 0x3fff), height: 1 + ((bits >> 14) & 0x3fff) };
+    }
+    if (kind === "VP8 ") return { width: b.readUInt16LE(26) & 0x3fff, height: b.readUInt16LE(28) & 0x3fff };
+    return null;
+  }
+  if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) { i++; continue; }
+      const marker = b[i + 1]!;
+      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+        return { width: b.readUInt16BE(i + 7), height: b.readUInt16BE(i + 5) };
+      }
+      i += 2 + b.readUInt16BE(i + 2);
+    }
+  }
+  return null;
+}
+/** OCV5-302: a caption proven by the image it describes. Real screenshots come
+ * in many sizes; only the two observed tuples were accepted, so any other
+ * resized Read image ended the turn with 409. Claude Code's caption
+ * (utils/imageResizer createImageMetadataText) must name exactly this image's
+ * pixel size as "displayed", describe a real downscale with the same aspect
+ * ratio, and carry the scale string Claude Code computes. */
+function captionMatchesImage(text: string, image: { width: number; height: number }): boolean {
+  const match = exactCaption(text);
+  if (!match) return false;
+  const [ow, oh, dw, dh] = [match[1], match[2], match[3], match[4]].map(Number) as [number, number, number, number];
+  if (dw !== image.width || dh !== image.height || dw > ow || dh > oh || (dw === ow && dh === oh)) return false;
+  if (match[5] !== (ow / dw).toFixed(2)) return false;
+  return Math.abs(ow / oh - dw / dh) <= (ow / oh) * (2 / Math.min(dw, dh));
+}
+/** Claude Code puts its prompt-cache breakpoint on the last block of the last
+ * message, which for a resized Read is the caption itself. */
+function bareTrailingText(part: unknown): Record<string, unknown> | null {
+  if (!object(part) || part.type !== "text" || typeof part.text !== "string") return null;
+  const keys = Object.keys(part).sort().join(",");
+  if (keys === "text,type") return part;
+  if (keys !== "cache_control,text,type" || !object(part.cache_control)) return null;
+  const cc = part.cache_control;
+  const ccKeys = Object.keys(cc).sort().join(",");
+  if (cc.type !== "ephemeral" || !(ccKeys === "type"
+    || (ccKeys === "ttl,type" && (cc.ttl === "5m" || cc.ttl === "1h")))) return null;
+  return { type: "text", text: part.text };
+}
 function captionShaped(text: string): boolean {
   return exactCaption(text) !== null;
 }
@@ -237,11 +296,14 @@ function foldProvenImageCaption(message: Record<string, unknown>,
   const trailing = content.slice(lastResult + 1);
   if (trailing.length === 0) return message;
   const captions: string[] = [];
+  const bareTrailing: Record<string, unknown>[] = [];
   for (const part of trailing) {
-    if (!object(part) || Object.keys(part).sort().join(",") !== "text,type"
-      || part.type !== "text" || typeof part.text !== "string") return message;
-    if (provenCaption(part.text)) captions.push(part.text);
-    else if (!generatedToolMeta(part.text)) return message;
+    const bare = bareTrailingText(part);
+    if (!bare) return message;
+    bareTrailing.push(bare);
+    const text = bare.text as string;
+    if (captionShaped(text)) captions.push(text);
+    else if (!generatedToolMeta(text)) return message;
   }
   if (captions.length !== 1) return message;
   const useIds = toolUseIds(assistant);
@@ -265,10 +327,13 @@ function foldProvenImageCaption(message: Record<string, unknown>,
   if (!object(imageResult) || !Array.isArray(imageResult.content)
     || !denseArray(imageResult.content)) return message;
   const caption = captions[0]!;
+  const imageBlock = imageResult.content.map(strictBoxImageBlock).find((item) => item !== null);
+  const dims = imageBlock ? boxImageDimensions(imageBlock.data) : null;
+  if (!provenCaption(caption) && !(dims && captionMatchesImage(caption, dims))) return message;
   const nextResults = results.slice();
   nextResults[imageIndex] = { ...imageResult, content: [...imageResult.content,
     { type: "text", text: caption }] };
-  const keptTrailing = trailing.filter((part) => object(part) && part.text !== caption);
+  const keptTrailing = bareTrailing.filter((part) => part.text !== caption);
   return { ...message, content: [...nextResults, ...keptTrailing] };
 }
 /** CCB's default mergeUserContentBlocks folds generated meta into the LAST
