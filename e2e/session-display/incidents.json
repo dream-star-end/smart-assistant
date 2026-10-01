@@ -5462,6 +5462,26 @@
           "assertion": "OCV5-304 a recovered tool exchange plans end to end with Claude Code's resume sentence"
         }
       ]
+    },
+    {
+      "id": "INC-20261001-BOX-SPOOL-READ-TRANSIENT",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #2ee979cd（v5-6232c85d1，14:58Z）：Box Claude Opus 5.5 长回合约 25 轮工具后，续接轮询 Box stdout spool 的一次 exec HTTPS 请求在网络层失败（fetch reject → BOX_EXEC_TRANSPORT_UNKNOWN）；只读、同 offset 可重读的 spool 读取从不重试，整回合记为 continuation_unknown，用户看到『任务执行失败 / 内部错误』。修复：pollBoxSpoolLines 对传输层不确定（fetch/stream/incomplete/单次超时/429/502/503/504）在同一 offset 有界退避重读（6 次约 12s，成功即清零，仍受回合期限与中止约束）；pending-call 与 terminal-proof 只读证明循环同样容忍；账号守卫、远端退出码、鉴权、帧错误仍立即失败。",
+      "rootFixCommit": "11d17197",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-306: a dropped exec exchange re-reads the same offset instead of failing the turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-306: account guard, remote exit and HTTP auth errors are never retried"
+        }
+      ]
     }
   ]
 }
