@@ -119,34 +119,6 @@ function generatedToolMeta(text: string): { hook?: string; budget: boolean } | n
   if (USER_BUDGET.test(text)) return { budget: true };
   return HOOK_CONTEXT.test(text) ? { hook: text, budget: false } : null;
 }
-/** CCB records the Read result and its generated image caption as consecutive
- * user messages. The Anthropic continuation boundary is one user tool-result
- * message, so join only this exact generated tail before folding it into the
- * owning image result. Ordinary consecutive user instructions stay untouched. */
-function mergeAdjacentGeneratedUserTail(messages: unknown[]): unknown[] {
-  const merged: unknown[] = [];
-  for (const message of messages) {
-    const previous = merged.at(-1);
-    if (object(previous) && previous.role === "user" && Array.isArray(previous.content)
-      && previous.content.length > 0
-      && previous.content.every((part: unknown) => object(part) && part.type === "tool_result")
-      && object(message) && message.role === "user") {
-      const raw = message.content;
-      const tail = typeof raw === "string" ? [{ type: "text", text: raw }]
-        : Array.isArray(raw) && denseArray(raw) ? raw : null;
-      if (tail && tail.length > 0 && tail.every((part: unknown) => {
-        if (!object(part) || part.type !== "text" || Object.keys(part).sort().join(",") !== "text,type"
-          || typeof part.text !== "string") return false;
-        return provenCaption(part.text) || generatedToolMeta(part.text) !== null;
-      })) {
-        merged[merged.length - 1] = { ...previous, content: [...previous.content, ...tail] };
-        continue;
-      }
-    }
-    merged.push(message);
-  }
-  return merged;
-}
 // CCB 2.1.280 prints this sibling after a scaled Read image. Only the two
 // dimension tuples below were observed (HTTP 80x2200 and JSONL 1290x2796).
 // Other sizes stay unfolded. The scale string is kept verbatim.
@@ -297,67 +269,6 @@ function stripEmbeddedBudget(last: Record<string, unknown>): Record<string, unkn
     : [...last.content.slice(0, -1), { ...tail, text }];
   return { ...last, content };
 }
-/** OCV5-302: Claude Code's Read of an image it resized adds a meta user
- * message `[Image: original WxH, displayed at WxH. Multiply coordinates by N
- * to map to original image.]` (utils/imageResizer createImageMetadataText).
- * The API request carries it as text after the tool_result blocks, either in
- * the same user message or as the next one, and the continuation classifier
- * rejected the turn as BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION ("任务执行暂时
- * 中断"). Fold exactly this text into the last image-bearing tool_result of
- * that message so the model still sees it and the turn continues. */
-const CCB_IMAGE_META = /^\[Image: original [1-9][0-9]{0,5}x[1-9][0-9]{0,5}, displayed at [1-9][0-9]{0,5}x[1-9][0-9]{0,5}\. Multiply coordinates by [0-9]{1,6}\.[0-9]{2} to map to original image\.\]$/;
-function isCcbImageMeta(block: unknown): block is { type: "text"; text: string } {
-  return object(block) && block.type === "text" && typeof block.text === "string"
-    && Object.keys(block).every((key) => key === "type" || key === "text"
-      || key === "cache_control") && CCB_IMAGE_META.test(block.text);
-}
-function hasImage(result: Record<string, unknown>): boolean {
-  return Array.isArray(result.content) && result.content.some((item) => object(item) && item.type === "image");
-}
-export function foldBoxCcbImageMetadata(body: ProxyBody): ProxyBody {
-  if (!Array.isArray(body.messages)) return body;
-  for (let i = 0; i < body.messages.length; i++) {
-    if (!Object.hasOwn(body.messages, i)) return body;
-  }
-  const messages: unknown[] = [];
-  let changed = false;
-  for (let i = 0; i < body.messages.length; i++) {
-    const message = body.messages[i];
-    const next = body.messages[i + 1];
-    if (!object(message) || message.role !== "user" || !Array.isArray(message.content)) {
-      messages.push(message); continue;
-    }
-    let blocks = message.content as unknown[];
-    // The meta message may arrive as its own user message right after.
-    let consumedNext = false;
-    if (object(next) && next.role === "user" && Array.isArray(next.content)
-      && next.content.length > 0 && next.content.every(isCcbImageMeta)
-      && Object.keys(next).every((key) => key === "role" || key === "content")) {
-      blocks = [...blocks, ...next.content];
-      consumedNext = true;
-    }
-    let cut = blocks.length;
-    while (cut > 0 && isCcbImageMeta(blocks[cut - 1])) cut--;
-    const metas = blocks.slice(cut) as Array<{ type: "text"; text: string }>;
-    const head = blocks.slice(0, cut);
-    const target = head.reduce<number>((found, block, index) => object(block)
-      && block.type === "tool_result" && hasImage(block) ? index : found, -1);
-    if (metas.length === 0 || target < 0
-      || head.some((block) => !object(block) || block.type !== "tool_result")) {
-      messages.push(message); continue;
-    }
-    const folded = head.map((block, index) => index !== target ? block : {
-      ...(block as Record<string, unknown>),
-      content: [...((block as { content: unknown[] }).content),
-        ...metas.map((meta) => ({ type: "text", text: meta.text }))],
-    });
-    messages.push({ ...message, content: folded });
-    changed = true;
-    if (consumedNext) i++;
-  }
-  return changed ? { ...body, messages } as ProxyBody : body;
-}
-
 function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
   if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
     || !Array.isArray(body.messages)) return body;
@@ -365,7 +276,7 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
     if (!Object.hasOwn(body.messages, i)) return body;
   }
   let changed = false;
-  const messages = mergeAdjacentGeneratedUserTail(body.messages).map((message, index) => {
+  const messages = body.messages.map((message, index) => {
     if (!object(message) || message.role !== "user" || !Array.isArray(message.content)
       || !message.content.some((part: unknown) => object(part) && part.type === "tool_result")) {
       return message;
@@ -663,7 +574,7 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
     const { context_management: _hint, ...rest } = body;
     semanticBody = rest as ProxyBody;
   }
-  semanticBody = stripBoxCcbToolBudgetTail(foldBoxCcbImageMetadata(semanticBody));
+  semanticBody = stripBoxCcbToolBudgetTail(semanticBody);
   // Opus 5.5 defaults adaptive display to "omitted". The actual Box CLI plan
   // maps both request forms to the same effort and response behavior; normalize
   // only this verified equivalence so a retry/continuation cannot evade its
