@@ -61,7 +61,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
   badAssetManifest?: boolean; writeMessage?: boolean; detached?: boolean;
   cleanupClaimedElsewhere?: boolean; consumeBudgetAtWrite?: boolean;
-  parallel?: boolean } = {}) {
+  parallel?: boolean; capacityWaitMs?: number } = {}) {
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
@@ -182,7 +182,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
       unknowns.push(phase);
       if (opts.hangUnknown) await new Promise<void>(() => {});
     },
-    now: () => now, budgetMs: 600_000 });
+    now: () => now, budgetMs: 600_000,
+    capacityWaitMs: opts.capacityWaitMs ?? 0 });
   return { service, registry, stages, unknowns, journalCalls,
     setCleanupDone: () => { cleanupDone = true; },
     getJournalUsage: () => journalUsage, getJournalPointer: () => journalPointer,
@@ -207,6 +208,37 @@ test("text admission rejects a third session and a duplicate session before paid
   assert.deepEqual(f.stages, [], "no Box staging or paid CLI can run");
   f.registry.confirmRemoteStopped(a);
   f.registry.confirmRemoteStopped(b);
+});
+
+test("OCV5-301 a session slot freed by the settling previous turn is waited for, not rejected", async () => {
+  const f = fixture({ capacityWaitMs: 5_000 });
+  const previous = f.registry.open({ uid: 3n, sessionId: input.sessionId!, accountId: 20n });
+  setTimeout(() => f.registry.confirmRemoteStopped(previous), 300);
+  const response = await f.service.fetch(input);
+  assert.equal(response.status, 200);
+  await response.text();
+});
+
+test("OCV5-301 an admission that commits after the caller left is prestart-closed", async () => {
+  const f = fixture({ capacityWaitMs: 5_000 });
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const prestart: string[] = [];
+  const journal = (f.service as unknown as { deps: { journal: Record<string, unknown> } }).deps.journal;
+  const admit = journal.admit as (input: unknown) => Promise<unknown>;
+  journal.admit = async (value: unknown) => { await gate; return admit(value); };
+  const markPrestartStopped = journal.markPrestartStopped as (input: { requestId: string }) => Promise<unknown>;
+  journal.markPrestartStopped = async (value: { requestId: string }) => {
+    prestart.push(value.requestId); return markPrestartStopped(value); };
+  const controller = new AbortController();
+  const pending = f.service.fetch({ ...input, init: { ...input.init, signal: controller.signal } })
+    .catch((error: unknown) => error);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+  await pending;
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(prestart, [input.requestId], "late success is closed, not left holding capacity");
 });
 
 test("one authenticated proxy fetch stages serially, returns billable SSE, then releases capacity", async () => {

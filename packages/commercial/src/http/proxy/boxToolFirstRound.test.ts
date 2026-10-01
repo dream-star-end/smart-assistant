@@ -754,14 +754,39 @@ test("first round rejects a catalog-matching heartbeat", async () => {
   assert.ok(f.sequence.includes("unknown"));
 });
 
-// OCV5-299: a continued session in which the model called a client-named tool
-// (e.g. `Bash`) that this invocation's CLI does not expose.
+// OCV5-299: a tool call the decoder must reject outright. Since OCV5-301 a
+// well-formed but unexposed name (e.g. bare `Bash`) is answered by the CLI
+// itself and retried in the same turn; a malformed name still takes this
+// fail-closed stop path.
 const unknownNameRecords = records.map((record) => {
-  const text = JSON.stringify(record).replaceAll(`"name":"${boxName}"`, '"name":"Bash"');
+  const text = JSON.stringify(record).replaceAll(`"name":"${boxName}"`, '"name":"Bash tool"');
   return JSON.parse(text) as unknown;
 });
 unknownNameRecords[0] = records[0];
 const unknownNameRaw = Buffer.from(unknownNameRecords.map((record) => JSON.stringify(record) + "\n").join(""));
+
+test("OCV5-301 a call the CLI rejects itself is retried in the same turn and handed off", async () => {
+  const rejected = records.slice(1).map((record) => JSON.parse(JSON.stringify(record)
+    .replaceAll(`"name":"${boxName}"`, '"name":"Bash"').replaceAll(toolId, "toolu_cli_rejected")
+    .replaceAll("msg_synthetic", "msg_rejected")) as unknown);
+  const cliError = { type: "user", message: { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_cli_rejected", is_error: true,
+    content: "<tool_use_error>Error: No such tool available: Bash</tool_use_error>" }] } };
+  const spoolBody = Buffer.from([records[0], ...rejected, cliError, ...records.slice(1)]
+    .map((record) => JSON.stringify(record) + "\n").join(""));
+  const f = fixture({ spoolBody });
+  let stops = 0;
+  const handoff = await runBoxToolFirstRound(f.input, { ...f.deps,
+    stopRejectedRun: async () => { stops++; return "stopped_proven" as const; } });
+  assert.equal(handoff.kind, "tool_handoff");
+  assert.equal(stops, 0, "the run is not stopped");
+  assert.deepEqual(f.unknownPhases, []);
+  const emitted = f.emitted.join("");
+  assert.equal(emitted.match(/event: message_start/g)?.length, 1, "one client message");
+  assert.ok(!emitted.includes("toolu_cli_rejected"), "the rejected call is never shown");
+  assert.ok(emitted.includes('"name":"local_echo"'));
+  assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+});
 
 test("a locally rejected tool name is stopped and settled, not left unknown", async () => {
   const f = fixture({ spoolBody: unknownNameRaw });

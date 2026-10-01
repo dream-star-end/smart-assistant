@@ -120,7 +120,10 @@ export async function runBoxToolContinuation(input: {
         }
       }
       if (record && typeof record === "object" && !Array.isArray(record)
-        && (record as { type?: unknown }).type === "user") {
+        && (record as { type?: unknown }).type === "user"
+        && !(modelStarted && decoder.awaitingCliToolError())) {
+        // OCV5-301: after the model starts, only Claude Code's own error for a
+        // rejected call may appear; the decoder validates and merges it.
         if (modelStarted) throw new BoxToolContinuationError("BOX_TOOL_ECHO_AFTER_MODEL");
         echo.accept(record);
         continue;

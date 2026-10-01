@@ -20,6 +20,7 @@ import type { BoxJournalPort, BoxRemoteCleanupCandidate } from "./boxDurableJour
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { ProxyBody } from "./shared.js";
 import { rootLogger } from "../../logging/logger.js";
+import { waitingForBoxCapacity } from "./boxCapacityWait.js";
 
 type ExecRunner = Pick<BoxExecTransport, "run">;
 const log = rootLogger.child({ subsys: "box-text-fetch" });
@@ -41,6 +42,8 @@ export class BoxTextFetch {
   private readonly disposal = new WeakMap<BoxResolvedTarget,
     { done: boolean; pending: Promise<void> | null }>();
   constructor(private readonly deps: {
+    /** OCV5-301 bounded wait for a held session/account slot (default 45s). */
+    capacityWaitMs?: number;
     supervisorAsset: Buffer;
     keeperAsset: Buffer;
     /** When injected, the text lane reuses the proven detached Box spool. */
@@ -272,9 +275,11 @@ export class BoxTextFetch {
       }
       const leaseSessionId = args.sessionId ?? args.requestId;
       try {
-        lease = this.deps.registry.open({ uid: args.uid, sessionId: leaseSessionId,
-          accountId: resolved.accountId, leaseMs: remaining(),
-          onRemoteStopped: () => this.disposeTarget(resolved!) });
+        // OCV5-301: the same session's previous turn may still be settling.
+        lease = await waitingForBoxCapacity(() => this.deps.registry.open({ uid: args.uid,
+          sessionId: leaseSessionId, accountId: resolved!.accountId, leaseMs: remaining(),
+          onRemoteStopped: () => this.disposeTarget(resolved!) }), abort.signal,
+          { maxWaitMs: this.deps.capacityWaitMs });
       } catch (error) {
         if (error instanceof Error && ["BOX_USER_CAPACITY_FULL",
           "BOX_ACCOUNT_CAPACITY_FULL", "BOX_SESSION_BUSY"].includes(error.message)) {
@@ -292,13 +297,26 @@ export class BoxTextFetch {
       abort.signal.addEventListener("abort", clientLeaseListener, { once: true });
 
       try {
-        await race(this.deps.journal.admit({ requestId: args.requestId,
-          uid: args.uid, accountId: resolved.accountId, model: args.canonicalModel,
+        const admitAccountId = resolved.accountId;
+        const pendingAdmission = waitingForBoxCapacity(() => this.deps.journal.admit({
+          requestId: args.requestId,
+          uid: args.uid, accountId: admitAccountId, model: args.canonicalModel,
           fingerprint, canonicalBody: args.canonicalBody,
           replayRequired: this.deps.writeMessage !== undefined,
           ...(detached ? { detachedRunnerHash: detached.detachedRunnerHash,
             upstreamModel: plan.expectedModel } : {}),
-          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }));
+          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch }), abort.signal,
+        { maxWaitMs: this.deps.capacityWaitMs });
+        // OCV5-301: an admission still in flight when the caller left may
+        // commit afterwards. No Box command follows it, so prestart-close it
+        // rather than let it hold the session's capacity.
+        void pendingAdmission.then(() => {
+          if (abort.signal.aborted && !journalAdmitted) {
+            void this.deps.journal.markPrestartStopped({ requestId: args.requestId,
+              uid: args.uid, leaseEpoch: plan.leaseEpoch }).catch(() => {});
+          }
+        }, () => {});
+        await race(pendingAdmission);
         journalAdmitted = true;
       } catch (error) {
         // No Box command has started, so the acquired target is safe to close.

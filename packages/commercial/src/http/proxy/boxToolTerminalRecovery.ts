@@ -93,7 +93,8 @@ export async function observeBoxToolTerminalOnly(input: {
         }
       }
       if (record && typeof record === "object" && !Array.isArray(record)
-        && (record as { type?: unknown }).type === "user") {
+        && (record as { type?: unknown }).type === "user"
+        && !(modelStarted && decoder.awaitingCliToolError())) {
         if (!echo || modelStarted) {
           return { status: "pending", reason: "BOX_RECOVERY_ECHO_UNEXPECTED" };
         }

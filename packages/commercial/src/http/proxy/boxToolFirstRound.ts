@@ -28,6 +28,7 @@ import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { ProxyBody } from "./shared.js";
+import { waitingForBoxCapacity } from "./boxCapacityWait.js";
 
 export class BoxToolFirstRoundError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolFirstRoundError"; }
@@ -74,6 +75,8 @@ export async function runBoxToolFirstRound(input: {
   keeperAsset: Buffer;
   virtualMcpAsset: Buffer;
   detachedRunnerAsset: Buffer;
+  /** OCV5-301 bounded wait for a held session/account slot (default 45s). */
+  capacityWaitMs?: number;
   /** OCV5-300: production passes "natural" so the CLI sees client names. */
   toolAliasMode?: BoxMcpAliasMode;
   journal: Journal;
@@ -318,8 +321,11 @@ export async function runBoxToolFirstRound(input: {
         }
       }
     }
-    const pendingAdmission = deps.journal.admit({ requestId: input.requestId, uid: input.uid,
-      accountId: target.accountId, model: input.canonicalModel, fingerprint,
+    // OCV5-301: the same session's previous turn may still be settling.
+    const admitAccountId = target.accountId;
+    const pendingAdmission = waitingForBoxCapacity(() => deps.journal.admit({
+      requestId: input.requestId, uid: input.uid,
+      accountId: admitAccountId, model: input.canonicalModel, fingerprint,
       canonicalBody: input.canonicalBody,
       replayRequired: deps.writeMessage !== undefined,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
@@ -328,7 +334,7 @@ export async function runBoxToolFirstRound(input: {
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
-          cliCwd: plan.cliCwd } } : {}) });
+          cliCwd: plan.cliCwd } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
