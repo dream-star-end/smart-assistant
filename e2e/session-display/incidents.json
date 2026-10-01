@@ -5252,14 +5252,14 @@
       "id": "INC-20261001-GROK-CLI-426",
       "occurredAt": "2026-10-01",
       "severity": "P1",
-      "symptom": "xAI 服务端开始强制 Grok CLI ≥1.0.13；selfhost 运行时镜像内 grok-native 1.0.5 的所有 grok-build/grok-build-fast 回合返回 426 Upgrade Required（UI『任务执行暂时中断，请直接重试本条消息』），发布门 C3 one model per engine 因此在现网与候选上均失败、阻断所有 selfhost 发布。修复：运行时镜像钉 Grok CLI 1.0.13（适配器参数全部兼容），webSearchProxy 客户端版本头同步。",
+      "symptom": "xAI 服务端开始强制 Grok CLI ≥1.0.13；selfhost 运行时镜像内 grok-native 1.0.5 的所有 grok-build/grok-build-fast 回合返回 426 Upgrade Required（UI『任务执行暂时中断，请直接重试本条消息』），发布门 C3 one model per engine 因此在现网与候选上均失败、阻断所有 selfhost 发布。修复：运行时镜像钉 Grok CLI 1.0.13（适配器参数全部兼容），webSearchProxy 客户端版本头同步。 商业版仍钉 grok105 镜像，其断言保持 1.0.5，需商业通道自行重建镜像后同步。",
       "rootFixCommit": "7c851773",
       "coverageCommits": [],
       "regressions": [
         {
           "layer": "unit",
           "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
-          "assertion": "grok 1.0.13 (test)"
+          "assertion": "production smoke allowlist covers every explicitly v5-owned leader scheduler"
         }
       ]
     }
