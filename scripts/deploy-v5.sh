@@ -1898,7 +1898,7 @@ image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime
 actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
 [[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
 actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
-[[ "$actual_grok" == grok\ 1.0.13\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
+[[ "$actual_grok" == grok\ 1.0.5\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
 [[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
@@ -6043,8 +6043,8 @@ assert_target_runtime_image_ready() {
     return 1
   }
   actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
-  [[ "$actual_grok" == grok\ 1.0.13\ * ]] || {
-    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.13 (...)'" >&2
+  [[ "$actual_grok" == grok\ 1.0.5\ * ]] || {
+    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.5 (...)'" >&2
     return 1
   }
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
@@ -8680,8 +8680,8 @@ activate_staged_inner() {
       echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.159.2'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
-    [[ "$actual_grok_version" == grok\ 1.0.13\ * ]] || {
-      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.13 (...)'" >&2; exit 1;
+    [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {
+      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.5 (...)'" >&2; exit 1;
     }
     echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version,grok=$actual_grok_version"
   fi
