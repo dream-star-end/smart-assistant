@@ -12,7 +12,7 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
   const client = await pool.connect();
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (request_id text PRIMARY KEY,
-      user_id bigint NOT NULL, state text NOT NULL, ctx jsonb NOT NULL)`);
+      user_id bigint NOT NULL, state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz DEFAULT now())`);
     await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
       user_id bigint NOT NULL, status text NOT NULL)`);
     const q = (sql: string, params: unknown[] = []) => client.query(sql, params);
@@ -48,6 +48,19 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
     await row("box-live", live, ["toolu_L"]);
     assert.equal((await find(["toolu_L"])).kind, "live", "dispatch still running");
     await row("box-cancel", done, ["toolu_C"], "aa".repeat(32), { boxCancelIntent: true });
-    assert.equal((await find(["toolu_C"])).kind, "none", "user already stopped it");
+    assert.equal((await find(["toolu_C"])).kind, "live", "a Stop in flight is not ours");
+    await row("box-stopped", done, ["toolu_F"], "aa".repeat(32), { boxState: "failed_stopped", boxCancelIntent: true });
+    const stopped = await find(["toolu_F"]);
+    assert.equal(stopped.kind === "orphan" && stopped.stopped, true, "already stopped exchange is recoverable");
+    // exactly one recovery claims an exchange; release gives it back
+    const claims = await Promise.all([1, 2].map((n) =>
+      journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: `box-recover-${n}` })));
+    assert.deepEqual(claims.filter(Boolean).length, 1);
+    assert.equal((await find(["toolu_S"])).kind, "claimed");
+    const winner = claims[0] ? "box-recover-1" : "box-recover-2";
+    await journal.releaseOrphanRecovery({ requestId: "box-old", uid: 3n, by: "box-recover-x" });
+    assert.equal((await find(["toolu_S"])).kind, "claimed", "only the winner may release");
+    await journal.releaseOrphanRecovery({ requestId: "box-old", uid: 3n, by: winner });
+    assert.equal((await find(["toolu_S"])).kind, "orphan");
   } finally { client.release(); await pool.end(); }
 });

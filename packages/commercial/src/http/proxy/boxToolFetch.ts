@@ -19,6 +19,7 @@ import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
+import { BoxDurableJournalError } from "./boxDurableJournal.js";
 
 type FetchArgs = { uid: bigint; sessionId: string | null; requestId: string;
   canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
@@ -82,13 +83,15 @@ export class BoxToolFetch {
   }) {}
 
   /** OCV5-304: a recovered dispatch resent tool results that only the earlier,
-   * finished dispatch's handoff could have received. Stop that orphaned run
-   * (it would otherwise wait for its deadline holding the session's slot)
-   * and let this request continue the exchange as a fresh invocation. Returns
-   * false, keeping the original rejection, unless that is proven safe. */
+   * finished dispatch's handoff could have received. Claim that exchange (one
+   * recovery only), stop its orphaned run exactly as the user's Stop does,
+   * and let this request continue it as a fresh invocation. Returns false,
+   * keeping the original rejection, unless all of that is proven. */
   private async releaseOrphanedExchange(args: FetchArgs, error: unknown): Promise<boolean> {
+    const journal = this.deps.journal;
     if (!(error instanceof Error) || (error as { code?: unknown }).code !== "BOX_TOOL_OWNER_UNKNOWN"
-      || !this.deps.stopOrphanRun || !this.deps.journal.findOrphanToolHandoff) return false;
+      || !this.deps.stopOrphanRun || !journal.findOrphanToolHandoff
+      || !journal.claimOrphanRecovery || !journal.releaseOrphanRecovery) return false;
     let toolIds: readonly string[], sessionId: string, turnKey: string;
     try {
       const classified = classifyBoxContinuation(args.canonicalBody);
@@ -96,15 +99,19 @@ export class BoxToolFetch {
       if (classified.classification !== "continuation_candidate") return false;
       toolIds = classified.toolIds; sessionId = fingerprint.sessionId; turnKey = fingerprint.turnKey;
     } catch { return false; }
-    const orphan = await this.deps.journal.findOrphanToolHandoff({ uid: args.uid,
-      sessionId, turnKey, toolIds });
-    if (orphan.kind === "live") return false;
-    if (orphan.kind === "orphan") {
-      let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
-      try { outcome = await this.deps.stopOrphanRun(orphan.identity); } catch { return false; }
-      if (outcome !== "stopped_proven") return false;
+    const orphan = await journal.findOrphanToolHandoff({ uid: args.uid, sessionId, turnKey, toolIds });
+    if (orphan.kind === "claimed") throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
+    if (orphan.kind !== "orphan") return false;
+    const claim = { requestId: orphan.identity.requestId, uid: args.uid, by: args.requestId };
+    if (!(await journal.claimOrphanRecovery(claim))) {
+      throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
     }
-    return true;
+    if (orphan.stopped) return true;
+    let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
+    try { outcome = await this.deps.stopOrphanRun(orphan.identity); } catch { /* unproven */ }
+    if (outcome === "stopped_proven") return true;
+    await journal.releaseOrphanRecovery(claim).catch(() => {});
+    return false;
   }
 
   private own(nonce: string, target: BoxResolvedTarget, uid: bigint,

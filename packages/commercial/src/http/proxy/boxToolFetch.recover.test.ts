@@ -20,14 +20,17 @@ const call = { uid: 3n, sessionId: "sess-recover", requestId: "box-recover", can
   init: { method: "POST", body: JSON.stringify({ ...body, model: "claude-opus-5-5" }) } };
 const orphan = { requestId: "box-orphan", uid: 3n, accountId: 20n, runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) };
 
-function service(opts: { orphan: unknown; stop?: string; error?: Error }) {
+function service(opts: { orphan: unknown; stop?: string; error?: Error; claim?: boolean }) {
   const calls: string[] = [];
   let firstInput: { resumeToolResults?: boolean } | null = null;
   const journal = { claimRemoteCleanup: async () => true, remoteCleanupStatus: async () => "pending",
     remoteCleanupDoneByRunIdentity: async () => false, prelaunchCleanupDoneByRunIdentity: async () => false,
     markRemoteCleaned: async () => {}, listRemoteCleanupCandidates: async () => [],
     findOrphanToolHandoff: async (input: { toolIds: readonly string[]; turnKey: string }) => {
-      calls.push(`find:${input.toolIds.join(",")}`); return opts.orphan; } };
+      calls.push(`find:${input.toolIds.join(",")}`); return opts.orphan; },
+    claimOrphanRecovery: async (input: { requestId: string; by: string }) => {
+      calls.push(`claim-orphan:${input.requestId}:${input.by}`); return opts.claim ?? true; },
+    releaseOrphanRecovery: async (input: { requestId: string }) => { calls.push(`release:${input.requestId}`); } };
   const svc = new BoxToolFetch({ supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
     virtualMcpAsset: Buffer.from("m"), detachedRunnerAsset: Buffer.from("d"), journal: journal as never,
     maxOutputTokensForModel: () => 128_000, resolveTarget: async () => ({ accountId: 20n }) as never,
@@ -48,25 +51,38 @@ function service(opts: { orphan: unknown; stop?: string; error?: Error }) {
 }
 
 test("OCV5-304 a recovered dispatch stops the orphan and continues as a fresh invocation", async () => {
-  const s = service({ orphan: { kind: "orphan", identity: orphan } });
+  const s = service({ orphan: { kind: "orphan", stopped: false, identity: orphan } });
   const response = await s.svc.fetch(call);
   assert.equal(response.status, 200);
   assert.match(await response.text(), /message_stop/);
-  assert.deepEqual(s.calls, ["claim", "find:toolu_S", "stop:box-orphan", "first"]);
+  assert.deepEqual(s.calls, ["claim", "find:toolu_S", "claim-orphan:box-orphan:box-recover",
+    "stop:box-orphan", "first"]);
   assert.equal(s.firstInput()?.resumeToolResults, true);
-  // nothing waits on the exchange any more (e.g. stopped earlier): still continues
-  const none = service({ orphan: { kind: "none" } });
-  assert.equal((await none.svc.fetch(call)).status, 200);
-  assert.deepEqual(none.calls, ["claim", "find:toolu_S", "first"]);
+  // already stopped (e.g. by the user): claimed, not stopped again, continues
+  const stopped = service({ orphan: { kind: "orphan", stopped: true, identity: orphan } });
+  assert.equal((await stopped.svc.fetch(call)).status, 200);
+  assert.deepEqual(stopped.calls, ["claim", "find:toolu_S", "claim-orphan:box-orphan:box-recover", "first"]);
+});
+
+test("concurrent recoveries continue the exchange only once", async () => {
+  for (const opts of [{ orphan: { kind: "claimed" } },
+    { orphan: { kind: "orphan", stopped: false, identity: orphan }, claim: false }]) {
+    const s = service(opts);
+    await assert.rejects(async () => { const r = await s.svc.fetch(call); await r.text(); },
+      /BOX_RESUME_IN_PROGRESS/);
+    assert.ok(!s.calls.includes("first") && !s.calls.some((c) => c.startsWith("stop:")), s.calls.join(" "));
+  }
 });
 
 test("a live owner, an unproven stop or any other claim error keeps the rejection", async () => {
-  for (const opts of [{ orphan: { kind: "live" } },
-    { orphan: { kind: "orphan", identity: orphan }, stop: "pending" },
-    { orphan: { kind: "orphan", identity: orphan }, stop: "completed_unsettled" },
-    { orphan: { kind: "orphan", identity: orphan }, error: new BoxDurableJournalError("BOX_TOOL_CONTEXT_CHANGED") }]) {
+  for (const opts of [{ orphan: { kind: "live" } }, { orphan: { kind: "none" } },
+    { orphan: { kind: "orphan", stopped: false, identity: orphan }, stop: "pending" },
+    { orphan: { kind: "orphan", stopped: false, identity: orphan }, stop: "completed_unsettled" },
+    { orphan: { kind: "orphan", stopped: false, identity: orphan }, error: new BoxDurableJournalError("BOX_TOOL_CONTEXT_CHANGED") }]) {
     const s = service(opts);
     await assert.rejects(async () => { const r = await s.svc.fetch(call); await r.text(); });
     assert.ok(!s.calls.includes("first"), s.calls.join(" "));
+    // an unproven stop gives the exchange back for a later recovery
+    if ((opts as { stop?: string }).stop) assert.ok(s.calls.includes("release:box-orphan"), s.calls.join(" "));
   }
 });

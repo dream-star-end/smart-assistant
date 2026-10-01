@@ -420,25 +420,26 @@ export class BoxDurableJournal implements BoxJournalPort {
   /**
    * OCV5-304: a recovered dispatch ("从断点继续"/"重新尝试") resends the same
    * tool results under a new turn key. A continuation belongs to its own
-   * dispatch, so the open handoff of the earlier, finished dispatch can never
-   * receive them; its CLI waits until its deadline and holds the session's
-   * capacity. Returns that orphan only when exactly one handoff in the session
-   * waits for exactly these tool ids under another turn key and its dispatch
-   * is terminal; "live" when such a handoff exists but cannot be proven
-   * finished. Read-only.
+   * dispatch, so the handoff of the earlier, finished dispatch can never
+   * receive them; its CLI waits until its deadline holding the session slot.
+   * Finds the single record of exactly this tool exchange under another turn
+   * key whose dispatch is terminal: still waiting ("handoff") or already
+   * stopped ("failed_stopped"). "claimed" when another recovery owns it,
+   * "live" when it cannot be proven finished, "none" when no such record.
    */
   async findOrphanToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
-    toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" }
-    | { kind: "orphan"; identity: { requestId: string; uid: bigint; accountId: bigint;
-      runNonce: string; leaseEpoch: string } }> {
+    toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" } | { kind: "claimed" }
+    | { kind: "orphan"; stopped: boolean; identity: { requestId: string; uid: bigint;
+      accountId: bigint; runNonce: string; leaseEpoch: string } }> {
     if (input.toolIds.length < 1 || input.toolIds.length > 32
       || input.toolIds.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))) return { kind: "none" };
     const want = [...input.toolIds].sort().join(",");
     const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
       `SELECT request_id, ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxState'='handoff'
-          AND ctx->>'boxTurnKey' IS DISTINCT FROM $3 AND NOT (ctx ? 'boxCancelIntent')
-          AND state IN ('inflight','finalizing','committed')`,
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
+          AND ctx->>'boxState' IN ('handoff','failed_stopped')
+          AND ctx->>'boxTurnKey' IS DISTINCT FROM $3
+          AND state IN ('inflight','finalizing','committed','aborted')`,
       [input.uid.toString(), input.sessionId, input.turnKey]);
     const matches = rows.rows.filter((row) => {
       const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
@@ -447,6 +448,10 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (matches.length === 0) return { kind: "none" };
     if (matches.length !== 1) return { kind: "live" };
     const row = matches[0]!, ctx = row.ctx;
+    if (ctx.boxRecoveredBy !== undefined) return { kind: "claimed" };
+    const stopped = ctx.boxState === "failed_stopped";
+    // A Stop already in flight (cancel intent, not yet proven) is not ours.
+    if (!stopped && ctx.boxCancelIntent !== undefined) return { kind: "live" };
     const billing = parseBoxBillingContext(ctx.boxBillingContext);
     if (!billing?.dispatchId || typeof ctx.boxAccountId !== "string"
       || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -458,8 +463,27 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2`,
       [input.uid.toString(), billing.dispatchId]);
     if (dispatch.rows[0]?.status !== "terminal") return { kind: "live" };
-    return { kind: "orphan", identity: { requestId: row.request_id, uid: input.uid,
+    return { kind: "orphan", stopped, identity: { requestId: row.request_id, uid: input.uid,
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
+  }
+
+  /** OCV5-304: exactly one recovery may continue an orphaned exchange. */
+  async claimOrphanRecovery(input: { requestId: string; uid: bigint; by: string }): Promise<boolean> {
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
+          updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND NOT (ctx ? 'boxRecoveredBy')
+          AND ctx->>'boxState' IN ('handoff','failed_stopped')`,
+      [input.requestId, input.uid.toString(), input.by]);
+    return changed.rowCount === 1;
+  }
+
+  /** Give the exchange back when the claimed recovery could not stop it. */
+  async releaseOrphanRecovery(input: { requestId: string; uid: bigint; by: string }): Promise<void> {
+    await this.pool.query(
+      `UPDATE request_finalize_journal SET ctx = ctx - 'boxRecoveredBy', updated_at=NOW()
+        WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxRecoveredBy'=$3`,
+      [input.requestId, input.uid.toString(), input.by]);
   }
 
   async findNativeCandidate(input: { uid: bigint; sessionId: string;
