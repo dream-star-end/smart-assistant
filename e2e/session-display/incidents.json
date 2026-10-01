@@ -5299,7 +5299,10 @@
       "severity": "P1",
       "symptom": "Box Claude 回合中模型调用了本次 CLI 未暴露的工具名（裸 Bash、deferred 工具、ExecuteExtraTool 等）时，Box 内层 Claude Code 会自己回 <tool_use_error> No such tool available 并让模型在同一次运行里重试；decoder 只认单条消息，直接整轮失败（原生 cc 会继续）。另：同一会话上一轮在 Box 侧仍在收尾（stop 证明/unknown 观察）时，用户紧接着发下一条被 BOX_CAPACITY_HELD 直接拒绝 →『消息未开始处理，已确认未计费』（线上 INC 前序：3265c646 收尾期间 22s 后的提交）。修复：decoder 合并 CLI 自拒后的重试为同一条可见消息（被拒调用不展示、usage 按段累加计费，最多 3 次，混合/畸形名仍 fail-closed）；admission 遇容量占用有界退避等待 45s（abort 感知，迟到提交 prestart 收口）。",
       "rootFixCommit": "fc0276aa",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "512ae788",
+        "18ac8043"
+      ],
       "regressions": [
         {
           "layer": "unit",
