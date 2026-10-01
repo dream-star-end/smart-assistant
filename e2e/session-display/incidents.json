@@ -5427,7 +5427,8 @@
       "rootFixCommit": "297db9bc",
       "coverageCommits": [
         "28232675",
-        "946ae2ed"
+        "946ae2ed",
+        "7c464fb7"
       ],
       "regressions": [
         {
@@ -5454,6 +5455,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
           "assertion": "concurrent recoveries continue the exchange only once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolPlan.resume.test.ts",
+          "assertion": "OCV5-304 a recovered tool exchange plans end to end with Claude Code's resume sentence"
         }
       ]
     }
