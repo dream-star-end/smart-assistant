@@ -22,6 +22,9 @@ type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string;
  * CLI limits, so the CLI passes their bytes through unchanged. */
 const EMPTY_MARKER = /^\(mcp__ocbridge__[A-Za-z0-9_-]{1,48} completed with no output\)$/;
 const CLI_PREVIEW_BYTES = 2000;
+/** Claude Code persists an MCP result only when the summed text length
+ * (toolResultStorage.contentSize) exceeds min(MCP 100k, default 50k). */
+const CLI_PERSIST_THRESHOLD_CHARS = 50_000;
 
 function cliFileSize(bytes: number): string {
   const kb = bytes / 1024;
@@ -33,6 +36,9 @@ function cliFileSize(bytes: number): string {
 /** Claude Code's buildLargeToolResultMessage, rebuilt from the published text. */
 function persistedMatches(echo: string, published: Array<{ type: "text"; text: string }>,
   id: string): boolean {
+  if (published.reduce((sum, block) => sum + block.text.length, 0) <= CLI_PERSIST_THRESHOLD_CHARS) {
+    return false;
+  }
   const sources = [JSON.stringify(published, null, 2),
     ...(published.length === 1 ? [published[0]!.text] : [])];
   const path = /^[^\n]{1,4096}\/tool-results\/[^\n/]{0,256}$/;
