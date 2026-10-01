@@ -465,3 +465,33 @@ describe("glm-5.3-zai effort support", () => {
     }
   });
 });
+
+describe("OCV5-305 Box Claude (capabilityZero + descriptor efforts)", () => {
+  test("descriptor 声明的 effort 透传;未声明 effort 的 capabilityZero 模型仍不发", () => {
+    const savedEffort = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    const savedDescriptor = process.env.OC_MODEL_EXECUTION_DESCRIPTOR;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    const box = {
+      canonicalModel: "box-api-claude-opus-5-5",
+      contextWindow: 200_000,
+      capabilityZero: true,
+      supportsThinking: false,
+      supportsVision: false,
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    };
+    process.env.OC_MODEL_EXECUTION_DESCRIPTOR = JSON.stringify(box);
+    for (const e of ["low", "medium", "high", "xhigh", "max"] as const) {
+      expect(resolveAppliedEffort("box-api-claude-opus-5-5", e)).toBe(e);
+    }
+    expect(resolveAppliedEffort("box-api-claude-opus-5-5", undefined)).toBeUndefined();
+    process.env.CLAUDE_CODE_EFFORT_LEVEL = "xhigh";
+    expect(resolveAppliedEffort("box-api-claude-opus-5-5", undefined)).toBe("xhigh");
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    process.env.OC_MODEL_EXECUTION_DESCRIPTOR = JSON.stringify({ ...box, supportedEfforts: [] });
+    expect(resolveAppliedEffort("box-api-claude-opus-5-5", "high")).toBeUndefined();
+    if (savedEffort === undefined) delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    else process.env.CLAUDE_CODE_EFFORT_LEVEL = savedEffort;
+    if (savedDescriptor === undefined) delete process.env.OC_MODEL_EXECUTION_DESCRIPTOR;
+    else process.env.OC_MODEL_EXECUTION_DESCRIPTOR = savedDescriptor;
+  });
+});
