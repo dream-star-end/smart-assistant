@@ -62,5 +62,13 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
     assert.equal((await find(["toolu_S"])).kind, "claimed", "only the winner may release");
     await journal.releaseOrphanRecovery({ requestId: "box-old", uid: 3n, by: winner });
     assert.equal((await find(["toolu_S"])).kind, "orphan");
+    // a user Stop that lands between find and claim wins (no resurrection)
+    const seen = await find(["toolu_S"]);
+    assert.equal(seen.kind, "orphan");
+    await q(`UPDATE request_finalize_journal SET ctx = ctx || '{"boxCancelIntent":true}'::jsonb WHERE request_id='box-old'`);
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: "box-recover-3" }), false);
+    // once that Stop is proven, the exchange may be recovered
+    await q(`UPDATE request_finalize_journal SET ctx = ctx || '{"boxState":"failed_stopped"}'::jsonb WHERE request_id='box-old'`);
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-old", uid: 3n, by: "box-recover-3" }), true);
   } finally { client.release(); await pool.end(); }
 });

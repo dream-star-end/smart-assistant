@@ -467,15 +467,38 @@ export class BoxDurableJournal implements BoxJournalPort {
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
   }
 
-  /** OCV5-304: exactly one recovery may continue an orphaned exchange. */
+  /** OCV5-304: exactly one recovery may continue an orphaned exchange. Taken
+   * under the same session advisory lock as recordUserCancelIntent, so a
+   * user Stop that lands first wins: a waiting handoff with a cancel intent is
+   * never claimed (an exchange already proven stopped may be). */
   async claimOrphanRecovery(input: { requestId: string; uid: bigint; by: string }): Promise<boolean> {
-    const changed = await this.pool.query(
-      `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
-          updated_at=NOW()
-        WHERE request_id=$1 AND user_id=$2 AND NOT (ctx ? 'boxRecoveredBy')
-          AND ctx->>'boxState' IN ('handoff','failed_stopped')`,
-      [input.requestId, input.uid.toString(), input.by]);
-    return changed.rowCount === 1;
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      const peek = await client.query<{ ctx: Record<string, unknown> }>(
+        `SELECT ctx FROM request_finalize_journal WHERE request_id=$1 AND user_id=$2`,
+        [input.requestId, input.uid.toString()]);
+      const sessionId = peek.rows[0]?.ctx?.boxSessionId;
+      if (peek.rowCount !== 1 || typeof sessionId !== "string"
+        || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) {
+        await client.query("ROLLBACK"); committed = true; return false;
+      }
+      await lock(client, [`box:session:${input.uid}:${sessionId}`]);
+      const changed = await client.query(
+        `UPDATE request_finalize_journal SET ctx = ctx || jsonb_build_object('boxRecoveredBy', $3::text),
+            updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxSessionId'=$4
+            AND NOT (ctx ? 'boxRecoveredBy')
+            AND (ctx->>'boxState'='failed_stopped'
+              OR (ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')))`,
+        [input.requestId, input.uid.toString(), input.by, sessionId]);
+      await client.query("COMMIT"); committed = true;
+      return changed.rowCount === 1;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
   }
 
   /** Give the exchange back when the claimed recovery could not stop it. */
