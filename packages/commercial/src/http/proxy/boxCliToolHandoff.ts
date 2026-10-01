@@ -34,13 +34,14 @@ const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 /** OCV5-301: how many consecutive model messages may consist only of calls
  * to tools this invocation does not expose before the run fails closed. */
 const BOX_CLI_REJECTED_SEGMENTS_MAX = 3;
-const CLI_TOOL_ERROR = /^<tool_use_error>[\s\S]{0,4096}<\/tool_use_error>$/;
-function cliToolErrorText(content: unknown): boolean {
-  if (typeof content === "string") return CLI_TOOL_ERROR.test(content);
+/** Exactly Claude Code's unknown-tool answer (services/tools/toolExecution);
+ * any other tool error (cancel, permission, validation) is not merged. */
+function cliNoSuchToolText(content: unknown, name: string): boolean {
+  const expected = `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>`;
+  if (typeof content === "string") return content === expected;
   return Array.isArray(content) && content.length === 1 && !!content[0]
     && typeof content[0] === "object" && (content[0] as Obj).type === "text"
-    && typeof (content[0] as Obj).text === "string"
-    && CLI_TOOL_ERROR.test((content[0] as Obj).text as string);
+    && (content[0] as Obj).text === expected;
 }
 
 export interface BoxToolUse {
@@ -152,12 +153,15 @@ export class BoxCliToolHandoffDecoder {
    * does not expose with its own error result and the model retries in a new
    * message of the same run; native Claude Code shows that as one turn. The
    * segments are merged into the single client-visible message: the rejected
-   * call and the CLI's error are dropped, later blocks keep their visible
-   * order, and usage is the sum of every segment (each was a paid call). */
+   * call and the CLI's error are dropped, text/thinking already streamed in
+   * that message stay (as native shows them), later blocks keep their visible
+   * order, and usage is the sum of every segment (each was a paid call). A
+   * segment with any exposed (valid) call is never merged. */
   private segments = 0;
   private segmentStart = 0;
   private readonly messageIds = new Set<string>();
-  private awaitingCliErrors: Set<string> | null = null;
+  /** Rejected call id -> its tool name, until the CLI's own answer arrives. */
+  private awaitingCliErrors: Map<string, string> | null = null;
   private awaitingNextMessage = false;
   private baseInput = 0;
   private baseOutput = 0;
@@ -328,7 +332,7 @@ export class BoxCliToolHandoffDecoder {
       const item = obj(raw);
       if (item.type !== "tool_result" || item.is_error !== true
         || typeof item.tool_use_id !== "string" || !awaiting.has(item.tool_use_id)
-        || !cliToolErrorText(item.content)) {
+        || !cliNoSuchToolText(item.content, awaiting.get(item.tool_use_id)!)) {
         throw new BoxCliToolHandoffError("BOX_TOOL_CLI_ERROR_INVALID");
       }
       awaiting.delete(item.tool_use_id);
@@ -674,7 +678,8 @@ export class BoxCliToolHandoffDecoder {
           throw new BoxCliToolHandoffError("BOX_TOOL_ID_OR_NAME_INVALID");
         }
         this.segments++;
-        this.awaitingCliErrors = new Set(rejected.map((block) => block.upstream.id as string));
+        this.awaitingCliErrors = new Map(rejected.map((block) =>
+          [block.upstream.id as string, block.upstream.name as string]));
         this.heldTerminal = [];
         return "";
       }

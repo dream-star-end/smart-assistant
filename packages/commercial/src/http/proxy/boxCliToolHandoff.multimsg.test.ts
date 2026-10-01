@@ -38,9 +38,9 @@ const stop = (reason: string, output: number, input = 10) => [
     usage: { input_tokens: input, output_tokens: output } }),
   event({ type: "message_stop" }),
 ];
-const cliError = (...ids: string[]) => ({ type: "user", message: { role: "user",
-  content: ids.map((id) => ({ type: "tool_result", tool_use_id: id, is_error: true,
-    content: "<tool_use_error>Error: No such tool available: Bash</tool_use_error>" })) },
+const cliError = (id: string, name = "Bash") => ({ type: "user", message: { role: "user",
+  content: [{ type: "tool_result", tool_use_id: id, is_error: true,
+    content: `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>` }] },
   parent_tool_use_id: null, session_id: "12345678-1234-4123-8123-123456789abc" });
 const rejectedSegment = (msg: string, toolId: string, name = "Bash", input = 10) => [
   start(msg, input), ...text(msg, 0, "Let me run it."),
@@ -95,7 +95,7 @@ test("a CLI-rejected call is dropped and the retry joins the same visible tool h
 test("a rejected call followed by a final answer settles with summed usage", () => {
   const decoder = new BoxCliToolHandoffDecoder(model, catalog, { allowFinal: true });
   const { last } = feed(decoder, [init, ...rejectedSegment("msg_a", "toolu_bad_1", "ExecuteExtraTool"),
-    cliError("toolu_bad_1"), start("msg_b", 30), ...text("msg_b", 0, "Done without it."),
+    cliError("toolu_bad_1", "ExecuteExtraTool"), start("msg_b", 30), ...text("msg_b", 0, "Done without it."),
     ...stop("end_turn", 4, 30),
     { type: "result", subtype: "success", is_error: false,
       usage: { input_tokens: 40, output_tokens: 11 } }]);
@@ -114,7 +114,7 @@ test("two rejected calls may be answered in separate CLI records", () => {
     ...call(msg, 0, "toolu_bad_1", "Read"),
     ...call(msg, 1, "toolu_bad_2", "Grep", [{ type: "tool_use", id: "toolu_bad_1",
       name: "Read", input: { value: "x" } }]),
-    ...stop("tool_use", 7), cliError("toolu_bad_1"), cliError("toolu_bad_2"),
+    ...stop("tool_use", 7), cliError("toolu_bad_1", "Read"), cliError("toolu_bad_2", "Grep"),
     start("msg_b", 30), ...call("msg_b", 0, "toolu_good", boxName), ...stop("tool_use", 3, 30)]);
   assert.deepEqual(last.candidate!.toolUses.map((use) => use.id), ["toolu_good"]);
 });
@@ -132,6 +132,12 @@ test("anything outside the exact rejected-call shape still fails closed", () => 
   const freeText = cliError("toolu_bad_1");
   (freeText.message.content[0] as { content: string }).content = "ran fine";
   fails([...base, freeText], "BOX_TOOL_CLI_ERROR_INVALID");
+  // only the exact unknown-tool answer for that call's own name is merged
+  fails([...base, cliError("toolu_bad_1", "Read")], "BOX_TOOL_CLI_ERROR_INVALID");
+  const cancelled = cliError("toolu_bad_1");
+  (cancelled.message.content[0] as { content: string }).content =
+    "<tool_use_error>Error: The user doesn't want to proceed</tool_use_error>";
+  fails([...base, cancelled], "BOX_TOOL_CLI_ERROR_INVALID");
   // a user record with nothing rejected, and a synthetic one
   fails([init, start("msg_a"), cliError("toolu_bad_1")], "BOX_TOOL_RECORD_INVALID");
   // valid and unknown calls mixed in one message keep the old rejection
