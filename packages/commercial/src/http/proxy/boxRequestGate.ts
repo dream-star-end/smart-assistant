@@ -13,7 +13,11 @@ export function validateBoxTextRequest(body: ProxyBody,
   options: { resumeToolResults?: boolean } = {}): string | null {
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
   if (body.tools?.length || body.tool_choice !== undefined) return "BOX_TOOLS_REQUIRE_LIVE_BRIDGE";
-  if (body.thinking !== undefined || body.output_config !== undefined) return "BOX_EFFORT_UNMAPPED";
+  if (body.thinking !== undefined || body.output_config !== undefined) {
+    // OCV5-305: an effort the Box CLI can run natively (see mapBoxCliEffort).
+    try { mapBoxCliEffort(body.thinking, body.output_config); }
+    catch { return "BOX_EFFORT_UNMAPPED"; }
+  }
   if (body.context_management !== undefined && !isBoxNoopContextManagement(body)) {
     return "BOX_PARAMETER_UNMAPPED";
   }

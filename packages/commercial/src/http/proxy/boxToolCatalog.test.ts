@@ -103,16 +103,19 @@ test("default real CCB adaptive-medium effort maps exactly, unsupported settings
     { effort: "medium" }), "medium");
   assert.equal(mapBoxCliEffort({ type: "adaptive" }, { effort: "medium" }), "medium",
     "real CCB2.1.280 omits the optional display field");
-  for (const effort of ["low", "high", "max"] as const) {
+  // OCV5-305: the full native Claude Code range, including xhigh, and the
+  // effort-only shape the capability-zero Box CCB profile sends.
+  for (const effort of ["low", "high", "xhigh", "max"] as const) {
+    assert.equal(mapBoxCliEffort(undefined, { effort }), effort);
     assert.equal(mapBoxCliEffort({ type: "adaptive", display: "omitted" },
       { effort }), effort);
   }
   for (const args of [
     [{ type: "enabled", budget_tokens: 1024 }, { effort: "medium" }],
-    [{ type: "adaptive", display: "omitted" }, { effort: "xhigh" }],
+    [{ type: "adaptive", display: "omitted" }, { effort: "ultra" }],
     [{ type: "adaptive", display: "summarized" }, { effort: "medium" }],
     [{ type: "adaptive", display: "omitted" }, { effort: "medium", format: "json" }],
-    [undefined, { effort: "medium" }],
+    [undefined, undefined],
   ]) {
     assert.throws(() => mapBoxCliEffort(args[0], args[1]),
       (error: unknown) => error instanceof BoxToolCatalogError

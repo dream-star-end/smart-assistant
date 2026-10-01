@@ -13,7 +13,10 @@ test("Box text route accepts only proved completed-history text shape", () => {
   assert.equal(validateBoxTextRequest({ ...base, stream: undefined }), "BOX_STREAM_REQUIRED");
   assert.equal(validateBoxTextRequest({ ...base, tools: [{ name: "Bash" }] }),
     "BOX_TOOLS_REQUIRE_LIVE_BRIDGE");
-  assert.equal(validateBoxTextRequest({ ...base, output_config: { effort: "high" } }),
+  // OCV5-305: a native effort runs as the Box CLI's --effort; anything the CLI
+  // cannot run as-is still fails closed.
+  assert.equal(validateBoxTextRequest({ ...base, output_config: { effort: "high" } }), null);
+  assert.equal(validateBoxTextRequest({ ...base, output_config: { effort: "ultra" } }),
     "BOX_EFFORT_UNMAPPED");
   assert.equal(validateBoxTextRequest({ ...base, thinking: { type: "enabled" } }),
     "BOX_EFFORT_UNMAPPED");
@@ -32,10 +35,11 @@ test("Box text route accepts only proved completed-history text shape", () => {
   ] }), "BOX_BLOCK_UNSUPPORTED");
 });
 
-test("pricing default effort injection is rejected, not silently dropped", () => {
+test("pricing default effort injection is honored, not silently dropped", () => {
+  // OCV5-305: the injected default reaches the Box CLI as --effort (boxEffort.test).
   const input = structuredClone(base);
   applyModelDefaultEffort(input, "high");
-  assert.equal(validateBoxTextRequest(input), "BOX_EFFORT_UNMAPPED");
+  assert.equal(validateBoxTextRequest(input), null);
 });
 
 test("tool bridge gate is explicit and validates first and next HTTP rounds", () => {

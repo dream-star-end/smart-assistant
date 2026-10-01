@@ -192,8 +192,12 @@ export interface ProviderCapabilityCeiling {
   efforts: readonly string[] | null;
 }
 
+export const BOX_ROUTE_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
 export function providerCapabilityCeiling(route: UpstreamRoute): ProviderCapabilityCeiling {
-  if (route.kind === "box") return { supportsVision: false, efforts: [] };
+  // OCV5-305: the Box CLI maps every platform effort to its native `--effort`
+  // (boxToolCatalog.BOX_CLI_EFFORTS; equality pinned by test).
+  if (route.kind === "box") return { supportsVision: false, efforts: BOX_ROUTE_EFFORTS };
   if (route.kind === "oauth") {
     // OAuth(Anthropic 官方)端点:原生多模态,无 output_config 白名单机制。
     return { supportsVision: true, efforts: null };

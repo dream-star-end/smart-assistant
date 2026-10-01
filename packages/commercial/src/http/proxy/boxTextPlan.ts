@@ -11,6 +11,7 @@ import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { validateBoxTextRequest } from "./boxRequestGate.js";
 import { makeBoxStageFiles, type BoxStageFile } from "./boxStageFiles.js";
 import { makeBoxNativeFileInspect } from "./boxNativeFile.js";
+import { mapBoxCliEffort } from "./boxToolCatalog.js";
 
 export class BoxTextPlanError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxTextPlanError"; }
@@ -153,6 +154,9 @@ export function makeBoxTextPlan(input: {
   const unsupported = validateBoxTextRequest(input.body,
     input.resumeToolResults ? { resumeToolResults: true } : {});
   if (unsupported) throw new BoxTextPlanError(unsupported);
+  // OCV5-305: a text-only turn runs at the user's effort too.
+  const effort = input.body.thinking === undefined && input.body.output_config === undefined
+    ? null : mapBoxCliEffort(input.body.thinking, input.body.output_config);
   if (!/^claude-[a-z0-9-]{3,64}$/.test(input.upstreamModel)
     || input.supervisorAsset.length === 0 || input.supervisorAsset.length > 32768
     || input.keeperAsset.length === 0 || input.keeperAsset.length > 32768
@@ -237,6 +241,7 @@ export function makeBoxTextPlan(input: {
       "--disallowedTools", "mcp__*", "--strict-mcp-config",
       "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
       "--disable-slash-commands", ...(nativePersistence ? [] : ["--no-session-persistence"]),
+      ...(effort ? ["--effort", effort] : []),
       "--system-prompt-file", systemPath,
       hasHistory || input.nativeResume ? "--resume" : "--session-id", mapped.sessionId],
     cwd: cliCwd,

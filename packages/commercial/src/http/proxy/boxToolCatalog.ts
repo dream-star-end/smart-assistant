@@ -213,17 +213,25 @@ export function rehydrateBoxToolCatalog(rawJson: string): BoxToolCatalog {
  * The API makes display optional for adaptive thinking; on Opus 5.5 the
  * omitted display maps to the same CLI behavior as explicit "omitted".
  * Do not coerce summarized or fixed-budget thinking. */
-export function mapBoxCliEffort(thinking: unknown, outputConfig: unknown): "low" | "medium" | "high" | "max" {
-  if (!record(thinking) || thinking.type !== "adaptive"
-    || (thinking.display !== undefined && thinking.display !== "omitted")
-    || Object.keys(thinking).some((key) => key !== "type" && key !== "display")
+/** OCV5-305: the Box CLI's own `--effort` levels (Claude Code 2.1.280:
+ * low, medium, high, xhigh, max) — the same choice native Claude Code offers. */
+export const BOX_CLI_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type BoxCliEffort = typeof BOX_CLI_EFFORTS[number];
+
+/** Map the client's effort to the Box CLI `--effort`. The CLI then runs its
+ * own native adaptive thinking at that level, so the client either sends
+ * Opus 5.5's adaptive thinking with the effort, or (Box's capability-zero
+ * CCB profile, OCV5-305) the effort alone. Any other shape fails closed. */
+export function mapBoxCliEffort(thinking: unknown, outputConfig: unknown): BoxCliEffort {
+  if ((thinking !== undefined && (!record(thinking) || thinking.type !== "adaptive"
+      || (thinking.display !== undefined && thinking.display !== "omitted")
+      || Object.keys(thinking).some((key) => key !== "type" && key !== "display")))
     || !record(outputConfig) || typeof outputConfig.effort !== "string"
     || Object.keys(outputConfig).some((key) => key !== "effort")) {
     throw new BoxToolCatalogError("BOX_EFFORT_UNMAPPED");
   }
-  if (outputConfig.effort !== "low" && outputConfig.effort !== "medium"
-    && outputConfig.effort !== "high" && outputConfig.effort !== "max") {
+  if (!(BOX_CLI_EFFORTS as readonly string[]).includes(outputConfig.effort)) {
     throw new BoxToolCatalogError("BOX_EFFORT_UNMAPPED");
   }
-  return outputConfig.effort;
+  return outputConfig.effort as BoxCliEffort;
 }
