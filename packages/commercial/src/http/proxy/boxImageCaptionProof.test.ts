@@ -67,3 +67,18 @@ test("a caption that does not describe this image, or an odd cache key, is not f
     assert.notEqual(kind(turn(strip, tail)), "continuation_candidate", JSON.stringify(tail).slice(0, 120));
   }
 });
+
+test("the caption as CCB's separate cached user message also continues, only when proven", async () => {
+  const shown = await png(923, 2000);
+  const split = (tail: unknown[]) => {
+    const body = turn(shown, []) as unknown as { messages: unknown[] };
+    return { ...body, messages: [...body.messages, { role: "user", content: tail }] } as unknown as ProxyBody;
+  };
+  assert.equal(kind(split([text(caption(1290, 2796, 923, 2000), { type: "ephemeral" })])),
+    "continuation_candidate");
+  assert.equal(kind(split([text(caption(1179, 2556, 923, 2000), { type: "ephemeral" })])),
+    "continuation_candidate");
+  assert.notEqual(kind(split([text(caption(1179, 2556, 900, 2000), { type: "ephemeral" })])),
+    "continuation_candidate");
+  assert.notEqual(kind(split([text("a new question", { type: "ephemeral" })])), "continuation_candidate");
+});

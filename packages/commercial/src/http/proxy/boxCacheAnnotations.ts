@@ -134,10 +134,11 @@ function mergeAdjacentGeneratedUserTail(messages: unknown[]): unknown[] {
       const raw = message.content;
       const tail = typeof raw === "string" ? [{ type: "text", text: raw }]
         : Array.isArray(raw) && denseArray(raw) ? raw : null;
+      // OCV5-302: Claude Code's prompt-cache breakpoint may sit on this tail.
       if (tail && tail.length > 0 && tail.every((part: unknown) => {
-        if (!object(part) || part.type !== "text" || Object.keys(part).sort().join(",") !== "text,type"
-          || typeof part.text !== "string") return false;
-        return provenCaption(part.text) || generatedToolMeta(part.text) !== null;
+        const bare = bareTrailingText(part);
+        if (!bare) return false;
+        return captionShaped(bare.text as string) || generatedToolMeta(bare.text as string) !== null;
       })) {
         merged[merged.length - 1] = { ...previous, content: [...previous.content, ...tail] };
         continue;
