@@ -404,6 +404,12 @@
       "reason": "Box-resident Claude print mode exits 0 after a finished answer, and a blocked fifo write was counted as a crash loop. The fix is unit-tested; it does not change session display.",
       "approvedBy": "user 2026-09-24 批准开工 OCV5-287",
       "expiresAt": "2026-10-24"
+    },
+    {
+      "commit": "da9cd5484db3b0e5c882f4032ee09685c4e5b5a7",
+      "reason": "Codex 1M models looked up account groups by the 1M billing id, got no official_oauth route, and Codex 0.159.2 failed every turn with workspace routing discovery failed. Lookup now uses the standard id. Unit-tested; it does not change session display.",
+      "approvedBy": "user 2026-10-01 修一下 gpt-6.1-sol-1m",
+      "expiresAt": "2026-10-31"
     }
   ]
 }
