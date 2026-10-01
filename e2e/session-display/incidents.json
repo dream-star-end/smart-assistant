@@ -5262,6 +5262,36 @@
           "assertion": "production smoke allowlist covers every explicitly v5-owned leader scheduler"
         }
       ]
+    },
+    {
+      "id": "INC-20261001-BOX-REJECTED-STREAM-WEDGE",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "Box Claude 续聊中模型调用了本次 CLI 未暴露的工具名（裸 Bash 等），egress 本地拒流（BOX_TOOL_ID_OR_NAME_INVALID）后 CLI 自行跑完，显式 stop 返回 completed_unsettled，journal 行永远停在 inflight/unknown：会话下一条消息 IDLE_HISTORY_PENDING →『消息未开始处理，已确认未计费』，且占一个账号槽。修复：凭 keeper 终态证明把该行零计费落为 failed_stopped/rejected_stream（idle 投影为 failed，会话解锁）；生产改用原生工具别名 mcp__ocbridge__<客户端名>，与本地 cc 一致并消除错名根因；旧 opaque 链/原生指针跨发布仍可绑定。两条存量卡死行用白名单一次性脚本 scripts/ocv5-300/settle-rejected-unknown.mts 处理。",
+      "rootFixCommit": "21bf1581",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "OCV5-300 a self-completed rejected stream is settled from its keeper proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxIdleChain.test.ts",
+          "assertion": "OCV5-300 a locally rejected first-round stream projects failed, not a wedge"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolCatalog.test.ts",
+          "assertion": "OCV5-300 natural aliases expose client names and keep opaque chains binding"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts",
+          "assertion": "rejected first-round stream settles unbilled, idempotently, and only once"
+        }
+      ]
     }
   ]
 }
