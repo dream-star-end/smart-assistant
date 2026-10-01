@@ -207,7 +207,11 @@ function captionMatchesImage(text: string, image: { width: number; height: numbe
   const [ow, oh, dw, dh] = [match[1], match[2], match[3], match[4]].map(Number) as [number, number, number, number];
   if (dw !== image.width || dh !== image.height || dw > ow || dh > oh || (dw === ow && dh === oh)) return false;
   if (match[5] !== (ow / dw).toFixed(2)) return false;
-  return Math.abs(ow / oh - dw / dh) <= (ow / oh) * (2 / Math.min(dw, dh));
+  // Some single scale s must give Math.round(ow*s) === dw and Math.round(oh*s)
+  // === dh: the two rounding intervals for s must overlap.
+  const low = Math.max((dw - 0.5) / ow, (dh - 0.5) / oh);
+  const high = Math.min((dw + 0.5) / ow, (dh + 0.5) / oh);
+  return low <= high;
 }
 /** Claude Code puts its prompt-cache breakpoint on the last block of the last
  * message, which for a resized Read is the caption itself. */

@@ -53,4 +53,17 @@ test("a caption that does not describe this image, or an odd cache key, is not f
   ]) {
     assert.notEqual(kind(turn(shown, tail)), "continuation_candidate", JSON.stringify(tail).slice(0, 120));
   }
+  // tiny / extreme images: the caption must describe one uniform downscale
+  const dot = await png(1, 1);
+  for (const tail of [[text(caption(100, 1, 1, 1))], [text(caption(1, 100, 1, 1))],
+    [text(caption(5, 1, 1, 1))]]) {
+    assert.notEqual(kind(turn(dot, tail)), "continuation_candidate", JSON.stringify(tail));
+  }
+  // a genuine rounding of a tiny image is still one uniform scale (s ~ 0.3)
+  assert.equal(kind(turn(dot, [text(caption(3, 2, 1, 1))])), "continuation_candidate");
+  const strip = await png(73, 2000);
+  assert.equal(kind(turn(strip, [text(caption(80, 2200, 73, 2000))])), "continuation_candidate");
+  for (const tail of [[text(caption(800, 2200, 73, 2000))], [text(caption(80, 22000, 73, 2000))]]) {
+    assert.notEqual(kind(turn(shown, tail)), "continuation_candidate", JSON.stringify(tail).slice(0, 120));
+  }
 });
