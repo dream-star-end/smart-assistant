@@ -5398,6 +5398,26 @@
           "assertion": "the caption as CCB's separate cached user message also continues, only when proven"
         }
       ]
+    },
+    {
+      "id": "INC-20261001-BOX-SKILL-CONTINUATION",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #aacd65f7（v5-681ee45a9）：Box Claude 回合中模型调用 Skill，Claude Code 回 tool_result『Launching skill: X』并把技能正文作为 isMeta 用户文本追加在其后；续接分类要求纯 tool_result，回 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，『工具 1 项』后即『模型服务暂时中断 / 任务执行暂时中断』，Box CLI 挂起。所有用到技能的 Box 回合均受影响。修复：语义规范化把该技能正文并入唯一一个内容恰为 launch 行的 Skill tool_result（同条或紧随的下一条 user 文本），其它形状仍 fail-closed。",
+      "rootFixCommit": "8fd82f68",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-303 the injected skill body joins its Skill result and the turn continues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "without exactly one Skill launch the trailing text is not folded"
+        }
+      ]
     }
   ]
 }
