@@ -2,7 +2,7 @@
  * This path never stages input, launches Claude, publishes tool results or
  * settles billing. It may only commit evidence to the original journal row. */
 import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
-import { compileBoxToolCatalog } from "./boxToolCatalog.js";
+import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
@@ -41,8 +41,10 @@ export async function observeBoxToolUnknown(input: {
     || (id.roundNo > 1 && (!id.resultHashes || id.resultHashes.length < 1))) {
     throw new BoxToolUnknownObserverError("BOX_OBSERVER_EVIDENCE_MISSING");
   }
-  const catalog = compileBoxToolCatalog(input.canonicalBody.tools);
-  if (catalog.bindingSha256 !== id.catalogHash) {
+  // OCV5-300: the unknown row may have been admitted with the opaque variant.
+  const catalog = boxCatalogMatching(compileBoxToolCatalog(input.canonicalBody.tools),
+    id.catalogHash);
+  if (!catalog) {
     throw new BoxToolUnknownObserverError("BOX_OBSERVER_CATALOG_CHANGED");
   }
   const fingerprint = deriveBoxCallFingerprint(id.uid, input.canonicalBody);

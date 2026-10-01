@@ -7,7 +7,7 @@ import type { ProxyBody } from "./shared.js";
 import { makeBoxTextPlan, makeBoxAssetStage, makeBoxAssetsStage, BoxTextPlanError,
   type BoxTextPlan } from "./boxTextPlan.js";
 import { compileBoxToolCatalog, mapBoxCliEffort,
-  type BoxToolCatalog } from "./boxToolCatalog.js";
+  type BoxToolCatalog, type BoxMcpAliasMode } from "./boxToolCatalog.js";
 import { BOX_TOOL_MAX_WALL_MS, BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
 
 export interface BoxToolPlan extends BoxTextPlan {
@@ -44,6 +44,7 @@ export function makeBoxToolPlan(input: {
   leaseEpoch?: string;
   nativePersistence?: boolean;
   nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
+  toolAliasMode?: BoxMcpAliasMode;
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
   if (choice !== undefined && (choice === null || typeof choice !== "object"
@@ -51,7 +52,7 @@ export function makeBoxToolPlan(input: {
     || (choice as { type?: unknown }).type !== "auto")) {
     throw new BoxTextPlanError("BOX_TOOL_CHOICE_UNMAPPED");
   }
-  const catalog = compileBoxToolCatalog(input.body.tools);
+  const catalog = compileBoxToolCatalog(input.body.tools, input.toolAliasMode);
   const effort = input.body.thinking === undefined && input.body.output_config === undefined
     ? null : mapBoxCliEffort(input.body.thinking, input.body.output_config);
   const runNonce = input.runNonce ?? randomBytes(12).toString("hex");

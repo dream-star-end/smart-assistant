@@ -336,6 +336,10 @@ export async function startEgress(): Promise<void> {
       keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
       virtualMcpAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_virtual_mcp.py")),
       detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
+      // OCV5-300: the CLI sees mcp__ocbridge__<client name> (Bash, Read, …)
+      // like native Claude Code; older opaque chains still bind via
+      // boxCatalogMatching.
+      toolAliasMode: "natural",
       journal: boxJournal,
       writeMessage: boxReplayWriter,
       maxOutputTokensForModel: (model) =>

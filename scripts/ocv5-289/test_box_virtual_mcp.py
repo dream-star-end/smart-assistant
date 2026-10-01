@@ -132,6 +132,38 @@ class VirtualMcpTest(unittest.TestCase):
         self.assertEqual(self.read(2)["error"]["code"], -32000)
         self.assertEqual(len(list(self.directory.glob(f"pending.{ident}.json"))), 1)
 
+    def write_catalog(self, names: list[str]) -> None:
+        raw = compact({"tools": [{"name": name, "description": "Synthetic local tool",
+                                  "inputSchema": {"type": "object"}} for name in names]})
+        self.catalog.chmod(0o600); self.catalog.write_bytes(raw)
+        self.hash = hashlib.sha256(raw).hexdigest()
+
+    def test_natural_alias_catalog_lists_and_calls_client_names(self) -> None:
+        # OCV5-300: aliases may be the client tool name itself (Bash, Read, ...).
+        self.write_catalog(["Bash", "Read", "t2"])
+        self.start()
+        self.send(1, "initialize", {"protocolVersion": "2025-06-18"})
+        self.read()
+        self.send(2, "tools/list")
+        self.assertEqual([t["name"] for t in self.read()["result"]["tools"]],
+                         ["Bash", "Read", "t2"])
+        ident = "toolu_natural_bash"
+        self.send(3, "tools/call", {"name": "Bash", "arguments": {"value": "x"},
+                                    "_meta": {"claudecode/toolUseId": ident}})
+        self.assertEqual(self.await_file(f"pending.{ident}.json")["name"], "Bash")
+        self.send(4, "tools/call", {"name": "t0", "arguments": {},
+                                    "_meta": {"claudecode/toolUseId": "toolu_natural_t0"}})
+        self.assertIn("error", self.read())
+
+    def test_duplicate_or_invalid_alias_catalog_refuses_start(self) -> None:
+        for names in (["Bash", "Bash"], ["mcp.bad"], ["A" * 49]):
+            self.write_catalog(names)
+            self.start()
+            self.assertEqual(self.child.wait(timeout=2), 126, names)
+            for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
+                stream.close()
+            self.child = None
+
     def test_wrong_catalog_hash_refuses_start(self) -> None:
         self.start("0" * 64)
         self.assertEqual(self.child.wait(timeout=2), 126)

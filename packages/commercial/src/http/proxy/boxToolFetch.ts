@@ -2,6 +2,7 @@
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
+import type { BoxMcpAliasMode } from "./boxToolCatalog.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
   BoxPrelaunchRecoveryCandidate, BoxNativeGcCandidate } from "./boxDurableJournal.js";
 import { runBoxToolFirstRound, type BoxToolFirstHandoff,
@@ -56,6 +57,7 @@ export class BoxToolFetch {
     keeperAsset: Buffer;
     virtualMcpAsset: Buffer;
     detachedRunnerAsset: Buffer;
+    toolAliasMode?: BoxMcpAliasMode;
     journal: BoxDurableJournal;
     writeMessage?: BoxReplayMessageWriter;
     maxOutputTokensForModel: (model: string) => number | null;
@@ -450,6 +452,7 @@ export class BoxToolFetch {
               keeperAsset: this.deps.keeperAsset,
               virtualMcpAsset: this.deps.virtualMcpAsset,
               detachedRunnerAsset: this.deps.detachedRunnerAsset,
+              toolAliasMode: this.deps.toolAliasMode,
               journal: this.deps.journal,
               writeMessage: this.deps.writeMessage,
               maxOutputTokensForModel: this.deps.maxOutputTokensForModel,

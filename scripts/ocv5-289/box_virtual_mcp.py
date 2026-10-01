@@ -20,6 +20,8 @@ import time
 RUN_DIR = re.compile(r"^ocv5-289-run-[0-9a-f]{24}$")
 TOOL_ID = re.compile(r"^toolu_[A-Za-z0-9_-]{1,120}$")
 HASH = re.compile(r"^[a-f0-9]{64}$")
+# OCV5-300: legacy opaque t{i} or the client tool name itself (see boxMcpAliasFor).
+ALIAS = re.compile(r"(?:t[0-9]{1,3}|[A-Za-z0-9_-]{1,48})")
 MAX_CATALOG = 1_048_576
 MAX_TOOL_FRAME = 8 * 1024 * 1024
 MAX_CALLS = 32
@@ -151,10 +153,12 @@ def read_catalog(dir_fd: int, wanted_hash: str) -> list[dict]:
     value = strict_json(raw)
     tools = value.get("tools") if isinstance(value, dict) else None
     if (not isinstance(tools, list) or not 1 <= len(tools) <= 128
-            or any(not isinstance(t, dict) or t.get("name") != f"t{i}"
+            or any(not isinstance(t, dict) or not isinstance(t.get("name"), str)
+                   or not ALIAS.fullmatch(t["name"])
                    or not isinstance(t.get("description"), str)
                    or not isinstance(t.get("inputSchema"), dict)
-                   for i, t in enumerate(tools))):
+                   for t in tools)
+            or len({t["name"] for t in tools}) != len(tools)):
         raise ValueError("BOX_MCP_CATALOG_INVALID")
     return tools
 

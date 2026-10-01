@@ -95,8 +95,13 @@ function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): Id
   }
   if (ctx.boxState !== "failed_stopped") return null;
   const proof = ctx.boxTerminalProof as { reason?: unknown; runNonce?: unknown; leaseEpoch?: unknown } | undefined;
+  // OCV5-300: a first round whose stream egress rejected is settled with the
+  // keeper's own proof (even worker_complete); nothing was delivered or billed.
+  const rejectedStream = ctx.boxStopOutcome === "rejected_stream" && chain.length === 1
+    && leaf.state === "aborted" && ctx.boxToolHandoff === undefined;
   if (!proof || typeof proof !== "object" || typeof proof.reason !== "string"
-    || !FAILED_PROOF_REASONS.has(proof.reason)
+    || !(FAILED_PROOF_REASONS.has(proof.reason)
+      || (rejectedStream && proof.reason === "worker_complete"))
     || typeof proof.runNonce !== "string" || typeof proof.leaseEpoch !== "string") return null;
   const hasHandoff = ctx.boxToolHandoff !== undefined;
   if (hasHandoff ? !RESUMABLE_STATES.has(leaf.state) : leaf.state !== "aborted") return null;

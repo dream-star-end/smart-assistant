@@ -460,6 +460,44 @@ test("warm native hit preflights one UUID and atomically claims before one paid 
   }
 });
 
+test("OCV5-300 natural mode still resumes a pointer written on the opaque release", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const priorBody = { ...canonicalBody,
+      messages: [{ role: "user", content: "prior question" }] } as ProxyBody;
+    const basis = makeBoxNativeHistoryBasis(priorBody, [{ type: "text", text: "READY" }]);
+    const opaqueHash = compileBoxToolCatalog(canonicalBody.tools).bindingSha256;
+    assert.notEqual(opaqueHash,
+      compileBoxToolCatalog(canonicalBody.tools, "natural").bindingSha256);
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: model, cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "f".repeat(64), ...basis, catalogHash: opaqueHash,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const f = fixture({ directFinal: true,
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const next = { ...canonicalBody, messages: [
+      { role: "user", content: "prior question" },
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "new question" },
+    ] } as ProxyBody;
+    const input = { ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } };
+    const result = await runBoxToolFirstRound(input, { ...f.deps, toolAliasMode: "natural" });
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(result.plan.sessionId, pointer.nativeSessionId, "native resume kept");
+    assert.equal(result.plan.catalog.bindingSha256, opaqueHash, "same catalog variant");
+    assert.equal((f.admittedNative as { ownerRequestId: string }).ownerRequestId, "native-owner");
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
 test("direct final cannot bill or emit terminal when success has trailing bytes", async () => {
   const f = fixture({ directFinal: true, finalTrailing: true });
   await assert.rejects(() => runBoxToolFirstRound(f.input, f.deps),
@@ -760,6 +798,40 @@ test("an unproven stop of a rejected stream stays on the fail-closed unknown pat
   const deps = { ...f.deps, stopRejectedRun: async () => { throw new Error("stop transport down"); } };
   await assert.rejects(() => runBoxToolFirstRound(f.input, deps), /BOX_TOOL_ID_OR_NAME_INVALID/);
   assert.deepEqual(f.unknownPhases, ["first_round_unknown"]);
+});
+
+test("OCV5-300 a self-completed rejected stream is settled from its keeper proof", async () => {
+  const f = fixture({ spoolBody: unknownNameRaw });
+  const settled: unknown[] = [];
+  const proof = { reason: "worker_complete" };
+  const deps = { ...f.deps, stopRejectedRun: async () => "completed_unsettled" as const,
+    readTerminalProof: (async (args: { runNonce: string; leaseEpoch: string }) => {
+      f.sequence.push("read-proof"); return { ...proof, runNonce: args.runNonce,
+        leaseEpoch: args.leaseEpoch }; }) as never,
+    journal: { ...(f.deps.journal as object), markFirstRoundRejectedStream: async (input: unknown) => {
+      settled.push(input); } } as never };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => (error as { code?: string }).code === "BOX_TOOL_NAME_UNAVAILABLE");
+  assert.equal(settled.length, 1);
+  const row = settled[0] as { requestId: string; uid: bigint; leaseEpoch: string;
+    proof: { reason: string; runNonce: string } };
+  assert.equal(row.requestId, "box-synthetic");
+  assert.equal(row.uid, 3n);
+  assert.equal(row.proof.reason, "worker_complete");
+  assert.match(row.proof.runNonce, /^[a-f0-9]{24}$/);
+  assert.deepEqual(f.unknownPhases, [], "no unknown row pins the session");
+  assert.equal(f.retained, false);
+  // an unreadable proof or a refused settle keeps the fail-closed unknown path
+  for (const broken of ["proof", "settle"] as const) {
+    const g = fixture({ spoolBody: unknownNameRaw });
+    const d = { ...g.deps, stopRejectedRun: async () => "completed_unsettled" as const,
+      readTerminalProof: (async () => { if (broken === "proof") throw new Error("no proof");
+        return proof; }) as never,
+      journal: { ...(g.deps.journal as object), markFirstRoundRejectedStream: async () => {
+        throw new Error("BOX_REJECTED_STREAM_FENCE_LOST"); } } as never };
+    await assert.rejects(() => runBoxToolFirstRound(g.input, d), /BOX_TOOL_ID_OR_NAME_INVALID/);
+    assert.deepEqual(g.unknownPhases, ["first_round_unknown"]);
+  }
 });
 
 test("other decoder failures never trigger the explicit stop", async () => {

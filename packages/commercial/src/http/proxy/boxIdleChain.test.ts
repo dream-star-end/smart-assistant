@@ -220,3 +220,20 @@ test("unknown, contradictory or incomplete failure shapes stay pending", () => {
   assert.equal(pendingOf([failedText], ["elsewhere"]), "pending");
   assert.equal(pendingOf([failedText, { ...failedText, requestId: "f-text-2" }]), "pending");
 });
+
+test("OCV5-300 a locally rejected first-round stream projects failed, not a wedge", () => {
+  const completeProof = { ...failedProof, reason: "worker_complete" };
+  const rejected = { ...failedText, ctx: { ...failedText.ctx,
+    boxTerminalProof: completeProof, boxStopOutcome: "rejected_stream" } };
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [rejected] }),
+    { status: "failed", sessionId, turnKey, requestIds: ["f-text"] });
+  const pendingOf = (rows: IdleChainRow[]) =>
+    projectBoxIdleChain({ sessionId, turnKey, rows }).status;
+  // the worker_complete exemption needs the explicit rejected_stream outcome,
+  // a journal-aborted single row, and no published tool handoff
+  assert.equal(pendingOf([{ ...rejected, ctx: { ...rejected.ctx, boxStopOutcome: "failed" } }]), "pending");
+  assert.equal(pendingOf([{ ...rejected, state: "committed" }]), "pending");
+  assert.equal(pendingOf([{ ...rejected, ctx: { ...rejected.ctx, boxToolHandoff: { roundNo: 1 } } }]), "pending");
+  assert.equal(pendingOf([{ ...rejected, ctx: { ...rejected.ctx,
+    boxTerminalProof: { ...completeProof, reason: "something_else" } } }]), "pending");
+});

@@ -1,7 +1,7 @@
 /** Resume the same detached CLI after OpenClaude-local tool results publish.
  * Delivers either the next durable tool handoff or a remotely-proven final
  * message. The caller retains the Box target until terminal cleanup. */
-import { compileBoxToolCatalog } from "./boxToolCatalog.js";
+import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
@@ -88,8 +88,10 @@ export async function runBoxToolContinuation(input: {
   };
   try {
     if (signal.aborted) throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_ABORTED");
-    const catalog = compileBoxToolCatalog(input.canonicalBody.tools);
-    if (catalog.bindingSha256 !== claim.catalogHash
+    // OCV5-300: resolve against the catalog variant this chain was admitted with.
+    const catalog = boxCatalogMatching(compileBoxToolCatalog(input.canonicalBody.tools),
+      claim.catalogHash);
+    if (!catalog
       || target.accountId !== claim.accountId || claim.roundNo < 2
       || claim.roundNo > BOX_TOOL_MAX_ROUNDS) {
       throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_BINDING_INVALID");

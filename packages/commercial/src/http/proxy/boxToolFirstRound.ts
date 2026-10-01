@@ -4,6 +4,8 @@
 import { isDeepStrictEqual } from "node:util";
 import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { makeBoxDetachedToolPlan, type BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
+import { boxCatalogAliasMode, boxCatalogMatching,
+  type BoxMcpAliasMode } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
   type BoxToolHandoffCandidate } from "./boxCliToolHandoff.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
@@ -48,7 +50,8 @@ export interface BoxToolFirstFinal {
 type Journal = Pick<BoxDurableJournal, "admit" |
   "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
   "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
-  & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer">>;
+  & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer"
+    | "markFirstRoundRejectedStream">>;
 
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
@@ -71,6 +74,8 @@ export async function runBoxToolFirstRound(input: {
   keeperAsset: Buffer;
   virtualMcpAsset: Buffer;
   detachedRunnerAsset: Buffer;
+  /** OCV5-300: production passes "natural" so the CLI sees client names. */
+  toolAliasMode?: BoxMcpAliasMode;
   journal: Journal;
   writeMessage?: BoxReplayMessageWriter;
   maxOutputTokensForModel: (model: string) => number | null;
@@ -92,6 +97,8 @@ export async function runBoxToolFirstRound(input: {
    * session. Anything else keeps the fail-closed unknown path. */
   stopRejectedRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
     runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
+  /** Test seam; production reads the keeper proof from the Box. */
+  readTerminalProof?: typeof readBoxTerminalProof;
 }): Promise<BoxToolFirstHandoff | BoxToolFirstFinal> {
   if (input.url !== BOX_INTERNAL_ENDPOINT || input.init.method !== "POST"
     || typeof input.init.body !== "string") {
@@ -132,7 +139,7 @@ export async function runBoxToolFirstRound(input: {
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
     detachedRunnerAsset: deps.detachedRunnerAsset,
-    nativePersistence: nativeEnabled });
+    nativePersistence: nativeEnabled, toolAliasMode: deps.toolAliasMode });
   const budget = deps.budgetMs ?? BOX_TOOL_MAX_WALL_MS;
   if (!Number.isSafeInteger(budget) || budget < 60_000
     || budget > BOX_TOOL_MAX_WALL_MS) {
@@ -275,15 +282,22 @@ export async function runBoxToolFirstRound(input: {
         if (signal.aborted) throw error;
         /* Cache lookup failure leaves the ordinary one-launch path. */
       }
-      if (candidate && candidate.pointer.accountId === target.accountId.toString()
+      // OCV5-300: a pointer written on the opaque-alias release resumes with
+      // that same catalog variant, so the native transcript's tool names and
+      // the staged MCP catalog stay identical across the rolling deploy.
+      const pointerCatalog = candidate
+        ? boxCatalogMatching(plan.catalog, candidate.pointer.catalogHash) : null;
+      if (candidate && pointerCatalog
+        && candidate.pointer.accountId === target.accountId.toString()
         && candidate.pointer.upstreamModel === input.upstreamModel
-        && candidate.pointer.catalogHash === plan.catalog.bindingSha256
         && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
         const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
           keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
           detachedRunnerAsset: deps.detachedRunnerAsset,
           runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+          toolAliasMode: pointerCatalog.bindingSha256 === plan.catalog.bindingSha256
+            ? deps.toolAliasMode : boxCatalogAliasMode(pointerCatalog),
           nativeResume: { cliCwd: candidate.pointer.cliCwd,
             sessionId: candidate.pointer.nativeSessionId,
             expectedSha256: candidate.pointer.transcriptSha256 } });
@@ -291,6 +305,9 @@ export async function runBoxToolFirstRound(input: {
           const inspected = await run(warm.nativePreflight!, 20_000);
           parseBoxNativeFileEvidence(inspected.stdout,
             candidate.pointer.transcriptSha256);
+          if (warm.catalog.bindingSha256 !== candidate.pointer.catalogHash) {
+            throw new Error("BOX_NATIVE_CATALOG_VARIANT_MISMATCH");
+          }
           plan = warm;
           nativeClaim = { ownerRequestId: candidate.ownerRequestId,
             pointer: candidate.pointer, upstreamModel: input.upstreamModel };
@@ -535,6 +552,19 @@ export async function runBoxToolFirstRound(input: {
         outcome = await deps.stopRejectedRun({ requestId: input.requestId, uid: input.uid,
           accountId: target.accountId, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch });
       } catch { outcome = "pending"; }
+      if (outcome === "completed_unsettled" && deps.journal.markFirstRoundRejectedStream) {
+        // OCV5-300: the CLI already finished on its own (it answered the bad
+        // call itself). Its keeper proof is final; settle the row as a
+        // rejected stream (no usage, not billed) instead of leaving it unknown.
+        try {
+          const proof = await bounded((deps.readTerminalProof ?? readBoxTerminalProof)({ target,
+            expectedAccountId: target.accountId, runNonce: plan.runNonce,
+            leaseEpoch: plan.leaseEpoch }), 20_000);
+          await bounded(deps.journal.markFirstRoundRejectedStream({ requestId: input.requestId,
+            uid: input.uid, leaseEpoch: plan.leaseEpoch, proof }), 5_000);
+          outcome = "stopped_proven";
+        } catch { /* unproven: keep the fail-closed unknown path below */ }
+      }
       if (outcome === "stopped_proven") {
         await closeBounded(target, "rejected_stream_dispose").catch(() => {});
         throw new BoxToolFirstRoundError(error.code === "BOX_TOOL_ID_OR_NAME_INVALID"

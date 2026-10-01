@@ -1,11 +1,11 @@
 /** Strict classifier for one already-framed CLI JSONL record.
  * A proven heartbeat is telemetry for a tool the previous round already
  * handed off. It is not a tool result, a new tool id, or a session claim. */
-import type { BoxToolCatalog } from "./boxToolCatalog.js";
+import { BOX_MCP_TOOL_NAME, type BoxToolCatalog } from "./boxToolCatalog.js";
 
 const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const BOX_NAME = /^mcp__ocbridge__t[0-9]{1,3}$/;
+const BOX_NAME = BOX_MCP_TOOL_NAME;
 const HEARTBEAT_INDEX = /^(0|[1-9][0-9]{0,5})$/;
 const HEARTBEAT_KEYS = "elapsed_time_seconds,heartbeat,parent_tool_use_id,session_id,tool_name,tool_use_id,type,uuid";
 

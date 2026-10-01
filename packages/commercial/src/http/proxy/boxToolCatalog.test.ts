@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BoxToolCatalogError, compileBoxToolCatalog, mapBoxCliEffort,
+import { BOX_MCP_TOOL_NAME, BoxToolCatalogError, boxCatalogMatching, boxMcpAliasFor,
+  compileBoxToolCatalog, mapBoxCliEffort,
   rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
 
 // Names observed from an isolated real Claude Code 2.1.280 Messages request;
@@ -82,7 +83,11 @@ test("staged catalog rehydrates through compile and rejects a drifted byte", () 
   assert.equal(restored.json, compiled.json);
   assert.equal(restored.bindingSha256, compiled.bindingSha256);
   assert.equal(restored.clientNameByBoxName.get("mcp__ocbridge__t0"), "foo.bar");
+  // t9 is a well-formed alias (OCV5-300), so the drift fails at the byte bind.
   assert.throws(() => rehydrateBoxToolCatalog(compiled.json.replace('"t0"', '"t9"')),
+    (error: unknown) => error instanceof BoxToolCatalogError
+      && error.code === "BOX_TOOL_CATALOG_BINDING_MISMATCH");
+  assert.throws(() => rehydrateBoxToolCatalog(compiled.json.replace('"t0"', '"bad.alias"')),
     (error: unknown) => error instanceof BoxToolCatalogError
       && error.code === "BOX_TOOL_CATALOG_REHYDRATE_INVALID");
   assert.throws(() => rehydrateBoxToolCatalog(compiled.json.replace('{"tools"', '{ "tools"')),
@@ -113,4 +118,32 @@ test("default real CCB adaptive-medium effort maps exactly, unsupported settings
       (error: unknown) => error instanceof BoxToolCatalogError
         && error.code === "BOX_EFFORT_UNMAPPED");
   }
+});
+
+test("OCV5-300 natural aliases expose client names and keep opaque chains binding", () => {
+  const source = [...ccNames.map(tool), tool("local.echo"), tool("t7"),
+    tool("A".repeat(49))];
+  const natural = compileBoxToolCatalog(source, "natural");
+  const opaque = compileBoxToolCatalog(source);
+  assert.equal(natural.boxNameByClientName.get("Bash"), "mcp__ocbridge__Bash");
+  assert.equal(natural.clientNameByBoxName.get("mcp__ocbridge__Read"), "Read");
+  // Not valid / ambiguous MCP names fall back to the opaque index alias.
+  assert.equal(natural.boxNameByClientName.get("local.echo"), `mcp__ocbridge__t${ccNames.length}`);
+  assert.equal(natural.boxNameByClientName.get("t7"), `mcp__ocbridge__t${ccNames.length + 1}`);
+  assert.equal(boxMcpAliasFor("A".repeat(49), 3), "t3");
+  for (const name of natural.clientNameByBoxName.keys()) assert.match(name, BOX_MCP_TOOL_NAME);
+  assert.equal(new Set(natural.clientNameByBoxName.keys()).size, source.length);
+  assert.equal(opaque.boxNameByClientName.get("Bash"), `mcp__ocbridge__t${ccNames.indexOf("Bash")}`);
+  assert.notEqual(natural.bindingSha256, opaque.bindingSha256);
+  // Rehydrate auto-detects the staged variant byte-exactly.
+  assert.equal(rehydrateBoxToolCatalog(natural.json).bindingSha256, natural.bindingSha256);
+  assert.equal(rehydrateBoxToolCatalog(opaque.json).bindingSha256, opaque.bindingSha256);
+  // A chain admitted on either release resolves to its own variant.
+  assert.equal(boxCatalogMatching(natural, opaque.bindingSha256)?.bindingSha256, opaque.bindingSha256);
+  assert.equal(boxCatalogMatching(opaque, natural.bindingSha256)?.bindingSha256, natural.bindingSha256);
+  assert.equal(boxCatalogMatching(natural, natural.bindingSha256), natural);
+  const drifted = compileBoxToolCatalog([...source.slice(0, -1), tool("Other")], "natural");
+  assert.equal(boxCatalogMatching(drifted, natural.bindingSha256), null);
+  assert.equal(boxCatalogMatching(natural, "0".repeat(64)), null);
+  assert.equal(boxCatalogMatching(natural, undefined), null);
 });

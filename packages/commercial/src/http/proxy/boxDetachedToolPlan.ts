@@ -1,6 +1,7 @@
 /** Offline assembly for a detached supervised Box tool invocation. It is not
  * a production route until actual Box cgroup survival and multi-round replay
  * fences pass. OpenClaude owns agent execution, tools, memory and Skills. */
+import type { BoxMcpAliasMode } from "./boxToolCatalog.js";
 import { createHash } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
@@ -27,6 +28,7 @@ export function makeBoxDetachedToolPlan(input: {
   leaseEpoch?: string;
   nativePersistence?: boolean;
   nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
+  toolAliasMode?: BoxMcpAliasMode;
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;
   const base = makeBoxToolPlan(toolInput);

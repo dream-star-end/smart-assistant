@@ -10,7 +10,7 @@ import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof } from "./boxTerminalProof.js";
-import type { BoxToolCatalog } from "./boxToolCatalog.js";
+import { boxCatalogMatching, type BoxToolCatalog } from "./boxToolCatalog.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -41,7 +41,9 @@ export async function observeBoxToolTerminalOnly(input: {
   | "readRecoveryWinner">; writeMessage: BoxReplayMessageWriter }):
   Promise<BoxToolTerminalRecovery> {
   const id = input.evidence;
-  if (input.catalog.bindingSha256 !== id.catalogHash) {
+  // OCV5-300: accept the admitted (opaque or natural) catalog variant.
+  const catalog = boxCatalogMatching(input.catalog, id.catalogHash);
+  if (!catalog) {
     return { status: "pending", reason: "BOX_RECOVERY_CATALOG_MISMATCH" };
   }
   if (id.roundNo > 1 && (!id.resultHashes || id.resultHashes.length < 1)) {
@@ -65,9 +67,9 @@ export async function observeBoxToolTerminalOnly(input: {
     const progress: BoxToolProgressBinding | undefined = id.roundNo > 1
       && id.priorToolUses && id.nativeSessionId
       ? { toolUses: id.priorToolUses, nativeSessionId: id.nativeSessionId,
-        catalog: input.catalog }
+        catalog: catalog }
       : undefined;
-    const decoder = new BoxCliToolHandoffDecoder(id.upstreamModel, input.catalog,
+    const decoder = new BoxCliToolHandoffDecoder(id.upstreamModel, catalog,
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
         ...(progress ? { progress } : {}) });
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(id.resultHashes!) : null;

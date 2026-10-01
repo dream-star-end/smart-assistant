@@ -31,6 +31,7 @@ import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrela
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
+import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
@@ -227,9 +228,12 @@ function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): bool
     : state === "failed_stopped" && proof.reason !== "worker_complete";
 }
 
+// A rejected_stream settlement (OCV5-300) carries the keeper's real proof,
+// possibly worker_complete; it is never a cleanup candidate here.
 const CLEANUP_STATE_FENCE = `((ctx->>'boxState'='terminal'
   AND state IN ('inflight','finalizing','committed'))
   OR (ctx->>'boxState'='failed_stopped'
+    AND ctx->>'boxStopOutcome' IS DISTINCT FROM 'rejected_stream'
     AND (state='aborted' OR (state IN ('inflight','finalizing','committed')
       AND ctx ? 'boxToolHandoff'))))`;
 
@@ -1423,6 +1427,81 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
+  /**
+   * OCV5-300: settle a launched first round whose output stream egress itself
+   * rejected (e.g. a tool name outside this invocation's catalog) once the
+   * remote keeper has written its terminal proof — including worker_complete,
+   * which the explicit-stop path cannot use. The run produced nothing that was
+   * delivered, so no usage is recorded and nothing is billed (final_credits 0,
+   * failure STREAM_FAILED, ctx.boxStopOutcome rejected_stream). Without this the row stayed inflight/unknown
+   * forever: it pinned the session (IDLE_HISTORY_PENDING -> "消息未开始处理")
+   * and an account slot. Exact identity, no handoff, no prior usage; idempotent.
+   */
+  async markFirstRoundRejectedStream(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !input.proof
+      || typeof input.proof.runNonce !== "string" || !/^[a-f0-9]{24}$/.test(input.proof.runNonce)) {
+      throw new BoxDurableJournalError("BOX_REJECTED_STREAM_EVIDENCE_INVALID");
+    }
+    try { parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
+      runNonce: input.proof.runNonce, leaseEpoch: input.leaseEpoch }); }
+    catch { throw new BoxDurableJournalError("BOX_REJECTED_STREAM_EVIDENCE_INVALID"); }
+    const client = await this.pool.connect();
+    let committed = false;
+    try {
+      await client.query("BEGIN");
+      const found = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+        `SELECT state,ctx FROM request_finalize_journal
+          WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+        [input.requestId, input.uid.toString()]);
+      const row = found.rows[0], ctx = row?.ctx;
+      if (found.rowCount !== 1 || !row || !ctx
+        || ctx.boxInvocationRecovery !== "v1"
+        || ctx.boxInvocationMode !== "detached_tool"
+        || ctx.boxRunNonce !== input.proof.runNonce
+        || ctx.boxLeaseEpoch !== input.leaseEpoch
+        || typeof ctx.boxAccountId !== "string"
+        || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+        || ctx.boxToolHandoff !== undefined
+        || ctx.boxOwnerRequestId !== undefined
+        || ctx.boxResumeRequestId !== undefined) {
+        throw new BoxDurableJournalError("BOX_REJECTED_STREAM_CHAIN_INVALID");
+      }
+      if (row.state === "aborted" && ctx.boxState === "failed_stopped"
+        && ctx.boxStopOutcome === "rejected_stream"
+        && isDeepStrictEqual(ctx.boxTerminalProof, input.proof)) {
+        await client.query("COMMIT"); committed = true; return;
+      }
+      if (row.state !== "inflight" || !["running", "unknown"].includes(String(ctx.boxState))) {
+        throw new BoxDurableJournalError("BOX_REJECTED_STREAM_FENCE_LOST");
+      }
+      const usage = await client.query(
+        `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
+        [input.requestId, input.uid.toString()]);
+      if (usage.rowCount) throw new BoxDurableJournalError("BOX_REJECTED_STREAM_USAGE_CONFLICT");
+      const changed = await client.query(
+        `UPDATE request_finalize_journal
+            SET state='aborted', failure_code='STREAM_FAILED',
+                final_credits=0,
+                ctx=ctx || $4::jsonb, updated_at=NOW()
+          WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
+            AND ctx->>'boxInvocationMode'='detached_tool'
+            AND ctx->>'boxState' IN ('running','unknown')
+            AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxOwnerRequestId')
+            AND NOT (ctx ? 'boxResumeRequestId')`,
+        [input.requestId, input.uid.toString(), input.leaseEpoch,
+          JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
+            boxStopOutcome: "rejected_stream" }), input.proof.runNonce]);
+      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_REJECTED_STREAM_FENCE_LOST");
+      await client.query("COMMIT"); committed = true;
+    } finally {
+      if (!committed) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
   async complete(input: Pick<BoxJournalAdmission, "requestId" | "uid" | "leaseEpoch"> &
     { proof: BoxTerminalProof; usage: BoxUsageEvidence;
       messagePointer?: BoxReplayMessagePointer }): Promise<void> {
@@ -1538,7 +1617,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         .some((index) => !Object.hasOwn(toolUses, index))
       || toolUses.some((use) => !use
         || typeof use.boxName !== "string"
-        || !/^mcp__ocbridge__t[0-9]{1,3}$/.test(use.boxName)
+        || !BOX_MCP_TOOL_NAME.test(use.boxName)
         || typeof use.clientName !== "string" || use.clientName.length < 1
         || !use.input || typeof use.input !== "object" || Array.isArray(use.input))
       || !Array.isArray(pending) || pending.length < 1
@@ -1682,7 +1761,9 @@ export class BoxDurableJournal implements BoxJournalPort {
     const fallbackAlias = view.fallbackAlias;
     const priorContextHash = view.priorContextHash;
     const nextContextHash = view.nextContextHash;
-    const boundCatalog = view.catalog;
+    // Rolling compatibility (OCV5-300): a chain handed off on the opaque-alias
+    // release keeps resolving against that exact catalog variant.
+    let boundCatalog = view.catalog;
     const assistantContent = view.assistantContent;
     const client = await this.pool.connect();
     let committed = false;
@@ -1749,9 +1830,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         || priorIds.includes(handoff.messageId)) {
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_INVALID");
       }
-      if (boundCatalog.bindingSha256 !== handoff.catalogHash) {
+      const matchedCatalog = boxCatalogMatching(boundCatalog, handoff.catalogHash);
+      if (!matchedCatalog) {
         throw new BoxDurableJournalError("BOX_TOOL_CATALOG_CHANGED");
       }
+      boundCatalog = matchedCatalog;
       if (ctx.boxContextHash !== priorContextHash) {
         throw new BoxDurableJournalError("BOX_TOOL_CONTEXT_CHANGED");
       }

@@ -10,6 +10,29 @@ export class BoxToolCatalogError extends Error {
 }
 
 export const BOX_MCP_SERVER = "ocbridge";
+/** Every virtual-MCP alias this code may emit or accept: the legacy opaque
+ * `tN` form, or the client tool's own name (OCV5-300). With the
+ * `mcp__ocbridge__` prefix the full name stays within 64 characters. */
+export const BOX_MCP_ALIAS = /^(?:t[0-9]{1,3}|[A-Za-z0-9_-]{1,48})$/;
+export const BOX_MCP_TOOL_NAME = /^mcp__ocbridge__(?:t[0-9]{1,3}|[A-Za-z0-9_-]{1,48})$/;
+const NATURAL_ALIAS = /^[A-Za-z0-9_-]{1,48}$/;
+const OPAQUE_ALIAS = /^t[0-9]{1,3}$/;
+
+/** The CLI-visible alias for the i-th declared client tool. A client name
+ * that is already a valid MCP tool name is used as-is, so the model sees the
+ * same names as a native Claude Code session (mcp__ocbridge__Bash, …). Names
+ * that are too long, carry other characters, or look like the opaque form
+ * fall back to `t{i}`; the two namespaces cannot collide. */
+export function boxMcpAliasFor(clientName: string, index: number): string {
+  return NATURAL_ALIAS.test(clientName) && !OPAQUE_ALIAS.test(clientName)
+    ? clientName : `t${index}`;
+}
+
+/** `natural` (OCV5-300, selected by production admission) uses
+ * boxMcpAliasFor; `opaque` (the compile default) reproduces a catalog staged
+ * before OCV5-300 (every alias t{i}) so chains admitted on the old release
+ * still rehydrate and bind byte-exactly. */
+export type BoxMcpAliasMode = "natural" | "opaque";
 export interface BoxMcpTool {
   name: string;
   description: string;
@@ -50,7 +73,8 @@ function validateJson(value: unknown, depth = 0): void {
   for (const key of keys) validateJson(value[key], depth + 1);
 }
 
-export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
+export function compileBoxToolCatalog(rawTools: unknown,
+  aliasMode: BoxMcpAliasMode = "opaque"): BoxToolCatalog {
   if (!Array.isArray(rawTools) || rawTools.length < 1 || rawTools.length > 128) {
     throw new BoxToolCatalogError("BOX_TOOL_COUNT_INVALID");
   }
@@ -76,13 +100,14 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
     if (Buffer.byteLength(schemaJson) > 65_536) {
       throw new BoxToolCatalogError("BOX_TOOL_SCHEMA_TOO_LARGE");
     }
-    const mcpName = `t${i}`;
+    const mcpName = aliasMode === "opaque" ? `t${i}` : boxMcpAliasFor(source.name, i);
     const boxName = `mcp__${BOX_MCP_SERVER}__${mcpName}`;
-    // The CLI sees only the opaque MCP alias (t0/t1/...), while the
-    // OpenClaude-side prompt and tool_choice name the original client tool.
-    // Preserve that name in the model-visible description; otherwise a model
-    // can truthfully say that e.g. `local_echo` is unavailable despite t0
-    // being present. This is identity metadata, never execution authority.
+    // The CLI sees the MCP alias (the client name itself when it is a valid
+    // MCP name, else t{i}), while the OpenClaude-side prompt and tool_choice
+    // name the original client tool. Preserve that name in the model-visible
+    // description; otherwise a model can truthfully say that e.g.
+    // `local.echo` is unavailable despite t0 being present. This is identity
+    // metadata, never execution authority.
     tools.push({ name: mcpName,
       description: `OpenClaude tool name: ${source.name}. ${source.description}`,
       inputSchema: source.input_schema });
@@ -101,6 +126,37 @@ export function compileBoxToolCatalog(rawTools: unknown): BoxToolCatalog {
 }
 
 const STAGED_NAME_PREFIX = "OpenClaude tool name: ";
+
+/** The alias mode a compiled catalog was built with. */
+export function boxCatalogAliasMode(catalog: BoxToolCatalog): BoxMcpAliasMode {
+  return catalog.tools.every((tool, index) => tool.name === `t${index}`) ? "opaque" : "natural";
+}
+
+/**
+ * OCV5-300 rolling compatibility. A chain admitted before natural aliases
+ * stored the binding of its opaque (t{i}) catalog. Given the catalog compiled
+ * from the same request tools, return the variant whose binding equals the
+ * stored hash, or null when neither does (a real catalog change).
+ */
+export function boxCatalogMatching(catalog: BoxToolCatalog, storedHash: unknown): BoxToolCatalog | null {
+  if (catalog.bindingSha256 === storedHash) return catalog;
+  if (typeof storedHash !== "string") return null;
+  try {
+    const declarations = catalog.tools.map((tool) => {
+      const rest = tool.description.startsWith(STAGED_NAME_PREFIX)
+        ? tool.description.slice(STAGED_NAME_PREFIX.length) : "";
+      const cut = rest.indexOf(". ");
+      if (cut <= 0) throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
+      return { name: rest.slice(0, cut), description: rest.slice(cut + 2),
+        input_schema: tool.inputSchema };
+    });
+    for (const mode of ["opaque", "natural"] as const) {
+      const variant = compileBoxToolCatalog(declarations, mode);
+      if (variant.bindingSha256 === storedHash) return variant;
+    }
+  } catch { /* malformed: not a match */ }
+  return null;
+}
 const CLIENT_NAME = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/;
 
 /** Rebuild the admitted catalog from the exact staged JSON. The raw bytes must
@@ -120,7 +176,8 @@ export function rehydrateBoxToolCatalog(rawJson: string): BoxToolCatalog {
   }
   const declarations = parsed.tools.map((item, index) => {
     if (!record(item) || Object.keys(item).sort().join(",") !== "description,inputSchema,name"
-      || item.name !== `t${index}` || typeof item.description !== "string"
+      || typeof item.name !== "string" || !BOX_MCP_ALIAS.test(item.name)
+      || typeof item.description !== "string"
       || !item.description.startsWith(STAGED_NAME_PREFIX)
       || !record(item.inputSchema)) {
       throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");
@@ -137,8 +194,9 @@ export function rehydrateBoxToolCatalog(rawJson: string): BoxToolCatalog {
     }
     return { name, description, input_schema: item.inputSchema };
   });
+  const opaque = parsed.tools.every((item, index) => record(item) && item.name === `t${index}`);
   let compiled: BoxToolCatalog;
-  try { compiled = compileBoxToolCatalog(declarations); }
+  try { compiled = compileBoxToolCatalog(declarations, opaque ? "opaque" : "natural"); }
   catch (error) {
     if (error instanceof BoxToolCatalogError) {
       throw new BoxToolCatalogError("BOX_TOOL_CATALOG_REHYDRATE_INVALID");

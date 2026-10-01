@@ -3,6 +3,7 @@
 import type { BoxToolUseDigest } from "./boxToolInputHash.js";
 import type { BoxUsageEvidence } from "./boxDurableJournal.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
+import { BOX_MCP_TOOL_NAME } from "./boxToolCatalog.js";
 
 export interface BoxStoredToolHandoff {
   version: 1;
@@ -63,7 +64,7 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
       || typeof item.id !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.id)
       || ids.has(item.id)
       || typeof item.boxName !== "string"
-      || !/^mcp__ocbridge__t[0-9]{1,3}$/.test(item.boxName)
+      || !BOX_MCP_TOOL_NAME.test(item.boxName)
       || typeof item.clientName !== "string" || item.clientName.length < 1
       || item.clientName.length > 128
       || typeof item.inputHash !== "string" || !/^[a-f0-9]{64}$/.test(item.inputHash)) return null;
