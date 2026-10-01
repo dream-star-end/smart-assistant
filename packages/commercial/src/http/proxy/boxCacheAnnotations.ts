@@ -119,6 +119,34 @@ function generatedToolMeta(text: string): { hook?: string; budget: boolean } | n
   if (USER_BUDGET.test(text)) return { budget: true };
   return HOOK_CONTEXT.test(text) ? { hook: text, budget: false } : null;
 }
+/** CCB records the Read result and its generated image caption as consecutive
+ * user messages. The Anthropic continuation boundary is one user tool-result
+ * message, so join only this exact generated tail before folding it into the
+ * owning image result. Ordinary consecutive user instructions stay untouched. */
+function mergeAdjacentGeneratedUserTail(messages: unknown[]): unknown[] {
+  const merged: unknown[] = [];
+  for (const message of messages) {
+    const previous = merged.at(-1);
+    if (object(previous) && previous.role === "user" && Array.isArray(previous.content)
+      && previous.content.length > 0
+      && previous.content.every((part: unknown) => object(part) && part.type === "tool_result")
+      && object(message) && message.role === "user") {
+      const raw = message.content;
+      const tail = typeof raw === "string" ? [{ type: "text", text: raw }]
+        : Array.isArray(raw) && denseArray(raw) ? raw : null;
+      if (tail && tail.length > 0 && tail.every((part: unknown) => {
+        if (!object(part) || part.type !== "text" || Object.keys(part).sort().join(",") !== "text,type"
+          || typeof part.text !== "string") return false;
+        return provenCaption(part.text) || generatedToolMeta(part.text) !== null;
+      })) {
+        merged[merged.length - 1] = { ...previous, content: [...previous.content, ...tail] };
+        continue;
+      }
+    }
+    merged.push(message);
+  }
+  return merged;
+}
 // CCB 2.1.280 prints this sibling after a scaled Read image. Only the two
 // dimension tuples below were observed (HTTP 80x2200 and JSONL 1290x2796).
 // Other sizes stay unfolded. The scale string is kept verbatim.
@@ -276,7 +304,7 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
     if (!Object.hasOwn(body.messages, i)) return body;
   }
   let changed = false;
-  const messages = body.messages.map((message, index) => {
+  const messages = mergeAdjacentGeneratedUserTail(body.messages).map((message, index) => {
     if (!object(message) || message.role !== "user" || !Array.isArray(message.content)
       || !message.content.some((part: unknown) => object(part) && part.type === "tool_result")) {
       return message;

@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
 import { deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import { matchBoxToolResults } from "./boxToolResultMatcher.js";
 import { makeBoxToolResultPlan } from "./boxToolResultPlan.js";
 import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
@@ -42,7 +43,8 @@ function body(messages: unknown[], extra: Record<string, unknown> = {}): ProxyBo
   return { model: "box-api-claude-opus-5-5", stream: true, max_tokens: 128,
     tools: [{ name: "Read", description: "read", input_schema: { type: "object", properties: {} } },
       { name: "Note", description: "note", input_schema: { type: "object", properties: {} } }],
-    messages, ...extra } as ProxyBody;
+    messages, metadata: { user_id: JSON.stringify({ session_id: "sess-a",
+      oc_turn_key: "ab".repeat(32) }) }, ...extra } as ProxyBody;
 }
 function uses() {
   return [
@@ -63,6 +65,22 @@ function siblingTurn(caption = CAPTION_80, data = PNG): ProxyBody {
     budget(),
   ]);
 }
+test("a caption in CCB's adjacent user message resumes the image handoff", () => {
+  const raw = body([
+    { role: "user", content: "look" },
+    { role: "assistant", content: uses() },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_img_owner", content: [image()] },
+      { type: "tool_result", tool_use_id: "toolu_note_last", content: "note-bytes" },
+    ] },
+    { role: "user", content: CAPTION_JSONL },
+  ]);
+  assert.equal(classifyBoxContinuation(raw).classification, "continuation_candidate");
+  const normalized = normalizeBoxSemanticBody(raw);
+  const current = normalized.messages.at(-1) as { content?: unknown };
+  assert.equal(JSON.stringify(current.content).includes(CAPTION_JSONL), true);
+});
+
 function resultContent(normalized: ProxyBody, id: string): unknown[] {
   const user = normalized.messages.at(-1) as { content: Array<Record<string, unknown>> };
   const block = user.content.find((part) => part.tool_use_id === id);
