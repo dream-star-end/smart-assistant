@@ -11,12 +11,13 @@
 #
 # 4 个文件串行，每个父超时 180000ms。mutex 900s 覆盖 4*180s+120s 清理。
 # job 20min 再留安装余量。这些是拟上界，不是 2 核实测。
-# min-tests: 5
+# min-tests: 6
 # max-minutes: 20
 # file-timeout-ms: 180000
 # mutex-timeout-seconds: 900
 packages/commercial/src/http/proxy/boxIdleProof.integ.test.ts
 packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts
+packages/commercial/src/http/proxy/boxOrphanHandoff.integ.test.ts
 packages/commercial/src/http/proxy/boxIdleSet.integ.test.ts
 packages/commercial/src/http/proxy/boxResourceEnvelope.pipeline.integ.test.ts
 packages/gateway/src/__tests__/ccbRealCliHeaders.integ.test.ts

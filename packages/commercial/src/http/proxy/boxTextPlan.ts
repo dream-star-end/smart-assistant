@@ -143,6 +143,8 @@ export function makeBoxTextPlan(input: {
    * belongs to the caller; this builder only emits the pinned CLI plan. */
   nativePersistence?: boolean;
   nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
+  /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
+  resumeToolResults?: boolean;
   /** Client tool name -> virtual-MCP alias of this invocation (tool plan only). */
   toolAliases?: ReadonlyMap<string, string>;
   /** Appended to the staged system prompt (tool plan: the alias table). */
@@ -188,7 +190,8 @@ export function makeBoxTextPlan(input: {
   // text; the tool plan passes its catalog aliases instead (OCV5-299).
   const mapped = compileBoxCliSyntheticTurn({ ...input.body, model: input.upstreamModel },
     { cwd, cliVersion: "2.1.280", sessionId: input.nativeResume?.sessionId,
-      toolAliases: input.toolAliases ?? new Map() });
+      toolAliases: input.toolAliases ?? new Map(),
+      ...(input.resumeToolResults ? { resumeToolResults: true } : {}) });
   const supervisorHash = sha(input.supervisorAsset);
   const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${supervisorHash.slice(0, 16)}.py`;
   const keeperHash = sha(input.keeperAsset);

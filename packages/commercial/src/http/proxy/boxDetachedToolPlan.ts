@@ -28,6 +28,8 @@ export function makeBoxDetachedToolPlan(input: {
   leaseEpoch?: string;
   nativePersistence?: boolean;
   nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
+  /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
+  resumeToolResults?: boolean;
   toolAliasMode?: BoxMcpAliasMode;
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;

@@ -47,6 +47,8 @@ export function makeBoxToolPlan(input: {
   leaseEpoch?: string;
   nativePersistence?: boolean;
   nativeResume?: { cliCwd: string; sessionId: string; expectedSha256: string };
+  /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
+  resumeToolResults?: boolean;
   toolAliasMode?: BoxMcpAliasMode;
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
@@ -65,6 +67,7 @@ export function makeBoxToolPlan(input: {
   const { tools: _tools, tool_choice: _choice, thinking: _thinking,
     output_config: _output, ...textBody } = input.body;
   const base = makeBoxTextPlan({ body: textBody, upstreamModel: input.upstreamModel,
+      ...(input.resumeToolResults ? { resumeToolResults: true } : {}),
       maxOutputTokensLimit: input.maxOutputTokensLimit,
       supervisorAsset: input.supervisorAsset, keeperAsset: input.keeperAsset,
       extraStageFiles: [{ path: catalogPath, raw: catalogRaw, hash: catalog.sha256 }],

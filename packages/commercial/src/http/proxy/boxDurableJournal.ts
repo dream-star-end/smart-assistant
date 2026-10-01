@@ -417,6 +417,51 @@ export class BoxDurableJournal implements BoxJournalPort {
     private readonly capacity: (uid: bigint, accountId: bigint) => number | BoxRunCapacity = () => 1) {}
 
   /** An older pointer cannot be reused after an intervening uncached turn. */
+  /**
+   * OCV5-304: a recovered dispatch ("从断点继续"/"重新尝试") resends the same
+   * tool results under a new turn key. A continuation belongs to its own
+   * dispatch, so the open handoff of the earlier, finished dispatch can never
+   * receive them; its CLI waits until its deadline and holds the session's
+   * capacity. Returns that orphan only when exactly one handoff in the session
+   * waits for exactly these tool ids under another turn key and its dispatch
+   * is terminal; "live" when such a handoff exists but cannot be proven
+   * finished. Read-only.
+   */
+  async findOrphanToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
+    toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" }
+    | { kind: "orphan"; identity: { requestId: string; uid: bigint; accountId: bigint;
+      runNonce: string; leaseEpoch: string } }> {
+    if (input.toolIds.length < 1 || input.toolIds.length > 32
+      || input.toolIds.some((id) => !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))) return { kind: "none" };
+    const want = [...input.toolIds].sort().join(",");
+    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id, ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxState'='handoff'
+          AND ctx->>'boxTurnKey' IS DISTINCT FROM $3 AND NOT (ctx ? 'boxCancelIntent')
+          AND state IN ('inflight','finalizing','committed')`,
+      [input.uid.toString(), input.sessionId, input.turnKey]);
+    const matches = rows.rows.filter((row) => {
+      const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
+      return handoff !== null && handoff.toolUses.map((use) => use.id).sort().join(",") === want;
+    });
+    if (matches.length === 0) return { kind: "none" };
+    if (matches.length !== 1) return { kind: "live" };
+    const row = matches[0]!, ctx = row.ctx;
+    const billing = parseBoxBillingContext(ctx.boxBillingContext);
+    if (!billing?.dispatchId || typeof ctx.boxAccountId !== "string"
+      || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+      || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+      || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)) {
+      return { kind: "live" };
+    }
+    const dispatch = await this.pool.query<{ status: string }>(
+      `SELECT status FROM turn_dispatches WHERE user_id=$1 AND dispatch_id::text=$2`,
+      [input.uid.toString(), billing.dispatchId]);
+    if (dispatch.rows[0]?.status !== "terminal") return { kind: "live" };
+    return { kind: "orphan", identity: { requestId: row.request_id, uid: input.uid,
+      accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
+  }
+
   async findNativeCandidate(input: { uid: bigint; sessionId: string;
     currentRequestId: string;
     canonicalModel: string }): Promise<BoxNativeCandidate | null> {

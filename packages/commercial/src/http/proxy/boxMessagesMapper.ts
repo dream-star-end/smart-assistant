@@ -142,6 +142,9 @@ function aliasHistory(history: Message[], aliases: ReadonlyMap<string, string>):
   });
 }
 
+/** Claude Code's own sentence for resuming an interrupted turn. */
+export const BOX_CLI_RESUME_PROMPT = "Continue from where you left off.";
+
 export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   cwd: string;
   cliVersion: string;
@@ -149,6 +152,10 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   /** Client tool name -> CLI-visible alias for this invocation. When given,
    * history is staged with callable names only (see aliasHistory). */
   toolAliases?: ReadonlyMap<string, string>;
+  /** OCV5-304: allow the current user message to be only the results of the
+   * previous assistant's tool calls (a tool exchange whose live Box owner is
+   * gone, e.g. a recovered dispatch). */
+  resumeToolResults?: boolean;
 }): BoxCliSyntheticTurn {
   if (!/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(args.cwd)
     || args.cliVersion !== "2.1.280") {
@@ -174,9 +181,18 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   if (currentIndex < 0 || messages.slice(currentIndex + 1).some((message) => message.role !== "system")) {
     throw new BoxMessagesShapeError("BOX_CURRENT_USER_REQUIRED");
   }
-  const current = messages[currentIndex]!;
+  let current = messages[currentIndex]!;
+  let resumed = false;
   if (blocks(current.content).some((block) => block.type === "tool_result")) {
-    throw new BoxMessagesShapeError("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    // OCV5-304: Claude Code 2.1.280 drops a stdin tool_result that answers a
+    // snapshot's dangling tool_use. Stage the complete exchange as history and
+    // continue with Claude Code's own resume sentence; the pairing check below
+    // still requires every tool_use to be answered exactly once.
+    if (!args.resumeToolResults
+      || !blocks(current.content).every((block) => block.type === "tool_result")) {
+      throw new BoxMessagesShapeError("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    }
+    resumed = true;
   }
   const promptParts: string[] = [];
   if (semantic.system !== undefined) promptParts.push(systemText(semantic.system));
@@ -184,6 +200,10 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     if (message.role === "system") promptParts.push(systemText(message.content));
   }
   const history = messages.slice(0, currentIndex).filter((message) => message.role !== "system");
+  if (resumed) {
+    history.push(current);
+    current = { ...current, content: BOX_CLI_RESUME_PROMPT };
+  }
   const pending = new Set<string>();
   for (const message of history) {
     for (const block of blocks(message.content)) {

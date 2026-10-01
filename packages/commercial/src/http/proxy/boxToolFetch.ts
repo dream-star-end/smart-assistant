@@ -17,6 +17,8 @@ import { makeBoxPrelaunchCleanup } from "./boxPrelaunchControl.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
+import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
+import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 
 type FetchArgs = { uid: bigint; sessionId: string | null; requestId: string;
   canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
@@ -74,7 +76,36 @@ export class BoxToolFetch {
     cleanupResolveTimeoutMs?: number;
     /** OCV5-299: explicit stop for a locally rejected first-round stream. */
     stopRejectedRun?: Parameters<First>[1]["stopRejectedRun"];
+    /** OCV5-304: stop an orphaned handoff exactly as the user's Stop does. */
+    stopOrphanRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
+      runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
   }) {}
+
+  /** OCV5-304: a recovered dispatch resent tool results that only the earlier,
+   * finished dispatch's handoff could have received. Stop that orphaned run
+   * (it would otherwise wait for its deadline holding the session's slot)
+   * and let this request continue the exchange as a fresh invocation. Returns
+   * false, keeping the original rejection, unless that is proven safe. */
+  private async releaseOrphanedExchange(args: FetchArgs, error: unknown): Promise<boolean> {
+    if (!(error instanceof Error) || (error as { code?: unknown }).code !== "BOX_TOOL_OWNER_UNKNOWN"
+      || !this.deps.stopOrphanRun || !this.deps.journal.findOrphanToolHandoff) return false;
+    let toolIds: readonly string[], sessionId: string, turnKey: string;
+    try {
+      const classified = classifyBoxContinuation(args.canonicalBody);
+      const fingerprint = deriveBoxCallFingerprint(args.uid, args.canonicalBody);
+      if (classified.classification !== "continuation_candidate") return false;
+      toolIds = classified.toolIds; sessionId = fingerprint.sessionId; turnKey = fingerprint.turnKey;
+    } catch { return false; }
+    const orphan = await this.deps.journal.findOrphanToolHandoff({ uid: args.uid,
+      sessionId, turnKey, toolIds });
+    if (orphan.kind === "live") return false;
+    if (orphan.kind === "orphan") {
+      let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
+      try { outcome = await this.deps.stopOrphanRun(orphan.identity); } catch { return false; }
+      if (outcome !== "stopped_proven") return false;
+    }
+    return true;
+  }
 
   private own(nonce: string, target: BoxResolvedTarget, uid: bigint,
     leaseEpoch: string): void {
@@ -415,8 +446,11 @@ export class BoxToolFetch {
           if (sse) controller.enqueue(Buffer.from(sse, "utf8"));
         };
         void (async () => {
+          let published: BoxToolPublishedResume | null = null;
+          let resumeToolResults = false;
           if (routeClass(args) === "continuation_candidate") {
-            const published: BoxToolPublishedResume = await (this.deps.publishResume
+            try {
+            published = await (this.deps.publishResume
               ?? publishBoxToolResume)({ ...args, init }, {
               journal: this.deps.journal,
               resolveTarget: (input) => this.deps.resolveTarget({ ...input,
@@ -425,6 +459,14 @@ export class BoxToolFetch {
                 target, args.uid, claim.leaseEpoch),
               onUnknown: this.deps.onUnknown,
             });
+            } catch (error) {
+              // OCV5-304: no claim was made and nothing launched; a recovered
+              // dispatch continues the exchange as a fresh Box invocation.
+              if (!(await this.releaseOrphanedExchange(args, error))) throw error;
+              resumeToolResults = true;
+            }
+          }
+          if (published) {
             this.own(published.claim.runNonce, published.target,
               args.uid, published.claim.leaseEpoch);
             acknowledge(); // the existing CLI received the durable tool-result handoff
@@ -447,7 +489,8 @@ export class BoxToolFetch {
             }
           } else {
             const outcome: BoxToolFirstHandoff | BoxToolFirstFinal = await (this.deps.runFirst
-              ?? runBoxToolFirstRound)({ ...args, init, emit, onLaunchAck: acknowledge }, {
+              ?? runBoxToolFirstRound)({ ...args, init, emit, onLaunchAck: acknowledge,
+                ...(resumeToolResults ? { resumeToolResults: true } : {}) }, {
               supervisorAsset: this.deps.supervisorAsset,
               keeperAsset: this.deps.keeperAsset,
               virtualMcpAsset: this.deps.virtualMcpAsset,

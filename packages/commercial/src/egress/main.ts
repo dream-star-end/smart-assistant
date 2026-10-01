@@ -350,6 +350,8 @@ export async function startEgress(): Promise<void> {
       // same explicit-stop coordinator as a user Stop (declared below; only
       // called at request time, after startup).
       stopRejectedRun: (identity) => boxStopCoordinator.requestStop(identity),
+      // OCV5-304: a recovered dispatch frees the earlier dispatch's orphaned run.
+      stopOrphanRun: (identity) => boxStopCoordinator.requestStop(identity),
     }) : undefined;
   const boxModel = boxTextModel ? {
     toolBridgeReady: boxToolModel !== undefined,

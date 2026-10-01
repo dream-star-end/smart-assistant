@@ -70,6 +70,9 @@ export async function runBoxToolFirstRound(input: {
   emit: (sse: string) => void;
   /** Resolve the HTTP response only after this invocation's paid launch ack. */
   onLaunchAck?: () => void;
+  /** OCV5-304: the request's last user message answers a tool exchange whose
+   * original Box run was stopped; replay it as history (see mapper). */
+  resumeToolResults?: boolean;
 }, deps: {
   supervisorAsset: Buffer;
   keeperAsset: Buffer;
@@ -142,7 +145,8 @@ export async function runBoxToolFirstRound(input: {
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
     detachedRunnerAsset: deps.detachedRunnerAsset,
-    nativePersistence: nativeEnabled, toolAliasMode: deps.toolAliasMode });
+    nativePersistence: nativeEnabled, toolAliasMode: deps.toolAliasMode,
+    ...(input.resumeToolResults ? { resumeToolResults: true } : {}) });
   const budget = deps.budgetMs ?? BOX_TOOL_MAX_WALL_MS;
   if (!Number.isSafeInteger(budget) || budget < 60_000
     || budget > BOX_TOOL_MAX_WALL_MS) {
@@ -276,7 +280,10 @@ export async function runBoxToolFirstRound(input: {
       throw error;
     }
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
-    if (nativeEnabled && input.sessionId && deps.journal.findNativeCandidate) {
+    // A resumed tool exchange must be staged from history: a native
+    // transcript stops at the unanswered tool_use (OCV5-304).
+    if (nativeEnabled && input.sessionId && deps.journal.findNativeCandidate
+      && !input.resumeToolResults) {
       let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
       try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
         sessionId: input.sessionId, currentRequestId: input.requestId,
