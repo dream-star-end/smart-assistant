@@ -11,7 +11,7 @@ import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
-import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -467,7 +467,8 @@ export async function runBoxToolFirstRound(input: {
             expectedAccountId: target.accountId, runNonce: plan.runNonce,
             leaseEpoch: plan.leaseEpoch, signal })); }
           catch (error) {
-            if (!(error instanceof BoxExecTransportError && error.terminalKnown)) throw error;
+            if (!(error instanceof BoxExecTransportError && error.terminalKnown)
+              && !isTransientBoxSpoolReadError(error)) throw error;
             await new Promise<void>((resolve) => setTimeout(resolve, 50));
           }
         }
@@ -530,7 +531,8 @@ export async function runBoxToolFirstRound(input: {
             parseBoxPendingCall(result.stdout, use);
             pending.add(use.id);
           } catch (error) {
-            if (!(error instanceof BoxExecTransportError && error.terminalKnown)) throw error;
+            if (!(error instanceof BoxExecTransportError && error.terminalKnown)
+              && !isTransientBoxSpoolReadError(error)) throw error;
           }
         }
         if (pending.size === 0) await new Promise<void>((resolve) => setTimeout(resolve, 50));

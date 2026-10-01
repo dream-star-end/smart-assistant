@@ -10,7 +10,7 @@ import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js"
 import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { BoxToolResultEcho } from "./boxToolResultEcho.js";
 import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
-import { pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { deriveBoxContextHash } from "./boxCallFingerprint.js";
@@ -149,7 +149,8 @@ export async function runBoxToolContinuation(input: {
               parseBoxPendingCall(result.stdout, use);
               pending.add(use.id);
             } catch (error) {
-              if (!(error instanceof BoxExecTransportError && error.terminalKnown)) throw error;
+              if (!(error instanceof BoxExecTransportError && error.terminalKnown)
+                && !isTransientBoxSpoolReadError(error)) throw error;
             }
           }
           if (pending.size === 0) await new Promise<void>((resolve) => setTimeout(resolve, 50));
@@ -179,7 +180,8 @@ export async function runBoxToolContinuation(input: {
             expectedAccountId: claim.accountId, runNonce: claim.runNonce,
             leaseEpoch: claim.leaseEpoch, signal })); }
           catch (error) {
-            if (!(error instanceof BoxExecTransportError && error.terminalKnown)) throw error;
+            if (!(error instanceof BoxExecTransportError && error.terminalKnown)
+              && !isTransientBoxSpoolReadError(error)) throw error;
             await new Promise<void>((resolve) => setTimeout(resolve, 50));
           }
         }
