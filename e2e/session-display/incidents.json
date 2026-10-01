@@ -5369,7 +5369,7 @@
       "severity": "P1",
       "symptom": "Box Claude 回合中客户端 Read 了一张需缩放的图片（如手机截图 1290x2796），Claude Code 在 tool_result 后追加 isMeta 尺寸说明 [Image: original …, displayed at …]；续接分类要求纯 tool_result，回 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，用户看到『任务执行暂时中断，请直接重试本条消息』，Box CLI 挂起等待。修复：语义规范化把该精确格式说明并入最后一个含图片的 tool_result，其它尾随内容仍 fail-closed。",
       "rootFixCommit": "93dc1251",
-      "coverageCommits": [],
+      "coverageCommits": ["a42108ea"],
       "regressions": [
         {
           "layer": "unit",
