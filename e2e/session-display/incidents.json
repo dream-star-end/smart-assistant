@@ -5418,6 +5418,36 @@
           "assertion": "without exactly one Skill launch the trailing text is not folded"
         }
       ]
+    },
+    {
+      "id": "INC-20261001-BOX-RECOVERED-TOOL-EXCHANGE",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #aacd65f7（v5-7fc1d4493）：Box 回合在工具交接后失败，服务端恢复回合（m-recover，从断点继续/重新尝试）用新 turn key 重发同一组 tool_result；续接只能绑定本 dispatch，连续 409 BOX_TOOL_OWNER_UNKNOWN →『任务执行失败 / 内部错误』，原 dispatch 的 Box CLI 一直等到超时并占着会话槽。任何在工具交接后失败的 Box 回合都无法恢复。修复：找到唯一等待这组 tool id、turn key 不同且 dispatch 已终结的孤儿 handoff，按用户停止路径停掉，再以全新调用续跑（完整工具交换写入快照历史 + Claude Code 原生续跑句）；live/停止未证实/其它错误仍拒绝。",
+      "rootFixCommit": "297db9bc",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
+          "assertion": "OCV5-304 a recovered dispatch stops the orphan and continues as a fresh invocation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
+          "assertion": "a live owner, an unproven stop or any other claim error keeps the rejection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.resume.test.ts",
+          "assertion": "OCV5-304 an answered tool exchange is staged as history and resumed with Claude Code's sentence"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxOrphanHandoff.integ.test.ts",
+          "assertion": "orphan handoff lookup requires same tool ids, another turn and a terminal dispatch"
+        }
+      ]
     }
   ]
 }
