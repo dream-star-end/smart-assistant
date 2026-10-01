@@ -4,7 +4,7 @@
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import type { BoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { BoxExecTransportError, type BoxExecTransport } from "./boxExecTransport.js";
-import { BoxSpoolPollError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { BoxSpoolPollError, isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 
@@ -53,7 +53,8 @@ export async function observeBoxDetachedText(input: {
         runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
         signal: abort.signal }); }
       catch (error) {
-        if (error instanceof BoxExecTransportError && error.terminalKnown) {
+        if ((error instanceof BoxExecTransportError && error.terminalKnown)
+          || isTransientBoxSpoolReadError(error)) {
           await new Promise<void>((resolve) => setTimeout(resolve, 50));
         } else if (error instanceof BoxExecTransportError) {
           throw new BoxDetachedTextObserveError("BOX_TEXT_TERMINAL_UNKNOWN");
