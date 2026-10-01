@@ -147,6 +147,13 @@ test("anything outside the exact rejected-call shape still fails closed", () => 
   fails([init, start("msg_a"), ...call("msg_a", 0, "toolu_bad_1", "Bash"),
     ...call("msg_a", 1, "toolu_good", boxName, [{ type: "tool_use", id: "toolu_bad_1",
       name: "Bash", input: { value: "x" } }])], "BOX_TOOL_ID_OR_NAME_INVALID");
+  // a rejected call id is unique, and a later exposed call cannot reuse it
+  fails([init, start("msg_a"), ...call("msg_a", 0, "toolu_dup", "Read"),
+    ...call("msg_a", 1, "toolu_dup", "Grep", [{ type: "tool_use", id: "toolu_dup",
+      name: "Read", input: { value: "x" } }])], "BOX_TOOL_DUPLICATE_ID");
+  fails([...base, cliError("toolu_bad_1"), start("msg_b", 30),
+    ...call("msg_b", 0, "toolu_bad_1", boxName), ...stop("tool_use", 3, 30)],
+  "BOX_TOOL_DUPLICATE_ID");
   // a reused upstream message id is not a new segment
   fails([...base, cliError("toolu_bad_1"), start("msg_a", 30)], "BOX_TOOL_MESSAGE_INVALID");
   // bounded: the fourth consecutive rejection fails

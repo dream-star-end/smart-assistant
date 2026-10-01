@@ -568,6 +568,10 @@ export class BoxCliToolHandoffDecoder {
           input = this.active.partial ? obj(JSON.parse(this.active.partial))
             : this.active.startInput!;
         } catch { throw new BoxCliToolHandoffError("BOX_TOOL_INPUT_INVALID"); }
+        const rejectedId = this.active.id!;
+        if (this.blocks.some((item) => item.upstream.id === rejectedId)) {
+          throw new BoxCliToolHandoffError("BOX_TOOL_DUPLICATE_ID");
+        }
         const upstream = { ...this.active.start, input };
         this.blocks.push({ type: "tool_use", hidden: true, upstream, visible: upstream });
         this.active = null;
@@ -608,7 +612,9 @@ export class BoxCliToolHandoffDecoder {
           if (this.active.partial && Object.keys(this.active.startInput!).length > 0) {
             throw new BoxCliToolHandoffError("BOX_TOOL_INPUT_INVALID");
           }
-          if (this.blocks.some((item) => item.use?.id === this.active!.id)) {
+          // Hidden (rejected) calls count too: an id is used once per turn.
+          if (this.blocks.some((item) => item.use?.id === this.active!.id
+            || item.upstream.id === this.active!.id)) {
             throw new BoxCliToolHandoffError("BOX_TOOL_DUPLICATE_ID");
           }
           const use = { id: this.active.id!, boxName: this.active.boxName!,
