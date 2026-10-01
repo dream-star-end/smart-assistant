@@ -5337,7 +5337,9 @@
       "severity": "P1",
       "symptom": "线上 #f82c733f：Box Claude 回合中客户端 Read 了一张 1290x2796 手机截图，续接轮里 Box 内层 Claude Code 把 MCP 图片缩到 923x2000 后回显，严格 echo 绑定不一致（BOX_TOOL_ECHO_CONTENT_MISMATCH）→ continuation_unknown →『任务执行失败 / 内部错误』，CLI 挂起等永不到达的工具结果、会话被卡。同类：空结果被 CLI 改写为 completed with no output、超 50k 字符结果被落盘为 <persisted-output>、MCP 截断。修复：claim 时按 CLI 限制规范化图片再发布与哈希；Box CLI 关闭 MCP 截断；echo 仅接受空结果/落盘两种可逐字节重建的改写（需已发布内容在手，恢复路径读取哈希校验过的发布文件），图片严格字节绑定；存量卡死链用白名单 user-Stop 脚本收口。",
       "rootFixCommit": "f1d63636",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "81b959db"
+      ],
       "regressions": [
         {
           "layer": "unit",
