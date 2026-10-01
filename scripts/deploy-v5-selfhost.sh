@@ -1233,10 +1233,18 @@ assert_aux_execstart_not_worktree() {
   done
 }
 
+# OCV5-306: proxy units whose unit file this deploy actually changed. Only these
+# may be bounced; a running proxy carries every in-flight Box/CCB stream.
+AUX_PROXY_UNITS_CHANGED=()
+
 install_aux_units() {
   log "── 安装辅助 systemd unit(hostnet/ccb-proxy/sshgate/tunnel;master/egress 只从候选 release snapshot 装) ──"
   sync_boot_scripts_best_effort
   install_unit "$UNIT_DIR/$V5_HOSTNET_UNIT"
+  local u
+  for u in "$V5_CCB_PROXY_UNIT" "$V5_CURSOR_PROXY_UNIT"; do
+    cmp -s -- "$UNIT_DIR/$u" "/etc/systemd/system/$u" || AUX_PROXY_UNITS_CHANGED+=("$u")
+  done
   install_unit "$UNIT_DIR/$V5_CCB_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_CURSOR_PROXY_UNIT"
   install_unit "$UNIT_DIR/$V5_SSHGATE_UNIT"
@@ -1272,17 +1280,29 @@ restart_sshgate() {
 refresh_ccb_proxy_path() {
   log "── 刷新 CCB 日本 HTTPS proxy listener + V5_EGRESS_IN ──"
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] sync setup-host-net.sh from HEAD; restart $V5_HOSTNET_UNIT; enable --now $V5_CCB_PROXY_UNIT; restart $V5_SSHGATE_UNIT"
+    echo "  [dry-run] sync setup-host-net.sh from HEAD; re-apply it in place (no $V5_HOSTNET_UNIT restart); enable --now $V5_CCB_PROXY_UNIT; restart $V5_SSHGATE_UNIT"
     return 0
   fi
   # install_aux_units intentionally prefers the old live boot script. This
   # pre-cutover step installs the committed HEAD script so port 18991 exists
   # before any new runtime container can receive the proxy env.
   sync_boot_scripts_from "$REPO_ROOT"
-  systemctl restart "$V5_HOSTNET_UNIT" \
-    || die "$V5_HOSTNET_UNIT restart failed while enabling CCB proxy path"
+  # OCV5-306 (#2ee979cd): never `systemctl restart` hostnet here. ccb-proxy,
+  # cursor-proxy (the Box exec egress) and sshgate Require= it, so a restart
+  # also bounces both HTTPS proxies and cuts every in-flight Box/CCB stream
+  # mid-turn ("任务执行失败" right after a tool succeeded). setup-host-net.sh is
+  # idempotent, so re-apply it in place and only start what is not running.
+  bash "$BOOT_SCRIPT_DIR/setup-host-net.sh" v5 \
+    || die "setup-host-net.sh v5 failed while enabling CCB proxy path"
+  systemctl start "$V5_HOSTNET_UNIT" \
+    || die "$V5_HOSTNET_UNIT failed to start"
   systemctl enable --now "$V5_CCB_PROXY_UNIT" \
     || die "$V5_CCB_PROXY_UNIT failed to start"
+  local changed
+  for changed in "${AUX_PROXY_UNITS_CHANGED[@]}"; do
+    log "  ⚠ $changed unit 文件已变 → try-restart(会中断其上在飞的连接)"
+    systemctl try-restart "$changed" || die "$changed restart failed after unit change"
+  done
   systemctl restart "$V5_SSHGATE_UNIT" \
     || die "$V5_SSHGATE_UNIT restart failed after hostnet flush"
   iptables -C V5_EGRESS_IN -d 172.31.0.1 -p tcp --dport 18991 \
