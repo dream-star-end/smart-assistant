@@ -5654,6 +5654,26 @@
           "assertion": "T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁、发送区可用"
         }
       ]
+    },
+    {
+      "id": "INC-20261002-COMPLETED-GOAL-DIAGNOSTIC-EMPTY",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium双视口与React回归复现（非声称生产用户报障）：completed历史目标进入处理过程后，MessageRenderer将所有goal返回null，展开只有空壳、正文与原始记录不可查看；仅恢复completed历史纯文本及精确原始记录，当前active/paused/blocked目标仍只在唯一dock展示，cleared不复活。",
+      "rootFixCommit": "f00e0564",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "已清除目标不占过程，只剩它时没有空壳，普通句子里的同样字句还在"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "completed goal diagnostics stay folded, exact raw survives and current dock is unique"
+        }
+      ]
     }
   ]
 }
