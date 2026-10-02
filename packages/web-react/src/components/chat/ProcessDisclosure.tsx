@@ -829,7 +829,7 @@ const NODE_TONE: Record<NodeTone, string> = {
   live: "oc-step-node-live text-accent ring-accent/45",
   error: "text-danger ring-danger/35 bg-[color-mix(in_srgb,var(--danger)_9%,var(--bg))]",
   warning: "text-warning ring-warning/40 bg-[color-mix(in_srgb,var(--warning)_10%,var(--bg))]",
-  idle: "text-muted ring-border-strong",
+  idle: "text-faint ring-border",
 };
 
 function StepNode({ Icon, tone }: { Icon: LucideIcon; tone: NodeTone }) {
@@ -1144,12 +1144,12 @@ export function ProcessDisclosure<T>({
               key={live.text}
               data-testid="process-step-live"
               data-live-pending={live.pending ? "true" : "false"}
-              className={`oc-swap-in min-w-0 truncate text-body font-medium ${live.pending ? "oc-live-status-shine text-fg" : "text-fg"}`}
+              className={`oc-swap-in min-w-0 truncate text-body font-medium ${!open ? `text-muted ${live.pending ? "oc-live-status-shine" : ""}` : "text-faint"}`}
             >
               {live.text}
             </span>
           ) : (
-            <span className="shrink-0 text-body font-medium text-fg">
+            <span className="shrink-0 text-body font-medium text-faint" data-testid="process-title">
               {steps > 0 ? `已执行 ${steps} 个步骤` : title}
             </span>
           )}
@@ -1236,6 +1236,12 @@ export function ProcessDisclosure<T>({
               const details = detailOpen(section.key);
               const current = active && index === currentIndex;
               const group = groupNode(section.messages, current);
+              // OCV5-312: 流光挂在「正在干活」的这一段摘要行上(当前段、本轮仍在进行),表明 agent 此刻在做什么;
+              // 其余过程文字一律 --faint,让下方 agent 的回复正文更突出。当前在写正文(叙述段)时不挂流光,流式文字本身就是信号。
+              // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持
+              // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
+              // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
+              const working = active && index === currentIndex;
               const missed = section.items.filter((item) => messagesOf(item).some((message) => message.role === "tool" && hasErrorMark(message))).length;
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
@@ -1248,7 +1254,9 @@ export function ProcessDisclosure<T>({
                       onClick={() => setDetailOpen(section.key, !details)}
                     >
                       <span
-                        className={`min-w-0 truncate text-body ${group.tone === "live" ? "text-fg" : "text-fg/90"}`}
+                        data-testid="process-group-summary"
+                        data-live-working={working ? "true" : "false"}
+                        className={`min-w-0 truncate text-body ${working ? "oc-live-status-shine text-muted" : "text-faint"}`}
                       >
                         {naturalSummary(section.items.map(messagesOf))}
                       </span>
