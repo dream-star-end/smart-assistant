@@ -2210,10 +2210,17 @@ export class BoxDurableJournal implements BoxJournalPort {
    * exact handoff usage and billing state, but cease holding remote capacity.
    * No missing model usage is invented and no CLI/tool call is replayed. */
   async markToolChainStoppedFailure(input: Pick<BoxJournalAdmission,
-    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof }): Promise<void> {
+    "requestId" | "uid" | "leaseEpoch"> & { proof: BoxTerminalProof;
+    /** OCV5-306 (#2ee979cd): the leaf's CLI exited by itself (worker_complete)
+     * after an ambiguous continuation cut, and its only post-resume output is
+     * a tool call nobody received. Same settlement as the first-round
+     * rejected_stream (OCV5-300): unbilled leaf, ancestors stop holding the
+     * session/account. Only a handoff-free unknown leaf qualifies. */
+    rejectedStream?: true }): Promise<void> {
+    const rejectedStream = input.rejectedStream === true;
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
-      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
-      || !input.proof || input.proof.reason === "worker_complete") {
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !input.proof
+      || (input.proof.reason === "worker_complete") !== rejectedStream) {
       throw new BoxDurableJournalError("BOX_FAILED_STOP_EVIDENCE_INVALID");
     }
     try { parseBoxTerminalProof(JSON.stringify(input.proof) + "\n", {
@@ -2259,8 +2266,13 @@ export class BoxDurableJournal implements BoxJournalPort {
       if (basis.boxToolHandoff !== undefined && !handoff) {
         throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
       }
+      if (rejectedStream && (handoff || current.state !== "inflight" && current.state !== "aborted"
+        || (current.state === "inflight" && basis.boxState !== "unknown"))) {
+        throw new BoxDurableJournalError("BOX_FAILED_STOP_CHAIN_INVALID");
+      }
       if ((handoff ? ["inflight", "finalizing", "committed"].includes(current.state)
         : current.state === "aborted") && basis.boxState === "failed_stopped"
+        && (basis.boxStopOutcome === "rejected_stream") === rejectedStream
         && rows.length === roundNo && isDeepStrictEqual(basis.boxTerminalProof, input.proof)) {
         await client.query("COMMIT"); committed = true; return;
       }
@@ -2316,7 +2328,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       }
       const stopParams = [current.request_id, input.uid.toString(), input.leaseEpoch,
         JSON.stringify({ boxState: "failed_stopped", boxTerminalProof: input.proof,
-          boxStopOutcome: "failed" }), input.proof.runNonce];
+          boxStopOutcome: rejectedStream ? "rejected_stream" : "failed" }), input.proof.runNonce];
       const stopped = handoff ? await client.query(
         `UPDATE request_finalize_journal SET ctx=ctx || $4::jsonb
           WHERE request_id=$1 AND user_id=$2
@@ -2331,7 +2343,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             WHERE request_id=$1 AND user_id=$2 AND state='inflight'
               AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$5
               AND ctx->>'boxState' IN ('linked','unknown')
-              AND NOT (ctx ? 'boxToolHandoff')`, stopParams);
+              AND ($6::boolean IS FALSE OR ctx->>'boxState'='unknown')
+              AND NOT (ctx ? 'boxToolHandoff')`, [...stopParams, rejectedStream]);
       if (stopped.rowCount !== 1) throw new BoxDurableJournalError("BOX_FAILED_STOP_FENCE_LOST");
       for (const ancestor of rows.slice(1)) {
         const changed = await client.query(

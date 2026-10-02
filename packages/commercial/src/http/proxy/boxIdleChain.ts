@@ -97,7 +97,9 @@ function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): Id
   const proof = ctx.boxTerminalProof as { reason?: unknown; runNonce?: unknown; leaseEpoch?: unknown } | undefined;
   // OCV5-300: a first round whose stream egress rejected is settled with the
   // keeper's own proof (even worker_complete); nothing was delivered or billed.
-  const rejectedStream = ctx.boxStopOutcome === "rejected_stream" && chain.length === 1
+  // OCV5-306: the same settlement may close the unknown leaf of a linked chain;
+  // its ancestors are still checked below (failed_stopped/failed handoffs).
+  const rejectedStream = ctx.boxStopOutcome === "rejected_stream"
     && leaf.state === "aborted" && ctx.boxToolHandoff === undefined;
   if (!proof || typeof proof !== "object" || typeof proof.reason !== "string"
     || !(FAILED_PROOF_REASONS.has(proof.reason)

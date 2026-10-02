@@ -237,3 +237,16 @@ test("OCV5-300 a locally rejected first-round stream projects failed, not a wedg
   assert.equal(pendingOf([{ ...rejected, ctx: { ...rejected.ctx,
     boxTerminalProof: { ...completeProof, reason: "something_else" } } }]), "pending");
 });
+
+test("OCV5-306 a rejected-stream leaf releases a linked chain; its ancestors must still be stopped", () => {
+  const completeProof = { ...failedProof, reason: "worker_complete" };
+  const cutLeaf = row("f-leaf", { boxState: "failed_stopped", boxTerminalProof: completeProof,
+    boxStopOutcome: "rejected_stream", boxAccountId: "20", boxRunNonce: NONCE, boxLeaseEpoch: EPOCH,
+    boxOwnerRequestId: "f-parent", boxParentResumeRevision: REV }, "aborted");
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [failedParent, cutLeaf] }),
+    { status: "failed", sessionId, turnKey, requestIds: ["f-leaf", "f-parent"] });
+  const pendingOf = (rows: IdleChainRow[]) => projectBoxIdleChain({ sessionId, turnKey, rows }).status;
+  assert.equal(pendingOf([{ ...failedParent, ctx: { ...failedParent.ctx, boxState: "resuming" } }, cutLeaf]), "pending");
+  assert.equal(pendingOf([failedParent, { ...cutLeaf, ctx: { ...cutLeaf.ctx, boxStopOutcome: "failed" } }]), "pending");
+  assert.equal(pendingOf([failedParent, { ...cutLeaf, state: "inflight" }]), "pending");
+});
