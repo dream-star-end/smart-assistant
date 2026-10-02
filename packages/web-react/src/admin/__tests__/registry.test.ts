@@ -18,15 +18,15 @@ const EXPECTED: Record<string, string[]> = {
   内容运营: ["marketplace", "tutorials"],
   系统配置: ["literature", "settings"],
   运行与事故: ["health", "alerts", "selfheal"],
-  审计与安全: ["audit"],
+  审计与安全: ["contentReviews", "audit"],
 };
 
 describe("registry 完整性", () => {
-  test("恰好 25 个页面，key 无重复", () => {
-    expect(adminPages).toHaveLength(25);
+  test("恰好 26 个页面，key 无重复", () => {
+    expect(adminPages).toHaveLength(26);
     const keys = adminPages.map((p) => p.key);
-    expect(new Set(keys).size).toBe(25);
-    expect(adminTabKeys.size).toBe(25);
+    expect(new Set(keys).size).toBe(26);
+    expect(adminTabKeys.size).toBe(26);
   });
 
   test("每个 key 都存在且分组正确", () => {
@@ -43,8 +43,9 @@ describe("registry 完整性", () => {
     expect(ADMIN_GROUP_ORDER).toEqual(Object.keys(EXPECTED));
     expect(adminGroups.map((g) => g.group)).toEqual(ADMIN_GROUP_ORDER);
     const flat = adminGroups.flatMap((g) => g.pages.map((p) => p.key));
-    expect(flat).toHaveLength(25);
-    expect(new Set(flat).size).toBe(25);
+    expect(flat).toEqual(Object.values(EXPECTED).flat());
+    expect(flat).toHaveLength(26);
+    expect(new Set(flat).size).toBe(26);
   });
 
   test("每页有标题/描述/图标/懒组件", () => {
@@ -57,6 +58,7 @@ describe("registry 完整性", () => {
   });
 
   test("getAdminPage：命中返回本页，非法 key 回落 dashboard", () => {
+    expect(getAdminPage("contentReviews").key).toBe("contentReviews");
     expect(getAdminPage("users").key).toBe("users");
     expect(getAdminPage("accountGroups").key).toBe("accountGroups");
     expect(getAdminPage("productFriction").key).toBe("productFriction");

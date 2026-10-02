@@ -380,12 +380,27 @@ function consultCardToggle(page) {
     .or(page.getByRole("button", { name: /咨询顾问/, expanded: true }));
 }
 
+async function ensureConsultProcessOpen(page) {
+  const shell = page.getByTestId("process-disclosure");
+  await shell.waitFor();
+  assert.equal(await shell.count(), 1, "consult belongs to the unique process shell");
+  const toggle = shell.getByTestId("process-toggle");
+  assert.equal(await toggle.count(), 1);
+  if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
+  const group = shell.getByTestId("process-detail-toggle");
+  await group.waitFor();
+  assert.equal(await group.count(), 1, "consult belongs to the unique tool group");
+  if (await group.getAttribute("aria-expanded") !== "true") await group.click();
+}
+
 async function expandConsultCard(page) {
+  await ensureConsultProcessOpen(page);
   const expand = page.getByRole("button", { name: /咨询顾问/, expanded: false });
   if (await expand.count()) await expand.first().click();
 }
 
 async function waitForConsultAdvice(page, inbounds) {
+  await ensureConsultProcessOpen(page);
   await consultCardToggle(page).waitFor({ timeout: 15_000 });
   await expandConsultCard(page);
   try {
@@ -434,6 +449,7 @@ test("real App two contexts: collab refresh, frozen turn, consult card, unique S
     await a.page.getByRole("button", { name: "发送" }).click();
     try {
       await a.page.getByTestId("message-text").waitFor({ timeout: 15_000 });
+      await ensureConsultProcessOpen(a.page);
       await consultCardToggle(a.page).waitFor({ timeout: 15_000 });
     } catch (err) {
       throw new Error(`${err.message}\n${await dumpPage(a.page, inbounds, "wait-card")}`);

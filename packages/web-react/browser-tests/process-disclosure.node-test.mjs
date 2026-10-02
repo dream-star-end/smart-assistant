@@ -59,6 +59,7 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
   try {
     async function open(width, touch) {
       const context = await browser.newContext({
+        timezoneId: "Asia/Shanghai",
         viewport: { width, height: touch ? 844 : 900 },
         isMobile: touch,
         hasTouch: touch,
@@ -166,7 +167,21 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await mobile.page.screenshot({ path: join(shots, "ocv5-265-manus-mobile-collapsed.png") });
       const userBefore = await mobile.page.getByText("做一版库存看板").boundingBox();
       await mobile.page.getByTestId("process-toggle").tap();
-      await mobile.page.getByTestId("process-detail-toggle").tap();
+      const stableGroup = mobile.page.getByTestId("process-detail-toggle");
+      assert.equal(await stableGroup.count(), 1);
+      const stableGeometry = await stableGroup.evaluate(async (el) => {
+        const appearance = el.closest(".oc-reveal");
+        const animations = (appearance?.getAnimations() ?? []).filter((animation) =>
+          animation.playState === "running" && animation.effect?.getComputedTiming().iterations !== Infinity);
+        const motion = animations.map((animation) => ({ name: animation.animationName,
+          duration: animation.effect?.getComputedTiming().duration, playState: animation.playState }));
+        await Promise.all(animations.map((animation) => animation.finished));
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const rect = el.getBoundingClientRect();
+        return { motion, detail: { y: rect.y, height: rect.height }, rootTop: document.getElementById("root")?.scrollTop };
+      });
+      console.log("MOBILE_GROUP_STABLE", JSON.stringify(stableGeometry));
+      await stableGroup.tap();
       await mobile.page.getByText("summarize-stock.mjs").waitFor();
       const userAfter = await mobile.page.getByText("做一版库存看板").boundingBox();
       assert.ok(userBefore && userAfter && Math.abs(userBefore.y - userAfter.y) < 80, "mobile expand stays on this turn");
@@ -320,9 +335,20 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
     const attention = await open(1280, false);
     try {
       await attention.page.evaluate(() => window.__processPage.setScene("attention"));
-      await attention.page.getByText("未成功").waitFor();
       await attention.page.getByTestId("permission-card").waitFor();
       await attention.page.getByText("任务待你确认").waitFor();
+      assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
+      const attentionProcess = attention.page.getByTestId("process-disclosure");
+      assert.equal(await attentionProcess.count(), 1);
+      const attentionToggle = attentionProcess.getByTestId("process-toggle");
+      assert.equal(await attentionToggle.getAttribute("aria-expanded"), "false");
+      await attentionToggle.click();
+      const attentionGroup = attentionProcess.getByTestId("process-detail-toggle");
+      assert.equal(await attentionGroup.count(), 1);
+      assert.equal(await attentionGroup.getAttribute("aria-expanded"), "false");
+      await attentionProcess.getByTestId("process-group-missed").waitFor();
+      assert.equal(await attentionProcess.getByTestId("process-group-missed").textContent(), "1 步未成功");
+      await attention.page.getByText("未成功").waitFor();
       assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
       await attention.page.getByRole("button", { name: "拒绝" }).click();
       await attention.page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-respond-count") === "1");
@@ -456,4 +482,110 @@ test("completed goal diagnostics stay folded, exact raw survives and current doc
   } finally {
     await browser.close();
   }
+});
+
+test("live status is single and readable in both themes and accessibility media", { timeout: 180000 }, async (t) => {
+  const sourceFiles = ["../src/styles.css", "../src/components/ToolCard.tsx", "../src/components/chat/ProcessDisclosure.tsx", "../src/components/chat/cards.tsx"];
+  const sourceHash = createHash("sha256").update(sourceFiles.map((path) => readFileSync(join(here, path), "utf8")).join("\n")).digest("hex");
+  const bundle = await build({
+    entryPoints: [join(here, "process-disclosure-harness.tsx")], bundle: true, write: false,
+    format: "iife", jsx: "automatic", loader: { ".css": "empty" },
+    alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
+    define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' }, logLevel: "silent",
+  });
+  const out = join(tmpdir(), `oc-status-readability-${process.pid}`);
+  const red = process.env.OC_STATUS_SHINE_RED === "1";
+  let reverted = 0;
+  const redPlugin = {
+    name: "status-shine-red-control", enforce: "pre",
+    transform(code, id) {
+      if (!red || id.split("?")[0] !== join(here, "../src/styles.css")) return;
+      const selector = ".oc-swap-in:not(.oc-live-status-shine)";
+      assert.equal(code.split(selector).length - 1, 1, "exact current product selector");
+      reverted += 1;
+      return code.replace(selector, ".oc-swap-in");
+    },
+  };
+  await viteBuild({
+    root: join(here, ".."), configFile: false, logLevel: "silent", plugins: [redPlugin, tailwindcss()],
+    build: { outDir: out, emptyOutDir: true, cssCodeSplit: false,
+      rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } } },
+  });
+  assert.equal(reverted, red ? 1 : 0, "only the requested CSS input is reverted");
+  const css = readFileSync(join(out, readdirSync(out).find((name) => name.endsWith(".css"))), "utf8");
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  const reports = [];
+  try {
+    for (const theme of ["light", "dark"]) for (const mode of ["normal", "reduce", "forced"]) {
+      await t.test(`${theme}/${mode}`, async () => {
+        const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true,
+          reducedMotion: mode === "reduce" ? "reduce" : "no-preference", forcedColors: mode === "forced" ? "active" : "none" });
+        const errors = [];
+        try {
+          const page = await context.newPage();
+          page.on("pageerror", (error) => errors.push(error.message));
+          await page.setContent(`<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style><div id="root"></div>`);
+          await page.evaluate((theme) => document.documentElement.classList.toggle("dark", theme === "dark"), theme);
+          await page.addScriptTag({ content: bundle.outputFiles[0].text });
+          await page.getByTestId("process-harness").waitFor();
+          await page.evaluate(() => window.__processPage.setScene("parallel"));
+          const shell = page.getByTestId("process-disclosure");
+          await page.getByTestId("process-step-live").waitFor();
+          assert.equal(await shell.count(), 1);
+          const toggle = shell.getByTestId("process-toggle");
+          if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.tap();
+          const group = shell.getByTestId("process-detail-toggle");
+          assert.equal(await group.count(), 1);
+          if (await group.getAttribute("aria-expanded") !== "true") await group.tap();
+          assert.equal(await shell.locator(".oc-live-status-shine").count(), 1, "only current outer status shines");
+          assert.equal(await toggle.locator(".oc-live-status-shine").count(), 1);
+          assert.equal(await shell.getByTestId("process-details").locator(".oc-live-status-shine").count(), 0, "tool and internal summaries do not shine again");
+          const tool = shell.getByTestId("tool-step").filter({ hasText: "STILL_RUNNING_FILE" });
+          assert.equal(await tool.count(), 1);
+          const header = tool.getByRole("button");
+          assert.equal(await header.count(), 1);
+          const box = await header.boundingBox();
+          assert.ok(box && box.height >= 44, `commercial mobile tool target: ${JSON.stringify(box)}`);
+          const text = toggle.locator(".oc-live-status-shine");
+          assert.ok((await text.innerText()).trim().length > 0);
+          const report = await text.evaluate((el) => {
+            const s = getComputedStyle(el);
+            let parent = el;
+            while (parent && getComputedStyle(parent).backgroundColor === "rgba(0, 0, 0, 0)") parent = parent.parentElement;
+            const bg = parent ? getComputedStyle(parent).backgroundColor : getComputedStyle(document.body).backgroundColor;
+            const rgb = (color) => {
+              const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
+              const ctx = canvas.getContext("2d"); ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1);
+              return Array.from(ctx.getImageData(0, 0, 1, 1).data).slice(0, 3);
+            };
+            const luminance = (color) => rgb(color).map((c) => c / 255).map((c) => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+            const faint = s.getPropertyValue("--faint").trim();
+            const a = luminance(faint), b = luminance(bg);
+            return { text: el.textContent, animation: s.animationName, background: s.backgroundImage, color: s.color, fill: s.webkitTextFillColor,
+              faint, bg, contrast: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), rect: { width: el.getBoundingClientRect().width, height: el.getBoundingClientRect().height } };
+          });
+          assert.ok(report.rect.width > 0 && report.rect.height > 0);
+          if (mode === "normal") {
+            assert.equal(report.animation, "oc-live-status-sweep");
+            assert.match(report.background, /linear-gradient/);
+            assert.equal(report.fill, "rgba(0, 0, 0, 0)");
+            assert.ok(report.contrast >= 4.5, `actual faint/background contrast: ${JSON.stringify(report)}`);
+          } else {
+            assert.equal(report.animation, "none");
+            assert.equal(report.background, "none");
+            assert.notEqual(report.color, "rgba(0, 0, 0, 0)");
+            assert.notEqual(report.fill, "rgba(0, 0, 0, 0)");
+          }
+          assert.deepEqual(errors, []);
+          mkdirSync(shots, { recursive: true });
+          await page.screenshot({ path: join(shots, `ocv5-308-status-${theme}-${mode}.png`) });
+          reports.push({ theme, mode, red, sourceHash, cssHash: createHash("sha256").update(css).digest("hex"), toolHeight: box.height, ...report });
+        } finally { await context.close(); }
+      });
+    }
+  } finally {
+    await browser.close();
+    console.log("STATUS_READABILITY", JSON.stringify(reports));
+  }
+  assert.equal(reports.length, 6, "all six real theme/media combinations executed");
 });
