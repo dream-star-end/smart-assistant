@@ -1144,12 +1144,12 @@ export function ProcessDisclosure<T>({
               key={live.text}
               data-testid="process-step-live"
               data-live-pending={live.pending ? "true" : "false"}
-              className={`oc-swap-in min-w-0 truncate text-body font-medium ${live.pending && !open ? "oc-live-status-shine text-muted" : "text-muted"}`}
+              className={`oc-swap-in min-w-0 truncate text-body font-medium ${!open ? `text-muted ${live.pending ? "oc-live-status-shine" : ""}` : "text-faint"}`}
             >
               {live.text}
             </span>
           ) : (
-            <span className="shrink-0 text-body font-medium text-muted">
+            <span className="shrink-0 text-body font-medium text-faint" data-testid="process-title">
               {steps > 0 ? `已执行 ${steps} 个步骤` : title}
             </span>
           )}

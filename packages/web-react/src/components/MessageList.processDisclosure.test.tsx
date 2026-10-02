@@ -1430,6 +1430,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(summaries[1]!.getAttribute("data-live-working")).toBe("true");
     expect(summaries[1]!.className).toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
+    expect(screen.getByTestId("process-step-live").className).toContain("text-faint");
     expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
 
     fireEvent.click(screen.getByTestId("process-toggle"));
@@ -1448,6 +1449,8 @@ describe("MessageList Manus 过程披露", () => {
       />,
     );
     expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(0);
+    // 结束后的外壳标题也是过程文字:--faint。
+    expect(screen.getByTestId("process-title").className).toContain("text-faint");
   });
 
   test("当前在写正文时不挂流光；过程行回落 --faint，干活行用 --muted 作无动效时的静态强调", () => {
