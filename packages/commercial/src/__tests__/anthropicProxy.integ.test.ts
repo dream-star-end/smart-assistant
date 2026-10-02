@@ -969,6 +969,41 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
     }
   });
 
+  test("OCV5-306: a same-request retry waits for a still-resolving Box call and replays it", async () => {
+    const old = process.env.OC_BOX_MODEL_API;
+    try {
+      process.env.OC_BOX_MODEL_API = "1";
+      const { h, headers } = boxRouteHarness();
+      let lookups = 0, launches = 0;
+      const replayed = { id: "msg_replayed", type: "message", role: "assistant", content: [] };
+      h.deps.boxModel = { async fetch() { launches++;
+        return sseResponse(200, makeFullSseChunks()); } };
+      h.deps.boxReplay = { pendingWait: { budgetMs: 2_000, intervalMs: 10 },
+        lookup: async () => { lookups++;
+          return lookups < 3 ? { kind: "pending", identity: {} as never }
+            : { kind: "ready", identity: {} as never, response: new Response(JSON.stringify(replayed),
+              { headers: { "content-type": "application/json" } }) }; } } as never;
+      const request = { ...minBody(BOX_API_MODEL), metadata: { user_id: JSON.stringify({
+        session_id: "web-box-replay", oc_turn_key: "a".repeat(64) }) } };
+      const realCcbFallback = { ...request } as Record<string, unknown>;
+      delete realCcbFallback.stream;
+      const out = await h.run(realCcbFallback, headers);
+      assert.equal(out.statusCode, 200, out.bodyText());
+      assert.deepEqual(JSON.parse(out.bodyText()), replayed);
+      assert.equal(lookups, 3);
+      assert.equal(launches, 0);
+      h.deps.boxReplay = { pendingWait: { budgetMs: 50, intervalMs: 10 },
+        lookup: async () => { lookups++; return { kind: "pending", identity: {} as never }; } } as never;
+      const still = await h.run(realCcbFallback, headers);
+      assert.equal(still.statusCode, 409);
+      assert.match(still.bodyText(), /BOX_REPLAY_PENDING/);
+      assert.equal(launches, 0);
+    } finally {
+      if (old === undefined) delete process.env.OC_BOX_MODEL_API;
+      else process.env.OC_BOX_MODEL_API = old;
+    }
+  });
+
   test("Box replay cannot bypass the current model authorization gate", async () => {
     const { h, headers } = boxRouteHarness();
     let lookups = 0;

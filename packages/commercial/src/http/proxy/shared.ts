@@ -1674,6 +1674,9 @@ export interface AnthropicProxyDeps {
       upstreamModel: string;
       trustedAuthority?: import("./boxPreparedContinuation.js").AuthorityProjection;
       prepared?: import("./boxPreparedContinuation.js").PreparedContinuation }): Promise<import("./boxReplayCompleted.js").BoxReplayLookup>;
+    /** OCV5-306: how long a same-request retry waits for a still-resolving
+     * Box call before answering BOX_REPLAY_PENDING. Absent = do not wait. */
+    pendingWait?: { budgetMs: number; intervalMs: number };
   };
   /** 上游 endpoint;默认 api.anthropic.com */
   upstreamEndpoint?: string;

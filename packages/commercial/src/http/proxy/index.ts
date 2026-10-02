@@ -120,6 +120,7 @@ import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.
 import { runUpstreamRoundTrip } from "./core.js";
 import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./boxNativeContextOwner.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
+import { waitForBoxReplay } from "./boxReplayWait.js";
 import { prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
@@ -928,11 +929,23 @@ export function makeAnthropicProxyHandler(
             // stream:true shape may proceed to a fresh Box launch.
             const replayBody = structuredClone(body);
             if (replayBody.stream !== true) replayBody.stream = false;
-            replay = await runWithVerifiedProxyByteBudget(byteBudget, () => deps.boxReplay!.lookup({
+            const lookupReplay = () => runWithVerifiedProxyByteBudget(byteBudget, () => deps.boxReplay!.lookup({
               uid, canonicalModel: body.model,
               canonicalBody: replayBody, upstreamModel: route.upstreamModel,
               trustedAuthority: boxPrepared!.authority, prepared: boxPrepared,
             }));
+            replay = await lookupReplay();
+            const pendingWait = deps.boxReplay.pendingWait;
+            if (replay.kind === "pending" && pendingWait) {
+              const gone = new AbortController();
+              const onClose = (): void => { if (!res.writableEnded) gone.abort(); };
+              res.once("close", onClose);
+              try {
+                replay = await waitForBoxReplay(replay, lookupReplay,
+                  { ...pendingWait, signal: gone.signal });
+              } finally { res.off("close", onClose); }
+              if (gone.signal.aborted) return;
+            }
           } catch (error) {
             if (error instanceof BoxDurableJournalError
               && (error.code === "BOX_AUTHORITY_REJECTED"

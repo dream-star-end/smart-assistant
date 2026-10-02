@@ -307,6 +307,9 @@ export async function startEgress(): Promise<void> {
       } else return first;
       return onlyAfterSettlement(await findCompletedBoxReplay(input, deps));
     },
+    // OCV5-306: CCB's same-request fallback must outlast a Box call that is
+    // still finishing after an ambiguous transport cut (#2ee979cd).
+    pendingWait: { budgetMs: 240_000, intervalMs: 3_000 }, // < CCB fallback 300s
   } : undefined;
   const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {
     uid: bigint; accountId: bigint; requestId: string; phase: string }) => {
