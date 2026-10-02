@@ -1155,7 +1155,7 @@ export function ProcessDisclosure<T>({
           )}
           <span className="sr-only">{`${title} · ${summary}`}</span>
           {active ? (
-            <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-muted" data-testid="process-meta">
+            <span className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint" data-testid="process-meta">
               {[elapsed, steps > 0 ? `${steps} 步` : ""].filter(Boolean).join(" · ")}
             </span>
           ) : tally.length > 0 ? (
@@ -1248,7 +1248,7 @@ export function ProcessDisclosure<T>({
                       onClick={() => setDetailOpen(section.key, !details)}
                     >
                       <span
-                        className={`min-w-0 truncate text-body ${group.tone === "live" ? "oc-live-status-shine text-fg" : "text-fg/90"}`}
+                        className={`min-w-0 truncate text-body ${group.tone === "live" ? "text-fg" : "text-fg/90"}`}
                       >
                         {naturalSummary(section.items.map(messagesOf))}
                       </span>

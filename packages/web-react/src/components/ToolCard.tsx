@@ -147,7 +147,7 @@ export function ToolCard({
               id={labelId}
               className={cn(
                 "max-w-[45%] shrink-0 truncate text-body font-medium",
-                commandRow ? "sr-only" : isRunning ? "oc-live-status-shine text-fg" : "text-fg/90",
+                commandRow ? "sr-only" : isRunning ? "text-fg" : "text-fg/90",
               )}
             >
               {meta.label}
@@ -157,7 +157,7 @@ export function ToolCard({
                 id={summaryId}
                 className={cn(
                   "min-w-0 truncate font-mono text-[12px]",
-                  commandRow ? (isRunning ? "oc-live-status-shine text-fg" : "text-fg/80") : "text-muted",
+                  commandRow ? (isRunning ? "text-fg" : "text-fg/80") : "text-muted",
                 )}
                 title={summary}
               >

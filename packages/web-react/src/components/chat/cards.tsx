@@ -1227,7 +1227,7 @@ export const ThinkingCard = memo(
             aria-controls={!collapsed && hasBody ? bodyId : undefined}
             className="group/step -mx-2 flex min-h-9 w-[calc(100%+1rem)] items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
           >
-            <span className={cn("shrink-0 text-body font-medium", live ? "oc-live-status-shine text-fg" : "text-fg/90")}>
+            <span className={cn("shrink-0 text-body font-medium", live ? "text-fg" : "text-fg/90")}>
               {label}
             </span>
             {summary ? (
