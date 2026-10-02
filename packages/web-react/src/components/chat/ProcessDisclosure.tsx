@@ -354,6 +354,19 @@ function interactiveTool(message: ChatMessage): boolean {
   return INTERACTIVE_TOOL_RE.test(message.toolName ?? "");
 }
 
+/**
+ * OCV5-307: a question / approval the user has already answered (allow or
+ * skip/deny). It no longer needs the user, so it reads as one more step of the
+ * turn and sits on the process rail instead of poking out as a separate card.
+ * Unanswered, submitting (`_controlPending`) and expired-unanswered prompts
+ * still need attention and stay on the top level. A shell that would hold only
+ * answered prompts (no real work) is unwrapped by the caller, so a lone
+ * question asked after the final answer keeps its old place.
+ */
+export function isAnsweredPrompt(message: ChatMessage): boolean {
+  return message.role === "permission" && message._resolved === true && message._controlPending !== true;
+}
+
 /** A background child that has not reached a terminal status must stay on the top level. */
 function liveBackgroundSubtask(message: ChatMessage): boolean {
   if (message.role !== "agent-group" && message.role !== "delegate-progress") return false;
@@ -393,6 +406,7 @@ export function isProcessMessage(
   }
   if (message._delegateStatus === "failed" || message._delegateStatus === "timeout") return false;
   if (liveBackgroundSubtask(message)) return false;
+  if (isAnsweredPrompt(message)) return true;
   if (interactiveTool(message)) return false;
   if (toolShowsUniqueArtifact(message, assistantArtifactKeys)) return false;
   if (isHistoricalGoalRecord(message)) return true;
@@ -425,6 +439,10 @@ function countLabel(message: ChatMessage): string {
   if (message.role === "plan") return "计划";
   if (message.role === "goal") return "目标";
   if (message.role === "agent-group" || message.role === "delegate-progress") return "子任务";
+  if (message.role === "permission") {
+    if (message.toolName === "AskUserQuestion") return "问答";
+    return /^exitplanmode$|exit_plan_mode/i.test(message.toolName ?? "") ? "计划确认" : "授权";
+  }
   return "";
 }
 
@@ -444,6 +462,8 @@ export type ProcessSection<T> = {
   key: string;
   narrative: boolean;
   goal: boolean;
+  /** Answered questions / approvals: always visible on the rail, never folded behind a count toggle. */
+  prompt?: boolean;
   items: T[];
   messages: ChatMessage[];
 };
@@ -458,12 +478,13 @@ export function processSections<T>(
     const messages = messagesOf(item);
     const narrative = messages.length > 0 && messages.every((message) => message.role === "assistant");
     const goal = !narrative && messages.length > 0 && messages.every((message) => isHistoricalGoalRecord(message));
+    const prompt = !narrative && !goal && messages.length > 0 && messages.every(isAnsweredPrompt);
     const previous = sections.at(-1);
-    if (!narrative && !goal && previous && !previous.narrative && !previous.goal) {
+    if (!narrative && !goal && !prompt && previous && !previous.narrative && !previous.goal && !previous.prompt) {
       previous.items.push(item);
       previous.messages.push(...messages);
     } else {
-      sections.push({ key: keyOf(item), narrative, goal, items: [item], messages: [...messages] });
+      sections.push({ key: keyOf(item), narrative, goal, prompt, items: [item], messages: [...messages] });
     }
   }
   return sections;
@@ -714,7 +735,7 @@ export function ProcessDisclosure<T>({
   // take the current-stage identity from the work still in progress.
   let currentIndex = -1;
   for (let i = sections.length - 1; i >= 0; i -= 1) {
-    if (!sections[i]?.goal) {
+    if (!sections[i]?.goal && !sections[i]?.prompt) {
       currentIndex = i;
       break;
     }
@@ -765,6 +786,17 @@ export function ProcessDisclosure<T>({
           <div className="ml-[6px] space-y-1.5 border-l border-border pl-3.5" data-testid={open ? "process-stages" : "process-older-steps"}>
             {olderSteps}
             {open ? sections.map((section, index) => {
+              if (section.prompt) {
+                // 已回答的问答/审批:作为过程里的一步常显(用户的选择是这轮的关键事实),
+                // 卡片自身在 resolved 态已换成与工具卡同一套中性外框。
+                return (
+                  <div key={section.key} data-testid="process-prompt" className="min-w-0 space-y-1.5 py-0.5">
+                    {section.items.map((item) => (
+                      <div key={keyOf(item)}>{renderItem(item)}</div>
+                    ))}
+                  </div>
+                );
+              }
               if (section.goal) {
                 return (
                   <div key={section.key} data-testid="process-goal" className="min-w-0">

@@ -190,7 +190,51 @@ describe("MessageList Manus 过程披露", () => {
     expect(answer.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("提问、审批和后台子任务不被折进过程，普通工具失败收在过程里", async () => {
+  test("OCV5-307: 未回答的提问留在过程外，同一轮已回答的提问在过程轨线上", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git status" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-done", "permission", "按哪个方向同步？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-done",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "按哪个方向同步？", options: [{ label: "双向同步" }] }] },
+      }),
+      row("bash2", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git merge" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-open", "permission", "现在推送吗？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-open",
+        inputJson: { questions: [{ question: "现在推送吗？", options: [{ label: "推送" }] }] },
+      }),
+    ]);
+    const cards = () => screen.getAllByTestId("permission-card");
+    const open = cards().find((card) => card.getAttribute("data-permission-request") === "req-open");
+    expect(open?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const done = cards().find((card) => card.getAttribute("data-permission-request") === "req-done");
+    expect(done?.closest("[data-testid=process-prompt]")).not.toBeNull();
+    expect(done?.className).toContain("border-border/80");
+    expect(open?.className).toContain("border-accent/40");
+  });
+
+  // OCV5-307:已回答的提问是这一轮的一个步骤,收进过程作为常显步骤;待审批 / 后台子任务仍在顶层。
+  test("已回答的提问进过程，待审批和后台子任务不被折进过程，普通工具失败收在过程里", async () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
       row("stage", "assistant", "我先查一下", { _clientMessageId: "u" }),
@@ -235,14 +279,19 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("还差你的确认")).toBeInTheDocument();
     expect(screen.queryByText("未成功")).not.toBeInTheDocument();
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
-    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+    // 已结束的轮次过程默认收起:已回答的提问跟着收在里面,不再单独一张卡挂在过程外。
+    expect(screen.queryByTestId("permission-card")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("问答 1 项");
     const approval = await screen.findByText("任务待你确认");
     expect(approval.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.getByText("后台盘点还在跑")).toBeInTheDocument();
     expect(screen.queryByText("hidden-probe-cmd")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-toggle"));
-    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    // 展开过程即可看到问答结果,不用再点开「N 项」细节。
+    const prompt = screen.getByTestId("process-prompt");
+    expect(within(prompt).getByTestId("permission-card")).toHaveTextContent("已提交");
+    fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
     const details = screen.getByTestId("process-details");
     expect(within(details).getAllByText("未成功").length).toBeGreaterThan(0);
     expect(within(details).getAllByText("probe-error-detail").length).toBeGreaterThan(0);
@@ -1085,7 +1134,8 @@ describe("MessageList Manus 过程披露", () => {
     );
     expect(screen.getByTestId("process-disclosure").className).not.toMatch(/ml-\[52px\]/);
     expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
-    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
+    // OCV5-307:进行中的轮次里,已回答的提问留在展开的过程轨线上(不再单独挂在过程外)。
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-prompt]")).not.toBeNull();
     expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
 
     view.rerender(
