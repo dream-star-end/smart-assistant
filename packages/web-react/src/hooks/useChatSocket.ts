@@ -113,6 +113,10 @@ export type UseChatSocket = {
     errorMessageId: string;
     agentId: string;
   }) => void;
+  /** 排队中的消息收回输入框，并从发送队列拿掉。 */
+  editQueuedMessage: (sessId: string, msgId: string) => string | undefined;
+  /** 停掉当前轮，马上发送这条已排队的消息。 */
+  sendQueuedNow: (sessId: string, msgId: string) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
   setActiveSession: (sessId: string | undefined) => void;
   /** Apply REST/WS platform goal snapshots to the live session model. */
@@ -185,7 +189,7 @@ export type UseChatSocket = {
   ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
   loadOlderLiveUnits: (
     sessId: string | undefined,
-  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean }>;
+  ) => Promise<{ ok: boolean; loaded: number; hasMore: boolean; error?: boolean; inflight?: boolean }>;
   /** 按需读取、校验并在 worker 中解析一条超大 immutable record。 */
   fetchTapeRecordPayload: (
     sessId: string | undefined,
@@ -771,6 +775,14 @@ export function useChatSocket(opts: {
     (p) => socket.continueInterruptedTurn(p),
     [socket],
   );
+  const editQueuedMessage = useCallback<UseChatSocket["editQueuedMessage"]>(
+    (sessId, msgId) => socket.editQueuedMessage(sessId, msgId),
+    [socket],
+  );
+  const sendQueuedNow = useCallback<UseChatSocket["sendQueuedNow"]>(
+    (sessId, msgId) => socket.sendQueuedNow(sessId, msgId),
+    [socket],
+  );
   const setActiveSession = useCallback((sessId: string | undefined) => socket.setActiveSession(sessId), [socket]);
   const setGoalState = useCallback<UseChatSocket["setGoalState"]>(
     (sessId, goal) => socket.setGoalState(sessId, goal),
@@ -862,6 +874,7 @@ export function useChatSocket(opts: {
   // 统一时间线点击加载并发闸。同一页只能由显式按钮触发一次；滚动与重渲染
   // 都不会进入这里，成功页在刷新前一直驻留内存。
   const olderHistoryFetchingRef = useRef<Set<string>>(new Set());
+  const liveUnitsFetchingRef = useRef<Set<string>>(new Set());
   const loadOlderHistory = useCallback<UseChatSocket["loadOlderHistory"]>(
     async (sessId) => {
       const a = authRef.current;
@@ -923,6 +936,11 @@ export function useChatSocket(opts: {
       if (!session || session._liveUnitsHasMoreBefore !== true || !before) {
         return { ok: true, loaded: 0, hasMore: false };
       }
+      const inflightKey = `${sessId}\0${before}`;
+      if (liveUnitsFetchingRef.current.has(inflightKey)) {
+        return { ok: true, loaded: 0, hasMore: true, inflight: true };
+      }
+      liveUnitsFetchingRef.current.add(inflightKey);
       try {
         const raw = await api.getSessionLiveUnits(a, sessId, { n: 20, before });
         if (!isLiveUnitsPage(raw) || raw.degraded === "fallback") {
@@ -939,6 +957,8 @@ export function useChatSocket(opts: {
         return { ok: true, loaded, hasMore: raw.hasMoreBefore };
       } catch {
         return { ok: false, loaded: 0, hasMore: true, error: true };
+      } finally {
+        liveUnitsFetchingRef.current.delete(inflightKey);
       }
     },
     [socket],
@@ -1129,6 +1149,8 @@ export function useChatSocket(opts: {
       stop,
       retryMessage,
       continueInterruptedTurn,
+      editQueuedMessage,
+      sendQueuedNow,
       setActiveSession,
       setGoalState,
       getTransientNotice,
@@ -1168,6 +1190,8 @@ export function useChatSocket(opts: {
       stop,
       retryMessage,
       continueInterruptedTurn,
+      editQueuedMessage,
+      sendQueuedNow,
       setActiveSession,
       setGoalState,
       getTransientNotice,

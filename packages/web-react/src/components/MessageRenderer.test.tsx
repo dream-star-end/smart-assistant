@@ -1100,6 +1100,53 @@ describe("MessageList 失败轮单一错误出口", () => {
   });
 });
 
+describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
+  const failedUser = mk("user", { id: "u-continued-source", text: "部署并验证", status: "sent" });
+  const committed = (id: string, text: string) => mk("assistant", {
+    id, text, _clientMessageId: failedUser.id, _errorCode: "engine_error",
+    _errorCardSnapshot: { disposition: "card", tone: "red", title: "任务执行失败", message: text },
+  });
+  const child = (extra: Partial<ChatMessage>) => mk("user", {
+    id: "u-continue-child", text: "↻ 从断点继续", status: "sent", _isAutoRetry: true,
+    _recoveryOfClientMessageId: failedUser.id, _recoveryMode: "checkpoint",
+    _automaticRecovery: false, ...extra,
+  });
+  const renderList = (messages: ChatMessage[]) => render(
+    <MessageList messages={messages} sending={false}
+      cb={{ onRegenerate: vi.fn(), onContinueInterrupted: vi.fn(),
+        resolveInterruptedContinuation: () => undefined }}
+      onRespondPermission={() => {}} />,
+  );
+
+  test("手动继续进行中：原失败卡与重新尝试一并收起", () => {
+    renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({}),
+      mk("assistant", { id: "a-resumed", text: "RESUMED_PROGRESS", _clientMessageId: "u-continue-child" })]);
+    expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: /重新尝试|从断点继续/ })).toBeNull();
+    expect(screen.getByText("RESUMED_PROGRESS")).toBeInTheDocument();
+  });
+
+  test("继续轮自己失败：只显示继续轮的真实失败卡", () => {
+    renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({ status: "error" }),
+      mk("assistant", { id: "a-child-error", text: "CHILD_REAL_FAILURE", _clientMessageId: "u-continue-child",
+        _errorCode: "codex_route_unavailable" })]);
+    expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.getByText("CHILD_REAL_FAILURE")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+  });
+
+  test("继续请求没发出去（无自身错误卡）或自动恢复：已见的失败卡保持可见", () => {
+    const { unmount } = renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"),
+      child({ status: "error" })]);
+    expect(screen.getAllByText("COMMITTED_SOURCE_CARD").length).toBeGreaterThan(0);
+    unmount();
+    renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"),
+      child({ _automaticRecovery: true })]);
+    expect(screen.getAllByText("COMMITTED_SOURCE_CARD").length).toBeGreaterThan(0);
+  });
+});
+
 describe("MessageList 每张调用卡 token 实时展示", () => {
   test("思考和工具卡只显示自己的调用消耗，最终助手保留本轮快照", () => {
     const messages: ChatMessage[] = [
@@ -1660,6 +1707,151 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
   });
 
+  test("仅本轮还有未加载步骤时，自动补齐且不显示加载按钮", async () => {
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: true, hasMore: true }));
+    render(
+      <MessageList
+        processDisclosure
+        messages={[
+          mk("user", { id: "u-open", text: "升级 codex" }),
+          mk("tool", { id: "tool-open", toolName: "Bash", text: "ls", output: "ok", _completed: true }),
+          mk("thinking", { id: "think-open", text: "看看版本" }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /查看更早历史记录/ })).toBeNull();
+    expect(screen.getAllByTestId("process-toggle")).toHaveLength(1);
+    const disclosure = screen.getByTestId("process-disclosure");
+    expect(screen.getByText("升级 codex").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1));
+    expect(within(disclosure).queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+  });
+
+  test("游标前移后继续自动补齐更早步骤", async () => {
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: true, hasMore: true }));
+    const view = render(
+      <MessageList
+        processDisclosure
+        sessionId="s-live"
+        messages={[
+          mk("user", { id: "u-cursor", text: "继续" }),
+          mk("tool", { id: "tool-cursor", toolName: "Bash", text: "pwd", output: "ok", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <MessageList
+        processDisclosure
+        sessionId="s-live"
+        messages={[
+          mk("user", { id: "u-cursor", text: "继续" }),
+          mk("tool", { id: "tool-cursor", toolName: "Bash", text: "pwd", output: "ok", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:20",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+  });
+
+  test("更早步骤加载失败时才出现重试，点击再请求一次", async () => {
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: false, error: true, hasMore: true }));
+    render(
+      <MessageList
+        processDisclosure
+        messages={[
+          mk("user", { id: "u-fail", text: "失败" }),
+          mk("tool", { id: "tool-fail", toolName: "Bash", text: "false", output: "no", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:10",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "加载失败，点击重试" })).toBeTruthy());
+    expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "加载失败，点击重试" }));
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(2));
+  });
+
+  test("既有更早对话又有本轮未加载步骤时，顶部按钮只翻对话", async () => {
+    const onLoadOlder = vi.fn();
+    const onLoadOlderLiveUnits = vi.fn(async () => ({ ok: true, hasMore: true }));
+    render(
+      <MessageList
+        processDisclosure
+        messages={[
+          mk("user", { id: "u-both", text: "上一页问题" }),
+          mk("tool", { id: "tool-both", toolName: "Bash", text: "pwd", output: "ok", _completed: true }),
+        ]}
+        sending={false}
+        cb={{}}
+        onRespondPermission={() => {}}
+        archive={{
+          hasMore: true,
+          loading: false,
+          error: false,
+          onLoadOlder,
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:15",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    await waitFor(() => expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "查看更早历史记录" }));
+    await waitFor(() => expect(onLoadOlder).toHaveBeenCalledTimes(1));
+    expect(onLoadOlderLiveUnits).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+  });
+
   test("统一时间线保留最新思考、工具和回答，完成态思考默认折叠且可完整展开", () => {
     const rows = [
       mk("user", { id: "u-latest", text: "最新问题", ts: 1, _timelineRecord: true }),
@@ -2128,7 +2320,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
     expect(screen.queryByText(/已思考/)).toBeNull();
   });
 
-  test("中间夹可见 goal 行 → 打断 thinking 连续性并渲染目标卡", () => {
+  test("中间夹 goal 行 → 打断 thinking，目标不进消息流", () => {
     renderList([
       mk("user", { id: "u1", text: "q", status: "sent" }),
       think("th1", "**Alpha**"),
@@ -2136,7 +2328,7 @@ describe("连续 thinking 行渲染层合并(codex 空正文标题卡)", () => {
       think("th2", "**Beta**"),
     ]);
     expect(screen.getAllByText(/已思考/)).toHaveLength(2);
-    expect(screen.getByText("目标")).toBeInTheDocument();
+    expect(screen.queryByText("目标")).toBeNull();
   });
 
   test("被会渲染的 assistant 叙事行打断 → 分成两张思考卡", () => {
@@ -2273,8 +2465,9 @@ describe("长时间线普通 DOM 分页与活跃状态稳定性", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getAllByLabelText("生成中")).toHaveLength(1);
-    expect(screen.getByLabelText("生成中")).toBe(status);
+    expect(screen.getByText("正在生成正文")).toBeInTheDocument();
+    expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
+    expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
   });
 
   test("移动端冷会话首条记录未到时仍显示加载/活动状态，不留整屏空白", () => {
@@ -3486,6 +3679,360 @@ describe("MessageList 会话内查找", () => {
     expect(document.activeElement).toBe(elsewhere);
     elsewhere.remove();
     opener.remove();
+    scroller.remove();
+  });
+});
+
+
+describe("补更早过程步骤时已渲染内容不跳动", () => {
+  const CLIENT = 200;
+  const USER_H = 80;
+  const HEADER = 40;
+  const TOGGLE_H = 40;
+  const OTHER_STAGE = 180;
+  const ANCHOR_BASE = 180;
+
+  function installGeometry(scroller: HTMLElement, heightOfAnchor: () => number) {
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    const layout = () => {
+      const rows = [...scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]")];
+      let y = 0;
+      const placed: {
+        row: HTMLElement;
+        top: number;
+        height: number;
+        parts: { el: HTMLElement; top: number; height: number }[];
+      }[] = [];
+      for (const row of rows) {
+        if (!row.querySelector("[data-testid=process-disclosure]")) {
+          placed.push({ row, top: y, height: USER_H, parts: [] });
+          y += USER_H;
+          continue;
+        }
+        const nodes = [...row.querySelectorAll<HTMLElement>(
+          "[data-testid='process-stage'], [data-testid='process-detail-toggle']",
+        )];
+        const stages = nodes.filter((node) => node.getAttribute("data-testid") === "process-stage");
+        const anchor = stages[stages.length - 1] ?? null;
+        let cursor = y + HEADER;
+        const parts: { el: HTMLElement; top: number; height: number }[] = [];
+        for (const node of nodes) {
+          const height = node === anchor
+            ? heightOfAnchor()
+            : node.getAttribute("data-testid") === "process-stage"
+              ? OTHER_STAGE
+              : TOGGLE_H;
+          parts.push({ el: node, top: cursor, height });
+          cursor += height;
+        }
+        const height = Math.max(HEADER, cursor - y);
+        placed.push({ row, top: y, height, parts });
+        y += height;
+      }
+      return { scrollHeight: y, placed };
+    };
+    const box = (top: number, height: number) => ({
+      x: 0,
+      y: top,
+      top,
+      left: 0,
+      right: 320,
+      bottom: top + height,
+      width: 320,
+      height,
+      toJSON() { return this; },
+    });
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: CLIENT });
+    Object.defineProperty(scroller, "scrollHeight", {
+      configurable: true,
+      get: () => layout().scrollHeight,
+    });
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === scroller) return box(0, CLIENT) as DOMRect;
+      if (!scroller.contains(this)) return original.call(this);
+      const { placed } = layout();
+      for (const row of placed) {
+        if (this === row.row) return box(row.top - scroller.scrollTop, row.height) as DOMRect;
+        for (const part of row.parts) {
+          if (this === part.el || part.el.contains(this)) {
+            return box(part.top - scroller.scrollTop, part.height) as DOMRect;
+          }
+        }
+      }
+      return box(0, 0) as DOMRect;
+    };
+    return () => {
+      HTMLElement.prototype.getBoundingClientRect = original;
+    };
+  }
+
+  function rows(includeOlder: boolean) {
+    return [
+      mk("user", { id: "jump-user", text: "请继续", status: "sent" }),
+      ...(includeOlder
+        ? [mk("assistant", { id: "older-note", text: "更早的中间说明" })]
+        : []),
+      mk("tool", {
+        id: "jump-tool",
+        toolName: "Bash",
+        text: "pwd",
+        output: "/work",
+        _completed: true,
+      }),
+      mk("assistant", { id: "jump-anchor", text: "已渲染锚点正文" }),
+    ];
+  }
+
+  function anchorTop(scroller: HTMLElement): number {
+    const stages = [...scroller.querySelectorAll<HTMLElement>("[data-testid='process-stage']")];
+    const anchor = stages.find((stage) => stage.getAttribute("data-find-member") === "jump-anchor")
+      ?? stages[stages.length - 1];
+    if (!anchor) throw new Error("已渲染锚点行没有挂上");
+    return anchor.getBoundingClientRect().top;
+  }
+
+  async function preload(onLoad: ReturnType<typeof vi.fn>) {
+    await waitFor(() => expect(onLoad).toHaveBeenCalled());
+  }
+
+  test("贴底自动补更早过程步骤时，已渲染锚点不因前插位移", async () => {
+    let anchorHeight = ANCHOR_BASE + 40;
+    let resolveLoad: (value: { ok: boolean; hasMore: boolean }) => void = () => {};
+    const onLoadOlderLiveUnits = vi.fn(
+      () => new Promise<{ ok: boolean; hasMore: boolean }>((resolve) => {
+        resolveLoad = resolve;
+      }),
+    );
+    const stick = createStickToBottomController();
+    const followBottomRef = stick.canRestick;
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const restore = installGeometry(scroller, () => anchorHeight);
+    const view = render(
+      <MessageList
+        processDisclosure
+        sessionId="s-live-jump"
+        messages={rows(false)}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+      { container: scroller },
+    );
+    await preload(onLoadOlderLiveUnits);
+    anchorHeight += 100;
+    view.rerender(
+      <MessageList
+        processDisclosure
+        sessionId="s-live-jump"
+        messages={rows(false)}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    const before = anchorTop(scroller);
+    await act(async () => {
+      view.rerender(
+        <MessageList
+          processDisclosure
+          sessionId="s-live-jump"
+          messages={rows(true)}
+          sending
+          cb={{}}
+          onRespondPermission={() => {}}
+          scrollParent={scroller}
+          followBottomRef={followBottomRef}
+          archive={{
+            hasMore: false,
+            loading: false,
+            error: false,
+            onLoadOlder: () => {},
+            liveHasMoreBefore: true,
+            liveUnitsCursor: "u:40",
+            onLoadOlderLiveUnits,
+          }}
+        />,
+      );
+      resolveLoad({ ok: true, hasMore: true });
+      await Promise.resolve();
+    });
+    const after = anchorTop(scroller);
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+    expect(
+      Math.abs(after - before),
+      `锚点 top ${before} -> ${after}，位移 ${after - before}px，scrollTop=${scroller.scrollTop} following=${followBottomRef.current}`,
+    ).toBeLessThanOrEqual(0.5);
+    expect(followBottomRef.current).toBe(true);
+    restore();
+    scroller.remove();
+  });
+
+  test("离底补更早过程步骤时按前插后的真实位置保持锚点", async () => {
+    let anchorHeight = ANCHOR_BASE + 40;
+    let resolveLoad: (value: { ok: boolean; hasMore: boolean }) => void = () => {};
+    const onLoadOlderLiveUnits = vi.fn(
+      () => new Promise<{ ok: boolean; hasMore: boolean }>((resolve) => {
+        resolveLoad = resolve;
+      }),
+    );
+    const stick = createStickToBottomController();
+    const followBottomRef = stick.canRestick;
+    followBottomRef.current = false;
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    scroller.scrollTop = 120;
+    const restore = installGeometry(scroller, () => anchorHeight);
+    const view = render(
+      <MessageList
+        processDisclosure
+        sessionId="s-live-jump-up"
+        messages={rows(false)}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+      { container: scroller },
+    );
+    scroller.scrollTop = 120;
+    followBottomRef.current = false;
+    await preload(onLoadOlderLiveUnits);
+    anchorHeight += 100;
+    view.rerender(
+      <MessageList
+        processDisclosure
+        sessionId="s-live-jump-up"
+        messages={rows(false)}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+    );
+    scroller.scrollTop = 120;
+    const before = anchorTop(scroller);
+    await act(async () => {
+      view.rerender(
+        <MessageList
+          processDisclosure
+          sessionId="s-live-jump-up"
+          messages={rows(true)}
+          sending
+          cb={{}}
+          onRespondPermission={() => {}}
+          scrollParent={scroller}
+          followBottomRef={followBottomRef}
+          archive={{
+            hasMore: false,
+            loading: false,
+            error: false,
+            onLoadOlder: () => {},
+            liveHasMoreBefore: true,
+            liveUnitsCursor: "u:40",
+            onLoadOlderLiveUnits,
+          }}
+        />,
+      );
+      resolveLoad({ ok: true, hasMore: true });
+      await Promise.resolve();
+    });
+    const after = anchorTop(scroller);
+    expect(
+      Math.abs(after - before),
+      `离底锚点 top ${before} -> ${after}，位移 ${after - before}px，scrollTop=${scroller.scrollTop}`,
+    ).toBeLessThanOrEqual(0.5);
+    expect(followBottomRef.current).toBe(false);
+    restore();
+    scroller.remove();
+  });
+
+  test("补页期间有上滑手势则结束时不恢复跟随", async () => {
+    let resolveLoad: (value: { ok: boolean; hasMore: boolean }) => void = () => {};
+    const onLoadOlderLiveUnits = vi.fn(
+      () => new Promise<{ ok: boolean; hasMore: boolean }>((resolve) => {
+        resolveLoad = resolve;
+      }),
+    );
+    const stick = createStickToBottomController();
+    const followBottomRef = stick.canRestick;
+    const scroller = document.createElement("div");
+    document.body.appendChild(scroller);
+    const restore = installGeometry(scroller, () => ANCHOR_BASE + 40);
+    render(
+      <MessageList
+        processDisclosure
+        sessionId="s-live-gesture"
+        messages={rows(false)}
+        sending
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        followBottomRef={followBottomRef}
+        archive={{
+          hasMore: false,
+          loading: false,
+          error: false,
+          onLoadOlder: () => {},
+          liveHasMoreBefore: true,
+          liveUnitsCursor: "u:40",
+          onLoadOlderLiveUnits,
+        }}
+      />,
+      { container: scroller },
+    );
+    await preload(onLoadOlderLiveUnits);
+    fireEvent.wheel(scroller);
+    followBottomRef.current = false;
+    await act(async () => {
+      resolveLoad({ ok: true, hasMore: true });
+      await Promise.resolve();
+    });
+    expect(followBottomRef.current).toBe(false);
+    expect(screen.queryByRole("button", { name: "加载更早的处理步骤" })).toBeNull();
+    restore();
     scroller.remove();
   });
 });

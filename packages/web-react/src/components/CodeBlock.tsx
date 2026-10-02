@@ -51,16 +51,20 @@ export function CodeBlock({ language, children }: { language?: string; children:
   };
 
   return (
-    <div className="my-4 overflow-hidden rounded-lg border border-border bg-code">
-      <div className="flex items-center justify-between border-b border-border px-3.5 py-1.5">
-        <span className="font-mono text-xs text-faint">{language || "code"}</span>
+    <div className="my-4 overflow-hidden rounded-[12px] border border-border bg-code">
+      {/* 表头:与代码同底、只用一道淡分隔线,语言名小号等宽;动作按钮去掉常驻底色,hover 才浮出。 */}
+      <div className="flex items-center justify-between border-b border-border/70 py-1 pl-4 pr-1.5">
+        <span className="font-mono text-caption tracking-wide text-faint">{language || "code"}</span>
         <div className="flex items-center gap-0.5">
           <button
             type="button"
             onClick={toggleWrap}
             aria-label="换行"
             aria-pressed={wrap}
-            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            className={cn(
+              "flex items-center gap-1.5 rounded-md px-2 py-1 text-caption transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3",
+              wrap ? "text-fg" : "text-faint",
+            )}
           >
             <WrapText size={13} />
             换行
@@ -68,16 +72,16 @@ export function CodeBlock({ language, children }: { language?: string; children:
           <button
             type="button"
             onClick={copy}
-            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-caption text-faint transition-colors hover:bg-hover hover:text-fg [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
           >
-            {copied ? <Check size={13} /> : <Copy size={13} />}
+            {copied ? <Check size={13} className="text-success" /> : <Copy size={13} />}
             {copied ? "已复制" : "复制"}
           </button>
         </div>
       </div>
       <pre
         className={cn(
-          "overflow-x-auto px-4 py-3.5 text-[13.5px] leading-relaxed",
+          "overflow-x-auto px-4 py-3 text-[13px] leading-[1.7] [scrollbar-width:thin]",
           wrap && "whitespace-pre-wrap break-words",
         )}
       >

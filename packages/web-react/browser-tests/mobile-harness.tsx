@@ -131,9 +131,14 @@ const MOBILE_AGENT: Agent = {
 };
 
 // 长展示名:顶栏拥挤度的真实上限(线上模型名比这更长的都有)。
+// 后面再垫一批行,让窄屏 sheet 必须滚才能看到底部思考档(OCV5-245)。
 const MOBILE_MODELS = [
   { id: "m-mobile-a", display_name: "OpenClaude 旗舰推理 Max 1M 长上下文", cost_x: 4.1 },
   { id: "m-mobile-b", display_name: "OpenClaude 均衡 Pro", cost_x: 4.1 },
+  ...Array.from({ length: 16 }, (_, i) => ({
+    id: `m-extra-${i}`,
+    display_name: `备用模型 ${String(i + 1).padStart(2, "0")}`,
+  })),
 ];
 
 function MobileChatPage() {
@@ -246,6 +251,9 @@ function MobileChatPage() {
           models={MOBILE_MODELS}
           selectedModelId={modelId}
           onSelectModel={setModelId}
+          effortSupported={["low", "medium", "high"]}
+          effortActive="high"
+          onSelectEffort={() => {}}
           credits="123456"
           onOpenBilling={() => {}}
           onNew={() => {}}

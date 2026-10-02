@@ -201,14 +201,17 @@ describe("proxyBodySchema — 数值/数组边界", () => {
     assert.equal(r.success, false);
   });
 
-  test("stream:false 显式给 → fail(我们只跑 stream)", () => {
+  test("stream:false 可解析供 Box 原调用回放,非 Box 在路由层拒绝", () => {
     const r = proxyBodySchema.safeParse({
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
       messages: [{ role: "user", content: "hi" }],
       stream: false,
     });
-    assert.equal(r.success, false);
+    assert.equal(r.success, true);
+    assert.equal(proxyBodySchema.safeParse({ model: "claude-sonnet-4-6",
+      max_tokens: 1024, messages: [{ role: "user", content: "hi" }],
+      stream: "false" }).success, false);
   });
 
   test("stream:true 显式给 OK,stream 字段省略也 OK", () => {
@@ -637,6 +640,26 @@ describe("UsageObserver — SSE 解析 + usage 提取", () => {
     }
   });
 
+  test("Anthropic delta only updates output; start input/cache survive to final billing", () => {
+    const o = new _UsageObserver();
+    feedEvents(o, ["event: message_start", `data: ${JSON.stringify({
+      type: "message_start", message: { usage: { input_tokens: 2, output_tokens: 0,
+        cache_read_input_tokens: 100, cache_creation_input_tokens: 20 } },
+    })}`]);
+    feedEvents(o, ["event: message_delta", `data: ${JSON.stringify({
+      type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { output_tokens: 7 },
+    })}`]);
+    const r = o.result();
+    assert.equal(r.kind, "final");
+    if (r.kind === "final") {
+      assert.equal(r.usage.input_tokens, 2n);
+      assert.equal(r.usage.output_tokens, 7n);
+      assert.equal(r.usage.cache_read_tokens, 100n);
+      assert.equal(r.usage.cache_write_tokens, 20n);
+    }
+  });
+
   test("非 message_start/delta 事件忽略", () => {
     const o = new _UsageObserver();
     feedEvents(o, [
@@ -1000,6 +1023,31 @@ describe("isClientAbort", () => {
 // ─── makeFinalizer.failClient — handler 级行为(Codex MEDIUM #3) ─────────
 
 describe("makeFinalizer.failClient → scheduler.release 走 client_error", () => {
+  test("Box paid abort holds precheck until exact usage settles; prelaunch abort releases", async () => {
+    let retained = true, releases = 0;
+    const pool = { query: async (sql: string) => sql.includes("AS retained")
+      ? { rows: [{ retained }], rowCount: 1 }
+      : { rows: [], rowCount: 0 } };
+    const redis = { releaseReservation: async () => { releases++; return true; } };
+    const scheduler = { release: async () => {} };
+    const base = { requestId: "box-paid-abort", userId: 1n,
+      containerId: 1n, accountId: null, slotId: null,
+      model: "box-api-claude-opus-5-5", pricing: sonnet,
+      precheckCredits: 100n,
+      preCheckReservation: { userId: "1", requestId: "box-paid-abort" },
+      log: rootLogger, sessionId: "box-session" };
+    const paid = makeFinalizer({ pgPool: pool, preCheckRedis: redis,
+      scheduler } as never, base);
+    assert.equal((await paid.failClient({ kind: "none" }, new Error("client closed"))).state,
+      "aborted");
+    assert.equal(releases, 0, "paid but unbilled Box call retains its Redis lock");
+    retained = false;
+    const prelaunch = makeFinalizer({ pgPool: pool, preCheckRedis: redis,
+      scheduler } as never, { ...base, requestId: "box-prelaunch-abort",
+      preCheckReservation: { userId: "1", requestId: "box-prelaunch-abort" } });
+    await prelaunch.failClient({ kind: "none" }, new Error("client closed"));
+    assert.equal(releases, 1, "unarmed/prelaunch failure must not hold credits for four hours");
+  });
   test("fail vs failClient:同样写 abort journal,但 release.kind 区分", async () => {
     type ReleaseCall = { account_id: bigint | string; slotId: string; kind: string; error?: string | null };
     const releaseCalls: ReleaseCall[] = [];

@@ -313,6 +313,48 @@ body {
 }
 @keyframes oc-shimmer { 100% { transform: translateX(100%); } }
 
+/* 进行中的处理过程状态行:沿文字扫一道高光,表示这一步还没结束。
+   基色与高光取 --muted / --fg,明暗主题都可读。完成态和失败态不加此类。
+   减少动态效果时本段不生效,文字保持 text-fg,避免透明字配上被压到 0.01ms 的扫光。 */
+@media (prefers-reduced-motion: no-preference) {
+  .oc-live-status-shine {
+    background-image: linear-gradient(
+      100deg,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 0%,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 36%,
+      var(--fg) 50%,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 64%,
+      color-mix(in srgb, var(--fg) 42%, var(--muted)) 100%
+    );
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    animation: oc-live-status-sweep 1.8s linear infinite;
+  }
+}
+/* 生成中三点(OCV5-307):6px 小点依次轻跃,颜色跟随当前文字色的 45%(明暗主题自适应)。
+   reduced-motion 下静止为三颗半透明点,不闪烁。 */
+.oc-dots { display: inline-flex; align-items: center; gap: 4px; height: 1em; }
+.oc-dots > span {
+  width: 6px; height: 6px; border-radius: 999px;
+  background: color-mix(in srgb, currentColor 45%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .oc-dots > span { animation: oc-dot-wave 1.2s var(--ease-standard) infinite; }
+  .oc-dots > span:nth-child(2) { animation-delay: 0.15s; }
+  .oc-dots > span:nth-child(3) { animation-delay: 0.3s; }
+}
+@keyframes oc-dot-wave {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.55; }
+  30% { transform: translateY(-3px); opacity: 1; }
+}
+@keyframes oc-live-status-sweep {
+  from { background-position: 120% 0; }
+  to { background-position: -20% 0; }
+}
+
 /* ── 生成占位卡(GeneratingPlaceholderCard)的粒子场景色。刻意明暗主题一致:
    粒子发光基面贴 image viewer 黑底质感 —— 浅色主题下也必须是深色,淡蓝粒子才
    可见,因此不走会随主题翻转的 surface token,固化在 styles.css 单一权威处。
@@ -823,28 +865,36 @@ body {
 .prose ol { list-style: decimal; }
 .prose li { margin: 4px 0; }
 .prose li::marker { color: var(--faint); }
-.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.3; margin: 26px 0 12px; letter-spacing: -0.01em; }
-.prose h1 { font-size: 1.5em; }
-.prose h2 { font-size: 1.28em; }
-.prose h3 { font-size: 1.12em; }
-.prose a { color: var(--accent); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+/* 标题:上距大于下距,让标题贴住它统领的段落;h1/h2 收紧字距,读起来更"排过版"。 */
+.prose h1, .prose h2, .prose h3, .prose h4 { font-weight: 650; line-height: 1.35; margin: 28px 0 10px; letter-spacing: -0.012em; }
+.prose h1 { font-size: 1.45em; letter-spacing: -0.02em; }
+.prose h2 { font-size: 1.24em; letter-spacing: -0.016em; }
+.prose h3 { font-size: 1.1em; }
+.prose h4 { font-size: 1em; }
+.prose a { color: var(--accent); text-decoration: none; border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); transition: border-color 0.15s; }
 .prose a:hover { border-bottom-color: var(--accent); }
 .prose strong { font-weight: 650; }
-.prose blockquote { margin: 0 0 16px; padding: 2px 0 2px 16px; border-left: 3px solid var(--border-strong); color: var(--muted); }
-.prose hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
-.prose .markdown-table-wrap { margin: 0 0 16px; }
+/* 引用:细竖线 + 正文色降一档,不再是 3px 灰柱。 */
+.prose blockquote { margin: 0 0 16px; padding: 1px 0 1px 14px; border-left: 2px solid color-mix(in srgb, var(--fg) 18%, transparent); color: var(--muted); }
+.prose blockquote > :last-child { margin-bottom: 0; }
+.prose hr { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
+/* 表格:外圈一道圆角细框 + 只留横向分隔线(去掉满格竖线),表头小一号、降为 muted,
+   数字等宽对齐。整表仍在 .markdown-table-region 内横滑(不撑宽时间线)。 */
+.prose .markdown-table-wrap { margin: 4px 0 18px; }
 .prose .markdown-table-hint { margin: 0 0 6px; font-size: 11px; color: var(--faint); }
-.prose .markdown-table-region { overflow-x: auto; border-radius: 6px; outline: none; }
+.prose .markdown-table-region { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); outline: none; }
 .prose .markdown-table-region:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
-.prose table { width: 100%; border-collapse: collapse; margin: 0; font-size: 14.5px; }
-.prose th, .prose td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
-.prose th { background: var(--hover); font-weight: 600; }
+.prose table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 0; font-size: 14.5px; font-variant-numeric: tabular-nums; }
+.prose th, .prose td { border: 0; border-bottom: 1px solid var(--border); padding: 9px 14px; text-align: left; vertical-align: top; }
+.prose tr:last-child > td { border-bottom: 0; }
+.prose th { background: color-mix(in srgb, var(--fg) 2.5%, transparent); font-size: 13px; font-weight: 600; color: var(--muted); }
 .prose :not(pre) > code {
   font-family: var(--font-mono);
-  font-size: 0.875em;
-  background: var(--active);
-  padding: 0.15em 0.4em;
-  border-radius: 6px;
+  font-size: 0.86em;
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fg) 5%, transparent);
+  padding: 0.12em 0.38em;
+  border-radius: 5px;
   white-space: break-spaces;
 }
 .prose pre { margin: 0 0 16px; }
@@ -854,6 +904,17 @@ body {
    scope 到 .prose(katex-display 只出现在助手正文);padding-block 给极端 accent/大定界符
    墨迹留余量,避免被 overflow-y:hidden 裁掉。 */
 .prose .katex-display { overflow-x: auto; overflow-y: hidden; padding-block: 0.08em; }
+
+/* 模型选择器窄屏 sheet(OCV5-245):未分层普通规则,才能盖过 Sheet 原语的 max-h-[85dvh]
+   工具类,并保留不支持 dvh 的 WebView 的 vh 回退。overflow 交给内部单一滚动容器,
+   避免原语 overflow-y-auto 与列表再叠一层滚动。 */
+.model-picker-sheet {
+  max-height: 85vh;
+  max-height: min(85dvh, calc(100% - env(safe-area-inset-bottom, 0px)));
+}
+.model-picker-sheet-scroll {
+  overscroll-behavior: contain;
+}
 
 /* Center dialogs share one visual-viewport/safe-area positioning contract. Keep the existing
    translateY(-50%) on each Radix content node. Declaration order is deliberate: vh is the old

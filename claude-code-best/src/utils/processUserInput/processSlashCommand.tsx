@@ -877,6 +877,15 @@ async function getMessagesForSlashCommand(
           }
 
           // Use discriminated union to handle different result types
+          if (result.type === 'compact' && result.compactionResult.idleStable) {
+            resetMicrocompactState()
+            return {
+              messages: buildPostCompactMessages(result.compactionResult) as AssistantMessage[],
+              shouldQuery: false,
+              command,
+            }
+          }
+
           if (result.type === 'compact') {
             // Append slash command messages to messagesToKeep so that
             // attachments and hookResults come after user messages

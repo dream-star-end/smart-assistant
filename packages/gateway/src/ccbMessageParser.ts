@@ -462,6 +462,7 @@ export class CcbMessageParser {
   private onToolUse?: (tool: DetectedToolUse) => void
   private onToolResult?: (result: DetectedToolResult) => void
   private onNativeCompactionSummary?: (summaryText: string) => void
+  private onIdleArtifactReceipt?: (receipt: { opId: string; digest: string }) => void
   private sawCompactBoundary = false
   private capturedNativeCompaction = false
   /** F5 — 每观测到一个 **Bash** tool_use(**含子 agent**,parentToolUseId 与否都触发)
@@ -509,6 +510,8 @@ export class CcbMessageParser {
     onToolUse?: (tool: DetectedToolUse) => void
     onToolResult?: (result: DetectedToolResult) => void
     onNativeCompactionSummary?: (summaryText: string) => void
+    /** Loader-checked idle artifact. A text callback is not this receipt. */
+    onIdleArtifactReceipt?: (receipt: { opId: string; digest: string }) => void
     /** F5 — 见字段级注释:所有 Bash tool_use(含子 agent)的归属登记回调。 */
     onBashToolObserved?: (toolUseId: string) => void
     onPostFinalRuntimeEvent?: (
@@ -554,6 +557,7 @@ export class CcbMessageParser {
     this.onToolUse = opts.onToolUse
     this.onToolResult = opts.onToolResult
     this.onNativeCompactionSummary = opts.onNativeCompactionSummary
+    this.onIdleArtifactReceipt = opts.onIdleArtifactReceipt
     this.onBashToolObserved = opts.onBashToolObserved
     this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
@@ -766,6 +770,15 @@ export class CcbMessageParser {
     if (msg.type === 'system') {
       if (raw.subtype === 'compact_boundary') {
         this.sawCompactBoundary = true
+        const meta = raw.compact_metadata
+        if (meta && typeof meta === 'object') {
+          const digest = (meta as { idle_receipt_digest?: unknown }).idle_receipt_digest
+          const opId = (meta as { idle_op_id?: unknown }).idle_op_id
+          if (typeof digest === 'string' && /^[a-f0-9]{64}$/.test(digest)
+            && typeof opId === 'string' && /^[a-f0-9]{64}$/.test(opId)) {
+            this.onIdleArtifactReceipt?.({ opId, digest })
+          }
+        }
         return
       }
       if (raw.subtype === 'bash_output_tail') {

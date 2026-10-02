@@ -34,6 +34,34 @@ test("deterministic install preserves auth, serves actual module probe and is id
     assert.equal(ok.status,200);assert.equal((await ok.json()).moduleSha256,hash(readFileSync(modulePath)));
   } finally { if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}rmSync(dir,{recursive:true,force:true}); }
 });
+test("host 1af23fe layout with isEventsEcho and createHostAuthService installs probe GET", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sand-installer-1af23fe-")), host = join(dir, "host-main.cjs");
+  let server;
+  try {
+    const original = readFileSync(join(__dirname, "fixtures/host-1af23fe.cjs")); writeFileSync(host, original);
+    const first = apply(host); assert.equal(first.status, 0, first.stdout + first.stderr);
+    const patched = readFileSync(host);
+    assert.match(patched.toString(), /eventStreamEchoes/);
+    assert.match(patched.toString(), /isEventsEcho/);
+    assert.match(patched.toString(), /handleSandStreamRelay/);
+    const again = apply(host); assert.equal(again.status, 0, again.stdout + again.stderr);
+    assert.equal(JSON.parse(again.stdout).changed, false);
+    const app = require(host); app.initialize({host:{log(){},environment:{auth:{}}},onStop(){}});
+    server = http.createServer((q,s) => app.handleRequest({authToken:"TEST_GATE"},q,s));
+    await new Promise(r=>server.listen(0,"127.0.0.1",r));
+    const url = "http://127.0.0.1:"+server.address().port+"/sand-stream-relay/aiserver.v1.InferenceService/Stream";
+    const headers={"content-type":"application/connect+proto","x-oc-sand-box-probe":"1","x-oc-sand-box-probe-nonce":"b".repeat(32)};
+    const denied=await fetch(url,{method:"POST",body:"",headers});assert.equal(denied.status,401);await denied.text();
+    const ok=await fetch(url,{method:"GET",headers:{...headers,authorization:"Bearer TEST_GATE"}});
+    assert.equal(ok.status,200);assert.equal((await ok.json()).moduleSha256,hash(readFileSync(modulePath)));
+  } finally { if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}rmSync(dir,{recursive:true,force:true}); }
+});
+test("syntax check timeout covers 26MB live host-main.cjs", () => {
+  const r = spawnSync("python3", ["-c", `import importlib.util,sys
+s=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+assert m.SYNTAX_CHECK_TIMEOUT_SEC >= 180, m.SYNTAX_CHECK_TIMEOUT_SEC`, installer], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+});
 test("unknown source, hash mismatch and syntax failure leave host and module unchanged", () => {
   const dir=mkdtempSync(join(tmpdir(),"sand-installer-reject-")),host=join(dir,"host-main.cjs"),target=join(dir,"ocv5-197-relay.cjs"),bad=join(dir,"bad.cjs");
   const original=readFileSync(join(__dirname,"fixtures/host-original.cjs"));

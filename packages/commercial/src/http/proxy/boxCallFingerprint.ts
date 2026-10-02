@@ -1,0 +1,247 @@
+/** Stable *secondary* Box replay fingerprint for one OpenClaude turn and
+ * canonical Messages request. This is NOT a client-supplied logical call ID:
+ * identical independent requests in the same turn are intentionally treated
+ * as ambiguous until the product chooses a fail-closed policy or proves a
+ * genuine per-call ID transport. Never use this alone to enable the route.
+ */
+import { createHash } from "node:crypto";
+import { currentVerifiedProxyByteBudget, type ProxyBody } from "./shared.js";
+import { normalizeBoxAssistantContent, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+
+export class BoxCallFingerprintError extends Error {
+  constructor(readonly code: string) { super(code); this.name = "BoxCallFingerprintError"; }
+}
+
+function updateStableJson(value: unknown, emit: (part: string) => void,
+  depth = 0): void {
+  if (depth > 64) throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_DEEP");
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    emit(JSON.stringify(value)); return;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    emit(JSON.stringify(value)); return;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 1_000_000) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    emit("[");
+    for (let index = 0; index < value.length; index++) {
+      if (!Object.hasOwn(value, index)) {
+        throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");
+      }
+      if (index) emit(",");
+      updateStableJson(value[index], emit, depth + 1);
+    }
+    emit("]"); return;
+  }
+  if (!value || typeof value !== "object") {
+    throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");
+  }
+  const object = value as Record<string, unknown>;
+  const keys = Object.keys(object).sort();
+  if (keys.length > 4096) throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+  emit("{");
+  keys.forEach((key, index) => {
+    if (index) emit(",");
+    emit(JSON.stringify(key)); emit(":");
+    updateStableJson(object[key], emit, depth + 1);
+  });
+  emit("}");
+}
+
+export interface BoxCallFingerprint {
+  readonly turnKey: string;
+  readonly sessionId: string;
+  readonly requestHash: string;
+  /** Secondary replay fence, not a unique logical-call claim. */
+  readonly replayFingerprint: string;
+}
+
+/** Privacy-safe binding for the CLI's effective invocation context. A resume
+ * request adds the assistant tool_use and user tool_result pair to the
+ * already-running CLI; neither message was part of its previous context. */
+export function deriveBoxContextHash(body: ProxyBody,
+  completedToolTail = false): string {
+  if (!Array.isArray(body.messages)
+    || (completedToolTail && body.messages.length < 2)) {
+    throw new BoxCallFingerprintError("BOX_CALL_CONTEXT_INVALID");
+  }
+  const normalized = normalizeBoxSemanticBody(body);
+  const { metadata: _tracking, ...modelBody } = normalized;
+  const messages = completedToolTail ? normalized.messages.slice(0, -2) : normalized.messages;
+  const hasher = createHash("sha256").update("ocv5-box-context-v1\0");
+  let bytes = 0;
+  const hashCeiling = currentVerifiedProxyByteBudget().contextHash;
+  updateStableJson({ ...modelBody, messages }, (part) => {
+    bytes += Buffer.byteLength(part);
+    if (bytes > hashCeiling) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    hasher.update(part);
+  });
+  return hasher.digest("hex");
+}
+
+/** Hash the complete client-visible assistant message content at handoff.
+ * The journal stores only this digest, never raw text, thinking or tool input. */
+export function hashBoxAssistantContent(content: unknown): string {
+  if (!Array.isArray(content) || content.length < 1 || content.length > 64) {
+    throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+  }
+  const hasher = createHash("sha256").update("ocv5-box-assistant-content-v1\0");
+  let bytes = 0;
+  updateStableJson(normalizeBoxAssistantContent(content), (part) => {
+    bytes += Buffer.byteLength(part);
+    if (bytes > 16 * 1024 * 1024) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    hasher.update(part);
+  });
+  return hasher.digest("hex");
+}
+
+/** CCB 2.1.280 keeps signed thinking but drops the provider-only `caller`
+ * field from tool_use when it reserializes the assistant into the next HTTP
+ * request. Bind every model-visible block and its order while allowing only
+ * that exact metadata omission. Unlike assistantEchoHash, this still binds
+ * thinking/signature bytes whenever they are present. */
+export function hashBoxAssistantNoCallerContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+  }
+  return hashBoxAssistantContent(content.map((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+    }
+    const item = block as Record<string, unknown>;
+    if (item.type !== "tool_use" || !Object.hasOwn(item, "caller")) return item;
+    const { caller: _providerOnly, ...semantic } = item;
+    return semantic;
+  }));
+}
+
+/** Claude Code may omit thinking and reserialize tool_use to its canonical
+ * four fields in the next HTTP history. The held Box CLI retains the exact
+ * original message; client echo still binds every text block and tool
+ * identity/input in order. Extra provider-only tool metadata is not echoed. */
+export function hashBoxAssistantEchoContent(content: unknown): string {
+  if (!Array.isArray(content)) {
+    throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+  }
+  const echo = content.flatMap((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) {
+      throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+    }
+    const item = block as Record<string, unknown>;
+    if (item.type === "thinking" || item.type === "redacted_thinking") return [];
+    if (item.type === "tool_use") {
+      if (typeof item.id !== "string" || typeof item.name !== "string"
+        || !item.input || typeof item.input !== "object" || Array.isArray(item.input)) {
+        throw new BoxCallFingerprintError("BOX_CALL_ASSISTANT_INVALID");
+      }
+      return [{ type: "tool_use", id: item.id, name: item.name, input: item.input }];
+    }
+    return [item];
+  });
+  return hashBoxAssistantContent(echo);
+}
+
+/** Original claim predicate on one comparison view. Only the full-content hash
+ * is computed. Stored noCaller/echo values are accepted only when that full
+ * hash already equals them; this function does not strip caller or thinking. */
+export function incomingAssistantAccepted(content: unknown, stored: {
+  assistantContentHash: string;
+  assistantNoCallerHash?: string;
+  assistantEchoHash?: string;
+}): boolean {
+  const fullHash = hashBoxAssistantContent(content);
+  const echoed = Array.isArray(content) && content.every((block) => {
+    if (!block || typeof block !== "object" || Array.isArray(block)) return true;
+    const type = (block as { type?: unknown }).type;
+    return type !== "thinking" && type !== "redacted_thinking";
+  });
+  return fullHash === stored.assistantContentHash
+    || (!!stored.assistantNoCallerHash && fullHash === stored.assistantNoCallerHash)
+    || (echoed && !!stored.assistantEchoHash && fullHash === stored.assistantEchoHash);
+}
+
+export function fingerprintOfPrepared(prepared: { fingerprint: BoxCallFingerprint | null }): BoxCallFingerprint {
+  if (!prepared.fingerprint) throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
+  return prepared.fingerprint;
+}
+
+export function deriveBoxCallFingerprint(uid: bigint, body: ProxyBody): BoxCallFingerprint {
+  if (uid <= 0n || !body.metadata || typeof body.metadata.user_id !== "string") {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
+  }
+  let userMeta: Record<string, unknown>;
+  try {
+    const value: unknown = JSON.parse(body.metadata.user_id);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    userMeta = value as Record<string, unknown>;
+  } catch { throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_INVALID"); }
+  const turnKey = userMeta.oc_turn_key;
+  if (typeof turnKey !== "string" || !/^[a-f0-9]{64}$/.test(turnKey)) {
+    throw new BoxCallFingerprintError("BOX_CALL_TURN_KEY_MISSING");
+  }
+  const outer = body.metadata.session_id;
+  const inner = userMeta.session_id;
+  if (outer !== undefined && typeof outer !== "string") {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_INVALID");
+  }
+  if (inner !== undefined && typeof inner !== "string") {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_INVALID");
+  }
+  if (outer !== undefined && inner !== undefined && outer !== inner) {
+    throw new BoxCallFingerprintError("BOX_CALL_SESSION_CONFLICT");
+  }
+  const sessionId = outer ?? inner;
+  if (typeof sessionId !== "string"
+    || !/^[A-Za-z0-9._:-]{1,256}$/.test(sessionId)) {
+    throw new BoxCallFingerprintError("BOX_CALL_IDENTITY_MISSING");
+  }
+  // Tracking metadata can change independently of the model request. Identity
+  // is separately bound by authenticated uid, session and the signed turn key.
+  const { metadata: _tracking, ...modelBody } = normalizeBoxSemanticBody(body);
+  const hasher = createHash("sha256");
+  let bytes = 0;
+  const hashCeiling = currentVerifiedProxyByteBudget().contextHash;
+  updateStableJson(modelBody, (part) => {
+    bytes += Buffer.byteLength(part);
+    if (bytes > hashCeiling) {
+      throw new BoxCallFingerprintError("BOX_CALL_BODY_TOO_LARGE");
+    }
+    hasher.update(part);
+  });
+  const requestHash = hasher.digest("hex");
+  const replayFingerprint = createHash("sha256")
+    .update("ocv5-box-replay-v1\0").update(uid.toString()).update("\0")
+    .update(sessionId).update("\0").update(turnKey).update("\0")
+    .update(requestHash).digest("hex");
+  return { turnKey, sessionId, requestHash, replayFingerprint };
+}
+
+/** CCB 2.1.280's non-streaming retry is a read-only alias of the original
+ * paid call, never permission to launch another model. The pinned CLI removes
+ * stream, caps max_tokens at 64k and caps enabled thinking below that limit.
+ * The same transform is applied to the admitted streaming request and the
+ * incoming non-streaming fallback before comparing their authenticated keys. */
+export function deriveBoxFallbackAlias(uid: bigint, body: ProxyBody): string {
+  const semantic = normalizeBoxSemanticBody(body);
+  if (!Number.isSafeInteger(semantic.max_tokens) || semantic.max_tokens < 1) {
+    throw new BoxCallFingerprintError("BOX_CALL_BODY_INVALID");
+  }
+  const { stream: _stream, ...rest } = semantic;
+  const max_tokens = Math.min(semantic.max_tokens, 64_000);
+  const thinking = rest.thinking;
+  const adjustedThinking = thinking && typeof thinking === "object"
+    && !Array.isArray(thinking) && (thinking as { type?: unknown }).type === "enabled"
+    && typeof (thinking as { budget_tokens?: unknown }).budget_tokens === "number"
+    ? { ...thinking, budget_tokens: Math.min(
+      (thinking as { budget_tokens: number }).budget_tokens, max_tokens - 1) }
+    : thinking;
+  const fallback = { ...rest, max_tokens,
+    ...(adjustedThinking === undefined ? {} : { thinking: adjustedThinking }) } as ProxyBody;
+  return deriveBoxCallFingerprint(uid, fallback).replayFingerprint;
+}

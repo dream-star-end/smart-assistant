@@ -36,7 +36,7 @@ const ASSERTION_DEBT_BASELINE = 37;
  *   + 2 条 SCNet 关机后从 V5 主发布门移除的 OCR 活体 proof。
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
-const PROOF_PENDING_BASELINE = 17;
+const PROOF_PENDING_BASELINE = 11;
 
 // ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
 // 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
@@ -415,25 +415,19 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 格式非法,源提交不可改写,只豁免其不可变祖先。之后的新提交仍逐条走 trailer 门
   // (已 mutation 验证:tip 之上再加一条坏 trailer 的 fix(v5) 仍会红)。
   "8ab8a57c82eee96028fe4d9b1015d3593c9e9334",
-  // 2026-09-19 full forward sync freeze: selfhost 839ad4420 is live
-  // (rel-839ad4420-20260918-161252, live sourceCommit). The batch imports 626
-  // selfhost commits (OCV5-158..OCV5-225, web-react a11y/UI audit, apps/windows
-  // desktop, 0278/0279 migrations); several fix(v5) sources predate this gate and
-  // cannot be amended because they are already shipped. Only their immutable
-  // ancestors are exempted; commits after this tip still go through the trailer
-  // gate one by one.
-  "839ad442098f8e68e0b9fd2b0e8f01519334031e",
-  // 2026-09-19 chase: selfhost b019bfb00 (stuck restore banner) is on
-  // origin/feat/v5-selfhost and cannot be amended. Freeze this tip so the
-  // imported fix(v5) passes check:v5:incidents; later commits still gate.
+  // 2026-09-19: selfhost rel-b019bfb00-20260918-182002 is live (restore-banner
+  // fix(v5) shipped without Incident trailer). Freeze this tip only; cherry-picks
+  // after it still go through the trailer gate (OCV5-224 registered separately).
   "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
-  // 2026-09-20 full forward sync freeze: selfhost f4f143088 is live
-  // (origin/feat/v5-selfhost). Imports OCV5-232..242 (official CC switch/version
-  // pin, Sand Box default, Grok resume, extra-prompt tz, CC beta headers,
-  // Claude quota reset, opus-4-8 rewrite, false SERVICE_RESTART, expired-authority
-  // lease). Source SHAs cannot be amended; only immutable ancestors of this tip
-  // are exempted.
+  // 2026-10-01: 197735db7 was pushed to feat/v5-selfhost before the trailer
+  // gate ran. Shared branch forbids rewriting it. Deploy failed before it
+  // became live. Freeze this tip only; later commits still go through the gate.
+  "197735db77dfbf05280c526963ae04846544cabe",
+
+  // OCV5-308: preserve all immutable commercial fences and freeze imported selfhost history.
+  "839ad442098f8e68e0b9fd2b0e8f01519334031e",
   "f4f1430885612c9d377b7495831fb08375d0c6cb",
+  "3772295e774a6c50406e3d975f5136f590834be3",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
@@ -559,6 +553,15 @@ function checkTrailerClosure(): number {
     }
     trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
+      // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
+      // rewriting it. The waiver records the user-approved smoke-only fix.
+      const ticketWaiver = waivers.get(sha.slice(0, 8));
+      if (
+        sha === "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43"
+        && trailer === "OCV5-276"
+        && ticketWaiver
+        && ticketWaiver.expiresAt >= today
+      ) continue;
       fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
     }
     const incident = manifest.incidents.find((item) => item.id === trailer);

@@ -11,16 +11,17 @@ import {
 import type { MessageLike } from '@openclaude/storage'
 import { isPathWithinRoot } from './pathAcl.js'
 
-/** Phase-1 consult identity is proven only for CCB parent turns. */
-export const ADVISOR_CONSULT_PARENT_ENGINES = ['ccb'] as const
+/** Any catalog main engine may turn advisor mode on. Unknown engines stay closed. */
+export const ADVISOR_CONSULT_PARENT_ENGINES = ['ccb', 'codex', 'grok', 'cursor'] as const
 export const ADVISOR_CONSULT_PARENT_REASON =
-  '一期仅 CCB 主会话（如 glm/MiniMax）可咨询顾问。Codex/Grok/Cursor 主引擎尚未证明稳定 tool_use 身份，不能选择顾问后在 consult 上必失败。主模型不会因此被切换。'
+  '这个会话暂时不能开顾问。主模型不会被换掉。'
+const CONSULT_INVOCATION_RE = /^[A-Za-z0-9:_-]{8,128}$/
 
 export function isAdvisorConsultParentEngine(engine: string | undefined): boolean {
-  return engine === 'ccb'
+  return (ADVISOR_CONSULT_PARENT_ENGINES as readonly string[]).includes(engine ?? '')
 }
 
-/** Unknown parent engines fail closed. Phase-1 consult is CCB-only. */
+/** Unknown parent engines fail closed. Known main engines may enable advisor mode. */
 export function advisorConsultParentGate(engine: string | undefined | null): {
   allowed: boolean
   engine?: string
@@ -30,13 +31,54 @@ export function advisorConsultParentGate(engine: string | undefined | null): {
   if (!normalized) {
     return {
       allowed: false,
-      reason: '当前主会话引擎未知，不能开启顾问（fail closed）。主模型不会被切换。',
+      reason: '当前会话还不知道用的是哪个模型，暂时不能开顾问。主模型不会被换掉。',
     }
   }
   if (!isAdvisorConsultParentEngine(normalized)) {
     return { allowed: false, engine: normalized, reason: ADVISOR_CONSULT_PARENT_REASON }
   }
   return { allowed: true, engine: normalized }
+}
+
+export type LiveConsultTool = {
+  toolName?: string
+  toolUseId?: string
+  completed?: boolean
+  inputJson?: unknown
+}
+
+export function isConsultAdvisorToolName(name: string | undefined): boolean {
+  const trimmed = (name ?? '').trim()
+  return trimmed === 'consult_advisor' || trimmed.endsWith('__consult_advisor')
+}
+
+function commandRequestsConsult(input: unknown): boolean {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return false
+  const record = input as Record<string, unknown>
+  const command = typeof record.command === 'string'
+    ? record.command
+    : typeof record.cmd === 'string'
+      ? record.cmd
+      : ''
+  return /(^|[\s;&|`(])oc-memory\s+consult-advisor(?:\s|$)/.test(command)
+}
+
+/** Bind a retry identity to the single in-flight consult call. Never mint one. */
+export function uniquePendingConsultInvocationId(
+  tools: readonly LiveConsultTool[] | undefined,
+): { ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' } {
+  const pending = (tools ?? []).filter(
+    (tool) =>
+      tool.completed !== true &&
+      (isConsultAdvisorToolName(tool.toolName) ||
+        ((tool.toolName === 'Bash' || tool.toolName === 'Shell') && commandRequestsConsult(tool.inputJson))),
+  )
+  if (pending.length > 1) return { ok: false, reason: 'ambiguous' }
+  const id = pending.length === 1 && typeof pending[0]?.toolUseId === 'string'
+    ? pending[0].toolUseId.trim()
+    : ''
+  if (!id || !CONSULT_INVOCATION_RE.test(id)) return { ok: false, reason: 'none' }
+  return { ok: true, invocationId: id }
 }
 
 export const ADVISOR_PREAMBLE = [

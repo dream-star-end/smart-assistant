@@ -193,6 +193,7 @@ import {
   updateMsgStatus,
   updateSendEnabled,
 } from './websocket.js?v=501cba4f'
+import { bindGoalDock } from './goalDock.js?v=goal1cba4f'
 
 // ── Slash commands ──
 import {
@@ -3101,6 +3102,7 @@ async function runExistingSessionBootPipeline() {
 
 async function init() {
   _initVisualViewportHeightSync()
+  bindGoalDock()
   // Global retry-once for <img>/<audio>/<video> that 401 before the session
   // cookie handshake lands (e.g. the cookie fetch was slow on first boot).
   _installMediaErrorRetry()

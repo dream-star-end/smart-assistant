@@ -22,6 +22,7 @@
 
 import { readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, relative } from "node:path";
+import { parseShardBudget } from "../.github/scripts/integ-shard-budget.ts";
 
 const REPO_ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const TIER_DIR = join(REPO_ROOT, ".github", "integ-tiers");
@@ -92,6 +93,11 @@ if (!tiers.some((t) => t.name.startsWith("pr-"))) {
 for (const t of tiers) {
   if (t.minTests === null) violations.push(`R4  ${t.file} 缺 \`# min-tests: N\` 指令(判绿的执行下界)`);
   if (t.maxMinutes === null) violations.push(`R4  ${t.file} 缺 \`# max-minutes: N\` 指令(CI timeout 预算)`);
+  try {
+    parseShardBudget(readFileSync(join(REPO_ROOT, t.file), "utf8"), {});
+  } catch (error) {
+    violations.push(`R4  ${t.file} 预算无效: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 // R3 + R2

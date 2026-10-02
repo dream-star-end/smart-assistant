@@ -1512,7 +1512,7 @@ export function getDeferredToolsDeltaAttachment(
   messages: Message[] | undefined,
   scanContext?: DeferredToolsDeltaScanContext,
 ): Attachment[] {
-  if (!isDeferredToolsDeltaEnabled()) return []
+  if (!isDeferredToolsDeltaEnabled(model)) return []
   // These three checks mirror the sync parts of isSearchExtraToolsEnabled —
   // the attachment text says "available via SearchExtraTools", so SearchExtraTools
   // has to actually be in the request. The async auto-threshold check

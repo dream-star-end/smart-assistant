@@ -56,7 +56,11 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
     assert.match(deploy, /OC_CLAUDE_CODE_TZ "Asia\/Tokyo"/)
     assert.match(deploy, /install_unit "\$UNIT_DIR\/\$V5_CCB_PROXY_UNIT"/)
     assert.match(deploy, /install_unit "\$UNIT_DIR\/\$V5_CURSOR_PROXY_UNIT"/)
-    assert.match(deploy, /systemctl restart "\$V5_HOSTNET_UNIT"/)
+    // OCV5-306: restarting hostnet bounces both proxies (Requires=) mid-turn.
+    assert.doesNotMatch(deploy, /systemctl (try-)?restart "\$V5_HOSTNET_UNIT"/)
+    assert.match(deploy, /bash "\$BOOT_SCRIPT_DIR\/setup-host-net\.sh" v5/)
+    assert.match(deploy, /systemctl start "\$V5_HOSTNET_UNIT"/)
+    assert.doesNotMatch(deploy, /systemctl restart "\$V5_(CCB|CURSOR)_PROXY_UNIT"/)
     assert.match(deploy, /systemctl enable --now "\$V5_CCB_PROXY_UNIT"/)
     assert.match(
       deploy,

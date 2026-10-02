@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "baseUrl": "../..",
+    "paths": {
+      "@openclaude/gateway": ["packages/gateway/src/index.ts"],
+      "@openclaude/protocol": ["packages/protocol/src/index.ts"]
+    }
+  }
+}

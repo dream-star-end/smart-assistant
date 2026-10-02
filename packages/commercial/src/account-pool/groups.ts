@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { PoolClient } from "pg";
+import { codexTransportModelId, isCodexLongContextModel } from "@openclaude/protocol";
 
 import { encrypt, decryptToBuffer } from "../crypto/aead.js";
 import { loadKmsKey, zeroBuffer } from "../crypto/keys.js";
@@ -280,13 +281,27 @@ export async function getAccountGroup(id: bigint | string): Promise<AccountGroup
   return res.rows[0] ? parseGroup(res.rows[0]) : null;
 }
 
+/**
+ * Codex 1M twins (e.g. gpt-6.1-sol-1m) are billing tiers only: migrations
+ * 0238/0288/0292 deliberately bind just the standard id in
+ * account_group_models. Group lookup must therefore use the standard
+ * transport id, otherwise a 1M turn gets no route, the container spawns
+ * Codex without the official_oauth provider override, and Codex 0.159.2
+ * fails every turn with "workspace routing discovery failed".
+ */
+export function groupLookupModelId(modelId: string, provider?: AccountGroupProvider): string {
+  const id = normalizeModelId(modelId);
+  if (provider !== "codex" || !isCodexLongContextModel(id)) return id;
+  return normalizeModelId(codexTransportModelId(id) ?? id);
+}
+
 export async function listEnabledGroupsForModel(args: {
   modelId: string;
   kind?: AccountGroupKind;
   provider?: AccountGroupProvider;
   runner?: QueryRunner;
 }): Promise<AccountGroupRow[]> {
-  const params: unknown[] = [normalizeModelId(args.modelId)];
+  const params: unknown[] = [groupLookupModelId(args.modelId, args.provider)];
   const where = ["g.enabled = TRUE", "gm.model_id = $1"];
   if (args.kind !== undefined) {
     params.push(args.kind);

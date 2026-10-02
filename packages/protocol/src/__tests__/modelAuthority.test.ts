@@ -216,6 +216,37 @@ describe('verifyAuthority', () => {
     assert.deepEqual(got, p)
   })
 
+  it('ccb.contextOwner box-native-v1 在签名载荷内往返', () => {
+    const p = makePayload({
+      canonicalModel: 'box-api-claude-opus-5-5',
+      engine: 'ccb',
+      executionDescriptor: {
+        capabilityProfile: {
+          ccb: { capabilityZero: false, supportsThinking: true, contextOwner: 'box-native-v1' },
+        },
+        capabilitySchemaVersion: 1,
+        contextWindow: 200_000,
+        supportedEfforts: ['high'],
+        supportsVision: false,
+      },
+    })
+    const got = verifyAuthority(signAuthorityEnvelope(p), keyring, NOW + 1000)
+    assert.equal(
+      (got.executionDescriptor.capabilityProfile.ccb as { contextOwner?: string }).contextOwner,
+      'box-native-v1',
+    )
+  })
+
+  it('ccb.contextOwner 不是 box-native-v1 → BadShape', () => {
+    const p = makePayload({
+      executionDescriptor: {
+        ...makePayload().executionDescriptor,
+        capabilityProfile: { ccb: { contextOwner: 'self-reported' } },
+      },
+    })
+    expectCode(() => verifyAuthority(signAuthorityEnvelope(p), keyring, NOW + 1000), 'BadShape')
+  })
+
   it('Grok engine 签发 → 验签 → 载荷逐字段还原', () => {
     const p = makePayload({ canonicalModel: 'grok-build', engine: 'grok' })
     const got = verifyAuthority(signAuthorityEnvelope(p), keyring, NOW + 1000)

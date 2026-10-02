@@ -139,15 +139,16 @@ function error(res: ServerResponse, status: number, code: string, requestId: str
   res.end(JSON.stringify({ error: { code, message: grokRelayPublicMessage(code) }, requestId }))
 }
 
-function upstreamHeaders(req: IncomingMessage, accessToken: Buffer): Record<string, string> {
+const GROK_RELAY_MODEL_IDS = new Set(['grok-build', 'grok-build-fast'])
+
+function upstreamHeaders(req: IncomingMessage, accessToken: Buffer, modelId: string): Record<string, string> {
   const out: Record<string, string> = {
     authorization: `Bearer ${accessToken.toString('utf8')}`,
-    // These two headers are part of the official CLI proxy contract. Own them
-    // server-side so a container cannot route a billed grok-build turn to a
-    // different backend model or switch the proxy authentication mode.
+    // Own these server-side. A container cannot pick an arbitrary backend
+    // model; the override is the route's model, limited to the allowlist.
     'x-xai-token-auth': 'xai-grok-cli',
     'x-authenticateresponse': 'authenticate-response',
-    'x-grok-model-override': 'grok-build',
+    'x-grok-model-override': modelId,
     'x-grok-client-mode': 'headless',
   }
   for (const [rawKey, rawValue] of Object.entries(req.headers)) {
@@ -199,7 +200,7 @@ export function makeGrokRelayHandler(deps: {
       containerId: identity.containerId,
       userId: BigInt(identity.userId),
     })
-    if (!context || context.modelId !== 'grok-build') { error(res, 404, 'GROK_ROUTE_EXPIRED', requestId); return }
+    if (!context || !GROK_RELAY_MODEL_IDS.has(context.modelId)) { error(res, 404, 'GROK_ROUTE_EXPIRED', requestId); return }
     let accessToken: Buffer | null = null
     if (deps.renewSlot && !deps.renewSlot(context.accountId, context.slotId)) {
       error(res, 409, 'GROK_SLOT_LEASE_LOST', requestId)
@@ -225,7 +226,7 @@ export function makeGrokRelayHandler(deps: {
       const upstream = await (deps.requestFn ?? request)(`${GROK_OFFICIAL_UPSTREAM_BASE_URL}${suffix}${parsed.search}`, {
         method: method as 'GET' | 'POST',
         dispatcher: route.dispatcher,
-        headers: upstreamHeaders(req, accessToken),
+        headers: upstreamHeaders(req, accessToken, context.modelId),
         body: method === 'GET' ? undefined : req,
       })
       res.statusCode = upstream.statusCode

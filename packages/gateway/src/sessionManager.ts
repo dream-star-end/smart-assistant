@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import {
@@ -34,14 +34,84 @@ import {
 // 本文件只消费 engine 中立契约(EngineAdapter / EngineEvent / TurnSummary /
 // PartialSnapshot)。ccbAdapter / codexAdapter 的 import 兼有 registry 注册副作用
 // ('ccb' / 'codex' factory)。
+import {
+  abandonAllIdle,
+  advanceIdleOp,
+  boxTurnMayIdle,
+  consumeIdleReset,
+  currentIdleSource,
+  idleAbandonReason,
+  idleOpSettled,
+  idleProofWaitMs,
+  pruneIdleOps,
+  readIdleReset,
+  sourceNeedsIdleOp,
+  type IdleOp,
+  IDLE_COMPACT_PROMPT,
+  IdleCompactRejected,
+  idleHistoryStillBlocked,
+  idleSummaryAccepted,
+  nativeShortForOp,
+  clearIdleCandidate,
+  readIdleCandidate,
+  readIdleNative,
+  readIdleOp,
+  readPendingIdle,
+  startIdleOp,
+  writeIdleCandidate,
+  writeIdleNative,
+  writeIdleOp,
+} from './boxIdleCompact.js'
+import { fetchBoxIdleProof, type IdleProofResponse } from './engine/boxIdleProofClient.js'
+import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
+
+/** Background idle drain re-arms while proof stays pending (egress settling). */
+const IDLE_DRAIN_RETRIES = 6
+const IDLE_DRAIN_RETRY_MS = 30_000
+
+// OCV5-297 idle helpers: module level so finishIdleUnderLock needs no `this` state.
+/** Source proof is gone but an op is unfinished: only its own idle-turn
+ * evidence (egress failed, or runner shut down + unseen past grace) settles
+ * it. Never dispatches. */
+async function settleStrandedIdleOp(session: AgentSession, op: IdleOp, recoveryDir: string): Promise<void> {
+  if (op.summaryText || readIdleNative(recoveryDir, op.sourceSessionId, op.revision)?.summaryText) return
+  const idleProof = await fetchBoxIdleProof({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey })
+  // Same authoritative evidence as a live op; a missing native file alone
+  // does not prove nothing was sent. Otherwise only the operator reset exits.
+  const reason = idleAbandonReason(op, idleProof)
+  if (!reason) return
+  log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason })
+  writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: reason })
+}
+
+/** Persist an op; once settled, rotate old settled files for the session. */
+function writeSettledIdleOp(recoveryDir: string, op: IdleOp): void {
+  writeIdleOp(recoveryDir, op)
+  if (idleOpSettled(op)) pruneIdleOps(recoveryDir, op.sessionKey)
+}
+
+/** Bounded wait on a pending proof (1s, 2s, 4s, … within the budget). */
+async function waitBoxIdleProof(input: { sessionId: string; turnKey: string }): Promise<IdleProofResponse> {
+  const deadline = Date.now() + idleProofWaitMs()
+  let delay = 1000
+  for (;;) {
+    const proof = await fetchBoxIdleProof(input)
+    if (proof.status !== 'pending' || Date.now() + delay > deadline) return proof
+    await new Promise((resolve) => setTimeout(resolve, delay))
+    delay = Math.min(delay * 2, 8000)
+  }
+}
+
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
 import {
+  cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
   cursorResumeStoreExists,
   cursorSandResumeInnerId,
+  isCursorSandBoxCcResumeId,
   isAnyCursorSandResumeId,
   relocateCursorResumeStore,
   usableCursorResumeId,
@@ -81,7 +151,7 @@ import {
   mapTurnTerminalStatus,
   type TurnTerminalStatus,
 } from './turnUsage.js'
-import { emptyCompletedTurnAssistantText } from './emptyCompletedTurn.js'
+import { emptyCompletedTurnAssistantText, shouldFailClosedEmptyModelTurn } from './emptyCompletedTurn.js'
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
@@ -615,6 +685,19 @@ export function shouldEmitContextRebuilt(opts: {
  */
 export const IDLE_TIMEOUT_TOOL_MS = 15 * 60_000
 export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
+/** One admitted Box detached tool chain may live four hours. Give its owner
+ * turn five minutes to observe the keeper's terminal proof before interrupt. */
+export const BOX_ACTIVE_TURN_IDLE_MS = 4 * 60 * 60_000 + 5 * 60_000
+const BOX_CANONICAL_MODEL = 'box-api-claude-opus-5-5'
+
+function isBoxActiveTurn(engineId?: string, modelId?: string): boolean {
+  return engineId === 'ccb' && modelId === BOX_CANONICAL_MODEL
+}
+
+export function pickTurnSilentBackstopMs(engineId?: string, modelId?: string): number {
+  return isBoxActiveTurn(engineId, modelId)
+    ? BOX_ACTIVE_TURN_IDLE_MS : 30 * 60_000
+}
 
 /**
  * 给定 turn 当前的 backend-side 状态 + parser 未完成工具数,返回该 turn 此刻
@@ -634,7 +717,9 @@ export function pickIdleTimeoutMs(
   /** M1a:providerTag 泛化为 engine id('ccb' | 'codex')。codex 判定从旧
    *  'codex-native'(provider 语义)改为 'codex'(engine 语义),真值表不变。 */
   engineId?: string,
+  modelId?: string,
 ): number {
+  if (isBoxActiveTurn(engineId, modelId)) return BOX_ACTIVE_TURN_IDLE_MS
   const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||
     (typeof currentTurnStatus === 'object' && currentTurnStatus !== null)
@@ -960,6 +1045,14 @@ export interface AgentSession {
     expiresAt?: number
   }
   _lastNativeCompactionSummary?: string
+  /** Signed context owner for the turn that currently holds session.lock. */
+  _boxContextOwner?: string
+  /** Set while the lock-held idle path is inside runner.submitTurn. */
+  _idleRunning?: boolean
+  /** OCV5-297: internal idle compact turns currently using the runner. Not a
+   * client turn and not _activeTurnCount (prompt-queue admission asserts that
+   * one); lifecycle gates (recycle drain, model switch, preheat) read it. */
+  _idleInternalTurns?: number
   // CCB CronCreate bridge: maps tool_use_id/content_key → gateway cron job ID
   _cronBridgeMap?: Map<string, string>
   /** Set by onFinish when the CCB result row signals a stale --resume session
@@ -1242,6 +1335,26 @@ export {
  *  理解成用户新指令);这里显式附带原始意图:上一轮因上游瞬时错误被打断,应
  *  继续完成同一任务。导出供引擎回放测试引用同一权威串。 */
 export const TRANSIENT_RETRY_INPUT = '上一条消息因上游瞬时错误中断，请继续完成该任务。'
+
+/**
+ * CCB/Codex 轮内瞬时重试走 TRANSIENT_RETRY_INPUT,接同一 native session,
+ * 不是重放原用户口令。已完成的 Bash/MCP 因此不会再跑一遍。
+ *
+ * checkpointSafe 仍只给 Read/Glob/Grep 盖章;本谓词补上「会话还在 + 工具已
+ * 完成 + 无挂起权限」的续跑。没有 native session 时拒绝,避免变成重放。
+ */
+export function isNativeEngineTransientContinuationSafe(input: {
+  providerTag: string | undefined
+  nativeSessionId: string | null | undefined
+  ccbSessionId: string | null | undefined
+  permissionCount: number
+  tools: readonly { completed?: boolean }[]
+}): boolean {
+  if (input.providerTag !== 'ccb' && input.providerTag !== 'codex') return false
+  if (!input.nativeSessionId && !input.ccbSessionId) return false
+  if (input.permissionCount !== 0) return false
+  return input.tools.every((tool) => tool.completed !== false)
+}
 
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
@@ -1972,6 +2085,44 @@ export interface PromptQueueExecutionFence {
   release(): void
 }
 
+
+const USER_GOAL_OBJECTIVE_MAX = 4000
+
+/** Browser goal-bar mutation. Usage counters stay on the previous snapshot. */
+export function nextUserGoal(
+  current: GoalStateSnapshot | null,
+  sessionId: string,
+  action: 'set' | 'pause' | 'resume' | 'clear',
+  objective: string | undefined,
+): GoalStateSnapshot | 'noop' | 'rejected' {
+  const clean = typeof objective === 'string' ? objective.trim() : ''
+  if (clean.length > USER_GOAL_OBJECTIVE_MAX) return 'rejected'
+  const now = new Date().toISOString()
+  const text = action === 'set' ? clean : current?.objective || clean
+  if (action !== 'clear' && !text) return 'rejected'
+  if (action === 'clear' && current?.status === 'cleared') return 'noop'
+  if (action === 'pause' && current?.status === 'paused') return 'noop'
+  if (action === 'resume' && current?.status === 'active' && current.objective === text) return 'noop'
+  if (action === 'set' && current?.status === 'active' && current.objective === text) return 'noop'
+  const status = action === 'clear' ? 'cleared' : action === 'pause' ? 'paused' : 'active'
+  return {
+    sessionId,
+    goalId: current?.goalId ?? randomUUID(),
+    objective: text || current?.objective || ' ',
+    status,
+    tokenBudget: current?.tokenBudget ?? null,
+    creditBudget: current?.creditBudget ?? null,
+    tokensUsed: current?.tokensUsed ?? 0,
+    creditsUsed: current?.creditsUsed ?? '0',
+    timeUsedSeconds: current?.timeUsedSeconds ?? 0,
+    stateRevision: (current?.stateRevision ?? 0) + 1,
+    snapshotRevision: (current?.snapshotRevision ?? 0) + 1,
+    createdAt: current?.createdAt ?? now,
+    updatedAt: now,
+    statusChangedAt: current?.status === status ? current.statusChangedAt : now,
+  }
+}
+
 export class SessionManager {
   private sessions = new Map<string, AgentSession>()
   /** OCV5-180 B1 — `${ownerTurnKey}\0${runId}` → exact-owner logical-run
@@ -2097,6 +2248,34 @@ export class SessionManager {
    */
   setRepoSnapshotProvider(fn: (sessionId: string) => RepoSnapshot | null): void {
     this._getRepoSnapshot = fn
+  }
+
+  /** Browser goal bar: pause, resume, replace, or clear the session goal.
+   * Objective text is accepted only for set, or when this session has no
+   * platform snapshot yet. Usage counters and budgets stay server-owned. */
+  async applyUserGoalAction(
+    sessionKey: string,
+    action: 'set' | 'pause' | 'resume' | 'clear',
+    objective: string | undefined,
+  ): Promise<'applied' | 'noop' | 'rejected'> {
+    const session = this.sessions.get(sessionKey)
+    if (!session) return 'rejected'
+    const prev = session.lock
+    let release!: () => void
+    session.lock = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    try {
+      await prev
+      const next = nextUserGoal(session._platformGoal ?? null, session.peerId, action, objective)
+      if (next === 'rejected') return 'rejected'
+      if (next === 'noop') return 'noop'
+      session._platformGoal = next
+      await session.runner.setGoalState(next)
+      return 'applied'
+    } finally {
+      release()
+    }
   }
 
   /** Apply a master-authored goal update at the next session lock boundary.
@@ -2309,6 +2488,7 @@ export class SessionManager {
     for (const session of this.sessions.values()) {
       activeTurns += Math.max(0, session._activeTurnCount ?? 0)
       activeTurns += Math.max(0, session._activeClientTurnCount ?? 0)
+      activeTurns += Math.max(0, session._idleInternalTurns ?? 0)
     }
     if (activeTurns > 0) this.releaseRuntimeRecycleDrain()
     return { accepted: activeTurns === 0, activeTurns }
@@ -3295,8 +3475,34 @@ export class SessionManager {
   ): string | undefined {
     const id = this._resumeMap.get(sessionKey)
     if (!id) return undefined
-    const tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    let tag = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(sessionKey))
+    // A false "no transcript" drop used to delete the provider and let the
+    // live-session overlay save the same id back as implicit ccb. The Fast
+    // transcript is still on disk; a positive Grok artifact puts the tag back.
+    // An unknown probe has no path and must not retag a real ccb id.
+    if (tag !== wantProvider && wantProvider === 'grok' && tag === SessionManager.CCB_PROVIDER_TAG) {
+      const recovered = probeResumeArtifact('grok', id)
+      if (recovered.exists && recovered.path) {
+        this._resumeMapProvider.set(sessionKey, 'grok')
+        tag = 'grok'
+        this._saveResumeMap()
+      }
+    }
     if (tag !== wantProvider) return undefined
+
+    if (tag === 'cursor' && isCursorSandBoxCcResumeId(id)) {
+      if (!cursorSandBoxCcResumeInnerId(id)) {
+        log.warn('resume-map Cursor box Claude entry is malformed — dropping silently', {
+          sessionKey,
+          resumeId: id,
+        })
+        this._forgetResumeEntry(sessionKey)
+        this._saveResumeMap()
+        return undefined
+      }
+      // The JSONL is on the account box, not in this container.
+      return id
+    }
 
     if (tag === 'cursor' && isAnyCursorSandResumeId(id)) {
       const sandJsonlId = cursorSandResumeInnerId(id) ?? cursorSandOfficialCcResumeInnerId(id)
@@ -3363,10 +3569,26 @@ export class SessionManager {
       provider: tag,
       resumeId: id,
     })
+    if (tag === 'grok') this._releaseGrokResumeHead(sessionKey)
     this._forgetResumeEntry(sessionKey)
     this._saveResumeMap()
     return undefined
   }
+
+  /** A Grok id with no on-disk transcript must not stay --resume-able.
+   *  Clearing the live head before `_saveResumeMap` also stops the overlay
+   *  from writing that dead id back. */
+  private _releaseGrokResumeHead(sessionKey: string): void {
+    const live = this.sessions.get(sessionKey)
+    if (!live || live.providerTag !== 'grok') return
+    live.ccbSessionId = null
+    live.runner.clearSessionId()
+    live._historicalContextInjected = false
+    live._historicalContextInjectedKey = undefined
+    live._forceHistoricalContextOnFirstTurn = true
+    live._contextRebuildNotice = 'native-resume-loss'
+  }
+
 
   /** Same cwd projection CursorAdapter.spawnTurn uses: repo workspace when
    *  ready, otherwise the agent base dir. Wrapper --workspace is pwd -P of
@@ -3573,7 +3795,12 @@ export class SessionManager {
         }
         if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
         if (sess.costImprecise === true) entry.costImprecise = true
-        const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
+        // Provider map wins when set. When a drop just cleared it, fall back
+        // to the live engine so a Grok id is not rewritten as implicit ccb
+        // (historyContextVersion only) and then refused on the next lookup.
+        const prov = SessionManager.normalizeEngineTag(
+          this._resumeMapProvider.get(key) ?? sess.providerTag,
+        )
         if (prov === SessionManager.CCB_PROVIDER_TAG) {
           entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
         }
@@ -4416,7 +4643,8 @@ export class SessionManager {
     switchId: string,
   ): Promise<{ sourceModel: string; targetModel: string }> {
     if (!/^[A-Za-z0-9:_-]{8,128}$/.test(switchId)) throw new Error('MODEL_SWITCH_ID_INVALID')
-    if ((session._activeTurnCount ?? 0) > 0 || (session._activeClientTurnCount ?? 0) > 0) {
+    if ((session._activeTurnCount ?? 0) > 0 || (session._activeClientTurnCount ?? 0) > 0
+      || (session._idleInternalTurns ?? 0) > 0) {
       throw new Error('MODEL_SWITCH_SESSION_BUSY')
     }
     const sourceModel = session.model ?? session.runner.model
@@ -4479,6 +4707,273 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Idle while the caller owns session.lock. Never calls public submit.
+   * The op file is the dispatch claim: only its creator may send one summary.
+   * A later call applies a stored capsule and does not reserve another turn.
+   *
+   * OCV5-297: works only from durable state (candidate / pending op) — the
+   * candidate itself is written by the source turn's submit. Nothing here
+   * settles on wall-clock alone; an op is abandoned only on authoritative
+   * evidence (egress `failed`, or the CCB idle turn ended and egress still
+   * has no row after IDLE_STOPPED_GRACE_MS).
+   */
+  private async finishIdleUnderLock(session: AgentSession, source: {
+    sessionId: string
+    turnKey: string
+  }, recoveryDir: string = paths.home): Promise<void> {
+    if (session._idleRunning) return
+    const pending = readPendingIdle(recoveryDir, session.sessionKey)
+    if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
+    const proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
+    if (proof.status === 'skipped') {
+      // Not configured / invalid identity. Safe to drop only a bare candidate:
+      // no op exists, so no summary was dispatched and nothing can arrive late.
+      log.error('box idle proof unavailable', {
+        sessionKey: session.sessionKey, reason: proof.reason, pendingOp: Boolean(pending),
+      })
+      if (!pending) clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
+    }
+    if (proof.status === 'not_found' || proof.status === 'failed') {
+      // The source turn produced no Box result: nothing to compact.
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      if (!pending) return
+      await settleStrandedIdleOp(session, pending, recoveryDir)
+      return
+    }
+    if (proof.status !== 'terminal' && proof.status !== 'terminal_set') return
+    // Dispatch gate: a new op is created only when the leaf says the real
+    // context needs it (or OC_BOX_IDLE_COMPACT_ALWAYS=1). An op that already
+    // exists for this revision is always driven to settlement.
+    if (!readIdleOp(recoveryDir, session.sessionKey, proof.revision) && !sourceNeedsIdleOp(proof)) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
+    }
+    const started = startIdleOp({
+      dir: recoveryDir,
+      sessionKey: session.sessionKey,
+      sourceSessionId: source.sessionId,
+      sourceTurnKey: source.turnKey,
+      revision: proof.revision,
+      idleTurnKey: createHash('sha256').update(`${session.sessionKey}:${proof.revision}`).digest('hex'),
+      frozenTail: [],
+      attachments: [],
+    })
+    let op = started.op
+    if (idleOpSettled(op)) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      return
+    }
+    const native = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+    if (nativeShortForOp(native, {
+      idleTurnKey: op.idleTurnKey,
+      revision: proof.revision,
+      sourceSessionId: source.sessionId,
+    })) {
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'short' })
+      return
+    }
+    if (native?.frozenTail.length) op = { ...op, frozenTail: native.frozenTail, attachments: native.attachments }
+    const summaryProof = await fetchBoxIdleProof({
+      sessionId: source.sessionId, turnKey: op.idleTurnKey,
+    })
+    const abandon = native?.summaryText ? undefined : idleAbandonReason(op, summaryProof)
+    if (abandon) {
+      log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason: abandon })
+      clearIdleCandidate(recoveryDir, session.sessionKey)
+      writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: abandon })
+      return
+    }
+    const accepted = idleSummaryAccepted(summaryProof, {
+      sessionId: source.sessionId,
+      idleTurnKey: op.idleTurnKey,
+      nativeSummary: native?.summaryText,
+    })
+    if (accepted) {
+      op = {
+        ...op,
+        summaryText: accepted.summaryText,
+        capsuleSha256: accepted.capsuleSha256,
+      }
+      if (!native?.summaryText) {
+        writeIdleNative(recoveryDir, {
+          v: 1, opId: op.idleTurnKey, revision: op.revision, sessionId: source.sessionId,
+          summaryText: accepted.summaryText, modelCalls: native?.modelCalls ?? 1, modelStarted: true,
+          frozenTail: op.frozenTail, attachments: op.attachments,
+        })
+      }
+    }
+    let step = advanceIdleOp({
+      op,
+      proof,
+      allowDispatch: started.ownedDispatch && !op.summaryText && !native?.summaryText && !native?.modelStarted,
+    })
+    const needsApply = Boolean(step.op.summaryText && step.op.receiptDigest !== step.op.artifact?.digest)
+    if (step.callModel || needsApply) {
+      if (!readIdleNative(recoveryDir, source.sessionId, proof.revision)) {
+        writeIdleNative(recoveryDir, {
+          v: 1, opId: step.op.idleTurnKey, revision: step.op.revision, sessionId: source.sessionId,
+          ...(step.op.summaryText ? { summaryText: step.op.summaryText } : {}),
+          modelCalls: 0, frozenTail: step.op.frozenTail, attachments: step.op.attachments,
+        })
+      }
+      session._idleRunning = true
+      session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+      try {
+        const settled = await runBoxIdleTurn(session.runner, {
+          input: IDLE_COMPACT_PROMPT,
+          turnKey: step.op.idleTurnKey,
+          onEvent: () => {},
+          sessionTotals: session,
+          toolUseIdToName: session.toolUseIdToName ?? new Map(),
+        })
+        const receipt = settled?.nativeIdleReceipt
+        const after = readIdleNative(recoveryDir, source.sessionId, proof.revision)
+        if (nativeShortForOp(after, {
+          idleTurnKey: step.op.idleTurnKey,
+          revision: proof.revision,
+          sourceSessionId: source.sessionId,
+        })) {
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+          step = { ...step, op: { ...step.op, disposition: 'short' } }
+        } else if (!step.op.summaryText && after?.summaryText) {
+          const again = await fetchBoxIdleProof({
+            sessionId: source.sessionId, turnKey: step.op.idleTurnKey,
+          })
+          const confirmed = idleSummaryAccepted(again, {
+            sessionId: source.sessionId,
+            idleTurnKey: step.op.idleTurnKey,
+            nativeSummary: after.summaryText,
+          })
+          if (confirmed) {
+            step = advanceIdleOp({
+              op: {
+                ...step.op,
+                summaryText: confirmed.summaryText,
+                capsuleSha256: confirmed.capsuleSha256,
+                frozenTail: after.frozenTail.length ? after.frozenTail : step.op.frozenTail,
+                attachments: after.attachments,
+              },
+              proof,
+              allowDispatch: false,
+            })
+            if (step.op.artifact && step.op.receiptDigest !== step.op.artifact.digest) {
+              const applied = await runBoxIdleTurn(session.runner, {
+                input: IDLE_COMPACT_PROMPT,
+                turnKey: step.op.idleTurnKey,
+                onEvent: () => {},
+                sessionTotals: session,
+                toolUseIdToName: session.toolUseIdToName ?? new Map(),
+              })
+              const applyReceipt = applied?.nativeIdleReceipt
+              if (applyReceipt && applyReceipt.opId === step.op.idleTurnKey
+                && applyReceipt.digest === step.op.artifact.digest) {
+                step = { ...step, op: { ...step.op, receiptDigest: applyReceipt.digest } }
+                clearIdleCandidate(recoveryDir, session.sessionKey)
+              }
+            }
+          }
+        }
+        if (receipt && receipt.opId === step.op.idleTurnKey && step.op.artifact
+          && receipt.digest === step.op.artifact.digest) {
+          step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
+          clearIdleCandidate(recoveryDir, session.sessionKey)
+        }
+      } catch (idleErr) {
+        // Timeout, crash or error: never a result and never a re-dispatch
+        // (ownedDispatch is one-shot). Only a confirmed shutdown of the CCB
+        // runner is recorded as evidence that it can no longer send the
+        // compact request; a later `not_found` past the grace window then
+        // proves nothing was sent. Without it the op waits for egress proof
+        // or the operator reset.
+        let killed = idleErr instanceof IdleTurnTimeoutError && idleErr.killed
+        if (!killed && typeof session.runner.shutdown === 'function') {
+          killed = await session.runner.shutdown().then(() => true, () => false)
+        }
+        if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
+        log.warn('box idle turn ended without result', {
+          sessionKey: session.sessionKey, revision: step.op.revision,
+          timeout: idleErr instanceof IdleTurnTimeoutError, runnerKilled: killed,
+        }, idleErr)
+      } finally {
+        session._idleRunning = false
+        session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
+      }
+    }
+    writeSettledIdleOp(recoveryDir, step.op)
+  }
+
+  /**
+   * Run durable idle work after the user turn released session.lock. Queued
+   * behind the lock like recycle; from scheduling to release it is counted as
+   * an internal turn (not a client turn and not _activeTurnCount, so the
+   * prompt-queue admission invariant is untouched). Rereads disk state under
+   * the lock, so a submit that took the lock first has already handled or
+   * superseded it.
+   */
+  private scheduleIdleDrain(session: AgentSession, attempt = 0): void {
+    // Counted from the moment the drain joins the lock chain (like submit()
+    // counts _activeTurnCount before `await prev`) until it releases, so
+    // recycle / model switch / preheat never see this runner as idle while a
+    // drain is waiting, reading proof, or running the idle turn.
+    session._idleInternalTurns = (session._idleInternalTurns ?? 0) + 1
+    void (async () => {
+      const prev = session.lock
+      let release!: () => void
+      session.lock = new Promise<void>((resolve) => (release = resolve))
+      let again = false
+      try {
+        await prev
+        if (this.sessions.get(session.sessionKey) !== session
+          || session._plannedTeardown || session._replacing) return
+        const source = currentIdleSource(paths.home, session.sessionKey)
+        if (!source) return
+        await this.finishIdleUnderLock(session, source)
+        again = currentIdleSource(paths.home, session.sessionKey) !== undefined
+      } catch (err) {
+        again = true
+        if (!(err instanceof IdleCompactRejected)) {
+          log.warn('idle background drain failed', { sessionKey: session.sessionKey }, err)
+        }
+      } finally {
+        session._idleInternalTurns = Math.max(0, (session._idleInternalTurns ?? 0) - 1)
+        release()
+      }
+      if (again && attempt < IDLE_DRAIN_RETRIES) {
+        const timer = setTimeout(() => this.scheduleIdleDrain(session, attempt + 1), IDLE_DRAIN_RETRY_MS)
+        timer.unref?.()
+      }
+    })()
+  }
+
+  /** Operator exit (requestIdleReset): replace the native session, then
+   * abandon this session's unfinished idle work. Caller owns session.lock. */
+  private async applyIdleResetIfRequested(session: AgentSession): Promise<void> {
+    const marker = readIdleReset(paths.home, session.sessionKey)
+    if (!marker) return
+    if (marker === 'corrupt') {
+      log.error('box idle reset marker invalid; ignored', { sessionKey: session.sessionKey })
+      return
+    }
+    if (session.runner.isRunning) await session.runner.shutdown().catch(() => {})
+    const sessionKey = session.sessionKey
+    this._resumeMap.delete(sessionKey)
+    this._resumeMapTimestamps.delete(sessionKey)
+    this._resumeMapProvider.delete(sessionKey)
+    this._resumeMapLastCost.delete(sessionKey)
+    this._resumeMapCostImprecise.delete(sessionKey)
+    this._resumeMapHistory.delete(sessionKey)
+    session.ccbSessionId = null
+    session.runner.clearSessionId?.()
+    this._saveResumeMap()
+    const abandoned = abandonAllIdle(paths.home, sessionKey)
+    consumeIdleReset(paths.home, sessionKey)
+    pruneIdleOps(paths.home, sessionKey)
+    log.warn('box idle reset applied: native session replaced', { sessionKey, abandoned })
+  }
+
   cancelModelSwitch(session: AgentSession, switchId: string): boolean {
     const transition = session._modelSwitchTransition
     if (!transition || transition.id !== switchId || transition.state === 'consuming') return false
@@ -4517,7 +5012,8 @@ export class SessionManager {
     const runner = session.runner
     if (typeof runner.preheat !== 'function') return 'skipped_engine'
     if (runner.isRunning) return 'already_running'
-    if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+    if ((session._activeTurnCount ?? 0) > 0 || (session._idleInternalTurns ?? 0) > 0
+      || this._promptQueueHolds(session)) {
       return 'skipped_busy'
     }
     const existing = this._preheatInFlight.get(session.sessionKey)
@@ -4536,7 +5032,8 @@ export class SessionManager {
         // Re-check under the lock: a turn/teardown may have landed meanwhile.
         if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
         if (session.runner.isRunning) return 'already_running'
-        if ((session._activeTurnCount ?? 0) > 0 || this._promptQueueHolds(session)) {
+        if ((session._activeTurnCount ?? 0) > 0 || (session._idleInternalTurns ?? 0) > 0
+          || this._promptQueueHolds(session)) {
           return 'skipped_busy'
         }
         const deadlineMs = resolveEnginePreheatDeadlineMs()
@@ -4854,6 +5351,26 @@ export class SessionManager {
     session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
     try {
       await prev
+      if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
+      const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
+      const idleCandidate = readIdleCandidate(paths.home, session.sessionKey)
+      if ((pendingIdle || idleCandidate) && opts?.modelSwitchInternal === undefined) {
+        await this.finishIdleUnderLock(session, {
+          sessionId: pendingIdle?.sourceSessionId ?? idleCandidate!.sessionId,
+          turnKey: pendingIdle?.sourceTurnKey ?? idleCandidate!.turnKey,
+        })
+        const still = readIdleCandidate(paths.home, session.sessionKey)
+        const recovered = pendingIdle
+          ? readIdleOp(paths.home, session.sessionKey, pendingIdle.revision)
+          : undefined
+        if (idleHistoryStillBlocked({ candidate: still, pending: pendingIdle, recovered })) {
+          throw new IdleCompactRejected('IDLE_HISTORY_PENDING')
+        }
+      }
+      session._boxContextOwner = opts?.modelAuthority?.executionDescriptor &&
+        typeof (opts.modelAuthority.executionDescriptor as { contextOwner?: unknown }).contextOwner === 'string'
+        ? (opts.modelAuthority.executionDescriptor as { contextOwner: string }).contextOwner
+        : undefined
       // A deferred dispatch can be cancelled while its predecessor owns the lock.
       // Fence it before resume promotion / runner reconfiguration, not only before
       // submitTurn. This read does not replace the final queued -> running CAS:
@@ -5163,6 +5680,9 @@ export class SessionManager {
       }
       const spawnCwd = this._cursorWorkspacePathForSession(session)
       const liveNativeId = session.runner.nativeSessionId
+      const liveBoxId = session.providerTag === 'cursor'
+        ? cursorSandBoxCcResumeInnerId(liveNativeId)
+        : undefined
       const liveSandJsonlId =
         session.providerTag === 'cursor'
           ? (cursorSandResumeInnerId(liveNativeId) ??
@@ -5170,7 +5690,9 @@ export class SessionManager {
           : undefined
       const usableCursorId =
         session.providerTag === 'cursor'
-          ? liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
+          ? liveBoxId
+            ? (liveNativeId ?? undefined)
+            : liveSandJsonlId && this._ccbJsonlExists(liveSandJsonlId)
             ? (liveNativeId ?? undefined)
             : usableCursorResumeId({
                 workspacePath: spawnCwd,
@@ -5392,6 +5914,7 @@ export class SessionManager {
             session.currentTurnStatus,
             session.runner.pendingToolCalls,
             session.providerTag,
+            session.model,
           )
           if (
             shouldTripIdleWatchdog({
@@ -5553,6 +6076,28 @@ export class SessionManager {
           if (session._externalTurnAbort === logicalTurnAbort) {
             session._externalTurnAbort = undefined
           }
+          const idleSessionId = session.runner.nativeSessionId ?? undefined
+          const idleTurnKey = session._currentTurnKey
+          // OCV5-297: only record the durable candidate while holding the lock
+          // (cheap, and it blocks a following submit until handled). Proof,
+          // compaction and settlement run after release in scheduleIdleDrain.
+          let idleFollowUp = false
+          if (unhandledTurnError === undefined && idleSessionId && idleTurnKey
+            && opts?.modelSwitchInternal === undefined) {
+            try {
+              if (boxTurnMayIdle({ model: session.model, contextOwner: session._boxContextOwner })) {
+                writeIdleCandidate(paths.home, {
+                  v: 1, sessionKey: session.sessionKey, sessionId: idleSessionId, turnKey: idleTurnKey,
+                  createdAt: Date.now(),
+                })
+              }
+              idleFollowUp = currentIdleSource(paths.home, session.sessionKey) !== undefined
+            } catch (idleErr) {
+              if (!(idleErr instanceof IdleCompactRejected)) {
+                log.warn('idle compact failed closed', { sessionKey: session.sessionKey }, idleErr)
+              }
+            }
+          }
           session._activeTurnCount = Math.max(0, (session._activeTurnCount ?? 0) - 1)
           session._currentTurnKey = undefined
           session._currentTurnIndex = undefined
@@ -5563,6 +6108,7 @@ export class SessionManager {
             this._promptQueueExecutionKeys.delete(session.sessionKey)
           }
           release()
+          if (idleFollowUp) this.scheduleIdleDrain(session)
         }
       }
     }
@@ -6187,7 +6733,8 @@ export class SessionManager {
       // active tasks keep running while genuinely stuck turns still get interrupted.
       // Waiting for the user is not silence: re-arm instead of IDLE_TIMEOUT/waiver.
       // The 12h logical-turn hard limit in submit() is unchanged.
-      const IDLE_TIMEOUT_MS = 30 * 60 * 1000 // 30 min of silence from runner
+      const IDLE_TIMEOUT_MS = pickTurnSilentBackstopMs(
+        session.providerTag, session.model)
       const timer = setTimeout(() => {
         const fire = applyTurnIdleTimeoutTick({
           waitingForUserInput: runner.waitingForUserInput === true,
@@ -6195,7 +6742,9 @@ export class SessionManager {
           refresh: () => timer.refresh(),
         })
         if (!fire) return
-        const reason = '任务 30 分钟没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。'
+        const duration = IDLE_TIMEOUT_MS === BOX_ACTIVE_TURN_IDLE_MS
+          ? '4 小时 5 分钟' : '30 分钟'
+        const reason = `任务 ${duration}没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。`
         const persistence =
           requestTerminalPersistence?.('interrupted', reason, 'IDLE_TIMEOUT', 'idle_timeout') ??
           Promise.resolve()
@@ -6754,7 +7303,8 @@ export class SessionManager {
           }
 
           try {
-            runner.interrupt()
+            runner.interrupt(status === 'interrupted' && errorCode === 'USER_CANCELLED'
+              ? 'user' : 'system')
           } catch {}
 
           // Give a cooperative interrupt one short window to produce its own
@@ -6971,17 +7521,26 @@ export class SessionManager {
           result.thinkingSegments.length === 0 &&
           result.tools.length === 0 &&
           !contextOverflowHasUsage
+        const checkpointSafe = assessTurnRecoveryTape(
+          freezeTools(result?.tools ?? []).map((tool) => ({
+            role: 'tool',
+            ...tool,
+            // TurnToolEntry omits completed for a matched result; the
+            // durable recovery contract requires an explicit terminal bit.
+            _completed: tool.completed !== false,
+          })),
+        ).checkpointSafe
+        const nativeContinuationSafe = isNativeEngineTransientContinuationSafe({
+          providerTag: session.providerTag,
+          nativeSessionId: session.runner.nativeSessionId,
+          ccbSessionId: session.ccbSessionId,
+          permissionCount: turnPermissionCount,
+          tools: result?.tools ?? [],
+        })
+        // Native continuation is not a replay: TRANSIENT_RETRY_INPUT resumes
+        // the same engine session. Completed Bash is therefore safe here.
         const transientContinuationIsSafe =
-          turnPermissionCount === 0 &&
-          assessTurnRecoveryTape(
-            freezeTools(result?.tools ?? []).map((tool) => ({
-              role: 'tool',
-              ...tool,
-              // TurnToolEntry omits completed for a matched result; the
-              // durable recovery contract requires an explicit terminal bit.
-              _completed: tool.completed !== false,
-            })),
-          ).checkpointSafe
+          turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)
         if (
           result?.isError &&
           retryTransientErrors &&
@@ -7076,6 +7635,13 @@ export class SessionManager {
               result.errorDetail?.includes('"result":"codex app-server exited code=') === true))
             ? requestedTerminal
             : null
+        const systemInterruptionOverride =
+          requestedTerminal?.status === 'interrupted' &&
+          requestedTerminal.errorCode === 'SYSTEM_INTERRUPT' &&
+          (result?.stopReason === 'interrupted' ||
+            ccbUserCancellationResult || engineUserCancellationResult)
+            ? requestedTerminal
+            : null
         if (userCancellationOverride && terminalEngineBilling?.status === 'error') {
           // A forced Codex app-server shutdown reports a generic CODEX_ERROR
           // because the runner cannot know why its process was killed. At
@@ -7088,7 +7654,8 @@ export class SessionManager {
           }
         }
         let terminalOverride =
-          (requestedTerminal?.waiveReason ? requestedTerminal : userCancellationOverride) ??
+          (requestedTerminal?.waiveReason ? requestedTerminal
+            : userCancellationOverride ?? systemInterruptionOverride) ??
           (modelAuthorityFailure
             ? {
                 status: 'crashed' as const,
@@ -7220,6 +7787,42 @@ export class SessionManager {
           (result.usage.inputTokens > 0 ||
             result.usage.cacheReadTokens > 0 ||
             result.usage.cacheCreationTokens > 0)
+        ) {
+          terminalOverride = {
+            status: 'crashed',
+            reason: '任务未能产生有效回复。本轮已自动免单；请重新尝试。',
+            errorCode: 'NO_RESPONSE',
+            waiveReason: 'no_response',
+          }
+          retainTerminalError(
+            terminalOverride.status,
+            terminalOverride.reason,
+            terminalOverride.errorCode,
+          )
+        }
+
+        // 连一次模型调用的 token 都没有、也没有任何可见产出时，不能记成 completed
+        // 再补「本轮未能产出可见回复」。那句话会变成假正文，评价和操作栏都会贴上去。
+        const retryAssistantPreview = retryAssistantSegments
+          .map((segment) => segment.text)
+          .join('')
+        if (
+          !terminalOverride &&
+          result &&
+          shouldFailClosedEmptyModelTurn({
+            status: 'completed',
+            assistantText: `${retryAssistantPreview}${result.assistantText ?? ''}`,
+            outputTokens: result.usage.outputTokens,
+            inputTokens: result.usage.inputTokens,
+            cacheReadTokens: result.usage.cacheReadTokens,
+            cacheCreationTokens: result.usage.cacheCreationTokens,
+            toolCallCount: turnToolCallCount,
+            blockCount: turnBlockCount,
+            structuredBlockCount: structuredBlocks.length,
+            apiState: signals.apiState,
+            isSlashCommand,
+            isError: result.isError === true,
+          })
         ) {
           terminalOverride = {
             status: 'crashed',
@@ -7635,18 +8238,35 @@ export class SessionManager {
         settle(() => resolve())
       }
 
+      let runnerExitInfo: { signal: string | null; crashed?: boolean } | undefined
       const handleError = (err: Error) => {
         // All unexpected runner failures share one recovery-facing code.  The
         // immutable detail still preserves the concrete transport/process
         // error, while the Master can make one deterministic retry decision.
-        const planned = this.shouldClassifyExitAsServiceRestart(session)
-        const persistence =
-          requestTerminalPersistence?.(
+        // Wait past handleExit's 150ms drain so a planned SIGTERM is classified
+        // once. Emitting RUNNER_CRASHED first and SERVICE_RESTART second is what
+        // repainted the same turn from red to yellow. The diagnostic event is
+        // recorded immediately; only the client-visible terminal waits.
+        const plannedAtError = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+        retainTerminalError(
+          plannedAtError ? 'interrupted' : 'crashed',
+          err.message,
+          plannedAtError ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
+        )
+        const persistence = (async () => {
+          await new Promise<void>((resolveWait) => {
+            const timer = setTimeout(resolveWait, 200)
+            timer.unref?.()
+          })
+          if (terminalPersistenceClaim !== 'none' || turn?.finalized) return
+          const planned = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
+          await (requestTerminalPersistence?.(
             planned ? 'interrupted' : 'crashed',
             err.message,
             planned ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
             planned ? 'no_response' : undefined,
-          ) ?? Promise.resolve()
+          ) ?? Promise.resolve())
+        })()
         this._trackPersistence(persistence)
       }
 
@@ -7657,6 +8277,7 @@ export class SessionManager {
         signal: string | null
         crashed: boolean
       }) => {
+        runnerExitInfo = { signal: info.signal, crashed: info.crashed }
         // Normal lifecycle restarts (model/effort/toolset swaps and Codex
         // app-server route-token respawns) emit a clean `exit` before the turn
         // continues on the replacement process. Do not finalize/detach the
@@ -7774,18 +8395,20 @@ export class SessionManager {
     })
   }
 
-  interrupt(sessionKey: string): boolean {
+  interrupt(sessionKey: string, reason: 'user' | 'system' = 'system'): boolean {
     const s = this.sessions.get(sessionKey)
     if (!s) return false
     const external = s._externalTurnAbort
     if (external && !external.signal.aborted) external.abort()
     const persistActiveTurn = s._persistActiveTurn
     if (persistActiveTurn) {
-      const persistence = persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
+      const persistence = reason === 'user'
+        ? persistActiveTurn('interrupted', '本轮已由用户停止。', 'USER_CANCELLED')
+        : persistActiveTurn('interrupted', '本轮因系统调度中断。', 'SYSTEM_INTERRUPT')
       this._trackPersistence(persistence)
       return true
     }
-    const runnerInterrupted = s.runner.interrupt()
+    const runnerInterrupted = s.runner.interrupt(reason)
     return !!external || runnerInterrupted
   }
 
@@ -7794,7 +8417,7 @@ export class SessionManager {
   interruptExact(sessionKey: string, turnKey: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._currentTurnKey !== turnKey) return false
-    return this.interrupt(sessionKey)
+    return this.interrupt(sessionKey, 'user')
   }
 
   /** Browser Stop fence: only interrupt the turn that owns this exact
@@ -7802,7 +8425,7 @@ export class SessionManager {
   interruptClientTurn(sessionKey: string, clientMessageId: string): boolean {
     const session = this.sessions.get(sessionKey)
     if (!session || session._runningClientMessageId !== clientMessageId) return false
-    return this.interrupt(sessionKey)
+    return this.interrupt(sessionKey, 'user')
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {

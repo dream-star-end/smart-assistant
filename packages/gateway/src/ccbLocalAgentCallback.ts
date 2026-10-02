@@ -18,6 +18,8 @@ export { parseOriginWebchatSessionKey }
 
 const SUMMARY_MAX = 800
 const PENDING_MAX = 1024
+/** Same status+summary inside one session is one notice, not a second turn. */
+const DUPLICATE_NOTICE_WINDOW_MS = 2 * 60_000
 
 /** Max finalize-time 12-retry windows before a pending inject is abandoned. */
 export const CCB_LOCAL_AGENT_INJECT_MAX_FINALIZE_ROUNDS = 5
@@ -50,6 +52,28 @@ type PendingEntry = {
 }
 
 const store = new Map<string, PendingEntry>()
+
+/** tool_use_ids whose Bash tool_result was already delivered in the foreground. */
+const foregroundBashToolUses = new Map<string, Set<string>>()
+const FOREGROUND_BASH_IDS_MAX = 512
+
+/**
+ * Not a foreground delivery. CLI 2.1.280: "Command did not complete within its
+ * … moved to the background (ID: …)". Vendored BashTool appends
+ * "was moved to the background with ID:" / "running in background with ID:".
+ */
+const BACKGROUND_BASH_RESULT =
+  /moved to the background(?:[\s\S]{0,120}\(ID:| with ID:)|running in background with ID:|backgrounded by user with ID:/i
+
+export const CCB_FOREGROUND_BASH_ALREADY_DELIVERED =
+  'foreground_bash_tool_result_already_delivered'
+
+export type CcbForegroundBashDrop = {
+  sessionKey: string
+  taskId: string
+  toolUseId: string
+  reason: typeof CCB_FOREGROUND_BASH_ALREADY_DELIVERED
+}
 
 export function ccbLocalAgentCallbackClientMessageId(taskId: string): string {
   const compact = taskId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 80)
@@ -190,6 +214,31 @@ export function noteCcbLocalAgentFinalizeRoundExhausted(
  * model answer) and CCB will never ack it. Record pending and wait for ack
  * or parent-turn finalize.
  */
+function noticeIdentity(notification: CcbLocalAgentNotification): string {
+  return `${notification.status.trim()}\n${notification.summary.trim()}`
+}
+
+/** A second bookend with the same status and summary is the same notice. */
+export function isDuplicateRecentLocalAgentNotice(
+  sessionKey: string,
+  notification: CcbLocalAgentNotification,
+  now = Date.now(),
+): boolean {
+  const summary = notification.summary.trim()
+  if (!summary) return false
+  const identity = noticeIdentity(notification)
+  const taskId = notification.taskId.trim()
+  for (const entry of store.values()) {
+    if (entry.sessionKey !== sessionKey) continue
+    if (entry.taskId === taskId) continue
+    if (!entry.payload.summary.trim()) continue
+    if (noticeIdentity(entry.payload) !== identity) continue
+    if (now - entry.firstSeenAt > DUPLICATE_NOTICE_WINDOW_MS) continue
+    return true
+  }
+  return false
+}
+
 export function noteCcbTaskNotification(opts: {
   sessionKey: string
   notification: CcbLocalAgentNotification
@@ -198,6 +247,9 @@ export function noteCcbTaskNotification(opts: {
 }): CcbLocalAgentCallbackDecision {
   const taskId = opts.notification.taskId.trim()
   if (!taskId) return 'noop'
+  if (isDuplicateRecentLocalAgentNotice(opts.sessionKey, { ...opts.notification, taskId })) {
+    return 'noop'
+  }
   const key = ccbLocalAgentPendingKey(opts.sessionKey, taskId)
   const existing = store.get(key)
   if (existing?.state === 'delivered') return 'noop'
@@ -244,6 +296,79 @@ export function ackCcbTaskNotificationDelivered(opts: {
   })
   evictIfNeeded()
   return 'acked'
+}
+
+/** True when this Bash tool_result is the foreground result the model already has. */
+export function isForegroundDeliveredBashToolResult(input: {
+  toolName?: string
+  output?: string
+  parentToolUseId?: string
+}): boolean {
+  if (input.parentToolUseId) return false
+  if (input.toolName !== 'Bash') return false
+  return !BACKGROUND_BASH_RESULT.test(input.output ?? '')
+}
+
+/**
+ * Record a parser tool_result block. No-op unless it is a foreground Bash
+ * delivery. Called as the block is observed; the bookend is not dropped here.
+ */
+export function noteForegroundBashToolResult(opts: {
+  sessionKey: string
+  toolUseId?: string
+  toolName?: string
+  output?: string
+  parentToolUseId?: string
+}): boolean {
+  const toolUseId = opts.toolUseId?.trim() ?? ''
+  if (!toolUseId || !opts.sessionKey) return false
+  if (!isForegroundDeliveredBashToolResult(opts)) return false
+  let ids = foregroundBashToolUses.get(opts.sessionKey)
+  if (!ids) {
+    ids = new Set()
+    foregroundBashToolUses.set(opts.sessionKey, ids)
+  }
+  if (ids.has(toolUseId)) return true
+  ids.add(toolUseId)
+  while (ids.size > FOREGROUND_BASH_IDS_MAX) {
+    const oldest = ids.keys().next().value
+    if (!oldest) break
+    ids.delete(oldest)
+  }
+  return true
+}
+
+function dropForegroundDeliveredBashCallbacks(sessionKey: string): CcbForegroundBashDrop[] {
+  const ids = foregroundBashToolUses.get(sessionKey)
+  if (!ids || ids.size === 0) return []
+  const dropped: CcbForegroundBashDrop[] = []
+  for (const entry of store.values()) {
+    if (entry.sessionKey !== sessionKey || entry.state !== 'pending') continue
+    const toolUseId = entry.payload.toolUseId?.trim() ?? ''
+    // Missing tool_use_id stays pending and injects. Do not guess.
+    if (!toolUseId || !ids.has(toolUseId)) continue
+    entry.state = 'delivered'
+    dropped.push({
+      sessionKey,
+      taskId: entry.taskId,
+      toolUseId,
+      reason: CCB_FOREGROUND_BASH_ALREADY_DELIVERED,
+    })
+  }
+  return dropped
+}
+
+/**
+ * Finalize flush. Drops pending bookends whose Bash tool_use_id was already
+ * delivered as a foreground tool_result, then returns whatever is still pending.
+ * Decision is here, not at note time: the bookend can arrive before tool_result.
+ */
+export function finalizeCcbLocalAgentPendingInjections(sessionKey: string): {
+  inject: Array<{ payload: CcbLocalAgentNotification; userId?: string }>
+  dropped: CcbForegroundBashDrop[]
+} {
+  const dropped = dropForegroundDeliveredBashCallbacks(sessionKey)
+  return { inject: takePendingInjectionsForSession(sessionKey), dropped }
 }
 
 export function takePendingInjectionsForSession(sessionKey: string): Array<{
@@ -294,10 +419,12 @@ export function clearCcbLocalAgentPendingForSession(sessionKey: string): void {
   for (const [key, entry] of store) {
     if (entry.sessionKey === sessionKey) store.delete(key)
   }
+  foregroundBashToolUses.delete(sessionKey)
 }
 
 export function resetCcbLocalAgentCallbackDedupeForTest(): void {
   store.clear()
+  foregroundBashToolUses.clear()
 }
 
 export function ccbLocalAgentPendingSizeForTest(): number {

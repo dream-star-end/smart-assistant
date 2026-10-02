@@ -4018,6 +4018,45 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # KL has no 127.0.0.1:55432. Do not ssh this probe and do not read
+  # DATABASE_URL. Commercial does not assume the controller fixture.
+  # The candidate is a git archive of full_sha; the gate hashes that tree.
+  # Do not write flavor.manifest.json and do not borrow checkout/donor deps.
+  box_dsn="${OC_V5_PROOF_TEST_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
+  if [[ -z "$box_dsn" ]]; then
+    echo "✗ box success recovery: explicit test DSN required (OC_V5_PROOF_TEST_DATABASE_URL or TEST_DATABASE_URL); no commercial default fixture" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)"
+  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
+    echo "✗ box success recovery: git archive $full_sha failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
+    echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha"); then
+    echo "✗ pinned box success recovery behavioral gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha"); then
+    echo "✗ pinned box multitool continuation gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
     echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
@@ -8639,15 +8678,15 @@ activate_staged_inner() {
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.153.3" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.153.3" >&2; exit 1;
+    [[ "$image_codex_version" == "0.159.2" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.159.2" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.153.3" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.153.3'" >&2; exit 1;
+    [[ "$actual_codex_version" == "codex-cli 0.159.2" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.159.2'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
     [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {

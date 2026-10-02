@@ -286,6 +286,7 @@ import {
   historyFromSessionMessages,
   isAdvisorConsultParentEngine,
   isAdvisorEngineOpen,
+  uniquePendingConsultInvocationId,
   isCcbAdvisorModelProven,
   listProvenAdvisorModels,
   matchConsultIdentity,
@@ -391,10 +392,11 @@ import {
   evaluateCcbLocalAgentInjectLimit,
   failCcbLocalAgentInject,
   getCcbLocalAgentCallbackState,
+  finalizeCcbLocalAgentPendingInjections,
   noteCcbLocalAgentFinalizeRoundExhausted,
   noteCcbTaskNotification,
+  noteForegroundBashToolResult,
   sessionHasInFlightTurn,
-  takePendingInjectionsForSession,
   type CcbLocalAgentNotification,
 } from './ccbLocalAgentCallback.js'
 import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
@@ -570,7 +572,7 @@ import {
   mergeOnDemandToolsets,
   resolveDelegateToolsets,
 } from './toolsetIntent.js'
-import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
+import { projectCcbExecutionDescriptor, resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import {
   handleV3CodexRelayLocal,
   readV3CodexRelayConfig,
@@ -12054,7 +12056,7 @@ export class Gateway {
         interrupted = descendantInterrupted || interrupted
         continue
       }
-      interrupted = this.sessions.interrupt(childSessionKey) || descendantInterrupted || interrupted
+      interrupted = this.sessions.interrupt(childSessionKey, 'user') || descendantInterrupted || interrupted
     }
     if (childSessionKeys.size === 0) this._activeDelegationsByParent.delete(parentSessionKey)
     this.log.info('interrupt_delegations', {
@@ -12394,6 +12396,21 @@ export class Gateway {
     }
   }
 
+  private async _invocationFromLiveConsultTool(parent: {
+    runner?: { getPartialSnapshot?: () => { completedTools?: unknown[] } }
+  } | undefined): Promise<{ ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' }> {
+    const read = () => {
+      const tools = parent?.runner?.getPartialSnapshot?.()?.completedTools
+      return uniquePendingConsultInvocationId(Array.isArray(tools) ? (tools as never) : [])
+    }
+    let found = read()
+    for (let i = 0; !found.ok && found.reason === 'none' && i < 8; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      found = read()
+    }
+    return found
+  }
+
   private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!isEngineLocalTurnExempt()) return this.sendError(res, 404, 'advisor consult is selfhost only')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
@@ -12415,9 +12432,21 @@ export class Gateway {
     }
     const claims = inspected.claims
     const invocationRaw = req.headers[CONSULT_INVOCATION_HEADER]
-    const invocationId = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim()
-    if (!invocationId || !/^[A-Za-z0-9:_-]{8,128}$/.test(invocationId)) {
-      return this.sendError(res, 400, 'x-openclaude-consult-invocation required')
+    const headerInvocation = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim() ?? ''
+    if (headerInvocation && !/^[A-Za-z0-9:_-]{8,128}$/.test(headerInvocation)) {
+      return this.sendError(res, 400, 'x-openclaude-consult-invocation invalid')
+    }
+    let invocationId = headerInvocation
+    if (!invocationId) {
+      const liveParent = this.sessions?.getByKey(claims.sessionKey)
+      const bound = await this._invocationFromLiveConsultTool(liveParent)
+      if (!bound.ok) {
+        const message = bound.reason === 'ambiguous'
+          ? '这一轮有多次顾问提问叠在一起，请一次只问一个。主模型不会被切换。'
+          : '这次顾问提问还没对上同一次调用，请再问一次。主模型不会被切换。'
+        return this.sendError(res, 409, message)
+      }
+      invocationId = bound.invocationId
     }
     const userId = String(this.getUserId(req) ?? '')
     if (!userId) return this.sendError(res, 401, 'missing user')
@@ -16303,8 +16332,16 @@ export class Gateway {
   private flushCcbLocalAgentPendingOnFinalize(
     session: { sessionKey: string; userId?: string },
   ): void {
-    const due = takePendingInjectionsForSession(session.sessionKey)
-    for (const item of due) {
+    const { inject, dropped } = finalizeCcbLocalAgentPendingInjections(session.sessionKey)
+    for (const item of dropped) {
+      this.log.info('ccb local-agent callback dropped', {
+        sessionKey: item.sessionKey,
+        taskId: item.taskId,
+        toolUseId: item.toolUseId,
+        reason: item.reason,
+      })
+    }
+    for (const item of inject) {
       this.queueCcbLocalAgentInject(session.sessionKey, item.payload, item.userId ?? session.userId)
     }
   }
@@ -17859,6 +17896,26 @@ export class Gateway {
       } else if (frame.type === 'inbound.goal_sync') {
         if (!isFromBridge) return
         await this.sessions.syncGoalState(frame.goal.sessionId, frame.goal)
+      } else if ((frame as any).type === 'inbound.control.goal') {
+        const goalFrame = frame as any
+        const goalAction = goalFrame.action
+        if (
+          goalAction !== 'set' &&
+          goalAction !== 'pause' &&
+          goalAction !== 'resume' &&
+          goalAction !== 'clear'
+        ) return
+        const goalPeer = goalFrame.peer
+        if (!goalPeer || typeof goalPeer.id !== 'string' || typeof goalFrame.channel !== 'string') return
+        const goalAgentId = typeof goalFrame.agentId === 'string' && goalFrame.agentId
+          ? goalFrame.agentId
+          : 'main'
+        const goalKind = typeof goalPeer.kind === 'string' && goalPeer.kind ? goalPeer.kind : 'dm'
+        const goalSessionKey = `agent:${goalAgentId}:${goalFrame.channel}:${goalKind}:${goalPeer.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`
+        const goalSession = this.sessions.getByKey(goalSessionKey)
+        if (!goalSession || goalSession.userId !== this.getWsUserId(ws)) return
+        const goalObjective = typeof goalFrame.objective === 'string' ? goalFrame.objective : undefined
+        await this.sessions.applyUserGoalAction(goalSessionKey, goalAction, goalObjective)
       } else if (frame.type === 'inbound.control.stop') {
         const applied = await this.handleStop(frame)
         const controlId = (frame as unknown as { controlId?: unknown }).controlId
@@ -18340,7 +18397,7 @@ export class Gateway {
         let interrupted = false
         for (const live of this.sessions.list()) {
           if (!live.sessionKey.endsWith(suffix)) continue
-          const selfInterrupted = this.sessions.interrupt(live.sessionKey)
+          const selfInterrupted = this.sessions.interrupt(live.sessionKey, 'user')
           const delegateInterrupted = this._interruptDelegationsForParent(live.sessionKey)
           if (selfInterrupted) this._settlePendingPermissionsForStop(live.sessionKey)
           interrupted = selfInterrupted || delegateInterrupted || interrupted
@@ -18360,7 +18417,7 @@ export class Gateway {
         sessionKey = routed.sessionKey
       }
     }
-    const selfInterrupted = this.sessions.interrupt(sessionKey)
+    const selfInterrupted = this.sessions.interrupt(sessionKey, 'user')
     const delegateInterrupted = this._interruptDelegationsForParent(sessionKey)
     if (selfInterrupted) this._settlePendingPermissionsForStop(sessionKey)
     let ok = selfInterrupted || delegateInterrupted
@@ -18370,7 +18427,7 @@ export class Gateway {
     if (!ok && frame.agentId) {
       for (const live of this.sessions.list()) {
         if (!live.sessionKey.endsWith(suffix)) continue
-        const fallbackSelf = this.sessions.interrupt(live.sessionKey)
+        const fallbackSelf = this.sessions.interrupt(live.sessionKey, 'user')
         const fallbackDelegates = this._interruptDelegationsForParent(live.sessionKey)
         if (fallbackSelf) this._settlePendingPermissionsForStop(live.sessionKey)
         ok = fallbackSelf || fallbackDelegates || ok
@@ -21658,6 +21715,15 @@ export class Gateway {
         // 必须放在 _apiErrorIntercepted guard 之前:本 turn 先启动 bg bash 再
         // 命中 API_ERROR 时,parser 已允许 finalized 后的 bash_output_tail 进来,
         // 这里若被 API_ERROR 吞掉,前端会再次卡在第一行——回归到修复前的症状。
+        if (b?.kind === 'tool_result') {
+          noteForegroundBashToolResult({
+            sessionKey,
+            toolUseId: typeof b.toolUseBlockId === 'string' ? b.toolUseBlockId : '',
+            toolName: typeof b.toolName === 'string' ? b.toolName : undefined,
+            output: typeof b.output === 'string' ? b.output : '',
+            parentToolUseId: typeof b.parentToolUseId === 'string' ? b.parentToolUseId : undefined,
+          })
+        }
         const isTail = b?.kind === 'tool_output_tail'
         if (isTail) {
           if (liveWechatAdapter) {
@@ -22135,18 +22201,13 @@ export class Gateway {
             modelAuthority: {
               authorityEnvelope: turnAuthority.authorityEnvelope,
               leaseEnvelope: turnAuthority.leaseEnvelope,
-              executionDescriptor: {
+              executionDescriptor: projectCcbExecutionDescriptor({
                 canonicalModel: turnAuthority.canonicalModel,
                 contextWindow: turnAuthority.contextWindow,
-                capabilityZero:
-                  (turnAuthority.capabilityProfile.ccb as { capabilityZero?: unknown } | undefined)
-                    ?.capabilityZero === true,
-                supportsThinking:
-                  (turnAuthority.capabilityProfile.ccb as { supportsThinking?: unknown } | undefined)
-                    ?.supportsThinking === true,
                 supportsVision: turnAuthority.supportsVision,
-                supportedEfforts: [...turnAuthority.supportedEfforts],
-              },
+                supportedEfforts: turnAuthority.supportedEfforts,
+                capabilityProfile: turnAuthority.capabilityProfile,
+              }),
             },
           }
         : {}),

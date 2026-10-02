@@ -516,6 +516,74 @@ describe('delegate engine-billing runtime', () => {
     assert.equal(journalCalls.length, 1)
   })
 
+  it('admits a 155-char taskboard parentSessionId and keeps it for settle', async () => {
+    assert.equal(TASKBOARD_SESSION_KEY_155.length, 155)
+    const { runtime, journalCalls } = makeRuntime()
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: 'gpt-5.6-sol',
+        engine: 'codex',
+        agentId: 'auditor',
+        delegateAgentId: 'auditor',
+        sessionKey: 'agent:auditor:delegate:stage-triage:1',
+        parentSessionId: TASKBOARD_SESSION_KEY_155,
+      },
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    const ctx = journalCalls[0] as { ctxJson: { parentSessionId?: string } }
+    assert.equal(ctx.ctxJson.parentSessionId, TASKBOARD_SESSION_KEY_155)
+    assert.equal(
+      resolveDelegateBillingAttribution(
+        { parentSessionId: TASKBOARD_SESSION_KEY_155 },
+        {},
+      ).parentSessionId,
+      TASKBOARD_SESSION_KEY_155,
+    )
+  })
+
+  it('rejects an over-long or illegal parentSessionId before the journal', async () => {
+    const { runtime, journalCalls } = makeRuntime()
+    const base = {
+      model: 'gpt-5.6-sol',
+      engine: 'codex',
+      agentId: 'auditor',
+      delegateAgentId: 'auditor',
+      sessionKey: 'agent:auditor:delegate:stage-triage:1',
+    }
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            ...base,
+            parentSessionId: 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1),
+          },
+        }),
+      /INVALID_PARENTSESSIONID/,
+    )
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            ...base,
+            parentSessionId: `${TASKBOARD_SESSION_KEY_155.slice(0, 154)}/`,
+          },
+        }),
+      /INVALID_PARENTSESSIONID/,
+    )
+    assert.equal(journalCalls.length, 0)
+    const dropped = resolveDelegateBillingAttribution(
+      { parentSessionId: 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1) },
+      { parentSessionId: TASKBOARD_SESSION_KEY_155 },
+    )
+    assert.equal(dropped.parentSessionId, TASKBOARD_SESSION_KEY_155)
+  })
+
   it('rejects illegal sessionKey characters and empty string', async () => {
     const { runtime, journalCalls } = makeRuntime()
     await assert.rejects(

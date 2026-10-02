@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { CURSOR_ENGINE_MODELS } from '../../../protocol/src/engineModels.js'
 import { uniqueCursorAccountIdFromSlotResults } from '../account-pool/cursorQuota.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..')
@@ -792,6 +793,31 @@ describe('oc-cursor wrapper', () => {
     }
   })
 
+  test('accepts the Cursor Grok 4.7 upstream ids and rejects unlisted siblings', () => {
+    const f = fixture()
+    for (const model of [
+      'grok-4.7-low',
+      'grok-4.7-high',
+      'grok-4.7-xhigh-fast',
+    ]) {
+      const result = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, result.stderr)
+    }
+    for (const model of ['grok-4.7', 'grok-4.7-max', 'cursor-grok-4.7-high']) {
+      const blocked = spawnSync(f.wrapper, ['--model', model, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(blocked.status, 2, model)
+      assert.match(blocked.stderr, /model is not allowlisted/)
+    }
+  })
+
   test('accepts the Cursor Grok 4.6 High Fast upstream id', () => {
     const f = fixture()
     const result = spawnSync(f.wrapper, ['--model', 'cursor-grok-4.6-high-fast', '--', 'hello'], {
@@ -859,10 +885,27 @@ describe('oc-cursor wrapper', () => {
     }
   })
 
+  test('accepts every declared Box Claude upstream model before a turn starts', () => {
+    const f = fixture()
+    const boxModels = CURSOR_ENGINE_MODELS.filter((model) => model.id.startsWith('box-claude-'))
+    assert.ok(boxModels.length > 0)
+    for (const model of boxModels) {
+      assert.ok(model.upstreamModel)
+      const result = spawnSync(f.wrapper, ['--model', model.upstreamModel, '--', 'hello'], {
+        cwd: f.dir,
+        env: f.env,
+        encoding: 'utf8',
+      })
+      assert.equal(result.status, 0, `${model.id} -> ${model.upstreamModel}: ${result.stderr}`)
+    }
+  })
+
   test('accepts Sand-probed Haiku 4.5, Gemini 3.1 Pro and GPT-5.6 Luna ids', () => {
     const f = fixture()
     for (const model of [
       'claude-haiku-4-5',
+      'claude-opus-5-5',
+      'claude-sonnet-5',
       'gemini-3.1-pro',
       'gpt-5.6-luna-low',
       'gpt-5.6-luna-high-fast',

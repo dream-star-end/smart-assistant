@@ -236,5 +236,8 @@ describe("ChatHeader compact navigation", () => {
     const row = screen.getByTestId("chat-model-row");
     expect(row).toContainElement(screen.getByRole("button", {name: "选择对话模型"}));
     expect(row).not.toContainElement(screen.getByRole("button", {name: "会话内查找"}));
+    // OCV5-295:窄屏模型行不再铺整宽灰底胶囊。
+    expect(row).not.toHaveClass("bg-hover/50");
+    expect(row).not.toHaveClass("rounded-xl");
   });
 });

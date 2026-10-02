@@ -1,0 +1,124 @@
+/** Bind the next authenticated Messages request to every tool_use from the
+ * completed Box model message. This is validation only: tool execution stays
+ * in OpenClaude's user container, and publication needs a separate durable CAS. */
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import type { ProxyBody } from "./shared.js";
+import type { BoxToolUse } from "./boxCliToolHandoff.js";
+import { hashBoxToolInput, type BoxToolUseDigest } from "./boxToolInputHash.js";
+import { normalizeBoxSemanticBody, normalizeBoxToolResultBlock,
+  strictBoxImageBlock } from "./boxCacheAnnotations.js";
+import type { BoxToolCatalog } from "./boxToolCatalog.js";
+import { inputSchemaFor, selectStoredToolInput } from "./boxToolInputEcho.js";
+
+const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
+// Leave room for the sidecar result envelope under its 8 MiB frame bound.
+const MAX_RESULT_BYTES = 8 * 1024 * 1024 - 4096;
+type McpContent = { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string };
+export interface BoxMatchedToolResult {
+  readonly modelToolUseId: string;
+  readonly content: readonly McpContent[];
+  readonly isError: boolean;
+  readonly contentHash: string;
+}
+export class BoxToolResultMatchError extends Error {
+  constructor(readonly code: string) { super(code); this.name = "BoxToolResultMatchError"; }
+}
+function record(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+function content(value: unknown): McpContent[] {
+  const blocks = typeof value === "string" ? [{ type: "text", text: value }] : value;
+  if (!Array.isArray(blocks) || blocks.length > 64) {
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTENT_INVALID");
+  }
+  const out: McpContent[] = [];
+  for (const block of blocks) {
+    if (!record(block)) throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTENT_INVALID");
+    if (block.type === "text" && typeof block.text === "string"
+      && Object.keys(block).sort().join(",") === "text,type") {
+      out.push({ type: "text", text: block.text });
+      continue;
+    }
+    const image = strictBoxImageBlock(block);
+    if (image) {
+      out.push({ type: "image", data: image.data, mimeType: image.mimeType });
+      continue;
+    }
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTENT_INVALID");
+  }
+  if (Buffer.byteLength(JSON.stringify(out)) > MAX_RESULT_BYTES) {
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_TOO_LARGE");
+  }
+  return out;
+}
+
+export function matchPreparedToolResults(prepared: { effectiveBody: ProxyBody | null },
+  expected: readonly (BoxToolUse | BoxToolUseDigest)[],
+  catalog?: BoxToolCatalog): readonly BoxMatchedToolResult[] {
+  if (!prepared.effectiveBody) throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
+  return matchBoxToolResults(prepared.effectiveBody, expected, catalog);
+}
+
+export function matchBoxToolResults(body: ProxyBody,
+  expected: readonly (BoxToolUse | BoxToolUseDigest)[],
+  catalog?: BoxToolCatalog): readonly BoxMatchedToolResult[] {
+  const effective = normalizeBoxSemanticBody(body);
+  if (!Array.isArray(expected) || expected.length < 1 || expected.length > 32
+    || !Array.isArray(effective.messages) || effective.messages.length < 2) {
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
+  }
+  const assistant = effective.messages.at(-2), user = effective.messages.at(-1);
+  if (!record(assistant) || assistant.role !== "assistant"
+    || !Array.isArray(assistant.content) || !record(user) || user.role !== "user"
+    || !Array.isArray(user.content)) {
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_CONTEXT_INVALID");
+  }
+  const uses = assistant.content.filter((block: unknown) => record(block) && block.type === "tool_use");
+  if (uses.length !== expected.length || user.content.length !== expected.length) {
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_SET_MISMATCH");
+  }
+  for (let i = 0; i < expected.length; i++) {
+    const use = uses[i];
+    const prior = expected[i]!;
+    let sameInput = false;
+    if (record(use)) {
+      try { sameInput = "inputHash" in prior
+        ? (hashBoxToolInput(use.input) === prior.inputHash || (catalog !== undefined
+          && selectStoredToolInput(use.input, prior.inputHash, prior.clientName,
+            inputSchemaFor(catalog, prior.clientName)) !== null))
+        : isDeepStrictEqual(use.input, prior.input); }
+      catch { sameInput = false; }
+    }
+    if (!record(use) || typeof prior.id !== "string" || !TOOL_ID.test(prior.id)
+      || use.id !== prior.id || use.name !== prior.clientName
+      || !sameInput) {
+      throw new BoxToolResultMatchError("BOX_TOOL_RESULT_HISTORY_MISMATCH");
+    }
+  }
+  const byId = new Map<string, BoxMatchedToolResult>();
+  for (const raw of user.content) {
+    let block: unknown;
+    try { block = normalizeBoxToolResultBlock(raw); }
+    catch { throw new BoxToolResultMatchError("BOX_TOOL_RESULT_SET_MISMATCH"); }
+    if (!record(block) || block.type !== "tool_result"
+      || typeof block.tool_use_id !== "string" || !TOOL_ID.test(block.tool_use_id)
+      || Object.keys(block).some((key) =>
+        key !== "type" && key !== "tool_use_id" && key !== "content" && key !== "is_error")
+      || (block.is_error !== undefined && typeof block.is_error !== "boolean")
+      || byId.has(block.tool_use_id)) {
+      throw new BoxToolResultMatchError("BOX_TOOL_RESULT_SET_MISMATCH");
+    }
+    const normalized = content(block.content);
+    const isError = block.is_error === true;
+    const contentHash = createHash("sha256").update(JSON.stringify({
+      content: normalized, isError })).digest("hex");
+    byId.set(block.tool_use_id, { modelToolUseId: block.tool_use_id,
+      content: normalized, isError, contentHash });
+  }
+  if (byId.size !== expected.length || expected.some((use) => !byId.has(use.id))) {
+    throw new BoxToolResultMatchError("BOX_TOOL_RESULT_SET_MISMATCH");
+  }
+  return expected.map((use) => byId.get(use.id)!);
+}

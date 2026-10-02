@@ -105,14 +105,15 @@ export function ToolCard({
       className={cn(
         // 不带外边距——间距交由容器（MessageList 的 gap / AgentGroupCard 的 space-y）统一控制，
         // 避免 margin 与父级 gap 叠加导致卡片间距过大（boss 反馈"卡片间距好大"的根因之一）。
-        "overflow-hidden rounded-md border bg-surface shadow-[0_1px_2px_rgba(0,0,0,0.025)] transition-colors",
+        // 无投影:一列工具卡靠 1px 细框 + 圆角成组,投影叠起来会显脏。
+        "overflow-hidden rounded-md border bg-surface transition-colors",
         hasError
           ? "border-danger/25"
           : isBlocked
             ? "border-warning/35"
             : isRunning
-              ? "border-accent/25"
-              : "border-border hover:border-border-strong",
+              ? "border-accent/30"
+              : "border-border/80 hover:border-border-strong",
         isActive && "ring-1 ring-accent/40",
       )}
     >
@@ -130,20 +131,20 @@ export function ToolCard({
             }
           : {})}
         className={cn(
-          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-          hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/70",
+          "flex min-h-10 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+          hasBody && "cursor-pointer hover:bg-hover/60 active:bg-active/60",
         )}
       >
         <span
           className={cn(
-            "flex size-7 shrink-0 items-center justify-center rounded-lg",
+            "flex size-6 shrink-0 items-center justify-center rounded-[7px]",
             toneTileClass(meta.tone),
           )}
         >
-          <Icon size={14} />
+          <Icon size={13} />
         </span>
         {/* 窄屏(L7):标题限宽、摘要优先截断,右侧徽章区 shrink-0 保持完整可见。 */}
-        <span id={labelId} className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-semibold text-fg">
+        <span id={labelId} className="min-w-0 max-w-[45%] shrink-0 truncate text-body font-medium text-fg">
           {meta.label}
         </span>
         {summary && (
@@ -151,7 +152,7 @@ export function ToolCard({
             id={summaryId}
             // 有错误首行时,窄屏把整行让给错误(T-11):摘要藏起来,错误首行单独占表头下一行。
             className={cn(
-              "min-w-0 truncate font-mono text-xs text-muted",
+              "min-w-0 truncate font-mono text-[12px] text-muted",
               errorFirstLine && "hidden sm:inline",
             )}
             title={summary}
@@ -183,17 +184,18 @@ export function ToolCard({
             ) : isCancelled ? (
               <Badge tone="neutral">{status.label}</Badge>
             ) : (
-              <Badge tone="success" className="gap-1.5">
-                <Check size={11} aria-hidden="true" />
-                {status.label}
-              </Badge>
+              // 成功是常态,不再每行挂一枚绿色胶囊:只留一个低调对勾,文案给读屏(sr-only)。
+              <span className="flex size-5 items-center justify-center text-success" title={status.label}>
+                <Check size={14} strokeWidth={2.25} aria-hidden="true" />
+                <span className="sr-only">{status.label}</span>
+              </span>
             )}
           </span>
           {hasBody && (
             <ChevronRight
               size={15}
               aria-hidden="true"
-              className={cn("text-faint transition-transform", open && "rotate-90")}
+              className={cn("text-faint transition-transform duration-200 ease-[var(--ease-spring)]", open && "rotate-90")}
             />
           )}
         </span>
@@ -227,7 +229,7 @@ export function ToolCard({
         </div>
       )}
       {open && hasBody && (
-        <div className="border-t border-border/80 bg-bg/35 px-3 py-2 [&>*:first-child]:mt-0">
+        <div className="border-t border-border/70 bg-bg/40 px-3 py-2 [&>*:first-child]:mt-0">
           <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>
             <ToolHeaderLabelContext.Provider value={meta.label}>
               <ToolBody name={name} input={input} tool={renderTool} />

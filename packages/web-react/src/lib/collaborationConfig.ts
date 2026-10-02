@@ -54,7 +54,7 @@ export const EMPTY_COLLAB_UI: CollabUiState = {
 
 /** 父引擎不支持顾问时的默认说明。服务端若返回 advisorConsultParentReason 则优先生效。 */
 export const ADVISOR_PARENT_BLOCK_REASON =
-  "当前模型不能向顾问提问。把顶栏模型换成 GLM 或 MiniMax 后再试。主模型不会被换成别的。";
+  "这个会话暂时不能开顾问。主模型不会被换掉。";
 
 export const ADVISOR_ENABLED_HINT = "主模型不变，只多一个出主意的顾问";
 

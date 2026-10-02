@@ -420,6 +420,15 @@ describe('OutboundError schema', () => {
       true,
     )
   })
+  it('accepts model_not_available', () => {
+    assert.equal(
+      Value.Check(OutboundError, {
+        ...(baseOutboundError() as object),
+        code: 'model_not_available',
+      }),
+      true,
+    )
+  })
   it('accepts valid traceId', () => {
     assert.equal(
       Value.Check(OutboundError, { ...(baseOutboundError() as object), traceId: VALID_TRACE }),

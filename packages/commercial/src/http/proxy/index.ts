@@ -40,6 +40,9 @@ import {
   makeFinalizer,
   startInflightJournal,
 } from "../../billing/proxyBilling.js";
+import { serializeBillingPricing } from "../../billing/persistedBillingPricing.js";
+import { serializeBoxBillingContext } from "./boxBillingContext.js";
+import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import {
   resolveAuthorityTurnDispatchSponsorship,
   admitVerificationSponsorship,
@@ -47,7 +50,7 @@ import {
   type VerificationSponsorshipSnapshot,
 } from "../../billing/verificationSponsorship.js";
 import { getDispatchByBillingRequestId } from "../../dispatch/turnDispatchStore.js";
-import { checkRateLimit } from "../../middleware/rateLimit.js";
+import { checkRateLimit, type RateLimitConfig } from "../../middleware/rateLimit.js";
 import {
   UnroutableProviderError,
   checkCapabilityWithinCeiling,
@@ -93,14 +96,19 @@ import {
   DEFAULT_PROXY_RATE_LIMIT,
   DEFAULT_MAX_CONCURRENT_PER_UID,
   MAX_BODY_BYTES_DEFAULT,
+  MAX_BODY_BYTES_HARD_CEILING,
+  PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
+  PROXY_BYTE_BUDGET_LEGACY,
   proxyBodySchema,
-  enforceFieldByteBudgets,
+  enforcePreAuthByteCeiling,
+  enforceVerifiedProxyBudget,
   estimateInputTokens,
   estimateContextInputTokens,
   estimateMaxCostBothSides,
   extractUsageAttribution,
   stripUsageAttributionKeys,
-  readBoundedJson,
+  readBoundedJsonMeasured,
+  runWithVerifiedProxyByteBudget,
   sendJsonError,
   stripNonTextContentBlocks,
   errMessageShort,
@@ -110,6 +118,12 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip } from "./core.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./boxNativeContextOwner.js";
+import { validateBoxRequest } from "./boxRequestGate.js";
+import { waitForBoxReplay } from "./boxReplayWait.js";
+import { prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
+import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -285,10 +299,32 @@ export function makeAnthropicProxyHandler(
   // 2026-04-21 安全审计 HIGH#3:Redis 抖动时的兜底限流(cap = Redis cap 的 1/3,
   // 向下取整至少 1;窗口同 Redis 以便行为连续)。Redis 正常时这个 map 始终空,
   // 不占资源;Redis 异常时它是最后一道防线。
-  const fallbackCap = Math.max(1, Math.floor(rateLimitCfg.max / 3));
+  // OCV5-297: with a Box rate configured, the pre-body check is only a coarse
+  // ceiling (shared + Box). After route selection each class is counted on
+  // its own key so general traffic cannot consume the Box budget and vice
+  // versa. Without a Box rate this is exactly the previous single check.
+  const boxRateCfg = deps.boxRateLimit;
+  const preReadRateCfg: RateLimitConfig = boxRateCfg
+    ? { ...rateLimitCfg, max: rateLimitCfg.max + boxRateCfg.max } : rateLimitCfg;
+  const generalRateCfg: RateLimitConfig = { ...rateLimitCfg, scope: `${rateLimitCfg.scope}_general` };
+  const fallbackCap = Math.max(1, Math.floor(preReadRateCfg.max / 3));
   const fallbackLimiter = deps.fallbackLimiter
-    ?? new FallbackRateLimiter(rateLimitCfg.windowSeconds, fallbackCap);
+    ?? new FallbackRateLimiter(preReadRateCfg.windowSeconds, fallbackCap);
+  const boxFallbackLimiter = boxRateCfg
+    ? new FallbackRateLimiter(boxRateCfg.windowSeconds, Math.max(1, Math.floor(boxRateCfg.max / 3)))
+    : null;
+  const generalFallbackLimiter = boxRateCfg
+    ? new FallbackRateLimiter(rateLimitCfg.windowSeconds, Math.max(1, Math.floor(rateLimitCfg.max / 3)))
+    : null;
+  const boxConcurrency = deps.boxConcurrencyLimiter;
+  // count_tokens stays on the legacy 16 MiB cap. /v1/messages may buffer the
+  // fixed 24 MiB ceiling before signature, then subdivides. An explicit
+  // deps.maxBodyBytes never raises the ceiling above 24 MiB.
   const maxBodyBytes = deps.maxBodyBytes ?? MAX_BODY_BYTES_DEFAULT;
+  const messageReadCeiling = Math.min(
+    deps.maxBodyBytes ?? MAX_BODY_BYTES_HARD_CEILING,
+    MAX_BODY_BYTES_HARD_CEILING,
+  );
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -383,7 +419,7 @@ export function makeAnthropicProxyHandler(
     try {
       const decision = await checkRateLimit(
         deps.rateLimitRedis,
-        rateLimitCfg,
+        preReadRateCfg,
         `uid:${uid.toString()}`,
       );
       if (!decision.allowed) {
@@ -417,27 +453,54 @@ export function makeAnthropicProxyHandler(
           "RATE_LIMITED",
           "rate limit fallback engaged (redis degraded)",
           requestId,
-          { "Retry-After": String(rateLimitCfg.windowSeconds) },
+          { "Retry-After": String(preReadRateCfg.windowSeconds) },
         );
         return;
       }
     }
 
+    /** Post-route class rate check. Returns false after sending 429. */
+    const passClassRate = async (cfg: RateLimitConfig,
+      fallback: FallbackRateLimiter, label: string): Promise<boolean> => {
+      try {
+        const decision = await checkRateLimit(deps.rateLimitRedis, cfg, `uid:${uid.toString()}`);
+        if (decision.allowed) return true;
+        userLog.warn("proxy_rate_limited", { count: decision.count, class: label });
+        incrAnthropicProxyReject("rate_limited");
+        sendJsonError(res, 429, "RATE_LIMITED", "too many requests, slow down", requestId,
+          { "Retry-After": String(decision.retryAfterSeconds) });
+        return false;
+      } catch (err) {
+        userLog.error("proxy_rate_limit_redis_failed", { err: errSummary(err), class: label });
+        if (fallback.tryAcquire(`uid:${uid.toString()}`)) return true;
+        incrAnthropicProxyReject("rate_limited");
+        sendJsonError(res, 429, "RATE_LIMITED", "rate limit fallback engaged (redis degraded)",
+          requestId, { "Retry-After": String(cfg.windowSeconds) });
+        return false;
+      }
+    };
+
     // 3) per-uid 并发上限
-    const releaseSlot = concurrency.acquire(`uid:${uid.toString()}`);
-    if (!releaseSlot) {
+    // Replaced by the Box pool slot once the route is known to be Box.
+    const sharedSlot = concurrency.acquire(`uid:${uid.toString()}`);
+    if (!sharedSlot) {
       userLog.warn("proxy_concurrency_full", { max: deps.maxConcurrentPerUid ?? DEFAULT_MAX_CONCURRENT_PER_UID });
       incrAnthropicProxyReject("concurrency");
       sendJsonError(res, 429, "CONCURRENT_LIMIT", "too many concurrent requests", requestId);
       return;
     }
+    let releaseSlot: () => void = sharedSlot;
 
     try {
-      // 4) 读 + parse + 校验 body
+      // 4) 读 + parse + 校验 body.
+      // 身份已过、签名未过:这里按固定硬上限分配,不看能力头,也不看 body.model。
+      // 超硬上限在读完前 413。签后才把 8/16 与 16/24 分开。
       let body: ProxyBody;
+      let rawBodyBytes = 0;
       try {
-        const raw = await readBoundedJson(req, maxBodyBytes);
-        const parsed = proxyBodySchema.safeParse(raw);
+        const measured = await readBoundedJsonMeasured(req, messageReadCeiling);
+        rawBodyBytes = measured.byteLength;
+        const parsed = proxyBodySchema.safeParse(measured.value);
         if (!parsed.success) {
           userLog.warn("proxy_body_schema_failed", { issues: parsed.error.issues });
           incrAnthropicProxyReject("bad_body");
@@ -445,7 +508,7 @@ export function makeAnthropicProxyHandler(
           return;
         }
         body = parsed.data;
-        enforceFieldByteBudgets(body);
+        enforcePreAuthByteCeiling(body, rawBodyBytes);
       } catch (err) {
         if (err instanceof HttpError) {
           userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
@@ -454,6 +517,37 @@ export function makeAnthropicProxyHandler(
           return;
         }
         throw err;
+      }
+
+      // `box-api-` 前缀不是放行。它只让可能走受信 Box 的请求先活过 legacy
+      // 8/16,好把签名和 catalog 路由判完。判完仍不是 Box / 无能力 / 未就绪
+      // 的,下面会按 legacy 拒绝。其它模型在进 gate 前就受原预算。
+      const deferLegacyUntilVerifiedBox = deps.modelCatalog != null
+        && deps.modelAuthorityEnforce === true
+        && body.model.startsWith("box-api-");
+      const rejectOverBudget = (budget: typeof PROXY_BYTE_BUDGET_LEGACY): boolean => {
+        try {
+          enforceVerifiedProxyBudget(body, rawBodyBytes, budget);
+          return false;
+        } catch (err) {
+          if (err instanceof HttpError) {
+            userLog.warn("proxy_body_rejected", { status: err.status, code: err.code });
+            incrAnthropicProxyReject(httpErrToReject(err));
+            sendJsonError(res, err.status, err.code, err.message, requestId);
+            return true;
+          }
+          throw err;
+        }
+      };
+      if (!deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
+
+      // A non-streaming request is never a fresh paid model dispatch. Only
+      // Box can use it to retrieve the exact prior round; reject it before
+      // Cursor external (which branches off ahead of the regular provider).
+      if (body.stream === false && !body.model.startsWith("box-api-")) {
+        incrAnthropicProxyReject("bad_body");
+        sendJsonError(res, 400, "BAD_BODY", "invalid request body", requestId);
+        return;
       }
 
       // 4-pre) 0277 单 key 名义积分上限(仅 API key identity 携带 apiKey 快照)。
@@ -570,6 +664,7 @@ export function makeAnthropicProxyHandler(
           });
         } catch (err) {
           if (err instanceof ModelGateReject) {
+            if (deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
             userLog.warn("proxy_model_authority_rejected", {
               kind: err.kind,
               code: err.code,
@@ -728,6 +823,7 @@ export function makeAnthropicProxyHandler(
         );
       } catch (err) {
         if (err instanceof UnroutableProviderError) {
+          if (deferLegacyUntilVerifiedBox && rejectOverBudget(PROXY_BYTE_BUDGET_LEGACY)) return;
           // 配置事故:catalog 里写了本进程不认识的 provider 机制。静默回落 OAuth 会把它发到
           // Anthropic 账号池上烧真钱 → 响亮 503 + error 日志(运维必须去修 catalog 行)。
           userLog.error("proxy_unroutable_provider", {
@@ -776,11 +872,127 @@ export function makeAnthropicProxyHandler(
         ? gate.descriptor.capabilityProfile.supportsVision
         : route.kind === "static"
           ? route.provider.supportsVision === true
-          : true;
+          : route.kind !== "box";
+      // Same ready bit issuance uses (default false). OC_BOX_MODEL_API only arms
+      // the transport; it does not prove the signed capability. Local catalog
+      // can select the limited budget without becoming a live-chain owner.
+      const byteBudget = selectBoxNativeByteBudget({
+        authorityKind: gate?.authorityKind,
+        routeKind: route.kind,
+        canonicalModel: gate?.descriptor.canonicalModel,
+        providerId: gate?.descriptor.providerId,
+        declaredContextOwner: gate?.descriptor.capabilityProfile.ccb.contextOwner,
+        verifiedSignedContextOwner: gate?.verifiedSignedContextOwner ?? null,
+        routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
+        containerId: containerIdBig,
+        externalApiKey: identity.apiKey != null,
+        transportConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
+      }) === "box-native-v1"
+        ? PROXY_BYTE_BUDGET_BOX_NATIVE_V1
+        : PROXY_BYTE_BUDGET_LEGACY;
+      if (deferLegacyUntilVerifiedBox && rejectOverBudget(byteBudget)) return;
+      // OCV5-297: a Box request holds its slot for the whole remote run, so it
+      // moves from the shared per-uid pool (sized for short requests) to the
+      // Box pool. Without an injected Box pool nothing changes.
+      if (route.kind === "box" && boxConcurrency) {
+        const releaseBox = boxConcurrency.acquire(`box:uid:${uid.toString()}`);
+        if (!releaseBox) {
+          userLog.warn("proxy_box_concurrency_full", { max: boxConcurrency.maxPerKey });
+          incrAnthropicProxyReject("concurrency");
+          sendJsonError(res, 429, "CONCURRENT_LIMIT", "too many concurrent requests", requestId);
+          return;
+        }
+        releaseSlot();
+        releaseSlot = releaseBox;
+      }
+      if (boxRateCfg && boxFallbackLimiter && generalFallbackLimiter) {
+        const passed = route.kind === "box"
+          ? await passClassRate(boxRateCfg, boxFallbackLimiter, "box")
+          : await passClassRate(generalRateCfg, generalFallbackLimiter, "general");
+        if (!passed) return;
+      }
+      // Same-round replay is a read-only path before account selection,
+      // preCheck, the generic inflight journal and the SSE finalizer. A
+      // disabled Box launch flag does not erase already completed capsules.
+      let boxPrepared: PreparedContinuation | undefined;
+      if (route.kind === "box") {
+        boxPrepared = runWithVerifiedProxyByteBudget(byteBudget, () => prepareBoxContinuation({
+          uid, canonicalModel: body.model, rawBody: body,
+          authorityKind: gate?.authorityKind ?? "local_catalog",
+          authorityTurnId: gate?.authorityTurnId ?? null,
+        }));
+        if (deps.boxReplay) {
+          let replay: Awaited<ReturnType<NonNullable<typeof deps.boxReplay>["lookup"]>>;
+          try {
+            // CCB 2.1.280's messages.create non-streaming fallback OMITS the
+            // stream key rather than sending false. Only the original paid
+            // stream:true shape may proceed to a fresh Box launch.
+            const replayBody = structuredClone(body);
+            if (replayBody.stream !== true) replayBody.stream = false;
+            const lookupReplay = () => runWithVerifiedProxyByteBudget(byteBudget, () => deps.boxReplay!.lookup({
+              uid, canonicalModel: body.model,
+              canonicalBody: replayBody, upstreamModel: route.upstreamModel,
+              trustedAuthority: boxPrepared!.authority, prepared: boxPrepared,
+            }));
+            replay = await lookupReplay();
+            const pendingWait = deps.boxReplay.pendingWait;
+            if (replay.kind === "pending" && pendingWait) {
+              const gone = new AbortController();
+              const onClose = (): void => { if (!res.writableEnded) gone.abort(); };
+              res.once("close", onClose);
+              try {
+                replay = await waitForBoxReplay(replay, lookupReplay,
+                  { ...pendingWait, signal: gone.signal });
+              } finally { res.off("close", onClose); }
+              if (gone.signal.aborted) return;
+            }
+          } catch (error) {
+            if (error instanceof BoxDurableJournalError
+              && (error.code === "BOX_AUTHORITY_REJECTED"
+                || error.code === "BOX_AUTHORITY_MALFORMED")) {
+              sendJsonError(res, 409, error.code, "authority binding rejected", requestId);
+              return;
+            }
+            userLog.warn("proxy_box_replay_unavailable", { err: errSummary(error) });
+            sendJsonError(res, 503, "BOX_REPLAY_UNAVAILABLE",
+              "previous Box response unavailable", requestId);
+            return;
+          }
+          if (replay.kind === "ready") {
+            const bytes = Buffer.from(await replay.response.arrayBuffer());
+            const headers: Record<string, string> = {};
+            replay.response.headers.forEach((value, key) => { headers[key] = value; });
+            res.writeHead(replay.response.status, headers);
+            res.end(bytes);
+            return;
+          }
+          if (replay.kind === "pending") {
+            sendJsonError(res, 409, "BOX_REPLAY_PENDING",
+              "previous Box call still resolving", requestId);
+            return;
+          }
+        }
+        if (body.stream !== true) {
+          sendJsonError(res, 409, "BOX_REPLAY_NOT_FOUND",
+            "previous Box call not found", requestId);
+          return;
+        }
+        if (boxPrepared.classification === "reject") {
+          sendJsonError(res, 409, boxPrepared.rejectCode ?? "BOX_PREPARED_REJECT",
+            "continuation rejected", requestId);
+          return;
+        }
+      }
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
+        boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
       });
       if (cfgErr) {
+        if (cfgErr.kind === "box_not_configured") {
+          incrAnthropicProxyReject("model_config_invalid");
+          sendJsonError(res, 503, "MODEL_NOT_AVAILABLE", "model not available", requestId);
+          return;
+        }
         // cfgErr.kind === "static_not_configured" —— 由 provider 的 commercial 语义映射决定
         // 503 错误码 + reject metric(deepseek/minimax/ark 各自一套，新增 provider 零改本处)。
         const meta = STATIC_PROVIDER_META[cfgErr.providerId];
@@ -797,6 +1009,22 @@ export function makeAnthropicProxyHandler(
           requestId,
         );
         return;
+      }
+      if (route.kind === "box") {
+        if (containerIdBig === null) {
+          incrAnthropicProxyReject("unauthorized_model");
+          sendJsonError(res, 403, "NOT_AUTHORIZED", "model not authorized", requestId);
+          return;
+        }
+        const unsupported = runWithVerifiedProxyByteBudget(byteBudget, () => validateBoxRequest(body,
+          process.env.OC_BOX_TOOL_BRIDGE === "1" && deps.boxModel?.toolBridgeReady === true,
+          boxPrepared));
+        if (unsupported) {
+          userLog.warn("proxy_box_request_unsupported", { reason: unsupported, model: body.model });
+          incrAnthropicProxyReject("bad_body");
+          sendJsonError(res, 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported", requestId);
+          return;
+        }
       }
 
       // 5d) Phase 5 platform envelope rewriter(2026-05-21,外接 ApiKey 路径
@@ -917,7 +1145,7 @@ export function makeAnthropicProxyHandler(
       // 故此 cap 是粗 guardrail：防超模型上下文窗(如 glm-5.1 200k / MiniMax-M3 512k)无声进更贵档。
       // **supportsVision provider(MiniMax-M3)跳过此 cap**:vision 请求含大 base64 image，
       // JSON.length/4 会把图当文本 token 严重高估(2MB 图≈725k「token」)而误撞文本 context cap →
-      // understand_image 永远 413。图请求的真正体积上限由下游 enforceFieldByteBudgets(messages 8MB)兜底。
+      // understand_image 永远 413。图请求的真正体积上限由字段字节预算兜底。
       if (
         route.kind === "static" &&
         !modelSupportsVision &&
@@ -1010,6 +1238,8 @@ export function makeAnthropicProxyHandler(
           userId: uid,
           requestId,
           maxCost: totalMaxCost,
+          ...(route.kind === "box"
+            ? { ttlSeconds: BOX_TOOL_MAX_WALL_MS / 1000 + 300 } : {}),
         });
       } catch (err) {
         if (err instanceof InsufficientCreditsError) {
@@ -1348,12 +1578,30 @@ export function makeAnthropicProxyHandler(
           ...(dispatchIdentity
             ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
             : {}),
-          ctxJson: buildProxyJournalCtxJson({
+          ctxJson: { ...buildProxyJournalCtxJson({
             runtimeKind: deps.runtimeKind,
             gate,
             dispatchIdentity,
             turnKey: attribution.turnKey ?? undefined,
-          }),
+          }), ...(route.kind === "box" ? {
+            boxInvocationRecovery: "v1",
+            billingPricing: serializeBillingPricing(pricing),
+            boxBillingContext: serializeBoxBillingContext({
+              sessionId, mode: attribution.mode,
+              parentSessionId: attribution.parentSessionId,
+              delegateAgentId: attribution.delegateAgentId,
+              turnKey: attribution.turnKey,
+              parentTurnKey: attribution.parentTurnKey,
+              authority: gate ? { kind: gate.authorityKind,
+                executionRevision: gate.executionRevision,
+                projectionRevision: gate.projectionRevision,
+                securityEpoch: gate.securityEpoch } : null,
+              dispatchId: dispatchIdentity?.dispatchId ?? null,
+              attemptNo: dispatchIdentity?.attemptNo ?? null,
+              verificationSponsorship,
+              apiKeyId: identity.apiKey?.id ?? null,
+            }),
+          } : {}) },
         });
         if (!admitted) {
           await releaseUpstreamSession(
@@ -1405,6 +1653,9 @@ export function makeAnthropicProxyHandler(
       // 广播与 finalize ledger 提取出不同结果(Codex plan v3 修订 J 锁定)。
       // 归因键已提取完毕 → 从 user_id JSON 剥掉 oc_ 内部键再转发上游
       // (内部会话拓扑不出代理;普通 chat 请求无 oc_ 键,原串零改写)。
+      // Box 的服务端 replay fingerprint 必须绑定清洗前的 canonical 请求。
+      // 仅内部 transport 消费这份深拷贝；实际上游 body 仍照常清洗。
+      const boxCanonicalBody = route.kind === "box" ? structuredClone(body) : null;
       if (body.metadata?.user_id !== undefined) {
         body.metadata.user_id = stripUsageAttributionKeys(body.metadata.user_id);
       }
@@ -1462,7 +1713,18 @@ export function makeAnthropicProxyHandler(
       // SSE 透传 + finalize + post-commit 广播 + zeroize。release 责任已在 finalize。
       await runUpstreamRoundTrip({
         pgPool: deps.pgPool,
-        fetchFn,
+        fetchFn: route.kind === "box"
+          ? ((url: string, init: RequestInit) => {
+              return runWithVerifiedProxyByteBudget(byteBudget, () => {
+                if (url !== BOX_INTERNAL_ENDPOINT || !deps.boxModel || !boxCanonicalBody) {
+                  throw new Error("BOX_FETCH_NOT_CONFIGURED");
+                }
+                return deps.boxModel.fetch({ uid, sessionId, requestId,
+                  canonicalModel: boxCanonicalBody.model, canonicalBody: boxCanonicalBody,
+                  upstreamModel: session.upstreamModel, url, init, prepared: boxPrepared });
+              });
+            }) as typeof fetch
+          : fetchFn,
         appendCostCredits: deps.appendCostCredits,
         broadcastToUser: deps.broadcastToUser,
         req,
@@ -1471,6 +1733,7 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        noHistoryRewriteRetry: route.kind === "box",
         quotaProbeProviderId,
         finalize,
         sessionId,

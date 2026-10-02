@@ -89,6 +89,7 @@ import {
   getSmallFastModel,
   isNonCustomOpusModel,
 } from '../../utils/model/model.js'
+import { boxNativeRemoteContextOwnsHistory } from '../../utils/model/boxNativeRemoteContext.js'
 import {
   asSystemPrompt,
   type SystemPrompt,
@@ -1387,7 +1388,7 @@ async function* queryModel(
   // When the delta attachment is enabled, deferred tools are announced
   // via persisted deferred_tools_delta attachments instead of this
   // ephemeral prepend (which busts cache whenever the pool changes).
-  if (useSearchExtraTools && !isDeferredToolsDeltaEnabled()) {
+  if (useSearchExtraTools && !isDeferredToolsDeltaEnabled(options.model)) {
     // Diff current deferred tools against what's already been announced in
     // prior <available-deferred-tools> injections. Only re-inject when new
     // tools appear (e.g. MCP server connects mid-session).
@@ -1716,7 +1717,13 @@ async function* queryModel(
     // thinking-clear latch,getAPIContextManagement 的签名随之简化为 { hasThinking }。
     // 上游 v2.8.4 这里传的 clearAllThinking:false 与删掉 latch 的效果等价,而
     // isRedactThinkingActive 我们的实现不消费 —— 故这两个字段不采纳。
-    const contextManagement = getAPIContextManagement({ hasThinking })
+    const contextManagement = boxNativeRemoteContextOwnsHistory({
+      model: options.model,
+      querySource: options.querySource,
+      messages,
+    })
+      ? undefined
+      : getAPIContextManagement({ hasThinking })
 
     const enablePromptCaching =
       options.enablePromptCaching ?? getPromptCachingEnabled(retryContext.model)

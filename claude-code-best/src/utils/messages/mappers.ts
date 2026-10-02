@@ -83,6 +83,8 @@ export function toSDKCompactMetadata(
   const seg = meta.preservedSegment as
     | { headUuid: UUID; anchorUuid: UUID; tailUuid: UUID }
     | undefined
+  const idleDigest = meta.idleReceiptDigest
+  const idleOpId = meta.idleOpId
   return {
     trigger: meta.trigger,
     pre_tokens: meta.preTokens,
@@ -93,7 +95,9 @@ export function toSDKCompactMetadata(
         tail_uuid: seg.tailUuid,
       },
     }),
-  }
+    ...(typeof idleDigest === 'string' ? { idle_receipt_digest: idleDigest } : {}),
+    ...(typeof idleOpId === 'string' ? { idle_op_id: idleOpId } : {}),
+  } as SDKCompactMetadata
 }
 
 /**

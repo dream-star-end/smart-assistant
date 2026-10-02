@@ -37,6 +37,9 @@ const SAFE_INT_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 /** 默认预扣 TTL(秒)。 */
 const DEFAULT_RESERVATION_TTL_SEC = 300;
+/** Box's four-hour keeper plus five-minute settlement margin. Ordinary
+ * requests still use DEFAULT_RESERVATION_TTL_SEC. */
+export const MAX_RESERVATION_TTL_SEC = 14_700;
 
 /**
  * 2026-05-06:**移除估算 ceiling**。线上事故:用户 ¥12 余额 + Opus 4.7 + 文件附件,
@@ -421,6 +424,12 @@ redis.call('HSET', amtKey, reqId, tostring(maxCost))
 -- safety net:避免 zset/hash 永留(即使所有 reservation 过期,也在 2×ttl 后删)
 local safetyTtlSec = math.floor(expMs / 1000) * 2
 if safetyTtlSec < 60 then safetyTtlSec = 60 end
+-- Both keys are per user, not per request. A later 300s reservation must not
+-- shorten an older four-hour Box lock's backing hash/zset lifetime.
+local oldLockTtl = redis.call('TTL', lockKey)
+local oldAmtTtl = redis.call('TTL', amtKey)
+if oldLockTtl > safetyTtlSec then safetyTtlSec = oldLockTtl end
+if oldAmtTtl > safetyTtlSec then safetyTtlSec = oldAmtTtl end
 redis.call('EXPIRE', lockKey, safetyTtlSec)
 redis.call('EXPIRE', amtKey,  safetyTtlSec)
 
@@ -455,8 +464,9 @@ export function wrapIoredisForPreCheck(client: Redis): PreCheckRedis {
       assertRequestId(requestId);
       assertSafeBigInt("balance", balance);
       assertSafeBigInt("maxCost", maxCost);
-      if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 3600) {
-        throw new TypeError(`ttlSeconds must be (0, 3600], got ${ttlSeconds}`);
+      if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0
+        || ttlSeconds > MAX_RESERVATION_TTL_SEC) {
+        throw new TypeError(`ttlSeconds must be (0, ${MAX_RESERVATION_TTL_SEC}], got ${ttlSeconds}`);
       }
       const uid = uidToStr(userId);
       const nowMs = Date.now();
@@ -542,8 +552,9 @@ export class InMemoryPreCheckRedis implements PreCheckRedis {
     assertRequestId(requestId);
     assertSafeBigInt("balance", balance);
     assertSafeBigInt("maxCost", maxCost);
-    if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > 3600) {
-      throw new TypeError(`ttlSeconds must be (0, 3600], got ${ttlSeconds}`);
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0
+      || ttlSeconds > MAX_RESERVATION_TTL_SEC) {
+      throw new TypeError(`ttlSeconds must be (0, ${MAX_RESERVATION_TTL_SEC}], got ${ttlSeconds}`);
     }
     const uid = uidToStr(userId);
     this.sweep(uid);

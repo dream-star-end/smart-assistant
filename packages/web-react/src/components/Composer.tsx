@@ -520,9 +520,14 @@ export function Composer({
         </button>
       )}
       <div
+        data-testid="composer-shell"
         className={cn(
-          "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",
+          // OCV5-295:外壳减负 —— 20px 圆角 + 轻阴影 --shadow-soft(原 26px + --shadow-float 浮层阴影)。
+          "rounded-[20px] border border-border-control bg-surface shadow-[var(--shadow-soft)] transition-all",
           "focus-within:border-border-strong",
+          // OCV5-307:聚焦时只"浮起一点"——比 soft 略深的投影 + 极淡强调色光晕,不再只是边框变浅。
+          // 刻意不用 --shadow-float(OCV5-295 已把外壳从浮层阴影降下来,测试锁定)。
+          "focus-within:shadow-[0_1px_2px_rgba(0,0,0,0.05),0_6px_22px_rgba(0,0,0,0.08)] focus-within:ring-4 focus-within:ring-accent/[0.06]",
           dragActive && "ring-2 ring-ring",
         )}
         onDragEnter={(e) => {

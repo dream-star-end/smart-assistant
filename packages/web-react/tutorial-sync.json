@@ -1,14 +1,14 @@
 {
   "capabilities": {
     "advisor-mode": {
-      "contentHash": "f196ea0c9a528bc8eaf6102f4d36e3d73d3e0589f8af66300175037554762ce2",
-      "contentVersion": 4,
+      "contentHash": "3b81c97465d1a5abef4801b56d0b6af03f783d5b3969c1a857412b1632bc3781",
+      "contentVersion": 5,
       "entryIdentityHash": "24e04eecd3a7f6cfa91bbc293f50dba69adca8cb28e06bbbaded5dbba129407a",
       "mediaHash": "cd76d4e5d826c6da1b0cb941a27cbbfc9871fb031f69987899127460914889e4",
       "mediaKey": "advisor-mode",
       "mediaVersion": 2,
       "registryHash": "a43187c6e5eaa5a81208f850c4bf9359b52c9b90471566fec12ec2a3a5989a8c",
-      "sourceHash": "444db31a2f35a2152716b532bdac040aed9aa31985a2280a1b154cb60ce3e9ea"
+      "sourceHash": "3adba72e9518110f1bb78bfb45bcff668dc8e8396ac9c4795f12c5d067c66797"
     },
     "agents": {
       "contentHash": "c9f6c415de8c42118a21065f8345bc52700a7292eb3f111ebec4dded9b0a464a",
@@ -111,14 +111,14 @@
       "sourceHash": "bff729da9364d73b648840f9a66d6cb1f787ad5544787e19c7521eb2985c3b82"
     },
     "inbox": {
-      "contentHash": "de7c3342fcf16d577fab2d7636e378af5a73180e02b409aec6197d2fff525f6f",
-      "contentVersion": 2,
+      "contentHash": "50f1a79d6bdd670ba30d8cdaefca17ffaf4d62cf50cdc206e0a39a2c42366d5e",
+      "contentVersion": 3,
       "entryIdentityHash": "33d325de9b35a44d675125850dcc68aed55c3cd1ae69ad462cb410faeb143090",
       "mediaHash": "b42d3d2017a4afc550449a031a46fc5fa4974dc50d1540958c6aceb2480b616b",
       "mediaKey": "inbox",
       "mediaVersion": 2,
       "registryHash": "a8a5a10f6db81c8adae5e129d9df1b6d8165d09edcbab9c7ac845ae833303d15",
-      "sourceHash": "0ccc10eef265312e8792af2ef8deec250b0a3ecf8808695e95e83fe665e68fc3"
+      "sourceHash": "8687c33af096bff05e3f114ecbe43ca9b3c4f843037fff1ecca6ec3232137b18"
     },
     "marketplace-discovery": {
       "contentHash": "414203beaf81ed85661ecc3ce0eede57b1ef7d4af8336d76d76c90dfbee9d7c4",
@@ -151,14 +151,14 @@
       "sourceHash": "23fe4f8cac5681bbf676431da2e05a87cca7ba314ede2059854e3e1a5475a85b"
     },
     "models-reasoning": {
-      "contentHash": "bc3298c3cacedf955141f406ad3e600c04892f596c773f6ff61676602bb70bdf",
-      "contentVersion": 6,
-      "entryIdentityHash": "4083cf539ec861234296b7d70c3b75791ac011c0aca59d11c36580dd965672f7",
+      "contentHash": "2086bd4bd642b17447debc712b0d857d1491bb99d68611129ab3f30cc8686dcd",
+      "contentVersion": 7,
+      "entryIdentityHash": "741c34d91e4d5f126f0ff46acacf11fec0e0d2935c2d557787004a0e265c39ae",
       "mediaHash": "593b0a345dc0c4b990344ad9692e9562dda0f71fa6fe4b300a3ddf15de0cf7a3",
       "mediaKey": "models-reasoning",
       "mediaVersion": 3,
       "registryHash": "05d9024636c1060f19b7670c735a8a5bc39bf7dfdacd83a719260e898df68ee2",
-      "sourceHash": "0190a003d8af9c455b31eb9b19ff6b25017b6e832eddc5f0931c38befb20f7b0"
+      "sourceHash": "0602636a5c3da3994695682c6b1bc0bdc37fb0600e1f870a6d818e5adacf3d3d"
     },
     "organization": {
       "contentHash": "7cb835c5e2b81ac2543f0f161a8e706139b7f5bafc5dae6080ab475b95e7e0dd",

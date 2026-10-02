@@ -46,6 +46,10 @@ import {
   errSummary,
 } from "./shared.js";
 import type { PreparedUpstreamSession } from "./upstream.js";
+import {
+  assertClaudeOAuthIdentity,
+  ClaudeIdentityGuardError,
+} from "./claudeIdentityGuard.js";
 import type { FinalizerHandle, FinalizeOutcome } from "../../billing/proxyBilling.js";
 import { maybeUpdateAccountQuota } from "../../account-pool/quota.js";
 import {
@@ -57,6 +61,10 @@ import {
 import { recordProviderHealthSample } from "./providerHealthSink.js";
 import { recordUpstreamPerformance } from "../../ws/turnPerformance.js";
 import { findRouteProviderForModel } from "@openclaude/protocol";
+import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPreparedContinuation.js";
+import { BoxTextFetchError } from "./boxTextFetch.js";
+import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
 import {
   clearProviderQuotaBlock,
   isMoonshotBillingQuotaExhausted,
@@ -111,6 +119,8 @@ export interface RoundTripCtx {
   uid: bigint;
   body: ProxyBody;
   session: PreparedUpstreamSession;
+  /** Box CLI calls are non-replayable: never strip signed history and invoke it again. */
+  noHistoryRewriteRetry?: boolean;
   /** Set only for the one request that atomically won an expired quota probe lease. */
   quotaProbeProviderId: string | null;
   finalize: FinalizerHandle;
@@ -198,7 +208,32 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // Authorization + anthropic-beta + (OAuth)device_id pin → session.applyUpstreamAuth
     // body sanitize(OAuth strip malformed thinking;DeepSeek noop)→ session.sanitizeMessages
     // 详见 proxy/upstream.ts 中两个实现的注释。
-    session.applyUpstreamAuth(safeHeaders, body, userLog);
+    try {
+      session.applyUpstreamAuth(safeHeaders, body, userLog);
+      if (session.accountId != null) {
+        await assertClaudeOAuthIdentity({
+          accountId: session.accountId,
+          pinnedUserId: session.pinnedUserId,
+          personaTimezone: session.personaTimezone,
+          userAgent: safeHeaders["user-agent"] ?? safeHeaders["User-Agent"],
+          xApp: safeHeaders["x-app"],
+          metadataUserId: body.metadata?.user_id,
+          dispatcher: session.dispatcher,
+        });
+      }
+    } catch (err) {
+      if (err instanceof ClaudeIdentityGuardError) {
+        incrAnthropicProxyReject("bad_headers");
+        userLog.warn("proxy_egress_identity_blocked", {
+          code: err.code,
+          detail: err.cause,
+        });
+        await finalize.failClient(observed, err, "INVALID_REQUEST");
+        sendJsonError(res, 503, "EGRESS_IDENTITY_MISMATCH", err.publicMessage, requestId);
+        return;
+      }
+      throw err;
+    }
     const upstreamMessages = session.sanitizeMessages(body.messages, body.model, userLog);
     const serializeUpstreamBody = (messages: unknown[]): string => JSON.stringify({
         ...body,
@@ -234,7 +269,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       } catch {
         upstreamErrorPreview = "";
       }
-      if (isProviderBoundHistoryError(upstreamErrorPreview)) {
+      if (!ctx.noHistoryRewriteRetry && isProviderBoundHistoryError(upstreamErrorPreview)) {
         const stripped = stripProviderBoundAssistantBlocks(upstreamMessages);
         if (stripped.blocksStripped > 0) {
           userLog.info("proxy_provider_bound_history_retry", {
@@ -549,9 +584,21 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
     else incrAnthropicProxySettle("aborted");
   } catch (err) {
+    const continuationConflict = err instanceof BoxContinuationDecisionError
+      || (err instanceof BoxDurableJournalError && isContinuationConflict(err.code));
+    const boxCapacityHeld = body.model === "box-api-claude-opus-5-5"
+      && ((err instanceof BoxDurableJournalError
+        || err instanceof BoxTextFetchError) && err.code === "BOX_CAPACITY_HELD"
+        || err instanceof BoxInvocationConflict
+          && ["BOX_USER_CAPACITY_FULL", "BOX_ACCOUNT_CAPACITY_FULL",
+            "BOX_SESSION_BUSY"].includes(err.code));
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
-    if (isClientAbort(err)) {
+    if (continuationConflict) {
+      await finalize.failClient(observed, err, "INVALID_REQUEST");
+    } else if (boxCapacityHeld) {
+      await finalize.failClient(observed, err, "INVALID_REQUEST");
+    } else if (isClientAbort(err)) {
       await finalize.failClient(observed, err, "CLIENT_ABORT");
       recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除
     } else {
@@ -568,12 +615,18 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         model: body.model,
         ttftMs: null,
         streamMs: null,
-        outcome: isClientAbort(err) ? "aborted" : "error",
+        outcome: continuationConflict || isClientAbort(err) ? "aborted" : "error",
       },
     );
     // 字节是否已 flush 决定怎么发错误
     if (!res.headersSent) {
-      sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
+      if (continuationConflict) {
+        const code = err instanceof BoxContinuationDecisionError || err instanceof BoxDurableJournalError
+          ? err.code : "BOX_PREPARED_REJECT";
+        sendJsonError(res, 409, code, "continuation not republished", requestId);
+      } else if (boxCapacityHeld) {
+        sendJsonError(res, 409, "BOX_CAPACITY_HELD", "Box slot busy", requestId);
+      } else sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
     } else {
       try {
         res.end();

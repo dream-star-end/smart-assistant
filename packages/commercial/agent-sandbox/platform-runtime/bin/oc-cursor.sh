@@ -465,6 +465,8 @@ done
 case "$model" in
   ""|cursor-grok-4.6-low|cursor-grok-4.6-low-fast|cursor-grok-4.6-medium|cursor-grok-4.6-medium-fast|\
   cursor-grok-4.6-high|cursor-grok-4.6-high-fast|cursor-grok-4.6-xhigh|cursor-grok-4.6-xhigh-fast|\
+  grok-4.7-low|grok-4.7-low-fast|grok-4.7-medium|grok-4.7-medium-fast|\
+  grok-4.7-high|grok-4.7-high-fast|grok-4.7-xhigh|grok-4.7-xhigh-fast|\
   composer-2.5|composer-2.5-fast|\
   claude-opus-5-thinking-low|claude-opus-5-thinking-low-fast|\
   claude-opus-5-thinking-medium|claude-opus-5-thinking-medium-fast|\
@@ -488,6 +490,7 @@ case "$model" in
   gpt-5.6-luna-high|gpt-5.6-luna-high-fast|gpt-5.6-luna-xhigh|gpt-5.6-luna-xhigh-fast|\
   gpt-5.6-luna-max|gpt-5.6-luna-max-fast|\
   claude-haiku-4-5|\
+  claude-opus-5-5|claude-sonnet-5|\
   cursor-grok-4.5-high) ;;
   *) die "model is not allowlisted" ;;
 esac
@@ -536,6 +539,8 @@ case "$model" in
     ;;
   cursor-grok-4.6-low|cursor-grok-4.6-low-fast|cursor-grok-4.6-medium|cursor-grok-4.6-medium-fast|\
   cursor-grok-4.6-high|cursor-grok-4.6-high-fast|cursor-grok-4.6-xhigh|cursor-grok-4.6-xhigh-fast|\
+  grok-4.7-low|grok-4.7-low-fast|grok-4.7-medium|grok-4.7-medium-fast|\
+  grok-4.7-high|grok-4.7-high-fast|grok-4.7-xhigh|grok-4.7-xhigh-fast|\
   composer-2.5|composer-2.5-fast|cursor-grok-4.5-high|cursor-grok-4.5-high-fast)
     cursor_family=cursor_models
     ;;

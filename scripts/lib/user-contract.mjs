@@ -13,8 +13,8 @@ export function parseOptions(env) {
   if (!/^[^\s@]+@[^\s@]+$/.test(email)) throw new Error("Invalid canary email");
   const cost = env.V5_CONTRACT_COST ?? "dry";
   if (!["dry", "live"].includes(cost)) throw new Error("V5_CONTRACT_COST must be dry or live");
-  const model = parseModels(env.V5_CONTRACT_MODEL_ID ?? "gpt-5.6-luna");
-  if (model.length !== 1) throw new Error("Expected one collapsed model");
+  const model = parseModels(env.V5_CONTRACT_MODEL_ID ?? "gpt-6-luna");
+  if (model.length !== 1) throw new Error("Expected one contract model");
   return { base: base.origin, email, passwordFile: env.V5_CANARY_PASSWORD_FILE || "/etc/openclaude/selfhost-canary.password", cost, model: model[0], models: parseModels(env.V5_CONTRACT_MODELS) };
 }
 export function turnPolicy(cost) {

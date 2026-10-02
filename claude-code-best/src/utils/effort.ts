@@ -246,8 +246,11 @@ export function resolveAppliedEffort(
     return undefined
   }
   // Ark/Z.AI glm-5.x 与 Moonshot K3 family 是 capabilityZero 但支持 effort,
-  // 不在此 early-return。
+  // 不在此 early-return。OCV5-305:signed descriptor 声明了 supportedEfforts 的
+  // capabilityZero 模型(Box Claude:内层 CLI 原生 --effort)同样放行。
+  const authority = getAuthorityModelCapabilities(model)
   if (
+    !(authority && authority.supportedEfforts.length > 0) &&
     isCapabilityZeroStaticModel(model) &&
     !isArkGlmModel(model) &&
     !isZaiGlm53Model(model) &&

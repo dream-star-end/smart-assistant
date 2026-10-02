@@ -16,15 +16,36 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  BOX_ACTIVE_TURN_IDLE_MS,
   IDLE_TIMEOUT_DEFAULT_MS,
   IDLE_TIMEOUT_TOOL_MS,
   applyTurnIdleTimeoutTick,
   pickIdleTimeoutMs,
+  pickTurnSilentBackstopMs,
   shouldFireTurnIdleTimeout,
   shouldTripIdleWatchdog,
 } from "../sessionManager.js";
 
 describe("pickIdleTimeoutMs", () => {
+  test("only authenticated Box CCB turn keeps both silence clocks past 4h", () => {
+    const box = "box-api-claude-opus-5-5";
+    assert.equal(BOX_ACTIVE_TURN_IDLE_MS, 4 * 60 * 60_000 + 5 * 60_000);
+    assert.equal(pickIdleTimeoutMs(null, 0, "ccb", box), BOX_ACTIVE_TURN_IDLE_MS);
+    assert.equal(pickIdleTimeoutMs("compacting", 1, "ccb", box), BOX_ACTIVE_TURN_IDLE_MS);
+    assert.equal(pickTurnSilentBackstopMs("ccb", box), BOX_ACTIVE_TURN_IDLE_MS);
+    for (const elapsed of [15 * 60_000 + 1, 30 * 60_000 + 1, 4 * 60 * 60_000]) {
+      assert.equal(shouldTripIdleWatchdog({ waitingForUserInput: false,
+        idleMs: elapsed, thresholdMs: pickIdleTimeoutMs(null, 0, "ccb", box) }), false);
+    }
+    assert.equal(shouldTripIdleWatchdog({ waitingForUserInput: false,
+      idleMs: BOX_ACTIVE_TURN_IDLE_MS + 1,
+      thresholdMs: pickIdleTimeoutMs(null, 0, "ccb", box) }), true);
+    assert.equal(pickIdleTimeoutMs(null, 0, "ccb", "claude-opus-5-5"),
+      IDLE_TIMEOUT_TOOL_MS);
+    assert.equal(pickIdleTimeoutMs(null, 0, "codex", box), IDLE_TIMEOUT_TOOL_MS);
+    assert.equal(pickTurnSilentBackstopMs("codex", box), 30 * 60_000);
+    assert.equal(pickTurnSilentBackstopMs("ccb", "claude-opus-5-5"), 30 * 60_000);
+  });
   test("没有 pending tool 且非 compacting → DEFAULT 档(5min)", () => {
     assert.equal(pickIdleTimeoutMs(null, 0), IDLE_TIMEOUT_DEFAULT_MS);
     assert.equal(pickIdleTimeoutMs(undefined, 0), IDLE_TIMEOUT_DEFAULT_MS);

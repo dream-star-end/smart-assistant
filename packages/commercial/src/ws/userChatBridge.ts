@@ -1,3 +1,4 @@
+import { inboundSessionKey, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -207,6 +208,7 @@ import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, signedCcbCapability } from "../http/proxy/boxNativeContextOwner.js";
 import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
 import type { AgentModelResolver } from "./agentModelAuthority.js";
@@ -843,10 +845,21 @@ function toProtocolDescriptor(
         supported: [...profile.reasoning.supported],
         codexModelDefault: profile.reasoning.codexModelDefault,
       },
-      ccb: {
-        capabilityZero: profile.ccb.capabilityZero,
-        supportsThinking: profile.ccb.supportsThinking,
-      },
+      ccb: (() => {
+        const ccb = signedCcbCapability({
+          canonicalModel: d.canonicalModel,
+          providerId: d.providerId,
+          capabilityZero: profile.ccb.capabilityZero,
+          supportsThinking: profile.ccb.supportsThinking,
+          declaredContextOwner: profile.ccb.contextOwner,
+          routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
+        });
+        return {
+          capabilityZero: ccb.capabilityZero,
+          supportsThinking: ccb.supportsThinking,
+          ...(ccb.contextOwner === undefined ? {} : { contextOwner: ccb.contextOwner }),
+        };
+      })(),
     },
     capabilitySchemaVersion: d.capabilitySchemaVersion,
     contextWindow: d.contextWindow,
@@ -5728,6 +5741,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               teamModeRequested &&
               (frameAgentId === "main" || frameAgentId === null || teamModeNonMainAgentDemotesToMain);
             const effectiveFrameAgentId = teamModeMain ? "main" : frameAgentId;
+            try {
+              const reviewFrame = parsed as {
+                channel?: unknown
+                peer?: { kind?: unknown; id?: unknown }
+                content?: { text?: unknown }
+              }
+              const reviewSessionKey = inboundSessionKey({
+                ...reviewFrame,
+                agentId: effectiveFrameAgentId ?? "main",
+              })
+              const reviewUserId = uid.toString()
+              const reviewText = reviewFrame.content?.text
+              if (typeof reviewText === "string" && reviewText.trim()) {
+                observeUserContentReview({
+                  text: reviewText,
+                  userId: reviewUserId,
+                  sessionKey: reviewSessionKey,
+                })
+              }
+            } catch {
+              // Recording must not block delivery of this message.
+            }
             const agentImpliedModel =
               effectiveFrameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[effectiveFrameAgentId] : undefined;
             // P0 计费旁路封堵 —— master agent 权威推导:帧无 model 时容器 gateway
