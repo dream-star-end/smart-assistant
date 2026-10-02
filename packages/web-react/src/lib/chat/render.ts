@@ -567,7 +567,7 @@ const ERROR_LABELS: Record<string, string> = {
   turn_limit: "本轮已自动免单",
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
   model_config_changed_retry_turn: "模型配置已更新，请重发",
-  model_not_available: "模型不可用",
+  model_not_available: "模型暂不可用",
   unresolved_agent_model: "未能确定模型",
   model_authority_unavailable: "模型服务暂时不可用",
   model_catalog_unavailable: "模型服务暂时不可用",

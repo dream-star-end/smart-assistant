@@ -355,6 +355,63 @@ body {
   to { background-position: -20% 0; }
 }
 
+/* ── 处理过程时间轴(OCV5-310) ─────────────────────────────────────────────
+   竖线穿过每一步 24px 圆形节点的中心(left 12px);上下各收 14px,底部淡出,不顶到外壳边缘。
+   节点自带 bg-bg 实底,把竖线「截断」在节点处。颜色全部取语义 token,明暗主题自适应。 */
+.oc-rail::before {
+  content: "";
+  position: absolute;
+  left: 11.5px;
+  top: 14px;
+  bottom: 14px;
+  width: 1px;
+  background: linear-gradient(to bottom, var(--border-strong), var(--border) 80%, transparent);
+  pointer-events: none;
+}
+/* 外壳运行中标志:一圈淡色轨道 + 一段 accent 弧光慢转,中心点轻微呼吸。 */
+.oc-orbit::before {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 999px;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.oc-orbit::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 999px;
+  border: 1.5px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+/* 运行中的步骤节点:accent 细环 + 向外扩散的柔光,一眼看出「这一步正在跑」。 */
+.oc-step-node-live { background: color-mix(in srgb, var(--accent) 8%, var(--bg)); }
+@media (prefers-reduced-motion: no-preference) {
+  .oc-orbit::after { animation: spin 1.1s linear infinite; }
+  .oc-orbit-core { animation: oc-breathe 1.8s var(--ease-standard) infinite; }
+  .oc-step-node-live { animation: oc-node-halo 1.8s var(--ease-standard) infinite; }
+  .oc-step-enter { animation: oc-step-in 0.36s var(--ease-spring) both; }
+  .oc-reveal { animation: oc-reveal 0.24s var(--ease-emphasized-decel) both; }
+  .oc-swap-in { animation: fade-in 0.28s ease both; }
+}
+@keyframes oc-breathe {
+  0%, 100% { transform: scale(0.8); opacity: 0.7; }
+  50% { transform: scale(1); opacity: 1; }
+}
+@keyframes oc-node-halo {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 32%, transparent); }
+  70%, 100% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent) 0%, transparent); }
+}
+@keyframes oc-step-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes oc-reveal {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: none; }
+}
+
 /* ── 生成占位卡(GeneratingPlaceholderCard)的粒子场景色。刻意明暗主题一致:
    粒子发光基面贴 image viewer 黑底质感 —— 浅色主题下也必须是深色,淡蓝粒子才
    可见,因此不走会随主题翻转的 surface token,固化在 styles.css 单一权威处。

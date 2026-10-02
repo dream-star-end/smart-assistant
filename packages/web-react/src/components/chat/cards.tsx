@@ -27,7 +27,7 @@ import {
   X,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import { memo, useEffect, useId, useRef, useState } from "react";
+import { createContext, memo, useContext, useEffect, useId, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
@@ -58,6 +58,7 @@ import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
+import { useProcessStep } from "./processStep";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
 import {
@@ -698,6 +699,14 @@ export function ProgressiveMarkdown({
 }
 
 // ═══════════════ assistant ═══════════════
+/**
+ * OCV5-307: set by ProcessDisclosure around an error card the turn already
+ * continued past. That failure is history, not the turn's outcome — its
+ * retry / regenerate / switch-model / continue actions would start duplicate
+ * work, so the card shows the error facts only.
+ */
+export const RecoveredStepContext = createContext(false);
+
 export function AssistantCard({
   msg,
   ctx,
@@ -712,6 +721,7 @@ export function AssistantCard({
   /** 只读面(教程回放 / 后台会话查看器):动作行只留复制/朗读,不出引用/重新生成/反馈。 */
   readOnly?: boolean;
 }) {
+  const recoveredStep = useContext(RecoveredStepContext);
   const live = isLive(msg, ctx);
   if (msg._hideUnpublishedFallback === true) return null;
   if (msg._errorHeldForRecovery === true && msg._errorCardSnapshot?.disposition !== "card") return null;
@@ -782,7 +792,7 @@ export function AssistantCard({
   // 尾部;错误卡恒追加在其归属 user 轮之后,故与"_clientMessageId 命中最后一条 user"等价),不另
   // 造第二套轮判定。历史中间错误卡:不显示任何重发按钮(标题/正文/详情照旧)。
   // 耗尽 CTA 是导航非重发,不受此门控。
-  const isLastTurn = ctx.inActiveTurn === true;
+  const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const interruptedContinuationTarget =
     isLastTurn && ctx.isLast
       ? cb.resolveInterruptedContinuation?.(msg)
@@ -937,6 +947,31 @@ export function AssistantCard({
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
           </output>
+        ) : recoveredStep && !suppressErrorAlert && presentedError ? (
+          // OCV5-307:本轮已越过的错误(例:上游满载的 turn 终态错误被记在较早的正文段上,随后同一轮又
+          // 继续并给出回复)。它是历史事实而非待办 —— 只留一行低调说明 + 可展开的请求信息,不再用整张
+          // 警示卡叫用户「切换模型后重发」。真正以错误收尾的轮次不进这里,仍是完整错误卡。
+          <div
+            role="status"
+            data-testid="recovered-error-note"
+            className="mt-2.5 flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border/70 bg-surface px-3 py-2 text-meta text-muted"
+          >
+            <AlertTriangle size={13} aria-hidden="true" className="shrink-0 text-warning" />
+            <span className="font-medium text-fg/80">
+              {isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
+            </span>
+            <span>· 本轮已继续，无需处理</span>
+            {shownDetail && (
+              <details className="basis-full">
+                <summary className="w-fit cursor-pointer select-none text-caption text-faint hover:text-fg [@media(hover:none)]:py-3.5">
+                  查看请求信息
+                </summary>
+                <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
+                  {shownDetail}
+                </pre>
+              </details>
+            )}
+          </div>
         ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
           <Alert
             tone="warning"
@@ -1169,7 +1204,9 @@ export const ThinkingCard = memo(
     const live = isLive(msgs[msgs.length - 1] ?? { role: "thinking" }, ctx);
     const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
     // 默认折叠态权威仍走 render 层 defaultCollapsed（thinking：流式展开、完成折叠）；用户手动切换后本地锁定。
-    const collapsed = userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx);
+    // 过程时间轴里(step)默认只露「正在思考 · 标题」,思考全文要点开才看。
+    const step = useProcessStep();
+    const collapsed = userCollapsed ?? (step ? true : defaultCollapsed({ role: "thinking" }, ctx));
     const segments = thinkingSegments(msgs.map((m) => m.text));
     // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持稳定的"思考过程"
     // （不随 delta/角色切换闪烁）。
@@ -1177,6 +1214,59 @@ export const ThinkingCard = memo(
     const headline = live ? "思考过程" : summary ? `已思考 · ${summary}` : "已思考";
     const bodyId = useId();
     const hasBody = segments.length > 0;
+    if (step) {
+      // OCV5-310 过程时间轴里的一行:节点(脑图标)由时间轴画;这里是「思考 · 最新小标题」,
+      // 展开后正文直接落在内容列,左侧一道细线与工具输出面板区分开。
+      const label = live ? "正在思考" : "思考";
+      return (
+        <div data-testid="thinking-step" className="min-w-0">
+          <button
+            type="button"
+            onClick={() => setUserCollapsed(!collapsed)}
+            aria-expanded={!collapsed}
+            aria-controls={!collapsed && hasBody ? bodyId : undefined}
+            className="group/step -mx-2 flex min-h-9 w-[calc(100%+1rem)] items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          >
+            <span className={cn("shrink-0 text-body font-medium", live ? "oc-live-status-shine text-fg" : "text-fg/90")}>
+              {label}
+            </span>
+            {summary ? (
+              <span className="min-w-0 truncate text-body text-muted" title={summary}>
+                {summary}
+              </span>
+            ) : null}
+            <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
+              <TokenUsageBadge usage={tokenUsage} />
+              {hasBody ? (
+                <ChevronRight
+                  size={14}
+                  aria-hidden
+                  className={cn(
+                    "text-faint transition-[transform,opacity] duration-200 ease-[var(--ease-spring)]",
+                    !collapsed ? "rotate-90 opacity-100" : "opacity-0 group-hover/step:opacity-100 group-focus-visible/step:opacity-100 [@media(hover:none)]:opacity-100",
+                  )}
+                />
+              ) : null}
+            </span>
+          </button>
+          {!collapsed && hasBody && (
+            <div id={bodyId} className="oc-reveal mb-1.5 mt-0.5 border-l-2 border-border pl-3">
+              {segments.map((seg, i) => (
+                <div
+                  key={i}
+                  className={cn(
+                    "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-[13.5px] [&_.prose_h2]:text-[13.5px] [&_.prose_h3]:text-[13.5px] [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
+                    i > 0 && "mt-2",
+                  )}
+                >
+                  <ProgressiveMarkdown text={seg} live={live} caret={live && i === segments.length - 1} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="overflow-hidden rounded-md border border-border/80 bg-surface/70 animate-in">
         {/* 折叠开关暴露展开态(aria-expanded,与 DelegateProgressCard / RuntimeEventCard 一致);

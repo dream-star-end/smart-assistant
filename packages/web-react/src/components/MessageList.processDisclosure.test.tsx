@@ -190,7 +190,158 @@ describe("MessageList Manus 过程披露", () => {
     expect(answer.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("提问、审批和后台子任务不被折进过程，普通工具失败收在过程里", async () => {
+  // OCV5-307 回归:OCV5-308 实况 —— 中途一次 model_not_available(detail=error_during_execution JSON)
+  // 之后本轮继续跑工具并给出回答,这张错误卡曾单独挂在收起的「工作过程」下面。
+  const midTurnError = (code = "model_not_available") =>
+    row("err-mid", "assistant", "通用代码已生成商业版候选并推送", {
+      _clientMessageId: "u",
+      _errorCode: code,
+      _errorDetail: '{"subtype":"error_during_execution","result":"Selected model is at capacity."}',
+      usage: { traceId: "trace-mid-err" },
+    });
+
+  test("OCV5-307: 本轮越过的中途错误卡收进过程，作为常显卡片步骤", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      midTurnError(),
+      row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("answer", "assistant", "已合并并推送", { _clientMessageId: "u" }),
+    ]);
+    // 收起态:只有一个过程壳,错误卡不在顶层
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.queryByText("模型暂不可用")).not.toBeInTheDocument();
+    expect(screen.getByText("已合并并推送").closest("[data-testid=process-disclosure]")).toBeNull();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const card = screen.getByTestId("process-card");
+    expect(within(card).getByText("模型暂不可用")).toBeInTheDocument();
+    expect(card.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    // OCV5-307:已越过的错误只留一行说明,不再是叫用户「切换模型后重发」的整张警示卡。
+    const note = within(card).getByTestId("recovered-error-note");
+    expect(note).toHaveTextContent("本轮已继续");
+    expect(within(card).queryByRole("alert")).toBeNull();
+    expect(card.textContent ?? "").not.toMatch(/切换一个模型|后重发/);
+  });
+
+  test("OCV5-307: 以 model_not_available 收尾的轮次，错误卡仍在顶层", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      midTurnError(),
+    ]);
+    expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留重试出口", () => {
+    renderList(
+      [
+        row("u", "user", "继续合并", { status: "replied" }),
+        row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+        midTurnError("engine_error"),
+      ],
+      { cb: { onRegenerate: () => {} } },
+    );
+    const retry = screen.getByRole("button", { name: /重新尝试|重试/ });
+    // 以错误收尾 = 本轮结局:仍是完整错误卡,不是「已继续」说明。
+    expect(screen.queryByTestId("recovered-error-note")).toBeNull();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    // 对照组:可重试码在顶层(本轮结局)有重试出口,下面「过程里不给」的断言才有意义。
+    expect(retry.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 过程里的已越过错误卡不再给重试/切换模型(防重复开工)", () => {
+    renderList(
+      [
+        row("u", "user", "继续合并", { status: "replied", _clientMessageId: "u" }),
+        row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+        midTurnError("engine_error"),
+        row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+        row("answer", "assistant", "已合并并推送", { _clientMessageId: "u" }),
+      ],
+      { cb: { onRegenerate: () => {}, onOpenModelPicker: () => {} } },
+    );
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const card = screen.getByTestId("process-card");
+    expect(within(card).getByTestId("recovered-error-note")).toBeInTheDocument();
+    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
+      expect(within(card).queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  test("OCV5-307: 终态错误后只有延迟定位行/状态行时不算继续，错误仍在顶层", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      midTurnError(),
+      row("locator", "assistant", "", { _clientMessageId: "u", _payloadDeferred: true }),
+      row("status", "assistant", "本轮结束", { _clientMessageId: "u", _turnStatusRecord: true }),
+    ]);
+    expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 已失败的子任务是过程步骤，不在收起的过程外单独成卡", () => {
+    renderList([
+      row("u", "user", "分派 T2", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git status" }, _completed: true, output: "ok" }),
+      row("child", "agent-group", "T2 校验迁移", {
+        _clientMessageId: "u",
+        _delegate: true,
+        _completed: true,
+        _isError: true,
+        _delegateStatus: "failed",
+      }),
+      row("answer", "assistant", "T2 失败，已改走 T3", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.queryByText("T2 校验迁移")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("子任务 1 项");
+  });
+
+  test("OCV5-307: 未回答的提问留在过程外，同一轮已回答的提问在过程轨线上", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git status" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-done", "permission", "按哪个方向同步？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-done",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "按哪个方向同步？", options: [{ label: "双向同步" }] }] },
+      }),
+      row("bash2", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git merge" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-open", "permission", "现在推送吗？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-open",
+        inputJson: { questions: [{ question: "现在推送吗？", options: [{ label: "推送" }] }] },
+      }),
+    ]);
+    const cards = () => screen.getAllByTestId("permission-card");
+    const open = cards().find((card) => card.getAttribute("data-permission-request") === "req-open");
+    expect(open?.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const done = cards().find((card) => card.getAttribute("data-permission-request") === "req-done");
+    expect(done?.closest("[data-testid=process-card]")).not.toBeNull();
+    expect(done?.className).toContain("border-border/80");
+    expect(open?.className).toContain("border-accent/40");
+  });
+
+  // OCV5-307:已回答的提问是这一轮的一个步骤,收进过程作为常显步骤;待审批 / 后台子任务仍在顶层。
+  test("已回答的提问进过程，待审批和后台子任务不被折进过程，普通工具失败收在过程里", async () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
       row("stage", "assistant", "我先查一下", { _clientMessageId: "u" }),
@@ -235,14 +386,19 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("还差你的确认")).toBeInTheDocument();
     expect(screen.queryByText("未成功")).not.toBeInTheDocument();
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
-    expect(screen.getByTestId("permission-card")).toBeInTheDocument();
+    // 已结束的轮次过程默认收起:已回答的提问跟着收在里面,不再单独一张卡挂在过程外。
+    expect(screen.queryByTestId("permission-card")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("问答 1 项");
     const approval = await screen.findByText("任务待你确认");
     expect(approval.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.getByText("后台盘点还在跑")).toBeInTheDocument();
     expect(screen.queryByText("hidden-probe-cmd")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-toggle"));
-    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    // 展开过程即可看到问答结果,不用再点开「N 项」细节。
+    const prompt = screen.getByTestId("process-card");
+    expect(within(prompt).getByTestId("permission-card")).toHaveTextContent("已提交");
+    fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
     const details = screen.getByTestId("process-details");
     expect(within(details).getAllByText("未成功").length).toBeGreaterThan(0);
     expect(within(details).getAllByText("probe-error-detail").length).toBeGreaterThan(0);
@@ -544,17 +700,18 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("生成图片")).not.toBeInTheDocument();
     expect(screen.queryByText("货架静物")).not.toBeInTheDocument();
 
+    // OCV5-307:回答之后的 bad/only 不再在回答下面另开一节,回到回答上方唯一的工作过程。
     const toggles = screen.getAllByTestId("process-toggle");
-    expect(toggles).toHaveLength(2);
+    expect(toggles).toHaveLength(1);
+    const answerRow = screen.getByText(/总结在这里/).closest("[data-testid=assistant-row]");
+    expect(screen.getByTestId("process-disclosure").compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(toggles[0]!);
     fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
     const first = screen.getAllByTestId("process-details")[0]!;
     expect(within(first).getByText(/paper\.pdf/).closest("[data-testid=process-details]")).not.toBeNull();
     expect(within(first).getByText("生成图片").closest("[data-testid=process-details]")).not.toBeNull();
     expect(first.textContent ?? "").toMatch(/cp x \/home\/agent\/\.openclaude\/generated\//);
-    fireEvent.click(toggles[1]!);
-    fireEvent.click(screen.getAllByTestId("process-detail-toggle")[1]!);
-    const second = screen.getAllByTestId("process-details")[1]!;
+    const second = first;
     for (const button of within(second).getAllByRole("button")) {
       if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
     }
@@ -935,7 +1092,7 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[3]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行中");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在运行命令");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
@@ -944,9 +1101,9 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[4]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行完成");
-    expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "false");
-    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
+    expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
+    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
     expect(screen.queryByText("CMD_DONE_SECRET")).not.toBeInTheDocument();
 
@@ -959,7 +1116,7 @@ describe("MessageList Manus 过程披露", () => {
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[6]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
     expectOne();
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行完成");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("VERSION");
     expect(screen.queryByText("READ_SECRET")).not.toBeInTheDocument();
 
@@ -1090,7 +1247,8 @@ describe("MessageList Manus 过程披露", () => {
     );
     expect(screen.getByTestId("process-disclosure").className).not.toMatch(/ml-\[52px\]/);
     expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
-    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
+    // OCV5-307:进行中的轮次里,已回答的提问留在展开的过程轨线上(不再单独挂在过程外)。
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-card]")).not.toBeNull();
     expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
 
     view.rerender(
@@ -1257,7 +1415,7 @@ describe("MessageList Manus 过程披露", () => {
       _turnTapeId: "tape-after-tool",
     });
     const view = renderList([user, running], { sending: true });
-    expect(screen.getByTestId("process-step-live")).toHaveTextContent("工具执行中");
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在运行命令");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_STILL_RUNNING");
 
     view.rerender(
@@ -1271,7 +1429,7 @@ describe("MessageList Manus 过程披露", () => {
       />,
     );
     const live = screen.getByTestId("process-step-live");
-    expect(live).toHaveTextContent("工具执行中");
+    expect(live).toHaveTextContent("正在运行命令");
     expect(live).not.toHaveTextContent("LIVE_STILL_RUNNING");
     expect(live).not.toHaveTextContent("已完成");
     expect(screen.getByTestId("process-goal")).toBeInTheDocument();
@@ -1280,7 +1438,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "true");
 
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
-    expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在运行命令");
     expect(screen.getByTestId("process-details")).toHaveTextContent("LIVE_STILL_RUNNING");
   });
 
@@ -1361,23 +1519,23 @@ describe("MessageList Manus 过程披露", () => {
     expectPhrase("echo", {
       toolName: "Bash",
       inputJson: { command: "echo view_image /tmp/a.png imagegen dlgjob-fake" },
-    }, "工具执行中", /view_image|imagegen|dlgjob|\/tmp/);
+    }, "正在运行命令", /view_image|imagegen|dlgjob|\/tmp/);
     expectPhrase("quoted-semi", {
       toolName: "Bash",
       inputJson: { command: "printf '%s' '; oc-vision understand fake.png'" },
-    }, "工具执行中", /正在识别图片|fake\.png|understand|oc-vision/);
+    }, "正在运行命令", /正在识别图片|fake\.png|understand|oc-vision/);
     expectPhrase("quoted-wait", {
       toolName: "Bash",
       inputJson: { command: "printf '%s' '; oc-memory delegate-wait dlgjob-quoted'" },
-    }, "工具执行中", /等待子任务完成|dlgjob/);
+    }, "正在运行命令", /等待子任务完成|dlgjob/);
     expectPhrase("and-chain", {
       toolName: "Bash",
       inputJson: { command: "cd /tmp && oc-vision understand fake.png" },
-    }, "工具执行中", /正在识别图片|fake\.png|understand/);
+    }, "正在运行命令", /正在识别图片|fake\.png|understand/);
     expectPhrase("py", {
       toolName: "Bash",
       inputJson: { command: "python build.py --output /tmp/view_image.png --note imagegen" },
-    }, "工具执行中", /view_image|imagegen|\/tmp|python/);
+    }, "正在运行命令", /view_image|imagegen|\/tmp|python/);
     expectPhrase("shot", {
       toolName: "Bash",
       inputJson: { command: "oc-browser screenshot --filename /home/agent/.openclaude/generated/secret-shot.png" },
@@ -1423,7 +1581,7 @@ describe("MessageList Manus 过程披露", () => {
       inputJson: { file_path: "/tmp/VERSION" },
       _completed: true,
       output: "ok",
-    }, "工具执行完成", /VERSION|\/tmp|Read/);
+    }, "正在思考下一步", /VERSION|\/tmp|Read/);
 
     cleanup();
     renderList([
@@ -1458,10 +1616,12 @@ describe("MessageList Manus 过程披露", () => {
         output: "probe-error-detail",
       }),
     ], { sending: true });
-    const missed = screen.getByText("未成功");
-    expect(missed).toHaveAttribute("data-live-pending", "false");
+    // OCV5-310: 未成功标在摘要行(安静的「N 步未成功」);外壳标题仍说在继续,不复读原因。
+    const missed = screen.getByTestId("process-group-missed");
+    expect(missed).toHaveTextContent("1 步未成功");
     expect(missed.className).not.toContain("oc-live-status-shine");
     expect(missed.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     expect(screen.queryByText("工具执行完成")).not.toBeInTheDocument();
 
@@ -1480,7 +1640,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByTestId("process-raw-command")).toHaveTextContent("oc-memory delegate-wait dlgjob-audit-SECRET");
-    expect(screen.queryByTestId("process-step-live")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-step-live").textContent ?? "").not.toMatch(/dlgjob/);
 
     cleanup();
     const wrapped = "/bin/bash -lc 'oc-memory delegate-wait dlgjob-wrap-SECRET'";
@@ -1626,7 +1786,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("research-assistant");
   });
 
-  test("正文后面的计划收回上面的工作过程，不在回答下面再开一节", () => {
+  test("正文后面的计划和已答提问收回上面的工作过程，不在回答下面再开一节", () => {
     renderList([
       ...settledTurn(),
       row("plan-late", "plan", "晚到的执行计划", {
@@ -1647,11 +1807,13 @@ describe("MessageList Manus 过程披露", () => {
     const answer = screen.getByText("看板已经做好").closest("[data-testid=assistant-row]");
     if (!answer) throw new Error("missing answer row");
     expect(disclosure.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(answer.compareDocumentPosition(screen.getByTestId("permission-card")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // OCV5-307:回答之后才答完的提问也是本轮步骤,随晚到的计划一起回到回答上方的工作过程;
+    // 收起态下不在回答下面单独露出。
+    expect(screen.queryByTestId("permission-card")).not.toBeInTheDocument();
     expect(screen.queryByText("核对折叠")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBe(disclosure);
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByText("核对折叠").closest("[data-testid=process-disclosure]")).toBe(disclosure);
   });
@@ -1675,7 +1837,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("只剩计划").closest("[data-testid=process-disclosure]")).toBe(disclosure);
   });
 
-  test("正文后面的普通工具仍另起一节，不跟计划一起被提前", () => {
+  // OCV5-307:用户报障「工作过程排在回答后面」。回答之后本轮还跑的工具同样收回回答上方的
+  // 那一个工作过程,不再在回答下面另开一节。
+  test("正文后面的普通工具也收回上面的工作过程，回答下面不再另开一节", () => {
     renderList([
       ...settledTurn(),
       row("late-tool", "tool", "后补命令", {
@@ -1686,11 +1850,63 @@ describe("MessageList Manus 过程披露", () => {
         output: "ok",
       }),
     ]);
-    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(2);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
     const answer = screen.getByText("看板已经做好").closest("[data-testid=assistant-row]");
     if (!answer) throw new Error("missing answer row");
+    const shell = screen.getByTestId("process-disclosure");
+    expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+    expect(screen.getByText("late-probe-cmd", { exact: false }).closest("[data-testid=process-disclosure]")).toBe(shell);
+  });
+
+  // OCV5-307 实况(webmuqjhduqb0ifd9 / tape b16e514b):网关把 turn 终态错误(codex serverOverloaded)
+  // 记在本轮**最后一段正文**上,之后存的工具行其实发生在错误之前。所以它不是「越过的中途错误」,
+  // 而是本轮结局:整张错误卡排在本轮末尾(回答之后),后面那些行收进回答上方唯一的工作过程。
+  test("OCV5-307: 记在最后一段正文上的终态错误排在本轮末尾，之后存的行收回上方工作过程", () => {
+    renderList(
+      [
+        row("u", "user", "把新模型都上线", { status: "replied" }),
+        row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+        row("s2", "assistant", "已明确：新增模型按个人版价格上线", { _clientMessageId: "u" }),
+        row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git diff" }, _completed: true, output: "ok" }),
+        row("err", "assistant", "方案审查已通过，现在进入实现", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+        row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+        row("th", "thinking", "**Resolving Git Conflicts**", { _clientMessageId: "u" }),
+        row("t3", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git push" }, _completed: true, output: "ok" }),
+      ],
+      { cb: { onOpenModelPicker: () => {} } },
+    );
     const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells).toHaveLength(1);
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 4 项");
+    const answer = screen.getByText("已明确：新增模型按个人版价格上线").closest("[data-testid=assistant-row]");
+    const outcome = screen.getByText("模型暂不可用");
+    if (!answer) throw new Error("missing answer row");
     expect(shells[0].compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(answer.compareDocumentPosition(shells[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // 终态错误:顶层、在回答之后、是完整错误卡(不是「本轮已继续」说明),且后面再没有过程壳
+    expect(outcome.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(answer.compareDocumentPosition(outcome) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByTestId("recovered-error-note")).toBeNull();
+    expect(screen.getByText("方案审查已通过，现在进入实现")).toBeInTheDocument();
+    expect(outcome.compareDocumentPosition(shells[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeFalsy();
+  });
+
+  test("OCV5-307: 回答之后以错误收尾时，错误卡留在回答下方原位，前面的工具仍回到上方工作过程", () => {
+    renderList([
+      row("u", "user", "同步两边分支", { status: "replied" }),
+      row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("s2", "assistant", "审查发现一个不能直接合并的问题", { _clientMessageId: "u" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("err", "assistant", "合并中断", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    const shell = screen.getByTestId("process-disclosure");
+    const answer = screen.getByText("审查发现一个不能直接合并的问题").closest("[data-testid=assistant-row]");
+    const error = screen.getByText("模型暂不可用");
+    if (!answer) throw new Error("missing answer row");
+    expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 });

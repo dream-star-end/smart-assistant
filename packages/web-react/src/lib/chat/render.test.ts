@@ -314,7 +314,7 @@ describe("errorLabel / stripMarkdown", () => {
   });
   test("模型权威拒帧的标题(类别)—— 不再回退「出错了」", () => {
     expect(errorLabel("model_config_changed_retry_turn")).toBe("模型配置已更新，请重发");
-    expect(errorLabel("model_not_available")).toBe("模型不可用");
+    expect(errorLabel("model_not_available")).toBe("模型暂不可用");
     expect(errorLabel("unresolved_agent_model")).toBe("未能确定模型");
     expect(errorLabel("model_authority_unavailable")).toBe("模型服务暂时不可用");
     expect(errorLabel("model_catalog_unavailable")).toBe("模型服务暂时不可用");

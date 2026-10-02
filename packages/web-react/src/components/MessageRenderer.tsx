@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -821,9 +821,50 @@ function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner:
 }
 
 /** Contiguous, turn-bounded display groups; never move an actionable row. */
+/**
+ * OCV5-307: errored assistant rows the turn moved past — later work (a tool,
+ * thought, plan, subtask, answered prompt or another assistant) follows in the
+ * same user turn. Those are a recovered step, not the turn's outcome, so they
+ * fold into the process. An error with nothing after it stays on the top level.
+ */
+function continuedErrorIds(messages: ChatMessage[]): Set<string> {
+  const ids = new Set<string>();
+  let pending: string[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      pending = [];
+      continue;
+    }
+    // Positive evidence only: transport / locator / status / hidden rows prove
+    // nothing about the turn continuing (Codex review: a deferred locator after a
+    // terminal error must not hide that error in a collapsed shell). When in
+    // doubt the error stays top-level, i.e. the pre-OCV5-307 behaviour.
+    if (
+      message._payloadDeferred || message._turnStatusRecord || message._genPlaceholder ||
+      message._turnTapeProcess || message._timelineAuxiliary || message._hideUnpublishedFallback === true
+    ) {
+      continue;
+    }
+    // Only a later successful reply proves the turn went on past the error. The
+    // gateway stamps a turn-terminal engine error (e.g. codex serverOverloaded
+    // at turn/completed) onto the turn's LAST assistant text segment, so tool /
+    // thinking rows stored after that segment ran BEFORE the error and prove
+    // nothing (OCV5-307, session webmuqjhduqb0ifd9: both "模型暂不可用" rows
+    // were the turn's real ending).
+    const isWork = message.role === "assistant" && !isErroredAssistant(message) && (message.text ?? "").trim().length > 0;
+    if (isWork && pending.length > 0) {
+      for (const id of pending) ids.add(id);
+      pending = [];
+    }
+    if (isErroredAssistant(message) && message.id) pending.push(message.id);
+  }
+  return ids;
+}
+
 function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
   const out: RenderItem[] = [];
   const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const continuedErrors = continuedErrorIds(messages);
   const activeStart = currentTurnStartIndex(messages);
   const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
   const assistantArtifactKeys = new Map<string, Set<string>>();
@@ -848,9 +889,12 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   type ProcessGroup = Extract<RenderItem, { kind: "process" }>;
   let group: ProcessGroup | undefined;
   let boundary = "";
-  // A static plan that arrives after the final answer is still this turn's
-  // work. Keep it in the shell above the answer. Do not open a second shell
-  // underneath, and do not move a question, approval, failure, or artifact.
+  // Work that arrives after the final answer is still this turn's work (a
+  // late plan, or — OCV5-307 — tools/thoughts the model ran after a mid-turn
+  // reply that ended up as the last visible text). Keep it in the shell above
+  // the answer: never open a second 工作过程 underneath. Rows that must stay
+  // put (question, approval, failure, artifact) are not foldable, end the
+  // carry, and keep their place.
   let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
   // Key off the turn, not the first row. Prepending an older live page must
   // not remount the shell the reader already has open.
@@ -872,7 +916,16 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       if (index >= 0) out.splice(index, 1, ...current.items);
     }
   };
-  const planOnly = (rows: ChatMessage[]) => rows.length > 0 && rows.every((message) => message.role === "plan");
+  // OCV5-307: a turn-terminal error is the turn's outcome. It renders once, at
+  // the end of its turn (after the answer), and does not split the shell: the
+  // rows stored after it (which ran before it, see continuedErrorIds) keep
+  // folding into the same 工作过程.
+  let terminal: { boundary: string; items: LeafRenderItem[] } | undefined;
+  const flushTerminal = () => {
+    if (!terminal) return;
+    out.push(...terminal.items);
+    terminal = undefined;
+  };
   for (const item of items) {
     const rows = itemMessages(item);
     // A cleared goal is not a row, a count, or a shell. Skipping it must not
@@ -881,8 +934,18 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;
+    if (terminal && terminal.boundary !== nextBoundary) {
+      seal(group, boundary);
+      if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+      flushTerminal();
+    }
+    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !continuedErrors.has(message.id))) {
+      (terminal ??= { boundary: nextBoundary, items: [] }).items.push(item);
+      continue;
+    }
     const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
-    const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id), ownedArtifacts));
+    const fold = rows.length > 0 && rows.every((message) =>
+      isProcessMessage(message, answerIds.has(message.id), ownedArtifacts, continuedErrors.has(message.id)));
     if (!fold) {
       seal(group, boundary);
       const crossedAnswer = rows.some((message) => answerIds.has(message.id));
@@ -900,7 +963,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       out.push(item);
       continue;
     }
-    if (carry && carry.boundary === nextBoundary && !group && planOnly(rows)) {
+    if (carry && carry.boundary === nextBoundary && !group) {
       if (!carry.group || out.indexOf(carry.group) < 0) {
         const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
         carry.group = created;
@@ -912,7 +975,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       if (rows.some((message) => activeIds.has(message.id))) carry.group.active = true;
       continue;
     }
-    if (carry && !planOnly(rows)) carry = undefined;
+    if (carry) carry = undefined;
     const rejoin = !group ? beforeAnswer.get(nextBoundary) : undefined;
     if (rejoin && out.includes(rejoin)) {
       group = rejoin;
@@ -930,6 +993,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   }
   seal(group, boundary);
   if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+  flushTerminal();
   return out;
 }
 
@@ -2563,6 +2627,7 @@ export function MessageList({
           messagesOf={itemMessages}
           eagerDeferred={eager}
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
+          startedAt={it.active ? turnActivity?.startedAt ?? null : null}
         />
       );
     }
