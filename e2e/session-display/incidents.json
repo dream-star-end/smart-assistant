@@ -710,12 +710,9 @@
       "symptom": "上下文耗尽的 turn 落成 ENGINE_ERROR 被前端当作可自动恢复;master 原子拒绝为 source_not_recoverable 后,REST 全量同步又暴露同一 source 错误并无限次重新排程。",
       "rootFixCommit": "83681d59",
       "coverageCommits": [
-        "8f04bb2d"
+        "8f04bb2d",
+        "dda24a1e"
       ],
-      "proofPending": {
-        "reason": "触发链=上下文耗尽→ENGINE_ERROR→自动恢复→source_not_recoverable→REST 同步后重复排程。10-stop-turn 只证用户 Stop 终态,语义不匹配,已撤销;恢复围栏跨刷新持久化目前只有 unit 覆盖,尚无覆盖该恢复重试环的 live-e2e/browser/deploy-gate。",
-        "since": "2026-07-26"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -726,6 +723,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence"
         }
       ]
     },
