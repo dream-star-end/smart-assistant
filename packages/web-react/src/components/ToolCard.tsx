@@ -168,12 +168,9 @@ export function ToolCard({
             <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
               <TokenUsageBadge usage={tokenUsage} />
               <span id={statusId} aria-live="polite" className="flex items-center text-meta">
-                {hasError ? (
-                  <span className="text-danger">{status.label}</span>
-                ) : isBlocked ? (
-                  <span className="text-warning">{status.label}</span>
-                ) : isCancelled ? (
-                  <span className="text-muted">{status.label}</span>
+                {/* 过程行里的未成功/受阻/取消是中途常态:如实标注,但与其他过程文字同为安静灰字。 */}
+                {hasError || isBlocked || isCancelled ? (
+                  <span className="text-faint">{status.label}</span>
                 ) : (
                   <span className="sr-only">{status.label}</span>
                 )}
@@ -209,7 +206,7 @@ export function ToolCard({
           )}
         </div>
         {errorFirstLine && (
-          <div id={errorId} className="-mt-0.5 truncate pb-1 text-meta text-danger/90" title={errorFirstLine}>
+          <div id={errorId} className="-mt-0.5 truncate pb-1 text-meta text-faint" title={errorFirstLine}>
             {errorFirstLine}
           </div>
         )}
@@ -217,7 +214,7 @@ export function ToolCard({
           <div
             className={cn(
               "oc-reveal mb-1.5 mt-0.5 overflow-hidden rounded-lg border bg-surface px-3 py-2 [&>*:first-child]:mt-0",
-              hasError ? "border-danger/20" : "border-border/80",
+              "border-border/80",
               isActive && "ring-1 ring-accent/40",
             )}
           >

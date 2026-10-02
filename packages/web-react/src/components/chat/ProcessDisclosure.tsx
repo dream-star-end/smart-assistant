@@ -799,13 +799,8 @@ function stepNode(messages: readonly ChatMessage[], live: boolean): { Icon: Luci
       const display = normalizeToolForDisplay(head);
       const meta = resolveToolMeta(display.name, display.input);
       const status = resolveToolStatus(display);
-      const tone: NodeTone = status.hasError
-        ? "error"
-        : status.isBlocked
-          ? "warning"
-          : status.isRunning && live
-            ? "live"
-            : "idle";
+      // OCV5-313: 过程里的单步未成功 / 受阻是正常工作流的一部分,节点不染红/黄,与其他步骤同色。
+      const tone: NodeTone = status.isRunning && live ? "live" : "idle";
       return { Icon: meta.icon, tone };
     } catch {
       return { Icon: Wrench, tone: "idle" };
@@ -818,7 +813,7 @@ function stepNode(messages: readonly ChatMessage[], live: boolean): { Icon: Luci
   if (head.role === "agent-group" || head.role === "delegate-progress") {
     const failed = hasErrorMark(head) || head._delegateStatus === "failed" || head._delegateStatus === "timeout";
     const done = head._completed === true || head._delegateStatus === "ok";
-    return { Icon: Bot, tone: failed ? "error" : live && !done ? "live" : "idle" };
+    return { Icon: Bot, tone: live && !done && !failed ? "live" : "idle" };
   }
   if (head.role === "thinking") return { Icon: Brain, tone: live ? "live" : "idle" };
   const Icon = KIND_ICON[countLabel(head)] ?? Circle;
@@ -1242,7 +1237,6 @@ export function ProcessDisclosure<T>({
               // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
               // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
               const working = active && index === currentIndex;
-              const missed = section.items.filter((item) => messagesOf(item).some((message) => message.role === "tool" && hasErrorMark(message))).length;
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
                   <RailRow node={<StepNode Icon={group.Icon} tone={group.tone} />} enter={false}>
@@ -1261,9 +1255,8 @@ export function ProcessDisclosure<T>({
                         {naturalSummary(section.items.map(messagesOf))}
                       </span>
                       <span className="sr-only">{operationSummary(section.messages)}</span>
-                      {missed > 0 ? (
-                        <span className="shrink-0 text-meta text-danger" data-testid="process-group-missed">{`${missed} 步未成功`}</span>
-                      ) : null}
+                      {/* OCV5-313: 不在摘要行单独点出「N 步未成功」——中途个别步骤没成功是正常流程,
+                          事实留在展开后的步骤行里(安静的灰字),整轮失败另有顶层错误卡。 */}
                       <ChevronRight
                         size={14}
                         aria-hidden

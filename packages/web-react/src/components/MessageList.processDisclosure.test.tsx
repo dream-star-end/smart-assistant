@@ -1488,6 +1488,46 @@ describe("MessageList Manus 过程披露", () => {
     expect(working.className).toContain("text-muted");
   });
 
+  test("刷新后上一轮的过程和回答不并进最新一轮的处理过程，旧问答卡回到自己那轮（OCV5-313）", () => {
+    const u1 = row("u1", "user", "个人版又有合入", { status: "replied", ts: 1_790_953_040_000 });
+    const u2 = row("u2", "user", "个人版又有新的提交", { status: "sent", ts: 1_790_957_298_000 });
+    const early = row("t1a", "tool", "终端", { _clientMessageId: "u1", toolName: "Bash", inputJson: { command: "git log -3" }, _completed: true, output: "ok" });
+    const mid1 = row("a1mid", "assistant", "收到，我再核对这次个人版增量", { _clientMessageId: "u1" });
+    const strayTool = row("t1b", "tool", "终端", { _clientMessageId: "u1", toolName: "Bash", inputJson: { command: "npm test" }, _completed: true, output: "ok" });
+    const strayFinal = row("a1fin", "assistant", "PREV_TURN_FINAL 最新合入已纳入商业候选并推送", { _clientMessageId: "u1" });
+    const oldQ = row("q-old", "permission", "OLD_Q 按哪个方向同步？", {
+      toolName: "AskUserQuestion",
+      requestId: "req-old",
+      _resolved: true,
+      _behavior: "allow",
+      _source: "local",
+      inputJson: { questions: [{ question: "OLD_Q 按哪个方向同步？", options: [{ label: "双向同步" }] }] },
+      ts: 1_790_920_012_000,
+    } as Partial<ChatMessage>);
+    const u0 = row("u0", "user", "将v5个人版和商业版代码同步下", { status: "replied", ts: 1_790_919_924_000 });
+    const a0 = row("a0", "assistant", "OLDEST_ANSWER", { _clientMessageId: "u0" });
+    const now = row("t2", "tool", "终端", { _clientMessageId: "u2", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: false });
+    renderList([u0, a0, u1, early, mid1, u2, strayTool, strayFinal, oldQ, now], { sending: true });
+    const shells = screen.getAllByTestId("process-disclosure");
+    const live = shells.find((shell) => shell.getAttribute("data-process-active") === "true")!;
+    expect(live).toBeTruthy();
+    expect(live.textContent ?? "").not.toMatch(/PREV_TURN_FINAL|收到，我再核对/);
+    // 上一轮的终答回到上一轮,显示为顶层回答,不在最新一轮的壳里。
+    const final = screen.getByText(/PREV_TURN_FINAL/);
+    expect(final.closest("[data-process-active=true]")).toBeNull();
+    // 旧问答卡排在它被回答的那一轮(最早那轮),在「个人版又有合入」之前,不再挂在最新回答后面。
+    // 默认它收在最早那轮已结束的「工作过程」里(已回答的问答进过程),不在页面底部露出。
+    expect(screen.queryByText(/OLD_Q/)).not.toBeInTheDocument();
+    const oldestShell = shells[0]!;
+    expect(oldestShell.getAttribute("data-process-active")).toBe("false");
+    fireEvent.click(within(oldestShell).getByTestId("process-toggle"));
+    const qNode = within(oldestShell).getAllByText(/OLD_Q/)[0] ?? null;
+    expect(qNode).not.toBeNull();
+    const laterUser = screen.getByText("个人版又有合入");
+    expect(qNode!.compareDocumentPosition(laterUser) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(qNode!.compareDocumentPosition(final) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   test("进行中的工具后追加已完成目标，当前工具仍默认可见", () => {
     const user = row("u", "user", "接着查", { status: "sent" });
     const running = row("cmd", "tool", "终端", {
@@ -1703,14 +1743,18 @@ describe("MessageList Manus 过程披露", () => {
         output: "probe-error-detail",
       }),
     ], { sending: true });
-    // OCV5-310: 未成功标在摘要行(安静的「N 步未成功」);外壳标题仍说在继续,不复读原因。
-    const missed = screen.getByTestId("process-group-missed");
-    expect(missed).toHaveTextContent("1 步未成功");
-    expect(missed.className).not.toContain("oc-live-status-shine");
-    expect(missed.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    // OCV5-313: 中途单步未成功是正常流程:摘要行不单独点出「N 步未成功」,也不染红;外壳标题仍说在继续。
+    expect(screen.queryByTestId("process-group-missed")).not.toBeInTheDocument();
+    expect(screen.queryByText(/步未成功/)).not.toBeInTheDocument();
+    expect(document.querySelector("[data-testid=process-disclosure] .text-danger")).toBeNull();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
     expect(screen.queryByText("probe-error-detail")).not.toBeInTheDocument();
     expect(screen.queryByText("工具执行完成")).not.toBeInTheDocument();
+    // 点开摘要后,这一步如实标「未成功」,但与其他过程文字同为安静灰字,整块不出现危险色。
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    const quiet = within(screen.getByTestId("process-details")).getByText("未成功");
+    expect(quiet.className).toContain("text-faint");
+    expect(document.querySelector("[data-testid=process-disclosure] .text-danger")).toBeNull();
 
     cleanup();
     renderList([
