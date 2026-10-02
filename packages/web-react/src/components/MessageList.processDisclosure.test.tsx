@@ -1066,7 +1066,10 @@ describe("MessageList Manus 过程披露", () => {
     expectOne();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
-    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
+    // OCV5-312: 展开时流光在「正在干活」的摘要行上,外壳标题不扫。
+    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
+    expect(screen.getAllByTestId("process-group-summary").filter((node) => node.getAttribute("data-live-working") === "true")).toHaveLength(1);
+    expect(screen.getAllByTestId("process-group-summary").find((node) => node.getAttribute("data-live-working") === "true")!.className).toContain("oc-live-status-shine");
     expect(screen.queryByText(/THINK_HIDDEN_TAIL/)).not.toBeInTheDocument();
 
     view.rerender(<MessageList processDisclosure messages={[user, ...phases[1]!]} sending sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
@@ -1090,7 +1093,10 @@ describe("MessageList Manus 过程披露", () => {
     expectOne();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在运行命令");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
-    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
+    // OCV5-312: 展开时流光在「正在干活」的摘要行上,外壳标题不扫。
+    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
+    expect(screen.getAllByTestId("process-group-summary").filter((node) => node.getAttribute("data-live-working") === "true")).toHaveLength(1);
+    expect(screen.getAllByTestId("process-group-summary").find((node) => node.getAttribute("data-live-working") === "true")!.className).toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("Bash");
     expect(screen.queryByText("RAW_JSON_SECRET")).not.toBeInTheDocument();
@@ -1099,7 +1105,10 @@ describe("MessageList Manus 过程披露", () => {
     expectOne();
     expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
     expect(screen.getByTestId("process-step-live")).toHaveAttribute("data-live-pending", "true");
-    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
+    // OCV5-312: 展开时流光在「正在干活」的摘要行上,外壳标题不扫。
+    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
+    expect(screen.getAllByTestId("process-group-summary").filter((node) => node.getAttribute("data-live-working") === "true")).toHaveLength(1);
+    expect(screen.getAllByTestId("process-group-summary").find((node) => node.getAttribute("data-live-working") === "true")!.className).toContain("oc-live-status-shine");
     expect(screen.getByTestId("process-step-live")).not.toHaveTextContent("LIVE_CMD_MARKER");
     expect(screen.queryByText("CMD_DONE_SECRET")).not.toBeInTheDocument();
 
@@ -1394,6 +1403,51 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByText("终答在壳外").closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.queryByTestId("process-stage")).not.toBeInTheDocument();
+  });
+
+  test("流光只在正在干活的那一段：展开挂摘要行，折叠挂标题，结束后没有", () => {
+    const user = row("u", "user", "清理磁盘", { status: "sent" });
+    const done = row("c1", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "du -sh /tmp" },
+      _completed: true,
+      output: "1G",
+    });
+    const mid = row("m", "assistant", "先看了临时目录，接下来清缓存。", { _clientMessageId: "u" });
+    const running = row("c2", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "rm -rf /tmp/cache" },
+      _completed: false,
+    });
+    const view = renderList([user, done, mid, running], { sending: true });
+    const summaries = screen.getAllByTestId("process-group-summary");
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]!.getAttribute("data-live-working")).toBe("false");
+    expect(summaries[0]!.className).not.toContain("oc-live-status-shine");
+    expect(summaries[0]!.className).toContain("text-faint");
+    expect(summaries[1]!.getAttribute("data-live-working")).toBe("true");
+    expect(summaries[1]!.className).toContain("oc-live-status-shine");
+    expect(screen.getByTestId("process-step-live").className).not.toContain("oc-live-status-shine");
+    expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
+
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.queryByTestId("process-group-summary")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-step-live").className).toContain("oc-live-status-shine");
+    expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
+
+    view.rerender(
+      <MessageList
+        processDisclosure
+        messages={[user, done, mid, { ...running, _completed: true, output: "ok" }, row("a", "assistant", "清理完成", { _clientMessageId: "u" })]}
+        sending={false}
+        sessionId="session-a"
+        cb={{}}
+        onRespondPermission={() => {}}
+      />,
+    );
+    expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(0);
   });
 
   test("进行中的工具后追加已完成目标，当前工具仍默认可见", () => {
