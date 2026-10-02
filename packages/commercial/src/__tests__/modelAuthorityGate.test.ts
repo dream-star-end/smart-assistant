@@ -126,14 +126,14 @@ const FLASH = entry({
   contextWindow: 1_000_000,
 });
 /**
- * PLATFORM_AUX_MODEL_IDS 的第二位成员:CCB 内置 Agent 子 agent 的默认钉
+ * PLATFORM_AUX_MODEL_IDS 的第二位成员(2026-09-03):CCB 内置 Agent 子 agent 的默认钉
  * (gateway DEFAULT_CCB_SUBAGENT_MODEL,即容器 CLAUDE_CODE_SUBAGENT_MODEL 的实际取值)。
  * platformAuxModels() 对集合成员 fail-closed,所以每个快照都必须带这一行。
  */
-const SUBAGENT = entry({
+const ZAI = entry({
   entryId: 5,
   modelId: DEFAULT_CCB_SUBAGENT_MODEL,
-  providerId: "scnet",
+  providerId: "zai",
   contextWindow: 200_000,
 });
 const OPUS5 = entry({
@@ -145,7 +145,7 @@ const OPUS5 = entry({
 
 function snap(epoch = EPOCH, over: { entries?: ModelCatalogEntry[] } = {}): ModelCatalogSnapshot {
   return new ModelCatalogSnapshot({
-    entries: over.entries ?? [GLM, SOL, DISABLED, FLASH, SUBAGENT],
+    entries: over.entries ?? [GLM, SOL, DISABLED, FLASH, ZAI],
     aliases: new Map([["glm-latest", 1]]),
     pricing: new Map(
       [
@@ -194,7 +194,7 @@ function snapOfficialCc(epoch = EPOCH): ModelCatalogSnapshot {
 function snapWithAdminModel(epoch = EPOCH): ModelCatalogSnapshot {
   const HAIKU = entry({ entryId: 9, modelId: "claude-haiku-4-5", providerId: null });
   return new ModelCatalogSnapshot({
-    entries: [GLM, SOL, DISABLED, FLASH, SUBAGENT, HAIKU],
+    entries: [GLM, SOL, DISABLED, FLASH, ZAI, HAIKU],
     aliases: new Map([["glm-latest", 1]]),
     pricing: new Map(
       [
@@ -651,11 +651,11 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
     assert.equal(d.authorityKind, "bridge_signed");
   });
 
-  test("CCB 子 agent 默认钉(CLAUDE_CODE_SUBAGENT_MODEL = glm-5.3)在非同模型父 turn 下 → 放行", async () => {
+  test("CCB 子 agent 默认钉(CLAUDE_CODE_SUBAGENT_MODEL = glm-5.3-zai)在非同模型父 turn 下 → 放行", async () => {
     // cursor-*/其他父模型的 turn lease 只签了主模型;子 agent 走 passthrough 打同一 egress,
     // 其模型必须在 aux 集里,否则每次 Agent 工具调用 403(selfhost 2026-09-02 事故)。
     const s = snap();
-    const { minted, keyring } = signerFor(s); // 主模型 glm-5.2 + aux=[deepseek-v4-flash, glm-5.3]
+    const { minted, keyring } = signerFor(s); // 主模型 glm-5.2 + aux=[deepseek-v4-flash, glm-5.3-zai]
     assert.deepEqual(minted.payload.auxModels, [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL].sort());
     const d = await enforceModelAuthority({
       catalog: source(s),
@@ -666,7 +666,7 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
       model: DEFAULT_CCB_SUBAGENT_MODEL,
     });
     assert.equal(d.canonicalModel, DEFAULT_CCB_SUBAGENT_MODEL);
-    assert.equal(d.descriptor.providerId, "scnet");
+    assert.equal(d.descriptor.providerId, "zai");
     assert.equal(d.authorityKind, "bridge_signed");
     assert.equal(d.authorityCanonicalModel, "glm-5.2");
   });
@@ -741,7 +741,7 @@ describe("modelAuthorityGate — auxModels 次级模型", () => {
     const before = snap();
     const { minted, keyring } = signerFor(before);
     const after = snap(EPOCH, {
-      entries: [GLM, SOL, DISABLED, entry({ ...FLASH, state: "disabled" }), SUBAGENT],
+      entries: [GLM, SOL, DISABLED, entry({ ...FLASH, state: "disabled" }), ZAI],
     });
     await expectReject(
       enforceModelAuthority({

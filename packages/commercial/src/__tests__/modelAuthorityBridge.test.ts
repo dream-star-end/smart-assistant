@@ -152,7 +152,7 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
     entry({
       entryId: 4,
       modelId: DEFAULT_CCB_SUBAGENT_MODEL,
-      providerId: "scnet",
+      providerId: "zai",
       contextWindow: 200_000,
     }),
   );

@@ -53,7 +53,6 @@ const PROVIDER_DEFAULT_DISPLAY: Record<string, string> = {
   minimax: "火山方舟 Agent Plan(MiniMax)",
   ark: "火山方舟 Coding Plan(GLM)",
   zai: "智谱国际版 Z.AI Coding Plan(GLM)",
-  scnet: "超算互联网 Token Plan(GLM)",
   opencodego: "OpenCode Go(Zen 网关)",
   kimi: "火山方舟 Agent Plan(Kimi)",
   "ark-k3": "火山方舟 Agent Plan(Kimi K3)",

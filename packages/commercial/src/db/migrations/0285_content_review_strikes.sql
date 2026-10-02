@@ -1,4 +1,3 @@
--- order-dependency: 0282_scnet_glm53_flash
 -- Content-review strikes live on the master database so the admin action,
 -- the inbox notice, the appeal, and the account ban share one count.
 -- Session-level bans are not the product path.

@@ -53,7 +53,6 @@ const NOOP_DEPS: PickUpstreamDeps = {
     "ark-k3": "ark-plan-key",
     moonshot: "moonshot-key",
     bailian: "bailian-key",
-    scnet: "scnet-key",
   },
 };
 
