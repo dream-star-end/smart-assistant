@@ -25,7 +25,7 @@ import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDispla
 import { detectOcCli, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { ProcessStepContext } from "./processStep";
-import { safeArtifactSrc } from "../tool/researchCards";
+import { safeArtifactSrc } from "../tool/artifactSrc";
 import { timelineMessageKey } from "./findInSession";
 
 /**

@@ -24,7 +24,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
 import { ProcessStepContext, useProcessStep } from "./chat/processStep";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
-import { ToolBody } from "./tool/bodies";
+import { ToolBody } from "./tool/lazyToolBody";
 import {
   ToolHeaderLabelContext,
   ToolInspectOpenContext,

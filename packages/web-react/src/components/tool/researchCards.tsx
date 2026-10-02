@@ -48,6 +48,7 @@ import { Badge } from "../ui";
 import { connectorToolCard } from "./connectorCards";
 import { useToolHeaderLabel } from "./context";
 import { ExpandControls, useExpandableSlice } from "./expandable";
+import { safeArtifactSrc } from "./artifactSrc";
 import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
 import { INLINE_SUMMARY_CLS, InlineAction } from "./inlineAction";
 import { detectOcCli, type OcCli } from "./meta";
@@ -511,17 +512,8 @@ function LitragCard({ data, partial }: { data: Record<string, unknown>; partial?
 /** 浏览器可直接预览的产物类型(其余只给下载)。 */
 const PREVIEWABLE_EXT = new Set(["html", "htm", "pdf", "png", "jpg", "jpeg", "gif", "webp", "svg"]);
 
-/** 产物 src 安全白名单:只允许**容器绝对路径**(/… 非 //,useSignedSrc 会签名)或 **http(s)**。
- *  拒绝 javascript:/data:/blob:/协议相对/相对路径 —— 防工具输出里的恶意串拼成可点 href(XSS)。
- *  导出供 bodies.tsx 复用(codex imageView 缩略图);依赖方向 bodies → researchCards,无环。 */
-export function safeArtifactSrc(s: unknown): string | null {
-  const v = asStr(s).trim();
-  if (!v) return null;
-  // 内联 http(s) 判定:不用 isSafeHttpUrl 类型守卫,避免它把 string 在 else 分支窄成 never。
-  if (/^https?:\/\//i.test(v)) return v;
-  if (v.startsWith("/") && !v.startsWith("//")) return v;
-  return null;
-}
+// 产物 src 白名单已下沉到 ./artifactSrc(OCV5-310),此处导入并原样再导出供既有调用方。
+export { safeArtifactSrc } from "./artifactSrc";
 
 /** 从路径取小写扩展名(先去 query/hash,再取末段 . 后)。 */
 function fileExt(s: string): string {

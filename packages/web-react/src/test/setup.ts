@@ -47,3 +47,7 @@ if (typeof window !== "undefined" && typeof window.ResizeObserver !== "function"
 if (typeof Element !== "undefined" && typeof Element.prototype.scrollIntoView !== "function") {
   Element.prototype.scrollIntoView = () => {};
 }
+
+// OCV5-310: 工具卡展开体改为按需加载(components/tool/lazyToolBody)。套件启动先把它预取好,
+// lazy 工厂随即走同步 thenable,所有渲染 ToolCard/InspectorPanel 的用例照旧同步断言。
+await (await import("../components/tool/lazyToolBody")).preloadToolBody();
