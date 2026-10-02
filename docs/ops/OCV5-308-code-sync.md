@@ -75,3 +75,32 @@ not close the independent continuation, Stop/capacity, UI or incident blockers.
 - Incident short-hash identity normalization is a separate open change. The
   full incident proof debt, browser/continuation/Stop blocks and rollout remain
   open. These two fixture batches are not production availability evidence.
+
+
+## CI/browser and lineage correction, batch 3 (not a rollout)
+
+Incident names are normalized only after full-object/unique-eight-hex and
+ancestor verification. The egress orphan rebase source is historical metadata
+with equal patch-id, not an exemption. Checker and baseline bytes are unchanged.
+Normalization exposed sixteen more incidents without proof or explicit pending;
+eighteen explicit pending rows were not the whole debt. They stay blockers.
+
+Browser corrections restore the real44px ToolCard header and constrain the
+user flex bubble without clipping. T68 follows approved OCV5-295 copy-always,
+more-collapsed contract with actual Chromium Clipboard API sentinel/click/read,
+manual raw/plain fixture expectations and full long-token copying. T69 awaits
+exact real Markdown, fonts and two frames; unchanged anchor oracles measured
+-0.25px in all three modes. Exact historical function/module negative builds
+hit T68 and T69 (-79.25px), not a full old-release claim.
+
+Restoring T13 exposed previously masked CDP state leakage: touch-disabled and
+detached both left hover:none. The isolated touch context now mounts the same
+shared pure ToolCard probe with production CSS, and main desktop explicitly
+keeps hover:hover plus zero touch. No runtime/network/case-manifest errors are
+suppressed. Final complete browser and fixture type results remain separate.
+
+0293 arrays sort both JS sides, independent of PG locale, with no deduplication
+or weakened exact model/price/capability/binding oracle. Real PG3/3, zero skip or
+cancel, exit0; web package typecheck exit0. Independent complete CI, incident,
+Stop/continuation/empty-output gates remain open. Nothing was deployed or
+activated, and this is not real billing or production availability evidence.

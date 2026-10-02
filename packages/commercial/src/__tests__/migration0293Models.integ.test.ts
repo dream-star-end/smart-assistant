@@ -25,7 +25,7 @@ async function assertPrepared() {
   assert.equal(specs.length,17);
   const rows = (await query(
     "SELECT c.*,to_jsonb(p) AS pricing FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id=ANY($1::text[]) ORDER BY c.model_id",[ids])).rows;
-  assert.deepEqual(rows.map(r=>r.model_id),[...ids].sort());
+  assert.deepEqual(rows.map(r=>r.model_id).sort(),[...ids].sort());
   for (const row of rows) {
     const spec = specs.find(s=>s.model_id===row.model_id)!;
     assert.equal(row.state,"staged");
@@ -72,7 +72,7 @@ describe("0293 commercial prepare new models without activating or changing old 
     await assertPrepared();
     for(const [provider,groupId] of seeded) {
       const expected=[...new Set(specs.filter(s=>s.group_provider===provider).map(s=>s.group_key))].sort();
-      const actual=(await query<{model_id:string}>("SELECT model_id FROM account_group_models WHERE group_id=$1 AND model_id=ANY($2::text[]) ORDER BY model_id",[groupId,keys])).rows.map(r=>r.model_id);
+      const actual=(await query<{model_id:string}>("SELECT model_id FROM account_group_models WHERE group_id=$1 AND model_id=ANY($2::text[]) ORDER BY model_id",[groupId,keys])).rows.map(r=>r.model_id).sort();
       assert.deepEqual(actual,expected);
     }
     assert.equal(keys.length,15);

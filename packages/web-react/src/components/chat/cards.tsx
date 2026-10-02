@@ -531,9 +531,9 @@ export function UserCard({
     // 桌面(hover:hover)上动作条贴在气泡左侧底边、绝对定位不占高度 —— 原先它在气泡下方
     // 预留整整一行(opacity-0 也占位),问题和自己的回答之间被撑开一大段空白。触屏照旧在下方。
     <div className="group flex flex-col items-end pt-3 animate-in" data-testid="user-row">
-      <div className="relative flex max-w-[78%] flex-col items-end">
+      <div className="relative flex min-w-0 max-w-[78%] flex-col items-end">
         <div
-          className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
+          className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
           data-testid="message-text"
         >
           {msg._replyTo && (
