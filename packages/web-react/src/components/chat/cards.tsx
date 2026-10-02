@@ -1013,6 +1013,11 @@ export function AssistantCard({
                   : (msg._recoverySkippedNotice ??
                     (isInsufficient ? creditsCopy.message : shownMessage))}
               </p>
+              {frozenCard && msg._recoverySkippedNotice && msg._recoverySkippedNotice !== shownMessage && (
+                <p data-testid="recovery-skipped-notice" className="mt-1.5 text-[13px] leading-5 text-muted [overflow-wrap:anywhere]">
+                  {msg._recoverySkippedNotice}
+                </p>
+              )}
               {shownDetail && (
                 <details className="mt-1.5 max-w-full">
                   <summary className="w-fit cursor-pointer select-none text-xs text-muted hover:text-fg [@media(hover:none)]:py-3.5">

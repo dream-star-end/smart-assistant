@@ -331,6 +331,7 @@ export function messageSignature(
         m.usage?.waived ? 1 : 0,
         m._truncated ?? "",
         m._errorCode ?? "",
+        JSON.stringify([Object.prototype.hasOwnProperty.call(m, "_recoverySkippedNotice"), m._recoverySkippedNotice ?? null]),
         m._errorCardSnapshot?.disposition ?? "",
         m._errorCardSnapshot?.disposition === "card"
           ? `${m._errorCardSnapshot.tone}:${m._errorCardSnapshot.title}:${m._errorCardSnapshot.message}`

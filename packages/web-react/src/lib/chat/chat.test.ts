@@ -11127,3 +11127,125 @@ describe("CCB ExecuteExtraTool wrapper → delegate agent-group", () => {
     expect(fanout?.role).toBe("tool");
   });
 });
+
+
+describe("existing route placeholder restores only durable recovery fences", () => {
+  test("hydration unions valid true decisions and matching user markers without clobbering live state or emitting", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const persistPendingDispatch = vi.fn(async () => {});
+    const persistPendingControl = vi.fn(async () => {});
+    const sock = makeSocket({ persistPendingDispatch, persistPendingControl });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!; ws.open();
+    const live = sock.ensureSession("s-fence", "main");
+    const routing = { model: "gpt-6-luna", teamMode: false, effortLevel: "high" as const };
+    const card = { disposition: "card", tone: "red", title: "live title", message: "live text" } as const;
+    live.messages.push({ id: "u-source", role: "user", text: "live request", ts: 1, _routing: routing },
+      { id: "live-error", role: "assistant", text: "", ts: 2, _clientMessageId: "u-source", _errorCode: "engine_error", _errorCardSnapshot: card });
+    live._sendingInFlight = true; live._activeClientMessageId = "u-active";
+    live._lastRouting = routing; live._automaticRecoveryDecisions = { "u-live": true };
+    const messages = live.messages, queue = sock.offlineQueue, beforeFrames = [...ws.sent];
+    sock.loadStored({ id: live.id, agentId: "other", title: "stale title", createdAt: 0, lastAt: 0,
+      messages: [{ id: "u-source", role: "user", text: "stale request", ts: 0, _automaticRecoveryAttempted: true },
+        { id: "not-a-user", role: "assistant", text: "", ts: 0, _automaticRecoveryAttempted: true }],
+      _automaticRecoveryDecisions: { "u-source": true, "u-future": true, "u-live": false, "bad:source": true, "not-true": 1 } as any,
+      _sendingInFlight: false, _activeClientMessageId: "stale-active" });
+    expect(live.messages).toBe(messages);
+    expect(live.messages[0]).toMatchObject({ text: "live request", _routing: routing, _automaticRecoveryAttempted: true });
+    expect(live.messages[1]?._errorCardSnapshot).toBe(card);
+    expect(live._lastRouting).toBe(routing);
+    expect(live._sendingInFlight).toBe(true); expect(live._activeClientMessageId).toBe("u-active");
+    expect(live._automaticRecoveryDecisions).toEqual({ "u-live": true, "u-source": true, "u-future": true });
+    expect(sock.offlineQueue).toBe(queue); expect(queue).toHaveLength(0);
+    expect(ws.sent).toEqual(beforeFrames);
+    expect(persistPendingDispatch).not.toHaveBeenCalled(); expect(persistPendingControl).not.toHaveBeenCalled();
+    sock.stop();
+  });
+  test("inherited keys, arrays and non-true values cannot add decisions", () => {
+    const sock = makeSocket(); const live = sock.ensureSession("s-invalid", "main");
+    const base = { id: live.id, agentId: "main", title: "", createdAt: 0, lastAt: 0, messages: [] };
+    for (const raw of [Object.create({ "u-inherited": true }), [true], { "u-false": false, "u-string": "true", "bad:source": true }]) {
+      sock.loadStored({ ...base, _automaticRecoveryDecisions: raw as any });
+      expect(live._automaticRecoveryDecisions).toBeUndefined();
+    }
+    sock.stop();
+  });
+  test("existing placeholder decision prevents an old REST error from scheduling a child", async () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: async () => {} }); sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!; ws.open();
+    sock.ensureSession("s-old-rest", "main");
+    sock.loadStored({ id: "s-old-rest", agentId: "main", title: "", createdAt: 0, lastAt: 0,
+      messages: [], _automaticRecoveryDecisions: { "u-old-rest": true } });
+    const rows: ChatMessage[] = [
+      { id: "u-old-rest", role: "user", text: "old request", ts: 1, _source: "server", _routing: { model: "gpt-6-luna", teamMode: false } },
+      { id: "thinking-old-rest", role: "thinking", text: "saved checkpoint", ts: 2, _source: "server", _turnTapeId: "tape-old", _clientMessageId: "u-old-rest" },
+      { id: "error-old-rest", role: "assistant", text: "", ts: 3, _source: "server", _turnTapeId: "tape-old", _clientMessageId: "u-old-rest", _errorCode: "ENGINE_ERROR" },
+    ];
+    sock.applyServerMessages("s-old-rest", "main", rows, true);
+    await (sock as any).autoRecoverTerminalTurn("s-old-rest", "u-old-rest");
+    expect(ws.sent.map((v) => JSON.parse(v)).filter((v) => v.type === "inbound.message")).toHaveLength(0);
+    expect(sock.offlineQueue).toHaveLength(0); sock.stop();
+  });
+  test("non-existing session retains ordinary hydration semantics", () => {
+    const sock = makeSocket();
+    sock.loadStored({ id: "s-new-hydrate", agentId: "main", title: "saved title", createdAt: 1, lastAt: 2,
+      messages: [{ id: "u-hydrate", role: "user", text: "saved request", ts: 1, _automaticRecoveryAttempted: true }],
+      _automaticRecoveryDecisions: { "u-hydrate": true } });
+    expect(sock.sessions.get("s-new-hydrate")?.title).toBe("saved title");
+    expect(sock.sessions.get("s-new-hydrate")?._automaticRecoveryDecisions).toEqual({ "u-hydrate": true });
+    expect(sock.sessions.get("s-new-hydrate")?.messages[0]?._automaticRecoveryAttempted).toBe(true); sock.stop();
+  });
+});
+
+
+describe("durable rejected feedback bridges placeholder to later server error", () => {
+  const oldNotice = "old rejected notice";
+  const error = (id = "history-error", source = "u-rejected", code = "ENGINE_ERROR"): ChatMessage => ({
+    id, role: "assistant", text: "", ts: 1, _clientMessageId: source, _errorCode: code, _source: "server" });
+  const disk = (id: string) => ({ id, agentId: "main", title: "old title", createdAt: 0, lastAt: 0,
+    messages: [{ ...error("old-live-error"), _recoverySkippedNotice: oldNotice }],
+    _automaticRecoveryDecisions: { "u-rejected": true as const } });
+  test("legacy feedback survives empty placeholder serialization and another reload before server row exists", () => {
+    const first = makeSocket(); const placeholder = first.ensureSession("s-feedback", "main");
+    first.loadStored(disk(placeholder.id));
+    expect(placeholder.messages).toHaveLength(0);
+    expect(placeholder._recoveryRejectedNotices).toEqual({ "u-rejected": { code: "engine_error", notice: oldNotice } });
+    const committed = first.toStored(placeholder.id)!;
+    const second = makeSocket(); second.ensureSession(placeholder.id, "main"); second.loadStored(committed);
+    second.applyServerMessages(placeholder.id, "main", [error()], true);
+    expect(second.sessions.get(placeholder.id)?.messages.find((m) => m.id === "history-error")?._recoverySkippedNotice).toBe(oldNotice);
+    expect(second.offlineQueue).toHaveLength(0); first.stop(); second.stop();
+  });
+  test("current feedback wins over late disk, without replacing live message or snapshot", () => {
+    const sock = makeSocket(); const live = sock.ensureSession("s-live-feedback", "main");
+    const snap = { disposition: "card", tone: "red", title: "live", message: "immutable" } as const;
+    const row = { ...error("live-error"), _errorCardSnapshot: snap, _recoverySkippedNotice: "current notice" };
+    live.messages.push(row); sock.loadStored(disk(live.id));
+    expect(live.messages[0]).toBe(row); expect(row._errorCardSnapshot).toBe(snap);
+    expect(live._recoveryRejectedNotices?.["u-rejected"].notice).toBe("current notice"); sock.stop();
+  });
+  test("explicit server text or clear wins and clear cannot revive on a following REST without field", () => {
+    const sock = makeSocket(); const live = sock.ensureSession("s-clear-feedback", "main"); sock.loadStored(disk(live.id));
+    sock.applyServerMessages(live.id, "main", [{ ...error(), _recoverySkippedNotice: "server notice" }], true);
+    expect(live._recoveryRejectedNotices?.["u-rejected"].notice).toBe("server notice");
+    sock.applyServerMessages(live.id, "main", [{ ...error(), _recoverySkippedNotice: "" }], true);
+    expect(live._recoveryRejectedNotices).toBeUndefined(); expect(live.messages[0]?._recoverySkippedNotice).toBe("");
+    sock.applyServerMessages(live.id, "main", [error()], true);
+    expect(live.messages[0]?._recoverySkippedNotice).toBeUndefined(); sock.stop();
+  });
+  test("wrong owner, wrong error code, non-error and independent session cannot consume feedback", () => {
+    const sock = makeSocket(); const live = sock.ensureSession("s-bound-feedback", "main"); sock.loadStored(disk(live.id));
+    sock.applyServerMessages(live.id, "main", [error("other-owner", "u-other"), error("other-code", "u-rejected", "auth_error"),
+      { ...error("plain-answer"), _errorCode: undefined, text: "valid answer" }], true);
+    expect(live.messages.every((m) => !m._recoverySkippedNotice)).toBe(true);
+    sock.applyServerMessages("s-independent", "main", [error()], true);
+    expect(sock.sessions.get("s-independent")?.messages[0]?._recoverySkippedNotice).toBeUndefined(); sock.stop();
+  });
+  test("malformed metadata and non-error legacy feedback cannot enter the session", () => {
+    const sock = makeSocket(); const live = sock.ensureSession("s-malformed-feedback", "main");
+    sock.loadStored({ ...disk(live.id), messages: [{ ...error(), _errorCode: undefined, _recoverySkippedNotice: oldNotice }],
+      _recoveryRejectedNotices: { "bad:source": { code: "engine_error", notice: oldNotice }, "u-empty": { code: "engine_error", notice: "" }, "u-array": [] } as any });
+    expect(live._recoveryRejectedNotices).toBeUndefined(); sock.stop();
+  });
+});
