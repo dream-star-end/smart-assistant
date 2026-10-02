@@ -692,17 +692,18 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("生成图片")).not.toBeInTheDocument();
     expect(screen.queryByText("货架静物")).not.toBeInTheDocument();
 
+    // OCV5-307:回答之后的 bad/only 不再在回答下面另开一节,回到回答上方唯一的工作过程。
     const toggles = screen.getAllByTestId("process-toggle");
-    expect(toggles).toHaveLength(2);
+    expect(toggles).toHaveLength(1);
+    const answerRow = screen.getByText(/总结在这里/).closest("[data-testid=assistant-row]");
+    expect(screen.getByTestId("process-disclosure").compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(toggles[0]!);
     fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
     const first = screen.getAllByTestId("process-details")[0]!;
     expect(within(first).getByText(/paper\.pdf/).closest("[data-testid=process-details]")).not.toBeNull();
     expect(within(first).getByText("生成图片").closest("[data-testid=process-details]")).not.toBeNull();
     expect(first.textContent ?? "").toMatch(/cp x \/home\/agent\/\.openclaude\/generated\//);
-    fireEvent.click(toggles[1]!);
-    fireEvent.click(screen.getAllByTestId("process-detail-toggle")[1]!);
-    const second = screen.getAllByTestId("process-details")[1]!;
+    const second = first;
     for (const button of within(second).getAllByRole("button")) {
       if (button.getAttribute("aria-expanded") === "false") fireEvent.click(button);
     }
@@ -1764,7 +1765,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("research-assistant");
   });
 
-  test("正文后面的计划收回上面的工作过程，不在回答下面再开一节", () => {
+  test("正文后面的计划和已答提问收回上面的工作过程，不在回答下面再开一节", () => {
     renderList([
       ...settledTurn(),
       row("plan-late", "plan", "晚到的执行计划", {
@@ -1785,11 +1786,13 @@ describe("MessageList Manus 过程披露", () => {
     const answer = screen.getByText("看板已经做好").closest("[data-testid=assistant-row]");
     if (!answer) throw new Error("missing answer row");
     expect(disclosure.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(answer.compareDocumentPosition(screen.getByTestId("permission-card")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // OCV5-307:回答之后才答完的提问也是本轮步骤,随晚到的计划一起回到回答上方的工作过程;
+    // 收起态下不在回答下面单独露出。
+    expect(screen.queryByTestId("permission-card")).not.toBeInTheDocument();
     expect(screen.queryByText("核对折叠")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBe(disclosure);
     fireEvent.click(screen.getByTestId("process-detail-toggle"));
     expect(screen.getByText("核对折叠").closest("[data-testid=process-disclosure]")).toBe(disclosure);
   });
@@ -1813,7 +1816,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("只剩计划").closest("[data-testid=process-disclosure]")).toBe(disclosure);
   });
 
-  test("正文后面的普通工具仍另起一节，不跟计划一起被提前", () => {
+  // OCV5-307:用户报障「工作过程排在回答后面」。回答之后本轮还跑的工具同样收回回答上方的
+  // 那一个工作过程,不再在回答下面另开一节。
+  test("正文后面的普通工具也收回上面的工作过程，回答下面不再另开一节", () => {
     renderList([
       ...settledTurn(),
       row("late-tool", "tool", "后补命令", {
@@ -1824,11 +1829,51 @@ describe("MessageList Manus 过程披露", () => {
         output: "ok",
       }),
     ]);
-    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(2);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
     const answer = screen.getByText("看板已经做好").closest("[data-testid=assistant-row]");
     if (!answer) throw new Error("missing answer row");
+    const shell = screen.getByTestId("process-disclosure");
+    expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    for (const toggle of screen.getAllByTestId("process-detail-toggle")) fireEvent.click(toggle);
+    expect(screen.getByText("late-probe-cmd", { exact: false }).closest("[data-testid=process-disclosure]")).toBe(shell);
+  });
+
+  test("OCV5-307: 回答之后的工具、思考和越过的错误都回到回答上方的唯一工作过程；顶层错误不被挪动", () => {
+    renderList([
+      row("u", "user", "同步两边分支", { status: "replied" }),
+      row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("s2", "assistant", "审查发现一个不能直接合并的问题", { _clientMessageId: "u" }),
+      row("err", "assistant", "候选已推送", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("th", "thinking", "**Resolving Git Conflicts**", { _clientMessageId: "u" }),
+      row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git push" }, _completed: true, output: "ok" }),
+    ]);
     const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells).toHaveLength(1);
+    const answer = screen.getByText("审查发现一个不能直接合并的问题").closest("[data-testid=assistant-row]");
+    if (!answer) throw new Error("missing answer row");
+    // 工作过程在回答上方,回答之后没有任何过程壳
     expect(shells[0].compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(answer.compareDocumentPosition(shells[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 3 项");
+    expect(screen.queryByText("模型暂不可用")).not.toBeInTheDocument();
+  });
+
+  test("OCV5-307: 回答之后以错误收尾时，错误卡留在回答下方原位，前面的工具仍回到上方工作过程", () => {
+    renderList([
+      row("u", "user", "同步两边分支", { status: "replied" }),
+      row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      row("s2", "assistant", "审查发现一个不能直接合并的问题", { _clientMessageId: "u" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("err", "assistant", "合并中断", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    const shell = screen.getByTestId("process-disclosure");
+    const answer = screen.getByText("审查发现一个不能直接合并的问题").closest("[data-testid=assistant-row]");
+    const error = screen.getByText("模型暂不可用");
+    if (!answer) throw new Error("missing answer row");
+    expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 });

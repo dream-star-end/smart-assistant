@@ -879,9 +879,12 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   type ProcessGroup = Extract<RenderItem, { kind: "process" }>;
   let group: ProcessGroup | undefined;
   let boundary = "";
-  // A static plan that arrives after the final answer is still this turn's
-  // work. Keep it in the shell above the answer. Do not open a second shell
-  // underneath, and do not move a question, approval, failure, or artifact.
+  // Work that arrives after the final answer is still this turn's work (a
+  // late plan, or — OCV5-307 — tools/thoughts the model ran after a mid-turn
+  // reply that ended up as the last visible text). Keep it in the shell above
+  // the answer: never open a second 工作过程 underneath. Rows that must stay
+  // put (question, approval, failure, artifact) are not foldable, end the
+  // carry, and keep their place.
   let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
   // Key off the turn, not the first row. Prepending an older live page must
   // not remount the shell the reader already has open.
@@ -903,7 +906,6 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       if (index >= 0) out.splice(index, 1, ...current.items);
     }
   };
-  const planOnly = (rows: ChatMessage[]) => rows.length > 0 && rows.every((message) => message.role === "plan");
   for (const item of items) {
     const rows = itemMessages(item);
     // A cleared goal is not a row, a count, or a shell. Skipping it must not
@@ -932,7 +934,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       out.push(item);
       continue;
     }
-    if (carry && carry.boundary === nextBoundary && !group && planOnly(rows)) {
+    if (carry && carry.boundary === nextBoundary && !group) {
       if (!carry.group || out.indexOf(carry.group) < 0) {
         const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
         carry.group = created;
@@ -944,7 +946,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       if (rows.some((message) => activeIds.has(message.id))) carry.group.active = true;
       continue;
     }
-    if (carry && !planOnly(rows)) carry = undefined;
+    if (carry) carry = undefined;
     const rejoin = !group ? beforeAnswer.get(nextBoundary) : undefined;
     if (rejoin && out.includes(rejoin)) {
       group = rejoin;
