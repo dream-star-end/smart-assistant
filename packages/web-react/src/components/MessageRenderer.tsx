@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ProcessDisclosure, artifactEvidenceKeys, isAnsweredPrompt, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -839,9 +839,13 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
     ) {
       continue;
     }
-    const isWork =
-      isFoldableWorkRole(message) || isAnsweredPrompt(message) ||
-      (message.role === "assistant" && !isErroredAssistant(message) && (message.text ?? "").trim().length > 0);
+    // Only a later successful reply proves the turn went on past the error. The
+    // gateway stamps a turn-terminal engine error (e.g. codex serverOverloaded
+    // at turn/completed) onto the turn's LAST assistant text segment, so tool /
+    // thinking rows stored after that segment ran BEFORE the error and prove
+    // nothing (OCV5-307, session webmuqjhduqb0ifd9: both "模型暂不可用" rows
+    // were the turn's real ending).
+    const isWork = message.role === "assistant" && !isErroredAssistant(message) && (message.text ?? "").trim().length > 0;
     if (isWork && pending.length > 0) {
       for (const id of pending) ids.add(id);
       pending = [];
@@ -906,6 +910,16 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
       if (index >= 0) out.splice(index, 1, ...current.items);
     }
   };
+  // OCV5-307: a turn-terminal error is the turn's outcome. It renders once, at
+  // the end of its turn (after the answer), and does not split the shell: the
+  // rows stored after it (which ran before it, see continuedErrorIds) keep
+  // folding into the same 工作过程.
+  let terminal: { boundary: string; items: LeafRenderItem[] } | undefined;
+  const flushTerminal = () => {
+    if (!terminal) return;
+    out.push(...terminal.items);
+    terminal = undefined;
+  };
   for (const item of items) {
     const rows = itemMessages(item);
     // A cleared goal is not a row, a count, or a shell. Skipping it must not
@@ -914,6 +928,15 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;
+    if (terminal && terminal.boundary !== nextBoundary) {
+      seal(group, boundary);
+      if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+      flushTerminal();
+    }
+    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !continuedErrors.has(message.id))) {
+      (terminal ??= { boundary: nextBoundary, items: [] }).items.push(item);
+      continue;
+    }
     const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
     const fold = rows.length > 0 && rows.every((message) =>
       isProcessMessage(message, answerIds.has(message.id), ownedArtifacts, continuedErrors.has(message.id)));
@@ -964,6 +987,7 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   }
   seal(group, boundary);
   if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+  flushTerminal();
   return out;
 }
 

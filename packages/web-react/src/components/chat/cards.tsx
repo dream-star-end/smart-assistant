@@ -946,6 +946,31 @@ export function AssistantCard({
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
           </output>
+        ) : recoveredStep && !suppressErrorAlert && presentedError ? (
+          // OCV5-307:本轮已越过的错误(例:上游满载的 turn 终态错误被记在较早的正文段上,随后同一轮又
+          // 继续并给出回复)。它是历史事实而非待办 —— 只留一行低调说明 + 可展开的请求信息,不再用整张
+          // 警示卡叫用户「切换模型后重发」。真正以错误收尾的轮次不进这里,仍是完整错误卡。
+          <div
+            role="status"
+            data-testid="recovered-error-note"
+            className="mt-2.5 flex max-w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border/70 bg-surface px-3 py-2 text-meta text-muted"
+          >
+            <AlertTriangle size={13} aria-hidden="true" className="shrink-0 text-warning" />
+            <span className="font-medium text-fg/80">
+              {isInsufficient && !frozenCard ? creditsCopy.title : shownTitle}
+            </span>
+            <span>· 本轮已继续，无需处理</span>
+            {shownDetail && (
+              <details className="basis-full">
+                <summary className="w-fit cursor-pointer select-none text-caption text-faint hover:text-fg [@media(hover:none)]:py-3.5">
+                  查看请求信息
+                </summary>
+                <pre className="mt-1.5 max-h-28 max-w-full overflow-auto whitespace-pre-wrap rounded-md bg-code px-2.5 py-2 text-caption text-muted [overflow-wrap:anywhere]">
+                  {shownDetail}
+                </pre>
+              </details>
+            )}
+          </div>
         ) : suppressErrorAlert && msg._recoverySkippedNotice ? (
           <Alert
             tone="warning"

@@ -216,6 +216,11 @@ describe("MessageList Manus 过程披露", () => {
     const card = screen.getByTestId("process-card");
     expect(within(card).getByText("模型暂不可用")).toBeInTheDocument();
     expect(card.closest("[data-testid=process-disclosure]")).not.toBeNull();
+    // OCV5-307:已越过的错误只留一行说明,不再是叫用户「切换模型后重发」的整张警示卡。
+    const note = within(card).getByTestId("recovered-error-note");
+    expect(note).toHaveTextContent("本轮已继续");
+    expect(within(card).queryByRole("alert")).toBeNull();
+    expect(card.textContent ?? "").not.toMatch(/切换一个模型|后重发/);
   });
 
   test("OCV5-307: 以 model_not_available 收尾的轮次，错误卡仍在顶层", () => {
@@ -237,6 +242,9 @@ describe("MessageList Manus 过程披露", () => {
       { cb: { onRegenerate: () => {} } },
     );
     const retry = screen.getByRole("button", { name: /重新尝试|重试/ });
+    // 以错误收尾 = 本轮结局:仍是完整错误卡,不是「已继续」说明。
+    expect(screen.queryByTestId("recovered-error-note")).toBeNull();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
     // 对照组:可重试码在顶层(本轮结局)有重试出口,下面「过程里不给」的断言才有意义。
     expect(retry.closest("[data-testid=process-disclosure]")).toBeNull();
   });
@@ -254,7 +262,7 @@ describe("MessageList Manus 过程披露", () => {
     );
     fireEvent.click(screen.getByTestId("process-toggle"));
     const card = screen.getByTestId("process-card");
-    expect(within(card).getByRole("alert")).toBeInTheDocument();
+    expect(within(card).getByTestId("recovered-error-note")).toBeInTheDocument();
     for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
       expect(within(card).queryByRole("button", { name })).toBeNull();
     }
@@ -1839,24 +1847,36 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("late-probe-cmd", { exact: false }).closest("[data-testid=process-disclosure]")).toBe(shell);
   });
 
-  test("OCV5-307: 回答之后的工具、思考和越过的错误都回到回答上方的唯一工作过程；顶层错误不被挪动", () => {
-    renderList([
-      row("u", "user", "同步两边分支", { status: "replied" }),
-      row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
-      row("s2", "assistant", "审查发现一个不能直接合并的问题", { _clientMessageId: "u" }),
-      row("err", "assistant", "候选已推送", { _clientMessageId: "u", _errorCode: "model_not_available" }),
-      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
-      row("th", "thinking", "**Resolving Git Conflicts**", { _clientMessageId: "u" }),
-      row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git push" }, _completed: true, output: "ok" }),
-    ]);
+  // OCV5-307 实况(webmuqjhduqb0ifd9 / tape b16e514b):网关把 turn 终态错误(codex serverOverloaded)
+  // 记在本轮**最后一段正文**上,之后存的工具行其实发生在错误之前。所以它不是「越过的中途错误」,
+  // 而是本轮结局:整张错误卡排在本轮末尾(回答之后),后面那些行收进回答上方唯一的工作过程。
+  test("OCV5-307: 记在最后一段正文上的终态错误排在本轮末尾，之后存的行收回上方工作过程", () => {
+    renderList(
+      [
+        row("u", "user", "把新模型都上线", { status: "replied" }),
+        row("t0", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+        row("s2", "assistant", "已明确：新增模型按个人版价格上线", { _clientMessageId: "u" }),
+        row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git diff" }, _completed: true, output: "ok" }),
+        row("err", "assistant", "方案审查已通过，现在进入实现", { _clientMessageId: "u", _errorCode: "model_not_available" }),
+        row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+        row("th", "thinking", "**Resolving Git Conflicts**", { _clientMessageId: "u" }),
+        row("t3", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git push" }, _completed: true, output: "ok" }),
+      ],
+      { cb: { onOpenModelPicker: () => {} } },
+    );
     const shells = screen.getAllByTestId("process-disclosure");
     expect(shells).toHaveLength(1);
-    const answer = screen.getByText("审查发现一个不能直接合并的问题").closest("[data-testid=assistant-row]");
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 4 项");
+    const answer = screen.getByText("已明确：新增模型按个人版价格上线").closest("[data-testid=assistant-row]");
+    const outcome = screen.getByText("模型暂不可用");
     if (!answer) throw new Error("missing answer row");
-    // 工作过程在回答上方,回答之后没有任何过程壳
     expect(shells[0].compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(screen.getByTestId("process-toggle")).toHaveTextContent("命令 3 项");
-    expect(screen.queryByText("模型暂不可用")).not.toBeInTheDocument();
+    // 终态错误:顶层、在回答之后、是完整错误卡(不是「本轮已继续」说明),且后面再没有过程壳
+    expect(outcome.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(answer.compareDocumentPosition(outcome) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByTestId("recovered-error-note")).toBeNull();
+    expect(screen.getByText("方案审查已通过，现在进入实现")).toBeInTheDocument();
+    expect(outcome.compareDocumentPosition(shells[0]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeFalsy();
   });
 
   test("OCV5-307: 回答之后以错误收尾时，错误卡留在回答下方原位，前面的工具仍回到上方工作过程", () => {
