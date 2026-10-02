@@ -4757,7 +4757,8 @@
       "coverageCommits": [
         "fc0e393a",
         "21e9b0c8",
-        "bc3b30d7"
+        "bc3b30d7",
+        "2c57167a"
       ],
       "regressions": [
         {
@@ -4774,6 +4775,16 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ccbLocalAgentCallback.test.ts",
           "assertion": "drops a second notice with the same status and summary"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/empty-turn-callback.node-test.mjs",
+          "assertion": "INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callback admission"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence"
         }
       ]
     },
