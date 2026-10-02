@@ -6,6 +6,7 @@ import { ChatInteractionContext } from "../tool/context";
 import { resetSubscribeUiState } from "../settings/SubscriptionDialog";
 import { BRAND } from "../../lib/brand";
 import { ToastProvider } from "../ui";
+import { ResponseRatingProvider } from "./ResponseRating";
 import {
   AssistantCard,
   type CardCallbacks,
@@ -220,8 +221,11 @@ describe("触屏动作行折叠(TouchActionRow)", () => {
     const toggle = screen.getByRole("button", { name: "更多操作" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(toggle).toHaveClass("[@media(hover:none)]:inline-flex");
+    // OCV5-295:完成态「复制」在折叠区外常显;折叠区以「复制纯文本」定位,开合语义不变。
+    const row = screen.getByRole("button", { name: "复制纯文本" }).parentElement!;
     const copy = screen.getByRole("button", { name: "复制" });
-    const row = copy.parentElement!;
+    expect(row).not.toContainElement(copy);
+    expect(copy.closest(".\\[\\@media\\(hover\\:none\\)\\]\\:hidden")).toBeNull();
     expect(row).toHaveClass("[@media(hover:none)]:hidden");
     expect(row).not.toHaveClass("[@media(hover:none)]:opacity-100");
 
@@ -238,18 +242,76 @@ describe("触屏动作行折叠(TouchActionRow)", () => {
     expect(row).toHaveClass("[@media(hover:none)]:hidden");
   });
 
-  test("末轮末条助手回复(可重新生成的那条)默认展开", () => {
+  // OCV5-295:末条不再默认整排展开。复制在折叠区外常显(一击),其余五个动作在「更多操作」里(两击内)。
+  test("末轮末条助手回复:复制常显在折叠区外,其余动作默认收在「更多操作」里", () => {
     render(
       <AssistantCard
         msg={{ id: "a-final", role: "assistant", text: "最新回答", ts: 1 } as ChatMessage}
         ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
-        cb={{ onRegenerate: vi.fn() }}
+        cb={{ onRegenerate: vi.fn(), onQuote: vi.fn(), onFeedback: vi.fn() }}
       />,
     );
+    const toggle = screen.getByRole("button", { name: "更多操作" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    const fold = screen.getByRole("button", { name: "重新生成" }).parentElement!;
+    expect(fold).toHaveClass("[@media(hover:none)]:hidden");
+    const copy = screen.getByRole("button", { name: "复制" });
+    expect(copy).toHaveClass("[@media(hover:none)]:size-11");
+    expect(fold).not.toContainElement(copy);
+    expect(copy.closest(".\\[\\@media\\(hover\\:none\\)\\]\\:hidden")).toBeNull();
+    for (const name of ["复制纯文本", "引用", "重新生成", "反馈"]) {
+      expect(fold).toContainElement(screen.getByRole("button", { name }));
+    }
+
+    fireEvent.click(toggle);
     expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: "重新生成" }).parentElement).toHaveClass(
-      "[@media(hover:none)]:opacity-100",
+    expect(fold).toHaveClass("[@media(hover:none)]:opacity-100");
+    expect(fold).not.toHaveClass("[@media(hover:none)]:hidden");
+  });
+
+  test("正向积分与请求号留在 assistant-meta,不进「更多操作」折叠区;评价行与 meta 同一父节点", () => {
+    render(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: vi.fn() }}>
+        <AssistantCard
+          msg={{
+            id: "a-cost",
+            role: "assistant",
+            text: "带费用的回答",
+            ts: Date.now() - 5_000,
+            usage: { traceId: "trace-cost-1234", costCredits: "109" },
+          } as ChatMessage}
+          ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
+          cb={{ onRegenerate: vi.fn() }}
+        />
+      </ResponseRatingProvider>,
     );
+    const meta = screen.getByTestId("assistant-meta");
+    const credits = screen.getByLabelText("消耗 109 积分");
+    const req = screen.getByRole("button", { name: "复制请求ID trace-cost-1234" });
+    expect(meta).toContainElement(credits);
+    expect(meta).toContainElement(req);
+    const fold = screen.getByRole("button", { name: "重新生成" }).parentElement!;
+    expect(fold).not.toContainElement(credits);
+    expect(fold).not.toContainElement(req);
+    const footer = screen.getByTestId("assistant-footer");
+    expect(footer).toContainElement(meta);
+    expect(footer).toContainElement(screen.getByRole("button", { name: "点赞" }));
+    expect(footer).toContainElement(screen.getByText("这条回复怎么样?"));
+  });
+
+  test("停止/失败精简行:复制 / 纯文本 / 引用直接可见,不收进折叠", () => {
+    renderErr(
+      errMsg({ _errorCode: "stopped", text: "停止前写出的半截答案", usage: { traceId: "trace-stop", costCredits: "12" } }),
+      { onRegenerate: vi.fn(), onQuote: vi.fn() },
+    );
+    expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
+    for (const name of ["复制", "复制纯文本", "引用"]) {
+      const row = screen.getByRole("button", { name }).parentElement!;
+      expect(row).toHaveClass("[@media(hover:none)]:opacity-100");
+      expect(row).not.toHaveClass("[@media(hover:none)]:hidden");
+    }
+    expect(screen.getByTestId("assistant-meta")).toContainElement(screen.getByLabelText("消耗 12 积分"));
+    expect(screen.getByRole("button", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
   });
 
   test("用户行同样默认折叠,开关为 44px 触控靶", () => {

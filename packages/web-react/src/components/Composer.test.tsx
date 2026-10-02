@@ -115,9 +115,11 @@ describe("Composer 语音不可用原因", () => {
 
 describe("Composer 控件边框 token", () => {
   test("外壳非聚焦用 border-border-control，聚焦用 border-border-strong，不用分隔线 border-border", () => {
-    const { container } = render(<Composer onSend={() => {}} />);
-    const shell = container.querySelector(".rounded-\\[26px\\]");
-    expect(shell).toBeTruthy();
+    render(<Composer onSend={() => {}} />);
+    // OCV5-295:用稳定 testid 取外壳,不再拿圆角类当选择器;外壳改轻阴影,不再用浮层 --shadow-float。
+    const shell = screen.getByTestId("composer-shell");
+    expect(shell.className).toContain("shadow-[var(--shadow-soft)]");
+    expect(shell.className).not.toContain("--shadow-float");
     expect(shell?.className).toContain("border-border-control");
     expect(shell?.className).toContain("focus-within:border-border-strong");
     expect(shell?.className).not.toMatch(/(?:^|\s)border-border(?:\s|$)/);
@@ -269,9 +271,8 @@ describe("Composer 拖拽上传", () => {
 
   test("drop 含 File 的 dataTransfer 后附件列表出现文件名", async () => {
     const onUpload = vi.fn(async () => ({ kind: "file" as const, url: "/api/media/note.txt" }));
-    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
-    const shell = container.querySelector(".rounded-\\[26px\\]");
-    expect(shell).toBeTruthy();
+    render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = screen.getByTestId("composer-shell");
     const file = new File(["hello"], "drop-note.txt", { type: "text/plain" });
     fireEvent.drop(shell as Element, { dataTransfer: fileDt(file) });
     expect(await screen.findByText("drop-note.txt")).toBeInTheDocument();
@@ -279,8 +280,8 @@ describe("Composer 拖拽上传", () => {
 
   test("dragover 含 Files 时根容器出现高亮 class；拖纯文本不高亮", () => {
     const onUpload = vi.fn(async () => ({ kind: "file" as const, url: "/x" }));
-    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
-    const shell = container.querySelector(".rounded-\\[26px\\]") as HTMLElement;
+    render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = screen.getByTestId("composer-shell");
     fireEvent.dragOver(shell, { dataTransfer: fileDt(undefined, ["Files"]) });
     expect(shell.className).toContain("ring-2");
     expect(shell.className).toContain("ring-ring");

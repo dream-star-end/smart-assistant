@@ -3083,7 +3083,7 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
       document.documentElement.classList.toggle("dark", next === "dark");
     }, theme);
 
-    const composerClass = await page.locator("#root [class*='rounded-[26px]']").first().getAttribute("class") ?? "";
+    const composerClass = await page.locator("#root [data-testid='composer-shell']").first().getAttribute("class") ?? "";
     if (!composerClass.includes("border-border-control")) {
       throw new Error(`Composer 非聚焦边框丢失(${theme}): ${composerClass}`);
     }
