@@ -13,6 +13,10 @@ import { wrapIoredisForPreCheck } from "../billing/preCheck.js";
 const hasRedisServer = spawnSync("redis-server", ["--version"],
   { stdio: "ignore" }).status === 0;
 
+if ((process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1") && !hasRedisServer) {
+  throw new Error("Redis TTL proof requires the real redis-server binary in CI");
+}
+
 test("Box 14700s lock survives later 300s reservation on same Redis key",
   { skip: !hasRedisServer }, async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "oc-box-reserve-"));

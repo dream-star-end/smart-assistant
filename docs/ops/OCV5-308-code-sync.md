@@ -31,3 +31,30 @@ B5 dedicated PG proof passed 3/3; source CI/incident debt remains a release bloc
   admitted 4.7. Signed Ed25519 consumption and local client reject bad bindings.
 - Full CI and production relay-version evidence are separate gates and remain
   required before activation. This is preparation, not an activation/live claim.
+
+
+## CI fixture/discovery/package-boundary correction, batch 1
+
+B7 was independently reviewed PASS at `1b6e6c003`. Its settle regression uses
+an injected finalizer and proves journal freeze, not a real debit; real billing
+and relay validation remain activation gates.
+
+CI TAP identified internal PG port 5432 vs external mapped 55432, Bun's runner
+HOME traversal after uid drop, missing host redis-server, duplicate integ discovery,
+and five cross-package src imports. Corrections retain real business oracles:
+
+- External test DSN is fenced before connection; actual current_database is
+  checked before writes. Existing TEMP and exclusive-schema assertions remain.
+  No server listen port is compared against a NAT mapping.
+- Bun 1.3.14 is copied to a dedicated traversable /tmp tool directory in CI,
+  executed by uid 1000 and passed explicitly. Real CCB launch keeps uid drop.
+- Isolated Unix-socket Redis binary is installed in CI; absence in required
+  execution now fails instead of skipping the long-TTL proof.
+- Gateway's discovered 336 targets are partitioned into 332 unit + 4 mandatory
+  integ targets with a machine guard checking actual PR shard execution.
+- Commercial content-review imports use gateway's explicit public exports.
+
+Evidence: `ci-pg-identity.log` 31/31 pass, `ci-discovery2.log` 5/5 including
+negative controls, `ci-runtime-fixture2.log` 2/2 with real CCB four HTTP calls
+and Redis 14700s TTL, zero skip/cancel; `ci-boundary-types2.exit` 0. These do
+not close the independent continuation, Stop/capacity, UI or incident blockers.

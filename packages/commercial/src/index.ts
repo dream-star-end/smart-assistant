@@ -1,4 +1,4 @@
-import { setContentReviewAlerter } from '../../gateway/src/jevContentReview.js'
+import { setContentReviewAlerter } from '@openclaude/gateway'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口

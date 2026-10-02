@@ -1,4 +1,4 @@
-import type { ContentReviewAlert } from '../../../gateway/src/jevContentReview.js'
+import type { ContentReviewAlert } from '@openclaude/gateway'
 
 import { query } from '../db/queries.js'
 import { enqueueAlert } from './alertOutbox.js'

@@ -1,3 +1,4 @@
+import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../../scripts/lib/testDatabaseIdentity.mjs";
 /** TEMP claim chain for a coordinate caption that stays a client sibling.
  * The second request is built from the original history, not from normalized output.
  * Loopback 55432 / openclaude_test only. */
@@ -23,6 +24,7 @@ import { hashBoxToolInput } from "./boxToolInputHash.js";
 import type { ProxyBody } from "./shared.js";
 
 const url = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+assertTestDatabaseUrl(url);
 const model = "box-api-claude-opus-5-5";
 const caption = "[Image: original 80x2200, displayed at 73x2000. Multiply coordinates by 1.10 to map to original image.]";
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -70,10 +72,7 @@ test("second TEMP claim keeps the client sibling and does not advance on failure
   const pool = new Pool({ connectionString: url, max: 1 });
   const client = await pool.connect();
   try {
-    const where = await client.query<{ db: string; port: number }>(
-      "SELECT current_database() AS db, inet_server_port() AS port");
-    assert.equal(where.rows[0]?.db, "openclaude_test");
-    assert.equal(Number(where.rows[0]?.port), 55432);
+    await assertConnectedTestDatabase(client);
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
       state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
@@ -203,10 +202,7 @@ test("TEMP authority mismatch and a second request id do not publish twice", asy
   const client = await pool.connect();
   const outsider = await other.connect();
   try {
-    const where = await client.query<{ db: string; port: number }>(
-      "SELECT current_database() AS db, inet_server_port() AS port");
-    assert.equal(where.rows[0]?.db, "openclaude_test");
-    assert.equal(Number(where.rows[0]?.port), 55432);
+    await assertConnectedTestDatabase(client);
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
       state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),

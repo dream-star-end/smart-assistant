@@ -1,3 +1,4 @@
+import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../../scripts/lib/testDatabaseIdentity.mjs";
 /** Publisher-level race, not two HTTP requests. pg_temp is invisible across
  * connections, so this uses the reviewed private-schema fixture. The exec
  * adapter runs the real Python plan. Loopback 55432 / openclaude_test only.
@@ -20,6 +21,7 @@ import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 
 const url = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+assertTestDatabaseUrl(url);
 const model = "box-api-claude-opus-5-5";
 const nonce = "a".repeat(24);
 const epoch = "b".repeat(32);
@@ -48,10 +50,7 @@ test("two concurrent journal claims publish one local file and add no usage row"
   const raw = new Pool({ connectionString: url, max: 2 });
   const runDir = `/tmp/ocv5-289-run-${nonce}`;
   try {
-    const where = await client.query<{ db: string; port: number }>(
-      "SELECT current_database() AS db, inet_server_port() AS port");
-    assert.equal(where.rows[0]?.db, "openclaude_test");
-    assert.equal(Number(where.rows[0]?.port), 55432);
+    await assertConnectedTestDatabase(client);
     await client.query(`CREATE SCHEMA ${schema}`);
     await client.query(`CREATE TABLE ${schema}.request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
@@ -253,9 +252,7 @@ test("native and billing session namespaces bind independently before publicatio
     const runNonce = randomBytes(12).toString("hex");
     const runDir = `/tmp/ocv5-289-run-${runNonce}`;
     try {
-      const where = await client.query("SELECT current_database() AS db, inet_server_port() AS port");
-      assert.equal(where.rows[0]?.db, "openclaude_test");
-      assert.equal(Number(where.rows[0]?.port), 55432);
+      await assertConnectedTestDatabase(client);
       await client.query(`CREATE TEMP TABLE request_finalize_journal (
         request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
         state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),

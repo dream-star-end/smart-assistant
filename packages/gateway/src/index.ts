@@ -123,8 +123,14 @@ export { setLiteratureSkillProvider, type LiteratureSkillProvider } from './prom
 export { setHostStaticProviderKeys } from './hostStaticProviders.js'
 
 export {
+  type ContentReviewAlert,
   inboundSessionKey,
   isContentReviewSessionBanned,
   observeUserContentReview,
   setContentReviewAlerter,
 } from './jevContentReview.js'
+
+// Content review management seams: commercial consumes the package boundary,
+// never another package's src path. Keep the public surface intentionally small.
+export { getContentReviewStore } from './contentReviewStore.js'
+export { shouldBanForStrikes, violationInbox } from './contentReviewNotice.js'

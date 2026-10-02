@@ -1,3 +1,4 @@
+import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../../scripts/lib/testDatabaseIdentity.mjs";
 /**
  * OCV5-296 idle chain. Real SessionManager.submit, real CcbAdapter,
  * real SubprocessRunner, and this checkout's claude-code-best entry.
@@ -92,6 +93,7 @@ const pendingById = new Map<string, string>();
 let mcpSerial = 0;
 const growthBodies: string[] = [];
 const TEST_DB = "postgres://test:test@127.0.0.1:55432/openclaude_test";
+assertTestDatabaseUrl(TEST_DB);
 const SCHEMA = `ocv5_296_idle_${randomBytes(3).toString("hex")}`;
 const REDIS_URL = "redis://127.0.0.1:56379/12";
 
@@ -325,9 +327,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       }
       await redis.quit();
     };
-    const ident = await admin.query("SELECT current_database() AS db, inet_server_port() AS port");
-    assert.equal(ident.rows[0].db, "openclaude_test");
-    assert.equal(Number(ident.rows[0].port), 55432);
+    await assertConnectedTestDatabase(admin);
     const publicUsers = await admin.query("SELECT to_regclass('public.users') AS reg");
     assert.equal(publicUsers.rows[0].reg, null);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);

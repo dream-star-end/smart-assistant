@@ -109,6 +109,12 @@ function killGroup(child: ChildProcess): void {
 test("claude-code-best consumes runner Box control lines on loopback", { timeout: 150_000 }, async () => {
   assert.equal(readFileSync(CLI, "utf8").length > 0, true);
   const lines = await runnerLines();
+  assert.equal(existsSync(MODULE_INSTALL), true, "claude-code-best/node_modules missing; bun install --ignore-scripts in that directory first");
+  const bun = process.env.BUN_BIN ?? "/usr/bin/bun";
+  const targetIdentity = process.getuid?.() === 0 ? { uid: 1000, gid: 1000 } : {};
+  const version = spawnSync(bun, ["--version"], { ...targetIdentity, encoding: "utf8", timeout: 10_000 });
+  assert.equal(version.status, 0, `Bun must execute under actual CLI uid: ${version.error ?? version.stderr}`);
+  assert.match(version.stdout.trim(), /^\d+\.\d+\.\d+/);
   const home = mkdtempSync(join(tmpdir(), "ocv5-296-ccb-"));
   // Host tsx is root, and /var/lib/docker is mode 750, so uid 1000 cannot open the
   // checkout path. This CLI aborts --dangerously-skip-permissions at euid 0 (setup.ts).
@@ -124,7 +130,6 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
   }
   const runtimeTree = view ?? CCB;
   const cliPath = join(runtimeTree, "src/entrypoints/cli.tsx");
-  assert.equal(existsSync(MODULE_INSTALL), true, "claude-code-best/node_modules missing; bun install --ignore-scripts in that directory first");
 
   const hits: Array<{ authority?: string; lease?: string; hasToolMark: boolean; bytes: number }> = [];
   const decisions: Array<(kind: "tool" | "text") => void> = [];
@@ -161,7 +166,6 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
   const port = typeof address === "object" && address ? address.port : 0;
   const { DEFAULT_BUILD_FEATURES, getMacroDefines } = await import(pathToFileURL(join(CCB, "scripts/defines.ts")).href);
   const defines = getMacroDefines();
-  const bun = process.env.BUN_BIN ?? "/usr/bin/bun";
   const args = [
     "run",
     ...Object.entries(defines).flatMap(([key, value]) => ["-d", `${key}:${value}`]),
