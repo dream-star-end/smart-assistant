@@ -708,6 +708,8 @@ export type ChatSession = {
   /** One durable decision per recovery source/lineage.  Unlike a field on the
    * user row, server-wins history replacement cannot erase this fence. */
   _automaticRecoveryDecisions?: Record<string, true>;
+  /** Client-only rejection feedback survives a placeholder preceding history hydration. */
+  _recoveryRejectedNotices?: Record<string, { code: string; notice: string }>;
   _isFirstTurnAfterReady?: boolean;
   _liveStreamBroken?: boolean;
   /** Exact restored/disconnected turn is being reconciled with REST authority.

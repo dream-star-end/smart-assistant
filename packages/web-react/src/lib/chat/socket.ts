@@ -162,6 +162,69 @@ import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../
 
 export type { ChatStatusClass };
 
+type RecoveryRejectedNotices = NonNullable<ChatSession["_recoveryRejectedNotices"]>;
+function validRecoveryRejectedNotices(raw: unknown): RecoveryRejectedNotices {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result: RecoveryRejectedNotices = {};
+  for (const [source, value] of Object.entries(raw)) {
+    if (!isClientMessageId(source) || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    const item = value as { code?: unknown; notice?: unknown };
+    if (typeof item.code !== "string" || !item.code.trim() || typeof item.notice !== "string" || !item.notice.trim()) continue;
+    result[source] = { code: normalizeTurnErrorCode(item.code), notice: item.notice };
+  }
+  return result;
+}
+function rejectionNoticesFromRows(rows: readonly ChatMessage[]): RecoveryRejectedNotices {
+  const result: RecoveryRejectedNotices = {};
+  for (const row of rows) {
+    if (row?.role !== "assistant" || !isClientMessageId(row._clientMessageId) ||
+        typeof row._errorCode !== "string" || !row._errorCode.trim() ||
+        typeof row._recoverySkippedNotice !== "string" || !row._recoverySkippedNotice.trim()) continue;
+    result[row._clientMessageId] = { code: normalizeTurnErrorCode(row._errorCode), notice: row._recoverySkippedNotice };
+  }
+  return result;
+}
+function restoreRejectedNoticeMetadata(session: ChatSession, stored: StoredSession): boolean {
+  const before = session._recoveryRejectedNotices;
+  const notices = {
+    ...rejectionNoticesFromRows(Array.isArray(stored.messages) ? stored.messages : []),
+    ...validRecoveryRejectedNotices(stored._recoveryRejectedNotices),
+    ...validRecoveryRejectedNotices(before),
+    ...rejectionNoticesFromRows(session.messages),
+  };
+  // A live explicit clear wins over late disk feedback.
+  for (const row of session.messages) {
+    if (row.role === "assistant" && isClientMessageId(row._clientMessageId) &&
+        Object.prototype.hasOwnProperty.call(row, "_recoverySkippedNotice") &&
+        (typeof row._recoverySkippedNotice !== "string" || !row._recoverySkippedNotice.trim())) delete notices[row._clientMessageId];
+  }
+  const next = Object.keys(notices).length ? notices : undefined;
+  if (JSON.stringify(before) === JSON.stringify(next)) return false;
+  session._recoveryRejectedNotices = next;
+  return true;
+}
+/** Inspect raw accepted server rows BEFORE local merge, so an explicit clear
+ * cannot be confused with feedback transplanted by the local cache. */
+function applyRejectedNoticeMetadata(session: ChatSession, serverRows: ChatMessage[]): ChatMessage[] {
+  const notices = validRecoveryRejectedNotices(session._recoveryRejectedNotices);
+  const rows = serverRows.map((row) => {
+    if (row?.role !== "assistant" || !isClientMessageId(row._clientMessageId) ||
+        typeof row._errorCode !== "string" || !row._errorCode.trim()) return row;
+    const source = row._clientMessageId, code = normalizeTurnErrorCode(row._errorCode);
+    if (Object.prototype.hasOwnProperty.call(row, "_recoverySkippedNotice")) {
+      if (typeof row._recoverySkippedNotice === "string" && row._recoverySkippedNotice.trim()) {
+        notices[source] = { code, notice: row._recoverySkippedNotice };
+      } else delete notices[source];
+      return row;
+    }
+    const feedback = notices[source];
+    return feedback?.code === code ? { ...row, _recoverySkippedNotice: feedback.notice } : row;
+  });
+  session._recoveryRejectedNotices = Object.keys(notices).length ? notices : undefined;
+  return rows;
+}
+
+
 
 function deferredTerminalErrorPaintForStore(
   paint: DeferredTerminalErrorPaint | undefined,
@@ -3129,6 +3192,10 @@ export class ChatSocket {
           message._clientMessageId === sourceClientMessageId
         ) {
           message._recoverySkippedNotice = skipNotice;
+          if (isClientMessageId(sourceClientMessageId) && typeof message._errorCode === "string" && message._errorCode.trim()) {
+            sess._recoveryRejectedNotices = { ...(sess._recoveryRejectedNotices ?? {}),
+              [sourceClientMessageId]: { code: normalizeTurnErrorCode(message._errorCode), notice: skipNotice } };
+          }
           attachedToError = true;
         }
       }
@@ -3759,6 +3826,7 @@ export class ChatSocket {
       ...(s._automaticRecoveryDecisions
         ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
         : {}),
+      ...(s._recoveryRejectedNotices ? { _recoveryRejectedNotices: validRecoveryRejectedNotices(s._recoveryRejectedNotices) } : {}),
       ...(deferredTerminalErrorId ? { _deferredTerminalErrorClientMessageId: deferredTerminalErrorId } : {}),
       ...(deferredTerminalErrorId && deferredTerminalErrorPaint
         ? { _deferredTerminalErrorPaint: deferredTerminalErrorPaint }
@@ -3787,7 +3855,33 @@ export class ChatSocket {
    * （tracker reset / teardown / agent 切换）一并恢复,再重建 block/agent 索引。
    */
   loadStored(stored: StoredSession): void {
-    if (!stored?.id || this.sessions.has(stored.id)) return;
+    if (!stored?.id) return;
+    const existing = this.sessions.get(stored.id);
+    if (existing) {
+      let changed = restoreRejectedNoticeMetadata(existing, stored);
+      // A route placeholder may precede asynchronous IndexedDB hydration.
+      // Preserve live data, but durable rejection fences are monotonic.
+      const raw = stored._automaticRecoveryDecisions;
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        const decisions = Object.fromEntries(Object.entries(raw).filter(([source, value]) =>
+          isClientMessageId(source) && value === true));
+        if (Object.keys(decisions).some((key) => existing._automaticRecoveryDecisions?.[key] !== true)) {
+          existing._automaticRecoveryDecisions = { ...(existing._automaticRecoveryDecisions ?? {}), ...decisions };
+          changed = true;
+        }
+      }
+      const attempted = new Set((Array.isArray(stored.messages) ? stored.messages : [])
+        .filter((row) => row?.role === "user" && isClientMessageId(row.id) && row._automaticRecoveryAttempted === true)
+        .map((row) => row.id));
+      for (const row of existing.messages) {
+        if (row.role === "user" && attempted.has(row.id) && row._automaticRecoveryAttempted !== true) {
+          row._automaticRecoveryAttempted = true;
+          changed = true;
+        }
+      }
+      if (changed) { this.deps.persistSession?.(stored.id); this.scheduleNotify(); }
+      return;
+    }
     const s = createSession({
       id: stored.id,
       agentId: stored.agentId || this.deps.defaultAgentId || "main",
@@ -3853,6 +3947,7 @@ export class ChatSocket {
       typeof stored._settledPermissionRequestIds === "object"
         ? { ...stored._settledPermissionRequestIds }
         : undefined;
+    restoreRejectedNoticeMetadata(s, stored);
     s._automaticRecoveryDecisions =
       stored._automaticRecoveryDecisions &&
       typeof stored._automaticRecoveryDecisions === "object"
@@ -4063,6 +4158,7 @@ export class ChatSocket {
     const hasVersion = typeof serverUpdatedAt === "number" && Number.isFinite(serverUpdatedAt);
     const watermark = s._lastServerSyncUpdatedAt ?? 0;
     if (hasVersion && serverUpdatedAt < watermark) return;
+    msgs = applyRejectedNoticeMetadata(s, msgs);
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;

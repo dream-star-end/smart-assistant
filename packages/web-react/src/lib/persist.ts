@@ -177,6 +177,8 @@ export type StoredSession = {
    *  `outbound.permission_request` for them must not open a new card. */
   _settledPermissionRequestIds?: Record<string, true>;
   _automaticRecoveryDecisions?: Record<string, true>;
+  /** Client-only rejection feedback survives a placeholder preceding history hydration. */
+  _recoveryRejectedNotices?: Record<string, { code: string; notice: string }>;
   /** 刷新后仍未裁决的源轮。历史失败 tape 不能把它当成终态否决。 */
   _deferredTerminalErrorClientMessageId?: string;
   _deferredTerminalErrorPaint?: {
@@ -1098,9 +1100,29 @@ function isCoveredStaleLocalRow(
 
 
 /** 实时 m-* 行和 tape 的 srv-* 行不是同一个 id。已提交的错误卡按 clientMessageId 迁到权威行上。 */
+/** Rejection feedback is separate from the immutable error-card snapshot.
+ * Preserve it only for the exact failed turn and normalized error kind. */
+function carryRecoverySkippedNotice(server: ChatMessage, local?: ChatMessage): ChatMessage {
+  if (!local || server.role !== "assistant" || local.role !== "assistant") return server;
+  if (Object.prototype.hasOwnProperty.call(server, "_recoverySkippedNotice")) return server;
+  if (typeof server._clientMessageId !== "string" || !server._clientMessageId ||
+      server._clientMessageId !== local._clientMessageId) return server;
+  if (typeof server._errorCode !== "string" || !server._errorCode.trim() ||
+      typeof local._errorCode !== "string" || !local._errorCode.trim() ||
+      normalizeTurnErrorCode(server._errorCode) !== normalizeTurnErrorCode(local._errorCode)) return server;
+  if (typeof local._recoverySkippedNotice !== "string" || !local._recoverySkippedNotice.trim()) return server;
+  return { ...server, _recoverySkippedNotice: local._recoverySkippedNotice };
+}
+
 function transplantCommittedErrorCards(server: ChatMessage[], local: ChatMessage[]): ChatMessage[] {
   const snaps = new Map<string, NonNullable<ChatMessage["_errorCardSnapshot"]>>();
+  const notices = new Map<string, ChatMessage>();
   for (const row of local) {
+    if (row?.role === "assistant" && typeof row._clientMessageId === "string" && row._clientMessageId.trim() &&
+        typeof row._errorCode === "string" && row._errorCode.trim() &&
+        typeof row._recoverySkippedNotice === "string" && row._recoverySkippedNotice.trim()) {
+      notices.set(`${row._clientMessageId}\0${normalizeTurnErrorCode(row._errorCode)}`, row);
+    }
     if (
       row?.role === "assistant" &&
       row._errorCardSnapshot &&
@@ -1110,9 +1132,14 @@ function transplantCommittedErrorCards(server: ChatMessage[], local: ChatMessage
       snaps.set(row._clientMessageId, row._errorCardSnapshot);
     }
   }
-  if (snaps.size === 0) return server;
+  if (snaps.size === 0 && notices.size === 0) return server;
   return server.map((row) => {
-    if (!row || row._errorCardSnapshot || row.role !== "assistant") return row;
+    if (!row || row.role !== "assistant") return row;
+    const noticeSource = typeof row._clientMessageId === "string" && typeof row._errorCode === "string"
+      ? notices.get(`${row._clientMessageId}\0${normalizeTurnErrorCode(row._errorCode)}`)
+      : undefined;
+    row = carryRecoverySkippedNotice(row, noticeSource);
+    if (row._errorCardSnapshot) return row;
     if (typeof row._errorCode !== "string" || row._errorCode.length === 0) return row;
     if (typeof row._clientMessageId !== "string") return row;
     const snap = snaps.get(row._clientMessageId);
@@ -1886,6 +1913,7 @@ function mergeLocalClientFields(
   preserveTapeProcessExpansion = true,
 ): ChatMessage {
   if (!localMsg || serverMsg.id !== localMsg.id) return serverMsg;
+  serverMsg = carryRecoverySkippedNotice(serverMsg, localMsg);
   // 已提交的错误卡快照单调保留。后到的 tape / 免单 / 重分类不得改已经看见的颜色和文案。
   if (localMsg._errorCardSnapshot && !serverMsg._errorCardSnapshot) {
     serverMsg = { ...serverMsg, _errorCardSnapshot: localMsg._errorCardSnapshot };
