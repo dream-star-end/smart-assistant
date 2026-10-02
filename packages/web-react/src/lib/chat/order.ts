@@ -392,11 +392,11 @@ function finiteTs(message: ChatMessage | undefined): number | undefined {
  *  - an explicit owner (`_turnOwnerId`, else `_clientMessageId`) naming a user
  *    present here that comes BEFORE the turn the row currently sits in; tape
  *    rows always carry their dispatch's user id;
- *  - for answered (resolved) permission cards only: a card cannot predate the
- *    user message of its own turn, so a card whose ts is more than a minute
- *    before the user it sits under belongs to the last user sent before it
- *    (covers cards rebuilt from owner-less legacy journal frames, and a wrong
- *    owner stamped at replay time).
+ *  - only for answered (resolved) permission cards that carry NO owner at all:
+ *    a card cannot predate the user message of its own turn, so one whose ts is
+ *    more than a minute before the user it sits under belongs to the latest
+ *    user sent at or before it. An explicit owner is never overridden by ts —
+ *    user rows and cards may come from different clocks.
  *
  * Never moved: rows of the turn they sit in, rows whose owner is not present
  * (paged out / hidden recovery id), open prompts, rows before the first user.
@@ -423,13 +423,23 @@ export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage
   }
   if (userIds.length < 2) return messages;
 
+  // Users sorted by ts (not array order: cross-device clocks need not be monotonic).
+  const byTs = userTs
+    .map((ts, index) => ({ ts, index }))
+    .filter((entry): entry is { ts: number; index: number } => entry.ts !== undefined)
+    .sort((left, right) => left.ts - right.ts || left.index - right.index);
   const turnByTs = (ts: number): number | undefined => {
+    let lo = 0;
+    let hi = byTs.length - 1;
     let found: number | undefined;
-    for (let index = 0; index < userTs.length; index++) {
-      const userAt = userTs[index];
-      if (userAt === undefined) continue;
-      if (userAt <= ts) found = index;
-      else break;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (byTs[mid]!.ts <= ts) {
+        found = byTs[mid]!.index;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
     }
     return found;
   };
@@ -449,17 +459,14 @@ export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage
       : nonEmptyString(message._clientMessageId)
         ? message._clientMessageId
         : undefined;
-    if (explicit) owner = turnIndexById.get(explicit);
-
-    if (message.role === "permission") {
+    if (explicit) {
+      owner = turnIndexById.get(explicit);
+    } else if (message.role === "permission") {
       const ts = finiteTs(message);
-      const sitsUnder = userTs[owner ?? current];
-      if (ts !== undefined && sitsUnder !== undefined && ts < sitsUnder - STRAY_TS_MARGIN_MS) {
-        owner = turnByTs(ts);
-      } else if (!explicit) {
-        continue;
-      }
-    } else if (!explicit) {
+      const sitsUnder = userTs[current];
+      if (ts === undefined || sitsUnder === undefined || ts >= sitsUnder - STRAY_TS_MARGIN_MS) continue;
+      owner = turnByTs(ts);
+    } else {
       continue;
     }
     if (owner === undefined || owner >= current) continue;
