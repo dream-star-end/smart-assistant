@@ -27,7 +27,7 @@ import {
   X,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
-import { memo, useEffect, useId, useRef, useState } from "react";
+import { createContext, memo, useContext, useEffect, useId, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";
 import {
@@ -698,6 +698,14 @@ export function ProgressiveMarkdown({
 }
 
 // ═══════════════ assistant ═══════════════
+/**
+ * OCV5-307: set by ProcessDisclosure around an error card the turn already
+ * continued past. That failure is history, not the turn's outcome — its
+ * retry / regenerate / switch-model / continue actions would start duplicate
+ * work, so the card shows the error facts only.
+ */
+export const RecoveredStepContext = createContext(false);
+
 export function AssistantCard({
   msg,
   ctx,
@@ -712,6 +720,7 @@ export function AssistantCard({
   /** 只读面(教程回放 / 后台会话查看器):动作行只留复制/朗读,不出引用/重新生成/反馈。 */
   readOnly?: boolean;
 }) {
+  const recoveredStep = useContext(RecoveredStepContext);
   const live = isLive(msg, ctx);
   if (msg._hideUnpublishedFallback === true) return null;
   if (msg._errorHeldForRecovery === true && msg._errorCardSnapshot?.disposition !== "card") return null;
@@ -782,7 +791,7 @@ export function AssistantCard({
   // 尾部;错误卡恒追加在其归属 user 轮之后,故与"_clientMessageId 命中最后一条 user"等价),不另
   // 造第二套轮判定。历史中间错误卡:不显示任何重发按钮(标题/正文/详情照旧)。
   // 耗尽 CTA 是导航非重发,不受此门控。
-  const isLastTurn = ctx.inActiveTurn === true;
+  const isLastTurn = ctx.inActiveTurn === true && !recoveredStep;
   const interruptedContinuationTarget =
     isLastTurn && ctx.isLast
       ? cb.resolveInterruptedContinuation?.(msg)

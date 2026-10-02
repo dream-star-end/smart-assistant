@@ -829,9 +829,19 @@ function continuedErrorIds(messages: ChatMessage[]): Set<string> {
       pending = [];
       continue;
     }
+    // Positive evidence only: transport / locator / status / hidden rows prove
+    // nothing about the turn continuing (Codex review: a deferred locator after a
+    // terminal error must not hide that error in a collapsed shell). When in
+    // doubt the error stays top-level, i.e. the pre-OCV5-307 behaviour.
+    if (
+      message._payloadDeferred || message._turnStatusRecord || message._genPlaceholder ||
+      message._turnTapeProcess || message._timelineAuxiliary || message._hideUnpublishedFallback === true
+    ) {
+      continue;
+    }
     const isWork =
       isFoldableWorkRole(message) || isAnsweredPrompt(message) ||
-      (message.role === "assistant" && !message._timelineAuxiliary);
+      (message.role === "assistant" && !isErroredAssistant(message) && (message.text ?? "").trim().length > 0);
     if (isWork && pending.length > 0) {
       for (const id of pending) ids.add(id);
       pending = [];
