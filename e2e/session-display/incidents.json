@@ -5515,6 +5515,26 @@
           "assertion": "OCV5-306: account guard, remote exit and HTTP auth errors are never retried"
         }
       ]
+    },
+    {
+      "id": "INC-20261002-CONTINUE-CARD-LINGERS",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "点『从断点继续』后任务已恢复执行（工具执行中），但原『任务执行失败』红卡仍留在时间线上并改为显示『重新尝试』，像是仍然失败。原因：恢复子轮只在原卡未提交时隐藏它，而用户能点到的卡都已提交。修复：手动继续进行中/完成后收起该卡；被拒绝时卡片带提示回来，继续轮自身失败显示自己的卡，自动恢复不改动已见的卡。",
+      "rootFixCommit": "0938b060",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "手动继续进行中：原失败卡与重新尝试一并收起"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "继续请求没发出去（无自身错误卡）或自动恢复：已见的失败卡保持可见"
+        }
+      ]
     }
   ]
 }
