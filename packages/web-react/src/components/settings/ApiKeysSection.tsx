@@ -91,12 +91,15 @@ const EMPTY_KEYS: ApiKeySummary[] = [];
 export function pickDefaultModel(
   available: string[] | null,
   preferred: string,
-  fallbackPattern?: RegExp,
+  fallbackPattern?: RegExp | readonly RegExp[],
 ): string {
   if (!available || available.length === 0 || available.includes(preferred)) return preferred;
   if (fallbackPattern) {
-    const hit = available.find((id) => fallbackPattern.test(id));
-    if (hit) return hit;
+    const patterns = fallbackPattern instanceof RegExp ? [fallbackPattern] : fallbackPattern;
+    for (const pattern of patterns) {
+      const hit = available.find((id) => pattern.test(id));
+      if (hit) return hit;
+    }
   }
   return available[0]!;
 }
@@ -277,7 +280,7 @@ export function ApiKeysSection({
   const opusModel = pickDefaultModel(externalModels, DEFAULT_OPUS_MODEL, /^(opus|fable)-/);
   const sonnetModel = pickDefaultModel(externalModels, DEFAULT_SONNET_MODEL, /^sonnet-/);
   // 轻量位：haiku 优先；没有就退到 gemini flash，再退到 sonnet。
-  const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /^haiku-|^gemini-|-flash(-|$)|^sonnet-/);
+  const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/]);
   const candidateKey = keySource === "new" ? (justCreated?.plaintext ?? "") : existingKey.trim();
   const knownKey = keys?.find(
     (key) => candidateKey.split(".")[1] === key.keyPrefix.replace(/^oc-cc\./, ""),
