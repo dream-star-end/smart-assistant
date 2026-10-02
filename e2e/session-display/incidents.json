@@ -5680,7 +5680,7 @@
       "occurredAt": "2026-10-02",
       "severity": "P2",
       "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户故障）：CC Switch轻量位的合并正则按服务端数组顺序，sonnet排在gemini flash前时错选sonnet；改为haiku→gemini/flash→sonnet逐档fallback。首选模型及空列表兜底不变，新建与已有密钥两条真实导入路径通过，精确历史调用负控均在haikuModel断言失败。",
-      "rootFixCommit": "a70733728",
+      "rootFixCommit": "a7073372",
       "coverageCommits": [],
       "regressions": [
         {
@@ -5700,7 +5700,7 @@
       "occurredAt": "2026-10-02",
       "severity": "P2",
       "symptom": "OCV5-308候选真实组件与Chromium复现（非声称生产用户故障）：个人版删除旧GPT-5.6家族映射，但商业版仍启用旧目录时退化为普通行，丢失标准/1M家族档位与长上下文费用确认。恢复商业canonical三项旧家族映射及折叠合同，新模型家族不变，目录启用、旧价格、权限和绑定均不改。真实1M选择证明未确认不切换、取消保留标准、确认才切换；精确移除旧映射负控重新触发原旧折叠与1M合同红。",
-      "rootFixCommit": "2804a5b00",
+      "rootFixCommit": "2804a5b0",
       "coverageCommits": [],
       "regressions": [
         {
@@ -5712,6 +5712,21 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/user-contract.node-test.mjs",
           "assertion": "legacy commercial 1M selection requires real cancel or confirmation"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-LIVE-STATUS-CASCADE",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户报障）：live状态同时带oc-swap-in与oc-live-status-shine，后置入场fade-in覆盖扫光动画，并覆盖forced-colors要求的animation:none。仅将入场selector排除shine，其他入场行为保留；六主题/媒体正控全部通过，独立旧CSS输入负控在两主题normal/forced四叶精准红，父级失败仅为成功reports汇总，reduced与原过程/历史目标证明继续通过。",
+      "rootFixCommit": "98760e9e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "live status is single and readable in both themes and accessibility media"
         }
       ]
     }
