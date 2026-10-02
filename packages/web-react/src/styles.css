@@ -313,25 +313,46 @@ body {
 }
 @keyframes oc-shimmer { 100% { transform: translateX(100%); } }
 
-/* 进行中的处理过程状态行:沿文字扫一道高光,表示这一步还没结束。
-   基色与高光取 --muted / --fg,明暗主题都可读。完成态和失败态不加此类。
-   减少动态效果时本段不生效,文字保持 text-fg,避免透明字配上被压到 0.01ms 的扫光。 */
+/* 进行中的状态字流光(OCV5-311)。一轮里只给「当前在做什么」那一句用:处理过程外壳标题的动作短语,
+   以及过程外独立的思考卡标题;过程里的摘要行 / 步骤行 / 思考行不叠流光(它们的「运行中」由节点光晕表达),
+   避免同屏几行一起闪。
+   - 基色 = --faint、高光 = --fg:最淡一刻也是 --faint 本身(该 token 按全站规则 ≥4.5:1,浅 ≈5.8、深 ≈6.0),
+     流光只是在可读的灰字上扫过一道实色,不牺牲可读性(--muted 作基色时与 --fg 太接近,扫光几乎看不见);
+   - 宽而柔的光带从左往右扫一遍(缓入缓出)后停顿,2.4s 一轮,像呼吸而不是进度条;
+   - 减少动态效果:整段不生效,文字保持原色;不支持 background-clip:text 的浏览器(@supports)同样保持原色,
+     不会出现「透明字没被裁出来」的空白;Windows 高对比(forced-colors):回落系统文字色;
+   - 选中文字时恢复实色,避免透明字配选区看不见。 */
 @media (prefers-reduced-motion: no-preference) {
+@supports ((background-clip: text) or (-webkit-background-clip: text)) {
   .oc-live-status-shine {
     background-image: linear-gradient(
       100deg,
-      color-mix(in srgb, var(--fg) 42%, var(--muted)) 0%,
-      color-mix(in srgb, var(--fg) 42%, var(--muted)) 36%,
+      var(--faint) 0%,
+      var(--faint) 34%,
       var(--fg) 50%,
-      color-mix(in srgb, var(--fg) 42%, var(--muted)) 64%,
-      color-mix(in srgb, var(--fg) 42%, var(--muted)) 100%
+      var(--faint) 66%,
+      var(--faint) 100%
     );
-    background-size: 220% 100%;
+    background-size: 250% 100%;
+    background-position: 115% 0;
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
     color: transparent;
-    animation: oc-live-status-sweep 1.8s linear infinite;
+    animation: oc-live-status-sweep 2.4s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+  }
+  .oc-live-status-shine::selection {
+    -webkit-text-fill-color: var(--fg);
+    color: var(--fg);
+  }
+}
+}
+@media (forced-colors: active) {
+  .oc-live-status-shine {
+    background: none;
+    -webkit-text-fill-color: CanvasText;
+    color: CanvasText;
+    animation: none;
   }
 }
 /* 生成中三点(OCV5-307):6px 小点依次轻跃,颜色跟随当前文字色的 45%(明暗主题自适应)。
@@ -350,9 +371,11 @@ body {
   0%, 60%, 100% { transform: translateY(0); opacity: 0.55; }
   30% { transform: translateY(-3px); opacity: 1; }
 }
+/* 背景宽 250%、光带占渐变 34%–66%:位置 ≥110% / ≤-10% 时光带完全在字外。两端取 115% / -15%,
+   起点与停顿都是纯 --faint,循环接缝不跳。 */
 @keyframes oc-live-status-sweep {
-  from { background-position: 120% 0; }
-  to { background-position: -20% 0; }
+  0% { background-position: 115% 0; }
+  70%, 100% { background-position: -15% 0; }
 }
 
 /* ── 处理过程时间轴(OCV5-310) ─────────────────────────────────────────────
