@@ -130,9 +130,10 @@ export type CodexEngineModel = (typeof CODEX_ENGINE_MODELS)[number]
 
 /**
  * 标准/1M 上下文成对家族。`collapsedByDefault` 是选择器的展示语义:为 true 的家族默认
- * 收进「更多 GPT 模型」折叠组。GPT-5.6(0288)与 GPT-6 Sol(0292)退出选择器;
+ * 收进「更多 GPT 模型」折叠组。个人版目录下线的 GPT-5.6 不据此删除商业兼容映射;GPT-6 Sol 不进该家族表;
  * GPT-6 Astra / GPT-6.1 Sol / Luna 都直接展示,不进「更多」。切流冒烟 C2 选可见模型,
- * 不再依赖折叠组。当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
+ * 不再依赖折叠组。商业仍启用的 GPT-5.6 家族保留原上下文与折叠合同，目录决定可见性。
+ * 当前选中模型落在折叠组时该组自动展开。不影响准入、计费与路由。
  */
 export const CONTEXT_TIER_FAMILIES = [
   {
@@ -155,6 +156,27 @@ export const CONTEXT_TIER_FAMILIES = [
     standardId: 'gpt-6-luna',
     longId: 'gpt-6-luna-1m',
     collapsedByDefault: false,
+  },
+  {
+    family: 'gpt-5.6-sol',
+    familyLabel: 'GPT-5.6-Sol',
+    standardId: 'gpt-5.6-sol',
+    longId: 'gpt-5.6-sol-1m',
+    collapsedByDefault: false,
+  },
+  {
+    family: 'gpt-5.6-terra',
+    familyLabel: 'GPT-5.6-Terra',
+    standardId: 'gpt-5.6-terra',
+    longId: 'gpt-5.6-terra-1m',
+    collapsedByDefault: true,
+  },
+  {
+    family: 'gpt-5.6-luna',
+    familyLabel: 'GPT-5.6-Luna',
+    standardId: 'gpt-5.6-luna',
+    longId: 'gpt-5.6-luna-1m',
+    collapsedByDefault: true,
   },
   {
     family: 'kimi-k3',

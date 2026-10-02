@@ -5694,6 +5694,26 @@
           "assertion": "CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixture API)"
         }
       ]
+    },
+    {
+      "id": "INC-20261002-COMMERCIAL-LEGACY-CONTEXT-COMPAT",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实组件与Chromium复现（非声称生产用户故障）：个人版删除旧GPT-5.6家族映射，但商业版仍启用旧目录时退化为普通行，丢失标准/1M家族档位与长上下文费用确认。恢复商业canonical三项旧家族映射及折叠合同，新模型家族不变，目录启用、旧价格、权限和绑定均不改。真实1M选择证明未确认不切换、取消保留标准、确认才切换；精确移除旧映射负控重新触发原旧折叠与1M合同红。",
+      "rootFixCommit": "2804a5b00",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/engineModels.test.ts",
+          "assertion": "context-tier families: new GPT-6 families expanded and legacy commercial GPT-5.6 context contract preserved"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/user-contract.node-test.mjs",
+          "assertion": "legacy commercial 1M selection requires real cancel or confirmation"
+        }
+      ]
     }
   ]
 }
