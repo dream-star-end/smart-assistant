@@ -15,7 +15,7 @@ import type { BoxResolvedTarget } from "./boxTextFetch.js";
 type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
     "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
-    "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" | "markFirstRoundRejectedStream" |
+    "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" |
     "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
     "readRecoveryWinner">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
@@ -104,14 +104,13 @@ export class BoxRemoteCleanupWorker {
         } finally { if (timer) clearTimeout(timer); }
         if (proof.reason === "worker_complete") {
           const outcome = await this.recoverProvedSuccess(candidate, target);
-          if (outcome === "undeliverable") {
-            // OCV5-306: the CLI finished on its own with a tool call no client
-            // ever received; settle unbilled instead of pinning the session.
-            const close = { requestId: candidate.requestId, uid: candidate.uid,
-              leaseEpoch: candidate.leaseEpoch, proof };
-            if (candidate.linked) await journal.markToolChainStoppedFailure({ ...close, rejectedStream: true });
-            else if (journal.markFirstRoundRejectedStream) await journal.markFirstRoundRejectedStream(close);
-            else { pending++; continue; }
+          if (outcome === "undeliverable" && candidate.linked) {
+            // OCV5-306: a linked final round whose CLI finished on its own with
+            // a tool call no client ever received. Abort only that unbilled
+            // final row instead of pinning the session. A first round with an
+            // intermediate handoff stays held (success-recovery gate contract).
+            await journal.markToolChainStoppedFailure({ requestId: candidate.requestId,
+              uid: candidate.uid, leaseEpoch: candidate.leaseEpoch, proof, rejectedStream: true });
             recovered++;
           } else if (outcome !== "committed") pending++;
           continue;
