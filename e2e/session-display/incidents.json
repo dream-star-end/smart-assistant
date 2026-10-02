@@ -4761,12 +4761,17 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/emptyCompletedTurn.test.ts",
-          "assertion": "token 全 0 且无产出时 shouldFailClosedEmptyModelTurn 为真；有正文/工具/token/斜杠命令不为真"
+          "assertion": "token 全 0 且没有任何产出 → 不能记成完成"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/emptyCompletedTurn.test.ts",
+          "assertion": "有正文、有工具、有 token、斜杠命令、已跳过的 API → 不改判"
         },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ccbLocalAgentCallback.test.ts",
-          "assertion": "两分钟内相同 status+summary 的第二条本地子 Agent 通知不再注入"
+          "assertion": "drops a second notice with the same status and summary"
         }
       ]
     },
@@ -4783,7 +4788,12 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
-          "assertion": "待发送卡片有修改和立即发送；对话流不渲染 status=queued 的用户消息"
+          "assertion": "钉在输入框上方的卡片右侧有修改和立即发送，不把排队消息画进对话"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
+          "assertion": "对话流不渲染还在排队的用户消息"
         }
       ]
     },
@@ -4800,7 +4810,22 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
-          "assertion": "本轮还有更早步骤时按游标自动补齐，不显示加载按钮；失败才出现重试；历史按钮仍只翻对话"
+          "assertion": "仅本轮还有未加载步骤时，自动补齐且不显示加载按钮"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "游标前移后继续自动补齐更早步骤"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "更早步骤加载失败时才出现重试，点击再请求一次"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "既有更早对话又有本轮未加载步骤时，顶部按钮只翻对话"
         }
       ]
     },
