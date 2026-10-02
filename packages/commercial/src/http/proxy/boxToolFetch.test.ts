@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
 import { BoxToolFirstRoundError } from "./boxToolFirstRound.js";
+import { prepareBoxContinuation, BoxContinuationDecisionError } from "./boxPreparedContinuation.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
@@ -9,7 +10,7 @@ import type { BoxNativePointer } from "./boxNativePointer.js";
 const tools = [{ name: "local_echo", description: "synthetic",
   input_schema: { type: "object", properties: {} } }];
 const firstBody: ProxyBody = { model: "box-api-claude-opus-5-5", max_tokens: 128,
-  stream: true, tools, messages: [{ role: "user", content: "first" }] };
+  stream: true, tools, metadata: { user_id: JSON.stringify({ session_id: "session", oc_turn_key: "a".repeat(64) }) }, messages: [{ role: "user", content: "first" }] };
 const nextBody: ProxyBody = { ...firstBody, messages: [
   { role: "assistant", content: [{ type: "tool_use", id: "toolu_A",
     name: "local_echo", input: {} }] },
@@ -140,6 +141,11 @@ test("same internal model fetch streams first handoff then next final without to
         + "Use Read rather than cat.\n</system-reminder>",
       cache_control: { type: "ephemeral" } }] },
     nextBody.messages[2]!] } as ProxyBody;
+  const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: hookedNext.model,
+    rawBody: hookedNext, authorityKind: "local_catalog", authorityTurnId: null });
+  assert.equal(prepared.classification, "continuation_candidate");
+  assert.equal(prepared.sessionId, "session");
+  assert.equal(prepared.turnKey, "a".repeat(64));
   const second = await service.fetch(call(hookedNext));
   assert.match(await second.text(), /event: message_stop/);
   assert.deepEqual(calls, ["first", "claim-and-publish", "continued-final"]);
@@ -607,4 +613,23 @@ test("cleanup status query failure never poisons an already-final SSE response",
   statusFails = false;
   assert.equal(await service.retryTerminalCleanup(), 0);
   assert.equal(disposed, true);
+});
+
+test("missing continuation metadata rejects before any publish, launch, resolve or wake", async () => {
+  let sideEffects = 0;
+  const forbidden = async (): Promise<never> => { sideEffects++; throw new Error("unexpected side effect"); };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
+    virtualMcpAsset: Buffer.from("m"), detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000, resolveTarget: forbidden,
+    onUnknown: forbidden, runFirst: forbidden as never, publishResume: forbidden as never,
+    runContinuation: forbidden as never });
+  const { metadata: _metadata, ...missing } = nextBody;
+  const body = missing as ProxyBody;
+  const prepared = prepareBoxContinuation({ uid: 3n, canonicalModel: body.model,
+    rawBody: body, authorityKind: "local_catalog", authorityTurnId: null });
+  assert.equal(prepared.classification, "reject");
+  assert.equal(prepared.rejectCode, "BOX_PREPARED_REJECT");
+  await assert.rejects(() => service.fetch(call(body)), (error: unknown) =>
+    error instanceof BoxContinuationDecisionError && error.code === "BOX_PREPARED_REJECT");
+  assert.equal(sideEffects, 0);
 });

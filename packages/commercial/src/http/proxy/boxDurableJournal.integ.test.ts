@@ -12,6 +12,7 @@ import { deriveBoxCallFingerprint, deriveBoxContextHash, deriveBoxFallbackAlias,
 import type { ProxyBody } from "./shared.js";
 import { abortInflightJournal } from "../../billing/proxyBilling.js";
 import { parseBoxNativePointer } from "./boxNativePointer.js";
+import { prepareBoxContinuation } from "./boxPreparedContinuation.js";
 
 const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
   ?? process.env.TEST_DATABASE_URL;
@@ -477,13 +478,43 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await client.query(`UPDATE request_finalize_journal SET
       ctx=jsonb_set(ctx,'{boxToolHandoff,spoolOffset}',to_jsonb(1234::bigint))
       WHERE request_id=$1`, [toolCall.requestId]);
+    const missingResult = { ...resumeBody, messages: [...resumeBody.messages.slice(0, -1),
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_B", content: "second" }] }] };
+    const missingPrepared = prepareBoxContinuation({ uid: 3n, canonicalModel: basis.model,
+      rawBody: missingResult, authorityKind: "local_catalog", authorityTurnId: null });
+    assert.equal(missingPrepared.classification, "reject");
+    assert.equal(missingPrepared.rejectCode, "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    const ownerBeforeInvalidResults = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
+    const childBeforeInvalidResults = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-${suffix}`]);
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
-      uid: 3n, canonicalModel: basis.model,
-      canonicalBody: { ...resumeBody, messages: [...resumeBody.messages.slice(0, -1),
-        { role: "user", content: [
-          { type: "tool_result", tool_use_id: "toolu_B", content: "second" }] }] } }),
+      uid: 3n, canonicalModel: basis.model, canonicalBody: missingResult }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    // Equal cardinality and legal IDs pass pure classification. The locked
+    // journal must still reject duplicated B/missing A rather than publish.
+    const duplicateResults = { ...resumeBody, messages: [...resumeBody.messages.slice(0, -1),
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
+        { type: "tool_result", tool_use_id: "toolu_B", content: "duplicate" }] }] };
+    const duplicatePrepared = prepareBoxContinuation({ uid: 3n, canonicalModel: basis.model,
+      rawBody: duplicateResults, authorityKind: "local_catalog", authorityTurnId: null });
+    assert.equal(duplicatePrepared.classification, "continuation_candidate");
+    assert.deepEqual(duplicatePrepared.toolIds, ["toolu_B", "toolu_B"]);
+    await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
+      uid: 3n, canonicalModel: basis.model, canonicalBody: duplicateResults }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_RESULT_MISMATCH");
+    const ownerAfterInvalidResults = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
+    const childAfterInvalidResults = await client.query<{ state: string; ctx: Record<string, unknown> }>(
+      "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-${suffix}`]);
+    assert.deepEqual(ownerAfterInvalidResults.rows, ownerBeforeInvalidResults.rows);
+    assert.equal(ownerAfterInvalidResults.rows[0]?.ctx.boxState, "handoff");
+    assert.deepEqual(childAfterInvalidResults.rows, childBeforeInvalidResults.rows,
+      "neither preclassification nor locked mismatch may claim a resume child");
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model,
       canonicalBody: { ...resumeBody, tools: [{ ...toolDeclarations[0]!,
@@ -1059,10 +1090,23 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_C",
         content: "third" }] },
     ] };
+    const canceledRowIds = [failedChainRoot.requestId, `box-h-${suffix}`, `box-cancel-child-${suffix}`];
+    const canceledBeforeResume = await client.query<{ request_id: string; state: string; ctx: Record<string, unknown> }>(
+      "SELECT request_id,state,ctx FROM request_finalize_journal WHERE request_id=ANY($1::text[]) ORDER BY request_id",
+      [canceledRowIds]);
+    assert.equal(canceledBeforeResume.rows.length, 3);
     await assert.rejects(() => journal.claimToolResume({
       requestId: `box-cancel-child-${suffix}`, uid: 3n,
       canonicalModel: basis.model, canonicalBody: afterCancelBody }),
-    /BOX_TOOL_OWNER_UNKNOWN/);
+    (error: unknown) => error instanceof BoxDurableJournalError && error.code === "BOX_RESUME_IN_PROGRESS");
+    const canceledAfterResume = await client.query<{ request_id: string; state: string; ctx: Record<string, unknown> }>(
+      "SELECT request_id,state,ctx FROM request_finalize_journal WHERE request_id=ANY($1::text[]) ORDER BY request_id",
+      [canceledRowIds]);
+    assert.deepEqual(canceledAfterResume.rows, canceledBeforeResume.rows);
+    const unclaimedCancelChild = canceledAfterResume.rows.find((row) => row.request_id === `box-cancel-child-${suffix}`)!;
+    assert.equal(unclaimedCancelChild.state, "inflight");
+    assert.equal(Object.hasOwn(unclaimedCancelChild.ctx, "boxOwnerRequestId"), false);
+    assert.equal(Object.hasOwn(unclaimedCancelChild.ctx, "boxResumeRequestId"), false);
     const linkedProbe = (await journal.listStoppedFailureProbeCandidates(20))
       .find((item) => item.requestId === `box-h-${suffix}`);
     assert.ok(linkedProbe);

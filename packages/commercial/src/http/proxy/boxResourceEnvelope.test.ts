@@ -8,10 +8,13 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 import {
   AUTHORITY_TTL_MS,
@@ -484,7 +487,7 @@ function handlerFor(options: {
   enforce?: boolean;
   box?: boolean;
   lease?: string | null;
-} = {}) {
+} = {}, factory: typeof makeAnthropicProxyHandler = makeAnthropicProxyHandler) {
   let launches = 0;
   const previous = process.env.OC_BOX_MODEL_API;
   if (options.box) process.env.OC_BOX_MODEL_API = "1";
@@ -518,12 +521,12 @@ function handlerFor(options: {
       if (previous === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = previous;
     },
-    handler: makeAnthropicProxyHandler(deps),
+    handler: factory(deps),
   };
 }
 
-async function call(payload: Buffer | object, options: Parameters<typeof handlerFor>[0] = {}, headers: Record<string, string> = {}) {
-  const harness = handlerFor(options);
+async function callWithFactory(payload: Buffer | object, options: Parameters<typeof handlerFor>[0] = {}, headers: Record<string, string> = {}, factory: typeof makeAnthropicProxyHandler = makeAnthropicProxyHandler) {
+  const harness = handlerFor(options, factory);
   const res = new MockRes();
   let thrown: unknown = null;
   try {
@@ -538,6 +541,49 @@ async function call(payload: Buffer | object, options: Parameters<typeof handler
     harness.restore();
   }
   return { res, thrown, launches: harness.launches() };
+}
+
+const call = callWithFactory;
+
+async function isolatedRouteFactories(t: TestContext) {
+  const checkoutCommercial = fileURLToPath(new URL("../../../", import.meta.url));
+  const checkoutRoot = fileURLToPath(new URL("../../../../../", import.meta.url));
+  const base = mkdtempSync(join(tmpdir(), "box-env-"));
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+  const on = join(base, "on/packages/commercial");
+  const off = join(base, "off/packages/commercial");
+  mkdirSync(on, { recursive: true });
+  cpSync(join(checkoutCommercial, "src"), join(on, "src"), { recursive: true });
+  cpSync(join(checkoutCommercial, "package.json"), join(on, "package.json"));
+  cpSync(on, off, { recursive: true }); // one frozen source, not two moving reads
+  const ownerRel = "src/http/proxy/boxNativeContextOwner.ts";
+  const original = readFileSync(join(on, ownerRel), "utf8");
+  const liveOwnerBefore = readFileSync(join(checkoutCommercial, ownerRel));
+  const literal = /export const BOX_NATIVE_CONTEXT_ROUTE_READY = (true|false);/g;
+  assert.equal([...original.matchAll(literal)].length, 1);
+  const onOwner = original.replace(literal, "export const BOX_NATIVE_CONTEXT_ROUTE_READY = true;");
+  const offOwner = original.replace(literal, "export const BOX_NATIVE_CONTEXT_ROUTE_READY = false;");
+  const mask = (text: string) => text.replace(literal, "export const BOX_NATIVE_CONTEXT_ROUTE_READY = <ready>;");
+  assert.equal(createHash("sha256").update(mask(onOwner)).digest("hex"),
+    createHash("sha256").update(mask(offOwner)).digest("hex"));
+  assert.equal(mask(original), mask(onOwner));
+  writeFileSync(join(on, ownerRel), onOwner);
+  writeFileSync(join(off, ownerRel), offOwner);
+  const differences: string[] = [];
+  const compare = (rel = "") => {
+    for (const entry of readdirSync(join(on, rel), { withFileTypes: true })) {
+      const file = join(rel, entry.name);
+      if (entry.isDirectory()) compare(file);
+      else if (!readFileSync(join(on, file)).equals(readFileSync(join(off, file)))) differences.push(file);
+    }
+  };
+  compare();
+  assert.deepEqual(differences, [ownerRel]);
+  for (const flavor of ["on", "off"]) symlinkSync(join(checkoutRoot, "node_modules"), join(base, flavor, "node_modules"));
+  const onFactory = (await import(pathToFileURL(join(on, "src/http/proxy/index.ts")).href)).makeAnthropicProxyHandler as typeof makeAnthropicProxyHandler;
+  const offFactory = (await import(pathToFileURL(join(off, "src/http/proxy/index.ts")).href)).makeAnthropicProxyHandler as typeof makeAnthropicProxyHandler;
+  assert.equal(readFileSync(join(checkoutCommercial, ownerRel)).equals(liveOwnerBefore), true);
+  return { onFactory, offFactory };
 }
 
 test("production handler keeps legacy and hard ceilings, and does not launch", async () => {
@@ -568,7 +614,10 @@ test("production handler keeps legacy and hard ceilings, and does not launch", a
   assert.equal(tooRaw.res.json().error?.code, "PAYLOAD_TOO_LARGE");
 });
 
-test("production handler keeps the enlarged envelope off while route-ready is false", async () => {
+test("isolated production handlers gate the envelope with false and true from the same frozen source", async (t) => {
+  const { onFactory, offFactory } = await isolatedRouteFactories(t);
+  const call = (payload: Buffer | object, options: Parameters<typeof handlerFor>[0] = {}, headers: Record<string, string> = {}) =>
+    callWithFactory(payload, options, headers, offFactory);
   const nine = bodyOf([{ role: "user", content: "n".repeat(9 * 1024 * 1024) }]);
   const lease = signLease();
   const leaseOnly = await call(nine, {
@@ -639,4 +688,21 @@ test("production handler keeps the enlarged envelope off while route-ready is fa
   });
   assert.equal(headerOnly.launches, 0);
   assert.equal(headerOnly.res.statusCode, 413);
+
+  // The same authenticated large request must pass only the true byte gate.
+  // A genuine non-streaming replay miss stops it after budget selection and
+  // before balance lookup, reservation, database or any paid upstream work.
+  const replayMiss = { ...nine, stream: false };
+  const signedHeaders = { [AUTHORITY_HEADER]: signAuthorityWithOwner() };
+  const signedOptions = { catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER), box: true };
+  const disabledSignedReplay = await call(replayMiss, signedOptions, signedHeaders);
+  assert.equal(disabledSignedReplay.res.statusCode, 413);
+  assert.equal(disabledSignedReplay.res.json().error?.code, "BODY_FIELD_TOO_LARGE");
+  assert.equal(disabledSignedReplay.thrown, null);
+  assert.equal(disabledSignedReplay.launches, 0);
+  const enabledSigned = await callWithFactory(replayMiss, signedOptions, signedHeaders, onFactory);
+  assert.equal(enabledSigned.res.statusCode, 409);
+  assert.equal(enabledSigned.res.json().error?.code, "BOX_REPLAY_NOT_FOUND");
+  assert.equal(enabledSigned.thrown, null);
+  assert.equal(enabledSigned.launches, 0, "replay miss must not launch paid Box work");
 });
