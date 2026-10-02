@@ -1238,6 +1238,9 @@ export function ProcessDisclosure<T>({
               const group = groupNode(section.messages, current);
               // OCV5-312: 流光挂在「正在干活」的这一段摘要行上(当前段、本轮仍在进行),表明 agent 此刻在做什么;
               // 其余过程文字一律 --faint,让下方 agent 的回复正文更突出。当前在写正文(叙述段)时不挂流光,流式文字本身就是信号。
+              // 有意为之:干活行的回落色是 --muted(比完成行略实)。流光与节点光晕在 reduced-motion / 不支持
+              // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
+              // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
               const working = active && index === currentIndex;
               const missed = section.items.filter((item) => messagesOf(item).some((message) => message.role === "tool" && hasErrorMark(message))).length;
               return (

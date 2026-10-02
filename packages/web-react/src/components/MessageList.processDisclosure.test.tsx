@@ -1450,6 +1450,37 @@ describe("MessageList Manus 过程披露", () => {
     expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(0);
   });
 
+  test("当前在写正文时不挂流光；过程行回落 --faint，干活行用 --muted 作无动效时的静态强调", () => {
+    const user = row("u", "user", "清理磁盘", { status: "sent" });
+    const done = row("c1", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "du -sh /tmp" },
+      _completed: true,
+      output: "1G",
+    });
+    const writing = row("m", "assistant", "临时目录占了 1G，我先说明一下清理方案。", { _clientMessageId: "u" });
+    renderList([user, done, writing], { sending: true });
+    const summary = screen.getByTestId("process-group-summary");
+    expect(summary.getAttribute("data-live-working")).toBe("false");
+    expect(summary.className).toContain("text-faint");
+    expect(summary.className).not.toContain("text-muted");
+    expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(0);
+    expect(screen.getByTestId("process-stage")).toHaveTextContent("我先说明一下清理方案");
+
+    cleanup();
+    renderList([user, row("c2", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "rm -rf /tmp/cache" },
+      _completed: false,
+    })], { sending: true });
+    const working = screen.getByTestId("process-group-summary");
+    expect(working.getAttribute("data-live-working")).toBe("true");
+    expect(working.className).toContain("oc-live-status-shine");
+    expect(working.className).toContain("text-muted");
+  });
+
   test("进行中的工具后追加已完成目标，当前工具仍默认可见", () => {
     const user = row("u", "user", "接着查", { status: "sent" });
     const running = row("cmd", "tool", "终端", {
