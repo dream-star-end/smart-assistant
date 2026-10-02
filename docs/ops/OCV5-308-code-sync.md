@@ -1,11 +1,14 @@
-# OCV5-308 — 双向通用代码同步，禁止自动发布
+# OCV5-308: code sync and commercial model release
 
-用户 2026-10-02 明确选择保留差异同步：通用功能与修复双向合入，各版模型、价格、路由、已应用迁移历史保持独立。本任务不部署、不迁移、不改线上配置、不启用 Box，不登记队列或搭车发布。
+Latest user scope supersedes the initial NO-DEPLOY/code-only plan: sync common code, release the frozen public 17 new models at personal four-dimensional price + multiplier; standard Grok upgrades to 4.7 at personal multiplier 2. Keep other 33 active-enabled commercial rows unchanged. Do not restore Astra 1M, expose internal canaries, copy credentials/group IDs, or execute personal retirement SQL in commercial.
 
-冻结输入：selfhost `3772295e774a6c50406e3d975f5136f590834be3`，commercial `b0c5ead00c566c295b331cfd188a9c30babe9885`。
+## Sequence (not yet deployed)
+1. Commercial 0283 normal-runner history + 0293 staged/disabled preparation. Personal execution set excludes both.
+2. Grok frozen authority upstream paired with the same pricing generation; compatible CLI/runtime + correct Cursor Box CC route; review and protected CI.
+3. Official commercial queue/mutation lease release. Prove old active models still usable and new upstream/tool/cost probes pass.
+4. Independent official double-lock CAS activation, standard Grok version+price in one transaction. Old 33 prices/permissions/bindings remain byte-for-byte; new min_plan_code=NULL preserves commercial ungated policy rather than copying personal Box lite gates.
+5. Failure: disable new entries and CAS restore Grok, then official code rollback; no blind retry.
 
-商业：保留 SCNet、原模型迁移集合，仅新增通用 0285 内容审查表，精确依赖现有 0282。个人 0280/0281、0283/0284、0286–0292 模型上线/定价/下线迁移与其专属 onboard 测试不在商业本次导入范围，仍完整保留在个人分支及 Git 合并祖先中。Box 通用 journal 使用既有 request_finalize_journal.ctx；未来启用 Cursor-engine Box Claude 必须另行审批并补 0291 audit CHECK（或批准的等效迁移）。
+Manifest: ops/ocv5-308/model-release-manifest.json. Public target count 17; internal-only additions are not automatically exposed. Frozen pricing/capabilities were read from real databases in this task. Recheck exact live state before mutations.
 
-个人：保留 Ark/ZAI 与个人迁移执行集合，不引入商业 0282。商业其他修复及必要 CI 适配仍保留，个人 0285 SQL 字节不变。
-
-两个分支允许有意的 flavor 差异，不要求 tree hash 相同。远端 canonical 更新即便成功也只代表源码整合；活跃 checkout 和线上 release 不随本任务更新，任何后续发布必须另获授权并走正常门禁。禁止提高证明债务上限、删除已有事故账本、伪造 proof 或绕过受保护 PR。
+B5 dedicated PG proof passed 3/3; source CI/incident debt remains a release blocker. Stage0 PASS does not mean code/release PASS. No production mutation has occurred.
