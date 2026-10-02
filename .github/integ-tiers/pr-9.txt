@@ -1,0 +1,9 @@
+# PR shard 9: real CCB control headers, Redis TTL isolation and Box capacity.
+# Each target must execute, with zero skip. No name filtering or weaker oracle.
+# min-tests: 3
+# max-minutes: 20
+# file-timeout-ms: 180000
+# mutex-timeout-seconds: 900
+packages/gateway/src/__tests__/ccbRealCliHeaders.integ.test.ts
+packages/commercial/src/__tests__/preCheckLongTtl.integ.test.ts
+packages/commercial/src/http/proxy/boxParallelAdmission.integ.test.ts

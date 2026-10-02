@@ -388,6 +388,10 @@ jobs:
             timeout: 40
           - shard: pr-7
             timeout: 90
+          - shard: pr-8
+            timeout: 25
+          - shard: pr-9
+            timeout: 20
 
     # 2026-07-26 门禁审计:110 个 *.integ.test.ts / 1549 个用例在 CI、deploy、
     # playbook 三处都不跑,而单测层白纸黑字把"SQL 真行为"delegate 给它们
