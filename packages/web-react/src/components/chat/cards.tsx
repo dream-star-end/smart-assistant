@@ -226,7 +226,7 @@ function ReqIdChip({ traceId }: { traceId: string }) {
         }
       }}
       // 触屏 44px 命中(a11y-B messages#2);桌面维持 20px 胶囊。
-      className="inline-flex items-center gap-1 rounded-full bg-hover px-2 py-0.5 font-mono text-caption text-faint transition-colors hover:text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
+      className="-mx-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-caption text-faint transition-colors hover:bg-hover hover:text-muted [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
     >
       {copied ? <Check size={11} /> : null}
       {copied ? "已复制" : `#${traceId.slice(0, 8)}`}
@@ -245,7 +245,7 @@ function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) 
   const showTime = Boolean(msg.ts);
   if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
-    <div data-testid="assistant-meta" className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-faint">
+    <div data-testid="assistant-meta" className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint">
       {showTime && (
         <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap text-caption">
           <TooltipProvider>
@@ -259,9 +259,9 @@ function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) 
         </Badge>
       )}
       {showCredits && (
-        <Badge tone="neutral" aria-label={`消耗 ${credits} 积分`}>
-          <Wallet size={11} /> {groupDigits(credits!)} 积分
-        </Badge>
+        <span aria-label={`消耗 ${credits} 积分`} className="inline-flex items-center gap-1 whitespace-nowrap tabular-nums">
+          <Wallet size={11} aria-hidden="true" /> {groupDigits(credits!)} 积分
+        </span>
       )}
       {traceId && <ReqIdChip traceId={traceId} />}
     </div>
@@ -379,6 +379,7 @@ function MessageActions({
   text,
   minimal = false,
   readOnly = false,
+  className,
 }: {
   msg: ChatMessage;
   cb: CardCallbacks;
@@ -389,13 +390,14 @@ function MessageActions({
   minimal?: boolean;
   /** 只读面(教程回放 / 后台会话查看器):不出引用/重新生成/反馈这类会写回会话的动作。 */
   readOnly?: boolean;
+  className?: string;
 }) {
   const body = text ?? msg.text ?? "";
   const copy = <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} />;
   // 停止 / 失败但有部分回答:只有复制 / 纯文本 / 引用三个,整排直接可见(不折叠)。
   if (minimal) {
     return (
-      <TouchActionRow defaultOpen>
+      <TouchActionRow defaultOpen className={className}>
         {copy}
         <CopyIconButton
           getText={() => stripMarkdown(body)}
@@ -420,7 +422,7 @@ function MessageActions({
   // OCV5-295:完成态「复制」常显(触屏/桌面都一击可达);其余动作收进同一个「更多操作」,
   // 末条也默认收起 —— 触屏不再为最新回复铺一整排 7 个 44px 图标。showRegen 只决定有无「重新生成」。
   return (
-    <div className="mt-1.5 flex items-center gap-0.5">
+    <div className={cn("mt-1.5 flex items-center gap-0.5", className)}>
       {copy}
       <TouchActionRow className="mt-0">
         <CopyIconButton
@@ -525,15 +527,49 @@ export function UserCard({
   const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
   const canEdit = !readOnly && Boolean(cb?.onEditResend);
   return (
-    <div className="group flex flex-col items-end animate-in" data-testid="user-row">
-      <div
-        className="max-w-[78%] whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
-        data-testid="message-text"
-      >
-        {msg._replyTo && (
-          <ReplyQuoteBlock role={msg._replyTo.role} text={msg._replyTo.text} />
+    // OCV5-307 节奏:每轮从用户提问开始,上方多留一点呼吸(pt-3),问与答之间收紧。
+    // 桌面(hover:hover)上动作条贴在气泡左侧底边、绝对定位不占高度 —— 原先它在气泡下方
+    // 预留整整一行(opacity-0 也占位),问题和自己的回答之间被撑开一大段空白。触屏照旧在下方。
+    <div className="group flex flex-col items-end pt-3 animate-in" data-testid="user-row">
+      <div className="relative flex max-w-[78%] flex-col items-end">
+        <div
+          className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
+          data-testid="message-text"
+        >
+          {msg._replyTo && (
+            <ReplyQuoteBlock role={msg._replyTo.role} text={msg._replyTo.text} />
+          )}
+          {msg.text}
+        </div>
+        {status !== "sending" && status !== "queued" && (
+          <TouchActionRow className="mt-1 [@media(hover:hover)]:absolute [@media(hover:hover)]:bottom-0.5 [@media(hover:hover)]:right-full [@media(hover:hover)]:mr-1.5 [@media(hover:hover)]:mt-0">
+            <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
+            {canQuote && (
+              <IconButton
+                aria-label="引用"
+                title="引用"
+                size="sm"
+                shape="square"
+                className="[@media(hover:none)]:size-11"
+                onClick={() => cb?.onQuote?.(msg)}
+              >
+                <Quote size={15} />
+              </IconButton>
+            )}
+            {canEdit && (
+              <IconButton
+                aria-label="编辑"
+                title="编辑并重新发送"
+                size="sm"
+                shape="square"
+                className="[@media(hover:none)]:size-11"
+                onClick={() => cb?.onEditResend?.(msg)}
+              >
+                <Pencil size={15} />
+              </IconButton>
+            )}
+          </TouchActionRow>
         )}
-        {msg.text}
       </div>
       {msg._media && msg._media.length > 0 && (
         <Media media={msg._media} className="justify-end" />
@@ -575,35 +611,6 @@ export function UserCard({
             </button>
           )}
         </div>
-      )}
-      {status !== "sending" && status !== "queued" && (
-        <TouchActionRow className="mt-1">
-          <CopyIconButton getText={() => msg.text || ""} label="复制" icon={<Copy size={15} />} />
-          {canQuote && (
-            <IconButton
-              aria-label="引用"
-              title="引用"
-              size="sm"
-              shape="square"
-              className="[@media(hover:none)]:size-11"
-              onClick={() => cb?.onQuote?.(msg)}
-            >
-              <Quote size={15} />
-            </IconButton>
-          )}
-          {canEdit && (
-            <IconButton
-              aria-label="编辑"
-              title="编辑并重新发送"
-              size="sm"
-              shape="square"
-              className="[@media(hover:none)]:size-11"
-              onClick={() => cb?.onEditResend?.(msg)}
-            >
-              <Pencil size={15} />
-            </IconButton>
-          )}
-        </TouchActionRow>
       )}
     </div>
   );
@@ -1058,45 +1065,70 @@ export function AssistantCard({
           </output>
         )}
 
-        {/* 动作条 + meta（流式中不显示动作条，避免抖动）。流式阶段不单挂 token。 */}
-        {!live && !hasError && msg.text && !isSyntheticEmptyNotice && (
-          <MessageActions
-            msg={msg}
-            cb={cb}
-            showRegen={showRegenerate && !hasError}
-            readOnly={readOnly}
-          />
-        )}
-        {/* 用户主动停止 / 失败但模型已产出合法部分回答:正文可见就必须可留存 —— 给精简动作行
-            (复制 / 复制纯文本 / 引用),不出朗读、重新生成、反馈(那些属于完整回答)。 */}
-        {!live && hasError && presentedError?.bodyText && (
-          <MessageActions
-            msg={msg}
-            cb={cb}
-            showRegen={false}
-            text={presentedError.bodyText}
-            minimal
-            readOnly={readOnly}
-          />
-        )}
-        {/* OCV5-295:meta 与评价行共用一个 flex-wrap 父节点(各自门控不变),宽度够就并排、不够自然换行,
-            省掉一整行附属 chrome;两者都不出时 empty:hidden 不留空白。 */}
-        <div
-          data-testid="assistant-footer"
-          className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 empty:hidden"
-        >
-          {/* 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
-              刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。 */}
-          {metaVisible && !hideOrphanSilentMeta && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
-          {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
-              所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
-              一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
-              其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
-              未登录/demo 由卡内 Context 兜底隐藏。 */}
-          {!live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply && ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn) && (
-            <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
-          )}
-        </div>
+        {/* 动作条 + meta（流式中不显示动作条，避免抖动）。流式阶段不单挂 token。
+            OCV5-307:动作、meta、评价合成**一条**底栏 —— 原先「复制」独占一行、meta+评价再占一行,
+            每条回答底下两行附属 chrome。现在左侧是动作(复制常显,其余 hover / 「更多操作」),
+            右侧是 meta + 评价;宽度不够时 flex-wrap 自然换行。桌面 hover 动作虽 opacity-0
+            仍占宽度,所以 meta 组走 ml-auto 靠右,不会被隐形按钮推出一段空白。 */}
+        {(() => {
+          const showActions = !live && !hasError && !!msg.text && !isSyntheticEmptyNotice;
+          const showMinimalActions = !live && hasError && !!presentedError?.bodyText;
+          // 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
+          // 刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。
+          const showMeta = metaVisible && !hideOrphanSilentMeta;
+          // 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
+          // 所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
+          // 一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
+          // 其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
+          // 未登录/demo 由卡内 Context 兜底隐藏。
+          const showRating =
+            !live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply &&
+            !!ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn);
+          const hasActions = showActions || showMinimalActions;
+          return (
+            <div
+              data-testid="assistant-footer"
+              className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 empty:hidden"
+            >
+              {showActions && (
+                <MessageActions
+                  msg={msg}
+                  cb={cb}
+                  showRegen={showRegenerate && !hasError}
+                  readOnly={readOnly}
+                  className="mt-0 -ml-1.5"
+                />
+              )}
+              {/* 用户主动停止 / 失败但模型已产出合法部分回答:正文可见就必须可留存 —— 给精简动作行
+                  (复制 / 复制纯文本 / 引用),不出朗读、重新生成、反馈(那些属于完整回答)。 */}
+              {showMinimalActions && (
+                <MessageActions
+                  msg={msg}
+                  cb={cb}
+                  showRegen={false}
+                  text={presentedError!.bodyText}
+                  minimal
+                  readOnly={readOnly}
+                  className="mt-0 -ml-1.5"
+                />
+              )}
+              {(showMeta || showRating) && (
+                <div
+                  className={cn(
+                    "flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 empty:hidden",
+                    // 窄屏不靠右:一靠右就和左侧动作拆成阶梯状的三行;贴着动作顺排更紧凑。
+                    hasActions && "sm:ml-auto sm:justify-end",
+                  )}
+                >
+                  {showMeta && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
+                  {showRating && (
+                    <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })()}
       </div>
     </div>
   );
@@ -1144,7 +1176,7 @@ export const ThinkingCard = memo(
     const bodyId = useId();
     const hasBody = segments.length > 0;
     return (
-      <div className="rounded-lg border border-border bg-surface/60 animate-in">
+      <div className="overflow-hidden rounded-md border border-border/80 bg-surface/70 animate-in">
         {/* 折叠开关暴露展开态(aria-expanded,与 DelegateProgressCard / RuntimeEventCard 一致);
             触屏下头部加高到 44px 触控靶。 */}
         <button
@@ -1152,20 +1184,23 @@ export const ThinkingCard = memo(
           onClick={() => setUserCollapsed(!collapsed)}
           aria-expanded={!collapsed}
           aria-controls={!collapsed && hasBody ? bodyId : undefined}
-          className="flex w-full items-center gap-2 px-3.5 py-2 text-left text-body text-muted hover:bg-hover [@media(hover:none)]:min-h-11"
+          className="flex min-h-10 w-full items-center gap-2.5 px-3 py-2 text-left text-body text-muted transition-colors hover:bg-hover/60 [@media(hover:none)]:min-h-11"
         >
-          <Brain size={14} className="shrink-0 text-faint" />
-          <span className="min-w-0 truncate font-medium" title={headline}>
+          {/* 与工具卡同一列 24px 图标格,思考/工具在过程里左缘对齐成一条线。 */}
+          <span className="flex size-6 shrink-0 items-center justify-center rounded-[7px] bg-hover text-faint">
+            <Brain size={13} />
+          </span>
+          <span className={cn("min-w-0 truncate font-medium", live && "oc-live-status-shine")} title={headline}>
             {headline}
           </span>
           <TokenUsageBadge usage={tokenUsage} />
           <ChevronRight
             size={14}
-            className={cn("ml-auto shrink-0 text-faint transition-transform", !collapsed && "rotate-90")}
+            className={cn("ml-auto shrink-0 text-faint transition-transform duration-200", !collapsed && "rotate-90")}
           />
         </button>
         {!collapsed && hasBody && (
-          <div id={bodyId} className="border-t border-border px-3.5 py-2.5">
+          <div id={bodyId} className="border-t border-border/70 px-3.5 py-2.5">
             {segments.map((seg, i) => (
               <div
                 key={i}
@@ -1212,8 +1247,8 @@ export function PlanCard({
       !!s && typeof s === "object" && typeof s.step === "string" && typeof s.status === "string",
   );
   return (
-    <div className="rounded-lg border border-border bg-surface animate-in">
-      <div className="flex items-center gap-2 border-b border-border px-3.5 py-2.5">
+    <div className="overflow-hidden rounded-md border border-border/80 bg-surface animate-in">
+      <div className="flex items-center gap-2.5 border-b border-border/70 px-3 py-2">
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
           <ListTodo size={14} />
         </span>
@@ -1251,7 +1286,7 @@ export function PlanCard({
 export function GoalCard({ msg }: { msg: ChatMessage }) {
   const status = msg.cleared ? "已清除" : msg.goalStatus || "已同步";
   return (
-    <div className="rounded-lg border border-border bg-surface px-3.5 py-3 animate-in">
+    <div className="rounded-md border border-border/80 bg-surface px-3 py-2.5 animate-in">
       <div className="flex items-center gap-2">
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent"><Target size={14} /></span>
         <span className="text-body font-medium text-fg">{msg.text || "会话目标"}</span>
@@ -1282,12 +1317,12 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
   const collapsed = userCollapsed ?? done;
   const tokenUsage = delegateTokenUsage(msg);
   return (
-    <div className="rounded-lg border border-border bg-surface animate-in">
+    <div className="overflow-hidden rounded-md border border-border/80 bg-surface animate-in">
       <button
         type="button"
         onClick={() => setUserCollapsed(!collapsed)}
         aria-expanded={!collapsed}
-        className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left hover:bg-hover"
+        className="flex min-h-10 w-full items-center gap-2.5 px-3 py-2 text-left transition-colors hover:bg-hover/60"
       >
         <span className="flex size-6 items-center justify-center rounded-md bg-accent-soft text-accent">
           <Sparkles size={13} />

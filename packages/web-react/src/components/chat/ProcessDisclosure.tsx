@@ -656,7 +656,8 @@ function stepLiveStatus(messages: readonly ChatMessage[]): { text: string; pendi
 }
 
 const toggleClass =
-  "group flex min-h-10 w-full items-center gap-2 rounded-md py-1.5 text-left text-sm text-muted hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
+  "group flex min-h-10 w-full items-center gap-2 rounded-md py-1.5 text-left text-sm text-muted transition-colors hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
+const chevronClass = "shrink-0 text-faint transition-transform duration-200 group-hover:text-muted";
 
 function StageText({ message, live = false }: { message: ChatMessage; live?: boolean }) {
   // Same suppression as AssistantCard: an unpublished fallback must not
@@ -753,15 +754,15 @@ export function ProcessDisclosure<T>({
         data-testid="process-toggle"
         onClick={() => setOpen(!open)}
       >
-        <ChevronRight size={14} className={open ? "shrink-0 rotate-90 transition-transform" : "shrink-0 transition-transform"} aria-hidden />
-        <span className="shrink-0">{title}</span>
-        <span className="min-w-0 truncate text-xs text-muted">{summary}</span>
+        <ChevronRight size={14} className={open ? `${chevronClass} rotate-90` : chevronClass} aria-hidden />
+        <span className="shrink-0 font-medium">{title}</span>
+        <span className="min-w-0 truncate text-xs text-faint">{summary}</span>
       </button>
       {!open
         ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
         : null}
       {(olderSteps || open) ? (
-          <div className="space-y-1.5 border-l border-border pl-2" data-testid={open ? "process-stages" : "process-older-steps"}>
+          <div className="ml-[6px] space-y-1.5 border-l border-border pl-3.5" data-testid={open ? "process-stages" : "process-older-steps"}>
             {olderSteps}
             {open ? sections.map((section, index) => {
               if (section.goal) {
@@ -799,7 +800,7 @@ export function ProcessDisclosure<T>({
                     <ChevronRight
                       size={13}
                       aria-hidden
-                      className={details ? "shrink-0 rotate-90 transition-transform" : "shrink-0 transition-transform"}
+                      className={details ? `${chevronClass} rotate-90` : chevronClass}
                     />
                     <span className="min-w-0 break-words">{operationSummary(section.messages)}</span>
                   </button>
