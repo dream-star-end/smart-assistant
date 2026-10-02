@@ -266,12 +266,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install isolated Redis proof runtime
+      - name: Install isolated proof runtimes
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends redis-server
+          sudo apt-get install -y --no-install-recommends redis-server python3-docx python3-pil pandoc
           redis-server --version
-          dpkg-query -W redis-server
+          /usr/bin/python3 -c 'import docx, PIL; print("python-docx", docx.__version__, "Pillow", PIL.__version__)'
+          pandoc --version
+          dpkg-query -W redis-server python3-docx python3-pil pandoc
 
       - name: Wait for test fixtures
         shell: bash

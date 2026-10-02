@@ -2,7 +2,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
@@ -22,10 +23,7 @@ const CAPTION_JSONL = "[Image: original 1290x2796, displayed at 923x2000. Multip
 const HOOK = "<system-reminder>\nPreToolUse:Read hook additional context: keep the figure.\n</system-reminder>";
 const BUDGET = "<total_tokens>14999987 tokens left</total_tokens>";
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-const SEALED = ["/home/agent/.openclaude/generated",
-  "/var/lib/docker/volumes/oc-v5-data-u3/_data/generated"]
-  .find((dir) => existsSync(join(dir, "ocv5-294-image-repro-raw-859a435f.json")))
-  ?? "/home/agent/.openclaude/generated";
+const SEALED = fileURLToPath(new URL("./__fixtures__/box-image-continuation/", import.meta.url));
 const SMALL_PRIOR = "07627858ce0e2f31de209036a2e0e7985d217c0c47ce3f01b8a334d1506f2ea2";
 const SMALL_NEXT = "1e12632030a3e7f45a9f275a6de7ce6031830ba601151529db4a897832fd6922";
 const SEALED_IMAGE = "a9491d8d9cb458b11d4ac6c5fc4b5c2d4d370a1d9b6f7960cc5dffae678538a0";
@@ -277,9 +275,25 @@ test("publisher file and echo bind the fixture bytes, not the matcher hash", () 
   } finally { rmSync(cwd, { recursive: true, force: true }); }
 });
 
-test("sealed tall raw resumes and the small raw context hashes stay put", { skip: !existsSync(join(SEALED, "ocv5-294-image-repro-raw-859a435f.json")) || !existsSync(join(SEALED, "ocv5-294-image-repro-raw-0d4483e2.json")) }, () => {
-  const tall = JSON.parse(readFileSync(join(SEALED, "ocv5-294-image-repro-raw-859a435f.json"), "utf8")) as { rounds: Array<{ body: ProxyBody }> };
-  const small = JSON.parse(readFileSync(join(SEALED, "ocv5-294-image-repro-raw-0d4483e2.json"), "utf8")) as { rounds: Array<{ body: ProxyBody }> };
+function readSealedFixture(name: string, expectedSha: string) {
+  const bytes = readFileSync(join(SEALED, name));
+  assert.equal(sha(bytes), expectedSha, "fixture byte identity must not drift");
+  const parsed = JSON.parse(bytes.toString("utf8")) as { label: string;
+    rounds: Array<{ body: ProxyBody; sha256: string; bytes: number }> };
+  assert.equal(parsed.label, "sanitized-synthetic-loopback-not-incident-wire");
+  for (const round of parsed.rounds) {
+    const bodyBytes = JSON.stringify(round.body);
+    assert.equal(round.sha256, sha(bodyBytes), "current round hash is not a stale source hash");
+    assert.equal(round.bytes, Buffer.byteLength(bodyBytes));
+  }
+  return parsed;
+}
+
+test("sealed tall raw resumes and the small raw context hashes stay put", () => {
+  const tall = readSealedFixture("ocv5-294-image-repro-raw-859a435f.json",
+    "208d9f42222fe5563f88b6b7ff97fcf8bc6fbee015e5f3e6ef7f41ec9aed5c4f");
+  const small = readSealedFixture("ocv5-294-image-repro-raw-0d4483e2.json",
+    "04228e790e830b1fec9f95ed7ffb04f002fb977ccde72a90a870bc256ac3c2d8");
   const tallBody = tall.rounds[1]!.body;
   const smallBody = small.rounds[1]!.body;
   const tallSnap = JSON.stringify(tallBody);
