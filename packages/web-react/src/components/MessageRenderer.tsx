@@ -8,7 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isAnsweredPrompt, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -815,9 +815,36 @@ function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner:
 }
 
 /** Contiguous, turn-bounded display groups; never move an actionable row. */
+/**
+ * OCV5-307: errored assistant rows the turn moved past — later work (a tool,
+ * thought, plan, subtask, answered prompt or another assistant) follows in the
+ * same user turn. Those are a recovered step, not the turn's outcome, so they
+ * fold into the process. An error with nothing after it stays on the top level.
+ */
+function continuedErrorIds(messages: ChatMessage[]): Set<string> {
+  const ids = new Set<string>();
+  let pending: string[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      pending = [];
+      continue;
+    }
+    const isWork =
+      isFoldableWorkRole(message) || isAnsweredPrompt(message) ||
+      (message.role === "assistant" && !message._timelineAuxiliary);
+    if (isWork && pending.length > 0) {
+      for (const id of pending) ids.add(id);
+      pending = [];
+    }
+    if (isErroredAssistant(message) && message.id) pending.push(message.id);
+  }
+  return ids;
+}
+
 function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
   const out: RenderItem[] = [];
   const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const continuedErrors = continuedErrorIds(messages);
   const activeStart = currentTurnStartIndex(messages);
   const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
   const assistantArtifactKeys = new Map<string, Set<string>>();
@@ -876,7 +903,8 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;
     const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
-    const fold = rows.length > 0 && rows.every((message) => isProcessMessage(message, answerIds.has(message.id), ownedArtifacts));
+    const fold = rows.length > 0 && rows.every((message) =>
+      isProcessMessage(message, answerIds.has(message.id), ownedArtifacts, continuedErrors.has(message.id)));
     if (!fold) {
       seal(group, boundary);
       const crossedAnswer = rows.some((message) => answerIds.has(message.id));

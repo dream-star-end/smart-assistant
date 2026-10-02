@@ -367,6 +367,34 @@ export function isAnsweredPrompt(message: ChatMessage): boolean {
   return message.role === "permission" && message._resolved === true && message._controlPending !== true;
 }
 
+function hasErrorMark(message: ChatMessage): boolean {
+  return Boolean(message.error || message._isError || message._errorCode);
+}
+
+/** An assistant row that carries a turn error (model unavailable, engine error…). */
+export function isErroredAssistant(message: ChatMessage): boolean {
+  return message.role === "assistant" && hasErrorMark(message);
+}
+
+/**
+ * OCV5-307: rows that render as a full card *inside* the process rail, always
+ * visible while the shell is open: answered prompts, and an errored assistant
+ * the turn recovered from (the caller only folds it when later work follows).
+ * The narrative renderer hides errored rows, so these must not be narrative.
+ */
+export function isProcessCardMessage(message: ChatMessage): boolean {
+  return isAnsweredPrompt(message) || isErroredAssistant(message);
+}
+
+/**
+ * A delegated child that reached a terminal state — including failed / timed
+ * out / errored. Like an ordinary tool miss it is one step of the turn; the
+ * failure stays visible on the card inside the process.
+ */
+function finishedSubtask(message: ChatMessage): boolean {
+  return message.role === "agent-group" || message.role === "delegate-progress";
+}
+
 /** A background child that has not reached a terminal status must stay on the top level. */
 function liveBackgroundSubtask(message: ChatMessage): boolean {
   if (message.role !== "agent-group" && message.role !== "delegate-progress") return false;
@@ -397,14 +425,26 @@ export function isProcessMessage(
   message: ChatMessage,
   final: boolean,
   assistantArtifactKeys?: ReadonlySet<string>,
+  /** The turn did more work after this row (caller-computed). Only used for errored assistants. */
+  continued = false,
 ): boolean {
   if (message._turnStatusRecord || message._genPlaceholder || message._turnTapeProcess) {
     return false;
   }
-  if ((message.error || message._isError || message._errorCode) && !ordinaryToolMiss(message)) {
+  // OCV5-307: an error only keeps a row on the top level when it is the turn's
+  // outcome. Tool/thought/plan misses, finished (incl. failed) subtasks and an
+  // assistant error the turn continued past are steps — they fold like the rest.
+  if (
+    hasErrorMark(message) &&
+    !ordinaryToolMiss(message) &&
+    !finishedSubtask(message) &&
+    !(continued && message.role === "assistant")
+  ) {
     return false;
   }
-  if (message._delegateStatus === "failed" || message._delegateStatus === "timeout") return false;
+  if ((message._delegateStatus === "failed" || message._delegateStatus === "timeout") && !finishedSubtask(message)) {
+    return false;
+  }
   if (liveBackgroundSubtask(message)) return false;
   if (isAnsweredPrompt(message)) return true;
   if (interactiveTool(message)) return false;
@@ -462,8 +502,8 @@ export type ProcessSection<T> = {
   key: string;
   narrative: boolean;
   goal: boolean;
-  /** Answered questions / approvals: always visible on the rail, never folded behind a count toggle. */
-  prompt?: boolean;
+  /** Full cards on the rail (answered prompts, recovered errors): always visible, never behind a count toggle. */
+  card?: boolean;
   items: T[];
   messages: ChatMessage[];
 };
@@ -476,15 +516,15 @@ export function processSections<T>(
   const sections: ProcessSection<T>[] = [];
   for (const item of items) {
     const messages = messagesOf(item);
-    const narrative = messages.length > 0 && messages.every((message) => message.role === "assistant");
-    const goal = !narrative && messages.length > 0 && messages.every((message) => isHistoricalGoalRecord(message));
-    const prompt = !narrative && !goal && messages.length > 0 && messages.every(isAnsweredPrompt);
+    const card = messages.length > 0 && messages.every(isProcessCardMessage);
+    const narrative = !card && messages.length > 0 && messages.every((message) => message.role === "assistant");
+    const goal = !narrative && !card && messages.length > 0 && messages.every((message) => isHistoricalGoalRecord(message));
     const previous = sections.at(-1);
-    if (!narrative && !goal && !prompt && previous && !previous.narrative && !previous.goal && !previous.prompt) {
+    if (!narrative && !goal && !card && previous && !previous.narrative && !previous.goal && !previous.card) {
       previous.items.push(item);
       previous.messages.push(...messages);
     } else {
-      sections.push({ key: keyOf(item), narrative, goal, prompt, items: [item], messages: [...messages] });
+      sections.push({ key: keyOf(item), narrative, goal, card, items: [item], messages: [...messages] });
     }
   }
   return sections;
@@ -735,7 +775,7 @@ export function ProcessDisclosure<T>({
   // take the current-stage identity from the work still in progress.
   let currentIndex = -1;
   for (let i = sections.length - 1; i >= 0; i -= 1) {
-    if (!sections[i]?.goal && !sections[i]?.prompt) {
+    if (!sections[i]?.goal && !sections[i]?.card) {
       currentIndex = i;
       break;
     }
@@ -786,11 +826,11 @@ export function ProcessDisclosure<T>({
           <div className="ml-[6px] space-y-1.5 border-l border-border pl-3.5" data-testid={open ? "process-stages" : "process-older-steps"}>
             {olderSteps}
             {open ? sections.map((section, index) => {
-              if (section.prompt) {
-                // 已回答的问答/审批:作为过程里的一步常显(用户的选择是这轮的关键事实),
-                // 卡片自身在 resolved 态已换成与工具卡同一套中性外框。
+              if (section.card) {
+                // 过程里常显的整卡步骤:已回答的问答/审批(用户的选择是这轮的关键事实)、
+                // 本轮已越过的中途错误(模型不可用等)。用原卡渲染,不藏在「N 项」后面。
                 return (
-                  <div key={section.key} data-testid="process-prompt" className="min-w-0 space-y-1.5 py-0.5">
+                  <div key={section.key} data-testid="process-card" className="min-w-0 space-y-1.5 py-0.5">
                     {section.items.map((item) => (
                       <div key={keyOf(item)}>{renderItem(item)}</div>
                     ))}

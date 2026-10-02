@@ -190,6 +190,62 @@ describe("MessageList Manus 过程披露", () => {
     expect(answer.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
+  // OCV5-307 回归:OCV5-308 实况 —— 中途一次 model_not_available(detail=error_during_execution JSON)
+  // 之后本轮继续跑工具并给出回答,这张错误卡曾单独挂在收起的「工作过程」下面。
+  const midTurnError = () =>
+    row("err-mid", "assistant", "通用代码已生成商业版候选并推送", {
+      _clientMessageId: "u",
+      _errorCode: "model_not_available",
+      _errorDetail: '{"subtype":"error_during_execution","result":"Selected model is at capacity."}',
+      usage: { traceId: "trace-mid-err" },
+    });
+
+  test("OCV5-307: 本轮越过的中途错误卡收进过程，作为常显卡片步骤", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      midTurnError(),
+      row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+      row("answer", "assistant", "已合并并推送", { _clientMessageId: "u" }),
+    ]);
+    // 收起态:只有一个过程壳,错误卡不在顶层
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.queryByText("模型暂不可用")).not.toBeInTheDocument();
+    expect(screen.getByText("已合并并推送").closest("[data-testid=process-disclosure]")).toBeNull();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const card = screen.getByTestId("process-card");
+    expect(within(card).getByText("模型暂不可用")).toBeInTheDocument();
+    expect(card.closest("[data-testid=process-disclosure]")).not.toBeNull();
+  });
+
+  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      midTurnError(),
+    ]);
+    const detail = screen.getByText("模型暂不可用");
+    expect(detail.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 已失败的子任务是过程步骤，不在收起的过程外单独成卡", () => {
+    renderList([
+      row("u", "user", "分派 T2", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git status" }, _completed: true, output: "ok" }),
+      row("child", "agent-group", "T2 校验迁移", {
+        _clientMessageId: "u",
+        _delegate: true,
+        _completed: true,
+        _isError: true,
+        _delegateStatus: "failed",
+      }),
+      row("answer", "assistant", "T2 失败，已改走 T3", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    expect(screen.queryByText("T2 校验迁移")).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-toggle")).toHaveTextContent("子任务 1 项");
+  });
+
   test("OCV5-307: 未回答的提问留在过程外，同一轮已回答的提问在过程轨线上", () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
@@ -228,7 +284,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
     fireEvent.click(screen.getByTestId("process-toggle"));
     const done = cards().find((card) => card.getAttribute("data-permission-request") === "req-done");
-    expect(done?.closest("[data-testid=process-prompt]")).not.toBeNull();
+    expect(done?.closest("[data-testid=process-card]")).not.toBeNull();
     expect(done?.className).toContain("border-border/80");
     expect(open?.className).toContain("border-accent/40");
   });
@@ -289,7 +345,7 @@ describe("MessageList Manus 过程披露", () => {
 
     fireEvent.click(screen.getByTestId("process-toggle"));
     // 展开过程即可看到问答结果,不用再点开「N 项」细节。
-    const prompt = screen.getByTestId("process-prompt");
+    const prompt = screen.getByTestId("process-card");
     expect(within(prompt).getByTestId("permission-card")).toHaveTextContent("已提交");
     fireEvent.click(screen.getAllByTestId("process-detail-toggle")[0]!);
     const details = screen.getByTestId("process-details");
@@ -1135,7 +1191,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByTestId("process-disclosure").className).not.toMatch(/ml-\[52px\]/);
     expect(screen.queryByLabelText("生成中")).not.toBeInTheDocument();
     // OCV5-307:进行中的轮次里,已回答的提问留在展开的过程轨线上(不再单独挂在过程外)。
-    expect(screen.getByTestId("permission-card").closest("[data-testid=process-prompt]")).not.toBeNull();
+    expect(screen.getByTestId("permission-card").closest("[data-testid=process-card]")).not.toBeNull();
     expect(screen.getByTestId("turn-activity-footer").querySelector(".bg-grad-cta")).toBeNull();
 
     view.rerender(
