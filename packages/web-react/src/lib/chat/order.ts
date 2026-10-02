@@ -369,3 +369,118 @@ function repairProcessCardsBeforeTerminal(messages: ChatMessage[], nowMs: number
   }
   return repaired;
 }
+
+/** A card cannot predate the user message of its own turn; allow this much browser/server clock skew. */
+const STRAY_TS_MARGIN_MS = 60_000;
+
+function finiteTs(message: ChatMessage | undefined): number | undefined {
+  const ts = message?.ts;
+  return typeof ts === "number" && Number.isFinite(ts) && ts > 0 ? ts : undefined;
+}
+
+/**
+ * OCV5-313: rows of an earlier, already-finished turn that ended up under a
+ * later user row go back to the end of their own turn.
+ *
+ * After a refresh the browser merges its kept copy with the server snapshot;
+ * rows that the merge could not place land at the tail — under the newest
+ * user — and the process view then folds them into that turn's 处理过程
+ * (an earlier turn's tools and even its final answer inside the newest shell),
+ * or shows long-answered 用户问答 cards after the latest answer.
+ *
+ * Evidence, strongest first:
+ *  - an explicit owner (`_turnOwnerId`, else `_clientMessageId`) naming a user
+ *    present here that comes BEFORE the turn the row currently sits in; tape
+ *    rows always carry their dispatch's user id;
+ *  - for answered (resolved) permission cards only: a card cannot predate the
+ *    user message of its own turn, so a card whose ts is more than a minute
+ *    before the user it sits under belongs to the last user sent before it
+ *    (covers cards rebuilt from owner-less legacy journal frames, and a wrong
+ *    owner stamped at replay time).
+ *
+ * Never moved: rows of the turn they sit in, rows whose owner is not present
+ * (paged out / hidden recovery id), open prompts, rows before the first user.
+ * Moved rows keep their relative order and go just before the next user after
+ * their owner. View-only and pure: returns the original array when nothing
+ * moves, so the active turn's live order (OCV5-272) is untouched.
+ */
+export function returnStrayRowsToOwnerTurn(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length < 3) return messages;
+  const userIds: string[] = [];
+  const userTs: Array<number | undefined> = [];
+  const turnIndexById = new Map<string, number>();
+  const turnOf: number[] = new Array(messages.length);
+  let turn = -1;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message?.role === "user" && nonEmptyString(message.id) && !turnIndexById.has(message.id)) {
+      turn += 1;
+      userIds.push(message.id);
+      userTs.push(finiteTs(message));
+      turnIndexById.set(message.id, turn);
+    }
+    turnOf[index] = turn;
+  }
+  if (userIds.length < 2) return messages;
+
+  const turnByTs = (ts: number): number | undefined => {
+    let found: number | undefined;
+    for (let index = 0; index < userTs.length; index++) {
+      const userAt = userTs[index];
+      if (userAt === undefined) continue;
+      if (userAt <= ts) found = index;
+      else break;
+    }
+    return found;
+  };
+
+  const strays = new Map<number, ChatMessage[]>();
+  const moved = new Set<ChatMessage>();
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (!message || message.role === "user") continue;
+    const current = turnOf[index] ?? -1;
+    if (current <= 0) continue;
+    if (message.role === "permission" && message._resolved !== true) continue;
+
+    let owner: number | undefined;
+    const explicit = nonEmptyString(message._turnOwnerId)
+      ? message._turnOwnerId
+      : nonEmptyString(message._clientMessageId)
+        ? message._clientMessageId
+        : undefined;
+    if (explicit) owner = turnIndexById.get(explicit);
+
+    if (message.role === "permission") {
+      const ts = finiteTs(message);
+      const sitsUnder = userTs[owner ?? current];
+      if (ts !== undefined && sitsUnder !== undefined && ts < sitsUnder - STRAY_TS_MARGIN_MS) {
+        owner = turnByTs(ts);
+      } else if (!explicit) {
+        continue;
+      }
+    } else if (!explicit) {
+      continue;
+    }
+    if (owner === undefined || owner >= current) continue;
+    moved.add(message);
+    const rows = strays.get(owner) ?? [];
+    rows.push(message);
+    strays.set(owner, rows);
+  }
+  if (moved.size === 0) return messages;
+
+  const out: ChatMessage[] = [];
+  let seenTurn = -1;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message?.role === "user" && nonEmptyString(message.id) && turnIndexById.get(message.id) === seenTurn + 1) {
+      const rows = strays.get(seenTurn);
+      if (rows) out.push(...rows);
+      seenTurn += 1;
+    }
+    if (moved.has(message)) continue;
+    out.push(message);
+  }
+  return out;
+}

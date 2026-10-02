@@ -8,6 +8,7 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
+import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
@@ -2120,7 +2121,9 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
-  const renderableMessages = safeMessages.filter(
+  // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
+  // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
+  const renderableMessages = returnStrayRowsToOwnerTurn(safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&
@@ -2143,7 +2146,7 @@ export function MessageList({
       !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
-  );
+  ));
   const visibleUserIds = new Set(
     renderableMessages
       .filter((message) => message.role === "user")
