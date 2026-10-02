@@ -58,6 +58,7 @@ import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
+import { useProcessStep } from "./processStep";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
 import {
@@ -1203,7 +1204,9 @@ export const ThinkingCard = memo(
     const live = isLive(msgs[msgs.length - 1] ?? { role: "thinking" }, ctx);
     const [userCollapsed, setUserCollapsed] = useState<boolean | null>(null);
     // 默认折叠态权威仍走 render 层 defaultCollapsed（thinking：流式展开、完成折叠）；用户手动切换后本地锁定。
-    const collapsed = userCollapsed ?? defaultCollapsed({ role: "thinking" }, ctx);
+    // 过程时间轴里(step)默认只露「正在思考 · 标题」,思考全文要点开才看。
+    const step = useProcessStep();
+    const collapsed = userCollapsed ?? (step ? true : defaultCollapsed({ role: "thinking" }, ctx));
     const segments = thinkingSegments(msgs.map((m) => m.text));
     // 折叠态摘要：完成后取最新段首个粗体标题；流式中保持稳定的"思考过程"
     // （不随 delta/角色切换闪烁）。
@@ -1211,6 +1214,59 @@ export const ThinkingCard = memo(
     const headline = live ? "思考过程" : summary ? `已思考 · ${summary}` : "已思考";
     const bodyId = useId();
     const hasBody = segments.length > 0;
+    if (step) {
+      // OCV5-310 过程时间轴里的一行:节点(脑图标)由时间轴画;这里是「思考 · 最新小标题」,
+      // 展开后正文直接落在内容列,左侧一道细线与工具输出面板区分开。
+      const label = live ? "正在思考" : "思考";
+      return (
+        <div data-testid="thinking-step" className="min-w-0">
+          <button
+            type="button"
+            onClick={() => setUserCollapsed(!collapsed)}
+            aria-expanded={!collapsed}
+            aria-controls={!collapsed && hasBody ? bodyId : undefined}
+            className="group/step -mx-2 flex min-h-9 w-[calc(100%+1rem)] items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 hover:bg-hover/70 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          >
+            <span className={cn("shrink-0 text-body font-medium", live ? "oc-live-status-shine text-fg" : "text-fg/90")}>
+              {label}
+            </span>
+            {summary ? (
+              <span className="min-w-0 truncate text-body text-muted" title={summary}>
+                {summary}
+              </span>
+            ) : null}
+            <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
+              <TokenUsageBadge usage={tokenUsage} />
+              {hasBody ? (
+                <ChevronRight
+                  size={14}
+                  aria-hidden
+                  className={cn(
+                    "text-faint transition-[transform,opacity] duration-200 ease-[var(--ease-spring)]",
+                    !collapsed ? "rotate-90 opacity-100" : "opacity-0 group-hover/step:opacity-100 group-focus-visible/step:opacity-100 [@media(hover:none)]:opacity-100",
+                  )}
+                />
+              ) : null}
+            </span>
+          </button>
+          {!collapsed && hasBody && (
+            <div id={bodyId} className="oc-reveal mb-1.5 mt-0.5 border-l-2 border-border pl-3">
+              {segments.map((seg, i) => (
+                <div
+                  key={i}
+                  className={cn(
+                    "text-[13.5px] leading-relaxed text-muted [&_.prose]:text-[13.5px] [&_.prose]:leading-relaxed [&_.prose]:text-inherit [&_.prose_p]:mb-1.5 [&_.prose_p:last-child]:mb-0 [&_.prose_strong]:font-medium [&_.prose_strong]:text-inherit [&_.prose_h1]:text-[13.5px] [&_.prose_h2]:text-[13.5px] [&_.prose_h3]:text-[13.5px] [&_.prose_h1]:font-medium [&_.prose_h2]:font-medium [&_.prose_h3]:font-medium [&_.prose_h1]:text-inherit [&_.prose_h2]:text-inherit [&_.prose_h3]:text-inherit",
+                    i > 0 && "mt-2",
+                  )}
+                >
+                  <ProgressiveMarkdown text={seg} live={live} caret={live && i === segments.length - 1} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="overflow-hidden rounded-md border border-border/80 bg-surface/70 animate-in">
         {/* 折叠开关暴露展开态(aria-expanded,与 DelegateProgressCard / RuntimeEventCard 一致);

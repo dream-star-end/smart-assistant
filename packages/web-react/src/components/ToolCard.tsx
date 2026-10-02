@@ -22,6 +22,7 @@
 import { Check, ChevronRight, PanelRight } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
+import { ProcessStepContext, useProcessStep } from "./chat/processStep";
 import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/bodies";
 import {
@@ -48,6 +49,7 @@ export function ToolCard({
   message: ToolLike;
   tokenUsage?: DisplayTokenUsage;
 }) {
+  const step = useProcessStep();
   const display = normalizeToolForDisplay(message);
   const name = display.name;
   const input = display.input;
@@ -85,21 +87,147 @@ export function ToolCard({
   // 运行中（流式）默认展开以便边流边看 diff/输出；历史（挂载即完成）默认折叠。
   // 未成功的卡也默认展开:错误详情是用户此刻最需要的信息,不该多一次点击。
   // 初值只在挂载求一次，之后用户手动 toggle 为权威（依赖稳定 key 保持实例）。
+  // 过程时间轴行(step):运行中 / 未成功都不自动摊开输出(输出只在点开这一步后出现),
+  // 未成功只标首行原因。用户在运行中点开过的,跑完自动收起(手动开合过则以用户为准)。
   const [open, setOpen] = useState(
-    () => isRunning || isBlocked || status.isConfirmation || hasError,
+    () => (isRunning && !step) || isBlocked || status.isConfirmation || (hasError && !step),
   );
   const userToggled = useRef(false);
   // 挂载时还是「完成/折叠」、随后归并成 error:true 的历史消息,同样按 F1 展开(T-07);
   // 用户已手动折叠过则尊重用户,不再跳动。
   useEffect(() => {
-    if (hasError && !userToggled.current) setOpen(true);
-  }, [hasError]);
+    if (hasError && !step && !userToggled.current) setOpen(true);
+  }, [hasError, step]);
+  const wasRunning = useRef(isRunning);
+  useEffect(() => {
+    if (step && wasRunning.current && !isRunning && !isBlocked && !userToggled.current) setOpen(false);
+    wasRunning.current = isRunning;
+  }, [isRunning, isBlocked, step]);
 
   // 无 body 的卡表头不渲染成 button(L5):没有可展开的内容,不该有可点语义。
   const HeaderTag = hasBody ? ("button" as const) : ("div" as const);
   const labelledBy = [labelId, summary ? summaryId : "", errorFirstLine ? errorId : "", statusId]
     .filter(Boolean)
     .join(" ");
+  const toggle = hasBody
+    ? {
+        type: "button" as const,
+        onClick: () => {
+          userToggled.current = true;
+          setOpen((o) => !o);
+        },
+        "aria-expanded": open,
+        "aria-labelledby": labelledBy,
+      }
+    : {};
+  const body = open && hasBody ? (
+    <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>
+      <ToolHeaderLabelContext.Provider value={meta.label}>
+        <ToolBody name={name} input={input} tool={renderTool} />
+      </ToolHeaderLabelContext.Provider>
+    </ToolInspectOpenContext.Provider>
+  ) : null;
+
+  if (step) {
+    // 命令行:节点已是终端图标,「终端」二字只留给读屏,命令本身就是这一步的标题。
+    const commandRow = meta.label === "终端" && !!summary;
+    // OCV5-310 过程时间轴里的一行:图标节点与状态色由时间轴画,这里只留「动作 + 一行摘要」,
+    // 成功不再挂对勾;未成功 / 受阻 / 已取消用一个安静的小字标出。展开体是一块轻底圆角面板。
+    return (
+      <div data-testid="tool-step" data-tool-status={status.kind} className="min-w-0">
+        <div className="group/step flex items-stretch">
+          <HeaderTag
+            {...toggle}
+            className={cn(
+              "-mx-2 flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              hasBody && "cursor-pointer hover:bg-hover/70 active:bg-active/60",
+            )}
+          >
+            <span
+              id={labelId}
+              className={cn(
+                "max-w-[45%] shrink-0 truncate text-body font-medium",
+                commandRow ? "sr-only" : isRunning ? "oc-live-status-shine text-fg" : "text-fg/90",
+              )}
+            >
+              {meta.label}
+            </span>
+            {summary && (
+              <span
+                id={summaryId}
+                className={cn(
+                  "min-w-0 truncate font-mono text-[12px]",
+                  commandRow ? (isRunning ? "oc-live-status-shine text-fg" : "text-fg/80") : "text-muted",
+                )}
+                title={summary}
+              >
+                {summary}
+              </span>
+            )}
+            <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
+              <TokenUsageBadge usage={tokenUsage} />
+              <span id={statusId} aria-live="polite" className="flex items-center text-meta">
+                {hasError ? (
+                  <span className="text-danger">{status.label}</span>
+                ) : isBlocked ? (
+                  <span className="text-warning">{status.label}</span>
+                ) : isCancelled ? (
+                  <span className="text-muted">{status.label}</span>
+                ) : (
+                  <span className="sr-only">{status.label}</span>
+                )}
+              </span>
+              {hasBody && (
+                <ChevronRight
+                  size={14}
+                  aria-hidden="true"
+                  className={cn(
+                    "text-faint transition-[transform,opacity] duration-200 ease-[var(--ease-spring)]",
+                    open ? "rotate-90 opacity-100" : "opacity-0 group-hover/step:opacity-100 group-focus-within/step:opacity-100 [@media(hover:none)]:opacity-100",
+                  )}
+                />
+              )}
+            </span>
+          </HeaderTag>
+          {canInspect && hasBody && (
+            <div className="flex shrink-0 items-center pl-1 opacity-0 transition-opacity group-hover/step:opacity-100 group-focus-within/step:opacity-100 [@media(hover:none)]:opacity-100">
+              <IconButton
+                size="sm"
+                shape="square"
+                aria-label="在详情面板查看"
+                aria-pressed={isActive || undefined}
+                title="在详情面板查看"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openInspect();
+                }}
+              >
+                <PanelRight size={14} />
+              </IconButton>
+            </div>
+          )}
+        </div>
+        {errorFirstLine && (
+          <div id={errorId} className="-mt-0.5 truncate pb-1 text-meta text-danger/90" title={errorFirstLine}>
+            {errorFirstLine}
+          </div>
+        )}
+        {body && (
+          <div
+            className={cn(
+              "oc-reveal mb-1.5 mt-0.5 overflow-hidden rounded-lg border bg-surface px-3 py-2 [&>*:first-child]:mt-0",
+              hasError ? "border-danger/20" : "border-border/80",
+              isActive && "ring-1 ring-accent/40",
+            )}
+          >
+            {/* 体内若再挂工具卡(扇出/子任务明细)用完整卡,不继承时间轴行样式。 */}
+            <ProcessStepContext.Provider value={false}>{body}</ProcessStepContext.Provider>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div
       className={cn(
@@ -119,17 +247,7 @@ export function ToolCard({
     >
       <div className="flex items-stretch">
       <HeaderTag
-        {...(hasBody
-          ? {
-              type: "button" as const,
-              onClick: () => {
-                userToggled.current = true;
-                setOpen((o) => !o);
-              },
-              "aria-expanded": open,
-              "aria-labelledby": labelledBy,
-            }
-          : {})}
+        {...toggle}
         className={cn(
           "flex min-h-10 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
           hasBody && "cursor-pointer hover:bg-hover/60 active:bg-active/60",
@@ -228,13 +346,9 @@ export function ToolCard({
           {errorFirstLine}
         </div>
       )}
-      {open && hasBody && (
+      {body && (
         <div className="border-t border-border/70 bg-bg/40 px-3 py-2 [&>*:first-child]:mt-0">
-          <ToolInspectOpenContext.Provider value={canInspect ? openInspect : null}>
-            <ToolHeaderLabelContext.Provider value={meta.label}>
-              <ToolBody name={name} input={input} tool={renderTool} />
-            </ToolHeaderLabelContext.Provider>
-          </ToolInspectOpenContext.Provider>
+          {body}
         </div>
       )}
     </div>

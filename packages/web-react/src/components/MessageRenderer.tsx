@@ -2621,6 +2621,7 @@ export function MessageList({
           messagesOf={itemMessages}
           eagerDeferred={eager}
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
+          startedAt={it.active ? turnActivity?.startedAt ?? null : null}
         />
       );
     }
