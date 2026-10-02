@@ -1,3 +1,5 @@
+import { grokExecutionUpstream, type GrokExecutionDescriptor } from '@openclaude/protocol'
+import { hashRouteToken } from '../account-pool/groups.js'
 import { randomBytes } from 'node:crypto'
 
 import {
@@ -239,6 +241,16 @@ export function createDelegateEngineBillingRuntime(
         }
         const basePricing = snapshot.billingPricingFor(canonical)
         if (!basePricing) throw new Error('DELEGATE_ENGINE_BILLING_PRICING_UNAVAILABLE')
+        let grokRouteTokenHash: string | undefined
+        if (engine === 'grok') {
+          grokRouteTokenHash = hashRouteToken(requireString(body, 'grokRouteToken', ROUTE_TOKEN_RE))
+          const boundRoute = await deps.getPool().query(
+            "SELECT model_id FROM grok_route_contexts WHERE token_hash=$1 AND container_id=$2 AND user_id=$3 AND model_id=$4 AND status='active' AND expires_at>NOW()",
+            [grokRouteTokenHash, String(identity.containerId), String(userId), canonical],
+          )
+          if (boundRoute.rows.length !== 1) throw new Error('DELEGATE_ENGINE_BILLING_GROK_ROUTE_MISMATCH')
+          grokExecutionUpstream(canonical, descriptor.upstreamModelId)
+        }
         const agentMul = await runAgentMul(deps.getPool(), agentId)
         const derivedPricing = {
           ...basePricing,
@@ -256,6 +268,14 @@ export function createDelegateEngineBillingRuntime(
           throw err
         }
         const engineSessionId = deriveEngineSessionId(sessionKey)
+        const grokExecutionDescriptor: GrokExecutionDescriptor | undefined = engine === 'grok'
+          ? Object.freeze({
+              canonicalModel: canonical,
+              upstreamModelId: grokExecutionUpstream(canonical, descriptor.upstreamModelId),
+              billingRequestId: requestId, executionRevision: snapshot.executionRevision,
+              engineSessionId, routeTokenHash: grokRouteTokenHash,
+            })
+          : undefined
         const advisorConsult = delegateAgentId === ADVISOR_AGENT_ID && engine === 'codex'
         let advisorRoute: AdvisorCodexAdmitRoute | undefined
         if (advisorConsult) {
@@ -290,6 +310,7 @@ export function createDelegateEngineBillingRuntime(
               source: sourceForEngine(engine),
               durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
               billingPricing: serializeBillingPricing(derivedPricing),
+              ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}),
               // Nested so settle does not treat these as a bridge_signed stamp.
               catalogGeneration: {
                 billingRevision: snapshot.billingRevision,
@@ -312,7 +333,7 @@ export function createDelegateEngineBillingRuntime(
         if (advisorConsult) {
           return { requestId, engineSessionId, route: advisorRoute }
         }
-        return { requestId, engineSessionId }
+        return { requestId, engineSessionId, ...(grokExecutionDescriptor ? { grokExecutionDescriptor } : {}) }
       }
 
       const requestId = requireString(body, 'requestId', REQUEST_ID_RE)

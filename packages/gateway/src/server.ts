@@ -1,3 +1,4 @@
+import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
@@ -14908,6 +14909,7 @@ export class Gateway {
       try {
         engineBillingAdmission = await billingApi.admit({
           model: billingModel,
+          ...(grokRoute ? { grokRouteToken: grokRoute.routeToken } : {}),
           engine: resolveDelegateEngineBillingEngine({
             delegateEngine: delegateExec?.engine,
             model: billingModel,
@@ -15180,7 +15182,9 @@ export class Gateway {
       engineBillingAdmission?.requestId,
       undefined,
       undefined,
-      { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}) },
+      { platformGoal: session._platformGoal ?? null, ...(grokRoute ? { grokRoute } : {}),
+        ...(engineBillingAdmission?.grokExecutionDescriptor
+          ? { grokExecutionDescriptor: engineBillingAdmission.grokExecutionDescriptor } : {}) },
     )
     try {
       await Promise.race([submitPromise, timeoutPromise])
@@ -22196,6 +22200,15 @@ export class Gateway {
       //
       // 无 descriptor(本地路径 / flag 未开)→ 不传 → runner 写空串清位 + (flag 开时)自取
       // local_catalog token。清位判定收在 runner 单点,任何 submit 入口都漏不掉。
+      ...(turnAuthority?.engine === 'grok'
+        ? { grokExecutionDescriptor: freezeGrokExecutionDescriptor({
+            canonicalModel: turnAuthority.canonicalModel,
+            upstreamModelId: (turnAuthority.capabilityProfile.grok as {upstreamModelId:string}).upstreamModelId,
+            billingRequestId: turnAuthority.billingRequestId ?? '',
+            executionRevision: turnAuthority.executionRevision,
+            authorityTurnId: turnAuthority.authorityTurnId,
+          }, {canonicalModel: turnAuthority.canonicalModel, billingRequestId: turnAuthority.billingRequestId ?? ''}) }
+        : {}),
       ...(turnAuthority !== undefined
         ? {
             modelAuthority: {

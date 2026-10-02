@@ -1,3 +1,4 @@
+import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
@@ -5144,6 +5145,7 @@ export class SessionManager {
       codexRoute?: CodexProviderConfigOverride | null
       /** Grok CLI receives only this one-turn opaque loopback relay route. */
       grokRoute?: GrokRouteOverride | null
+      grokExecutionDescriptor?: GrokExecutionDescriptor
       /** Master-authored recovery fence for a first-event silent engine turn.
        * Only Grok currently consumes it; arbitrary client input cannot set it. */
       resetNativeSession?: boolean
@@ -5946,6 +5948,7 @@ export class SessionManager {
         consumingModelSwitch ? [] : contextOverflowRetryInputs,
         opts?.automaticRetryState,
         consumingModelSwitch ? transition : undefined,
+        opts?.grokExecutionDescriptor,
       )
       try {
         await Promise.race([logicalTurnRun, livenessPromise])
@@ -6153,6 +6156,7 @@ export class SessionManager {
     contextOverflowRetryInputs: string[] = [],
     automaticRetryState?: AutomaticRetryState,
     modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
+    grokExecutionDescriptor?: GrokExecutionDescriptor,
   ): Promise<void> {
     const retryState: AutomaticRetryState = automaticRetryState ?? {
       rootClientMessageId: clientMessageId ?? session.sessionKey,
@@ -6385,6 +6389,7 @@ export class SessionManager {
           attemptOrdinal,
           retryState,
           modelSwitchTransition,
+          grokExecutionDescriptor,
         )
         return // success
       } catch (err: any) {
@@ -6593,6 +6598,7 @@ export class SessionManager {
     attemptOrdinal = 0,
     automaticRetryState?: AutomaticRetryState,
     modelSwitchTransition?: AgentSession['_modelSwitchTransition'],
+    grokExecutionDescriptor?: GrokExecutionDescriptor,
   ): Promise<void> {
     const { runner } = session
     const turnStartTime = Date.now()
@@ -8349,6 +8355,7 @@ export class SessionManager {
         // 模型权威批次 §4:bridge turn 的两张签名票(本地路径 undefined → CCB runner
         // 自取 local_catalog token;codex adapter 不消费本字段)。
         ...(modelAuthority !== undefined ? { modelAuthority } : {}),
+        ...(grokExecutionDescriptor !== undefined ? { grokExecutionDescriptor } : {}),
         traceId,
         assistantMessageId,
         thinkingMessageId,

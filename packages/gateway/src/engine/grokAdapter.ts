@@ -1,3 +1,5 @@
+import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
+import { isV3ContainerRuntime } from '../hostStaticProviders.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * First-class adapter for xAI's official Grok CLI. The CLI runs once per turn
@@ -351,6 +353,8 @@ function assembleGrokPrompt(
 
 interface GrokTurnContext {
   params: TurnParams
+  readonly canonicalModel: string | undefined
+  readonly upstreamModelId: string
   startedAt: number
   proc: ChildProcessByStdio<null, Readable, Readable> | null
   promptDir: string | null
@@ -457,10 +461,24 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
+    const canonicalModel = this.currentModel
+    const frozen = params.grokExecutionDescriptor
+      ? freezeGrokExecutionDescriptor(params.grokExecutionDescriptor, {
+          canonicalModel: canonicalModel ?? '',
+          billingRequestId: params.requestId ?? '',
+          ...(params.grokExecutionDescriptor.routeTokenHash !== undefined
+            ? {routeTokenHash: createHash('sha256').update(this.route?.routeToken ?? '').digest('hex')} : {}),
+        })
+      : undefined
+    if (!frozen && isV3ContainerRuntime()) throw new Error('GROK_EXECUTION_DESCRIPTOR_REQUIRED')
+    // Only an explicit legacy non-container runtime may retain static mapping.
+    const upstreamModelId = frozen?.upstreamModelId ?? grokUpstreamModel(canonicalModel)
     let resolveSummary!: (summary: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((resolve) => { resolveSummary = resolve })
     const ctx: GrokTurnContext = {
       params,
+      canonicalModel,
+      upstreamModelId,
       startedAt: Date.now(),
       proc: null,
       promptDir: null,
@@ -576,7 +594,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
     })
-    const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools)
+    const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools, ctx.canonicalModel)
     const promptDir = mkdtempSync(join(tmpdir(), 'oc-grok-prompt-'))
     const promptFile = join(promptDir, 'prompt.md')
     try {
@@ -619,8 +637,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
       GROK_HOME: (() => {
-        const runtimeHome = grokRuntimeHome(platform.launchHome, this.currentModel)
-        const stableRoot = this.currentModel === 'grok-build-fast'
+        const runtimeHome = grokRuntimeHome(platform.launchHome, ctx.canonicalModel)
+        const stableRoot = ctx.canonicalModel === 'grok-build-fast'
           ? join(platform.grokHome, 'fast')
           : platform.grokHome
         const stableSessions = join(stableRoot, 'sessions')
@@ -634,7 +652,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
     ctx.launchSpec = { cwd, env, bin, promptFile }
-    if (this.currentModel === 'grok-build-fast' && env.GROK_HOME) {
+    if (ctx.canonicalModel === 'grok-build-fast' && env.GROK_HOME) {
       seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
       ensureFastCatalog(bin, env, env.GROK_HOME)
     }
@@ -646,7 +664,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (!spec) throw new Error('GROK_LAUNCH_SPEC_MISSING')
     const args = [
       '--agent', 'grok-build',
-      '--model', grokUpstreamModel(this.currentModel),
+      '--model', ctx.upstreamModelId,
       '--prompt-file', spec.promptFile,
       '--output-format', 'streaming-json',
       '--always-approve',
@@ -867,6 +885,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     params: TurnParams,
     repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
     availableMcpTools: string[],
+    canonicalModel: string | undefined,
   ): Promise<string> {
     const input = promptText(params.input)
     try {
@@ -876,7 +895,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         persona: this.opts.persona,
         identityCompat: this.opts.identityCompat?.assets,
         provider: 'grok',
-        model: this.currentModel,
+        model: canonicalModel,
         repoSnapshot: repoSnapshot ?? undefined,
         availableMcpTools,
         skillEvalExclude: this.opts.skillEvalExclude,
@@ -1152,7 +1171,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const budget = ctx.params.creditBudgetFen
     if (budget === undefined) return
     const fen = await runningCostFenForUsage({
-      modelId: this.currentModel,
+      modelId: ctx.canonicalModel,
       usage: {
         inputTokens: ctx.lastUsage.inputTokens,
         outputTokens: ctx.lastUsage.outputTokens,

@@ -1,3 +1,4 @@
+import { grokExecutionUpstream } from '@openclaude/protocol'
 import { inboundSessionKey, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
@@ -830,6 +831,8 @@ const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
  *   - commercial/billing/modelCatalog 的那份是 DB 投影(带 providerId / upstreamModelId
  *     —— **路由**语义,只有 master/egress 需要,容器不该看见上游身份);
  *   - protocol 的那份是**容器执行**语义(capability / context / effort / vision)。
+ * Grok CLI exception: a public model version is required by --model; project
+ * it from this same snapshot, never provider credentials or endpoints.
  * 这里做一次显式收窄 = 「凭据与路由不进容器」这条边界在类型层的落点。
  *
  * `contextWindow` 的 null 原样进入签名载荷；0 不是合法窗口，不能拿哨兵值混淆语义。
@@ -840,6 +843,7 @@ function toProtocolDescriptor(
   const profile = d.capabilityProfile;
   return {
     capabilityProfile: {
+      ...(d.engine === 'grok' ? { grok: { upstreamModelId: grokExecutionUpstream(d.canonicalModel, d.upstreamModelId) } } : {}),
       supportsVision: profile.supportsVision,
       reasoning: {
         supported: [...profile.reasoning.supported],

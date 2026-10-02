@@ -1,3 +1,4 @@
+import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 /**
  * engineAdapter — EngineAdapter 契约(形式化原 SubprocessRunner 的 de-facto
  * EventEmitter 契约,底座差异全部收口在 adapter 内)。
@@ -132,6 +133,8 @@ export interface TurnParams {
    * 走 bridge journal / codex-relay,不读本字段(engine 中立 = 允许底座忽略)。
    */
   modelAuthority?: TurnModelAuthority
+  /** Trusted per-turn Grok admission; same generation as frozen billing price. */
+  grokExecutionDescriptor?: GrokExecutionDescriptor
   traceId?: string
   /** V3 v7 — canonical assistant/thinking row id(见 sessionManager.runOneTurnWithRetry)。 */
   assistantMessageId?: string
