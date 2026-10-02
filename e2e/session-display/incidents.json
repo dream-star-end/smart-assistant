@@ -5674,6 +5674,26 @@
           "assertion": "completed goal diagnostics stay folded, exact raw survives and current dock is unique"
         }
       ]
+    },
+    {
+      "id": "INC-20261002-CCSWITCH-LIGHTWEIGHT-ORDER",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户故障）：CC Switch轻量位的合并正则按服务端数组顺序，sonnet排在gemini flash前时错选sonnet；改为haiku→gemini/flash→sonnet逐档fallback。首选模型及空列表兜底不变，新建与已有密钥两条真实导入路径通过，精确历史调用负控均在haikuModel断言失败。",
+      "rootFixCommit": "a70733728",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/ApiAccessTab.test.tsx",
+          "assertion": "缺 haiku 时 flash 优先于更早的 sonnet，没有 flash 才选 sonnet"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
+          "assertion": "CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixture API)"
+        }
+      ]
     }
   ]
 }
