@@ -288,7 +288,7 @@ describe('collapsed GPT family group (2026-09-05)', () => {
     { id: 'gpt-5.6-luna-1m', display_name: 'GPT-5.6-Luna' },
   ]
 
-  it('keeps GPT-6 families expanded and does not group retired GPT-5.6 rows', () => {
+  it('keeps new GPT-6 families expanded and preserves legacy commercial GPT-5.6 context rows', () => {
     const rows = modelPickerRows([
       ...MODELS,
       { id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' },
@@ -300,37 +300,31 @@ describe('collapsed GPT family group (2026-09-05)', () => {
       .filter((row) => row.kind === 'context-family')
       .map((row) => (row.kind === 'context-family' ? [row.row.family, row.row.collapsed] : []))
     expect(flags).toEqual([
+      ['gpt-5.6-sol', false],
       ['gpt-6-astra', false],
+      ['gpt-5.6-terra', true],
+      ['gpt-5.6-luna', true],
       ['gpt-6.1-sol', false],
       ['gpt-6-luna', false],
     ])
   })
 
-  it('leaves retired GPT-5.6 rows visible because they are no longer a collapsed family', () => {
+  it('legacy commercial Terra/Luna are collapsed while Sol/Astra stay visible in catalog order', () => {
     const rows = modelPickerRows(MODELS)
     const { visible, collapsed, selectedInCollapsed } = partitionCollapsedRows(rows, 'gpt-5.6-sol')
-    expect(collapsed).toEqual([])
-    expect(visible.map(rowKey)).toEqual([
-      'glm-5.3',
-      'gpt-5.6-sol',
-      'gpt-5.6-sol-1m',
-      'gpt-6-astra',
-      'gpt-5.6-terra',
-      'gpt-5.6-terra-1m',
-      'gpt-5.6-luna',
-      'gpt-5.6-luna-1m',
-    ])
+    expect(collapsed.map(rowKey)).toEqual(['gpt-5.6-terra', 'gpt-5.6-luna'])
+    expect(visible.map(rowKey)).toEqual(['glm-5.3', 'gpt-5.6-sol', 'gpt-6-astra'])
     expect(selectedInCollapsed).toBe(false)
   })
 
-  it('does not treat a retired GPT-5.6 id as selected inside the collapsed group', () => {
+  it('recognizes legacy commercial Terra/Luna selections inside the collapsed group', () => {
     const rows = modelPickerRows(MODELS)
-    expect(partitionCollapsedRows(rows, 'gpt-5.6-terra').selectedInCollapsed).toBe(false)
-    expect(partitionCollapsedRows(rows, 'gpt-5.6-luna-1m').selectedInCollapsed).toBe(false)
+    expect(partitionCollapsedRows(rows, 'gpt-5.6-terra').selectedInCollapsed).toBe(true)
+    expect(partitionCollapsedRows(rows, 'gpt-5.6-luna-1m').selectedInCollapsed).toBe(true)
     expect(partitionCollapsedRows(rows, undefined).selectedInCollapsed).toBe(false)
   })
 
-  it('keeps retired degraded rows in the visible list', () => {
+  it('keeps fully degraded legacy families visible and healthy Luna collapsed', () => {
     const rows = modelPickerRows([
       { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
       { id: 'gpt-5.6-terra', display_name: 'GPT-5.6-Terra', degraded: true },
@@ -338,8 +332,8 @@ describe('collapsed GPT family group (2026-09-05)', () => {
       { id: 'gpt-5.6-luna', display_name: 'GPT-5.6-Luna' },
     ])
     const { visible, collapsed } = partitionCollapsedRows(rows, undefined)
-    expect(collapsed).toEqual([])
-    expect(visible.map(rowKey)).toEqual(['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-terra-1m'])
+    expect(collapsed.map(rowKey)).toEqual(['gpt-5.6-luna'])
+    expect(visible.map(rowKey)).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra'])
   })
 
   it('collapses official Grok 4.7 and Fast into one row labeled from the standard model', () => {
