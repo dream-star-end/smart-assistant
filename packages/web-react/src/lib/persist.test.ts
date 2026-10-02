@@ -3039,3 +3039,40 @@ describe("isUnresolvedPermissionPrompt (INC-20260903-PENDING-PERMISSION-LOST)", 
     expect(isUnresolvedPermissionPrompt(withDeadline, 4_999)).toBe(true);
   });
 });
+
+
+describe("recovery rejection feedback survives authoritative history", () => {
+  const notice = "未从断点继续：服务端没有确认到可恢复的中断断点，原任务仍已保留。";
+  const snapshot = { disposition: "card", tone: "red", title: "原错误", message: "原文不可变" } as const;
+  const local: ChatMessage = { id: "live-error", role: "assistant", text: "", ts: 1,
+    _clientMessageId: "source", _errorCode: "ENGINE_ERROR", _errorCardSnapshot: snapshot, _recoverySkippedNotice: notice };
+  for (const mode of ["full", "incremental"] as const) {
+    const merge = (server: ChatMessage) => mode === "full"
+      ? mergeFullServerWins([server], [local]).find((m) => m.id === server.id)!
+      : applyServerIncremental([local], [server]).find((m) => m.id === server.id)!;
+    test(`${mode}: same id carries notice without rewriting snapshot`, () => {
+      const server = { ...local }; delete server._recoverySkippedNotice;
+      expect(merge(server)._recoverySkippedNotice).toBe(notice);
+      expect(merge(server)._errorCardSnapshot).toEqual(snapshot);
+    });
+    test(`${mode}: explicit server notice including empty string wins`, () => {
+      for (const value of ["server decision", ""]) expect(merge({ ...local, _recoverySkippedNotice: value })._recoverySkippedNotice).toBe(value);
+    });
+    test(`${mode}: changed owner, changed code and non-error cannot inherit notice`, () => {
+      for (const change of [{ _clientMessageId: "other" }, { _errorCode: "auth_error" }, { _errorCode: undefined }, { role: "user" as const }]) {
+        const server = { ...local, ...change }; delete server._recoverySkippedNotice;
+        expect(merge(server)._recoverySkippedNotice).toBeUndefined();
+      }
+    });
+  }
+  test("full: live to history identity migration carries notice even with a server snapshot", () => {
+    const server: ChatMessage = { id: "history-error", role: "assistant", text: "", ts: 2,
+      _clientMessageId: "source", _errorCode: "engine_error", _errorCardSnapshot: snapshot };
+    expect(mergeFullServerWins([server], [local]).find((m) => m.id === server.id)?._recoverySkippedNotice).toBe(notice);
+  });
+  test("full: notice migration does not require a local error snapshot", () => {
+    const noSnapshot = { ...local }; delete noSnapshot._errorCardSnapshot;
+    const server = { ...noSnapshot, id: "history-error" }; delete server._recoverySkippedNotice;
+    expect(mergeFullServerWins([server], [noSnapshot]).find((m) => m.id === server.id)?._recoverySkippedNotice).toBe(notice);
+  });
+});

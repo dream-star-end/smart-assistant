@@ -4068,3 +4068,71 @@ describe("补更早过程步骤时已渲染内容不跳动", () => {
     scroller.remove();
   });
 });
+
+
+test("frozen error keeps original card and displays recovery rejection once", () => {
+  const notice = "未从断点继续：服务端没有确认到可恢复的中断断点，原任务仍已保留。";
+  render(<MessageList messages={[
+    mk("user", { id: "notice-source", text: "原请求" }),
+    mk("assistant", { id: "notice-error", text: "", _clientMessageId: "notice-source", _errorCode: "ENGINE_ERROR",
+      _recoverySkippedNotice: notice,
+      _errorCardSnapshot: { disposition: "card", tone: "red", title: "首次错误标题", message: "首次错误正文不可改" } }),
+  ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
+  expect(screen.getAllByText("首次错误标题")).toHaveLength(1);
+  expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
+  expect(screen.getAllByText("首次错误正文不可改")).toHaveLength(1);
+  expect(screen.getAllByText(notice)).toHaveLength(1);
+  expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
+});
+
+
+test("silent error rejection uses only the existing warning feedback surface", () => {
+  const notice = "拒绝反馈不可重复";
+  render(<MessageList messages={[
+    mk("user", { id: "silent-source", text: "原请求" }),
+    mk("assistant", { id: "silent-error", text: "", _clientMessageId: "silent-source", _errorCode: "engine_error",
+      _recoverySkippedNotice: notice, _errorCardSnapshot: { disposition: "silent" } }),
+  ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
+  expect(screen.getAllByText(notice)).toHaveLength(1);
+  expect(screen.getAllByText("这句没有发出去")).toHaveLength(1);
+  expect(screen.queryByTestId("recovery-skipped-notice")).toBeNull();
+});
+
+
+test("same-reference recovery feedback updates through memo without rewriting the frozen error", () => {
+  const row = mk("assistant", { id: "memo-error", text: "", _clientMessageId: "memo-source", _errorCode: "engine_error",
+    _errorCardSnapshot: { disposition: "card", tone: "red", title: "固定标题", message: "固定错误正文" } });
+  const messages = [mk("user", { id: "memo-source", text: "请求" }), row];
+  const props = { messages, sending: false, cb: { onRegenerate: () => {} }, onRespondPermission: () => {} };
+  const view = render(<MessageList {...props} />);
+  const context = { isLast: true, sending: false };
+  const absent = messageSignature(row, context);
+  row._recoverySkippedNotice = "反馈甲";
+  const first = messageSignature(row, context);
+  expect(first).not.toBe(absent); view.rerender(<MessageList {...props} />);
+  expect(screen.getAllByText("反馈甲")).toHaveLength(1);
+  row._recoverySkippedNotice = "反馈乙";
+  expect(messageSignature(row, context)).not.toBe(first); view.rerender(<MessageList {...props} />);
+  expect(screen.queryByText("反馈甲")).toBeNull(); expect(screen.getAllByText("反馈乙")).toHaveLength(1);
+  row._recoverySkippedNotice = "";
+  expect(messageSignature(row, context)).not.toBe(absent); view.rerender(<MessageList {...props} />);
+  expect(screen.queryByText("反馈乙")).toBeNull(); expect(screen.queryByTestId("recovery-skipped-notice")).toBeNull();
+  expect(screen.getAllByText("固定标题")).toHaveLength(1); expect(screen.getAllByText("固定错误正文")).toHaveLength(1);
+  expect(screen.getByText("固定标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
+  expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
+});
+
+
+test("frozen rejection already in original message appears only once", () => {
+  const notice = "未从断点继续：原任务仍已保留。";
+  render(<MessageList messages={[
+    mk("user", { id: "same-notice-source", text: "原请求" }),
+    mk("assistant", { id: "same-notice-error", text: "", _clientMessageId: "same-notice-source", _errorCode: "ENGINE_ERROR",
+      _recoverySkippedNotice: notice,
+      _errorCardSnapshot: { disposition: "card", tone: "red", title: "首次错误标题", message: notice } }),
+  ]} sending={false} cb={{ onRegenerate: () => {} }} onRespondPermission={() => {}} />);
+  expect(screen.getAllByText(notice)).toHaveLength(1);
+  expect(screen.getAllByText("首次错误标题")).toHaveLength(1);
+  expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
+  expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
+});
