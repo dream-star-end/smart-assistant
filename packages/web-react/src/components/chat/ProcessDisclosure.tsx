@@ -1,7 +1,7 @@
 import { ChevronRight } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import { ProgressiveMarkdown } from "./cards";
+import { ProgressiveMarkdown, RecoveredStepContext } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli } from "../tool/meta";
 import { safeArtifactSrc } from "../tool/researchCards";
@@ -831,9 +831,12 @@ export function ProcessDisclosure<T>({
                 // 本轮已越过的中途错误(模型不可用等)。用原卡渲染,不藏在「N 项」后面。
                 return (
                   <div key={section.key} data-testid="process-card" className="min-w-0 space-y-1.5 py-0.5">
-                    {section.items.map((item) => (
-                      <div key={keyOf(item)}>{renderItem(item)}</div>
-                    ))}
+                    {/* 能进过程的错误卡都已被本轮越过:不再给重试/切换模型/从断点继续(会重复开工)。 */}
+                    <RecoveredStepContext.Provider value>
+                      {section.items.map((item) => (
+                        <div key={keyOf(item)}>{renderItem(item)}</div>
+                      ))}
+                    </RecoveredStepContext.Provider>
                   </div>
                 );
               }

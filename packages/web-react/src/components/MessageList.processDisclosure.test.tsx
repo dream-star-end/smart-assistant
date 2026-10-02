@@ -192,10 +192,10 @@ describe("MessageList Manus 过程披露", () => {
 
   // OCV5-307 回归:OCV5-308 实况 —— 中途一次 model_not_available(detail=error_during_execution JSON)
   // 之后本轮继续跑工具并给出回答,这张错误卡曾单独挂在收起的「工作过程」下面。
-  const midTurnError = () =>
+  const midTurnError = (code = "model_not_available") =>
     row("err-mid", "assistant", "通用代码已生成商业版候选并推送", {
       _clientMessageId: "u",
-      _errorCode: "model_not_available",
+      _errorCode: code,
       _errorDetail: '{"subtype":"error_during_execution","result":"Selected model is at capacity."}',
       usage: { traceId: "trace-mid-err" },
     });
@@ -218,14 +218,57 @@ describe("MessageList Manus 过程披露", () => {
     expect(card.closest("[data-testid=process-disclosure]")).not.toBeNull();
   });
 
-  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果", () => {
+  test("OCV5-307: 以 model_not_available 收尾的轮次，错误卡仍在顶层", () => {
     renderList([
       row("u", "user", "继续合并", { status: "replied" }),
       row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
       midTurnError(),
     ]);
-    const detail = screen.getByText("模型暂不可用");
-    expect(detail.closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 以错误收尾的轮次，错误卡仍是顶层结果且保留重试出口", () => {
+    renderList(
+      [
+        row("u", "user", "继续合并", { status: "replied" }),
+        row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+        midTurnError("engine_error"),
+      ],
+      { cb: { onRegenerate: () => {} } },
+    );
+    const retry = screen.getByRole("button", { name: /重新尝试|重试/ });
+    // 对照组:可重试码在顶层(本轮结局)有重试出口,下面「过程里不给」的断言才有意义。
+    expect(retry.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-307: 过程里的已越过错误卡不再给重试/切换模型(防重复开工)", () => {
+    renderList(
+      [
+        row("u", "user", "继续合并", { status: "replied", _clientMessageId: "u" }),
+        row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+        midTurnError("engine_error"),
+        row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git merge" }, _completed: true, output: "ok" }),
+        row("answer", "assistant", "已合并并推送", { _clientMessageId: "u" }),
+      ],
+      { cb: { onRegenerate: () => {}, onOpenModelPicker: () => {} } },
+    );
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const card = screen.getByTestId("process-card");
+    expect(within(card).getByRole("alert")).toBeInTheDocument();
+    for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
+      expect(within(card).queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  test("OCV5-307: 终态错误后只有延迟定位行/状态行时不算继续，错误仍在顶层", () => {
+    renderList([
+      row("u", "user", "继续合并", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "git fetch" }, _completed: true, output: "ok" }),
+      midTurnError(),
+      row("locator", "assistant", "", { _clientMessageId: "u", _payloadDeferred: true }),
+      row("status", "assistant", "本轮结束", { _clientMessageId: "u", _turnStatusRecord: true }),
+    ]);
+    expect(screen.getByText("模型暂不可用").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
   test("OCV5-307: 已失败的子任务是过程步骤，不在收起的过程外单独成卡", () => {
