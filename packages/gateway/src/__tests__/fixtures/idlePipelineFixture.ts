@@ -79,6 +79,7 @@ const MAX_HTTP = 80;
 const GROW_CHARS = 180_000;
 const GROW_TARGET = 8_860_467;
 let summaryRequested = false;
+let defaultHighFirstBusiness = false;
 let growthActive = false;
 let growthRound = 0;
 let growthStopRound = 60;
@@ -170,7 +171,31 @@ function restoreEnv(name: string, previous: string | undefined): void {
   else process.env[name] = previous;
 }
 
-export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam" | "barriers"): Promise<void> {
+type IdleCase = "defaultLow" | "defaultHigh" | "short" | "fresh" | "live2" | "grow2" | "localAuth" | "seam" | "barriers";
+
+/** These legacy cases exercise the idle protocol even when their synthetic
+ * leaf reports only 20 tokens. They are explicitly forced, not a default
+ * policy acceptance test. Restore on success, failure and cleanup failure. */
+export async function runIdleCase(mode: IdleCase): Promise<void> {
+  const previousAlways = process.env.OC_BOX_IDLE_COMPACT_ALWAYS;
+  const previousHigh = defaultHighFirstBusiness;
+  const previousGrowth = growthActive;
+  const previousSummary = summaryRequested;
+  const defaultPolicy = mode === "defaultLow" || mode === "defaultHigh";
+  process.env.OC_BOX_IDLE_COMPACT_ALWAYS = defaultPolicy ? "0" : "1";
+  defaultHighFirstBusiness = mode === "defaultHigh";
+  growthActive = false;
+  summaryRequested = false;
+  try { await runIdleProtocolCase(mode); }
+  finally {
+    restoreEnv("OC_BOX_IDLE_COMPACT_ALWAYS", previousAlways);
+    defaultHighFirstBusiness = previousHigh;
+    growthActive = previousGrowth;
+    summaryRequested = previousSummary;
+  }
+}
+
+async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicRaw = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
   const keyId = "mak1_testkey00000001";
@@ -188,7 +213,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
   let poolEnd: (() => Promise<void>) | undefined;
   let redisQuit: (() => Promise<void>) | undefined;
   let restoreLocalAuth: (() => void) | undefined;
-  const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT };
+  const report: Record<string, unknown> = { schema: SCHEMA, redis: REDIS_URL, checkout: CHECKOUT, forcedIdleProtocol: process.env.OC_BOX_IDLE_COMPACT_ALWAYS === "1" };
   let holdNextSettlement = false;
   let holdSummaryCommit = false;
   let holdSourceCommit = false;
@@ -731,7 +756,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         contextOwner: "box-native-v1" as const,
       },
     };
-    if (mode === "short") {
+    if (mode === "short" || mode === "defaultLow" || mode === "defaultHigh") {
     const adapter = new CcbAdapter({
       sessionKey: "agent:main:webchat:dm:idle-peer",
       agentId: "main",
@@ -817,11 +842,30 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
     if (secondSubmitError) throw secondSubmitError;
     const short = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ applied?: boolean; summaryText?: string }>;
     report.nativeFiles = short;
-    assert.equal(short.some((file) => file.applied && !file.summaryText), true, JSON.stringify(short));
+    if (mode === "defaultLow") {
+      assert.deepEqual(short, [], "low-usage default policy must not dispatch native idle");
+      assert.deepEqual(listJson(join(HOME, "idle-ops")), [], "low-usage default policy creates no idle op");
+    } else {
+      assert.equal(short.some((file) => file.applied && !file.summaryText), true, JSON.stringify(short));
+    }
     const added = hits.slice(beforeSecond);
     report.secondHits = added;
-    assert.equal(added.some((hit) => hit.summary), false);
+    assert.equal(added.some((hit) => hit.summary || hit.kind === "idle-summary"), false);
+    if (mode === "defaultHigh") {
+      const stock = added.filter((hit) => hit.url === "/v1/messages" && hit.kind === "stock-auto-summary");
+      report.stockSummaryHttp = stock.length;
+      assert.ok(stock.length <= 1, "a single next user must not trigger repeated stock compaction");
+      const nextBusiness = added.filter((hit) => hit.url === "/v1/messages" && hit.kind === "business" && hit.status === 200);
+      assert.equal(nextBusiness.length, 1, "next ordinary business reaches the real model once");
+    }
     assert.equal(added.some((hit) => hit.url === "/v1/messages" && hit.status === 200), true);
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      // SSE/gateway completion precedes the egress transaction's COMMIT.
+      for (const hit of hits.filter((item) => item.url === "/v1/messages" && item.status === 200)) {
+        assert.ok(hit.requestId);
+        await waitForCommitted(admin, SCHEMA, hit.requestId);
+      }
+    }
     const ledgers = await pool.query(
       `SELECT u.request_id, u.status AS usage_status, u.cost_credits::text, u.turn_key,
               l.id::text AS ledger_id, l.delta::text, l.ref_id
@@ -829,12 +873,42 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
          JOIN credit_ledger l ON l.id = u.ledger_id
         ORDER BY u.id`);
     report.ledgers = ledgers.rows;
+    if (mode === "defaultLow" || mode === "defaultHigh") {
+      const sourceProofs = hits.filter((hit) => hit.url === "/internal/box/idle-proof" && hit.status === 200)
+        .map((hit) => JSON.parse(hit.body ?? "{}") as { status?: string; turnKey?: string; compactRequired?: boolean; requestId?: string });
+      const sourceProof = sourceProofs.find((proof) => proof.status === "terminal" && proof.requestId === modelHit.requestId);
+      assert.ok(sourceProof, "real committed source proof is required");
+      assert.equal(sourceProof.compactRequired, mode === "defaultHigh");
+      report.defaultSourceProof = sourceProof;
+      const sourceUsage = await pool.query<{ input_tokens: string; cache_read_tokens: string; output_tokens: string }>(
+        "SELECT input_tokens::text,cache_read_tokens::text,output_tokens::text FROM usage_records WHERE request_id=$1", [modelHit.requestId]);
+      assert.equal(sourceUsage.rows.length, 1);
+      assert.equal(sourceUsage.rows[0]!.input_tokens, mode === "defaultHigh" ? "160000" : "20");
+      assert.equal(sourceUsage.rows[0]!.cache_read_tokens, mode === "defaultHigh" ? "7000" : "0");
+      assert.equal(sourceUsage.rows[0]!.output_tokens, "4");
+      report.defaultSourceUsage = sourceUsage.rows[0];
+      assert.equal(ledgers.rows.filter((row: { request_id: string }) => row.request_id === modelHit.requestId).length, 1);
+      const nextBusiness = added.filter((hit) => hit.url === "/v1/messages" && hit.status === 200 && hit.kind === "business");
+      assert.equal(nextBusiness.length, 1);
+      assert.equal(ledgers.rows.filter((row: { request_id: string }) => row.request_id === nextBusiness[0]!.requestId).length, 1);
+      assert.notEqual(modelHit.cred?.ocTurnKey, nextBusiness[0]!.cred?.ocTurnKey);
+      const stock = added.filter((hit) => hit.url === "/v1/messages" && hit.kind === "stock-auto-summary" && hit.status === 200);
+      assert.deepEqual(ledgers.rows.map((row: { request_id: string }) => row.request_id).sort(),
+        [modelHit.requestId, nextBusiness[0]!.requestId, ...stock.map((hit) => hit.requestId)].sort(),
+        "only source, next business and an observed stock summary may be charged");
+      const nextBook = ledgers.rows.find((row: { request_id: string }) => row.request_id === nextBusiness[0]!.requestId)!;
+      for (const hit of stock) {
+        const stockBook = ledgers.rows.find((row: { request_id: string }) => row.request_id === hit.requestId)!;
+        assert.equal(stockBook.turn_key, nextBook.turn_key, "stock summary is a separate request on the next business turn");
+        assert.notEqual(stockBook.request_id, nextBook.request_id);
+      }
+    }
     const seenRequests = new Set<string>();
     const seenTurns = new Set<string>();
     for (const row of ledgers.rows as Array<{ request_id: string; turn_key: string; delta: string }>) {
       assert.equal(seenRequests.has(row.request_id), false, row.request_id);
       seenRequests.add(row.request_id);
-      assert.equal(seenTurns.has(row.turn_key), false, row.turn_key);
+      if (mode !== "defaultHigh") assert.equal(seenTurns.has(row.turn_key), false, row.turn_key);
       seenTurns.add(row.turn_key);
       assert.ok(BigInt(row.delta) < 0n);
     }
@@ -905,6 +979,7 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       assert.equal(freshIds.includes(heldId), true, heldId);
       const candidateFile = join(HOME, "idle-candidates", `${encodeURIComponent(freshKey)}.json`);
       assert.equal(existsSync(candidateFile), true);
+      const sourceCandidateTurnKey = (JSON.parse(readFileSync(candidateFile, "utf8")) as { turnKey: string }).turnKey;
       const usageHidden = await pool.query<{ request_id: string }>(
         "SELECT request_id FROM usage_records WHERE request_id = $1 OR request_id = $2",
         [freshIds[0], freshIds[1]]);
@@ -957,7 +1032,16 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
       const nextBusiness = nextModel.filter((hit) => hit.status === 200 && hit.mentions?.next === true && hit.kind !== "idle-summary");
       assert.equal(nextBusiness.length, 1, JSON.stringify(report.nextHits));
       assert.equal(freshIds.includes(nextBusiness[0]!.requestId ?? ""), false);
-      assert.equal(existsSync(candidateFile), false);
+      const nextTurnKey = nextBusiness[0]!.cred?.ocTurnKey;
+      assert.equal(typeof nextTurnKey, "string");
+      assert.notEqual(nextTurnKey, sourceCandidateTurnKey);
+      if (existsSync(candidateFile)) {
+        const nextCandidate = JSON.parse(readFileSync(candidateFile, "utf8")) as { sessionKey: string; turnKey: string };
+        assert.equal(nextCandidate.sessionKey, freshKey);
+        assert.equal(nextCandidate.turnKey, nextTurnKey, "only the new business turn may remain a candidate");
+        assert.notEqual(nextCandidate.turnKey, sourceCandidateTurnKey, "settled source candidate must not occupy the next turn");
+        report.nextBusinessCandidate = nextCandidate;
+      }
       const nativeRows = listJson(join(HOME, "idle-native")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ applied?: boolean; summaryText?: string; sessionId?: string }>;
       const ops = listJson(join(HOME, "idle-ops")).map((file) => JSON.parse(readFileSync(file, "utf8"))) as Array<{ disposition?: string; summaryText?: string; sourceSessionId?: string }>;
       report.nativeFiles = nativeRows;
@@ -976,6 +1060,8 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         assert.equal("requestId" in proof, false);
         assert.deepEqual([...(proof.requestIds as string[])].sort(), [...freshIds].sort());
       }
+      assert.ok(nextBusiness[0]!.requestId);
+      await waitForCommitted(admin, SCHEMA, nextBusiness[0]!.requestId);
       const books = await pool.query<{ request_id: string; turn_key: string; ledger_id: string; delta: string; balance_after: string }>(
         `SELECT u.request_id, u.turn_key, l.id::text AS ledger_id, l.delta::text, l.balance_after::text
            FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
@@ -2046,7 +2132,9 @@ function prepareModelSpool(raw: string): void {
     } catch { return ["mcp__ocbridge__t0"]; }
   })();
   if (!growthActive || classified.kind === "idle-summary") {
-    spoolBuf = textSpool(initTools);
+    const highSource = defaultHighFirstBusiness && classified.kind === "business";
+    if (highSource) defaultHighFirstBusiness = false;
+    spoolBuf = textSpool(initTools, highSource);
     if (!growthActive) pendingById.clear();
     return;
   }
@@ -2086,20 +2174,24 @@ function stripInit(buffer: Buffer): Buffer {
   return Buffer.from(text.slice(newline + 1));
 }
 
-function textSpool(tools: string[]): Buffer {
+function textSpool(tools: string[], highSource = false): Buffer {
   const model = "claude-opus-5-5";
+  // Only the first default-high business leaf reaches the real usage floor.
+  // Both stock and dedicated idle summaries retain the ordinary low usage.
+  const input = highSource ? 160_000 : 20;
+  const cacheRead = highSource ? 7_000 : 0;
   const text = summaryRequested ? "outer-history-summary" : "DONE-6K";
   const event = (value: unknown) => ({ type: "stream_event", event: value });
   const rows = [
     { type: "system", subtype: "init", tools, mcp_servers: [{}] },
-    event({ type: "message_start", message: { id: "msg_idle_6k", model, role: "assistant", content: [], usage: { input_tokens: 20, output_tokens: 0 } } }),
+    event({ type: "message_start", message: { id: "msg_idle_6k", model, role: "assistant", content: [], usage: { input_tokens: input, cache_read_input_tokens: cacheRead, output_tokens: 0 } } }),
     event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
     event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
     { type: "assistant", message: { id: "msg_idle_6k", model, role: "assistant", content: [{ type: "text", text }] } },
     event({ type: "content_block_stop", index: 0 }),
-    event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 20, output_tokens: 4 } }),
+    event({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: input, cache_read_input_tokens: cacheRead, output_tokens: 4 } }),
     event({ type: "message_stop" }),
-    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 20, output_tokens: 4 } },
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: input, cache_read_input_tokens: cacheRead, output_tokens: 4 } },
   ];
   return Buffer.from(rows.map((row) => JSON.stringify(row) + "\n").join(""));
 }
