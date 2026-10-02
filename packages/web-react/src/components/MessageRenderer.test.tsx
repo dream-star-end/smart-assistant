@@ -1100,6 +1100,53 @@ describe("MessageList 失败轮单一错误出口", () => {
   });
 });
 
+describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
+  const failedUser = mk("user", { id: "u-continued-source", text: "部署并验证", status: "sent" });
+  const committed = (id: string, text: string) => mk("assistant", {
+    id, text, _clientMessageId: failedUser.id, _errorCode: "engine_error",
+    _errorCardSnapshot: { disposition: "card", tone: "red", title: "任务执行失败", message: text },
+  });
+  const child = (extra: Partial<ChatMessage>) => mk("user", {
+    id: "u-continue-child", text: "↻ 从断点继续", status: "sent", _isAutoRetry: true,
+    _recoveryOfClientMessageId: failedUser.id, _recoveryMode: "checkpoint",
+    _automaticRecovery: false, ...extra,
+  });
+  const renderList = (messages: ChatMessage[]) => render(
+    <MessageList messages={messages} sending={false}
+      cb={{ onRegenerate: vi.fn(), onContinueInterrupted: vi.fn(),
+        resolveInterruptedContinuation: () => undefined }}
+      onRespondPermission={() => {}} />,
+  );
+
+  test("手动继续进行中：原失败卡与重新尝试一并收起", () => {
+    renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({}),
+      mk("assistant", { id: "a-resumed", text: "RESUMED_PROGRESS", _clientMessageId: "u-continue-child" })]);
+    expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: /重新尝试|从断点继续/ })).toBeNull();
+    expect(screen.getByText("RESUMED_PROGRESS")).toBeInTheDocument();
+  });
+
+  test("继续轮自己失败：只显示继续轮的真实失败卡", () => {
+    renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"), child({ status: "error" }),
+      mk("assistant", { id: "a-child-error", text: "CHILD_REAL_FAILURE", _clientMessageId: "u-continue-child",
+        _errorCode: "codex_route_unavailable" })]);
+    expect(screen.queryByText("COMMITTED_SOURCE_CARD")).toBeNull();
+    expect(screen.getByText("CHILD_REAL_FAILURE")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+  });
+
+  test("继续请求没发出去（无自身错误卡）或自动恢复：已见的失败卡保持可见", () => {
+    const { unmount } = renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"),
+      child({ status: "error" })]);
+    expect(screen.getAllByText("COMMITTED_SOURCE_CARD").length).toBeGreaterThan(0);
+    unmount();
+    renderList([failedUser, committed("a-committed", "COMMITTED_SOURCE_CARD"),
+      child({ _automaticRecovery: true })]);
+    expect(screen.getAllByText("COMMITTED_SOURCE_CARD").length).toBeGreaterThan(0);
+  });
+});
+
 describe("MessageList 每张调用卡 token 实时展示", () => {
   test("思考和工具卡只显示自己的调用消耗，最终助手保留本轮快照", () => {
     const messages: ChatMessage[] = [

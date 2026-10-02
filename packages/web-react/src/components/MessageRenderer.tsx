@@ -2035,6 +2035,27 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
+  // OCV5-307: the user acted on a committed card by clicking 从断点继续. While
+  // that manual continuation runs (or after it finished) the card is resolved,
+  // not a live failure; leaving it up showed 任务执行失败 + 重新尝试 next to
+  // 工具执行中. A declined child is removed (the card returns with its notice)
+  // and a failed child paints its own card; a child that failed without one
+  // keeps the source card. Automatic recovery never repaints a seen card.
+  const childErrorIds = new Set(
+    safeMessages
+      .filter((message) => message.role === "assistant" && !!message._errorCode)
+      .map((message) => message._clientMessageId)
+      .filter(isNonEmptyId),
+  );
+  const manuallyContinuedSourceIds = new Set(
+    safeMessages
+      .filter((message) =>
+        isRecoveryControlUserTurn(message) &&
+        message._automaticRecovery !== true &&
+        (message.status !== "error" || childErrorIds.has(message.id)))
+      .map((message) => message._recoveryOfClientMessageId)
+      .filter(isNonEmptyId),
+  );
   const renderableMessages = safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
@@ -2050,8 +2071,10 @@ export function MessageList({
         !!m._errorCode &&
         typeof m._clientMessageId === "string" &&
         recoveredSourceIds.has(m._clientMessageId) &&
-        // 已经提交的卡不许因恢复子轮再被藏掉。没提交的中间态仍隐藏。
-        m._errorCardSnapshot?.disposition !== "card"
+        // 已经提交的卡不许因自动恢复子轮再被藏掉；没提交的中间态仍隐藏。
+        // 用户手动「从断点继续」后，这张卡已被处理，随之收起（OCV5-307）。
+        (m._errorCardSnapshot?.disposition !== "card" ||
+          manuallyContinuedSourceIds.has(m._clientMessageId))
       ) &&
       !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
       !isRedundantRuntimeEnvelope(m) &&
