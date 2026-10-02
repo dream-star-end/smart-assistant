@@ -78,10 +78,12 @@ export function AssistantMessage({
           </OptionsGroupProvider>
         ) : streaming ? (
           // 三点跳动只有视觉,给读屏一个状态名;aria-hidden 掉装饰点。
-          <output aria-live="polite" aria-label="正在生成回复" className="flex items-center gap-1.5 py-1 text-muted">
-            <span aria-hidden className="size-2 animate-pulse rounded-full bg-muted" />
-            <span aria-hidden className="size-2 animate-pulse rounded-full bg-muted [animation-delay:200ms]" />
-            <span aria-hidden className="size-2 animate-pulse rounded-full bg-muted [animation-delay:400ms]" />
+          <output aria-live="polite" aria-label="正在生成回复" className="flex items-center py-1.5 text-muted">
+            <span aria-hidden className="oc-dots">
+              <span />
+              <span />
+              <span />
+            </span>
           </output>
         ) : null}
         {!streaming && message.content && (

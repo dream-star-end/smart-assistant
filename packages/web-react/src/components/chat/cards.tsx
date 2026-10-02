@@ -1136,10 +1136,12 @@ export function AssistantCard({
 
 function TypingDots() {
   return (
-    <div className="flex items-center gap-1.5 py-1 text-muted" aria-label="生成中">
-      <span className="size-2 animate-pulse rounded-full bg-muted" />
-      <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:200ms]" />
-      <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:400ms]" />
+    <div className="flex items-center py-1.5 text-muted" aria-label="生成中">
+      <span className="oc-dots" aria-hidden>
+        <span />
+        <span />
+        <span />
+      </span>
     </div>
   );
 }
