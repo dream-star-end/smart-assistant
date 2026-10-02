@@ -520,8 +520,10 @@ export function Composer({
         </button>
       )}
       <div
+        data-testid="composer-shell"
         className={cn(
-          "rounded-[26px] border border-border-control bg-surface shadow-[var(--shadow-float)] transition-all",
+          // OCV5-295:外壳减负 —— 20px 圆角 + 轻阴影 --shadow-soft(原 26px + --shadow-float 浮层阴影)。
+          "rounded-[20px] border border-border-control bg-surface shadow-[var(--shadow-soft)] transition-all",
           "focus-within:border-border-strong",
           dragActive && "ring-2 ring-ring",
         )}

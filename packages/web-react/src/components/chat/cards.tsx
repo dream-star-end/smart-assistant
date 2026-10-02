@@ -245,7 +245,7 @@ function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) 
   const showTime = Boolean(msg.ts);
   if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
-    <div data-testid="assistant-meta" className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-faint">
+    <div data-testid="assistant-meta" className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-faint">
       {showTime && (
         <time dateTime={new Date(msg.ts).toISOString()} className="whitespace-nowrap text-caption">
           <TooltipProvider>
@@ -332,7 +332,8 @@ function SpeakButton({ getText }: { getText: () => string }) {
 // ─── 触屏动作行折叠 ───────────────────────────────────────────────────────
 // 桌面:hover 露出整排动作(无预留高度以外的视觉噪音)。触屏没有 hover,原先整排 44px 图标
 // 对**每条**消息常显,长会话里 1 行正文配 3 行 chrome。现在触屏默认只露一个 44px「更多」开关,
-// 点开才展开整排;`defaultOpen` 让末轮末条助手回复(最常要复制/重新生成的那条)默认展开。
+// 点开才展开整排。完成态助手回复的「复制」放在本行外常显(OCV5-295),其余一律默认收起;
+// `defaultOpen` 只给停止/失败精简行(复制/纯文本/引用三个)用,让它们直接可见。
 // jsdom 无 CSS,开关与整排同时存在于 DOM,既有按钮断言不受影响。
 function TouchActionRow({
   children,
@@ -390,52 +391,82 @@ function MessageActions({
   readOnly?: boolean;
 }) {
   const body = text ?? msg.text ?? "";
+  const copy = <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} />;
+  // 停止 / 失败但有部分回答:只有复制 / 纯文本 / 引用三个,整排直接可见(不折叠)。
+  if (minimal) {
+    return (
+      <TouchActionRow defaultOpen>
+        {copy}
+        <CopyIconButton
+          getText={() => stripMarkdown(body)}
+          label="复制纯文本"
+          icon={<Type size={15} />}
+        />
+        {!readOnly && cb.onQuote && (
+          <IconButton
+            aria-label="引用"
+            title="引用"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={() => cb.onQuote?.(msg)}
+          >
+            <Quote size={15} />
+          </IconButton>
+        )}
+      </TouchActionRow>
+    );
+  }
+  // OCV5-295:完成态「复制」常显(触屏/桌面都一击可达);其余动作收进同一个「更多操作」,
+  // 末条也默认收起 —— 触屏不再为最新回复铺一整排 7 个 44px 图标。showRegen 只决定有无「重新生成」。
   return (
-    <TouchActionRow defaultOpen={showRegen && !readOnly}>
-      <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} />
-      <CopyIconButton
-        getText={() => stripMarkdown(body)}
-        label="复制纯文本"
-        icon={<Type size={15} />}
-      />
-      {!minimal && <SpeakButton getText={() => stripMarkdown(body)} />}
-      {!readOnly && cb.onQuote && (
-        <IconButton
-          aria-label="引用"
-          title="引用"
-          size="sm"
-          shape="square"
-          className="[@media(hover:none)]:size-11"
-          onClick={() => cb.onQuote?.(msg)}
-        >
-          <Quote size={15} />
-        </IconButton>
-      )}
-      {!minimal && !readOnly && showRegen && cb.onRegenerate && (
-        <IconButton
-          aria-label="重新生成"
-          title="重新生成"
-          size="sm"
-          shape="square"
-          className="[@media(hover:none)]:size-11"
-          onClick={cb.onRegenerate}
-        >
-          <RotateCcw size={15} />
-        </IconButton>
-      )}
-      {!minimal && !readOnly && cb.onFeedback && (
-        <IconButton
-          aria-label="反馈"
-          title="反馈"
-          size="sm"
-          shape="square"
-          className="[@media(hover:none)]:size-11"
-          onClick={() => cb.onFeedback?.(buildFeedbackCtx(msg))}
-        >
-          <MessageSquare size={15} />
-        </IconButton>
-      )}
-    </TouchActionRow>
+    <div className="mt-1.5 flex items-center gap-0.5">
+      {copy}
+      <TouchActionRow className="mt-0">
+        <CopyIconButton
+          getText={() => stripMarkdown(body)}
+          label="复制纯文本"
+          icon={<Type size={15} />}
+        />
+        <SpeakButton getText={() => stripMarkdown(body)} />
+        {!readOnly && cb.onQuote && (
+          <IconButton
+            aria-label="引用"
+            title="引用"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={() => cb.onQuote?.(msg)}
+          >
+            <Quote size={15} />
+          </IconButton>
+        )}
+        {!readOnly && showRegen && cb.onRegenerate && (
+          <IconButton
+            aria-label="重新生成"
+            title="重新生成"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={cb.onRegenerate}
+          >
+            <RotateCcw size={15} />
+          </IconButton>
+        )}
+        {!readOnly && cb.onFeedback && (
+          <IconButton
+            aria-label="反馈"
+            title="反馈"
+            size="sm"
+            shape="square"
+            className="[@media(hover:none)]:size-11"
+            onClick={() => cb.onFeedback?.(buildFeedbackCtx(msg))}
+          >
+            <MessageSquare size={15} />
+          </IconButton>
+        )}
+      </TouchActionRow>
+    </div>
   );
 }
 
@@ -1048,17 +1079,24 @@ export function AssistantCard({
             readOnly={readOnly}
           />
         )}
-        {/* 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
-            刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。 */}
-        {metaVisible && !hideOrphanSilentMeta && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
-        {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
-            所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
-            一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
-            其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
-            未登录/demo 由卡内 Context 兜底隐藏。 */}
-        {!live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply && ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn) && (
-          <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
-        )}
+        {/* OCV5-295:meta 与评价行共用一个 flex-wrap 父节点(各自门控不变),宽度够就并排、不够自然换行,
+            省掉一整行附属 chrome;两者都不出时 empty:hidden 不留空白。 */}
+        <div
+          data-testid="assistant-footer"
+          className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 empty:hidden"
+        >
+          {/* 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
+              刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。 */}
+          {metaVisible && !hideOrphanSilentMeta && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
+          {/* 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
+              所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
+              一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
+              其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
+              未登录/demo 由卡内 Context 兜底隐藏。 */}
+          {!live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply && ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn) && (
+            <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
+          )}
+        </div>
       </div>
     </div>
   );

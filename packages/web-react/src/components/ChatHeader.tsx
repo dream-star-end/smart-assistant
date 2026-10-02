@@ -218,7 +218,8 @@ export function ChatHeader({
         </button>
       ) : null}
       {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (
-        <div className="order-last flex min-w-0 basis-full items-center gap-1 rounded-xl bg-hover/50 sm:order-none sm:flex-1 sm:basis-auto sm:bg-transparent" data-testid="chat-model-row">
+        <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">
+          {/* OCV5-295:窄屏模型行不再铺整宽灰底(像主 CTA);触发器自带 44px 命中与截断,模型名/倍率直接可读。 */}
           {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
               点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
           {advisorModeActive && (
