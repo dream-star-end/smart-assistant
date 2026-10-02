@@ -58,3 +58,20 @@ Evidence: `ci-pg-identity.log` 31/31 pass, `ci-discovery2.log` 5/5 including
 negative controls, `ci-runtime-fixture2.log` 2/2 with real CCB four HTTP calls
 and Redis 14700s TTL, zero skip/cancel; `ci-boundary-types2.exit` 0. These do
 not close the independent continuation, Stop/capacity, UI or incident blockers.
+
+
+## CI storage guard / continued negative-control wiring, batch 2
+
+- Batch 1 at `d7a22cd26` reviewed PASS. Discovery/DSN negative tests are now
+  explicitly included in the normal `test:v5:ops` target set, not only manual runs.
+- The existing operator probe's finance SQL uses a pinned client, creates TEMP
+  shadows and proves every finance relation resolves to pg_temp before admission.
+  The architecture checker now accepts only that exact file's two complete TEMP
+  DDL lines. It does not whitelist the whole file or relax global SQL detection.
+  Persistent DML, near-matching DDL and the same statements in any other file
+  still fail the negative controls.
+- `ci-temp-guard.log`: 8/8 pass, no fail/cancel/skip. Full storage suite
+  `ci-storage2.log`: 515/515 pass, no fail/cancel/skip, exit0.
+- Incident short-hash identity normalization is a separate open change. The
+  full incident proof debt, browser/continuation/Stop blocks and rollout remain
+  open. These two fixture batches are not production availability evidence.

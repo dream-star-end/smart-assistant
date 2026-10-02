@@ -98,6 +98,19 @@ const WHITELIST = new Set<string>([
   "scripts/sessions-fix-oversized.ts",
 ])
 
+// This operator pins every journal/finalizer query to one client and proves all
+// financial relations resolve to pg_temp before admission. Only these two TEMP
+// DDL statements are legal; this does NOT whitelist future persistent SQL, the
+// whole file, or other files sharing a directory/name prefix.
+const TEMP_SHADOW_TOOL = "scripts/ocv5-289/boxToolFetchLiveProbe.ts"
+const TEMP_SHADOW_LINES = new Set([
+  'await client.query("CREATE TEMP TABLE pending_usage_patches (LIKE public.pending_usage_patches INCLUDING ALL)");',
+  'await client.query("CREATE TEMP TABLE client_sessions (LIKE public.client_sessions INCLUDING ALL)");',
+])
+function isAllowedTempShadowSql(relativePath: string, line: string): boolean {
+  return relativePath === TEMP_SHADOW_TOOL && TEMP_SHADOW_LINES.has(line.trim())
+}
+
 // 扫描根目录(仓内一级)。node_modules/dist/.git 等在遍历时剪掉。
 const SCAN_ROOTS = ["packages", "scripts"]
 const PRUNE_DIRS = new Set(["node_modules", "dist", ".git", "build", "coverage", ".turbo", "__tests__"])
@@ -142,7 +155,7 @@ describe("架构:master 六张权威表 SQL 字面量白名单(RFC D6b)", () => 
       }
       const lines = text.split("\n")
       for (let i = 0; i < lines.length; i++) {
-        if (SQL_CONTEXT.test(lines[i])) {
+        if (SQL_CONTEXT.test(lines[i]) && !isAllowedTempShadowSql(rel, lines[i])) {
           violations.push(`${rel}:${i + 1}: ${lines[i].trim().slice(0, 120)}`)
         }
       }
@@ -158,9 +171,24 @@ describe("架构:master 六张权威表 SQL 字面量白名单(RFC D6b)", () => 
   })
 
   test("白名单自洽:每个白名单文件都真实存在(防陈旧路径)", () => {
-    for (const rel of WHITELIST) {
+    for (const rel of [...WHITELIST, TEMP_SHADOW_TOOL]) {
       const abs = join(REPO_ROOT, rel)
       assert.doesNotThrow(() => readFileSync(abs, "utf8"), `白名单文件不存在(路径陈旧?): ${rel}`)
     }
   })
+
+  test("TEMP operator exception cannot admit persistent SQL, another file, or near-matching DDL", () => {
+    for (const line of TEMP_SHADOW_LINES) {
+      assert.equal(isAllowedTempShadowSql(TEMP_SHADOW_TOOL, line), true)
+      assert.equal(isAllowedTempShadowSql("scripts/ocv5-289/anotherProbe.ts", line), false)
+      assert.equal(isAllowedTempShadowSql(TEMP_SHADOW_TOOL, line.replace("TEMP ", "")), false)
+    }
+    for (const line of ['await client.query("UPDATE client_sessions SET user_id=3");',
+      'await client.query("DELETE FROM pending_usage_patches");',
+      'await client.query("CREATE TEMP TABLE client_sessions AS SELECT * FROM public.client_sessions");']) {
+      assert.equal(SQL_CONTEXT.test(line), true)
+      assert.equal(isAllowedTempShadowSql(TEMP_SHADOW_TOOL, line), false)
+    }
+  })
+
 })
