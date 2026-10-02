@@ -32,6 +32,10 @@ const EXISTING_SUMMARY = {
 async function bundleHarness() {
   const source = await readFile(componentPath, "utf8");
   const negative = process.env.OC_CC_SWITCH_ASCII_NAME_RED === "1";
+  const lightweightNegative = process.env.OC_CC_SWITCH_LIGHTWEIGHT_RED === "1";
+  const orderedLightweight = "pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/])";
+  const historicalLightweight = "pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, /^haiku-|^gemini-|-flash(-|$)|^sonnet-/)";
+  let lightweightReplacements = 0;
   const fixed = "name: BRAND.nameEn,";
   const historical = "name: BRAND.name,";
   let replacements = 0;
@@ -48,16 +52,24 @@ async function bundleHarness() {
       "process.env.NODE_ENV": '"production"',
       "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}',
     },
-    plugins: negative ? [{
+    plugins: negative || lightweightNegative ? [{
       name: "cc-switch-exact-pre-f496-name-expression",
       setup(esbuildApi) {
         esbuildApi.onLoad({ filter: /[\\/]ApiKeysSection\.tsx$/ }, async ({ path }) => {
           assert.equal(path, componentPath, "negative control must target the real component only");
           const current = await readFile(path, "utf8");
           assert.equal(current, source, "source must not drift during bundling");
-          assert.equal(current.split(fixed).length - 1, 1, "negative control requires exactly one expression");
-          replacements += 1;
-          bundledSource = current.replace(fixed, historical);
+          bundledSource = current;
+          if (negative) {
+            assert.equal(current.split(fixed).length - 1, 1, "negative control requires exactly one expression");
+            replacements += 1;
+            bundledSource = bundledSource.replace(fixed, historical);
+          }
+          if (lightweightNegative) {
+            assert.equal(current.split(orderedLightweight).length - 1, 1, "lightweight negative control requires the exact fixed call");
+            lightweightReplacements += 1;
+            bundledSource = bundledSource.replace(orderedLightweight, historicalLightweight);
+          }
           return { contents: bundledSource, loader: "tsx", resolveDir: dirname(path) };
         });
       },
@@ -65,11 +77,12 @@ async function bundleHarness() {
     logLevel: "error",
   });
   assert.equal(replacements, negative ? 1 : 0, "exactly one controlled replacement, never a product edit");
+  assert.equal(lightweightReplacements, lightweightNegative ? 1 : 0, "exactly one historical lightweight call, never a product edit");
   assert.equal(await readFile(componentPath, "utf8"), source, "bundle injection leaves product bytes intact");
   console.log("cc-switch-source-evidence " + JSON.stringify({
-    mode: negative ? "exact-pre-f496-name-expression-negative" : "current-worktree",
+    mode: lightweightNegative ? "exact-historical-lightweight-call-negative" : negative ? "exact-pre-f496-name-expression-negative" : "current-worktree",
     historicalFix: "f496228de43718852cebda8fb9f35eb0e9c3a9c0",
-    replacements, sourceSha256: sha256(source), bundledSourceSha256: sha256(bundledSource),
+    replacements, lightweightReplacements, sourceSha256: sha256(source), bundledSourceSha256: sha256(bundledSource),
     testSha256: sha256(await readFile(fileURLToPath(import.meta.url))),
     harnessSha256: sha256(await readFile(new URL("./cc-switch-ascii-name-harness.tsx", import.meta.url))),
     apiSha256: sha256(await readFile(new URL("../src/lib/api.ts", import.meta.url))),
@@ -152,7 +165,7 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
       });
       await page.goto(origin);
       await page.addScriptTag({ content: bundled.text });
-      if (source === "new") await page.getByText("还没有 API Key", { exact: true }).waitFor();
+      if (source === "new") await page.getByText("还没有 API Key。在上方「创建新密钥」里起个名（如 MacBook）即可创建第一把。", { exact: true }).waitFor();
       else await page.getByTestId("api-keys-list").waitFor();
       // A nondefault model proves the real fetch response, filtering and public-id conversion settled.
       await page.waitForFunction(() =>
@@ -164,7 +177,7 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
         await page.getByRole("textbox", { name: "新密钥名称", exact: true }).fill(LABEL);
         await assertNotImportable(page); // A label alone must not manufacture a key.
         await page.getByRole("button", { name: "创建", exact: true }).click();
-        await page.getByText("已包含刚创建的密钥,可直接导入。", { exact: true }).waitFor();
+        await page.getByText("已包含刚创建的密钥，可直接导入。", { exact: true }).waitFor();
       } else {
         await page.getByRole("tab", { name: "使用已有密钥", exact: true }).click();
         const input = page.getByLabel("完整 API Key", { exact: true });
