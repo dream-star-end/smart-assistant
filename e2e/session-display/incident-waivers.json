@@ -410,6 +410,12 @@
       "reason": "Codex 1M models looked up account groups by the 1M billing id, got no official_oauth route, and Codex 0.159.2 failed every turn with workspace routing discovery failed. Lookup now uses the standard id. Unit-tested; it does not change session display.",
       "approvedBy": "user 2026-10-01 修一下 gpt-6.1-sol-1m",
       "expiresAt": "2026-10-31"
+    },
+    {
+      "commit": "793c4f0b15928a59eaaedab3f8ba6194d1fb496a",
+      "reason": "The model-unavailable card said the model was retired, but the same code also covers an upstream at-capacity reply. Only the card copy changed; retry policy and classification are unchanged.",
+      "approvedBy": "user 2026-10-02 改下吧（模型不可用文案）",
+      "expiresAt": "2026-11-01"
     }
   ]
 }
