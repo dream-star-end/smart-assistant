@@ -5469,7 +5469,9 @@
       "severity": "P1",
       "symptom": "线上 #2ee979cd（v5-080328c70 发布期间）：Box Claude 回合两条终端命令完成后，续接请求的 Box exec 流在发布脚本 restart hostnet（连带 cursor-proxy）的同一秒被切断 → BOX_EXEC_TRANSPORT_UNKNOWN（500）；远端 CLI 实际继续跑完（worker_complete），但 CCB 一秒后的同请求非流式回退命中 replay pending → 409 BOX_REPLAY_PENDING，回合以『任务执行失败 / 内部错误』结束。修复：发布不再 restart hostnet/代理（526f3fb7c）；replay 路径对仍在收尾的 Box 调用只读复查最多 240s，就绪后回放真实结果。",
       "rootFixCommit": "c97b1e03",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "e0ac5662"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -5480,6 +5482,16 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
           "assertion": "OCV5-306: a same-request retry waits for a still-resolving Box call and replays it"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts",
+          "assertion": "OCV5-306 an unknown linked leaf whose CLI exited by itself settles unbilled and releases the chain"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxIdleChain.test.ts",
+          "assertion": "OCV5-306 a rejected-stream leaf releases a linked chain; its ancestors must still be stopped"
         }
       ]
     }
