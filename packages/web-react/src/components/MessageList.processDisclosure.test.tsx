@@ -828,7 +828,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("shelf-unique.png").closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
-  test("回答元信息用 caption，旧日期和近时都在，积分与 token 仍在", () => {
+  test("回答元信息用 caption 和本地日期，积分仍在，token 不打印", () => {
     const oldTs = 1_700_000_000_000;
     const recentTs = Date.now() - 2_000;
     renderList([
@@ -854,7 +854,11 @@ describe("MessageList Manus 过程披露", () => {
     const metas = screen.getAllByTestId("assistant-meta");
     expect(metas).toHaveLength(2);
     expect(metas[0]).toHaveClass("text-caption");
-    expect(metas[0]).toHaveTextContent("2023-11-15");
+    const date = new Date(oldTs);
+    const localDate = [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
+    expect(metas[0]).toHaveTextContent(localDate);
+    expect(metas[0].querySelector("time")).toHaveAttribute("datetime", date.toISOString());
+    expect(metas[0]).toHaveTextContent("#abc12345");
     expect(metas[0]).toHaveTextContent("12 积分");
     expect(metas[0]).not.toHaveTextContent(/token/i);
     expect(metas[0].querySelector("time.tabular-nums")?.className ?? "").toContain("text-caption");
@@ -1013,9 +1017,10 @@ describe("MessageList Manus 过程披露", () => {
       }),
       row("answer", "assistant", "目标先保持", { _clientMessageId: "u" }),
     ]);
-    expect(screen.getByText("发布前确认目标").closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(screen.getByText("被堵住的目标").closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(screen.getAllByRole("button", { name: "查看原始目标记录" })).toHaveLength(2);
+    expect(screen.queryByText("发布前确认目标")).not.toBeInTheDocument();
+    expect(screen.queryByText("被堵住的目标")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始目标记录" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("process-toggle")).not.toHaveTextContent("目标");
     expect(screen.getByTestId("permission-card").closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.getByText("目标先保持").closest("[data-testid=process-disclosure]")).toBeNull();
     expect(screen.queryByText("goal-not-a-card")).not.toBeInTheDocument();
@@ -1532,6 +1537,9 @@ describe("MessageList Manus 过程披露", () => {
 
     cleanup();
     const sample = "**对照重点**\n\n第一段说明。\n\n- 北仓\n\n`sku`";
+    const completedGoal = row("done", "goal", "做完的目标", {
+      _clientMessageId: "u", goalStatus: "completed", cleared: false, _turnTapeId: "tape-done",
+    });
     renderList([
       row("u", "user", "继续", { status: "replied" }),
       row("flag", "goal", "只看清除标记", {
@@ -1545,12 +1553,7 @@ describe("MessageList Manus 过程披露", () => {
         goalStatus: " Cleared ",
         _turnTapeId: "tape-status",
       }),
-      row("done", "goal", "做完的目标", {
-        _clientMessageId: "u",
-        goalStatus: "completed",
-        cleared: false,
-        _turnTapeId: "tape-done",
-      }),
+      completedGoal,
       row("paused", "goal", "暂停的目标", {
         _clientMessageId: "u",
         goalStatus: "paused",
@@ -1580,8 +1583,9 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText("只看状态")).not.toBeInTheDocument();
     expect(screen.queryByText("目标已清除")).not.toBeInTheDocument();
     expect(screen.getByText("目标已清除这句话是主助手回答")).toBeInTheDocument();
-    expect(screen.getByText("暂停的目标").closest("[data-testid=process-disclosure]")).toBeNull();
-    expect(screen.getByText("堵住的目标").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.queryByText("暂停的目标")).not.toBeInTheDocument();
+    expect(screen.queryByText("堵住的目标")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始目标记录" })).not.toBeInTheDocument();
     const meta = screen.getByTestId("assistant-meta");
     expect(meta).toHaveTextContent("9 积分");
     expect(meta.querySelector("time")).not.toBeNull();
@@ -1592,7 +1596,14 @@ describe("MessageList Manus 过程披露", () => {
     expect(goalToggle).toHaveTextContent("命令 1 项");
     expect(goalToggle).not.toHaveTextContent("目标 2");
     fireEvent.click(goalToggle);
-    expect(screen.getByText(/做完的目标/).closest("[data-testid=process-goal]")).not.toBeNull();
+    const historical = screen.getByTestId("process-goal");
+    expect(within(historical).getByText("做完的目标")).toBeInTheDocument();
+    const rawToggle = within(historical).getByRole("button", { name: "查看原始目标记录" });
+    expect(historical.querySelector("pre")).toBeNull();
+    fireEvent.click(rawToggle);
+    expect(historical.querySelector("pre")?.textContent).toBe(JSON.stringify(completedGoal, null, 2));
+    fireEvent.click(within(historical).getByRole("button", { name: "收起原始目标记录" }));
+    expect(historical.querySelector("pre")).toBeNull();
     const stage = screen.getByTestId("process-stage");
     expect(stage.className).not.toMatch(/\btext-sm\b|\bleading-6\b|\btext-muted\b/);
     expect(stage.querySelector(".prose")).not.toBeNull();

@@ -383,7 +383,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     expect(notice).toHaveClass("max-w-full", "break-words", "rounded-xl");
   });
 
-  test("goal → 渲染原生目标更新卡", () => {
+  test("goal → 当前目标不在消息流重复渲染", () => {
     renderMsg(mk("goal", {
       text: "目标",
       goalStatus: "active",
@@ -391,9 +391,10 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
       tokenBudget: 1_000,
       timeUsedSeconds: 8,
     }));
-    expect(screen.getByText("目标")).toBeInTheDocument();
-    expect(screen.getByText("active")).toBeInTheDocument();
-    expect(screen.getByText("Token 120 / 1,000 · 8s")).toBeInTheDocument();
+    expect(screen.queryByText("目标")).not.toBeInTheDocument();
+    expect(screen.queryByText("active")).not.toBeInTheDocument();
+    expect(screen.queryByText("Token 120 / 1,000 · 8s")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看原始目标记录" })).not.toBeInTheDocument();
   });
 });
 
@@ -1148,7 +1149,7 @@ describe("OCV5-307 从断点继续后已提交的失败卡收起", () => {
 });
 
 describe("MessageList 每张调用卡 token 实时展示", () => {
-  test("思考和工具卡只显示自己的调用消耗，最终助手保留本轮快照", () => {
+  test("思考和工具卡保留自己的调用量，最终助手只显示时间积分请求ID", () => {
     const messages: ChatMessage[] = [
       mk("user", { id: "u-live-token", text: "继续" }),
       mk("thinking", {
@@ -1171,7 +1172,7 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
           usage: { totalTokens: 128 },
         },
       }),
-      mk("assistant", { id: "a-live-token", text: "阶段结果" }),
+      mk("assistant", { id: "a-live-token", text: "阶段结果", usage: { totalTokens: 256, costCredits: "7", traceId: "live0001" } }),
       mk("plan", { id: "plan-live-token", text: "下一步计划" }),
     ];
     const view = render(
@@ -1188,13 +1189,16 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
     );
     expect(screen.getByText("64")).toBeInTheDocument();
     expect(screen.getByText("128")).toBeInTheDocument();
-    expect(screen.getByText("256")).toBeInTheDocument();
+    expect(screen.queryByText("256")).not.toBeInTheDocument();
+    expect(screen.getByText("阶段结果")).toBeInTheDocument();
+    expect(screen.queryByTestId("assistant-meta")).not.toBeInTheDocument();
 
     messages[2]._callUsage = {
       callId: "a1-ccb-2",
       targetIds: ["tool-live-token"],
       usage: { totalTokens: 2_048 },
     };
+    messages[3] = { ...messages[3], usage: { totalTokens: 512, costCredits: "9", traceId: "live0002" } };
     view.rerender(
       <MessageList
         messages={messages}
@@ -1209,11 +1213,22 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
     );
     expect(screen.getByText("2.05k")).toBeInTheDocument();
     expect(screen.queryByText("128")).not.toBeInTheDocument();
-    expect(screen.getByText("512")).toBeInTheDocument();
+    expect(screen.queryByText("512")).not.toBeInTheDocument();
+    expect(screen.getByText("阶段结果")).toBeInTheDocument();
+    expect(screen.queryByTestId("assistant-meta")).not.toBeInTheDocument();
     expect(screen.queryByText("256")).not.toBeInTheDocument();
+    view.rerender(<MessageList messages={messages} sending={false} cb={{}} onRespondPermission={() => {}} />);
+    expect(screen.getByText("64")).toBeInTheDocument();
+    expect(screen.getByText("2.05k")).toBeInTheDocument();
+    expect(screen.getByText("阶段结果")).toBeInTheDocument();
+    const settledMeta = screen.getByTestId("assistant-meta");
+    expect(settledMeta).toHaveTextContent("9 积分");
+    expect(settledMeta.querySelector("time")).toHaveAttribute("datetime", new Date(1000).toISOString());
+    expect(within(settledMeta).getByRole("button", { name: "复制请求ID live0002" })).toBeInTheDocument();
+    expect(settledMeta).not.toHaveTextContent(/token|256|512/i);
   });
 
-  test("浏览器估算只显示在最终助手，exact 接棒后移除约字", () => {
+  test("浏览器估算和 exact 接棒均不在最终助手脚注打印", () => {
     const messages: ChatMessage[] = [
       mk("user", { id: "u-estimated-token", text: "继续" }),
       mk("tool", {
@@ -1222,7 +1237,7 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
         inputJson: { command: "pwd" },
         _completed: false,
       }),
-      mk("assistant", { id: "a-estimated-token", text: "处理中" }),
+      mk("assistant", { id: "a-estimated-token", text: "处理中", usage: { totalTokens: 128, costCredits: "2", traceId: "estim001" } }),
     ];
     const view = render(
       <MessageList
@@ -1236,8 +1251,11 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("约128")).toBeInTheDocument();
-    expect(screen.getAllByLabelText("本轮估算约 128 token")).toHaveLength(1);
+    expect(screen.queryByText("约128")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("本轮估算约 128 token")).not.toBeInTheDocument();
+    expect(screen.getByText("处理中")).toBeInTheDocument();
+    expect(screen.queryByTestId("assistant-meta")).not.toBeInTheDocument();
+    messages[2] = { ...messages[2], usage: { totalTokens: 128, costCredits: "3", traceId: "estim002" } };
 
     view.rerender(
       <MessageList
@@ -1251,8 +1269,18 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
         onRespondPermission={() => {}}
       />,
     );
-    expect(screen.getByText("128")).toBeInTheDocument();
+    expect(screen.queryByText("128")).not.toBeInTheDocument();
     expect(screen.queryByText("约128")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("本轮估算约 128 token")).not.toBeInTheDocument();
+    expect(screen.getByText("处理中")).toBeInTheDocument();
+    expect(screen.queryByTestId("assistant-meta")).not.toBeInTheDocument();
+    view.rerender(<MessageList messages={messages} sending={false} cb={{}} onRespondPermission={() => {}} />);
+    expect(screen.getByText("处理中")).toBeInTheDocument();
+    const settledMeta = screen.getByTestId("assistant-meta");
+    expect(settledMeta).toHaveTextContent("3 积分");
+    expect(settledMeta.querySelector("time")).toHaveAttribute("datetime", new Date(1000).toISOString());
+    expect(within(settledMeta).getByRole("button", { name: "复制请求ID estim002" })).toBeInTheDocument();
+    expect(settledMeta).not.toHaveTextContent(/token|约128|128/i);
   });
 
   test("历史轮恢复每张卡自己的 durable 调用消耗，不复制最终助手总量", () => {
@@ -1272,7 +1300,7 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
       mk("assistant", {
         id: "a-history-token",
         text: "完成",
-        usage: { totalTokens: 333 },
+        usage: { totalTokens: 333, costCredits: "11", traceId: "hist0001" },
       }),
     ];
     render(
@@ -1284,7 +1312,11 @@ describe("MessageList 每张调用卡 token 实时展示", () => {
       />,
     );
     expect(screen.getByText("111")).toBeInTheDocument();
-    expect(screen.getByText("333")).toBeInTheDocument();
+    expect(screen.queryByText("333")).not.toBeInTheDocument();
+    expect(screen.getByTestId("assistant-row")).toHaveTextContent("完成");
+    expect(screen.getByTestId("assistant-meta")).toHaveTextContent("11 积分");
+    expect(within(screen.getByTestId("assistant-meta")).getByRole("button", { name: "复制请求ID hist0001" })).toBeInTheDocument();
+    expect(screen.getByTestId("assistant-meta")).not.toHaveTextContent(/token/i);
   });
 
   test("旧缓存缺 targetIds/callId 的调用用量不会炸掉整条会话", () => {

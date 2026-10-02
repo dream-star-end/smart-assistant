@@ -319,9 +319,15 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "goal":
-        // Current objective is the one-line composer dock. Repeated active
-        // echoes must not keep stacking cards in the transcript.
-        return null;
+        // Current objectives belong only to the composer dock. Completed
+        // rows remain read-only historical diagnostics inside the process.
+        if (isClearedGoalRecord(message) || !isHistoricalGoalRecord(message)) return null;
+        return (
+          <TapeBackedCard>
+            <p className="whitespace-pre-wrap break-words text-sm text-fg">{message.text || "会话目标"}</p>
+            <ExactTapeRecordDisclosure messages={[message]} label="目标" />
+          </TapeBackedCard>
+        );
       case "permission": {
         // INC-20260904-STOP-LEAVES-PERMISSION-PENDING (fix C):
         // A permission card owned by a master automatic-recovery turn

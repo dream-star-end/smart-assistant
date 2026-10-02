@@ -1,12 +1,13 @@
 import { useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { MessageList } from "../src/components/MessageRenderer";
+import { PinnedGoalBar } from "../src/components/chat/PinnedGoalBar";
 import { createStickToBottomController } from "../src/components/chat/stickToBottom";
 import type { ChatMessage } from "../src/lib/chat/model";
 import { TooltipProvider } from "../src/components/ui";
 import { BASH_CMD, OLD_TS, READ_PATH, STAGE_TEXT, answerText, recentTs } from "./process-disclosure-story.mjs";
 
-type Scene = "gallery" | "stream" | "find" | "attention" | "parallel";
+type Scene = "gallery" | "stream" | "find" | "attention" | "parallel" | "goals";
 type Mode = "legacy" | "manus";
 
 function row(id: string, role: ChatMessage["role"], text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
@@ -157,6 +158,31 @@ function messagesFor(scene: Scene, extra: string): ChatMessage[] {
   return galleryMessages();
 }
 
+function goalMessages(cleared: boolean): ChatMessage[] {
+  const owner = { _clientMessageId: "u-goal" };
+  const messages = [
+    row("u-goal", "user", "保留历史目标诊断", { status: "replied" }),
+    row("g-done", "goal", "COMPLETED_GOAL_DIAGNOSTIC", {
+      ...owner, goalStatus: "completed", _turnTapeId: "goal-diagnostic-tape",
+      _eventHistory: [{ type: "goal.updated", status: "completed",
+        objective: "COMPLETED_GOAL_DIAGNOSTIC", marker: "RAW_GOAL_MARKER" }],
+    }),
+    row("g-active", "goal", "CURRENT_ACTIVE_NOT_IN_TRANSCRIPT", { ...owner, goalStatus: "active" }),
+    row("g-paused", "goal", "CURRENT_PAUSED_NOT_IN_TRANSCRIPT", { ...owner, goalStatus: "paused" }),
+    row("g-cleared", "goal", "CLEARED_RECORD_NOT_VISIBLE", { ...owner, goalStatus: " Cleared " }),
+    row("g-blocked", "goal", "CURRENT_BLOCKED_DOCK_ONLY", {
+      ...owner, goalStatus: "blocked", tokensUsed: 120, tokenBudget: 1_000, timeUsedSeconds: 8,
+    }),
+    row("goal-tool", "tool", "终端", { ...owner, toolName: "Bash",
+      inputJson: { command: "echo GOAL_DIAGNOSTIC_COMMAND" }, _completed: true, output: "ok" }),
+    row("goal-answer", "assistant", "目标更新不是普通回答。", owner),
+  ];
+  if (cleared) messages.push(row("g-latest-cleared", "goal", "LATEST_CLEARED_NO_FALLBACK", {
+    ...owner, goalStatus: "active", cleared: true,
+  }));
+  return messages;
+}
+
 function Harness() {
   const [mode, setMode] = useState<Mode>("manus");
   const [scene, setScene] = useState<Scene>("gallery");
@@ -164,6 +190,7 @@ function Harness() {
   const [extra, setExtra] = useState("");
   const [findOpen, setFindOpen] = useState(false);
   const [respondCount, setRespondCount] = useState(0);
+  const [goalCleared, setGoalCleared] = useState(false);
   const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
   const stick = useRef(createStickToBottomController()).current;
   const followBottomRef = useMemo(() => ({
@@ -178,7 +205,7 @@ function Harness() {
     correctTo: stick.correctTo,
     releaseUserIntent: stick.releaseUserIntent,
   }), [stick]);
-  const messages = messagesFor(scene, extra);
+  const messages = scene === "goals" ? goalMessages(goalCleared) : messagesFor(scene, extra);
   const scrolled = scene === "find" || scene === "stream";
 
   const page = {
@@ -189,12 +216,14 @@ function Harness() {
       setSending(next === "stream" || next === "parallel");
       setFindOpen(next === "find");
       setRespondCount(0);
+      setGoalCleared(false);
     },
     setSending,
     appendAnswer(text: string) {
       setExtra((value) => value + text);
     },
     respondCount,
+    clearLatestGoal() { setGoalCleared(true); },
   };
   (window as unknown as { __processPage: typeof page }).__processPage = page;
 
@@ -228,6 +257,7 @@ function Harness() {
             {list}
           </div>
         ) : list}
+        {scene === "goals" ? <PinnedGoalBar messages={messages} /> : null}
       </div>
     </TooltipProvider>
   );

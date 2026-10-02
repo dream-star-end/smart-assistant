@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -330,6 +332,126 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.equal(attention.errors.length, 0, attention.errors.join("\n"));
     } finally {
       await attention.context.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test("completed goal diagnostics stay folded, exact raw survives and current dock is unique", { timeout: 180000 }, async (t) => {
+  mkdirSync(shots, { recursive: true });
+  const out = join(tmpdir(), "oc-goal-diagnostic-" + process.pid);
+  mkdirSync(out, { recursive: true });
+  const negative = process.env.OC_GOAL_DIAGNOSTIC_NEGATIVE === "1";
+  const sourcePath = join(here, "../src/components/MessageRenderer.tsx");
+  const currentSource = readFileSync(sourcePath, "utf8");
+  const historicalSource = execFileSync("git", [
+    "show", "1935342a5bb212e26fbc9a7d13c36292ea39f2bd:packages/web-react/src/components/MessageRenderer.tsx",
+  ], { cwd: join(here, "../../.."), encoding: "utf8" });
+  const goalBranch = /      case "goal":\n[\s\S]*?(?=      case "permission":)/;
+  const currentBranch = currentSource.match(goalBranch)?.[0];
+  const historicalBranch = historicalSource.match(goalBranch)?.[0];
+  assert.ok(currentBranch && historicalBranch, "exact goal branches must exist");
+  assert.notEqual(currentBranch, historicalBranch, "negative control must restore the real historical branch");
+  const bundledSource = negative ? currentSource.replace(goalBranch, historicalBranch) : currentSource;
+  const sourceSha = createHash("sha256").update(bundledSource).digest("hex");
+  const bundle = await build({
+    entryPoints: [join(here, "process-disclosure-harness.tsx")],
+    bundle: true, write: false, format: "iife", jsx: "automatic",
+    loader: { ".css": "empty" },
+    alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
+    define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
+    plugins: [{
+      name: "goal-diagnostic-exact-source",
+      setup(api) {
+        api.onLoad({ filter: /[/\\]MessageRenderer\.tsx$/ }, (args) => {
+          assert.equal(args.path, sourcePath);
+          return { contents: bundledSource, loader: "tsx", resolveDir: dirname(args.path) };
+        });
+      },
+    }],
+    logLevel: "silent",
+  });
+  await viteBuild({
+    root: join(here, ".."), configFile: false, logLevel: "silent", plugins: [tailwindcss()],
+    build: { outDir: out, emptyOutDir: true, cssCodeSplit: false,
+      rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } } },
+  });
+  const css = readFileSync(join(out, readdirSync(out).find((name) => name.endsWith(".css"))), "utf8");
+  const browser = await chromium.launch({
+    executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"],
+  });
+  try {
+    for (const width of [1280, 390]) {
+      await t.test("viewport " + width, async () => {
+        const context = await browser.newContext({
+          viewport: { width, height: width === 390 ? 844 : 900 },
+          isMobile: width === 390, hasTouch: width === 390, deviceScaleFactor: 1,
+        });
+        const page = await context.newPage();
+        const errors = [];
+        const report = { width, negative, sourceSha, checkpoints: [], complete: false };
+        page.on("pageerror", (error) => errors.push(error.message));
+        const activate = async (locator) => width === 390 ? locator.tap() : locator.click();
+        try {
+          await page.setContent('<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><style>' + css + '</style><div id="root"></div>');
+          await page.addScriptTag({ content: bundle.outputFiles[0].text });
+          await page.getByTestId("process-harness").waitFor();
+          await page.evaluate(() => window.__processPage.setScene("goals"));
+          await page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-scene") === "goals");
+          await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          const process = page.getByTestId("process-disclosure");
+          assert.equal(await process.count(), 1);
+          const toggle = process.getByTestId("process-toggle");
+          assert.equal(await toggle.getAttribute("aria-expanded"), "false");
+          assert.match(await toggle.innerText(), /目标 1 项/);
+          assert.doesNotMatch(await toggle.innerText(), /目标 [234]/);
+          assert.equal(await page.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count(), 0);
+          assert.equal(await page.getByRole("button", { name: "查看原始目标记录" }).count(), 0);
+          report.checkpoints.push("collapsed");
+          const dock = page.getByTestId("pinned-goal");
+          assert.equal(await dock.count(), 1);
+          assert.equal(await dock.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 1);
+          assert.match(await dock.innerText(), /阻塞/);
+          assert.match(await dock.innerText(), /120\/1,000/);
+          for (const hidden of ["CURRENT_ACTIVE_NOT_IN_TRANSCRIPT", "CURRENT_PAUSED_NOT_IN_TRANSCRIPT", "CLEARED_RECORD_NOT_VISIBLE"]) {
+            assert.equal(await page.getByText(hidden, { exact: true }).count(), 0);
+          }
+          assert.equal(await process.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
+          assert.equal(errors.length, 0, errors.join("\n"));
+          report.checkpoints.push("current-dock");
+          await activate(toggle);
+          const historical = process.getByTestId("process-goal");
+          await historical.waitFor({ state: "attached" });
+          report.historicalTextCount = await historical.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count();
+          assert.equal(report.historicalTextCount, 1, "completed historical goal must not render an empty process shell");
+          report.checkpoints.push("historical-open");
+          assert.equal(await historical.locator("pre").count(), 0);
+          await activate(historical.getByRole("button", { name: "查看原始目标记录" }));
+          const raw = await historical.locator("pre").textContent();
+          const expectedRaw = JSON.stringify([{ type: "goal.updated", status: "completed",
+            objective: "COMPLETED_GOAL_DIAGNOSTIC", marker: "RAW_GOAL_MARKER" }], null, 2);
+          assert.equal(raw, expectedRaw, "raw event history must survive exactly");
+          await activate(historical.getByRole("button", { name: "收起原始目标记录" }));
+          assert.equal(await historical.locator("pre").count(), 0);
+          report.checkpoints.push("raw");
+          await page.evaluate(() => window.__processPage.clearLatestGoal());
+          await page.waitForFunction(() => !document.querySelector("[data-testid=pinned-goal]"));
+          assert.equal(await page.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
+          assert.equal(await page.getByText("LATEST_CLEARED_NO_FALLBACK", { exact: true }).count(), 0);
+          assert.equal(await historical.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count(), 1);
+          assert.match(await toggle.innerText(), /目标 1 项/);
+          assert.equal(await page.getByText("目标更新不是普通回答。", { exact: true }).count(), 1);
+          report.checkpoints.push("clear");
+          assert.equal(errors.length, 0, errors.join("\n"));
+          report.complete = true;
+          await page.screenshot({ path: join(shots, "ocv5-308-goal-diagnostic-" + width + ".png") });
+        } finally {
+          report.pageErrors = errors;
+          writeFileSync(join(shots, "ocv5-308-goal-diagnostic-" + (negative ? "negative-" : "positive-") + width + ".json"), JSON.stringify(report, null, 2));
+          await context.close();
+        }
+      });
     }
   } finally {
     await browser.close();
