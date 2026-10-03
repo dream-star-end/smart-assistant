@@ -4086,7 +4086,7 @@ describe('v5 release safety lanes', () => {
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
-      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.5 (test)}"',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.13 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -4123,6 +4123,7 @@ describe('v5 release safety lanes', () => {
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
       [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
       [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
+      [{ GROK_VERSION: 'grok 1.0.5 (previous commercial)' }, /Grok binary=.*expected='grok 1\.0\.13/],
       [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
     ] as const) {
       await writeFile(capture, '')
