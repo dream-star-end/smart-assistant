@@ -5020,7 +5020,8 @@
         "9cd8bff9",
         "5dae9fac",
         "a9fab8cb",
-        "4b42122e"
+        "4b42122e",
+        "edbe08e8"
       ],
       "regressions": [
         {
@@ -5059,9 +5060,9 @@
           "assertion": "INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof"
         },
         {
-          "layer": "integration",
-          "path": "scripts/lib/user-contract-browser.test.mjs",
-          "assertion": "cold UI login waits for a delayed real button rather than bypassing login"
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "HOOK_CURRENT_TEXT"
         }
       ]
     },
