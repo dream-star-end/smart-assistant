@@ -12,7 +12,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync,
+  readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, writeFileSync, writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,7 @@ const RUNNER_HASH = "d".repeat(64);
 const BEHAVIOR = [
   "unknown worker_complete closed through reconcileBatch to a readable capsule and this-round usage",
   "intermediate handoff stayed pending without capsule or CAS",
+  "staged history and system use current catalog aliases; rejected first round is proven failed with zero charge, idle failed, and next admission succeeds",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -237,7 +238,11 @@ function digestLine(root: string): string {
   for (const path of Object.values(files)) {
     if (!existsSync(path)) throw new Error("BOX_SUCCESS_GATE_DIGEST");
   }
-  return `box success recovery gate: digest worker=${sha256(files.worker)} schema=${sha256(files.schema)} pg=${sha256(files.pg)} tsx=${sha256(files.tsx)}`;
+  const additional = ["boxMessagesMapper", "boxToolCatalog", "boxToolPlan", "boxTextPlan", "boxStageFiles", "boxDetachedToolPlan", "boxToolFirstRound", "boxUserStopCoordinator", "boxDurableJournal", "boxIdleChain", "boxCallFingerprint", "boxBillingContext", "boxKeeperStop", "boxTerminalProof", "boxPrelaunchControl", "boxCliToolHandoff", "boxToolCapacity", "boxCapacityWait", "boxFastPath", "boxStageBatch", "boxDetachedRunAccess", "boxSpoolPoller", "boxSpoolRead", "upstream"]
+    .map((name) => `${name}=${sha256(join(root, "packages/commercial/src/http/proxy", name + ".ts"))}`).join(" ");
+  const assets = ["box_supervisor.py", "box_keeper.py", "box_virtual_mcp.py", "box_detached_runner.py"]
+    .map((name) => `${name}=${sha256(join(root, "scripts/ocv5-289", name))}`).join(" ");
+  return `box success recovery gate: digest worker=${sha256(files.worker)} schema=${sha256(files.schema)} pg=${sha256(files.pg)} tsx=${sha256(files.tsx)} ${additional} ${assets}`;
 }
 
 function assertWorkerEnv(home: string): void {
@@ -453,6 +458,251 @@ function remember(ledger: string, owned: string[], path: string): void {
   mkdirSync(path, { mode: 0o700 });
   chmodSync(path, 0o700);
 }
+
+// The remote filesystem is a private mount namespace. Only the paid CLI,
+// spool and keeper protocol are controlled transport; all product state
+// transitions and every staging Python byte are the candidate's own code.
+const TOOL_NAMESPACE = String.raw`import hashlib,json,os,stat,subprocess,sys
+home,tmp,expected_ns,expected_digest,raw=sys.argv[1:]
+req=json.loads(raw)
+if hashlib.sha256(raw.encode()).hexdigest()!=expected_digest:raise SystemExit('BOX_TOOL_NS_REQUEST_CHANGED')
+ns=os.readlink('/proc/self/ns/mnt')
+if ns==expected_ns:raise SystemExit('BOX_TOOL_NS_NOT_PRIVATE')
+with open('/proc/self/mountinfo') as f:mi=f.read()
+if any(x.startswith(('shared:','master:')) for line in mi.splitlines() for x in line.split()[6:line.split().index('-')]):raise SystemExit('BOX_TOOL_NS_PROPAGATION')
+def directory(path,owned):
+ parts=path.split('/');current='/'
+ for part in parts:
+  if not part:continue
+  current=os.path.join(current,part);st=os.lstat(current)
+  if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):raise SystemExit('BOX_TOOL_NS_DIRECTORY')
+ st=os.lstat(path)
+ if owned and (st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode) not in (0o700,0o1777)):raise SystemExit('BOX_TOOL_NS_OWNER')
+ return (st.st_dev,st.st_ino,st.st_uid,stat.S_IMODE(st.st_mode))
+hs=directory(home,True);ts=directory(tmp,True)
+directory('/home',False);directory('/tmp',False)
+subprocess.run(['/usr/bin/mount','--bind',home,'/home'],check=True)
+if directory('/home',True)!=hs:raise SystemExit('BOX_TOOL_NS_HOME_BIND')
+subprocess.run(['/usr/bin/mount','--bind',tmp,'/tmp'],check=True)
+if directory('/tmp',True)!=ts:raise SystemExit('BOX_TOOL_NS_TMP_BIND')
+os.chdir(req.get('cwd') or '/tmp')
+sys.stderr.write('BOX_TOOL_NAMESPACE '+json.dumps({'namespace':ns,'digest':expected_digest},sort_keys=True)+'\n');sys.stderr.flush()
+os.execve(req['command'],[req['command'],*req['args']],req.get('environment') or {})`;
+
+async function runToolNameBusiness(root: string, client: QueryClient,
+  capsuleParent: string): Promise<void> {
+  const [first, stopMod, journalMod, catalogMod, fingerprintMod, billingMod,
+    keeperMod, terminalMod, upstreamMod] = await Promise.all([
+    import("../packages/commercial/src/http/proxy/boxToolFirstRound.ts"),
+    import("../packages/commercial/src/http/proxy/boxUserStopCoordinator.ts"),
+    import("../packages/commercial/src/http/proxy/boxDurableJournal.ts"),
+    import("../packages/commercial/src/http/proxy/boxToolCatalog.ts"),
+    import("../packages/commercial/src/http/proxy/boxCallFingerprint.ts"),
+    import("../packages/commercial/src/http/proxy/boxBillingContext.ts"),
+    import("../packages/commercial/src/http/proxy/boxKeeperStop.ts"),
+    import("../packages/commercial/src/http/proxy/boxTerminalProof.ts"),
+    import("../packages/commercial/src/http/proxy/upstream.ts"),
+  ]);
+  const uid = 900_000_232n, accountId = 21n, containerId = 232n;
+  const sessionId = "gate-tool-name", turnKey = "e".repeat(64);
+  const model = "box-api-claude-opus-5-5";
+  const prefix = "Follow the original instructions. Use Bash, Read and ExecuteExtraTool.";
+  const names = ["Bash", "Read", "ExecuteExtraTool"];
+  const body = { model, max_tokens: 128, stream: true, system: prefix,
+    tool_choice: { type: "auto" },
+    tools: names.map((name) => ({ name, description: `synthetic ${name}`,
+      input_schema: { type: "object", properties: { value: { type: "string" } } } })),
+    metadata: { user_id: JSON.stringify({ session_id: sessionId, oc_turn_key: turnKey }) },
+    messages: [
+      { role: "user", content: "previous task" },
+      { role: "assistant", content: [
+        ...names.map((name, index) => ({ type: "tool_use", id: `toolu_hist_${index}`,
+          name, input: { value: `input-${index}` } })),
+        { type: "tool_use", id: "toolu_hist_gone", name: "LegacyTool", input: { q: "complete-input" } },
+      ] },
+      { role: "user", content: [
+        ...names.map((_, index) => ({ type: "tool_result", tool_use_id: `toolu_hist_${index}`,
+          content: `complete-result-${index}` })),
+        { type: "tool_result", tool_use_id: "toolu_hist_gone", is_error: true,
+          content: [{ type: "text", text: "complete-error-result" }] },
+      ] },
+      { role: "assistant", content: "previous task complete" },
+      { role: "user", content: "continue with this catalog" },
+    ],
+  };
+  const same = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
+    query: client.query.bind(client) } as unknown as ConstructorParameters<typeof journalMod.BoxDurableJournal>[0];
+  const journal = new journalMod.BoxDurableJournal(same);
+  const catalog = catalogMod.compileBoxToolCatalog(body.tools, "natural");
+  const remoteHome = join(capsuleParent, "remote-home"), homeBox = join(remoteHome, "box"), remoteTmp = join(capsuleParent, "remote-tmp");
+  mkdirSync(remoteHome, { mode: 0o700 });
+  mkdirSync(homeBox, { mode: 0o700 }); mkdirSync(remoteTmp, { mode: 0o1777 });
+  chmodSync(remoteTmp, 0o1777);
+  mkdirSync(join(homeBox, ".claude", "projects"), { recursive: true, mode: 0o700 });
+  const hostNamespace = readFileSync("/proc/self/mountinfo", "utf8");
+  const hostNs = readlinkSync("/proc/self/ns/mnt");
+  const hostHome = lstatSync("/home");
+  const counts = { stage: 0, launch: 0, spool: 0, stop: 0, proof: 0,
+    coordinator: 0, unknown: 0, retained: 0, disposed: 0, ack: 0 };
+  const requests: Array<{ digest: string; namespace: string }> = [];
+  let nonce = "", epoch = "", stopped = false;
+  const identityUnchanged = () => {
+    const current = lstatSync("/home");
+    assert.deepEqual([current.dev, current.ino, current.uid, current.mode],
+      [hostHome.dev, hostHome.ino, hostHome.uid, hostHome.mode], "BOX_TOOL_HOST_HOME_CHANGED");
+    assert.equal(readFileSync("/proc/self/mountinfo", "utf8"), hostNamespace, "BOX_TOOL_HOST_MOUNTS_CHANGED");
+  };
+  const executeStage = (req: ExecRequest) => {
+    const raw = JSON.stringify(req), digest = createHash("sha256").update(raw).digest("hex");
+    const ran = spawnSync("/usr/bin/unshare", ["--mount", "--propagation", "private", "--",
+      "/usr/bin/python3", "-I", "-c", TOOL_NAMESPACE, remoteHome, remoteTmp,
+      hostNs, digest, raw], { encoding: "utf8", env: req.environment,
+      timeout: PY_TIMEOUT_MS, killSignal: "SIGKILL" });
+    identityUnchanged();
+    if (ran.error || ran.status !== 0) throw new Error(`BOX_TOOL_STAGE_EXEC ${ran.status}: ${ran.stderr}`);
+    const record = /BOX_TOOL_NAMESPACE (\{[^\n]+\})/.exec(ran.stderr ?? "");
+    assert.ok(record, "BOX_TOOL_NAMESPACE_RECEIPT");
+    const audit = JSON.parse(record[1]!) as { digest: string; namespace: string };
+    assert.equal(audit.digest, digest); assert.notEqual(audit.namespace, hostNs);
+    requests.push(audit); counts.stage++;
+    return { stdout: ran.stdout ?? "", stderrBytes: 0, exitCode: 0 as const };
+  };
+  const inspectStaged = () => {
+    const project = join(homeBox, ".claude", "projects", `-tmp-ocv5-289-run-${nonce}`);
+    const files = readdirSync(project).filter((name) => name.endsWith(".jsonl"));
+    assert.equal(files.length, 1, "BOX_TOOL_HISTORY_SINGLE_SNAPSHOT");
+    const stagedCatalog = readFileSync(join(remoteTmp, `ocv5-289-run-${nonce}`, "tool-catalog.json"), "utf8");
+    assert.equal(stagedCatalog, catalog.json, "BOX_TOOL_STAGED_CATALOG_BYTES");
+    assert.equal(createHash("sha256").update(stagedCatalog).digest("hex"), catalog.sha256, "BOX_TOOL_STAGED_CATALOG_HASH");
+    const raw = readFileSync(join(project, files[0]!), "utf8");
+    const records = raw.trim().split("\n").map((line) => JSON.parse(line));
+    const blocks = records.flatMap((row) => Array.isArray(row.message?.content) ? row.message.content : []);
+    for (const [index, name] of names.entries()) {
+      const call = blocks.find((block) => block.type === "tool_use" && block.id === `toolu_hist_${index}`);
+      assert.equal(blocks.filter((block) => block.type === "tool_use" && block.id === `toolu_hist_${index}`).length, 1, "BOX_TOOL_HISTORY_CALL_COUNT");
+      assert.ok(call, "BOX_TOOL_HISTORY_ALIAS_MISSING");
+      assert.equal(call.name, catalog.boxNameByClientName.get(name), "BOX_TOOL_HISTORY_ALIAS");
+      assert.deepEqual(call.input, { value: `input-${index}` }, "BOX_TOOL_HISTORY_INPUT");
+      const result = blocks.find((block) => block.type === "tool_result" && block.tool_use_id === call.id);
+      assert.equal(blocks.filter((block) => block.type === "tool_result" && block.tool_use_id === call.id).length, 1, "BOX_TOOL_HISTORY_RESULT_COUNT");
+      assert.deepEqual(result, { type: "tool_result", tool_use_id: call.id,
+        content: `complete-result-${index}` }, "BOX_TOOL_HISTORY_PAIR");
+    }
+    assert.ok(!blocks.some((block) => block.type === "tool_use" && block.name === "LegacyTool"),
+      "BOX_TOOL_HISTORY_LEGACY_CALLABLE");
+    assert.ok(!blocks.some((block) => (block.type === "tool_use" && block.id === "toolu_hist_gone")
+      || (block.type === "tool_result" && block.tool_use_id === "toolu_hist_gone")), "BOX_TOOL_HISTORY_LEGACY_PAIR_CALLABLE");
+    const text = blocks.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+    assert.ok(text.includes('Earlier call to tool "LegacyTool", not available in this turn')
+      && text.includes('"q":"complete-input"')
+      && text.includes('Result of earlier "LegacyTool" call (error): complete-error-result'),
+    "BOX_TOOL_HISTORY_LEGACY_BYTES");
+    const system = readFileSync(join(remoteTmp, `ocv5-289-run-${nonce}`, "system.txt"), "utf8");
+    assert.ok(system.startsWith(prefix + "\n\n"), "BOX_TOOL_SYSTEM_PREFIX");
+    assert.ok(system.includes("<tool-naming>") && system.endsWith("</tool-naming>"), "BOX_TOOL_SYSTEM_NOTICE");
+    for (const name of names) assert.ok(system.includes(`- ${name} → ${catalog.boxNameByClientName.get(name)}`),
+      "BOX_TOOL_SYSTEM_ALIAS");
+  };
+  const exact = (a: ExecRequest, b: ExecRequest) => JSON.stringify(a) === JSON.stringify(b);
+  const remote = async (req: ExecRequest) => {
+    const args = req.args;
+    if (args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-") && args[5] === "--read") {
+      counts.spool++;
+      const bad = [
+        { type: "system", subtype: "init", tools: [...catalog.clientNameByBoxName.keys()], mcp_servers: [{}] },
+        { type: "stream_event", event: { type: "message_start", message: {
+          id: "msg_rejected", model: MODEL, role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } } },
+        { type: "stream_event", event: { type: "content_block_start", index: 0,
+          content_block: { type: "tool_use", id: "toolu_rejected", name: "Bash tool", input: {} } } },
+      ];
+      const spool = Buffer.from(bad.map((line) => JSON.stringify(line) + "\n").join(""));
+      const offset = Number(args[7]); assert.equal(offset, 0, "BOX_TOOL_SPOOL_START");
+      return { stdout: JSON.stringify({ data: spool.toString("base64"), offset: spool.length }), stderrBytes: 0, exitCode: 0 as const };
+    }
+    if (args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-")
+      && args[5] === `/tmp/ocv5-289-run-${nonce}`) {
+      const row = await client.query("SELECT ctx FROM request_finalize_journal WHERE request_id='gate-tool-rejected'");
+      assert.equal((row.rows[0]?.ctx as Record<string, unknown>)?.boxLaunchPermit, true, "BOX_TOOL_REAL_LAUNCH_PERMIT");
+      inspectStaged(); counts.launch++;
+      return { stdout: "launched\n", stderrBytes: 0, exitCode: 0 as const };
+    }
+    if (nonce && exact(req, keeperMod.makeBoxKeeperStop(nonce, epoch))) {
+      const row = await client.query("SELECT ctx FROM request_finalize_journal WHERE request_id='gate-tool-rejected'");
+      assert.ok((row.rows[0]?.ctx as Record<string, unknown>)?.boxCancelIntent, "BOX_TOOL_CANCEL_BEFORE_REMOTE_STOP");
+      counts.stop++; stopped = true;
+      return { stdout: "stop-requested\n", stderrBytes: 0, exitCode: 0 as const };
+    }
+    if (nonce && exact(req, terminalMod.makeBoxTerminalRead(`/tmp/ocv5-289-proof-${nonce}`))) {
+      assert.ok(stopped, "BOX_TOOL_PROOF_BEFORE_STOP"); counts.proof++;
+      return { stdout: JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
+        keeperPid: 101, cliPid: 102, reason: "keeper_stopped", revision: 1 }) + "\n", stderrBytes: 0, exitCode: 0 as const };
+    }
+    if (args[2]?.includes("identity['identityHash']")) { nonce = args[3]!; epoch = args[4]!; }
+    return executeStage(req);
+  };
+  const target = { accountId, exec: { run: remote }, dispose: async () => { counts.disposed++; } };
+  const coordinator = new stopMod.BoxUserStopCoordinator({ journal,
+    resolver: { resolve: async (args) => { assert.equal(args.requiredAccountId, accountId); return target; } }, proofWaitMs: 0 });
+  const prepare = async (requestId: string, currentTurn: string) => {
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,container_id,state,ctx,precheck_credits) VALUES ($1,$2,$3,'inflight',$4::jsonb,0)`,
+    [requestId, uid.toString(), containerId.toString(), JSON.stringify({ model,
+      boxInvocationRecovery: "v1", billingPricing: { v: 1, modelId: model, displayName: "Opus",
+        inputPerMtok: "1", outputPerMtok: "1", cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" },
+      boxBillingContext: billingMod.serializeBoxBillingContext({ sessionId, turnKey: currentTurn }) })]);
+  };
+  await client.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'gate-tool@test.invalid','unused',10000)", [uid.toString()]);
+  await prepare("gate-tool-rejected", turnKey);
+  const financial = () => client.query(`SELECT
+    (SELECT COUNT(*)::text FROM usage_records) AS usage,
+    (SELECT COUNT(*)::text FROM credit_ledger) AS ledger,
+    (SELECT credits::text FROM users WHERE id=$1) AS wallet`, [uid.toString()]);
+  const before = await financial();
+  let rejection: unknown;
+  try {
+    await first.runBoxToolFirstRound({ uid, sessionId, requestId: "gate-tool-rejected",
+      canonicalModel: model, canonicalBody: body, upstreamModel: MODEL,
+      url: upstreamMod.BOX_INTERNAL_ENDPOINT, init: { method: "POST", body: JSON.stringify({ ...body, model: MODEL }) },
+      emit: () => {}, onLaunchAck: () => { counts.ack++; } }, {
+      supervisorAsset: readFileSync(join(root, "scripts/ocv5-289/box_supervisor.py")),
+      keeperAsset: readFileSync(join(root, "scripts/ocv5-289/box_keeper.py")),
+      virtualMcpAsset: readFileSync(join(root, "scripts/ocv5-289/box_virtual_mcp.py")),
+      detachedRunnerAsset: readFileSync(join(root, "scripts/ocv5-289/box_detached_runner.py")),
+      toolAliasMode: "natural", journal, maxOutputTokensForModel: () => 128_000,
+      resolveTarget: async () => target, onUnknown: async () => { counts.unknown++; },
+      retainUnknownTarget: () => { counts.retained++; }, retainCleanupTarget: () => { counts.retained++; },
+      stopRejectedRun: async (identity) => { counts.coordinator++; return coordinator.requestStop(identity); },
+    });
+  } catch (error) { rejection = error; }
+  assert.ok(rejection instanceof first.BoxToolFirstRoundError && rejection.code === "BOX_TOOL_NAME_UNAVAILABLE",
+    `BOX_TOOL_FIRSTROUND_PROVEN_STOP: ${rejection instanceof Error ? rejection.message : String(rejection)}`);
+  const settled = await client.query("SELECT state,final_credits::text,ctx FROM request_finalize_journal WHERE request_id='gate-tool-rejected'");
+  assert.equal(settled.rows[0]?.state, "aborted", "BOX_TOOL_STOP_STATE");
+  assert.equal(settled.rows[0]?.final_credits, "0", "BOX_TOOL_ZERO_CHARGE");
+  assert.equal((settled.rows[0]?.ctx as Record<string, unknown>)?.boxState, "failed_stopped", "BOX_TOOL_FAILED_STOPPED");
+  assert.deepEqual((await financial()).rows, before.rows, "BOX_TOOL_FINANCIAL_UNCHANGED");
+  const idle = await journal.readIdleProof({ uid, containerId, sessionId, turnKey });
+  assert.equal(idle.status, "failed", "BOX_TOOL_IDLE_FAILED");
+  if (idle.status === "failed") assert.deepEqual(idle.requestIds, ["gate-tool-rejected"]);
+  const nextBody = { ...body, metadata: { user_id: JSON.stringify({ session_id: sessionId, oc_turn_key: "f".repeat(64) }) },
+    messages: [{ role: "user", content: "a new independent turn" }] };
+  await prepare("gate-tool-next", "f".repeat(64));
+  await journal.admit({ requestId: "gate-tool-next", uid, accountId, model, canonicalBody: nextBody,
+    fingerprint: fingerprintMod.deriveBoxCallFingerprint(uid, nextBody),
+    runNonce: randomBytes(12).toString("hex"), leaseEpoch: randomBytes(16).toString("hex"),
+    invocationMode: "detached_tool", contextHash: fingerprintMod.deriveBoxContextHash(nextBody),
+    catalogHash: catalog.bindingSha256, detachedRunnerHash: RUNNER_HASH });
+  const next = await client.query("SELECT ctx->>'boxState' AS box FROM request_finalize_journal WHERE request_id='gate-tool-next'");
+  assert.equal(next.rows[0]?.box, "reserved", "BOX_TOOL_NEXT_REAL_ADMISSION");
+  assert.deepEqual({ ...counts, stage: 0 }, { stage: 0, launch: 1, spool: 1, stop: 1, proof: 1,
+    coordinator: 1, unknown: 0, retained: 0, disposed: 2, ack: 1 }, "BOX_TOOL_CALL_COUNTS");
+  assert.ok(counts.stage > 4 && requests.length === counts.stage, "BOX_TOOL_ACTUAL_STAGE_COUNT");
+  identityUnchanged();
+  emit(`box success recovery gate: tool-name receipt ${JSON.stringify({ counts, requests, idle: idle.status, next: next.rows[0]?.box,
+    financialBefore: before.rows, financialAfter: (await financial()).rows, transport: "isolated filesystem; controlled paid CLI/spool/keeper" })}`);
+  emit(BEHAVIOR[2]!);
+}
+
 
 async function runBusiness(root: string, ledger: string, db: DbConfig): Promise<void> {
   const product = await Promise.all([
@@ -683,6 +933,7 @@ async function runBusiness(root: string, ledger: string, db: DbConfig): Promise<
     assert.deepEqual(writes, ["gate-ok"]);
     emit(BEHAVIOR[0]!);
     emit(BEHAVIOR[1]!);
+    await runToolNameBusiness(root, client!, capsuleParent);
   } finally {
     try { client?.release(); } catch { /* already released */ }
     if (pool) await pool.end();

@@ -319,6 +319,26 @@ async function holdIgnoreExit(): Promise<void> {
   }
 }
 
+async function toolNameReceipt(): Promise<void> {
+  const sha = process.argv[3] ?? "";
+  const dsn = process.env.OC_V5_PROOF_TEST_DATABASE_URL ?? process.env.TEST_DATABASE_URL;
+  if (!/^[0-9a-f]{40}$/.test(sha) || !dsn) fail("tool-name explicit sha/test DSN required");
+  const ran = spawnSync(process.execPath, ["--import", LOADER, GATE, "--candidate-sha", sha], {
+    encoding: "utf8", env: { ...baseEnv(), TEST_DATABASE_URL: dsn }, timeout: 96_000,
+  });
+  process.stdout.write(ran.stdout ?? ""); process.stderr.write(ran.stderr ?? "");
+  if (ran.error || ran.status !== 0) fail(`tool-name formal gate exit ${ran.status}`);
+  const receipt = /box success recovery gate: tool-name receipt (\{[^\n]+\})/.exec(ran.stdout ?? "");
+  if (!receipt) fail("tool-name actual receipt missing");
+  const value = JSON.parse(receipt[1]!) as { counts: { stage: number; launch: number; stop: number; proof: number; coordinator: number }; requests: { digest: string; namespace: string }[]; idle: string; next: string; financialBefore: unknown; financialAfter: unknown };
+  if (value.counts.stage < 5 || value.counts.launch !== 1 || value.counts.stop !== 1 || value.counts.proof !== 1 || value.counts.coordinator !== 1
+    || value.idle !== "failed" || value.next !== "reserved"
+    || value.requests.length !== value.counts.stage
+    || value.requests.some((r) => !/^[0-9a-f]{64}$/.test(r.digest) || !/^mnt:\[\d+\]$/.test(r.namespace))
+    || JSON.stringify(value.financialBefore) !== JSON.stringify(value.financialAfter)) fail("tool-name business receipt invalid");
+  process.stdout.write("box success recovery selftest: PASS tool-name continuous actual PG/stage/stop/idle/admission\n");
+}
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "--local";
   if (mode === "--supervise-hold") {
@@ -347,6 +367,10 @@ async function main(): Promise<void> {
       process.stderr.write(`${error instanceof Error ? error.message : error}\n`);
       process.exit(1);
     }
+  }
+  if (mode === "--tool-name") {
+    await toolNameReceipt();
+    return;
   }
   if (mode === "--stage-fault") {
     await stageFault();
