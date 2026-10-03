@@ -3831,6 +3831,9 @@ await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底
           ? Object.fromEntries(Object.entries(window.__liveUnits).map(([k, v]) => [k, Boolean(v?.started)]))
           : null,
         roots: document.querySelectorAll("[data-testid^=\"live-units\"]").length,
+        olderMarkers: Object.fromEntries(["follow", "away", "gesture"].map((mode) => [
+          mode, document.querySelectorAll(`[data-testid="live-units-${mode}"] [data-find-member="older-${mode}"]`).length,
+        ])),
         text: (document.body?.innerText || "").slice(0, 400),
       }));
       throw new Error(`${err.message} diag=${JSON.stringify(diag)}`);
@@ -3863,7 +3866,7 @@ await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底
           clientHeight: scroller.clientHeight,
           distance: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight,
           following: window.__liveUnits[which].following(),
-          button: Boolean(scroller.querySelector("button")?.textContent?.includes("加载更早的处理步骤")),
+          button: [...scroller.querySelectorAll("button")].some((button) => button.textContent?.includes("加载更早的处理步骤")),
         };
       }, mode);
     }
@@ -3935,6 +3938,7 @@ await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底
     if (Math.abs(awayDelta) > 1) {
       throw new Error(`T69 离底前插位移 ${awayDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify(away)}`);
     }
+    if (away.after.button) throw new Error("T69 离底仍出现手动加载更早按钮");
     if (away.after.following !== false) {
       throw new Error(`T69 离底补页后被拉回跟随: ${JSON.stringify(away.after)}`);
     }
