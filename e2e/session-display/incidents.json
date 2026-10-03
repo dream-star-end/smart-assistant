@@ -5606,12 +5606,12 @@
       "regressions": [
         {
           "layer": "unit",
-          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
           "assertion": "allows automatic checkpoint continuation for the live tape"
         },
         {
           "layer": "unit",
-          "path": "packages/protocol/src/__tests__/turnErrorTaxonomy.test.ts",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
           "assertion": "keeps any open tool, delegate or permission on the manual path"
         },
         {
