@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../../packages/commercial/dist-types/ocv5-308-operator",
+    "tsBuildInfoFile": "../../packages/commercial/dist-types/ocv5-308-operator/.tsbuildinfo"
+  },
+  "include": [
+    "model-release-operator.ts"
+  ]
+}
