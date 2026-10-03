@@ -828,7 +828,13 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
     const { context_management: _hint, ...rest } = body;
     semanticBody = rest as ProxyBody;
   }
-  semanticBody = foldBoxCcbSkillBody(stripBoxCcbToolBudgetTail(semanticBody));
+  // OCV5-317 (#b6df9aee): CCB 2.1.280 puts the `<total_tokens>` budget system
+  // tail right after a Skill step's results. That tail is only recognized next
+  // to a pure tool_result message, so the Skill body must be folded first; the
+  // second pass then strips the tail. The first pass keeps hook/caption tails
+  // folded before the Skill fold can claim their text.
+  semanticBody = stripBoxCcbToolBudgetTail(
+    foldBoxCcbSkillBody(stripBoxCcbToolBudgetTail(semanticBody)));
   // Opus 5.5 defaults adaptive display to "omitted". The actual Box CLI plan
   // maps both request forms to the same effort and response behavior; normalize
   // only this verified equivalence so a retry/continuation cannot evade its
