@@ -5680,6 +5680,26 @@
           "assertion": "OCV5-322 empty automatic recovery attempt 3 stops"
         }
       ]
+    },
+    {
+      "id": "INC-20261004-BOX-RESUME-UNSENT-PARKED",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "线上（v5-2d8b60e30 上线后，2026-10-03 16:00Z / 台北 00:00）：会话 webmusk512gnvx22z 全能助手 Box Claude Opus。第 32 轮工具结果恢复发布已写入 claim，随后解析 Box 目标失败（BOX_TARGET_UNAVAILABLE / SandProvisionError:REQUEST_FAILED），一次 exec 都没跑。该叶子被标为 unknown（resume_publish_unknown），但 keeper/supervisor/CLI 仍活着，在等一份永远不会再发布的工具结果。直到 4 小时 supervisor 截止前，这个 run 一直占着会话的 Box 槽：CCB 重试（『模型繁忙，正在重试中』）45 秒后得到 409 BOX_CAPACITY_HELD，回合以 upstream_failed 结束。它也让 idle proof 一直 pending，自动续接和之后每条消息都被 IDLE_HISTORY_PENDING 拒绝（『消息未开始处理，已确认未计费』）。修复：未解析到目标即失败的发布记为 resume_publish_unsent。清理 worker 读不到 proof 时，对 unsent 叶子（10 秒后）和普通 resume_publish_unknown 叶子（20 分钟后）先在 journal 写停止意图，再请原 nonce/epoch keeper 停止，读到它自己的终止 proof 后走既有 markToolChainStoppedFailure 关链，释放槽位并让 idle proof 变为 failed。",
+      "rootFixCommit": "cf9ae2ae",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "unsent resume leaf: intent, keeper stop, proof, then the existing chain CAS"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxStaleResumeStop.integ.test.ts",
+          "assertion": "stale resume leaves are listed with phase and age and take one stop intent"
+        }
+      ]
     }
   ]
 }
