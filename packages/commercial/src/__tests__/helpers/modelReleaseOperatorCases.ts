@@ -291,6 +291,9 @@ async function privateCli(args: string[], options: { limitOutput?: boolean; nonR
     'printf "%s\\n" "$(readlink /proc/self/ns/mnt)" > "$CB_TRACE.ns"',
     'cat /proc/self/mountinfo > "$CB_TRACE.mountinfo.before"',
     '! grep -Eq " (shared|master):" /proc/self/mountinfo',
+    // Keep the exact running binary inode readable before overlaying /opt.
+    // setup-node places it under /opt/hostedtoolcache on hosted CI.
+    'exec {fixture_node_fd}<"$CB_NODE"',
     // Cover existing parents before any mkdir; namespace != filesystem isolation.
     'mount -t tmpfs -o mode=755,size=16m tmpfs /run',
     'mount -t tmpfs -o mode=755,size=32m tmpfs /opt',
@@ -304,7 +307,8 @@ async function privateCli(args: string[], options: { limitOutput?: boolean; nonR
     'mount --bind "$CB_MANIFEST" /opt/ocv5308-cli/ops/ocv5-308/model-release-manifest.json',
     'mount --bind "$CB_SQL" /opt/ocv5308-cli/packages/commercial/src/db/migrations/0293_commercial_new_models_prepare.sql',
     'mount --bind "$CB_MODULES" /opt/ocv5308-cli/node_modules',
-    'mount --bind "$CB_NODE" /opt/ocv5308-cli/node',
+    'mount --bind "/proc/$$/fd/$fixture_node_fd" /opt/ocv5308-cli/node',
+    'exec {fixture_node_fd}<&-',
     'if [ "$CB_LIMIT_OUTPUT" = 1 ]; then mkdir /run/ocv5308-output; mount -t tmpfs -o mode=755,size=4096 tmpfs /run/ocv5308-output; fi',
     'cat /proc/self/mountinfo > "$CB_TRACE.mountinfo.after"',
     'if [ "$CB_NONROOT" = 1 ]; then exec setpriv --reuid 65534 --regid 65534 --clear-groups /opt/ocv5308-cli/node /opt/ocv5308-cli/ops/ocv5-308/model-release-operator.mjs "$@"; fi',
@@ -334,7 +338,9 @@ async function privateCli(args: string[], options: { limitOutput?: boolean; nonR
   const beforeMounts=await readFile(trace+".mountinfo.before","utf8");
   assert.equal(/ (?:shared|master):/.test(beforeMounts),false,"mount propagation must be private BEFORE mounting");
   assert.equal(await readFile("/proc/self/mountinfo","utf8"),parent,"host mount topology unchanged");
-  const afterMounts=await readFile(trace+".mountinfo.after","utf8");
+  const afterMounts=await readFile(trace+".mountinfo.after","utf8").catch((cause: unknown) => {
+    throw new Error(`namespace CLI preparation did not complete (exit=${code}): ${stderr}`, {cause});
+  });
   console.log("OPERATOR_NAMESPACE_EVIDENCE "+JSON.stringify({
     childNamespace,parentNamespace,privatePropagation:true,hostUnchanged:true,
     beforeSha256:createHash("sha256").update(beforeMounts).digest("hex"),
