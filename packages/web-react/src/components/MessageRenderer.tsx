@@ -926,6 +926,15 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     // A cleared goal is not a row, a count, or a shell. Skipping it must not
     // seal the current process or move the owner/page boundary.
     if (rows.length > 0 && rows.every(isClearedGoalRecord)) continue;
+    // OCV5-320: a current goal (active / paused / blocked echo) lives in the
+    // composer dock and paints nothing here. Codex goal mode emits one at turn
+    // end, often between the answer and the steps that follow it; treating it
+    // as a top-level row ended the carry and opened a second 已执行 N 个步骤
+    // under the answer. Keep the item but let it touch no shell state.
+    if (rows.length > 0 && rows.every((message) => message.role === "goal" && !isHistoricalGoalRecord(message))) {
+      out.push(item);
+      continue;
+    }
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;

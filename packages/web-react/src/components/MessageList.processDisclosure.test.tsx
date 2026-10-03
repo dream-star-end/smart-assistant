@@ -1146,6 +1146,51 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByTestId("process-goal")).not.toBeInTheDocument();
   });
 
+  // OCV5-320:#0498a304 实况 —— Codex 目标模式在回答之后回写一条进行中的目标(只在输入框上方钉住,
+  // 正文不画),随后又跑了 2 步。这条看不见的目标行不能把步骤挤到回答下面另开一个「已执行 N 个步骤」。
+  test("OCV5-320: 回答后的进行中目标回写不把后续步骤推到回答下面", () => {
+    const bash = (id: string, command: string) => row(id, "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command },
+      _completed: true,
+      output: "ok",
+    });
+    renderList([
+      row("u", "user", "完成 OCV5-308", { status: "replied" }),
+      bash("before", "probe-before"),
+      row("answer", "assistant", "OCV5-308 已处理完", { _clientMessageId: "u" }),
+      row("goal", "goal", "完成 OCV5-308", { _clientMessageId: "u", goalStatus: "active", cleared: false }),
+      bash("after-1", "probe-after-1"),
+      bash("after-2", "probe-after-2"),
+    ]);
+    const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells).toHaveLength(1);
+    const answerRow = screen.getByText("OCV5-308 已处理完").closest("[data-testid=assistant-row]");
+    expect(answerRow).not.toBeNull();
+    expect(shells[0]!.compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/probe-before[\s\S]*probe-after-1[\s\S]*probe-after-2/);
+  });
+
+  test("OCV5-320: 进行中轮次里的目标回写不把过程拆成两节", () => {
+    const bash = (id: string, command: string) => row(id, "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command },
+      _completed: true,
+      output: "ok",
+    });
+    renderList([
+      row("u", "user", "完成 OCV5-308", { status: "sent" }),
+      bash("one", "probe-one"),
+      row("goal", "goal", "完成 OCV5-308", { _clientMessageId: "u", goalStatus: "active", cleared: false }),
+      bash("two", "probe-two"),
+    ], { sending: true, turnActivity: { startedAt: Date.now(), agentName: "助手" } });
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+  });
+
   test("进行中的目标和待确认不收进过程，普通句子里的目标二字也不当目标卡", () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
