@@ -4796,13 +4796,14 @@
       "rootFixCommit": "fc121930",
       "coverageCommits": [
         "fc121930",
-        "d4206e71"
+        "d4206e71",
+        "ad130c36"
       ],
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
-          "assertion": "钉在输入框上方的卡片右侧有修改和立即发送，不把排队消息画进对话"
+          "assertion": "钉在输入框上方的卡片右侧是修改、删除、立即发送三个图标按钮，不把排队消息画进对话"
         },
         {
           "layer": "unit",
