@@ -301,10 +301,92 @@ export function allowUnsafeAutomaticCheckpoint(input: {
   leftoverBacked: boolean
   records: readonly unknown[]
 }): boolean {
+  if (modelPlaneFailureAfterSettledTools(input.errorCode, input.records)) return true
   if (hasMeaningfulAutomaticRecoveryProgress(input.records)) return false
   if (input.status === 'completed') return true
   return input.leftoverBacked &&
     normalizeTurnErrorCode(input.errorCode) === 'service_restart'
+}
+
+/** OCV5-317 (#b6df9aee): a model call that fails *between* tool steps leaves
+ * every tool finished and its result in the native session. A checkpoint
+ * continuation never re-runs those tools: the resume prompt starts a new model
+ * call over the persisted results and requires an observable-state check
+ * before any repeated write. Requiring per-tool effect proof here sent every
+ * Box Claude turn that had used Bash to a manual 「从断点继续」 card.
+ * Only model-plane failures qualify (runner loss/restart keep their own
+ * rules), and only when no tool, delegate or permission is still open. */
+const MODEL_PLANE_CHECKPOINT_CODES = new Set([
+  'upstream_failed',
+  'upstream_error',
+  'upstream_timeout',
+  'network_error',
+  'rate_limited',
+  'model_capacity',
+  'engine_error',
+])
+
+function topLevelNonTerminal(row: Record<string, unknown>): boolean {
+  for (const key of ['kind', 'status', 'outcome']) {
+    const value = row[key]
+    if (typeof value === 'string' && NON_TERMINAL_RECOVERY_STATES.has(value.toLowerCase())) {
+      return true
+    }
+  }
+  return false
+}
+
+function childToolsSettled(value: unknown): boolean {
+  if (!Array.isArray(value)) return true
+  return value.every((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return true
+    const child = item as Record<string, unknown>
+    if (child.kind === 'tool_use' && (child._completed !== true || topLevelNonTerminal(child))) {
+      return false
+    }
+    return childToolsSettled(child.childBlocks)
+  })
+}
+
+/** Checkpoints admitted only by modelPlaneFailureAfterSettledTools get a
+ * shorter automatic budget: a failure that repeats on a fresh continuation
+ * call is deterministic, and the user should see the card instead of ten
+ * automatic bubbles. */
+export const SETTLED_TOOLS_CHECKPOINT_RETRY_MAX = 3
+
+export function modelPlaneFailureAfterSettledTools(
+  errorCode: string,
+  records: readonly unknown[],
+): boolean {
+  if (!MODEL_PLANE_CHECKPOINT_CODES.has(normalizeTurnErrorCode(errorCode))) return false
+  const observed = new Set<string>()
+  const settled = new Set<string>()
+  let sawTool = false
+  for (const raw of records) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const record = raw as Record<string, unknown>
+    const role = record.role
+    if (role === 'tool') {
+      sawTool = true
+      const id = toolObservationId(record)
+      if (!id || record._completed !== true || topLevelNonTerminal(record)) return false
+      settled.add(id)
+    } else if (role === 'agent-group' || role === 'delegate-progress') {
+      sawTool = true
+      if (record._completed !== true || topLevelNonTerminal(record) ||
+        !childToolsSettled(record.childBlocks)) return false
+    } else if (role === 'permission') {
+      if (record._resolved !== true) return false
+    } else if (role === 'runtime-event') {
+      if (topLevelNonTerminal(record)) return false
+    }
+    if (record.kind === 'tool_use' || record.type === 'tool_use') {
+      const id = toolObservationId(record)
+      if (!id) return false
+      observed.add(id)
+    }
+  }
+  return sawTool && [...observed].every((id) => settled.has(id))
 }
 
 /** Call this *before* the `checkpoint && !checkpointSafe` bypass.
