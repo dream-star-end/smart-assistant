@@ -85,7 +85,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
   const cssName = readdirSync(cssDir).find((name) => name.endsWith(".css"));
   writeFileSync(join(assetDir, "styles.css"), readFileSync(join(cssDir, cssName)));
 
-  const preview = await startPreviewServer(assetDir);
+  const preview = await startPreviewServer(assetDir, { holdWarningFinal: true });
   const browser = await chromium.launch({
     executablePath: resolveBrowserExecutable(),
     headless: true,
@@ -390,6 +390,11 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       const beforeSend = preview.stats.inboundMessages.length;
       await sendText(desktop.page, "把南仓预警补进同一张看板");
       await waitUntil("composer inbound", () => preview.stats.inboundMessages.length > beforeSend);
+      const warningInbounds = preview.stats.inboundMessages.slice(beforeSend).filter((frame) =>
+        frame.peer?.id === BOARD_SESSION && frame.content?.text === "把南仓预警补进同一张看板");
+      assert.equal(warningInbounds.length, 1, "warning turn must have one actual inbound identity");
+      const warningInbound = warningInbounds[0];
+      assert.ok(warningInbound.clientMessageId, "warning inbound has no clientMessageId");
       await desktop.page.getByText("南仓预警已补进看板").waitFor();
       await desktop.page.getByText("预警段落-02").waitFor();
       assert.equal(await desktop.page.getByText("预警段落-08").count(), 0, "later token arrived before the scroll sample");
@@ -459,6 +464,9 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
         return !!el && el.scrollHeight - el.scrollTop - el.clientHeight < 90;
       });
       await desktop.page.screenshot({ path: join(shots, "ocv5-265-e2e-stream-answer.png") });
+      assert.equal(preview.releaseWarningFinal(BOARD_SESSION, warningInbound.clientMessageId), true);
+      assert.equal(preview.releaseWarningFinal(BOARD_SESSION, warningInbound.clientMessageId), false, "final release repeated");
+      assert.equal(preview.pendingWarningFinalCount(), 0, "warning final gate leaked");
       await desktop.page.getByRole("button", { name: "发送" }).waitFor({ timeout: 20_000 });
       assert.equal(await liveToggle.getAttribute("aria-expanded"), "false", "finished turn stayed expanded without an explicit open");
       const finishedAnswer = await desktop.page.getByText("南仓预警已补进看板").evaluate((el) => ({
@@ -873,6 +881,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       evidence,
     }, null, 2));
   } finally {
+    preview.clearWarningFinals();
     await browser.close();
     await new Promise((done) => preview.server.close(done));
   }

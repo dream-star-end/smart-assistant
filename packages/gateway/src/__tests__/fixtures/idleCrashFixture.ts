@@ -75,8 +75,11 @@ export function saveIdleCheckpoint(home: string, root: string, sessionKey: strin
     const rel = relative(home, file);
     assert.ok(!rel.startsWith(".."));
     mkdirSync(dirname(join(root, rel)), { recursive: true });
-    cpSync(file, join(root, rel));
-    return { relative: rel, sha256: createHash("sha256").update(readFileSync(file)).digest("hex") };
+    // The live runner may append after this read. Receipt and saved bytes must
+    // describe the same observation, not a second read of the live file.
+    const bytes = readFileSync(file);
+    writeFileSync(join(root, rel), bytes);
+    return { relative: rel, sha256: createHash("sha256").update(bytes).digest("hex") };
   });
   const result = { root, home, files: saved, directories };
   writeFileSync(join(root, "manifest.json"), JSON.stringify(result, null, 2));

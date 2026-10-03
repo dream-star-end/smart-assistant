@@ -10,7 +10,7 @@ import { assertTestDatabaseUrl, assertConnectedTestDatabase } from "../../../../
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign as cryptoSign } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
@@ -20,6 +20,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { IDLE_COMPACT_PROMPT, writeIdleCandidate, writeIdleNative } from "../../boxIdleCompact.js";
 import { _setModelCatalogClientForTests } from "../../modelCatalogClient.js";
+import { mintIdleUserAuthority, type IdleAuthorityRecord } from "./idleAuthorityFixture.js";
 import { installIdleFaultFixture, armIdleFault, saveIdleCheckpoint, restoreIdleCheckpoint,
    captureIdleTranscript, readRecoveredConversation, assertRecoveredContent, type IdleCheckpoint } from "./idleCrashFixture.js";
 
@@ -706,12 +707,11 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
     const { SessionManager } = await import("../../sessionManager.js");
     const { CcbAdapter } = await import("../../engine/ccbAdapter.js");
     const { setV3MasterSinkSingleton } = await import("../../v3MasterSink.js");
-    const protocol = await import("@openclaude/protocol");
+
     setV3MasterSinkSingleton({
       persistOrQueue: async () => ({ ok: true }),
       attemptOnce: async () => { throw new Error("unused"); },
     } as never);
-    const authority = signAuthority(protocol, privateKey, keyId);
     const work = join(HOME, "work");
     mkdirSync(work);
     const adapterConfig = {
@@ -747,14 +747,13 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       defaults: { permissionMode: "bypassPermissions", model: MODEL },
     } as never);
     const onEvent = (event: { kind?: string }) => { events.push(event.kind ?? "unknown"); };
-    const modelAuthority = {
-      authorityEnvelope: authority.authority,
-      leaseEnvelope: authority.lease,
-      executionDescriptor: {
-        canonicalModel: MODEL, contextWindow: 200_000, capabilityZero: true,
-        supportsThinking: false, supportsVision: false, supportedEfforts: [],
-        contextOwner: "box-native-v1" as const,
-      },
+    const authorityRecords: Array<IdleAuthorityRecord & { source: string }> = [];
+    report.userAuthorities = authorityRecords;
+    // One signature pair per new inbound; CCB's internal live continuation retains it.
+    const newModelAuthority = (source: string) => {
+      const minted = mintIdleUserAuthority(privateKey, keyId, MODEL);
+      authorityRecords.push({ source, ...minted.record });
+      return minted.modelAuthority;
     };
     if (mode === "short" || mode === "defaultLow" || mode === "defaultHigh") {
     const adapter = new CcbAdapter({
@@ -792,7 +791,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
     } as never;
     let firstError: string | undefined;
     try {
-      await sm.submit(session, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+      await sm.submit(session, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-input") });
     } catch (error) {
       firstError = error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
     }
@@ -829,7 +828,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
     let secondSubmitError: unknown;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        await sm.submit(session, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+        await sm.submit(session, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary next") });
         secondSubmitError = undefined;
         break;
       } catch (error) {
@@ -955,7 +954,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       const beforeFresh = hits.length;
       let freshError = "";
       try {
-        await sm.submit(freshSession, "ordinary leaf", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+        await sm.submit(freshSession, "ordinary leaf", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary leaf") });
       } catch (error) {
         freshError = error instanceof Error ? error.message : String(error);
       }
@@ -997,7 +996,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       const blockedAt = hits.filter((hit) => hit.url === "/v1/messages").length;
       let blockedError = "";
       try {
-        await sm.submit(freshSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+        await sm.submit(freshSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("blocked-user") });
       } catch (error) {
         blockedError = error instanceof Error ? error.message : String(error);
       }
@@ -1020,7 +1019,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       }
       assert.equal(settled, true, "held request ids did not become committed usage");
       const beforeNext = hits.length;
-      await sm.submit(freshSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+      await sm.submit(freshSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary next") });
       const nextHits = hits.slice(beforeNext);
       const nextModel = nextHits.filter((hit) => hit.url === "/v1/messages");
       report.nextHits = nextModel.map((hit) => ({
@@ -1116,7 +1115,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         executionTarget: { kind: "local" }, providerTag: "ccb",
       } as never;
       adapterShutdown = () => sourceAdapter.shutdown();
-      await sm.submit(sourceSession, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+      await sm.submit(sourceSession, "c".repeat(6000), onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-input") });
       const sourceHit = hits.find((hit) => hit.url === "/v1/messages");
       report.sourceCred = sourceHit?.cred ?? null;
       report.sourceStatus = sourceHit?.status ?? null;
@@ -1369,7 +1368,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       const before = hits.length;
       let liveError = "";
       let submitDone = false;
-      const submitPromise = sm.submit(liveSession, "grow", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority })
+      const submitPromise = sm.submit(liveSession, "grow", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("grow") })
         .then(() => { submitDone = true; }, (error) => {
           liveError = error instanceof Error ? error.message : String(error);
           submitDone = true;
@@ -1397,7 +1396,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         assert.equal(hits.filter((hit) => hit.summary).length, 0);
         const beforeSourceBlocked = hits.length;
         let sourceBlocked = "";
-        try { await sm.submit(liveSession, "source-pending-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority }); }
+        try { await sm.submit(liveSession, "source-pending-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("source-pending-user") }); }
         catch (error) { sourceBlocked = error instanceof Error ? error.message : String(error); }
         assert.match(sourceBlocked, /IDLE_HISTORY_PENDING/);
         assert.equal(hits.slice(beforeSourceBlocked).filter((hit) => hit.url === "/v1/messages").length, 0);
@@ -1406,7 +1405,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         report.sourceCommitted = sourceRequestId;
         // Re-enter through the normal same-session consumer. No helper call to
         // finishIdleUnderLock and no hand-written op or summary.
-        const recovery = sm.submit(liveSession, "resume-after-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority })
+        const recovery = sm.submit(liveSession, "resume-after-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("resume-after-source") })
           .then(() => "ok", (error) => error instanceof Error ? error.message : String(error));
         await until(() => heldCommits.length > 0, 120_000, "summary COMMIT after source recovery");
         assert.equal(heldKinds.at(-1), "summary");
@@ -1429,7 +1428,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
           : { rows: [{ usage_n: "missing-request-id", state: null }] };
         const httpAtHold = hits.filter((hit) => hit.url === "/v1/messages").length;
         let blockedText = "";
-        const blockedPromise = sm.submit(liveSession, "barrier-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority })
+        const blockedPromise = sm.submit(liveSession, "barrier-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("barrier-user") })
           .then(() => "ok", (error) => {
             blockedText = error instanceof Error ? error.message : String(error);
             return blockedText;
@@ -1568,7 +1567,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
           const blockedAt = hits.filter((hit) => hit.url === "/v1/messages").length;
           let blocked = "";
           try {
-            await sm.submit(liveSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+            await sm.submit(liveSession, "blocked-user", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("blocked-user") });
           } catch (error) {
             blocked = error instanceof Error ? error.message : String(error);
           }
@@ -1587,7 +1586,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         let nextError = "";
         for (let attempt = 0; attempt < 5; attempt += 1) {
           try {
-            await sm.submit(liveSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+            await sm.submit(liveSession, "ordinary next", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("ordinary next") });
             nextError = "";
             break;
           } catch (error) {
@@ -1664,7 +1663,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         let secondError = "";
         for (let attempt = 0; attempt < 8; attempt += 1) {
           try {
-            await sm.submit(liveSession, "second-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+            await sm.submit(liveSession, "second-source", onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority("second-source") });
             secondError = "";
             break;
           } catch (error) {
@@ -1716,7 +1715,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
           await coldRunner();
           const startHits = hits.length;
           const usageBefore = Number((await pool.query("SELECT count(*)::int AS n FROM usage_records")).rows[0].n);
-          const interrupted = sm.submit(liveSession, `crash-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority })
+          const interrupted = sm.submit(liveSession, `crash-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority(`crash-${windowName}`) })
             .then(() => "unexpected-success", (error) => error instanceof Error ? error.message : String(error));
           await until(() => existsSync(join(faultControl, "reached.json")), 90_000, `real ${windowName} cut point`);
           const reached = JSON.parse(readFileSync(join(faultControl, "reached.json"), "utf8"));
@@ -1739,7 +1738,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
           restoreIdleCheckpoint(atFault);
           await coldRunner();
           try {
-            await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority });
+            await sm.submit(liveSession, `recover-${windowName}`, onEvent, undefined, MODEL, undefined, undefined, undefined, { modelAuthority: newModelAuthority(`recover-${windowName}`) });
           } finally {
             captureIdleTranscript(HOME, nativeId, join(rawDir, `ocv5-296-post-user-${windowName}-${SCHEMA.slice(-6)}`));
           }
@@ -2399,37 +2398,4 @@ async function execStage(plan: {
     rmSync(plan.cwd, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   }
-}
-
-type ProtocolModule = typeof import("@openclaude/protocol");
-
-function signAuthority(protocol: Pick<ProtocolModule,
-  "MODEL_AUTHORITY_VERSION" | "AUTHORITY_TTL_MS" | "authoritySigningInput" | "encodeAuthorityEnvelope" | "turnLeaseSigningInput" | "encodeTurnLeaseEnvelope"
->, privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"], keyId: string): { authority: string; lease: string } {
-  const now = Date.now();
-  const expiresAt = now + protocol.AUTHORITY_TTL_MS;
-  const payload: Parameters<ProtocolModule["authoritySigningInput"]>[0] = {
-    v: protocol.MODEL_AUTHORITY_VERSION, keyId, uid: 3, containerId: 7,
-    authorityTurnId: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", connectionChallenge: "chal-idle",
-    canonicalModel: MODEL, engine: "ccb",
-    executionDescriptor: {
-      capabilityProfile: {
-        supportsVision: false,
-        reasoning: { supported: [], codexModelDefault: null },
-        ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" },
-      },
-      capabilitySchemaVersion: 1, contextWindow: 200_000, supportedEfforts: [], supportsVision: false,
-    },
-    executionRevision: "b".repeat(64), securityEpoch: 12,
-    issuedAt: expiresAt - protocol.AUTHORITY_TTL_MS, expiresAt,
-  };
-  const lease: Parameters<ProtocolModule["turnLeaseSigningInput"]>[0] = {
-    v: protocol.MODEL_AUTHORITY_VERSION, keyId, uid: 3, containerId: 7,
-    authorityTurnId: payload.authorityTurnId, canonicalModel: MODEL, securityEpoch: 12,
-    connectionChallenge: "chal-idle", issuedAt: now - 60_000, expiresAt: now + 30 * 60_000,
-  };
-  return {
-    authority: protocol.encodeAuthorityEnvelope(payload, cryptoSign(null, protocol.authoritySigningInput(payload), privateKey)),
-    lease: protocol.encodeTurnLeaseEnvelope(lease, cryptoSign(null, protocol.turnLeaseSigningInput(lease), privateKey)),
-  };
 }

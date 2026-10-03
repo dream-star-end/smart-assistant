@@ -184,7 +184,11 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         assert.notEqual(committed._historyRevision, reloadRevision);
         await page.reload();
         await until("reload hydrates old server error", () => detailResponses > before);
-        await page.getByText("RECOVERY_ORIGINAL_REQUEST", { exact: true }).waitFor();
+        const originalUser = page.getByTestId("user-row").getByTestId("message-text")
+          .filter({ hasText: /^RECOVERY_ORIGINAL_REQUEST$/ });
+        await originalUser.waitFor();
+        assert.equal(await originalUser.count(), 1, "reload renders exactly one original user request");
+        assert.equal(await originalUser.textContent(), "RECOVERY_ORIGINAL_REQUEST");
         await until("reload processed old REST", async () => (await stored(page))?._historyRevision===preview.store.revision);
         if (red) await until("RED observes second child after reload", () => scenario.children.length>=2);
         assert.equal(scenario.children.length, 1, "reload must not submit second recovery child");

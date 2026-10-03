@@ -17,6 +17,70 @@ function execute(request: BoxCcExecRequest) {
     env: request.environment, encoding: "utf8", timeout: 7000, maxBuffer: 128 * 1024 });
 }
 
+// A pipe data event is a byte chunk, not a complete lock receipt.
+function waitForLockLine(holder: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let received = "";
+    const cleanup = () => {
+      clearTimeout(timer);
+      holder.stdout!.off("data", onData);
+      holder.off("error", onError);
+      holder.off("exit", onExit);
+    };
+    const finish = (error?: Error) => {
+      cleanup();
+      if (error) reject(error); else resolve();
+    };
+    const onData = (data: Buffer) => {
+      received += data.toString("utf8");
+      if (received.includes("\n")) {
+        received === "locked\n" ? finish() : finish(new Error("bad lock handshake"));
+      }
+    };
+    const onError = (error: Error) => finish(error);
+    const onExit = (code: number | null) => finish(new Error("lock holder exited " + code));
+    const timer = setTimeout(() => finish(new Error("lock holder did not start")), 2000);
+    holder.stdout!.on("data", onData);
+    holder.once("error", onError);
+    holder.once("exit", onExit);
+  });
+}
+
+function stopHolder(holder: ReturnType<typeof spawn>, signal: NodeJS.Signals): Promise<void> {
+  if (holder.exitCode !== null || holder.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { holder.off("exit", onExit); holder.off("error", onError); };
+    const onExit = () => { cleanup(); resolve(); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    holder.once("exit", onExit);
+    holder.once("error", onError);
+    holder.kill(signal);
+  });
+}
+
+test("lock receipt accepts real split pipe writes and rejects an invalid full line", async () => {
+  for (const [suffix, valid] of [["ed\\n", true], ["ed-invalid\\n", false]] as const) {
+    const holder = spawn(process.execPath, ["-e",
+      "process.stdout.write('lock'); process.stdin.once('data', () => process.stdout.write('" + suffix + "')); setTimeout(() => {}, 10000)"],
+      { stdio: ["pipe", "pipe", "pipe"] });
+    const chunks: string[] = [];
+    const advance = (data: Buffer) => {
+      chunks.push(data.toString("utf8"));
+      if (chunks.length === 1) holder.stdin!.write("next");
+    };
+    holder.stdout!.on("data", advance);
+    try {
+      if (valid) await waitForLockLine(holder);
+      else await assert.rejects(waitForLockLine(holder), /bad lock handshake/);
+      holder.stdout!.off("data", advance);
+      assert.deepEqual(chunks, ["lock", valid ? "ed\n" : "ed-invalid\n"]);
+      assert.equal(holder.stdout!.listenerCount("data"), 0);
+      assert.equal(holder.listenerCount("error"), 0);
+      assert.equal(holder.listenerCount("exit"), 0);
+    } finally { await stopHolder(holder, "SIGKILL"); }
+  }
+});
+
 test("private stage requires the permanent lock identity and CLOSED rejects late Exec", () => {
   const runNonce = randomBytes(12).toString("hex");
   const identity = { runNonce, leaseEpoch: randomBytes(16).toString("hex"),
@@ -120,25 +184,17 @@ test("cross-process lock holder prevents close from passing an active writer", a
     holder = spawn("/usr/bin/python3", ["-u", "-c",
       "import fcntl,os,time,sys; f=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); time.sleep(10)",
       `${controlDir}/lock`], { stdio: ["ignore", "pipe", "pipe"] });
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("lock holder did not start")), 2000);
-      holder!.stdout!.once("data", (data: Buffer) => {
-        clearTimeout(timer);
-        data.toString() === "locked\n" ? resolve() : reject(new Error("bad lock handshake"));
-      });
-      holder!.once("exit", (code) => { clearTimeout(timer);
-        reject(new Error(`lock holder exited ${code}`)); });
-    });
+    await waitForLockLine(holder);
     const began = Date.now();
     const attempt = execute(makeBoxPrelaunchCloseFence(receipt));
     assert.notEqual(attempt.status, 0, "close must not pass a held writer lock");
     assert.ok(Date.now() - began >= 4500, "close must have contended on flock");
     assert.equal(existsSync(`${controlDir}/CLOSED`), false);
-    holder.kill("SIGTERM");
+    await stopHolder(holder, "SIGTERM");
     const after = execute(makeBoxPrelaunchCloseFence(receipt));
     assert.equal(after.status, 0, after.stderr);
   } finally {
-    holder?.kill("SIGKILL");
+    if (holder) await stopHolder(holder, "SIGKILL");
     rmSync(controlDir, { recursive: true, force: true });
   }
 });
