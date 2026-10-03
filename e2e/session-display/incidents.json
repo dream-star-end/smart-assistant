@@ -5655,6 +5655,26 @@
           "assertion": "OCV5-321 settled-tools checkpoint survives leftover live tool frames"
         }
       ]
+    },
+    {
+      "id": "INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #7da201bd/#2a81a2fe（v5-bc4b6f432 上线后，13:03Z）：会话 webmus5cc8xo8xspo 在 09:00 有一轮 Box 工具结果已提交但模型未读到就失败。CCB 丢弃自己的 API Error 行，之后每条用户消息（含自动『从断点继续』提示）都被合并进那条 tool_result 消息（尾形 user:tool_result+text+text…），egress 一律 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，且每次失败再多一个 text 块，会话永久无法继续；master 把每次空的自动续接都当新机会，20 秒内连发 10 次（『模型繁忙，正在重试中 8/10』、两张灰卡、红卡）。修复：已回答的工具交换 + 仅文本尾判为 fresh（answeredToolIds），BoxToolFetch 先证明本回合没有在等这些结果的 handoff、孤儿 handoff 已认领并停止，再以 resumeToolResults 把交换落为历史、文本作为新提示冷启动；空的自动续接再次以模型面错误失败时只给 3 次预算（CLI 自己的 API Error 行不算进展）；停止探针失败原因写日志。",
+      "rootFixCommit": "cafdfc81",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAnsweredExchange.test.ts",
+          "assertion": "with no waiting handoff the prompt runs fresh over the staged exchange"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-322 empty automatic recovery attempt 3 stops"
+        }
+      ]
     }
   ]
 }
