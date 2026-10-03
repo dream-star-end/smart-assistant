@@ -9,6 +9,26 @@
     {
       "engine": "ccb",
       "model": "deepseek-v4-flash"
+    },
+    {
+      "id": "INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "SIDEBAR-R1 发布（rel-83425ac39，06:01Z）前后，Box Claude Opus 5.5 会话每条消息都出『消息未开始处理 / 已确认未计费，请重试』（turn_dispatches 05:58/06:03/06:05Z DISPATCH_NOT_ACCEPTED，容器 IDLE_HISTORY_PENDING）。05:42 该会话的空闲压缩开始：CCB 分叉压缩调用未产出可用摘要，回落到关闭 thinking 的请求，带 temperature:1，被 Box 闸门以 BOX_PARAMETER_UNMAPPED 拒绝（egress 05:43:23）。CCB 把被拒的摘要请求当作正常回合结束，空闲 op 既无摘要也未走异常分支，runner 未关停、无 runnerKilledAt，not_found 证明永远无法结案，会话被钉死直到人工重置（06:02 容器重建也无效）。修复：已派发却无摘要结束的空闲回合同样关停 runner 并记录 runnerKilledAt；早于当前运行时化身（PID 1 启动：容器重建/主机重启）写入的未结 op 以化身启动时间作为关停证据，宽限期后 not_found 结案为 idle_turn_never_sent，不丢原生上下文。",
+      "rootFixCommit": "599ce66b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
+          "assertion": "a normal turn end with no summary shuts the runner down and records it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
+          "assertion": "the incident shape: an op stranded by a previous container settles on the next submit"
+        }
+      ]
     }
   ],
   "incidents": [
