@@ -3120,12 +3120,21 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
       const row = btn.closest("div");
       const duration = row?.querySelector("[data-session-duration]");
       return {
-        hasAccent: Boolean(row?.querySelector(".bg-accent")),
+        // SIDEBAR-R1：选中态 = 浮起卡片（bg-sidebar-active + shadow-sidebar-active），不再是左侧 accent 竖条。
+        isCard:
+          row?.getAttribute("data-active") === "true" &&
+          row.classList.contains("bg-sidebar-active") &&
+          row.classList.contains("shadow-sidebar-active"),
+        cardBg: row ? getComputedStyle(row).backgroundColor : "",
         durationText: duration?.textContent ?? "",
         durationTitle: duration?.getAttribute("title") ?? "",
       };
     });
-    if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    if (!activeState.isCard) throw new Error(`活跃会话缺少选中卡片(${theme}): ${JSON.stringify(activeState)}`);
+    // 真实 CSS 必须把选中面画出来（token 漏定义时会回落透明，卡片隐形）。
+    if (!activeState.cardBg || /rgba\(0, 0, 0, 0\)|transparent/.test(activeState.cardBg)) {
+      throw new Error(`活跃会话选中面是透明的(${theme}): ${activeState.cardBg}`);
+    }
     // 用时改用中文单位（侧栏审计 SR-01：中文界面不混英文缩写 25m/3h/2d），8 分钟 → 「8分」。
     if (activeState.durationText !== "8分" || !activeState.durationTitle.includes("→")) {
       throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
@@ -3133,12 +3142,15 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
       throw new Error(`会话行仍显示最新消息摘要(${theme})`);
     }
-    const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
-      (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
+    const idleCard = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
+      (btn) => btn.closest("div")?.getAttribute("data-active") === "true",
     );
-    if (idleAccent) throw new Error(`空闲会话不应有 accent 竖条(${theme})`);
+    if (idleCard) throw new Error(`空闲会话不应是选中卡片(${theme})`);
 
-    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).getAttribute("class") ?? "";
+    // SIDEBAR-R1：描边 + 实底画在外层卡片 [data-sidebar-new] 上，按钮本身透明铺满。
+    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).evaluate(
+      (btn) => btn.closest("[data-sidebar-new]")?.getAttribute("class") ?? "",
+    );
     if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
       throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
     }

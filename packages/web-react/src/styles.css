@@ -10,6 +10,10 @@
   --color-bg: var(--bg);
   --color-surface: var(--surface);
   --color-sidebar: var(--sidebar);
+  /* 侧栏选中项「浮起卡片」：浅色=白卡 + 发丝描边阴影；深色=半透白面 + 内描边（SIDEBAR-R1）。 */
+  --color-sidebar-active: var(--sidebar-active);
+  --shadow-sidebar-active: var(--sidebar-active-shadow);
+  --shadow-sidebar-btn: var(--sidebar-btn-shadow);
   --color-elevated: var(--elevated);
   --color-hover: var(--hover);
   --color-active: var(--active);
@@ -113,6 +117,9 @@
   --bg: #fafafb;
   --surface: #ffffff;
   --sidebar: #f5f5f8;
+  --sidebar-active: #ffffff;
+  --sidebar-active-shadow: 0 1px 2px rgba(16, 16, 24, 0.06), 0 0 0 1px rgba(16, 16, 24, 0.05);
+  --sidebar-btn-shadow: 0 1px 2px rgba(16, 16, 24, 0.05), 0 1px 0 rgba(255, 255, 255, 0.6) inset;
   --elevated: #ffffff;
   --hover: #15151b0a;
   --active: #15151b14;
@@ -164,6 +171,9 @@
   --bg: #0c0c11;
   --surface: #15151c;
   --sidebar: #09090e;
+  --sidebar-active: #ffffff12;
+  --sidebar-active-shadow: inset 0 0 0 1px #ffffff0a;
+  --sidebar-btn-shadow: inset 0 1px 0 #ffffff0d;
   --elevated: #1c1c25;
   --hover: #ffffff0f;
   --active: #ffffff1a;
@@ -246,6 +256,10 @@ body {
 @layer utilities {
   .no-scrollbar::-webkit-scrollbar { display: none; }
   .no-scrollbar { scrollbar-width: none; }
+  /* 侧栏会话列表上下边缘柔和淡出：滚动内容滑入顶部操作区 / 底栏时不再被一刀切断（SIDEBAR-R1）。 */
+  .sidebar-scroll-fade {
+    mask-image: linear-gradient(to bottom, transparent 0, #000 8px, #000 calc(100% - 16px), transparent 100%);
+  }
   .chat-scroll-area { overflow-anchor: none; /* single-writer: disable browser scroll anchoring */ }
   /* 委派过程卡内 scroller 也单一写手，禁止 overflow-anchor 改 scrollTop。 */
   .delegate-process-scroller { overflow-anchor: none; }
@@ -479,6 +493,9 @@ body {
   --bg: #090a08;
   --surface: #121410;
   --sidebar: #0d0f0c;
+  --sidebar-active: rgba(255, 255, 255, 0.07);
+  --sidebar-active-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --sidebar-btn-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
   --elevated: #171a15;
   --hover: rgba(255, 255, 255, 0.075);
   --active: rgba(255, 255, 255, 0.12);
@@ -627,13 +644,12 @@ body {
     border-radius: 9999px;
     animation: oc-rating-nudge 1.4s ease-in-out 2;
   }
-  /* 侧栏「运行中」状态点呼吸。reduce 偏好下本块不生效 → 常亮 accent 点。 */
+  /* 侧栏「运行中」细线环匀速旋转。reduce 偏好下本块不生效 → 静止缺口环（形状仍与实心点可辨）。 */
   @keyframes oc-session-running {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.28; }
+    to { transform: rotate(360deg); }
   }
   .oc-session-running {
-    animation: oc-session-running 1.4s ease-in-out infinite;
+    animation: oc-session-running 0.9s linear infinite;
   }
 }
 

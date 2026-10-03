@@ -31,18 +31,21 @@ export function BatchBar({
   const disabled = count === 0;
   return (
     <div
-      className="mx-1 mb-1 flex flex-col gap-1 rounded-lg bg-hover px-2 py-1.5 text-caption"
+      // 与顶部「新建会话」同一张浮起卡片语言（发丝描边 + 极轻投影），不再是一块灰底色块（SIDEBAR-R1）。
+      className="mx-2 mb-1.5 flex flex-col gap-0.5 rounded-sm border border-border bg-surface px-1.5 py-1 text-caption shadow-sidebar-btn"
       data-testid="sidebar-batch-bar"
       role="toolbar"
       aria-label="批量操作"
     >
       <div className="flex items-center gap-1">
-        <span className="min-w-0 flex-1 truncate font-medium text-fg">已选 {count} 条</span>
+        <span className="min-w-0 flex-1 truncate pl-1 font-medium text-fg">
+          已选 <span className="tabular-nums text-accent">{count}</span> 条
+        </span>
         <Button
           type="button"
           variant="ghost"
           size="sm"
-          className="h-7 shrink-0 px-2 text-caption"
+          className="h-7 shrink-0 rounded-xs px-2 text-caption"
           onClick={onCancel}
         >
           取消

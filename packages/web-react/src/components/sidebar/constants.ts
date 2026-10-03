@@ -1,8 +1,12 @@
 /** 会话超过此条数（拍平后的 items）才窗口化渲染。测试可经 props 覆盖。 */
 export const VIRTUALIZE_THRESHOLD = 120;
 
-/** 会话行固定为单行（含触控 ≥44px）。 */
-export const SESSION_ROW_HEIGHT = 44;
+/**
+ * 会话行固定为单行。桌面（hover 可用）36px：与 ChatGPT / Linear 同档的紧凑密度，一屏多放约 20% 会话；
+ * 触屏（hover:none）仍保 44px 触控靶（SIDEBAR-R1）。拍平层按 coarsePointer 选档，VirtualList 依 item.height 排位。
+ */
+export const SESSION_ROW_HEIGHT = 36;
+export const SESSION_ROW_HEIGHT_TOUCH = 44;
 
 export const GROUP_HEADER_HEIGHT = 32;
 /**
@@ -10,7 +14,8 @@ export const GROUP_HEADER_HEIGHT = 32;
  * 32px 的标题行装不下会溢出盖住上一行（审计 S-04），拍平层按 item.height 排 offsets 故这里同步加高。
  */
 export const GROUP_HEADER_HEIGHT_TOUCH = 44;
-export const PROJECT_ROW_HEIGHT = 44;
+export const PROJECT_ROW_HEIGHT = 36;
+export const PROJECT_ROW_HEIGHT_TOUCH = 44;
 export const HINT_ROW_HEIGHT = 36;
 export const SEARCH_HIT_HEIGHT = 62;
 
