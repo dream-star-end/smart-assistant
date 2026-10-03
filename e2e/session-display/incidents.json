@@ -5535,6 +5535,46 @@
           "assertion": "继续请求没发出去（无自身错误卡）或自动恢复：已见的失败卡保持可见"
         }
       ]
+    },
+    {
+      "id": "INC-20261003-BOX-PARALLEL-SKILL-BODIES",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #72191544（v5-0d0c1359a，01:14Z）：Box Claude Opus 5.5 在同一步并行调用两个 Skill，Claude Code 为每个 launch 注入一段 SKILL.md 正文；OCV5-303 的折叠只认恰好一个 Skill，两段正文留在 tool_result 消息里，egress 以 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝续接，用户看到『任务执行暂时中断』。修复：多个 Skill 时按每段正文自己的『Base directory for this skill: …/<name>』归到同名 launch（紧跟各自结果、全部结果之后、或后续纯文本 user 消息均可）；无法归属的仍不折叠、仍 409。",
+      "rootFixCommit": "8057d0eb",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-314 parallel Skill bodies each join their own launch, in any layout"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-314 unattributable parallel Skill text is not folded"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "#72191544 被 409 续接拒绝结束后，同会话再发『继续』显示『消息未开始处理 / 已确认未计费』：网关 submit 抛 IDLE_HISTORY_PENDING。被拒请求从未到 Box，交出工具调用的 Box CLI 仍挂起等结果（占账号槽），idle proof 恒 pending/unsettled，会话 idle 候选挡住之后每条消息直到 CLI 数小时后超时。修复：Box 回合的 CCB result 恰为 egress『continuation rejected』409（BOX_*）时，CCB adapter 每回合一次走与浏览器停止相同的内部 Box stop，链收为已证明停止的失败，proof=failed，候选清除，下一条消息正常开始；瞬时 Box 错误不匹配。",
+      "rootFixCommit": "6dd199c8",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-315 a Box continuation reject settles the parked Box turn once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-315 only the exact continuation reject qualifies"
+        }
+      ]
     }
   ]
 }
