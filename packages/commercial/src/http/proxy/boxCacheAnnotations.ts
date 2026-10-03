@@ -622,9 +622,79 @@ function rejectIfUnapprovedBoundary(message: Record<string, unknown>): void {
  * BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION ("模型服务暂时中断"). The Box CLI
  * can receive client output only through tool results, so the body joins the
  * Skill result it belongs to: the model sees the same content in the same
- * turn, as native Claude Code does. Anchored to exactly one Skill call whose
- * result is exactly its launch line; anything else stays untouched. */
+ * turn, as native Claude Code does. Anchored to a Skill call whose result is
+ * exactly its launch line; anything else stays untouched. */
 const SKILL_LAUNCH = /^Launching skill: [A-Za-z0-9][A-Za-z0-9:_.\/@-]{0,127}$/;
+/** OCV5-314 (#72191544): one assistant step may call several Skills. Claude
+ * Code then injects one body per launch, after its own result or after all
+ * results. A body is assigned only by its own "Base directory for this skill:"
+ * header naming exactly one launch; text without a header continues the body
+ * before it. Anything unattributable stays untouched (and is still rejected). */
+const SKILL_BASE = /^Base directory for this skill: ([^\n]+?)\/*(?:\n|$)/;
+function skillBaseName(text: string): string | null {
+  const match = SKILL_BASE.exec(text);
+  if (!match) return null;
+  const dir = match[1]!;
+  const name = dir.slice(dir.lastIndexOf("/") + 1);
+  return name.length > 0 ? name : null;
+}
+function launchBaseName(launch: string): string {
+  const name = launch.slice("Launching skill: ".length);
+  return name.slice(Math.max(name.lastIndexOf(":"), name.lastIndexOf("/")) + 1);
+}
+function foldParallelSkillBodies(content: unknown[], skillIds: ReadonlySet<string>,
+  following: readonly unknown[]): { results: unknown[]; consumed: number } | null {
+  const results: Record<string, unknown>[] = [];
+  const texts: Array<{ type: "text"; text: string }> = [];
+  for (const part of content) {
+    if (object(part) && part.type === "tool_result") { results.push(part); continue; }
+    if (results.length === 0) return null;
+    const bare = bareTrailingText(part);
+    if (!bare || (bare.text as string).length === 0) return null;
+    texts.push({ type: "text", text: bare.text as string });
+  }
+  let consumed = 0;
+  if (texts.length === 0) {
+    for (const next of following) {
+      if (!object(next) || next.role !== "user"
+        || Object.keys(next).sort().join(",") !== "content,role") break;
+      const blocks = skillBodyBlocks(next.content);
+      if (!blocks || skillBaseName(blocks[0]!.text) === null) break;
+      texts.push(...blocks);
+      consumed++;
+    }
+  }
+  if (texts.length === 0) return null;
+  const launchAt = new Map<string, number>();
+  const ambiguous = new Set<string>();
+  results.forEach((part, index) => {
+    if (typeof part.tool_use_id !== "string" || !skillIds.has(part.tool_use_id)) return;
+    const launch = skillLaunchText(part.content);
+    if (!launch) return;
+    const name = launchBaseName(launch);
+    if (launchAt.has(name)) ambiguous.add(name);
+    launchAt.set(name, index);
+  });
+  const bodies = new Map<number, Array<{ type: "text"; text: string }>>();
+  let current: Array<{ type: "text"; text: string }> | null = null;
+  for (const text of texts) {
+    const name = skillBaseName(text.text);
+    if (name === null) {
+      if (!current) return null;
+      current.push(text);
+      continue;
+    }
+    const at = launchAt.get(name);
+    if (at === undefined || ambiguous.has(name) || bodies.has(at)) return null;
+    current = [text];
+    bodies.set(at, current);
+  }
+  const folded = results.map((part, index) => {
+    const body = bodies.get(index);
+    return body ? { ...part, content: [{ type: "text", text: skillLaunchText(part.content)! }, ...body] } : part;
+  });
+  return { results: folded, consumed };
+}
 function skillLaunchText(content: unknown): string | null {
   if (typeof content === "string") return SKILL_LAUNCH.test(content) ? content : null;
   if (Array.isArray(content) && content.length === 1 && object(content[0])
@@ -660,6 +730,17 @@ export function foldBoxCcbSkillBody(body: ProxyBody): ProxyBody {
     if (cut === 0) { messages.push(message); continue; }
     const skills = (assistant.content as unknown[]).filter((part) => object(part)
       && part.type === "tool_use" && part.name === "Skill");
+    if (skills.length > 1) {
+      const ids = new Set(skills.map((part) => (part as Record<string, unknown>).id)
+        .filter((id): id is string => typeof id === "string"));
+      const parallel = ids.size === skills.length
+        ? foldParallelSkillBodies(content, ids, body.messages.slice(i + 1)) : null;
+      if (!parallel) { messages.push(message); continue; }
+      messages.push({ ...message, content: parallel.results });
+      changed = true;
+      i += parallel.consumed;
+      continue;
+    }
     if (skills.length !== 1 || !object(skills[0]) || typeof skills[0].id !== "string") {
       messages.push(message); continue;
     }

@@ -61,3 +61,83 @@ test("without exactly one Skill launch the trailing text is not folded", () => {
     assert.notEqual(classifyBoxContinuation(shaped).classification, "continuation_candidate");
   }
 });
+
+// OCV5-314 live #72191544 (v5-0d0c1359a): Box Claude called two Skills in one
+// step (v5-session-goal-start-triage + openclaude-instance-topology). Claude
+// Code injected one body per launch -> the single-Skill fold left both bodies
+// in the tool-result message -> 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION.
+const bodyOf = (name: string, rest = "# Title\nSteps.") =>
+  `Base directory for this skill: /home/agent/.openclaude/skills/${name}\n\n${rest}`;
+const use = (id: string, name: string) => ({ type: "tool_use", id, name: "Skill", input: { skill: name } });
+const launchOf = (id: string, name: string) => ({ type: "tool_result", tool_use_id: id,
+  content: `Launching skill: ${name}` });
+const txt = (text: string) => ({ type: "text", text });
+const foldedOf = (id: string, name: string, ...bodies: string[]) => ({ ...launchOf(id, name),
+  content: [txt(`Launching skill: ${name}`), ...bodies.map(txt)] });
+const A = "v5-session-goal-start-triage";
+const B = "openclaude-instance-topology";
+const twoUses = [use("toolu_a", A), use("toolu_b", B)];
+
+test("OCV5-314 parallel Skill bodies each join their own launch, in any layout", () => {
+  const expected = [foldedOf("toolu_a", A, bodyOf(A)), foldedOf("toolu_b", B, bodyOf(B))];
+  for (const shaped of [
+    // interleaved: each body right after its own result
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), txt(bodyOf(A)),
+      launchOf("toolu_b", B), txt(bodyOf(B))] }),
+    // results first, bodies after (any order, cache_control on the last)
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), launchOf("toolu_b", B),
+      txt(bodyOf(B)), { ...txt(bodyOf(A)), cache_control: { type: "ephemeral" } }] }),
+    // bodies as following text-only user messages
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), launchOf("toolu_b", B)] },
+      { role: "user", content: bodyOf(A) }, { role: "user", content: [txt(bodyOf(B))] }),
+  ]) {
+    const out = foldBoxCcbSkillBody(shaped);
+    assert.equal(out.messages.length, 3);
+    assert.deepEqual((out.messages[2] as { content: unknown[] }).content, expected);
+    const classified = classifyBoxContinuation(shaped);
+    assert.equal(classified.classification, "continuation_candidate", String(classified.rejectCode));
+    assert.deepEqual(classified.toolIds, ["toolu_a", "toolu_b"]);
+    const matched = matchBoxToolResults(shaped, [
+      { id: "toolu_a", boxName: "mcp__ocbridge__Skill", clientName: "Skill", input: { skill: A } },
+      { id: "toolu_b", boxName: "mcp__ocbridge__Skill", clientName: "Skill", input: { skill: B } }]);
+    assert.deepEqual(matched.map((row) => row!.content), expected.map((row) => row.content));
+  }
+  // a headerless continuation block stays with the body before it; a plugin
+  // skill name matches its directory; a parallel non-Skill result is untouched
+  const plugin = "suite:deploy";
+  const read = { type: "tool_result", tool_use_id: "toolu_read", content: "file" };
+  const mixed = body([use("toolu_a", A), use("toolu_p", plugin), readUse], { role: "user", content: [
+    launchOf("toolu_a", A), launchOf("toolu_p", plugin), read,
+    txt(bodyOf("deploy")), txt(bodyOf(A)), txt("ARGUMENTS: now")] });
+  assert.deepEqual((foldBoxCcbSkillBody(mixed).messages[2] as { content: unknown[] }).content, [
+    foldedOf("toolu_a", A, bodyOf(A), "ARGUMENTS: now"), foldedOf("toolu_p", plugin, bodyOf("deploy")), read]);
+  assert.equal(classifyBoxContinuation(mixed).classification, "continuation_candidate");
+});
+
+test("OCV5-314 unattributable parallel Skill text is not folded", () => {
+  for (const shaped of [
+    // header names no launch
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), launchOf("toolu_b", B),
+      txt(bodyOf("other"))] }),
+    // text without any header first
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), launchOf("toolu_b", B),
+      txt("please also do X"), txt(bodyOf(A))] }),
+    // two bodies for one launch
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), launchOf("toolu_b", B),
+      txt(bodyOf(A)), txt(bodyOf(A))] }),
+    // the same skill launched twice: ambiguous
+    body([use("toolu_a", A), use("toolu_a2", A)], { role: "user", content: [launchOf("toolu_a", A),
+      launchOf("toolu_a2", A), txt(bodyOf(A))] }),
+    // a failed launch keeps its body unattributed
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A),
+      { ...launchOf("toolu_b", B), content: "Skill failed" }, txt(bodyOf(B))] }),
+    // text before the first result
+    body(twoUses, { role: "user", content: [txt(bodyOf(A)), launchOf("toolu_a", A), launchOf("toolu_b", B)] }),
+    // a following user message without a header is a real user turn
+    body(twoUses, { role: "user", content: [launchOf("toolu_a", A), launchOf("toolu_b", B)] },
+      { role: "user", content: "and then deploy" }),
+  ]) {
+    assert.equal(foldBoxCcbSkillBody(shaped), shaped);
+    assert.notEqual(classifyBoxContinuation(shaped).classification, "continuation_candidate");
+  }
+});
