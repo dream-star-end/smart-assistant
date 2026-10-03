@@ -216,7 +216,13 @@ export function boxRequestTailShape(body: ProxyBody, count = 3): string {
   }).join(" | ").slice(0, 400);
 }
 
-/** OCV5-322: tool results followed only by non-empty text blocks. */
+/** Text Claude Code itself injects beside tool results (image captions,
+ * hook / budget reminders, Skill bodies). Alone it is never a user prompt;
+ * an unfolded one must keep the live-continuation rejection (OCV5-302/303). */
+const CCB_INJECTED_TEXT = /^(?:<system-reminder>|<total_tokens>|\[Image[: ]|\[Request interrupted|Base directory for this skill:)/;
+
+/** OCV5-322: tool results followed only by non-empty text blocks, at least
+ * one of which is not text Claude Code injected itself. */
 export function answeredExchangeSplit(content: readonly unknown[]):
   { results: Record<string, unknown>[]; texts: Record<string, unknown>[] } | null {
   let cut = 0;
@@ -225,7 +231,8 @@ export function answeredExchangeSplit(content: readonly unknown[]):
   const results = content.slice(0, cut) as Record<string, unknown>[];
   const texts = content.slice(cut);
   if (results.length < 1 || texts.length < 1 || !texts.every((block) => record(block)
-    && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)) {
+    && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)
+    || texts.every((block) => CCB_INJECTED_TEXT.test(((block as { text: string }).text).trimStart()))) {
     return null;
   }
   return { results, texts: texts as Record<string, unknown>[] };

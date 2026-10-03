@@ -38,6 +38,11 @@ test("an answered exchange followed by a prompt is fresh, never a live continuat
     authorityKind: "local_catalog", authorityTurnId: null });
   assert.deepEqual(prepared.answeredToolIds, ["toolu_A", "toolu_B"]);
   assert.equal(validateBoxToolRequest(merged, prepared), null);
+  // a real prompt may carry Claude Code's own reminder beside it
+  const reminded = classifyBoxContinuation(bodyWith([...results,
+    { type: "text", text: "<system-reminder>\nTodo list changed\n</system-reminder>" },
+    { type: "text", text: resume }]));
+  assert.deepEqual(reminded.answeredToolIds, ["toolu_A", "toolu_B"]);
   // a pure tool-result message stays a live continuation candidate
   const pure = classifyBoxContinuation(bodyWith(results));
   assert.equal(pure.classification, "continuation_candidate");
@@ -53,6 +58,10 @@ test("anything but trailing text, or unpaired results, keeps the old rejection",
     [...results, { type: "text", text: "  " }],
     [results[0], { type: "text", text: resume }],
     [results[0], results[0], { type: "text", text: resume }],
+    // only text Claude Code injects itself (an unfolded caption / hook)
+    [...results, { type: "text", text: "[Image: original 10x10, displayed at 10x10.X]" },
+      { type: "text", text: "<system-reminder>\nhook\n</system-reminder>" }],
+    [...results, { type: "text", text: "<system-reminder>\n<total_tokens>999 tokens left</total_tokens>\n</system-reminder> go" }],
   ]) {
     const classified = classifyBoxContinuation(bodyWith(last));
     assert.equal(classified.classification, "reject", JSON.stringify(last).slice(0, 120));

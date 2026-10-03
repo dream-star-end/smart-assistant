@@ -115,12 +115,7 @@ test("unique non-terminal image keeps the original caption once, then hook and b
 
 test("unknown, conflicting, and malformed captions stay unfolded", () => {
   const unknown = siblingTurn("[Image: original 10x10, displayed at 10x10. Multiply coordinates by 1.00 to map to original image.]");
-  // Never folded into the live continuation. Since OCV5-322 the unfolded
-  // text makes it an answered exchange + prompt, which BoxToolFetch still
-  // answers with 409 while this turn's handoff waits (boxAnsweredExchange).
-  const unfolded = classifyBoxContinuation(unknown);
-  assert.notEqual(unfolded.classification, "continuation_candidate");
-  assert.deepEqual(unfolded.answeredToolIds, ["toolu_img_owner", "toolu_note_last"]);
+  assert.notEqual(validateBoxRequest(unknown, true), null);
   assert.equal(JSON.stringify(normalizeBoxSemanticBody(unknown)).split("displayed at").length - 1, 1);
   const conflict = siblingTurn();
   const user = conflict.messages[2] as { content: Array<Record<string, unknown>> };
