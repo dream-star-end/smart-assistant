@@ -305,6 +305,104 @@ async function takeGestureEvents(page) {
   });
 }
 
+
+// Capture actual input before the product's cancellation listener.
+async function installPendingCancelObserver(page) {
+  await page.evaluate(() => {
+    window.__findPendingCancelEvents = [];
+    if (window.__findPendingCancelObserverInstalled) return;
+    window.__findPendingCancelObserverInstalled = true;
+    const observe = (event) => {
+      const s = document.querySelector("[data-testid=find-chat-scroll]");
+      if (!s || !(event.target instanceof Node) || !s.contains(event.target)) return;
+      const current = document.querySelector("[data-find-current]");
+      const row = current?.getBoundingClientRect();
+      const view = s.getBoundingClientRect();
+      let toolbar = document.querySelector("[aria-label='在会话中查找']");
+      while (toolbar && toolbar !== s) {
+        if (["sticky", "fixed"].includes(getComputedStyle(toolbar).position)) break;
+        toolbar = toolbar.parentElement;
+      }
+      const top = toolbar && toolbar !== s ? toolbar.getBoundingClientRect().bottom : view.top;
+      const style = getComputedStyle(s);
+      const borderLeft = parseFloat(style.borderLeftWidth) || 0;
+      const borderRight = parseFloat(style.borderRightWidth) || 0;
+      const gutter = s.offsetWidth - s.clientWidth - borderLeft - borderRight;
+      const thumbHeight = s.clientHeight * s.clientHeight / s.scrollHeight;
+      const thumbTop = view.top + (parseFloat(style.borderTopWidth) || 0)
+        + (s.clientHeight - thumbHeight) * s.scrollTop / (s.scrollHeight - s.clientHeight);
+      window.__findPendingCancelEvents.push({
+        type: event.type, trusted: event.isTrusted, deltaY: event.deltaY,
+        pointerType: event.pointerType,
+        inScroller: true, inToolbar: !!(toolbar && toolbar !== s && toolbar.contains(event.target)),
+        gutter, thumbHeight, thumbTop,
+        inScrollbar: gutter > 0 && event.clientX >= view.right - borderRight - gutter
+          && event.clientX <= view.right - borderRight,
+        inThumb: event.clientY >= thumbTop && event.clientY <= thumbTop + thumbHeight,
+        key: current?.getAttribute("data-chat-virtual-key") ?? null,
+        findPin: document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") || "",
+        visible: !!(row && row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1),
+        following: window.__findPage.following, scrollTop: s.scrollTop,
+        sessionId: document.querySelector("[data-testid=session]")?.textContent ?? "",
+      });
+    };
+    document.addEventListener("wheel", observe, { capture: true, passive: true });
+    document.addEventListener("pointerdown", observe, { capture: true, passive: true });
+  });
+}
+
+async function cancelPendingWithRealInput(page, events, kind) {
+  await installPendingCancelObserver(page);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    // Fixture setup only. Never force-scroll or reset the pin after accepted input.
+    await page.getByTestId("find-chat-scroll").evaluate((s) => { s.scrollTop = s.scrollHeight; });
+    await page.waitForTimeout(40);
+    const point = await page.getByTestId("find-chat-scroll").evaluate((s, mode) => {
+      const r = s.getBoundingClientRect();
+      const style = getComputedStyle(s);
+      const right = parseFloat(style.borderRightWidth) || 0;
+      const left = parseFloat(style.borderLeftWidth) || 0;
+      const gutter = s.offsetWidth - s.clientWidth - left - right;
+      if (mode === "drag" && gutter <= 0) throw new Error("native scrollbar gutter absent");
+      const thumbHeight = s.clientHeight * s.clientHeight / s.scrollHeight;
+      const thumbTop = r.y + (parseFloat(style.borderTopWidth) || 0)
+        + (s.clientHeight - thumbHeight) * s.scrollTop / (s.scrollHeight - s.clientHeight);
+      return { x: mode === "drag" ? r.right - right - gutter / 2 : r.x + r.width / 2,
+        y: mode === "drag" ? thumbTop + thumbHeight / 2 : r.y + s.clientHeight * 0.7 };
+    }, kind);
+    await page.mouse.move(point.x, point.y);
+    await page.evaluate(() => { window.__findPendingCancelEvents = []; });
+    await page.mouse.wheel(0, -120);
+    events.wheels += 1;
+    await page.keyboard.press("Enter");
+    events.enters = (events.enters || 0) + 1;
+    const pending = await snapshot(page);
+    if (pending.findPin !== "m250" || pending.visible || pending.following) continue;
+    if (kind === "wheel") {
+      await page.mouse.wheel(0, -240);
+      events.wheels += 1;
+    } else {
+      await page.mouse.down();
+      await page.mouse.move(point.x, point.y - 50, { steps: 6 });
+      await page.mouse.up();
+      events.drags += 1;
+    }
+    await page.waitForFunction((mode) => window.__findPendingCancelEvents.some((e) =>
+      mode === "wheel" ? e.type === "wheel" && e.deltaY === -240 : e.type === "pointerdown"), kind, { timeout: 4000 });
+    const observed = await page.evaluate((mode) => window.__findPendingCancelEvents.find((e) =>
+      mode === "wheel" ? e.type === "wheel" && e.deltaY === -240 : e.type === "pointerdown"), kind);
+    const qualified = observed.trusted && observed.inScroller && !observed.inToolbar
+      && observed.findPin === "m250" && observed.key === "m250" && !observed.visible && !observed.following
+      && (kind === "wheel" || (observed.pointerType === "mouse" && observed.inScrollbar && observed.inThumb));
+    if (!qualified) continue; // Only unmet input preconditions may be rebuilt.
+    assert.equal(observed.trusted, true);
+    assert.equal(observed.findPin, "m250");
+    assert.equal(observed.visible, false);
+    return { pending, observed }; // Never retry a qualified gesture's business outcome.
+  }
+  assert.fail("no trusted " + kind + " reached the actual pending m250 input window");
+}
+
 /** Pending pin without re-holding the synthetic fence. */
 async function waitPendingNatural(page, key, timeout = 4000) {
   const handle = await page.waitForFunction((k) => {
@@ -428,6 +526,8 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
     const browser = await chromium.launch({
       executablePath: resolveBrowserExecutable(),
       headless: true,
+      // A native scrollbar drag cannot exist under Playwright's hide flag.
+      ignoreDefaultArgs: ["--hide-scrollbars"],
       args: ["--no-sandbox", "--disable-overlay-scrollbar"],
     });
     const rows = [];
@@ -696,13 +796,9 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         try {
           await typeNeedle(page, "FIND_NEEDLE_MID");
           events.keys += 15;
-          await holdFence(page);
-          events.wheels += 1;
+          await waitFindReady(page, "1/1");
           const sessionBefore = await page.getByTestId("session").textContent();
-          await page.getByRole("button", { name: "下一处" }).click();
-          events.clicks += 1;
-          await waitPin(page, "m250");
-          const pending = await snapshot(page);
+          const { pending, observed: wheelInput } = await cancelPendingWithRealInput(page, events, "wheel");
           pending.pageErrors = errors.length;
           const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
           record(rows, "pending-positive-m250", {
@@ -713,47 +809,33 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           assert.equal(pending.visible, false);
           assert.equal(pending.following, false);
           const topBefore = pending.scrollTop;
-          await page.getByTestId("find-chat-scroll").hover();
-          await page.mouse.wheel(0, -240);
-          events.wheels += 1;
           await page.waitForTimeout(280);
           const afterWheel = await snapshot(page);
           afterWheel.pageErrors = errors.length;
           const cancelled = afterWheel.findPin === "" && afterWheel.visible !== true;
           record(rows, "wheel-cancel-no-rejump", {
             findPin: "", visible: false, following: false,
-          }, afterWheel, events, cancelled && afterWheel.scrollTop !== topBefore,
+          }, afterWheel, { ...events, input: wheelInput, topBeforeInput: pending.scrollTop }, cancelled && afterWheel.scrollTop !== topBefore,
             cancelled ? "" : `rejump pin=${afterWheel.findPin} visible=${afterWheel.visible} key=${afterWheel.key}`);
           assert.equal(afterWheel.findPin, "");
+          assert.notEqual(afterWheel.scrollTop, topBefore);
           assert.notEqual(afterWheel.key === "m250" && afterWheel.visible, true);
           assert.equal(await page.getByTestId("session").textContent(), sessionBefore);
 
           await page.evaluate(() => { window.__findPage.peakMounted = 0; });
-          await holdFence(page);
-          await page.getByRole("button", { name: "下一处" }).click();
-          events.clicks += 1;
-          await waitPin(page, "m250");
-          const pending2 = await snapshot(page);
+          const { pending: pending2, observed: dragInput } = await cancelPendingWithRealInput(page, events, "drag");
           assert.equal(pending2.findPin, "m250");
-          const box = await page.getByTestId("find-chat-scroll").boundingBox();
-          const metrics = await page.getByTestId("find-chat-scroll").evaluate((el) => ({
-            clientWidth: el.clientWidth, offsetWidth: el.offsetWidth, height: el.clientHeight,
-          }));
-          const gutter = Math.max(metrics.offsetWidth - metrics.clientWidth, 12);
-          const x = box.x + box.width - Math.min(6, gutter / 2);
-          const y = box.y + metrics.height * 0.7;
-          await page.mouse.move(x, y);
-          await page.mouse.down();
-          await page.mouse.move(x, y - 50, { steps: 6 });
-          await page.mouse.up();
-          events.drags += 1;
+          assert.equal(pending2.visible, false);
           await page.waitForTimeout(280);
           const afterDrag = await snapshot(page);
           afterDrag.pageErrors = errors.length;
-          record(rows, "scrollbar-drag-cancel", { findPin: "", visible: false }, afterDrag, events,
-            afterDrag.findPin === "" && !(afterDrag.key === "m250" && afterDrag.visible),
+          record(rows, "scrollbar-drag-cancel", { findPin: "", visible: false }, afterDrag, { ...events, input: dragInput, topBeforeInput: pending2.scrollTop },
+            afterDrag.findPin === "" && !(afterDrag.key === "m250" && afterDrag.visible) && afterDrag.scrollTop !== pending2.scrollTop,
             `drag pin=${afterDrag.findPin} key=${afterDrag.key} visible=${afterDrag.visible}`);
           assert.equal(afterDrag.findPin, "");
+          assert.notEqual(afterDrag.key === "m250" && afterDrag.visible, true);
+          assert.notEqual(afterDrag.scrollTop, pending2.scrollTop);
+          assert.equal(afterDrag.sessionId, sessionBefore);
           assert.deepEqual(errors, []);
         } finally {
           await context.close();

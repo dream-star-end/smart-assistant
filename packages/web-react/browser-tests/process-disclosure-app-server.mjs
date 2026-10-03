@@ -380,6 +380,21 @@ export function startPreviewServer(assetDir, options = {}) {
     outbound: 0,
     outboundByType: {},
   };
+  // Only the explicit App streaming fixture holds its own real inbound final.
+  const pendingWarningFinals = new Map();
+  const warningFinalKey = (sessId, clientMessageId) => JSON.stringify([sessId, clientMessageId]);
+  const releaseWarningFinal = (sessId, clientMessageId) => {
+    const key = warningFinalKey(sessId, clientMessageId);
+    const gate = pendingWarningFinals.get(key);
+    if (!gate) return false;
+    pendingWarningFinals.delete(key);
+    gate.resolve();
+    return true;
+  };
+  const clearWarningFinals = () => {
+    for (const gate of pendingWarningFinals.values()) gate.resolve();
+    pendingWarningFinals.clear();
+  };
   const seqBySession = new Map();
   const nextSeq = (id) => {
     const n = (seqBySession.get(id) || 0) + 1;
@@ -540,6 +555,7 @@ export function startPreviewServer(assetDir, options = {}) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
   });
 
+  server.on("close", clearWarningFinals);
   wss.on("connection", (ws) => {
     const send = (frame) => {
       if (ws.readyState !== 1) return false;
@@ -602,7 +618,17 @@ export function startPreviewServer(assetDir, options = {}) {
         peer: { id: sessId, kind: "dm" },
         clientMessageId,
       });
-      void playTurn(send, store, sessId, clientMessageId, text, nextSeq).catch((error) => {
+      let warningFinal = null;
+      if (options.holdWarningFinal === true && sessId === BOARD_SESSION &&
+          text === "把南仓预警补进同一张看板" && typeof clientMessageId === "string" && clientMessageId) {
+        const key = warningFinalKey(sessId, clientMessageId);
+        if (pendingWarningFinals.has(key)) throw new Error("duplicate warning inbound identity");
+        let resolve;
+        const promise = new Promise((done) => { resolve = done; });
+        pendingWarningFinals.set(key, { resolve });
+        warningFinal = promise;
+      }
+      void playTurn(send, store, sessId, clientMessageId, text, nextSeq, warningFinal).catch((error) => {
         send({
           type: "outbound.error",
           sessionKey: sessionKey(sessId),
@@ -630,6 +656,9 @@ export function startPreviewServer(assetDir, options = {}) {
         unknown,
         stats,
         store,
+        releaseWarningFinal,
+        clearWarningFinals,
+        pendingWarningFinalCount: () => pendingWarningFinals.size,
         url: `http://127.0.0.1:${port}/s/${BOARD_SESSION}`,
       });
     });
@@ -958,7 +987,7 @@ async function playPhasedTurn(emit, remember, clientMessageId) {
   await waitFixtureStep();
 }
 
-async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
+async function playTurn(send, store, sessId, clientMessageId, text, nextSeq, warningFinal = null) {
   const key = sessionKey(sessId);
   const base = {
     type: "outbound.message",
@@ -1094,6 +1123,7 @@ async function playTurn(send, store, sessId, clientMessageId, text, nextSeq) {
     });
   }
 
+  if (warningFinal) await warningFinal;
   const start = (bucket.at(-1)?._seq || 0) + 1;
   bucket.push(...stamp(persisted, start));
   store.revision += 1;
