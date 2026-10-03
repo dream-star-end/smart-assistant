@@ -5375,7 +5375,8 @@
       "symptom": "Box Claude 续聊（非原生续接、由 completed history 编 CLI snapshot）时，历史 tool_use 与系统提示均用 OpenClaude 客户端工具名（Bash/Read/ExecuteExtraTool），而 CLI 只暴露本次 mcp__ocbridge__tN；模型按裸名调用→CLI『No such tool available』→egress 首轮解码 BOX_TOOL_ID_OR_NAME_INVALID→markUnknown(first_round_unknown) 永久 inflight/unknown：该会话下一条消息在 submit 开头 IDLE_HISTORY_PENDING→DISPATCH_NOT_ACCEPTED（UI『消息未开始处理，已确认未计费』），并占住账号并发名额。修复：snapshot 历史调用改写为本轮别名（缺席工具连结果降级为完整文本）、系统提示追加别名对照表；首轮本地确定性拒绝经用户 Stop 同路径显式停止并落 failed_stopped（零计费），idle proof 读到 failed 自动解锁。",
       "rootFixCommit": "257ab6da",
       "coverageCommits": [
-        "af864ea5"
+        "af864ea5",
+        "8f60d6ef"
       ],
       "regressions": [
         {
@@ -5392,6 +5393,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
           "assertion": "a locally rejected tool name is stopped and settled, not left unknown"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "staged history and system use current catalog aliases; rejected first round is proven failed with zero charge, idle failed, and next admission succeeds"
         }
       ]
     },
