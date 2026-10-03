@@ -25,3 +25,8 @@ packages/commercial/src/http/proxy/boxCapacityAdmission.integ.test.ts
 packages/commercial/src/__tests__/migration0283History.integ.test.ts
 
 packages/commercial/src/__tests__/migration0293Models.integ.test.ts
+packages/commercial/src/__tests__/modelReleaseOperator.integ.test.ts
+packages/commercial/src/__tests__/modelReleaseOperator.groupB.integ.test.ts
+packages/commercial/src/__tests__/modelReleaseOperator.groupC.integ.test.ts
+packages/commercial/src/__tests__/modelReleaseOperator.groupD.integ.test.ts
+packages/commercial/src/__tests__/modelReleaseOperator.groupE.integ.test.ts
