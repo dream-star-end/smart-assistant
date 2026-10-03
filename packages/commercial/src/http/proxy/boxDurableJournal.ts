@@ -186,7 +186,13 @@ export interface BoxStoppedFailureProbeCandidate {
   readonly runNonce: string;
   readonly leaseEpoch: string;
   readonly linked: boolean;
+  /** OCV5-323: an inflight unknown resume leaf without a handoff. Its CLI
+   * waits for tool results that no request will publish again. */
+  readonly staleResume?: { readonly phase: BoxStaleResumePhase; readonly unknownForMs: number };
 }
+export type BoxStaleResumePhase = "resume_publish_unsent" | "resume_publish_unknown";
+const STALE_RESUME_PHASES: ReadonlySet<string> = new Set<BoxStaleResumePhase>(
+  ["resume_publish_unsent", "resume_publish_unknown"]);
 export type BoxRecoveryRejectReason =
   | "BOX_RECOVERY_NOT_UNKNOWN_LEAF"
   | "BOX_RECOVERY_CHAIN_INVALID"
@@ -2397,8 +2403,10 @@ export class BoxDurableJournal implements BoxJournalPort {
    * pinned Box read returns a valid terminal marker; no paid call is retried. */
   async listStoppedFailureProbeCandidates(limit = 10): Promise<BoxStoppedFailureProbeCandidate[]> {
     const found = await this.pool.query<{ request_id: string; user_id: string;
-      ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
+      state: string; unknown_for_ms: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,user_id::text,state,ctx,
+          GREATEST(0,(EXTRACT(EPOCH FROM (NOW()-updated_at))*1000))::bigint::text AS unknown_for_ms
+        FROM request_finalize_journal
         WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
           AND ${STOP_MODE_FENCE}
           AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
@@ -2437,11 +2445,48 @@ export class BoxDurableJournal implements BoxJournalPort {
         || (ctx.boxOwnerRequestId !== undefined
           && (typeof ctx.boxOwnerRequestId !== "string"
             || !/^[A-Za-z0-9_-]{1,64}$/.test(ctx.boxOwnerRequestId)))) continue;
+      const unknownForMs = Number(row.unknown_for_ms);
+      const staleResume = row.state === "inflight" && ctx.boxState === "unknown"
+        && ctx.boxInvocationMode === "detached_tool"
+        && ctx.boxToolHandoff === undefined
+        && typeof ctx.boxUnknownPhase === "string" && STALE_RESUME_PHASES.has(ctx.boxUnknownPhase)
+        && Number.isSafeInteger(unknownForMs)
+        ? { phase: ctx.boxUnknownPhase as BoxStaleResumePhase, unknownForMs } : undefined;
       candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
         accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
-        leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined });
+        leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined,
+        ...(staleResume ? { staleResume } : {}) });
     }
     return candidates;
+  }
+
+  /** OCV5-323: durable intent before the worker asks the original keeper to
+   * stop an abandoned resume leaf (same rule as the explicit user stop: intent
+   * commits before the remote stop). Only the first marker is kept. A stop
+   * request is never terminal evidence. Does not change billing age. */
+  async recordStaleResumeStop(input: BoxStoppedFailureProbeCandidate &
+    { phase: BoxStaleResumePhase }): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !STALE_RESUME_PHASES.has(input.phase)) {
+      throw new BoxDurableJournalError("BOX_STALE_RESUME_IDENTITY_INVALID");
+    }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || jsonb_build_object('boxStaleResumeStop',
+            COALESCE(ctx->'boxStaleResumeStop', jsonb_build_object('phase',$6::text,
+              'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint)))
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState'='unknown' AND ctx->>'boxUnknownPhase'=$6
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxTerminalProof')
+          AND NOT (ctx ? 'boxResumeRequestId')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, input.phase]);
+    return changed.rowCount === 1;
   }
 
   /** Cross-worker CAS with a durable retry clock; never changes billing age. */

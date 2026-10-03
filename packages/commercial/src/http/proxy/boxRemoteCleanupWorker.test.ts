@@ -209,3 +209,107 @@ test("missing terminal marker leaves unknown Box run fenced and never cleans", a
   assert.equal(stopped, 0);
   assert.equal(cleaned, 0);
 });
+
+// OCV5-323 (#webmusk512gnvx22z): a resume publish whose Box target never
+// resolved left the CLI waiting for tool results nobody would publish. The
+// run held the session's Box slot and its idle proof for the 4 h deadline.
+function staleResumeWorker(input: {
+  phase: "resume_publish_unsent" | "resume_publish_unknown";
+  unknownForMs: number;
+  intent?: boolean;
+  stopStdout?: string | Error;
+  proofAfterStop?: boolean;
+}) {
+  const sequence: string[] = [];
+  const probe = { requestId: "box-resume-leaf", uid: 3n, accountId: 20n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: true,
+    staleResume: { phase: input.phase, unknownForMs: input.unknownForMs } };
+  const failedProof = { ...candidate.proof, reason: "worker_failed" as const,
+    revision: 2 as const, workerExitCode: 143 };
+  let stopped = false;
+  const worker = new BoxRemoteCleanupWorker({
+    staleResumeProofWaitMs: 50,
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      recordStaleResumeStop: async (args: { phase: string; requestId: string }) => {
+        assert.equal(args.phase, input.phase);
+        assert.equal(args.requestId, probe.requestId);
+        sequence.push("intent"); return input.intent ?? true;
+      },
+      markFirstRoundStoppedFailure: async () => { throw new Error("wrong round"); },
+      markToolChainStoppedFailure: async ({ proof }: { proof: unknown }) => {
+        assert.deepEqual(proof, failedProof); sequence.push("stopped-CAS");
+      },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => false,
+      markRemoteCleaned: async () => { throw new Error("must not clean"); } } as never,
+    resolver: { resolve: async (args: { allowWakeIfHibernated?: boolean }) => {
+      assert.equal(args.allowWakeIfHibernated, false);
+      return { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+        if (request.args.at(-1)?.startsWith("/tmp/ocv5-289-proof-")) {
+          sequence.push("proof-read");
+          if (!stopped || input.proofAfterStop === false) {
+            throw Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" });
+          }
+          return { stdout: JSON.stringify(failedProof) + "\n", stderrBytes: 0, exitCode: 0 };
+        }
+        assert.deepEqual(request.args.slice(-2), [candidate.runNonce, candidate.leaseEpoch],
+          "stop is bound to the original nonce/epoch keeper");
+        sequence.push("keeper-stop");
+        const out = input.stopStdout ?? "stop-requested\n";
+        if (out instanceof Error) throw out;
+        stopped = true;
+        return { stdout: out, stderrBytes: 0, exitCode: 0 };
+      } }, dispose: async () => { sequence.push("dispose"); } } as never;
+    } } as never,
+  });
+  return { worker, sequence };
+}
+
+test("unsent resume leaf: intent, keeper stop, proof, then the existing chain CAS", async () => {
+  const { worker, sequence } = staleResumeWorker({ phase: "resume_publish_unsent",
+    unknownForMs: 20_000 });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(sequence, ["proof-read", "intent", "keeper-stop", "proof-read",
+    "stopped-CAS", "dispose"]);
+});
+
+test("unsent resume leaf younger than the grace stays a plain pending probe", async () => {
+  const { worker, sequence } = staleResumeWorker({ phase: "resume_publish_unsent",
+    unknownForMs: 2_000 });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(sequence, ["proof-read", "dispose"]);
+});
+
+test("possibly published resume leaf is left alone for 20 minutes, then stopped", async () => {
+  const early = staleResumeWorker({ phase: "resume_publish_unknown", unknownForMs: 19 * 60_000 });
+  assert.deepEqual(await early.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(early.sequence, ["proof-read", "dispose"]);
+  const late = staleResumeWorker({ phase: "resume_publish_unknown", unknownForMs: 21 * 60_000 });
+  assert.deepEqual(await late.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(late.sequence, ["proof-read", "intent", "keeper-stop", "proof-read",
+    "stopped-CAS", "dispose"]);
+});
+
+test("lost stop intent CAS never signals the keeper", async () => {
+  const { worker, sequence } = staleResumeWorker({ phase: "resume_publish_unsent",
+    unknownForMs: 60_000, intent: false });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(sequence, ["proof-read", "intent", "dispose"]);
+});
+
+test("a stop that cannot reach the keeper is not evidence and closes nothing", async () => {
+  const { worker, sequence } = staleResumeWorker({ phase: "resume_publish_unsent",
+    unknownForMs: 60_000,
+    stopStdout: Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" }) });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(sequence, ["proof-read", "intent", "keeper-stop", "dispose"]);
+});
+
+test("a requested stop without a proof inside the wait stays pending", async () => {
+  const { worker, sequence } = staleResumeWorker({ phase: "resume_publish_unsent",
+    unknownForMs: 60_000, proofAfterStop: false });
+  assert.deepEqual(await worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.equal(sequence.includes("stopped-CAS"), false);
+  assert.equal(sequence.filter((step) => step === "keeper-stop").length, 1);
+});

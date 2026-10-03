@@ -2,10 +2,11 @@
  * terminal-proof journal candidate may reach remote Exec; no CLI launch,
  * tool publication or paid retry exists in this worker. */
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
-import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
+import type { BoxDurableJournal, BoxRemoteCleanupCandidate, BoxStaleResumePhase,
   BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
+import { makeBoxKeeperStop } from "./boxKeeperStop.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
-import { readBoxTerminalProof } from "./boxTerminalProof.js";
+import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { readBoxStagedToolCatalog } from "./boxStagedCatalogRead.js";
 import { rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
 import { observeBoxToolTerminalOnly } from "./boxToolTerminalRecovery.js";
@@ -26,12 +27,29 @@ function probeFailureTag(error: unknown): { reason: string; cause?: string } {
   return typeof causeTag === "string" ? { reason, cause: causeTag.slice(0, 120) } : { reason };
 }
 
+/** OCV5-323: a resume leaf goes unknown when its publish failed. No request
+ * ever re-publishes those tool results, so the CLI waits until the 4 h
+ * supervisor deadline while the run holds the session's Box slot and the idle
+ * proof (IDLE_HISTORY_PENDING, 「消息未开始处理」). `unsent` (the target never
+ * resolved, nothing reached the run) is stopped at once. Plain `unknown` may
+ * have published every result, so it gets time to finish by itself first. */
+const STALE_RESUME_STOP_AFTER_MS: Record<BoxStaleResumePhase, number> = {
+  resume_publish_unsent: 10_000,
+  resume_publish_unknown: 20 * 60_000,
+};
+
+function staleResumeDue(candidate: BoxStoppedFailureProbeCandidate): BoxStaleResumePhase | null {
+  const stale = candidate.staleResume;
+  if (!stale || !candidate.linked) return null;
+  return stale.unknownForMs >= STALE_RESUME_STOP_AFTER_MS[stale.phase] ? stale.phase : null;
+}
+
 type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
     "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
     "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" |
     "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
-    "readRecoveryWinner">>;
+    "readRecoveryWinner" | "recordStaleResumeStop">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 
@@ -39,7 +57,9 @@ export class BoxRemoteCleanupWorker {
   private readonly orphaned = new Map<BoxResolvedTarget,
     { pending: Promise<void> | null; failed: boolean }>();
   constructor(private readonly deps: { journal: Journal; resolver: Resolver;
-    writeRecoveryMessage?: BoxReplayMessageWriter }) {}
+    writeRecoveryMessage?: BoxReplayMessageWriter;
+    /** How long to re-read the proof after a stale-resume stop. */
+    staleResumeProofWaitMs?: number }) {}
 
   private async resolvePinned(candidate: Pick<BoxRemoteCleanupCandidate,
     "uid" | "requestId" | "accountId">): Promise<BoxResolvedTarget> {
@@ -102,20 +122,13 @@ export class BoxRemoteCleanupWorker {
         if (!await journal.claimStoppedFailureProbe(candidate)) continue;
         target = await this.resolvePinned(candidate);
         if (target.accountId !== candidate.accountId) throw new Error("BOX_STOP_PROBE_ACCOUNT_MISMATCH");
-        const abort = new AbortController();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        let proof: Awaited<ReturnType<typeof readBoxTerminalProof>>;
-        try {
-          proof = await Promise.race([
-            readBoxTerminalProof({ target, expectedAccountId: candidate.accountId,
-              runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch,
-              signal: abort.signal }),
-            new Promise<never>((_, reject) => {
-              timer = setTimeout(() => { abort.abort();
-                reject(new Error("BOX_STOP_PROBE_TIMEOUT")); }, 11_000);
-            }),
-          ]);
-        } finally { if (timer) clearTimeout(timer); }
+        let proof: BoxTerminalProof;
+        try { proof = await this.readProof(candidate, target); }
+        catch (error) {
+          const phase = staleResumeDue(candidate);
+          if (!phase) throw error;
+          proof = await this.stopStaleResume(candidate, target, phase, error);
+        }
         if (proof.reason === "worker_complete") {
           const outcome = await this.recoverProvedSuccess(candidate, target);
           if (outcome === "undeliverable" && candidate.linked) {
@@ -144,6 +157,56 @@ export class BoxRemoteCleanupWorker {
       finally { if (target) await this.closeLocal(target); }
     }
     return { recovered, pending };
+  }
+
+  private async readProof(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget): Promise<BoxTerminalProof> {
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        readBoxTerminalProof({ target, expectedAccountId: candidate.accountId,
+          runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch,
+          signal: abort.signal }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => { abort.abort();
+            reject(new Error("BOX_STOP_PROBE_TIMEOUT")); }, 11_000);
+        }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** OCV5-323: journal the intent, ask the original nonce/epoch-bound keeper
+   * to stop, then wait briefly for its own terminal proof. The stop is never
+   * evidence; without a proof the row stays pending exactly as before. */
+  private async stopStaleResume(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget, phase: BoxStaleResumePhase,
+    readError: unknown): Promise<BoxTerminalProof> {
+    const record = this.deps.journal.recordStaleResumeStop;
+    if (!record || !await record.call(this.deps.journal, { ...candidate, phase })) throw readError;
+    let outcome: string;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        target.exec.run(makeBoxKeeperStop(candidate.runNonce, candidate.leaseEpoch),
+          { timeoutMs: 10_000, maxResponseBytes: 1024 }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("BOX_STALE_RESUME_STOP_TIMEOUT")), 10_500);
+        }),
+      ]);
+      outcome = /^[a-z-]{1,32}$/.test(result.stdout.trim()) ? result.stdout.trim() : "unexpected";
+    } catch (error) { outcome = probeFailureTag(error).reason; }
+    finally { if (timer) clearTimeout(timer); }
+    workerLog.warn("box_stale_resume_stop", { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString(), phase,
+      unknownForMs: candidate.staleResume?.unknownForMs, outcome });
+    if (outcome !== "stop-requested" && outcome !== "terminal-present") throw readError;
+    const deadline = Date.now() + (this.deps.staleResumeProofWaitMs ?? 15_000);
+    for (;;) {
+      try { return await this.readProof(candidate, target); }
+      catch (error) { if (Date.now() >= deadline) throw error; }
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    }
   }
 
   /** worker_complete is not a failure. Close one final round only when the
