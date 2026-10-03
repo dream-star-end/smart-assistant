@@ -5640,6 +5640,21 @@
           "assertion": "the incident shape: an op stranded by a previous container settles on the next submit"
         }
       ]
+    },
+    {
+      "id": "INC-20261003-BOX-LEFTOVER-TOOL-FRAMES",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #611729fb（v5-a1d06cff1 发布前，09:00Z）：Box Claude Opus 5.5 回合执行 79 步后，一次工具结果续接时 Box exec 目标解析失败（BOX_TARGET_UNAVAILABLE → resume_publish_unknown → 500），CCB 重试被 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝，红卡『任务执行失败 / 内部错误』且只能手点『从断点继续』。所有工具均已完成，按 OCV5-317 应自动断点续接，但 master 判 checkpoint_unsafe：残留 live 帧里每个 tool_use 块被转成无 id、未完成的 tool 记录，凡决策时 live 帧尚在的带工具回合都被当成有未完成工具。修复：残留 tool_use / tool_result 按 id 配对（tool_result.toolUseBlockId → tool_use.blockId），无 id 的块仍按原规则 fail-closed；BOX_TARGET_UNAVAILABLE 附带安全的原因标签（仅错误名/供给码）。",
+      "rootFixCommit": "bcaa4772",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-321 settled-tools checkpoint survives leftover live tool frames"
+        }
+      ]
     }
   ]
 }
