@@ -1138,6 +1138,7 @@ function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): P
 }
 
 async function manualLeaseFixture() {
+  assert.equal(process.getuid?.(), 0, 'real root is required for the private admission env')
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-manual-lease-'))
   dirs.push(dir)
   const bin = path.join(dir, 'bin')
@@ -1155,7 +1156,27 @@ async function manualLeaseFixture() {
   const source = await readFile(manualMutationLease, 'utf8')
   const lockNeedle = 'PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"'
   assert.equal(source.split(lockNeedle).length - 1, 1, 'manual wrapper lock path replacement drifted')
+  const envFile = path.join(dir, 'v5.env')
+  const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
+  await writeFile(envFile, [
+    `DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
+    `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
+    `MODEL_CATALOG_ADMIN_DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
+    `OC_EGRESS_SECRET=${JSON.stringify('e'.repeat(32))}`,
+  ].join('\n') + '\n', { mode: 0o600 })
+  const envNeedle = 'V5_ENV="/etc/openclaude/commercial-v5.env"'
+  assert.equal(source.split(envNeedle).length - 1, 1, 'manual wrapper env path replacement drifted')
+  const helperBytes = await readFile(path.join(root, 'scripts/lib/v5-mutation-admission.sh'))
+  await mkdir(path.join(dir, 'lib'))
+  const copiedHelper = path.join(dir, 'lib/v5-mutation-admission.sh')
+  await writeFile(copiedHelper, helperBytes, { mode: 0o600 })
+  assert.equal(
+    createHash('sha256').update(await readFile(copiedHelper)).digest('hex'),
+    createHash('sha256').update(helperBytes).digest('hex'),
+    'manual fixture must consume the actual admission helper bytes',
+  )
   const fixtureSource = source.replace(lockNeedle, `PRODUCTION_MUTATION_LOCK="${lock}"`)
+    .replace(envNeedle, `V5_ENV="${envFile}"`)
   await writeFile(wrapper, fixtureSource)
   await chmod(wrapper, 0o755)
   await writeFile(
@@ -6546,7 +6567,9 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     // C1:trap 现在同时清 fencing meta 再退出。
     const signalTrap = holder.indexOf("trap 'drop_meta; exit 0' HUP INT TERM")
     const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
-    const leased = holder.indexOf('echo LEASED')
+    const leaseEcho = String.raw`echo \"LEASED $admission_nonce\"`
+    const leased = holder.indexOf(leaseEcho)
+    assert.ok(leased >= 0, 'nonce-bound LEASED handshake must exist')
     const loop = holder.indexOf('while :; do', leased)
     assert.ok(parentCapture >= 0, 'remote holder 未快照 sshd session parent')
     assert.ok(signalTrap > parentCapture && signalTrap < leased, '退出 trap 必须在 LEASED 握手前安装')
@@ -6563,7 +6586,11 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.doesNotMatch(holder, /exec sleep infinity/, '禁止 PID 1 收养的无限 sleep 继续持锁')
     // C1 硬 TTL + fencing 证据:meta 在 LEASED 前落盘,TTL 在 watch 循环里到点自 exit,
     // 每条退出路径都清自己的 meta。这几条一起消除"SIGKILL 部署→残活 ssh 焊死远端 lease 永不过期"。
-    assert.ok(holder.indexOf('write_meta\necho LEASED') >= 0, 'fencing meta 必须在 LEASED 握手前写(write_meta 调用)')
+    const metaWritten = holder.indexOf('\nwrite_meta\n')
+    const admission = holder.indexOf('\nv5_mutation_admission ')
+    assert.ok(metaWritten >= 0 && admission > metaWritten && admission < leased, 'fencing meta and successful common admission must precede the nonce-bound handshake')
+    const admissionFailure = holder.indexOf('|| { drop_meta; exit 79; }', admission)
+    assert.ok(admissionFailure > admission && admissionFailure < leased, 'failed admission must exit before LEASED')
     assert.ok(holder.indexOf('lease_ttl=') > parentCapture && holder.indexOf('lease_ttl=') < leased, 'remote holder 缺硬 TTL 变量 lease_ttl')
     assert.ok(
       holder.indexOf('-ge \\"\\$lease_ttl\\"', loop) > loop,

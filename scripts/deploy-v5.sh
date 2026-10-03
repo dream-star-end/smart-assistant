@@ -1476,6 +1476,10 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   local ttl_margin=2 local_ttl
   # deploy_id/holder_host = fencing 证据(reclaim 打印持有者身份;deploy_id 也用作 holder 自清 meta 的归属校验)。
   local deploy_id holder_host meta_path
+  local admission_nonce admission_helper_b64
+  admission_nonce="$(openssl rand -hex 16)"
+  [[ "$admission_nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+  admission_helper_b64="$(base64 -w0 "$REPO_ROOT/scripts/lib/v5-mutation-admission.sh")" || return 1
   deploy_id="$(openssl rand -hex 12)"
   holder_host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
   meta_path="$PRODUCTION_MUTATION_LEASE_META"
@@ -1508,7 +1512,9 @@ current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev
 case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 76
 write_meta
-echo LEASED
+eval \"\$(printf '%s' '$admission_helper_b64' | base64 -d)\" || exit 79
+v5_mutation_admission '$PRODUCTION_MUTATION_LOCK.admission-nonce' '$admission_nonce' '$V5_ENV' \"\$lease_start\" \"\$lease_ttl\" \"\$lease_parent\" || { drop_meta; exit 79; }
+echo \"LEASED $admission_nonce\"
 while :; do
   current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || { drop_meta; exit 0; }
   case \"\$current_parent\" in ''|*[!0-9]*) drop_meta; exit 0 ;; esac
@@ -1604,7 +1610,7 @@ done"
   while (( waited < poll_attempts )); do
     same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" || break
     same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" || break
-    if grep -q LEASED "$out" 2>/dev/null; then got=1; break; fi
+    if grep -Fxq "LEASED $admission_nonce" "$out" 2>/dev/null; then got=1; break; fi
     sleep 0.1; waited=$((waited + 1))
   done
   rm -f "$out"
@@ -1618,6 +1624,7 @@ done"
     return 1
   fi
   MUTATION_DEPLOY_ID="$deploy_id"
+  MUTATION_ADMISSION_NONCE="$admission_nonce"
   MUTATION_HOLDER_IDENTITY="$holder_host:$$:$MODE"
   echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,本地安全 TTL ${local_ttl}s,远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
   return 0
@@ -6916,7 +6923,40 @@ smoke() {
 }
 
 # ───────────────────────── bootstrap:首次建立 v5 ─────────────────────────
+assert_bootstrap_complete_env() {
+  # Full candidate schema is bootstrap-only, never a repair/recovery lease gate.
+  assert_mutation_lease_alive "bootstrap-env" || return 86
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] require complete pre-provisioned bootstrap V5 env"
+    return 0
+  fi
+  local artifact digest compressed
+  artifact="$(node "$REPO_ROOT/scripts/lib/build-v5-bootstrap-validator.mjs")" || return 79
+  digest="${artifact%% *}"; compressed="${artifact#* }"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && -n "$compressed" ]] || return 79
+  ssh "$KL_HOST" bash -s -- "$V5_ENV" "$digest" "$compressed" <<'BOOTSTRAP_ENV'
+set -Eeuo pipefail
+env_file="$1"; expected_sha="$2"; compressed="$3"
+[[ "$(id -u)" == 0 && -f "$env_file" && ! -L "$env_file" &&
+   "$(stat -c '%u:%a' "$env_file")" == "0:600" ]] || exit 77
+umask 077
+tmp="$(mktemp)" || exit 77
+trap 'rm -f "$tmp"' EXIT
+printf '%s' "$compressed" | base64 -d | gzip -d >"$tmp" || exit 79
+actual_sha="$(sha256sum "$tmp")"; actual_sha="${actual_sha%% *}"
+[[ "$actual_sha" == "$expected_sha" ]] || { echo "bootstrap: validator SHA-256 mismatch" >&2; exit 79; }
+# No public/live source, unit, env or dependency installation in validation.
+timeout --signal=KILL --kill-after=1 20 bash -c '
+  set -euo pipefail
+  set -a; . "$1"; set +a
+  export NODE_ENV=production
+  exec node "$2"
+' bootstrap-env "$env_file" "$tmp"
+BOOTSTRAP_ENV
+}
+
 bootstrap() {
+  assert_bootstrap_complete_env || return $?
   echo "══ v5 bootstrap on $KL_HOST ══"
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
