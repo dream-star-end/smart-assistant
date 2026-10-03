@@ -500,7 +500,7 @@ function ReplyQuoteBlock({
       <div className="mb-0.5 text-caption font-medium">
         {role === "assistant" ? BRAND.name : "你"}
       </div>
-      <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5">
+      <div className="line-clamp-2 whitespace-pre-wrap break-words text-[12.5px] leading-5 [overflow-wrap:anywhere]">
         {text}
       </div>
     </div>
@@ -533,10 +533,13 @@ export function UserCard({
     // OCV5-307 节奏:每轮从用户提问开始,上方多留一点呼吸(pt-3),问与答之间收紧。
     // 桌面(hover:hover)上动作条贴在气泡左侧底边、绝对定位不占高度 —— 原先它在气泡下方
     // 预留整整一行(opacity-0 也占位),问题和自己的回答之间被撑开一大段空白。触屏照旧在下方。
-    <div className="group flex flex-col items-end pt-3 animate-in" data-testid="user-row">
-      <div className="relative flex max-w-[78%] flex-col items-end">
+    // 长消息(定时续跑代发的整段提示、会话键、路径、URL)里的无空格长串:`break-words` 只在溢出时
+    // 折行,不降低 min-content,items-end 的 flex 子项会被最长串撑宽、向左溢出屏幕被裁掉。
+    // `overflow-wrap:anywhere` 让长串参与 min-content 计算,配合 min-w-0/max-w-full 把气泡锁在屏内。
+    <div className="group flex min-w-0 flex-col items-end pt-3 animate-in" data-testid="user-row">
+      <div className="relative flex min-w-0 max-w-[78%] flex-col items-end">
         <div
-          className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg"
+          className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15.5px] leading-relaxed text-fg [overflow-wrap:anywhere]"
           data-testid="message-text"
         >
           {msg._replyTo && (
@@ -861,8 +864,8 @@ export function AssistantCard({
         ) : null}
         {msg.cronPush && (
           <div className="mb-1.5">
-            <Badge tone="accent">
-              <Info size={11} /> {msg.cronLabel || "定时推送"}
+            <Badge tone="accent" className="max-w-full shrink whitespace-normal text-left [overflow-wrap:anywhere]">
+              <Info size={11} className="shrink-0" /> {msg.cronLabel || "定时推送"}
             </Badge>
           </div>
         )}
@@ -1488,8 +1491,8 @@ export function DelegateProgressCard({ msg }: { msg: ChatMessage }) {
 export function SystemCard({ msg }: { msg: ChatMessage }) {
   if (!msg.text) return null;
   return (
-    <div className="flex justify-center animate-in">
-      <div className="max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-1.5 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] sm:text-center">
+    <div className="flex min-w-0 justify-center animate-in">
+      <div className="min-w-0 max-w-full whitespace-pre-wrap break-words rounded-xl bg-hover px-3 py-1.5 text-left text-[12px] leading-relaxed text-faint sm:max-w-[80%] sm:text-center [overflow-wrap:anywhere]">
         {msg.text}
       </div>
     </div>
