@@ -2183,7 +2183,12 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
   await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
   await mobilePage.waitForFunction(() => {
     const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
-    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
+    // The old rows already overflow: wait for this growth's real Markdown,
+    // not just its raw-text Suspense fallback, before sampling touch geometry.
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200 &&
+      Array.from(node.querySelectorAll('[data-chat-virtual-key="mobile-grow-0"] .prose p')).some(
+        (paragraph) => paragraph.textContent === "MOBILE_GROW_0_35 触控滚动高度增长回归样本。",
+      );
   }, null, { timeout: 5000 });
   // grow 后 layout 可能还在涨高；反复 armSticky 直到真贴底，避免 12px 级竞态。
   await mobilePage.waitForFunction(() => {
