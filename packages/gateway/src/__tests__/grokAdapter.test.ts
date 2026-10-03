@@ -4,7 +4,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/grokAdapter.test.ts
  */
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { describe, test } from 'node:test'
@@ -157,7 +157,7 @@ for (const event of [
       }])
 
       const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; promptFile: string; promptMode: number; prompt: string; env: Record<string, string> }
-      assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.6'])
+      assert.deepEqual(captured.argv.slice(0, 4), ['--agent', 'grok-build', '--model', 'grok-4.7'])
       assert.match(captured.prompt, /OpenClaude Platform Context \(Grok adapter\)/)
       assert.match(captured.prompt, /fix it/)
       assert.equal(captured.promptMode, 0o600)
@@ -172,7 +172,11 @@ for (const event of [
       assert.equal(captured.env.GROK_CLI_CHAT_PROXY_BASE_URL, baseUrl)
       assert.equal(captured.env.GROK_MODELS_BASE_URL, baseUrl)
       assert.equal(captured.env.GROK_MODELS_LIST_URL, `${baseUrl}/models`)
-      assert.equal(captured.env.GROK_HOME, path.join(process.env.OPENCLAUDE_HOME!, 'grok-build'))
+      assert.match(captured.env.GROK_HOME, /grok-build\/caller\/[0-9a-f]{16}$/)
+      assert.equal(
+        await realpath(path.join(captured.env.GROK_HOME, 'sessions')),
+        path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'sessions'),
+      )
       assert.equal(captured.env.OPENCLAUDE_ENGINE, 'grok')
       assert.equal(captured.env.PATH, '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin')
       assert.equal(captured.env.OPENCLAUDE_V3_CONTAINER_TOKEN, undefined)
@@ -490,6 +494,73 @@ setInterval(() => {}, 1000)
 })
 
 
+test('grok-build-fast uses its own GROK_HOME and does not resume a standard session', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-fast-home-'))
+  const fake = path.join(dir, 'fake-grok.cjs')
+  const capture = path.join(dir, 'capture.json')
+  await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, home: process.env.GROK_HOME }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
+`)
+  await chmod(fake, 0o755)
+  const previousBin = process.env.OC_GROK_CLI_BIN
+  const previousHome = process.env.OPENCLAUDE_HOME
+  const previousCapture = process.env.FAKE_GROK_CAPTURE
+  process.env.OC_GROK_CLI_BIN = fake
+  process.env.OPENCLAUDE_HOME = path.join(dir, 'openclaude-home')
+  process.env.FAKE_GROK_CAPTURE = capture
+  const baseHome = path.join(process.env.OPENCLAUDE_HOME, 'grok-build')
+  await mkdir(baseHome, { recursive: true })
+  await writeFile(path.join(baseHome, 'models_cache.json'), JSON.stringify({
+    fetched_at: '2026-09-22T00:00:00Z',
+    origin: 'http://old.example/models',
+    models: {
+      'grok-4.7-build-fast': { info: { id: 'grok-4.7-build-fast', base_url: 'http://old.example' }, api_key: 'nope' },
+    },
+  }))
+  try {
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.setGrokRoute({
+      baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+      routeToken: TOKEN,
+    })
+    adapter.on('error', () => {})
+    adapter.setResumeSessionId('prior-session')
+    adapter.setModel('grok-build-fast')
+    const run = adapter.submitTurn({
+      input: 'fast',
+      requestId: REQUEST_ID,
+      turnKey: TURN_KEY,
+      onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map(),
+    })
+    await run.submitted
+    await run.summary
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; home: string }
+    assert.equal(captured.argv[captured.argv.indexOf('--model') + 1], 'grok-4.7-build-fast')
+    assert.equal(captured.argv.includes('--resume'), false)
+    assert.match(captured.home, /grok-build\/caller\/[0-9a-f]{16}\/fast$/)
+    assert.equal(
+      await realpath(path.join(captured.home, 'sessions')),
+      path.join(baseHome, 'fast', 'sessions'),
+    )
+    const seeded = JSON.parse(await readFile(path.join(captured.home, 'models_cache.json'), 'utf8')) as {
+      models: Record<string, { api_key: string | null }>
+    }
+    assert.ok(seeded.models['grok-4.7-build-fast'])
+    assert.equal(seeded.models['grok-4.7-build-fast']?.api_key, null)
+    assert.equal((seeded as { origin?: string }).origin, `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1/models`)
+  } finally {
+    restoreEnv('OC_GROK_CLI_BIN', previousBin)
+    restoreEnv('OPENCLAUDE_HOME', previousHome)
+    restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('projects openclaude-memory into GROK_HOME when a gateway token is present', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-mcp-'))
   const fake = path.join(dir, 'fake-grok.cjs')
@@ -499,7 +570,7 @@ const fs = require('node:fs')
 const argv = process.argv.slice(2)
 const promptFile = argv[argv.indexOf('--prompt-file') + 1]
 const prompt = fs.readFileSync(promptFile, 'utf8')
-fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt }))
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt, home: process.env.GROK_HOME }))
 console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_tokens: 0 } }))
 `)
   await chmod(fake, 0o755)
@@ -531,17 +602,17 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
     })
     await run.submitted
     await run.summary
-    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string }
+    const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string; home: string }
     assert.match(captured.prompt, /use memory/)
     assert.equal(captured.prompt.includes('bearer-must-not-enter-argv'), false)
     assert.equal(JSON.stringify(captured.argv).includes('bearer-must-not-enter-argv'), false)
-    const managedConfig = await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'config.toml'), 'utf8')
+    assert.match(captured.home, /grok-build\/caller\/[0-9a-f]{16}$/)
+    const managedConfig = await readFile(path.join(captured.home, 'config.toml'), 'utf8')
     assert.match(managedConfig, /\[mcp_servers\."openclaude-memory"\]/)
     assert.equal(managedConfig.includes('bearer-must-not-enter-argv'), false)
-    assert.equal(
-      await readFile(path.join(process.env.OPENCLAUDE_HOME!, 'grok-build', 'gateway-token'), 'utf8'),
-      'bearer-must-not-enter-argv',
-    )
+    const tokenPath = managedConfig.match(/OPENCLAUDE_GATEWAY_TOKEN_FILE = "([^"]+)"/)?.[1]
+    assert.ok(tokenPath)
+    assert.equal(await readFile(tokenPath!, 'utf8'), 'bearer-must-not-enter-argv')
   } finally {
     restoreEnv('OC_GROK_CLI_BIN', previousBin)
     restoreEnv('OPENCLAUDE_HOME', previousHome)
@@ -1048,4 +1119,84 @@ test('TaskOutput empty failed output is empty_output, not task_dead', () => {
     classifyToolFailure({ outputPreview: 'No task found with ID: abc' }).errorClass,
     'task_not_found',
   )
+})
+
+
+describe('V5 trusted Grok execution admission', () => {
+  test('rejects missing, wrong-request, wrong-route and wrong-version descriptors before any spawn', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-grok-reject-'))
+    const prev = process.env.OC_CONTAINER_ID
+    process.env.OC_CONTAINER_ID = '7'
+    try {
+      const adapter = new GrokAdapter(createOpts(dir))
+      adapter.setGrokRoute({ baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`, routeToken: TOKEN })
+      let spawns = 0; adapter.on('spawn', () => spawns++)
+      const params = { input: 'rejected', requestId: REQUEST_ID, onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() }
+      const descriptor = { canonicalModel: 'grok-build', upstreamModelId: 'grok-4.7',
+        billingRequestId: REQUEST_ID, executionRevision: 'revision-1' }
+      assert.throws(() => adapter.submitTurn(params), /DESCRIPTOR_REQUIRED/)
+      for (const patch of [ { billingRequestId: 'd'.repeat(32) }, { canonicalModel: 'grok-build-fast' },
+        { upstreamModelId: 'grok-4.7-build-fast' }, { routeTokenHash: '0'.repeat(64) } ]) {
+        assert.throws(() => adapter.submitTurn({ ...params, grokExecutionDescriptor: { ...descriptor, ...patch } }), /DESCRIPTOR_INVALID/)
+      }
+      assert.equal(spawns, 0)
+    } finally { restoreEnv('OC_CONTAINER_ID', prev); await rm(dir, { recursive: true, force: true }) }
+  })
+
+  test('real child argv freezes 4.6 through resume retry, then accepts 4.7 on next turn', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-grok-freeze-'))
+    const fake = join(dir, 'fake-grok.cjs'); const capture = join(dir, 'argv.jsonl')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs'); const argv = process.argv.slice(2)
+fs.appendFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify(argv)+'\\n')
+if (argv.includes('--resume')) setInterval(() => {}, 1000)
+else {
+  console.log(JSON.stringify({ type: 'text', data: 'frozen version ran' }))
+  console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', usage: { input_tokens: 2, output_tokens: 1 } }))
+}
+`)
+    await chmod(fake, 0o755)
+    const keys = ['OC_CONTAINER_ID', 'OC_GROK_CLI_BIN', 'FAKE_GROK_CAPTURE', 'OPENCLAUDE_HOME']
+    const previous = keys.map(k => process.env[k])
+    process.env.OC_CONTAINER_ID = '7'; process.env.OC_GROK_CLI_BIN = fake
+    process.env.FAKE_GROK_CAPTURE = capture; process.env.OPENCLAUDE_HOME = join(dir, 'home')
+    _internals.setProcessKeepaliveTestHooks({ firstStdoutMs: 2000 })
+    const adapter = new GrokAdapter(createOpts(dir))
+    adapter.on('error', () => {})
+    try {
+      adapter.setGrokRoute({ baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`, routeToken: TOKEN })
+      const descriptor = { canonicalModel: 'grok-build', upstreamModelId: 'grok-4.6',
+        billingRequestId: REQUEST_ID, executionRevision: 'old-generation' }
+      const params = { input: 'run', requestId: REQUEST_ID, onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() }
+      const run = adapter.submitTurn({ ...params, grokExecutionDescriptor: descriptor })
+      descriptor.upstreamModelId = 'grok-4.7'
+      await run.submitted
+      // Wait for the real resumed CLI to enter its silent loop before mutating
+      // adapter state. A spawn event alone is not proof the child has run.
+      const readyDeadline = Date.now() + 1800
+      for (;;) {
+        try { if ((await readFile(capture, 'utf8')).trim()) break } catch {}
+        assert.ok(Date.now() < readyDeadline, 'resumed CLI did not reach capture handshake')
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      adapter.setModel('grok-build-fast')
+      assert.equal((await run.summary)?.assistantText, 'frozen version ran')
+      await adapter.waitForOutputDrain()
+      const attempts = (await readFile(capture, 'utf8')).trim().split('\n').map(x => JSON.parse(x) as string[])
+      assert.equal(attempts.length, 2, 'must really spawn resume and clean retry')
+      assert.ok(attempts[0].includes('--resume')); assert.ok(!attempts[1].includes('--resume'))
+      assert.deepEqual(attempts.map(a => a[a.indexOf('--model') + 1]), ['grok-4.6', 'grok-4.6'])
+      adapter.setModel('grok-build'); adapter.setResumeSessionId('')
+      const next = adapter.submitTurn({ ...params, grokExecutionDescriptor: { ...descriptor, executionRevision: 'new-generation' } })
+      await next.submitted; assert.equal((await next.summary)?.assistantText, 'frozen version ran')
+      await adapter.waitForOutputDrain()
+      const all = (await readFile(capture, 'utf8')).trim().split('\n').map(x => JSON.parse(x) as string[])
+      assert.equal(all.length, 3); assert.equal(all[2][all[2].indexOf('--model') + 1], 'grok-4.7')
+    } finally {
+      await adapter.shutdown(); _internals.setProcessKeepaliveTestHooks(null)
+      keys.forEach((k, i) => restoreEnv(k, previous[i])); await rm(dir, { recursive: true, force: true })
+    }
+  })
 })

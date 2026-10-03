@@ -27,7 +27,7 @@
  * anthropicProxy.integ.test.ts;那里的 mock 更重。
  */
 
-import { afterEach, describe, test } from "node:test";
+import { afterEach, beforeEach, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -38,6 +38,10 @@ import type { ProxyBody, UsageObservation } from "../http/proxy/shared.js";
 import type { FinalizerHandle, FinalizeOutcome } from "../billing/proxyBilling.js";
 import { rootLogger } from "../logging/logger.js";
 import { _setProviderQuotaRunnerForTest } from "../admin/providerQuotaCircuit.js";
+import {
+  resetClaudeIdentityGuardForTest,
+  setClaudeIdentityGuardRuntimeForTest,
+} from "../http/proxy/claudeIdentityGuard.js";
 
 const log = rootLogger.child({ subsys: "proxyCore.unit.test" });
 
@@ -335,7 +339,13 @@ function buildCtx(opts: BuildCtxOpts) {
   return { ctx, req, res, session, finalize };
 }
 
-afterEach(() => _setProviderQuotaRunnerForTest(undefined));
+beforeEach(() => {
+  setClaudeIdentityGuardRuntimeForTest({ enabled: false });
+});
+afterEach(() => {
+  _setProviderQuotaRunnerForTest(undefined);
+  resetClaudeIdentityGuardForTest();
+});
 
 describe("runUpstreamRoundTrip — platform model / upstream model 分离", () => {
   test("平台 kimi-k3-ark 只在发往上游的 JSON 改写为 kimi-k3", async () => {
@@ -451,6 +461,38 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     assert.equal(finalize.commitCalls.length, 1);
     assert.equal(finalize.failCalls.length, 0);
     assert.equal(finalize.failClientCalls.length, 0);
+  });
+
+  test("Box 非重放策略:签名 400 不删除历史、不发第二次模型调用", async () => {
+    const sentBodies: Array<Record<string, unknown>> = [];
+    const signatureError = JSON.stringify({
+      type: "error",
+      error: { type: "invalid_request_error", message: "thinking signature invalid" },
+    });
+    const { ctx, res, finalize } = buildCtx({
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return sentBodies.length === 1
+          ? new Response(signatureError, { status: 400 })
+          : sseFullResponse(); // 若误重试会假绿,下方调用数/终态断言会抓住。
+      },
+    });
+    const messages = [{ role: "assistant", content: [
+      { type: "thinking", thinking: "signed", signature: "q".repeat(64) },
+      { type: "text", text: "visible" },
+    ] }];
+    const before = structuredClone(messages);
+    ctx.body.messages = messages as ProxyBody["messages"];
+    ctx.noHistoryRewriteRetry = true;
+
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(sentBodies.length, 1, "Box request must never be silently replayed");
+    assert.deepEqual(sentBodies[0]!.messages, before);
+    assert.deepEqual(messages, before, "the canonical history must remain unchanged");
+    assert.equal(finalize.commitCalls.length, 0);
+    assert.equal(finalize.failClientCalls.length, 1);
+    assert.notEqual(res.statusCode, 200);
   });
 
   test("上游 500 → finalize.fail(非 failClient)+ 502 UPSTREAM_ERROR", async () => {

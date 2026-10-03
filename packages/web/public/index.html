@@ -39,7 +39,7 @@
 <link rel="apple-touch-icon" href="/icon.svg" />
 <link rel="stylesheet" href="/vendor/github-dark.min.css" />
 <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
-<link rel="stylesheet" href="/style.css?v=501cba4f" />
+<link rel="stylesheet" href="/style.css?v=goal1cba4f" />
 <!-- main.js version bumped 2026-04-21: 积分化 + /login routing -->
 <style>/* Inline styles removed — see style.css */
 </style>
@@ -1337,6 +1337,33 @@
           </span>
         </div>
       </div>
+      <section id="goal-dock" class="goal-dock" hidden data-open="0" data-state="active" data-editing="0" data-confirm="0">
+        <button type="button" id="goal-dock-line" class="goal-dock-line" aria-expanded="false">
+          <span class="goal-dock-mark" aria-hidden="true"></span>
+          <span id="goal-dock-pill" class="goal-dock-pill">进行中</span>
+          <span id="goal-dock-title" class="goal-dock-title"></span>
+          <span id="goal-dock-stat" class="goal-dock-stat"></span>
+          <svg class="goal-dock-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+        <div id="goal-dock-body" class="goal-dock-body" hidden>
+          <p id="goal-dock-objective" class="goal-dock-objective"></p>
+          <textarea id="goal-dock-editbox" class="goal-dock-editbox" hidden></textarea>
+          <div id="goal-dock-meta" class="goal-dock-meta"></div>
+          <div class="goal-dock-actions">
+            <button type="button" id="goal-dock-edit" class="goal-dock-act">改目标</button>
+            <button type="button" id="goal-dock-toggle" class="goal-dock-act goal-dock-act-primary">暂停</button>
+            <button type="button" id="goal-dock-save" class="goal-dock-act goal-dock-act-primary" hidden>保存</button>
+            <button type="button" id="goal-dock-cancel" class="goal-dock-act" hidden>取消</button>
+            <button type="button" id="goal-dock-ask" class="goal-dock-link">删除</button>
+            <div class="goal-dock-confirm">
+              删除这个目标？
+              <button type="button" id="goal-dock-no" class="goal-dock-act">取消</button>
+              <button type="button" id="goal-dock-yes" class="goal-dock-link">删除</button>
+            </div>
+          </div>
+          <div id="goal-dock-note" class="goal-dock-note"></div>
+        </div>
+      </section>
       <div class="composer-inner">
         <div id="attachments" class="attachments" hidden></div>
         <div id="composer-modes" class="composer-modes" hidden>
@@ -2586,6 +2613,6 @@
 <script src="/vendor/katex/katex.min.js" defer></script>
 <script src="/vendor/qrcode.min.js"></script>
 <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
-<script type="module" src="/modules/main.js?v=501cba4f"></script>
+<script type="module" src="/modules/main.js?v=goal1cba4f"></script>
 </body>
 </html>

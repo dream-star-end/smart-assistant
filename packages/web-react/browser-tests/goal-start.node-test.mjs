@@ -83,12 +83,14 @@ test("full App goal save auto-start (desktop/mobile, failure, retry, busy)", { t
         await objective.fill("目标自动开工验证");
         await page.getByRole("button", { name: "设置并开始", exact: true }).click();
         await page.getByRole("alert").waitFor();
+        assert.equal(await page.getByTestId("queued-send-row").count(), 0);
         assert.equal(await page.getByTestId("user-row").count(), 0);
         await page.getByRole("button", { name: "设置并开始", exact: true }).click();
         await page.getByRole("dialog").waitFor({ state: "hidden" });
-        await page.getByTestId("user-row").waitFor();
-        assert.equal(await page.getByTestId("user-row").count(), 1);
-        assert.match(await page.getByTestId("user-row").textContent(), /目标自动开工验证/);
+        assert.equal(await page.getByTestId("queued-send-row").count(), 1);
+        assert.match(await page.getByTestId("queued-send-row").textContent(), /目标自动开工验证/);
+        assert.equal(await page.getByTestId("queued-send-row").locator("p").textContent(), "目标自动开工验证");
+        assert.equal(await page.getByTestId("user-row").count(), 0);
         assert.equal(rows.size, 1, "must send to the just-materialized session");
         assert.equal(calls.filter(([kind]) => kind === "goal").length, 1);
         assert.ok(calls.some(([kind, id, data]) => kind === "patch" && goals.has(id) && data.title === "目标自动开工验证"));
@@ -96,7 +98,8 @@ test("full App goal save auto-start (desktop/mobile, failure, retry, busy)", { t
         await objective.fill("更新目标但不重复开工");
         await page.getByRole("button", { name: "保存", exact: true }).click();
         await page.getByRole("dialog").waitFor({ state: "hidden" });
-        assert.equal(await page.getByTestId("user-row").count(), 1, "offline-queued is busy, no duplicate");
+        assert.equal(await page.getByTestId("queued-send-row").count(), 1, "offline-queued is busy, no duplicate");
+        assert.equal(await page.getByTestId("user-row").count(), 0);
         assert.equal(calls.filter(([kind]) => kind === "goal").length, 2);
         assert.deepEqual(errors, []);
       } catch (error) {

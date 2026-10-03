@@ -97,6 +97,10 @@ export const DURABLE_TABLES: readonly string[] = [
   "compute_hosts",
   "compute_pool_state",
   "connections",
+  // 内容审查打击、申诉和账号封禁是执法状态，不按年龄静默删除。
+  "content_review_account_bans",
+  "content_review_appeals",
+  "content_review_strikes",
   "connector_platform_oauth_apps",
   "connector_token_cache",
   "credit_ledger",

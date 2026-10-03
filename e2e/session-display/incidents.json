@@ -710,12 +710,9 @@
       "symptom": "上下文耗尽的 turn 落成 ENGINE_ERROR 被前端当作可自动恢复;master 原子拒绝为 source_not_recoverable 后,REST 全量同步又暴露同一 source 错误并无限次重新排程。",
       "rootFixCommit": "83681d59",
       "coverageCommits": [
-        "8f04bb2d"
+        "8f04bb2d",
+        "dda24a1e"
       ],
-      "proofPending": {
-        "reason": "触发链=上下文耗尽→ENGINE_ERROR→自动恢复→source_not_recoverable→REST 同步后重复排程。10-stop-turn 只证用户 Stop 终态,语义不匹配,已撤销;恢复围栏跨刷新持久化目前只有 unit 覆盖,尚无覆盖该恢复重试环的 live-e2e/browser/deploy-gate。",
-        "since": "2026-07-26"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -726,6 +723,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence"
         }
       ]
     },
@@ -4513,6 +4515,1387 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "SERVICE_RESTART leftover with live progress refuses automatic recovery"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-SAND-UOR-LOOP",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "唯一 active Cursor Sand 账号 20 的 Box install 卡在 submitted 后，UNKNOWN_OPERATION_RESULT 死循环，空池导致整条 Cursor 引擎 DISPATCH_NOT_ACCEPTED。",
+      "rootFixCommit": "9bfa706c",
+      "coverageCommits": [
+        "9bfa706c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-SAND-INSTALL-RETRY",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "Cursor Sand Box sendPrompt 对 clientNonce=nonce-install 幂等，同 nonce 重试 accepted 但不执行；维护 bot 自造 INSTALLER_B64_MISSING 而不跑官方 python heredoc，空池无法恢复。",
+      "rootFixCommit": "66dc86ca",
+      "coverageCommits": [
+        "66dc86ca"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "stale submitted retries sendPrompt on the same agent instead of looping UNKNOWN_OPERATION_RESULT"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandActor.test.ts",
+          "assertion": "installer prompt contains exact reviewed source and module bytes, not credentials"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-CCB-TRANSIENT-CONTINUE",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "官方 CC 终端工具已完成后，瞬时 Anthropic 5xx 被 checkpointSafe 拦住不自动续跑，直接红卡收轮。",
+      "rootFixCommit": "6781147e",
+      "coverageCommits": [
+        "6781147e",
+        "d3cb01ae"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "API Error 500 after completed Bash retries TRANSIENT_RETRY_INPUT"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "capacity failure after a completed tool with unknown external outcome never auto-continues"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-OFFICIAL-CC-UA-PIN",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "官方 CC 开着时 OAuth 池 persona UA 仍发 CCB fork claude-cli/2.8.4，活体容器是官方 Claude Code 2.1.278；出口日本但 persona 随机美东。",
+      "rootFixCommit": "231f30c1",
+      "coverageCommits": [
+        "231f30c1"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/persona.unit.test.ts",
+          "assertion": "OC_CCB_OFFICIAL_CC=1 → UA 钉官方 Claude Code 版本"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/persona.unit.test.ts",
+          "assertion": "OFFICIAL_CC_CLI_VERSION 与 runtime-build.env 钉一致"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-CLAUDE-IDENTITY-GUARD",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "Claude OAuth 出站不核对出口 IP/时区/设备一致性，persona 与日本出口错配或 device_id 未钉仍打到 Anthropic。",
+      "rootFixCommit": "0c37e008",
+      "coverageCommits": [
+        "0c37e008"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/claudeIdentityGuard.unit.test.ts",
+          "assertion": "persona 时区与出口时区不一致 → tz_mismatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/claudeIdentityGuard.unit.test.ts",
+          "assertion": "出口 IP 相对 env 钉漂移 → ip_drift"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyUpstream.unit.test.ts",
+          "assertion": "pinned schema breach → fail-closed,不重写 device_id"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260921-CLAUDE-EGRESS-PRECHECK-ACTIVE",
+      "occurredAt": "2026-09-21",
+      "severity": "P1",
+      "symptom": "管理台新建 Claude 账号绑同一 egress 失败：预检把 disabled Claude 也算占用，与只约束 active 的唯一索引不一致。",
+      "rootFixCommit": "b0c1c07a",
+      "coverageCommits": [
+        "b0c1c07a",
+        "44833768"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/adminAccounts.egressPrecheck.unit.test.ts",
+          "assertion": "只统计 active Claude，与 idx_claude_accounts_egress_proxy_uniq 一致"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/claude-egress-precheck.node-test.mjs",
+          "assertion": "INC-20260921-CLAUDE-EGRESS-PRECHECK-ACTIVE: real modal POST, PG and audit"
+        }
+      ],
+      "historicalRebasedLineage": [
+        {
+          "sourceCommit": "1d7f79c7af6a24a40952d8c018a63c752e0041e4",
+          "ancestorCommit": "b0c1c07a6afb97b3f4cd583d9a072efb3801bdbf",
+          "patchId": "e3a2c3194ae19b3b0819fd05f45eba308a793fed",
+          "recordedByCommit": "0bfbe9c46752c73fcba66ffe5a517d7cbf04a173",
+          "reason": "Historical rebase source is not an ancestor of this branch; same stable patch-id as active ancestor. Historical metadata only; active lineage retains all ancestry and evidence gates."
+        }
+      ]
+    },
+    {
+      "id": "INC-20260923-CCB-FOREGROUND-BASH-CALLBACK",
+      "occurredAt": "2026-09-23",
+      "severity": "P1",
+      "symptom": "CLI 2.1.280 对已以前台 tool_result 交付的 Bash 仍发无 ack 的 task_notification，父回合 finalize 把它注入成新的计费轮；空正文且错误卡被静默隐藏、又没有正向扣费时，助手底栏仍单独挂出。",
+      "rootFixCommit": "692c3c6c",
+      "coverageCommits": [
+        "a9040b8d"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "foreground bash tool_result already delivered then task_notification with no ack injects 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "timeout moved to background tool_result then task_notification injects 1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "task_notification without tool_use_id still injects 1"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbForegroundBashCallback.test.ts",
+          "assertion": "bookend before foreground tool_result still injects 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "空正文且静默错误卡隐藏且免单时不渲染 assistant-meta"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "空正文静默错误但有正向积分时仍显示积分"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "有正文的免单轮仍显示已免单"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "正向积分显示积分"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260923-EMPTY-TURN-NO-REPLY",
+      "occurredAt": "2026-09-23",
+      "severity": "P1",
+      "symptom": "继续聊天时模型 0 token 仍被记成完成，空回复句挂上评价和操作；同一条停止通知会再开一轮；自动续跑被拒后界面不说明。",
+      "rootFixCommit": "fc0e393a",
+      "coverageCommits": [
+        "fc0e393a",
+        "21e9b0c8",
+        "bc3b30d7",
+        "2c57167a"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/emptyCompletedTurn.test.ts",
+          "assertion": "token 全 0 且没有任何产出 → 不能记成完成"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/emptyCompletedTurn.test.ts",
+          "assertion": "有正文、有工具、有 token、斜杠命令、已跳过的 API → 不改判"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ccbLocalAgentCallback.test.ts",
+          "assertion": "drops a second notice with the same status and summary"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/empty-turn-callback.node-test.mjs",
+          "assertion": "INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callback admission"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260923-QUEUE-ABOVE-COMPOSER",
+      "occurredAt": "2026-09-23",
+      "severity": "P1",
+      "symptom": "上一条还在跑时，新消息被画进对话窗口。用户要的是输入框上方的待发送列表，右侧是修改和立即发送。",
+      "rootFixCommit": "fc121930",
+      "coverageCommits": [
+        "fc121930",
+        "d4206e71",
+        "ad130c36"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
+          "assertion": "钉在输入框上方的卡片右侧是修改、删除、立即发送三个图标按钮，不把排队消息画进对话"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
+          "assertion": "对话流不渲染还在排队的用户消息"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/queued-send-app.node-test.mjs",
+          "assertion": "INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before send-now"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260923-PROCESS-STEPS-AUTO",
+      "occurredAt": "2026-09-23",
+      "severity": "P2",
+      "symptom": "工作过程区要手动点「加载更早的处理步骤」才能看到本轮更早的步骤。",
+      "rootFixCommit": "f8f619b7",
+      "coverageCommits": [
+        "f8f619b7",
+        "53d4cd5c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "仅本轮还有未加载步骤时，自动补齐且不显示加载按钮"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "游标前移后继续自动补齐更早步骤"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "更早步骤加载失败时才出现重试，点击再请求一次"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "既有更早对话又有本轮未加载步骤时，顶部按钮只翻对话"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T69 贴底补更早过程步骤时已渲染锚点不位移，离底保持锚点，上滑后不恢复跟随"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260924-LIVE-UNITS-VIEWPORT-JUMP",
+      "occurredAt": "2026-09-24",
+      "severity": "P1",
+      "symptom": "流式回复时自动补更早过程步骤，已经渲染出来的文字整块上下跳。",
+      "rootFixCommit": "d203d9bf",
+      "coverageCommits": [
+        "d203d9bf",
+        "2d37d709",
+        "5abf0dfd"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "贴底自动补更早过程步骤时，已渲染锚点不因前插位移"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "离底补更早过程步骤时按前插后的真实位置保持锚点"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T69 贴底补更早过程步骤时已渲染锚点不位移，离底保持锚点，上滑后不恢复跟随"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260926-BOX-CC-CALLERLESS-RESUME",
+      "occurredAt": "2026-09-26",
+      "severity": "P1",
+      "symptom": "自用 V5 管理员在 Box Claude Opus 5.5 网页回合中本地 skill_search 和 Bash 均成功，Claude Code 续接时保留 thinking 但省略 tool_use.caller，旧 Box journal 误报 BOX_TOOL_ASSISTANT_CHANGED；请求显示无法处理，首轮模型用量仍扣 5 积分。",
+      "rootFixCommit": "dc6f53fb",
+      "coverageCommits": [
+        "dc6f53fb"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCallFingerprint.test.ts",
+          "assertion": "CCB preserved thinking with callerless two-tool echo binds all semantic bytes"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.integ.test.ts",
+          "assertion": "Box journal fences replay/account capacity and persists proof plus exact usage"
+        }
+      ],
+      "proofPending": {
+        "reason": "真实自用管理员网页故障和远端终止清理已取证；当前只有实际 Claude Code 2.1.280 离线双工具协议回归及 PG TEMP 集成，尚无可在商业候选自动重放的同链浏览器或 live-e2e 夹具。selfhost 修复上线后需用新的用户认证网页回合验收，不得重放失败付费调用。",
+        "since": "2026-09-26"
+      }
+    },
+    {
+      "id": "INC-20260926-BOX-STAGE-UNKNOWN",
+      "occurredAt": "2026-09-26",
+      "severity": "P1",
+      "symptom": "Box 第二轮私有输入 staging 超时被误归为无来源取消；无远端写入围栏和清理证明，用户请求失败且账号容量长期占用。",
+      "rootFixCommit": "9a851852",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "prelaunch cleanup closes writes, removes partial private files, and is idempotent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "failed INIT cannot authorize deletion of a preexisting run directory"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchJournal.integ.test.ts",
+          "assertion": "prelaunch cleanup CAS cannot cross a durable launch permit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "fresh egress recovers only a no-launch prelaunch row without paid replay"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260926-BOX-IDLE-WAKE",
+      "occurredAt": "2026-09-26",
+      "severity": "P1",
+      "symptom": "Box 空闲休眠后，已上架模型的首轮调用会因 BOX_NOT_RUNNING 直接失败；必须仅在已鉴权的真实模型调用上单次唤醒并证明 RUNNING。",
+      "rootFixCommit": "1debc5c3",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandProvision.test.ts",
+          "assertion": "only explicit model-call wake turns HIBERNATED into a proven Exec descriptor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+          "assertion": "only explicitly authorized resolver calls wake a hibernated Box"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAccountResolver.test.ts",
+          "assertion": "credential rotation after wake Ensure blocks post-state read and Exec"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "only model first/resume paths request wake; recovery resolver remains default no-wake"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260927-BOX-HOOK-RESUME",
+      "occurredAt": "2026-09-27",
+      "severity": "P1",
+      "symptom": "V5 selfhost Box Opus 5.5 在真实 Claude Code 第二次 Bash 工具结果续接时，将 PreToolUse hook additionalContext 产生的兄弟文本或独立 system 钩子误判为新合成回合，HTTP 400 中断已付费工具链。",
+      "rootFixCommit": "aeefb65b",
+      "coverageCommits": [
+        "aeefb65b",
+        "74e263ed",
+        "d68d1c24",
+        "49c87d0e",
+        "2872667f",
+        "fa56a333",
+        "799460f6",
+        "2191f6dc",
+        "1be8c94d",
+        "15b26fba",
+        "2cdc7341",
+        "e8a41a03",
+        "39fc5bbe",
+        "29065741",
+        "d785e372",
+        "b1bca9bf",
+        "d707ac36",
+        "6a070d9e",
+        "32832c6b",
+        "0610a28c",
+        "97fd6525",
+        "b99cc952",
+        "46650320",
+        "4b603e6b",
+        "7c356956",
+        "bb510411",
+        "c43d600c",
+        "f81e5489",
+        "4ffc4779",
+        "b4c04573",
+        "970d8ac1",
+        "fdde945b",
+        "9cd8bff9",
+        "5dae9fac",
+        "a9fab8cb",
+        "4b42122e",
+        "edbe08e8"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRequestGate.test.ts",
+          "assertion": "real CCB hook context beside a tool result remains a live continuation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRequestGate.test.ts",
+          "assertion": "CCB system hook after tool_result is the same live continuation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "CCB-generated system hook is preserved as tool-result text before budget removal"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "two CCB hook-context tool rounds preserve bytes and the next context hash"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "CCB budget is a no-op beside or inside tool results"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.integ.test.ts",
+          "assertion": "Box journal fences replay/account capacity and persists proof plus exact usage"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "HOOK_CURRENT_TEXT"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260928-BOX-MULTITOOL-CONTINUATION",
+      "occurredAt": "2026-09-28",
+      "severity": "P1",
+      "symptom": "V5 selfhost Box 在第二次 Bash 的效率 PreToolUse additionalContext 与 total_tokens 被 CCB 2.1.280 合成同一条无 system-reminder 包装的 system 消息后，第三跳被 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝。",
+      "rootFixCommit": "6f559fec",
+      "coverageCommits": [
+        "bcae6f63",
+        "400d418d",
+        "1a7a6fa3",
+        "c26f0005",
+        "ebea094e",
+        "4dae0956",
+        "276c7cb4",
+        "2026604b",
+        "5ae79fe7",
+        "daeb5627",
+        "ed815301",
+        "f229790e",
+        "77794a8c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCacheAnnotations.test.ts",
+          "assertion": "unwrapped CCB hook plus budget system tail stays one continuation"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "ocv5-b1-continuation-pass"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolInputEcho.test.ts",
+          "assertion": "mixed omit and false match, and a tampered caller is not stripped into acceptance"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.test.ts",
+          "assertion": "unique non-terminal image keeps the original caption once, then hook and budget"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "second TEMP claim keeps the client sibling and does not advance on failure"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPreparedContinuation.test.ts",
+          "assertion": "current image and hook tail is a continuation, not a fresh launch"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "TEMP authority mismatch and a second request id do not publish twice"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts",
+          "assertion": "two concurrent journal claims publish one local file and add no usage row"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "continuation conflict is 409 from core and does not insert usage"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "two HTTP requests race one handoff through the proxy and publish once"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "real replay identity rejects before settle and consumes one committed capsule"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "raw image sibling publishes once, then final and a new user gain no second publish"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxImageContinuation.claim.integ.test.ts",
+          "assertion": "commit failure, lost ack, and a rebuilt journal do not gain a publish"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "prepared route, authority, and single publish"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolProgress.test.ts",
+          "assertion": "strict heartbeat shape accepts 30 60 540 and rejects malformed progress"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "long tool heartbeats before between and after echoes do not advance handoff offset"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolUnknownObserver.test.ts",
+          "assertion": "observer skips a bound heartbeat and still rejects the outer session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "same chunk stops at message_stop and leaves the next heartbeat"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "first round rejects a catalog-matching heartbeat"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.progress.integ.test.ts",
+          "assertion": "TEMP owner chain projects prior tool uses and the root native session"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.progress.integ.test.ts",
+          "assertion": "three-row owner projects the immediate tool and not a child session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "bound heartbeat still needs a real final proof and exact EOF"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolProgress.test.ts",
+          "assertion": "root cli session is the only progress authority"
+        }
+      ],
+      "preparedBehaviorGate": {
+        "path": "scripts/check-v5-box-continuation.ts",
+        "wired": true,
+        "note": "Formal root is an external supervisor: required --expect-sha, no unknown args, worker in its own process group, 60s deadline from before spawn, exit 0 only with the business receipt. deploy-v5.sh and scripts/v5-selfhost-master-release-lib.sh run the candidate node/tsx on this script before seal. The source guard remains auxiliary."
+      }
+    },
+    {
+      "id": "INC-20260928-BOX-TOOL-SUCCESS-RECOVERY",
+      "occurredAt": "2026-09-28",
+      "severity": "P1",
+      "symptom": "V5 selfhost Box detached tool chain can finish with worker_complete while the local journal leaf stays unknown if the user does not retry. The shared-leader stop probe treated that proof as pending, so the seat, capsule and per-request usage were not closed.",
+      "rootFixCommit": "d9879ab2",
+      "coverageCommits": [
+        "d9879ab2",
+        "cee76e0c",
+        "990dd064",
+        "78906790",
+        "a925e98e",
+        "d13d12e0",
+        "01a716a1"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "terminal-only recovery does not write a handoff or skip to a later final"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "journal state committed with boxState handoff is not a terminal winner"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxDurableJournal.recovery.test.ts",
+          "assertion": "recovery evidence reads parent hashes, root permit, and fixed model mapping"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStagedCatalogRead.test.ts",
+          "assertion": "chunked catalog read stays inside one Connect frame and still closes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStagedCatalogRead.test.ts",
+          "assertion": "near-1MiB catalog frames in chunks and a changed chunk identity is rejected"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "third-round unknown closes once and settles each original request"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "two connections racing completeToolChain leave one terminal leaf"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "a real catalog read plus a capsule write failure does not settle or clean"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "a real capsule followed by a stop CAS does not bill or delete the remote catalog"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/billing/boxToolSuccessRecovery.integ.test.ts",
+          "assertion": "cancel intent survives a second tick and cleanup retries on the temp journal"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "unknown worker_complete closed through reconcileBatch to a readable capsule and this-round usage"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "INC-20260928-BOX-TOOL-SUCCESS-RECOVERY source regression guard, not end-to-end proof"
+        }
+      ]
+    },
+    {
+      "id": "INC-20260929-BOX-INNER-COMPACT",
+      "occurredAt": "2026-09-29",
+      "severity": "P1",
+      "symptom": "内层官方 CLI 2.1.280 的 compact_boundary 与紧随的 synthetic summary 被固定 decoder 当成未知记录或工具 echo。本批只让受信 session 的这一对记录不发 SSE、不进 echo、不计本轮 message usage。生产 DISABLE_AUTO_COMPACT=1 未解除，跨层活工具链仍未闭合。",
+      "rootFixCommit": "098ff858",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliCompaction.test.ts",
+          "assertion": "trusted classic-2 boundary and synthetic summary are not billed as the message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxNativeContextOwner.test.ts",
+          "assertion": "explicit route on issues box-native-v1 and explicit route off does not"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResourceEnvelope.test.ts",
+          "assertion": "64x128KiB passes only the verified messages budget"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleCompact.test.ts",
+          "assertion": "same capsule and frozen tail rebuild one artifact without a model call"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxResourceEnvelope.test.ts",
+          "assertion": "lease-only has no capability"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxPreparedContinuation.race.integ.test.ts",
+          "assertion": "native and billing session namespaces bind independently before publication"
+        }
+      ],
+      "coverageCommits": [
+        "edbe08e8",
+        "dc44ba85",
+        "8c3c2a28",
+        "44c20717",
+        "3085e958",
+        "bc7ee813",
+        "1a9bad21",
+        "5df7fbc8",
+        "3785fa60",
+        "4dcedc34",
+        "cefee7de",
+        "4b5923e1",
+        "6eb57890",
+        "13dbc2f1",
+        "f98fa1f0",
+        "5927dfba",
+        "cf0863ec",
+        "e52e3aa1",
+        "bcdbc0a4",
+        "5c2d92f2",
+        "d2575943",
+        "57bdac7c",
+        "22a13a58",
+        "01748b48"
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-TOOL-NAME-CONTINUE",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "Box Claude 续聊（非原生续接、由 completed history 编 CLI snapshot）时，历史 tool_use 与系统提示均用 OpenClaude 客户端工具名（Bash/Read/ExecuteExtraTool），而 CLI 只暴露本次 mcp__ocbridge__tN；模型按裸名调用→CLI『No such tool available』→egress 首轮解码 BOX_TOOL_ID_OR_NAME_INVALID→markUnknown(first_round_unknown) 永久 inflight/unknown：该会话下一条消息在 submit 开头 IDLE_HISTORY_PENDING→DISPATCH_NOT_ACCEPTED（UI『消息未开始处理，已确认未计费』），并占住账号并发名额。修复：snapshot 历史调用改写为本轮别名（缺席工具连结果降级为完整文本）、系统提示追加别名对照表；首轮本地确定性拒绝经用户 Stop 同路径显式停止并落 failed_stopped（零计费），idle proof 读到 failed 自动解锁。",
+      "rootFixCommit": "257ab6da",
+      "coverageCommits": [
+        "af864ea5",
+        "8f60d6ef"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "renames a call of a catalog tool to this invocation's alias and keeps its result paired"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolPlan.test.ts",
+          "assertion": "OCV5-299: the staged system prompt maps every plain tool name to its alias"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "a locally rejected tool name is stopped and settled, not left unknown"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "staged history and system use current catalog aliases; rejected first round is proven failed with zero charge, idle failed, and next admission succeeds"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-GROK-CLI-426",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "xAI 服务端开始强制 Grok CLI ≥1.0.13；selfhost 运行时镜像内 grok-native 1.0.5 的所有 grok-build/grok-build-fast 回合返回 426 Upgrade Required（UI『任务执行暂时中断，请直接重试本条消息』），发布门 C3 one model per engine 因此在现网与候选上均失败、阻断所有 selfhost 发布。修复：运行时镜像钉 Grok CLI 1.0.13（适配器参数全部兼容），webSearchProxy 客户端版本头同步。 商业版仍钉 grok105 镜像，其断言保持 1.0.5，需商业通道自行重建镜像后同步。",
+      "rootFixCommit": "7c851773",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
+          "assertion": "production smoke allowlist covers every explicitly v5-owned leader scheduler"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-REJECTED-STREAM-WEDGE",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "Box Claude 续聊中模型调用了本次 CLI 未暴露的工具名（裸 Bash 等），egress 本地拒流（BOX_TOOL_ID_OR_NAME_INVALID）后 CLI 自行跑完，显式 stop 返回 completed_unsettled，journal 行永远停在 inflight/unknown：会话下一条消息 IDLE_HISTORY_PENDING →『消息未开始处理，已确认未计费』，且占一个账号槽。修复：凭 keeper 终态证明把该行零计费落为 failed_stopped/rejected_stream（idle 投影为 failed，会话解锁）；生产改用原生工具别名 mcp__ocbridge__<客户端名>，与本地 cc 一致并消除错名根因；旧 opaque 链/原生指针跨发布仍可绑定。两条存量卡死行用白名单一次性脚本 scripts/ocv5-300/settle-rejected-unknown.mts 处理。",
+      "rootFixCommit": "21bf1581",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "OCV5-300 a self-completed rejected stream is settled from its keeper proof"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxIdleChain.test.ts",
+          "assertion": "OCV5-300 a locally rejected first-round stream projects failed, not a wedge"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolCatalog.test.ts",
+          "assertion": "OCV5-300 natural aliases expose client names and keep opaque chains binding"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts",
+          "assertion": "rejected first-round stream settles unbilled, idempotently, and only once"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-CLI-REJECTED-CALL-TURN-FAIL",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "Box Claude 回合中模型调用了本次 CLI 未暴露的工具名（裸 Bash、deferred 工具、ExecuteExtraTool 等）时，Box 内层 Claude Code 会自己回 <tool_use_error> No such tool available 并让模型在同一次运行里重试；decoder 只认单条消息，直接整轮失败（原生 cc 会继续）。另：同一会话上一轮在 Box 侧仍在收尾（stop 证明/unknown 观察）时，用户紧接着发下一条被 BOX_CAPACITY_HELD 直接拒绝 →『消息未开始处理，已确认未计费』（线上 INC 前序：3265c646 收尾期间 22s 后的提交）。修复：decoder 合并 CLI 自拒后的重试为同一条可见消息（被拒调用不展示、usage 按段累加计费，最多 3 次，混合/畸形名仍 fail-closed）；admission 遇容量占用有界退避等待 45s（abort 感知，迟到提交 prestart 收口）。",
+      "rootFixCommit": "fc0276aa",
+      "coverageCommits": [
+        "512ae788",
+        "18ac8043"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.multimsg.test.ts",
+          "assertion": "a CLI-rejected call is dropped and the retry joins the same visible tool handoff"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.multimsg.test.ts",
+          "assertion": "anything outside the exact rejected-call shape still fails closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "OCV5-301 a call the CLI rejects itself is retried in the same turn and handed off"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCapacityWait.test.ts",
+          "assertion": "OCV5-301 a capacity held by a settling turn is waited out, not rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxTextFetch.test.ts",
+          "assertion": "OCV5-301 an admission that commits after the caller left is prestart-closed"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-CLI-RESULT-REWRITE-ECHO",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #f82c733f：Box Claude 回合中客户端 Read 了一张 1290x2796 手机截图，续接轮里 Box 内层 Claude Code 把 MCP 图片缩到 923x2000 后回显，严格 echo 绑定不一致（BOX_TOOL_ECHO_CONTENT_MISMATCH）→ continuation_unknown →『任务执行失败 / 内部错误』，CLI 挂起等永不到达的工具结果、会话被卡。同类：空结果被 CLI 改写为 completed with no output、超 50k 字符结果被落盘为 <persisted-output>、MCP 截断。修复：claim 时按 CLI 限制规范化图片再发布与哈希；Box CLI 关闭 MCP 截断；echo 仅接受空结果/落盘两种可逐字节重建的改写（需已发布内容在手，恢复路径读取哈希校验过的发布文件），图片严格字节绑定；存量卡死链用白名单 user-Stop 脚本收口。",
+      "rootFixCommit": "f1d63636",
+      "coverageCommits": [
+        "81b959db"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResultImages.test.ts",
+          "assertion": "OCV5-302 a phone screenshot is fitted inside the CLI limits like Claude Code does"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResultEcho.cli.test.ts",
+          "assertion": "OCV5-302 image echoes stay byte-exact: a CLI resize is never accepted"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResultEcho.cli.test.ts",
+          "assertion": "the empty marker and persisted-output preview must be exact rewrites of published text"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPublishedResults.test.ts",
+          "assertion": "OCV5-302 recovery reads the published result in chunks when it hashes to the journal"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-CCB-IMAGE-META-CONTINUATION",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "Box Claude 回合中客户端 Read 了一张需缩放的图片（如手机截图 1290x2796），Claude Code 在 tool_result 后追加 isMeta 尺寸说明 [Image: original …, displayed at …]；续接分类要求纯 tool_result，回 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，用户看到『任务执行暂时中断，请直接重试本条消息』，Box CLI 挂起等待。修复：语义规范化把该精确格式说明并入最后一个含图片的 tool_result，其它尾随内容仍 fail-closed。",
+      "rootFixCommit": "465b844d",
+      "coverageCommits": [
+        "a42108ea",
+        "93dc1251",
+        "dede72fb",
+        "ad8c3a3b",
+        "15500488"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionProof.test.ts",
+          "assertion": "OCV5-302 the cached caption of the live repro image continues the turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionProof.test.ts",
+          "assertion": "any real downscale is proven by the image itself, not by a size allowlist"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionProof.test.ts",
+          "assertion": "a caption that does not describe this image, or an odd cache key, is not folded"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionProof.test.ts",
+          "assertion": "the caption as CCB's separate cached user message also continues, only when proven"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-SKILL-CONTINUATION",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #aacd65f7（v5-681ee45a9）：Box Claude 回合中模型调用 Skill，Claude Code 回 tool_result『Launching skill: X』并把技能正文作为 isMeta 用户文本追加在其后；续接分类要求纯 tool_result，回 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，『工具 1 项』后即『模型服务暂时中断 / 任务执行暂时中断』，Box CLI 挂起。所有用到技能的 Box 回合均受影响。修复：语义规范化把该技能正文并入唯一一个内容恰为 launch 行的 Skill tool_result（同条或紧随的下一条 user 文本），其它形状仍 fail-closed。",
+      "rootFixCommit": "8fd82f68",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-303 the injected skill body joins its Skill result and the turn continues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "without exactly one Skill launch the trailing text is not folded"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-RECOVERED-TOOL-EXCHANGE",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #aacd65f7（v5-7fc1d4493）：Box 回合在工具交接后失败，服务端恢复回合（m-recover，从断点继续/重新尝试）用新 turn key 重发同一组 tool_result；续接只能绑定本 dispatch，连续 409 BOX_TOOL_OWNER_UNKNOWN →『任务执行失败 / 内部错误』，原 dispatch 的 Box CLI 一直等到超时并占着会话槽。任何在工具交接后失败的 Box 回合都无法恢复。修复：找到唯一等待这组 tool id、turn key 不同且 dispatch 已终结的孤儿 handoff，按用户停止路径停掉，再以全新调用续跑（完整工具交换写入快照历史 + Claude Code 原生续跑句）；live/停止未证实/其它错误仍拒绝。",
+      "rootFixCommit": "297db9bc",
+      "coverageCommits": [
+        "28232675",
+        "946ae2ed",
+        "7c464fb7"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
+          "assertion": "OCV5-304 a recovered dispatch stops the orphan and continues as a fresh invocation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
+          "assertion": "a live owner, an unproven stop or any other claim error keeps the rejection"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.resume.test.ts",
+          "assertion": "OCV5-304 an answered tool exchange is staged as history and resumed with Claude Code's sentence"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxOrphanHandoff.integ.test.ts",
+          "assertion": "orphan handoff lookup requires same tool ids, another turn and a terminal dispatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
+          "assertion": "concurrent recoveries continue the exchange only once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolPlan.resume.test.ts",
+          "assertion": "OCV5-304 a recovered tool exchange plans end to end with Claude Code's resume sentence"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-BOX-REPLAY-PENDING-AFTER-CUT",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #2ee979cd（v5-080328c70 发布期间）：Box Claude 回合两条终端命令完成后，续接请求的 Box exec 流在发布脚本 restart hostnet（连带 cursor-proxy）的同一秒被切断 → BOX_EXEC_TRANSPORT_UNKNOWN（500）；远端 CLI 实际继续跑完（worker_complete），但 CCB 一秒后的同请求非流式回退命中 replay pending → 409 BOX_REPLAY_PENDING，回合以『任务执行失败 / 内部错误』结束。修复：发布不再 restart hostnet/代理（526f3fb7c）；replay 路径对仍在收尾的 Box 调用只读复查最多 240s，就绪后回放真实结果。",
+      "rootFixCommit": "c97b1e03",
+      "coverageCommits": [
+        "e0ac5662",
+        "265e9ff6"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReplayWait.test.ts",
+          "assertion": "a still-resolving Box call is awaited until its replay is ready"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "OCV5-306: a same-request retry waits for a still-resolving Box call and replays it"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts",
+          "assertion": "OCV5-306 an unknown linked leaf whose CLI exited by itself settles unbilled and releases the chain"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxIdleChain.test.ts",
+          "assertion": "OCV5-306 a rejected-stream leaf releases a linked chain; its ancestors must still be stopped"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261001-BOX-SPOOL-READ-TRANSIENT",
+      "occurredAt": "2026-10-01",
+      "severity": "P1",
+      "symptom": "线上 #2ee979cd（v5-6232c85d1，14:58Z）：Box Claude Opus 5.5 长回合约 25 轮工具后，续接轮询 Box stdout spool 的一次 exec HTTPS 请求在网络层失败（fetch reject → BOX_EXEC_TRANSPORT_UNKNOWN）；只读、同 offset 可重读的 spool 读取从不重试，整回合记为 continuation_unknown，用户看到『任务执行失败 / 内部错误』。修复：pollBoxSpoolLines 对传输层不确定（fetch/stream/incomplete/单次超时/429/502/503/504）在同一 offset 有界退避重读（6 次约 12s，成功即清零，仍受回合期限与中止约束）；pending-call 与 terminal-proof 只读证明循环同样容忍；账号守卫、远端退出码、鉴权、帧错误仍立即失败。",
+      "rootFixCommit": "9f725ffa",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-306: a dropped exec exchange re-reads the same offset instead of failing the turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
+          "assertion": "OCV5-306: account guard, remote exit and HTTP auth errors are never retried"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-CONTINUE-CARD-LINGERS",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "点『从断点继续』后任务已恢复执行（工具执行中），但原『任务执行失败』红卡仍留在时间线上并改为显示『重新尝试』，像是仍然失败。原因：恢复子轮只在原卡未提交时隐藏它，而用户能点到的卡都已提交。修复：手动继续进行中/完成后收起该卡；被拒绝时卡片带提示回来，继续轮自身失败显示自己的卡，自动恢复不改动已见的卡。",
+      "rootFixCommit": "0938b060",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "手动继续进行中：原失败卡与重新尝试一并收起"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "继续请求没发出去（无自身错误卡）或自动恢复：已见的失败卡保持可见"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-TOOL-HIT-TARGET",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium回归复现（非声称生产用户报障）：工具卡默认头部只有40px，低于原44px键盘/指针命中合同；恢复44px。",
+      "rootFixCommit": "5abf0dfd",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-USER-BUBBLE-OVERFLOW",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选390px真实Chromium回归复现（非声称生产用户报障）：flex用户气泡的无空格长串向左越界约720px，聊天区域裁掉不可达正文；只补子节点max/min宽度约束，全文保留且真实剪贴板可复制。",
+      "rootFixCommit": "5abf0dfd",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁、发送区可用"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-COMPLETED-GOAL-DIAGNOSTIC-EMPTY",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium双视口与React回归复现（非声称生产用户报障）：completed历史目标进入处理过程后，MessageRenderer将所有goal返回null，展开只有空壳、正文与原始记录不可查看；仅恢复completed历史纯文本及精确原始记录，当前active/paused/blocked目标仍只在唯一dock展示，cleared不复活。",
+      "rootFixCommit": "f00e0564",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "已清除目标不占过程，只剩它时没有空壳，普通句子里的同样字句还在"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "completed goal diagnostics stay folded, exact raw survives and current dock is unique"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-CCSWITCH-LIGHTWEIGHT-ORDER",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户故障）：CC Switch轻量位的合并正则按服务端数组顺序，sonnet排在gemini flash前时错选sonnet；改为haiku→gemini/flash→sonnet逐档fallback。首选模型及空列表兜底不变，新建与已有密钥两条真实导入路径通过，精确历史调用负控均在haikuModel断言失败。",
+      "rootFixCommit": "a7073372",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/ApiAccessTab.test.tsx",
+          "assertion": "缺 haiku 时 flash 优先于更早的 sonnet，没有 flash 才选 sonnet"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
+          "assertion": "CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixture API)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-COMMERCIAL-LEGACY-CONTEXT-COMPAT",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实组件与Chromium复现（非声称生产用户故障）：个人版删除旧GPT-5.6家族映射，但商业版仍启用旧目录时退化为普通行，丢失标准/1M家族档位与长上下文费用确认。恢复商业canonical三项旧家族映射及折叠合同，新模型家族不变，目录启用、旧价格、权限和绑定均不改。真实1M选择证明未确认不切换、取消保留标准、确认才切换；精确移除旧映射负控重新触发原旧折叠与1M合同红。",
+      "rootFixCommit": "2804a5b0",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/engineModels.test.ts",
+          "assertion": "context-tier families: new GPT-6 families expanded and legacy commercial GPT-5.6 context contract preserved"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/user-contract.node-test.mjs",
+          "assertion": "legacy commercial 1M selection requires real cancel or confirmation"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-LIVE-STATUS-CASCADE",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户报障）：live状态同时带oc-swap-in与oc-live-status-shine，后置入场fade-in覆盖扫光动画，并覆盖forced-colors要求的animation:none。仅将入场selector排除shine，其他入场行为保留；六主题/媒体正控全部通过，独立旧CSS输入负控在两主题normal/forced四叶精准红，父级失败仅为成功reports汇总，reduced与原过程/历史目标证明继续通过。",
+      "rootFixCommit": "98760e9e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "live status is single and readable in both themes and accessibility media"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-PARALLEL-SKILL-BODIES",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #72191544（v5-0d0c1359a，01:14Z）：Box Claude Opus 5.5 在同一步并行调用两个 Skill，Claude Code 为每个 launch 注入一段 SKILL.md 正文；OCV5-303 的折叠只认恰好一个 Skill，两段正文留在 tool_result 消息里，egress 以 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝续接，用户看到『任务执行暂时中断』。修复：多个 Skill 时按每段正文自己的『Base directory for this skill: …/<name>』归到同名 launch（紧跟各自结果、全部结果之后、或后续纯文本 user 消息均可）；无法归属的仍不折叠、仍 409。",
+      "rootFixCommit": "8057d0eb",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-314 parallel Skill bodies each join their own launch, in any layout"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-314 unattributable parallel Skill text is not folded"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "#72191544 被 409 续接拒绝结束后，同会话再发『继续』显示『消息未开始处理 / 已确认未计费』：网关 submit 抛 IDLE_HISTORY_PENDING。被拒请求从未到 Box，交出工具调用的 Box CLI 仍挂起等结果（占账号槽），idle proof 恒 pending/unsettled，会话 idle 候选挡住之后每条消息直到 CLI 数小时后超时。修复：Box 回合的 CCB result 恰为 egress『continuation rejected』409（BOX_*）时，CCB adapter 每回合一次走与浏览器停止相同的内部 Box stop，链收为已证明停止的失败，proof=failed，候选清除，下一条消息正常开始；瞬时 Box 错误不匹配。",
+      "rootFixCommit": "6dd199c8",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-315 a Box continuation reject settles the parked Box turn once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-315 only the exact continuation reject qualifies"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-SKILL-BUDGET-TAIL",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #b6df9aee（v5-ecfded4f0，03:09Z）：Box Claude Opus 5.5 同一步并行 Bash + Skill 后，egress 以 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝续接，红卡『模型服务暂时中断』。用真实 Claude Code 2.1.280 对接抓包上游复现：CCB 在工具结果消息后追加 system『<total_tokens>…</total_tokens>』预算尾；该尾只在紧邻纯 tool_result 消息时被剥离，而 Skill 正文折叠发生在剥离之后，尾巴留下 → 拒绝。修复：先剥离、再折叠 Skill 正文、再剥离一次；未批准的 system 尾仍拒绝；拒绝时记录无内容的尾部形状日志。",
+      "rootFixCommit": "15a6d2a5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-317 a Skill step followed by the CCB budget system tail continues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-317 reject diagnostics carry the tail shape without content"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-SETTLED-TOOLS-MANUAL-RESUME",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "#b6df9aee 中断后没有自动恢复，只能手点『从断点继续』：master 判 checkpoint_unsafe。回合 Read（有 read_only 证明）、Bash、Skill 均已完成并有结果，随后下一次模型调用 ENGINE_ERROR；自动断点续接要求每个工具都有网关副作用证明，Bash 永远没有，于是所有用过 Bash 的 Box Claude 回合遇模型错误都停在手动卡。修复：模型面错误（upstream_failed/error/timeout、network_error、rate_limited、model_capacity、engine_error）且所有工具/委派/权限都已收口、每个 tool_use 都有完成记录时，允许自动断点续接（续接不重跑工具，提示词要求先查可观察状态）；此类自动续接最多 3 次；未完成/未知工具、runner 丢失、服务重启仍走原规则。",
+      "rootFixCommit": "f3c91504",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
+          "assertion": "allows automatic checkpoint continuation for the live tape"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
+          "assertion": "keeps any open tool, delegate or permission on the manual path"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-317 finalize schedules a checkpoint after settled Bash/Skill and a model-plane error"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "SIDEBAR-R1 发布（rel-83425ac39，06:01Z）前后，Box Claude Opus 5.5 会话每条消息都出『消息未开始处理 / 已确认未计费，请重试』（turn_dispatches 05:58/06:03/06:05Z DISPATCH_NOT_ACCEPTED，容器 IDLE_HISTORY_PENDING）。05:42 该会话的空闲压缩开始：CCB 分叉压缩调用未产出可用摘要，回落到关闭 thinking 的请求，带 temperature:1，被 Box 闸门以 BOX_PARAMETER_UNMAPPED 拒绝（egress 05:43:23）。CCB 把被拒的摘要请求当作正常回合结束，空闲 op 既无摘要也未走异常分支，runner 未关停、无 runnerKilledAt，not_found 证明永远无法结案，会话被钉死直到人工重置（06:02 容器重建也无效）。修复：已派发却无摘要结束的空闲回合同样关停 runner 并记录 runnerKilledAt；早于当前运行时化身（PID 1 启动：容器重建/主机重启）写入的未结 op 以化身启动时间作为关停证据，宽限期后 not_found 结案为 idle_turn_never_sent，不丢原生上下文。",
+      "rootFixCommit": "599ce66b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
+          "assertion": "a normal turn end with no summary shuts the runner down and records it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
+          "assertion": "the incident shape: an op stranded by a previous container settles on the next submit"
         }
       ]
     }

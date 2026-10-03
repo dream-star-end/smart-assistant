@@ -779,7 +779,9 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
   model_config_changed_retry_turn:
     "平台的模型配置刚刚更新，本轮已停止（不计费）。你的消息没有丢：点它下方的「重试」即可原样重发。",
-  model_not_available: "这个模型当前不可用（已下架或未对你的账号开通），请在上方切换一个模型后重发。",
+  // 同一码覆盖：上游满载且明说换模型、grok 路由过期、provider 未配置、catalog 下架（errorClassify OCV5-252）。
+  // 文案不能只说「已下架/未开通」——满载是最常见来源，那样写会误导用户以为模型被撤了。
+  model_not_available: "这个模型暂时接不了这条请求（可能是上游满载，也可能已下架或未对你的账号开通），请在上方切换一个模型后重发。",
   unresolved_agent_model: "没能确定本轮要用的模型，请在上方选择模型后重发。",
   model_authority_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
   model_catalog_unavailable: "模型配置正在同步，请稍后点「重试」重发本条消息。",
@@ -865,6 +867,21 @@ export const REPORT_EXEMPT_TURN_ERR_CODES: ReadonlySet<string> = REPORT_EXEMPT_T
 export function problemCardPresentation(code: string, waived: boolean): "red" | "yellow" {
   if (waived || turnErrorSemantics(normalizeTurnErrorCode(code)).expected === true) return "yellow";
   return "red";
+}
+
+/**
+ * 这些终态不是故障卡。点停、计划内重启、容器回收一律不出错误卡。
+ * 已恢复成功和旧错误重放由调用方丢弃，不在这里画第二张。
+ */
+export const SILENT_TURN_ERROR_CODES: ReadonlySet<string> = new Set([
+  "stopped",
+  "user_cancelled",
+  "service_restart",
+  "codex_container_recycled",
+]);
+
+export function isSilentTurnErrorCode(code: unknown): boolean {
+  return SILENT_TURN_ERROR_CODES.has(normalizeTurnErrorCode(code));
 }
 
 // ═══════════════ 流式行身份（server canonical id upsert，websocket.js:606）═══════════════

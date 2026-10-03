@@ -6,6 +6,8 @@ import {
   createLeaderBundle,
   LeaderBundleRollbackIncompleteError,
 } from "../deploy/leaderBundle.js";
+import { startFinalizeJournalReconciler,
+  type ReconcilerHandle } from "../billing/finalizeJournalReconciler.js";
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -16,6 +18,31 @@ function deferred<T>() {
 }
 
 describe("LeaderBundle", () => {
+  test("Box recovery tick holds shared leader handoff until it settles", async () => {
+    const gate = deferred<void>(), started = deferred<void>();
+    let h: ReconcilerHandle | null = null;
+    const bundle = createLeaderBundle();
+    bundle.add({ name: "finalizeReconciler", domain: "shared", start: () => {
+      h = startFinalizeJournalReconciler({ runOnStart: false,
+        reconcileFn: async () => ({ committed: 0, aborted: 0, durableWaived: 0 }),
+        boxRecoveryFn: async () => { started.resolve(); await gate.promise },
+        alertStuckFinalizingFn: async () => 0, gcFn: async () => 0 });
+      return { stop: () => h!.stop() };
+    } });
+    await bundle.start();
+    const tick = h!.runNow();
+    await started.promise;
+    let handedOff = false;
+    const draining = bundle.stopAndDrain(1000).then((result) => {
+      assert.equal(result.drained, true);
+      handedOff = true;
+    });
+    await Promise.resolve();
+    assert.equal(handedOff, false);
+    gate.resolve();
+    await Promise.all([tick, draining]);
+    assert.equal(handedOff, true);
+  });
   test("start 幂等:重复 start 每个成员只启动一次", async () => {
     const starts: string[] = [];
     const bundle = createLeaderBundle();

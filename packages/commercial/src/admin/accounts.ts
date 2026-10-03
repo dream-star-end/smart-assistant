@@ -306,15 +306,15 @@ function isEgressProxyUniqueViolation(err: unknown): boolean {
 }
 
 /**
- * 反封 #1 — claude 一号一代理预检:同一 egress_proxy_id 已绑其它 active/非删除
- * 的 claude 账号时,给出友好错误(DB 唯一索引是最终兜底,这里是提前拦 + 明确报错)。
+ * 反封 #1 — claude 一号一代理预检。必须与
+ * `idx_claude_accounts_egress_proxy_uniq`(provider=claude AND status=active)
+ * 一致:disabled/cooldown/banned 行可留审计,不占坑。
  */
+export const CLAUDE_EGRESS_OCCUPIED_SQL = `SELECT COUNT(*)::text AS c FROM claude_accounts
+      WHERE provider = 'claude' AND status = 'active' AND egress_proxy_id = $1::bigint`;
+
 async function ensureEgressProxyNotBoundToOtherClaude(proxyId: string): Promise<void> {
-  const r = await getPool().query<{ c: string }>(
-    `SELECT COUNT(*)::text AS c FROM claude_accounts
-      WHERE provider = 'claude' AND egress_proxy_id = $1::bigint`,
-    [proxyId],
-  );
+  const r = await getPool().query<{ c: string }>(CLAUDE_EGRESS_OCCUPIED_SQL, [proxyId]);
   if (r.rows[0] && r.rows[0].c !== "0") {
     throw new RangeError("egress_proxy_already_bound_to_claude");
   }

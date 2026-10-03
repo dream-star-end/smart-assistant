@@ -4,11 +4,12 @@ import {
   Building2,
   ChevronDown,
   ChevronRight,
+  ChevronsUpDown,
   Film,
   Globe,
-  Kanban,
   KeyRound,
   LayoutGrid,
+  ListChecks,
   LogOut,
   MessageSquareText,
   PanelLeftClose,
@@ -16,7 +17,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
-  Sparkles,
+  SquareKanban,
   Store,
   X,
 } from "lucide-react";
@@ -44,6 +45,7 @@ import type {
   User,
 } from "../lib/types";
 import { cn, formatCompactCount, formatCredits } from "../lib/utils";
+import { BrandMark } from "./BrandMark";
 import { ThemeToggle } from "./ThemeToggle";
 import { BatchBar } from "./sidebar/BatchBar";
 import { ProjectRow } from "./sidebar/ProjectRow";
@@ -80,8 +82,11 @@ import {
 const EMPTY_HINT_CTA_HEIGHT = 108;
 /** 零会话零项目的引导空态（图标 + 标题 + 两行说明 + 两个按钮，S-13）。 */
 const EMPTY_ALL_HEIGHT = 200;
-/** 底栏在此宽度以下进入紧凑态：隐藏「案例」文字只留图标，给昵称 / 余额让位（S-09）。 */
-const FOOTER_COMPACT_WIDTH = 260;
+/**
+ * 底栏「案例」入口在此宽度及以上才带文字；默认 268px 与移动抽屉一律只留图标（title / aria-label 照旧），
+ * 把横向空间让给昵称与余额 —— 268px 下文字版会把「余额 258.5万 积分」截成「余额 258.5万…」（S-09 / SIDEBAR-R1）。
+ */
+const FOOTER_LABEL_MIN_WIDTH = 300;
 
 function readArchivedExpanded(userId: string | undefined): boolean {
   if (!userId) return false;
@@ -535,7 +540,7 @@ export function Sidebar({
 
   // 底栏余额：默认 268px 下完整千分位数字已被截成「1,234,56…」（S-09），底栏一律用
   // 万 / 亿 缩写（formatCompactCount），精确值放 title 悬浮；账号菜单里空间充足仍显完整数字。
-  const footerCompact = typeof width === "number" && width < FOOTER_COMPACT_WIDTH;
+  const footerCompact = typeof width !== "number" || width < FOOTER_LABEL_MIN_WIDTH;
   const creditsExact = credits != null ? `${formatCredits(credits)} 积分` : null;
   // 无余额（个人版 / 自托管未接计费、demo、未登录）时副标题此前写死「多模型 · 计量计费」——
   // 商业化营销文案出现在不计费的部署形态里（S-14）。改为有邮箱显邮箱、没有就不占这一行；
@@ -547,28 +552,40 @@ export function Sidebar({
       data-product-feature={PRODUCT_CAPABILITIES.billing.id}
       disabled={!hasAccountMenu}
       aria-label={hasAccountMenu ? "账号菜单" : undefined}
-      className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-2.5 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg enabled:hover:bg-hover"
+      className="flex min-w-0 flex-1 items-center gap-2.5 rounded-sm py-1.5 pl-1.5 pr-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring enabled:hover:bg-hover data-[state=open]:bg-hover [@media(hover:none)]:min-h-11"
     >
-      <Avatar tone="ink" className="text-body">
+      <Avatar
+        size="sm"
+        tone="neutral"
+        className="bg-accent-soft text-[12px] text-accent ring-1 ring-inset ring-accent/15"
+      >
         {(user?.displayName || "U").slice(0, 1).toUpperCase()}
       </Avatar>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-section font-medium text-fg">
+      <span className="min-w-0 flex-1 leading-tight">
+        <span className="block truncate text-body font-medium text-fg">
           {user?.displayName || "未登录"}
         </span>
         {credits != null ? (
           <span
-            className="block truncate text-caption text-faint"
+            className="mt-0.5 block truncate text-caption tabular-nums text-faint"
             title={creditsExact ? `余额 ${creditsExact}` : undefined}
           >
             {`余额 ${formatCompactCount(credits)} 积分`}
           </span>
         ) : accountSubtitle ? (
-          <span className="block truncate text-caption text-faint" title={accountSubtitle}>
+          <span className="mt-0.5 block truncate text-caption text-faint" title={accountSubtitle}>
             {accountSubtitle}
           </span>
         ) : null}
       </span>
+      {hasAccountMenu && (
+        // 触屏两侧各有 44px 图标钮，省掉这枚纯装饰箭头把宽度还给余额。
+        <ChevronsUpDown
+          size={14}
+          aria-hidden
+          className="shrink-0 text-faint [@media(hover:none)]:hidden"
+        />
+      )}
     </button>
   );
 
@@ -578,22 +595,24 @@ export function Sidebar({
       return (
         <h2
           className={cn(
-            "m-0 flex h-full px-3 text-caption font-medium uppercase tracking-wide text-faint",
-            // 触屏下带按钮的标题行升到 44px（拍平层同步加高），文字与 44px 按钮垂直居中对齐（S-04）。
-            withAction && coarse ? "items-center" : "items-end pb-1",
+            "m-0 flex h-full items-center pl-2.5 pr-1 text-caption font-medium tracking-[0.04em] text-faint",
+            // 桌面 32px 行：文字压在下部、贴近其所属分组；触屏带按钮的标题行升到 44px（拍平层同步加高），
+            // 文字与 44px 按钮垂直居中对齐（S-04）。
+            !(withAction && coarse) && "pt-2.5",
           )}
         >
           {item.label}
           {withAction && (
             <IconButton
               aria-label="新建项目"
+              title="新建项目"
               variant="muted"
               size="xs"
               shape="square"
-              className="ml-auto"
+              className="ml-auto rounded-xs"
               onClick={onCreateProject}
             >
-              <Plus size={13} />
+              <Plus size={14} />
             </IconButton>
           )}
         </h2>
@@ -648,13 +667,20 @@ export function Sidebar({
           role={isSearchHint ? "status" : undefined}
           aria-live={isSearchHint ? "polite" : undefined}
           className={cn(
-            "flex h-full items-center px-3 text-body text-faint",
+            "relative flex h-full items-center px-3 text-body text-faint",
             emptyCenter && "justify-center py-6",
             item.text === "消息搜索失败" && "text-danger",
             emptyList && "flex-col items-center gap-2",
-            emptyProject && "gap-2 text-caption",
+            // 空项目提示落在子会话标题列上，并延续项目的层级引导线（与 SessionRow 同轴）。
+            emptyProject && "gap-2 pl-[44px] text-caption",
           )}
         >
+          {emptyProject && (
+            <span
+              aria-hidden
+              className="pointer-events-none absolute inset-y-0 left-[15px] w-px bg-border"
+            />
+          )}
           <span>{item.text}</span>
           {emptyList && (
             <Button variant="secondary" size="sm" onClick={onNewHere}>
@@ -768,8 +794,8 @@ export function Sidebar({
           }}
           className={
             unreadIds?.has(hit.sessionId) || hit.unread
-              ? "flex h-full w-full min-w-0 flex-col justify-center rounded-md px-3 text-left text-section text-fg outline-none hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              : "flex h-full w-full min-w-0 flex-col justify-center rounded-md px-3 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+              ? "flex h-full w-full min-w-0 flex-col justify-center gap-0.5 rounded-sm px-2.5 text-left text-section text-fg outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
+              : "flex h-full w-full min-w-0 flex-col justify-center gap-0.5 rounded-sm px-2.5 text-left text-section text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
           }
         >
           <span
@@ -802,16 +828,23 @@ export function Sidebar({
               onLoadArchived?.();
             }
           }}
-          className="flex h-full w-full items-center gap-1.5 rounded-md px-2 text-left text-section text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          // 与项目行同一骨架（图标列 / 名称 / 旋转箭头 / 计数），但整行取 faint：归档是次要入口。
+          className="mt-1 flex h-[calc(100%-0.25rem)] w-full items-center gap-2 rounded-sm pl-2 pr-2 text-left text-section text-faint outline-none transition-colors duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
         >
-          {item.expanded ? (
-            <ChevronDown size={14} className="shrink-0 text-faint" />
-          ) : (
-            <ChevronRight size={14} className="shrink-0 text-faint" />
-          )}
-          <Archive size={14} className="shrink-0 text-faint" />
-          <span className="min-w-0 flex-1 truncate">已归档</span>
-          <span className="shrink-0 text-caption text-faint">{item.count}</span>
+          <span className="flex size-3.5 shrink-0 items-center justify-center">
+            <Archive size={14} aria-hidden />
+          </span>
+          <span className="min-w-0 truncate">已归档</span>
+          <ChevronRight
+            size={12}
+            aria-hidden
+            className={cn(
+              "shrink-0 transition-transform duration-200 ease-standard",
+              item.expanded && "rotate-90",
+            )}
+          />
+          <span className="min-w-0 flex-1" />
+          <span className="shrink-0 tabular-nums text-caption">{item.count}</span>
         </button>
       );
     }
@@ -821,7 +854,8 @@ export function Sidebar({
   return (
     <aside
       className={cn(
-        "relative flex h-full shrink-0 flex-col bg-sidebar",
+        // 桌面加一道发丝分隔线与主区切开（移动抽屉自带遮罩，不需要）。
+        "relative flex h-full shrink-0 flex-col bg-sidebar md:border-r md:border-border/70",
         width == null && "w-[268px]",
         resizing && "select-none",
       )}
@@ -848,16 +882,18 @@ export function Sidebar({
           )}
         />
       )}
-      <div
-        className="flex flex-col gap-1.5 px-2.5 pb-1.5 pt-2.5"
-        data-product-entry-scope="sidebar-primary"
-      >
-        <div className="flex items-center justify-between px-1">
-          <div className="flex items-center gap-2">
-            <span className="flex size-7 items-center justify-center rounded-lg bg-grad-cta text-white">
-              <Sparkles size={15} />
+      <div className="flex flex-col px-2 pb-1 pt-2.5" data-product-entry-scope="sidebar-primary">
+        <div className="mb-2.5 flex h-8 items-center justify-between pl-2 pr-0.5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <BrandMark
+              className="size-[26px]"
+              rounded="rounded-[8px]"
+              fontSize="text-[14px]"
+              flat
+            />
+            <span className="truncate text-title font-semibold tracking-tight text-fg">
+              {BRAND.name}
             </span>
-            <span className="text-title font-semibold tracking-tight">{BRAND.name}</span>
           </div>
           {onCollapse && (
             <IconButton
@@ -868,47 +904,107 @@ export function Sidebar({
               variant="muted"
               size="sm"
               shape="square"
+              className="rounded-xs"
             >
-              <PanelLeftClose size={17} />
+              <PanelLeftClose size={16} />
             </IconButton>
           )}
         </div>
 
-        {onNewWithAgent ? (
-          <div className="flex w-full">
-            <Button
-              data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-              variant="secondary"
-              onClick={onNew}
-              className="h-9 min-w-0 flex-1 justify-start gap-2 rounded-l-lg rounded-r-none border-r-0 px-3 text-section font-medium"
-            >
-              <Plus size={16} />
-              新建会话
-            </Button>
-            <IconButton
-              data-product-feature={PRODUCT_CAPABILITIES.agents.id}
-              variant="ghost"
-              shape="square"
-              size="md"
-              aria-label="选择智能体后新建"
-              title="选择智能体后新建"
-              onClick={onNewWithAgent}
-              className="rounded-l-none rounded-r-lg border border-border bg-surface text-fg hover:border-border-strong hover:bg-hover"
-            >
-              <ChevronDown size={16} />
-            </IconButton>
-          </div>
-        ) : (
-          <Button
+        {/* 主操作：一张带发丝描边的浮起卡片，左侧墨色圆形「+」是整栏唯一的强视觉锚点；
+            有智能体选择时右侧以细分隔线切出下拉，而不是两块拼接的按钮（SIDEBAR-R1）。 */}
+        <div
+          data-sidebar-new
+          className="mb-2 flex h-9 w-full items-stretch rounded-sm border border-border bg-surface text-section shadow-sidebar-btn transition-[border-color,box-shadow] duration-150 ease-standard hover:border-border-strong [@media(hover:none)]:h-11"
+        >
+          <button
+            type="button"
             data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
-            variant="secondary"
             onClick={onNew}
-            className="h-9 w-full justify-start gap-2 rounded-lg px-3 text-section font-medium"
+            className={cn(
+              "flex min-w-0 flex-1 items-center gap-2.5 pl-2 pr-2 text-left font-medium text-fg outline-none transition-colors duration-150 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+              onNewWithAgent ? "rounded-l-[8px]" : "rounded-[8px]",
+            )}
           >
-            <Plus size={16} />
-            新建会话
-          </Button>
-        )}
+            <span
+              aria-hidden
+              className="flex size-[22px] shrink-0 items-center justify-center rounded-full bg-primary text-primary-fg"
+            >
+              <Plus size={14} strokeWidth={2.5} />
+            </span>
+            <span className="truncate">新建会话</span>
+          </button>
+          {onNewWithAgent && (
+            <>
+              <span aria-hidden className="my-2 w-px shrink-0 bg-border" />
+              <button
+                type="button"
+                data-product-feature={PRODUCT_CAPABILITIES.agents.id}
+                aria-label="选择智能体后新建"
+                title="选择智能体后新建"
+                onClick={onNewWithAgent}
+                className="flex w-9 shrink-0 items-center justify-center rounded-r-[8px] text-faint outline-none transition-colors duration-150 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:w-11"
+              >
+                <ChevronDown size={15} />
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* 搜索与「任务」同一导航行骨架（图标列 / 文字 / 尾部操作）：静息时像导航项，聚焦时浮起成输入卡。 */}
+        <label className="group/search flex h-8 min-w-0 items-center gap-2.5 rounded-sm pl-2.5 pr-1 text-muted transition-[background-color,box-shadow] duration-150 hover:bg-hover focus-within:bg-sidebar-active focus-within:shadow-sidebar-active focus-within:ring-1 focus-within:ring-ring [@media(hover:none)]:min-h-11">
+          <Search
+            size={15}
+            aria-hidden
+            className="shrink-0 text-faint transition-colors group-focus-within/search:text-fg"
+          />
+          <input
+            data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
+            data-sidebar-search
+            aria-label="搜索标题或消息"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={(e) => {
+              // Escape 一键清空，不必手动全选删除才能回到列表（S-07）。
+              if (e.key === "Escape" && q) {
+                e.preventDefault();
+                setQ("");
+              }
+            }}
+            placeholder="搜索标题或消息"
+            // 输入字号移动端保持 16px（iOS 输入框 <16px 聚焦会整页放大）；占位符单独取导航行字号，
+            // 静息态与下方「任务」同一视觉重量（iOS 缩放只看输入框本身字号，不看 placeholder）。
+            className="h-full w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-section placeholder:text-muted md:text-section"
+          />
+          {q && (
+            <IconButton
+              data-product-control
+              aria-label="清除搜索"
+              title="清除搜索"
+              variant="muted"
+              size="xs"
+              shape="round"
+              onClick={() => setQ("")}
+            >
+              <X size={13} />
+            </IconButton>
+          )}
+          {onBatch && !multiSelect && (
+            <IconButton
+              data-product-control
+              data-sidebar-multiselect
+              aria-label="多选"
+              title="多选（批量归档 / 移动 / 删除）"
+              variant="muted"
+              size="xs"
+              shape="square"
+              className="rounded-xs"
+              onClick={() => setMultiSelect(true)}
+            >
+              <ListChecks size={15} />
+            </IconButton>
+          )}
+        </label>
 
         {onOpenBoard && (
           <button
@@ -918,67 +1014,20 @@ export function Sidebar({
             onClick={onOpenBoard}
             aria-current={boardActive ? "true" : undefined}
             className={cn(
-              "relative flex h-9 items-center gap-2 rounded-lg px-3 text-left text-section font-medium outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-              boardActive ? "bg-active text-fg" : "text-muted",
+              "mt-0.5 flex h-8 items-center gap-2.5 rounded-sm px-2.5 text-left text-section outline-none transition-[background-color,color,box-shadow] duration-150 focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+              boardActive
+                ? "bg-sidebar-active font-medium text-fg shadow-sidebar-active"
+                : "text-muted hover:bg-hover hover:text-fg",
             )}
           >
-            {boardActive && (
-              <span
-                aria-hidden
-                className="absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent"
-              />
-            )}
-            <Kanban size={16} className="text-faint" />
+            <SquareKanban
+              size={15}
+              aria-hidden
+              className={boardActive ? "text-fg" : "text-faint"}
+            />
             任务
           </button>
         )}
-
-        <div className="flex min-w-0 items-center gap-1">
-          <label className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg bg-hover px-2.5 transition-shadow focus-within:ring-2 focus-within:ring-ring [@media(hover:none)]:min-h-11">
-            <Search size={15} className="shrink-0 text-faint" />
-            <input
-              data-product-feature={PRODUCT_CAPABILITIES.sessions.id}
-              data-sidebar-search
-              aria-label="搜索标题或消息"
-              value={q}
-              onChange={(e) => setQ(e.target.value)}
-              onKeyDown={(e) => {
-                // Escape 一键清空，不必手动全选删除才能回到列表（S-07）。
-                if (e.key === "Escape" && q) {
-                  e.preventDefault();
-                  setQ("");
-                }
-              }}
-              placeholder="搜索标题或消息"
-              className="w-full min-w-0 bg-transparent text-base text-fg outline-none placeholder:text-faint md:text-sm"
-            />
-            {q && (
-              <IconButton
-                data-product-control
-                aria-label="清除搜索"
-                title="清除搜索"
-                variant="muted"
-                size="xs"
-                shape="round"
-                className="-mr-1"
-                onClick={() => setQ("")}
-              >
-                <X size={13} />
-              </IconButton>
-            )}
-          </label>
-          {onBatch && !multiSelect && (
-            <button
-              data-product-control
-              type="button"
-              onClick={() => setMultiSelect(true)}
-              // 高度已有触屏 44px,宽度只有 38px(t-762 sidebar#4):触控档再补 44px 最小宽。
-              className="h-9 shrink-0 rounded-md px-2 text-caption font-medium text-faint outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
-            >
-              多选
-            </button>
-          )}
-        </div>
       </div>
 
       {multiSelect && onBatch && (
@@ -1002,7 +1051,7 @@ export function Sidebar({
           threshold={virtualizeThreshold}
           onEndReached={hasMore && !searching ? onLoadMore : undefined}
           renderItem={renderFlat}
-          className="no-scrollbar flex-1 overflow-y-auto px-2 pb-3"
+          className="no-scrollbar sidebar-scroll-fade flex-1 overflow-y-auto px-2 pb-3"
         />
       </nav>
       {loadingMore ? (
@@ -1021,7 +1070,7 @@ export function Sidebar({
       ) : null}
 
       <div
-        className="flex items-center gap-1 border-t border-border px-2 pt-2 sidebar-foot-safe-b"
+        className="flex items-center gap-0.5 border-t border-border/70 px-2 pt-1.5 sidebar-foot-safe-b"
         data-product-entry-scope="sidebar-account"
       >
         {hasAccountMenu ? (
@@ -1035,7 +1084,10 @@ export function Sidebar({
               data-product-entry-scope="account-menu"
             >
               <div className="flex items-center gap-2.5 px-2 py-2">
-                <Avatar tone="ink" className="text-body">
+                <Avatar
+                  tone="neutral"
+                  className="bg-accent-soft text-body text-accent ring-1 ring-inset ring-accent/15"
+                >
                   {(user?.displayName || "U").slice(0, 1).toUpperCase()}
                 </Avatar>
                 <div className="min-w-0 flex-1">
@@ -1157,14 +1209,16 @@ export function Sidebar({
             onClick={onOpenTutorial}
             aria-label="打开案例展厅"
             title="案例展厅"
-            className="h-8 shrink-0 gap-1 px-2 text-faint hover:text-fg"
+            className={cn(
+              "h-7 shrink-0 gap-1 rounded-xs text-faint hover:text-fg [@media(hover:none)]:size-11",
+              footerCompact ? "w-7 px-0" : "px-2",
+            )}
           >
             <BookOpen size={16} />
-            {/* 窄于 260px 只留图标（原 `width < 220` 低于 SIDEBAR_WIDTH_MIN 恒为 false，S-09）。 */}
             {!footerCompact && <span className="text-caption font-medium">案例</span>}
           </Button>
         )}
-        {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} />}
+        {theme && onCycleTheme && <ThemeToggle theme={theme} onCycle={onCycleTheme} compact />}
       </div>
     </aside>
   );

@@ -26,6 +26,7 @@ afterEach(async () => {
 })
 
 async function fixture(ttlSeconds: number) {
+  assert.equal(process.getuid?.(), 0, 'real root is required for the private admission env')
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-lease-'))
   dirs.push(dir)
   const bin = path.join(dir, 'bin')
@@ -51,6 +52,14 @@ async function fixture(ttlSeconds: number) {
   await chmod(path.join(bin, 'ssh'), 0o755)
   const lock = path.join(dir, 'mut.lock')
   const laneMarker = path.join(dir, 'mutation-lane-inflight')
+  const envFile = path.join(dir, 'v5.env')
+  const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
+  await writeFile(envFile, [
+    `DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
+    `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
+    `MODEL_CATALOG_ADMIN_DATABASE_URL=${JSON.stringify(fixtureUrl)}`,
+    `OC_EGRESS_SECRET=${JSON.stringify('e'.repeat(32))}`,
+  ].join('\n') + '\n', { mode: 0o600 })
   return {
     dir,
     lock,
@@ -63,6 +72,7 @@ async function fixture(ttlSeconds: number) {
       OC_V5_PRODUCTION_MUTATION_LOCK: lock,
       OC_V5_MUTATION_LEASE_TTL_SECONDS: String(ttlSeconds),
       OC_V5_MUTATION_LANE_MARKER: laneMarker,
+      OC_TEST_V5_ENV: envFile,
     } as NodeJS.ProcessEnv,
   }
 }
@@ -70,7 +80,7 @@ async function fixture(ttlSeconds: number) {
 function spawnOrchestrated(script: string, env: NodeJS.ProcessEnv) {
   return spawn(
     'bash',
-    ['-c', `V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh\nset +e\n${script}`],
+    ['-c', `V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh\nV5_ENV="$OC_TEST_V5_ENV"\nset +e\n${script}`],
     { cwd: root, env: { ...process.env, ...env }, stdio: 'ignore', detached: true },
   )
 }
@@ -126,7 +136,7 @@ function orchestrate(script: string, env: NodeJS.ProcessEnv, timeoutMs = 30_000)
   const childEnv = { ...process.env, ...env }
   return spawnSync(
     'bash',
-    ['-c', `V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh\nset +e\n${script}`],
+    ['-c', `V5_DEPLOY_SOURCE_ONLY=1 source scripts/deploy-v5.sh\nV5_ENV="$OC_TEST_V5_ENV"\nset +e\n${script}`],
     { cwd: root, encoding: 'utf8', env: childEnv, timeout: timeoutMs },
   )
 }
@@ -192,11 +202,13 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
 
   test('reclaim refuses a live holder within TTL, and force cleans it', async () => {
     const fx = await fixture(3600) // 大 TTL → holder 不会自退
+    const ready = path.join(fx.dir, 'acquired-ready')
     const out = orchestrate(
       [
-        '( acquire_production_mutation_lease 5 >/dev/null 2>&1; sleep 30 ) &',
+        `( acquire_production_mutation_lease 5 >/dev/null 2>&1 || exit; : >"${ready}"; sleep 30 ) &`,
         'KEEPER=$!',
-        `for _ in $(seq 1 100); do [ -f "${fx.meta}" ] && break; sleep 0.1; done`,
+        `for _ in $(seq 1 100); do [ -f "${fx.meta}" ] && [ -f "${ready}" ] && break; sleep 0.1; done`,
+        `[ -f "${ready}" ] || exit 97`,
         'reclaim_production_mutation_lease 2>&1 | grep -o "REFUSE:holder-live" | head -1',
         'OC_V5_RECLAIM_FORCE=1 reclaim_production_mutation_lease 2>&1 | grep -o "CLEAN:forced" | head -1',
         `[ -f "${fx.meta}" ] || echo META_CLEARED`,
@@ -263,11 +275,13 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
 
   test('reclaim cleans a stale meta whose holder process is already dead', async () => {
     const fx = await fixture(3600)
+    const ready = path.join(fx.dir, 'acquired-ready')
     const out = orchestrate(
       [
-        '( acquire_production_mutation_lease 5 >/dev/null 2>&1; sleep 30 ) &',
+        `( acquire_production_mutation_lease 5 >/dev/null 2>&1 || exit; : >"${ready}"; sleep 30 ) &`,
         'KEEPER=$!',
-        `for _ in $(seq 1 100); do [ -f "${fx.meta}" ] && break; sleep 0.1; done`,
+        `for _ in $(seq 1 100); do [ -f "${fx.meta}" ] && [ -f "${ready}" ] && break; sleep 0.1; done`,
+        `[ -f "${ready}" ] || exit 97`,
         // SIGKILL holder:trap 不跑 → meta 残留(陈旧),flock 由内核释放
         `RPID=$(sed -n 's/.*"remote_pid":\\([0-9]*\\).*/\\1/p' "${fx.meta}")`,
         'kill -9 "$RPID" 2>/dev/null',

@@ -204,7 +204,15 @@ export function ResponseRatingCard({
   return (
     // oc-rating-nudge:纯 box-shadow/border-radius 脉冲(见 styles.css),无布局位移、
     // respect prefers-reduced-motion、暗色自适应；未命中/已评时不加,布局与常态完全一致。
-    <div className={cn("mt-1 flex flex-col gap-2", nudged && "oc-rating-nudge")}>
+    // OCV5-295:根节点不再强制独占一行(与 MetaRow 同一 flex-wrap 父节点里并排);
+    // 点踩展开补充区时整卡 basis-full 另起一行,补充区自身也 basis-full。
+    <div
+      className={cn(
+        "flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-2",
+        expanded && rating && "basis-full",
+        nudged && "oc-rating-nudge",
+      )}
+    >
       <div className="flex items-center gap-1.5 text-meta text-faint">
         <span>
           {expanded && rating === "down"
@@ -220,7 +228,7 @@ export function ResponseRatingCard({
       </div>
 
       {expanded && rating && (
-        <div className="flex flex-col gap-2.5 rounded-lg border border-border bg-surface/60 px-3 py-2.5 animate-in">
+        <div className="flex basis-full flex-col gap-2.5 rounded-lg border border-border bg-surface/60 px-3 py-2.5 animate-in">
           <div className="flex flex-wrap gap-1.5">
             {DOWN_TAGS.map((t) => (
               <TagChip key={t} label={t} active={tags.includes(t)} onClick={() => toggleTag(t)} />

@@ -69,6 +69,9 @@ export {
   type ZcodeRouteOverride,
 } from './engine/zcodeAdapter.js'
 export * from './engine/promptInput.js'
+// Bounded paid Box-model transport reuses the existing Connect Exec wire codec.
+export { encodeExecRequest, parseExecFramesStrict, type BoxCcExecRequest,
+  type ExecFrame } from './engine/cursorBoxCcExec.js'
 // 模型执行权威(容器侧验签消费)。导出 CONTAINER_ATTEST_FRAME_TYPE 等常量供 commercial
 // 侧的 parity 测试锁定 —— 两包不互相 import 生产代码,但「attest 帧 type 必须同值」这条
 // 契约要有一处硬断言,否则改一侧就是静默失联(bridge 永远等不到 attest → 全站拒连接)。
@@ -118,3 +121,16 @@ export { setLiteratureSkillProvider, type LiteratureSkillProvider } from './prom
 // 注入平台静态 key 表(供 host 平台 agent 合成首帧解析到静态模型后 CCB 子进程直连上游)。
 // Personal 不调即恒 null = 整块 no-op(settings.json 继续掌权,零行为变化)。见 hostStaticProviders。
 export { setHostStaticProviderKeys } from './hostStaticProviders.js'
+
+export {
+  type ContentReviewAlert,
+  inboundSessionKey,
+  isContentReviewSessionBanned,
+  observeUserContentReview,
+  setContentReviewAlerter,
+} from './jevContentReview.js'
+
+// Content review management seams: commercial consumes the package boundary,
+// never another package's src path. Keep the public surface intentionally small.
+export { getContentReviewStore } from './contentReviewStore.js'
+export { shouldBanForStrikes, violationInbox } from './contentReviewNotice.js'

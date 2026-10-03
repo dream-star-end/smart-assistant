@@ -1,3 +1,4 @@
+import { grokExecutionUpstream } from '@openclaude/protocol'
 /**
  * modelAuthority(容器侧)—— master 签发的**模型执行权威**的验签消费端。
  *
@@ -516,6 +517,21 @@ export class ModelAuthorityConsumer {
           'CCB execution descriptor missing capabilityZero/supportsThinking',
         )
       }
+      if (ccb.contextOwner !== undefined && ccb.contextOwner !== 'box-native-v1') {
+        throw new AuthorityRejected('bad_shape', 'CCB contextOwner is not box-native-v1')
+      }
+      if (ccb.contextOwner === 'box-native-v1' && payload.canonicalModel !== 'box-api-claude-opus-5-5') {
+        throw new AuthorityRejected(
+          'bad_shape',
+          'box-native-v1 contextOwner requires the signed Box model',
+        )
+      }
+    }
+
+    if (payload.engine === 'grok') {
+      const grok = descriptorRaw.capabilityProfile.grok as { upstreamModelId?: unknown } | undefined
+      try { grokExecutionUpstream(payload.canonicalModel, grok?.upstreamModelId) }
+      catch { throw new AuthorityRejected('bad_shape', 'Grok signed descriptor missing or mismatched public upstream version') }
     }
 
     // 单次消费(cache 满 → AuthorityRejected('replay_cache_full') 已在 cache 内抛)。

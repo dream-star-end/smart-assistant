@@ -48,6 +48,7 @@ import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { notifyClaimFenceOf } from '../engineNotifier.js'
 import { createLogger } from '../logger.js'
 import { renewTurnLease } from '../masterTurnLease.js'
+import { notifyBoxUserStop } from './boxUserStopClient.js'
 
 const log = createLogger({ module: 'ccbAdapter' })
 
@@ -110,6 +111,24 @@ function redactModelAuthorityRuntimeEvents(
  */
 const CCB_EDE_CANCEL_DIAGNOSTIC_RE =
   /^\[ede_diagnostic\] result_type=(?:user|undefined) last_content_type=n\/a stop_reason=(?:null|tool_use)$/
+
+/** OCV5-315 (#72191544): egress answers a deterministic Box continuation
+ * reject (409 BOX_*, "continuation rejected") before any Box call. Claude
+ * Code ends the turn on it, but the Box CLI that handed off the tool calls is
+ * still parked waiting for their results, holding the account slot. Its idle
+ * proof then stays pending, so the session's idle candidate blocks every next
+ * message with IDLE_HISTORY_PENDING ("消息未开始处理"). Only this exact
+ * reject qualifies; transient Box errors keep their own recovery. */
+const BOX_CONTINUATION_REJECTED =
+  /^API Error: 409 \{"error":\{"code":"BOX_[A-Z0-9_]{1,64}","message":"continuation rejected"\}/
+
+export function isBoxContinuationRejectedDetail(errorDetail: string | undefined): boolean {
+  if (!errorDetail || !errorDetail.includes('continuation rejected')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(errorDetail) } catch { return false }
+  const result = (parsed as { result?: unknown } | null)?.result
+  return typeof result === 'string' && BOX_CONTINUATION_REJECTED.test(result)
+}
 
 export function isCcbUserCancellationDiagnostic(
   errorDetail: string | undefined,
@@ -195,6 +214,8 @@ export function asCcbSessionTotals(totals: EngineSessionTotals): CcbSessionTotal
 interface CcbTurnContext {
   parser: CcbMessageParser
   telemetry: TelemetryChannel
+  turnKey?: string
+  boxStopNotified: boolean
   /**
    * F3 — 本 turn **明确拥有**的 Bash tool_use_id 集(只收 name==='Bash' 的工具)。
    * 用于 bash_output_tail 路由的 fail-closed 判定:全局 origin map 若把某 id 逐出,
@@ -225,6 +246,7 @@ function buildTurnSummary(
   telemetry: TelemetryChannel,
   nativeCompactionSummary?: string,
   creditExhausted = false,
+  nativeIdleReceipt?: { opId: string; digest: string },
 ): TurnSummary {
   if (creditExhausted) {
     // Our own interrupt lands as CCB's cooperative-abort diagnostic (an
@@ -251,6 +273,7 @@ function buildTurnSummary(
       numTurns: result.numTurns,
       isError: true,
       ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
+      ...(nativeIdleReceipt ? { nativeIdleReceipt } : {}),
       errorKind: 'other',
       errorClass: 'insufficient_credits',
       errorDetail: CREDIT_EXHAUSTED_DETAIL,
@@ -283,6 +306,7 @@ function buildTurnSummary(
     numTurns: result.numTurns,
     isError: result.isError,
     ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
+    ...(nativeIdleReceipt ? { nativeIdleReceipt } : {}),
     ...(errorKind ? { errorKind } : {}),
     // 审计 R3:与 codexAdapter 对称,把 TurnResult.errorClass 复制到 TurnSummary。
     // CCB result 帧不产 errorClass(恒 undefined,不落),此处仅保证映射对称、不丢字段。
@@ -352,7 +376,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private readonly runner: SubprocessRunner
-  private readonly harness: 'ccb' | 'official-cc'
+  private harness: 'ccb' | 'official-cc'
   private readonly authorityEngine: 'ccb' | 'cursor'
 
   /**
@@ -369,6 +393,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * pendingToolCalls 归 0、telemetry 停止 ingest。
    */
   private _activeTurn: CcbTurnContext | null = null
+  private _boxStopPending: Promise<void> | null = null
   /** InlinePush eligibility is revoked at interrupt / terminal persistence. */
   private _interrupting = false
   /**
@@ -428,8 +453,13 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
+    if (params.modelAuthority) {
+      const pinned = this.runner.pinBoxNativeHarness(params.modelAuthority.executionDescriptor)
+      if (pinned === 'ccb') this.harness = 'ccb'
+    }
     const telemetry = new TelemetryChannel()
     let nativeCompactionSummary: string | undefined
+    let nativeIdleReceipt: { opId: string; digest: string } | undefined
     let resolveSummary!: (s: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((res) => {
       resolveSummary = res
@@ -490,12 +520,16 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
       },
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
       onNativeCompactionSummary: (summaryText) => { nativeCompactionSummary = summaryText },
+      onIdleArtifactReceipt: (receipt) => { nativeIdleReceipt = receipt },
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,
       onFinish: (result) => {
         // parser.finish() 幂等 → onFinish 恰好一次。identity guard:只有当
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
         ctx.stopLeaseRenewal?.()
+        if (result?.isError && isBoxContinuationRejectedDetail(result.errorDetail)) {
+          this._notifyBoxStop(ctx, 'continuation_rejected')
+        }
         resolveSummary(
           result
             ? buildTurnSummary(
@@ -503,6 +537,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
                 telemetry,
                 nativeCompactionSummary,
                 ctx.creditGuard.isExhausted,
+                nativeIdleReceipt,
               )
             : null,
         )
@@ -517,6 +552,8 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     const ctx: CcbTurnContext = {
       parser,
       telemetry,
+      turnKey: params.turnKey,
+      boxStopNotified: false,
       ownedBashToolUseIds: new Set(),
       pendingPermissionRequestIds: new Set(),
       creditGuard: null as unknown as CreditBudgetGuard,
@@ -726,13 +763,40 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     log.warn('dropped unattributable bash_output_tail (fail-closed)', { toolUseId })
   }
 
-  interrupt(): boolean {
+  /** Settle this turn's Box chain through the internal Stop route, once.
+   * Browser Stop is explicit; an ordinary provider HTTP disconnect never
+   * calls this notifier. The gateway owns it beyond the CLI interrupt. */
+  private _notifyBoxStop(turn: CcbTurnContext, cause: 'user' | 'continuation_rejected'): void {
+    const nativeSessionId = this.runner.sessionId
+    if (turn.boxStopNotified || this.model !== 'box-api-claude-opus-5-5'
+      || !turn.turnKey || !nativeSessionId) return
+    turn.boxStopNotified = true
+    this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
+      turnKey: turn.turnKey }).then((outcome) => {
+      if (outcome === 'skipped') log.warn('box_user_stop_notification_skipped', { cause })
+      else if (cause !== 'user') log.info('box_stop_after_continuation_reject', { outcome })
+    }).catch(() => {
+      log.warn('box_user_stop_notification_pending', { cause })
+    })
+  }
+
+  interrupt(reason: 'user' | 'system' = 'system'): boolean {
+    const active = this._activeTurn
+    if (reason === 'user' && active) this._notifyBoxStop(active, 'user')
     this._interrupting = true
     if (this._activeTurn) this._activeTurn = null
     return this.runner.interrupt()
   }
 
   async shutdown(): Promise<void> {
+    if (this._boxStopPending) {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([this._boxStopPending, new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, 2_000)
+        })])
+      } finally { if (timer) clearTimeout(timer) }
+    }
     // F3⑤:先 await 底座停产出(SIGTERM+SIGKILL 链走完),drain 期间的尾帧仍能按
     // origin map 正确归位;**之后**再清 map,避免清早了让尾 tail 落回 fail-closed 丢弃。
     await this.runner.shutdown()

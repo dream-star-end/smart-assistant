@@ -1,0 +1,598 @@
+/** First paid Box tool round on the existing OpenClaude Messages path.
+ * Off-route until the complete cross-HTTP resume/terminal coordinator passes
+ * real Box acceptance. The remote CLI never executes OpenClaude tools. */
+import { isDeepStrictEqual } from "node:util";
+import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
+import { makeBoxDetachedToolPlan, type BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
+import { boxCatalogAliasMode, boxCatalogMatching,
+  type BoxMcpAliasMode } from "./boxToolCatalog.js";
+import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError,
+  type BoxToolHandoffCandidate } from "./boxCliToolHandoff.js";
+import { BoxExecTransportError } from "./boxExecTransport.js";
+import type { BoxDurableJournal } from "./boxDurableJournal.js";
+import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
+import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
+import { readBoxSpoolChunk } from "./boxSpoolRead.js";
+import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
+import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { makeBoxStageBatch } from "./boxStageBatch.js";
+import { boxFastPathEnabled } from "./boxFastPath.js";
+import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
+import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
+  makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
+  type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
+import { randomBytes } from "node:crypto";
+import { matchesBoxNativeHistory } from "./boxNativeHistory.js";
+import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
+import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
+import type { BoxResolvedTarget } from "./boxTextFetch.js";
+import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
+import type { ProxyBody } from "./shared.js";
+import { waitingForBoxCapacity } from "./boxCapacityWait.js";
+
+export class BoxToolFirstRoundError extends Error {
+  constructor(readonly code: string) { super(code); this.name = "BoxToolFirstRoundError"; }
+}
+export interface BoxToolFirstHandoff {
+  readonly kind: "tool_handoff";
+  readonly plan: BoxDetachedToolPlan;
+  /** Must remain owned until nonce/epoch-bound remote terminal proof. */
+  readonly target: BoxResolvedTarget;
+  readonly candidate: BoxToolHandoffCandidate;
+  readonly spoolOffset: number;
+}
+export interface BoxToolFirstFinal {
+  readonly kind: "final";
+  readonly plan: BoxDetachedToolPlan;
+  readonly target: BoxResolvedTarget;
+  readonly proof: BoxTerminalProof;
+  readonly nativePointer?: BoxNativePointer;
+}
+type Journal = Pick<BoxDurableJournal, "admit" |
+  "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
+  "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
+  & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer"
+    | "markFirstRoundRejectedStream">>;
+
+/** Decoder rejections that are a deterministic property of this stream (not a
+ * transport or service failure) and may be stopped and settled explicitly. */
+const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID"]);
+
+export async function runBoxToolFirstRound(input: {
+  uid: bigint;
+  sessionId: string | null;
+  requestId: string;
+  canonicalModel: string;
+  canonicalBody: ProxyBody;
+  upstreamModel: string;
+  url: string;
+  init: RequestInit;
+  emit: (sse: string) => void;
+  /** Resolve the HTTP response only after this invocation's paid launch ack. */
+  onLaunchAck?: () => void;
+  /** OCV5-304: the request's last user message answers a tool exchange whose
+   * original Box run was stopped; replay it as history (see mapper). */
+  resumeToolResults?: boolean;
+}, deps: {
+  supervisorAsset: Buffer;
+  keeperAsset: Buffer;
+  virtualMcpAsset: Buffer;
+  detachedRunnerAsset: Buffer;
+  /** OCV5-301 bounded wait for a held session/account slot (default 45s). */
+  capacityWaitMs?: number;
+  /** OCV5-300: production passes "natural" so the CLI sees client names. */
+  toolAliasMode?: BoxMcpAliasMode;
+  journal: Journal;
+  writeMessage?: BoxReplayMessageWriter;
+  maxOutputTokensForModel: (model: string) => number | null;
+  resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
+    upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
+  onUnknown: (args: { uid: bigint; accountId: bigint; requestId: string;
+    phase: string }) => Promise<void>;
+  /** Retain the local target until remote proof or explicit operator recovery. */
+  retainUnknownTarget: (handle: { target: BoxResolvedTarget;
+    plan: BoxDetachedToolPlan; uid: bigint; requestId: string }) => void;
+  /** Failed local-agent close remains explicitly owned for bounded retry. */
+  retainCleanupTarget: (handle: { target: BoxResolvedTarget;
+    pending: Promise<void>; uid: bigint; requestId: string; phase: string }) => void;
+  budgetMs?: number;
+  /** OCV5-299: stop a launched run whose stream this decoder deterministically
+   * rejected (e.g. a tool name outside this invocation's catalog). Returns the
+   * explicit-stop outcome; only "stopped_proven" means the row is now a proven
+   * failed_stopped (no usage billed) instead of an unknown that pins the
+   * session. Anything else keeps the fail-closed unknown path. */
+  stopRejectedRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
+    runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
+  /** Test seam; production reads the keeper proof from the Box. */
+  readTerminalProof?: typeof readBoxTerminalProof;
+}): Promise<BoxToolFirstHandoff | BoxToolFirstFinal> {
+  if (input.url !== BOX_INTERNAL_ENDPOINT || input.init.method !== "POST"
+    || typeof input.init.body !== "string") {
+    throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_REQUEST_INVALID");
+  }
+  let body: ProxyBody;
+  try { body = JSON.parse(input.init.body) as ProxyBody; }
+  catch { throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_REQUEST_INVALID"); }
+  if (input.canonicalBody.model !== input.canonicalModel
+    || body.model !== input.upstreamModel
+    || body.max_tokens !== input.canonicalBody.max_tokens
+    || !isDeepStrictEqual(body.messages, input.canonicalBody.messages)
+    || !isDeepStrictEqual(body.tools, input.canonicalBody.tools)
+    || !Array.isArray(body.tools) || body.tools.length < 1) {
+    throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
+  }
+  const cap = deps.maxOutputTokensForModel(input.canonicalModel);
+  if (cap === null) throw new BoxToolFirstRoundError("BOX_TOOL_MODEL_NOT_CONFIGURED");
+  let fingerprint: ReturnType<typeof deriveBoxCallFingerprint>;
+  let contextHash: string;
+  try {
+    fingerprint = deriveBoxCallFingerprint(input.uid, input.canonicalBody);
+    contextHash = deriveBoxContextHash(input.canonicalBody);
+  }
+  catch { throw new BoxToolFirstRoundError("BOX_TOOL_IDENTITY_MISSING"); }
+  // The durable digest must describe the request actually passed to the
+  // remote CLI, not merely the handler snapshot used for identity checks.
+  try {
+    if (deriveBoxContextHash({ ...body, model: input.canonicalModel }) !== contextHash) {
+      throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
+    }
+  } catch (error) {
+    if (error instanceof BoxToolFirstRoundError) throw error;
+    throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
+  }
+  const nativeEnabled = boxFastPathEnabled();
+  let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+    maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
+    keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
+    detachedRunnerAsset: deps.detachedRunnerAsset,
+    nativePersistence: nativeEnabled, toolAliasMode: deps.toolAliasMode,
+    ...(input.resumeToolResults ? { resumeToolResults: true } : {}) });
+  const budget = deps.budgetMs ?? BOX_TOOL_MAX_WALL_MS;
+  if (!Number.isSafeInteger(budget) || budget < 60_000
+    || budget > BOX_TOOL_MAX_WALL_MS) {
+    throw new BoxToolFirstRoundError("BOX_TOOL_BUDGET_INVALID");
+  }
+  const startedAt = Date.now();
+  const remaining = () => Math.max(0, budget - (Date.now() - startedAt));
+  const abort = new AbortController();
+  const onClientAbort = (): void => abort.abort();
+  input.init.signal?.addEventListener("abort", onClientAbort, { once: true });
+  if (input.init.signal?.aborted) abort.abort();
+  const timer = setTimeout(() => abort.abort(), budget);
+  const signal = abort.signal;
+  const aborted = new Promise<never>((_, reject) => {
+    signal.addEventListener("abort", () => reject(
+      new BoxToolFirstRoundError("BOX_TOOL_ABORTED")), { once: true });
+  });
+  void aborted.catch(() => {});
+  const race = <T>(value: Promise<T>): Promise<T> => Promise.race([value, aborted]);
+  let target: BoxResolvedTarget | null = null;
+  let admitted = false, launchAttempted = false;
+  let armAttempted = false;
+  let prelaunchReceipt: BoxPrelaunchReceipt | null = null;
+  let prestartClosed = false;
+  let unknownNotified = false;
+  type Disposal = { pending: Promise<void>; retained: boolean };
+  const disposals = new WeakMap<BoxResolvedTarget, Disposal>();
+  const retainCleanup = (owned: BoxResolvedTarget, state: Disposal,
+    phase: string): void => {
+    if (state.retained) return;
+    state.retained = true;
+    deps.retainCleanupTarget({ target: owned, pending: state.pending,
+      uid: input.uid, requestId: input.requestId, phase });
+  };
+  const disposeOnce = (owned: BoxResolvedTarget, phase: string): Disposal => {
+    const existing = disposals.get(owned);
+    if (existing) return existing;
+    const state: Disposal = { pending: Promise.resolve(), retained: false };
+    const pending = Promise.resolve().then(() => owned.dispose?.()).then(() => {},
+      (error: unknown) => {
+        retainCleanup(owned, state, phase);
+        throw error;
+      });
+    state.pending = pending;
+    disposals.set(owned, state);
+    return state;
+  };
+  const bounded = async <T>(pending: Promise<T>, ms: number): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { return await Promise.race([pending, new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new BoxToolFirstRoundError(
+        "BOX_TOOL_CLEANUP_TIMEOUT")), ms);
+    })]); }
+    finally { if (timer) clearTimeout(timer); }
+  };
+  const closeBounded = async (owned: BoxResolvedTarget, phase: string): Promise<void> => {
+    const state = disposeOnce(owned, phase);
+    try { await bounded(state.pending, 200); }
+    catch (error) {
+      if (error instanceof BoxToolFirstRoundError
+        && error.code === "BOX_TOOL_CLEANUP_TIMEOUT") {
+        retainCleanup(owned, state, phase);
+      }
+      throw error;
+    }
+  };
+  const unknown = async (phase: string): Promise<void> => {
+    if (!admitted || !target || unknownNotified) return;
+    unknownNotified = true;
+    deps.retainUnknownTarget({ target, plan, uid: input.uid,
+      requestId: input.requestId });
+    const observed = Promise.allSettled([
+      deps.journal.markUnknown({ requestId: input.requestId, uid: input.uid,
+        leaseEpoch: plan.leaseEpoch, phase }),
+      deps.onUnknown({ uid: input.uid, accountId: target.accountId,
+        requestId: input.requestId, phase }),
+    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { await Promise.race([observed, new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, 200);
+    })]); }
+    finally { if (timer) clearTimeout(timer); }
+  };
+  const run = async (request: Parameters<BoxResolvedTarget["exec"]["run"]>[0],
+    timeoutMs = 20_000) => {
+    if (!target || signal.aborted || remaining() < 1000) {
+      throw new BoxToolFirstRoundError("BOX_TOOL_ABORTED");
+    }
+    return race(target.exec.run(request, { timeoutMs: Math.min(timeoutMs, remaining()),
+      maxResponseBytes: 1_048_576, signal }));
+  };
+  const prestart = async (): Promise<void> => {
+    if (!target || !admitted) return;
+    if (prelaunchReceipt) {
+      try {
+        // Never use caller abort here: a timed-out private stage can still be
+        // mutating remotely. CLEANED is emitted only under the same flock.
+        const cleaned = await bounded(target.exec.run(
+          makeBoxPrelaunchCleanup(prelaunchReceipt), {
+          timeoutMs: 20_000, maxResponseBytes: 4096 }), 20_500);
+        if (cleaned.stdout.trim() !== `cleaned:${prelaunchReceipt.identityHash}`) {
+          throw new Error("cleanup receipt mismatch");
+        }
+        await bounded(deps.journal.markGuardedPrestartStopped({
+          requestId: input.requestId, uid: input.uid, accountId: target.accountId,
+          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+          receipt: prelaunchReceipt, cleanedReceipt: cleaned.stdout.trim(),
+        }), 2_000);
+        prestartClosed = true;
+      } catch { await unknown("prestart_cleanup_unknown"); }
+      return;
+    }
+    try { await bounded(deps.journal.markPrestartStopped({ requestId: input.requestId,
+      uid: input.uid, leaseEpoch: plan.leaseEpoch }), 2_000); prestartClosed = true; }
+    catch { await unknown("prestart_journal_unknown"); }
+  };
+  try {
+    if (signal.aborted) throw new BoxToolFirstRoundError("BOX_TOOL_ABORTED");
+    const pendingTarget = deps.resolveTarget({ uid: input.uid, sessionId: input.sessionId,
+      requestId: input.requestId, upstreamModel: input.upstreamModel, signal });
+    let resolutionAbandoned = false;
+    let completedTarget: BoxResolvedTarget | null = null;
+    void pendingTarget.then((late) => {
+      completedTarget = late;
+      if (resolutionAbandoned) void closeBounded(late, "late_resolver").catch(() => {});
+    }, () => {});
+    try { target = await race(pendingTarget); }
+    catch (error) {
+      resolutionAbandoned = true;
+      if (completedTarget) void closeBounded(completedTarget, "late_resolver").catch(() => {});
+      throw error;
+    }
+    let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
+    // A resumed tool exchange must be staged from history: a native
+    // transcript stops at the unanswered tool_use (OCV5-304).
+    if (nativeEnabled && input.sessionId && deps.journal.findNativeCandidate
+      && !input.resumeToolResults) {
+      let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
+      try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
+        sessionId: input.sessionId, currentRequestId: input.requestId,
+        canonicalModel: input.canonicalModel })); }
+      catch (error) {
+        if (signal.aborted) throw error;
+        /* Cache lookup failure leaves the ordinary one-launch path. */
+      }
+      // OCV5-300: a pointer written on the opaque-alias release resumes with
+      // that same catalog variant, so the native transcript's tool names and
+      // the staged MCP catalog stay identical across the rolling deploy.
+      const pointerCatalog = candidate
+        ? boxCatalogMatching(plan.catalog, candidate.pointer.catalogHash) : null;
+      if (candidate && pointerCatalog
+        && candidate.pointer.accountId === target.accountId.toString()
+        && candidate.pointer.upstreamModel === input.upstreamModel
+        && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
+        const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+          maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
+          keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
+          detachedRunnerAsset: deps.detachedRunnerAsset,
+          runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+          toolAliasMode: pointerCatalog.bindingSha256 === plan.catalog.bindingSha256
+            ? deps.toolAliasMode : boxCatalogAliasMode(pointerCatalog),
+          nativeResume: { cliCwd: candidate.pointer.cliCwd,
+            sessionId: candidate.pointer.nativeSessionId,
+            expectedSha256: candidate.pointer.transcriptSha256 } });
+        try {
+          const inspected = await run(warm.nativePreflight!, 20_000);
+          parseBoxNativeFileEvidence(inspected.stdout,
+            candidate.pointer.transcriptSha256);
+          if (warm.catalog.bindingSha256 !== candidate.pointer.catalogHash) {
+            throw new Error("BOX_NATIVE_CATALOG_VARIANT_MISMATCH");
+          }
+          plan = warm;
+          nativeClaim = { ownerRequestId: candidate.ownerRequestId,
+            pointer: candidate.pointer, upstreamModel: input.upstreamModel };
+        } catch (error) {
+          if (signal.aborted || error instanceof BoxToolFirstRoundError
+            && error.code === "BOX_TOOL_ABORTED") throw error;
+          // Preflight is read-only/no paid CLI. A miss falls back exactly once.
+        }
+      }
+    }
+    // OCV5-301: the same session's previous turn may still be settling.
+    const admitAccountId = target.accountId;
+    const pendingAdmission = waitingForBoxCapacity(() => deps.journal.admit({
+      requestId: input.requestId, uid: input.uid,
+      accountId: admitAccountId, model: input.canonicalModel, fingerprint,
+      canonicalBody: input.canonicalBody,
+      replayRequired: deps.writeMessage !== undefined,
+      runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+      invocationMode: "detached_tool", contextHash,
+      detachedRunnerHash: plan.detachedRunnerHash,
+      catalogHash: plan.catalog.bindingSha256,
+      ...(nativeClaim ? { nativeClaim }
+        : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
+          cliCwd: plan.cliCwd } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
+    // A timed-out admission can commit after the HTTP caller has left. No
+    // model launch follows it, so its late success is safe to prestart-close.
+    void pendingAdmission.then(() => {
+      if (signal.aborted && !admitted) void deps.journal.markPrestartStopped({
+        requestId: input.requestId, uid: input.uid, leaseEpoch: plan.leaseEpoch }).catch(() => {});
+    }, () => {});
+    await race(pendingAdmission);
+    admitted = true;
+    let stageLabel = "before_stage";
+    try {
+      if (boxFastPathEnabled()) {
+        stageLabel = "assets";
+        const staged = await run(plan.stageAssets);
+        if (staged.stdout.trim() !== plan.assetManifest) {
+          throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
+        }
+      } else {
+        for (const [label, request, expected] of [
+          ["supervisor", plan.stageSupervisor, plan.supervisorHash],
+          ["keeper", plan.stageKeeper, plan.keeperHash],
+          ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
+          ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
+        ] as const) {
+          stageLabel = label;
+          const staged = await run(request);
+          if (staged.stdout.trim() !== expected) {
+            throw new BoxToolFirstRoundError("BOX_TOOL_ASSET_STAGE_INVALID");
+          }
+        }
+      }
+      stageLabel = "prelaunch_bootstrap";
+      const controlId = randomBytes(16).toString("hex");
+      const bootstrap = await run(makeBoxPrelaunchBootstrap({
+        runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+        accountId: target.accountId.toString(), controlId,
+      }));
+      prelaunchReceipt = parseBoxPrelaunchBootstrap(bootstrap.stdout, {
+        runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+        accountId: target.accountId.toString(), controlId,
+      });
+      stageLabel = "prelaunch_journal";
+      await race(deps.journal.recordPrelaunchControl({ requestId: input.requestId,
+        uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
+        leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
+      if (boxFastPathEnabled()) {
+        const receipt = prelaunchReceipt;
+        const guarded = plan.stageInputs.map((request, index) => {
+          if (index === 0) {
+            if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+              throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+            }
+            return makeBoxPrelaunchInit(receipt, request.args[4]);
+          }
+          return guardBoxPrivateStage(request, receipt);
+        });
+        const batch = makeBoxStageBatch(guarded);
+        if (batch) {
+          stageLabel = "input_batch";
+          const staged = await run(batch.request, 60_000);
+          if (staged.stdout.trim() !== batch.expected) {
+            throw new BoxToolFirstRoundError("BOX_TOOL_INPUT_STAGE_INVALID");
+          }
+        } else {
+          for (const [index, request] of guarded.entries()) {
+            stageLabel = `input_${index}`;
+            await run(request);
+          }
+        }
+      } else {
+        for (const [index, request] of plan.stageInputs.entries()) {
+          stageLabel = `input_${index}`;
+          if (index === 0) {
+            if (request.args[3] !== plan.cwd || typeof request.args[4] !== "string") {
+              throw new BoxToolFirstRoundError("BOX_TOOL_INIT_PLAN_INVALID");
+            }
+            await run(makeBoxPrelaunchInit(prelaunchReceipt, request.args[4]));
+          } else {
+            await run(guardBoxPrivateStage(request, prelaunchReceipt));
+          }
+        }
+      }
+      if (signal.aborted || remaining() < 60_000) {
+        throw new BoxToolFirstRoundError("BOX_TOOL_BUDGET_EXHAUSTED");
+      }
+      stageLabel = "launch_arm";
+      armAttempted = true;
+      await race(deps.journal.armGuardedLaunch({ requestId: input.requestId,
+        uid: input.uid, accountId: target.accountId, runNonce: plan.runNonce,
+        leaseEpoch: plan.leaseEpoch, receipt: prelaunchReceipt }));
+    } catch (error) {
+      // An arm CAS may have committed before its acknowledgement was lost.
+      // Never clean remotely after that point without a separate proof that
+      // the paid launch permit was not granted.
+      if (armAttempted) {
+        await unknown("launch_arm_unknown");
+        throw error;
+      }
+      await prestart();
+      if (!prestartClosed && error instanceof BoxExecTransportError
+        && !error.terminalKnown) {
+        await unknown(`stage_transport_unknown:${stageLabel}:${error.code}`);
+      }
+      throw error;
+    }
+    launchAttempted = true;
+    const launch = await run(plan.launch);
+    if (launch.stdout.trim() !== "launched") {
+      throw new BoxToolFirstRoundError("BOX_TOOL_LAUNCH_UNKNOWN");
+    }
+    input.onLaunchAck?.();
+    const decoder = new BoxCliToolHandoffDecoder(plan.expectedModel, plan.catalog,
+      { allowFinal: true, ...(nativeEnabled ? { trustedNativeSessionId: plan.sessionId } : {}) });
+    for await (const line of pollBoxSpoolLines({ exec: target.exec, access: plan,
+      startOffset: 0, deadlineMs: Math.max(1, remaining()), signal })) {
+      const decoded = decoder.push(line.text);
+      if (decoded.sse) input.emit(decoded.sse);
+      if (decoded.finalCandidate) {
+        const final = decoded.finalCandidate;
+        let proof: BoxTerminalProof | null = null;
+        const until = Date.now() + 20_000;
+        while (!proof && Date.now() < until && !signal.aborted) {
+          try { proof = await race(readBoxTerminalProof({ target,
+            expectedAccountId: target.accountId, runNonce: plan.runNonce,
+            leaseEpoch: plan.leaseEpoch, signal })); }
+          catch (error) {
+            if (!(error instanceof BoxExecTransportError && error.terminalKnown)
+              && !isTransientBoxSpoolReadError(error)) throw error;
+            await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        if (!proof || proof.reason !== "worker_complete") {
+          throw new BoxToolFirstRoundError("BOX_TOOL_TERMINAL_UNPROVEN");
+        }
+        const trailing = await race(readBoxSpoolChunk({ exec: target.exec,
+          plan, offset: line.endOffset, signal }));
+        if (trailing.bytes.length !== 0) {
+          throw new BoxToolFirstRoundError("BOX_TOOL_FINAL_TRAILING_BYTES");
+        }
+        decoder.finishFinal();
+        const usage = { inputTokens: final.inputTokens,
+          outputTokens: final.outputTokens, cacheReadTokens: final.cacheReadTokens,
+          cacheWriteTokens: final.cacheWriteTokens };
+        const messagePointer = deps.writeMessage
+          ? await race(deps.writeMessage({ uid: input.uid.toString(),
+            requestId: input.requestId, runNonce: plan.runNonce,
+            leaseEpoch: plan.leaseEpoch, roundNo: 1 }, decoder.completedMessage()))
+          : undefined;
+        await race(deps.journal.complete({ requestId: input.requestId,
+          uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage,
+          ...(messagePointer ? { messagePointer } : {}) }));
+        let nativePointer: BoxNativePointer | undefined;
+        if (nativeEnabled && final.assistantContentHash
+          && deps.journal.attachNativePointer) {
+          try {
+            const inspected = await target.exec.run(makeBoxNativeFileInspect({
+              cliCwd: plan.cliCwd, nativeSessionId: plan.sessionId }), {
+              timeoutMs: 10_000, maxResponseBytes: 4096 });
+            const file = parseBoxNativeFileEvidence(inspected.stdout);
+            const candidate = parseBoxNativePointer({ version: 1,
+              accountId: target.accountId.toString(), upstreamModel: input.upstreamModel,
+              cliVersion: "2.1.280", nativeSessionId: plan.sessionId,
+              cliCwd: plan.cliCwd, transcriptSha256: file.sha256,
+              contextHashBeforeFinal: contextHash,
+              assistantContentHash: final.assistantContentHash,
+              catalogHash: plan.catalog.bindingSha256,
+              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+            if (candidate && await deps.journal.attachNativePointer({
+              requestId: input.requestId, uid: input.uid,
+              accountId: target.accountId, proof, pointer: candidate })) {
+              nativePointer = candidate;
+            }
+          } catch { /* Optional cache failure cannot erase settled model usage. */ }
+        }
+        input.emit(decoder.commitFinal({ terminalReason: proof.reason,
+          journaledUsage: usage }));
+        return { kind: "final", plan, target, proof,
+          ...(nativePointer ? { nativePointer } : {}) };
+      }
+      if (!decoded.candidate) continue;
+      const candidate = decoded.candidate;
+      const pending = new Set<string>();
+      const pendingDeadline = Date.now() + Math.min(5000, remaining());
+      while (pending.size === 0 && Date.now() < pendingDeadline && !signal.aborted) {
+        for (const use of candidate.toolUses) {
+          try {
+            const result = await run(makeBoxPendingRead(plan.cwd, use.id));
+            parseBoxPendingCall(result.stdout, use);
+            pending.add(use.id);
+          } catch (error) {
+            if (!(error instanceof BoxExecTransportError && error.terminalKnown)
+              && !isTransientBoxSpoolReadError(error)) throw error;
+          }
+        }
+        if (pending.size === 0) await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
+      if (pending.size === 0) throw new BoxToolFirstRoundError("BOX_TOOL_PENDING_UNPROVEN");
+      const messagePointer = deps.writeMessage
+        ? await race(deps.writeMessage({ uid: input.uid.toString(),
+          requestId: input.requestId, runNonce: plan.runNonce,
+          leaseEpoch: plan.leaseEpoch, roundNo: 1 }, decoder.completedMessage()))
+        : undefined;
+      const proof = await race(deps.journal.recordToolHandoff({ requestId: input.requestId,
+        uid: input.uid, leaseEpoch: plan.leaseEpoch, candidate, roundNo: 1,
+        spoolOffset: line.endOffset, detachedRunnerHash: plan.detachedRunnerHash,
+        catalogHash: plan.catalog.bindingSha256,
+        verifiedPendingToolUseIds: [...pending],
+        ...(messagePointer ? { messagePointer } : {}) }));
+      input.emit(decoder.commitHandoff(proof));
+      return { kind: "tool_handoff", plan, target, candidate,
+        spoolOffset: line.endOffset };
+    }
+    throw new BoxToolFirstRoundError("BOX_TOOL_STREAM_INCOMPLETE");
+  } catch (error) {
+    if (launchAttempted && admitted && target && deps.stopRejectedRun
+      && error instanceof BoxCliToolHandoffError
+      && BOX_LOCALLY_REJECTED_STREAM.has(error.code)) {
+      // The CLI is still alive (it answers the bad call itself and keeps
+      // going). Stop it now through the same explicit-stop path as a user
+      // Stop; a proven stop settles the row as failed_stopped so the session
+      // is not pinned by an unknown row and its idle proof reads `failed`.
+      let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
+      try {
+        outcome = await deps.stopRejectedRun({ requestId: input.requestId, uid: input.uid,
+          accountId: target.accountId, runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch });
+      } catch { outcome = "pending"; }
+      if (outcome === "completed_unsettled" && deps.journal.markFirstRoundRejectedStream) {
+        // OCV5-300: the CLI already finished on its own (it answered the bad
+        // call itself). Its keeper proof is final; settle the row as a
+        // rejected stream (no usage, not billed) instead of leaving it unknown.
+        try {
+          const proof = await bounded((deps.readTerminalProof ?? readBoxTerminalProof)({ target,
+            expectedAccountId: target.accountId, runNonce: plan.runNonce,
+            leaseEpoch: plan.leaseEpoch }), 20_000);
+          await bounded(deps.journal.markFirstRoundRejectedStream({ requestId: input.requestId,
+            uid: input.uid, leaseEpoch: plan.leaseEpoch, proof }), 5_000);
+          outcome = "stopped_proven";
+        } catch { /* unproven: keep the fail-closed unknown path below */ }
+      }
+      if (outcome === "stopped_proven") {
+        await closeBounded(target, "rejected_stream_dispose").catch(() => {});
+        throw new BoxToolFirstRoundError(error.code === "BOX_TOOL_ID_OR_NAME_INVALID"
+          ? "BOX_TOOL_NAME_UNAVAILABLE" : error.code);
+      }
+    }
+    if (launchAttempted) await unknown("first_round_unknown");
+    if ((!admitted || prestartClosed) && target) {
+      await closeBounded(target, "prestart_dispose").catch(() => {});
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    input.init.signal?.removeEventListener("abort", onClientAbort);
+  }
+}

@@ -2,10 +2,19 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 // Real ModelSelector + trusted Chromium clicks. This is NOT a full App/login/live test.
 import { test } from 'node:test'
+import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { launchJourneyBrowser, selectJourneyModel } from '../../../scripts/lib/journey-browser.mjs'
 const { build } = createRequire(import.meta.url)('esbuild')
-test('R2 real collapsed picker selects exact model (shared deployment helper)', async () => {
+const authorityPath = fileURLToPath(new URL('../../protocol/src/engineModels.ts', import.meta.url))
+const sha = (text) => createHash('sha256').update(text).digest('hex')
+const legacyBlocks = ["  {\n    family: 'gpt-5.6-sol',\n    familyLabel: 'GPT-5.6-Sol',\n    standardId: 'gpt-5.6-sol',\n    longId: 'gpt-5.6-sol-1m',\n    collapsedByDefault: false,\n  },\n", "  {\n    family: 'gpt-5.6-terra',\n    familyLabel: 'GPT-5.6-Terra',\n    standardId: 'gpt-5.6-terra',\n    longId: 'gpt-5.6-terra-1m',\n    collapsedByDefault: true,\n  },\n", "  {\n    family: 'gpt-5.6-luna',\n    familyLabel: 'GPT-5.6-Luna',\n    standardId: 'gpt-5.6-luna',\n    longId: 'gpt-5.6-luna-1m',\n    collapsedByDefault: true,\n  },\n"]
+async function pickerBundle() {
+  const source = await readFile(authorityPath, 'utf8')
+  const negative = process.env.OC_LEGACY_CONTEXT_RED === '1'
+  let replacements = 0, bundledSource = source
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL('./user-contract-harness.tsx', import.meta.url))],
     bundle: true,
@@ -19,8 +28,29 @@ test('R2 real collapsed picker selects exact model (shared deployment helper)', 
         new URL('../../protocol/src/index.ts', import.meta.url),
       ),
     },
+    plugins: negative ? [{ name: 'remove-only-commercial-legacy-context', setup(api) {
+      api.onLoad({ filter: /[\/]engineModels\.tsx?$/ }, async ({ path }) => {
+        assert.equal(path, authorityPath)
+        const current = await readFile(path, 'utf8')
+        assert.equal(current, source)
+        bundledSource = current
+        for (const block of legacyBlocks) {
+          assert.equal(bundledSource.split(block).length - 1, 1, 'exactly one restored legacy family')
+          bundledSource = bundledSource.replace(block, '')
+          replacements++
+        }
+        return { contents: bundledSource, loader: 'ts', resolveDir: dirname(path) }
+      })
+    }}] : [],
     define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env.MODE': '"production"' },
   })
+  assert.equal(replacements, negative ? 3 : 0)
+  assert.equal(await readFile(authorityPath, 'utf8'), source, 'in-memory negative control leaves authority unchanged')
+  console.log('legacy-context-evidence ' + JSON.stringify({ negative, replacements, sourceSha: sha(source), bundledSha: sha(bundledSource) }))
+  return bundle
+}
+test('R2 real collapsed picker selects exact model (shared deployment helper)', async () => {
+  const bundle = await pickerBundle()
   const browser = await launchJourneyBrowser()
   try {
     const page = await browser.newPage()
@@ -35,6 +65,34 @@ test('R2 real collapsed picker selects exact model (shared deployment helper)', 
   } finally {
     await browser.close()
   }
+})
+
+test('legacy commercial 1M selection requires real cancel or confirmation', async () => {
+  const bundle = await pickerBundle()
+  const browser = await launchJourneyBrowser()
+  try {
+    const page = await browser.newPage()
+    await page.setContent('<html><body><div id="root"></div></body></html>')
+    await page.addScriptTag({ content: bundle.outputFiles[0].text })
+    const selectLong = async () => {
+      await page.getByRole('button', { name: '选择对话模型' }).click()
+      await page.getByRole('menu').waitFor()
+      const long = page.locator('[data-context="1m"]')
+      assert.equal(await long.count(), 1, 'legacy selected family must offer exactly one 1M choice')
+      await long.click()
+      await page.getByRole('dialog').waitFor()
+      assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-sol', 'no selection before consent')
+    }
+    await selectLong()
+    await page.getByRole('button', { name: '保留标准', exact: true }).click()
+    await page.getByRole('dialog').waitFor({ state: 'hidden' })
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-sol', 'cancel preserves standard model')
+    await selectLong()
+    await page.getByRole('button', { name: '仍要切换', exact: true }).click()
+    await page.getByRole('dialog').waitFor({ state: 'hidden' })
+    await page.waitForFunction(() => document.querySelector('[data-testid="selected-model"]')?.textContent === 'gpt-5.6-sol-1m')
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-sol-1m', 'only confirmation selects long model')
+  } finally { await browser.close() }
 })
 
 import { spawn } from 'node:child_process'
@@ -102,6 +160,8 @@ for (const cost of ['dry', 'live'])
             V5_E2E_BASE: `http://127.0.0.1:${server.address().port}`,
             V5_CANARY_PASSWORD_FILE: join(dir, 'password'),
             V5_CONTRACT_COST: cost,
+            V5_CONTRACT_MODEL_ID: 'gpt-5.6-luna',
+            V5_CONTRACT_MODELS: 'gpt-5.6-sol,deepseek-v4-flash',
           },
           stdio: ['ignore', 'pipe', 'pipe'],
         },

@@ -33,6 +33,7 @@ import { count } from './array.js'
 import { getMergedBetas } from './betas.js'
 import { getContextWindowForModel } from './context.js'
 import { logForDebugging } from './debug.js'
+import { isTrustedBoxDeferredAnnouncement } from './model/boxDeferredAnnouncement.js'
 import { isEnvDefinedFalsy, isEnvTruthy } from './envUtils.js'
 import { jsonStringify } from './slowOperations.js'
 import { zodToJsonSchema } from './zodToJsonSchema.js'
@@ -590,7 +591,8 @@ export type DeferredToolsDeltaScanContext = {
  * False → claude.ts keeps its per-call <available-deferred-tools>
  * header prepend (the attachment does not fire).
  */
-export function isDeferredToolsDeltaEnabled(): boolean {
+export function isDeferredToolsDeltaEnabled(model?: string): boolean {
+  if (isTrustedBoxDeferredAnnouncement(model)) return true
   return (
     process.env.USER_TYPE === 'ant' ||
     getFeatureValue_CACHED_MAY_BE_STALE('tengu_glacier_2xr', false)

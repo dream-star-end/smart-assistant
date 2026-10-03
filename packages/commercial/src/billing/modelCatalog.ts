@@ -71,6 +71,8 @@ export interface ModelCapabilityProfile {
   ccb: {
     capabilityZero: boolean;
     supportsThinking: boolean;
+    /** Catalog may declare the token. Issuance still requires the ready route. */
+    contextOwner?: "box-native-v1";
   };
 }
 
@@ -315,6 +317,13 @@ export function parseCapabilityProfile(modelId: string, raw: unknown): ModelCapa
   ) {
     throw new TypeError(`model ${modelId}: capability_profile.ccb must declare capability_zero/supports_thinking`);
   }
+  let contextOwner: "box-native-v1" | undefined;
+  if (ccb.context_owner !== undefined) {
+    if (ccb.context_owner !== "box-native-v1") {
+      throw new TypeError(`model ${modelId}: capability_profile.ccb.context_owner must be box-native-v1`);
+    }
+    contextOwner = "box-native-v1";
+  }
   return {
     supportsVision: vision,
     reasoning: {
@@ -324,6 +333,7 @@ export function parseCapabilityProfile(modelId: string, raw: unknown): ModelCapa
     ccb: {
       capabilityZero: ccb.capability_zero,
       supportsThinking: ccb.supports_thinking,
+      ...(contextOwner === undefined ? {} : { contextOwner }),
     },
   };
 }

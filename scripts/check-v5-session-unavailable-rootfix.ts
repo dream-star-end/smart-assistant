@@ -80,6 +80,161 @@ console.log(
 )
 console.log('[session-unavailable-rootfix] PASS — INC-20260906-COMMERCIAL-UNIT-HANG-DEFAULT-CODEX-MODEL team-leader default-model test contract is locked')
 
+// INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof.
+// The Box tests and real account canary must separately prove cleanup and
+// cross-HTTP business outcomes before its model catalog entry is enabled.
+const boxPrelaunch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxPrelaunchControl.ts'), 'utf8')
+const boxJournal = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const boxFetch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolFetch.ts'), 'utf8')
+const boxEgress = readFileSync(join(root,
+  'packages/commercial/src/egress/main.ts'), 'utf8')
+for (const [source, markers] of [
+  [boxPrelaunch, ['fcntl.flock', 'OWNED_RUN', 'OWNED_PROJECT', 'CLOSED', 'CLEANED']],
+  [boxJournal, ['boxLaunchPermit', 'markGuardedPrestartStopped',
+    'listPrelaunchRecoveryCandidates']],
+  [boxFetch, ['reconcilePrelaunchRecovery', 'makeBoxPrelaunchCleanup']],
+  [boxEgress, ['boxRecoveryTimer', 'reconcilePrelaunchRecovery(10)']],
+] as const) {
+  for (const marker of markers) {
+    if (!source.includes(marker)) throw new Error(`[box-stage-unknown] missing ${marker}`)
+  }
+}
+console.log('INC-20260926-BOX-STAGE-UNKNOWN source regression guard, not end-to-end proof')
+
+// INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof.
+// The real HIBERNATED→no-paid Box capability probe and signed user-container
+// business turn are separate acceptance evidence; never infer them from text.
+const boxProvision = readFileSync(join(root,
+  'packages/commercial/src/account-pool/cursorSandProvision.ts'), 'utf8')
+const boxResolver = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxAccountResolver.ts'), 'utf8')
+for (const [source, markers] of [
+  [boxProvision, ['allowWakeIfHibernated', 'BOX_WAKE_UNPROVEN',
+    'SAND_BOX_RUN_STATE_HIBERNATED']],
+  [boxResolver, ['allowWakeIfHibernated?: boolean',
+    'allowWakeIfHibernated: args.allowWakeIfHibernated === true']],
+  [boxFetch, ['allowWakeIfHibernated: true', 'reconcilePrelaunchRecovery']],
+  [boxEgress, ['allowWakeIfHibernated: true', 'boxRecoveryTimer']],
+] as const) {
+  for (const marker of markers) {
+    if (!source.includes(marker)) throw new Error(`[box-idle-wake] missing ${marker}`)
+  }
+}
+console.log('INC-20260926-BOX-IDLE-WAKE source regression guard, not end-to-end proof')
+
+// INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof.
+// The focused real-shape tests and authenticated Box canary are separate proof;
+// this only locks the shared fold-before-budget entry used by both routes.
+const boxCache = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxCacheAnnotations.ts'), 'utf8')
+const boxGate = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRequestGate.ts'), 'utf8')
+const stripAt = boxCache.indexOf('export function stripBoxCcbToolBudgetTail(')
+const stripEnd = boxCache.indexOf('export function normalizeBoxSemanticBody(', stripAt)
+const foldAt = boxCache.indexOf('const effective = foldBoxCcbHookContext(body);', stripAt)
+const budgetAt = boxCache.indexOf('const kept = effective.messages.filter(', foldAt)
+if (stripAt < 0 || stripEnd <= stripAt || foldAt <= stripAt
+  || foldAt >= stripEnd || budgetAt <= foldAt || budgetAt >= stripEnd
+  || !boxGate.includes('classifyBoxContinuation(body)')
+  || !boxFetch.includes('continuation_candidate')) {
+  throw new Error('[box-hook-resume] shared fold-before-budget continuation path missing')
+}
+console.log('INC-20260927-BOX-HOOK-RESUME source regression guard, not end-to-end proof')
+
+// INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof.
+if (!boxCache.includes('function bareHookBeforeBudget(')
+  || !boxCache.includes('const BARE_HOOK =')
+  || !boxCache.includes('const BARE_BUDGET =')
+  || !boxCache.includes('const PROGRESS_SENTENCE =')
+  || !boxCache.includes('function rejectUnapprovedToolBoundary(')) {
+  throw new Error('[box-multitool-continuation] unwrapped hook-plus-budget fold missing')
+}
+console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION source regression guard, not end-to-end proof')
+if (!boxCache.includes('function foldProvenImageCaption(')
+  || !boxCache.includes('const current = foldProvenImageCaption(message, assistant);')
+  || !boxCache.includes('80x2200>73x2000@1.10')
+  || !boxCache.includes('1290x2796>923x2000@1.40')
+  || !boxCache.includes('export function strictBoxImageBlock(')) {
+  throw new Error('[box-image-continuation] proven caption fold is not on the shared hook path')
+}
+const preparedSrc = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxPreparedContinuation.ts'), 'utf8')
+const preparedGate = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRequestGate.ts'), 'utf8')
+const preparedFetch = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolFetch.ts'), 'utf8')
+const preparedEgress = readFileSync(join(root,
+  'packages/commercial/src/egress/main.ts'), 'utf8')
+for (const marker of [
+  'export function decisionMayPublish',
+  'export function resumeMayPublish',
+  'export function authoritiesBind',
+  'export function classifyBoxContinuation',
+  'export function consumePrepared',
+]) {
+  if (!preparedSrc.includes(marker)) {
+    throw new Error(`[box-prepared-continuation] missing ${marker}`)
+  }
+}
+const preparedPublish = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolResumePublish.ts'), 'utf8')
+const preparedJournal = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+if (!preparedGate.includes('classifyBoxContinuation')
+  || !preparedFetch.includes('continuation_candidate')
+  || !preparedEgress.includes('continuation_candidate')
+  || !preparedPublish.includes('resumeMayPublish(')
+  || !preparedJournal.includes('matchPreparedToolResults(')
+  || !preparedJournal.includes('consumePrepared(')
+  || !preparedSrc.includes('fingerprintOfPrepared')) {
+  throw new Error('[box-prepared-continuation] gate, fetch, or egress does not consume the prepared class')
+}
+console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION image coordinate caption folds on every tool boundary')
+const editEcho = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolInputEcho.ts'), 'utf8')
+const editJournal = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxDurableJournal.ts'), 'utf8')
+const editFinger = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxCallFingerprint.ts'), 'utf8')
+if (!editEcho.includes('export function editReplaceAllFalseDefault(')
+  || !editEcho.includes('export function selectStoredToolInput(')
+  || !editJournal.includes('comparableAssistantContent(')
+  || !editJournal.includes('incomingAssistantAccepted(')
+  || editJournal.includes('hashAssistantClaimViews(')
+  || editFinger.includes('function hashAssistantClaimViews')) {
+  throw new Error('[box-edit-default] comparison alias is not on the claim path')
+}
+console.log('INC-20260928-BOX-MULTITOOL-CONTINUATION edit-default comparison guard')
+// INC-20260928-BOX-TOOL-SUCCESS-RECOVERY source regression guard, not end-to-end proof.
+// Chunked catalog reads and the terminal-only winner check are source locks.
+// They are not a live Box call, a browser journey, or a production ledger proof.
+const boxCatalogRead = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxStagedCatalogRead.ts'), 'utf8')
+const boxTerminalRecovery = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxToolTerminalRecovery.ts'), 'utf8')
+const boxCleanup = readFileSync(join(root,
+  'packages/commercial/src/http/proxy/boxRemoteCleanupWorker.ts'), 'utf8')
+const boxIndex = readFileSync(join(root, 'packages/commercial/src/index.ts'), 'utf8')
+if (!boxCatalogRead.includes('const CHUNK_BYTES = 262_144')
+  || !boxCatalogRead.includes('const FILE_MAX_BYTES = 1_048_576')
+  || !boxCatalogRead.includes('os.O_NOFOLLOW')
+  || boxCatalogRead.includes('maxResponseBytes: 2_097_152')) {
+  throw new Error('[box-tool-success-recovery] catalog read no longer uses a bounded chunk under the 1MiB frame cap')
+}
+if (!boxTerminalRecovery.includes('winner.boxState === "terminal" && winner.proofReason === "worker_complete"')
+  || !boxTerminalRecovery.includes('winner.proofReason !== "worker_complete"')) {
+  throw new Error('[box-tool-success-recovery] winner check no longer requires a parsed Box terminal proof')
+}
+if (!boxCleanup.includes('allowWakeIfHibernated: false')
+  || !boxCleanup.includes('readBoxStagedToolCatalog')
+  || !boxIndex.includes('writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT)')) {
+  throw new Error('[box-tool-success-recovery] cleanup worker no longer reuses the no-wake recovery writer')
+}
+console.log('INC-20260928-BOX-TOOL-SUCCESS-RECOVERY source regression guard, not end-to-end proof')
+
 // INC-20260907-MEDIA-CURSOR-PRECISION: source regression guard, not end-to-end proof.
 // The mediaGeneration integration suite separately verifies real PostgreSQL ordering.
 const mediaStore = readFileSync(join(root, 'packages/commercial/src/media-generation/store.ts'), 'utf8')
@@ -108,6 +263,87 @@ if (!mediaEncoder.includes('JSON.stringify([timestamp, id])') || mediaEncoder.in
   throw new Error('[media-cursor-rootfix] cursor encoder must preserve the raw PostgreSQL timestamp')
 }
 console.log('[media-cursor-rootfix] PASS — INC-20260907-MEDIA-CURSOR-PRECISION source contracts locked')
+
+// INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.
+const sandLifecycleSrc = readFileSync(join(root, 'packages/commercial/src/account-pool/cursorSandLifecycle.ts'), 'utf8')
+if (sandLifecycleSrc.includes('if (this.now() - op.startedAt > 15 * 60_000) throw new SandProvisionError("UNKNOWN_OPERATION_RESULT")')) {
+  throw new Error('[sand-uor-loop] stale in-flight still throws UNKNOWN_OPERATION_RESULT without resetting the operation')
+}
+if (!sandLifecycleSrc.includes('Stale in-flight must not loop on UNKNOWN_OPERATION_RESULT')) {
+  throw new Error('[sand-uor-loop] missing stale in-flight reset contract')
+}
+if (!/if \(op\.agentId\) \{\s*op\.nonce = nonce\(\);\s*op\.phase = "created";/.test(sandLifecycleSrc)) {
+  throw new Error('[sand-uor-loop] stale submitted must rotate nonce then retry sendPrompt on the owned agent')
+}
+console.log('[sand-uor-loop] PASS — INC-20260921-SAND-UOR-LOOP: source regression guard, not end-to-end proof.')
+
+// INC-20260921-SAND-INSTALL-RETRY: Box sendPrompt is idempotent on nonce+"-install";
+// the maintenance bot must exec the heredoc, not invent INSTALLER_B64_MISSING.
+const sandInstallerSrc = readFileSync(join(root, 'packages/commercial/src/account-pool/cursorSandInstaller.ts'), 'utf8')
+if (!sandInstallerSrc.includes('Do not spawn a subagent')) {
+  throw new Error('[sand-install-retry] installer prompt must forbid spawning a subagent')
+}
+if (!sandInstallerSrc.includes('INSTALLER_B64_MISSING')) {
+  throw new Error('[sand-install-retry] installer prompt must forbid invented INSTALLER_B64_MISSING')
+}
+if (!sandInstallerSrc.includes('execute the exact python3 heredoc below once in THIS Bot')) {
+  throw new Error('[sand-install-retry] installer prompt must require executing the heredoc in this Bot')
+}
+console.log('[sand-install-retry] PASS — INC-20260921-SAND-INSTALL-RETRY: source regression guard, not end-to-end proof.')
+
+// INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.
+const sessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+if (!sessionManagerSrc.includes('export function isNativeEngineTransientContinuationSafe(')) {
+  throw new Error('[ccb-transient-continue] missing native continuation predicate')
+}
+if (!sessionManagerSrc.includes('turnPermissionCount === 0 && (checkpointSafe || nativeContinuationSafe)')) {
+  throw new Error('[ccb-transient-continue] transient continuation must OR native session resume with read-only checkpoint')
+}
+if (!sessionManagerSrc.includes('TRANSIENT_RETRY_INPUT resumes')) {
+  throw new Error('[ccb-transient-continue] missing native-continuation-is-not-replay contract')
+}
+console.log('[ccb-transient-continue] PASS — INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.')
+
+// INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.
+const identityGuardSrc = readFileSync(
+  join(root, 'packages/commercial/src/http/proxy/claudeIdentityGuard.ts'),
+  'utf8',
+)
+const identityCoreSrc = readFileSync(join(root, 'packages/commercial/src/http/proxy/core.ts'), 'utf8')
+if (!identityGuardSrc.includes('export async function assertClaudeOAuthIdentity(')) {
+  throw new Error('[claude-identity-guard] missing assertClaudeOAuthIdentity')
+}
+if (!identityCoreSrc.includes('await assertClaudeOAuthIdentity({')) {
+  throw new Error('[claude-identity-guard] core.ts must call assertClaudeOAuthIdentity before fetch')
+}
+if (!identityCoreSrc.includes('EGRESS_IDENTITY_MISMATCH')) {
+  throw new Error('[claude-identity-guard] mismatch must fail-closed with EGRESS_IDENTITY_MISMATCH')
+}
+console.log('[claude-identity-guard] PASS — INC-20260921-CLAUDE-IDENTITY-GUARD: source regression guard, not end-to-end proof.')
+
+// INC-20260923-CCB-FOREGROUND-BASH-CALLBACK: source regression guard, not end-to-end proof.
+const foregroundBashCallbackSrc = readFileSync(join(root, 'packages/gateway/src/ccbLocalAgentCallback.ts'), 'utf8')
+const foregroundBashServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const foregroundBashCardsSrc = readFileSync(join(root, 'packages/web-react/src/components/chat/cards.tsx'), 'utf8')
+if (!foregroundBashCallbackSrc.includes('export function finalizeCcbLocalAgentPendingInjections(')) {
+  throw new Error('[ccb-foreground-bash] flush predicate missing from ccbLocalAgentCallback.ts')
+}
+if (!foregroundBashCallbackSrc.includes('foreground_bash_tool_result_already_delivered')) {
+  throw new Error('[ccb-foreground-bash] drop reason missing')
+}
+if (!foregroundBashCallbackSrc.includes("if (!toolUseId || !ids.has(toolUseId)) continue")) {
+  throw new Error('[ccb-foreground-bash] missing tool_use_id must still inject')
+}
+if (!foregroundBashServerSrc.includes('finalizeCcbLocalAgentPendingInjections(session.sessionKey)')) {
+  throw new Error('[ccb-foreground-bash] server finalize flush must call the predicate')
+}
+if (!foregroundBashServerSrc.includes('noteForegroundBashToolResult({')) {
+  throw new Error('[ccb-foreground-bash] server must record parser tool_result blocks')
+}
+if (!foregroundBashCardsSrc.includes('const hideOrphanSilentMeta = suppressErrorAlert && !hasDisplayableBody && !positiveCharge')) {
+  throw new Error('[ccb-foreground-bash] empty silent waived rows must skip MetaRow')
+}
+console.log('[ccb-foreground-bash] PASS — INC-20260923-CCB-FOREGROUND-BASH-CALLBACK: source regression guard, not end-to-end proof.')
 
 // INC-20260907-DELEGATE-LEDGER-REAP: source regression guard, not end-to-end proof.
 // The delegateDurable unit suite separately exercises real SQLite retire/prune and

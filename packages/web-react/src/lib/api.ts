@@ -727,6 +727,12 @@ const CROSS_DOMAIN_ERROR_MESSAGES: Record<string, string> = {
   RATE_LIMITED: "操作过于频繁，请稍后再试",
 };
 
+/** 管理台 VALIDATION issues.path → 中文。不进 CROSS_DOMAIN（VALIDATION 跨域语义不同）。 */
+const ADMIN_ISSUE_MESSAGES: Record<string, string> = {
+  egress_proxy_already_bound_to_claude:
+    "该出口已绑定其他启用中的 Claude 账号（已停用的号不占坑）",
+};
+
 /** throwApi→withReqId 烙进 message 尾部的「（追踪号 …）」后缀（withReqId 的确定格式）。 */
 const REQ_ID_SUFFIX_RE = /（追踪号\s+[^）]+）\s*$/;
 
@@ -780,6 +786,12 @@ export function apiErrorMessage(err: unknown, fallback: string): string {
   if (err instanceof ApiError) {
     if (err.code && CROSS_DOMAIN_ERROR_MESSAGES[err.code]) {
       return CROSS_DOMAIN_ERROR_MESSAGES[err.code];
+    }
+    if (err.issues) {
+      for (const issue of err.issues) {
+        const zh = ADMIN_ISSUE_MESSAGES[issue.path] ?? ADMIN_ISSUE_MESSAGES[issue.message];
+        if (zh) return zh;
+      }
     }
     const base = err.message.replace(REQ_ID_SUFFIX_RE, "").trim();
     if (base && hasCjk(base) && !GENERIC_HTTP_MESSAGE_RE.test(base)) return base;
@@ -3786,6 +3798,23 @@ export const api = {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  /** 对一条违规记录申诉（POST /api/me/content-appeals）。 */
+  appealContentStrike: (
+    a: AuthSession,
+    strikeId: string,
+    statement: string,
+  ): Promise<{ ok: boolean; appealId: string }> =>
+    jsonOrThrow(
+      callWithRefresh(a, (t) =>
+        fetch("/api/me/content-appeals", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ strikeId, statement }),
         }),
       ),
     ),

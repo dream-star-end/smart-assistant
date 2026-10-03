@@ -68,10 +68,11 @@ export function deriveActivePlanStep(todos: TodoItem[]): string | null {
 function ActivityDots() {
   // 与 cards.tsx 的 TypingDots 视觉一致；此处内联三点避免 cards ↔ TurnActivity 循环 import。
   return (
-    <span className="flex items-center gap-1.5" aria-hidden>
-      <span className="size-2 animate-pulse rounded-full bg-muted" />
-      <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:200ms]" />
-      <span className="size-2 animate-pulse rounded-full bg-muted [animation-delay:400ms]" />
+    // OCV5-307:三颗 6px 小点依次轻跃(oc-dot-wave,styles.css),取代三颗 8px 深灰点同步闪烁。
+    <span className="oc-dots" aria-hidden>
+      <span />
+      <span />
+      <span />
     </span>
   );
 }

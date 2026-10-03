@@ -6,6 +6,7 @@ import { ChatInteractionContext } from "../tool/context";
 import { resetSubscribeUiState } from "../settings/SubscriptionDialog";
 import { BRAND } from "../../lib/brand";
 import { ToastProvider } from "../ui";
+import { ResponseRatingProvider } from "./ResponseRating";
 import {
   AssistantCard,
   type CardCallbacks,
@@ -220,8 +221,11 @@ describe("触屏动作行折叠(TouchActionRow)", () => {
     const toggle = screen.getByRole("button", { name: "更多操作" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(toggle).toHaveClass("[@media(hover:none)]:inline-flex");
+    // OCV5-295:完成态「复制」在折叠区外常显;折叠区以「复制纯文本」定位,开合语义不变。
+    const row = screen.getByRole("button", { name: "复制纯文本" }).parentElement!;
     const copy = screen.getByRole("button", { name: "复制" });
-    const row = copy.parentElement!;
+    expect(row).not.toContainElement(copy);
+    expect(copy.closest(".\\[\\@media\\(hover\\:none\\)\\]\\:hidden")).toBeNull();
     expect(row).toHaveClass("[@media(hover:none)]:hidden");
     expect(row).not.toHaveClass("[@media(hover:none)]:opacity-100");
 
@@ -238,18 +242,76 @@ describe("触屏动作行折叠(TouchActionRow)", () => {
     expect(row).toHaveClass("[@media(hover:none)]:hidden");
   });
 
-  test("末轮末条助手回复(可重新生成的那条)默认展开", () => {
+  // OCV5-295:末条不再默认整排展开。复制在折叠区外常显(一击),其余五个动作在「更多操作」里(两击内)。
+  test("末轮末条助手回复:复制常显在折叠区外,其余动作默认收在「更多操作」里", () => {
     render(
       <AssistantCard
         msg={{ id: "a-final", role: "assistant", text: "最新回答", ts: 1 } as ChatMessage}
         ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
-        cb={{ onRegenerate: vi.fn() }}
+        cb={{ onRegenerate: vi.fn(), onQuote: vi.fn(), onFeedback: vi.fn() }}
       />,
     );
+    const toggle = screen.getByRole("button", { name: "更多操作" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    const fold = screen.getByRole("button", { name: "重新生成" }).parentElement!;
+    expect(fold).toHaveClass("[@media(hover:none)]:hidden");
+    const copy = screen.getByRole("button", { name: "复制" });
+    expect(copy).toHaveClass("[@media(hover:none)]:size-11");
+    expect(fold).not.toContainElement(copy);
+    expect(copy.closest(".\\[\\@media\\(hover\\:none\\)\\]\\:hidden")).toBeNull();
+    for (const name of ["复制纯文本", "引用", "重新生成", "反馈"]) {
+      expect(fold).toContainElement(screen.getByRole("button", { name }));
+    }
+
+    fireEvent.click(toggle);
     expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: "重新生成" }).parentElement).toHaveClass(
-      "[@media(hover:none)]:opacity-100",
+    expect(fold).toHaveClass("[@media(hover:none)]:opacity-100");
+    expect(fold).not.toHaveClass("[@media(hover:none)]:hidden");
+  });
+
+  test("正向积分与请求号留在 assistant-meta,不进「更多操作」折叠区;评价行与 meta 同一父节点", () => {
+    render(
+      <ResponseRatingProvider value={{ ratings: new Map(), submit: vi.fn() }}>
+        <AssistantCard
+          msg={{
+            id: "a-cost",
+            role: "assistant",
+            text: "带费用的回答",
+            ts: Date.now() - 5_000,
+            usage: { traceId: "trace-cost-1234", costCredits: "109" },
+          } as ChatMessage}
+          ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
+          cb={{ onRegenerate: vi.fn() }}
+        />
+      </ResponseRatingProvider>,
     );
+    const meta = screen.getByTestId("assistant-meta");
+    const credits = screen.getByLabelText("消耗 109 积分");
+    const req = screen.getByRole("button", { name: "复制请求ID trace-cost-1234" });
+    expect(meta).toContainElement(credits);
+    expect(meta).toContainElement(req);
+    const fold = screen.getByRole("button", { name: "重新生成" }).parentElement!;
+    expect(fold).not.toContainElement(credits);
+    expect(fold).not.toContainElement(req);
+    const footer = screen.getByTestId("assistant-footer");
+    expect(footer).toContainElement(meta);
+    expect(footer).toContainElement(screen.getByRole("button", { name: "点赞" }));
+    expect(footer).toContainElement(screen.getByText("这条回复怎么样?"));
+  });
+
+  test("停止/失败精简行:复制 / 纯文本 / 引用直接可见,不收进折叠", () => {
+    renderErr(
+      errMsg({ _errorCode: "stopped", text: "停止前写出的半截答案", usage: { traceId: "trace-stop", costCredits: "12" } }),
+      { onRegenerate: vi.fn(), onQuote: vi.fn() },
+    );
+    expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
+    for (const name of ["复制", "复制纯文本", "引用"]) {
+      const row = screen.getByRole("button", { name }).parentElement!;
+      expect(row).toHaveClass("[@media(hover:none)]:opacity-100");
+      expect(row).not.toHaveClass("[@media(hover:none)]:hidden");
+    }
+    expect(screen.getByTestId("assistant-meta")).toContainElement(screen.getByLabelText("消耗 12 积分"));
+    expect(screen.getByRole("button", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
   });
 
   test("用户行同样默认折叠,开关为 44px 触控靶", () => {
@@ -271,8 +333,25 @@ describe("UserCard 状态标签(M-09)", () => {
     expect(screen.getByText("已送达")).toBeInTheDocument();
     rerender(<UserCard msg={userMsg({ status: "sending" })} cb={{}} />);
     expect(screen.getByText("发送中")).toBeInTheDocument();
-    rerender(<UserCard msg={userMsg({ status: "queued" })} cb={{}} />);
-    expect(screen.getByText("排队中")).toBeInTheDocument();
+    rerender(<UserCard msg={userMsg({ status: "queued", text: "等一下再发" })} cb={{}} />);
+    expect(screen.getByText("还在等上一项")).toBeInTheDocument();
+    expect(screen.getByText("等一下再发")).toBeInTheDocument();
+  });
+
+  test("直接渲染排队用户卡时仍提供修改和立即发送", () => {
+    const onEditQueued = vi.fn();
+    const onSendQueuedNow = vi.fn();
+    render(
+      <UserCard
+        msg={userMsg({ status: "queued", text: "先记下来" })}
+        cb={{ onEditQueued, onSendQueuedNow }}
+      />,
+    );
+    expect(screen.getByText("先记下来")).toBeInTheDocument();
+    screen.getByRole("button", { name: "修改" }).click();
+    screen.getByRole("button", { name: "立即发送" }).click();
+    expect(onEditQueued).toHaveBeenCalledTimes(1);
+    expect(onSendQueuedNow).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -311,7 +390,7 @@ describe("AssistantCard 部分回答的精简动作行(M-18)", () => {
 });
 
 describe("token 用量并入 MetaRow(M-08)", () => {
-  test("终态助手行:token 徽章带单位且与时间/积分/请求ID 同一行,不再单独悬在正文下方", () => {
+  test("终态助手行底部不显示 token，时间和积分、请求ID仍在同一行", () => {
     render(
       <AssistantCard
         msg={{
@@ -323,27 +402,28 @@ describe("token 用量并入 MetaRow(M-08)", () => {
         } as ChatMessage}
         ctx={{ isLast: true, sending: false, inActiveTurn: false }}
         cb={{}}
-        tokenUsage={{ totalTokens: 5_980 }}
+        tokenUsage={{ totalTokens: 5_980, estimated: true }}
       />,
     );
-    const badge = screen.getByLabelText("本轮 5,980 token");
-    expect(badge).toHaveTextContent("5.98k token");
-    const metaRow = badge.parentElement!;
+    const metaRow = screen.getByTestId("assistant-meta");
+    expect(metaRow).not.toHaveTextContent(/token/i);
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
     expect(metaRow.querySelector("time")).not.toBeNull();
     expect(metaRow).toContainElement(screen.getByLabelText("消耗 1280 积分"));
     expect(metaRow).toContainElement(screen.getByRole("button", { name: "复制请求ID trace-tok" }));
   });
 
-  test("流式中 MetaRow 尚未出现,token 用量仍单独实时显示", () => {
+  test("流式中不另起孤立 token 行，终态时间行也不出现", () => {
     render(
       <AssistantCard
         msg={{ id: "a-live", role: "assistant", text: "生成中的正文", ts: 1 } as ChatMessage}
         ctx={{ isLast: true, sending: true, inActiveTurn: true }}
         cb={{}}
-        tokenUsage={{ totalTokens: 256 }}
+        tokenUsage={{ totalTokens: 27_500 }}
       />,
     );
-    expect(screen.getByLabelText("本轮 256 token")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/token/i)).not.toBeInTheDocument();
     expect(document.querySelector("time")).toBeNull();
   });
 });
@@ -415,6 +495,87 @@ describe("ThinkingCard 折叠开关可访问性(M-10)", () => {
   });
 });
 
+describe("AssistantCard 空正文静默免单不挂底栏", () => {
+  const quietCtx: RenderCtx = { isLast: true, sending: false, inActiveTurn: false };
+
+  test("空正文且静默错误卡隐藏且免单时不渲染 assistant-meta", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-silent",
+          role: "assistant",
+          text: "",
+          ts: Date.now() - 60_000,
+          _errorCode: "service_restart",
+          usage: { waived: true, traceId: "trace-silent", costCredits: "0" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.queryByTestId("assistant-meta")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+  });
+
+  test("有正文的免单轮仍显示已免单", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-waived-body",
+          role: "assistant",
+          text: "这是已经交付的回答",
+          ts: Date.now() - 60_000,
+          usage: { waived: true, traceId: "trace-body", costCredits: "0" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("本轮已免单")).toBeInTheDocument();
+  });
+
+  test("空正文静默错误但有正向积分时仍显示积分", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-silent-pay",
+          role: "assistant",
+          text: "",
+          ts: Date.now() - 60_000,
+          _errorCode: "service_restart",
+          usage: { traceId: "trace-silent-pay", costCredits: "6" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 6 积分")).toBeInTheDocument();
+  });
+
+  test("正向积分显示积分", () => {
+    render(
+      <AssistantCard
+        msg={{
+          id: "a-credits",
+          role: "assistant",
+          text: "扣了费的回答",
+          ts: Date.now() - 60_000,
+          usage: { traceId: "trace-pay", costCredits: "6" },
+        }}
+        ctx={quietCtx}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+    expect(screen.getByLabelText("消耗 6 积分")).toBeInTheDocument();
+    expect(screen.queryByLabelText("本轮已免单")).toBeNull();
+  });
+});
+
 describe("AssistantCard MetaRow 时间", () => {
   test("助手卡 MetaRow 有 time 元素", () => {
     const ts = Date.now() - 60_000;
@@ -467,7 +628,7 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
       expect(screen.queryByRole("button", { name: /重试|重新尝试/ })).toBeNull();
       expect(screen.getByRole("button", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
       expect(screen.getByLabelText("消耗 4096 积分")).toBeInTheDocument();
-      expect(screen.getByLabelText("本轮 42 token")).toBeInTheDocument();
+      expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
     },
   );
 
@@ -659,18 +820,32 @@ describe("AssistantCard 红卡重试 CTA 硬门(任务④)", () => {
     expect(screen.queryByRole("button", { name: "重新尝试" })).toBeNull();
   });
 
-  test("续跑被拒后错误卡改写说明并隐藏「从断点继续」", () => {
-    const error = errMsg({
+  test("计划内重启本身不出错误卡；自动续跑被拒时要说明这句没发出去", () => {
+    renderErr(errMsg({
+      _errorCode: "SERVICE_RESTART",
+      _clientMessageId: "u1",
+      usage: { waived: true },
+    }), {
+      onContinueInterrupted: vi.fn(),
+      resolveInterruptedContinuation: () => retryableUser,
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
+
+    renderErr(errMsg({
       _errorCode: "SERVICE_RESTART",
       _clientMessageId: "u1",
       usage: { waived: true },
       _recoverySkippedNotice: "没法从保存的进度继续。任务内容还在，请刷新后再试。",
-    });
-    renderErr(error, {
+    }), {
       onContinueInterrupted: vi.fn(),
+      onRegenerate: vi.fn(),
       resolveInterruptedContinuation: () => retryableUser,
     });
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText("这句没有发出去")).toBeInTheDocument();
     expect(screen.getByText("没法从保存的进度继续。任务内容还在，请刷新后再试。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "从断点继续" })).toBeNull();
   });
 
@@ -780,9 +955,11 @@ describe("AssistantCard 失败轮部分正文(Codex 审计 R6)", () => {
         cb={{ onRegenerate: vi.fn() }}
       />,
     );
-    expect(screen.getByText("本轮已自动免单")).toBeInTheDocument();
-    // 免单红卡:精确「重试」不显(waived → 非可重试)。
+    expect(screen.getByText("这轮没有回复")).toBeInTheDocument();
+    expect(screen.getByText("模型没有生成内容，本轮未扣费。点重试再发一次。")).toBeInTheDocument();
+    // 免单卡不走精确「重试」(那会按原 payload 重发)。末轮给「重新尝试」。
     expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
+    expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
   });
 });
 
@@ -1055,5 +1232,31 @@ describe("AssistantCard 中断轮展示（requestId / 正文 / 空窗占位）",
     const row = screen.getByTestId("assistant-row");
     expect(row.querySelector("[data-testid=message-text]")).toBeNull();
     expect(pending.closest("[data-testid=assistant-row]")).toBe(row);
+  });
+});
+
+describe("普通回答不再占头像列", () => {
+  test("最终回答没有头像占位；别的 agent 只用名称", () => {
+    const { rerender } = render(
+      <AssistantCard
+        msg={{ id: "a", role: "assistant", text: "这是最终回答", ts: 1 } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    const row = screen.getByTestId("assistant-row");
+    expect(row).toHaveTextContent("这是最终回答");
+    expect(row.querySelector(".bg-grad-cta")).toBeNull();
+    expect(row.className).not.toMatch(/gap-4/);
+    expect(screen.queryByTestId("assistant-speaker")).not.toBeInTheDocument();
+    rerender(
+      <AssistantCard
+        msg={{ id: "a", role: "assistant", text: "队员回复", ts: 1, agentId: "coding-assistant" } as ChatMessage}
+        ctx={{ isLast: true, sending: false, inActiveTurn: false }}
+        cb={{}}
+      />,
+    );
+    expect(screen.getByTestId("assistant-speaker")).toHaveTextContent("coding-assistant");
+    expect(screen.getByTestId("assistant-row").querySelector(".bg-grad-cta")).toBeNull();
   });
 });

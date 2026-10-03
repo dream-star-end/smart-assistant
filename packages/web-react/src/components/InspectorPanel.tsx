@@ -16,7 +16,7 @@
 import { Check, Copy, X } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
-import { ToolBody } from "./tool/bodies";
+import { ToolBody } from "./tool/lazyToolBody";
 import {
   ToolBodyFullContext,
   ToolHeaderLabelContext,

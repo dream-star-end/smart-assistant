@@ -409,6 +409,49 @@ describe('B3 adversarial first-pack byte budget', () => {
     assert.equal(page.degraded, false)
     assert.ok(page.resume?.frameSeq)
   })
+
+  it('a huge open subtask does not evict the parent tools from the first pack', () => {
+    const frames: LiveFrameInput[] = [
+      frame('g', 1, {
+        kind: 'delegate_progress',
+        runId: 'dlg-huge',
+        phase: 'start',
+        goal: '审查上下文',
+        agentId: 'auditor',
+      }),
+      frame('c', 2, {
+        kind: 'delegate_progress',
+        runId: 'dlg-huge',
+        phase: 'tool',
+        block: {
+          kind: 'tool_use',
+          blockId: 'child-huge',
+          toolName: 'Read',
+          inputJson: { body: kb(400) },
+        },
+      }),
+    ]
+    for (let i = 0; i < 3; i++) {
+      frames.push(frame(`p${i}`, 10 + i, {
+        kind: 'tool_use',
+        blockId: `parent-${i}`,
+        toolName: 'Bash',
+        inputPreview: `step-${i}`,
+      }))
+    }
+    const page = assembleLiveUnitsPage(frames, META, {
+      n: 20,
+      k: 20,
+      maxBytes: 64 * 1024,
+      previewMax: 1024,
+    })
+    const bytes = Buffer.byteLength(JSON.stringify(page), 'utf8')
+    assert.ok(bytes <= 64 * 1024, `first pack ${bytes} exceeded 64KB`)
+    assert.equal(page.degraded, false)
+    assert.ok(page.units.some((u) => u.kind === 'agent_group' && u.open && u.runId === 'dlg-huge'))
+    const parent = page.units.filter((u) => u.kind === 'tool' && u.blockId?.startsWith('parent-'))
+    assert.equal(parent.length, 3)
+  })
 })
 
 describe('stable unit ids and payloadRef tape fallback', () => {

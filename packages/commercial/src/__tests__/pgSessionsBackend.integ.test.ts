@@ -6070,6 +6070,65 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     });
   });
 
+  // OCV5-317 (#b6df9aee): Box Claude finished Read/Bash/Skill, then the next
+  // model call failed. Bash carries no gateway effect proof, but nothing is
+  // re-run by a checkpoint continuation, so automatic recovery is admitted.
+  for (const [label, bashCompleted, expected] of [
+    ["admits", true, "admitted"],
+    ["still refuses an open tool for", false, "recovery_conflict"],
+  ] as const) {
+    maybe(`OCV5-317 ${label} a model-plane failure after settled tools`, async () => {
+      const sessionId = `s-ocv5-317-${bashCompleted ? "settled" : "open"}`;
+      const sourceClientMessageId = `cm-ocv5-317-${bashCompleted ? "settled" : "open"}`;
+      await seedRecoverableSource({
+        sessionId,
+        sourceClientMessageId,
+        tapeStatus: "completed",
+        errorCode: "ENGINE_ERROR",
+        records: [{
+          id: `tool-bash-${sourceClientMessageId}`,
+          role: "tool",
+          text: "3\nhost-ok",
+          ts: 2,
+          toolUseId: `toolu_bash_${bashCompleted ? "s" : "o"}`,
+          toolName: "Bash",
+          status: bashCompleted ? "completed" : "executing",
+          _completed: bashCompleted,
+          _clientMessageId: sourceClientMessageId,
+        }, {
+          id: `err-${sourceClientMessageId}`,
+          role: "assistant",
+          text: "API Error: 409",
+          ts: 3,
+          _errorCode: "ENGINE_ERROR",
+          _clientMessageId: sourceClientMessageId,
+        }] as MessageLike[],
+      });
+      const identity = turnRecoveryAttemptIdentity(sessionId, sourceClientMessageId, 1);
+      const recovered = await backend.admitUserTurn(admitInput({
+        sessionId,
+        clientMessageId: identity.clientMessageId,
+        billingRequestId: `brq-${identity.clientMessageId}`,
+        dispatchId: randomUUID(),
+        message: {
+          id: identity.clientMessageId,
+          role: "user",
+          text: "automatic checkpoint",
+          ts: 4,
+        } as MessageLike & { id: string },
+        recovery: {
+          sourceClientMessageId,
+          mode: "checkpoint",
+          automatic: true,
+          rootClientMessageId: sourceClientMessageId,
+          attempt: 1,
+          max: 10,
+        },
+      }));
+      assert.equal(recovered.kind, expected, String((recovered as { reason?: unknown }).reason));
+    });
+  }
+
   maybe("lossless waiver recovery retains automatic checkpoint safety gate", async () => {
     const sessionId = "s-dd-recovery-lossless-unsafe";
     const sourceClientMessageId = "cm-dd-recovery-lossless-unsafe";
@@ -6768,6 +6827,61 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(request.content?.recovery?.mode, "checkpoint");
     assert.match(request.content?.text ?? "", /先查询其当前可观察状态/);
     assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
+  });
+
+  // OCV5-317 (#b6df9aee): the live Box Claude tape — Bash and Skill finished,
+  // then the next model call failed with ENGINE_ERROR. Finalize must schedule
+  // the automatic checkpoint instead of leaving a manual 「从断点继续」 card.
+  maybe("OCV5-317 finalize schedules a checkpoint after settled Bash/Skill and a model-plane error", async () => {
+    const sessionId = "s-ocv5-317-finalize";
+    const sourceClientMessageId = "cm-ocv5-317-finalize-source";
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "refactor the sidebar",
+        ts: 1,
+        _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "7".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "API Error: 409",
+      tools: [{
+        blockId: "toolu_ocv5_317_bash",
+        toolName: "Bash",
+        inputJson: { command: "git status --short" },
+        output: "M a.ts",
+        completed: true,
+      }, {
+        blockId: "toolu_ocv5_317_skill",
+        toolName: "Skill",
+        inputJson: { skill: "v5-selfhost-shared-worktree-deploy-discipline" },
+        output: "Launching skill: v5-selfhost-shared-worktree-deploy-discipline",
+        completed: true,
+      }],
+      errorCode: "ENGINE_ERROR",
+      createdAt: 1_783_950_150_000,
+      usage: { inputTokens: 6, outputTokens: 872 },
+    }));
+    const jobs = await pool.query<{ recovery_mode: string; semantic_recovery_attempt: number }>(
+      `SELECT recovery_mode,semantic_recovery_attempt
+         FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+      [UID, sessionId, sourceClientMessageId],
+    );
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
+    assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
   });
 
   maybe("silent liveness recovery resets native state once, then pauses the durable lineage", async () => {

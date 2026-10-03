@@ -164,7 +164,7 @@ test('stop interrupts active delegate children for the stopped parent session', 
 test('exact browser Stop finds the old assistant turn and cascades through its team tree', () => {
   assert.match(
     SESSION_MANAGER_TS,
-    /interruptClientTurn\([\s\S]*_runningClientMessageId\s*!==\s*clientMessageId[\s\S]*return this\.interrupt\(sessionKey\)/,
+    /interruptClientTurn\([\s\S]*_runningClientMessageId\s*!==\s*clientMessageId[\s\S]*return this\.interrupt\(sessionKey, [\x22\x27]user[\x22\x27]\)/,
     'SessionManager must reject stale turn ids and interrupt only the exact browser turn owner',
   )
   assert.match(

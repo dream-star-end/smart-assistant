@@ -27,6 +27,12 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { signAccess } from "../auth/jwt.js";
+import { HttpError } from "../http/util.js";
+import type { CommercialHttpDeps, RequestContext } from "../http/handlers.js";
+import { handleAdminListContentReviews, handleAdminNotifyContentReview,
+  handleAdminListContentAppeals, handleAdminDecideContentAppeal } from "../http/admin/contentReviews.js";
 import {
   BASELINE_JSON,
   ROUTER_TS,
@@ -151,4 +157,36 @@ describe("admin-route-inventory (S3 PoC hard gate #1)", () => {
         "handleAdminMarketplaceFeatured|handleAdminMarketplaceRevoke|handleAdminMarketplaceReview",
     });
   });
+});
+
+test("four new content admin routes are exact, ordered and not duplicated", () => {
+  const actual = currentAdminRoutes().filter((route) => route.pathValue.startsWith("/api/admin/content-"));
+  assert.deepEqual(actual, [
+    { method: "GET", pathKind: "path", pathValue: "/api/admin/content-reviews", handler: "handleAdminListContentReviews" },
+    { method: "POST", pathKind: "pathPrefix", pathValue: "/api/admin/content-reviews/", handler: "handleAdminNotifyContentReview" },
+    { method: "GET", pathKind: "path", pathValue: "/api/admin/content-appeals", handler: "handleAdminListContentAppeals" },
+    { method: "POST", pathKind: "pathPrefix", pathValue: "/api/admin/content-appeals/", handler: "handleAdminDecideContentAppeal" },
+  ]);
+});
+
+test("content admin handlers reject both anonymous and valid ordinary users before business side effects", async () => {
+  const secret = "synthetic-content-admin-regression-secret-only";
+  const { token } = await signAccess({ sub: "3", role: "user" }, secret);
+  const ctx = {} as RequestContext;
+  const deps = { jwtSecret: secret } as CommercialHttpDeps;
+  const res = { end() { assert.fail("unauthorized request must never write a success response"); } } as unknown as ServerResponse;
+  for (const [handler, method, url] of [
+    [handleAdminListContentReviews, "GET", "/api/admin/content-reviews"],
+    [handleAdminNotifyContentReview, "POST", "/api/admin/content-reviews/1/notify"],
+    [handleAdminListContentAppeals, "GET", "/api/admin/content-appeals"],
+    [handleAdminDecideContentAppeal, "POST", "/api/admin/content-appeals/1/approve"],
+  ] as const) {
+    for (const [headers, status, code] of [
+      [{}, 401, "UNAUTHORIZED"], [{ authorization: `Bearer ${token}` }, 403, "FORBIDDEN"],
+    ] as const) {
+      const req = { method, url, headers } as IncomingMessage;
+      await assert.rejects(() => handler(req, res, ctx, deps), (error: unknown) =>
+        error instanceof HttpError && error.status === status && error.code === code, `${method} ${url}`);
+    }
+  }
 });

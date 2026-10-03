@@ -22,9 +22,12 @@ export function ThemeToggle({
   theme,
   onCycle,
   titleHint,
+  compact = false,
 }: {
   theme: Theme;
   onCycle: () => void;
+  /** 紧凑档（侧栏底栏）：28px muted 方钮 + 16px 图标，与相邻图标钮同一视觉重量。 */
+  compact?: boolean;
   /** 追加到 tooltip/aria-label 的场景化提示（如 Landing 上"影响登录后的界面"）。 */
   titleHint?: string;
 }) {
@@ -47,8 +50,11 @@ export function ThemeToggle({
       title={title}
       aria-label={ariaLabel}
       shape="square"
+      {...(compact
+        ? { size: "sm" as const, variant: "muted" as const, className: "rounded-xs" }
+        : {})}
     >
-      <Icon size={18} />
+      <Icon size={compact ? 16 : 18} />
     </IconButton>
   );
 }

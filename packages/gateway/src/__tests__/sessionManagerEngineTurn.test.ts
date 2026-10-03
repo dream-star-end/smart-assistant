@@ -16,7 +16,12 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 
-import { SessionManager, TRANSIENT_RETRY_INPUT, type AgentSession } from "../sessionManager.js";
+import {
+  SessionManager,
+  TRANSIENT_RETRY_INPUT,
+  isNativeEngineTransientContinuationSafe,
+  type AgentSession,
+} from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
 import type { SessionStreamEvent, DurableRuntimeEvent } from "../engine/engineEvents.js";
 import type { EngineCreateOpts } from "../engine/registry.js";
@@ -30,6 +35,7 @@ import type { OpenClaudeConfig } from "@openclaude/storage";
 import type { ToolCalledEvent, TurnCompletedEvent } from "@openclaude/protocol";
 import { eventBus } from "../eventBus.js";
 import { EMPTY_COMPLETED_TURN_NOTICE } from "../emptyCompletedTurn.js";
+import { classifyRunError } from "../errorClassify.js";
 
 function collectTurnCompleted(): { events: TurnCompletedEvent[]; stop: () => void } {
   const events: TurnCompletedEvent[] = [];
@@ -281,7 +287,7 @@ test("an aborted logical-turn signal fences both pre-submit and retry backoff wi
   try {
     (sm as unknown as { _runOneTurn: () => Promise<void> })._runOneTurn = async () => {
       attempts += 1;
-      throw new Error("Selected model is at capacity. Please try a different model.");
+      throw new Error("model is overloaded");
     };
     (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 30_000;
 
@@ -410,20 +416,33 @@ describe("phantom three-state judgment", () => {
     assert.equal(session.turns, 1, "skipped 是正常完成,不回滚");
   });
 
-  test("called(willCallApi 已发)+ 全零 → 不判 phantom(诊断仅告警)", async () => {
-    const sm = new SessionManager(makeConfigStub());
-    const events: SessionStreamEvent[] = [];
-    const runner = new FakeCcbRunner((r) => {
-      setImmediate(() => {
-        r.telemetry("turn.willCallApi");
-        r.result(); // 无 stop_reason、零 blocks → incomplete 诊断路径
+  test("called 全零不是 phantom，但真实终态 NO_RESPONSE 带免单标记且无空完成正文", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          r.telemetry("turn.willCallApi");
+          r.result();
+        });
       });
-    });
-    const session = makeSession(runner);
-
-    await runOneTurn(sm, session, events);
-    assert.ok(events.some((e) => e.kind === "final"));
-    assert.equal(session.turns, 1);
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" } as Partial<AgentSession>);
+      await runOneTurn(sm, session, events);
+      await sm.awaitPendingPersistence();
+      assert.equal(runner.submittedInputs.length, 1, "called-empty is not phantom/retry");
+      assert.equal(session.turns, 1);
+      assert.equal(events.some((e) => e.kind === "final"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "crashed");
+      assert.equal(captured.payloads[0]!.errorCode, "NO_RESPONSE");
+      assert.equal(captured.payloads[0]!.waiveReason, "no_response");
+      assert.equal(captured.payloads[0]!.text ?? "", "");
+      assert.equal((captured.payloads[0]!.text ?? "").includes(EMPTY_COMPLETED_TURN_NOTICE), false);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
   });
 
   test("unknown + 有输出(blocks>0)→ 不判 phantom", async () => {
@@ -630,6 +649,32 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("try a different model is unavailable, not a capacity retry", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => setImmediate(() => r.result({
+        is_error: true, subtype: "error_during_execution",
+        // Real CCB result has raw text only, not a forged conflicting class.
+        result: "Selected model is at capacity. Please try a different model.",
+      })));
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" } as Partial<AgentSession>);
+      await sm.submit(session, "finish task", (event) => events.push(event));
+      await sm.awaitPendingPersistence();
+      assert.equal(runner.submittedInputs.length, 1);
+      assert.equal(events.some((event) => event.kind === "turn_status" && typeof event.status === "object" && event.status?.status === "retrying"), false);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, "model_not_available");
+      const errors = events.filter((event) => event.kind === "error");
+      assert.equal(errors.length, 1);
+      assert.ok(errors[0]!.kind === "error" && errors[0]!.error.includes("Please try a different model."));
+      assert.equal(errors[0]!.kind === "error" && classifyRunError(errors[0]!.error).code, "model_not_available");
+
+    } finally { setV3MasterSinkSingleton(null); }
+  });
+
   test("capacity failure succeeds within the shared 3-failure circuit and persists one exact paid turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
@@ -665,7 +710,7 @@ describe("crash/interrupt partial persistence", () => {
             r.result({
               is_error: true,
               subtype: "error_during_execution",
-              result: "Selected model is at capacity. Please try a different model.",
+              result: "Selected model is at capacity. Please retry later.",
               errorClass: "model_capacity",
             });
             return;
@@ -774,7 +819,7 @@ describe("crash/interrupt partial persistence", () => {
           r.result({
             is_error: true,
             subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please try a different model.",
+            result: "Selected model is at capacity. Please retry later.",
             errorClass: "model_capacity",
           });
         });
@@ -807,6 +852,42 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
+  test("native continuation allows completed tools only when the engine session still exists", () => {
+    const base = {
+      providerTag: "ccb" as const,
+      nativeSessionId: null as string | null,
+      ccbSessionId: "ccb-sess-1" as string | null,
+      permissionCount: 0,
+      tools: [{ completed: true }],
+    };
+    assert.equal(isNativeEngineTransientContinuationSafe(base), true);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      ccbSessionId: null,
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      ccbSessionId: null,
+      nativeSessionId: "native-1",
+    }), true);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      tools: [{ completed: false }],
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      permissionCount: 1,
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      providerTag: "cursor",
+    }), false);
+    assert.equal(isNativeEngineTransientContinuationSafe({
+      ...base,
+      tools: [],
+    }), true);
+  });
+
   test("capacity failure after an unresolved tool boundary never auto-continues", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
@@ -828,7 +909,7 @@ describe("crash/interrupt partial persistence", () => {
           r.result({
             is_error: true,
             subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please try a different model.",
+            result: "Selected model is at capacity. Please retry later.",
             errorClass: "model_capacity",
           });
         });
@@ -854,7 +935,7 @@ describe("crash/interrupt partial persistence", () => {
     }
   });
 
-  test("capacity failure after a completed tool with unknown external outcome never auto-continues", async () => {
+  test("capacity failure after a completed Bash continues the same native session", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
     try {
@@ -866,29 +947,34 @@ describe("crash/interrupt partial persistence", () => {
       const runner = new FakeCcbRunner((r) => {
         submits++;
         setImmediate(() => {
-          r.msg({
-            type: "assistant",
-            message: {
-              content: [{ type: "tool_use", id: "tool-unknown", name: "Bash", input: { k: 1 } }],
-            },
-          });
-          r.msg({
-            type: "user",
-            message: {
-              content: [{
-                type: "tool_result",
-                tool_use_id: "tool-unknown",
-                content: JSON.stringify({ outcome: "unknown" }),
-                is_error: false,
-              }],
-            },
-          });
-          r.result({
-            is_error: true,
-            subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please try a different model.",
-            errorClass: "model_capacity",
-          });
+          if (submits === 1) {
+            r.msg({
+              type: "assistant",
+              message: {
+                content: [{ type: "tool_use", id: "tool-unknown", name: "Bash", input: { k: 1 } }],
+              },
+            });
+            r.msg({
+              type: "user",
+              message: {
+                content: [{
+                  type: "tool_result",
+                  tool_use_id: "tool-unknown",
+                  content: JSON.stringify({ outcome: "unknown" }),
+                  is_error: false,
+                }],
+              },
+            });
+            r.result({
+              is_error: true,
+              subtype: "error_during_execution",
+              result: "Selected model is at capacity. Please retry later.",
+              errorClass: "model_capacity",
+            });
+            return;
+          }
+          r.text("retry succeeded");
+          r.result({ stop_reason: "end_turn" });
         });
       });
       const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
@@ -902,15 +988,103 @@ describe("crash/interrupt partial persistence", () => {
         "a".repeat(32),
       );
 
+      assert.equal(submits, 2);
+      assert.deepEqual(runner.submittedInputs, ["run once", TRANSIENT_RETRY_INPUT]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
+      assert.ok(captured.payloads[0]!.text?.includes("retry succeeded"));
+      assert.notEqual(captured.payloads[0]!.tools?.[0]?.completed, false);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("capacity failure after a completed tool with unknown external outcome never auto-continues", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          r.toolPair("tool-bash", "Bash", "pong");
+          r.result({
+            is_error: true,
+            subtype: "error_during_execution",
+            result: "Selected model is at capacity. Please retry later.",
+            errorClass: "model_capacity",
+          });
+        });
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+        ccbSessionId: null,
+      });
+
+      await sm.submit(
+        session,
+        "run once",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "b".repeat(32),
+      );
+
       assert.equal(submits, 1);
       assert.equal(events.some((event) => event.kind === "turn_status"), false);
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0]!.errorCode, "model_capacity");
-      assert.notEqual(captured.payloads[0]!.tools?.[0]?.completed, false);
-      assert.match(
-        JSON.stringify(captured.payloads[0]!.tools?.[0]?.outputJson),
-        /unknown/,
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("API Error 500 after completed Bash retries TRANSIENT_RETRY_INPUT", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })
+        ._transientRetryDelayMs = () => 0;
+      const events: SessionStreamEvent[] = [];
+      let submits = 0;
+      const runner = new FakeCcbRunner((r) => {
+        submits++;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.toolPair("tool-bash", "Bash", "pong");
+            r.result({
+              is_error: true,
+              subtype: "success",
+              result: "API Error: 500 internal error. This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (172.31.0.1:18892).",
+              terminal_reason: "api_error",
+            });
+            return;
+          }
+          r.text("retry succeeded");
+          r.result({ stop_reason: "end_turn" });
+        });
+      });
+      const session = makeSession(runner, { channel: "webchat", userId: "user-1" });
+
+      await sm.submit(
+        session,
+        "run once",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        "c".repeat(32),
       );
+
+      assert.equal(submits, 2, "completed Bash + 500 must auto-retry");
+      assert.deepEqual(runner.submittedInputs, ["run once", TRANSIENT_RETRY_INPUT]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "completed");
     } finally {
       setV3MasterSinkSingleton(null);
     }
@@ -1298,7 +1472,7 @@ describe("crash/interrupt partial persistence", () => {
       setImmediate(() => r.result({
         is_error: true,
         subtype: "error_during_execution",
-        result: "Selected model is at capacity. Please try a different model.",
+        result: "Selected model is at capacity. Please retry later.",
         errorClass: "model_capacity",
       }));
     });
@@ -1792,8 +1966,8 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
-      assert.equal(sm.interrupt(session.sessionKey), true, "repeat Stop remains idempotent");
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true, "repeat Stop remains idempotent");
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -1879,7 +2053,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -1943,7 +2117,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2011,7 +2185,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2079,7 +2253,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2157,7 +2331,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2219,7 +2393,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2278,7 +2452,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2344,7 +2518,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2417,7 +2591,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2485,7 +2659,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2547,7 +2721,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2617,7 +2791,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -3273,9 +3447,10 @@ describe("crash/interrupt partial persistence", () => {
     assert.equal(session._contextRebuildNotice, undefined);
   });
 
-  test("runner error waits for drained late output instead of freezing an early partial", async () => {
+  test("runner error waits for drained late output instead of freezing an early partial", { timeout: 5_000 }, async (t) => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
     try {
       const sm = new SessionManager(makeConfigStub());
       const events: SessionStreamEvent[] = [];
@@ -3292,7 +3467,13 @@ describe("crash/interrupt partial persistence", () => {
       } as Partial<AgentSession>);
 
       await runOneTurn(sm, session, events);
-      await sm.awaitPendingPersistence();
+      let persistenceDrained = false;
+      const drain = sm.awaitPendingPersistence().then(() => { persistenceDrained = true; });
+      await Promise.resolve();
+      assert.equal(persistenceDrained, false, "actual tracked200ms callback must still be pending");
+      t.mock.timers.tick(200);
+      await drain;
+      assert.equal(persistenceDrained, true);
 
       assert.equal(captured.payloads.length, 1);
       assert.equal(captured.payloads[0]!.status, "completed");
@@ -3305,6 +3486,7 @@ describe("crash/interrupt partial persistence", () => {
         ),
       );
     } finally {
+      t.mock.timers.reset();
       setV3MasterSinkSingleton(null);
     }
   });

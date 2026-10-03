@@ -6,8 +6,10 @@ import {
   GROUP_HEADER_HEIGHT_TOUCH,
   HINT_ROW_HEIGHT,
   PROJECT_ROW_HEIGHT,
+  PROJECT_ROW_HEIGHT_TOUCH,
   SEARCH_HIT_HEIGHT,
   SESSION_ROW_HEIGHT,
+  SESSION_ROW_HEIGHT_TOUCH,
 } from "./constants";
 
 /**
@@ -83,13 +85,16 @@ function runningIn(list: Session[], isRunning?: (s: Session) => boolean): number
 
 export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
   const items: FlatItem[] = [];
+  // 桌面紧凑 36px / 触屏 44px 触控靶（SIDEBAR-R1）。
+  const SESSION_H = input.coarsePointer ? SESSION_ROW_HEIGHT_TOUCH : SESSION_ROW_HEIGHT;
+  const PROJECT_H = input.coarsePointer ? PROJECT_ROW_HEIGHT_TOUCH : PROJECT_ROW_HEIGHT;
 
   if (input.searching) {
     for (const [label, list] of input.ungroupedGroups) {
       if (label)
         items.push({ kind: "header", key: `h-${label}`, label, height: GROUP_HEADER_HEIGHT });
       for (const s of list) {
-        items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
+        items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_H });
       }
     }
     if (input.searchRemote === "loading") {
@@ -144,7 +149,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
   if (input.pinned.length > 0) {
     items.push({ kind: "header", key: "h-pinned", label: "置顶", height: GROUP_HEADER_HEIGHT });
     for (const s of input.pinned) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_H });
     }
   }
 
@@ -183,7 +188,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
         count,
         collapsed,
         runningCount: runningIn(kids, input.isRunning),
-        height: PROJECT_ROW_HEIGHT,
+        height: PROJECT_H,
       });
       if (!collapsed) {
         if (kids.length === 0) {
@@ -203,7 +208,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
             key: `s-${s.id}`,
             session: s,
             indent: true,
-            height: SESSION_ROW_HEIGHT,
+            height: SESSION_H,
           });
         }
       }
@@ -220,7 +225,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       count: defaultKids.length,
       collapsed: defaultCollapsed,
       runningCount: runningIn(defaultKids, input.isRunning),
-      height: PROJECT_ROW_HEIGHT,
+      height: PROJECT_H,
     });
     if (!defaultCollapsed) {
       if (defaultKids.length === 0) {
@@ -238,7 +243,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
           key: `s-${s.id}`,
           session: s,
           indent: true,
-          height: SESSION_ROW_HEIGHT,
+          height: SESSION_H,
         });
       }
     }
@@ -249,7 +254,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
     key: "archived-toggle",
     count: input.archived.length,
     expanded: input.archivedExpanded,
-    height: PROJECT_ROW_HEIGHT,
+    height: PROJECT_H,
   });
   if (input.archivedExpanded) {
     if (input.archivedLoading) {
@@ -268,7 +273,7 @@ export function flattenSidebarItems(input: FlattenInput): FlatItem[] {
       });
     }
     for (const s of input.archived) {
-      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_ROW_HEIGHT });
+      items.push({ kind: "session", key: `s-${s.id}`, session: s, height: SESSION_H });
     }
   }
 

@@ -419,3 +419,51 @@ describe('grok relay account health feedback', () => {
     assert.deepEqual(order, ['expire', 'fail:53:grok_http_401'])
   })
 })
+
+describe('internal Grok relay model allowlist', () => {
+  async function relay(modelId: string) {
+    const captured: { headers?: Headers; calls: number } = { calls: 0 }
+    const handler = makeGrokRelayHandler({
+      identityRepo: repo(),
+      resolveContext: async () => ({ modelId, accountId: 53n, slotId: 'slot-53' }),
+      freshToken: async () => Buffer.from('real-xai-oauth-token', 'utf8'),
+      resolveDispatcher: async () => ({ dispatcher: DISPATCHER }),
+      requestFn: (async (_url: unknown, init: { headers?: HeadersInit }) => {
+        captured.calls += 1
+        captured.headers = new Headers(init.headers as HeadersInit)
+        return { statusCode: 200, headers: { 'content-type': 'text/plain' }, body: Readable.from(['ok']) }
+      }) as never,
+      renewSlot: () => true,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/chat/completions`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${CONTAINER_TOKEN}`,
+          'content-type': 'application/json',
+          'x-grok-model-override': 'attacker-model',
+        },
+        body: '{}',
+      })
+      return { status: response.status, body: await response.text(), captured }
+    } finally {
+      await close(server)
+    }
+  }
+
+  test('grok-build-fast keeps its own model override', async () => {
+    const result = await relay('grok-build-fast')
+    assert.equal(result.status, 200)
+    assert.equal(result.captured.calls, 1)
+    assert.equal(result.captured.headers?.get('x-grok-model-override'), 'grok-build-fast')
+  })
+
+  test('an unknown route model expires before upstream traffic', async () => {
+    const result = await relay('grok-4.6')
+    assert.equal(result.status, 404)
+    assert.equal(result.captured.calls, 0)
+    assert.match(result.body, /grok route expired/)
+  })
+})

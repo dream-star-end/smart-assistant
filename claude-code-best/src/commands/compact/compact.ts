@@ -13,7 +13,12 @@ import {
   ERROR_MESSAGE_NOT_ENOUGH_MESSAGES,
   ERROR_MESSAGE_USER_ABORT,
   mergeHookInstructions,
+  summarizeMessagesForIdle,
 } from '../../services/compact/compact.js'
+import { IDLE_COMPACT_INSTRUCTIONS, runIdleCompact } from '../../services/compact/idleRecover.js'
+import { getSessionId } from '../../bootstrap/state.js'
+import { loadConversationForResume } from '../../utils/conversationRecovery.js'
+import { flushSessionStorage, recordTranscript } from '../../utils/sessionStorage.js'
 import { suppressCompactWarning } from '../../services/compact/compactWarningState.js'
 import { microcompactMessages } from '../../services/compact/microCompact.js'
 import { runPostCompactCleanup } from '../../services/compact/postCompactCleanup.js'
@@ -54,6 +59,40 @@ export const call: LocalCommandCall = async (args, context) => {
   const customInstructions = args.trim()
 
   try {
+    // Box idle is selected before session memory, reactive, and microcompact.
+    // A normal /compact (any other instruction, or this prompt with no idle
+    // file) keeps the path below.
+    if (customInstructions === IDLE_COMPACT_INSTRUCTIONS) {
+      const idleResult = await runIdleCompact({
+        sessionId: getSessionId(),
+        messages,
+        summarize: async (msgs) => summarizeMessagesForIdle(
+          msgs,
+          context,
+          await getCacheSharingParams(context, msgs),
+          customInstructions,
+        ),
+        record: recordTranscript,
+        flush: flushSessionStorage,
+        load: async (id) => loadConversationForResume(id, undefined),
+      })
+      if (idleResult === 'short' || idleResult === 'prepared') return { type: 'skip' }
+      if (idleResult) {
+        setLastSummarizedMessageId(undefined)
+        suppressCompactWarning()
+        getUserContext.cache.clear?.()
+        runPostCompactCleanup()
+        return {
+          type: 'compact',
+          compactionResult: idleResult,
+          displayText: buildDisplayText(context, idleResult.userDisplayMessage, {
+            pre: idleResult.preCompactTokenCount,
+            post: idleResult.truePostCompactTokenCount,
+          }),
+        }
+      }
+    }
+
     // Try session memory compaction first if no custom instructions
     // (session memory compaction doesn't support custom instructions)
     if (!customInstructions) {

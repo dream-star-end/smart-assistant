@@ -1,3 +1,5 @@
+import { grokExecutionUpstream } from '@openclaude/protocol'
+import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
@@ -207,6 +209,7 @@ import { readClientSessionModelId } from "../db/pgSessionsBackend.js";
 import type { AuthoritySigner } from "./authoritySigner.js";
 import { type AuthorityKeyCensus, authorityKeyCensus } from "./authorityKeyCensus.js";
 import { platformAuxModels, readSecurityEpoch } from "../billing/modelCatalog.js";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, signedCcbCapability } from "../http/proxy/boxNativeContextOwner.js";
 import type { ModelCatalogCache, ModelCatalogSnapshot } from "../billing/modelCatalog.js";
 import type { GithubSelectionRow } from "../github/sessionWorkspaces.js";
 import type { AgentModelResolver } from "./agentModelAuthority.js";
@@ -828,6 +831,8 @@ const DEFAULT_ATTEST_TIMEOUT_MS = 10_000;
  *   - commercial/billing/modelCatalog 的那份是 DB 投影(带 providerId / upstreamModelId
  *     —— **路由**语义,只有 master/egress 需要,容器不该看见上游身份);
  *   - protocol 的那份是**容器执行**语义(capability / context / effort / vision)。
+ * Grok CLI exception: a public model version is required by --model; project
+ * it from this same snapshot, never provider credentials or endpoints.
  * 这里做一次显式收窄 = 「凭据与路由不进容器」这条边界在类型层的落点。
  *
  * `contextWindow` 的 null 原样进入签名载荷；0 不是合法窗口，不能拿哨兵值混淆语义。
@@ -838,15 +843,27 @@ function toProtocolDescriptor(
   const profile = d.capabilityProfile;
   return {
     capabilityProfile: {
+      ...(d.engine === 'grok' ? { grok: { upstreamModelId: grokExecutionUpstream(d.canonicalModel, d.upstreamModelId) } } : {}),
       supportsVision: profile.supportsVision,
       reasoning: {
         supported: [...profile.reasoning.supported],
         codexModelDefault: profile.reasoning.codexModelDefault,
       },
-      ccb: {
-        capabilityZero: profile.ccb.capabilityZero,
-        supportsThinking: profile.ccb.supportsThinking,
-      },
+      ccb: (() => {
+        const ccb = signedCcbCapability({
+          canonicalModel: d.canonicalModel,
+          providerId: d.providerId,
+          capabilityZero: profile.ccb.capabilityZero,
+          supportsThinking: profile.ccb.supportsThinking,
+          declaredContextOwner: profile.ccb.contextOwner,
+          routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
+        });
+        return {
+          capabilityZero: ccb.capabilityZero,
+          supportsThinking: ccb.supportsThinking,
+          ...(ccb.contextOwner === undefined ? {} : { contextOwner: ccb.contextOwner }),
+        };
+      })(),
     },
     capabilitySchemaVersion: d.capabilitySchemaVersion,
     contextWindow: d.contextWindow,
@@ -5728,6 +5745,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               teamModeRequested &&
               (frameAgentId === "main" || frameAgentId === null || teamModeNonMainAgentDemotesToMain);
             const effectiveFrameAgentId = teamModeMain ? "main" : frameAgentId;
+            try {
+              const reviewFrame = parsed as {
+                channel?: unknown
+                peer?: { kind?: unknown; id?: unknown }
+                content?: { text?: unknown }
+              }
+              const reviewSessionKey = inboundSessionKey({
+                ...reviewFrame,
+                agentId: effectiveFrameAgentId ?? "main",
+              })
+              const reviewUserId = uid.toString()
+              const reviewText = reviewFrame.content?.text
+              if (typeof reviewText === "string" && reviewText.trim()) {
+                observeUserContentReview({
+                  text: reviewText,
+                  userId: reviewUserId,
+                  sessionKey: reviewSessionKey,
+                })
+              }
+            } catch {
+              // Recording must not block delivery of this message.
+            }
             const agentImpliedModel =
               effectiveFrameAgentId !== null ? AGENT_AUTHZ_IMPLIED_MODEL[effectiveFrameAgentId] : undefined;
             // P0 计费旁路封堵 —— master agent 权威推导:帧无 model 时容器 gateway

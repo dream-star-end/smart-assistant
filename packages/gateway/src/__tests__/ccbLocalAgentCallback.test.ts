@@ -282,6 +282,14 @@ describe('blocker 3: retryable inject keeps pending and retries once', () => {
     assert.equal(beginCcbLocalAgentInject(SESSION, 'agt-cap'), false)
   })
 
+  it('drops a second notice with the same status and summary', () => {
+    const summary = "Background shell command didn't finish before the previous session ended"
+    assert.equal(note('agt-stop-1', false, { status: 'stopped', summary }), 'inject')
+    assert.equal(note('agt-stop-2', false, { status: 'stopped', summary }), 'noop')
+    assert.equal(getCcbLocalAgentCallbackState(SESSION, 'agt-stop-2'), undefined)
+    assert.equal(note('agt-stop-3', false, { status: 'stopped', summary: '另一条命令结束了' }), 'inject')
+  })
+
   it('abandons observably after pending TTL', () => {
     assert.equal(note('agt-ttl', false), 'inject')
     setCcbLocalAgentFirstSeenAtForTest(

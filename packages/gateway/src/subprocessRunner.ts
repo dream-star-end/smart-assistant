@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, resolve } from 'node:path'
 import { type McpServerConfig, type OpenClaudeConfig, paths } from '@openclaude/storage'
 import { createLogger } from './logger.js'
+import { boxCcBridgePath, stripBoxCcParentAuth } from './engine/cursorBoxCc.js'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { atomicWriteJsonFile, buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
@@ -122,6 +123,17 @@ export function _isExpectedOfficialClaudeAbortExit(args: {
     && args.code === 1
     && args.signal == null
     && args.abortResultObserved
+}
+
+/** Box-resident official Claude is one-shot print mode: a finished answer
+ * exits 0. That must not feed the crash-loop gate. The session layer still
+ * sees the exit so a turn with no result can finalize. */
+export function _boxCcOneShotExitSkipsCrashLoop(args: {
+  boxResidentCc: boolean
+  code: number | null
+  signal: NodeJS.Signals | null
+}): boolean {
+  return args.boxResidentCc && args.code === 0 && args.signal == null
 }
 
 /**
@@ -488,6 +500,9 @@ export function finalizeCcbSpawnEnv(input: {
 const REQUIRE_AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
 export const MODEL_EXECUTION_DESCRIPTOR_ENV = 'OC_MODEL_EXECUTION_DESCRIPTOR'
 
+export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
+export const BOX_NATIVE_CONTEXT_MODEL = 'box-api-claude-opus-5-5'
+
 export interface CcbExecutionDescriptor {
   readonly canonicalModel: string
   readonly contextWindow: number | null
@@ -495,6 +510,7 @@ export interface CcbExecutionDescriptor {
   readonly supportsThinking: boolean
   readonly supportsVision: boolean
   readonly supportedEfforts: readonly string[]
+  readonly contextOwner?: typeof BOX_NATIVE_CONTEXT_OWNER
 }
 
 export function shouldRecycleForVisionCapability(
@@ -580,14 +596,38 @@ export function _buildUpdateEnvStdinLine(vars: Record<string, string>): string {
 /**
  * 本 turn 的上游凭据(单一收口 —— 所有 CCB submit 都经此,任何调用方都不可能漏清位)。
  *
- *   - bridge turn(有 descriptor)      → 只挂长命 lease。短 authority 已由 gateway 在
- *     开始执行前验签 + 单次消费;若继续把它挂到每个 CCB 请求,2min 后它过期会让仍有效的
- *     lease 一起被 egress 拒绝;
+ *   - bridge turn(有 descriptor)      → 默认只挂长命 lease。egress 在同 turn 有效
+ *     lease 下仍接受已过期的短 authority(OCV5-242),所以已验签 Box 主 turn
+ *     (expectedEngine=ccb、执行模型与 descriptor 都是 box-api-claude-opus-5-5、
+ *     contextOwner=box-native-v1)保留原始 authority+lease 双头。其它模型、缺 cap、
+ *     cursor、local 仍只投影原有那一张,不重签。
  *   - 本地路径 turn(cron/synthetic/delegate)且 flag 开 → 现取 `x-oc-local-catalog` token
  *     (**每 turn 现取**:它携带 epoch,缓存下来会在安全变更后带旧 epoch 撞 fence);
  *     取不到(master 不可达 / epoch 验不出)→ 抛 → **拒新 turn**(方案 §3:无 baked 回落);
  *   - flag 未开 / 个人版 / 非托管容器   → undefined → 写空串(egress 侧 gate 未装配,零行为变化)。
  */
+function boxNativeDualHeaderTurn(
+  authority: TurnModelAuthority,
+  model: string | undefined,
+  expectedEngine: 'ccb' | 'cursor',
+): boolean {
+  return expectedEngine === 'ccb'
+    && model === BOX_NATIVE_CONTEXT_MODEL
+    && authority.executionDescriptor.canonicalModel === BOX_NATIVE_CONTEXT_MODEL
+    && authority.executionDescriptor.contextOwner === BOX_NATIVE_CONTEXT_OWNER
+}
+
+/** Renewal replaces the lease on the current turn bundle. Non-Box bundles stay lease-only. */
+function renewTurnHeaderBundle(
+  current: TurnUpstreamHeaders | undefined,
+  leaseEnvelope: string,
+): TurnUpstreamHeaders {
+  if (current?.authority !== undefined) {
+    return { authority: current.authority, lease: leaseEnvelope }
+  }
+  return { lease: leaseEnvelope }
+}
+
 async function resolveTurnRuntime(
   authority: TurnModelAuthority | undefined,
   model: string | undefined,
@@ -595,10 +635,10 @@ async function resolveTurnRuntime(
   expectedEngine: 'ccb' | 'cursor' = 'ccb',
 ): Promise<{ headers?: TurnUpstreamHeaders; descriptor?: CcbExecutionDescriptor }> {
   if (authority) {
-    return {
-      headers: { lease: authority.leaseEnvelope },
-      descriptor: authority.executionDescriptor,
-    }
+    const headers: TurnUpstreamHeaders = boxNativeDualHeaderTurn(authority, model, expectedEngine)
+      ? { authority: authority.authorityEnvelope, lease: authority.leaseEnvelope }
+      : { lease: authority.leaseEnvelope }
+    return { headers, descriptor: authority.executionDescriptor }
   }
   if (env[REQUIRE_AUTHORITY_ENV] !== '1') return {}
   const client = getModelCatalogClient()
@@ -866,6 +906,10 @@ export interface SubprocessRunnerOpts {
    * unless `OC_CCB_OFFICIAL_CC=1`). Official-cc is either Cursor Sand
    * loopback (`authorityEngine=cursor`) or the engine=ccb Anthropic proxy. */
   harness?: 'ccb' | 'official-cc'
+  /** Official Claude Code runs inside the selected account's Grok Bot box. */
+  boxResidentCc?: boolean
+  /** Writes the 0600 exec control file on first spawn. */
+  prepareBoxCc?: () => Promise<string>
   permissionMode?: string
   resumeSessionId?: string // 续上之前的 CCB session
   /** Engine-agnostic durable-artifact ladder: given the native id the engine
@@ -1043,6 +1087,64 @@ export function resolveCcbHarness(
 ): 'ccb' | 'official-cc' {
   if (optsHarness === 'ccb' || optsHarness === 'official-cc') return optsHarness
   return ccbOfficialCcEnabled(env) ? 'official-cc' : 'ccb'
+}
+
+export class BoxNativeHarnessError extends Error {
+  constructor(readonly code: 'BOX_NATIVE_CONTEXT_MISMATCH' | 'BOX_NATIVE_HARNESS_LOCKED') {
+    super(code)
+    this.name = 'BoxNativeHarnessError'
+  }
+}
+
+/** Project the signed profile into the env descriptor. Does not read body or env. */
+export function projectCcbExecutionDescriptor(input: {
+  canonicalModel: string
+  contextWindow: number | null
+  supportsVision: boolean
+  supportedEfforts: readonly string[]
+  capabilityProfile: Readonly<Record<string, unknown>>
+}): CcbExecutionDescriptor {
+  const raw = input.capabilityProfile.ccb
+  const ccb = raw !== null && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+  if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
+  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && input.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
+  return {
+    canonicalModel: input.canonicalModel,
+    contextWindow: input.contextWindow,
+    capabilityZero: ccb.capabilityZero === true,
+    supportsThinking: ccb.supportsThinking === true,
+    supportsVision: input.supportsVision,
+    supportedEfforts: [...input.supportedEfforts],
+    ...(ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER ? { contextOwner: BOX_NATIVE_CONTEXT_OWNER } : {}),
+  }
+}
+
+/**
+ * A new runner with a valid signed Box context owner explicitly selects the
+ * CCB fork. An already-spawned official process is not swapped. Missing the
+ * token leaves the caller harness, including OC_CCB_OFFICIAL_CC, unchanged.
+ */
+export function applyBoxNativeHarness(input: {
+  model: string | undefined
+  descriptor: CcbExecutionDescriptor | undefined
+  harness: 'ccb' | 'official-cc' | undefined
+  spawned: boolean
+}): 'ccb' | 'official-cc' | undefined {
+  if (input.descriptor?.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) return input.harness
+  if (
+    input.model !== BOX_NATIVE_CONTEXT_MODEL ||
+    input.descriptor.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL
+  ) {
+    throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+  }
+  if (input.spawned && resolveCcbHarness(input.harness) !== 'ccb') {
+    throw new BoxNativeHarnessError('BOX_NATIVE_HARNESS_LOCKED')
+  }
+  return 'ccb'
 }
 
 /** Fail-closed spawn gates for official-cc. Cursor still requires the Sand
@@ -1302,6 +1404,8 @@ export class SubprocessRunner extends EventEmitter {
   /** 本 turn 解析后的 descriptor；首次 spawn 也必须看到，不能等 stdin 才补。 */
   private currentExecutionDescriptorEnv = ''
   private currentExecutionDescriptor: CcbExecutionDescriptor | undefined
+  /** Header bundle last written for the current turn. Cleared on shutdown. */
+  private currentTurnHeaders: TurnUpstreamHeaders | undefined
   private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
   private stdoutBuf = ''
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
@@ -1348,6 +1452,7 @@ export class SubprocessRunner extends EventEmitter {
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
+  private boxCcControlPath: string | null = null
   private officialAbortResultObserved = false
   /** engine=ccb official-cc: headers applied at next spawn (stock CLI cannot
    * hot-update env). Cursor Sand official-cc leaves this unset. */
@@ -1355,6 +1460,21 @@ export class SubprocessRunner extends EventEmitter {
   private spawnedOfficialHeaderFingerprint: string | undefined
   /** Timestamp of last stdout activity — used for liveness detection */
   public lastActivityAt: number = Date.now()
+
+  /** Explicit ccb harness for a not-yet-spawned runner that carries the signed token. */
+  pinBoxNativeHarness(descriptor: CcbExecutionDescriptor | undefined): 'ccb' | 'official-cc' {
+    const next = applyBoxNativeHarness({
+      model: this.opts.model,
+      descriptor,
+      harness: this.opts.harness,
+      spawned: this.proc !== null,
+    })
+    if (descriptor?.contextOwner === BOX_NATIVE_CONTEXT_OWNER) {
+      if (next !== 'ccb') throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
+      this.opts.harness = 'ccb'
+    }
+    return resolveCcbHarness(this.opts.harness)
+  }
 
   constructor(private opts: SubprocessRunnerOpts) {
     super()
@@ -1523,13 +1643,28 @@ export class SubprocessRunner extends EventEmitter {
     // is assigned would never bump _consecutiveCrashes, and the caller could
     // retry immediately and re-throw, burning CPU.
     try {
+    if (this.opts.boxResidentCc && !this.boxCcControlPath) {
+      if (!this.opts.prepareBoxCc) {
+        this.starting = false
+        throw new Error('BOX_CC_CONTROL_REQUIRED')
+      }
+      this.boxCcControlPath = await this.opts.prepareBoxCc()
+    }
     const { config } = this.opts
     const harness = resolveCcbHarness(this.opts.harness)
     let binaryDir: string
     let command: string
     let ccbEntry: string | undefined
     let ccbRuntime: string | undefined
-    if (harness === 'official-cc') {
+    if (this.opts.boxResidentCc) {
+      const bridge = boxCcBridgePath()
+      if (!existsSync(bridge)) {
+        this.starting = false
+        throw new Error('BOX_CC_BRIDGE_MISSING')
+      }
+      command = process.execPath
+      binaryDir = dirname(bridge)
+    } else if (harness === 'official-cc') {
       try {
         assertOfficialCcSpawnPreconditions(this.opts)
       } catch (err) {
@@ -1637,7 +1772,7 @@ export class SubprocessRunner extends EventEmitter {
         })
       }
     }
-    const args = harness === 'official-cc'
+    let args = harness === 'official-cc'
       ? buildOfficialClaudeCliArgs({
           model: this.opts.model,
           permissionMode: this.opts.permissionMode,
@@ -1665,6 +1800,7 @@ export class SubprocessRunner extends EventEmitter {
           settingsFile: learningContext.settingsFile,
           structuredOutputSchema: this.opts.structuredOutputSchema,
         })
+    if (this.opts.boxResidentCc) args = [boxCcBridgePath(), ...args]
 
     // ── Provider-aware auth injection ──
     // CCB auth priority: ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > settings.json
@@ -1703,7 +1839,7 @@ export class SubprocessRunner extends EventEmitter {
     if (this.opts.providerEnvOverride) {
       Object.assign(finalizedProviderEnv, this.opts.providerEnvOverride)
     }
-    if (harness === 'official-cc' && this.opts.authorityEngine === 'cursor') {
+    if (harness === 'official-cc' && this.opts.authorityEngine === 'cursor' && !this.opts.boxResidentCc) {
       if (!isOfficialClaudeCursorSandLoopbackEnv(finalizedProviderEnv)) {
         this.starting = false
         this._boundRepoBinding = null
@@ -1811,12 +1947,22 @@ export class SubprocessRunner extends EventEmitter {
                 CLAUDE_CODE_UNATTENDED_RETRY: '0',
               }
             : {}),
-          ...(harness === 'official-cc' && this.pendingOfficialSpawnEnv
+          ...(harness === 'official-cc' && !this.opts.boxResidentCc && this.pendingOfficialSpawnEnv
             ? this.pendingOfficialSpawnEnv
             : {}),
         },
         stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'],
         detached: true, // create process group so shutdown() can kill all children
+      }
+      if (this.opts.boxResidentCc) {
+        if (!this.boxCcControlPath) {
+          this.starting = false
+          throw new Error('BOX_CC_CONTROL_REQUIRED')
+        }
+        spawnOpts.env = stripBoxCcParentAuth(
+          spawnOpts.env as Record<string, string>,
+          this.boxCcControlPath,
+        )
       }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)
@@ -1946,8 +2092,13 @@ export class SubprocessRunner extends EventEmitter {
         signal,
         abortResultObserved: this.officialAbortResultObserved,
       })
+      const skipCrashLoop = _boxCcOneShotExitSkipsCrashLoop({
+        boxResidentCc: this.opts.boxResidentCc === true,
+        code,
+        signal,
+      })
       const crashed = !this.shuttingDown && !expectedOfficialAbortExit
-      if (crashed) {
+      if (crashed && !skipCrashLoop) {
         this._recordCrash()
       } else {
         // Keep `shuttingDown` true until the stdout-drained `close` boundary.
@@ -2166,6 +2317,7 @@ export class SubprocessRunner extends EventEmitter {
       process.env,
       this.opts.authorityEngine ?? 'ccb',
     )
+    this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
         lock: this.opts.advisorExecutionLock,
@@ -2202,6 +2354,7 @@ export class SubprocessRunner extends EventEmitter {
       }
       this.pendingOfficialSpawnEnv = spawnEnv
     }
+    this.currentTurnHeaders = runtime.headers
     const envUpdateLine = harness === 'ccb'
       ? _buildUpdateEnvStdinLine(
           {
@@ -2263,9 +2416,12 @@ export class SubprocessRunner extends EventEmitter {
       if (this.opts.authorityEngine === 'cursor') {
         throw new Error('OFFICIAL_CC_LEASE_NOOP_OUTSIDE_CURSOR_SAND')
       }
-      // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the new lease
-      // and invalidate the spawn fingerprint so the next submit recycles.
-      const headerEnv = _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope })
+      // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the renewed
+      // bundle and invalidate the spawn fingerprint so the next submit recycles.
+      // Box keeps the same-turn authority; every other turn stays lease-only.
+      const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
+      this.currentTurnHeaders = renewed
+      const headerEnv = _buildAnthropicCustomHeadersEnv(renewed)
       this.pendingOfficialSpawnEnv = {
         ...(this.pendingOfficialSpawnEnv ?? {}),
         ...headerEnv,
@@ -2273,8 +2429,10 @@ export class SubprocessRunner extends EventEmitter {
       this.spawnedOfficialHeaderFingerprint = undefined
       return
     }
+    const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
+    this.currentTurnHeaders = renewed
     const envUpdateLine = _buildUpdateEnvStdinLine(
-      _buildAnthropicCustomHeadersEnv({ lease: leaseEnvelope }),
+      _buildAnthropicCustomHeadersEnv(renewed),
     )
     if (!this.proc) throw new Error('cannot renew turn lease without a running CCB subprocess')
     await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
@@ -2883,6 +3041,7 @@ export class SubprocessRunner extends EventEmitter {
   }
 
   async shutdown(): Promise<void> {
+    this.currentTurnHeaders = undefined
     // Drop shared in-flight start so a hung preheat cannot be reused by submit().
     this._startEpoch += 1
     this._startPromise = null

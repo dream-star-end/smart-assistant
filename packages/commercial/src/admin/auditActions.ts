@@ -43,6 +43,7 @@ export const ADMIN_AUDIT_ACTIONS = {
 
   // ── 计费/模型配置(tx)────────────────────────────────────────────
   "billing.ledger.reconcile": { kind: "write", mode: "tx" },
+  "pricing.create": { kind: "write", mode: "tx" },
   "pricing.patch": { kind: "write", mode: "tx" },
   "plan.patch": { kind: "write", mode: "tx" },
   "model_grant.add": { kind: "write", mode: "tx" },

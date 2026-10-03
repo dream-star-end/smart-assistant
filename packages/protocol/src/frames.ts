@@ -1051,6 +1051,7 @@ export const OutboundError = Type.Object({
     Type.Literal('rate_limited'),
     Type.Literal('model_capacity'),
     Type.Literal('model_config_changed_retry_turn'),
+    Type.Literal('model_not_available'),
     Type.Literal('upstream_failed'),
     Type.Literal('context_too_long'),
     Type.Literal('bad_request'),

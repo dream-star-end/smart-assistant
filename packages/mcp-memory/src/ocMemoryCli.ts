@@ -226,10 +226,9 @@ async function main(): Promise<void> {
     if (!question) fail('consult-advisor requires --question "<text>"')
     const concern = flags.concern || ''
     const invocation = resolveConsultInvocationId({ env: process.env })
-    if (!invocation.ok) fail(invocation.error)
     const headers = gatewayDelegateHeaders()
     headers[DELEGATE_CONTEXT_HEADER] = ctxTok.token
-    headers[CONSULT_INVOCATION_HEADER] = invocation.invocationId
+    if (invocation.ok) headers[CONSULT_INVOCATION_HEADER] = invocation.invocationId
     try {
       const result = await consultAdvisorUntilAdvice({
         post: () =>

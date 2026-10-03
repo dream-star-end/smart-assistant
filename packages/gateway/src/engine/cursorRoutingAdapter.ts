@@ -22,11 +22,15 @@ import {
   CursorAdapter,
   CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX,
   CURSOR_SAND_RESUME_PREFIX,
+  cursorSandBoxCcResumeInnerId,
   cursorSandOfficialCcResumeInnerId,
   cursorSandResumeInnerId,
+  CURSOR_SAND_BOX_CC_RESUME_PREFIX,
   isAnyCursorSandResumeId,
 } from './cursorAdapter.js'
 import { CursorSandAdapter } from './cursorSandAdapter.js'
+import { CursorBoxCcAdapter } from './cursorBoxCcAdapter.js'
+import { cursorBoxCcEnabled, cursorBoxCcSelectionEligible, isBoxClaudeCatalogModel } from './cursorBoxCc.js'
 import {
   cursorSandEnabledForSelection,
   selectCursorCredential,
@@ -37,7 +41,7 @@ import { _shutdownOriginFrames } from '../subprocessRunner.js'
 
 const log = createLogger({ module: 'cursorRoutingAdapter' })
 
-export type CursorVariant = 'native' | 'sand-ccb' | 'sand-official-cc'
+export type CursorVariant = 'native' | 'sand-ccb' | 'sand-official-cc' | 'sand-box-cc'
 
 const FORWARDED_EVENTS = [
   'session_id',
@@ -77,6 +81,12 @@ export function cursorVariantFor(
   executionTarget?: ExecutionTarget,
   env: NodeJS.ProcessEnv = process.env,
 ): CursorVariant {
+  if (
+    executionTarget?.kind !== 'remote'
+    && cursorBoxCcEnabled(env)
+    && cursorBoxCcSelectionEligible(selection)
+    && isBoxClaudeCatalogModel(model)
+  ) return 'sand-box-cc'
   if (!cursorSandEnabledForSelection(model, selection)) return 'native'
   if (
     executionTarget?.kind !== 'remote'
@@ -89,12 +99,14 @@ function resumeForVariant(resume: string | undefined, variant: CursorVariant): s
   if (!resume) return undefined
   if (variant === 'sand-ccb') return cursorSandResumeInnerId(resume)
   if (variant === 'sand-official-cc') return cursorSandOfficialCcResumeInnerId(resume)
+  if (variant === 'sand-box-cc') return cursorSandBoxCcResumeInnerId(resume)
   return isAnyCursorSandResumeId(resume) ? undefined : resume
 }
 
 function prefixResumeId(id: string, variant: CursorVariant): string {
   if (variant === 'sand-ccb') return `${CURSOR_SAND_RESUME_PREFIX}${id}`
   if (variant === 'sand-official-cc') return `${CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX}${id}`
+  if (variant === 'sand-box-cc') return `${CURSOR_SAND_BOX_CC_RESUME_PREFIX}${id}`
   return id
 }
 
@@ -144,11 +156,14 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     const innerOpts = {
       ...this.opts,
       resumeSessionId: resumeForVariant(this.opts.resumeSessionId, variant),
-      harness: variant === 'sand-official-cc' ? 'official-cc' as const : 'ccb' as const,
+      harness: variant === 'sand-official-cc' || variant === 'sand-box-cc'
+        ? 'official-cc' as const
+        : 'ccb' as const,
+      boxResidentCc: variant === 'sand-box-cc',
     }
-    return variant !== 'native'
-      ? new CursorSandAdapter(innerOpts)
-      : new CursorAdapter(innerOpts)
+    if (variant === 'native') return new CursorAdapter(innerOpts)
+    if (variant === 'sand-box-cc') return new CursorBoxCcAdapter(innerOpts)
+    return new CursorSandAdapter(innerOpts)
   }
 
   private bindInner(): void {

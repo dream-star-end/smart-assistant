@@ -82,6 +82,69 @@ describe('resolveDurableWaiverAgeMs', () => {
 describe('startFinalizeJournalReconciler', () => {
   const noGc = async () => 0
 
+  test('Box billing recovery shares the existing tick without blocking legacy reconcile/GC', async () => {
+    let boxCalls = 0, gcCalls = 0, errors = 0
+    const h = startFinalizeJournalReconciler({
+      runOnStart: false,
+      reconcileFn: async () => ({ committed: 1, aborted: 0, durableWaived: 0 }),
+      boxRecoveryFn: async () => { boxCalls++; throw new Error('synthetic Box DB failure') },
+      alertStuckFinalizingFn: async () => 0,
+      gcFn: async () => { gcCalls++; return 2 },
+      onError: () => { errors++ },
+    })
+    try {
+      const result = await h.runNow()
+      assert.equal(boxCalls, 1)
+      assert.equal(errors, 1)
+      assert.equal(gcCalls, 1)
+      assert.equal(result.committed, 1)
+      assert.equal(result.gc, 2)
+    } finally { h.stop() }
+  })
+
+  test('leader stop drains active tick and forbids a not-yet-started Box stage', async () => {
+    let releaseLegacy!: () => void
+    let signalLegacy!: () => void
+    const legacyStarted = new Promise<void>((resolve) => { signalLegacy = resolve })
+    const legacyGate = new Promise<void>((resolve) => { releaseLegacy = resolve })
+    let boxCalls = 0
+    const h = startFinalizeJournalReconciler({ runOnStart: false,
+      reconcileFn: async () => { signalLegacy(); await legacyGate
+        return { committed: 0, aborted: 0, durableWaived: 0 } },
+      boxRecoveryFn: async () => { boxCalls++ },
+      alertStuckFinalizingFn: async () => 0, gcFn: noGc })
+    const tick = h.runNow()
+    await legacyStarted
+    let drained = false
+    const stop = h.stop().then(() => { drained = true })
+    await Promise.resolve()
+    assert.equal(drained, false, 'handoff must wait for old tick')
+    releaseLegacy()
+    await Promise.all([tick, stop])
+    assert.equal(drained, true)
+    assert.equal(boxCalls, 0, 'old leader may not enter Box recovery after stop')
+  })
+
+  test('leader stop waits for Box recovery already in progress', async () => {
+    let releaseBox!: () => void
+    let signalBox!: () => void
+    const boxStarted = new Promise<void>((resolve) => { signalBox = resolve })
+    const boxGate = new Promise<void>((resolve) => { releaseBox = resolve })
+    const h = startFinalizeJournalReconciler({ runOnStart: false,
+      reconcileFn: async () => ({ committed: 0, aborted: 0, durableWaived: 0 }),
+      boxRecoveryFn: async () => { signalBox(); await boxGate },
+      alertStuckFinalizingFn: async () => 0, gcFn: noGc })
+    const tick = h.runNow()
+    await boxStarted
+    let drained = false
+    const stop = h.stop().then(() => { drained = true })
+    await Promise.resolve()
+    assert.equal(drained, false)
+    releaseBox()
+    await Promise.all([tick, stop])
+    assert.equal(drained, true)
+  })
+
   test('runOnStart 默认 true,boot 立即 reconcile 一次', async () => {
     let n = 0
     const h = startFinalizeJournalReconciler({

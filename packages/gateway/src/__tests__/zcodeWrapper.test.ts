@@ -112,7 +112,7 @@ describe('oc-zcode wrapper', () => {
     assert.match(build, /OC_INCLUDE_ZCODE=\$\{OC_INCLUDE_ZCODE:-0\}/)
     assert.match(dockerfile, /ARG OC_INCLUDE_ZCODE=0/)
     assert.match(dockerfile, /OC_ZCODE_CLI_VERSION=0\.16\.3/)
-    assert.match(dockerfile, /b420dea50961b77d5c75b08b924da41ab529c720a7ec32eacbe95a6d843199e0/)
+    assert.match(dockerfile, /ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61/)
     assert.match(dockerfile, /--appimage-extract/)
   })
 

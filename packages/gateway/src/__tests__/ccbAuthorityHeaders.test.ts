@@ -9,8 +9,9 @@
  *   stdin `update_environment_variables` → CCB `process.env.ANTHROPIC_CUSTOM_HEADERS`
  *   → 每请求现读(client.ts getCustomHeaders,client 每请求新建)→ `/v1/messages` header。
  *
- * 所以本文件的断言全部落在**写进 stdin 的字节序列**上 —— 那是 gateway 侧唯一可观测、
- * 也是唯一有意义的 ground truth:
+ * 本文件断言落在 runner 写进 stdin 的控制行，以及一个自写的 node -e 适配进程。
+ * 那个进程自己解析 header 并自己发 HTTP，不是 claude-code-best。
+ * 真实 CLI 消费见 ccbRealCliHeaders.integ.test.ts。
  *   ① env 更新必须**先于** user message(同一管道按行处理 ⇒ 本 turn 首个上游请求必带新票);
  *   ② bridge turn → 只投影长 lease,短 authority / local catalog 均不出容器;
  *   ③ 无票的 turn → **写空串清位**(上一 turn 的 lease 绝不允许泄漏到下一 turn);
@@ -20,7 +21,9 @@
  * 跑法:npx tsx --test packages/gateway/src/__tests__/ccbAuthorityHeaders.test.ts
  */
 import * as assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { createServer } from 'node:http'
 import { afterEach, describe, it } from 'node:test'
 
 import { CcbAdapter } from '../engine/ccbAdapter.js'
@@ -70,12 +73,14 @@ function createHarness(
   failWrite?: number,
   spawnedDescriptor: unknown = EXECUTION_DESCRIPTOR,
   official = false,
+  model = 'glm-5.2',
 ): Harness {
   const runner = new SubprocessRunner({
     sessionKey: 'test',
     agentId: 'test',
     agentBaseDir: '/tmp',
-    model: 'glm-5.2',
+    model,
+    ...(model === 'box-api-claude-opus-5-5' ? { harness: 'ccb' as const } : {}),
     config: {} as never,
     ...(official ? {
       harness: 'official-cc' as const,
@@ -148,6 +153,84 @@ function parseEnvLine(line: string): Record<string, string> {
 }
 
 /** `ANTHROPIC_CUSTOM_HEADERS` 串 → header map(逐字节复刻 CCB getCustomHeaders 的解析)。 */
+/** Adapter only: this process parses headers itself. It is not claude-code-best. */
+const FORK_SCRIPT = `
+const http = require('http')
+const readline = require('readline')
+const port = Number(process.env.PORT)
+function parse(raw) {
+  const out = {}
+  for (const line of String(raw || '').split(/\\n/)) {
+    const i = line.indexOf(':')
+    if (i < 0 || !line.trim()) continue
+    out[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim()
+  }
+  return out
+}
+function post(tag, headers) {
+  return new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: '/' + tag, headers }, (res) => {
+      res.resume()
+      res.on('end', () => resolve())
+    })
+    req.on('error', (err) => { console.error(err); resolve() })
+    req.end('{}')
+  })
+}
+let headers = {}
+let chain = Promise.resolve()
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', (line) => {
+  chain = chain.then(async () => {
+    const msg = JSON.parse(line)
+    if (msg.type === 'update_environment_variables') {
+      headers = parse(msg.variables && msg.variables.ANTHROPIC_CUSTOM_HEADERS)
+      await post('env', headers)
+    } else if (msg.type === 'user') {
+      await post('turn', headers)
+      await post('tool', headers)
+    }
+  })
+})
+rl.on('close', () => { chain.then(() => process.exit(0), (err) => { console.error(err); process.exit(1) }) })
+`
+
+function captureForkHeaders(lines: string[]): Promise<Array<{ tag: string; headers: Record<string, string> }>> {
+  return new Promise((resolve, reject) => {
+    const hits: Array<{ tag: string; headers: Record<string, string> }> = []
+    const server = createServer((req, res) => {
+      const headers: Record<string, string> = {}
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (typeof value === 'string') headers[key] = value
+      }
+      hits.push({ tag: (req.url ?? '/').slice(1), headers })
+      res.end('ok')
+    })
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      if (!address || typeof address === 'string') {
+        reject(new Error('loopback bind failed'))
+        return
+      }
+      const child = spawn(process.execPath, ['-e', FORK_SCRIPT], {
+        env: { PORT: String(address.port) },
+      })
+      let stderr = ''
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (chunk) => { stderr += chunk })
+      child.on('error', reject)
+      child.on('exit', (code) => {
+        server.close(() => {
+          if (code !== 0) reject(new Error(stderr || `fork exit ${code}`))
+          else resolve(hits)
+        })
+      })
+      for (const line of lines) child.stdin.write(line)
+      child.stdin.end()
+    })
+  })
+}
+
 function parseCustomHeaders(raw: string): Record<string, string> {
   const out: Record<string, string> = {}
   for (const line of raw.split(/\n|\r\n/)) {
@@ -258,6 +341,44 @@ describe('CCB authority headers — bridge turn', () => {
     assert.ok(!(AUTHORITY_HEADER in headers))
     // bridge lease 与本地路径 token 是**不同 kind、不同 header**,不允许互相伪装(R3-M6)。
     assert.ok(!(LOCAL_CATALOG_HEADER in headers))
+  })
+
+  it('适配进程消费 Box 控制行:双头、renew 只换 lease、下一 turn 清位(不是 claude-code-best)', async () => {
+    const box = {
+      canonicalModel: 'box-api-claude-opus-5-5',
+      contextWindow: 200_000,
+      capabilityZero: false,
+      supportsThinking: true,
+      supportsVision: false,
+      supportedEfforts: [] as string[],
+      contextOwner: 'box-native-v1' as const,
+    }
+    const { runner, writes } = createHarness(undefined, box, false, box.canonicalModel)
+    const bundle = {
+      authorityEnvelope: 'BOXAUTH',
+      leaseEnvelope: 'BOXLEASE1',
+      executionDescriptor: box,
+    }
+    await runner.submit('first', 'req-box', bundle)
+    await runner.updateTurnLease('BOXLEASE2')
+    ;(runner as unknown as { spawnedExecutionDescriptor: unknown }).spawnedExecutionDescriptor = undefined
+    await runner.submit('next')
+
+    const hits = await captureForkHeaders(writes)
+    const named = (tag: string) => hits.filter((hit) => hit.tag === tag)
+    assert.equal(named('env')[0]?.headers['x-oc-model-authority'], 'BOXAUTH')
+    assert.equal(named('env')[0]?.headers['x-oc-turn-lease'], 'BOXLEASE1')
+    assert.equal(named('turn')[0]?.headers['x-oc-model-authority'], 'BOXAUTH')
+    assert.equal(named('tool')[0]?.headers['x-oc-turn-lease'], 'BOXLEASE1')
+    assert.equal(named('turn')[0]?.headers['x-oc-model-authority'], named('tool')[0]?.headers['x-oc-model-authority'])
+    const renew = named('env')[1]
+    assert.equal(renew?.headers['x-oc-model-authority'], 'BOXAUTH')
+    assert.equal(renew?.headers['x-oc-turn-lease'], 'BOXLEASE2')
+    const cleared = named('env')[2]
+    assert.equal(cleared?.headers['x-oc-model-authority'], undefined)
+    assert.equal(cleared?.headers['x-oc-turn-lease'], undefined)
+    assert.equal(named('turn')[1]?.headers['x-oc-model-authority'], undefined)
+    assert.equal(named('tool')[1]?.headers['x-oc-turn-lease'], undefined)
   })
 
   it('bridge turn 不受 OC_MODEL_AUTHORITY flag 影响(有票就带票,不去拉 catalog)', async () => {
@@ -449,6 +570,7 @@ describe('CcbAdapter — modelAuthority 透传', () => {
       ): void {
         this.consultTurnBinding = binding
       }
+      pinBoxNativeHarness(): 'ccb' { return 'ccb' }
       async submit(
         _input: unknown,
         _requestId?: string,

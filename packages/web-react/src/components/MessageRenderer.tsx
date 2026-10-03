@@ -8,7 +8,9 @@
  * MessageList：把会话消息流渲成普通 DOM 卡片列表 + 流式 typing 指示 + 向上历史分页。
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
-import { ChevronDown, ChevronUp, Info, Sparkles, X } from "lucide-react";
+import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
   type ReactNode,
@@ -19,9 +21,10 @@ import {
   useRef,
   useState,
 } from "react";
-import type {
-  ChatMessage,
-  LiveTurnTokenUsageSnapshot,
+import {
+  isRetryingTurnStatus,
+  type ChatMessage,
+  type LiveTurnTokenUsageSnapshot,
 } from "../lib/chat/model";
 import { UserUpwardPagingController } from "../lib/chat/tapePaging";
 import {
@@ -32,7 +35,7 @@ import {
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
-import { isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
+import { isPlatedAssistantMessage, isRecoveryControlUserTurn, isRecoveryTurnClientMessageId } from "../lib/chat/pure";
 import { sanitizeChatMessages } from "../lib/chat/sanitizeChatMessages";
 import {
   EAGER_MEDIA_TAIL_ITEMS,
@@ -60,7 +63,6 @@ import {
   AssistantCard,
   type CardCallbacks,
   DelegateProgressCard,
-  GoalCard,
   PlanCard,
   SystemCard,
   ThinkingCard,
@@ -91,7 +93,7 @@ import {
 import { JournalHydrationRetry, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { MessageBoundary } from "./MessageBoundary";
 import { asStr, resolveToolInput } from "./tool/format";
-import { Alert, Avatar, IconButton, Input, Spinner } from "./ui";
+import { Alert, IconButton, Input, Spinner } from "./ui";
 import { cn } from "../lib/utils";
 import {
   findMatches,
@@ -318,9 +320,12 @@ export const MessageRenderer = memo(
           </TapeBackedCard>
         );
       case "goal":
+        // Current objectives belong only to the composer dock. Completed
+        // rows remain read-only historical diagnostics inside the process.
+        if (isClearedGoalRecord(message) || !isHistoricalGoalRecord(message)) return null;
         return (
           <TapeBackedCard>
-            <GoalCard msg={message} />
+            <p className="whitespace-pre-wrap break-words text-sm text-fg">{message.text || "会话目标"}</p>
             <ExactTapeRecordDisclosure messages={[message]} label="目标" />
           </TapeBackedCard>
         );
@@ -740,7 +745,7 @@ function rowHeightBucket(sessionId: string | undefined): Map<string, number> {
   return created;
 }
 
-type RenderItem =
+type LeafRenderItem =
   | {
       kind: "single";
       m: ChatMessage;
@@ -758,6 +763,240 @@ type RenderItem =
       idx: number;
       tokenUsage?: DisplayTokenUsage;
     };
+
+type RenderItem = LeafRenderItem | {
+  kind: "process"; key: string; members: ChatMessage[]; items: LeafRenderItem[]; active: boolean;
+};
+function itemMessages(item: LeafRenderItem): ChatMessage[] {
+  return item.kind === "single" ? [item.m] : item.members;
+}
+
+/**
+ * Visible answer ids for disclosure. While a turn is still sending, no
+ * assistant is promoted to the final answer — a later tool must not split the
+ * one process shell, and the live body stays inside that shell as Markdown.
+ * After the turn stops, the last assistant of the turn is the only top-level
+ * answer. A deferred empty locator for a finished turn stays outside too.
+ * Deliverable rows are excluded separately by isProcessMessage.
+ */
+function disclosureAnswerIds(messages: ChatMessage[], finals: boolean[], sending: boolean): Set<string> {
+  const ids = new Set<string>();
+  const activeStart = currentTurnStartIndex(messages);
+  const live = (index: number) => sending && index >= activeStart;
+  for (let i = 0; i < messages.length; i++) {
+    if (!finals[i] || live(i)) continue;
+    const id = messages[i]?.id;
+    if (id) ids.add(id);
+  }
+  const lastAssistant = new Map<string, number>();
+  let segment = "head";
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (!message) continue;
+    if (message.role === "user") {
+      segment = message.id;
+      continue;
+    }
+    if (message.role !== "assistant") continue;
+    lastAssistant.set(message._clientMessageId || segment, i);
+  }
+  for (const index of lastAssistant.values()) {
+    if (live(index)) continue;
+    const message = messages[index];
+    if (!message?._payloadDeferred || !message.id) continue;
+    ids.add(message.id);
+  }
+  return ids;
+}
+
+function advanceDisclosureBoundary(rows: ChatMessage[], owner: string): { owner: string; boundary: string } {
+  const nextOwner = rows[0]?.role === "user" ? rows[0].id : owner;
+  // One visible user turn, one shell. A step's own _clientMessageId often
+  // disagrees with that turn while the live pack and the tape are both on
+  // screen (or a hidden recovery id is stamped on later rows). Page keys
+  // already stay off this boundary; the row id must too.
+  return {
+    owner: nextOwner,
+    boundary: nextOwner,
+  };
+}
+
+/** Contiguous, turn-bounded display groups; never move an actionable row. */
+/**
+ * OCV5-307: errored assistant rows the turn moved past — later work (a tool,
+ * thought, plan, subtask, answered prompt or another assistant) follows in the
+ * same user turn. Those are a recovered step, not the turn's outcome, so they
+ * fold into the process. An error with nothing after it stays on the top level.
+ */
+function continuedErrorIds(messages: ChatMessage[]): Set<string> {
+  const ids = new Set<string>();
+  let pending: string[] = [];
+  for (const message of messages) {
+    if (message.role === "user") {
+      pending = [];
+      continue;
+    }
+    // Positive evidence only: transport / locator / status / hidden rows prove
+    // nothing about the turn continuing (Codex review: a deferred locator after a
+    // terminal error must not hide that error in a collapsed shell). When in
+    // doubt the error stays top-level, i.e. the pre-OCV5-307 behaviour.
+    if (
+      message._payloadDeferred || message._turnStatusRecord || message._genPlaceholder ||
+      message._turnTapeProcess || message._timelineAuxiliary || message._hideUnpublishedFallback === true
+    ) {
+      continue;
+    }
+    // Only a later successful reply proves the turn went on past the error. The
+    // gateway stamps a turn-terminal engine error (e.g. codex serverOverloaded
+    // at turn/completed) onto the turn's LAST assistant text segment, so tool /
+    // thinking rows stored after that segment ran BEFORE the error and prove
+    // nothing (OCV5-307, session webmuqjhduqb0ifd9: both "模型暂不可用" rows
+    // were the turn's real ending).
+    const isWork = message.role === "assistant" && !isErroredAssistant(message) && (message.text ?? "").trim().length > 0;
+    if (isWork && pending.length > 0) {
+      for (const id of pending) ids.add(id);
+      pending = [];
+    }
+    if (isErroredAssistant(message) && message.id) pending.push(message.id);
+  }
+  return ids;
+}
+
+function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], finals: boolean[], sending: boolean): RenderItem[] {
+  const out: RenderItem[] = [];
+  const answerIds = disclosureAnswerIds(messages, finals, sending);
+  const continuedErrors = continuedErrorIds(messages);
+  const activeStart = currentTurnStartIndex(messages);
+  const activeIds = new Set(sending ? messages.slice(activeStart).map((message) => message.id) : []);
+  const assistantArtifactKeys = new Map<string, Set<string>>();
+  let scanOwner = "head";
+  for (const item of items) {
+    const rows = itemMessages(item);
+    const advanced = advanceDisclosureBoundary(rows, scanOwner);
+    scanOwner = advanced.owner;
+    for (const message of rows) {
+      if (message.role !== "assistant" || message._hideUnpublishedFallback === true) continue;
+      const keys = artifactEvidenceKeys(message.text ?? "");
+      if (keys.length === 0) continue;
+      let owned = assistantArtifactKeys.get(advanced.boundary);
+      if (!owned) {
+        owned = new Set();
+        assistantArtifactKeys.set(advanced.boundary, owned);
+      }
+      for (const key of keys) owned.add(key);
+    }
+  }
+  let owner = "head";
+  type ProcessGroup = Extract<RenderItem, { kind: "process" }>;
+  let group: ProcessGroup | undefined;
+  let boundary = "";
+  // Work that arrives after the final answer is still this turn's work (a
+  // late plan, or — OCV5-307 — tools/thoughts the model ran after a mid-turn
+  // reply that ended up as the last visible text). Keep it in the shell above
+  // the answer: never open a second 工作过程 underneath. Rows that must stay
+  // put (question, approval, failure, artifact) are not foldable, end the
+  // carry, and keep their place.
+  let carry: { boundary: string; group: ProcessGroup | undefined; answerIndex: number } | undefined;
+  // Key off the turn, not the first row. Prepending an older live page must
+  // not remount the shell the reader already has open.
+  const shellOrdinal = new Map<string, number>();
+  // Shells still open for a turn that has not crossed its final answer.
+  // A later step with a different row id rejoins this shell instead of
+  // painting a second 处理过程. Crossing the answer drops the entry so a
+  // tool that arrives under the answer stays a separate section below it.
+  const beforeAnswer = new Map<string, ProcessGroup>();
+  const seal = (current: ProcessGroup | undefined, keyBoundary: string) => {
+    if (!current || current.key) return;
+    const work = current.members.find((message) =>
+      !isClearedGoalRecord(message) && (isFoldableWorkRole(message) || isHistoricalGoalRecord(message)));
+    const ordinal = shellOrdinal.get(keyBoundary) ?? 0;
+    shellOrdinal.set(keyBoundary, ordinal + 1);
+    current.key = ordinal === 0 ? `process:${keyBoundary}` : `process:${keyBoundary}:${ordinal}`;
+    if (!work) {
+      const index = out.indexOf(current);
+      if (index >= 0) out.splice(index, 1, ...current.items);
+    }
+  };
+  // OCV5-307: a turn-terminal error is the turn's outcome. It renders once, at
+  // the end of its turn (after the answer), and does not split the shell: the
+  // rows stored after it (which ran before it, see continuedErrorIds) keep
+  // folding into the same 工作过程.
+  let terminal: { boundary: string; items: LeafRenderItem[] } | undefined;
+  const flushTerminal = () => {
+    if (!terminal) return;
+    out.push(...terminal.items);
+    terminal = undefined;
+  };
+  for (const item of items) {
+    const rows = itemMessages(item);
+    // A cleared goal is not a row, a count, or a shell. Skipping it must not
+    // seal the current process or move the owner/page boundary.
+    if (rows.length > 0 && rows.every(isClearedGoalRecord)) continue;
+    const advanced = advanceDisclosureBoundary(rows, owner);
+    owner = advanced.owner;
+    const nextBoundary = advanced.boundary;
+    if (terminal && terminal.boundary !== nextBoundary) {
+      seal(group, boundary);
+      if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+      flushTerminal();
+    }
+    if (rows.length > 0 && rows.every((message) => isErroredAssistant(message) && !continuedErrors.has(message.id))) {
+      (terminal ??= { boundary: nextBoundary, items: [] }).items.push(item);
+      continue;
+    }
+    const ownedArtifacts = assistantArtifactKeys.get(nextBoundary);
+    const fold = rows.length > 0 && rows.every((message) =>
+      isProcessMessage(message, answerIds.has(message.id), ownedArtifacts, continuedErrors.has(message.id)));
+    if (!fold) {
+      seal(group, boundary);
+      const crossedAnswer = rows.some((message) => answerIds.has(message.id));
+      if (crossedAnswer) {
+        beforeAnswer.delete(boundary);
+        const kept = group ?? (carry?.boundary === nextBoundary ? carry.group : undefined);
+        carry = { boundary: nextBoundary, group: kept, answerIndex: out.length };
+      } else if (group && out.includes(group)) {
+        beforeAnswer.set(boundary, group);
+        carry = undefined;
+      } else {
+        carry = undefined;
+      }
+      group = undefined;
+      out.push(item);
+      continue;
+    }
+    if (carry && carry.boundary === nextBoundary && !group) {
+      if (!carry.group || out.indexOf(carry.group) < 0) {
+        const created: ProcessGroup = { kind: "process", key: "", members: [], items: [], active: false };
+        carry.group = created;
+        out.splice(carry.answerIndex, 0, created);
+        carry.answerIndex += 1;
+      }
+      carry.group.items.push(item);
+      carry.group.members.push(...rows);
+      if (rows.some((message) => activeIds.has(message.id))) carry.group.active = true;
+      continue;
+    }
+    if (carry) carry = undefined;
+    const rejoin = !group ? beforeAnswer.get(nextBoundary) : undefined;
+    if (rejoin && out.includes(rejoin)) {
+      group = rejoin;
+      boundary = nextBoundary;
+    } else if (!group || boundary !== nextBoundary) {
+      seal(group, boundary);
+      group = { kind: "process", key: "", members: [], items: [], active: false };
+      boundary = nextBoundary;
+      beforeAnswer.set(nextBoundary, group);
+      out.push(group);
+    }
+    group.items.push(item);
+    group.members.push(...rows);
+    if (rows.some((message) => activeIds.has(message.id))) group.active = true;
+  }
+  seal(group, boundary);
+  if (carry?.group && carry.group.key === "") seal(carry.group, carry.boundary);
+  flushTerminal();
+  return out;
+}
 
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
   if (!message) return "";
@@ -803,7 +1042,7 @@ function coalesceTeam(
   start: number,
   sending: boolean,
   liveTurnUsage?: { clientMessageId: string; usage: LiveTurnTokenUsageSnapshot },
-): RenderItem[] {
+): LeafRenderItem[] {
   const total = messages.length;
   const slice = messages.slice(start);
   // 全量前缀扫描:anchorOf[i] = 第 i 行之前(含自身若为 user)最近的 user 下标,无则 -1;
@@ -888,7 +1127,7 @@ function coalesceTeam(
       teamCount.set(k, (teamCount.get(k) ?? 0) + 1);
     }
   }
-  const items: RenderItem[] = [];
+  const items: LeafRenderItem[] = [];
   const emittedTeam = new Set<string>();
   // 连续 thinking 行合并:被吸收进某组的 thinking 行(首条除外)记入此集,外层循环跳过它们。
   const consumedThinking = new Set<number>();
@@ -1024,6 +1263,8 @@ export function shouldShowScrollToBottom(
   return messageCount > 0 && following === false && distance > 80;
 }
 const TIMELINE_WINDOW_EXPAND_ITEMS = 80;
+/** Safety stop for a cursor that keeps moving. One manual page remains after this. */
+const LIVE_UNITS_AUTO_PAGE_CAP = 40;
 const TIMELINE_EXPAND_NEAR_TOP_PX = 160;
 
 function defaultTailStart(length: number): number {
@@ -1032,6 +1273,7 @@ function defaultTailStart(length: number): number {
 
 function renderItemKey(item: RenderItem): string {
   try {
+    if (item.kind === "process") return item.key;
     if (item.kind === "single") {
       return timelineMessageKey(item.m);
     }
@@ -1087,6 +1329,53 @@ function findTargetVisible(el: HTMLElement, scroller: HTMLElement): boolean {
   return row.height > 0 && row.bottom > top + 1 && row.top >= top - 1 && row.top < view.bottom - 1;
 }
 
+type LiveUnitsViewportAnchor = {
+  top: number;
+  member: string;
+};
+
+type LiveUnitsViewportHold = {
+  following: boolean;
+  epoch: number;
+  anchor: LiveUnitsViewportAnchor | null;
+};
+
+/** Topmost on-screen step. A process shell's own top does not move when an
+ * older page is inserted inside it, so the anchor has to be that step. */
+function captureLiveUnitsAnchor(scroller: HTMLElement): LiveUnitsViewportAnchor | null {
+  const viewport = scroller.getBoundingClientRect();
+  const rows = scroller.querySelectorAll<HTMLElement>("[data-chat-virtual-key]");
+  for (const row of rows) {
+    const rowRect = row.getBoundingClientRect();
+    if (rowRect.bottom <= viewport.top + 0.5 || rowRect.top >= viewport.bottom - 0.5) continue;
+    for (const candidate of row.querySelectorAll<HTMLElement>("[data-find-member]")) {
+      const rect = candidate.getBoundingClientRect();
+      const member = candidate.getAttribute("data-find-member");
+      if (!member || rect.height <= 0) continue;
+      if (rect.bottom <= viewport.top + 0.5 || rect.top >= viewport.bottom - 0.5) continue;
+      return { top: rect.top - viewport.top, member };
+    }
+  }
+  return null;
+}
+
+/** Move by the anchor's position after this commit, not by a height taken
+ * before the request. Bottom streaming between those two moments must not
+ * be treated as a prepend. */
+function restoreLiveUnitsAnchor(
+  scroller: HTMLElement,
+  anchor: LiveUnitsViewportAnchor,
+  writeTop: (el: HTMLElement, nextTop: number) => void,
+): void {
+  const el = scroller.querySelector<HTMLElement>(
+    `[data-find-member="${escapeFindSelector(anchor.member)}"]`,
+  );
+  if (!el) return;
+  const current = el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  const delta = current - anchor.top;
+  if (Math.abs(delta) > 0.5) writeTop(scroller, scroller.scrollTop + delta);
+}
+
 function eventInFindToolbar(scroller: HTMLElement, target: EventTarget | null): boolean {
   const bar = findToolbarEl(scroller);
   return !!(bar && target instanceof Node && bar.contains(target));
@@ -1105,7 +1394,18 @@ type FindPinState = {
   gen: number;
   renderIndex: number;
   renderKey: string;
+  /** Timeline key of the matched message. Equals renderKey for a single row. */
+  memberKey?: string;
 };
+
+function pinnedFindElement(scroller: HTMLElement, pin: FindPinState): HTMLElement | null {
+  if (pin.memberKey) {
+    const member = scroller.querySelector(`[data-find-member="${escapeFindSelector(pin.memberKey)}"]`);
+    if (member instanceof HTMLElement) return member;
+  }
+  const row = scroller.querySelector(`[data-chat-virtual-key="${escapeFindSelector(pin.renderKey)}"]`);
+  return row instanceof HTMLElement ? row : null;
+}
 
 function lastUserItemIndex(items: RenderItem[]): number {
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -1137,10 +1437,44 @@ export type MessageListArchive = {
   onLoadOlder: () => void | Promise<void>;
   /** Hot live-unit window still has earlier units than the first pack. */
   liveHasMoreBefore?: boolean;
-  onLoadOlderLiveUnits?: () => void | Promise<void>;
+  /** Server cursor for the next older live-unit page. Auto-load keys on this. */
+  liveUnitsCursor?: string | null;
+  onLoadOlderLiveUnits?: () => void | Promise<void | {
+    ok?: boolean;
+    hasMore?: boolean;
+    error?: boolean;
+    inflight?: boolean;
+  }>;
 };
 
+function turnHasVisibleWork(
+  processDisclosure: boolean,
+  items: RenderItem[],
+  messages: ChatMessage[],
+  turnStart: number,
+): boolean {
+  if (processDisclosure && items.some((item) => item.kind === "process" && item.active)) return true;
+  for (let i = Math.max(0, turnStart); i < messages.length; i += 1) {
+    const message = messages[i];
+    if (message && isPlatedAssistantMessage(message)) return true;
+  }
+  return false;
+}
+
+/** Retry, stop, and engine status stay. A second 「思考中」 under live steps or body does not. */
+function keepDistinctActivity(info: TurnActivityInfo | null | undefined): boolean {
+  if (!info) return false;
+  if (info.recoveryStatus?.kind === "stopping") return true;
+  if (isRetryingTurnStatus(info.turnStatus)) return true;
+  const status = info.turnStatus;
+  if (status === "compacting" || status === "engine_starting" || status === "engine_resuming" || status === "waiting_for_user") {
+    return true;
+  }
+  return !!info.leaderStep;
+}
+
 export function MessageList({
+  processDisclosure = false,
   messages,
   sending,
   liveTurnUsage,
@@ -1159,6 +1493,8 @@ export function MessageList({
   followBottomRef,
   find,
 }: {
+  /** Main chat uses result-first presentation; diagnostics may retain raw rows. */
+  processDisclosure?: boolean;
   messages: ChatMessage[];
   sending: boolean;
   /** Active browser turn's live token display; estimates are explicitly marked. */
@@ -1203,6 +1539,14 @@ export function MessageList({
   /** 会话内查找条。有值即渲染；关闭后高亮一并清除。 */
   find?: { onClose: () => void };
 }) {
+  // 还没开始发送的用户消息不进对话流，改由输入框上方的待发送列表呈现。
+  messages = messages.filter((message) => message.role !== "user" || message.status !== "queued");
+  // MessageList owns expansion so virtual unmounts and live→history updates cannot reset user intent.
+  const [disclosureState, setDisclosureState] = useState<{ session?: string; values: Record<string, boolean> }>({ values: {} });
+  const disclosureValues = disclosureState.session === sessionId ? disclosureState.values : {};
+  const setDisclosure = (key: string, open: boolean) => setDisclosureState(previous => ({
+    session: sessionId, values: { ...(previous.session === sessionId ? previous.values : {}), [key]: open },
+  }));
   const pagingOwnerRef = useRef<{
     generation: string;
     controller: UserUpwardPagingController;
@@ -1218,6 +1562,14 @@ export function MessageList({
   const [archiveQueued, setArchiveQueued] = useState(false);
   const archiveQueuedRef = useRef(false);
   const archiveQueueTokenRef = useRef(0);
+  const liveQueuedRef = useRef(false);
+  const [liveUnitsBusy, setLiveUnitsBusy] = useState(false);
+  const requestedLiveCursorRef = useRef<string | null>(null);
+  const liveAutoPagesRef = useRef<{ session?: string; count: number }>({ count: 0 });
+  const [liveUnitsAttention, setLiveUnitsAttention] = useState<{
+    session?: string;
+    kind: "error" | "cap";
+  } | null>(null);
   const [windowVersion, setWindowVersion] = useState(0);
   const [paintRange, setPaintRange] = useState({ start: 0, end: TIMELINE_INITIAL_TAIL_ITEMS });
   const itemCountRef = useRef(0);
@@ -1225,6 +1577,8 @@ export function MessageList({
   const startOverrideRef = useRef<number | null>(null);
   const pendingExpandCorrectionRef = useRef<{ height: number; top: number } | null>(null);
   const viewportPreserveLockRef = useRef(false);
+  const liveUnitsHoldRef = useRef<LiveUnitsViewportHold | null>(null);
+  const liveUnitsSettleRef = useRef<LiveUnitsViewportHold | null>(null);
   const listRootRef = useRef<HTMLDivElement | null>(null);
   const didSnapToBottomRef = useRef(false);
   const followBottomRefBox = useRef(followBottomRef);
@@ -1288,7 +1642,7 @@ export function MessageList({
   useEffect(() => {
     const pin = findPinRef.current;
     if (!pin) return;
-    const stillHit = findMatchesList.some((match) => match.key === pin.renderKey);
+    const stillHit = findMatchesList.some((match) => match.key === (pin.memberKey ?? pin.renderKey));
     if (!stillHit) bumpFindGeneration();
   }, [findMatchesList, bumpFindGeneration]);
   useEffect(() => {
@@ -1335,8 +1689,7 @@ export function MessageList({
     const tick = () => {
       frame = 0;
       if (findGenRef.current !== gen || findPinRef.current?.gen !== gen) return;
-      const esc = escapeFindSelector(pin.renderKey);
-      const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+      const el = pinnedFindElement(scroller, pin);
       if (el instanceof HTMLElement) {
         const row = el.getBoundingClientRect();
         follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
@@ -1352,7 +1705,7 @@ export function MessageList({
                 if (left <= 0 || findGenRef.current !== gen) return;
                 requestAnimationFrame(() => {
                   if (findGenRef.current !== gen) return;
-                  const node = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+                  const node = pinnedFindElement(scroller, pin);
                   if (node instanceof HTMLElement) {
                     const next = node.getBoundingClientRect();
                     follow.correctTo?.(scroller, scroller.scrollTop + (next.top - findViewTop(scroller)));
@@ -1446,6 +1799,8 @@ export function MessageList({
     startOverrideRef.current = null;
     didSnapToBottomRef.current = false;
     viewportPreserveLockRef.current = false;
+    liveUnitsHoldRef.current = null;
+    liveUnitsSettleRef.current = null;
     rowHeightCacheRef.current = rowHeightBucket(sessionId);
     visibleKeysRef.current = [];
     eagerPayloadKeysRef.current = null;
@@ -1530,6 +1885,20 @@ export function MessageList({
     };
     const onWindowBlur = () => endPointer();
     const onScroll = () => {
+      // A following live-unit fetch has not inserted its page yet. If the
+      // reader already left the bottom, remember the step now — writing
+      // scrollTop here would fight the gesture, and writing it after the
+      // fence drops would be a second jump. The prepend commit corrects
+      // once, and correctTo itself no-ops while a fence is up.
+      const hold = liveUnitsHoldRef.current;
+      if (
+        hold?.following &&
+        processPaging.interactionVersion() !== hold.epoch
+      ) {
+        hold.following = false;
+        hold.anchor = captureLiveUnitsAnchor(scroller);
+        viewportPreserveLockRef.current = true;
+      }
       if (scrollbarPointerId !== null) {
         processPaging.signalUserInteraction();
       } else if (touchMomentum) {
@@ -1737,7 +2106,30 @@ export function MessageList({
       .map((message) => message._recoveryOfClientMessageId)
       .filter(isNonEmptyId),
   );
-  const renderableMessages = safeMessages.filter(
+  // OCV5-307: the user acted on a committed card by clicking 从断点继续. While
+  // that manual continuation runs (or after it finished) the card is resolved,
+  // not a live failure; leaving it up showed 任务执行失败 + 重新尝试 next to
+  // 工具执行中. A declined child is removed (the card returns with its notice)
+  // and a failed child paints its own card; a child that failed without one
+  // keeps the source card. Automatic recovery never repaints a seen card.
+  const childErrorIds = new Set(
+    safeMessages
+      .filter((message) => message.role === "assistant" && !!message._errorCode)
+      .map((message) => message._clientMessageId)
+      .filter(isNonEmptyId),
+  );
+  const manuallyContinuedSourceIds = new Set(
+    safeMessages
+      .filter((message) =>
+        isRecoveryControlUserTurn(message) &&
+        message._automaticRecovery !== true &&
+        (message.status !== "error" || childErrorIds.has(message.id)))
+      .map((message) => message._recoveryOfClientMessageId)
+      .filter(isNonEmptyId),
+  );
+  // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
+  // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
+  const renderableMessages = returnStrayRowsToOwnerTurn(safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&
@@ -1751,11 +2143,16 @@ export function MessageList({
         m.role === "assistant" &&
         !!m._errorCode &&
         typeof m._clientMessageId === "string" &&
-        recoveredSourceIds.has(m._clientMessageId)
+        recoveredSourceIds.has(m._clientMessageId) &&
+        // 已经提交的卡不许因自动恢复子轮再被藏掉；没提交的中间态仍隐藏。
+        // 用户手动「从断点继续」后，这张卡已被处理，随之收起（OCV5-307）。
+        (m._errorCardSnapshot?.disposition !== "card" ||
+          manuallyContinuedSourceIds.has(m._clientMessageId))
       ) &&
+      !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
-  );
+  ));
   const visibleUserIds = new Set(
     renderableMessages
       .filter((message) => message.role === "user")
@@ -1823,28 +2220,87 @@ export function MessageList({
     });
   }, [archive, hasOlderHistory, pagingGeneration, processPaging]);
   const liveHasMore = archive?.liveHasMoreBefore === true;
+  const liveAttention = liveUnitsAttention && liveUnitsAttention.session === sessionId
+    ? liveUnitsAttention.kind
+    : null;
+  if (liveAutoPagesRef.current.session !== sessionId) {
+    liveAutoPagesRef.current = { session: sessionId, count: 0 };
+  }
   const requestOlderLiveUnits = useCallback(() => {
-    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || archiveQueuedRef.current) {
-      return;
+    if (!archive?.onLoadOlderLiveUnits || !liveHasMore || archive.loading || liveQueuedRef.current) {
+      return false;
     }
-    archiveQueuedRef.current = true;
-    setArchiveQueued(true);
+    liveQueuedRef.current = true;
+    setLiveUnitsBusy(true);
     const token = ++archiveQueueTokenRef.current;
     const el = scrollParent;
-    beginViewportPreserve();
-    if (el) {
-      pendingExpandCorrectionRef.current = {
-        height: el.scrollHeight,
-        top: el.scrollTop,
+    const follow = followBottomRefBox.current;
+    const following = follow?.current === true;
+    // beginViewportPreserve is for manual history and window expansion: it
+    // drops following and never restores it. A live-unit page must not use
+    // that, and must not snapshot height before the rows exist.
+    if (following) {
+      liveUnitsHoldRef.current = {
+        following: true,
+        epoch: processPaging.interactionVersion(),
+        anchor: null,
+      };
+    } else {
+      viewportPreserveLockRef.current = true;
+      liveUnitsHoldRef.current = {
+        following: false,
+        epoch: processPaging.interactionVersion(),
+        anchor: el ? captureLiveUnitsAnchor(el) : null,
       };
     }
-    void Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
+    const pending = Promise.resolve(archive.onLoadOlderLiveUnits()).finally(() => {
       if (archiveQueueTokenRef.current !== token) return;
-      archiveQueuedRef.current = false;
-      setArchiveQueued(false);
+      const hold = liveUnitsHoldRef.current;
+      liveUnitsHoldRef.current = null;
+      liveUnitsSettleRef.current = hold;
+      liveQueuedRef.current = false;
+      setLiveUnitsBusy(false);
       setWindowVersion((value) => value + 1);
     });
-  }, [archive, liveHasMore, scrollParent, beginViewportPreserve]);
+    return pending;
+  }, [archive, liveHasMore, scrollParent, processPaging]);
+  // Earlier steps of this turn load themselves. History stays a manual button,
+  // and scrolling never starts either request.
+  useEffect(() => {
+    if (!liveHasMore) {
+      if (liveAttention) setLiveUnitsAttention(null);
+      return;
+    }
+    if (liveAttention) return;
+    const cursor = archive?.liveUnitsCursor;
+    if (typeof cursor !== "string" || cursor.length === 0) return;
+    if (archive?.loading) return;
+    const mark = `${sessionId ?? ""}\0${cursor}`;
+    if (requestedLiveCursorRef.current === mark) return;
+    if (liveAutoPagesRef.current.count >= LIVE_UNITS_AUTO_PAGE_CAP) {
+      setLiveUnitsAttention({ session: sessionId, kind: "cap" });
+      return;
+    }
+    const pending = requestOlderLiveUnits();
+    if (pending === false) return;
+    requestedLiveCursorRef.current = mark;
+    liveAutoPagesRef.current.count += 1;
+    void pending.then((result) => {
+      if (!result || result.inflight) return;
+      if (requestedLiveCursorRef.current !== mark) return;
+      if (result.error || result.ok === false) {
+        requestedLiveCursorRef.current = null;
+        setLiveUnitsAttention({ session: sessionId, kind: "error" });
+      }
+    });
+  }, [
+    liveHasMore,
+    liveAttention,
+    archive?.liveUnitsCursor,
+    archive?.loading,
+    sessionId,
+    requestOlderLiveUnits,
+  ]);
   const expandLocalWindow = useCallback(() => {
     const el = scrollParent;
     const total = itemCountRef.current;
@@ -1861,15 +2317,36 @@ export function MessageList({
     setWindowVersion((value) => value + 1);
   }, [scrollParent]);
   useLayoutEffect(() => {
-    const pending = pendingExpandCorrectionRef.current;
     const el = scrollParent;
-    if (!pending || !el) return;
-    pendingExpandCorrectionRef.current = null;
-    if (typeof followBottomRef?.correctTo === "function") {
-      followBottomRef.correctTo(el, correctedScrollTop(pending.height, el.scrollHeight, pending.top));
+    const pending = pendingExpandCorrectionRef.current;
+    if (pending && el) {
+      pendingExpandCorrectionRef.current = null;
+      if (typeof followBottomRef?.correctTo === "function") {
+        followBottomRef.correctTo(el, correctedScrollTop(pending.height, el.scrollHeight, pending.top));
+      }
+      endViewportPreserve();
+    }
+    const settled = liveUnitsSettleRef.current;
+    if (!settled) return;
+    liveUnitsSettleRef.current = null;
+    const follow = followBottomRefBox.current;
+    if (!el || !follow) {
+      if (!settled.following) endViewportPreserve();
+      return;
+    }
+    const gestured = processPaging.interactionVersion() !== settled.epoch;
+    if (settled.following) {
+      if (!gestured) {
+        follow.current = true;
+        follow.scrollToBottom?.(el);
+      }
+      return;
+    }
+    if (settled.anchor && typeof follow.correctTo === "function") {
+      restoreLiveUnitsAnchor(el, settled.anchor, follow.correctTo);
     }
     endViewportPreserve();
-  }, [windowVersion, scrollParent]);
+  }, [windowVersion, scrollParent, processPaging]);
   useLayoutEffect(() => {
     const scroller = scrollParent;
     const root = listRootRef.current;
@@ -1931,6 +2408,7 @@ export function MessageList({
       idx: absIdx,
     }));
   }
+  if (processDisclosure) renderItems = discloseProcess(renderItems as LeafRenderItem[], renderableMessages, ratingFinal, sending);
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -1949,9 +2427,14 @@ export function MessageList({
   visibleCountRef.current = visibleItems.length;
   visibleKeysRef.current = visibleItems.map(itemKey);
   if (eagerPayloadKeysRef.current === null && visibleItems.length > 0) {
-    eagerPayloadKeysRef.current = new Set(
-      visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey),
-    );
+    const eager = new Set(visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS).map(itemKey));
+    for (const item of visibleItems.slice(-EAGER_PAYLOAD_TAIL_ITEMS)) {
+      if (item.kind !== "process") continue;
+      for (const message of item.members) {
+        if (message._payloadDeferred) eager.add(message._timelineUnitKey ?? message.id);
+      }
+    }
+    eagerPayloadKeysRef.current = eager;
     eagerMediaKeysRef.current = new Set(
       visibleItems.slice(-EAGER_MEDIA_TAIL_ITEMS).map(itemKey),
     );
@@ -2024,6 +2507,22 @@ export function MessageList({
     )
     : 0;
   useLayoutEffect(() => {
+    const el = scrollParent;
+    const hold = liveUnitsHoldRef.current;
+    if (!el || !hold) return;
+    const follow = followBottomRefBox.current;
+    if (!follow) return;
+    if (hold.following) {
+      if (follow.current && processPaging.interactionVersion() === hold.epoch) {
+        follow.scrollToBottom?.(el);
+      }
+      return;
+    }
+    if (hold.anchor && typeof follow.correctTo === "function") {
+      restoreLiveUnitsAnchor(el, hold.anchor, follow.correctTo);
+    }
+  });
+  useLayoutEffect(() => {
     const root = listRootRef.current;
     if (root) {
       for (const row of root.querySelectorAll<HTMLElement>("[data-chat-virtual-key]")) {
@@ -2051,11 +2550,90 @@ export function MessageList({
     }
     lastViewportAnchorRef.current = captureVisibleVirtualRowAnchor(el);
   }, [paintStart, paintEnd, scrollParent, windowVersion, sessionId, visibleItems.length]);
-  const showHistoryBoundary = hasOlderHistory || liveHasMore || windowStart > 0 || renderableMessages.some(
+  const showHistoryBoundary = hasOlderHistory || windowStart > 0 || renderableMessages.some(
     (message) => typeof message._historyPageLoadedFrom === "string",
   );
+  // Earlier live units belong to this turn. They auto-fill from the server
+  // cursor, so the process shell does not show a load button. A control only
+  // appears after a failed page or the auto-page cap, and stays inside the
+  // latest process shell rather than above the opening message.
+  const olderLiveStepsKey = (() => {
+    if (!liveHasMore || !liveAttention) return null;
+    let key: string | null = null;
+    for (const item of visibleItems) {
+      if (item.kind === "process") key = itemKey(item);
+    }
+    return key;
+  })();
+  const olderLiveStepsControl = liveHasMore && liveAttention ? (
+    <div className="flex justify-center pb-2" data-testid="older-live-steps-loader">
+      <button
+        type="button"
+        onClick={() => {
+          if (liveAttention === "error") {
+            requestedLiveCursorRef.current = null;
+            setLiveUnitsAttention(null);
+            return;
+          }
+          const pending = requestOlderLiveUnits();
+          if (pending === false) return;
+          void pending.then((result) => {
+            if (!result || result.inflight) return;
+            if (result.error || result.ok === false) {
+              setLiveUnitsAttention({ session: sessionId, kind: "error" });
+            }
+          });
+        }}
+        disabled={liveUnitsBusy}
+        aria-busy={liveUnitsBusy}
+        className="inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
+      >
+        {liveUnitsBusy
+          ? <><Spinner size={12} /> 加载中…</>
+          : liveAttention === "error"
+            ? <span className="text-danger">加载失败，点击重试</span>
+            : "加载更早的处理步骤"}
+      </button>
+    </div>
+  ) : null;
 
-  const renderItem = (it: RenderItem) => {
+  const renderItem = (it: RenderItem): ReactNode => {
+    if (it.kind === "process") {
+      const sections = processSections(it.items, itemMessages, renderItemKey);
+      const needle = findQuery.trim().toLowerCase();
+      const sectionHit = (section: { messages: ChatMessage[]; narrative: boolean }) =>
+        !!needle && section.messages.some((message) =>
+          (message.role === "assistant" || message.role === "user") &&
+          (message.text ?? "").toLowerCase().includes(needle)
+        );
+      const eager = eagerPayloadKeysRef.current?.has(it.key) === true
+        || it.members.some((message) => message._payloadDeferred && eagerPayloadKeysRef.current?.has(timelineMessageKey(message)));
+      const explicit = disclosureValues[it.key];
+      // Absent means the default: open while this turn is still running,
+      // closed once it has finished. A click stores true or false and is not
+      // reset when tokens arrive or the turn completes.
+      const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
+      return (
+        <ProcessDisclosure
+          sections={sections}
+          active={it.active}
+          open={open}
+          setOpen={(next) => setDisclosure(it.key, next)}
+          detailOpen={(key) => {
+            if (disclosureValues[`detail:${key}`] === true) return true;
+            const section = sections.find((candidate) => candidate.key === key);
+            return !!section && sectionHit(section);
+          }}
+          setDetailOpen={(key, open) => setDisclosure(`detail:${key}`, open)}
+          renderItem={renderItem}
+          keyOf={renderItemKey}
+          messagesOf={itemMessages}
+          eagerDeferred={eager}
+          olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
+          startedAt={it.active ? turnActivity?.startedAt ?? null : null}
+        />
+      );
+    }
     if (it.kind === "single" && it.m._genPlaceholder) {
       const gp = it.m._genPlaceholder;
       const placeholderSig = `genph|${it.m.id}|${gp.status}|${gp.startedAt}|${gp.aspect}`;
@@ -2139,7 +2717,7 @@ export function MessageList({
       </MessageBoundary>
     );
   };
-  const canRevealOlder = windowStart > 0 || hasOlderHistory || liveHasMore;
+  const canRevealOlder = windowStart > 0 || hasOlderHistory;
   const historyControl = showHistoryBoundary ? (
     <div
       className="mx-auto flex max-w-3xl justify-center px-5 pb-4 pt-8"
@@ -2147,7 +2725,7 @@ export function MessageList({
     >
       <button
         type="button"
-        onClick={windowStart > 0 ? expandLocalWindow : liveHasMore ? requestOlderLiveUnits : hasOlderHistory ? requestOlderArchive : undefined}
+        onClick={windowStart > 0 ? expandLocalWindow : hasOlderHistory ? requestOlderArchive : undefined}
         disabled={!canRevealOlder || Boolean(archive?.loading) || archiveQueued}
         aria-busy={hasOlderHistory && windowStart === 0 && (Boolean(archive?.loading) || archiveQueued)}
         className="mx-auto inline-flex items-center gap-1.5 rounded-full bg-hover px-3 py-1 text-xs text-muted transition-colors hover:text-fg disabled:cursor-default disabled:opacity-60 [@media(hover:none)]:min-h-11 [@media(hover:none)]:py-2.5"
@@ -2167,21 +2745,17 @@ export function MessageList({
     </div>
   ) : null;
   // footer 不再自带 px-5:它嵌在列表根(px-5)内,双份内边距会让本轮活动指示 / 软提示 / 尾部骨架比
-  // 时间线内容多缩进 20px(footer 头像与助手头像不对齐)。空列表早返回分支由外层容器补 px-5。
+  // 时间线内容多缩进 20px。空列表早返回分支由外层容器补 px-5。
+  const workVisible = turnHasVisibleWork(processDisclosure, renderItems, renderableMessages, turnStart);
+  const showTurnActivity = sending && (!workVisible || keepDistinctActivity(turnActivity));
   const footer = (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 pb-8 pt-4" data-testid="timeline-footer">
       <div data-testid="turn-activity-footer">
-        {sending && (
-          <div className="flex gap-4">
-            {/* 与 AssistantCard 一致:移动端隐藏头像,窄屏正文占满宽度。 */}
-            <Avatar tone="brand" className="mt-0.5 hidden shadow-sm sm:inline-flex">
-              <Sparkles size={16} />
-            </Avatar>
-            <div className="min-w-0 flex-1">
-              <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
-            </div>
+        {showTurnActivity ? (
+          <div className="min-w-0">
+            <TurnActivity info={turnActivity ?? { startedAt: null, agentName: "助手" }} />
           </div>
-        )}
+        ) : null}
       </div>
       {/* 会话级 transient 软提示（超时软提示等，非消息卡片、不落库；刷新即消失，不与真内容矛盾）。 */}
       {transientNotice && (
@@ -2237,7 +2811,8 @@ export function MessageList({
     findMatchesList.length === 0
       ? -1
       : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
-  const findCurrentKey = findCurrent >= 0 ? findMatchesList[findCurrent]?.key : undefined;
+  const findLookup = findLookupItems(renderItems);
+  const findCurrentTarget = findCurrent >= 0 ? locateFindMatch(findLookup, findMatchesList[findCurrent]) : null;
   const jumpTo = (match: FindMatch) => {
     const follow = followBottomRef;
     const scroller = scrollParent;
@@ -2257,11 +2832,10 @@ export function MessageList({
       startOverrideRef.current = target.renderIndex;
       setWindowVersion((value) => value + 1);
     }
-    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey };
+    const pin = { gen, renderIndex: target.renderIndex, renderKey: target.renderKey, memberKey: target.memberKey };
     findPinRef.current = pin;
     setFindPin(pin);
-    const esc = escapeFindSelector(target.renderKey);
-    const el = scroller.querySelector(`[data-chat-virtual-key="${esc}"]`);
+    const el = pinnedFindElement(scroller, pin);
     if (el instanceof HTMLElement) {
       const row = el.getBoundingClientRect();
       follow.correctTo?.(scroller, scroller.scrollTop + (row.top - findViewTop(scroller)));
@@ -2399,6 +2973,8 @@ export function MessageList({
       ) : null}
       {paintedItems.map((item, paintedIndex) => {
         const key = itemKey(item);
+        const findCurrentHere = findCurrentTarget?.renderKey === key;
+        const findRowHit = findLookup.some((entry) => entry.key === key && entry.memberKeys.some((member) => findHitKeys.has(member)));
         const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
         const visibleIndex = paintStart + paintedIndex;
         const liveRow =
@@ -2421,11 +2997,11 @@ export function MessageList({
                 liveRow
                   ? "chat-virtual-item chat-timeline-row chat-timeline-row-live"
                   : "chat-virtual-item chat-timeline-row",
-                find && findCurrentKey === key && "ring-1 ring-accent/60",
-                find && findCurrentKey !== key && findHitKeys.has(key) && "bg-accent-soft/30",
+                find && findCurrentHere && "ring-1 ring-accent/60",
+                find && !findCurrentHere && findRowHit && "bg-accent-soft/30",
               )}
               data-chat-virtual-key={key}
-              data-find-current={find && findCurrentKey === key ? "" : undefined}
+              data-find-current={find && findCurrentHere ? "" : undefined}
               style={cachedHeight ? { containIntrinsicSize: `auto ${cachedHeight}px` } : undefined}
             >
               {renderItem(item)}
@@ -2440,6 +3016,7 @@ export function MessageList({
           style={{ height: bottomSpacerPx }}
         />
       ) : null}
+      {olderLiveStepsKey === null ? olderLiveStepsControl : null}
       {footer}
       {/* 回到底部 FAB。它是滚动内容(也是 ResizeObserver root)的子节点,所以必须
           **零高度、常驻挂载**,只用 opacity/pointer-events 切可见。若随 following
@@ -2470,6 +3047,8 @@ export function MessageList({
               if (!scrollParent || !followBottomRef?.jumpToBottom) return;
               pendingExpandCorrectionRef.current = null;
               viewportPreserveLockRef.current = false;
+              liveUnitsHoldRef.current = null;
+              liveUnitsSettleRef.current = null;
               lastViewportAnchorRef.current = null;
               followBottomRef.jumpToBottom(scrollParent);
               setShowScrollToBottom(shouldShowScrollToBottom(
