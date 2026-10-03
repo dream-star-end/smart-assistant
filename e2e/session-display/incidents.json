@@ -4795,7 +4795,8 @@
       "symptom": "上一条还在跑时，新消息被画进对话窗口。用户要的是输入框上方的待发送列表，右侧是修改和立即发送。",
       "rootFixCommit": "fc121930",
       "coverageCommits": [
-        "fc121930"
+        "fc121930",
+        "d4206e71"
       ],
       "regressions": [
         {
@@ -4807,6 +4808,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/QueuedSendList.test.tsx",
           "assertion": "对话流不渲染还在排队的用户消息"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/queued-send-app.node-test.mjs",
+          "assertion": "INC-20260923-QUEUE-ABOVE-COMPOSER: real App queues, edits and stops before send-now"
         }
       ]
     },
