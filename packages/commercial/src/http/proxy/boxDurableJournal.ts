@@ -22,7 +22,7 @@ import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { projectRootCliSession } from "./boxToolProgress.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES,
-  reserveBoxToolEcho } from "./boxToolCapacity.js";
+  reserveBoxToolEcho, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { authorityFromJournalCtx, consumePrepared, isContinuationConflict,
   PreparedConsumptionError, trustedIdentitiesBind,
   type AuthorityProjection, type PreparedContinuation,
@@ -36,6 +36,8 @@ import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
+/** OCV5-322: past this age (from its first active row) a run cannot be alive. */
+export const BOX_RUN_EXPIRED_AFTER_MS = BOX_TOOL_MAX_WALL_MS + 15 * 60 * 1000;
 
 export class BoxDurableJournalError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxDurableJournalError"; }
@@ -1048,10 +1050,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       // counted once per nonce:epoch. A malformed active row cannot be proven
       // to share a run, so it occupies one slot by itself (never NULL, never
       // merged) instead of blocking the whole account.
+      // OCV5-322: the Box supervisor kills every CLI at its --deadline
+      // (<= BOX_TOOL_MAX_WALL_MS after launch; a chain's rounds share one CLI).
+      // A run whose first active row is older than that plus a grace cannot
+      // still execute, so an unprovable unknown/handoff row no longer pins the
+      // session or eats account/user slots forever (#7da201bd: a 09:00 chain
+      // held its session for hours; 10-01 rows still held account 20).
       const occupied = await client.query<{ same_session: boolean;
         account_occupied: string; user_occupied: string; malformed_ids: string[] | null }>(
-        `WITH active AS (
-           SELECT request_id, user_id,
+        `WITH rows AS (
+           SELECT request_id, user_id, created_at,
              ctx->>'boxSessionId' AS session_id, ctx->>'boxAccountId' AS account_id,
              CASE WHEN COALESCE(ctx->>'boxRunNonce','') ~ '^[a-f0-9]{24}$'
                     AND COALESCE(ctx->>'boxLeaseEpoch','') ~ '^[a-f0-9]{32}$'
@@ -1065,7 +1073,11 @@ export class BoxDurableJournal implements BoxJournalPort {
                     AND ctx->>'boxSessionId' IS NOT NULL) AS malformed
            FROM request_finalize_journal
            WHERE ctx->>'boxState' = ANY($1::text[])
-             AND (ctx->>'boxAccountId' = $2 OR user_id = $3))
+             AND (ctx->>'boxAccountId' = $2 OR user_id = $3)),
+         active AS (
+           SELECT * FROM rows
+            WHERE run_key IN (SELECT run_key FROM rows GROUP BY run_key
+              HAVING MIN(created_at) > NOW() - make_interval(secs => $5::double precision)))
          SELECT
            COALESCE(bool_or(user_id = $3 AND session_id = $4), false) AS same_session,
            COUNT(DISTINCT run_key) FILTER (WHERE account_id = $2) AS account_occupied,
@@ -1073,7 +1085,7 @@ export class BoxDurableJournal implements BoxJournalPort {
            (array_agg(request_id ORDER BY request_id) FILTER (WHERE malformed))[1:5] AS malformed_ids
          FROM active`,
         [ACTIVE, input.accountId.toString(), input.uid.toString(),
-          input.fingerprint.sessionId]);
+          input.fingerprint.sessionId, BOX_RUN_EXPIRED_AFTER_MS / 1000]);
       const usage = occupied.rows[0];
       if (!usage || usage.same_session) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       if (usage.malformed_ids?.length) {
