@@ -58,6 +58,7 @@ import {
   readIdleOp,
   readPendingIdle,
   startIdleOp,
+  withIncarnationShutdown,
   writeIdleCandidate,
   writeIdleNative,
   writeIdleOp,
@@ -78,10 +79,11 @@ async function settleStrandedIdleOp(session: AgentSession, op: IdleOp, recoveryD
   const idleProof = await fetchBoxIdleProof({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey })
   // Same authoritative evidence as a live op; a missing native file alone
   // does not prove nothing was sent. Otherwise only the operator reset exits.
-  const reason = idleAbandonReason(op, idleProof)
+  const evidenced = withIncarnationShutdown(recoveryDir, op)
+  const reason = idleAbandonReason(evidenced, idleProof)
   if (!reason) return
   log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason })
-  writeSettledIdleOp(recoveryDir, { ...op, disposition: 'abandoned', abandonReason: reason })
+  writeSettledIdleOp(recoveryDir, { ...evidenced, disposition: 'abandoned', abandonReason: reason })
 }
 
 /** Persist an op; once settled, rotate old settled files for the session. */
@@ -4760,7 +4762,7 @@ export class SessionManager {
       frozenTail: [],
       attachments: [],
     })
-    let op = started.op
+    let op = withIncarnationShutdown(recoveryDir, started.op)
     if (idleOpSettled(op)) {
       clearIdleCandidate(recoveryDir, session.sessionKey)
       return
@@ -4880,6 +4882,22 @@ export class SessionManager {
           && receipt.digest === step.op.artifact.digest) {
           step = { ...step, op: { ...step.op, receiptDigest: receipt.digest } }
           clearIdleCandidate(recoveryDir, session.sessionKey)
+        }
+        // OCV5-319: CCB ends the idle turn normally when its summary request
+        // was refused (e.g. Box egress BOX_PARAMETER_UNMAPPED on the
+        // thinking-disabled compact fallback). No summary arrived and none can
+        // be re-dispatched, so this is the same "ended without result" as a
+        // thrown turn: shut the child down and record it, or the op never
+        // settles and every next message fails with IDLE_HISTORY_PENDING.
+        if (step.callModel && !step.op.summaryText && !idleOpSettled(step.op)
+          && !readIdleNative(recoveryDir, source.sessionId, proof.revision)?.summaryText) {
+          const killed = typeof session.runner.shutdown === 'function'
+            && await session.runner.shutdown().then(() => true, () => false)
+          if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
+          log.warn('box idle turn ended without result', {
+            sessionKey: session.sessionKey, revision: step.op.revision,
+            timeout: false, noSummary: true, runnerKilled: killed,
+          })
         }
       } catch (idleErr) {
         // Timeout, crash or error: never a result and never a re-dispatch
