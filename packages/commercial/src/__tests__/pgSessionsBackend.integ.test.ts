@@ -6868,6 +6868,89 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
   });
 
+  // OCV5-321 (#611729fb): same settled Box tape, but the live stream for the
+  // source message still holds tool_use + tool_result frames when finalize
+  // decides. Those leftovers must pair by id instead of reading as open tools.
+  maybe("OCV5-321 settled-tools checkpoint survives leftover live tool frames", async () => {
+    const sessionId = "s-ocv5-321-leftover";
+    const sourceClientMessageId = "cm-ocv5-321-leftover-source";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "add the tests",
+        ts: 1,
+        _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
+       VALUES ($1,$2,$3,$4,'gateway','live','interrupted')`,
+      [`legacy:621:${sessionKey}`, sessionId, CUSER, sourceClientMessageId],
+    );
+    const frames = [
+      [{ kind: "tool_use", blockId: "toolu_ocv5_321_read", toolName: "Read", partial: true }],
+      [{ kind: "tool_use", blockId: "toolu_ocv5_321_read", toolName: "Read", inputJson: { file_path: "a.ts" } }],
+      [{ kind: "tool_result", blockId: "toolu_ocv5_321_read:result",
+        toolUseBlockId: "toolu_ocv5_321_read", toolName: "Read", isError: false, output: "x" }],
+      [{ kind: "text", text: "Quick update: both changes are written." },
+        { kind: "tool_use", blockId: "toolu_ocv5_321_bash", toolName: "Bash", inputJson: { command: "ls" } }],
+      [{ kind: "tool_result", blockId: "toolu_ocv5_321_bash:result",
+        toolUseBlockId: "toolu_ocv5_321_bash", toolName: "Bash", isError: false, output: "a.ts" }],
+    ];
+    for (const [index, blocks] of frames.entries()) {
+      const payload = Buffer.from(JSON.stringify({
+        type: "outbound.message",
+        clientMessageId: sourceClientMessageId,
+        blocks,
+      }));
+      await pool.query(
+        `INSERT INTO client_session_live_frames
+           (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+         VALUES ($1,'gateway',621,$2,$3,$4,$5)`,
+        [`legacy:621:${sessionKey}`, sessionKey, index + 1, payload, sha256(payload)],
+      );
+    }
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "6".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "API Error: 409",
+      tools: [{
+        blockId: "toolu_ocv5_321_read",
+        toolName: "Read",
+        inputJson: { file_path: "a.ts" },
+        output: "x",
+        completed: true,
+      }, {
+        blockId: "toolu_ocv5_321_bash",
+        toolName: "Bash",
+        inputJson: { command: "ls" },
+        output: "a.ts",
+        completed: true,
+      }],
+      errorCode: "ENGINE_ERROR",
+      createdAt: 1_783_950_160_000,
+      usage: { inputTokens: 6, outputTokens: 872 },
+    }));
+    const jobs = await pool.query<{ recovery_mode: string }>(
+      `SELECT recovery_mode FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+      [UID, sessionId, sourceClientMessageId],
+    );
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
+  });
+
   maybe("silent liveness recovery resets native state once, then pauses the durable lineage", async () => {
     const sessionId = "s-dd-recovery-silent-streak";
     const sourceClientMessageId = "cm-dd-recovery-silent-source";
