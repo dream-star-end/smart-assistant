@@ -196,6 +196,23 @@ function toolUseIds(assistant: Record<string, unknown>): string[] | null {
   return ids.length > 0 && new Set(ids).size === ids.length ? ids : null;
 }
 
+/** Content-free shape of the last request messages for reject diagnostics:
+ * role and block types only (e.g. "user:tool_result+tool_result+text"). */
+export function boxRequestTailShape(body: ProxyBody, count = 3): string {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  return messages.slice(-count).map((message) => {
+    if (!record(message)) return typeof message;
+    const role = typeof message.role === "string" ? message.role.slice(0, 16) : "?";
+    const content = message.content;
+    const types = typeof content === "string" ? "string"
+      : Array.isArray(content) ? content.slice(0, 16).map((block) => record(block)
+        && typeof block.type === "string" ? block.type.slice(0, 24) : "?").join("+")
+        + (content.length > 16 ? `+…${content.length}` : "")
+      : typeof content;
+    return `${role}:${types}`;
+  }).join(" | ").slice(0, 400);
+}
+
 export function classifyBoxContinuation(body: ProxyBody): Pick<PreparedContinuation,
   "classification" | "rejectCode" | "effectiveBody" | "toolIds" | "priorContextHash" | "nextContextHash"> {
   let effective: ProxyBody;

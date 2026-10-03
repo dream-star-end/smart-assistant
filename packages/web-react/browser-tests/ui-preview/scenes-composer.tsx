@@ -14,6 +14,7 @@ import { AgentScopePicker, AgentScopeSummary } from '../../src/components/AgentS
 import { ChatHeader } from '../../src/components/ChatHeader'
 import { AttachChip, Composer } from '../../src/components/Composer'
 import { GoalDialog } from '../../src/components/GoalDialog'
+import { QueuedSendList } from '../../src/components/chat/QueuedSendList'
 import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
@@ -486,6 +487,39 @@ export const composerScenes: Scene[] = [
             <LongContextCostWarning />
           </div>
         </div>
+      </div>
+    ),
+  },
+  {
+    id: 'composer-queued-send',
+    label: '输入框上方待发送卡片（图标：修改 / 删除 / 立即发送）',
+    group: '工作区',
+    viewports: ['desktop', 'mobile'],
+    api: {},
+    render: () => (
+      <div className="flex min-h-screen flex-col justify-end bg-bg pb-6 text-fg">
+        <QueuedSendList
+          messages={[
+            { id: 'q1', role: 'user', ts: 1, status: 'queued', text: '继续' },
+            { id: 'q2', role: 'user', ts: 2, status: 'queued',
+              text: '顺便把排队发送的卡片也改成图标，并且加一个删除按钮，长文字要能正常截断显示' },
+          ]}
+          onEdit={() => {}}
+          onDelete={() => {}}
+          onSendNow={() => {}}
+        />
+        <Composer
+          draftKey="preview-queued"
+          onSend={() => {}}
+          onUpload={async () => ({ kind: 'image', url: '/api/media/x' })}
+          getVoiceToken={() => 'preview-token'}
+          onOpenRepo={() => {}}
+          repoSelection={null}
+          goal={null}
+          onSetGoal={async () => {}}
+          onGoalAction={async () => {}}
+          busy
+        />
       </div>
     ),
   },

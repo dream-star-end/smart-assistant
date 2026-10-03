@@ -64,6 +64,8 @@ import {
   resolveModelHistoryContextWindow,
   supportsAutomaticTurnRecovery,
   allowUnsafeAutomaticCheckpoint,
+  modelPlaneFailureAfterSettledTools,
+  SETTLED_TOOLS_CHECKPOINT_RETRY_MAX,
   shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
   shouldResetNativeSessionForRecovery,
@@ -2251,7 +2253,14 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
     });
     return done(declined("silent_no_progress", errorCode), paused);
   }
-  if (currentAttempt >= AUTOMATIC_TURN_RETRY_MAX) {
+  // OCV5-317: a checkpoint admitted only because every tool had settled keeps
+  // a short automatic budget (tools ran, so the old no-progress rule never
+  // overlaps this one).
+  const retryLimit = assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
+      modelPlaneFailureAfterSettledTools(errorCode, [...recoveryRecords, ...leftoverRecords])
+    ? SETTLED_TOOLS_CHECKPOINT_RETRY_MAX
+    : AUTOMATIC_TURN_RETRY_MAX;
+  if (currentAttempt >= retryLimit) {
     await appendRecoveryGiveUpTerminalCard(client, {
       sessionId: input.sessionId,
       sessionUserId: input.sessionUserId,

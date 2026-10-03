@@ -399,6 +399,42 @@ export function idleAbandonReason(op: IdleOp, idleProof: IdleProofResponse,
   return undefined
 }
 
+/**
+ * OCV5-319: wall-clock start of this runtime incarnation = PID 1 of our PID
+ * namespace (the container init; the host init after a reboot). Every CCB
+ * child of an earlier incarnation is gone, so it can no longer send a compact
+ * request. undefined when /proc is unreadable (no evidence, nothing settles).
+ */
+let incarnationStart: number | null | undefined
+export function runtimeIncarnationStartMs(): number | undefined {
+  if (incarnationStart !== undefined) return incarnationStart ?? undefined
+  incarnationStart = null
+  try {
+    const stat = readFileSync('/proc/1/stat', 'utf8')
+    // Fields after "pid (comm) " start at field 3; starttime is field 22.
+    const ticks = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19])
+    const btime = Number(/^btime (\d+)$/m.exec(readFileSync('/proc/stat', 'utf8'))?.[1])
+    // /proc reports starttime in USER_HZ, which Linux fixes at 100.
+    if (Number.isSafeInteger(ticks) && ticks >= 0 && Number.isSafeInteger(btime) && btime > 0) {
+      incarnationStart = btime * 1000 + ticks * 10
+    }
+  } catch { /* no evidence */ }
+  return incarnationStart ?? undefined
+}
+
+/**
+ * An unfinished op last written before this incarnation started belongs to a
+ * runner that died with the previous container/host: treat the incarnation
+ * start as its confirmed shutdown, so the usual grace + `not_found` proof can
+ * settle it instead of pinning the session on IDLE_HISTORY_PENDING forever.
+ */
+export function withIncarnationShutdown(dir: string, op: IdleOp,
+  start: number | undefined = runtimeIncarnationStartMs()): IdleOp {
+  if (typeof op.runnerKilledAt === 'number' || idleOpSettled(op) || start === undefined) return op
+  const written = mtimeOf(opPath(dir, op))
+  return written > 0 && written < start ? { ...op, runnerKilledAt: start } : op
+}
+
 export function abandonIdleOp(dir: string, op: IdleOp, reason: NonNullable<IdleOp['abandonReason']>): IdleOp {
   const abandoned: IdleOp = { ...op, disposition: 'abandoned', abandonReason: reason }
   writeIdleOp(dir, abandoned)

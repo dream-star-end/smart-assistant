@@ -112,6 +112,24 @@ function redactModelAuthorityRuntimeEvents(
 const CCB_EDE_CANCEL_DIAGNOSTIC_RE =
   /^\[ede_diagnostic\] result_type=(?:user|undefined) last_content_type=n\/a stop_reason=(?:null|tool_use)$/
 
+/** OCV5-315 (#72191544): egress answers a deterministic Box continuation
+ * reject (409 BOX_*, "continuation rejected") before any Box call. Claude
+ * Code ends the turn on it, but the Box CLI that handed off the tool calls is
+ * still parked waiting for their results, holding the account slot. Its idle
+ * proof then stays pending, so the session's idle candidate blocks every next
+ * message with IDLE_HISTORY_PENDING ("消息未开始处理"). Only this exact
+ * reject qualifies; transient Box errors keep their own recovery. */
+const BOX_CONTINUATION_REJECTED =
+  /^API Error: 409 \{"error":\{"code":"BOX_[A-Z0-9_]{1,64}","message":"continuation rejected"\}/
+
+export function isBoxContinuationRejectedDetail(errorDetail: string | undefined): boolean {
+  if (!errorDetail || !errorDetail.includes('continuation rejected')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(errorDetail) } catch { return false }
+  const result = (parsed as { result?: unknown } | null)?.result
+  return typeof result === 'string' && BOX_CONTINUATION_REJECTED.test(result)
+}
+
 export function isCcbUserCancellationDiagnostic(
   errorDetail: string | undefined,
   stopReason: string | null | undefined,
@@ -509,6 +527,9 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         // activeTurn 仍指向本 turn 才清(防 stale end 误清后继 turn)。
         if (this._activeTurn === ctx) this._activeTurn = null
         ctx.stopLeaseRenewal?.()
+        if (result?.isError && isBoxContinuationRejectedDetail(result.errorDetail)) {
+          this._notifyBoxStop(ctx, 'continuation_rejected')
+        }
         resolveSummary(
           result
             ? buildTurnSummary(
@@ -742,22 +763,26 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
     log.warn('dropped unattributable bash_output_tail (fail-closed)', { toolUseId })
   }
 
+  /** Settle this turn's Box chain through the internal Stop route, once.
+   * Browser Stop is explicit; an ordinary provider HTTP disconnect never
+   * calls this notifier. The gateway owns it beyond the CLI interrupt. */
+  private _notifyBoxStop(turn: CcbTurnContext, cause: 'user' | 'continuation_rejected'): void {
+    const nativeSessionId = this.runner.sessionId
+    if (turn.boxStopNotified || this.model !== 'box-api-claude-opus-5-5'
+      || !turn.turnKey || !nativeSessionId) return
+    turn.boxStopNotified = true
+    this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
+      turnKey: turn.turnKey }).then((outcome) => {
+      if (outcome === 'skipped') log.warn('box_user_stop_notification_skipped', { cause })
+      else if (cause !== 'user') log.info('box_stop_after_continuation_reject', { outcome })
+    }).catch(() => {
+      log.warn('box_user_stop_notification_pending', { cause })
+    })
+  }
+
   interrupt(reason: 'user' | 'system' = 'system'): boolean {
     const active = this._activeTurn
-    const nativeSessionId = this.runner.sessionId
-    if (reason === 'user' && active && !active.boxStopNotified
-      && this.model === 'box-api-claude-opus-5-5'
-      && active.turnKey && nativeSessionId) {
-      active.boxStopNotified = true
-      // Browser Stop is explicit; an ordinary provider HTTP disconnect never
-      // calls this notifier. The gateway owns it beyond the CLI interrupt.
-      this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,
-        turnKey: active.turnKey }).then((outcome) => {
-        if (outcome === 'skipped') log.warn('box_user_stop_notification_skipped')
-      }).catch(() => {
-        log.warn('box_user_stop_notification_pending')
-      })
-    }
+    if (reason === 'user' && active) this._notifyBoxStop(active, 'user')
     this._interrupting = true
     if (this._activeTurn) this._activeTurn = null
     return this.runner.interrupt()

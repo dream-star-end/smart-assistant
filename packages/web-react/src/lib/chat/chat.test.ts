@@ -9716,6 +9716,23 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
     expect(sock.sessions.get("s1")!.messages.find((m) => m.role === "user")?.status).toBe("queued");
   });
 
+  test("OCV5-316 deleting a queued message drops it from the queue and it is never sent", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true); // connecting: both dispatches wait in the offline queue
+    const ws = FakeWS.instances.at(-1)!;
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "keep" });
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "drop" });
+    const drop = sock.sessions.get("s1")!.messages.find((m) => m.role === "user" && m.text === "drop")!;
+    expect(sock.discardQueuedMessage("s1", drop.id)).toBe(true);
+    expect(sock.discardQueuedMessage("s1", drop.id)).toBe(false);
+    expect(sock.offlineQueue.map((i) => i.payload.content.text)).toEqual(["keep"]);
+    expect(sock.sessions.get("s1")!.messages.some((m) => m.id === drop.id)).toBe(false);
+    ws.open();
+    const sent = ws.sent.map((raw) => JSON.parse(raw)).filter((payload) => payload.type === "inbound.message");
+    expect(sent.some((payload) => payload.clientMessageId === drop.id)).toBe(false);
+  });
+
   test("offline replay keeps attempt 0 and the exact original idempotency key", () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);

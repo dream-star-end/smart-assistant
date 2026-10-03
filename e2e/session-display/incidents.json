@@ -5779,6 +5779,111 @@
           "assertion": "live status is single and readable in both themes and accessibility media"
         }
       ]
+    },
+    {
+      "id": "INC-20261003-BOX-PARALLEL-SKILL-BODIES",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #72191544（v5-0d0c1359a，01:14Z）：Box Claude Opus 5.5 在同一步并行调用两个 Skill，Claude Code 为每个 launch 注入一段 SKILL.md 正文；OCV5-303 的折叠只认恰好一个 Skill，两段正文留在 tool_result 消息里，egress 以 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝续接，用户看到『任务执行暂时中断』。修复：多个 Skill 时按每段正文自己的『Base directory for this skill: …/<name>』归到同名 launch（紧跟各自结果、全部结果之后、或后续纯文本 user 消息均可）；无法归属的仍不折叠、仍 409。",
+      "rootFixCommit": "8057d0eb",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-314 parallel Skill bodies each join their own launch, in any layout"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-314 unattributable parallel Skill text is not folded"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "#72191544 被 409 续接拒绝结束后，同会话再发『继续』显示『消息未开始处理 / 已确认未计费』：网关 submit 抛 IDLE_HISTORY_PENDING。被拒请求从未到 Box，交出工具调用的 Box CLI 仍挂起等结果（占账号槽），idle proof 恒 pending/unsettled，会话 idle 候选挡住之后每条消息直到 CLI 数小时后超时。修复：Box 回合的 CCB result 恰为 egress『continuation rejected』409（BOX_*）时，CCB adapter 每回合一次走与浏览器停止相同的内部 Box stop，链收为已证明停止的失败，proof=failed，候选清除，下一条消息正常开始；瞬时 Box 错误不匹配。",
+      "rootFixCommit": "6dd199c8",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-315 a Box continuation reject settles the parked Box turn once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-315 only the exact continuation reject qualifies"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-SKILL-BUDGET-TAIL",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #b6df9aee（v5-ecfded4f0，03:09Z）：Box Claude Opus 5.5 同一步并行 Bash + Skill 后，egress 以 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝续接，红卡『模型服务暂时中断』。用真实 Claude Code 2.1.280 对接抓包上游复现：CCB 在工具结果消息后追加 system『<total_tokens>…</total_tokens>』预算尾；该尾只在紧邻纯 tool_result 消息时被剥离，而 Skill 正文折叠发生在剥离之后，尾巴留下 → 拒绝。修复：先剥离、再折叠 Skill 正文、再剥离一次；未批准的 system 尾仍拒绝；拒绝时记录无内容的尾部形状日志。",
+      "rootFixCommit": "15a6d2a5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-317 a Skill step followed by the CCB budget system tail continues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
+          "assertion": "OCV5-317 reject diagnostics carry the tail shape without content"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-SETTLED-TOOLS-MANUAL-RESUME",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "#b6df9aee 中断后没有自动恢复，只能手点『从断点继续』：master 判 checkpoint_unsafe。回合 Read（有 read_only 证明）、Bash、Skill 均已完成并有结果，随后下一次模型调用 ENGINE_ERROR；自动断点续接要求每个工具都有网关副作用证明，Bash 永远没有，于是所有用过 Bash 的 Box Claude 回合遇模型错误都停在手动卡。修复：模型面错误（upstream_failed/error/timeout、network_error、rate_limited、model_capacity、engine_error）且所有工具/委派/权限都已收口、每个 tool_use 都有完成记录时，允许自动断点续接（续接不重跑工具，提示词要求先查可观察状态）；此类自动续接最多 3 次；未完成/未知工具、runner 丢失、服务重启仍走原规则。",
+      "rootFixCommit": "f3c91504",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
+          "assertion": "allows automatic checkpoint continuation for the live tape"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
+          "assertion": "keeps any open tool, delegate or permission on the manual path"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-317 finalize schedules a checkpoint after settled Bash/Skill and a model-plane error"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "SIDEBAR-R1 发布（rel-83425ac39，06:01Z）前后，Box Claude Opus 5.5 会话每条消息都出『消息未开始处理 / 已确认未计费，请重试』（turn_dispatches 05:58/06:03/06:05Z DISPATCH_NOT_ACCEPTED，容器 IDLE_HISTORY_PENDING）。05:42 该会话的空闲压缩开始：CCB 分叉压缩调用未产出可用摘要，回落到关闭 thinking 的请求，带 temperature:1，被 Box 闸门以 BOX_PARAMETER_UNMAPPED 拒绝（egress 05:43:23）。CCB 把被拒的摘要请求当作正常回合结束，空闲 op 既无摘要也未走异常分支，runner 未关停、无 runnerKilledAt，not_found 证明永远无法结案，会话被钉死直到人工重置（06:02 容器重建也无效）。修复：已派发却无摘要结束的空闲回合同样关停 runner 并记录 runnerKilledAt；早于当前运行时化身（PID 1 启动：容器重建/主机重启）写入的未结 op 以化身启动时间作为关停证据，宽限期后 not_found 结案为 idle_turn_never_sent，不丢原生上下文。",
+      "rootFixCommit": "599ce66b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
+          "assertion": "a normal turn end with no summary shuts the runner down and records it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
+          "assertion": "the incident shape: an op stranded by a previous container settles on the next submit"
+        }
+      ]
     }
   ]
 }
