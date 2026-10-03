@@ -115,6 +115,8 @@ export type UseChatSocket = {
   }) => void;
   /** 排队中的消息收回输入框，并从发送队列拿掉。 */
   editQueuedMessage: (sessId: string, msgId: string) => string | undefined;
+  /** 排队中的消息直接删掉，不发了。 */
+  discardQueuedMessage: (sessId: string, msgId: string) => boolean;
   /** 停掉当前轮，马上发送这条已排队的消息。 */
   sendQueuedNow: (sessId: string, msgId: string) => void;
   /** 告知当前选中会话（S1 对账无条件优先拉它）。*/
@@ -779,6 +781,10 @@ export function useChatSocket(opts: {
     (sessId, msgId) => socket.editQueuedMessage(sessId, msgId),
     [socket],
   );
+  const discardQueuedMessage = useCallback<UseChatSocket["discardQueuedMessage"]>(
+    (sessId, msgId) => socket.discardQueuedMessage(sessId, msgId),
+    [socket],
+  );
   const sendQueuedNow = useCallback<UseChatSocket["sendQueuedNow"]>(
     (sessId, msgId) => socket.sendQueuedNow(sessId, msgId),
     [socket],
@@ -1150,6 +1156,7 @@ export function useChatSocket(opts: {
       retryMessage,
       continueInterruptedTurn,
       editQueuedMessage,
+      discardQueuedMessage,
       sendQueuedNow,
       setActiveSession,
       setGoalState,
@@ -1191,6 +1198,7 @@ export function useChatSocket(opts: {
       retryMessage,
       continueInterruptedTurn,
       editQueuedMessage,
+      discardQueuedMessage,
       sendQueuedNow,
       setActiveSession,
       setGoalState,

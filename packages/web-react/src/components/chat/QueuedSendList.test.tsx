@@ -12,17 +12,35 @@ function user(partial: Partial<ChatMessage> & Pick<ChatMessage, "id" | "text">):
 }
 
 describe("待发送列表", () => {
-  test("钉在输入框上方的卡片右侧有修改和立即发送，不把排队消息画进对话", () => {
+  test("钉在输入框上方的卡片右侧是修改、删除、立即发送三个图标按钮，不把排队消息画进对话", () => {
     const onEdit = vi.fn();
+    const onDelete = vi.fn();
     const onSendNow = vi.fn();
     const waiting = user({ id: "wait", text: "等上一轮结束再发", status: "queued" });
-    render(<QueuedSendList messages={[waiting]} onEdit={onEdit} onSendNow={onSendNow} />);
+    render(<QueuedSendList messages={[waiting]} onEdit={onEdit} onDelete={onDelete} onSendNow={onSendNow} />);
     expect(screen.getByTestId("queued-send-list")).toBeInTheDocument();
     expect(screen.getByText("等上一轮结束再发")).toBeInTheDocument();
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual(["修改", "删除", "立即发送"]);
+    // OCV5-316: icons only, no text labels inside the buttons
+    for (const button of buttons) {
+      expect(button.textContent).toBe("");
+      expect(button.querySelector("svg")).not.toBeNull();
+      expect(button).toHaveAttribute("title", button.getAttribute("aria-label"));
+    }
     screen.getByRole("button", { name: "修改" }).click();
+    screen.getByRole("button", { name: "删除" }).click();
     screen.getByRole("button", { name: "立即发送" }).click();
     expect(onEdit).toHaveBeenCalledWith(waiting);
+    expect(onDelete).toHaveBeenCalledWith(waiting);
     expect(onSendNow).toHaveBeenCalledWith(waiting);
+  });
+
+  test("没有删除回调时不画删除按钮", () => {
+    const waiting = user({ id: "wait", text: "排队", status: "queued" });
+    render(<QueuedSendList messages={[waiting]} onEdit={() => {}} onSendNow={() => {}} />);
+    expect(screen.queryByRole("button", { name: "删除" })).toBeNull();
+    expect(screen.getAllByRole("button")).toHaveLength(2);
   });
 
   test("对话流不渲染还在排队的用户消息", () => {

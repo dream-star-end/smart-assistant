@@ -5960,6 +5960,11 @@ export class ChatSocket {
     return text;
   }
 
+  /** Drop a not-yet-sent message from the queue without sending it. */
+  discardQueuedMessage(sessId: string, msgId: string): boolean {
+    return this.editQueuedMessage(sessId, msgId) !== undefined;
+  }
+
   /**
    * Send one queued message now. If a turn is still running, stop it first.
    * Stop normally holds later messages; this click is the explicit send.

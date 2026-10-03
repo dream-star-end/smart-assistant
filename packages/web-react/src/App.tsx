@@ -2573,6 +2573,10 @@ export function App() {
           : (m.text || "");
         setComposerPrefill({ text, nonce: Date.now() });
       },
+      onDeleteQueued: (m) => {
+        if (!activeId) return;
+        sockRef.current?.discardQueuedMessage(activeId, m.id);
+      },
       onSendQueuedNow: (m) => {
         if (!activeId) return;
         sockRef.current?.sendQueuedNow(activeId, m.id);
@@ -3924,6 +3928,7 @@ export function App() {
             <QueuedSendList
               messages={queuedOutgoing}
               onEdit={(message) => cardCallbacks.onEditQueued?.(message)}
+              onDelete={(message) => cardCallbacks.onDeleteQueued?.(message)}
               onSendNow={(message) => cardCallbacks.onSendQueuedNow?.(message)}
             />
           )}

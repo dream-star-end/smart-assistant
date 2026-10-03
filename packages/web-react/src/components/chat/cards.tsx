@@ -127,6 +127,8 @@ export type CardCallbacks = {
   onEditResend?: (msg: ChatMessage) => void;
   /** 排队中的消息：收回输入框，并从队列里拿掉，避免稍后又自动发出。 */
   onEditQueued?: (msg: ChatMessage) => void;
+  /** 排队中的消息：直接从队列里删掉，不发了。 */
+  onDeleteQueued?: (msg: ChatMessage) => void;
   /** 排队中的消息：停掉当前这轮，马上发这一条。 */
   onSendQueuedNow?: (msg: ChatMessage) => void;
   /** 打开顶栏模型选择器（红卡「切换模型」）。 */
