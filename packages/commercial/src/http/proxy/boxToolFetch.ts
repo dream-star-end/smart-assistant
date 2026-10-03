@@ -88,10 +88,9 @@ export class BoxToolFetch {
    * and let this request continue it as a fresh invocation. Returns false,
    * keeping the original rejection, unless all of that is proven. */
   private async releaseOrphanedExchange(args: FetchArgs, error: unknown): Promise<boolean> {
-    const journal = this.deps.journal;
-    if (!(error instanceof Error) || (error as { code?: unknown }).code !== "BOX_TOOL_OWNER_UNKNOWN"
-      || !this.deps.stopOrphanRun || !journal.findOrphanToolHandoff
-      || !journal.claimOrphanRecovery || !journal.releaseOrphanRecovery) return false;
+    if (!(error instanceof Error) || (error as { code?: unknown }).code !== "BOX_TOOL_OWNER_UNKNOWN") {
+      return false;
+    }
     let toolIds: readonly string[], sessionId: string, turnKey: string;
     try {
       const classified = classifyBoxContinuation(args.canonicalBody);
@@ -99,20 +98,47 @@ export class BoxToolFetch {
       if (classified.classification !== "continuation_candidate") return false;
       toolIds = classified.toolIds; sessionId = fingerprint.sessionId; turnKey = fingerprint.turnKey;
     } catch { return false; }
-    const orphan = await journal.findOrphanToolHandoff({ uid: args.uid, sessionId, turnKey, toolIds });
+    return await this.releaseOrphan(args, { toolIds, sessionId, turnKey }) === "released";
+  }
+
+  /** OCV5-322: an answered exchange arrives together with a new prompt. It may
+   * run fresh only when no handoff of this turn still waits for the results
+   * and any orphaned earlier handoff is claimed and proven stopped first. */
+  private async admitAnsweredExchange(args: FetchArgs, toolIds: readonly string[]): Promise<void> {
+    const journal = this.deps.journal;
+    let sessionId: string, turnKey: string;
+    try {
+      ({ sessionId, turnKey } = deriveBoxCallFingerprint(args.uid, args.canonicalBody));
+    } catch {
+      throw new BoxContinuationDecisionError("reject", "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    }
+    if (!journal.hasWaitingToolHandoff
+      || await journal.hasWaitingToolHandoff({ uid: args.uid, sessionId, turnKey, toolIds })
+      || await this.releaseOrphan(args, { toolIds, sessionId, turnKey }) === "held") {
+      throw new BoxContinuationDecisionError("reject", "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    }
+  }
+
+  private async releaseOrphan(args: FetchArgs, exchange: { toolIds: readonly string[];
+    sessionId: string; turnKey: string }): Promise<"released" | "none" | "held"> {
+    const journal = this.deps.journal;
+    if (!this.deps.stopOrphanRun || !journal.findOrphanToolHandoff
+      || !journal.claimOrphanRecovery || !journal.releaseOrphanRecovery) return "held";
+    const orphan = await journal.findOrphanToolHandoff({ uid: args.uid, ...exchange });
     if (orphan.kind === "claimed") throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
-    if (orphan.kind !== "orphan") return false;
+    if (orphan.kind === "none") return "none";
+    if (orphan.kind !== "orphan") return "held";
     const claim = { requestId: orphan.identity.requestId, uid: args.uid, by: args.requestId };
     if (!(await journal.claimOrphanRecovery({ ...claim,
       ...(orphan.staleClaim ? { replacing: orphan.staleClaim } : {}) }))) {
       throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
     }
-    if (orphan.stopped) return true;
+    if (orphan.stopped) return "released";
     let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
     try { outcome = await this.deps.stopOrphanRun(orphan.identity); } catch { /* unproven */ }
-    if (outcome === "stopped_proven") return true;
+    if (outcome === "stopped_proven") return "released";
     await journal.releaseOrphanRecovery(claim).catch(() => {});
-    return false;
+    return "held";
   }
 
   private own(nonce: string, target: BoxResolvedTarget, uid: bigint,
@@ -456,7 +482,15 @@ export class BoxToolFetch {
         void (async () => {
           let published: BoxToolPublishedResume | null = null;
           let resumeToolResults = false;
-          if (routeClass(args) === "continuation_candidate") {
+          const route = routeClass(args);
+          const answered = route === "fresh" ? (args.prepared
+            ? args.prepared.answeredToolIds
+            : classifyBoxContinuation(args.canonicalBody).answeredToolIds) : undefined;
+          if (answered?.length) {
+            await this.admitAnsweredExchange(args, answered);
+            resumeToolResults = true;
+          }
+          if (route === "continuation_candidate") {
             try {
             published = await (this.deps.publishResume
               ?? publishBoxToolResume)({ ...args, init }, {

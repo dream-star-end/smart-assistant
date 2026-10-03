@@ -183,14 +183,27 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   }
   let current = messages[currentIndex]!;
   let resumed = false;
+  let prompt: Block[] | null = null;
   if (blocks(current.content).some((block) => block.type === "tool_result")) {
     // OCV5-304: Claude Code 2.1.280 drops a stdin tool_result that answers a
     // snapshot's dangling tool_use. Stage the complete exchange as history and
     // continue with Claude Code's own resume sentence; the pairing check below
     // still requires every tool_use to be answered exactly once.
-    if (!args.resumeToolResults
-      || !blocks(current.content).every((block) => block.type === "tool_result")) {
+    // OCV5-322: results followed only by text are that exchange plus a new
+    // prompt (Claude Code merged them); the text becomes the stdin prompt.
+    const all = Array.isArray(current.content) ? current.content : [];
+    const cut = all.findIndex((block) => blocks([block])[0]?.type !== "tool_result");
+    const tail = cut < 0 ? [] : all.slice(cut);
+    const textTail = tail.length > 0 && tail.every((block) => {
+      const [item] = blocks([block]);
+      return item?.type === "text" && typeof item.text === "string" && item.text.trim().length > 0;
+    });
+    if (!args.resumeToolResults || cut === 0 || (tail.length > 0 && !textTail)) {
       throw new BoxMessagesShapeError("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    }
+    if (textTail) {
+      prompt = tail as Block[];
+      current = { ...current, content: all.slice(0, cut) };
     }
     resumed = true;
   }
@@ -202,7 +215,7 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   const history = messages.slice(0, currentIndex).filter((message) => message.role !== "system");
   if (resumed) {
     history.push(current);
-    current = { ...current, content: BOX_CLI_RESUME_PROMPT };
+    current = { ...current, content: prompt ?? BOX_CLI_RESUME_PROMPT };
   }
   const pending = new Set<string>();
   for (const message of history) {

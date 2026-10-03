@@ -11,6 +11,20 @@ import { rehydrateBoxToolCatalog } from "./boxToolCatalog.js";
 import { observeBoxToolTerminalOnly } from "./boxToolTerminalRecovery.js";
 import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
+import { rootLogger } from "../../logging/logger.js";
+
+const workerLog = rootLogger.child({ subsys: "box-cleanup-worker" });
+
+/** OCV5-322: content-free reason why a stop probe stayed pending. */
+function probeFailureTag(error: unknown): { reason: string; cause?: string } {
+  if (!(error instanceof Error)) return { reason: "non_error" };
+  const code = (error as { code?: unknown }).code;
+  const causeTag = (error as { causeTag?: unknown }).causeTag;
+  const reason = typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code) ? code
+    : /^[A-Z0-9_]{1,64}$/.test(error.message) ? error.message
+    : error.name.replace(/[^A-Za-z0-9_]/g, "").slice(0, 48) || "error";
+  return typeof causeTag === "string" ? { reason, cause: causeTag.slice(0, 120) } : { reason };
+}
 
 type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
@@ -120,7 +134,13 @@ export class BoxRemoteCleanupWorker {
         if (candidate.linked) await journal.markToolChainStoppedFailure(stop);
         else await journal.markFirstRoundStoppedFailure(stop);
         recovered++;
-      } catch { pending++; }
+      } catch (error) {
+        pending++;
+        // OCV5-322: a probe that can never resolve held a session for hours
+        // without a trace; every retry (2 min apart) now says why.
+        workerLog.warn("box_stop_probe_pending", { requestId: candidate.requestId,
+          accountId: candidate.accountId.toString(), ...probeFailureTag(error) });
+      }
       finally { if (target) await this.closeLocal(target); }
     }
     return { recovered, pending };

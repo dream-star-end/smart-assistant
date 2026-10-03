@@ -65,6 +65,7 @@ import {
   supportsAutomaticTurnRecovery,
   allowUnsafeAutomaticCheckpoint,
   modelPlaneFailureAfterSettledTools,
+  emptyRecoveryRepeatsModelPlaneFailure,
   SETTLED_TOOLS_CHECKPOINT_RETRY_MAX,
   shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
@@ -2272,8 +2273,15 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // OCV5-317: a checkpoint admitted only because every tool had settled keeps
   // a short automatic budget (tools ran, so the old no-progress rule never
   // overlaps this one).
-  const retryLimit = assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
-      modelPlaneFailureAfterSettledTools(errorCode, [...recoveryRecords, ...leftoverRecords])
+  // OCV5-322: an empty automatic recovery that failed on the model plane
+  // again is deterministic too (#7da201bd: ten 409s in twenty seconds).
+  const retryLimit = (assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
+      modelPlaneFailureAfterSettledTools(errorCode, [...recoveryRecords, ...leftoverRecords])) ||
+      emptyRecoveryRepeatsModelPlaneFailure({
+        errorCode,
+        currentAttempt,
+        records: [...recoveryRecords, ...leftoverRecords],
+      })
     ? SETTLED_TOOLS_CHECKPOINT_RETRY_MAX
     : AUTOMATIC_TURN_RETRY_MAX;
   if (currentAttempt >= retryLimit) {

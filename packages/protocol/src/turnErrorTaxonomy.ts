@@ -389,6 +389,33 @@ export function modelPlaneFailureAfterSettledTools(
   return sawTool && [...observed].every((id) => settled.has(id))
 }
 
+/** Claude Code's own "API Error: <status> …" result row: the CLI reports a
+ * failed request as an assistant message, but no model produced it. */
+function isCliApiErrorRow(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const row = value as Record<string, unknown>
+  return row.role === 'assistant' && typeof row.text === 'string' &&
+    /^API Error: [1-5][0-9]{2}\b/.test(row.text.trim())
+}
+
+/** OCV5-322: an automatic recovery that failed with a model-plane error
+ * before any model output (only the CLI's own "API Error" row) is repeating a
+ * deterministic failure; it gets the short settled-tools budget instead of
+ * ten back-to-back retries. */
+export function emptyRecoveryRepeatsModelPlaneFailure(input: {
+  errorCode: string
+  currentAttempt: number
+  records: readonly unknown[]
+}): boolean {
+  if (input.currentAttempt < 1) return false
+  if (!MODEL_PLANE_CHECKPOINT_CODES.has(normalizeTurnErrorCode(input.errorCode))) return false
+  // Its text is not output; any usage it carries still counts as progress.
+  return !hasMeaningfulAutomaticRecoveryProgress(
+    input.records.map((record) => isCliApiErrorRow(record)
+      ? { ...(record as Record<string, unknown>), text: '' } : record),
+  )
+}
+
 /** Call this *before* the `checkpoint && !checkpointSafe` bypass.
  * Safe checkpoints with live official-cc output still schedule `--resume`
  * (OCV5-241). Only SERVICE_RESTART is gated; other completed-error

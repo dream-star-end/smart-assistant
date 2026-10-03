@@ -6951,6 +6951,60 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
   });
 
+  // OCV5-322 (#7da201bd): every automatic 「从断点继续」 failed within a second
+  // with the same Box 409; the only record was Claude Code's own "API Error"
+  // row. Such an empty repeat gets the short budget, not ten attempts.
+  for (const [attempt, scheduled] of [[2, true], [3, false]] as const) {
+    maybe(`OCV5-322 empty automatic recovery attempt ${attempt} ${scheduled ? "retries" : "stops"}`, async () => {
+      const sessionId = `s-ocv5-322-empty-${attempt}`;
+      const root = `cm-ocv5-322-root-${attempt}`;
+      const sourceClientMessageId = turnRecoveryAttemptIdentity(sessionId, root, attempt).clientMessageId;
+      const admission = await backend.admitUserTurn(admitInput({
+        sessionId,
+        clientMessageId: sourceClientMessageId,
+        billingRequestId: `brq-${sourceClientMessageId}`,
+        message: {
+          id: sourceClientMessageId,
+          role: "user",
+          text: "继续完成刚才因临时异常中断的任务。",
+          ts: 1,
+          _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+          _automaticRecovery: true,
+          _automaticRecoveryAttempt: attempt,
+          _automaticRecoveryRootClientMessageId: root,
+          _recoveryOfClientMessageId: root,
+        } as MessageLike & { id: string },
+      }));
+      assert.equal(admission.kind, "admitted");
+      await stageAndFinalize(CUSER, buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: "completed",
+        turnKey: (attempt === 2 ? "8" : "9").repeat(64),
+        clientMessageId: sourceClientMessageId,
+        text: "API Error: 409 {\"error\":{\"code\":\"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION\"}}",
+        errorCode: "ENGINE_ERROR",
+        createdAt: 1_783_950_170_000 + attempt,
+        usage: { inputTokens: 0, outputTokens: 0 },
+        // the CLI's own result event, as on the live tape
+        runtimeEvents: [{
+          ordinal: 1,
+          observedAt: 1_783_950_170_100,
+          source: "ccb",
+          payload: { type: "result", is_error: true, num_turns: 1 },
+        }],
+      }));
+      const jobs = await pool.query<{ semantic_recovery_attempt: number }>(
+        `SELECT semantic_recovery_attempt FROM turn_recovery_jobs
+          WHERE user_id=$1 AND session_id=$2`,
+        [UID, sessionId],
+      );
+      assert.deepEqual(jobs.rows.map((row) => row.semantic_recovery_attempt),
+        scheduled ? [attempt + 1] : []);
+    });
+  }
+
   maybe("silent liveness recovery resets native state once, then pauses the durable lineage", async () => {
     const sessionId = "s-dd-recovery-silent-streak";
     const sourceClientMessageId = "cm-dd-recovery-silent-source";

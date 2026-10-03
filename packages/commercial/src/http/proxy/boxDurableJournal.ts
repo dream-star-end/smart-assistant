@@ -427,6 +427,23 @@ export class BoxDurableJournal implements BoxJournalPort {
    * stopped ("failed_stopped"). "claimed" when another recovery owns it,
    * "live" when it cannot be proven finished, "none" when no such record.
    */
+  /** OCV5-322: a handoff of this very turn still waits for exactly these
+   * tool results, so the request is a live continuation, never a fresh run. */
+  async hasWaitingToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
+    toolIds: readonly string[] }): Promise<boolean> {
+    const want = [...input.toolIds].sort().join(",");
+    const rows = await this.pool.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
+          AND ctx->>'boxState'='handoff'
+          AND state IN ('inflight','finalizing','committed')`,
+      [input.uid.toString(), input.sessionId, input.turnKey]);
+    return rows.rows.some((row) => {
+      const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
+      return handoff === null || handoff.toolUses.map((use) => use.id).sort().join(",") === want;
+    });
+  }
+
   async findOrphanToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
     toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" } | { kind: "claimed" }
     | { kind: "orphan"; stopped: boolean; staleClaim?: string; identity: { requestId: string;
