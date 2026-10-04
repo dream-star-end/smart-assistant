@@ -122,9 +122,14 @@ test("cross-process lock holder prevents close from passing an active writer", a
       `${controlDir}/lock`], { stdio: ["ignore", "pipe", "pipe"] });
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("lock holder did not start")), 2000);
-      holder!.stdout!.once("data", (data: Buffer) => {
+      // `python3 -u` writes the word and the newline separately; under load
+      // they arrive as two chunks, so read up to the line end.
+      let seen = "";
+      holder!.stdout!.on("data", (data: Buffer) => {
+        seen += data.toString();
+        if (!seen.includes("\n")) return;
         clearTimeout(timer);
-        data.toString() === "locked\n" ? resolve() : reject(new Error("bad lock handshake"));
+        seen === "locked\n" ? resolve() : reject(new Error("bad lock handshake"));
       });
       holder!.once("exit", (code) => { clearTimeout(timer);
         reject(new Error(`lock holder exited ${code}`)); });
