@@ -107,6 +107,15 @@ function sh(cwd: string, command: string, args: string[]): string {
  * tree, env file, cutover root and lock, and the stand-in programs. */
 function capsule() {
   const root = mkdtempSync(join(tmpdir(), "ocv5-308-grok-"));
+  // the directory is this function's to remove until it hands the capsule over
+  try {
+    return furnish(root);
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+function furnish(root: string) {
   const write = (path: string, content: string, mode = 0o600) => {
     mkdirSync(join(root, path, ".."), { recursive: true });
     writeFileSync(join(root, path), content, { mode });
@@ -138,8 +147,10 @@ function capsule() {
     write, remove: () => rmSync(root, { recursive: true, force: true }) };
 }
 
+type Capsule = ReturnType<typeof furnish>;
+
 /** Source the real deploy-v5.sh and call one of its functions with DRY=0. */
-function consumer(box: ReturnType<typeof capsule>, grok: string, unit: "active" | "inactive", call: string) {
+function consumer(box: Capsule, grok: string, unit: "active" | "inactive", call: string) {
   box.resetCalls();
   const harness = `set -euo pipefail
 export V5_DEPLOY_SOURCE_ONLY=1
@@ -171,7 +182,7 @@ const current = `grok ${MINIMUM} (capsule)`;
 const previous = "grok 1.0.5 (previous commercial image)";
 
 // The image that is about to be put in service is checked while v5 is still online.
-function proveOfflinePrepare(box: ReturnType<typeof capsule>): string {
+function proveOfflinePrepare(box: Capsule): string {
   const call = `CUTOVER_TARGET_IMAGE='${IMAGE}'; CUTOVER_NONCE='${NONCE}'; prepare_offline_cutover`;
   box.resetEnv();
   const old = consumer(box, previous, "active", call);
@@ -191,7 +202,7 @@ function proveOfflinePrepare(box: ReturnType<typeof capsule>): string {
 }
 
 // The online slim image switch.
-function proveOnlineImage(box: ReturnType<typeof capsule>): string {
+function proveOnlineImage(box: Capsule): string {
   box.write("remote/commercial-v5.env", `OC_RUNTIME_IMAGE=${OLD_IMAGE}\nOC_RUNTIME_RELEASE=/runtime/current\nDATABASE_URL=capsule\n`);
   const call = `TARGET_RUNTIME_IMAGE='${IMAGE}'; TARGET_RUNTIME_IMAGE_ID='${IMAGE_ID}'; ENABLE_RELEASE_FLAG=1
 assert_target_runtime_image_ready`;
@@ -205,7 +216,7 @@ assert_target_runtime_image_ready`;
 }
 
 // The staged activation: the stopped unit may be started only on a checked image.
-function proveStagedActivation(box: ReturnType<typeof capsule>): string {
+function proveStagedActivation(box: Capsule): string {
   const bundle = `remote/cutovers/${NONCE}`;
   const call = `CUTOVER_NONCE='${NONCE}'; activate_staged_inner`;
   const staged = (grok: string) => {
@@ -308,7 +319,7 @@ function proveImagePin(): string {
 
 async function main(): Promise<void> {
   const candidateSha = parseArgs(process.argv);
-  let box: ReturnType<typeof capsule> | undefined;
+  let box: Capsule | undefined;
   // covers the asynchronous web search seam; the synchronous consumers enforce the same budget themselves
   const deadline = setTimeout(() => {
     console.error("[grok-cli-compatibility] deadline exceeded");
