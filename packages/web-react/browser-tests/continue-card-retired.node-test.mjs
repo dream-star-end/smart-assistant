@@ -133,15 +133,18 @@ test("INC-20261002-CONTINUE-CARD-LINGERS: real App click on 从断点继续 reti
           console.log("CONTINUE_CARD_RECEIPT", JSON.stringify({ width, decline, children: 1, cardBack: true, red, transformCount }));
           return;
         }
-        await until("the continuation is running its tool", () => scenario.running === true);
-        const settle = () => page.evaluate(() => new Promise((done) => setTimeout(() => requestAnimationFrame(() => requestAnimationFrame(done)), 400)));
-        await settle();
+        // The page itself shows the continuation's command running: the process
+        // shell is active and counts the resumed command next to the saved one.
+        const running = page.locator('[data-testid="process-disclosure"][data-process-active="true"]')
+          .getByTestId("process-toggle").filter({ hasText: /正在运行命令.*命令 2 项/ });
+        await running.waitFor();
+        assert.equal(scenario.running, true);
         // While the continuation runs the source card is resolved, not a live failure.
         assert.equal(await card.count(), 0, "running continuation: the committed failure card is retired");
         assert.equal(await page.getByRole("button", { name: /重新尝试|从断点继续/ }).count(), 0, "running continuation: no retry or resume button remains");
         scenario.finish();
         await page.getByText("CONTINUE_RESUMED_ANSWER", { exact: true }).waitFor();
-        await settle();
+        await running.waitFor({ state: "detached" });
         assert.equal(await card.count(), 0, "finished continuation: the card stays retired");
         assert.equal(await page.getByRole("button", { name: /重新尝试|从断点继续/ }).count(), 0, "finished continuation: no retry or resume button");
         assert.deepEqual(errors, []);
