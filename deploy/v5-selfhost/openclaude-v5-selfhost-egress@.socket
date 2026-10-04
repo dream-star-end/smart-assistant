@@ -8,6 +8,13 @@ Description=OpenClaude v5 Selfhost Egress shared listener (slot %i)
 After=network.target openclaude-v5-selfhost-hostnet.service openclaude-v5-selfhost-boot-guard.service
 Wants=openclaude-v5-selfhost-hostnet.service
 Conflicts=openclaude-v5-selfhost-egress.service
+# 不要默认依赖:socket 默认 Before=sockets.target,而本 unit 必须排在 hostnet(→ docker)
+# 和 boot-guard 之后,它们又都排在 basic.target(→ sockets.target)之后 —— 开机成环,
+# systemd 随机删一个 job 破环(2026-10-04 删的是 containerd,docker 没起来)。
+# 关掉后要自己补回关机时的停止顺序。
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Socket]
 ListenStream=172.31.0.1:18892
