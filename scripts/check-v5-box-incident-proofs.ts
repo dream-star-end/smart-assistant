@@ -80,7 +80,9 @@ type Api = {
   finishIdle: (session: unknown, source: { sessionId: string; turnKey: string }, dir: string) => Promise<void>;
   idle: IdleFiles;
   boxNative: { model: string; owner: string };
-  gatewaySource: string;
+  /** One SessionManager of the gateway; its durable idle state lives under `home`. */
+  sessionManager: { submit: (...args: unknown[]) => Promise<unknown> };
+  home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
   tape: { version: number; partBytes: number };
 };
@@ -158,6 +160,11 @@ async function load(): Promise<Api> {
   const idleFiles = await import(pathToFileURL(join(GATEWAY, "boxIdleCompact.ts")).href);
   const sessions = await import(pathToFileURL(join(GATEWAY, "sessionManager.ts")).href);
   const authority = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/modelAuthority.ts")).href);
+  // A commercial container wires its lossless history sink at startup and submit() refuses to run
+  // without one. No turn runs in these proofs, so the sink is never used; using it fails the gate.
+  const sink = await import(pathToFileURL(join(GATEWAY, "v3MasterSink.ts")).href);
+  sink.setV3MasterSinkSingleton({ persistOrQueue: async () => fail("GATEWAY_SINK_USED"),
+    attemptOnce: async () => fail("GATEWAY_SINK_USED") });
   const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
   const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
@@ -198,7 +205,10 @@ async function load(): Promise<Api> {
     finishIdle: (session, source, dir) => sessions.SessionManager.prototype.finishIdleUnderLock.call({}, session, source, dir),
     idle: idleFiles,
     boxNative: { model: authority.BOX_NATIVE_CONTEXT_MODEL, owner: authority.BOX_NATIVE_CONTEXT_OWNER },
-    gatewaySource: readFileSync(join(GATEWAY, "sessionManager.ts"), "utf8"),
+    sessionManager: new sessions.SessionManager({ version: 1, gateway: { bind: "127.0.0.1", port: 0, accessToken: "" },
+      auth: { mode: "subscription", claudeCodePath: "" }, sessions: { dbPath: "" },
+      defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
+    home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES } };
 }
@@ -1524,31 +1534,33 @@ async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigi
     } };
 }
 
-/** The session as SessionManager's idle step sees it. Its CCB idle turn, when
- * one is dispatched, ends normally with no summary. */
-function idleSession(api: Api, sessionKey: string, counters: { submits: number; shutdowns: number },
+/** A live session of the gateway's SessionManager on the Box native model. The
+ * runner stands in for the CCB subprocess: an idle turn, when one is
+ * dispatched, ends normally with no summary. */
+function gatewaySession(api: Api, sessionKey: string, counters: { submits: number; shutdowns: number },
   shutdown: () => Promise<void> = async () => {}) {
-  return { sessionKey, model: api.boxNative.model, _boxContextOwner: api.boxNative.owner,
-    runner: Object.assign(new EventEmitter(), {
+  return { sessionKey, agentId: "main", channel: "webchat", peerId: sessionKey, title: "proof", startedAt: Date.now(),
+    model: api.boxNative.model, _boxContextOwner: api.boxNative.owner, lock: Promise.resolve(), lastUsedAt: 0,
+    totalCostUSD: 0, totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+    turns: 0, _lastCcbCumulativeCost: 0, toolUseIdToName: new Map(), executionTarget: { kind: "local" }, providerTag: "ccb",
+    runner: Object.assign(new EventEmitter(), { model: api.boxNative.model, engineId: "ccb", capabilities: {},
       submitTurn: () => { counters.submits++; return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }; },
       shutdown: () => { counters.shutdowns++; return shutdown(); } }) };
 }
-/** The idle gate every message passes in SessionManager.submit(), step for step
- * with the product's own functions: durable idle work is driven first, and the
- * message is refused with IDLE_HISTORY_PENDING ("消息未开始处理") while the
- * session's history is still pending. */
-async function submitIdleGate(api: Api, session: { sessionKey: string }, dir: string): Promise<"admitted" | "IDLE_HISTORY_PENDING"> {
-  if (!/const still = readIdleCandidate\(paths\.home, session\.sessionKey\)[\s\S]{0,300}idleHistoryStillBlocked\(\{ candidate: still, pending: pendingIdle, recovered \}\)\) \{\s*throw new IdleCompactRejected\('IDLE_HISTORY_PENDING'\)/
-    .test(api.gatewaySource)) fail("SUBMIT_IDLE_GATE_CHANGED");
-  const pending = api.idle.readPendingIdle(dir, session.sessionKey) as { sourceSessionId: string; sourceTurnKey: string;
-    revision: string } | undefined;
-  const candidate = api.idle.readIdleCandidate(dir, session.sessionKey) as { sessionId: string; turnKey: string } | undefined;
-  if (!pending && !candidate) return "admitted";
-  await api.finishIdle(session, { sessionId: pending?.sourceSessionId ?? candidate!.sessionId,
-    turnKey: pending?.sourceTurnKey ?? candidate!.turnKey }, dir);
-  const still = api.idle.readIdleCandidate(dir, session.sessionKey);
-  const recovered = pending ? api.idle.readIdleOp(dir, session.sessionKey, pending.revision) : undefined;
-  return api.idle.idleHistoryStillBlocked({ candidate: still, pending, recovered }) ? "IDLE_HISTORY_PENDING" : "admitted";
+const PAST_IDLE_GATE = "PROOF_PAST_IDLE_GATE";
+/** A message arrives for the session: the product's SessionManager.submit().
+ * submit() drives the session's durable idle work and refuses the message
+ * with IDLE_HISTORY_PENDING ("消息未开始处理") while its history is pending.
+ * The first thing it does with an admitted message is read the turn's model
+ * authority descriptor; this call ends there, before any runner is touched. */
+async function submitMessage(api: Api, session: unknown): Promise<"admitted" | "IDLE_HISTORY_PENDING"> {
+  const executionDescriptor = Object.defineProperty({}, "contextOwner",
+    { get: () => { throw new Error(PAST_IDLE_GATE); } });
+  const outcome = await codeOf(() => api.sessionManager.submit(session, "next message", () => {}, undefined,
+    api.boxNative.model, undefined, undefined, undefined, { modelAuthority: { executionDescriptor } }));
+  if (outcome === PAST_IDLE_GATE) return "admitted";
+  if (outcome.includes("IDLE_HISTORY_PENDING")) return "IDLE_HISTORY_PENDING";
+  return fail(`SUBMIT_ENDED_${outcome}`);
 }
 
 // INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE, live #72191544: egress refused a
@@ -1578,15 +1590,15 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     409, code, "continuation rejected", "dc1551b789864b0500d6bd581ffd538b");
   if (!wire.includes(code)) fail("REJECT_WIRE_BODY");
   const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-308-reject-"));
+  const dir = api.home;
   const counters = { submits: 0, shutdowns: 0 };
-  const session = idleSession(api, "reject-session", counters);
+  const session = gatewaySession(api, "reject-session", counters);
   // the turn's own submit left the session's idle candidate, as for every Box native turn
   api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
   try {
     if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("REJECT_NOT_PARKED");
     // while the Box turn is parked, a message to this session is refused: the incident
-    if (await submitIdleGate(api, session, dir) !== "IDLE_HISTORY_PENDING") fail("REJECT_PARKED_TURN_DID_NOT_BLOCK");
+    if (await submitMessage(api, session) !== "IDLE_HISTORY_PENDING") fail("REJECT_PARKED_TURN_DID_NOT_BLOCK");
     const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
       setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
     const adapter = api.ccbAdapter(runner);
@@ -1604,10 +1616,10 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     // what the session's idle candidate waits for, read the way the gateway reads it
     const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
     if (idle.status !== "failed") fail(`REJECT_IDLE_${idle.status}`);
-    // the next message passes submit's idle gate: the candidate is cleared, nothing is compacted
-    if (await submitIdleGate(api, session, dir) !== "admitted") fail("REJECT_NEXT_MESSAGE_STILL_BLOCKED");
+    // the next message is admitted by submit(): the candidate is cleared, nothing is compacted
+    if (await submitMessage(api, session) !== "admitted") fail("REJECT_NEXT_MESSAGE_STILL_BLOCKED");
     if (api.idle.readIdleCandidate(dir, session.sessionKey) !== undefined || counters.submits !== 0) fail("REJECT_CANDIDATE_KEPT");
-    if (await submitIdleGate(api, session, dir) !== "admitted") fail("REJECT_NEXT_MESSAGE_BLOCKED_AGAIN");
+    if (await submitMessage(api, session) !== "admitted") fail("REJECT_NEXT_MESSAGE_BLOCKED_AGAIN");
     // a transient Box answer of the same shape is not a continuation reject and stops nothing
     const other = api.ccbAdapter(runner);
     const otherTurn = other.submitTurn({ input: "run it", turnKey: "e".repeat(64), onEvent: () => {},
@@ -1620,7 +1632,6 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) fail("REJECT_TRANSIENT_STOPPED");
   } finally {
     await routes.close();
-    rmSync(dir, { recursive: true, force: true });
   }
   // and egress admits, launches and answers it
   await prechecked(api, db, { ...who, requestId: "box-rej-next", turnKey: "d".repeat(64) });
@@ -1663,11 +1674,11 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     fail("IDLE_COMPACT_FALLBACK_ADMITTED");
   }
   const routes = await egressInternalRoutes(api, journal, who, source.target, store.read);
-  const dir = join(root, "recovery");
+  const dir = api.home;
   const counters = { submits: 0, shutdowns: 0 };
-  const session = (sessionKey: string, shutdown?: () => Promise<void>) => idleSession(api, sessionKey, counters, shutdown);
-  /** A message arrives for the session: SessionManager.submit()'s idle gate. */
-  const submit = (sessionKey: string, shutdown?: () => Promise<void>) => submitIdleGate(api, session(sessionKey, shutdown), dir);
+  /** A message arrives for the session. */
+  const submit = (sessionKey: string, shutdown?: () => Promise<void>) =>
+    submitMessage(api, gatewaySession(api, sessionKey, counters, shutdown));
   try {
     const proof = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey: sourceTurn }) as {
       status: string; revision?: string; compactRequired?: boolean };
@@ -1738,9 +1749,21 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
   const Pool = (pg.default ?? pg).Pool;
   const schema = `oc_incident_proof_${randomBytes(6).toString("hex")}`;
   const admin = new Pool({ ...(config as object), max: 1 });
+  const pool = new Pool({ ...(config as object), max: 6, options: `-c search_path=${schema}` });
+  /** Dropping the schema is part of the result: a schema left behind fails the gate. */
+  const drop = async (): Promise<void> => {
+    await pool.end().catch(() => {});
+    try {
+      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      const left = await admin.query("SELECT 1 FROM pg_namespace WHERE nspname=$1", [schema]);
+      if (left.rows.length !== 0) fail("SESSIONS_SCHEMA_LEFT_BEHIND");
+    } finally {
+      await admin.end().catch(() => {});
+    }
+  };
+  cleanups.add(drop);
   await admin.query("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public");
   await admin.query(`CREATE SCHEMA ${schema}`);
-  const pool = new Pool({ ...(config as object), max: 6, options: `-c search_path=${schema}` });
   try {
     const migrate = async (...names: string[]) => {
       for (const name of names) {
@@ -1782,9 +1805,8 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
       VALUES (true, 'pg_authoritative', 1, 'proof-cutover', 'proof-digest', $1)`, [Date.now()]);
     return await run(api.sessionsBackend(pool), pool as Db);
   } finally {
-    await pool.end().catch(() => {});
-    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
-    await admin.end();
+    cleanups.delete(drop);
+    await drop();
   }
 }
 
@@ -1862,13 +1884,26 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
   });
 }
 
+/** Things this run created outside its own memory; each is undone exactly once. */
+const cleanups = new Set<() => Promise<void> | void>();
+async function cleanUp(): Promise<void> {
+  const pending = [...cleanups];
+  cleanups.clear();
+  for (const undo of pending.reverse()) await undo();
+}
+
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
     console.error("[box-incident-proofs] deadline exceeded");
-    process.exit(1);
+    // still drop what this run created, bounded, before failing
+    void Promise.race([cleanUp().catch(() => {}), tick(8_000)]).then(() => process.exit(1));
   }, LIMIT_MS);
   const database = await testDatabase();
+  // the gateway keeps its durable session state under OPENCLAUDE_HOME, read when its modules load
+  const home = mkdtempSync(join(tmpdir(), "ocv5-308-home-"));
+  cleanups.add(() => rmSync(home, { recursive: true, force: true }));
+  process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
@@ -1877,10 +1912,12 @@ async function main(): Promise<void> {
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db)]),
     await proveSettledToolsAutoResume(api, database)];
+  await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }
-main().catch((error: unknown) => {
+main().catch(async (error: unknown) => {
   console.error(error instanceof Error ? error.message : String(error));
+  await Promise.race([cleanUp().catch((failure: unknown) => console.error(String(failure))), tick(8_000)]);
   process.exit(1);
 });
