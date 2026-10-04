@@ -5772,6 +5772,24 @@
           "assertion": "an expired linked chain closes once: unbilled leaf aborted, waiting ancestors released"
         }
       ]
+    },
+    {
+      "id": "INC-20261004-BOX-CLI-VERSION-UNREADABLE",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "线上（v5-0ee3b3710，2026-10-04 12:42Z 起）：8563617b 的 Box CLI 版本闸门读版本时向 exec 传输层要 64 字节响应，而传输层的下限是 1024，请求在本机就以 BOX_EXEC_REQUEST_INVALID 被拒、从未发出。闸门把任何失败都读成 BOX_CLI_VERSION_UNREADABLE，于是任意 Box 上的新启动都会在准入前被拒（不占槽、不启动、不计费，但 Box Claude 无法开新回合）。上线后到发现前没有用户回合撞到；由账号 25 的线上只读探针在 14:22Z 发现（单测用的假 exec 没有这道校验）。修复：读取改要 1024 字节，解析仍只接受一行精确版本号；新增用例让读取走真实 BoxExecTransport 并要求请求到达 fetch。",
+      "rootFixCommit": "7721c063",
+      "proofPending": {
+        "reason": "回归在 unit 层（真实 BoxExecTransport 的请求校验）；线上证据是一次性的运维只读探针（账号 25 读到 2.1.288 并放行），不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-04"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "the version read is a request the real Box exec transport sends"
+        }
+      ]
     }
   ]
 }
