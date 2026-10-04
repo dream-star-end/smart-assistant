@@ -88,7 +88,8 @@ type Api = {
 };
 type SessionsBackend = { admitUserTurn: (input: unknown) => Promise<{ kind: string }>;
   stageLosslessTurnTapePart: (userId: string, request: unknown, bytes: Buffer) => Promise<unknown>;
-  finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }> };
+  finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }>;
+  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null> };
 type RouteHandler = (req: unknown, res: unknown, ctx: { hostUuid: string; boundIp: string }) => Promise<void>;
 type IdleOp = { runnerKilledAt?: number; disposition?: string; abandonReason?: string; [key: string]: unknown };
 type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
@@ -1863,8 +1864,7 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
       }
       const jobs = (await db.query(`SELECT recovery_mode AS mode, semantic_recovery_attempt AS attempt
         FROM turn_recovery_jobs WHERE user_id=$1 AND session_id=$2`, [uid.toString(), sessionId])).rows;
-      const messages = JSON.parse(String((await db.query("SELECT messages FROM client_sessions WHERE id=$1",
-        [sessionId])).rows[0]?.messages ?? "[]")) as Array<{ id?: string }>;
+      const messages = (await backend.getClientSession(sessionId, sessionUser))?.messages ?? [];
       return { jobs: jobs.map((job) => `${String(job.mode)}#${String(job.attempt)}`),
         gaveUp: messages.some((message) => String(message.id).startsWith("m-recovery-giveup-")) };
     };
