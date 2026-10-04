@@ -340,6 +340,68 @@ describe("MessageList Manus 过程披露", () => {
     expect(open?.className).toContain("border-accent/40");
   });
 
+  test("已回答的问答卡和它同一次调用的 AskUserQuestion 工具行：工具行不再漏在过程外", () => {
+    renderList([
+      row("u", "user", "上线吧", { status: "replied" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git status" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-card", "permission", "怎么处理？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-ship",
+        toolUseId: "toolu_ship",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "怎么处理？", options: [{ label: "现在合并并部署" }] }] },
+      }),
+      row("ask-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        blockId: "toolu_ship",
+        _completed: true,
+        inputJson: { questions: [{ question: "怎么处理？", options: [{ label: "现在合并并部署" }] }] },
+        output: 'User has answered your questions: "怎么处理？"="现在合并并部署".',
+      }),
+      row("final", "assistant", "已合并", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.queryByText("向用户提问")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const card = screen.getAllByTestId("permission-card").find((el) => el.getAttribute("data-permission-request") === "req-ship");
+    expect(card?.closest("[data-testid=process-card]")).not.toBeNull();
+    expect(screen.queryByText("向用户提问")).not.toBeInTheDocument();
+    expect(screen.queryByText(/User has answered your questions/)).not.toBeInTheDocument();
+  });
+
+  test("没有配对问答卡的 AskUserQuestion 工具行照常显示（不同 tool_use id 不算配对）", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("ask-card", "permission", "另一个问题？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-other",
+        toolUseId: "toolu_other",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "另一个问题？", options: [{ label: "好" }] }] },
+      }),
+      row("ask-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        blockId: "toolu_lonely",
+        _completed: true,
+        inputJson: { questions: [{ question: "孤立的问题？", options: [{ label: "好" }] }] },
+        output: "User has answered your questions.",
+      }),
+    ]);
+    expect(screen.getAllByText("向用户提问").length).toBeGreaterThan(0);
+  });
+
   // OCV5-307:已回答的提问是这一轮的一个步骤,收进过程作为常显步骤;待审批 / 后台子任务仍在顶层。
   test("已回答的提问进过程，待审批和后台子任务不被折进过程，普通工具失败收在过程里", async () => {
     renderList([

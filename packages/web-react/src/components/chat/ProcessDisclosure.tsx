@@ -376,6 +376,34 @@ function interactiveTool(message: ChatMessage): boolean {
 }
 
 /**
+ * A CCB question lands twice: the 用户问答 card (role=permission, bound to the
+ * engine tool_use by `toolUseId`) and the AskUserQuestion tool row of that same
+ * call (its result is the raw "User has answered your questions: …" echo). The
+ * card already shows the question and the answer, and owns the pending /
+ * answered state, so the tool row is a duplicate. Left in place it is caught by
+ * `interactiveTool` and sits outside 处理过程 under the answered card.
+ *
+ * Returns the ids of tool rows to drop. Only an exact tool_use id pairing
+ * counts; a tool row whose card is missing (paged out, lost history) stays.
+ */
+export function promptShadowedToolIds(messages: readonly ChatMessage[]): Set<string> {
+  const promptToolUseIds = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "permission" && message.toolName === "AskUserQuestion" && message.toolUseId) {
+      promptToolUseIds.add(message.toolUseId);
+    }
+  }
+  const ids = new Set<string>();
+  if (promptToolUseIds.size === 0) return ids;
+  for (const message of messages) {
+    if (message.role !== "tool" || message.toolName !== "AskUserQuestion") continue;
+    const toolUseId = message.toolUseId ?? message.blockId;
+    if (toolUseId && promptToolUseIds.has(toolUseId)) ids.add(message.id);
+  }
+  return ids;
+}
+
+/**
  * OCV5-307: a question / approval the user has already answered (allow or
  * skip/deny). It no longer needs the user, so it reads as one more step of the
  * turn and sits on the process rail instead of poking out as a separate card.
