@@ -10,10 +10,11 @@ import { resolveAccountEgressDispatcher } from
 import { BoxAccountResolver, readBoxUidProxy } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
 async function main(): Promise<void> {
-  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== "20"
-    || process.env.OCV5_289_ACK_USER_ID !== "3"
+  const operator = requireBoxOperatorAccount("BOX_STABILITY_ACK_REQUIRED");
+  if (process.env.OCV5_289_ACK_USER_ID !== "3"
     || process.env.OCV5_289_STABILITY_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_STABILITY_ACK_REQUIRED");
   const failures: Array<{ path: string; code: string; name: string }> = [];
@@ -47,13 +48,13 @@ async function main(): Promise<void> {
   });
   const target = await resolver.resolve({ uid: 3n, sessionId: null,
     requestId: `ocv5-289-stability-${randomBytes(12).toString("hex")}`,
-    upstreamModel: "claude-opus-5-5", requiredAccountId: 20n,
+    upstreamModel: "claude-opus-5-5", requiredAccountId: operator.id,
     signal: new AbortController().signal });
   let completed = 0;
   const elapsedMs: number[] = [];
   let attempted = 0, started = 0;
   try {
-    if (target.accountId !== 20n) throw new Error("BOX_STABILITY_ACCOUNT_MISMATCH");
+    if (target.accountId !== operator.id) throw new Error("BOX_STABILITY_ACCOUNT_MISMATCH");
     for (let i = 0; i < 8; i++) {
       attempted = i + 1;
       const nonce = randomBytes(6).toString("hex");
@@ -72,7 +73,7 @@ async function main(): Promise<void> {
       completed++;
       elapsedMs.push(Date.now() - started);
     }
-    process.stdout.write(JSON.stringify({ accountId: "20", completed,
+    process.stdout.write(JSON.stringify({ accountId: operator.text, completed,
       readOnlyExec: true, payloadProbe, payloadBytes: encoded.length,
       elapsedMs, transportFailures: failures }) + "\n");
   } catch (error) {

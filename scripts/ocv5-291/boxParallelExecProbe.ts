@@ -4,8 +4,10 @@ import { performance } from "node:perf_hooks";
 import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "../ocv5-289/boxOperatorAccount.js";
 
 async function main(): Promise<void> {
+  const operator = requireBoxOperatorAccount("BOX_PARALLEL_PROBE_BOUNDARY_INVALID");
   if (hostname() !== "v3-dev-sg" || getRuntimeChannel() !== "v5"
     || process.env.OC_USER_ID !== "3"
     || process.env.OCV5_291_PARALLEL_EXEC_PROBE_ACK !== "1") {
@@ -20,10 +22,10 @@ async function main(): Promise<void> {
     const resolved = await Promise.all(["a", "b"].map((label) =>
       resolver.resolve({ uid: 3n, sessionId: null,
         requestId: `box-parallel-exec-probe-${label}`,
-        upstreamModel: "claude-opus-5-5", requiredAccountId: 20n,
+        upstreamModel: "claude-opus-5-5", requiredAccountId: operator.id,
         allowWakeIfHibernated: false, signal: abort.signal })));
     targets.push(...resolved);
-    if (targets.some((target) => target.accountId !== 20n))
+    if (targets.some((target) => target.accountId !== operator.id))
       throw new Error("BOX_PARALLEL_PROBE_ACCOUNT_MISMATCH");
     const readyMs = Math.round(performance.now() - t0);
     const start = performance.now();
@@ -47,14 +49,14 @@ async function main(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 300));
     const ensured = await resolver.resolve({ uid: 3n, sessionId: null,
       requestId: "box-parallel-exec-probe-ensure", upstreamModel: "claude-opus-5-5",
-      requiredAccountId: 20n, allowWakeIfHibernated: false, signal: abort.signal });
+      requiredAccountId: operator.id, allowWakeIfHibernated: false, signal: abort.signal });
     targets.push(ensured);
     const heldResult = await held;
-    if (ensured.accountId !== 20n || heldResult.exitCode !== 0
+    if (ensured.accountId !== operator.id || heldResult.exitCode !== 0
       || heldResult.stdout.trim() !== "held-alive") {
       throw new Error("BOX_PARALLEL_ENSURE_DISRUPTED_EXEC");
     }
-    process.stdout.write(JSON.stringify({ accountId: "20", execCount: 2,
+    process.stdout.write(JSON.stringify({ accountId: operator.text, execCount: 2,
       readyMs, overlappedExecMs: elapsedMs, ensureDuringExec: "passed", paidCliCalls: 0,
       promptsSent: 0 }) + "\n");
   } finally {

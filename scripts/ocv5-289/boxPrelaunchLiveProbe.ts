@@ -9,6 +9,7 @@ import { makeBoxPrelaunchBootstrap, parseBoxPrelaunchBootstrap,
 import { makeBoxStageFiles } from "../../packages/commercial/src/http/proxy/boxStageFiles.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
 const OBSERVE = String.raw`import hashlib,json,os,re,sys
 nonce,uuid=sys.argv[1:]
@@ -86,8 +87,8 @@ print(json.dumps({'runtimeHash':hashlib.sha256(runtime).hexdigest()[:20],
  'statErrors':stat_errors,'zombies':zombies,'cmdlineTruncated':truncated},sort_keys=True,separators=(',',':')))`;
 
 async function main(): Promise<void> {
-  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== "20"
-    || process.env.OCV5_289_ACK_USER_ID !== "3"
+  const operator = requireBoxOperatorAccount("BOX_FENCE_OPERATOR_ACK_REQUIRED");
+  if (process.env.OCV5_289_ACK_USER_ID !== "3"
     || process.env.OCV5_289_NO_PAID_FENCE_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_FENCE_OPERATOR_ACK_REQUIRED");
   const runNonce = randomBytes(12).toString("hex");
@@ -107,7 +108,7 @@ async function main(): Promise<void> {
   const wakeAuthorized = process.env.OCV5_289_AUTO_WAKE_TEST_ACK === "1";
   const target = await resolver.resolve({ uid: 3n, sessionId: null,
     requestId: `box-no-paid-fence-${runNonce}`, upstreamModel: "claude-opus-5-5",
-    requiredAccountId: 20n, allowWakeIfHibernated: wakeAuthorized,
+    requiredAccountId: operator.id, allowWakeIfHibernated: wakeAuthorized,
     signal: new AbortController().signal });
   let receipt: BoxPrelaunchReceipt | null = null;
   let clean = false;
@@ -117,11 +118,11 @@ async function main(): Promise<void> {
     return target.exec.run(request, { timeoutMs: 20_000, maxResponseBytes: 8192 });
   };
   try {
-    if (target.accountId !== 20n) throw new Error("BOX_ACCOUNT_MISMATCH");
+    if (target.accountId !== operator.id) throw new Error("BOX_ACCOUNT_MISMATCH");
     const bootstrap = await run(makeBoxPrelaunchBootstrap({ runNonce, leaseEpoch,
-      accountId: "20", controlId }));
+      accountId: operator.text, controlId }));
     receipt = parseBoxPrelaunchBootstrap(bootstrap.stdout, { runNonce, leaseEpoch,
-      accountId: "20", controlId });
+      accountId: operator.text, controlId });
     const init = await run(makeBoxPrelaunchInit(receipt, project));
     if (init.stdout.trim() !== "ready") throw new Error("BOX_FENCE_INIT_UNPROVEN");
     for (const step of staged.requests.slice(1)) {
@@ -200,7 +201,7 @@ async function main(): Promise<void> {
         sameRuntime: first.runtimeHash === second.runtimeHash,
         separatedMs: Number(second.sampleTimeMs) - Number(first.sampleTimeMs) };
     }
-    process.stdout.write(JSON.stringify({ accountId: "20", runNonce,
+    process.stdout.write(JSON.stringify({ accountId: operator.text, runNonce,
       realBox: true, paidCalls: 0, wakeAuthorized, syntheticProjectFile: true,
       stagedHashesMatch: true, remoteCleaned: true,
       ...(oldEvidence === undefined ? {} : { oldEvidence }) }) + "\n");

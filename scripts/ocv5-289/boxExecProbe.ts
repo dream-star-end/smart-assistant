@@ -12,13 +12,13 @@ import { CursorSandProvisionClient } from '../../packages/commercial/src/account
 import { getRuntimeChannel } from '../../packages/commercial/src/runtimeChannel.js'
 import { encodeExecRequest, parseExecFramesStrict } from '../../packages/gateway/src/engine/cursorBoxCcExec.js'
 import { boxExecEgressBasis } from './boxExecBasis.js'
+import { requireBoxOperatorAccount } from './boxOperatorAccount.js'
 import { withPinnedBoxHistoryVersion } from './boxHistoryVersionGate.js'
 import { compileBoxCliSyntheticTurn } from '../../packages/commercial/src/http/proxy/boxMessagesMapper.js'
 import { BoxCliSseError, completedBoxCliToSse } from '../../packages/commercial/src/http/proxy/boxCliSse.js'
 import { compileBoxToolCatalog } from '../../packages/commercial/src/http/proxy/boxToolCatalog.js'
 import type { ProxyBody } from '../../packages/commercial/src/http/proxy/shared.js'
 
-const ACCOUNT_ID = '20'
 const AUTH_DIR = '/etc/openclaude/cursor-v5-u3'
 const MODEL = '/home/box/.local/bin/claude'
 const COMMANDS = [['--version'], ['--help']] as const
@@ -83,7 +83,8 @@ function safeCliStreamShape(records: Array<Record<string, unknown>>): Record<str
     initMcpCount: Array.isArray(init?.mcp_servers) ? init.mcp_servers.length : null }
 }
 async function main(): Promise<void> {
-if (process.env.OCV5_289_ACK_ACCOUNT_ID !== ACCOUNT_ID || process.env.OCV5_289_ACK_USER_ID !== '3') {
+const ACCOUNT_ID = requireBoxOperatorAccount('OCV5_289_OPERATOR_ACK_REQUIRED').text
+if (process.env.OCV5_289_ACK_USER_ID !== '3') {
   throw new Error('OCV5_289_OPERATOR_ACK_REQUIRED')
 }
 if (['OCV5_289_PARALLEL_ACK', 'OCV5_289_INFERENCE_ACK', 'OCV5_289_TOOL_ACK',

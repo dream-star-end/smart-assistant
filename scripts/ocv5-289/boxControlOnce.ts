@@ -10,12 +10,10 @@ import { CursorSandProvisionClient, sandPrincipal } from
   "../../packages/commercial/src/account-pool/cursorSandProvision.js";
 import { readBoxUidProxy } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
 async function main(): Promise<void> {
-  const accountId = "20";
-  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== accountId) {
-    throw new Error("BOX_STATE_ACK_REQUIRED");
-  }
+  const accountId = requireBoxOperatorAccount("BOX_STATE_ACK_REQUIRED").text;
   const account = await getAccount(accountId);
   if (!account || account.provider !== "cursor" || account.status !== "active"
     || !account.cursor_sand_enabled || account.cursor_credential_kind !== "session"

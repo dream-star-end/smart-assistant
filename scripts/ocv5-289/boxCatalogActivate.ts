@@ -16,6 +16,7 @@ import { assertModelCatalogAdminPoolConfigured,
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 import { boxCatalogActivationAction, sameSelfhostCatalogEndpoint } from
   "./boxCatalogBoundary.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
 const MODEL = "box-api-claude-opus-5-5";
 const SOURCE = "claude-opus-5-5";
@@ -70,8 +71,8 @@ function liveEgressReady(expectedSha: string): { slot: string; sourceCommit: str
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "plan";
   assertion(mode === "plan" || mode === "activate", "BOX_CATALOG_MODE_INVALID");
+  const operator = requireBoxOperatorAccount("BOX_CATALOG_SELFHOST_BOUNDARY_INVALID");
   assertion(hostname() === "v3-dev-sg" && getRuntimeChannel() === "v5"
-    && process.env.OCV5_289_ACK_ACCOUNT_ID === "20"
     && process.env.OCV5_289_ACK_USER_ID === "3",
   "BOX_CATALOG_SELFHOST_BOUNDARY_INVALID");
   const expectedSha = process.env.OCV5_289_EXPECT_LIVE_SHA ?? "";
@@ -121,14 +122,14 @@ async function main(): Promise<void> {
     let live: { slot: string; sourceCommit: string } | null = null;
     if (mode === "activate") {
       live = liveEgressReady(expectedSha);
-      const account = await getAccount("20");
+      const account = await getAccount(operator.text);
       assertion(account?.provider === "cursor" && account.status === "active"
         && account.cursor_sand_enabled
         && account.cursor_credential_kind === "session"
         && account.cursor_sand_access_state === "SAND_ACCESS_STATE_GRANTED"
         && (!account.cooldown_until || account.cooldown_until.getTime() <= Date.now()),
       "BOX_CATALOG_ACCOUNT_INELIGIBLE");
-      const snapshot = await getCursorTokenSnapshot("20");
+      const snapshot = await getCursorTokenSnapshot(operator.text);
       try {
         assertion(snapshot?.credential_kind === "session"
           && typeof snapshot.machine_id === "string" && snapshot.machine_id.length > 0

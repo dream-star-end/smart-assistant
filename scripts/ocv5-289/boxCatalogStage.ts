@@ -14,6 +14,7 @@ import { createStaged, normalizeVersionInput,
   "../../packages/commercial/src/admin/modelCatalogOps.js";
 import { writeAdminAudit } from "../../packages/commercial/src/admin/audit.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 import { sameSelfhostCatalogEndpoint } from "./boxCatalogBoundary.js";
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -62,8 +63,8 @@ function exactPrice(row: PriceRow, source: PriceRow): boolean {
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "plan";
   assertion(mode === "plan" || mode === "stage", "BOX_CATALOG_MODE_INVALID");
+  requireBoxOperatorAccount("BOX_CATALOG_SELFHOST_BOUNDARY_INVALID");
   assertion(hostname() === "v3-dev-sg" && getRuntimeChannel() === "v5"
-    && process.env.OCV5_289_ACK_ACCOUNT_ID === "20"
     && process.env.OCV5_289_ACK_USER_ID === "3",
   "BOX_CATALOG_SELFHOST_BOUNDARY_INVALID");
   if (mode === "stage") assertion(process.env.OCV5_289_CATALOG_STAGE_ACK === "1",
