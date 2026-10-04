@@ -7,9 +7,15 @@
  * checked next to it. A proof names its incident in the receipt.
  * --expect-sha is the builder archive SHA; the archive has no .git, so it is
  * recorded in the receipt and not compared here.
+ * Incidents whose fix lives in the durable journal run against real Postgres:
+ * TEST_DATABASE_URL must name a loopback *_test database (the same explicit
+ * DSN the neighbouring success-recovery gate requires); only session-local
+ * TEMP tables are created. The Box account itself is simulated at its exec
+ * endpoint; everything between the request and that endpoint is product code.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { deflateSync } from "node:zlib";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,9 +51,27 @@ type Api = {
   boxEndpoint: string;
   asset: (name: string) => Buffer;
   continuation: (input: unknown, deps: unknown) => Promise<{ kind: string }>;
-  catalogHash: (tools: unknown[]) => string;
+  catalogHash: (tools: unknown[], mode?: "natural" | "opaque") => string;
   observeText: (input: unknown) => Promise<{ proof: { reason: string }; message: unknown }>;
+  journal: (db: Db) => Journal;
+  stopCoordinator: (journal: Journal, target: unknown) => { requestStop: (identity: unknown) => Promise<string> };
+  billingContext: (input: { sessionId: string; turnKey: string; dispatchId?: string; attemptNo?: number }) => unknown;
+  /** egress/main.ts, where production chooses the options the proofs pass by hand. */
+  egressSource: string;
+  proxySource: string;
+  toolFetch: (deps: unknown) => { fetch: (input: unknown) => Promise<Response> };
+  findReplay: (input: unknown, deps: unknown) => Promise<ReplayLookup>;
+  observeUnknown: (input: unknown, deps: unknown) => Promise<string>;
+  waitReplay: (first: ReplayLookup, lookup: () => Promise<ReplayLookup>, opts: { budgetMs: number; intervalMs: number;
+    signal: AbortSignal; now?: () => number; sleep?: (ms: number, signal: AbortSignal) => Promise<void> }) => Promise<ReplayLookup>;
+  cleanupWorker: (deps: unknown) => { reconcileStoppedFailures: () => Promise<{ recovered: number; pending: number }> };
+  replayStore: (root: string) => { write: unknown; read: unknown };
 };
+type ReplayLookup = { kind: string; response?: Response;
+  identity?: { state?: string; rootLaunchPermit?: boolean; invocationMode?: string } };
+type Db = { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
+type Journal = { readIdleProof: (input: { uid: bigint; containerId: bigint; sessionId: string; turnKey: string }) =>
+  Promise<{ status: string; requestIds?: string[] }>; [method: string]: (...args: never[]) => Promise<unknown> };
 type Decoder = {
   push: (chunk: string) => { sse: string; candidate: { toolUses: ReadonlyArray<{ id: string; clientName: string }>;
     inputTokens: number; outputTokens: number; cacheReadTokens: number } | null; finalCandidate: unknown };
@@ -88,6 +112,15 @@ async function load(): Promise<Api> {
   const upstream = await import(pathToFileURL(join(PROXY, "upstream.ts")).href);
   const continuation = await import(pathToFileURL(join(PROXY, "boxToolContinuation.ts")).href);
   const observe = await import(pathToFileURL(join(PROXY, "boxDetachedTextObserve.ts")).href);
+  const journal = await import(pathToFileURL(join(PROXY, "boxDurableJournal.ts")).href);
+  const stop = await import(pathToFileURL(join(PROXY, "boxUserStopCoordinator.ts")).href);
+  const billing = await import(pathToFileURL(join(PROXY, "boxBillingContext.ts")).href);
+  const toolFetch = await import(pathToFileURL(join(PROXY, "boxToolFetch.ts")).href);
+  const replay = await import(pathToFileURL(join(PROXY, "boxReplayCompleted.ts")).href);
+  const observer = await import(pathToFileURL(join(PROXY, "boxToolUnknownObserver.ts")).href);
+  const replayWait = await import(pathToFileURL(join(PROXY, "boxReplayWait.ts")).href);
+  const worker = await import(pathToFileURL(join(PROXY, "boxRemoteCleanupWorker.ts")).href);
+  const replaySetup = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/egress/boxReplaySetup.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
@@ -103,8 +136,22 @@ async function load(): Promise<Api> {
     published: published.withPublishedBoxResults, boxEndpoint: upstream.BOX_INTERNAL_ENDPOINT,
     asset: (name) => readFileSync(join(CANDIDATE, "scripts/ocv5-289", name)),
     continuation: continuation.runBoxToolContinuation,
-    catalogHash: (tools) => catalog.compileBoxToolCatalog(tools, "natural").bindingSha256,
-    observeText: observe.observeBoxDetachedText };
+    catalogHash: (tools, mode = "natural") => catalog.compileBoxToolCatalog(tools, mode).bindingSha256,
+    observeText: observe.observeBoxDetachedText,
+    // The journal opens its own transactions; every "connection" is the one pinned session.
+    journal: (db) => new journal.BoxDurableJournal({ query: db.query.bind(db),
+      connect: async () => ({ query: db.query.bind(db), release: () => {} }) }),
+    stopCoordinator: (boxJournal, target) => new stop.BoxUserStopCoordinator({ journal: boxJournal,
+      resolver: { resolve: async () => target }, proofWaitMs: 0 }),
+    billingContext: billing.serializeBoxBillingContext,
+    egressSource: readFileSync(join(CANDIDATE, "packages/commercial/src/egress/main.ts"), "utf8"),
+    proxySource: readFileSync(join(PROXY, "index.ts"), "utf8"),
+    toolFetch: (deps) => new toolFetch.BoxToolFetch(deps),
+    findReplay: replay.findCompletedBoxReplay, observeUnknown: observer.observeBoxToolUnknown,
+    waitReplay: replayWait.waitForBoxReplay,
+    cleanupWorker: (deps) => new worker.BoxRemoteCleanupWorker(deps),
+    replayStore: (root) => ({ write: replaySetup.createBoxReplayWriter(true, root),
+      read: replaySetup.createBoxReplayReader(root) }) };
 }
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -497,31 +544,51 @@ async function codeOf(run: () => Promise<unknown>): Promise<string> {
  * files and terminal proof, plus the durable journal. `faults` let one call
  * fail the way the incident recorded it. The round under test is the
  * product's own runBoxToolFirstRound. */
-function boxHost(api: Api, spool: Buffer, faults: {
+function boxHost(api: Api, initialSpool: Buffer, faults: {
   admit?: (call: number) => Promise<void> | void;
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
   proofRead?: (call: number) => void;
   capacityWaitMs?: number;
-  signal?: AbortSignal } = {}) {
+  signal?: AbortSignal;
+  /** The durable journal on real Postgres instead of the in-memory one. */
+  real?: { journal: unknown; uid: bigint; requestId: string; sessionId: string; turnKey: string;
+    messages?: unknown[]; resumeToolResults?: boolean; proofReason?: string;
+    nextSpool?: Buffer; stopIgnored?: boolean; dispatchId?: string;
+    /** The Box account this session is pinned to (its capacity is per account). */
+    accountId?: bigint;
+    stopRejectedRun?: (identity: unknown) => Promise<string> } } = {}) {
   const sequence: string[] = [];
   const emitted: string[] = [];
-  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0 };
+  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0 };
   let nonce = "", epoch = "", controlHash = "", disposed = false;
+  const epochs = new Map<string, string>();
+  const stopped = new Set<string>();
   let launchEnvironment: Record<string, string> = {};
+  let launchArgs: string[] = [];
+  let spool = initialSpool;
+  const staged: unknown[] = [];
+  /** Files the product wrote into the private run directory, by path. */
+  const files = new Map<string, Buffer>();
+  const parts = new Map<string, Buffer>();
   const run = async (request: ExecRequest): Promise<ExecReply> => {
     const args = request.args;
     if (args[2]?.includes("identity['identityHash']")) {
       const manifest = { accountId: args[5], controlDev: "2049", controlId: args[6], controlIno: "9001",
         leaseEpoch: args[4], lockDev: "2049", lockIno: "9002", runNonce: args[3], version: 2 };
       controlHash = createHash("sha256").update(JSON.stringify(manifest)).digest("hex");
+      nonce = args[3]!;
+      epoch = args[4]!;
+      epochs.set(nonce, epoch);
       return reply(`${JSON.stringify({ ...manifest, identityHash: controlHash })}\n`);
     }
     if (args[2]?.includes("def clean_dir(parent_path,name,allowed):")) return reply(`cleaned:${controlHash}\n`);
     if (isRunner(args) && args[5] !== "--read") {
       sequence.push("launch");
-      count.launch++;
+      // a later invocation on this account is another CLI with its own spool
+      if (++count.launch > 1 && faults.real?.nextSpool) spool = faults.real.nextSpool;
       launchEnvironment = { ...request.environment };
+      launchArgs = [...args];
       return reply("launched\n");
     }
     if (isRunner(args)) {
@@ -535,13 +602,22 @@ function boxHost(api: Api, spool: Buffer, faults: {
       return reply(JSON.stringify({ version: 1, modelToolUseId: args[4], mcpRequestId: 7,
         name: "Bash", arguments: { value: "x" } }));
     }
+    if (args.length === 5 && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{32}$/.test(args[4] ?? "")) {
+      // the keeper is asked to stop: a CLI still waiting for tool results stops, one that already exited does not
+      count.stop++;
+      if (faults.real?.proofReason === undefined && !faults.real?.stopIgnored) stopped.add(args[3]!);
+      return reply("stop-requested\n");
+    }
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
       faults.proofRead?.(++count.proofRead);
-      return reply(`${JSON.stringify({ runNonce: nonce, leaseEpoch: epoch, keeperPid: 101, cliPid: 102,
-        reason: "worker_complete", revision: 1 })}\n`);
+      const asked = args[3]?.slice(-24) ?? nonce;
+      return reply(`${JSON.stringify({ runNonce: asked, leaseEpoch: epochs.get(asked) ?? epoch, keeperPid: 101,
+        cliPid: 102, reason: stopped.has(asked) ? "keeper_stopped" : faults.real?.proofReason ?? "worker_complete",
+        revision: 1 })}\n`);
     }
     if (args[2]?.includes("print('staged:'+str(len(steps)))")) {
       const steps = JSON.parse(Buffer.from(args[3]!, "base64").toString("utf8")) as unknown[];
+      staged.push(...steps);
       return reply(`staged:${steps.length}\n`);
     }
     if (args[0] === "-I" && args[1] === "-c" && args[3]?.startsWith("/tmp/ocv5-289-")
@@ -549,9 +625,34 @@ function boxHost(api: Api, spool: Buffer, faults: {
       sequence.push("stage");
       return reply(`${Array.from({ length: (args.length - 3) / 4 }, (_, i) => args[5 + i * 4]).join(",")}\n`);
     }
+    // a private-stage write, plain or wrapped by the prelaunch guard: [cwd, project, path, ...]
+    const guarded = args.length > 6 && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{64}$/.test(args[4] ?? "");
+    const code = guarded ? Buffer.from(args[5]!, "base64").toString("utf8") : args[2] ?? "";
+    const rest = guarded ? args.slice(6) : args.slice(3);
+    if (code.includes("print(start+size)")) {
+      const [path, offset] = [rest[2]!, Number(rest[3])];
+      const raw = Buffer.concat(rest.slice(5).map((part) => Buffer.from(part, "base64")));
+      parts.set(path, Buffer.concat([(parts.get(path) ?? Buffer.alloc(0)).subarray(0, offset), raw]));
+      return reply(`${offset + raw.length}\n`);
+    }
+    if (code.includes("print(want)")) {
+      const [path, want] = [rest[2]!, rest[4]!];
+      const raw = parts.get(path) ?? Buffer.alloc(0);
+      if (createHash("sha256").update(raw).digest("hex") !== want) fail("BOX_HOST_STAGED_FILE_HASH");
+      files.set(path, raw);
+      return reply(`${want}\n`);
+    }
+    if (code.includes("'tool-catalog.json'") && code.includes('"size":st.st_size')) {
+      const file = files.get(`/tmp/ocv5-289-run-${args[3]}/tool-catalog.json`);
+      if (!file) throw api.transportError("BOX_EXEC_REMOTE_EXIT");
+      const offset = Number(args[4]);
+      return reply(JSON.stringify({ data: file.subarray(offset, offset + Number(args[5])).toString("base64"),
+        dev: "2049", ino: "9003", offset, size: file.length }));
+    }
+    staged.push(request);
     return reply("ok\n");
   };
-  const journal = {
+  const journal = faults.real?.journal ?? {
     admit: async (identity: { runNonce: string; leaseEpoch: string }) => {
       await faults.admit?.(++count.admit);
       sequence.push("admit");
@@ -571,23 +672,32 @@ function boxHost(api: Api, spool: Buffer, faults: {
     },
     complete: async () => { sequence.push("complete"); },
   };
+  const real = faults.real;
+  const sessionId = real?.sessionId ?? "session-proof";
   const body = { model: CLI_MODEL, max_tokens: 128, stream: true,
-    messages: [{ role: "user", content: "run it" }], tools: CLI_TOOLS, tool_choice: { type: "auto" },
-    metadata: { user_id: JSON.stringify({ session_id: "session-proof", oc_turn_key: "a".repeat(64) }) } };
-  const round = () => api.firstRound({ uid: 3n, sessionId: "session-proof", requestId: "box-proof",
+    messages: real?.messages ?? [{ role: "user", content: "run it" }], tools: CLI_TOOLS, tool_choice: { type: "auto" },
+    metadata: { user_id: JSON.stringify({ session_id: sessionId, oc_turn_key: real?.turnKey ?? "a".repeat(64) }) } };
+  const target = { accountId: real?.accountId ?? 20n, dispose: async () => { disposed = true; }, exec: { run } };
+  const call = { uid: real?.uid ?? 3n, sessionId, requestId: real?.requestId ?? "box-proof",
     canonicalModel: MODEL, canonicalBody: { ...body, model: MODEL }, upstreamModel: CLI_MODEL,
     url: api.boxEndpoint, init: { method: "POST", body: JSON.stringify(body),
-      ...(faults.signal ? { signal: faults.signal } : {}) },
-    emit: (sse: string) => { emitted.push(sse); } },
-  { supervisorAsset: api.asset("box_supervisor.py"), keeperAsset: api.asset("box_keeper.py"),
+      ...(faults.signal ? { signal: faults.signal } : {}) } };
+  const deps = { supervisorAsset: api.asset("box_supervisor.py"), keeperAsset: api.asset("box_keeper.py"),
     virtualMcpAsset: api.asset("box_virtual_mcp.py"), detachedRunnerAsset: api.asset("box_detached_runner.py"),
     toolAliasMode: "natural", journal, maxOutputTokensForModel: () => 128_000,
     ...(faults.capacityWaitMs === undefined ? {} : { capacityWaitMs: faults.capacityWaitMs }),
-    resolveTarget: async () => ({ accountId: 20n, dispose: async () => { disposed = true; }, exec: { run } }),
+    ...(real?.stopRejectedRun ? { stopRejectedRun: real.stopRejectedRun } : {}),
+    resolveTarget: async () => target,
     onUnknown: async () => {}, retainUnknownTarget: () => { sequence.push("retain-unknown"); },
-    retainCleanupTarget: () => {} });
-  return { round, sequence, count, sse: () => emitted.join(""),
-    get disposed() { return disposed; }, get launchEnvironment() { return launchEnvironment; } };
+    retainCleanupTarget: () => {} };
+  const round = () => api.firstRound({ ...call, emit: (sse: string) => { emitted.push(sse); },
+    ...(real?.resumeToolResults ? { resumeToolResults: true } : {}) }, deps);
+  return { round, call, deps, target, sequence, count, staged, files, sse: () => emitted.join(""),
+    /** The CLI goes on and appends to its stdout spool. */
+    write: (records: unknown[]) => { spool = Buffer.concat([spool, spoolOf(records)]); },
+    get spoolLength() { return spool.length; },
+    get disposed() { return disposed; }, get launchEnvironment() { return launchEnvironment; },
+    get launchArgs() { return launchArgs; }, get runNonce() { return nonce; }, get leaseEpoch() { return epoch; } };
 }
 
 /** Round N of a Box turn: the client's tool results were published to the
@@ -597,14 +707,14 @@ function boxHost(api: Api, spool: Buffer, faults: {
 function boxContinuation(api: Api, results: readonly EchoExpected[], records: unknown[], faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
-  proofRead?: (call: number) => void } = {}) {
+  proofRead?: (call: number) => void } = {}, catalogHash = api.catalogHash(CLI_TOOLS)) {
   const sequence: string[] = [];
   const emitted: string[] = [];
   const count = { spoolRead: 0, pendingRead: 0, proofRead: 0 };
   const offsets: number[] = [];
   const claim = { ownerRequestId: "box-owner", accountId: 20n, runNonce: "a".repeat(24),
     leaseEpoch: "b".repeat(32), spoolOffset: 1234, roundNo: 2, detachedRunnerHash: "b".repeat(64),
-    catalogHash: api.catalogHash(CLI_TOOLS), durableRevision: "rev-1", results,
+    catalogHash, durableRevision: "rev-1", results,
     toolUses: results.map((result) => ({ id: result.modelToolUseId, boxName: BOX_BASH, clientName: "Bash",
       inputHash: "f".repeat(64) })) };
   const bytes = spoolOf(records);
@@ -620,7 +730,7 @@ function boxContinuation(api: Api, results: readonly EchoExpected[], records: un
     if (args[2]?.includes("pending.")) {
       faults.pendingRead?.(++count.pendingRead);
       return reply(JSON.stringify({ version: 1, modelToolUseId: args[4], mcpRequestId: 7,
-        name: "Bash", arguments: { value: "x" } }));
+        name: catalogHash === api.catalogHash(CLI_TOOLS) ? "Bash" : "t0", arguments: { value: "x" } }));
     }
     faults.proofRead?.(++count.proofRead);
     return reply(`${JSON.stringify({ runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch, keeperPid: 101,
@@ -960,6 +1070,348 @@ async function proveSpoolReadTransient(api: Api): Promise<string> {
   return "[ocv5-306-spool-read-transient] PASS — a dropped spool read is read again at the same offset";
 }
 
+/** One pinned session on the explicit loopback test database. The journal's
+ * tables are session-local TEMP tables built from the product's own schema
+ * mirror, so nothing here can reach or outlive into a persistent schema. */
+async function withJournalDatabase<T>(run: (db: Db) => Promise<T>): Promise<T> {
+  const gate = await import(pathToFileURL(join(CANDIDATE, "scripts/check-v5-box-success-recovery.ts")).href);
+  const { config } = gate.parseTestDatabase(process.env.TEST_DATABASE_URL);
+  const pg = await import("pg");
+  const pool = new (pg.default ?? pg).Pool({ ...config, max: 1 });
+  const client = await pool.connect();
+  try {
+    const ddl = readFileSync(join(CANDIDATE, "packages/commercial/src/billing/boxBillingRecoveryTempSchema.sql"), "utf8");
+    for (const statement of ddl.split(/;\s*(?:\r?\n|$)/)) {
+      const sql = statement.replace(/^\s*--.*$/gm, "").trim();
+      if (sql) await client.query(sql);
+    }
+    await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
+      user_id bigint NOT NULL, status text NOT NULL)`);
+    const shadow = await client.query(`SELECT n.nspname AS schema FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.oid = ANY (ARRAY[to_regclass('request_finalize_journal'), to_regclass('usage_records'),
+        to_regclass('users'), to_regclass('credit_ledger'), to_regclass('turn_dispatches')])`);
+    if (shadow.rows.length !== 5 || shadow.rows.some((row: { schema: string }) => !/^pg_temp(?:_\d+)?$/.test(row.schema))) {
+      fail("JOURNAL_TABLES_NOT_SESSION_LOCAL");
+    }
+    return await run(client as Db);
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+const JOURNAL_PRICING = { v: 1, modelId: MODEL, displayName: "Opus", inputPerMtok: "1", outputPerMtok: "1",
+  cacheReadPerMtok: "1", cacheWritePerMtok: "1", multiplier: "1" };
+/** What the proxy's precheck writes before a Box call is admitted. */
+async function prechecked(api: Api, db: Db, row: { requestId: string; uid: bigint; containerId: bigint;
+  sessionId: string; turnKey: string; dispatchId?: string }): Promise<void> {
+  await db.query(`INSERT INTO request_finalize_journal
+    (request_id,user_id,container_id,state,ctx,precheck_credits) VALUES ($1,$2,$3,'inflight',$4::jsonb,0)`,
+  [row.requestId, row.uid.toString(), row.containerId.toString(), JSON.stringify({ model: MODEL,
+    boxInvocationRecovery: "v1", billingPricing: JOURNAL_PRICING,
+    boxBillingContext: api.billingContext({ sessionId: row.sessionId, turnKey: row.turnKey,
+      ...(row.dispatchId ? { dispatchId: row.dispatchId, attemptNo: 1 } : {}) }) })]);
+}
+const journalRow = async (db: Db, requestId: string) => (await db.query(
+  `SELECT state,failure_code,final_credits::text AS credits,ctx FROM request_finalize_journal WHERE request_id=$1`,
+  [requestId])).rows[0] as { state: string; failure_code: string | null; credits: string | null;
+    ctx: Record<string, unknown> } | undefined;
+const money = async (db: Db, uid: bigint) => JSON.stringify((await db.query(`SELECT
+  (SELECT COUNT(*)::text FROM usage_records) AS usage, (SELECT COUNT(*)::text FROM credit_ledger) AS ledger,
+  (SELECT credits::text FROM users WHERE id=$1) AS wallet`, [uid.toString()])).rows);
+
+// INC-20261001-BOX-REJECTED-STREAM-WEDGE: the model called a tool name outside
+// this invocation's catalog, egress rejected the stream, the Box CLI answered
+// the call itself and finished. The explicit stop then found nothing to stop
+// (completed_unsettled) and the journal row stayed inflight/unknown for good:
+// every next message of the session was refused ("消息未开始处理") and one
+// account slot leaked. The row must settle unbilled from the keeper's proof,
+// and production must expose the client's own tool names to the CLI.
+async function proveRejectedStreamWedge(api: Api, db: Db): Promise<string> {
+  const who = { uid: 900_000_300n, containerId: 300n, sessionId: "session-wedge" };
+  const journal = api.journal(db);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'wedge@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const before = await money(db, who.uid);
+  const turnKey = "3".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-wedge", turnKey });
+  // one message with a valid call and a bare, unexposed name: rejected, never merged
+  const mixed = [cliInit, start("msg_a"), ...call("msg_a", 0, "toolu_ok", BOX_BASH),
+    ...call("msg_a", 1, "toolu_bad", "Bash", [{ type: "tool_use", id: "toolu_ok", name: BOX_BASH, input: { value: "x" } }])];
+  let stops = 0;
+  const host = boxHost(api, spoolOf(mixed), { real: { journal, ...who, requestId: "box-wedge", turnKey,
+    // the CLI already exited by itself: its keeper proof says worker_complete
+    proofReason: "worker_complete",
+    stopRejectedRun: async (identity) => { stops++; return api.stopCoordinator(journal, host.target).requestStop(identity); } } });
+  const rejected = await codeOf(host.round);
+  if (rejected !== "BOX_TOOL_NAME_UNAVAILABLE") fail(`WEDGE_NOT_SETTLED_${rejected}`);
+  if (stops !== 1 || host.count.launch !== 1) fail("WEDGE_STOP_OR_LAUNCH_COUNT");
+  const row = await journalRow(db, "box-wedge");
+  if (row?.state !== "aborted" || row.failure_code !== "STREAM_FAILED" || row.credits !== "0"
+    || row.ctx.boxState !== "failed_stopped" || row.ctx.boxStopOutcome !== "rejected_stream"
+    || (row.ctx.boxTerminalProof as { reason?: string } | undefined)?.reason !== "worker_complete") {
+    fail(`WEDGE_ROW_${row?.state}_${String(row?.ctx.boxState)}_${String(row?.ctx.boxStopOutcome)}`);
+  }
+  if (await money(db, who.uid) !== before) fail("WEDGE_BILLED");
+  const idle = await journal.readIdleProof({ ...who, turnKey });
+  if (idle.status !== "failed" || !isDeepStrictEqual(idle.requestIds, ["box-wedge"])) fail(`WEDGE_IDLE_${idle.status}`);
+  // the settled row keeps the keeper's worker_complete proof; cleanup must not take it for corrupt evidence
+  const cleanup = await journal.listRemoteCleanupCandidates(10 as never) as Array<{ requestId: string }>;
+  if (cleanup.some((item) => item.requestId === "box-wedge")
+    || (await journalRow(db, "box-wedge"))?.ctx.boxRemoteCleanupQuarantine !== undefined) fail("WEDGE_QUARANTINED");
+  // the user's next message in that session is admitted, launched and answered
+  const nextKey = "4".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-wedge-next", turnKey: nextKey });
+  const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+    real: { journal, ...who, requestId: "box-wedge-next", turnKey: nextKey } });
+  const answered = await must("WEDGE_NEXT_MESSAGE", next.round());
+  if (answered.kind !== "final" || !next.sse().includes("done")) fail("WEDGE_NEXT_MESSAGE_NO_ANSWER");
+  if ((await journalRow(db, "box-wedge-next"))?.ctx.boxState !== "terminal") fail("WEDGE_NEXT_MESSAGE_NOT_SETTLED");
+  // the CLI is launched with the client's own names, so a native "Bash" resolves
+  const allowed = next.launchArgs[next.launchArgs.indexOf("--allowedTools") + 1];
+  if (allowed !== BOX_BASH) fail(`WEDGE_ALIAS_${allowed}`);
+  if (!/new BoxToolFetch\(\{[^}]*?toolAliasMode: "natural"/s.test(api.egressSource)) fail("WEDGE_PRODUCTION_ALIAS_MODE");
+  // a chain admitted before that release, on the opaque t0 binding, still continues
+  const opaqueUse = [start("msg_o"), ...call("msg_o", 0, "toolu_opaque", "mcp__ocbridge__t0"), ...stop("tool_use", 4)];
+  const opaque = boxContinuation(api, [publishedText("toolu_prior", "ok")],
+    [echoOf("toolu_prior", "ok"), ...opaqueUse], {}, api.catalogHash(CLI_TOOLS, "opaque"));
+  if ((await must("WEDGE_OPAQUE_CHAIN", opaque.round())).kind !== "tool_handoff"
+    || !opaque.sse().includes('"name":"Bash"')) fail("WEDGE_OPAQUE_CHAIN_LOST");
+  return "[ocv5-300-rejected-stream-wedge] PASS — a rejected stream whose CLI finished settles unbilled and the next message runs";
+}
+
+/** A Box tool turn as egress serves it: the product's BoxToolFetch on the real
+ * journal, with one Box account behind it. `first` is the round that hands the
+ * tool call to the client; `next` sends the client's tool result back. */
+function boxTurn(api: Api, db: Db, journal: Journal, who: { uid: bigint; containerId: bigint; sessionId: string },
+  name: string, turnKey: string, writeMessage?: unknown,
+  options: { dispatchId?: string; nextSpool?: Buffer; stopIgnored?: boolean } = {}) {
+  const cut = { active: false };
+  const host = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
+    // the exec stream of a continuation is cut in a way a re-read cannot repair
+    spoolRead: () => { if (cut.active) throw api.transportError("BOX_EXEC_HTTP_500"); },
+    real: { journal, ...who, accountId: who.containerId, requestId: `${name}-1`, turnKey, ...options } });
+  const service = api.toolFetch({ ...host.deps, ...(writeMessage ? { writeMessage } : {}),
+    stopOrphanRun: (identity: unknown) => api.stopCoordinator(journal, host.target).requestStop(identity) });
+  const exchange = [{ role: "user", content: "run it" },
+    { role: "assistant", content: [text("Using the bridge."),
+      { type: "tool_use", id: "toolu_good_1", name: "Bash", input: { value: "x" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" }] }];
+  /** The request that carries the tool result, under this or another turn key. */
+  const answer = (requestId: string, key = turnKey) => {
+    const body = { ...JSON.parse(host.call.init.body) as Body, messages: exchange,
+      metadata: { user_id: JSON.stringify({ session_id: who.sessionId, oc_turn_key: key }) } };
+    return { ...host.call, requestId, canonicalBody: { ...body, model: MODEL },
+      init: { method: "POST", body: JSON.stringify(body) } };
+  };
+  return { host, service, cut, answer,
+    first: async () => {
+      await prechecked(api, db, { ...who, requestId: `${name}-1`, turnKey,
+        ...(options.dispatchId ? { dispatchId: options.dispatchId } : {}) });
+      const sse = await must(`${name}_FIRST_ROUND`, service.fetch(host.call).then((response) => response.text()));
+      if (!sse.includes("toolu_good_1") || host.count.launch !== 1) fail(`${name}_FIRST_ROUND`);
+    },
+    next: async (requestId: string, key = turnKey, dispatchId?: string) => {
+      await prechecked(api, db, { ...who, requestId, turnKey: key, ...(dispatchId ? { dispatchId } : {}) });
+      return service.fetch(answer(requestId, key));
+    } };
+}
+
+// INC-20261002-BOX-REPLAY-PENDING-AFTER-CUT, live #2ee979cd: right after the
+// turn's tools succeeded the continuation's Box exec stream was cut. The CLI on
+// the Box kept going and finished, but CCB's same-request non-streaming retry
+// one second later found the call still resolving and got 409
+// BOX_REPLAY_PENDING ("任务执行失败"). The retry must keep looking, read-only,
+// until the real result is ready. A cut continuation whose CLI ran on to a
+// tool call nobody received must not pin the session either.
+async function proveReplayPendingAfterCut(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const root = mkdtempSync(join(tmpdir(), "ocv5-308-replay-"));
+  try {
+    const store = api.replayStore(join(root, "state"));
+    const who = { uid: 900_000_306n, containerId: 306n, sessionId: "session-cut" };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'cut@test.invalid','unused',10000)",
+      [who.uid.toString()]);
+    const turn = boxTurn(api, db, journal, who, "box-cut", "6".repeat(64), store.write);
+    await turn.first();
+    turn.cut.active = true;
+    const cutResponse = await turn.next("box-cut-2");
+    if (await codeOf(() => cutResponse.text()) !== "BOX_EXEC_HTTP_500") fail("REPLAY_CONTINUATION_NOT_CUT");
+    turn.cut.active = false;
+    if ((await journalRow(db, "box-cut-2"))?.ctx.boxState !== "unknown") fail("REPLAY_LEAF_NOT_UNKNOWN");
+    // the CLI is still working: it has echoed the tool result and the model has not answered yet
+    turn.host.write([echoOf("toolu_good_1", "ok")]);
+    // CCB's fallback: the same request without the stream key. The lookup is egress's own
+    // composition (find, re-observe an unknown detached call read-only, find again).
+    const retry = { uid: who.uid, canonicalModel: MODEL, upstreamModel: CLI_MODEL,
+      canonicalBody: { ...turn.answer("box-cut-2").canonicalBody, stream: false } };
+    const deps = { journal, readMessage: store.read };
+    let lookups = 0;
+    const lookup = async (): Promise<ReplayLookup> => {
+      lookups++;
+      const found = await api.findReplay(retry, deps);
+      if (found.kind !== "pending" || found.identity?.state !== "unknown" || !found.identity.rootLaunchPermit) return found;
+      await api.observeUnknown({ identity: found.identity, canonicalBody: retry.canonicalBody, upstreamModel: CLI_MODEL },
+        { journal, writeMessage: store.write, resolveTarget: async () => turn.host.target, budgetMs: 1000 });
+      return api.findReplay(retry, deps);
+    };
+    const first = await lookup();
+    if (first.kind !== "pending") fail(`REPLAY_FIRST_LOOKUP_${first.kind}`);
+    setTimeout(() => turn.host.write(FINAL_ANSWER), 30);
+    const replayed = await api.waitReplay(first, lookup, { budgetMs: 20_000, intervalMs: 100,
+      signal: new AbortController().signal });
+    if (replayed.kind !== "ready" || !replayed.response) fail(`REPLAY_STILL_${replayed.kind}`);
+    const message = await replayed.response.json() as { content?: Array<{ text?: string }> };
+    if (message.content?.[0]?.text !== "done") fail("REPLAY_NOT_THE_REAL_RESULT");
+    if (turn.host.count.launch !== 1) fail("REPLAY_RELAUNCHED");
+    if ((await journalRow(db, "box-cut-2"))?.ctx.boxState !== "terminal") fail("REPLAY_LEAF_NOT_SETTLED");
+    // production waits 240s in 3s steps, inside CCB's 300s fallback timeout, and the handler uses it
+    const wait = /pendingWait: \{ budgetMs: ([0-9_]+), intervalMs: ([0-9_]+) \}/.exec(api.egressSource);
+    const budgetMs = Number(wait?.[1]?.replaceAll("_", "")), intervalMs = Number(wait?.[2]?.replaceAll("_", ""));
+    if (!(budgetMs >= 120_000 && budgetMs < 300_000 && intervalMs >= 1000 && intervalMs <= 10_000)) fail("REPLAY_PRODUCTION_WAIT");
+    if (!/replay\.kind === "pending" && pendingWait\)[\s\S]{0,400}waitForBoxReplay\(replay, lookupReplay,\s*\{ \.\.\.pendingWait/
+      .test(api.proxySource)) fail("REPLAY_HANDLER_NOT_WAITING");
+    let clock = 0, polls = 0;
+    const still = await api.waitReplay({ kind: "pending" }, async () => { polls++; return { kind: "pending" }; },
+      { budgetMs, intervalMs, signal: new AbortController().signal, now: () => clock,
+        sleep: async (ms) => { clock += ms; } });
+    if (still.kind !== "pending" || clock > budgetMs || polls !== Math.floor(budgetMs / intervalMs)) fail("REPLAY_WAIT_UNBOUNDED");
+    const gone = new AbortController();
+    gone.abort();
+    await api.waitReplay({ kind: "pending" }, async () => { polls = -1; return { kind: "ready" }; },
+      { budgetMs, intervalMs, signal: gone.signal, now: () => 0, sleep: async () => {} });
+    if (polls === -1) fail("REPLAY_WAITED_FOR_GONE_CLIENT");
+
+    // a cut continuation whose CLI ran on to another tool call and exited: nobody can receive that
+    // call, so the unknown leaf is closed unbilled and the session is released
+    const stuck = { uid: 900_000_307n, containerId: 307n, sessionId: "session-cut-unseen" };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'unseen@test.invalid','unused',10000)",
+      [stuck.uid.toString()]);
+    const before = await money(db, stuck.uid);
+    const unseen = boxTurn(api, db, journal, stuck, "box-unseen", "7".repeat(64), store.write);
+    await unseen.first();
+    unseen.cut.active = true;
+    await codeOf(async () => (await unseen.next("box-unseen-2")).text());
+    unseen.cut.active = false;
+    unseen.host.write([echoOf("toolu_good_1", "ok"), start("msg_c", 30, 5),
+      ...call("msg_c", 0, "toolu_unseen", BOX_BASH), ...stop("tool_use", 9, 30)]);
+    const sweeper = api.cleanupWorker({ journal, writeRecoveryMessage: store.write,
+      resolver: { resolve: async () => unseen.host.target } });
+    const swept = await sweeper.reconcileStoppedFailures();
+    const leaf = await journalRow(db, "box-unseen-2"), parent = await journalRow(db, "box-unseen-1");
+    if (swept.recovered !== 1 || leaf?.state !== "aborted" || leaf.credits !== "0"
+      || leaf.ctx.boxState !== "failed_stopped" || leaf.ctx.boxStopOutcome !== "rejected_stream"
+      || parent?.ctx.boxState !== "failed_stopped") {
+      fail(`REPLAY_UNSEEN_LEAF_${swept.recovered}_${leaf?.state}_${String(leaf?.ctx.boxState)}_${String(parent?.ctx.boxState)}`);
+    }
+    if (await money(db, stuck.uid) !== before) fail("REPLAY_UNSEEN_BILLED");
+    const idle = await journal.readIdleProof({ ...stuck, turnKey: "7".repeat(64) });
+    if (idle.status !== "failed") fail(`REPLAY_UNSEEN_IDLE_${idle.status}`);
+    await prechecked(api, db, { ...stuck, requestId: "box-unseen-next", turnKey: "8".repeat(64) });
+    const nextMessage = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+      real: { journal, ...stuck, accountId: stuck.containerId, requestId: "box-unseen-next", turnKey: "8".repeat(64) } });
+    if ((await must("REPLAY_UNSEEN_NEXT_MESSAGE", nextMessage.round())).kind !== "final") fail("REPLAY_UNSEEN_NEXT_MESSAGE");
+    // a first round left unknown with a handoff in its spool is a different shape and stays held
+    const held = { uid: 900_000_308n, containerId: 308n, sessionId: "session-first-held" };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'held@test.invalid','unused',10000)",
+      [held.uid.toString()]);
+    await prechecked(api, db, { ...held, requestId: "box-held-1", turnKey: "9".repeat(64) });
+    const firstHeld = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
+      pendingRead: () => { throw api.transportError("BOX_EXEC_HTTP_500"); },
+      real: { journal, ...held, accountId: held.containerId, requestId: "box-held-1", turnKey: "9".repeat(64) } });
+    if (await codeOf(firstHeld.round) !== "BOX_EXEC_HTTP_500") fail("REPLAY_FIRST_ROUND_NOT_CUT");
+    const again = await api.cleanupWorker({ journal, writeRecoveryMessage: store.write,
+      resolver: { resolve: async () => firstHeld.target } }).reconcileStoppedFailures();
+    if ((await journalRow(db, "box-held-1"))?.ctx.boxState !== "unknown" || again.recovered !== 0) {
+      fail("REPLAY_FIRST_ROUND_HANDOFF_RELEASED");
+    }
+    return "[ocv5-306-replay-pending-after-cut] PASS — a retry waits for the still-finishing Box call and replays its real result";
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// INC-20261001-BOX-RECOVERED-TOOL-EXCHANGE, live #aacd65f7: a Box turn failed
+// after it had handed tool calls to the client. The server's recovery turns
+// ("从断点继续 / 重新尝试") resent the same tool results under a new turn key; a
+// continuation can only bind to its own dispatch, so each one was 409
+// BOX_TOOL_OWNER_UNKNOWN ("任务执行失败"), while the first dispatch's CLI kept
+// waiting and held the session's slot. The recovery must stop that orphan the
+// way a user Stop does and continue the exchange as one fresh invocation.
+async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  // each user has one dispatch that has ended and one that is still running
+  const endedOf = (uid: bigint) => `11111111-1111-4111-8111-${uid.toString().padStart(12, "0")}`;
+  const runningOf = (uid: bigint) => `22222222-2222-4222-8222-${uid.toString().padStart(12, "0")}`;
+  const user = async (uid: bigint, label: string) => {
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    await db.query(`INSERT INTO turn_dispatches VALUES ($1,$3,'terminal'),($2,$3,'running')`,
+      [endedOf(uid), runningOf(uid), uid.toString()]);
+  };
+  const who = { uid: 900_000_304n, containerId: 304n, sessionId: "session-recover" };
+  await user(who.uid, "recover");
+  // the turn whose dispatch has ended; its CLI is parked waiting for the tool result
+  const turn = boxTurn(api, db, journal, who, "box-rec", "a".repeat(64), undefined,
+    { dispatchId: endedOf(who.uid), nextSpool: spoolOf([cliInit, ...FINAL_ANSWER]) });
+  await turn.first();
+  // the recovery turn: the same tool result, another turn key
+  const recovered = await must("RECOVERED_EXCHANGE_REJECTED", turn.next("box-rec-2", "b".repeat(64), runningOf(who.uid)));
+  const sse = await must("RECOVERED_EXCHANGE_STREAM", recovered.text());
+  if (recovered.status !== 200 || !sse.includes("done")) fail("RECOVERED_EXCHANGE_NO_ANSWER");
+  if (turn.host.count.stop !== 1 || turn.host.count.launch !== 2) {
+    fail(`RECOVERED_EXCHANGE_STOP_${turn.host.count.stop}_LAUNCH_${turn.host.count.launch}`);
+  }
+  const orphan = await journalRow(db, "box-rec-1"), fresh = await journalRow(db, "box-rec-2");
+  if (orphan?.ctx.boxState !== "failed_stopped" || orphan.ctx.boxRecoveredBy !== "box-rec-2"
+    || (orphan.ctx.boxTerminalProof as { reason?: string } | undefined)?.reason !== "keeper_stopped") {
+    fail(`RECOVERED_ORPHAN_${String(orphan?.ctx.boxState)}_${String(orphan?.ctx.boxRecoveredBy)}`);
+  }
+  if (fresh?.ctx.boxState !== "terminal" || fresh.ctx.boxRunNonce === orphan.ctx.boxRunNonce) fail("RECOVERED_NOT_A_FRESH_RUN");
+  // the fresh CLI gets the whole exchange as history and Claude Code's own resume sentence as its prompt
+  const run = `/tmp/ocv5-289-run-${String(fresh.ctx.boxRunNonce)}`;
+  const stdin = turn.host.files.get(`${run}/stdin.jsonl`)?.toString("utf8") ?? "";
+  const history = [...turn.host.files].filter(([path]) => path.endsWith(".jsonl") && !path.startsWith(run))
+    .map(([, raw]) => raw.toString("utf8")).join("\n");
+  if (!stdin.includes("Continue from where you left off.") || stdin.includes("toolu_good_1")) fail("RECOVERED_PROMPT");
+  if (!history.includes('"tool_use"') || !history.includes('"tool_result"')
+    || (history.match(/toolu_good_1/g) ?? []).length !== 2) fail("RECOVERED_HISTORY");
+  // a second recovery of the same exchange never starts another paid run
+  const again = await codeOf(async () => (await turn.next("box-rec-3", "c".repeat(64), runningOf(who.uid))).text());
+  if (again !== "BOX_RESUME_IN_PROGRESS" || turn.host.count.launch !== 2) fail(`RECOVERED_TWICE_${again}`);
+
+  // an exchange whose dispatch is still running belongs to its live owner
+  const liveUser = { uid: 900_000_305n, containerId: 305n, sessionId: "session-live-owner" };
+  await user(liveUser.uid, "live-owner");
+  const live = boxTurn(api, db, journal, liveUser, "box-live", "a".repeat(64), undefined, { dispatchId: runningOf(liveUser.uid) });
+  await live.first();
+  const refused = await codeOf(async () => (await live.next("box-live-2", "b".repeat(64), runningOf(liveUser.uid))).text());
+  if (refused !== "BOX_TOOL_OWNER_UNKNOWN" || live.host.count.stop !== 0 || live.host.count.launch !== 1
+    || (await journalRow(db, "box-live-1"))?.ctx.boxState !== "handoff") fail(`RECOVERED_LIVE_OWNER_${refused}`);
+  // a stop that cannot be proven keeps the rejection and gives the exchange back
+  const unproven = { uid: 900_000_309n, containerId: 309n, sessionId: "session-unproven-stop" };
+  await user(unproven.uid, "unproven");
+  const parked = boxTurn(api, db, journal, unproven, "box-park", "a".repeat(64), undefined,
+    { dispatchId: endedOf(unproven.uid), stopIgnored: true });
+  await parked.first();
+  const kept = await codeOf(async () => (await parked.next("box-park-2", "b".repeat(64), runningOf(unproven.uid))).text());
+  const parkedRow = await journalRow(db, "box-park-1");
+  if (kept !== "BOX_TOOL_OWNER_UNKNOWN" || parked.host.count.launch !== 1 || parkedRow?.ctx.boxRecoveredBy !== undefined) {
+    fail(`RECOVERED_UNPROVEN_STOP_${kept}_${String(parkedRow?.ctx.boxRecoveredBy)}`);
+  }
+  // an exchange the user is stopping is the user's: the recovery neither claims nor continues it
+  const stopping = { uid: 900_000_310n, containerId: 310n, sessionId: "session-user-stop" };
+  await user(stopping.uid, "user-stop");
+  const pressed = boxTurn(api, db, journal, stopping, "box-stop", "a".repeat(64), undefined, { dispatchId: endedOf(stopping.uid) });
+  await pressed.first();
+  await journal.recordUserCancelIntent({ requestId: "box-stop-1", uid: stopping.uid, accountId: stopping.containerId,
+    runNonce: pressed.host.runNonce, leaseEpoch: pressed.host.leaseEpoch } as never);
+  const yielded = await codeOf(async () => (await pressed.next("box-stop-2", "b".repeat(64), runningOf(stopping.uid))).text());
+  if (yielded !== "BOX_TOOL_OWNER_UNKNOWN" || pressed.host.count.stop !== 0 || pressed.host.count.launch !== 1
+    || (await journalRow(db, "box-stop-1"))?.ctx.boxRecoveredBy !== undefined) fail(`RECOVERED_USER_STOP_${yielded}`);
+  return "[ocv5-304-recovered-tool-exchange] PASS — a recovery turn stops the orphaned run and continues its tool exchange once";
+}
+
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -969,7 +1421,9 @@ async function main(): Promise<void> {
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
-    await proveSpoolReadTransient(api)];
+    await proveSpoolReadTransient(api),
+    ...await withJournalDatabase(async (db) => [await proveRejectedStreamWedge(api, db),
+      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db)])];
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }

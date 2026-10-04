@@ -5425,6 +5425,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-300-rejected-stream-wedge] PASS — a rejected stream whose CLI finished settles unbilled and the next message runs"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
           "assertion": "OCV5-300 a self-completed rejected stream is settled from its keeper proof"
@@ -5605,6 +5610,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-304-recovered-tool-exchange] PASS — a recovery turn stops the orphaned run and continues its tool exchange once"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
           "assertion": "OCV5-304 a recovered dispatch stops the orphan and continues as a fresh invocation"
@@ -5647,6 +5657,11 @@
         "265e9ff6"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-306-replay-pending-after-cut] PASS — a retry waits for the still-finishing Box call and replays its real result"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxReplayWait.test.ts",
