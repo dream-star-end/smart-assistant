@@ -178,6 +178,12 @@ jobs:
             sleep 2
           done
 
+      # 界面是中文。托管 runner 没有 CJK 字体时汉字按回退字形排版,行数和高度都和用户看到的不一样。
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
       # 浏览器门把截图和预览地址写到用户容器的 generated 目录;托管 runner 上没有这个目录,
       # 不建它这些用例在 mkdir 就 EACCES。
       - name: Prepare browser artifact directory

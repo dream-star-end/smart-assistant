@@ -5678,6 +5678,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/continue-card-retired.node-test.mjs",
+          "assertion": "running continuation: the committed failure card is retired"
+        },
+        {
           "layer": "unit",
           "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
           "assertion": "手动继续进行中：原失败卡与重新尝试一并收起"
