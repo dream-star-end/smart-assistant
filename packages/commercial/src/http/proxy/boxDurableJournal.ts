@@ -2965,9 +2965,14 @@ export class BoxDurableJournal implements BoxJournalPort {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-      const found = await client.query<{ request_id: string; state: string;
-        ctx: Record<string, unknown> }>(
-        `SELECT request_id,state,ctx FROM request_finalize_journal
+      type IdleRow = { request_id: string; state: string; final_credits: string | null;
+        failure_code: string | null; ctx: Record<string, unknown> };
+      const idleRow = (row: IdleRow): IdleChainRow => ({ requestId: row.request_id,
+        state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
+        failureCode: row.failure_code });
+      const found = await client.query<IdleRow>(
+        `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx
+           FROM request_finalize_journal
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
             AND ctx->>'model'='box-api-claude-opus-5-5'
@@ -2988,9 +2993,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       // OCV5-313: a run closed as expired_unproven stops holding the session,
       // but only as a whole, structurally valid chain (exact marker, linkage,
       // identity). The state name alone releases nothing.
-      const expired = await client.query<{ request_id: string; state: string;
-        ctx: Record<string, unknown> }>(
-        `SELECT request_id,state,ctx FROM request_finalize_journal
+      const expired = await client.query<IdleRow>(
+        `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx
+           FROM request_finalize_journal
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'boxSessionId'=$3
             AND ctx->>'boxInvocationRecovery'='v1'
@@ -2998,11 +3003,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         [input.uid.toString(), input.containerId.toString(), input.sessionId,
           BOX_EXPIRED_UNPROVEN_STATE]);
       await client.query("COMMIT");
-      const released = validExpiredChainIds(expired.rows.map((row) => ({
-        requestId: row.request_id, state: row.state, ctx: row.ctx })));
-      const rows: IdleChainRow[] = found.rows.map((row) => ({
-        requestId: row.request_id, state: row.state, ctx: row.ctx,
-      }));
+      const released = validExpiredChainIds(expired.rows.map(idleRow));
+      const rows: IdleChainRow[] = found.rows.map(idleRow);
       const proof = projectBoxIdleChain({
         sessionId: input.sessionId,
         turnKey: input.turnKey,

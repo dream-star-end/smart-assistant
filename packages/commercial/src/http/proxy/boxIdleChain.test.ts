@@ -253,72 +253,136 @@ test("OCV5-306 a rejected-stream leaf releases a linked chain; its ancestors mus
 });
 
 // ── OCV5-313: a run closed as expired_unproven ended without a model result ──
+const CATALOG = "c".repeat(64), RUNNER = "d".repeat(64);
+const XREV = "33333333-3333-4333-8333-333333333333";
 const expiredMarker = { v: 1, atMs: 1791096241420, priorBoxState: "unknown",
   cause: "BOX_ACCOUNT_UNAVAILABLE" };
-const expiredIdentity = { boxAccountId: "20", boxRunNonce: NONCE, boxLeaseEpoch: EPOCH };
-const expiredLeaf = row("x-leaf", { ...expiredIdentity, boxState: "expired_unproven",
-  boxExpiredClose: expiredMarker, boxOwnerRequestId: "x-parent",
-  boxParentResumeRevision: "33333333-3333-4333-8333-333333333333" }, "aborted");
-const expiredParent = row("x-parent", { ...expiredIdentity, boxState: "expired_unproven",
-  boxToolHandoff: { roundNo: 1 }, boxResumeRequestId: "x-leaf",
-  boxResumeRevision: "33333333-3333-4333-8333-333333333333" });
+const storedHandoff = (roundNo: number, extra: Record<string, unknown> = {}) => ({ version: 1,
+  roundNo, messageId: `msg_${roundNo}`, assistantContentHash: "e".repeat(64), spoolOffset: 8,
+  detachedRunnerHash: RUNNER, catalogHash: CATALOG,
+  toolUses: [{ id: `toolu_x${roundNo}`, boxName: "mcp__ocbridge__t0", clientName: "Note",
+    inputHash: "f".repeat(64) }], verifiedPendingToolUseIds: [`toolu_x${roundNo}`],
+  usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 }, ...extra });
+const expiredIdentity = { boxAccountId: "20", boxRunNonce: NONCE, boxLeaseEpoch: EPOCH,
+  boxInvocationMode: "detached_tool", boxCatalogHash: CATALOG, boxDetachedRunnerHash: RUNNER };
+const aborted = { state: "aborted", finalCredits: "0", failureCode: "STREAM_FAILED" };
+const expiredLeaf: IdleChainRow = { ...row("x-leaf", { ...expiredIdentity,
+  boxState: "expired_unproven", boxExpiredClose: expiredMarker, boxOwnerRequestId: "x-parent",
+  boxRoundNo: 2, boxParentResumeRevision: XREV }), ...aborted };
+const expiredParent: IdleChainRow = { ...row("x-parent", { ...expiredIdentity,
+  boxState: "expired_unproven", boxToolHandoff: storedHandoff(1), boxLaunchPermit: true,
+  boxHandoffRevision: "55555555-5555-4555-8555-555555555555", boxResumeRequestId: "x-leaf",
+  boxResumeRevision: XREV }), finalCredits: "8", failureCode: null };
+const expiredFirst: IdleChainRow = { ...row("x-first", { ...expiredIdentity,
+  boxState: "expired_unproven",
+  boxExpiredClose: { ...expiredMarker, priorBoxState: "running" } }), ...aborted };
+const expiredHandoff: IdleChainRow = { ...row("x-handoff", { ...expiredIdentity,
+  boxState: "expired_unproven", boxExpiredClose: { ...expiredMarker, priorBoxState: "handoff" },
+  boxToolHandoff: storedHandoff(1),
+  boxHandoffRevision: "66666666-6666-4666-8666-666666666666" }), finalCredits: "8",
+  failureCode: null };
+const withCtx = (base: IdleChainRow, extra: Record<string, unknown>,
+  columns: Partial<IdleChainRow> = {}): IdleChainRow =>
+  ({ ...base, ...columns, ctx: { ...base.ctx, ...extra } });
 
 test("OCV5-313 an expired unproven chain projects failed in each shape the journal writes", () => {
   const failed = (ids: string[]) => ({ status: "failed", sessionId, turnKey, requestIds: ids });
   assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [expiredParent, expiredLeaf] }),
     failed(["x-leaf", "x-parent"]));
-  // unbilled first round (tool or detached text): one aborted row
-  const first = row("x-first", { ...expiredIdentity, boxState: "expired_unproven",
-    boxExpiredClose: { ...expiredMarker, priorBoxState: "running" } }, "aborted");
-  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [first] }), failed(["x-first"]));
+  // unbilled first round (tool, or the armed detached text lane): one aborted row
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [expiredFirst] }),
+    failed(["x-first"]));
+  const text = withCtx(expiredFirst, { boxInvocationMode: "text", boxLaunchPermit: true,
+    boxUpstreamModel: "claude-opus-5-5", boxCatalogHash: undefined });
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [text] }), failed(["x-first"]));
   // billed handoff nobody answered: the leaf keeps its settlement
-  const handoff = row("x-handoff", { ...expiredIdentity, boxState: "expired_unproven",
-    boxExpiredClose: { ...expiredMarker, priorBoxState: "handoff" },
-    boxToolHandoff: { roundNo: 1 } });
-  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [handoff] }), failed(["x-handoff"]));
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [expiredHandoff] }),
+    failed(["x-handoff"]));
 });
 
-test("OCV5-313 a malformed, contradictory or half-closed expired chain stays pending", () => {
-  const pending = (rows: IdleChainRow[], other?: string[]) => assert.equal(projectBoxIdleChain({
-    sessionId, turnKey, rows, ...(other ? { otherOpenRequestIds: other } : {}) }).status, "pending");
-  const leafWith = (extra: Record<string, unknown>, state = "aborted") =>
-    ({ ...expiredLeaf, state, ctx: { ...expiredLeaf.ctx, ...extra } });
-  pending([expiredParent, leafWith({ boxExpiredClose: undefined })]);
-  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, extra: 1 } })]);
-  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, priorBoxState: "terminal" } })]);
-  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, atMs: 12 } })]);
-  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, cause: "free text!" } })]);
-  pending([expiredParent, leafWith({}, "inflight")]);                 // unbilled leaf not aborted
-  pending([expiredParent, leafWith({ boxTerminalProof: failedProof })]); // proof contradicts unproven
-  pending([expiredParent, leafWith({ boxRunNonce: "9".repeat(24) })]);
-  pending([{ ...expiredParent, ctx: { ...expiredParent.ctx, boxState: "resuming" } }, expiredLeaf]);
-  pending([{ ...expiredParent, ctx: { ...expiredParent.ctx, boxAccountId: "25" } }, expiredLeaf]);
-  pending([{ ...expiredParent, ctx: { ...expiredParent.ctx,
-    boxResumeRevision: "44444444-4444-4444-8444-444444444444" } }, expiredLeaf]);
-  pending([expiredParent, expiredLeaf], ["another-open-chain"]);
+test("OCV5-313 any shape the journal's expiry cannot have written stays pending", () => {
+  const pending = (name: string, rows: IdleChainRow[], other?: string[]) => {
+    assert.equal(projectBoxIdleChain({ sessionId, turnKey, rows,
+      ...(other ? { otherOpenRequestIds: other } : {}) }).status, "pending", name);
+    assert.deepEqual([...validExpiredChainIds(rows)], [], `${name}: releases nothing`);
+  };
+  const leaf = (name: string, extra: Record<string, unknown>, columns: Partial<IdleChainRow> = {}) =>
+    pending(name, [expiredParent, withCtx(expiredLeaf, extra, columns)]);
+  const parent = (name: string, extra: Record<string, unknown>, columns: Partial<IdleChainRow> = {}) =>
+    pending(name, [withCtx(expiredParent, extra, columns), expiredLeaf]);
+  // marker
+  leaf("marker missing", { boxExpiredClose: undefined });
+  leaf("marker extra key", { boxExpiredClose: { ...expiredMarker, extra: 1 } });
+  leaf("marker prior terminal", { boxExpiredClose: { ...expiredMarker, priorBoxState: "terminal" } });
+  leaf("marker prior of another round type",
+    { boxExpiredClose: { ...expiredMarker, priorBoxState: "running" } });
+  leaf("marker time", { boxExpiredClose: { ...expiredMarker, atMs: 12 } });
+  leaf("marker cause", { boxExpiredClose: { ...expiredMarker, cause: "free text!" } });
+  // settlement of the unbilled leaf
+  leaf("leaf not aborted", {}, { state: "inflight" });
+  leaf("credits missing", {}, { finalCredits: null });
+  leaf("credits charged", {}, { finalCredits: "3" });
+  leaf("failure code missing", {}, { failureCode: null });
+  leaf("failure code other", {}, { failureCode: "USER_CANCELLED" });
+  leaf("settlement claim", { settlementClaimId: "claim-1" });
+  // contradicting evidence
+  leaf("proof on the leaf", { boxTerminalProof: failedProof });
+  leaf("leaf resumed", { boxResumeRequestId: "someone" });
+  parent("proof on an ancestor", { boxTerminalProof: failedProof });
+  // identity and chain binding
+  leaf("other nonce", { boxRunNonce: "9".repeat(24) });
+  leaf("malformed nonce", { boxRunNonce: "short" });
+  leaf("round number", { boxRoundNo: 3 });
+  leaf("round number missing", { boxRoundNo: undefined });
+  leaf("catalog hash malformed", { boxCatalogHash: "nope" });
+  leaf("runner hash missing", { boxDetachedRunnerHash: undefined });
+  leaf("recovery version", { boxInvocationRecovery: "v0" });
+  leaf("text mode in a linked chain", { boxInvocationMode: "text", boxLaunchPermit: true,
+    boxUpstreamModel: "claude-opus-5-5" });
+  leaf("revision mismatch", { boxParentResumeRevision: "44444444-4444-4444-8444-444444444444" });
+  parent("ancestor still waiting", { boxState: "resuming" });
+  parent("ancestor account", { boxAccountId: "25" });
+  parent("ancestor handoff malformed", { boxToolHandoff: { roundNo: 1 } });
+  parent("ancestor handoff round", { boxToolHandoff: storedHandoff(2) });
+  parent("ancestor catalog", { boxToolHandoff: storedHandoff(1, { catalogHash: "a".repeat(64) }) });
+  parent("ancestor runner", { boxToolHandoff: storedHandoff(1, { detachedRunnerHash: "a".repeat(64) }) });
+  parent("ancestor aborted", {}, { state: "aborted" });
+  parent("ancestor resumes another child", { boxResumeRequestId: "another" });
+  pending("revision not a uuid", [withCtx(expiredParent, { boxResumeRevision: "rev-1" }),
+    withCtx(expiredLeaf, { boxParentResumeRevision: "rev-1" })]);
+  // first-round and handoff shapes
+  pending("first round with a linked prior state", [withCtx(expiredFirst,
+    { boxExpiredClose: { ...expiredMarker, priorBoxState: "linked" } })]);
+  pending("unarmed text row", [withCtx(expiredFirst, { boxInvocationMode: "text" })]);
+  pending("handoff revision", [withCtx(expiredHandoff, { boxHandoffRevision: "rev-1" })]);
+  pending("handoff round", [withCtx(expiredHandoff, { boxToolHandoff: storedHandoff(2) })]);
+  pending("handoff leaf aborted", [{ ...expiredHandoff, state: "aborted" }]);
+  pending("handoff with an unbilled prior state", [withCtx(expiredHandoff,
+    { boxExpiredClose: { ...expiredMarker, priorBoxState: "running" } })]);
+  assert.equal(projectBoxIdleChain({ sessionId, turnKey, rows: [expiredParent, expiredLeaf],
+    otherOpenRequestIds: ["another-open-chain"] }).status, "pending");
   // The operator's OCV5-312 close is not a failure shape for its own turn.
-  pending([row("op-leaf", { ...expiredIdentity, boxState: "operator_unreachable_closed",
+  pending("operator close", [{ ...row("op-leaf", { ...expiredIdentity,
+    boxState: "operator_unreachable_closed",
     boxOperatorUnreachableClose: { v: 1, ticket: "OCV5-312", atMs: 1791096241420,
       priorBoxState: "unknown", accountStatus: "disabled", terminalProof: false,
-      remoteCleanup: false } }, "inflight")]);
+      remoteCleanup: false } }), state: "inflight" }]);
 });
 
 test("OCV5-313 only a complete valid expired chain stops counting as another open chain", () => {
   const ids = (rows: IdleChainRow[]) => [...validExpiredChainIds(rows)].sort();
   assert.deepEqual(ids([expiredParent, expiredLeaf]), ["x-leaf", "x-parent"]);
-  const stray = row("stray", { ...expiredIdentity, boxState: "expired_unproven" }, "aborted");
+  assert.deepEqual(ids([expiredFirst]), ["x-first"]);
+  assert.deepEqual(ids([expiredHandoff]), ["x-handoff"]);
+  const stray: IdleChainRow = { ...row("stray", { ...expiredIdentity,
+    boxState: "expired_unproven" }), ...aborted };
   assert.deepEqual(ids([expiredParent, expiredLeaf, stray]), ["x-leaf", "x-parent"],
     "a row with the state but no marker stays open");
-  const badMarker = { ...expiredLeaf, ctx: { ...expiredLeaf.ctx,
-    boxExpiredClose: { ...expiredMarker, cause: "free text!" } } };
-  assert.deepEqual(ids([expiredParent, badMarker]), [], "a malformed marker releases nothing");
   assert.deepEqual(ids([expiredLeaf]), [], "a leaf whose ancestor is not closed releases nothing");
   assert.deepEqual(ids([expiredParent]), [], "an ancestor without its closed leaf releases nothing");
-  const inflight = { ...expiredLeaf, state: "inflight" };
-  assert.deepEqual(ids([expiredParent, inflight]), []);
   // Another turn's valid chain is judged on its own.
-  const otherTurn = row("y-first", { ...expiredIdentity, boxTurnKey: "ef".repeat(32),
-    boxState: "expired_unproven", boxExpiredClose: expiredMarker }, "aborted");
+  const otherTurn = withCtx({ ...expiredFirst, requestId: "y-first" },
+    { boxTurnKey: "ef".repeat(32) });
   assert.deepEqual(ids([expiredLeaf, otherTurn]), ["y-first"]);
   assert.deepEqual(ids([row("live", { boxState: "unknown" }, "inflight")]), []);
 });
