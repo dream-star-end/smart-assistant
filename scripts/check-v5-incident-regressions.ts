@@ -98,8 +98,11 @@ type Waiver = {
 function fail(message: string): never {
   throw new Error(`[incident-regressions] ${message}`);
 }
+// execFileSync 默认 maxBuffer 1 MiB;trailer 门的 `git log start..HEAD` 带完整 body,
+// 分支长到一定程度就 ENOBUFS,整道门在检查任何提交之前就抛。
+const GIT_MAX_BUFFER = 256 * 1024 * 1024;
 function git(...args: string[]): string {
-  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
+  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER }).trim();
 }
 function commitFiles(sha: string): string[] {
   return git("show", "--format=", "--name-only", sha).split("\n").map((line) => line.trim()).filter(Boolean);
@@ -185,12 +188,13 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
-  // test:gateway 是 `find packages/gateway/src -name "*.test.ts"`,子目录(如 taskboard/__tests__)
-  // 同样被跑;这里按 runner 的真实口径放行,不再只认顶层 __tests__。
-  if (/^packages\/gateway\/src\/(?:[^/]+\/)*__tests__\/[^/]+\.test\.ts$/.test(path)) {
+  // test:gateway 是 `find packages/gateway/src -type f -name "*.test.ts"`:src 下任何位置的
+  // *.test.ts 都被跑(含与源码同目录的 engine/*.test.ts),这里按 runner 的真实口径放行。
+  if (/^packages\/gateway\/src\/(?:[^/]+\/)*[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
   }
-  if (/^packages\/protocol\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+  // test:protocol 是 `find packages/protocol/src -type f -name "*.test.ts"`,CI 的 protocol job 调用它。
+  if (/^packages\/protocol\/src\/(?:[^/]+\/)*[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:protocol", "CI job protocol → npm run test:protocol");
   }
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
@@ -210,8 +214,6 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     if (!ROOT_PACKAGE_JSON.includes(path)) fail(`${path} 未列进 npm run test:v5:ops 的文件清单`);
     return { status: "wired", runner: "CI job v5-ops → npm run test:v5:ops" };
   }
-  // packages/protocol/src/__tests__ 当前没有任何 npm script 收它(2026-07-26 核实),
-  // 谁把它当证据登记,谁必须先补 runner。
   fail(`${path} 映射不到任何 runner(layer=${layer});先把它接进 CI 再登记为证据`);
 }
 
