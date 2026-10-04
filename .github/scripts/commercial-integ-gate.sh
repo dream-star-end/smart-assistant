@@ -136,7 +136,7 @@ echo "TAP ->     $tap_out"
 # --test-timeout:node:test 默认 per-test timeout 是 Infinity,单个卡死的用例
 #   会吃掉整个 job 预算(实测 blockedForUser.integ 单文件占用数分钟不出结果)。
 # --test-concurrency=1:共享 PG fixture,并发跑会互相毒化。
-cmd="npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=${file_timeout_ms} ${files[*]}"
+cmd="npx tsx --import ./scripts/lib/test-blocking-stdio.mjs --test --test-force-exit --test-concurrency=1 --test-timeout=${file_timeout_ms} ${files[*]}"
 OC_TEST_MUTEX_TIMEOUT="$mutex_timeout_seconds" bash scripts/test-mutex.sh commercial "$cmd" > "$tap_out" 2>&1
 status=$?
 echo "test runner exit: $status"
