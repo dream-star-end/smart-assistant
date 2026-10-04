@@ -443,7 +443,7 @@ test("the operator's unreachable close converts only with its exact marker and o
   void before;
 }));
 
-test("a closed run stops blocking the other turns of its session",
+test("only a validly closed run stops blocking the other turns of its session",
   { skip: !testDatabaseUrl }, async () => withDb(async (db) => {
   const stuck = await db.chain("blocker", 2, "unknown");
   const turn = "cd".repeat(32), nonce = "7".repeat(24);
@@ -456,15 +456,49 @@ test("a closed run stops blocking the other turns of its session",
     boxUsage: { inputTokens: 10, cacheReadTokens: 0 } }, FRESH, 3);
   const next = () => db.journal.readIdleProof({ uid: 3n, containerId: 635n,
     sessionId: stuck.session, turnKey: turn });
-  assert.deepEqual(await next(), { status: "pending", reason: "other_chain" });
-  // The OCV5-312 operator state alone already releases the other turns …
-  await db.patch(stuck.leaf, { boxState: "operator_unreachable_closed" });
-  await db.patch(stuck.ids[0]!, { boxState: "operator_unreachable_closed" });
-  assert.equal((await next()).status, "terminal");
-  // … and so does the expired close of the whole chain.
-  await db.patch(stuck.leaf, { boxState: "unknown" });
-  await db.patch(stuck.ids[0]!, { boxState: "resuming" });
-  assert.deepEqual(await next(), { status: "pending", reason: "other_chain" });
+  const blocked = { status: "pending", reason: "other_chain" };
+  assert.deepEqual(await next(), blocked);
+  // A state name alone releases nothing: not the operator's, not ours.
+  const original = { leaf: (await db.ctxOf(stuck.leaf)).ctx.boxState,
+    root: (await db.ctxOf(stuck.ids[0]!)).ctx.boxState };
+  const restore = async () => {
+    await db.client.query(`UPDATE request_finalize_journal
+      SET ctx=(ctx - 'boxExpiredClose' - 'boxOperatorUnreachableClose') || $2::jsonb, state='inflight'
+      WHERE request_id=$1`, [stuck.leaf, JSON.stringify({ boxState: original.leaf })]);
+    await db.patch(stuck.ids[0]!, { boxState: original.root });
+  };
+  const operatorMarker = { v: 1, ticket: "OCV5-312", atMs: 1791096241420, priorBoxState: "unknown",
+    accountStatus: "disabled", terminalProof: false, remoteCleanup: false };
+  await db.patch(stuck.leaf, { boxState: "operator_unreachable_closed",
+    boxOperatorUnreachableClose: operatorMarker });
+  assert.deepEqual(await next(), blocked, "operator-closed rows wait for their conversion");
+  await restore();
+  const marker = { v: 1, atMs: 1791096241420, priorBoxState: "unknown", cause: "operator" };
+  const aborted = () => db.client.query(
+    "UPDATE request_finalize_journal SET state='aborted' WHERE request_id=$1", [stuck.leaf]);
+  for (const [name, leafCtx, rootCtx, abort] of [
+    ["state without marker", { boxState: "expired_unproven" }, { boxState: "expired_unproven" }, true],
+    ["malformed marker", { boxState: "expired_unproven",
+      boxExpiredClose: { ...marker, cause: "free text!" } }, { boxState: "expired_unproven" }, true],
+    ["extra marker key", { boxState: "expired_unproven",
+      boxExpiredClose: { ...marker, note: 1 } }, { boxState: "expired_unproven" }, true],
+    ["ancestor still waiting", { boxState: "expired_unproven", boxExpiredClose: marker },
+      { boxState: "resuming" }, true],
+    ["unbilled leaf not aborted", { boxState: "expired_unproven", boxExpiredClose: marker },
+      { boxState: "expired_unproven" }, false],
+    ["leaf with a proof", { boxState: "expired_unproven", boxExpiredClose: marker,
+      boxTerminalProof: { reason: "worker_failed" } }, { boxState: "expired_unproven" }, true],
+  ] as const) {
+    await db.patch(stuck.leaf, leafCtx);
+    await db.patch(stuck.ids[0]!, rootCtx);
+    if (abort) await aborted();
+    assert.deepEqual(await next(), blocked, name);
+    await db.client.query(`UPDATE request_finalize_journal SET ctx=ctx - 'boxTerminalProof'
+      WHERE request_id=$1`, [stuck.leaf]);
+    await restore();
+  }
+  assert.deepEqual(await next(), blocked);
+  // The journal's own close of the whole chain releases the session.
   await db.journal.markRunExpiredUnproven(stuck.identity);
   assert.equal((await next()).status, "terminal");
 }));

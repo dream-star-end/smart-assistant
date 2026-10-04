@@ -8,7 +8,8 @@ import { rootLogger } from "../../logging/logger.js";
 import { BOX_RUNS_CEILING, validRunCapacity, type BoxRunCapacity } from "./boxCapacityPolicy.js";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
-import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, withVerifiedCapsule,
+import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, validExpiredChainIds,
+  withVerifiedCapsule,
   type BoxIdleProof, type IdleChainRow } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
@@ -2978,17 +2979,27 @@ export class BoxDurableJournal implements BoxJournalPort {
             AND ctx->>'boxSessionId'=$3
             AND ctx->>'boxInvocationRecovery'='v1'
             AND (
-              -- OCV5-313: an expired or operator-closed run no longer holds
-              -- the session; whether its own turn reads failed is decided by
-              -- the chain projection, not here.
-              COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped','prestart_stopped',
-                '${BOX_EXPIRED_UNPROVEN_STATE}','${BOX_OPERATOR_UNREACHABLE_CLOSED_STATE}')
+              COALESCE(ctx->>'boxState','') NOT IN ('terminal','failed_stopped','prestart_stopped')
               OR (ctx->>'boxState'='terminal' AND state <> 'committed')
               -- A prestart stop is closed only under its own fence (never launched).
               OR (ctx->>'boxState'='prestart_stopped' AND ctx ? 'boxLaunchPermit')
             )`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId]);
+      // OCV5-313: a run closed as expired_unproven stops holding the session,
+      // but only as a whole, structurally valid chain (exact marker, linkage,
+      // identity). The state name alone releases nothing.
+      const expired = await client.query<{ request_id: string; state: string;
+        ctx: Record<string, unknown> }>(
+        `SELECT request_id,state,ctx FROM request_finalize_journal
+          WHERE user_id=$1 AND container_id=$2
+            AND ctx->>'boxSessionId'=$3
+            AND ctx->>'boxInvocationRecovery'='v1'
+            AND ctx->>'boxState'=$4`,
+        [input.uid.toString(), input.containerId.toString(), input.sessionId,
+          BOX_EXPIRED_UNPROVEN_STATE]);
       await client.query("COMMIT");
+      const released = validExpiredChainIds(expired.rows.map((row) => ({
+        requestId: row.request_id, state: row.state, ctx: row.ctx })));
       const rows: IdleChainRow[] = found.rows.map((row) => ({
         requestId: row.request_id, state: row.state, ctx: row.ctx,
       }));
@@ -2996,7 +3007,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         sessionId: input.sessionId,
         turnKey: input.turnKey,
         rows,
-        otherOpenRequestIds: open.rows.map((row) => row.request_id),
+        otherOpenRequestIds: open.rows.map((row) => row.request_id)
+          .filter((id) => !released.has(id)),
       });
       if (!readCapsule) return proof;
       if (proof.status === "terminal") {

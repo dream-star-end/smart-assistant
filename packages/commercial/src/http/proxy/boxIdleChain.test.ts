@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { projectBoxIdleChain, withVerifiedCapsule, type IdleChainRow } from "./boxIdleChain.js";
+import { projectBoxIdleChain, validExpiredChainIds, withVerifiedCapsule,
+  type IdleChainRow } from "./boxIdleChain.js";
 
 const sessionId = "ccb-session";
 const turnKey = "ab".repeat(32);
@@ -300,4 +301,24 @@ test("OCV5-313 a malformed, contradictory or half-closed expired chain stays pen
     boxOperatorUnreachableClose: { v: 1, ticket: "OCV5-312", atMs: 1791096241420,
       priorBoxState: "unknown", accountStatus: "disabled", terminalProof: false,
       remoteCleanup: false } }, "inflight")]);
+});
+
+test("OCV5-313 only a complete valid expired chain stops counting as another open chain", () => {
+  const ids = (rows: IdleChainRow[]) => [...validExpiredChainIds(rows)].sort();
+  assert.deepEqual(ids([expiredParent, expiredLeaf]), ["x-leaf", "x-parent"]);
+  const stray = row("stray", { ...expiredIdentity, boxState: "expired_unproven" }, "aborted");
+  assert.deepEqual(ids([expiredParent, expiredLeaf, stray]), ["x-leaf", "x-parent"],
+    "a row with the state but no marker stays open");
+  const badMarker = { ...expiredLeaf, ctx: { ...expiredLeaf.ctx,
+    boxExpiredClose: { ...expiredMarker, cause: "free text!" } } };
+  assert.deepEqual(ids([expiredParent, badMarker]), [], "a malformed marker releases nothing");
+  assert.deepEqual(ids([expiredLeaf]), [], "a leaf whose ancestor is not closed releases nothing");
+  assert.deepEqual(ids([expiredParent]), [], "an ancestor without its closed leaf releases nothing");
+  const inflight = { ...expiredLeaf, state: "inflight" };
+  assert.deepEqual(ids([expiredParent, inflight]), []);
+  // Another turn's valid chain is judged on its own.
+  const otherTurn = row("y-first", { ...expiredIdentity, boxTurnKey: "ef".repeat(32),
+    boxState: "expired_unproven", boxExpiredClose: expiredMarker }, "aborted");
+  assert.deepEqual(ids([expiredLeaf, otherTurn]), ["y-first"]);
+  assert.deepEqual(ids([row("live", { boxState: "unknown" }, "inflight")]), []);
 });

@@ -153,6 +153,32 @@ function projectExpiredChain(chain: IdleChainRow[]): IdleChainRow[] | null {
   return chain;
 }
 
+/** OCV5-313: request ids of the session's expired_unproven rows that form a
+ * complete, valid expired chain within their own turn. Used to decide which
+ * closed runs stop counting as another open chain; a row with a missing or
+ * malformed marker, a broken linkage or a missing ancestor is not returned. */
+export function validExpiredChainIds(rows: readonly IdleChainRow[]): Set<string> {
+  const byTurn = new Map<string, IdleChainRow[]>();
+  for (const row of rows) {
+    const turnKey = row.ctx.boxTurnKey;
+    if (row.ctx.boxState !== BOX_EXPIRED_UNPROVEN_STATE || typeof turnKey !== "string") continue;
+    const group = byTurn.get(turnKey);
+    if (group) group.push(row); else byTurn.set(turnKey, [row]);
+  }
+  const valid = new Set<string>();
+  for (const group of byTurn.values()) {
+    const byId = new Map(group.map((row) => [row.requestId, row]));
+    if (byId.size !== group.length) continue;
+    const owners = new Set(group.map((row) => row.ctx.boxOwnerRequestId));
+    for (const leaf of group) {
+      if (owners.has(leaf.requestId)) continue;
+      const chain = projectFailedChain(leaf.requestId, byId);
+      if (chain) for (const row of chain) valid.add(row.requestId);
+    }
+  }
+  return valid;
+}
+
 type ChainFailure = { ok: false; reason: string };
 type ChainOk = { ok: true; chain: IdleChainRow[] };
 
