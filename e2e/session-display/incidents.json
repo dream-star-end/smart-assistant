@@ -5458,6 +5458,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-301-cli-rejected-call] PASS — a call the CLI rejects is retried inside one visible turn"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.multimsg.test.ts",
           "assertion": "a CLI-rejected call is dropped and the retry joins the same visible tool handoff"
@@ -5494,6 +5499,11 @@
         "81b959db"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-302-result-rewrite-echo] PASS — a phone screenshot is published fitted and its echo binds byte for byte"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolResultImages.test.ts",

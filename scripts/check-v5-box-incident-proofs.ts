@@ -8,6 +8,7 @@
  * --expect-sha is the builder archive SHA; the archive has no .git, so it is
  * recorded in the receipt and not compared here.
  */
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { deflateSync } from "node:zlib";
 import { join } from "node:path";
@@ -24,8 +25,22 @@ type Expected = { id: string; boxName: string; clientName: string; input: Record
 type Api = {
   gate: (body: Body, toolBridgeEnabled: boolean) => string | null;
   classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[] };
-  match: (body: Body, expected: readonly Expected[]) => ReadonlyArray<{ modelToolUseId: string; content: unknown }>;
+  match: (body: Body, expected: readonly Expected[]) => ReadonlyArray<Matched>;
+  fitForCli: (results: readonly Matched[]) => Promise<readonly Matched[]>;
+  echo: (expected: readonly EchoExpected[]) => { accept: (raw: unknown) => void;
+    verifyDeferred: () => Promise<void>; assertComplete: () => void };
+  decoder: (model: string, tools: unknown[]) => Decoder;
 };
+type Decoder = {
+  push: (chunk: string) => { sse: string; candidate: { toolUses: ReadonlyArray<{ id: string; clientName: string }>;
+    inputTokens: number; outputTokens: number; cacheReadTokens: number } | null; finalCandidate: unknown };
+  completedMessage: () => { id?: unknown; content?: unknown };
+  commitHandoff: (proof: { durableRevision: string; journaledToolUseIds: string[];
+    verifiedPendingToolUseIds: string[] }) => string;
+};
+type Matched = { modelToolUseId: string; isError: boolean; contentHash: string;
+  content: ReadonlyArray<{ type: string; text?: string; data?: string; mimeType?: string }> };
+type EchoExpected = { modelToolUseId: string; isError: boolean; contentHash: string; content?: unknown };
 
 function fail(message: string): never {
   throw new Error(`[box-incident-proofs] ${message}`);
@@ -41,8 +56,15 @@ async function load(): Promise<Api> {
   const gate = await import(pathToFileURL(join(PROXY, "boxRequestGate.ts")).href);
   const prepared = await import(pathToFileURL(join(PROXY, "boxPreparedContinuation.ts")).href);
   const matcher = await import(pathToFileURL(join(PROXY, "boxToolResultMatcher.ts")).href);
+  const images = await import(pathToFileURL(join(PROXY, "boxToolResultImages.ts")).href);
+  const echo = await import(pathToFileURL(join(PROXY, "boxToolResultEcho.ts")).href);
+  const handoff = await import(pathToFileURL(join(PROXY, "boxCliToolHandoff.ts")).href);
+  const catalog = await import(pathToFileURL(join(PROXY, "boxToolCatalog.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
-    match: matcher.matchBoxToolResults };
+    match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
+    echo: (expected) => new echo.BoxToolResultEcho(expected),
+    decoder: (model, tools) => new handoff.BoxCliToolHandoffDecoder(model,
+      catalog.compileBoxToolCatalog(tools, "natural")) };
 }
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -250,6 +272,152 @@ function proveImageCaption(api: Api): string {
   return "[ocv5-302-image-caption] PASS — a resized Read image continues when the caption is proven by the image";
 }
 
+function pngSize(data: string): [number, number] {
+  const bytes = Buffer.from(data, "base64");
+  if (bytes.readUInt32BE(0) !== 0x89504e47) fail("NOT_A_PNG");
+  return [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
+}
+async function echoCode(run: () => Promise<void> | void): Promise<string> {
+  try { await run(); } catch (error) { return String((error as { code?: unknown }).code ?? "THREW"); }
+  return "ACCEPTED";
+}
+
+// INC-20261001-BOX-CLI-RESULT-REWRITE-ECHO, live #f82c733f: the client Read a
+// 1290x2796 screenshot, the Box CLI resized it to 923x2000 before echoing it,
+// the strict echo bind saw other bytes and the turn failed. OpenClaude now
+// publishes the image already fitted to the CLI limits, so the CLI passes it
+// through and the echo is byte-exact; the CLI's two text rewrites are accepted
+// only when they are exact rewrites of what was published.
+async function proveResultRewriteEcho(api: Api): Promise<string> {
+  const original = png(1290, 2796);
+  const body: Body = { model: MODEL, stream: true, max_tokens: 64, tools: [tool("Read")],
+    messages: [{ role: "user", content: "看图" },
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_shot", name: "Read",
+        input: { file_path: "/shot.png" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_shot", content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: original } }] }] }] };
+  if (api.gate(body, true) !== null) fail("REWRITE_GATE");
+  const matched = api.match(body, [{ id: "toolu_shot", boxName: "mcp__ocbridge__Read", clientName: "Read",
+    input: { file_path: "/shot.png" } }]);
+  const [published] = await api.fitForCli(matched);
+  const image = published?.content.find((block) => block.type === "image");
+  if (!published || !image?.data) fail("REWRITE_NO_IMAGE");
+  if (!isDeepStrictEqual(pngSize(image.data), [923, 2000])) fail("REWRITE_IMAGE_NOT_FITTED");
+  if (published.contentHash === matched[0]!.contentHash) fail("REWRITE_HASH_NOT_RECOMPUTED");
+  const again = await api.fitForCli([published]);
+  if (again[0] !== published) fail("REWRITE_NOT_IDEMPOTENT");
+  const echoed = (data: string) => ({ type: "user", message: { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_shot", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data } }] }] } });
+  const bind = (expected: EchoExpected, raw: unknown) => echoCode(async () => {
+    const echo = api.echo([expected]);
+    echo.accept(raw);
+    await echo.verifyDeferred();
+    echo.assertComplete();
+  });
+  // the CLI passes the fitted bytes through: the bind holds and the turn goes on
+  if (await bind(published, echoed(image.data)) !== "ACCEPTED") fail("REWRITE_EXACT_ECHO_REFUSED");
+  // any other picture of the same size is still refused
+  if (await bind(published, echoed(png(923, 2000))) !== "BOX_TOOL_ECHO_CONTENT_MISMATCH") fail("REWRITE_OTHER_BYTES");
+  const hash = (content: unknown) => createHash("sha256").update(JSON.stringify({ content, isError: false })).digest("hex");
+  const textResult = (content: Array<{ type: "text"; text: string }>): EchoExpected =>
+    ({ modelToolUseId: "toolu_shot", isError: false, contentHash: hash(content), content });
+  const textEcho = (content: string) => ({ type: "user", message: { role: "user", content: [{ type: "tool_result",
+    tool_use_id: "toolu_shot", content }] } });
+  const marker = "(mcp__ocbridge__Bash completed with no output)";
+  if (await bind(textResult([{ type: "text", text: "" }]), textEcho(marker)) !== "ACCEPTED") fail("REWRITE_EMPTY_MARKER");
+  if (await bind(textResult([{ type: "text", text: "data" }]), textEcho(marker)) !== "BOX_TOOL_ECHO_CONTENT_MISMATCH") {
+    fail("REWRITE_MARKER_FOR_REAL_OUTPUT");
+  }
+  const skipped = api.echo([textResult([{ type: "text", text: "" }])]);
+  skipped.accept(textEcho(marker));
+  if (await echoCode(() => skipped.assertComplete()) !== "BOX_TOOL_ECHO_UNVERIFIED") fail("REWRITE_UNVERIFIED_COMPLETES");
+  return "[ocv5-302-result-rewrite-echo] PASS — a phone screenshot is published fitted and its echo binds byte for byte";
+}
+
+// INC-20261001-BOX-CLI-REJECTED-CALL-TURN-FAIL: the model called a tool name
+// this Box invocation does not expose (bare Bash). Claude Code answered with
+// its own <tool_use_error> and the model retried in a new message of the same
+// run; the decoder rejected the first call with BOX_TOOL_ID_OR_NAME_INVALID
+// and the turn failed. The client must see one continuing message and receive
+// only the retried call, billed for both model calls.
+function proveCliRejectedCall(api: Api): string {
+  const model = "claude-opus-5-5";
+  const boxName = "mcp__ocbridge__Bash";
+  const tools = [{ name: "Bash", description: "Synthetic local tool",
+    input_schema: { type: "object", properties: { value: { type: "string" } } } }];
+  const event = (value: unknown) => ({ type: "stream_event", event: value });
+  const init = { type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] };
+  const start = (id: string, input = 10, read = 0) => event({ type: "message_start", message: {
+    id, model, role: "assistant", content: [],
+    usage: { input_tokens: input, output_tokens: 0, cache_read_input_tokens: read } } });
+  const say = (id: string, index: number, value: string) => [
+    event({ type: "content_block_start", index, content_block: { type: "text", text: "" } }),
+    event({ type: "content_block_delta", index, delta: { type: "text_delta", text: value } }),
+    { type: "assistant", message: { id, model, role: "assistant", content: [text(value)] } },
+    event({ type: "content_block_stop", index })];
+  const call = (id: string, index: number, toolId: string, name: string, prior: unknown[] = []) => [
+    event({ type: "content_block_start", index, content_block: { type: "tool_use", id: toolId, name, input: {} } }),
+    event({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: '{"value":"x"}' } }),
+    { type: "assistant", message: { id, model, role: "assistant",
+      content: [...prior, { type: "tool_use", id: toolId, name, input: { value: "x" } }] } },
+    event({ type: "content_block_stop", index })];
+  const stop = (reason: string, output: number, input = 10) => [
+    event({ type: "message_delta", delta: { stop_reason: reason }, usage: { input_tokens: input, output_tokens: output } }),
+    event({ type: "message_stop" })];
+  const cliError = (id: string, content = "<tool_use_error>Error: No such tool available: Bash</tool_use_error>") =>
+    ({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: true, content }] },
+      parent_tool_use_id: null, session_id: "12345678-1234-4123-8123-123456789abc" });
+  const rejected = [start("msg_a"), ...say("msg_a", 0, "Let me run it."),
+    ...call("msg_a", 1, "toolu_bad_1", "Bash", [text("Let me run it.")]), ...stop("tool_use", 7)];
+  const retry = [start("msg_b", 30, 5), ...say("msg_b", 0, "Using the bridge."),
+    ...call("msg_b", 1, "toolu_good_1", boxName, [text("Using the bridge.")]), ...stop("tool_use", 9, 30)];
+  const feed = (records: unknown[]) => {
+    const decoder = api.decoder(model, tools);
+    let sse = "";
+    let last: ReturnType<Decoder["push"]> | null = null;
+    for (const record of records) {
+      last = decoder.push(`${JSON.stringify(record)}\n`);
+      sse += last.sse;
+      if (last.candidate || last.finalCandidate) break;
+    }
+    return { decoder, sse, last };
+  };
+  const failsWith = (records: unknown[]): string => {
+    try { feed(records); } catch (error) { return String((error as { code?: unknown }).code ?? "THREW"); }
+    return "ACCEPTED";
+  };
+  let run: ReturnType<typeof feed>;
+  try { run = feed([init, ...rejected, cliError("toolu_bad_1"), ...retry]); } catch (error) {
+    fail(`REJECTED_CALL_TURN_FAILED_${String((error as { code?: unknown }).code ?? "THREW")}`);
+  }
+  const candidate = run.last?.candidate;
+  if (!candidate) fail("REJECTED_CALL_NO_HANDOFF");
+  if ((run.sse.match(/event: message_start/g) ?? []).length !== 1) fail("REJECTED_CALL_SECOND_MESSAGE");
+  if (run.sse.includes("toolu_bad_1")) fail("REJECTED_CALL_VISIBLE");
+  if (!run.sse.includes("Let me run it.") || !run.sse.includes("Using the bridge.")) fail("REJECTED_CALL_TEXT_LOST");
+  if (!isDeepStrictEqual(candidate.toolUses.map((use) => [use.id, use.clientName]), [["toolu_good_1", "Bash"]])) {
+    fail("REJECTED_CALL_WRONG_HANDOFF");
+  }
+  if (!isDeepStrictEqual([candidate.inputTokens, candidate.outputTokens, candidate.cacheReadTokens], [40, 16, 5])) {
+    fail("REJECTED_CALL_USAGE");
+  }
+  if (!isDeepStrictEqual(run.decoder.completedMessage().content, [text("Let me run it."), text("Using the bridge."),
+    { type: "tool_use", id: "toolu_good_1", name: "Bash", input: { value: "x" } }])) fail("REJECTED_CALL_CONTENT");
+  const held = run.decoder.commitHandoff({ durableRevision: "rev-1", journaledToolUseIds: ["toolu_good_1"],
+    verifiedPendingToolUseIds: ["toolu_good_1"] });
+  if (!held.includes('"name":"Bash"') || (held.match(/event: message_stop/g) ?? []).length !== 1) fail("REJECTED_CALL_HELD");
+  // only Claude Code's own unknown-tool answer for that call is merged
+  if (failsWith([init, ...rejected, ...retry]) !== "BOX_TOOL_CLI_ERROR_MISSING") fail("REJECTED_CALL_NO_CLI_ERROR");
+  if (failsWith([init, ...rejected, cliError("toolu_bad_1", "ran fine")]) !== "BOX_TOOL_CLI_ERROR_INVALID") {
+    fail("REJECTED_CALL_FREE_TEXT");
+  }
+  if (failsWith([init, ...rejected, cliError("toolu_other")]) !== "BOX_TOOL_CLI_ERROR_INVALID") fail("REJECTED_CALL_OTHER_ID");
+  if (failsWith([init, start("msg_a"), ...call("msg_a", 0, "toolu_good", boxName),
+    ...call("msg_a", 1, "toolu_bad_1", "Bash", [{ type: "tool_use", id: "toolu_good", name: boxName,
+      input: { value: "x" } }])]) !== "BOX_TOOL_ID_OR_NAME_INVALID") fail("REJECTED_CALL_MIXED_MESSAGE");
+  return "[ocv5-301-cli-rejected-call] PASS — a call the CLI rejects is retried inside one visible turn";
+}
+
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -258,7 +426,7 @@ async function main(): Promise<void> {
   }, LIMIT_MS);
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api)];
+    proveImageCaption(api), await proveResultRewriteEcho(api), proveCliRejectedCall(api)];
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }
