@@ -178,6 +178,11 @@ jobs:
             sleep 2
           done
 
+      # 浏览器门把截图和预览地址写到用户容器的 generated 目录;托管 runner 上没有这个目录,
+      # 不建它这些用例在 mkdir 就 EACCES。
+      - name: Prepare browser artifact directory
+        run: sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /home/agent/.openclaude/generated
+
       - name: Run web-react-browser
         run: npm run test:browser
 

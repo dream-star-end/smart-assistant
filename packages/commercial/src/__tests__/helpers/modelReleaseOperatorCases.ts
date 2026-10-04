@@ -314,13 +314,18 @@ async function privateCli(args: string[], options: { limitOutput?: boolean; nonR
     'if [ "$CB_NONROOT" = 1 ]; then exec setpriv --reuid 65534 --regid 65534 --clear-groups /opt/ocv5308-cli/node /opt/ocv5308-cli/ops/ocv5-308/model-release-operator.mjs "$@"; fi',
     'exec /opt/ocv5308-cli/node /opt/ocv5308-cli/ops/ocv5-308/model-release-operator.mjs "$@"',
   ].join("\n");
+  // The CLI trusts only root-owned release files. A hosted checkout belongs to
+  // the runner user, so bind this root process's own byte-identical copies.
+  const manifestCopy=join(root,"model-release-manifest.json");
+  const sqlCopy=join(root,"0293_commercial_new_models_prepare.sql");
+  await writeFile(manifestCopy,await readFile(fileURLToPath(new URL("../../../../../ops/ocv5-308/model-release-manifest.json",import.meta.url))),{mode:0o644});
+  await writeFile(sqlCopy,await readFile(fileURLToPath(new URL("../../db/migrations/0293_commercial_new_models_prepare.sql",import.meta.url))),{mode:0o644});
   const child = spawn("unshare", ["--mount","--propagation","private","bash","-c",script,
     "fixture-private-namespace",...args], { detached:true, env: { ...process.env,
       OC_V5_MODEL_RELEASE_DATABASE_URL: db.url, OC_V5_MUTATION_ADMISSION_NONCE:nonce,
       CB_TRACE:trace, CB_LEASE:join(root,"lease"), CB_RELEASES:context.releasesRoot!,
       CB_BUNDLE:join(root,"model-release-operator.mjs"),
-      CB_MANIFEST:fileURLToPath(new URL("../../../../../ops/ocv5-308/model-release-manifest.json",import.meta.url)),
-      CB_SQL:fileURLToPath(new URL("../../db/migrations/0293_commercial_new_models_prepare.sql",import.meta.url)),
+      CB_MANIFEST:manifestCopy, CB_SQL:sqlCopy,
       CB_MODULES:await realpath(fileURLToPath(new URL("../../../../../node_modules",import.meta.url))),
       CB_NODE:process.execPath, CB_LIMIT_OUTPUT:options.limitOutput?"1":"0", CB_NONROOT:options.nonRoot?"1":"0",
     }, stdio:["ignore","pipe","pipe"] });
