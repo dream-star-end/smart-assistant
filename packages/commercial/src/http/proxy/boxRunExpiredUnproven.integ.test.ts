@@ -149,6 +149,24 @@ test("an expired linked chain closes once: unbilled leaf aborted, waiting ancest
     const closed = await db.snapshot();
     assert.deepEqual(await db.journal.markRunExpiredUnproven(run.identity),
       { action: "already_closed", shape: "unbilled_leaf", priorBoxState: leafState, ancestors: 2 });
+    // A half-closed or altered chain is not reported as closed.
+    for (const [id, damage] of [[run.ids[0]!, { boxState: "resuming" }],
+      [run.ids[1]!, { boxResumeRevision: uuid(55) }],
+      [run.leaf, { boxRoundNo: 9 }]] as const) {
+      const good = (await db.ctxOf(id)).ctx;
+      await db.patch(id, damage);
+      await assert.rejects(db.journal.markRunExpiredUnproven(run.identity),
+        code("BOX_EXPIRED_CLOSE_CHAIN_INVALID"));
+      await db.client.query("UPDATE request_finalize_journal SET ctx=$2::jsonb WHERE request_id=$1",
+        [id, JSON.stringify(good)]);
+    }
+    await db.client.query("UPDATE request_finalize_journal SET final_credits=5 WHERE request_id=$1",
+      [run.leaf]);
+    await assert.rejects(db.journal.markRunExpiredUnproven(run.identity),
+      code("BOX_EXPIRED_CLOSE_CHAIN_INVALID"));
+    await db.client.query("UPDATE request_finalize_journal SET final_credits=0 WHERE request_id=$1",
+      [run.leaf]);
+    assert.equal(await db.snapshot(), closed);
     // Every late writer of this run loses its own fence and changes nothing.
     const proof = { runNonce: run.identity.runNonce, leaseEpoch: EPOCH, keeperPid: 11, cliPid: 12 };
     const usage = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -363,6 +381,11 @@ test("evidence, settlement and identity that contradict an unproven close refuse
     db.patch(run.ids[0]!, { boxResumeRequestId: "another-child" }));
   await refuse("ancestor-terminal", "BOX_EXPIRED_CLOSE_CHAIN_INVALID", (run) =>
     db.patch(run.ids[0]!, { boxState: "terminal" }));
+  // The idle proof would never read such a chain as closed (session pinned).
+  await refuse("ancestor-proof", "BOX_EXPIRED_CLOSE_CHAIN_INVALID", (run) =>
+    db.patch(run.ids[0]!, { boxTerminalProof: { reason: "worker_failed",
+      runNonce: run.identity.runNonce, leaseEpoch: EPOCH, keeperPid: 1, cliPid: 2, revision: 2,
+      workerExitCode: 1 } }));
   await refuse("ancestor-turn", "BOX_EXPIRED_CLOSE_CHAIN_INVALID", (run) =>
     db.patch(run.ids[0]!, { boxTurnKey: "ef".repeat(32) }));
   await refuse("ancestor-session", "BOX_EXPIRED_CLOSE_CHAIN_INVALID", (run) =>

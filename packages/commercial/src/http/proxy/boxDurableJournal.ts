@@ -2440,7 +2440,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       await client.query("BEGIN");
       const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
       type Row = { request_id: string; state: string; final_credits: string | null;
-        expired: boolean; ctx: Record<string, unknown> };
+        failure_code: string | null; expired: boolean; ctx: Record<string, unknown> };
       const rows: Row[] = [];
       const seen = new Set<string>();
       let cursor: string | null = input.requestId;
@@ -2448,7 +2448,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) invalid();
         seen.add(cursor);
         const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
-          `SELECT request_id,state,final_credits::text AS final_credits,ctx,
+          `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx,
               created_at <= NOW() - make_interval(secs => $3::double precision) AS expired
              FROM request_finalize_journal
             WHERE request_id=$1 AND user_id=$2 FOR UPDATE`, [cursor, uid, expirySec]);
@@ -2478,7 +2478,12 @@ export class BoxDurableJournal implements BoxJournalPort {
       const shape = handoff ? "billed_handoff" as const : "unbilled_leaf" as const;
       const closed = parseBoxExpiredClose(basis.boxExpiredClose);
       if (basis.boxState === BOX_EXPIRED_UNPROVEN_STATE) {
-        if (!closed || (handoff ? !resumable : leaf.state !== "aborted")) invalid();
+        // Idempotent only for the complete end state this method writes, as
+        // judged by the same projection the idle proof uses.
+        const valid = validExpiredChainIds(rows.map((row) => ({ requestId: row.request_id,
+          state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
+          failureCode: row.failure_code })));
+        if (!closed || rows.some((row) => !valid.has(row.request_id))) invalid();
         await client.query("ROLLBACK"); finished = true;
         return { action: "already_closed", shape, priorBoxState: closed!.priorBoxState,
           ancestors: rows.length - 1 };
@@ -2518,6 +2523,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             || stored.detachedRunnerHash !== basis.boxDetachedRunnerHash
             || !["inflight", "finalizing", "committed"].includes(parent.state)
             || !["resuming", "unknown"].includes(String(ctx.boxState))
+            // A proof anywhere in the chain belongs to the proof-based closers.
+            || ctx.boxTerminalProof !== undefined
             || ctx.boxResumeRequestId !== child.request_id
             || typeof ctx.boxResumeRevision !== "string"
             || !UUID_V4.test(ctx.boxResumeRevision)
@@ -2567,7 +2574,7 @@ export class BoxDurableJournal implements BoxJournalPort {
               SET ctx=ctx || jsonb_build_object('boxState',$4::text), updated_at=NOW()
             WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
               AND ctx->>'boxState' IN ('resuming','unknown')
-              AND ctx ? 'boxToolHandoff'`,
+              AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxTerminalProof')`,
           [ancestor.request_id, uid, input.leaseEpoch, BOX_EXPIRED_UNPROVEN_STATE]);
         if (moved.rowCount !== 1) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_FENCE_LOST");
       }
