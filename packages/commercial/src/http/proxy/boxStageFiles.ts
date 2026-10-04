@@ -20,12 +20,28 @@ export class BoxStageError extends Error {
 }
 export interface BoxStageFile { path: string; raw: Buffer; hash: string }
 
+// A Box whose Claude never persisted a session has no projects directory yet
+// (OCV5-310): INIT creates that one parent, and only inside our own ~/.claude.
 const INIT = String.raw`import os,re,sys
 cwd,project=sys.argv[1:]
 if not re.fullmatch(r'/tmp/ocv5-289-run-[0-9a-f]{24}',cwd):raise SystemExit(1)
 if project and project!='/home/box/.claude/projects/'+cwd.replace('/','-'):raise SystemExit(1)
 os.mkdir(cwd,0o700)
-if project:os.mkdir(project,0o700)
+if project:
+ parts=project.strip('/').split('/')
+ fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  for depth,part in enumerate(parts[:-1]):
+   try:nxt=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+   except FileNotFoundError:
+    if depth!=len(parts)-2 or os.fstat(fd).st_uid!=os.getuid():raise
+    try:os.mkdir(part,0o700,dir_fd=fd)
+    except FileExistsError:pass
+    os.fsync(fd)
+    nxt=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+   os.close(fd);fd=nxt
+  os.mkdir(parts[-1],0o700,dir_fd=fd)
+ finally:os.close(fd)
 print('ready')`;
 
 const WRITE = String.raw`import base64,os,re,stat,sys

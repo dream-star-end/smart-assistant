@@ -242,3 +242,91 @@ test("failed INIT cannot authorize deletion of a preexisting run directory", () 
     rmSync(controlDir, { recursive: true, force: true });
   }
 });
+
+// OCV5-310: a newly added account's Box has ~/.claude but no projects
+// directory until its Claude persists a first session.
+function freshBoxHome() {
+  const home = `/tmp/ocv5-310-box-home-${randomBytes(8).toString("hex")}`;
+  const projects = `${home}/.claude/projects`;
+  const at = (suffix: string) => `('tmp','${home.slice("/tmp/".length)}','.claude'${suffix})`;
+  const relocate = (request: BoxCcExecRequest): BoxCcExecRequest => ({ ...request,
+    args: request.args.map((arg) => arg.replaceAll("/home/box/.claude/projects", projects)
+      .replaceAll("('home','box','.claude','projects')", at(",'projects'"))
+      .replaceAll("('home','box','.claude')", at(""))) });
+  return { home, projects, relocate };
+}
+function freshIdentity() {
+  const runNonce = randomBytes(12).toString("hex");
+  return { runNonce, leaseEpoch: randomBytes(16).toString("hex"),
+    controlId: randomBytes(16).toString("hex"), accountId: "25" };
+}
+
+test("history stages on a never-used Box that has no projects directory yet", () => {
+  const identity = freshIdentity(), runNonce = identity.runNonce;
+  const controlDir = `/tmp/ocv5-289-stage-${runNonce}`;
+  const cwd = `/tmp/ocv5-289-run-${runNonce}`;
+  const project = `/home/box/.claude/projects/-tmp-ocv5-289-run-${runNonce}`;
+  const sid = "12345678-1234-4123-8123-123456789abc";
+  const raw = Buffer.from("synthetic-history\n");
+  const plan = makeBoxStageFiles({ cwd, project, files: [{ path: `${project}/${sid}.jsonl`,
+    raw, hash: createHash("sha256").update(raw).digest("hex") }] });
+  const { home, projects, relocate } = freshBoxHome();
+  const staged = `${projects}/-tmp-ocv5-289-run-${runNonce}`;
+  mkdirSync(`${home}/.claude`, { recursive: true, mode: 0o755 });
+  try {
+    const boot = execute(relocate(makeBoxPrelaunchBootstrap(identity)));
+    assert.equal(boot.status, 0, boot.stderr);
+    const receipt = parseBoxPrelaunchBootstrap(boot.stdout, identity);
+    assert.equal(statSync(projects).mode & 0o777, 0o700);
+    const init = execute(relocate(makeBoxPrelaunchInit(receipt, project)));
+    assert.equal(init.status, 0, init.stderr);
+    assert.equal(init.stdout.trim(), "ready");
+    for (const step of plan.requests.slice(1)) {
+      const result = execute(relocate(guardBoxPrivateStage(relocate(step), receipt)));
+      assert.equal(result.status, 0, result.stderr);
+    }
+    assert.deepEqual(readFileSync(`${staged}/${sid}.jsonl`), raw);
+    const clean = execute(relocate(makeBoxPrelaunchCleanup(receipt)));
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.equal(clean.stdout.trim(), `cleaned:${receipt.identityHash}`);
+    assert.equal(existsSync(staged), false);
+    assert.equal(existsSync(cwd), false);
+    assert.equal(existsSync(projects), true, "the shared parent is kept for later runs");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(controlDir, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap never creates a missing ~/.claude or follows a symlinked one", () => {
+  const { home, projects, relocate } = freshBoxHome();
+  const elsewhere = `${home}-elsewhere`;
+  const controls: string[] = [];
+  const bootstrap = () => {
+    const identity = freshIdentity();
+    controls.push(`/tmp/ocv5-289-stage-${identity.runNonce}`);
+    const boot = execute(relocate(makeBoxPrelaunchBootstrap(identity)));
+    assert.equal(boot.status, 0, boot.stderr);
+    return parseBoxPrelaunchBootstrap(boot.stdout, identity);
+  };
+  mkdirSync(home, { mode: 0o700 });
+  mkdirSync(elsewhere, { mode: 0o700 });
+  try {
+    bootstrap();
+    assert.equal(existsSync(`${home}/.claude`), false);
+    symlinkSync(elsewhere, `${home}/.claude`);
+    const receipt = bootstrap();
+    assert.equal(existsSync(`${elsewhere}/projects`), false);
+    assert.notEqual(execute(relocate(makeBoxPrelaunchInit(receipt,
+      `/home/box/.claude/projects/-tmp-ocv5-289-run-${receipt.runNonce}`))).status, 0);
+    assert.equal(existsSync(projects), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(elsewhere, { recursive: true, force: true });
+    for (const path of controls) {
+      rmSync(path, { recursive: true, force: true });
+      rmSync(path.replace("-stage-", "-run-"), { recursive: true, force: true });
+    }
+  }
+});

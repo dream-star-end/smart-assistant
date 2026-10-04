@@ -36,9 +36,25 @@ function validIdentity(value: BoxPrelaunchIdentity): void {
 
 // This parent is root-owned sticky /tmp. The control directory, lock and
 // identity inode are pinned and never part of run-data cleanup or GC.
+// A Box whose Claude never persisted a session has ~/.claude but no projects
+// directory yet (OCV5-310), and INIT only opens it. Bootstrap is the one
+// unbatched Exec every guarded run starts with, so the best-effort create
+// lives here instead of growing the size-bounded guarded stage batch. Only
+// inside our own ~/.claude; when it cannot be made, INIT fails as before.
 const BOOTSTRAP = String.raw`import hashlib,json,os,re,stat,sys
 nonce,epoch,account,control=sys.argv[1:]
 if not re.fullmatch(r'[a-f0-9]{24}',nonce) or not re.fullmatch(r'[a-f0-9]{32}',epoch) or not re.fullmatch(r'[1-9][0-9]{0,18}',account) or not re.fullmatch(r'[a-f0-9]{32}',control):raise SystemExit(126)
+def ensure_projects():
+ fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:
+  for name in ('home','box','.claude'):
+   nxt=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+   os.close(fd);fd=nxt
+  if os.fstat(fd).st_uid==os.getuid():
+   os.mkdir('projects',0o700,dir_fd=fd);os.fsync(fd)
+ finally:os.close(fd)
+try:ensure_projects()
+except OSError:pass
 parent=os.open('/tmp',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
 name='ocv5-289-stage-'+nonce
 try:

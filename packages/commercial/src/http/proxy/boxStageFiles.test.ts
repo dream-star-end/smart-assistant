@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, truncateSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync,
+  truncateSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { makeBoxStageFiles, BoxStageError } from "./boxStageFiles.js";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
@@ -153,5 +154,53 @@ test("native cleanup removes private inputs but preserves completed project and 
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("history stages on a never-used Box that has no projects directory yet", () => {
+  // OCV5-310: a newly added account's Box has no ~/.claude/projects until its
+  // Claude persists a first session.
+  const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const root = `/tmp/ocv5-310-fresh-projects-${randomBytes(8).toString("hex")}`;
+  const project = `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}`;
+  const sid = "12345678-1234-4123-8123-123456789abc";
+  const snapshot = Buffer.from("synthetic-history\n");
+  const plan = makeBoxStageFiles({ cwd, project, files: [
+    { path: `${project}/${sid}.jsonl`, raw: snapshot, hash: sha(snapshot) }] });
+  const local = (step: BoxCcExecRequest) => spawnSync(step.command,
+    step.args.map((arg) => arg.replaceAll("/home/box/.claude/projects", root)),
+    { cwd: step.cwd, env: step.environment, encoding: "utf8", timeout: 5000 });
+  assert.equal(existsSync(root), false);
+  try {
+    for (const step of plan.requests) {
+      const result = local(step);
+      assert.equal(result.status, 0, result.stderr);
+    }
+    assert.equal(statSync(root).mode & 0o777, 0o700);
+    assert.deepEqual(readFileSync(`${root}/${cwd.replaceAll("/", "-")}/${sid}.jsonl`), snapshot);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("INIT refuses a symlinked projects directory instead of following it", () => {
+  const cwd = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const real = `/tmp/ocv5-310-real-projects-${randomBytes(8).toString("hex")}`;
+  const link = `/tmp/ocv5-310-link-projects-${randomBytes(8).toString("hex")}`;
+  const project = `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}`;
+  const init = makeBoxStageFiles({ cwd, project, files: [] }).requests[0]!;
+  mkdirSync(real, { mode: 0o700 });
+  symlinkSync(real, link);
+  try {
+    const result = spawnSync(init.command,
+      init.args.map((arg) => arg.replaceAll("/home/box/.claude/projects", link)),
+      { cwd: init.cwd, env: init.environment, encoding: "utf8", timeout: 5000 });
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(readdirSync(real), []);
+  } finally {
+    rmSync(link, { force: true });
+    rmSync(real, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
