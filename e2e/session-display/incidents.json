@@ -5662,7 +5662,10 @@
       "severity": "P1",
       "symptom": "线上 #7da201bd/#2a81a2fe（v5-bc4b6f432 上线后，13:03Z）：会话 webmus5cc8xo8xspo 在 09:00 有一轮 Box 工具结果已提交但模型未读到就失败。CCB 丢弃自己的 API Error 行，之后每条用户消息（含自动『从断点继续』提示）都被合并进那条 tool_result 消息（尾形 user:tool_result+text+text…），egress 一律 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，且每次失败再多一个 text 块，会话永久无法继续；master 把每次空的自动续接都当新机会，20 秒内连发 10 次（『模型繁忙，正在重试中 8/10』、两张灰卡、红卡）。修复：已回答的工具交换 + 仅文本尾判为 fresh（answeredToolIds），BoxToolFetch 先证明本回合没有在等这些结果的 handoff、孤儿 handoff 已认领并停止，再以 resumeToolResults 把交换落为历史、文本作为新提示冷启动；空的自动续接再次以模型面错误失败时只给 3 次预算（CLI 自己的 API Error 行不算进展）；停止探针失败原因写日志。",
       "rootFixCommit": "cafdfc81",
-      "coverageCommits": ["10c5bd71", "81c3fe9a"],
+      "coverageCommits": [
+        "10c5bd71",
+        "81c3fe9a"
+      ],
       "regressions": [
         {
           "layer": "integration",
@@ -5700,6 +5703,40 @@
           "assertion": "stale resume leaves are listed with phase and age and take one stop intent"
         }
       ]
+    },
+    {
+      "id": "INC-20261004-BOX-FRESH-PROJECTS-DIR",
+      "occurredAt": "2026-10-04",
+      "severity": "P2",
+      "symptom": "线上 selfhost（v5-5ef67b4d8）：2026-10-04 新加 Cursor 账号 25，Sand 生命周期已 ready、Box RUNNING、Box 内 Claude Code 2.1.288 可执行，但该 Box 从未持久化过 Claude 会话：~/.claude 存在，~/.claude/projects 不存在。零付费运维探针 boxPrelaunchLiveProbe（run 2e8943bf85258d42fb192640）在 prelaunch INIT 以 BOX_EXEC_REMOTE_EXIT 失败。带历史的回合都要把会话快照暂存到该目录下，所以已有会话切到新账号时会在 Claude 启动前失败；账号 20 没暴露是因为早期探针已在它的 Box 里建过该目录。本次由探针在用户回合命中前发现，没有对应的用户失败回合。修复：守卫路径由 prelaunch bootstrap（每个守卫 run 唯一不进批的 Exec）在 ~/.claude 属于本用户时尽力创建 projects 目录（0700，逐级 O_NOFOLLOW，绝不创建 ~/.claude），INIT/stage/cleanup 仍只打开不创建；文本路径的 stage INIT 以同样方式只创建这一层父目录，并拒绝符号链接的 projects。修复后同一探针在账号 25 真实 Box 通过，并经产品 BoxTextFetch 路径完成合成历史回放。",
+      "rootFixCommit": "d66309cf",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "history stages on a never-used Box that has no projects directory yet"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "bootstrap never creates a missing ~/.claude or follows a symlinked one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStageFiles.test.ts",
+          "assertion": "history stages on a never-used Box that has no projects directory yet"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStageFiles.test.ts",
+          "assertion": "INIT refuses a symlinked projects directory instead of following it"
+        }
+      ],
+      "proofPending": {
+        "reason": "已在账号 25 真实 Box 用零付费 boxPrelaunchLiveProbe（修复前失败、修复后通过）和一次合成历史回放（boxTextStreamProbe，OCV5_289_STREAM_HISTORY_ACK=1）验证。这两个探针需要真实 Box 账号凭据，接不进 CI 的 browser/live-e2e/deploy-gate runner。selfhost 上线后需用真实用户的带历史 Box 回合验收。",
+        "since": "2026-10-04"
+      }
     }
   ]
 }
