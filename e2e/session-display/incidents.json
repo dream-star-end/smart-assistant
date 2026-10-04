@@ -4188,10 +4188,7 @@
       "rootFixCommit": "497916e2",
       "coverageCommits": [
         "90824ce7",
-        "9e518cf7",
-        "25a5b3c9",
-        "3144c3a9",
-        "2b4af86e"
+        "9e518cf7"
       ],
       "regressions": [
         {
@@ -4264,7 +4261,7 @@
         }
       ],
       "coverageCommits": [
-        "929970ac9"
+        "929970ac"
       ]
     },
     {
@@ -4272,7 +4269,7 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "刚加的官方 Claude Pro OAuth 一发请求就被 18892 代理拦下：官方 Claude Code 带头 anthropic-beta fallback-credit-2026-06-01，ALLOWED_BETA_VALUES 没有该项，ANTHROPIC_BETA_NOT_ALLOWED，账号 3 次失败进 cooldown，前台「上游连续失败」。",
-      "rootFixCommit": "419183882",
+      "rootFixCommit": "41918388",
       "regressions": [
         {
           "layer": "unit",
@@ -4291,7 +4288,7 @@
         }
       ],
       "coverageCommits": [
-        "419183882"
+        "41918388"
       ]
     },
     {
@@ -4299,7 +4296,7 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "OCV5-236 上线后官方 CC 能打，Opus 5 很高再被 18892 拦：anthropic-beta thinking-token-count-2026-05-13 不在 ALLOWED_BETA_VALUES，账号 cooldown，前台「模型繁忙」。",
-      "rootFixCommit": "6b22b40da",
+      "rootFixCommit": "6b22b40d",
       "regressions": [
         {
           "layer": "unit",
@@ -4313,7 +4310,7 @@
         }
       ],
       "coverageCommits": [
-        "6b22b40da"
+        "6b22b40d"
       ]
     },
     {
@@ -4321,7 +4318,7 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC Opus 5 黄卡「模型繁忙」：18892 proxy_account_pool_unavailable reason=no_active。唯一 Claude 号 quota_5h_pct=96 被 95% 阈值踢出池，但 quota_5h_resets_at 已过；占用只从响应头回写，出池后永不刷新。",
-      "rootFixCommit": "d08669ae4",
+      "rootFixCommit": "d08669ae",
       "regressions": [
         {
           "layer": "unit",
@@ -4340,7 +4337,7 @@
         }
       ],
       "coverageCommits": [
-        "d08669ae4"
+        "d08669ae"
       ]
     },
     {
@@ -4348,7 +4345,7 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 选 Opus 5 时另打 claude-opus-4-8，18892 MODEL_NOT_AVAILABLE；CLI 写成 Failed to authenticate，前台红卡认证状态异常。",
-      "rootFixCommit": "a63fbe791",
+      "rootFixCommit": "a63fbe79",
       "regressions": [
         {
           "layer": "unit",
@@ -4367,7 +4364,7 @@
         }
       ],
       "coverageCommits": [
-        "a63fbe791"
+        "a63fbe79"
       ]
     },
     {
@@ -4375,10 +4372,10 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 活回合被误判 SERVICE_RESTART：黄卡「任务已中断」但进程仍在出活、过一会又自动续跑。",
-      "rootFixCommit": "2116af09f",
+      "rootFixCommit": "2116af09",
       "coverageCommits": [
-        "2116af09f",
-        "b08aa77b4"
+        "2116af09",
+        "b08aa77b"
       ],
       "regressions": [
         {
@@ -4398,10 +4395,10 @@
       "occurredAt": "2026-09-20",
       "severity": "P1",
       "symptom": "官方 CC 长工具空闲后 403 model authority expired（sleep 240 > 120s TTL，过期 envelope 与有效 lease 同带）；随后 leftover/unpublished 磁带仍 SERVICE_RESTART 自动恢复出黄卡「任务已中断」，进程继续出 token。",
-      "rootFixCommit": "ac3dc10d8",
+      "rootFixCommit": "ac3dc10d",
       "coverageCommits": [
-        "ac3dc10d8",
-        "4a6812df4"
+        "ac3dc10d",
+        "4a6812df"
       ],
       "regressions": [
         {
@@ -4446,9 +4443,9 @@
       "occurredAt": "2026-09-21",
       "severity": "P1",
       "symptom": "唯一 active Cursor Sand 账号 20 的 Box install 卡在 submitted 后，UNKNOWN_OPERATION_RESULT 死循环，空池导致整条 Cursor 引擎 DISPATCH_NOT_ACCEPTED。",
-      "rootFixCommit": "9bfa706c7",
+      "rootFixCommit": "9bfa706c",
       "coverageCommits": [
-        "9bfa706c7"
+        "9bfa706c"
       ],
       "regressions": [
         {
@@ -4468,9 +4465,9 @@
       "occurredAt": "2026-09-21",
       "severity": "P1",
       "symptom": "Cursor Sand Box sendPrompt 对 clientNonce=nonce-install 幂等，同 nonce 重试 accepted 但不执行；维护 bot 自造 INSTALLER_B64_MISSING 而不跑官方 python heredoc，空池无法恢复。",
-      "rootFixCommit": "66dc86caa",
+      "rootFixCommit": "66dc86ca",
       "coverageCommits": [
-        "66dc86caa"
+        "66dc86ca"
       ],
       "regressions": [
         {
@@ -4495,10 +4492,10 @@
       "occurredAt": "2026-09-21",
       "severity": "P1",
       "symptom": "官方 CC 终端工具已完成后，瞬时 Anthropic 5xx 被 checkpointSafe 拦住不自动续跑，直接红卡收轮。",
-      "rootFixCommit": "6781147ea",
+      "rootFixCommit": "6781147e",
       "coverageCommits": [
-        "6781147ea",
-        "d3cb01ae9"
+        "6781147e",
+        "d3cb01ae"
       ],
       "regressions": [
         {
@@ -4523,9 +4520,9 @@
       "occurredAt": "2026-09-21",
       "severity": "P1",
       "symptom": "官方 CC 开着时 OAuth 池 persona UA 仍发 CCB fork claude-cli/2.8.4，活体容器是官方 Claude Code 2.1.278；出口日本但 persona 随机美东。",
-      "rootFixCommit": "231f30c1f",
+      "rootFixCommit": "231f30c1",
       "coverageCommits": [
-        "231f30c1f"
+        "231f30c1"
       ],
       "regressions": [
         {
@@ -4550,9 +4547,9 @@
       "occurredAt": "2026-09-21",
       "severity": "P1",
       "symptom": "Claude OAuth 出站不核对出口 IP/时区/设备一致性，persona 与日本出口错配或 device_id 未钉仍打到 Anthropic。",
-      "rootFixCommit": "0c37e008f",
+      "rootFixCommit": "0c37e008",
       "coverageCommits": [
-        "0c37e008f"
+        "0c37e008"
       ],
       "regressions": [
         {
@@ -4584,8 +4581,7 @@
       "symptom": "管理台新建 Claude 账号绑同一 egress 失败：预检把 disabled Claude 也算占用，与只约束 active 的唯一索引不一致。",
       "rootFixCommit": "b0c1c07a",
       "coverageCommits": [
-        "b0c1c07a",
-        "1d7f79c7a"
+        "b0c1c07a"
       ],
       "regressions": [
         {
@@ -4662,10 +4658,10 @@
       "occurredAt": "2026-09-23",
       "severity": "P1",
       "symptom": "继续聊天时模型 0 token 仍被记成完成，空回复句挂上评价和操作；同一条停止通知会再开一轮；自动续跑被拒后界面不说明。",
-      "rootFixCommit": "fc0e393ac",
+      "rootFixCommit": "fc0e393a",
       "coverageCommits": [
-        "fc0e393ac",
-        "21e9b0c848cdff5daa0e5631738fe65d4554d6d5",
+        "fc0e393a",
+        "21e9b0c8",
         "bc3b30d7"
       ],
       "regressions": [
@@ -4686,9 +4682,9 @@
       "occurredAt": "2026-09-23",
       "severity": "P1",
       "symptom": "上一条还在跑时，新消息被画进对话窗口。用户要的是输入框上方的待发送列表，右侧是修改和立即发送。",
-      "rootFixCommit": "fc121930733cec01557e8b274ec856137895ad2f",
+      "rootFixCommit": "fc121930",
       "coverageCommits": [
-        "fc121930733cec01557e8b274ec856137895ad2f"
+        "fc121930"
       ],
       "regressions": [
         {
@@ -4703,9 +4699,9 @@
       "occurredAt": "2026-09-23",
       "severity": "P2",
       "symptom": "工作过程区要手动点「加载更早的处理步骤」才能看到本轮更早的步骤。",
-      "rootFixCommit": "f8f619b77ee6ca2206e030de3b440e12aaa11604",
+      "rootFixCommit": "f8f619b7",
       "coverageCommits": [
-        "f8f619b77ee6ca2206e030de3b440e12aaa11604"
+        "f8f619b7"
       ],
       "regressions": [
         {
@@ -4743,9 +4739,9 @@
       "occurredAt": "2026-09-26",
       "severity": "P1",
       "symptom": "自用 V5 管理员在 Box Claude Opus 5.5 网页回合中本地 skill_search 和 Bash 均成功，Claude Code 续接时保留 thinking 但省略 tool_use.caller，旧 Box journal 误报 BOX_TOOL_ASSISTANT_CHANGED；请求显示无法处理，首轮模型用量仍扣 5 积分。",
-      "rootFixCommit": "dc6f53fb66d1144021c55f1b628f34f17641b1c4",
+      "rootFixCommit": "dc6f53fb",
       "coverageCommits": [
-        "dc6f53fb66d1144021c55f1b628f34f17641b1c4"
+        "dc6f53fb"
       ],
       "regressions": [
         {
@@ -4931,12 +4927,12 @@
         "1a7a6fa3",
         "c26f0005",
         "ebea094e",
-        "4dae0956d",
-        "276c7cb40",
+        "4dae0956",
+        "276c7cb4",
         "2026604b",
-        "5ae79fe716bb",
-        "daeb562702e631fe747c31c59c54d2c125e1234b",
-        "ed815301e56eab0ae7fdded381a8f0c15faa1630",
+        "5ae79fe7",
+        "daeb5627",
+        "ed815301",
         "f229790e",
         "77794a8c"
       ],
