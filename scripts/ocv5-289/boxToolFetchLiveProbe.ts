@@ -20,13 +20,15 @@ import { BOX_INTERNAL_ENDPOINT } from
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 import type { ProxyBody } from
   "../../packages/commercial/src/http/proxy/shared.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
-const UID = 3n, ACCOUNT_ID = 20n;
+// The operator names the exact account; evidence files are per account.
+const UID = 3n, ACCOUNT_ID = requireBoxOperatorAccount("BOX_TOOL_FETCH_ACK_REQUIRED").id;
 const MODEL = "box-api-claude-opus-5-5", UPSTREAM = "claude-opus-5-5";
 const EVIDENCE_PARENT = "/var/lib/openclaude";
 const EVIDENCE_DIR = `${EVIDENCE_PARENT}/ocv5-289-box-operator`;
-const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-20.json`;
-const OPERATOR_MUTEX = `${EVIDENCE_DIR}/account-20.mutex`;
+const EVIDENCE_PATH = `${EVIDENCE_DIR}/account-${ACCOUNT_ID}.json`;
+const OPERATOR_MUTEX = `${EVIDENCE_DIR}/account-${ACCOUNT_ID}.mutex`;
 type Event = { event: string; data: Record<string, unknown> };
 function assertion(ok: unknown, code: string): asserts ok {
   if (!ok) throw new Error(code);

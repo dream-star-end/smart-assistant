@@ -17,11 +17,14 @@ import { makeBoxRunCleanup } from
 import { parseBoxTerminalProof } from
   "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
-const UID = 3n, ACCOUNT = 20n;
+// The operator names the exact account; evidence files are per account.
+const OPERATOR = requireBoxOperatorAccount("BOX_SIGNED_HANDOFF_RECOVERY_ACK_REQUIRED");
+const UID = 3n, ACCOUNT = OPERATOR.id;
 const DIR = "/var/lib/openclaude/ocv5-289-box-operator";
-const LOCK = `${DIR}/account-20.json`;
-const MUTEX = `${DIR}/account-20.mutex`;
+const LOCK = `${DIR}/account-${OPERATOR.text}.json`;
+const MUTEX = `${DIR}/account-${OPERATOR.text}.mutex`;
 const WORK = "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-289-box-api";
 function assertion(ok: unknown, code: string): asserts ok { if (!ok) throw new Error(code); }
 function syncDir(path: string): void {
@@ -44,7 +47,7 @@ function writeOnce(path: string, raw: string): void {
 async function main(): Promise<void> {
   assertion(hostname() === "v3-dev-sg" && getRuntimeChannel() === "v5"
     && process.env.OCV5_289_SIGNED_HANDOFF_RECOVERY_ACK === "1"
-    && process.env.OCV5_289_ACK_ACCOUNT_ID === "20"
+    && process.env.OCV5_289_ACK_ACCOUNT_ID === OPERATOR.text
     && process.env.OCV5_289_ACK_USER_ID === "3",
   "BOX_SIGNED_HANDOFF_RECOVERY_ACK_REQUIRED");
   const dir = lstatSync(DIR);
@@ -60,7 +63,7 @@ async function main(): Promise<void> {
     const raw = readFileSync(LOCK, "utf8");
     assertion(Buffer.byteLength(raw) === lockStat.size, "BOX_RECOVERY_LOCK_INVALID");
     const lock = JSON.parse(raw) as Record<string, unknown>;
-    assertion(lock.accountId === "20" && lock.uid === "3" && lock.state === "unresolved"
+    assertion(lock.accountId === OPERATOR.text && lock.uid === "3" && lock.state === "unresolved"
       && lock.firstId === process.env.OCV5_289_EXPECTED_FIRST_ID
       && lock.runNonce === process.env.OCV5_289_EXPECTED_RUN_NONCE
       && lock.leaseEpoch === process.env.OCV5_289_EXPECTED_LEASE_EPOCH
@@ -89,7 +92,7 @@ async function main(): Promise<void> {
         && row.state === "committed"
         && (ctx?.boxState === "handoff" || ctx?.boxState === "failed_stopped")
         && ctx?.boxInvocationMode === "detached_tool"
-        && ctx?.boxAccountId === "20" && ctx?.boxRunNonce === lock.runNonce
+        && ctx?.boxAccountId === OPERATOR.text && ctx?.boxRunNonce === lock.runNonce
         && ctx?.boxLeaseEpoch === lock.leaseEpoch && !!ctx?.boxToolHandoff
         && !ctx?.boxResumeRequestId
         && (ctx.boxState === "handoff" ? !ctx.boxTerminalProof
@@ -205,7 +208,7 @@ async function main(): Promise<void> {
       const afterSecondUsage = await pool.query(
         "SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=3", [lock.secondId]);
       assertion(afterSecondUsage.rowCount === 0, "BOX_RECOVERY_SECOND_USAGE_CHANGED");
-      const archivePath = `${DIR}/account-20.stopped-${lock.runNonce}.json`;
+      const archivePath = `${DIR}/account-${OPERATOR.text}.stopped-${lock.runNonce}.json`;
       const archive = { kind: "signed_operator_stopped_handoff", originalLock: lock,
         terminalProof: proof, usageId: afterUsage.rows[0]!.id,
         costCredits: afterUsage.rows[0]!.cost, remoteCleanupDone: true,

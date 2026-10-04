@@ -7,10 +7,13 @@ import { Pool } from "pg";
 import { parseBoxTerminalProof } from
   "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
+// The operator names the exact account; evidence files are per account.
+const OPERATOR = requireBoxOperatorAccount("BOX_SIGNED_CLOSE_ACK_REQUIRED");
 const DIR = "/var/lib/openclaude/ocv5-289-box-operator";
-const LOCK = `${DIR}/account-20.json`;
-const MUTEX = `${DIR}/account-20.mutex`;
+const LOCK = `${DIR}/account-${OPERATOR.text}.json`;
+const MUTEX = `${DIR}/account-${OPERATOR.text}.mutex`;
 function assertion(ok: unknown, code: string): asserts ok { if (!ok) throw new Error(code); }
 function syncDir(): void {
   const fd = openSync(DIR, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -45,7 +48,7 @@ function writeOnce(path: string, raw: string): void {
 async function main(): Promise<void> {
   assertion(getRuntimeChannel() === "v5" && hostname() === "v3-dev-sg"
     && process.env.OCV5_289_SIGNED_CLOSE_ACK === "1"
-    && process.env.OCV5_289_ACK_ACCOUNT_ID === "20"
+    && process.env.OCV5_289_ACK_ACCOUNT_ID === OPERATOR.text
     && process.env.OCV5_289_ACK_USER_ID === "3",
   "BOX_SIGNED_CLOSE_ACK_REQUIRED");
   writeOnce(MUTEX, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
@@ -53,7 +56,7 @@ async function main(): Promise<void> {
     const st = lstatSync(LOCK);
     const raw = readOwned(LOCK, 4096);
     const lock = JSON.parse(raw) as Record<string, unknown>;
-    assertion(lock.accountId === "20" && lock.uid === "3"
+    assertion(lock.accountId === OPERATOR.text && lock.uid === "3"
       && lock.state === "unresolved"
       && lock.firstId === process.env.OCV5_289_EXPECTED_FIRST_ID
       && lock.runNonce === process.env.OCV5_289_EXPECTED_RUN_NONCE
@@ -79,7 +82,7 @@ async function main(): Promise<void> {
       assertion(found.rows.length === 1 && row?.user_id === "3"
         && row.state === "committed" && ctx?.boxState === "terminal"
         && ctx?.boxInvocationMode === "detached_tool"
-        && ctx?.boxAccountId === "20" && ctx?.boxRunNonce === lock.runNonce
+        && ctx?.boxAccountId === OPERATOR.text && ctx?.boxRunNonce === lock.runNonce
         && ctx?.boxLeaseEpoch === lock.leaseEpoch
         && ctx?.boxRemoteCleanup === "done"
         && ctx?.boxTerminalProof && typeof ctx.boxTerminalProof === "object",
@@ -107,7 +110,7 @@ async function main(): Promise<void> {
         && charges.rows.reduce((sum, item) => sum - BigInt(item.delta), 0n)
           === BigInt(usage.rows[0]!.cost_credits),
       "BOX_SIGNED_CLOSE_LEDGER_UNPROVEN");
-      const archivePath = `${DIR}/account-20.completed-${lock.runNonce}.json`;
+      const archivePath = `${DIR}/account-${OPERATOR.text}.completed-${lock.runNonce}.json`;
       const archive = { kind: "signed_operator_terminal_no_tool",
         originalLock: lock, terminalProof: proof, usageId: usage.rows[0]!.id,
         costCredits: usage.rows[0]!.cost_credits,
