@@ -12,7 +12,7 @@ import { CursorSandProvisionClient } from "./cursorSandProvision.js";
 import { readSandLifecycleState, writeSandJsonAtomic, SAND_STATE_FILE, sandHash, type SandLifecycleState } from "./cursorSandState.js";
 import { syncCursorAuthDir } from "./cursorMaterializer.js";
 
-test("lost install response survives new processes without a second create/send; only a real probe promotes ready", { timeout: 30_000 }, async () => {
+test("lost install response survives new processes without a second create/send; only a real probe promotes ready", { timeout: 150_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sand-coordinator-"));
   const token = "x." + Buffer.from(JSON.stringify({ type: "session", sub: "same-principal", exp: 2_000_000_000 })).toString("base64url") + ".y";
   const moduleHash = "d".repeat(64), machine = "a".repeat(32);
@@ -56,7 +56,8 @@ test("lost install response survives new processes without a second create/send;
     `;
     const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] }); children.add(child);
     let err = ""; child.stdout.resume(); child.stderr.on("data", (b) => { err += b; });
-    const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+    // A cold tsx child takes ~8s alone and over 10s beside the full suite.
+    const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
     try { const exit = await new Promise<number | null>((r, reject) => { child.on("error", reject); child.on("close", r); }); assert.equal(exit, 0, err); }
     finally { clearTimeout(timer); children.delete(child); }
   }

@@ -182,6 +182,30 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/content-reviews",
+    "handler": "handleAdminListContentReviews"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/content-reviews/",
+    "handler": "handleAdminNotifyContentReview"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/content-appeals",
+    "handler": "handleAdminListContentAppeals"
+  },
+  {
+    "method": "POST",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/content-appeals/",
+    "handler": "handleAdminDecideContentAppeal"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/host-audit",
     "handler": "handleAdminListHostAudit"
   },

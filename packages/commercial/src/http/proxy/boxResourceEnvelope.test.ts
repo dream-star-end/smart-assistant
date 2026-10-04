@@ -568,7 +568,7 @@ test("production handler keeps legacy and hard ceilings, and does not launch", a
   assert.equal(tooRaw.res.json().error?.code, "PAYLOAD_TOO_LARGE");
 });
 
-test("production handler keeps the enlarged envelope off while route-ready is false", async () => {
+test("production handler opens the enlarged envelope only to a signed capability", async () => {
   const nine = bodyOf([{ role: "user", content: "n".repeat(9 * 1024 * 1024) }]);
   const lease = signLease();
   const leaseOnly = await call(nine, {
@@ -583,8 +583,11 @@ test("production handler keeps the enlarged envelope off while route-ready is fa
     catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),
     box: true,
   }, { [AUTHORITY_HEADER]: signAuthorityWithOwner() });
+  // Route-ready is on (22a13a58e): the verified owner admits these bytes, so
+  // the request passes the envelope and stops at the stubbed precheck instead.
   assert.equal(signedCap.launches, 0);
-  assert.equal(signedCap.res.statusCode, 413, "signed token does not override route-ready false");
+  assert.notEqual(signedCap.res.statusCode, 413, "signed capability admits the enlarged envelope");
+  assert.ok(signedCap.thrown instanceof Error, "signed capability still stops before Box fetch");
 
   const withinLegacy = await call(bodyOf([{ role: "user", content: "hi" }]), {
     catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),

@@ -69,7 +69,8 @@ describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
       providerId: "box_cli", upstreamModelId: "claude-opus-5-5",
     });
     assert.deepEqual(route, { kind: "box", upstreamModel: "claude-opus-5-5" });
-    assert.deepEqual(providerCapabilityCeiling(route), { supportsVision: false, efforts: [] });
+    assert.deepEqual(providerCapabilityCeiling(route),
+      { supportsVision: false, efforts: ["low", "medium", "high", "xhigh", "max"] });
     assert.deepEqual(validateUpstreamConfig(route, { boxConfigured: false }),
       { kind: "box_not_configured" });
     assert.equal(validateUpstreamConfig(route, { boxConfigured: true }), null);

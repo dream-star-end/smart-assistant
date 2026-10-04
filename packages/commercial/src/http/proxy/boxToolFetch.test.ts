@@ -10,7 +10,9 @@ import type { BoxNativePointer } from "./boxNativePointer.js";
 const tools = [{ name: "local_echo", description: "synthetic",
   input_schema: { type: "object", properties: {} } }];
 const firstBody: ProxyBody = { model: "box-api-claude-opus-5-5", max_tokens: 128,
-  stream: true, tools, messages: [{ role: "user", content: "first" }] };
+  stream: true, tools, messages: [{ role: "user", content: "first" }],
+  metadata: { user_id: JSON.stringify({ session_id: "session",
+    oc_turn_key: "a".repeat(64) }) } };
 const nextBody: ProxyBody = { ...firstBody, messages: [
   { role: "assistant", content: [{ type: "tool_use", id: "toolu_A",
     name: "local_echo", input: {} }] },
