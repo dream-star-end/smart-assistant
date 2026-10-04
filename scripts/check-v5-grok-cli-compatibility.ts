@@ -22,7 +22,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+/** Total budget for the whole gate, fixture preparation included. The
+ * consumers run synchronously, so each one is given what is left of it and is
+ * killed with its whole process group when that runs out. */
 const LIMIT_MS = 120_000;
+const startedAt = Date.now();
+const remainingMs = (): number => LIMIT_MS - (Date.now() - startedAt);
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const DEPLOY = join(CANDIDATE, "scripts/deploy-v5.sh");
 /** The oldest Grok CLI xAI still serves. */
@@ -91,7 +96,8 @@ esac`,
 };
 
 function sh(cwd: string, command: string, args: string[]): string {
-  const ran = spawnSync(command, args, { cwd, encoding: "utf8" });
+  const ran = spawnSync(command, args, { cwd, encoding: "utf8", timeout: Math.max(1, remainingMs() - 2000),
+    killSignal: "SIGKILL" });
   if (ran.status !== 0) fail(`FIXTURE_${command}_${args[0]}: ${ran.stderr}`);
   return ran.stdout.trim();
 }
@@ -151,9 +157,14 @@ ssh() {
 scp() { echo 'capsule: scp refused' >&2; return 97; }
 ${call}
 `;
-  const ran = spawnSync("bash", ["-c", harness], { encoding: "utf8", timeout: 60_000,
+  const seconds = Math.floor(remainingMs() / 1000) - 2;
+  if (seconds < 1) fail("DEADLINE_EXCEEDED");
+  // timeout(1) runs the harness in its own process group and kills the group, so nothing it started outlives it
+  const ran = spawnSync("/usr/bin/timeout", ["--signal=KILL", String(seconds), "bash", "-c", harness], { encoding: "utf8",
+    timeout: seconds * 1000 + 1500, killSignal: "SIGKILL",
     env: { PATH: "/usr/bin:/bin", HOME: box.root, CAPSULE: box.root, STANDIN_GROK: grok, STANDIN_UNIT: unit,
       STANDIN_COMMIT: box.commit, ALLOW_ANY_BRANCH: "1" } });
+  if (ran.status === 137 || ran.signal === "SIGKILL" || ran.error) fail("DEADLINE_EXCEEDED");
   return { status: ran.status, out: `${ran.stdout}`, err: `${ran.stderr}`, calls: box.calls() };
 }
 const current = `grok ${MINIMUM} (capsule)`;
@@ -298,11 +309,12 @@ function proveImagePin(): string {
 async function main(): Promise<void> {
   const candidateSha = parseArgs(process.argv);
   let box: ReturnType<typeof capsule> | undefined;
+  // covers the asynchronous web search seam; the synchronous consumers enforce the same budget themselves
   const deadline = setTimeout(() => {
     console.error("[grok-cli-compatibility] deadline exceeded");
     box?.remove();
     process.exit(1);
-  }, LIMIT_MS);
+  }, Math.max(1, remainingMs()));
   try {
     box = capsule();
     const proofs = [proveOfflinePrepare(box), proveOnlineImage(box), proveStagedActivation(box),
