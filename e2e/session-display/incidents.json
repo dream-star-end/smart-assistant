@@ -5745,7 +5745,8 @@
       "symptom": "线上（v5-0fabfe865，2026-10-04 05:14Z / 台北 13:14）：账号 25 的 Box 装的是 Claude Code 2.1.288，而 Box 链路全部按 2.1.280 验证。请求 1a28c670（第 2 轮，Read 一张 png）发布的工具结果是一个 image 块，2.1.288 回显成 image 加它自己写的 `[Image: source: …/tool-results/<file>]` 文本块，严格回显校验抛 BOX_TOOL_ECHO_CONTENT_MISMATCH，回合以『内部错误』失败，叶子记为 continuation_unknown。CLI 无人接管地继续跑：又发了两个没人应答的工具调用（各等 MCP 1800 秒超时），一小时后自己结束。OCV5-323 的限时停止只认 resume_publish_* 阶段，stop-probe 每 3 分钟只打一条 BOX_EXEC_REMOTE_EXIT；证明出现后恢复又撞上同一个回显，静默返回 pending。这一行一直占着会话和它的 idle proof，过期后仍被 idle proof 当成未结束的链。钉在已禁用账号 20 上的行同样没有终态（BOX_ACCOUNT_UNAVAILABLE，OCV5-312 只能人工收尾）。修复：回显接受 CLI 自己加的图片来源注记（其余仍逐字节绑定）；回显被拒时立即经显式停止路径停掉 CLI，叶子记 continuation_echo_rejected；限时停止覆盖所有 unknown 阶段；已结束但不可能产出可交付结果的 run 按未计费 rejected_stream 收尾；超过最大存活时间且读不到证明的 run 进入新终态 expired_unproven（不伪造证明）；idle proof 把它读成 failed；新启动先校验 Box 上的 Claude Code 版本，不在支持列表就在准入前拒绝；2.1.288 上不再记录或认领标成 2.1.280 的 native pointer。",
       "rootFixCommit": "8563617b",
       "coverageCommits": [
-        "4e9db60a"
+        "4e9db60a",
+        "c59c3fdc"
       ],
       "regressions": [
         {
