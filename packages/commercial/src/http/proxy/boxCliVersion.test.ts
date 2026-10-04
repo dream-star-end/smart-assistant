@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BOX_CLI_VERSIONS, BoxCliVersionError, BoxCliVersionGate, boxCliNativeResumeVerified,
   gateBoxLaunchResolver, makeBoxCliVersionRead, parseBoxCliVersion } from "./boxCliVersion.js";
+import { BoxExecTransport } from "./boxExecTransport.js";
 
 function box(accountId: bigint, versions: Array<string | Error>) {
   let reads = 0, disposed = 0;
@@ -92,4 +93,17 @@ test("a supported result is cached per account for the TTL; a refusal is never c
   await assert.rejects(gate.read(flaky.target), BoxCliVersionError);
   assert.equal(await gate.read(flaky.target), "2.1.280", "a failed read is retried at once");
   assert.equal(flaky.reads(), 2);
+});
+
+test("the version read is a request the real Box exec transport sends", async () => {
+  // rel-0ee3b3710 asked for a 64-byte response; the transport's floor is 1024,
+  // so the read was refused locally and every Box read as unreadable.
+  let sent = 0;
+  const transport = new BoxExecTransport(
+    { execUrl: "https://box.invalid/exec", execToken: "exec", networkToken: "network" },
+    (async () => { sent += 1; throw new Error("stop once the request has left"); }) as never,
+    async () => {});
+  await assert.rejects(() => new BoxCliVersionGate().read({ accountId: 25n, exec: transport } as never),
+    (error: unknown) => error instanceof BoxCliVersionError && error.code === "BOX_CLI_VERSION_UNREADABLE");
+  assert.equal(sent, 1, "the read passed the transport's own request checks");
 });

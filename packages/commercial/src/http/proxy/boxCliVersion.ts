@@ -67,8 +67,11 @@ export class BoxCliVersionGate {
     this.seen.delete(key);
     let version: string | null = null;
     try {
+      // 1024 is the exec transport's smallest response budget; a lower value
+      // is refused before the request leaves. parseBoxCliVersion still accepts
+      // one exact version line only.
       const result = await target.exec.run(makeBoxCliVersionRead(), {
-        timeoutMs: this.opts.timeoutMs ?? 10_000, maxResponseBytes: 64,
+        timeoutMs: this.opts.timeoutMs ?? 10_000, maxResponseBytes: 1024,
         ...(signal ? { signal } : {}) });
       version = parseBoxCliVersion(result.stdout);
     } catch { version = null; }
