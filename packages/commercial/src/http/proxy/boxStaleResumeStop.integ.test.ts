@@ -18,7 +18,8 @@ test("stale resume leaves are listed with phase and age and take one stop intent
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL,
       container_id bigint, state text NOT NULL,
-      ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     const query = (sql: string, params: unknown[] = []) => client.query(sql, params);
     const journal = new BoxDurableJournal({ connect: async () => ({ query,
@@ -29,8 +30,9 @@ test("stale resume leaves are listed with phase and age and take one stop intent
       boxAccountId: "20", boxLeaseEpoch: leaseEpoch };
     const insert = async (id: string, state: string, ctx: Record<string, unknown>,
       age: string) => client.query(`INSERT INTO request_finalize_journal
-        (request_id,user_id,state,ctx,updated_at)
-        VALUES ($1,3,$2,$3::jsonb,NOW()-$4::interval)`, [id, state, JSON.stringify(ctx), age]);
+        (request_id,user_id,state,ctx,created_at,updated_at)
+        VALUES ($1,3,$2,$3::jsonb,NOW()-$4::interval,NOW()-$4::interval)`,
+      [id, state, JSON.stringify(ctx), age]);
     const unsent = `box-unsent-${suffix}`, unknown = `box-unknown-${suffix}`;
     const other = `box-other-${suffix}`, first = `box-first-${suffix}`;
     await insert(unsent, "inflight", { ...base, boxState: "unknown",
@@ -44,6 +46,21 @@ test("stale resume leaves are listed with phase and age and take one stop intent
       boxUnknownPhase: "continuation_unknown" }, "2 hours");
     await insert(first, "inflight", { ...base, boxState: "running",
       boxRunNonce: "4".repeat(24) }, "2 hours");
+    // OCV5-313: a launched first round that went unknown, one that never got
+    // its launch permit, and a leaf older than the run's maximum lifetime.
+    const launched = `box-launched-${suffix}`, staged = `box-staged-${suffix}`;
+    const ancient = `box-ancient-${suffix}`, odd = `box-odd-${suffix}`;
+    await insert(launched, "inflight", { ...base, boxState: "unknown", boxLaunchPermit: true,
+      boxRunNonce: "6".repeat(24), boxUnknownPhase: "first_round_unknown" }, "30 minutes");
+    await insert(staged, "inflight", { ...base, boxState: "unknown",
+      boxRunNonce: "7".repeat(24),
+      boxUnknownPhase: "stage_transport_unknown:input_3:BOX_EXEC_TIMEOUT" }, "30 minutes");
+    await insert(ancient, "inflight", { ...base, boxState: "unknown",
+      boxRunNonce: "8".repeat(24), boxOwnerRequestId: `box-root8-${suffix}`,
+      boxUnknownPhase: "continuation_echo_rejected" }, "5 hours");
+    await insert(odd, "inflight", { ...base, boxState: "unknown",
+      boxRunNonce: "a".repeat(24), boxOwnerRequestId: `box-root9-${suffix}`,
+      boxUnknownPhase: "free text; DROP" }, "30 minutes");
 
     const listed = await journal.listStoppedFailureProbeCandidates(20);
     const byId = new Map(listed.map((item) => [item.requestId, item]));
@@ -55,16 +72,34 @@ test("stale resume leaves are listed with phase and age and take one stop intent
       && unsentProbe.staleResume!.unknownForMs < 120_000);
     assert.equal(unknownProbe.staleResume?.phase, "resume_publish_unknown");
     assert.ok(unknownProbe.staleResume!.unknownForMs >= 25 * 60_000 - 1000);
-    assert.equal(byId.get(other)!.staleResume, undefined, "other unknown phases are not stale resumes");
-    assert.equal(byId.get(first)!.staleResume, undefined);
+    // OCV5-313: every unknown phase of a launched run is a stop candidate.
+    assert.equal(byId.get(other)!.staleResume?.phase, "continuation_unknown");
+    assert.ok(byId.get(other)!.staleResume!.unknownForMs >= 2 * 3_600_000 - 1000);
+    assert.equal(byId.get(first)!.staleResume, undefined, "a running row is not unknown");
+    assert.equal(byId.get(launched)!.staleResume?.phase, "first_round_unknown");
+    assert.equal(byId.get(launched)!.linked, false);
+    assert.equal(byId.get(staged)!.staleResume, undefined,
+      "no launch permit: no keeper exists, prelaunch recovery owns the row");
+    assert.equal(byId.get(odd)!.staleResume, undefined, "an unvalidated phase is never used");
+    assert.equal(byId.get(ancient)!.staleResume?.phase, "continuation_echo_rejected");
+    assert.equal(byId.get(ancient)!.expired, true);
+    for (const id of [unsent, unknown, other, first, launched, staged, odd]) {
+      assert.equal(byId.get(id)!.expired, undefined, "younger than the run's maximum lifetime");
+    }
 
     // Wrong phase or identity never records intent.
     assert.equal(await journal.recordStaleResumeStop({ ...unsentProbe,
       phase: "resume_publish_unknown" }), false);
     assert.equal(await journal.recordStaleResumeStop({ ...unsentProbe,
       runNonce: "5".repeat(24), phase: "resume_publish_unsent" }), false);
+    assert.equal(await journal.recordStaleResumeStop({ ...unsentProbe,
+      phase: "continuation_unknown" }), false, "the phase must be the row's own");
     await assert.rejects(journal.recordStaleResumeStop({ ...unsentProbe,
-      phase: "continuation_unknown" as never }), BoxDurableJournalError);
+      phase: "free text; DROP" }), BoxDurableJournalError);
+    assert.equal(await journal.recordStaleResumeStop({ ...byId.get(other)!,
+      phase: "continuation_unknown" }), true);
+    assert.equal(await journal.recordStaleResumeStop({ ...byId.get(launched)!,
+      phase: "first_round_unknown" }), true);
 
     assert.equal(await journal.recordStaleResumeStop({ ...unsentProbe,
       phase: "resume_publish_unsent" }), true);

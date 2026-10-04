@@ -250,3 +250,54 @@ test("OCV5-306 a rejected-stream leaf releases a linked chain; its ancestors mus
   assert.equal(pendingOf([failedParent, { ...cutLeaf, ctx: { ...cutLeaf.ctx, boxStopOutcome: "failed" } }]), "pending");
   assert.equal(pendingOf([failedParent, { ...cutLeaf, state: "inflight" }]), "pending");
 });
+
+// ── OCV5-313: a run closed as expired_unproven ended without a model result ──
+const expiredMarker = { v: 1, atMs: 1791096241420, priorBoxState: "unknown",
+  cause: "BOX_ACCOUNT_UNAVAILABLE" };
+const expiredIdentity = { boxAccountId: "20", boxRunNonce: NONCE, boxLeaseEpoch: EPOCH };
+const expiredLeaf = row("x-leaf", { ...expiredIdentity, boxState: "expired_unproven",
+  boxExpiredClose: expiredMarker, boxOwnerRequestId: "x-parent",
+  boxParentResumeRevision: "33333333-3333-4333-8333-333333333333" }, "aborted");
+const expiredParent = row("x-parent", { ...expiredIdentity, boxState: "expired_unproven",
+  boxToolHandoff: { roundNo: 1 }, boxResumeRequestId: "x-leaf",
+  boxResumeRevision: "33333333-3333-4333-8333-333333333333" });
+
+test("OCV5-313 an expired unproven chain projects failed in each shape the journal writes", () => {
+  const failed = (ids: string[]) => ({ status: "failed", sessionId, turnKey, requestIds: ids });
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [expiredParent, expiredLeaf] }),
+    failed(["x-leaf", "x-parent"]));
+  // unbilled first round (tool or detached text): one aborted row
+  const first = row("x-first", { ...expiredIdentity, boxState: "expired_unproven",
+    boxExpiredClose: { ...expiredMarker, priorBoxState: "running" } }, "aborted");
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [first] }), failed(["x-first"]));
+  // billed handoff nobody answered: the leaf keeps its settlement
+  const handoff = row("x-handoff", { ...expiredIdentity, boxState: "expired_unproven",
+    boxExpiredClose: { ...expiredMarker, priorBoxState: "handoff" },
+    boxToolHandoff: { roundNo: 1 } });
+  assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows: [handoff] }), failed(["x-handoff"]));
+});
+
+test("OCV5-313 a malformed, contradictory or half-closed expired chain stays pending", () => {
+  const pending = (rows: IdleChainRow[], other?: string[]) => assert.equal(projectBoxIdleChain({
+    sessionId, turnKey, rows, ...(other ? { otherOpenRequestIds: other } : {}) }).status, "pending");
+  const leafWith = (extra: Record<string, unknown>, state = "aborted") =>
+    ({ ...expiredLeaf, state, ctx: { ...expiredLeaf.ctx, ...extra } });
+  pending([expiredParent, leafWith({ boxExpiredClose: undefined })]);
+  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, extra: 1 } })]);
+  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, priorBoxState: "terminal" } })]);
+  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, atMs: 12 } })]);
+  pending([expiredParent, leafWith({ boxExpiredClose: { ...expiredMarker, cause: "free text!" } })]);
+  pending([expiredParent, leafWith({}, "inflight")]);                 // unbilled leaf not aborted
+  pending([expiredParent, leafWith({ boxTerminalProof: failedProof })]); // proof contradicts unproven
+  pending([expiredParent, leafWith({ boxRunNonce: "9".repeat(24) })]);
+  pending([{ ...expiredParent, ctx: { ...expiredParent.ctx, boxState: "resuming" } }, expiredLeaf]);
+  pending([{ ...expiredParent, ctx: { ...expiredParent.ctx, boxAccountId: "25" } }, expiredLeaf]);
+  pending([{ ...expiredParent, ctx: { ...expiredParent.ctx,
+    boxResumeRevision: "44444444-4444-4444-8444-444444444444" } }, expiredLeaf]);
+  pending([expiredParent, expiredLeaf], ["another-open-chain"]);
+  // The operator's OCV5-312 close is not a failure shape for its own turn.
+  pending([row("op-leaf", { ...expiredIdentity, boxState: "operator_unreachable_closed",
+    boxOperatorUnreachableClose: { v: 1, ticket: "OCV5-312", atMs: 1791096241420,
+      priorBoxState: "unknown", accountStatus: "disabled", terminalProof: false,
+      remoteCleanup: false } }, "inflight")]);
+});

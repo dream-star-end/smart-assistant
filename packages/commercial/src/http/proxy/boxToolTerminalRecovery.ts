@@ -12,7 +12,7 @@ import { readBoxSpoolChunk } from "./boxSpoolRead.js";
 import { readBoxTerminalProof } from "./boxTerminalProof.js";
 import { boxCatalogMatching, type BoxToolCatalog } from "./boxToolCatalog.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
-import { BoxToolResultEcho } from "./boxToolResultEcho.js";
+import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { withPublishedBoxResults } from "./boxPublishedResults.js";
 
@@ -21,7 +21,11 @@ const LOST_RACE = new Set(["BOX_JOURNAL_COMPLETE_FENCE_LOST", "BOX_TOOL_CHAIN_FE
 
 export type BoxToolTerminalRecovery =
   | { status: "committed" }
-  | { status: "pending"; reason: string };
+  /** OCV5-313: `undeliverable` is set only where the finished CLI's immutable
+   * spool itself rules out a deliverable final (never from an error message):
+   * a later tool call nobody received, a rejected result echo, a malformed
+   * record or final. Infrastructure outcomes never carry it. */
+  | { status: "pending"; reason: string; undeliverable?: true };
 
 function winnerClosed(winner: BoxRecoveryWinner | null): boolean {
   if (!winner) return false;
@@ -84,7 +88,9 @@ export async function observeBoxToolTerminalOnly(input: {
       deadlineMs: budget, signal: abort.signal, pollIntervalMs: 1 })) {
       let record: unknown;
       try { record = JSON.parse(line.text); }
-      catch { return { status: "pending", reason: "BOX_RECOVERY_RECORD_INVALID" }; }
+      catch {
+        return { status: "pending", reason: "BOX_RECOVERY_RECORD_INVALID", undeliverable: true };
+      }
       if (compaction) {
         try {
           if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
@@ -99,7 +105,7 @@ export async function observeBoxToolTerminalOnly(input: {
         && (record as { type?: unknown }).type === "user"
         && !(modelStarted && decoder.awaitingCliToolError())) {
         if (!echo || modelStarted) {
-          return { status: "pending", reason: "BOX_RECOVERY_ECHO_UNEXPECTED" };
+          return { status: "pending", reason: "BOX_RECOVERY_ECHO_UNEXPECTED", undeliverable: true };
         }
         echo.accept(record);
         continue;
@@ -113,7 +119,8 @@ export async function observeBoxToolTerminalOnly(input: {
       }
       const decoded = decoder.push(line.text);
       if (decoded.candidate) {
-        return { status: "pending", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF" };
+        return { status: "pending", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF",
+          undeliverable: true };
       }
       if (decoded.finalCandidate) {
         if (abort.signal.aborted) return { status: "pending", reason: "BOX_RECOVERY_ABORTED" };
@@ -129,10 +136,13 @@ export async function observeBoxToolTerminalOnly(input: {
         const trailing = await readBoxSpoolChunk({ exec: input.target.exec,
           plan: access, offset: line.endOffset, signal: abort.signal });
         if (trailing.bytes.length !== 0) {
-          return { status: "pending", reason: "BOX_RECOVERY_FINAL_TRAILING_BYTES" };
+          return { status: "pending", reason: "BOX_RECOVERY_FINAL_TRAILING_BYTES",
+            undeliverable: true };
         }
         try { decoder.finishFinal(); }
-        catch { return { status: "pending", reason: "BOX_RECOVERY_FINAL_INVALID" }; }
+        catch {
+          return { status: "pending", reason: "BOX_RECOVERY_FINAL_INVALID", undeliverable: true };
+        }
         endOffset = line.endOffset;
         const final = decoded.finalCandidate;
         const usage = { inputTokens: final.inputTokens, outputTokens: final.outputTokens,
@@ -165,6 +175,9 @@ export async function observeBoxToolTerminalOnly(input: {
     return { status: "pending", reason: "BOX_RECOVERY_FINAL_MISSING" };
   } catch (error) {
     if (abort.signal.aborted) return { status: "pending", reason: "BOX_RECOVERY_ABORTED" };
+    if (error instanceof BoxToolResultEchoError) {
+      return { status: "pending", reason: error.code, undeliverable: true };
+    }
     return { status: "pending", reason: error instanceof Error
       ? error.message : "BOX_RECOVERY_OBSERVE_FAILED" };
   } finally {

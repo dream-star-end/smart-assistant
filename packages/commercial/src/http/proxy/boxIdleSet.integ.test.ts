@@ -19,7 +19,8 @@ test("a committed summary root plus a handoff chain is a ready set", async () =>
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL,
       container_id bigint, state text NOT NULL,
-      ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     const reg = await client.query<{ name: string | null }>(
       `SELECT to_regclass('request_finalize_journal')::text AS name`);

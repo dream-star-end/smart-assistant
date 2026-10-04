@@ -86,7 +86,8 @@ test("terminal-only recovery does not write a handoff or skip to a later final",
     journal: { complete: async () => { completes++; },
       completeToolChain: async () => { completes++; },
       readRecoveryWinner: async () => null } as never });
-  assert.deepEqual(outcome, { status: "pending", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF" });
+  assert.deepEqual(outcome, { status: "pending", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF",
+    undeliverable: true });
   assert.equal(writes, 0);
   assert.equal(completes, 0);
 });
@@ -309,4 +310,43 @@ test("terminal recovery bills the final message after a pre-model compact and re
       completeToolChain: async () => { throw new Error("must not complete"); },
       readRecoveryWinner: async () => null } as never });
   assert.deepEqual(mid, { status: "pending", reason: "BOX_CLI_COMPACT_PHASE" });
+});
+
+// OCV5-313 (#1a28c670): only what the finished spool itself rules out is
+// marked undeliverable; an infrastructure failure never is.
+test("OCV5-313 a rejected result echo is undeliverable; infrastructure failures are not", async () => {
+  const published = { modelToolUseId: "toolu_prior_a", isError: false,
+    contentHash: "0".repeat(64) };
+  const round2 = { ...evidence, roundNo: 2, resultHashes: [published],
+    priorToolUses: undefined } as unknown as BoxDetachedUnknownRecovery;
+  const echoed = { type: "user", message: { role: "user", content: [
+    { type: "tool_result", tool_use_id: "toolu_prior_a", content: "other bytes" }] } };
+  const deps = { writeMessage: async () => { throw new Error("must not write"); },
+    journal: { complete: async () => { throw new Error("must not complete"); },
+      completeToolChain: async () => { throw new Error("must not complete"); },
+      readRecoveryWinner: async () => null } as never };
+  const target = spool([echoed, ...finalRecords.slice(1)]);
+  const run = target.exec.run;
+  target.exec.run = async (req: { args: string[] }) => {
+    // The published result file is not readable here: hash-only evidence.
+    if (req.args.some((arg) => arg.startsWith("toolu_"))) throw new Error("BOX_EXEC_REMOTE_EXIT");
+    return run(req);
+  };
+  assert.deepEqual(await observeBoxToolTerminalOnly({ evidence: round2, catalog,
+    target: target as never }, deps),
+  { status: "pending", reason: "BOX_TOOL_ECHO_CONTENT_MISMATCH", undeliverable: true });
+  // A first round never expects a user record before the model starts.
+  assert.deepEqual(await observeBoxToolTerminalOnly({ evidence, catalog,
+    target: spool([echoed, ...finalRecords.slice(1)]) as never }, deps),
+  { status: "pending", reason: "BOX_RECOVERY_ECHO_UNEXPECTED", undeliverable: true });
+  // Capsule write failure on a real final: stays plain pending.
+  const capsule = await observeBoxToolTerminalOnly({ evidence, catalog,
+    target: spool(finalRecords) as never }, { ...deps,
+    writeMessage: async () => { throw new Error("disk full"); } });
+  assert.deepEqual(capsule, { status: "pending", reason: "BOX_RECOVERY_CAPSULE_FAILED" });
+  // A spool read that throws is infrastructure, not a verdict on the spool.
+  const broken = { accountId: 20n, exec: { run: async () => { throw new Error("BOX_EXEC_TIMEOUT"); } } };
+  const unread = await observeBoxToolTerminalOnly({ evidence, catalog, target: broken as never }, deps);
+  assert.equal(unread.status, "pending");
+  assert.equal("undeliverable" in unread, false);
 });

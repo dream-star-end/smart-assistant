@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
 import { BoxToolFirstRoundError } from "./boxToolFirstRound.js";
+import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
@@ -607,4 +608,89 @@ test("cleanup status query failure never poisons an already-final SSE response",
   statusFails = false;
   assert.equal(await service.retryTerminalCleanup(), 0);
   assert.equal(disposed, true);
+});
+
+// OCV5-313 (#1a28c670): a rejected tool-result echo failed the request and the
+// CLI then ran on alone for an hour, holding the session and its idle proof.
+const resultBody = { ...firstBody, messages: [{ role: "user", content: "first" },
+  ...nextBody.messages.slice(0, 2)], metadata: { user_id: JSON.stringify({
+  session_id: "session", oc_turn_key: "ab".repeat(32) }) } } as ProxyBody;
+function echoRejectedService(stop: (identity: unknown) => Promise<string>, echoStopWaitMs = 200) {
+  const calls: string[] = [];
+  const target = { accountId: 25n,
+    exec: { run: async () => ({ stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const }) },
+    dispose: async () => {} };
+  const claim = { runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32), accountId: 25n,
+    spoolOffset: 9904, roundNo: 2 };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    echoStopWaitMs,
+    publishResume: (async () => ({ claim, target, access: {} })) as never,
+    runContinuation: (async () => {
+      calls.push("continuation");
+      throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+    }) as never,
+    stopRejectedRun: (async (identity: unknown) => {
+      calls.push("stop"); return stop(identity);
+    }) as never });
+  return { service, calls, claim };
+}
+
+test("OCV5-313 a rejected result echo stops the run through the explicit-stop path before the request fails", async () => {
+  let identity: unknown;
+  const { service, calls, claim } = echoRejectedService(async (seen) => {
+    identity = seen; return "stopped_proven";
+  });
+  const response = await service.fetch(call(resultBody));
+  await assert.rejects(response.text(), /BOX_TOOL_ECHO_CONTENT_MISMATCH/);
+  assert.deepEqual(calls, ["continuation", "stop"]);
+  assert.deepEqual(identity, { requestId: "box-next", uid: 3n, accountId: claim.accountId,
+    runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch });
+});
+
+test("OCV5-313 the stop wait is bounded and a late or failing stop is still observed", async () => {
+  let release!: () => void;
+  const slow = echoRejectedService(() => new Promise<string>((resolve) => {
+    release = () => resolve("pending");
+  }), 50);
+  const startedAt = Date.now();
+  const response = await slow.service.fetch(call(resultBody));
+  await assert.rejects(response.text(), /BOX_TOOL_ECHO_CONTENT_MISMATCH/);
+  assert.ok(Date.now() - startedAt < 2_000, "the request does not wait for a hanging stop");
+  assert.deepEqual(slow.calls, ["continuation", "stop"]);
+  release();
+  // A stop that rejects must not surface as an unhandled rejection.
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const failing = echoRejectedService(async () => { throw new Error("BOX_CANCEL_IDENTITY_INVALID"); });
+    const failed = await failing.service.fetch(call(resultBody));
+    await assert.rejects(failed.text(), /BOX_TOOL_ECHO_CONTENT_MISMATCH/);
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(unhandled, []);
+  } finally { process.off("unhandledRejection", onUnhandled); }
+});
+
+test("OCV5-313 other continuation failures do not request a stop", async () => {
+  const calls: string[] = [];
+  const target = { accountId: 25n,
+    exec: { run: async () => ({ stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const }) },
+    dispose: async () => {} };
+  const service = new BoxToolFetch({ supervisorAsset: Buffer.from("s"),
+    keeperAsset: Buffer.from("k"), virtualMcpAsset: Buffer.from("m"),
+    detachedRunnerAsset: Buffer.from("d"), journal: journal(),
+    maxOutputTokensForModel: () => 128_000,
+    resolveTarget: async () => target as never, onUnknown: async () => {},
+    publishResume: (async () => ({ claim: { runNonce: "e".repeat(24),
+      leaseEpoch: "f".repeat(32), accountId: 25n, spoolOffset: 1, roundNo: 2 },
+    target, access: {} })) as never,
+    runContinuation: (async () => { throw new Error("BOX_TOOL_STREAM_INCOMPLETE"); }) as never,
+    stopRejectedRun: (async () => { calls.push("stop"); return "pending"; }) as never });
+  const response = await service.fetch(call(resultBody));
+  await assert.rejects(response.text(), /BOX_TOOL_STREAM_INCOMPLETE/);
+  assert.deepEqual(calls, []);
 });

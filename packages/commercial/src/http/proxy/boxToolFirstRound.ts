@@ -17,6 +17,7 @@ import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
+import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
 import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
@@ -282,7 +283,9 @@ export async function runBoxToolFirstRound(input: {
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
     // A resumed tool exchange must be staged from history: a native
     // transcript stops at the unanswered tool_use (OCV5-304).
-    if (nativeEnabled && input.sessionId && deps.journal.findNativeCandidate
+    // OCV5-313: only where this Box's CLI build has verified native resume.
+    if (nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)
+      && input.sessionId && deps.journal.findNativeCandidate
       && !input.resumeToolResults) {
       let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
       try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
@@ -493,7 +496,8 @@ export async function runBoxToolFirstRound(input: {
           uid: input.uid, leaseEpoch: plan.leaseEpoch, proof, usage,
           ...(messagePointer ? { messagePointer } : {}) }));
         let nativePointer: BoxNativePointer | undefined;
-        if (nativeEnabled && final.assistantContentHash
+        if (nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)
+          && final.assistantContentHash
           && deps.journal.attachNativePointer) {
           try {
             const inspected = await target.exec.run(makeBoxNativeFileInspect({

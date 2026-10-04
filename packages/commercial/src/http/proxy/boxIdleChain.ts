@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { parseBoxReplayMessagePointer, type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
+import { BOX_EXPIRED_UNPROVEN_STATE, parseBoxExpiredClose } from "./boxExpiredClose.js";
 
 /** Real autocompact floor for a 200k window minus the stock buffer. Not a test override. */
 export const IDLE_COMPACT_USAGE_FLOOR = 167_000;
@@ -32,7 +33,8 @@ export type BoxIdleProof =
     }
   /** OCV5-297: the whole chain ended in a proven stop with no model result.
    * Only the exact failure shapes written by the journal state machine
-   * qualify; anything unknown or malformed stays pending. */
+   * qualify; anything unknown or malformed stays pending.
+   * OCV5-313: also a chain closed as expired_unproven. */
   | {
       status: "failed";
       sessionId: string;
@@ -93,6 +95,7 @@ function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): Id
       && ctx.boxOwnerRequestId === undefined && ctx.boxResumeRequestId === undefined
       ? chain : null;
   }
+  if (ctx.boxState === BOX_EXPIRED_UNPROVEN_STATE) return projectExpiredChain(chain);
   if (ctx.boxState !== "failed_stopped") return null;
   const proof = ctx.boxTerminalProof as { reason?: unknown; runNonce?: unknown; leaseEpoch?: unknown } | undefined;
   // OCV5-300: a first round whose stream egress rejected is settled with the
@@ -117,6 +120,31 @@ function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): Id
     const parent = chain[i]!;
     const child = chain[i - 1]!;
     if (parent.ctx.boxState !== "failed_stopped" || parent.ctx.boxStopOutcome !== "failed"
+      || parent.ctx.boxToolHandoff === undefined || !RESUMABLE_STATES.has(parent.state)
+      || parent.ctx.boxResumeRequestId !== child.requestId
+      || typeof parent.ctx.boxResumeRevision !== "string"
+      || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) return null;
+  }
+  return chain;
+}
+
+/** OCV5-313: the exact shapes markRunExpiredUnproven writes. The run ended
+ * without a keeper proof, so there is no model result to wait for. */
+function projectExpiredChain(chain: IdleChainRow[]): IdleChainRow[] | null {
+  const leaf = chain[0]!, ctx = leaf.ctx;
+  if (!parseBoxExpiredClose(ctx.boxExpiredClose) || ctx.boxTerminalProof !== undefined
+    || ctx.boxResumeRequestId !== undefined || typeof ctx.boxRunNonce !== "string"
+    || typeof ctx.boxLeaseEpoch !== "string") return null;
+  if (ctx.boxToolHandoff !== undefined ? !RESUMABLE_STATES.has(leaf.state)
+    : leaf.state !== "aborted") return null;
+  for (const row of chain) {
+    if (row.ctx.boxRunNonce !== ctx.boxRunNonce || row.ctx.boxLeaseEpoch !== ctx.boxLeaseEpoch
+      || row.ctx.boxAccountId !== ctx.boxAccountId || row.ctx.boxSessionId !== ctx.boxSessionId
+      || row.ctx.boxTurnKey !== ctx.boxTurnKey || row.ctx.model !== ctx.model) return null;
+  }
+  for (let i = 1; i < chain.length; i++) {
+    const parent = chain[i]!, child = chain[i - 1]!;
+    if (parent.ctx.boxState !== BOX_EXPIRED_UNPROVEN_STATE
       || parent.ctx.boxToolHandoff === undefined || !RESUMABLE_STATES.has(parent.state)
       || parent.ctx.boxResumeRequestId !== child.requestId
       || typeof parent.ctx.boxResumeRevision !== "string"
