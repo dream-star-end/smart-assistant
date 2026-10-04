@@ -5531,6 +5531,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-302-image-caption] PASS — a resized Read image continues when the caption is proven by the image"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxImageCaptionProof.test.ts",
           "assertion": "OCV5-302 the cached caption of the live repro image continues the turn"
@@ -5560,6 +5565,11 @@
       "rootFixCommit": "8fd82f68",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-303-skill-continuation] PASS — a Skill launch with its injected body continues"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
@@ -5808,6 +5818,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-314-parallel-skill-bodies] PASS — each parallel Skill body joins its own launch"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
           "assertion": "OCV5-314 parallel Skill bodies each join their own launch, in any layout"
@@ -5847,6 +5862,11 @@
       "rootFixCommit": "15a6d2a5",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-skill-budget-tail] PASS — a Skill step followed by the CCB budget tail continues"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCcbSkillBody.test.ts",
