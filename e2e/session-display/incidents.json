@@ -5407,8 +5407,30 @@
       "severity": "P1",
       "symptom": "xAI 服务端开始强制 Grok CLI ≥1.0.13；selfhost 运行时镜像内 grok-native 1.0.5 的所有 grok-build/grok-build-fast 回合返回 426 Upgrade Required（UI『任务执行暂时中断，请直接重试本条消息』），发布门 C3 one model per engine 因此在现网与候选上均失败、阻断所有 selfhost 发布。修复：运行时镜像钉 Grok CLI 1.0.13（适配器参数全部兼容），webSearchProxy 客户端版本头同步。 商业版仍钉 grok105 镜像，其断言保持 1.0.5，需商业通道自行重建镜像后同步。",
       "rootFixCommit": "7c851773",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "e93c03d6"
+      ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.13"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.13"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.13 before it may start"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "[grok-426-web-search-header] PASS — the master's Grok web search presents a client version xAI serves"
+        },
         {
           "layer": "unit",
           "path": "scripts/__tests__/v5ReleaseSafety.test.ts",
@@ -5424,6 +5446,11 @@
       "rootFixCommit": "21bf1581",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-300-rejected-stream-wedge] PASS — a rejected stream whose CLI finished settles unbilled and the next message runs"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
@@ -5457,6 +5484,11 @@
         "18ac8043"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-301-cli-rejected-call] PASS — a call the CLI rejects is retried inside one visible turn"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.multimsg.test.ts",
@@ -5494,6 +5526,11 @@
         "81b959db"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-302-result-rewrite-echo] PASS — a phone screenshot is published fitted and its echo binds byte for byte"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolResultImages.test.ts",
@@ -5595,6 +5632,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-304-recovered-tool-exchange] PASS — a recovery turn stops the orphaned run and continues its tool exchange once"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFetch.recover.test.ts",
           "assertion": "OCV5-304 a recovered dispatch stops the orphan and continues as a fresh invocation"
@@ -5638,6 +5680,11 @@
       ],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-306-replay-pending-after-cut] PASS — a retry waits for the still-finishing Box call and replays its real result"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxReplayWait.test.ts",
           "assertion": "a still-resolving Box call is awaited until its replay is ready"
@@ -5667,6 +5714,11 @@
       "rootFixCommit": "9f725ffa",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-306-spool-read-transient] PASS — a dropped spool read is read again at the same offset"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxSpoolPoller.test.ts",
@@ -5843,6 +5895,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message passes submit"
+        },
+        {
           "layer": "unit",
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
           "assertion": "OCV5-315 a Box continuation reject settles the parked Box turn once"
@@ -5888,6 +5945,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation"
+        },
+        {
           "layer": "unit",
           "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
           "assertion": "allows automatic checkpoint continuation for the live tape"
@@ -5912,6 +5974,11 @@
       "rootFixCommit": "599ce66b",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
