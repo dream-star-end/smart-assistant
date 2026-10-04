@@ -2634,6 +2634,7 @@ export function MessageList({
           eagerDeferred={eager}
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
           startedAt={it.active ? turnActivity?.startedAt ?? null : null}
+          lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
         />
       );
     }
