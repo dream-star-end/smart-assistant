@@ -4071,6 +4071,14 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  if ! (cd "$box_cand" && timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then
+    echo "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
     echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
