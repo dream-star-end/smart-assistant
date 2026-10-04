@@ -235,7 +235,7 @@ describe("SessionManager pending-persistence tracking", () => {
     const secondPromise = sm.beginExternalTurn(session);
     await Promise.resolve();
     assert.equal(session._externalTurnAbort?.signal, first.signal);
-    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(sm.interrupt(session.sessionKey, "user"), true);
     assert.equal(first.signal.aborted, true);
 
     first.finish("errored");
@@ -268,7 +268,7 @@ describe("SessionManager pending-persistence tracking", () => {
       session,
     );
 
-    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(sm.interrupt(session.sessionKey, "user"), true);
     assert.equal(logicalAbort.signal.aborted, true);
     assert.deepEqual(calls, [{
       status: "interrupted",
@@ -292,6 +292,22 @@ describe("SessionManager pending-persistence tracking", () => {
     assert.equal(drained, true);
   });
 
+  test("unspecified interruption remains system; exact stale browser Stop never aborts the live owner", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const session = makeTurnSession(new FakeTurnRunner(() => {}));
+    const calls: Array<{ status: string; reason: string; errorCode: string }> = [];
+    session._runningClientMessageId = "live-owner";
+    session._externalTurnAbort = new AbortController();
+    session._persistActiveTurn = async (status, reason, errorCode) => { calls.push({ status, reason, errorCode }); };
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+    assert.equal(sm.interruptClientTurn(session.sessionKey, "stale-owner"), false);
+    assert.equal(session._externalTurnAbort.signal.aborted, false);
+    assert.deepEqual(calls, []);
+    assert.equal(sm.interrupt(session.sessionKey), true);
+    await sm.awaitPendingPersistence();
+    assert.deepEqual(calls, [{ status: "interrupted", reason: "本轮因系统调度中断。", errorCode: "SYSTEM_INTERRUPT" }]);
+  });
+
   test("user Stop retains the direct runner fallback before the persistence hook exists", () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeTurnRunner(() => {});
@@ -302,7 +318,7 @@ describe("SessionManager pending-persistence tracking", () => {
       session,
     );
 
-    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(sm.interrupt(session.sessionKey, "user"), true);
     assert.equal(runner.interruptCalls, 1);
   });
 

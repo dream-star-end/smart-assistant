@@ -2,8 +2,8 @@
   "schema": 1,
   "pipelineVersion": 2,
   "generatedAt": "2026-07-15T08:00:00.000Z",
-  "sourceCommit": "55ec3d5ec4dfea31f8b0e7f11c6411aeffba818d",
-  "sourceTreeHash": "30716d561bd0649f4f3e36f0dc052838bd56fc0ff783a458eefdb2970a9846fb",
+  "sourceCommit": "8f5dd6b07c1de9216d3d417215f17c0f4439eb86",
+  "sourceTreeHash": "89fb16df1b2bb288045b72400b32510448d90e4a885e1e81d4be881591e22cee",
   "productionEntry": "index.html -> src/main.tsx -> App",
   "fixtureBoundary": "HTTP / WebSocket / browser capabilities only",
   "networkPolicy": "local static + explicit fixtures; unknown local and all external requests fail",
@@ -45,35 +45,32 @@
     ]
   },
   "incremental": {
-    "at": "2026-09-07T04:40:05.147Z",
+    "at": "2026-10-04T22:05:13.537Z",
     "featureIds": [
-      "agents",
-      "chat-basics",
-      "models-reasoning",
-      "sessions-history"
+      "advisor-mode"
     ],
     "previousGeneratedAt": "2026-07-15T08:00:00.000Z"
   },
   "scenarios": {
     "chat-basics": {
-      "mediaVersion": 4,
+      "mediaVersion": 5,
       "caption": "输入目标并发送，随后核对助手返回的完整交付。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "新建会话，准备描述任务",
-          "dHash": "3936394692c821b085e00068849388b420648c238c20c280c402c6432c022c80"
+          "dHash": "b90e390e32e1946800d32c34892480438c20804084c0200094009c01a2038202"
         },
         {
           "label": "写清目标、字段和交付格式",
-          "dHash": "3936394692c821b085e00068849388b420648c238c20c090c643c6432c822c80"
+          "dHash": "b90e390e32e1946800d32c34892480438c20804080c0201096019ec1a20b820b"
         },
         {
           "label": "发送后核对助手的完整交付",
-          "dHash": "3906392694cc24cc864d06cc83228580240084008080c100c402c6432c022c80"
+          "dHash": "b90e390e3cc19c020a892cc98cc98cc9922c904c80022000c8008c01a2038202"
         }
       ],
       "actions": [
@@ -130,29 +127,29 @@
         "助手已返回完整交付"
       ],
       "poster": {
-        "sha256": "aba6b8b5613501e36ff0acdaf9b87349361e6cb3cb2b89e13d73bdddb89dccf1",
-        "bytes": 19318
+        "sha256": "10d6a6961dadc1b57eaa8c1ed519c7485264a3cd48a9b86a996df8c7b9a97bfe",
+        "bytes": 22250
       },
       "video": {
-        "sha256": "b071a3d395fc8130f8c4e483e8f8b4ded9ab6cbbd2bf3c1af538ce9af3399c5d",
-        "bytes": 101106
+        "sha256": "35066bab49b07f5178e4583679c1ae8f3fb9fee0d1488f8f9b630f9dc216b64b",
+        "bytes": 100468
       }
     },
     "sessions-history": {
-      "mediaVersion": 3,
+      "mediaVersion": 4,
       "caption": "搜索会话并切换到“客户研究”，继续已有工作。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "在侧栏搜索已有项目",
-          "dHash": "3926390eb48d048da489272c872884d384000400008001000402c6432c022c80"
+          "dHash": "b90e390a1989b9892989298989899f518b58429c0442000080004c01a2038202"
         },
         {
           "label": "打开会话并恢复历史上下文",
-          "dHash": "3926390e948d248d8489272c872884d384000400008001000402c6432c022c80"
+          "dHash": "b90e390a1989a9892989298989899f519b58429c0442000080004c01a2038202"
         }
       ],
       "actions": [
@@ -193,12 +190,12 @@
         "历史消息已恢复"
       ],
       "poster": {
-        "sha256": "051823e9c5ed9604fa02dac4335ebca307e35300e979485a238aba9528ccee67",
-        "bytes": 20976
+        "sha256": "7001bf50f66cd8b55bc259646b4babfa0b0afeb8f614a4394a3f558cbf8ceaf9",
+        "bytes": 23222
       },
       "video": {
-        "sha256": "ff806eb9533416cbf105b2c18e16b2f15660a4674e7678d819b81ee5cc40f95c",
-        "bytes": 68902
+        "sha256": "deee30c512f21bd47d4d374378ca45a76201f9a64f9bec2c3d1f7f2a19174f0c",
+        "bytes": 76637
       }
     },
     "models-reasoning": {
@@ -821,24 +818,24 @@
       }
     },
     "agents": {
-      "mediaVersion": 4,
+      "mediaVersion": 5,
       "caption": "从侧栏选择专业助手并新建会话，再从顶栏核对当前角色。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "3926390e948d248d8489072c872884d3240084008080c100c402c6432c022c80"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "查看已安装的专业智能体",
-          "dHash": "390619068416821692369116959692c692c69096a18684a6981698960c062c00"
+          "dHash": "990e891606169e1691d691868516824696e691469836918681869c369816a208"
         },
         {
           "label": "确认新会话使用编程助手",
-          "dHash": "3906393692c820c085a0006881428cb12db1864e8e68c180c402c6432c022c80"
+          "dHash": "b90e390e32e1946800c62c31893180438e70804084c0200094009c01a2038202"
         },
         {
           "label": "在智能体目录中核对当前角色与专业说明",
-          "dHash": "390619068416821692369116959692c692c69196a18685a6989698960c062c00"
+          "dHash": "990e891606169e1691d691868516824696e6914698369186818691f69816a208"
         }
       ],
       "actions": [
@@ -884,7 +881,7 @@
           ],
           "tag": "button",
           "role": null,
-          "label": "💻编程助手",
+          "label": "切换智能体，当前编程助手",
           "matchedFeatureId": "agents",
           "matchedControl": true,
           "dialogTitle": null,
@@ -898,47 +895,47 @@
         "新会话输入框为空，旧任务内容未带入"
       ],
       "poster": {
-        "sha256": "b104cebccd1e3bad4d44f5203bdbbe2733aebc62e4936e16b0de54c91fdcd61d",
-        "bytes": 22922
+        "sha256": "028f9e7688e1fd5e922cd6d4128c51c71f5118e459ead185785aba11dabafe4f",
+        "bytes": 22810
       },
       "video": {
-        "sha256": "8a5af55c637cbe78a997333a6213dd05db766a43aecd8916bb4a53fabc2bef56",
-        "bytes": 101917
+        "sha256": "30204afe1b9a6e4c5a62da422363d392fd208d4376c619e6bd2db5c9b646082e",
+        "bytes": 105083
       }
     },
     "team-mode": {
-      "mediaVersion": 3,
+      "mediaVersion": 4,
       "caption": "在智能体选择器中开启团队模式并确认队长说明。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "启用团队模式并核对队长计费说明",
-          "dHash": "390c190e8416821692369116950692de92d69096a18684a6989698160c063c00"
+          "dHash": "990e891606169e1691d691868516866696e692e692969936928681868426b248"
         },
         {
           "label": "在工作区顶栏确认团队模式与队长引擎已生效",
-          "dHash": "3d4c192e9b41a748a500a5482548a747a7ac27a8240384208403a6021c820c80"
+          "dHash": "b946392a399989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "在工作区顶栏核对团队模式状态与关闭入口",
-          "dHash": "3d4c194a9b45a490a4d0a7402740a747a72c27a8240384208403a6021c820c80"
+          "dHash": "b946392a3b498b090899299999a99f51bb58929c8442200094009c01a2038202"
         }
       ],
       "actions": [
         {
-          "step": "启用团队模式",
-          "selector": "[role=\"dialog\"] [role=\"switch\"][data-product-feature=\"team-mode\"]",
+          "step": "选择团队模式",
+          "selector": "[role=\"dialog\"] button[data-product-feature=\"team-mode\"]",
           "expectedFeatureId": "team-mode",
           "assertions": [
-            "visible:[role=\"dialog\"] [role=\"switch\"][data-product-feature=\"team-mode\"]",
+            "visible:[role=\"dialog\"] button[data-product-feature=\"team-mode\"]",
             "feature:team-mode"
           ],
           "tag": "button",
-          "role": "switch",
-          "label": "启用团队模式",
+          "role": null,
+          "label": "团队队长切换为 GPT-6-Astra 并委派已安装智能体",
           "matchedFeatureId": "team-mode",
           "matchedControl": true,
           "dialogTitle": "选择智能体",
@@ -963,17 +960,17 @@
       ],
       "assertions": [
         "智能体选择器已打开",
-        "团队模式开关已启用",
+        "团队选项已选中",
         "顶栏已常驻显示团队模式状态",
         "团队模式状态与关闭入口已显示"
       ],
       "poster": {
-        "sha256": "c8003a6f919cd378fb7a19d289f7e8dbe1dd7e3bad02c87744924dd4e9f5b660",
-        "bytes": 28848
+        "sha256": "e2f85a70726d56d6a74497ffab0f1608a7a26ca0fcf5418d7fecd12c011be65f",
+        "bytes": 29756
       },
       "video": {
-        "sha256": "d80644cc1b193837c917c7ccf71715ccb4c35833121a86bc6bb67f9ee07627f6",
-        "bytes": 109760
+        "sha256": "ea76f9cbcdcb478e5c96af240340ff6449e05f2f6cd8e7c20e57439786d1febc",
+        "bytes": 104866
       }
     },
     "memory-auto-dream": {
@@ -1538,33 +1535,33 @@
       }
     },
     "billing-usage": {
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "caption": "打开账户与用量，查看余额、趋势和模型消耗。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "392c190a9a01a748a540a5482548a742a7482728245384008403a6021c820c80"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "查看当前套餐与可用积分",
-          "dHash": "190c89168816925692169116801690169416801e901690169216841610162c08"
+          "dHash": "b90e190f0007090b080b1c4b190b180b1a0b1c0b180b190b389b191b3d278240"
         },
         {
           "label": "查看趋势、模型消耗与缓存命中",
-          "dHash": "190c891688169256921691669066919681969196819691b6959691961c562c80"
+          "dHash": "b90e1917000b083308330d5b181b184b184b184b18cb2a4b2c4b284b32138200"
         }
       ],
       "actions": [
         {
           "step": "打开账户与计费",
-          "selector": "aside button[data-product-feature=\"billing-usage\"][aria-label=\"设置\"]",
+          "selector": "[role=\"menuitem\"][data-product-feature=\"billing-usage\"]",
           "expectedFeatureId": "billing-usage",
           "assertions": [
-            "visible:aside button[data-product-feature=\"billing-usage\"][aria-label=\"设置\"]",
+            "visible:[role=\"menuitem\"][data-product-feature=\"billing-usage\"]",
             "feature:billing-usage"
           ],
-          "tag": "button",
-          "role": null,
+          "tag": "div",
+          "role": "menuitem",
           "label": "设置",
           "matchedFeatureId": "billing-usage",
           "matchedControl": true,
@@ -1596,12 +1593,12 @@
         "用量趋势图已加载"
       ],
       "poster": {
-        "sha256": "c991db1ef6b36684c3ea2ff07192befb6130ca09f87b31fb510203c90d5fec90",
-        "bytes": 12414
+        "sha256": "eb6e59dd77128e85386295eba251ab5970003dcd0c000fd49f3ab34aa241de45",
+        "bytes": 13316
       },
       "video": {
-        "sha256": "8c038dc5a37321fdef75cac7506f5b9d7bafef133877722eaf656f282dd65751",
-        "bytes": 62145
+        "sha256": "351a611bf027cc4e380462b8e740367b650a3f2b0048ffb7c9d68b7ca75df353",
+        "bytes": 72555
       }
     },
     "organization": {
@@ -1789,20 +1786,20 @@
       }
     },
     "taskboard": {
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "caption": "点击侧栏“任务”，进入任务面板查看阶段与工单。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "3d26390692b024b288381a008602803220328000c000c200a40286033c822c80"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "打开任务面板",
-          "dHash": "34eb3c6a8e1c242e8440214884c487c223c08008c080c000a000800024002400"
+          "dHash": "b4ea3c6a3e1c942e1040214890a491a2a15080c88140201090009000a4008000"
         },
         {
           "label": "查看阶段与工单",
-          "dHash": "34eb3c6b8e1324218440214884c487c223c08008c080c000a000800024002400"
+          "dHash": "b4ea3c6a3e1394211040214890a491a2a15080c88140201090009000a4008000"
         }
       ],
       "actions": [
@@ -1828,33 +1825,33 @@
         "已切到列表展示"
       ],
       "poster": {
-        "sha256": "84a3f6a766ba30dcf79244b21cd1f5b5fa6752eec96e8e2664225d4aff3c4fc8",
-        "bytes": 16634
+        "sha256": "e923d45bf5c698efedf1b578b59b7be2de27e1b15f08b82fd08323488fdad5d5",
+        "bytes": 18168
       },
       "video": {
-        "sha256": "37f9714470229a2a1d756b21ec07973410717c95d914698cdc28bfc6d47e4190",
-        "bytes": 50757
+        "sha256": "d0f69c144ab826f9408604fd757dd464767537d3c772fdda3c429faeed9b8e69",
+        "bytes": 53398
       }
     },
     "advisor-mode": {
-      "mediaVersion": 2,
+      "mediaVersion": 3,
       "caption": "在智能体选择器中选择顾问，并核对顶栏冻结的顾问型号。",
       "stages": [
         {
           "label": "真实工作区已就绪",
-          "dHash": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00"
+          "dHash": "b90e390a398989890989298999899f51bb58929c8442200094009c01a2038202"
         },
         {
           "label": "在智能体选择器中选择顾问并核对说明",
-          "dHash": "0f1e2d3c4b5a697887766554433221100ffeeddccbbaa9988776655443322110"
+          "dHash": "990e814604169a169156919685368606968696069056913691b690169616a208"
         },
         {
           "label": "在工作区顶栏确认顾问模式与冻结型号",
-          "dHash": "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"
+          "dHash": "b92e39543f3097312c282d549d22dd129c6492648402200098009c01a2038202"
         },
         {
           "label": "在工作区顶栏核对顾问建议须执行者验证",
-          "dHash": "fedcba9876543210ffeeddccbbaa99887766554433221100aabbccddeeff0011"
+          "dHash": "b96e391436d894d92c982c989c9add229c6492648402200098009c01a2038202"
         }
       ],
       "actions": [
@@ -1867,8 +1864,8 @@
             "feature:advisor-mode"
           ],
           "tag": "button",
-          "role": "button",
-          "label": "顾问",
+          "role": null,
+          "label": "顾问主模型不变，只多一个出主意的顾问",
           "matchedFeatureId": "advisor-mode",
           "matchedControl": true,
           "dialogTitle": "选择智能体",
@@ -1892,18 +1889,19 @@
         }
       ],
       "assertions": [
+        "季度经营复盘会话已打开",
         "智能体选择器已打开",
         "顾问选项已选中",
         "顶栏已常驻显示顾问模式状态",
         "顾问模式状态与关闭入口已显示"
       ],
       "poster": {
-        "sha256": "ded2c4d41f66775eb2d45bbd25957daa806258bcaa34f4fa9942fd5dd7a08b77",
-        "bytes": 28885
+        "sha256": "5a0dde8664122127050ee914de4c2c8b6bb0e8928aa25cc57de2deebf36fe79b",
+        "bytes": 26474
       },
       "video": {
-        "sha256": "6c425fbc96048141c0ea16e23b6c356c95c1e3f3c42ea7a026a90666897c9402",
-        "bytes": 74934
+        "sha256": "74ea684e797c9a2f99f94c3e0beb6655f9f9f78fc8f90e0ed8ce22eab0153102",
+        "bytes": 109729
       }
     }
   }

@@ -38,6 +38,7 @@
 // 跑法:npm run test:browser(web-react 包内);失败截图落 $OC_BROWSER_TEST_ARTIFACTS
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -84,6 +85,55 @@ await esbuild.build({
   },
   alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
   logLevel: "silent",
+});
+
+// T13: isolated touch page mounts only the shared real ToolCard fixture.
+const toolTouchBundlePath = join(outDir, "tool-touch.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "tool-touch-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: toolTouchBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+});
+
+// T69 only. OC_CHAT_BASELINE swaps MessageRenderer for the pre-fix tree so the
+// same fixture can fail on ed8c283f9 and pass on d203d9bf6. The main harness
+// stays on the current sources; other cases must not inherit that swap.
+const liveUnitsBundlePath = join(outDir, "live-units-viewport.js");
+await esbuild.build({
+  entryPoints: [join(HERE, "live-units-viewport-harness.tsx")],
+  bundle: true,
+  format: "iife",
+  outfile: liveUnitsBundlePath,
+  jsx: "automatic",
+  loader: { ".css": "empty" },
+  define: {
+    "process.env.NODE_ENV": '"production"',
+    "import.meta.env.MODE": '"production"',
+  },
+  alias: { "node:crypto": join(HERE, "stubs", "node-crypto.js") },
+  logLevel: "silent",
+  plugins: process.env.OC_CHAT_BASELINE
+    ? [{
+        name: "oc-chat-baseline",
+        setup(build) {
+          build.onLoad({ filter: /src\/components\/MessageRenderer\.tsx$/ }, (args) => {
+            const rel = args.path.slice(args.path.indexOf("packages/web-react/"));
+            const contents = execFileSync(
+              "git",
+              ["show", `${process.env.OC_CHAT_BASELINE}:${rel}`],
+              { cwd: join(HERE, "../../.."), encoding: "utf8" },
+            );
+            return { contents, loader: "tsx" };
+          });
+        },
+      }]
+    : [],
 });
 
 const previewBundlePath = join(outDir, "preview-harness.js");
@@ -170,6 +220,11 @@ if (!previewCssFile) throw new Error("browser-tests: 预览 production CSS 构�
 // / .min-h-11)被删掉后门依然全绿(2026-07-26 审计实锤:删 styles.css 的
 // .chat-scroll-area 规则,T8 照过)。现在 T4/T8/T13 断言的就是线上那份 CSS。
 const productionCss = readFileSync(join(previewCssDir, previewCssFile), "utf8");
+const liveUnitsHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${productionCss}</style><style>
+  html,body{margin:0;overflow:auto;height:auto}
+  .timeline-scroll-probe{height:240px;width:720px;overflow-y:auto;position:relative;border:1px solid #ccc;scrollbar-gutter:stable}
+  .live-units-case{margin:8px 0}
+</style></head><body><div id="live-units-viewport-root"></div><script>${readFileSync(liveUnitsBundlePath, "utf8")}</script></body></html>`;
 const previewHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>${productionCss}</style></head><body><div id="root"></div><script>${readFileSync(previewBundlePath, "utf8")}</script></body></html>`;
 // 移动整页(T25):与线上 index.html 同构 —— 同一份 production CSS、同一条 viewport meta、
 // 单一 #root 挂载点,**零测试脚手架样式**(加一条覆盖就等于把被测的布局改掉了)。
@@ -192,6 +247,8 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
   #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
 </style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="process-card-owner-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+
+const toolTouchHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${productionCss}</style></head><body><div id="tool-card-polish-root"></div><script>${readFileSync(toolTouchBundlePath, "utf8")}</script></body></html>`;
 
 // ── drive ───────────────────────────────────────────────────────────────────
 let browser;
@@ -1319,24 +1376,34 @@ await check("T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽
     throw new Error("市场列表未按需渐进展示");
   }
   // 卡内文字型操作(查看更多 / 展开全部 / 收起…)与表头同一 44px 触控标准(tools 审计 T-08)。
-  // 主 harness 是桌面(hover 可用)上下文:用 CDP 临时开触摸仿真 —— Chromium 在触摸仿真下把
-  // primary hover 置为 none、pointer 置为 coarse,`[@media(hover:none)]` 规则即刻生效(Playwright 的
-  // hasTouch 走的就是这条),量一次真实高度再还原;不必另起一个完整 harness 上下文。
+  // Chromium keeps hover:none even after CDP touch emulation is disabled.
+  // Never mutate the shared desktop page's media: measure the same real card
+  // in an isolated touch context, then prove the desktop contract is intact.
   const more = root.getByRole("button", { name: /查看更多/ });
   await more.waitFor({ state: "visible", timeout: 3000 });
-  const desktopMore = await more.boundingBox();
-  const cdp = await page.context().newCDPSession(page);
+  const touchContext = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true });
   try {
-    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
-    const hoverNone = await page.evaluate(() => window.matchMedia("(hover: none)").matches);
-    if (!hoverNone) throw new Error("触摸仿真未让 (hover: none) 生效,无法测触控高度");
-    const touchMore = await more.boundingBox();
+    const touchPage = await touchContext.newPage();
+    watchRuntimeErrors(touchPage, "T13-isolated-touch");
+    await touchPage.route("**/*", serveBuiltAsset);
+    const touchUrl = "http://127.0.0.1/__openclaude_browser_tool_touch__";
+    await touchPage.route(touchUrl, (route) => route.fulfill({ status: 200, contentType: "text/html", body: toolTouchHtml }));
+    await touchPage.goto(touchUrl);
+    if (!(await touchPage.evaluate(() => matchMedia("(hover:none)").matches))) {
+      throw new Error("独立触屏上下文没有启用hover:none");
+    }
+    const touchRoot = touchPage.locator("#tool-card-polish-root");
+    await touchRoot.getByRole("button", { name: /^搜索 AI 市场/ }).click();
+    const touchMore = await touchRoot.getByRole("button", { name: /查看更多/ }).boundingBox();
     if (!touchMore || touchMore.height < TOUCH_MIN) {
-      throw new Error(`触屏下卡内「查看更多」高度=${touchMore?.height ?? 0}px，应至少 44px(桌面 ${desktopMore?.height ?? 0}px)`);
+      throw new Error(`触屏下卡内查看更多高度=${touchMore?.height ?? 0}px，应至少44px`);
     }
   } finally {
-    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
-    await cdp.detach();
+    await touchContext.close();
+  }
+  const desktopMedia = await page.evaluate(() => ({ hover: matchMedia("(hover:hover)").matches, touch: navigator.maxTouchPoints }));
+  if (!desktopMedia.hover || desktopMedia.touch !== 0) {
+    throw new Error(`T13污染了共享桌面媒体条件: ${JSON.stringify(desktopMedia)}`);
   }
   await more.click();
   await root.getByText("浏览器能力 10", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
@@ -2008,9 +2075,9 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
 
 // ── T68 触屏动作行折叠(messages 审计 M-03)──────────────────────────────────────
 // 触屏没有 hover:此前每条消息下方常显整排 44px 动作图标(助手 5 个、用户 3 个)+ 状态标签,
-// 长会话里 1 行正文配 3 行 chrome。现在触屏默认只露一个「更多操作」开关,点开才展开整排。
+// 长会话里 1 行正文配 3 行 chrome。OCV5-295:助手复制常显，其余动作默认收进「更多操作」。
 // jsdom 无 CSS 量不出"看得见/看不见",这里在 (hover:none) 真生效的 390×844 上下文里量。
-await check("T68 390px 触屏:动作行默认只露 44px「更多操作」,点开才展开整排,末条助手默认展开", async () => {
+await check("T68 390px 触屏:助手一击复制原文，更多默认收起且纯文本复制完整，用户动作可展开", async () => {
   screenshotPage = mobilePage;
   const hoverNone = await mobilePage.evaluate(() => matchMedia("(hover: none)").matches);
   if (!hoverNone) throw new Error("移动上下文未仿真 (hover: none),本用例前提不成立(hasTouch 丢了?)");
@@ -2057,21 +2124,57 @@ await check("T68 390px 触屏:动作行默认只露 44px「更多操作」,点�
     throw new Error("收起后开关应回到 aria-expanded=false");
   }
 
-  // ③ 末轮末条助手回复(最常要复制/重新生成的那条)默认展开:「复制纯文本」直接可见且 ≥44px。
-  //    (用「复制纯文本」而非「复制」定位:助手正文里的代码块自带一个「复制」按钮。)
-  const assistantRow = mobilePage
-    .getByTestId("assistant-row")
-    .filter({ hasText: "MOBILE_ASSISTANT_TAIL_MARKER" });
+  // ③ OCV5-295: every completed assistant has one-click copy, including the tail.
+  // Clipboard is Chromium's real API; neither writeText nor the formatter is stubbed.
+  await mobileContext.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1" });
+  const wideAssistant = mobilePage.getByTestId("assistant-row").filter({ hasText: "MOBILE_ASSISTANT_TAIL_MARKER" });
+  if (!(await wideAssistant.getByRole("button", { name: "复制", exact: true }).last().isVisible())) {
+    throw new Error("之前完成态宽内容助手行的一击复制入口消失");
+  }
+  const assistantRow = mobilePage.getByTestId("assistant-row").filter({ hasText: "MOBILE-ASSISTANT-COPY-FIXTURE" });
+  const assistantCopy = assistantRow.getByRole("button", { name: "复制", exact: true });
+  const assistantToggle = assistantRow.getByRole("button", { name: "更多操作" });
   const plainCopy = assistantRow.getByRole("button", { name: "复制纯文本" });
-  await plainCopy.waitFor({ state: "visible", timeout: 5000 });
+  await assistantCopy.waitFor({ state: "visible", timeout: 5000 });
+  for (const button of [assistantCopy, assistantToggle]) {
+    const box = await button.boundingBox();
+    if (!box || box.height < TOUCH_MIN || box.width < TOUCH_MIN) {
+      throw new Error(`助手常显动作触控靶不足44px: ${JSON.stringify(box)}`);
+    }
+  }
+  if ((await assistantToggle.getAttribute("aria-expanded")) !== "false" || await plainCopy.isVisible()) {
+    throw new Error("末条助手更多操作应默认收起，复制纯文本不得常显");
+  }
+  const expectedCopy = await mobilePage.evaluate(() => window.__mobilePage.copyFixture);
+  async function copyAndRead(button, expected, label) {
+    // Reset to a sentinel so stale clipboard contents cannot make a broken click pass.
+    await mobilePage.evaluate(() => navigator.clipboard.writeText("T68-NOT-COPIED"));
+    await button.click();
+    await mobilePage.waitForFunction(async (text) => await navigator.clipboard.readText() === text, expected, { timeout: 3000 });
+    const actual = await mobilePage.evaluate(() => navigator.clipboard.readText());
+    if (actual !== expected) throw new Error(`${label} 剪贴板全文不一致: ${JSON.stringify(actual)}`);
+  }
+  await copyAndRead(assistantCopy, expectedCopy.raw, "助手原文复制");
+  await assistantToggle.click();
+  await plainCopy.waitFor({ state: "visible", timeout: 3000 });
   const plainBox = await plainCopy.boundingBox();
-  if (!plainBox || plainBox.height < TOUCH_MIN) {
-    throw new Error(`末条助手动作按钮触控靶不足 44px: ${JSON.stringify(plainBox)}`);
+  if (!plainBox || plainBox.height < TOUCH_MIN || plainBox.width < TOUCH_MIN) {
+    throw new Error(`纯文本复制触控靶不足44px: ${JSON.stringify(plainBox)}`);
   }
-  const assistantCollapse = assistantRow.getByRole("button", { name: "收起操作" });
-  if ((await assistantCollapse.getAttribute("aria-expanded")) !== "true") {
-    throw new Error("末轮末条助手回复的动作行应默认展开");
+  await copyAndRead(plainCopy, expectedCopy.plain, "助手纯文本复制");
+  await assistantRow.getByRole("button", { name: "收起操作" }).click();
+  await plainCopy.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await assistantRow.getByRole("button", { name: "更多操作" }).getAttribute("aria-expanded")) !== "false") {
+    throw new Error("助手收起后 aria-expanded 没有恢复 false");
   }
+  // T25 corroboration: wrapping must not hide or truncate the user's long token.
+  const expectedUser = "MOBILE_LONG_TOKEN_MARKER_aG9yaXpvbnRhbC1vdmVyZmxvdy1yZWdyZXNzaW9uLWNhbmFyeS12ZXJ5LWxvbmctdW5icm9rZW4tdG9rZW4";
+  if (await userRow.getByTestId("message-text").textContent() !== expectedUser) {
+    throw new Error("用户长串正文被截断");
+  }
+  await userRow.getByRole("button", { name: "更多操作" }).click();
+  await copyAndRead(userCopy, expectedUser, "用户长串复制");
+  await userRow.getByRole("button", { name: "收起操作" }).click();
 });
 
 await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹", async () => {
@@ -2080,7 +2183,12 @@ await check("T43 移动端首次上滑立即解除贴底，内容再长不回弹
   await mobilePage.evaluate(() => window.__mobilePage.growTimeline());
   await mobilePage.waitForFunction(() => {
     const node = document.querySelector('[data-testid="mobile-chat-scroll"]');
-    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200;
+    // The old rows already overflow: wait for this growth's real Markdown,
+    // not just its raw-text Suspense fallback, before sampling touch geometry.
+    return node instanceof HTMLElement && node.scrollHeight > node.clientHeight + 200 &&
+      Array.from(node.querySelectorAll('[data-chat-virtual-key="mobile-grow-0"] .prose p')).some(
+        (paragraph) => paragraph.textContent === "MOBILE_GROW_0_35 触控滚动高度增长回归样本。",
+      );
   }, null, { timeout: 5000 });
   // grow 后 layout 可能还在涨高；反复 armSticky 直到真贴底，避免 12px 级竞态。
   await mobilePage.waitForFunction(() => {
@@ -2774,52 +2882,52 @@ await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用
 });
 
 await check("T30 视频任务中心持久排队、实时进度与跨 worker 取消终态", async () => {
-  await page.evaluate(() => window.__openMediaTask(true));
-  await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
-  // 审计 M-05：与 status 同义的 phase（queued/canceled）不再重复拼在状态后面，原始 phase 只留在 title 里排障。
-  await page.getByText("排队中", { exact: true }).first().waitFor({ state: "visible" });
-  if (await page.getByText(/· queued/).count()) {
-    throw new Error("任务状态行仍把协议 phase 枚举原样拼给用户");
-  }
-  await page.evaluate(() => window.__pushMediaJob({
-    id: "33333333-3333-4333-8333-333333333333",
-    requestId: "browser-media-request",
-    kind: "h3_generate",
-    resourceClass: "gpu-h3",
-    status: "running",
-    phase: "sampling",
-    prompt: "BROWSER_MEDIA_TASK",
-    sessionId: null,
-    projectId: null,
-    projectShotId: null,
-    currentStep: 7,
-    totalSteps: 20,
-    queuePosition: null,
-    resultUrl: null,
-    resultSha256: null,
-    resultSize: null,
-    errorCode: null,
-    errorMessage: null,
-    createdAt: "2026-08-05T00:00:00.000Z",
-    updatedAt: "2026-08-05T00:00:01.000Z",
-  }));
-  await page.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
-  await page.getByText("生成中 · 正在生成画面", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  const drawer = page.getByRole("dialog", { name: "视频任务中心", exact: true });
+  const job = drawer.locator("article").filter({ has: page.getByText("BROWSER_MEDIA_TASK", { exact: true }) });
   const cancelRequests = [];
   const onCancelRequest = (request) => {
-    if (
-      request.method() === "POST" &&
-      request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel")
-    ) {
+    if (request.method() === "POST" &&
+      request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel")) {
       cancelRequests.push(request);
     }
   };
   page.on("request", onCancelRequest);
   try {
+    await page.evaluate(() => window.__openMediaTask(true));
+    await job.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
+    // 审计 M-05：与 status 同义的 phase（queued/canceled）不再重复拼在状态后面，原始 phase 只留在 title 里排障。
+    await job.getByText("排队中", { exact: true }).waitFor({ state: "visible" });
+    if (await job.getByText(/· queued/).count()) {
+      throw new Error("任务状态行仍把协议 phase 枚举原样拼给用户");
+    }
+    await page.evaluate(() => window.__pushMediaJob({
+      id: "33333333-3333-4333-8333-333333333333",
+      requestId: "browser-media-request",
+      kind: "h3_generate",
+      resourceClass: "gpu-h3",
+      status: "running",
+      phase: "sampling",
+      prompt: "BROWSER_MEDIA_TASK",
+      sessionId: null,
+      projectId: null,
+      projectShotId: null,
+      currentStep: 7,
+      totalSteps: 20,
+      queuePosition: null,
+      resultUrl: null,
+      resultSha256: null,
+      resultSize: null,
+      errorCode: null,
+      errorMessage: null,
+      createdAt: "2026-08-05T00:00:00.000Z",
+      updatedAt: "2026-08-05T00:00:01.000Z",
+    }));
+    await job.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
+    await job.getByText("生成中 · 正在生成画面", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
     // 审计 M-06：取消是不可逆操作，先弹确认层；「再想想」不发请求，「取消任务」才发且只发一次。
     // exact:true:同页 #interrupted-tool-status-root 的工具卡表头可及名含「已取消」(tools T-22 起
     // 表头可及名 = 标签 + 摘要 + 状态),子串匹配会撞成 strict mode violation。
-    await page.getByRole("button", { name: "取消", exact: true }).click();
+    await job.getByRole("button", { name: "取消", exact: true }).click();
     const confirmDialog = page.getByRole("dialog", { name: "取消这个视频任务？" });
     await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
     await confirmDialog.getByRole("button", { name: "再想想" }).click();
@@ -2827,27 +2935,41 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     await page.waitForTimeout(300);
     if (cancelRequests.length !== 0) throw new Error("「再想想」不该发出取消请求");
 
-    await page.getByRole("button", { name: "取消", exact: true }).click();
+    await job.getByRole("button", { name: "取消", exact: true }).click();
     await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
-    const canceled = page.waitForRequest(
-      (request) =>
-        request.method() === "POST" &&
-        request.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
+    const canceled = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        response.url().endsWith("/api/media-generation/jobs/33333333-3333-4333-8333-333333333333/cancel"),
       { timeout: 5000 },
     );
     await confirmDialog.getByRole("button", { name: "取消任务" }).click();
-    const request = await canceled;
+    const response = await canceled;
+    if (!response.ok()) throw new Error("取消响应失败: " + response.status());
+    const receipt = await response.json();
+    if (receipt.job?.id !== "33333333-3333-4333-8333-333333333333" || receipt.job?.status !== "canceled") {
+      throw new Error("取消响应未确认目标任务终态: " + JSON.stringify(receipt));
+    }
+    const request = response.request();
     if (request.postData() !== "{}") throw new Error(`取消请求体漂移: ${request.postData()}`);
+    // M-05 起状态行不再拼协议 phase(原「已取消 · canceled」),只剩「已取消」。
+    await job.getByText("已取消", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    if (cancelRequests.length !== 1) throw new Error(`取消请求应只发一次，实际 ${cancelRequests.length} 次`);
+    if (await job.getByRole("button", { name: "取消", exact: true }).count()) {
+      throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
+    }
   } finally {
     page.off("request", onCancelRequest);
+    const confirmation = page.getByRole("dialog", { name: "取消这个视频任务？", exact: true });
+    if (await confirmation.isVisible()) {
+      await confirmation.getByRole("button", { name: "再想想", exact: true }).click();
+      await confirmation.waitFor({ state: "hidden", timeout: 3000 });
+    }
+    if (await drawer.isVisible()) {
+      await drawer.getByRole("button", { name: "关闭视频任务", exact: true }).click();
+      await drawer.waitFor({ state: "hidden", timeout: 3000 });
+    }
   }
-  // M-05 起状态行不再拼协议 phase(原「已取消 · canceled」),只剩「已取消」。
-  await page.getByText("已取消", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
-  if (cancelRequests.length !== 1) throw new Error(`取消请求应只发一次，实际 ${cancelRequests.length} 次`);
-  if (await page.getByRole("button", { name: "取消", exact: true }).count()) {
-    throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
-  }
-  await page.evaluate(() => window.__openMediaTask(false));
 });
 
 await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次", async () => {
@@ -3042,7 +3164,7 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
       document.documentElement.classList.toggle("dark", next === "dark");
     }, theme);
 
-    const composerClass = await page.locator("#root [class*='rounded-[26px]']").first().getAttribute("class") ?? "";
+    const composerClass = await page.locator("#root [data-testid='composer-shell']").first().getAttribute("class") ?? "";
     if (!composerClass.includes("border-border-control")) {
       throw new Error(`Composer 非聚焦边框丢失(${theme}): ${composerClass}`);
     }
@@ -3079,12 +3201,21 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
       const row = btn.closest("div");
       const duration = row?.querySelector("[data-session-duration]");
       return {
-        hasAccent: Boolean(row?.querySelector(".bg-accent")),
+        // SIDEBAR-R1：选中态 = 浮起卡片（bg-sidebar-active + shadow-sidebar-active），不再是左侧 accent 竖条。
+        isCard:
+          row?.getAttribute("data-active") === "true" &&
+          row.classList.contains("bg-sidebar-active") &&
+          row.classList.contains("shadow-sidebar-active"),
+        cardBg: row ? getComputedStyle(row).backgroundColor : "",
         durationText: duration?.textContent ?? "",
         durationTitle: duration?.getAttribute("title") ?? "",
       };
     });
-    if (!activeState.hasAccent) throw new Error(`活跃会话缺少 accent 竖条(${theme})`);
+    if (!activeState.isCard) throw new Error(`活跃会话缺少选中卡片(${theme}): ${JSON.stringify(activeState)}`);
+    // 真实 CSS 必须把选中面画出来（token 漏定义时会回落透明，卡片隐形）。
+    if (!activeState.cardBg || /rgba\(0, 0, 0, 0\)|transparent/.test(activeState.cardBg)) {
+      throw new Error(`活跃会话选中面是透明的(${theme}): ${activeState.cardBg}`);
+    }
     // 用时改用中文单位（侧栏审计 SR-01：中文界面不混英文缩写 25m/3h/2d），8 分钟 → 「8分」。
     if (activeState.durationText !== "8分" || !activeState.durationTitle.includes("→")) {
       throw new Error(`会话累计用时未按 createdAt → lastAt 展示(${theme}): ${JSON.stringify(activeState)}`);
@@ -3092,12 +3223,15 @@ await check("T41 Codex 密度 token：Composer/ToolCard/Sidebar 在 1440 与 390
     if (await sidebar.getByText("浏览器契约：摘要不应显示", { exact: true }).count() !== 0) {
       throw new Error(`会话行仍显示最新消息摘要(${theme})`);
     }
-    const idleAccent = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
-      (btn) => Boolean(btn.closest("div")?.querySelector(".bg-accent")),
+    const idleCard = await sidebar.getByRole("button", { name: "密度验收空闲会话" }).evaluate(
+      (btn) => btn.closest("div")?.getAttribute("data-active") === "true",
     );
-    if (idleAccent) throw new Error(`空闲会话不应有 accent 竖条(${theme})`);
+    if (idleCard) throw new Error(`空闲会话不应是选中卡片(${theme})`);
 
-    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).getAttribute("class") ?? "";
+    // SIDEBAR-R1：描边 + 实底画在外层卡片 [data-sidebar-new] 上，按钮本身透明铺满。
+    const createClass = await sidebar.getByRole("button", { name: "新建会话" }).evaluate(
+      (btn) => btn.closest("[data-sidebar-new]")?.getAttribute("class") ?? "",
+    );
     if (!createClass.includes("text-section") || !createClass.includes("border-border") || !createClass.includes("bg-surface")) {
       throw new Error(`新建会话未保持 secondary(${theme}): ${createClass}`);
     }
@@ -3684,6 +3818,189 @@ await check("T67 过程卡越过所属 user 的坏序经 merge/restore 自愈且
     state: "visible",
     timeout: 3000,
   });
+});
+
+
+await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底保持锚点，上滑后不恢复跟随", async () => {
+  const liveUrl = "http://127.0.0.1/__openclaude_live_units_viewport__";
+  const livePage = await browser.newPage();
+  watchRuntimeErrors(livePage, "live-units");
+  const previousShot = screenshotPage;
+  screenshotPage = livePage;
+  try {
+    await livePage.route("**/*", serveBuiltAsset);
+    await livePage.route(liveUrl, (route) => route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: liveUnitsHtml,
+    }));
+    await livePage.goto(liveUrl);
+    try {
+      await livePage.waitForFunction(() => (
+        window.__liveUnits.follow.started
+        && window.__liveUnits.away.started
+        && window.__liveUnits.gesture.started
+      ), null, { timeout: 4000 });
+    } catch (err) {
+      const diag = await livePage.evaluate(() => ({
+        hasApi: typeof window.__liveUnits,
+        started: window.__liveUnits
+          ? Object.fromEntries(Object.entries(window.__liveUnits).map(([k, v]) => [k, Boolean(v?.started)]))
+          : null,
+        roots: document.querySelectorAll("[data-testid^=\"live-units\"]").length,
+        olderMarkers: Object.fromEntries(["follow", "away", "gesture"].map((mode) => [
+          mode, document.querySelectorAll(`[data-testid="live-units-${mode}"] [data-find-member="older-${mode}"]`).length,
+        ])),
+        text: (document.body?.innerText || "").slice(0, 400),
+      }));
+      throw new Error(`${err.message} diag=${JSON.stringify(diag)}`);
+    }
+
+    const initialAnchorText = "已渲染锚点正文\n第二行仍在视口里\n".repeat(6);
+    await livePage.waitForFunction((expected) => ["follow", "away", "gesture"].every((mode) => {
+      const anchor = document.querySelector(`[data-testid="live-units-${mode}"] [data-find-member="jump-anchor-${mode}"]`);
+      const paragraph = anchor?.querySelector("p");
+      return paragraph?.textContent === expected.trim();
+    }), initialAnchorText, { timeout: 5000 });
+    await livePage.evaluate(async () => {
+      await document.fonts.ready;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+
+    async function geometry(mode) {
+      return livePage.evaluate((which) => {
+        const scroller = document.querySelector(`[data-testid="live-units-${which}"]`);
+        const anchor = scroller?.querySelector(`[data-find-member="jump-anchor-${which}"]`);
+        if (!(scroller instanceof HTMLElement) || !(anchor instanceof HTMLElement)) {
+          return { missing: true, mode: which };
+        }
+        const top = anchor.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+        return {
+          missing: false,
+          top,
+          scrollTop: scroller.scrollTop,
+          scrollHeight: scroller.scrollHeight,
+          clientHeight: scroller.clientHeight,
+          distance: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight,
+          following: window.__liveUnits[which].following(),
+          button: [...scroller.querySelectorAll("button")].some((button) => button.textContent?.includes("加载更早的处理步骤")),
+        };
+      }, mode);
+    }
+    async function frames() {
+      await livePage.evaluate(() => new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve(undefined)));
+      }));
+    }
+    async function growThenPrepend(mode) {
+      const beforeHeight = (await geometry(mode)).scrollHeight;
+      await livePage.evaluate((which) => window.__liveUnits[which].grow(), mode);
+      try {
+        await livePage.waitForFunction(({ which, prev }) => {
+          const scroller = document.querySelector(`[data-testid="live-units-${which}"]`);
+          return scroller instanceof HTMLElement && scroller.scrollHeight > prev + 8;
+        }, { which: mode, prev: beforeHeight }, { timeout: 4000 });
+      } catch (err) {
+        const snap = await geometry(mode);
+        const text = await livePage.locator(`[data-testid="live-units-${mode}"]`).innerText();
+        throw new Error(`T69 ${mode} 流式增高未反映到 scrollHeight prev=${beforeHeight} now=${JSON.stringify(snap)} text=${text.slice(0, 240)}`);
+      }
+      await frames();
+      const before = await geometry(mode);
+      await livePage.evaluate((which) => window.__liveUnits[which].prepend(), mode);
+      try {
+        await livePage.waitForFunction((which) => {
+          const scroller = document.querySelector(`[data-testid="live-units-${which}"]`);
+          return Boolean(scroller?.querySelector(`[data-find-member="older-${which}"]`));
+        }, mode, { timeout: 4000 });
+      } catch (err) {
+        const text = await livePage.locator(`[data-testid="live-units-${mode}"]`).innerText();
+        throw new Error(`T69 ${mode} 前插未进 DOM text=${text.slice(0, 300)}`);
+      }
+      await frames();
+      const after = await geometry(mode);
+      return { before, after };
+    }
+
+    const follow = await growThenPrepend("follow");
+    const followDelta = follow.after.top - follow.before.top;
+    console.log(`[T69 follow] ${JSON.stringify({ before: follow.before, after: follow.after, delta: followDelta })}`);
+    if (follow.before.missing || follow.after.missing) {
+      throw new Error(`T69 贴底锚点没有真实几何: ${JSON.stringify(follow)}`);
+    }
+    // Chromium lays the prepended block on a fractional pixel. The fixed build
+    // stays pinned (distance 0) and the anchor moves by a fraction of a pixel;
+    // the pre-fix build moves it by the whole prepend (~190px). 1px still
+    // separates those and matches the subpixel slack already used by TOUCH_MIN.
+    if (Math.abs(followDelta) > 1) {
+      throw new Error(`T69 贴底前插位移 ${followDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify(follow)}`);
+    }
+    if (follow.after.following !== true) {
+      throw new Error(`T69 贴底补页后跟随被清掉: ${JSON.stringify(follow.after)}`);
+    }
+    if (!(follow.after.distance < 2)) {
+      throw new Error(`T69 贴底补页后离开了底部: ${JSON.stringify(follow.after)}`);
+    }
+    if (!(follow.after.scrollHeight > follow.before.scrollHeight + 20)) {
+      throw new Error(`T69 贴底 scrollHeight 没有随前插变高: ${JSON.stringify(follow)}`);
+    }
+    if (follow.after.button) throw new Error("T69 贴底仍出现手动加载更早按钮");
+
+    const away = await growThenPrepend("away");
+    const awayDelta = away.after.top - away.before.top;
+    console.log(`[T69 away] ${JSON.stringify({ before: away.before, after: away.after, delta: awayDelta })}`);
+    if (away.before.missing || away.after.missing) {
+      throw new Error(`T69 离底锚点没有真实几何: ${JSON.stringify(away)}`);
+    }
+    if (Math.abs(awayDelta) > 1) {
+      throw new Error(`T69 离底前插位移 ${awayDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify(away)}`);
+    }
+    if (away.after.button) throw new Error("T69 离底仍出现手动加载更早按钮");
+    if (away.after.following !== false) {
+      throw new Error(`T69 离底补页后被拉回跟随: ${JSON.stringify(away.after)}`);
+    }
+    if (!(away.after.scrollHeight > away.before.scrollHeight + 20)) {
+      throw new Error(`T69 离底 scrollHeight 没有随前插变高: ${JSON.stringify(away)}`);
+    }
+
+    await livePage.evaluate(() => window.__liveUnits.gesture.grow());
+    await frames();
+    const gestureScroller = livePage.getByTestId("live-units-gesture");
+    await gestureScroller.hover();
+    await gestureScroller.evaluate((node) => {
+      node.dispatchEvent(new WheelEvent("wheel", { deltaY: -140, bubbles: true, cancelable: true }));
+      if (!(node instanceof HTMLElement)) return;
+      node.scrollTop = Math.max(0, node.scrollTop - 120);
+      node.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await livePage.waitForTimeout(280);
+    const gestured = await geometry("gesture");
+    if (gestured.following !== false) {
+      throw new Error(`T69 上滑后仍在跟随: ${JSON.stringify(gestured)}`);
+    }
+    await livePage.evaluate(() => window.__liveUnits.gesture.prepend());
+    await livePage.waitForFunction(() => Boolean(
+      document.querySelector('[data-testid="live-units-gesture"] [data-find-member="older-gesture"]'),
+    ), null, { timeout: 4000 });
+    await frames();
+    await livePage.waitForTimeout(280);
+    const gestureAfter = await geometry("gesture");
+    const gestureDelta = gestureAfter.top - gestured.top;
+    console.log(`[T69 gesture] ${JSON.stringify({ before: gestured, after: gestureAfter, delta: gestureDelta })}`);
+    if (gestureAfter.following !== false) {
+      throw new Error(`T69 上滑手势后补页结束又恢复了跟随: ${JSON.stringify(gestureAfter)}`);
+    }
+    if (gestureAfter.missing || gestured.missing) {
+      throw new Error(`T69 手势锚点没有真实几何: ${JSON.stringify({ before: gestured, after: gestureAfter })}`);
+    }
+    if (Math.abs(gestureDelta) > 1) {
+      throw new Error(`T69 上滑后前插位移 ${gestureDelta.toFixed(2)}px，应 ≤1px; ${JSON.stringify({ before: gestured, after: gestureAfter })}`);
+    }
+    if (gestureAfter.button) throw new Error("T69 手势场景出现手动加载更早按钮");
+  } finally {
+    screenshotPage = previousShot;
+    await livePage.close();
+  }
 });
 
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {

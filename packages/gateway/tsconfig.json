@@ -2,7 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist-types",
-    "tsBuildInfoFile": "dist-types/.tsbuildinfo"
+    "tsBuildInfoFile": "dist-types/.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@openclaude/protocol": ["../protocol/src/index.ts"]
+    }
   },
   "include": ["src"],
   "references": [

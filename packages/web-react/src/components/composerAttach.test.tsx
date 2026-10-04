@@ -489,8 +489,8 @@ describe("AttachChip（对话框上传图的「编辑」入口 —— 需求 §5
 describe("附件上限竞态(C-22)", () => {
   test("同一帧内连续两次拖放,合计仍不超过 MAX_ATTACHMENTS_PER_MESSAGE", async () => {
     const onUpload = vi.fn(async () => ({ kind: "file", url: "/x" }) as MediaRef);
-    const { container } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
-    const shell = container.querySelector(".rounded-\\[26px\\]") as HTMLElement;
+    const { getByTestId } = render(<Composer onSend={() => {}} onUpload={onUpload} />);
+    const shell = getByTestId("composer-shell");
     const mk = (i: number) => new File(["x"], `race-${i}.txt`, { type: "text/plain" });
     const batch = Math.max(1, MAX_ATTACHMENTS_PER_MESSAGE - 1);
     const dt = (files: File[]) => ({ types: ["Files"], files, dropEffect: "none", items: [] });

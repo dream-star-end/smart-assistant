@@ -7,16 +7,22 @@ export function BrandMark({
   className = 'size-9',
   glow = false,
   fontSize = 'text-[19px]',
+  rounded = 'rounded-[11px]',
+  flat = false,
 }: {
   className?: string
   glow?: boolean
   fontSize?: string
+  /** 小尺寸（侧栏 28px）按比例收圆角，避免 11px 圆角在小方块上糊成圆形。 */
+  rounded?: string
+  /** 不带投影（工作区内的小尺寸品牌位，大投影会显脏）。 */
+  flat?: boolean
 }) {
   return (
     <span
       aria-hidden
-      className={`${className} grid shrink-0 place-items-center rounded-[11px] bg-brand ${fontSize} font-black leading-none text-brand-fg${
-        glow ? ' shadow-brand-glow' : ' shadow-float'
+      className={`${className} grid shrink-0 place-items-center ${rounded} bg-brand ${fontSize} font-black leading-none text-brand-fg${
+        glow ? ' shadow-brand-glow' : flat ? '' : ' shadow-float'
       }`}
     >
       从

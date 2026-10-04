@@ -1,3 +1,5 @@
+import { setContentReviewAlerter } from '@openclaude/gateway'
+import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
  * @openclaude/commercial — OpenClaude 商业化模块入口
  *
@@ -50,6 +52,11 @@ import {
   type CursorExternalApiOutbox,
 } from "./billing/cursorExternalApiOutbox.js";
 import { closePool, createPool, getPool } from "./db/index.js";
+import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
+import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
+import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
+import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
+import { createBoxReplayRecoveryWriter } from "./egress/boxReplaySetup.js";
 import {
   assertModelCatalogAdminPoolConfigured,
   closeModelCatalogAdminPool,
@@ -584,6 +591,11 @@ import {
   makeMiniMaxWebSearchHandler,
   type MiniMaxWebSearchHandler,
 } from "./minimax/webSearchProxy.js";
+import {
+  GROK_WEB_SEARCH_PATH,
+  makeGrokWebSearchHandler,
+  type GrokWebSearchHandler,
+} from "./grok/webSearchProxy.js";
 import { MediaGenerationService } from "./media-generation/service.js";
 import {
   MEDIA_GENERATION_INTERNAL_PREFIX,
@@ -2347,6 +2359,10 @@ export async function registerCommercial(
         identityRepo,
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
       });
+      // MiniMax 失败时 CCB 再打这条。Grok 订阅 token 只留在 master。
+      const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
+        identityRepo,
+      });
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -2848,6 +2864,9 @@ export async function registerCommercial(
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
           return minimaxWebSearchHandler(req, res, ctx);
+        }
+        if (path === GROK_WEB_SEARCH_PATH) {
+          return grokWebSearchHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);
@@ -6140,6 +6159,13 @@ export async function registerCommercial(
   // 阈值向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min)；durable Codex 另用 ≥24h
   // evidence SLA，且只豁免无 usage 的 inflight，绝不抢 finalizing owner。
   if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
+    // Local ProxyAgent cleanup state must outlive a temporary loss of shared
+    // leadership. Only the scheduler starts/stops on each leader term.
+    const boxRemoteCleanup = new BoxRemoteCleanupWorker({
+      journal: new BoxDurableJournal(getPool()),
+      resolver: createProductionBoxAccountResolver(),
+      writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),
+    });
     leaderBundle.add({
       name: "finalizeReconciler",
       domain: "shared",
@@ -6162,6 +6188,15 @@ export async function registerCommercial(
           intervalMs,
           thresholdMs,
           durableWaiverAgeMs,
+          boxRecoveryFn: async () => {
+            const results = await Promise.allSettled([
+              reconcileBoxBillingBatch(getPool(), 20, preCheckRedis),
+              boxRemoteCleanup.reconcileBatch(10),
+            ]);
+            if (results.some((result) => result.status === "rejected")) {
+              throw new Error("BOX_RECOVERY_PARTIAL_FAILURE");
+            }
+          },
         }));
         return { stop: () => h.stop() };
       },
@@ -6880,6 +6915,8 @@ export async function registerCommercial(
     await leaderBundle.start();
     await seedPlatformAgentsForLeadership();
   }
+
+  setContentReviewAlerter((event) => { void alertContentReview(event) })
 
   return {
     handle: async (req, res) => {

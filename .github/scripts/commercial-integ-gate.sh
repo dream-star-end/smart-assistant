@@ -28,7 +28,12 @@ set -uo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
-target="${1:?usage: commercial-integ-gate.sh <tier|shard>  e.g. pr | pr-2 | nightly-4}"
+print_mode=0
+if [[ "${1:-}" == "--print-budget" ]]; then
+  print_mode=1
+  shift
+fi
+target="${1:?usage: commercial-integ-gate.sh [--print-budget] <tier|shard>  e.g. pr | pr-2 | nightly-4}"
 tier_dir=".github/integ-tiers"
 
 # 解析 target → 分片清单集合
@@ -48,35 +53,53 @@ fi
 # Aggregate targets must preserve each shard's own known-failure and count
 # baseline. Running every file in one Node process also turns a shard-local
 # timeout into an unrelated aggregate failure, so recurse into exact shards.
+# 聚合时卸掉父进程的超时覆盖。否则一个 OC_INTEG_TEST_TIMEOUT_MS 会串到每一片，
+# 和该片清单冲突或把长片打回 180000。每一片只读自己的 manifest。
 if [[ "$target" == "pr" || "$target" == "nightly" ]]; then
   for manifest in "${manifests[@]}"; do
     shard="$(basename "$manifest" .txt)"
-    bash "${BASH_SOURCE[0]}" "$shard" || exit 1
+    if [[ "$print_mode" == 1 ]]; then
+      env -u OC_INTEG_TEST_TIMEOUT_MS -u OC_TEST_MUTEX_TIMEOUT \
+        bash "${BASH_SOURCE[0]}" --print-budget "$shard" || exit 1
+    else
+      env -u OC_INTEG_TEST_TIMEOUT_MS -u OC_TEST_MUTEX_TIMEOUT \
+        bash "${BASH_SOURCE[0]}" "$shard" || exit 1
+    fi
   done
+  if [[ "$print_mode" == 1 ]]; then
+    exit 0
+  fi
   echo ""
   echo "PASS: $target aggregate -- every shard passed its own G1-G4 contract"
   exit 0
 fi
 
-# 收集文件与 min-tests 下界(多片相加)
-files=()
-min_tests=0
-for m in "${manifests[@]}"; do
-  n="$(sed -n 's/^#[[:space:]]*min-tests:[[:space:]]*\([0-9]\+\)[[:space:]]*$/\1/p' "$m" | head -1)"
-  if [[ -z "$n" ]]; then
-    echo "::error::$m 缺 '# min-tests: N' 指令 —— 没有执行下界就没法证明用例真跑了" >&2
+# 预算只从清单解析。print-shell 的赋值都是解析器自己的整数和相对路径。
+manifest="${manifests[0]}"
+budget_shell="$(mktemp)"
+if [[ -x ./node_modules/.bin/tsx ]]; then
+  tsx_cmd=(./node_modules/.bin/tsx)
+else
+  tsx_cmd=(npx tsx)
+fi
+if ! "${tsx_cmd[@]}" .github/scripts/integ-shard-budget.ts print-shell "$manifest" >"$budget_shell"; then
+  rm -f "$budget_shell"
+  exit 2
+fi
+# shellcheck disable=SC1090
+source "$budget_shell"
+rm -f "$budget_shell"
+min_tests="$min_tests"
+if [[ "$print_mode" == 1 ]]; then
+  printf 'shard=%s file_timeout_ms=%s mutex_timeout_seconds=%s max_minutes=%s files=%s\n' \
+    "$target" "$file_timeout_ms" "$mutex_timeout_seconds" "$max_minutes" "${#files[@]}"
+  exit 0
+fi
+for line in "${files[@]}"; do
+  if [[ ! -f "$line" ]]; then
+    echo "::error::$manifest 登记的文件不存在:$line(跑 npm run lint:integ-tiers 收敛)" >&2
     exit 2
   fi
-  min_tests=$(( min_tests + n ))
-  while IFS= read -r line; do
-    line="${line%%$'\r'}"
-    [[ -z "${line// }" || "$line" == \#* ]] && continue
-    if [[ ! -f "$line" ]]; then
-      echo "::error::$m 登记的文件不存在:$line(跑 npm run lint:integ-tiers 收敛)" >&2
-      exit 2
-    fi
-    files+=("$line")
-  done < "$m"
 done
 
 if [[ ${#files[@]} -eq 0 ]]; then
@@ -102,6 +125,9 @@ echo "== commercial-integ gate: $target =="
 echo "shards:    ${manifests[*]}"
 echo "files:     ${#files[@]}"
 echo "min-tests: $min_tests"
+echo "file-timeout-ms: $file_timeout_ms"
+echo "mutex-timeout-seconds: $mutex_timeout_seconds"
+echo "max-minutes: $max_minutes"
 echo "baseline:  $baseline"
 echo "TAP ->     $tap_out"
 
@@ -110,8 +136,8 @@ echo "TAP ->     $tap_out"
 # --test-timeout:node:test 默认 per-test timeout 是 Infinity,单个卡死的用例
 #   会吃掉整个 job 预算(实测 blockedForUser.integ 单文件占用数分钟不出结果)。
 # --test-concurrency=1:共享 PG fixture,并发跑会互相毒化。
-cmd="npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=${OC_INTEG_TEST_TIMEOUT_MS:-180000} ${files[*]}"
-bash scripts/test-mutex.sh commercial "$cmd" > "$tap_out" 2>&1
+cmd="npx tsx --test --test-force-exit --test-concurrency=1 --test-timeout=${file_timeout_ms} ${files[*]}"
+OC_TEST_MUTEX_TIMEOUT="$mutex_timeout_seconds" bash scripts/test-mutex.sh commercial "$cmd" > "$tap_out" 2>&1
 status=$?
 echo "test runner exit: $status"
 

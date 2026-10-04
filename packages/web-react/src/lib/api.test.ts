@@ -1075,6 +1075,24 @@ test('apiErrorMessage: RATE_LIMITED 跨域通用码 → 标准中文（忽略英
   expect(apiErrorMessage(err, '操作失败')).toBe('操作过于频繁，请稍后再试')
 })
 
+test('apiErrorMessage: Claude 出口已被启用号占用 → 中文，不回退成请求失败', () => {
+  const err = new ApiError({
+    status: 400,
+    code: 'VALIDATION',
+    message: 'invalid egress_proxy_already_bound_to_claude（追踪号 req-ep）',
+    requestId: 'req-ep',
+    issues: [
+      {
+        path: 'egress_proxy_already_bound_to_claude',
+        message: 'egress_proxy_already_bound_to_claude',
+      },
+    ],
+  })
+  expect(apiErrorMessage(err, '创建失败')).toBe(
+    '该出口已绑定其他启用中的 Claude 账号（已停用的号不占坑）',
+  )
+})
+
 test('apiErrorMessage: fetch 网络失败（TypeError）→ 标准网络中文，不外露英文', () => {
   expect(apiErrorMessage(new TypeError('Failed to fetch'), '加载失败')).toBe(
     '网络连接不可用，请检查网络后重试',

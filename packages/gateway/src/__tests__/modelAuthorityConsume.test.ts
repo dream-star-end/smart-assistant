@@ -129,7 +129,7 @@ function mintFrame(
   return {
     type: 'inbound.message',
     model: payload.canonicalModel,
-    ...(payload.engine === 'codex' && typeof payload.billingRequestId === 'string'
+    ...(['codex', 'grok', 'cursor', 'zcode'].includes(payload.engine) && typeof payload.billingRequestId === 'string'
       ? { requestId: payload.billingRequestId }
       : {}),
     [MODEL_AUTHORITY_FIELD]: {
@@ -204,6 +204,7 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
       canonicalModel: 'grok-build',
       engine: 'grok',
       billingRequestId,
+      executionDescriptor: { ...DESCRIPTOR, capabilityProfile: { ...DESCRIPTOR.capabilityProfile, grok: { upstreamModelId: 'grok-4.6' } } },
     })
     frame.requestId = billingRequestId
 
@@ -482,6 +483,58 @@ describe('modelAuthority — 验签 + gateway 断言全集', () => {
     expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')
   })
 
+  test('伪造 contextOwner 拒；错模型拒；确切 Box 模型接受', () => {
+    const key = makeKey('mak1_boxowner')
+    const consumer = makeConsumer(key)
+    const fakeConn = consumer.newConnection()
+    const fake = mintFrame(key, {
+      connectionChallenge: fakeConn.challenge,
+      canonicalModel: 'box-api-claude-opus-5-5',
+      executionDescriptor: {
+        ...DESCRIPTOR,
+        capabilityProfile: {
+          ...DESCRIPTOR.capabilityProfile,
+          ccb: { capabilityZero: true, supportsThinking: true, contextOwner: 'fake' },
+        },
+      },
+    })
+    expectReject(() => consumer.consume(fake, fakeConn), 'bad_shape')
+
+    const wrongModel = makeConsumer(key)
+    const wrongConn = wrongModel.newConnection()
+    const wrong = mintFrame(key, {
+      connectionChallenge: wrongConn.challenge,
+      canonicalModel: 'glm-5.2',
+      executionDescriptor: {
+        ...DESCRIPTOR,
+        capabilityProfile: {
+          ...DESCRIPTOR.capabilityProfile,
+          ccb: { capabilityZero: true, supportsThinking: true, contextOwner: 'box-native-v1' },
+        },
+      },
+    })
+    expectReject(() => wrongModel.consume(wrong, wrongConn), 'bad_shape')
+
+    const ready = makeConsumer(key)
+    const readyConn = ready.newConnection()
+    const ok = mintFrame(key, {
+      connectionChallenge: readyConn.challenge,
+      canonicalModel: 'box-api-claude-opus-5-5',
+      executionDescriptor: {
+        ...DESCRIPTOR,
+        capabilityProfile: {
+          ...DESCRIPTOR.capabilityProfile,
+          ccb: { capabilityZero: true, supportsThinking: true, contextOwner: 'box-native-v1' },
+        },
+      },
+    })
+    const turn = ready.consume(ok, readyConn)
+    assert.equal(
+      (turn.capabilityProfile.ccb as { contextOwner?: string }).contextOwner,
+      'box-native-v1',
+    )
+  })
+
   test('capability schema 未来版本 → unknown_capability_version(fail-closed,不尽力解析)', () => {
     const key = makeKey('mak1_a')
     const consumer = makeConsumer(key)
@@ -631,5 +684,37 @@ describe('descriptor 驱动执行选择(engine / model)', () => {
     assert.equal(d.codexDefaultEffort, 'xhigh')
     assert.deepEqual([...d.supportedEfforts], ['medium', 'xhigh'])
     assert.equal(d.supportsVision, true)
+  })
+})
+
+
+describe('Grok signed execution version binding', () => {
+  for (const [canonicalModel, upstreamModelId] of [
+    ['grok-build', 'grok-4.6'], ['grok-build', 'grok-4.7'], ['grok-build-fast', 'grok-4.7-build-fast'],
+  ]) test(`accepts signed ${canonicalModel}/${upstreamModelId}`, () => {
+    const key = makeKey('grok-version'); const consumer = makeConsumer(key); const conn = consumer.newConnection()
+    const frame = mintFrame(key, { connectionChallenge: conn.challenge, canonicalModel, engine: 'grok',
+      billingRequestId: 'a'.repeat(32), executionDescriptor: { ...DESCRIPTOR,
+        capabilityProfile: { ...DESCRIPTOR.capabilityProfile, grok: { upstreamModelId } } } })
+    const d = consumer.consume(frame, conn)
+    assert.deepEqual(d.capabilityProfile.grok, { upstreamModelId })
+    assert.equal(d.billingRequestId, frame.requestId)
+  })
+  for (const upstreamModelId of [undefined, 'grok-4.7-build-fast', 'invented-version']) {
+    test(`rejects signed standard Grok invalid upstream ${upstreamModelId}`, () => {
+      const key = makeKey('grok-invalid'); const consumer = makeConsumer(key); const conn = consumer.newConnection()
+      const frame = mintFrame(key, { connectionChallenge: conn.challenge, canonicalModel: 'grok-build', engine: 'grok',
+        billingRequestId: 'a'.repeat(32), executionDescriptor: { ...DESCRIPTOR,
+          capabilityProfile: { ...DESCRIPTOR.capabilityProfile, grok: upstreamModelId === undefined ? {} : { upstreamModelId } } } })
+      expectReject(() => consumer.consume(frame, conn), 'bad_shape')
+    })
+  }
+  test('rejects cross-request Grok authority despite valid signature', () => {
+    const key = makeKey('grok-request'); const consumer = makeConsumer(key); const conn = consumer.newConnection()
+    const frame = mintFrame(key, { connectionChallenge: conn.challenge, canonicalModel: 'grok-build', engine: 'grok',
+      billingRequestId: 'a'.repeat(32), executionDescriptor: { ...DESCRIPTOR,
+        capabilityProfile: { ...DESCRIPTOR.capabilityProfile, grok: { upstreamModelId: 'grok-4.7' } } } })
+    frame.requestId = 'b'.repeat(32)
+    expectReject(() => consumer.consume(frame, conn), 'billing_request_mismatch')
   })
 })

@@ -270,3 +270,81 @@ describe('Codex 0.153.3 generated schema fixture (runtime image pin 2026-09-05)'
     }
   })
 })
+
+describe('Codex 0.155.1 generated schema fixture (runtime image pin 2026-09-23)', () => {
+  const root155 = new URL('./fixtures/codex-app-server-0.155.1/', import.meta.url)
+  const read155 = (name: string): Buffer => readFileSync(new URL(name, root155))
+  const manifest155 = JSON.parse(read155('manifest.json').toString('utf8')) as JsonObject
+
+  it('pins the 0.155.1 binary and proves the four schemas are byte-identical to 0.153.3', () => {
+    assert.equal(manifest155.codexVersion, '0.155.1')
+    assert.equal(
+      manifest155.binarySha256,
+      '0753dfe1d8b87a52436deb13eb1c549661ef4c84fee2c5aa688385eebeccb761',
+    )
+    assert.equal(manifest155.identicalTo, 'codex-app-server-0.153.3')
+    assert.deepEqual(manifest155.methods, ['turn/steer', 'item/tool/requestUserInput'])
+    const generated155 = object(manifest155.generatedFiles, 'manifest155.generatedFiles')
+    const repository155 = object(manifest155.repositoryFiles, 'manifest155.repositoryFiles')
+    const manifest153 = JSON.parse(
+      readFileSync(new URL('./fixtures/codex-app-server-0.153.3/manifest.json', import.meta.url)).toString('utf8'),
+    ) as JsonObject
+    const generated153 = object(manifest153.generatedFiles, 'manifest153.generatedFiles')
+    for (const name of [
+      'TurnSteerParams.json',
+      'TurnSteerResponse.json',
+      'ToolRequestUserInputParams.json',
+      'ToolRequestUserInputResponse.json',
+    ] as const) {
+      const raw = read155(name)
+      assert.equal(repository155[name], sha256(raw), `${name} repository bytes`)
+      assert.equal(generated155[name], sha256(raw.subarray(0, -1)), `${name} generator bytes`)
+      assert.equal(generated155[name], generated153[name], `${name} must not drift from 0.153.3`)
+    }
+  })
+})
+
+describe('Codex 0.159.2 generated schema fixture (runtime image pin 2026-10-01)', () => {
+  const root159 = new URL('./fixtures/codex-app-server-0.159.2/', import.meta.url)
+  const read159 = (name: string): Buffer => readFileSync(new URL(name, root159))
+  const manifest159 = JSON.parse(read159('manifest.json').toString('utf8')) as JsonObject
+
+  it('pins 0.159.2 and keeps requestUserInput identical while TurnSteerParams only widens UserInput', () => {
+    assert.equal(manifest159.codexVersion, '0.159.2')
+    assert.equal(
+      manifest159.binarySha256,
+      '1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e',
+    )
+    assert.deepEqual(manifest159.methods, ['turn/steer', 'item/tool/requestUserInput'])
+    const generated159 = object(manifest159.generatedFiles, 'manifest159.generatedFiles')
+    const repository159 = object(manifest159.repositoryFiles, 'manifest159.repositoryFiles')
+    const manifest155 = JSON.parse(
+      readFileSync(new URL('./fixtures/codex-app-server-0.155.1/manifest.json', import.meta.url)).toString('utf8'),
+    ) as JsonObject
+    const generated155 = object(manifest155.generatedFiles, 'manifest155.generatedFiles')
+    for (const name of [
+      'TurnSteerResponse.json',
+      'ToolRequestUserInputParams.json',
+      'ToolRequestUserInputResponse.json',
+    ] as const) {
+      const raw = read159(name)
+      assert.equal(repository159[name], sha256(raw), `${name} repository bytes`)
+      assert.equal(generated159[name], sha256(raw.subarray(0, -1)), `${name} generator bytes`)
+      assert.equal(generated159[name], generated155[name], `${name} must not drift from 0.155.1`)
+    }
+    const steer = read159('TurnSteerParams.json')
+    assert.equal(repository159['TurnSteerParams.json'], sha256(steer))
+    assert.equal(generated159['TurnSteerParams.json'], sha256(steer.subarray(0, -1)))
+    assert.notEqual(generated159['TurnSteerParams.json'], generated155['TurnSteerParams.json'])
+    const schema = JSON.parse(steer.toString('utf8')) as JsonObject
+    assert.deepEqual(schema.required, ['expectedTurnId', 'input', 'threadId'])
+    const defs = object(schema.definitions, 'TurnSteerParams.definitions')
+    const userInput = object(defs.UserInput, 'UserInput')
+    const branches = array(userInput.oneOf, 'UserInput.oneOf')
+    const image = object(branches[1], 'UserInput image branch')
+    assert.deepEqual(image.required, ['type'])
+    const choices = array(image.anyOf, 'UserInput.anyOf')
+    const keys = choices.map((choice) => Object.keys(object(object(choice, 'choice').properties, 'props')))
+    assert.deepEqual(keys, [['url'], ['fileId']])
+  })
+})

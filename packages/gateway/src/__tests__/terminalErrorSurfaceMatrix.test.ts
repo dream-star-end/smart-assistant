@@ -85,10 +85,16 @@ const SCENARIOS: readonly Scenario[] = [
   },
   {
     code: 'model_capacity',
-    sample: 'Selected model is at capacity. Please try a different model.',
+    sample: 'model is overloaded',
     attempts: 3,
     persistEngineClass: false,
     why: '#229 本体仍自动重试容量故障;同类连续 3 次后熔断并引导换引擎',
+  },
+  {
+    code: 'model_not_available',
+    sample: 'Selected model is at capacity. Please try a different model.',
+    attempts: 1,
+    why: '原文明示换模型,同模型自动重试永远不会成功,不进 TRANSIENT_RETRY_ERROR_CODES',
   },
   {
     code: 'upstream_failed',

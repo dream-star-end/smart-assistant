@@ -16,7 +16,7 @@ else
 fi
 
 APP_VERSION=3.8.1
-APP_SHA=b420dea50961b77d5c75b08b924da41ab529c720a7ec32eacbe95a6d843199e0
+APP_SHA=ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61
 APP_URL="https://cdn-zcode.z.ai/zcode/electron/releases/${APP_VERSION}/linux-x64/ZCode-${APP_VERSION}-linux-x64.AppImage"
 archive="$OUT_DIR/ZCode-${APP_VERSION}-linux-x64.AppImage"
 

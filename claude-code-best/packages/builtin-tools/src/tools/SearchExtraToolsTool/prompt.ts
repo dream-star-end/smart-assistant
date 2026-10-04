@@ -1,6 +1,8 @@
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
 import type { Tool } from 'src/Tool.js'
 import { CORE_TOOLS } from 'src/constants/tools.js'
+import { isTrustedBoxDeferredAnnouncement } from 'src/utils/model/boxDeferredAnnouncement.js'
+import { getMainLoopModel } from 'src/utils/model/model.js'
 
 export { SEARCH_EXTRA_TOOLS_TOOL_NAME } from './constants.js'
 
@@ -16,6 +18,7 @@ const PROMPT_HEAD = `Search for deferred tools by name or keyword. LOW PRIORITY 
 // <available-deferred-tools> block (pre-gate behavior).
 function getToolLocationHint(): string {
   const deltaEnabled =
+    isTrustedBoxDeferredAnnouncement(getMainLoopModel()) ||
     process.env.USER_TYPE === 'ant' ||
     getFeatureValue_CACHED_MAY_BE_STALE('tengu_glacier_2xr', false)
   return deltaEnabled

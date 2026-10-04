@@ -437,8 +437,28 @@ export class QueryEngine {
       querySource: 'sdk',
     })
 
-    // Push new messages, including user input and any attachments
-    this.mutableMessages.push(...messagesFromUserInput)
+    // Successful local idle compact returns the full post-compact sequence
+    // (boundary first, carrying the existing idle op). Print mode shares this
+    // array, so replace its contents in place before the first record.
+    // Assigning a new array would detach that reference; pushing would keep
+    // the pre-compact prefix, which a later owned turn can rewrite. Prepared,
+    // short, failed, and non-idle results still append.
+    const idleHead = messagesFromUserInput[0]
+    const idleOpId =
+      !shouldQuery &&
+      idleHead?.type === 'system' &&
+      idleHead.subtype === 'compact_boundary'
+        ? (idleHead as SystemCompactBoundaryMessage).compactMetadata?.idleOpId
+        : undefined
+    if (typeof idleOpId === 'string' && idleOpId.length > 0) {
+      this.mutableMessages.splice(
+        0,
+        this.mutableMessages.length,
+        ...messagesFromUserInput,
+      )
+    } else {
+      this.mutableMessages.push(...messagesFromUserInput)
+    }
 
     // Update params to reflect updates from processing /slash commands
     const messages = [...this.mutableMessages]

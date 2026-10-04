@@ -1,0 +1,11 @@
+# PR 门 · 分片 6 —— OCV5-296 idle seam（单用例，未在本轮重跑）
+#
+# R29 记录 seam 1 pass / 约 8min（16 核，非本文件拆分后的全量零 skip，
+# 也不是 2 核）。父超时 1200000ms 对齐用例自身 timeout。mutex 1500s 留清理。
+# job 40min 另留安装。拟上界，不声称 2 核绿。本轮未重跑。
+#
+# min-tests: 1
+# max-minutes: 40
+# file-timeout-ms: 1200000
+# mutex-timeout-seconds: 1500
+packages/gateway/src/__tests__/idlePipeline.seam.integ.test.ts

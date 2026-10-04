@@ -361,7 +361,7 @@ test('handleStop scans live webchat sessions when agentId is omitted', () => {
   )
   assert.match(
     handleStop,
-    /this\.sessions\.interrupt\(live\.sessionKey\)/,
+    /this\.sessions\.interrupt\(live\.sessionKey, [\x22\x27]user[\x22\x27]\)/,
     'agent-less WeChat /stop fallback must interrupt the matched live runner instead of defaulting to main',
   )
 })

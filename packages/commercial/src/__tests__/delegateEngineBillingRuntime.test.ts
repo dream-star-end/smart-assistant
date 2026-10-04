@@ -1,3 +1,4 @@
+import { hashRouteToken } from '../account-pool/groups.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
@@ -58,6 +59,7 @@ const CACHE_DECOY: ModelPricing = {
 const IDENTITY = { userId: 42, containerId: 7 }
 const REQUEST_ID = 'ab'.repeat(16)
 const SECURITY_EPOCH = 7n
+const GROK_ROUTE_TOKEN = 'f'.repeat(64)
 
 const CAPABILITY = {
   supportsVision: false,
@@ -99,13 +101,14 @@ function catalogPrice(modelId: string, over: Partial<ModelCatalogPricing> = {}):
 function defaultSnapshot(over?: {
   prices?: Partial<Record<string, Partial<ModelCatalogPricing>>>
   epoch?: bigint
+  grokUpstream?: string
 }): ModelCatalogSnapshot {
   const price = (modelId: string, extra: Partial<ModelCatalogPricing> = {}) =>
     catalogPrice(modelId, { ...(over?.prices?.[modelId] ?? {}), ...extra })
   return new ModelCatalogSnapshot({
     entries: [
       catalogEntry({ entryId: 1, modelId: 'gpt-5.6-sol', engine: 'codex' }),
-      catalogEntry({ entryId: 2, modelId: 'grok-build', engine: 'grok' }),
+      catalogEntry({ entryId: 2, modelId: 'grok-build', engine: 'grok', upstreamModelId: over?.grokUpstream ?? 'grok-4.6' }),
       catalogEntry({ entryId: 3, modelId: 'glm-5.3-zai', engine: 'ccb', providerId: 'ark' }),
       catalogEntry({ entryId: 4, modelId: 'admin-codex', engine: 'codex' }),
       catalogEntry({ entryId: 5, modelId: 'hidden-codex', engine: 'codex' }),
@@ -151,6 +154,7 @@ function admitBody(over: Record<string, unknown> = {}) {
     agentId: 'auditor',
     delegateAgentId: 'auditor',
     sessionKey: 'agent:auditor:delegate:main:1',
+    grokRouteToken: GROK_ROUTE_TOKEN,
     ...over,
   }
 }
@@ -166,6 +170,7 @@ function makeRuntime(opts?: {
   pricingGet?: (model: string) => ModelPricing | undefined
   advisorRoute?: import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute | (() => Promise<import('../billing/advisorCodexAdmitRoute.js').AdvisorCodexAdmitRoute>)
   advisorRouteThrow?: Error
+  grokRouteMatches?: boolean
 }) {
   const journals =
     opts?.journals ??
@@ -185,6 +190,13 @@ function makeRuntime(opts?: {
     getPool: () =>
       ({
         async query(sql: string, params?: unknown[]) {
+          if (String(sql).includes('FROM grok_route_contexts')) {
+            assert.equal(params?.[0], hashRouteToken(GROK_ROUTE_TOKEN))
+            assert.equal(params?.[1], String(IDENTITY.containerId))
+            assert.equal(params?.[2], String(IDENTITY.userId))
+            assert.equal(params?.[3], 'grok-build')
+            return { rows: opts?.grokRouteMatches === false ? [] : [{model_id: 'grok-build'}] }
+          }
           if (String(sql).includes('FROM request_finalize_journal')) {
             const row = journals.get(String(params?.[0]))
             return {
@@ -329,6 +341,7 @@ describe('delegate engine-billing runtime', () => {
       body: {
         model: 'grok-build',
         engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
         agentId: 'coding-assistant',
         delegateAgentId: 'coding-assistant',
         sessionKey: 'agent:coding-assistant:delegate:main:1',
@@ -506,6 +519,7 @@ describe('delegate engine-billing runtime', () => {
       body: {
         model: 'grok-build',
         engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
         agentId: 'stage-triage',
         delegateAgentId: 'stage-triage',
         sessionKey: TASKBOARD_SESSION_KEY_155,
@@ -514,6 +528,74 @@ describe('delegate engine-billing runtime', () => {
     assert.equal(result.requestId, REQUEST_ID)
     assert.equal(result.engineSessionId, deriveEngineSessionId(TASKBOARD_SESSION_KEY_155))
     assert.equal(journalCalls.length, 1)
+  })
+
+  it('admits a 155-char taskboard parentSessionId and keeps it for settle', async () => {
+    assert.equal(TASKBOARD_SESSION_KEY_155.length, 155)
+    const { runtime, journalCalls } = makeRuntime()
+    const result = await runtime.handle({
+      path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+      identity: IDENTITY,
+      body: {
+        model: 'gpt-5.6-sol',
+        engine: 'codex',
+        agentId: 'auditor',
+        delegateAgentId: 'auditor',
+        sessionKey: 'agent:auditor:delegate:stage-triage:1',
+        parentSessionId: TASKBOARD_SESSION_KEY_155,
+      },
+    })
+    assert.equal(result.requestId, REQUEST_ID)
+    const ctx = journalCalls[0] as { ctxJson: { parentSessionId?: string } }
+    assert.equal(ctx.ctxJson.parentSessionId, TASKBOARD_SESSION_KEY_155)
+    assert.equal(
+      resolveDelegateBillingAttribution(
+        { parentSessionId: TASKBOARD_SESSION_KEY_155 },
+        {},
+      ).parentSessionId,
+      TASKBOARD_SESSION_KEY_155,
+    )
+  })
+
+  it('rejects an over-long or illegal parentSessionId before the journal', async () => {
+    const { runtime, journalCalls } = makeRuntime()
+    const base = {
+      model: 'gpt-5.6-sol',
+      engine: 'codex',
+      agentId: 'auditor',
+      delegateAgentId: 'auditor',
+      sessionKey: 'agent:auditor:delegate:stage-triage:1',
+    }
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            ...base,
+            parentSessionId: 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1),
+          },
+        }),
+      /INVALID_PARENTSESSIONID/,
+    )
+    await assert.rejects(
+      () =>
+        runtime.handle({
+          path: DELEGATE_ENGINE_BILLING_ADMIT_PATH,
+          identity: IDENTITY,
+          body: {
+            ...base,
+            parentSessionId: `${TASKBOARD_SESSION_KEY_155.slice(0, 154)}/`,
+          },
+        }),
+      /INVALID_PARENTSESSIONID/,
+    )
+    assert.equal(journalCalls.length, 0)
+    const dropped = resolveDelegateBillingAttribution(
+      { parentSessionId: 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1) },
+      { parentSessionId: TASKBOARD_SESSION_KEY_155 },
+    )
+    assert.equal(dropped.parentSessionId, TASKBOARD_SESSION_KEY_155)
   })
 
   it('rejects illegal sessionKey characters and empty string', async () => {
@@ -526,6 +608,7 @@ describe('delegate engine-billing runtime', () => {
           body: {
             model: 'grok-build',
             engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
             agentId: 'stage-triage',
             delegateAgentId: 'stage-triage',
             sessionKey: `${TASKBOARD_SESSION_KEY_155.slice(0, 154)}/`,
@@ -541,6 +624,7 @@ describe('delegate engine-billing runtime', () => {
           body: {
             model: 'grok-build',
             engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
             agentId: 'stage-triage',
             delegateAgentId: 'stage-triage',
             sessionKey: `${TASKBOARD_SESSION_KEY_155.slice(0, 154)} `,
@@ -556,6 +640,7 @@ describe('delegate engine-billing runtime', () => {
           body: {
             model: 'grok-build',
             engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
             agentId: 'stage-triage',
             delegateAgentId: 'stage-triage',
             sessionKey: '',
@@ -576,6 +661,7 @@ describe('delegate engine-billing runtime', () => {
           body: {
             model: 'grok-build',
             engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
             agentId: 'stage-triage',
             delegateAgentId: 'stage-triage',
             sessionKey: 'a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1),
@@ -590,6 +676,7 @@ describe('delegate engine-billing runtime', () => {
       body: {
         model: 'grok-build',
         engine: 'grok',
+        grokRouteToken: GROK_ROUTE_TOKEN,
         agentId: 'stage-triage',
         delegateAgentId: 'stage-triage',
         sessionKey: boundary,
@@ -1069,5 +1156,49 @@ describe('delegate engine-billing admit uses one fenced snapshot', () => {
     assert.equal(journalCalls.length, 0)
     assert.equal(releaseCalls.length, 1)
     assert.equal(abortCalls.length, 0)
+  })
+})
+
+
+describe('Grok admission execution and billing generation', () => {
+  const grokBody = () => admitBody({ model: 'grok-build', engine: 'grok' })
+  it('freezes old version and four prices; settlement after catalog change keeps admitted pricing', async () => {
+    const old = defaultSnapshot({ grokUpstream: 'grok-4.6' })
+    const latest = defaultSnapshot({ grokUpstream: 'grok-4.7', prices: { 'grok-build': {
+      inputPerMtok: 250n, outputPerMtok: 1500n, cacheReadPerMtok: 25n, cacheWritePerMtok: 0n, multiplier: '2.000',
+    } } })
+    const rig = makeRuntime({ snapshot: old })
+    const admitted = await rig.runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity: IDENTITY, body: grokBody() })
+    const ctx = rig.journals.get(REQUEST_ID)!.ctx
+    assert.deepEqual(ctx.grokExecutionDescriptor, admitted.grokExecutionDescriptor)
+    assert.deepEqual(admitted.grokExecutionDescriptor, {
+      canonicalModel: 'grok-build', upstreamModelId: 'grok-4.6', billingRequestId: REQUEST_ID,
+      executionRevision: old.executionRevision, engineSessionId: deriveEngineSessionId(String(grokBody().sessionKey)),
+      routeTokenHash: hashRouteToken(GROK_ROUTE_TOKEN),
+    })
+    rig.replaceSnapshot(latest)
+    await rig.runtime.handle({ path: DELEGATE_ENGINE_BILLING_SETTLE_PATH, identity: IDENTITY,
+      body: { requestId: REQUEST_ID, engineSessionId: admitted.engineSessionId, status: 'success', durationMs: 10 } })
+    assert.deepEqual(ctx.grokExecutionDescriptor, admitted.grokExecutionDescriptor)
+    const frozen = parseBillingPricing(ctx.billingPricing, 'grok-build')!
+    assert.deepEqual([frozen.input_per_mtok, frozen.output_per_mtok, frozen.cache_read_per_mtok, frozen.cache_write_per_mtok, frozen.multiplier],
+      [1000n, 5000n, 100n, 500n, '1.000'])
+    const next = makeRuntime({ snapshot: latest })
+    const newAdmission = await next.runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity: IDENTITY, body: grokBody() })
+    assert.equal((newAdmission.grokExecutionDescriptor as { upstreamModelId: string }).upstreamModelId, 'grok-4.7')
+    const newCtx = next.journals.get(REQUEST_ID)!.ctx
+    const newPrice = parseBillingPricing(newCtx.billingPricing, 'grok-build')!
+    assert.deepEqual([newPrice.input_per_mtok, newPrice.output_per_mtok, newPrice.cache_read_per_mtok, newPrice.cache_write_per_mtok, newPrice.multiplier],
+      [250n, 1500n, 25n, 0n, '2.000'])
+    assert.equal((newCtx.grokExecutionDescriptor as { executionRevision: string }).executionRevision, latest.executionRevision)
+  })
+  for (const [name, body, opts, error] of [
+    ['missing route', { ...grokBody(), grokRouteToken: undefined }, {}, /INVALID_GROKROUTETOKEN/],
+    ['foreign or expired route', grokBody(), { grokRouteMatches: false }, /GROK_ROUTE_MISMATCH/],
+    ['wrong upstream', grokBody(), { snapshot: defaultSnapshot({ grokUpstream: 'grok-4.7-build-fast' }) }, /DESCRIPTOR_INVALID/],
+  ] as const) it(`rejects ${name} before reserve or journal`, async () => {
+    const rig = makeRuntime(opts)
+    await assert.rejects(() => rig.runtime.handle({ path: DELEGATE_ENGINE_BILLING_ADMIT_PATH, identity: IDENTITY, body }), error)
+    assert.equal(rig.precheckCalls.length, 0); assert.equal(rig.journalCalls.length, 0); assert.equal(rig.journals.size, 0)
   })
 })

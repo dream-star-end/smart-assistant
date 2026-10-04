@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 /**
  * engine-reported 委派计费客户端:admit 字段白名单、32-hex 校验、
  * settle/abandon 路径。不打 live master。
@@ -30,6 +31,14 @@ function response(statusCode: number, body: unknown) {
       },
     },
   }
+}
+
+const GROK_ROUTE_TOKEN = 'f'.repeat(64)
+const GROK_DESCRIPTOR = {
+  canonicalModel: 'grok-build', upstreamModelId: 'grok-4.6',
+  billingRequestId: 'a'.repeat(32), executionRevision: 'test-execution-revision',
+  engineSessionId: `oceng-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`,
+  routeTokenHash: createHash('sha256').update(GROK_ROUTE_TOKEN).digest('hex'),
 }
 
 const ENV = {
@@ -79,12 +88,14 @@ describe('createDelegateEngineBillingClient', () => {
         return response(200, {
           requestId: 'a'.repeat(32),
           engineSessionId: `oceng-${'b'.repeat(48)}`,
+          grokExecutionDescriptor: GROK_DESCRIPTOR,
         })
       }) as any,
     })
     const admission = await client.admit({
       model: 'grok-build',
       engine: 'grok',
+      grokRouteToken: GROK_ROUTE_TOKEN,
       agentId: 'auditor',
       delegateAgentId: 'auditor',
       sessionKey: 'agent:auditor:delegate:main:1',
@@ -96,6 +107,7 @@ describe('createDelegateEngineBillingClient', () => {
     assert.deepEqual(JSON.parse(posted), {
       model: 'grok-build',
       engine: 'grok',
+      grokRouteToken: GROK_ROUTE_TOKEN,
       agentId: 'auditor',
       delegateAgentId: 'auditor',
       sessionKey: 'agent:auditor:delegate:main:1',
@@ -111,6 +123,7 @@ describe('createDelegateEngineBillingClient', () => {
         response(200, {
           requestId: 'a'.repeat(32),
           engineSessionId: `oceng-${'b'.repeat(48)}`,
+          grokExecutionDescriptor: GROK_DESCRIPTOR,
           route: { kind: 'official_oauth', groupId: '9' },
         })) as any,
     })
@@ -310,6 +323,7 @@ describe('createDelegateEngineBillingClient', () => {
         return response(200, {
           requestId: 'a'.repeat(32),
           engineSessionId: `oceng-${'b'.repeat(48)}`,
+          grokExecutionDescriptor: GROK_DESCRIPTOR,
         })
       }) as any,
     })
@@ -339,6 +353,7 @@ describe('createDelegateEngineBillingClient', () => {
         return response(200, {
           requestId: 'a'.repeat(32),
           engineSessionId: `oceng-${'b'.repeat(48)}`,
+          grokExecutionDescriptor: GROK_DESCRIPTOR,
         })
       }) as any,
     })
@@ -426,6 +441,7 @@ describe('delegate engine-billing sessionKey contract', () => {
         response(200, {
           requestId: 'a'.repeat(32),
           engineSessionId: `oceng-${'b'.repeat(48)}`,
+          grokExecutionDescriptor: GROK_DESCRIPTOR,
         })) as any,
     })
   }
@@ -434,6 +450,7 @@ describe('delegate engine-billing sessionKey contract', () => {
     return admittingClient().admit({
       model: 'grok-build',
       engine: 'grok',
+      grokRouteToken: GROK_ROUTE_TOKEN,
       agentId: 'stage-triage',
       delegateAgentId: 'stage-triage',
       sessionKey,
@@ -465,5 +482,33 @@ describe('delegate engine-billing sessionKey contract', () => {
       () => admit('a'.repeat(DELEGATE_ENGINE_BILLING_SESSION_KEY_MAX_CHARS + 1)),
       /INVALID_SESSION/,
     )
+  })
+})
+
+
+describe('Grok authenticated admission response bindings', () => {
+  for (const [name, patch] of [
+    ['request', { billingRequestId: 'c'.repeat(32) }],
+    ['canonical model', { canonicalModel: 'grok-build-fast' }],
+    ['upstream', { upstreamModelId: 'grok-4.7-build-fast' }],
+    ['engine session', { engineSessionId: 'other-session' }],
+    ['route', { routeTokenHash: '0'.repeat(64) }],
+  ] as const) it(`rejects mismatched ${name}`, async () => {
+    const client = createDelegateEngineBillingClient({ env: ENV, startupRecovery: false,
+      fetcher: (async () => response(200, { requestId: 'a'.repeat(32), engineSessionId: GROK_DESCRIPTOR.engineSessionId,
+        grokExecutionDescriptor: { ...GROK_DESCRIPTOR, ...patch } })) as any })
+    await assert.rejects(() => client.admit({ model: 'grok-build', engine: 'grok', grokRouteToken: GROK_ROUTE_TOKEN,
+      agentId: 'main', delegateAgentId: 'main', sessionKey: 'delegate-binding-test' }), /DESCRIPTOR_INVALID/)
+  })
+  it('copies and freezes the trusted response rather than retaining a mutable object', async () => {
+    const descriptor = { ...GROK_DESCRIPTOR }
+    const client = createDelegateEngineBillingClient({ env: ENV, startupRecovery: false,
+      fetcher: (async () => response(200, { requestId: 'a'.repeat(32), engineSessionId: GROK_DESCRIPTOR.engineSessionId,
+        grokExecutionDescriptor: descriptor })) as any })
+    const admitted = await client.admit({ model: 'grok-build', engine: 'grok', grokRouteToken: GROK_ROUTE_TOKEN,
+      agentId: 'main', delegateAgentId: 'main', sessionKey: 'delegate-binding-test' })
+    descriptor.upstreamModelId = 'grok-4.7'
+    assert.equal(admitted.grokExecutionDescriptor?.upstreamModelId, 'grok-4.6')
+    assert.equal(Object.isFrozen(admitted.grokExecutionDescriptor), true)
   })
 })

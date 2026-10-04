@@ -42,6 +42,7 @@
 import type { IncomingHttpHeaders } from "node:http";
 
 import {
+  BOX_NATIVE_CONTEXT_OWNER,
   ModelAuthorityError,
   assertLeaseMatchesAuthority,
   isModelAllowedByAuthority,
@@ -212,6 +213,12 @@ export interface ModelAuthorityDecision {
   canonicalModel: string;
   /** catalog 派生的完整执行语义(engine / provider / upstream / capability / context / effort)。 */
   descriptor: ModelExecutionDescriptor;
+  /**
+   * contextOwner taken only from a verified full authority envelope.
+   * Lease-only and local_catalog are null. Catalog descriptor is not copied here.
+   * Absent on older fixtures means the same as null: not proven.
+   */
+  verifiedSignedContextOwner?: typeof BOX_NATIVE_CONTEXT_OWNER | null;
   authorityKind: AuthorityKind;
   /** 落 usage_records.execution_revision(全局执行投影哈希;**不下发**用户)。 */
   executionRevision: string;
@@ -453,6 +460,7 @@ export async function enforceModelAuthority(args: EnforceArgs): Promise<ModelAut
       canonicalModel,
       descriptor,
       authorityKind: "local_catalog",
+      verifiedSignedContextOwner: null,
       executionRevision: snapshot.executionRevision,
       projectionRevision,
       claimedProjectionRevision: token.projectionRevision,
@@ -630,6 +638,7 @@ function verifyBridgeAuthority(a: {
     canonicalModel: a.canonicalModel,
     descriptor: a.descriptor,
     authorityKind: "bridge_signed",
+    verifiedSignedContextOwner: signedContextOwner(authority),
     executionRevision: a.snapshot.executionRevision,
     // 全局 executionRevision 不下发用户;bridge 路径也不产出 per-uid projectionRevision。
     projectionRevision: null,
@@ -645,6 +654,19 @@ function verifyBridgeAuthority(a: {
     // settle 侧用它反查 dispatch 身份写入 usage_records.dispatch_id/attempt_no。
     ...(authority?.billingRequestId ? { billingRequestId: authority.billingRequestId } : {}),
   };
+}
+
+/** Full envelope only. A verified lease has no capabilityProfile. */
+function signedContextOwner(
+  authority: ModelAuthorityPayload | null,
+): typeof BOX_NATIVE_CONTEXT_OWNER | null {
+  if (!authority) return null;
+  const profile = authority.executionDescriptor.capabilityProfile;
+  if (!profile || typeof profile !== "object" || Array.isArray(profile)) return null;
+  const ccb = (profile as { ccb?: unknown }).ccb;
+  if (!ccb || typeof ccb !== "object" || Array.isArray(ccb)) return null;
+  const owner = (ccb as { contextOwner?: unknown }).contextOwner;
+  return owner === BOX_NATIVE_CONTEXT_OWNER ? BOX_NATIVE_CONTEXT_OWNER : null;
 }
 
 function assertEpochMatches(tokenEpoch: bigint, snapshotEpoch: bigint, kind: AuthorityKind): void {

@@ -218,7 +218,8 @@ export function ChatHeader({
         </button>
       ) : null}
       {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (
-        <div className="order-last flex min-w-0 basis-full items-center gap-1 rounded-xl bg-hover/50 sm:order-none sm:flex-1 sm:basis-auto sm:bg-transparent" data-testid="chat-model-row">
+        <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">
+          {/* OCV5-295:窄屏模型行不再铺整宽灰底(像主 CTA);触发器自带 44px 命中与截断,模型名/倍率直接可读。 */}
           {/* 团队模式可见指示:开启期间常驻 agent 名旁(弹窗外唯一的知情入口),
               点击弹说明 + 一键关闭。仅 main 会话(teamModeActive)显示。 */}
           {advisorModeActive && (
@@ -228,16 +229,19 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.advisorMode.id}
                   aria-label="顾问模式已开启"
-                  className="flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+                  className="group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
                 >
-                  <ShieldCheck size={11} className="shrink-0" />
-                  <span className="sm:hidden">顾问</span>
-                  <span className="hidden sm:inline">顾问模式</span>
-                  {advisorModelLabel ? (
-                    <span className="hidden max-w-[8rem] truncate sm:inline" title={advisorModelLabel}>
-                      · {advisorModelLabel}
-                    </span>
-                  ) : null}
+                  {/* OCV5-307:44px 命中区留在透明 button 上,可见的是内层细胶囊 —— 原先整颗 44px 高的色块显得笨重。 */}
+                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+                    <ShieldCheck size={11} className="shrink-0" />
+                    <span className="sm:hidden">顾问</span>
+                    <span className="hidden sm:inline">顾问模式</span>
+                    {advisorModelLabel ? (
+                      <span className="hidden max-w-[8rem] truncate sm:inline" title={advisorModelLabel}>
+                        · {advisorModelLabel}
+                      </span>
+                    ) : null}
+                  </span>
                 </button>
               </PopoverTrigger>
               <PopoverContent>
@@ -270,12 +274,14 @@ export function ChatHeader({
                   type="button"
                   data-product-feature={PRODUCT_CAPABILITIES.teamMode.id}
                   aria-label="团队模式已开启"
-                  className="flex min-h-11 min-w-11 shrink-0 items-center justify-center gap-1 rounded-full bg-accent-soft px-2 py-0.5 text-caption font-medium text-accent outline-none transition-colors hover:bg-accent/15 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
+                  className="group flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-bg active:scale-[0.98]"
                 >
-                  <Users size={11} className="shrink-0" />
-                  {/* 窄屏给「团队」二字；sm+ 仍用全称，桌面既有断言不红。 */}
-                  <span className="sm:hidden">团队</span>
-                  <span className="hidden sm:inline">团队模式</span>
+                  <span className="flex items-center gap-1 rounded-full bg-accent-soft px-2.5 py-1 text-caption font-medium leading-none text-accent transition-colors group-hover:bg-accent/15">
+                    <Users size={11} className="shrink-0" />
+                    {/* 窄屏给「团队」二字；sm+ 仍用全称，桌面既有断言不红。 */}
+                    <span className="sm:hidden">团队</span>
+                    <span className="hidden sm:inline">团队模式</span>
+                  </span>
                 </button>
               </PopoverTrigger>
               <PopoverContent>

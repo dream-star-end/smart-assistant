@@ -1,0 +1,21 @@
+# PR 门 · 分片 4 —— OCV5-296 短 integ（证明/集合/资源信封/CCB 头）
+#
+# 这一片绿，直接证明：idle proof 在结算后才可见、summary set 可就绪、
+# Box 资源信封在 on/off 候选上按 legacy/放行分叉、真实 CCB CLI 吃掉
+# loopback 控制行。不改 pr-1/2/3。
+#
+# 2026-09-30 宿主 16 核 / node 20，改 on/off 后再跑这 4 个文件：
+# tests 4 / pass 4 / fail 0 / skipped 0，墙钟约 157s（含信封用例 105s）。
+# 父超时保持 180000：单文件都短于 180s。max-minutes 20 含 CI 的 npm ci
+# 与 Bun 1.3.14/CCB lockfile 安装，不是 2 核实测，待审定。不把 grow 算进本片。
+#
+# 4 个文件串行，每个父超时 180000ms。mutex 900s 覆盖 4*180s+120s 清理。
+# job 20min 再留安装余量。这些是拟上界，不是 2 核实测。
+# min-tests: 4
+# max-minutes: 20
+# file-timeout-ms: 180000
+# mutex-timeout-seconds: 900
+packages/commercial/src/http/proxy/boxIdleProof.integ.test.ts
+packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts
+packages/commercial/src/http/proxy/boxOrphanHandoff.integ.test.ts
+packages/commercial/src/http/proxy/boxIdleSet.integ.test.ts

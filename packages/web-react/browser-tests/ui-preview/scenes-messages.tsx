@@ -569,7 +569,35 @@ function ScrollWindowScene() {
   )
 }
 
+/** OCV5-318:定时续跑代发的长提示(会话键/路径/环境变量串无空格)在手机上必须折行,不得横向溢出。 */
+function cronLongWrap(): ChatMessage[] {
+  resetClock()
+  const label = '【OCV5-308 商业上线看门狗·每30分钟】用户 2026-10-03 授权：跟踪个人版会话 a'
+  const prompt =
+    '【OCV5-308 商业上线看门狗·每30分钟】用户 2026-10-03 授权：跟踪个人版会话 agent:main:webchat:dm:webmuqjhduqb0ifd9（截图里 GPT-6.1-Sol 的「全能助手」，单号 OCV5-308）。若该会话已停、且商业版还没把「保留旧模型 + 按个人版定价上新模型」真正上线，就从断点接着做，直到商业版上线。\n\n' +
+    '2) 若未上线，判断原会话是否还在干：进程命令行含 OPENCLAUDE_SESSION_KEY=agent:main:webchat:dm:webmuqjhduqb0ifd9，或 /home/agent/.openclaude/workspace/ocv5-308 下日志在近 25 分钟内有新写入。\n' +
+    '3) 先 task_get OCV5-308 读最新评论和 workspace/ocv5-308/CONTINUE-*.md，https://reasoning-procedures.trycloudflare.com/very/long/path/without/any/spaces/at/all/0123456789abcdef'
+  return [
+    msg({
+      id: 'u-cron',
+      role: 'user',
+      text: `⏰ 定时续跑「${label}」\n\n${prompt}\n\n请带着本对话已有上下文继续执行上述任务。不要只播报，要真的做完。`,
+      status: 'replied',
+    }),
+    msg({ id: 'sys-long', role: 'system', text: `系统提示 OPENCLAUDE_SESSION_KEY=agent:main:webchat:dm:webmuqjhduqb0ifd9/home/agent/.openclaude/workspace/ocv5-308` }),
+    msg({ id: 'a-cron', role: 'assistant', text: '商业版尚未上线，原会话仍在推进。', cronPush: true, cronLabel: label }),
+  ]
+}
+
 export const messagesScenes: Scene[] = [
+  {
+    id: 'messages-cron-long-wrap',
+    label: '消息 · 定时续跑代发长提示在手机上折行(无横向溢出)',
+    group: '工作区',
+    viewports: ['desktop', 'mobile'],
+    api: {},
+    render: () => <StaticList messages={cronLongWrap()} />,
+  },
   {
     id: 'messages-timeline-rich',
     label: '消息 · 完整历史时间线(富文本/思考/工具/计划/目标/委派/系统卡)',

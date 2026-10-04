@@ -1,3 +1,5 @@
+import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
+import { isV3ContainerRuntime } from '../hostStaticProviders.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * First-class adapter for xAI's official Grok CLI. The CLI runs once per turn
@@ -6,9 +8,9 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
  */
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { synthesizeEmptyFailedToolPreview, type GoalStateSnapshot, type OutboundContentBlock } from '@openclaude/protocol'
@@ -52,7 +54,74 @@ const log = createLogger({ module: 'grokAdapter' })
 
 const GROK_SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const GROK_SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
-const GROK_UPSTREAM_MODEL = 'grok-4.6'
+const GROK_UPSTREAM_MODEL = 'grok-4.7'
+const GROK_FAST_UPSTREAM_MODEL = 'grok-4.7-build-fast'
+
+function grokUpstreamModel(model: string | undefined): string {
+  return model === 'grok-build-fast' ? GROK_FAST_UPSTREAM_MODEL : GROK_UPSTREAM_MODEL
+}
+
+/**
+ * Fast 不和标准档共用 GROK_HOME。标准档的常驻 leader 会把 --model 当成
+ * 切模型，而它内存里的清单要等自己刷新后才认得 grok-4.7-build-fast，
+ * 在那之前固定回 unknown model id。独立 home 会自己拉一份模型清单再启动。
+ */
+function grokRuntimeHome(baseHome: string, model: string | undefined): string {
+  if (model !== 'grok-build-fast') return baseHome
+  const home = join(baseHome, 'fast')
+  mkdirSync(home, { recursive: true, mode: 0o700 })
+  const config = join(baseHome, 'config.toml')
+  if (existsSync(config)) {
+    const target = join(home, 'config.toml')
+    writeFileSync(target, readFileSync(config), { mode: 0o600 })
+    chmodSync(target, 0o600)
+  }
+  return home
+}
+
+function seedFastCatalog(baseHome: string, fastHome: string, listUrl: string | undefined): void {
+  const src = join(baseHome, 'models_cache.json')
+  const dest = join(fastHome, 'models_cache.json')
+  if (!existsSync(src) || existsSync(dest)) return
+  let parsed: {
+    models?: Record<string, { info?: { base_url?: string }; api_key?: string | null }>
+    origin?: string
+    fetched_at?: string
+  }
+  try {
+    parsed = JSON.parse(readFileSync(src, 'utf8')) as typeof parsed
+  } catch {
+    return
+  }
+  if (!parsed.models?.[GROK_FAST_UPSTREAM_MODEL]) return
+  const base = listUrl?.replace(/\/models$/, '')
+  if (listUrl) parsed.origin = listUrl
+  parsed.fetched_at = new Date().toISOString()
+  for (const entry of Object.values(parsed.models)) {
+    if (!entry) continue
+    entry.api_key = null
+    if (base && entry.info) entry.info.base_url = base
+  }
+  writeFileSync(dest, JSON.stringify(parsed), { mode: 0o600 })
+  chmodSync(dest, 0o600)
+}
+
+function ensureFastCatalog(bin: string, env: NodeJS.ProcessEnv, fastHome: string): void {
+  const dest = join(fastHome, 'models_cache.json')
+  if (existsSync(dest)) {
+    try {
+      const parsed = JSON.parse(readFileSync(dest, 'utf8')) as { models?: Record<string, unknown> }
+      if (parsed.models?.[GROK_FAST_UPSTREAM_MODEL]) return
+    } catch {
+      // Fall through and ask the CLI to fetch.
+    }
+  }
+  try {
+    spawnSync(bin, ['models'], { env, timeout: 8_000, stdio: 'ignore' })
+  } catch {
+    // The turn reports the model error if the catalog is still empty.
+  }
+}
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
 const PROCESS_KEEPALIVE_INTERVAL_DEFAULT_MS = 30_000
 const PROCESS_KEEPALIVE_INTERVAL_MIN_MS = 5_000
@@ -284,6 +353,8 @@ function assembleGrokPrompt(
 
 interface GrokTurnContext {
   params: TurnParams
+  readonly canonicalModel: string | undefined
+  readonly upstreamModelId: string
   startedAt: number
   proc: ChildProcessByStdio<null, Readable, Readable> | null
   promptDir: string | null
@@ -390,10 +461,24 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   }
 
   submitTurn(params: TurnParams): EngineTurnRun {
+    const canonicalModel = this.currentModel
+    const frozen = params.grokExecutionDescriptor
+      ? freezeGrokExecutionDescriptor(params.grokExecutionDescriptor, {
+          canonicalModel: canonicalModel ?? '',
+          billingRequestId: params.requestId ?? '',
+          ...(params.grokExecutionDescriptor.routeTokenHash !== undefined
+            ? {routeTokenHash: createHash('sha256').update(this.route?.routeToken ?? '').digest('hex')} : {}),
+        })
+      : undefined
+    if (!frozen && isV3ContainerRuntime()) throw new Error('GROK_EXECUTION_DESCRIPTOR_REQUIRED')
+    // Only an explicit legacy non-container runtime may retain static mapping.
+    const upstreamModelId = frozen?.upstreamModelId ?? grokUpstreamModel(canonicalModel)
     let resolveSummary!: (summary: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((resolve) => { resolveSummary = resolve })
     const ctx: GrokTurnContext = {
       params,
+      canonicalModel,
+      upstreamModelId,
       startedAt: Date.now(),
       proc: null,
       promptDir: null,
@@ -494,13 +579,22 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,
+      ...(ctx.params.consultTurn && ctx.params.turnKey
+        ? {
+            consultTurn: {
+              turnKey: ctx.params.turnKey,
+              turnIndex: ctx.params.consultTurn.turnIndex,
+              configVersion: ctx.params.consultTurn.configVersion,
+            },
+          }
+        : {}),
       claudeCodePath: this.opts.config.auth.claudeCodePath,
       skillEvalMode: this.opts.skillEvalMode,
       skillEvalExclude: this.opts.skillEvalExclude,
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
     })
-    const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools)
+    const prompt = await this.composePrompt(ctx.params, repoSnapshot, platform.advertisedMcpTools, ctx.canonicalModel)
     const promptDir = mkdtempSync(join(tmpdir(), 'oc-grok-prompt-'))
     const promptFile = join(promptDir, 'prompt.md')
     try {
@@ -542,12 +636,26 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       GROK_MODELS_LIST_URL: `${route.baseUrl.replace(/\/$/, '')}/models`,
       GROK_CLI_AUTO_UPDATE: 'false',
       GROK_TELEMETRY_ENABLED: 'false',
-      GROK_HOME: platform.grokHome,
+      GROK_HOME: (() => {
+        const runtimeHome = grokRuntimeHome(platform.launchHome, ctx.canonicalModel)
+        const stableRoot = ctx.canonicalModel === 'grok-build-fast'
+          ? join(platform.grokHome, 'fast')
+          : platform.grokHome
+        const stableSessions = join(stableRoot, 'sessions')
+        mkdirSync(stableSessions, { recursive: true, mode: 0o700 })
+        const dest = join(runtimeHome, 'sessions')
+        if (dest !== stableSessions && !existsSync(dest)) symlinkSync(stableSessions, dest)
+        return runtimeHome
+      })(),
       ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
     }
     const bin = process.env.OC_GROK_CLI_BIN?.trim()
       || (existsSync('/usr/local/bin/grok-native') ? '/usr/local/bin/grok-native' : 'grok')
     ctx.launchSpec = { cwd, env, bin, promptFile }
+    if (ctx.canonicalModel === 'grok-build-fast' && env.GROK_HOME) {
+      seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
+      ensureFastCatalog(bin, env, env.GROK_HOME)
+    }
     this.spawnGrokChild(ctx, { resume: Boolean(this.nativeId) })
   }
 
@@ -556,7 +664,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (!spec) throw new Error('GROK_LAUNCH_SPEC_MISSING')
     const args = [
       '--agent', 'grok-build',
-      '--model', GROK_UPSTREAM_MODEL,
+      '--model', ctx.upstreamModelId,
       '--prompt-file', spec.promptFile,
       '--output-format', 'streaming-json',
       '--always-approve',
@@ -777,6 +885,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     params: TurnParams,
     repoSnapshot: ReturnType<NonNullable<EngineCreateOpts['getRepoSnapshot']>> | null,
     availableMcpTools: string[],
+    canonicalModel: string | undefined,
   ): Promise<string> {
     const input = promptText(params.input)
     try {
@@ -786,7 +895,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
         persona: this.opts.persona,
         identityCompat: this.opts.identityCompat?.assets,
         provider: 'grok',
-        model: this.currentModel,
+        model: canonicalModel,
         repoSnapshot: repoSnapshot ?? undefined,
         availableMcpTools,
         skillEvalExclude: this.opts.skillEvalExclude,
@@ -1062,7 +1171,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const budget = ctx.params.creditBudgetFen
     if (budget === undefined) return
     const fen = await runningCostFenForUsage({
-      modelId: this.currentModel,
+      modelId: ctx.canonicalModel,
       usage: {
         inputTokens: ctx.lastUsage.inputTokens,
         outputTokens: ctx.lastUsage.outputTokens,
@@ -1282,13 +1391,18 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   waitForOutputDrain(): Promise<void> { return this.drain }
   readCompactionHandoffSince(compactStartedAt: number): Promise<NativeModelHandoffArtifact> {
     if (!this.nativeId) return Promise.reject(new Error('GROK_COMPACTION_SESSION_NOT_READY'))
-    return readLatestGrokNativeHandoff(prepareGrokHome(), this.nativeId, compactStartedAt)
+    return readLatestGrokNativeHandoff(grokRuntimeHome(prepareGrokHome(), this.currentModel), this.nativeId, compactStartedAt)
   }
 
   get nativeSessionId(): string | null { return this.nativeId }
   clearSessionId(): void { this.nativeId = null }
   setResumeSessionId(sessionId: string): void { this.nativeId = sessionId }
-  setModel(model: string | undefined): void { this.currentModel = model }
+  setModel(model: string | undefined): void {
+    const nextFast = model === 'grok-build-fast'
+    const currentFast = this.currentModel === 'grok-build-fast'
+    if (nextFast !== currentFast) this.nativeId = null
+    this.currentModel = model
+  }
   get model(): string | undefined { return this.currentModel }
   setEffortLevel(level: string | undefined): void { this.currentEffort = level }
   get effortLevel(): string | undefined { return this.currentEffort }

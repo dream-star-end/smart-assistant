@@ -36,7 +36,7 @@ import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWith
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
-import { issueDelegateContextToken } from '../delegateContext.js'
+import { issueParentCallerToken } from '../delegateContext.js'
 import { formatPresentOptionsFence } from './presentOptions.js'
 import { CursorRoutingAdapter } from './cursorRoutingAdapter.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
@@ -1454,6 +1454,7 @@ export function attachCursorGatewayRouting(
 export const CURSOR_CHATS_DIR_NAME = 'cursor-chats'
 export const CURSOR_SAND_RESUME_PREFIX = 'sand-ccb:'
 export const CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX = 'sand-official-cc:'
+export const CURSOR_SAND_BOX_CC_RESUME_PREFIX = 'sand-box-cc:'
 const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export function isCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
@@ -1486,8 +1487,26 @@ export function cursorSandOfficialCcResumeInnerId(
   return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
 }
 
+export function isCursorSandBoxCcResumeId(
+  sessionId: string | null | undefined,
+): sessionId is string {
+  return typeof sessionId === 'string'
+    && sessionId.startsWith(CURSOR_SAND_BOX_CC_RESUME_PREFIX)
+}
+
+/** Transcript lives in the account box, not the container CLAUDE_CONFIG_DIR. */
+export function cursorSandBoxCcResumeInnerId(
+  sessionId: string | null | undefined,
+): string | undefined {
+  if (!isCursorSandBoxCcResumeId(sessionId)) return undefined
+  const inner = sessionId.slice(CURSOR_SAND_BOX_CC_RESUME_PREFIX.length)
+  return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+}
+
 export function isAnyCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
-  return isCursorSandResumeId(sessionId) || isCursorSandOfficialCcResumeId(sessionId)
+  return isCursorSandResumeId(sessionId)
+    || isCursorSandOfficialCcResumeId(sessionId)
+    || isCursorSandBoxCcResumeId(sessionId)
 }
 
 /** Durable Cursor chat store, deliberately OUTSIDE the per-turn ephemeral HOME
@@ -1981,10 +2000,17 @@ export class CursorAdapter extends EventEmitter implements EngineAdapter {
         const contextFile = resolve(contextDir, 'delegate-context')
         writeFileSync(
           contextFile,
-          `${issueDelegateContextToken({
+          `${issueParentCallerToken({
             agentId: this.opts.agentId,
             sessionKey: this.opts.sessionKey,
             depth: this.opts.delegationDepth ?? 0,
+            consultTurn: ctx.params.consultTurn && ctx.params.turnKey
+              ? {
+                  turnKey: ctx.params.turnKey,
+                  turnIndex: ctx.params.consultTurn.turnIndex,
+                  configVersion: ctx.params.consultTurn.configVersion,
+                }
+              : null,
           })}\n`,
           { mode: 0o600 },
         )

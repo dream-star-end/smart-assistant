@@ -19,7 +19,7 @@ import {
 import { REVIEW_VERDICT_NEEDS_FIX, REVIEW_VERDICT_PASS } from "@openclaude/protocol/teamCards";
 import { isServerAuthoredRow } from "./model";
 import type { BashTail, ChatMessage, ChildBlock } from "./model";
-import { friendlyBridgeErrorMessage, insufficientCreditsCopy } from "./pure";
+import { friendlyBridgeErrorMessage, insufficientCreditsCopy, isSilentTurnErrorCode, problemCardPresentation } from "./pure";
 
 /**
  * dispatch 终态错误码(免单语义:受理未执行 = 未计费 / 服务重启中断 = 已退款)。归一化小写。
@@ -331,6 +331,11 @@ export function messageSignature(
         m.usage?.waived ? 1 : 0,
         m._truncated ?? "",
         m._errorCode ?? "",
+        JSON.stringify([Object.prototype.hasOwnProperty.call(m, "_recoverySkippedNotice"), m._recoverySkippedNotice ?? null]),
+        m._errorCardSnapshot?.disposition ?? "",
+        m._errorCardSnapshot?.disposition === "card"
+          ? `${m._errorCardSnapshot.tone}:${m._errorCardSnapshot.title}:${m._errorCardSnapshot.message}`
+          : "",
         m._errorDetail ? m._errorDetail.length : 0,
         m._emptyTurn ? 1 : 0,
         m._emptyTurnSoft ? 1 : 0,
@@ -563,7 +568,7 @@ const ERROR_LABELS: Record<string, string> = {
   turn_limit: "本轮已自动免单",
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
   model_config_changed_retry_turn: "模型配置已更新，请重发",
-  model_not_available: "模型不可用",
+  model_not_available: "模型暂不可用",
   unresolved_agent_model: "未能确定模型",
   model_authority_unavailable: "模型服务暂时不可用",
   model_catalog_unavailable: "模型服务暂时不可用",
@@ -784,6 +789,87 @@ export function errorPresentation(
     ...(detailOut ? { detail: detailOut } : {}),
     waived: false,
   };
+}
+
+/**
+ * 第一次看到这条错误时写死展示。已有快照则原样返回，禁止按新错误码重算。
+ * 静默终态写 `silent`，渲染器不出错误卡。
+ */
+export function commitErrorCardSnapshot(
+  message: ChatMessage,
+  messageOverride?: string,
+): "card" | "silent" | undefined {
+  if (message._errorCardSnapshot) return message._errorCardSnapshot.disposition;
+  if (typeof message._errorCode !== "string" || message._errorCode.length === 0) return undefined;
+  if (isSilentTurnErrorCode(message._errorCode)) {
+    message._errorCardSnapshot = { disposition: "silent" };
+    return "silent";
+  }
+  const presented = errorPresentation(
+    message._errorCode,
+    message.text,
+    message._errorDetail,
+    message.usage?.waived === true,
+  );
+  const tone: "red" | "yellow" =
+    presented.waived || problemCardPresentation(message._errorCode, false) === "yellow"
+      ? "yellow"
+      : "red";
+  const body = typeof messageOverride === "string" && messageOverride.length > 0
+    ? messageOverride
+    : presented.message;
+  message._errorCardSnapshot = {
+    disposition: "card",
+    tone,
+    title: presented.title,
+    message: body,
+    ...(presented.detail ? { detail: presented.detail } : {}),
+  };
+  return "card";
+}
+
+export function freezeErrorCardSnapshots(
+  messages: readonly ChatMessage[],
+  deferredClientMessageId?: string,
+  cancelledClientMessageIds?: ReadonlySet<string>,
+): void {
+  const recoveringSources = new Set<string>();
+  if (deferredClientMessageId) recoveringSources.add(deferredClientMessageId);
+  for (const message of messages) {
+    if (
+      message?.role === "user" &&
+      message._automaticRecovery === true &&
+      typeof message._recoveryOfClientMessageId === "string" &&
+      message._recoveryOfClientMessageId.length > 0
+    ) {
+      recoveringSources.add(message._recoveryOfClientMessageId);
+    }
+  }
+  for (const message of messages) {
+    if (message._errorCardSnapshot?.disposition === "card") {
+      message._errorHeldForRecovery = undefined;
+      continue;
+    }
+    if (
+      cancelledClientMessageIds &&
+      typeof message._clientMessageId === "string" &&
+      cancelledClientMessageIds.has(message._clientMessageId) &&
+      message._errorCode
+    ) {
+      message._errorCardSnapshot = { disposition: "silent" };
+      message._errorHeldForRecovery = undefined;
+      continue;
+    }
+    if (
+      typeof message._clientMessageId === "string" &&
+      recoveringSources.has(message._clientMessageId) &&
+      message._errorCode
+    ) {
+      message._errorHeldForRecovery = true;
+      continue;
+    }
+    commitErrorCardSnapshot(message);
+  }
 }
 
 /**

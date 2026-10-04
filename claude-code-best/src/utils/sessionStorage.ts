@@ -30,6 +30,7 @@ import {
   isSessionPersistenceDisabled,
   switchSession,
 } from '../bootstrap/state.js'
+import { processTrustsBoxDeferredAnnouncement } from './model/boxDeferredAnnouncement.js'
 import { builtInCommandNames } from '../commands.js'
 import { COMMAND_NAME_TAG, TICK_TAG } from '../constants/xml.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
@@ -1018,6 +1019,7 @@ class Project {
     agentId?: string,
     startingParentUuid?: UUID | null,
     teamInfo?: { teamName?: string; agentName?: string },
+    preserveMessageTimestamp = false,
   ) {
     return this.trackWrite(async () => {
       let parentUuid: UUID | null = startingParentUuid ?? null
@@ -1080,7 +1082,9 @@ class Project {
           entrypoint: getEntrypoint(),
           cwd: getCwd(),
           sessionId,
-          timestamp: new Date().toISOString(),
+          timestamp: preserveMessageTimestamp && message.timestamp
+            ? message.timestamp
+            : new Date().toISOString(),
           version: VERSION,
           gitBranch,
           slug,
@@ -1447,6 +1451,7 @@ export async function recordTranscript(
   teamInfo?: TeamInfo,
   startingParentUuidHint?: UUID,
   allMessages?: readonly Message[],
+  preserveMessageTimestamp = false,
 ): Promise<UUID | null> {
   const cleanedMessages = cleanMessagesForLogging(messages, allMessages)
   const sessionId = getSessionId() as UUID
@@ -1473,6 +1478,7 @@ export async function recordTranscript(
       undefined,
       startingParentUuid,
       teamInfo,
+      preserveMessageTimestamp,
     )
   }
   // Return the last ACTUALLY recorded chain-participant's UUID, OR the
@@ -4492,6 +4498,15 @@ export function isLoggableMessage(m: Message): boolean {
   // When enabled, we allow hook_additional_context through since it contains
   // user-configured hook output that is useful for session context on resume.
   if (m.type === 'attachment' && getUserType() !== 'ant') {
+    // External transcripts drop attachments. A trusted Box process is the
+    // exception for deferred_tools_delta: the announcement is caller history,
+    // and the ephemeral API prepend is off for that same descriptor.
+    if (
+      m.attachment?.type === 'deferred_tools_delta' &&
+      processTrustsBoxDeferredAnnouncement()
+    ) {
+      return true
+    }
     if (
       m.attachment!.type === 'hook_additional_context' &&
       isEnvTruthy(process.env.CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT)

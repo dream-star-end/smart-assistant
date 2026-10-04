@@ -106,6 +106,8 @@ start_run() {
   add_optional_env runner V5_ENV
   add_optional_env runner CADDY_HTTP_PORT
   add_optional_env runner OC_V5_BASELINE_REMOUNT_TIMEOUT_SECONDS
+  # build_release 的 Box 事故证明门要求显式测试库(回环 *_test);transient unit 不继承调用方环境。
+  add_optional_env runner OC_V5_PROOF_TEST_DATABASE_URL
 
   runner+=(/usr/bin/bash "$SCRIPT_DIR/deploy-v5.sh" "$@")
   "${runner[@]}"

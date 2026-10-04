@@ -141,6 +141,7 @@ describe("auditActions — 注册表", () => {
     assert.ok(isAdminAuditAction("account.migrate_to_pool"));
     assert.ok(isAdminAuditAction("user.patch"));
     assert.ok(isAdminAuditAction("user.credits.adjust"));
+    assert.ok(isAdminAuditAction("pricing.create"));
     assert.ok(!isAdminAuditAction("credits.adjust"));
     assert.ok(!isAdminAuditAction("blocked_route_bypass"));
     assert.ok(!isAdminAuditAction("toString"));
@@ -163,6 +164,7 @@ describe("auditActions — 注册表", () => {
       "org.credits.adjust",
       "user.patch",
       "billing.ledger.reconcile",
+      "pricing.create",
       "pricing.patch",
       "plan.patch",
       "model_grant.add",

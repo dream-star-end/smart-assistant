@@ -76,7 +76,7 @@ describe('V5 branch deployment policy', () => {
     assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-codex0153-grok105-zcode381-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-cc2280-codex01592-grok1013-zcode381-slim$/m)
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
@@ -1137,7 +1137,129 @@ function waitForChildExit(child: ReturnType<typeof spawn>, timeoutMs: number): P
   })
 }
 
-async function manualLeaseFixture() {
+type ManualPgTransportOptions = { pgTransport: 'os-supervision'; deployDelaySeconds?: 2 }
+type ManualPgTransportEvent = {
+  seq: number; kind: 'entered' | 'completed' | 'rejected'; role: string;
+  pid: number; start: string; monotonicNs: number; args: string[]; reason?: string;
+}
+
+// This transport is ONLY for the shortest OS-supervision TTL leaf. It is not
+// evidence of a real PG admission/lock, which has its own unchanged integration gate.
+async function manualOsPgTransport(dir: string, bin: string, deployDelaySeconds = 0) {
+  const identitySql = "SELECT json_build_object('clusterId', system_identifier::text, 'database', current_database(), 'databaseOid', (SELECT oid::text FROM pg_database WHERE datname=current_database()), 'serverAddress', inet_server_addr()::text, 'serverPort', inet_server_port(), 'postmasterEpoch', extract(epoch FROM pg_postmaster_start_time())::text, 'inRecovery', pg_is_in_recovery())::text FROM pg_control_system()"
+  const deploySql = `BEGIN; ${identitySql}; SELECT pg_advisory_xact_lock(hashtextextended('openclaude:v5:production-mutation-admission:v1',0)); COMMIT;`
+  const dsns = {
+    gateway: 'postgresql://test_gateway:test@127.0.0.1:55432/openclaude_test',
+    deploy: 'postgresql://test_deploy:test@127.0.0.1:55432/openclaude_test',
+    admin: 'postgresql://test_admin:test@127.0.0.1:55432/openclaude_test',
+  }
+  const receipt = path.join(dir, 'os-pg-transport.json')
+  const transport = path.join(bin, 'psql')
+  const config = path.join(dir, 'os-pg-transport-config.json')
+  await writeFile(config, JSON.stringify({ dsns, identitySql, deploySql, receipt, deployDelaySeconds }), { mode: 0o600 })
+  await writeFile(receipt, JSON.stringify({ events: [] }), { mode: 0o600 })
+  await writeFile(transport, '#!/usr/bin/python3\n' + String.raw`
+import fcntl, json, os, sys, time
+from pathlib import Path
+cfg = json.loads(Path(${JSON.stringify(config)}).read_text())
+args = sys.argv[1:]
+role = next((r for r, dsn in cfg['dsns'].items() if args and args[0] == dsn), 'unknown')
+pid = os.getpid()
+start = Path('/proc/self/stat').read_text().rsplit(') ', 1)[1].split()[19]
+def transact(fn):
+    with open(cfg['receipt'] + '.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(Path(cfg['receipt']).read_text())
+        result = fn(state)
+        temp = cfg['receipt'] + '.' + str(pid)
+        Path(temp).write_text(json.dumps(state))
+        os.replace(temp, cfg['receipt'])
+        return result
+def record(state, kind, reason=None):
+    row = dict(seq=len(state['events']) + 1, kind=kind, role=role,
+               pid=pid, start=start, monotonicNs=time.monotonic_ns(), args=args)
+    if reason is not None: row['reason'] = reason
+    state['events'].append(row)
+def enter(state):
+    expected_sql = cfg['deploySql'] if role == 'deploy' else cfg['identitySql']
+    expected_args = [cfg['dsns'].get(role), '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-c', expected_sql]
+    reason = None
+    if role == 'unknown' or args != expected_args: reason = 'argv-or-sql'
+    elif any(e['role'] == role and e['kind'] == 'entered' for e in state['events']): reason = 'duplicate-role'
+    elif role != 'deploy' and not any(e['role'] == 'deploy' and e['kind'] == 'completed' for e in state['events']): reason = 'read-before-deploy-completed'
+    if reason:
+        record(state, 'rejected', reason)
+        return False
+    record(state, 'entered')
+    return True
+if not transact(enter):
+    print('OS-only PG transport rejected unexpected protocol', file=sys.stderr)
+    sys.exit(79)
+if role == 'deploy' and cfg['deployDelaySeconds']:
+    time.sleep(cfg['deployDelaySeconds'])
+identity = dict(clusterId='123456789', database='openclaude_test', databaseOid='16384',
+                serverAddress='127.0.0.1', serverPort=55432, postmasterEpoch='1700000000', inRecovery=False)
+def complete(state):
+    # Receipt completion is only published after the actual response is flushed.
+    sys.stdout.write(json.dumps(identity) + '\n')
+    sys.stdout.flush()
+    record(state, 'completed')
+transact(complete)
+`, { mode: 0o755 })
+  return { dsns, identitySql, deploySql, receipt, transport }
+}
+
+async function manualPgTransportEvents(fx: Awaited<ReturnType<typeof manualLeaseFixture>>): Promise<ManualPgTransportEvent[]> {
+  assert.ok(fx.pgTransport, 'the fixture must explicitly select OS-only PG transport')
+  return (JSON.parse(await readFile(fx.pgTransport.receipt, 'utf8')) as { events: ManualPgTransportEvent[] }).events
+}
+
+async function assertManualOsPgProtocol(fx: Awaited<ReturnType<typeof manualLeaseFixture>>) {
+  const events = await manualPgTransportEvents(fx)
+  assert.equal(events.length, 6, 'OS transport must receive exactly three requests and three flushed completions')
+  assert.equal(events.some((e) => e.kind === 'rejected'), false, 'unexpected PG transport call')
+  const deployDone = events.find((e) => e.role === 'deploy' && e.kind === 'completed')!
+  for (const role of ['deploy', 'gateway', 'admin'] as const) {
+    const entered = events.filter((e) => e.role === role && e.kind === 'entered')
+    const completed = events.filter((e) => e.role === role && e.kind === 'completed')
+    assert.equal(entered.length, 1, `${role} transport request count`)
+    assert.equal(completed.length, 1, `${role} flushed completion count`)
+    const expectedSql = role === 'deploy' ? fx.pgTransport!.deploySql : fx.pgTransport!.identitySql
+    assert.deepEqual(entered[0].args, [fx.pgTransport!.dsns[role], '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-c', expectedSql])
+    assert.equal(completed[0].seq > entered[0].seq, true, `${role} completed before entering`)
+    if (role !== 'deploy') assert.equal(entered[0].seq > deployDone.seq, true, `${role} read before deploy response completed`)
+  }
+}
+
+type ManualProcessIdentity = { pid: number; start: string }
+async function manualProcessIdentity(pid: number): Promise<ManualProcessIdentity | undefined> {
+  const raw = await readFile(`/proc/${pid}/stat`, 'utf8').catch(() => '')
+  if (!raw) return undefined
+  return { pid, start: raw.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/)[19] }
+}
+async function manualOwnedProcessSnapshot(fx: Awaited<ReturnType<typeof manualLeaseFixture>>, wrapperPid: number) {
+  const roots = [wrapperPid, ...(await manualPgTransportEvents(fx)).map((e) => e.pid)]
+  for (const file of [fx.sshPids, fx.remotePids]) {
+    roots.push(...(await readFile(file, 'utf8').catch(() => '')).trim().split(/\s+/).map(Number))
+  }
+  const owned = new Map<number, ManualProcessIdentity>()
+  const queue = roots.filter((pid) => Number.isSafeInteger(pid) && pid > 1)
+  while (queue.length) {
+    const pid = queue.shift()!
+    if (owned.has(pid)) continue
+    const before = await manualProcessIdentity(pid)
+    if (!before) continue
+    const children = await readFile(`/proc/${pid}/task/${pid}/children`, 'utf8').catch(() => '')
+    const after = await manualProcessIdentity(pid)
+    if (after?.start !== before.start) continue
+    owned.set(pid, before)
+    queue.push(...children.trim().split(/\s+/).map(Number).filter((child) => Number.isSafeInteger(child) && child > 1))
+  }
+  return [...owned.values()]
+}
+
+async function manualLeaseFixture(options?: ManualPgTransportOptions) {
+  assert.equal(process.getuid?.(), 0, 'real root is required for the private admission env')
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-manual-lease-'))
   dirs.push(dir)
   const bin = path.join(dir, 'bin')
@@ -1155,7 +1277,28 @@ async function manualLeaseFixture() {
   const source = await readFile(manualMutationLease, 'utf8')
   const lockNeedle = 'PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"'
   assert.equal(source.split(lockNeedle).length - 1, 1, 'manual wrapper lock path replacement drifted')
+  const envFile = path.join(dir, 'v5.env')
+  const fixtureUrl = 'postgresql://test:test@127.0.0.1:55432/openclaude_test'
+  const pgTransport = options ? await manualOsPgTransport(dir, bin, options.deployDelaySeconds) : undefined
+  await writeFile(envFile, [
+    `DATABASE_URL=${JSON.stringify(pgTransport?.dsns.gateway ?? fixtureUrl)}`,
+    `MODEL_AUTHORITY_DEPLOY_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.deploy ?? fixtureUrl)}`,
+    `MODEL_CATALOG_ADMIN_DATABASE_URL=${JSON.stringify(pgTransport?.dsns.admin ?? fixtureUrl)}`,
+    `OC_EGRESS_SECRET=${JSON.stringify('e'.repeat(32))}`,
+  ].join('\n') + '\n', { mode: 0o600 })
+  const envNeedle = 'V5_ENV="/etc/openclaude/commercial-v5.env"'
+  assert.equal(source.split(envNeedle).length - 1, 1, 'manual wrapper env path replacement drifted')
+  const helperBytes = await readFile(path.join(root, 'scripts/lib/v5-mutation-admission.sh'))
+  await mkdir(path.join(dir, 'lib'))
+  const copiedHelper = path.join(dir, 'lib/v5-mutation-admission.sh')
+  await writeFile(copiedHelper, helperBytes, { mode: 0o600 })
+  assert.equal(
+    createHash('sha256').update(await readFile(copiedHelper)).digest('hex'),
+    createHash('sha256').update(helperBytes).digest('hex'),
+    'manual fixture must consume the actual admission helper bytes',
+  )
   const fixtureSource = source.replace(lockNeedle, `PRODUCTION_MUTATION_LOCK="${lock}"`)
+    .replace(envNeedle, `V5_ENV="${envFile}"`)
   await writeFile(wrapper, fixtureSource)
   await chmod(wrapper, 0o755)
   await writeFile(
@@ -1208,6 +1351,7 @@ async function manualLeaseFixture() {
     sshPids,
     remotePids,
     commandPids,
+    pgTransport,
     wrapper,
     command,
     env: {
@@ -4065,7 +4209,7 @@ describe('v5 release safety lanes', () => {
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
-      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.5 (test)}"',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.13 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -4102,6 +4246,7 @@ describe('v5 release safety lanes', () => {
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
       [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
       [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
+      [{ GROK_VERSION: 'grok 1.0.5 (previous commercial)' }, /Grok binary=.*expected='grok 1\.0\.13/],
       [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
     ] as const) {
       await writeFile(capture, '')
@@ -6546,7 +6691,9 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     // C1:trap 现在同时清 fencing meta 再退出。
     const signalTrap = holder.indexOf("trap 'drop_meta; exit 0' HUP INT TERM")
     const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
-    const leased = holder.indexOf('echo LEASED')
+    const leaseEcho = String.raw`echo \"LEASED $admission_nonce\"`
+    const leased = holder.indexOf(leaseEcho)
+    assert.ok(leased >= 0, 'nonce-bound LEASED handshake must exist')
     const loop = holder.indexOf('while :; do', leased)
     assert.ok(parentCapture >= 0, 'remote holder 未快照 sshd session parent')
     assert.ok(signalTrap > parentCapture && signalTrap < leased, '退出 trap 必须在 LEASED 握手前安装')
@@ -6563,7 +6710,11 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.doesNotMatch(holder, /exec sleep infinity/, '禁止 PID 1 收养的无限 sleep 继续持锁')
     // C1 硬 TTL + fencing 证据:meta 在 LEASED 前落盘,TTL 在 watch 循环里到点自 exit,
     // 每条退出路径都清自己的 meta。这几条一起消除"SIGKILL 部署→残活 ssh 焊死远端 lease 永不过期"。
-    assert.ok(holder.indexOf('write_meta\necho LEASED') >= 0, 'fencing meta 必须在 LEASED 握手前写(write_meta 调用)')
+    const metaWritten = holder.indexOf('\nwrite_meta\n')
+    const admission = holder.indexOf('\nv5_mutation_admission ')
+    assert.ok(metaWritten >= 0 && admission > metaWritten && admission < leased, 'fencing meta and successful common admission must precede the nonce-bound handshake')
+    const admissionFailure = holder.indexOf('|| { drop_meta; exit 79; }', admission)
+    assert.ok(admissionFailure > admission && admissionFailure < leased, 'failed admission must exit before LEASED')
     assert.ok(holder.indexOf('lease_ttl=') > parentCapture && holder.indexOf('lease_ttl=') < leased, 'remote holder 缺硬 TTL 变量 lease_ttl')
     assert.ok(
       holder.indexOf('-ge \\"\\$lease_ttl\\"', loop) > loop,
@@ -6809,7 +6960,7 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
   })
 
   test('manual mutation wrapper hard TTL fences long commands and preserves normal command status', async () => {
-    const ttlFx = await manualLeaseFixture()
+    const ttlFx = await manualLeaseFixture({ pgTransport: 'os-supervision' })
     const stubborn = await writeStubbornManualCommand(ttlFx)
     const ttlChild = spawn('bash', [ttlFx.wrapper, stubborn], {
       env: { ...ttlFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' },
@@ -6828,12 +6979,13 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'hard TTL left command-group processes alive',
       )
+      await assertManualOsPgProtocol(ttlFx)
     } finally {
       ttlChild.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(ttlFx.commandPids, ttlFx.sshPids, ttlFx.remotePids)
     }
 
-    const rcFx = await manualLeaseFixture()
+    const rcFx = await manualLeaseFixture({ pgTransport: 'os-supervision' })
     const rcCommand = path.join(rcFx.dir, 'exit-23.sh')
     await writeFile(rcCommand, '#!/bin/bash\nexit 23\n')
     await chmod(rcCommand, 0o755)
@@ -6849,8 +7001,69 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'normal nonzero command exit left the lease held',
       )
+      await assertManualOsPgProtocol(rcFx)
     } finally {
       await killManualLeaseFixtureProcesses(rcFx.sshPids, rcFx.remotePids)
+    }
+  })
+
+  test('OS-only PG transport rejects invalid protocol and slow admission expires before command start', async () => {
+    const slowFx = await manualLeaseFixture({ pgTransport: 'os-supervision', deployDelaySeconds: 2 })
+    const slowChild = spawn('bash', [slowFx.wrapper, slowFx.command], {
+      env: { ...slowFx.env, OC_V5_MUTATION_LEASE_TTL_SECONDS: '2' },
+      stdio: 'ignore',
+    })
+    let owned: ManualProcessIdentity[] = []
+    try {
+      assert.equal(await waitUntilManualLease(async () =>
+        (await manualPgTransportEvents(slowFx)).some((e) => e.role === 'deploy' && e.kind === 'entered'), 5_000), true,
+      'slow case never reached the actual transport')
+      const entry = (await manualPgTransportEvents(slowFx)).find((e) => e.role === 'deploy' && e.kind === 'entered')!
+      assert.equal((await manualProcessIdentity(entry.pid))?.start, entry.start, 'slow transport is not a live PID/start-bound process')
+      owned = await manualOwnedProcessSnapshot(slowFx, slowChild.pid!)
+      assert.equal(owned.some((p) => p.pid === entry.pid && p.start === entry.start), true, 'transport missing from owned subtree')
+      assert.equal(owned.some((p) => p.pid === slowChild.pid), true, 'wrapper missing from owned subtree')
+      assert.equal(await waitForChildExit(slowChild, 8_000), true, 'slow acquisition did not terminate under original hard TTL')
+      assert.equal(slowChild.exitCode, 86, `slow acquisition must fail closed; signal=${slowChild.signalCode}`)
+      assert.equal(existsSync(slowFx.commandStarted), false, 'expired acquisition started a command')
+      assert.deepEqual((await manualPgTransportEvents(slowFx)).map((e) => [e.role, e.kind]), [['deploy', 'entered']], 'slow deploy must not flush an accepted response or admit reads')
+      assert.equal(await waitUntilManualLease(async () => {
+        for (const process of owned) if ((await manualProcessIdentity(process.pid))?.start === process.start) return false
+        return true
+      }, 6_000), true, 'expired acquisition left PID/start-bound transport descendants alive')
+      assert.equal(await waitUntilManualLease(() => spawnSync('flock', ['-n', slowFx.lock, 'true']).status === 0, 6_000), true,
+      'expired acquisition left remote flock held')
+    } finally {
+      slowChild.kill('SIGKILL')
+      for (const process of owned) {
+        if ((await manualProcessIdentity(process.pid))?.start === process.start) {
+          try { globalThis.process.kill(process.pid, 'SIGKILL') } catch { /* already gone */ }
+        }
+      }
+      await killManualLeaseFixtureProcesses(slowFx.sshPids, slowFx.remotePids)
+    }
+
+    for (const invalid of ['unknown-sql', 'wrong-role-sql', 'duplicate-role', 'early-read', 'unknown-dsn', 'invalid-argv'] as const) {
+      const fx = await manualLeaseFixture({ pgTransport: 'os-supervision' })
+      const pg = fx.pgTransport!
+      const argv = [pg.dsns.deploy, '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-c', pg.deploySql]
+      if (invalid === 'duplicate-role') {
+        const accepted = spawnSync(pg.transport, argv, { env: fx.env, encoding: 'utf8', timeout: 10_000 })
+        assert.equal(accepted.status, 0, 'duplicate negative control requires the first actual call to complete')
+        assert.equal(JSON.parse(accepted.stdout).inRecovery, false)
+      }
+      if (invalid === 'unknown-sql') argv[6] = 'SELECT 1'
+      if (invalid === 'wrong-role-sql') argv[6] = pg.identitySql
+      if (invalid === 'early-read') { argv[0] = pg.dsns.gateway; argv[6] = pg.identitySql }
+      if (invalid === 'unknown-dsn') argv[0] = 'postgresql://unknown:test@127.0.0.1:55432/openclaude_test'
+      if (invalid === 'invalid-argv') argv[2] = '-At'
+      const rejected = spawnSync(pg.transport, argv, { env: fx.env, encoding: 'utf8', timeout: 10_000 })
+      assert.equal(rejected.status, 79, `${invalid} must be explicitly rejected`)
+      assert.equal(rejected.stdout, '', `${invalid} must not return a successful identity`)
+      const events = await manualPgTransportEvents(fx)
+      assert.equal(events.length, invalid === 'duplicate-role' ? 3 : 1, `${invalid} actual call count`)
+      assert.equal(events.at(-1)?.kind, 'rejected', `${invalid} must have a refusal receipt`)
+      assert.deepEqual(events.at(-1)?.args, argv)
     }
   })
 

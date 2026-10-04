@@ -31,7 +31,8 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
   },
   { input: '402 INSUFFICIENT_CREDITS: balance=1 required=9', code: 'insufficient_credits' },
   { input: '429 Too Many Requests', code: 'rate_limited' },
-  { input: 'Selected model is at capacity. Please try a different model.', code: 'model_capacity' },
+  { input: 'model is overloaded', code: 'model_capacity' },
+  { input: 'Selected model is at capacity. Please try a different model.', code: 'model_not_available' },
   { input: 'Anthropic returned 502 Bad Gateway', code: 'upstream_failed' },
   {
     input: "prompt is too long: ran out of room in the model's context window",
@@ -152,6 +153,7 @@ describe('turnErrorTaxonomy 契约 — wire OutboundError.code 枚举', () => {
     // model_capacity 是本批新增 wire 码,显式钉死其在枚举里(防被摘掉)。
     assert.ok(wireCodes.includes('model_capacity'))
     assert.ok(wireCodes.includes('model_config_changed_retry_turn'))
+    assert.ok(wireCodes.includes('model_not_available'))
     assert.ok(wireCodes.includes('user_cancelled'))
     // E4 — gateway 权威终态透传码 + E6 持久化降级码,钉死在 wire 枚举里。
     for (const code of [

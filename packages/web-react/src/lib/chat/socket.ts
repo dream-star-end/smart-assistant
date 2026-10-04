@@ -58,6 +58,7 @@ import {
 } from "./liveUnitsHydrate";
 import { repairPostFinalProcessOrder } from "./order";
 import {
+  freezeErrorCardSnapshots,
   isDispatchLostCode,
   isDispatchTerminalRow,
 } from "./render";
@@ -160,6 +161,89 @@ import {
 import type { DurableLiveFrame, DurableLiveFramePage, RefreshOutcome } from "../types";
 
 export type { ChatStatusClass };
+
+type RecoveryRejectedNotices = NonNullable<ChatSession["_recoveryRejectedNotices"]>;
+function validRecoveryRejectedNotices(raw: unknown): RecoveryRejectedNotices {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result: RecoveryRejectedNotices = {};
+  for (const [source, value] of Object.entries(raw)) {
+    if (!isClientMessageId(source) || !value || typeof value !== "object" || Array.isArray(value)) continue;
+    const item = value as { code?: unknown; notice?: unknown };
+    if (typeof item.code !== "string" || !item.code.trim() || typeof item.notice !== "string" || !item.notice.trim()) continue;
+    result[source] = { code: normalizeTurnErrorCode(item.code), notice: item.notice };
+  }
+  return result;
+}
+function rejectionNoticesFromRows(rows: readonly ChatMessage[]): RecoveryRejectedNotices {
+  const result: RecoveryRejectedNotices = {};
+  for (const row of rows) {
+    if (row?.role !== "assistant" || !isClientMessageId(row._clientMessageId) ||
+        typeof row._errorCode !== "string" || !row._errorCode.trim() ||
+        typeof row._recoverySkippedNotice !== "string" || !row._recoverySkippedNotice.trim()) continue;
+    result[row._clientMessageId] = { code: normalizeTurnErrorCode(row._errorCode), notice: row._recoverySkippedNotice };
+  }
+  return result;
+}
+function restoreRejectedNoticeMetadata(session: ChatSession, stored: StoredSession): boolean {
+  const before = session._recoveryRejectedNotices;
+  const notices = {
+    ...rejectionNoticesFromRows(Array.isArray(stored.messages) ? stored.messages : []),
+    ...validRecoveryRejectedNotices(stored._recoveryRejectedNotices),
+    ...validRecoveryRejectedNotices(before),
+    ...rejectionNoticesFromRows(session.messages),
+  };
+  // A live explicit clear wins over late disk feedback.
+  for (const row of session.messages) {
+    if (row.role === "assistant" && isClientMessageId(row._clientMessageId) &&
+        Object.prototype.hasOwnProperty.call(row, "_recoverySkippedNotice") &&
+        (typeof row._recoverySkippedNotice !== "string" || !row._recoverySkippedNotice.trim())) delete notices[row._clientMessageId];
+  }
+  const next = Object.keys(notices).length ? notices : undefined;
+  if (JSON.stringify(before) === JSON.stringify(next)) return false;
+  session._recoveryRejectedNotices = next;
+  return true;
+}
+/** Inspect raw accepted server rows BEFORE local merge, so an explicit clear
+ * cannot be confused with feedback transplanted by the local cache. */
+function applyRejectedNoticeMetadata(session: ChatSession, serverRows: ChatMessage[]): ChatMessage[] {
+  const notices = validRecoveryRejectedNotices(session._recoveryRejectedNotices);
+  const rows = serverRows.map((row) => {
+    if (row?.role !== "assistant" || !isClientMessageId(row._clientMessageId) ||
+        typeof row._errorCode !== "string" || !row._errorCode.trim()) return row;
+    const source = row._clientMessageId, code = normalizeTurnErrorCode(row._errorCode);
+    if (Object.prototype.hasOwnProperty.call(row, "_recoverySkippedNotice")) {
+      if (typeof row._recoverySkippedNotice === "string" && row._recoverySkippedNotice.trim()) {
+        notices[source] = { code, notice: row._recoverySkippedNotice };
+      } else delete notices[source];
+      return row;
+    }
+    const feedback = notices[source];
+    return feedback?.code === code ? { ...row, _recoverySkippedNotice: feedback.notice } : row;
+  });
+  session._recoveryRejectedNotices = Object.keys(notices).length ? notices : undefined;
+  return rows;
+}
+
+
+
+function deferredTerminalErrorPaintForStore(
+  paint: DeferredTerminalErrorPaint | undefined,
+): StoredSession["_deferredTerminalErrorPaint"] | undefined {
+  if (!paint) return undefined;
+  const normalized = typeof paint.normalized === "string" ? paint.normalized.slice(0, 64) : "";
+  const text = typeof paint.text === "string" ? paint.text.slice(0, 4000) : "";
+  if (!normalized || !text) return undefined;
+  return {
+    normalized,
+    text,
+    ...(typeof paint.detail === "string" && paint.detail ? { detail: paint.detail.slice(0, 2000) } : {}),
+    ...(typeof paint.displayMessage === "string" && paint.displayMessage
+      ? { displayMessage: paint.displayMessage.slice(0, 4000) }
+      : {}),
+    ...(isClientMessageId(paint.clientMessageId) ? { clientMessageId: paint.clientMessageId } : {}),
+    ...(typeof paint.traceId === "string" && paint.traceId ? { traceId: paint.traceId.slice(0, 128) } : {}),
+  };
+}
 
 function messageHasVisibleBody(message: ChatMessage): boolean {
   if (typeof message.text === "string" && message.text.trim().length > 0) return true;
@@ -351,9 +435,9 @@ export function recoverySkippedNotice(reason?: string): string {
     case "source_tape_malformed":
       return "没法从保存的进度继续。任务内容还在，请刷新后再试。";
     case "recovery_mode_mismatch":
-      return "没法从保存的进度继续。任务内容还在，请再点一次「从断点继续」。";
+      return "没法从断点继续。这句没有发出去，点重试再发一次。";
     case "automatic_checkpoint_unsafe":
-      return "自动续跑已跳过。任务内容还在，你可以手动从进度继续。";
+      return "自动续跑已跳过。这句没有发出去，请手动从进度继续，或点重试再发一次。";
     case "automatic_retry_exhausted":
       return "自动恢复已达到次数上限，原任务仍已保留。请在错误卡上手动重试。";
     case "capability_unavailable":
@@ -1916,6 +2000,7 @@ export class ChatSocket {
         }
       },
       deferTerminalErrorForRecovery: (sessId, paint) => this.deferTerminalErrorForRecovery(sessId, paint),
+      discardDeferredTerminalError: (sessId, clientMessageId) => this.discardDeferredTerminalError(sessId, clientMessageId),
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
@@ -2860,7 +2945,21 @@ export class ChatSocket {
     if (sess) sess._deferredTerminalErrorClientMessageId = undefined;
   }
 
-  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。*/
+  /** 静默终态到达时丢掉还没画上的延后卡。已经提交的卡不动。 */
+  private discardDeferredTerminalError(sessId: string, clientMessageId?: string): void {
+    const pending = this.pendingRecoveryErrors.get(sessId);
+    if (!pending) return;
+    if (pending.clientMessageId && clientMessageId && pending.clientMessageId !== clientMessageId) return;
+    clearTimeout(pending.timer);
+    this.pendingRecoveryErrors.delete(sessId);
+    const sess = this.sessions.get(sessId);
+    if (sess && (!clientMessageId || sess._deferredTerminalErrorClientMessageId === clientMessageId)) {
+      sess._deferredTerminalErrorClientMessageId = undefined;
+    }
+  }
+
+  /** 负向收口:用与实时路径完全相同的 painter 补画红卡并清发送态。失败/取消只在这里报。
+   * 宽限超时不准画卡：软状态继续等真正的裁决。点停也不补错误卡。 */
   private materializePendingRecoveryError(
     sessId: string,
     cause: ProblemCardMaterializeCause,
@@ -2868,6 +2967,10 @@ export class ChatSocket {
   ): void {
     const pending = this.pendingRecoveryErrors.get(sessId);
     if (!pending) return;
+    if (cause === "decision_timeout" || cause === "adoption_timeout") {
+      clearTimeout(pending.timer);
+      return;
+    }
     clearTimeout(pending.timer);
     this.pendingRecoveryErrors.delete(sessId);
     const sess = this.sessions.get(sessId);
@@ -2875,6 +2978,29 @@ export class ChatSocket {
     sess._deferredTerminalErrorClientMessageId = undefined;
     const wasActive = sess._sendingInFlight &&
       (!pending.clientMessageId || sess._activeClientMessageId === pending.clientMessageId);
+    if (cause === "stop_fenced") {
+      if (wasActive) {
+        sess._sendingInFlight = false;
+        sess._activeClientMessageId = undefined;
+        sess._turnStatus = null;
+        this.clearThinkingSafety(sessId);
+        this.kickQueuedDrainIfIdle();
+      }
+      this.deps.persistSession?.(sessId);
+      this.scheduleNotify();
+      const rootCmid = this.problemCardRootCmid(sess, pending.clientMessageId);
+      if (rootCmid) {
+        this.reportProblemCard(sessId, {
+          rootCmid,
+          code: pending.paint.normalized,
+          outcome: "cancelled",
+          path: "stop_fenced",
+          presentation: "soft",
+          traceId: pending.paint.traceId,
+        });
+      }
+      return;
+    }
     const painted = paintDeferredTerminalError(sess, pending.paint, this.effects());
     if (wasActive && !sess._sendingInFlight) {
       // painter 已清 in-flight;补齐 socket 侧收尾(thinking-safety / 排队消息续发)。
@@ -2890,7 +3016,7 @@ export class ChatSocket {
     this.reportProblemCard(sessId, {
       rootCmid,
       code,
-      outcome: cause === "stop_fenced" ? "cancelled" : "failed",
+      outcome: "failed",
       path: cause,
       presentation: problemCardPresentation(code, false),
       ...(reason ? { reason } : {}),
@@ -3034,6 +3160,21 @@ export class ChatSocket {
     const sourceClientMessageId = isClientMessageId(frame.sourceClientMessageId)
       ? frame.sourceClientMessageId
       : undefined;
+    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
+    const hadCommittedCard = sourceClientMessageId
+      ? sess.messages.some((message) =>
+        message.role === "assistant" &&
+        message._clientMessageId === sourceClientMessageId &&
+        message._errorCardSnapshot?.disposition === "card")
+      : false;
+    const pendingPaint = this.pendingRecoveryErrors.get(sessId);
+    if (
+      !hadCommittedCard &&
+      pendingPaint &&
+      (!pendingPaint.clientMessageId || pendingPaint.clientMessageId === sourceClientMessageId)
+    ) {
+      pendingPaint.paint = { ...pendingPaint.paint, displayMessage: skipNotice };
+    }
     // 血统被 master 原子拒绝:延后的红卡必须先落地,下方的 skip 提示才有卡可挂。
     this.settlePendingRecoveryError(sessId, sourceClientMessageId, "declined", "recovery_skipped");
     if (sourceClientMessageId) {
@@ -3042,7 +3183,6 @@ export class ChatSocket {
         [sourceClientMessageId]: true,
       };
     }
-    const skipNotice = recoverySkippedNotice(frame.recoverySkippedReason);
     let attachedToError = false;
     if (sourceClientMessageId) {
       for (const message of sess.messages) {
@@ -3052,6 +3192,10 @@ export class ChatSocket {
           message._clientMessageId === sourceClientMessageId
         ) {
           message._recoverySkippedNotice = skipNotice;
+          if (isClientMessageId(sourceClientMessageId) && typeof message._errorCode === "string" && message._errorCode.trim()) {
+            sess._recoveryRejectedNotices = { ...(sess._recoveryRejectedNotices ?? {}),
+              [sourceClientMessageId]: { code: normalizeTurnErrorCode(message._errorCode), notice: skipNotice } };
+          }
           attachedToError = true;
         }
       }
@@ -3647,6 +3791,14 @@ export class ChatSocket {
         return clean;
       });
     }
+    const pendingDeferred = this.pendingRecoveryErrors.get(s.id);
+    const pendingDeferredId = pendingDeferred?.clientMessageId;
+    const deferredTerminalErrorId = isClientMessageId(s._deferredTerminalErrorClientMessageId)
+      ? s._deferredTerminalErrorClientMessageId
+      : isClientMessageId(pendingDeferredId)
+        ? pendingDeferredId
+        : undefined;
+    const deferredTerminalErrorPaint = deferredTerminalErrorPaintForStore(pendingDeferred?.paint);
     return {
       id: s.id,
       agentId: s.agentId,
@@ -3674,6 +3826,11 @@ export class ChatSocket {
       ...(s._automaticRecoveryDecisions
         ? { _automaticRecoveryDecisions: { ...s._automaticRecoveryDecisions } }
         : {}),
+      ...(s._recoveryRejectedNotices ? { _recoveryRejectedNotices: validRecoveryRejectedNotices(s._recoveryRejectedNotices) } : {}),
+      ...(deferredTerminalErrorId ? { _deferredTerminalErrorClientMessageId: deferredTerminalErrorId } : {}),
+      ...(deferredTerminalErrorId && deferredTerminalErrorPaint
+        ? { _deferredTerminalErrorPaint: deferredTerminalErrorPaint }
+        : {}),
       ...(typeof s._turnStartedAt === "number" ? { _turnStartedAt: s._turnStartedAt } : {}),
       ...(typeof s._lastFrameAt === "number" ? { _lastFrameAt: s._lastFrameAt } : {}),
       _maxSeq: s._maxSeq,
@@ -3698,7 +3855,33 @@ export class ChatSocket {
    * （tracker reset / teardown / agent 切换）一并恢复,再重建 block/agent 索引。
    */
   loadStored(stored: StoredSession): void {
-    if (!stored?.id || this.sessions.has(stored.id)) return;
+    if (!stored?.id) return;
+    const existing = this.sessions.get(stored.id);
+    if (existing) {
+      let changed = restoreRejectedNoticeMetadata(existing, stored);
+      // A route placeholder may precede asynchronous IndexedDB hydration.
+      // Preserve live data, but durable rejection fences are monotonic.
+      const raw = stored._automaticRecoveryDecisions;
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        const decisions = Object.fromEntries(Object.entries(raw).filter(([source, value]) =>
+          isClientMessageId(source) && value === true));
+        if (Object.keys(decisions).some((key) => existing._automaticRecoveryDecisions?.[key] !== true)) {
+          existing._automaticRecoveryDecisions = { ...(existing._automaticRecoveryDecisions ?? {}), ...decisions };
+          changed = true;
+        }
+      }
+      const attempted = new Set((Array.isArray(stored.messages) ? stored.messages : [])
+        .filter((row) => row?.role === "user" && isClientMessageId(row.id) && row._automaticRecoveryAttempted === true)
+        .map((row) => row.id));
+      for (const row of existing.messages) {
+        if (row.role === "user" && attempted.has(row.id) && row._automaticRecoveryAttempted !== true) {
+          row._automaticRecoveryAttempted = true;
+          changed = true;
+        }
+      }
+      if (changed) { this.deps.persistSession?.(stored.id); this.scheduleNotify(); }
+      return;
+    }
     const s = createSession({
       id: stored.id,
       agentId: stored.agentId || this.deps.defaultAgentId || "main",
@@ -3764,6 +3947,7 @@ export class ChatSocket {
       typeof stored._settledPermissionRequestIds === "object"
         ? { ...stored._settledPermissionRequestIds }
         : undefined;
+    restoreRejectedNoticeMetadata(s, stored);
     s._automaticRecoveryDecisions =
       stored._automaticRecoveryDecisions &&
       typeof stored._automaticRecoveryDecisions === "object"
@@ -3799,10 +3983,16 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
-    const repairedStoredMessages = repairPostFinalProcessOrder(s.messages);
-    const repairedStoredOrder = repairedStoredMessages !== s.messages;
-    if (repairedStoredOrder) s.messages = repairedStoredMessages;
+    // An in-flight reload must keep the stored live order. Terminal repair
+    // runs only after the turn has actually stopped. OCV5-272
+    let repairedStoredOrder = false;
+    if (!restoredExactInFlight) {
+      const repairedStoredMessages = repairPostFinalProcessOrder(s.messages);
+      repairedStoredOrder = repairedStoredMessages !== s.messages;
+      if (repairedStoredOrder) s.messages = repairedStoredMessages;
+    }
     this.sessions.set(stored.id, s);
+    this.restoreDeferredTerminalError(s, stored);
     const storedControls = Array.isArray(stored._pendingControls)
       ? stored._pendingControls.filter((item) =>
           item?.kind === "control" &&
@@ -3842,6 +4032,55 @@ export class ChatSocket {
     }
     if (storedPending.length > 0 && !s._dispatchPaused) this.kickDispatchPump();
     this.scheduleNotify();
+  }
+
+
+  /** 刷新后继续等裁决。历史失败 tape 不能自行把源轮提交成错误卡。 */
+  private restoreDeferredTerminalError(s: ChatSession, stored: StoredSession): void {
+    const cmid = stored._deferredTerminalErrorClientMessageId;
+    const paint = stored._deferredTerminalErrorPaint;
+    if (!isClientMessageId(cmid) || !paint) return;
+    if (typeof paint.normalized !== "string" || typeof paint.text !== "string") return;
+    if (paint.normalized.length === 0 || paint.normalized.length > 64) return;
+    if (paint.text.length === 0 || paint.text.length > 4000) return;
+    if (s._cancelledAutomaticRecoveryIds?.[cmid] === true) return;
+    if (s._automaticRecoveryDecisions?.[cmid] === true) return;
+    s._deferredTerminalErrorClientMessageId = cmid;
+    if (!s._sendingInFlight) {
+      s._sendingInFlight = true;
+      s._activeClientMessageId = cmid;
+    }
+    const source = s.messages.find((message) => message.role === "user" && message.id === cmid);
+    const sourceAttempt = typeof source?._automaticRecoveryAttempt === "number" &&
+        Number.isSafeInteger(source._automaticRecoveryAttempt) &&
+        source._automaticRecoveryAttempt >= 1
+      ? source._automaticRecoveryAttempt
+      : 0;
+    s._turnStatus = {
+      kind: "retrying",
+      attempt: Math.min(sourceAttempt + 1, AUTOMATIC_TURN_RETRY_MAX),
+      max: AUTOMATIC_TURN_RETRY_MAX,
+      retryAt: Date.now(),
+    };
+    const restored: DeferredTerminalErrorPaint = {
+      normalized: paint.normalized,
+      text: paint.text,
+      ...(typeof paint.detail === "string" ? { detail: paint.detail } : {}),
+      ...(typeof paint.displayMessage === "string" ? { displayMessage: paint.displayMessage } : {}),
+      clientMessageId: isClientMessageId(paint.clientMessageId) ? paint.clientMessageId : cmid,
+      ...(typeof paint.traceId === "string" ? { traceId: paint.traceId } : {}),
+    };
+    const timer = setTimeout(
+      () => this.materializePendingRecoveryError(s.id, "decision_timeout"),
+      RECOVERY_DECISION_GRACE_MS,
+    );
+    if (typeof timer === "object" && timer && "unref" in timer) timer.unref();
+    this.pendingRecoveryErrors.set(s.id, {
+      paint: restored,
+      clientMessageId: cmid,
+      timer,
+      decided: false,
+    });
   }
 
   /**
@@ -3919,6 +4158,7 @@ export class ChatSocket {
     const hasVersion = typeof serverUpdatedAt === "number" && Number.isFinite(serverUpdatedAt);
     const watermark = s._lastServerSyncUpdatedAt ?? 0;
     if (hasVersion && serverUpdatedAt < watermark) return;
+    msgs = applyRejectedNoticeMetadata(s, msgs);
     // 会话级模型选择镜像:载荷已过版本护栏(未被证明过期)才应用,server-wins;
     // 缺省 = 服务端无值,保留本地(与侧栏 listSessions 合并同语义)。
     if (typeof archive?.modelId === "string" && archive.modelId) s._selectedModelId = archive.modelId;
@@ -4003,6 +4243,7 @@ export class ChatSocket {
         );
     s.messages = reconcileTimelineBashTailAuxiliaries(s.messages);
     s.messages = reconcileLateDelegateAgentGroups(s.messages);
+    const settlingActiveTurn = !!sendingCmid && terminalTurns.has(sendingCmid);
     if (hasVersion) s._lastServerSyncUpdatedAt = serverUpdatedAt;
     if (hasHistoryRevision) {
       s._historyRevision = incomingHistoryRevision;
@@ -4041,7 +4282,14 @@ export class ChatSocket {
     rebuildIndexes(s);
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
-    s.messages = repairPostFinalProcessOrder(s.messages);
+    if (!s._sendingInFlight || settlingActiveTurn) {
+      s.messages = repairPostFinalProcessOrder(s.messages);
+    }
+    freezeErrorCardSnapshots(
+      s.messages,
+      s._deferredTerminalErrorClientMessageId,
+      new Set(Object.keys(s._cancelledAutomaticRecoveryIds ?? {})),
+    );
     // 生成占位卡兜底消解:对账带回的 server 行若证明占位所属轮已在服务端收尾(锚点 user
     // 行被 echo + 存在更晚 _seq 的 server-authored assistant 行),清运行中占位——覆盖
     // 「live 终帧丢失、结果靠 REST 对账补上」的帧丢失类故障(2026-07-11 boss 生产事故)。
@@ -4063,6 +4311,7 @@ export class ChatSocket {
     if (
       !this.masterOwnsAutomaticRecovery &&
       tailRecoverableError &&
+      s._deferredTerminalErrorClientMessageId !== tailRecoverableError._clientMessageId &&
       s._automaticRecoveryDecisions?.[recoveryDecisionKey] !== true
     ) {
       setTimeout(
@@ -4566,8 +4815,34 @@ export class ChatSocket {
       ? Math.max(0, streamGeneration)
       : 0;
     const mapped = units.map((unit) => liveUnitToMessage(unit, { streamGeneration: generation }));
-    if (resetClientMessageIds.length > 0) {
-      this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
+    if (units.length === 0) {
+      // An empty pack is an explicit reset. A non-empty pack is only the tail
+      // window (plus open subtask cards). Wiping every local row for the turn
+      // and painting that window is what left a refresh with just the subtask.
+      if (resetClientMessageIds.length > 0) {
+        this.resetOwnerLocalRows(sess, resetClientMessageIds, liveProcessOwnersFromUnits(units));
+      }
+    } else {
+      const incomingIds = new Set<string>();
+      const incomingBlockIds = new Set<string>();
+      for (const unit of units) {
+        if (typeof unit.id === "string" && unit.id) incomingIds.add(unit.id);
+        const messageId = (unit as { messageId?: unknown }).messageId;
+        if (typeof messageId === "string" && messageId) incomingIds.add(messageId);
+        if (typeof unit.blockId === "string" && unit.blockId) incomingBlockIds.add(unit.blockId);
+      }
+      sess.messages = sess.messages.filter((message) => {
+        if (message._source === "server" || typeof message._turnTapeId === "string") return true;
+        if (incomingIds.has(message.id)) return false;
+        if (typeof message.blockId === "string" && incomingBlockIds.has(message.blockId)) return false;
+        return true;
+      });
+      if (sess._streamingAssistant && !sess.messages.includes(sess._streamingAssistant)) {
+        sess._streamingAssistant = null;
+      }
+      if (sess._streamingThinking && !sess.messages.includes(sess._streamingThinking)) {
+        sess._streamingThinking = null;
+      }
     }
     sess.messages = prependLiveUnitMessages(sess.messages, mapped);
     restoreLiveUnitStreamingState(sess, units);
@@ -4714,6 +4989,8 @@ export class ChatSocket {
   private convergeTerminalTurns(s: ChatSession, terminalTurns: Map<string, ServerTurnTerminal>): void {
     if (terminalTurns.size === 0) return;
     for (const [cmid, kind] of terminalTurns) {
+      // 恢复还没裁决。源轮 tape 不是终态否决，不能清掉「正在重试」也不能画卡。
+      if (s._deferredTerminalErrorClientMessageId === cmid) continue;
       const userRow = s.messages.find((m) => m.role === "user" && m.id === cmid);
       if (userRow) {
         if (kind === "completed") {
@@ -4759,6 +5036,11 @@ export class ChatSocket {
     normalizeDelegateCards(s);
     normalizeGoalCards(s);
     s.messages = repairPostFinalProcessOrder(s.messages);
+    freezeErrorCardSnapshots(
+      s.messages,
+      s._deferredTerminalErrorClientMessageId,
+      new Set(Object.keys(s._cancelledAutomaticRecoveryIds ?? {})),
+    );
     this.scheduleNotify();
   }
 
@@ -5754,6 +6036,49 @@ export class ChatSocket {
     else this.setTransientNotice(sess.id, "正在确认发送…");
     this.scheduleNotify();
     this.deps.persistSession?.(sess.id);
+  }
+
+  /** Pull a not-yet-sent message back into the composer and drop it from the queue. */
+  editQueuedMessage(sessId: string, msgId: string): string | undefined {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return undefined;
+    const user = sess.messages.find((message) => message.role === "user" && message.id === msgId);
+    if (!user || user.status !== "queued") return undefined;
+    const text = user._modelText || user.text || "";
+    this.clearPendingDispatch(sessId, msgId);
+    sess.messages = sess.messages.filter((message) => message.id !== msgId);
+    const stillQueued = this.offlineQueue.some(
+      (item) => item.sessId === sessId && item.state === "queued",
+    );
+    if (!stillQueued) sess._dispatchPaused = false;
+    this.deps.persistSession?.(sessId);
+    this.scheduleNotify();
+    return text;
+  }
+
+  /** Drop a not-yet-sent message from the queue without sending it. */
+  discardQueuedMessage(sessId: string, msgId: string): boolean {
+    return this.editQueuedMessage(sessId, msgId) !== undefined;
+  }
+
+  /**
+   * Send one queued message now. If a turn is still running, stop it first.
+   * Stop normally holds later messages; this click is the explicit send.
+   */
+  sendQueuedNow(sessId: string, msgId: string): void {
+    const sess = this.sessions.get(sessId);
+    if (!sess) return;
+    const queued = this.offlineQueue.some(
+      (item) => item.sessId === sessId && item.msgId === msgId && item.state === "queued",
+    );
+    const user = sess.messages.find((message) => message.role === "user" && message.id === msgId);
+    if (!queued || !user || user.status !== "queued") return;
+    if (sess._sendingInFlight && sess._activeClientMessageId !== msgId) {
+      this.stopTurn(sessId);
+    }
+    sess._dispatchPaused = false;
+    this.scheduleNotify();
+    this.kickDispatchPump();
   }
 
   stopTurn(sessId: string): void {

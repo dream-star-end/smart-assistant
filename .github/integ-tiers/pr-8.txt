@@ -1,0 +1,7 @@
+# PR shard 8: complete Box resource-envelope pipeline, split from pr-4.
+# The test's declared upper bound is 900000ms; keep the full test and oracle.
+# min-tests: 1
+# max-minutes: 25
+# file-timeout-ms: 900000
+# mutex-timeout-seconds: 1080
+packages/commercial/src/http/proxy/boxResourceEnvelope.pipeline.integ.test.ts

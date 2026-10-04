@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
@@ -148,17 +148,21 @@ describe("Sidebar 会话列表", () => {
     );
   });
 
-  it("活跃会话行有左侧 accent 竖条；非活跃行无竖条、圆角同为 rounded-md", () => {
+  // SIDEBAR-R1：选中态由「左侧 accent 竖条 + 灰底」改为浮起卡片（选中面 + 发丝描边阴影），
+  // 与「新建会话」卡片同一视觉语言；非颜色线索 = 卡片投影 + 标题加粗，读屏走 aria-current。
+  it("活跃会话行是浮起卡片（选中面 + 描边阴影 + 标题加粗）；非活跃行无卡片、圆角一致", () => {
     renderSidebar({ sessions: listSessions, activeId: "s-beta" });
     const activeBtn = screen.getByRole("button", { name: "Beta 上线检查" });
     const activeRow = activeBtn.closest("div");
-    expect(activeRow).toHaveClass("rounded-md", "bg-active");
-    expect(activeRow?.querySelector(".bg-accent")).not.toBeNull();
+    expect(activeRow).toHaveClass("rounded-sm", "bg-sidebar-active", "shadow-sidebar-active");
+    expect(activeRow).toHaveAttribute("data-active", "true");
+    expect(activeBtn.querySelector(".font-medium")).not.toBeNull();
 
     const idleBtn = screen.getByRole("button", { name: "季度复盘 Alpha" });
     const idleRow = idleBtn.closest("div");
-    expect(idleRow).toHaveClass("rounded-md");
-    expect(idleRow?.querySelector(".bg-accent")).toBeNull();
+    expect(idleRow).toHaveClass("rounded-sm");
+    expect(idleRow).not.toHaveClass("bg-sidebar-active");
+    expect(idleRow).not.toHaveAttribute("data-active");
   });
 
   it("管理/市场/组织/后台不再占侧栏主区；点账号菜单才出现，设置与退出也在菜单里", () => {
@@ -178,10 +182,13 @@ describe("Sidebar 会话列表", () => {
       onCycleTheme: () => {},
     });
     // 顶部「新建会话」+ 空态 CTA 同名(空态出口),取 DOM 序第一个(顶部按钮)锁 class 契约。
+    // SIDEBAR-R1：可见边界(描边 + 实底)画在外层卡片 [data-sidebar-new] 上，按钮本身透明铺满。
     const create = screen.getAllByRole("button", { name: "新建会话" })[0];
-    expect(create).toHaveClass("text-section");
-    expect(create.className).toMatch(/border-border/);
-    expect(create.className).toMatch(/bg-surface/);
+    const createCard = create.closest("[data-sidebar-new]");
+    expect(createCard).not.toBeNull();
+    expect(createCard).toHaveClass("text-section");
+    expect(createCard!.className).toMatch(/border-border/);
+    expect(createCard!.className).toMatch(/bg-surface/);
 
     expect(screen.queryByRole("button", { name: /管理中心/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /^市场/ })).toBeNull();
@@ -192,7 +199,8 @@ describe("Sidebar 会话列表", () => {
 
     const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
     expect(tutorial).toBeInTheDocument();
-    expect(tutorial).toHaveTextContent("案例");
+    // 默认宽度只留图标（SIDEBAR-R1），入口靠 aria-label / title 可辨。
+    expect(tutorial).toHaveAttribute("title", "案例展厅");
     expect(screen.getByRole("button", { name: /切换主题/ })).toBeInTheDocument();
 
     openAccountMenu();
@@ -659,7 +667,9 @@ describe("Sidebar 会话状态点", () => {
 
     const runImgs = leadImgs("正在跑");
     expect(runImgs).toHaveLength(1);
-    expect(runImgs[0]).toHaveClass("bg-info", "oc-session-running");
+    // 运行中 = info 色细线旋转环（形状与实心点可辨，不只靠颜色，SIDEBAR-R1）。
+    expect(runImgs[0]).toHaveClass("border-info", "oc-session-running");
+    expect(runImgs[0]).toHaveAttribute("data-dot-kind", "running");
     expect(runImgs[0]).toHaveAccessibleName("运行中");
     expect(
       runImgs[0]!.compareDocumentPosition(screen.getByRole("button", { name: "正在跑" })) &
@@ -672,7 +682,9 @@ describe("Sidebar 会话状态点", () => {
 
     const unreadImgs = leadImgs("未读完成");
     expect(unreadImgs).toHaveLength(1);
-    expect(unreadImgs[0]).toHaveClass("bg-success");
+    // 未读 = accent 实心点（「有新结果未看」的通用语汇，SIDEBAR-R1）。
+    expect(unreadImgs[0]).toHaveClass("bg-accent");
+    expect(unreadImgs[0]).toHaveAttribute("data-dot-kind", "unread");
     expect(unreadImgs[0]).toHaveAccessibleName("未读");
     expect(screen.getAllByRole("img", { name: "未读" })).toHaveLength(1);
 
@@ -1280,7 +1292,7 @@ describe("Sidebar 运行中置顶", () => {
     expect(collapsedBtn.querySelector("[data-project-running='2']")).toHaveTextContent("2");
     const collapsedDot = collapsedBtn.querySelector("[role='img']");
     expect(collapsedDot).toHaveAccessibleName("运行中");
-    expect(collapsedDot).toHaveClass("bg-info", "oc-session-running");
+    expect(collapsedDot).toHaveClass("border-info", "oc-session-running");
 
     rerender(
       <Sidebar
@@ -1299,7 +1311,7 @@ describe("Sidebar 运行中置顶", () => {
     const expandedBtn = screen.getByRole("button", { name: /工作/ });
     expect(expandedBtn.querySelector("[data-project-running]")).toBeNull();
     expect(screen.getByRole("button", { name: "跑着 A" })).toBeInTheDocument();
-    expect(leadImgs("跑着 A")[0]).toHaveClass("bg-info", "oc-session-running");
+    expect(leadImgs("跑着 A")[0]).toHaveClass("border-info", "oc-session-running");
     expect(sessionTitlesInList()).toEqual(["跑着 A", "跑着 B", "空闲"]);
   });
 
@@ -1581,8 +1593,15 @@ describe("Sidebar S-09 底栏最窄宽度", () => {
     expect(chip).toHaveAttribute("title", "余额 1,234,567 积分");
   });
 
-  it("默认 268px 仍显示「案例」文字", () => {
-    renderSidebar({ width: 268, credits: "1234567", onOpenTutorial: () => {} });
+  // SIDEBAR-R1：268px（默认 / 移动抽屉）下「案例」文字会把余额截成「余额 258.5万…」，
+  // 改为只留图标（aria-label / title 不变）；≥300px 拖宽后才带文字。
+  it("默认 268px 只留图标且余额完整；拖宽到 300px 才显示「案例」文字", () => {
+    const { unmount } = renderSidebar({ width: 268, credits: "1234567", onOpenTutorial: () => {} });
+    const tutorial = screen.getByRole("button", { name: "打开案例展厅" });
+    expect(tutorial).not.toHaveTextContent("案例");
+    expect(tutorial).toHaveAttribute("title", "案例展厅");
+    unmount();
+    renderSidebar({ width: 300, credits: "1234567", onOpenTutorial: () => {} });
     expect(screen.getByRole("button", { name: "打开案例展厅" })).toHaveTextContent("案例");
   });
 });
@@ -1798,5 +1817,104 @@ describe("Sidebar S-06 折叠按钮可访问名称", () => {
     );
     expect(screen.getByRole("button", { name: "关闭导航" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "折叠侧栏" })).toBeNull();
+  });
+});
+
+// SIDEBAR-R1：行菜单的第二入口。触屏只在当前会话常显「更多」，其余行长按呼出同一份菜单；
+// 桌面右键同样直达。长按成功后吞掉随后那一次 click，不能「呼出菜单 + 顺带切会话」。
+describe("Sidebar SIDEBAR-R1 行菜单：右键 / 触屏长按", () => {
+  const rows = [
+    session({ id: "s-a", title: "当前会话", updatedAt: iso(3) }),
+    session({ id: "s-b", title: "别的会话", updatedAt: iso(2) }),
+  ];
+
+  /** jsdom 的 PointerEvent 不一定带 pointerType / 坐标：显式补上，与真机触摸一致。 */
+  function touchPointer(
+    kind: "pointerDown" | "pointerMove" | "pointerUp",
+    el: Element,
+    x = 20,
+    y = 10,
+  ) {
+    const ev = createEvent[kind](el, { button: 0 });
+    Object.defineProperty(ev, "pointerType", { value: "touch" });
+    Object.defineProperty(ev, "clientX", { value: x });
+    Object.defineProperty(ev, "clientY", { value: y });
+    fireEvent(el, ev);
+  }
+
+  it("右键会话行直接打开行菜单", () => {
+    renderSidebar({ sessions: rows, activeId: "s-a" });
+    const row = screen.getByRole("button", { name: "别的会话" }).closest("div")!;
+    fireEvent.contextMenu(row);
+    expect(screen.getByRole("menuitem", { name: "重命名" })).toBeInTheDocument();
+  });
+
+  it("触屏长按 ≥450ms 打开行菜单，且松手后的 click 不切换会话", () => {
+    vi.useFakeTimers();
+    try {
+      const onSelect = vi.fn();
+      renderSidebar({ sessions: rows, activeId: "s-a", onSelect });
+      const btn = screen.getByRole("button", { name: "别的会话" });
+      touchPointer("pointerDown", btn);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      touchPointer("pointerUp", btn);
+      fireEvent.click(btn);
+      expect(onSelect).not.toHaveBeenCalled();
+      expect(screen.getByRole("menuitem", { name: "重命名" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("短按照常切换会话；按住后滑动（滚动列表）不会误触长按", () => {
+    vi.useFakeTimers();
+    try {
+      const onSelect = vi.fn();
+      renderSidebar({ sessions: rows, activeId: "s-a", onSelect });
+      const btn = screen.getByRole("button", { name: "别的会话" });
+      touchPointer("pointerDown", btn);
+      act(() => {
+        vi.advanceTimersByTime(120);
+      });
+      touchPointer("pointerUp", btn);
+      fireEvent.click(btn);
+      expect(onSelect).toHaveBeenCalledWith("s-b");
+
+      touchPointer("pointerDown", btn, 20, 10);
+      touchPointer("pointerMove", btn, 20, 40);
+      act(() => {
+        vi.advanceTimersByTime(600);
+      });
+      expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("多选入口收进搜索行尾部的图标钮，可访问名仍是「多选」", () => {
+    renderSidebar({ sessions: rows, onBatch: () => {} });
+    const entry = screen.getByRole("button", { name: "多选" });
+    expect(entry.closest("label")?.querySelector("[data-sidebar-search]")).not.toBeNull();
+    fireEvent.click(entry);
+    expect(screen.getByTestId("sidebar-batch-bar")).toBeInTheDocument();
+  });
+
+  it("项目内会话带层级引导线；置顶 / 未分组顶层会话不带", () => {
+    renderSidebar({
+      sessions: [
+        session({ id: "s-in", title: "项目里", projectId: "p-1", updatedAt: iso(3) }),
+        session({ id: "s-pin", title: "置顶的", pinned: true, updatedAt: iso(2) }),
+      ],
+      projects: [project({ id: "p-1", name: "甲" })],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    const rowOf = (t: string) =>
+      screen.getByRole("button", { name: t }).closest("[data-session-row]")!;
+    expect(rowOf("项目里").querySelector("[data-session-guide]")).not.toBeNull();
+    expect(rowOf("置顶的").querySelector("[data-session-guide]")).toBeNull();
   });
 });

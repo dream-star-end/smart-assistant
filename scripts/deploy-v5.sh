@@ -1476,6 +1476,10 @@ acquire_production_mutation_lease() {  # [<wait_secs>=60]
   local ttl_margin=2 local_ttl
   # deploy_id/holder_host = fencing 证据(reclaim 打印持有者身份;deploy_id 也用作 holder 自清 meta 的归属校验)。
   local deploy_id holder_host meta_path
+  local admission_nonce admission_helper_b64
+  admission_nonce="$(openssl rand -hex 16)"
+  [[ "$admission_nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+  admission_helper_b64="$(base64 -w0 "$REPO_ROOT/scripts/lib/v5-mutation-admission.sh")" || return 1
   deploy_id="$(openssl rand -hex 12)"
   holder_host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
   meta_path="$PRODUCTION_MUTATION_LEASE_META"
@@ -1508,7 +1512,9 @@ current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev
 case \"\$current_parent\" in ''|*[!0-9]*) exit 76 ;; esac
 [ \"\$current_parent\" = \"\$lease_parent\" ] || exit 76
 write_meta
-echo LEASED
+eval \"\$(printf '%s' '$admission_helper_b64' | base64 -d)\" || exit 79
+v5_mutation_admission '$PRODUCTION_MUTATION_LOCK.admission-nonce' '$admission_nonce' '$V5_ENV' \"\$lease_start\" \"\$lease_ttl\" \"\$lease_parent\" || { drop_meta; exit 79; }
+echo \"LEASED $admission_nonce\"
 while :; do
   current_parent=\"\$(awk '/^PPid:/{print \$2; exit}' \"/proc/\$\$/status\" 2>/dev/null)\" || { drop_meta; exit 0; }
   case \"\$current_parent\" in ''|*[!0-9]*) drop_meta; exit 0 ;; esac
@@ -1604,7 +1610,7 @@ done"
   while (( waited < poll_attempts )); do
     same_live_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" || break
     same_live_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" || break
-    if grep -q LEASED "$out" 2>/dev/null; then got=1; break; fi
+    if grep -Fxq "LEASED $admission_nonce" "$out" 2>/dev/null; then got=1; break; fi
     sleep 0.1; waited=$((waited + 1))
   done
   rm -f "$out"
@@ -1618,6 +1624,7 @@ done"
     return 1
   fi
   MUTATION_DEPLOY_ID="$deploy_id"
+  MUTATION_ADMISSION_NONCE="$admission_nonce"
   MUTATION_HOLDER_IDENTITY="$holder_host:$$:$MODE"
   echo "  ✓ 已取得 kl-mirror production-mutation lease(后台 ssh pid=$MUTATION_LEASE_PID,本地安全 TTL ${local_ttl}s,远端 holder 硬 TTL ${lease_ttl}s,deploy_id=$deploy_id)"
   return 0
@@ -1898,7 +1905,7 @@ image_grok="$(docker image inspect --format '{{ index .Config.Labels "oc.runtime
 actual_codex="$(docker run --rm --entrypoint codex "$target_image" --version)"
 [[ "$actual_codex" == "codex-cli $image_codex" ]] || { echo 'FATAL: image codex label/binary mismatch' >&2; exit 1; }
 actual_grok="$(docker run --rm --entrypoint grok-native "$target_image" --version)"
-[[ "$actual_grok" == grok\ 1.0.5\ * ]] || { echo 'FATAL: image Grok binary mismatch' >&2; exit 1; }
+[[ "$actual_grok" == grok\ 1.0.13\ * ]] || { echo 'FATAL: image Grok binary mismatch (expected grok 1.0.13 (...))' >&2; exit 1; }
 
 dburl="$(grep '^DATABASE_URL=' "$env_file" | tail -n 1 | cut -d= -f2-)"
 [[ -n "$dburl" ]] || { echo 'FATAL: DATABASE_URL missing' >&2; exit 1; }
@@ -4018,6 +4025,61 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # KL has no 127.0.0.1:55432. Do not ssh this probe and do not read
+  # DATABASE_URL. Commercial does not assume the controller fixture.
+  # The candidate is a git archive of full_sha; the gate hashes that tree.
+  # Do not write flavor.manifest.json and do not borrow checkout/donor deps.
+  box_dsn="${OC_V5_PROOF_TEST_DATABASE_URL:-${TEST_DATABASE_URL:-}}"
+  if [[ -z "$box_dsn" ]]; then
+    echo "✗ box success recovery: explicit test DSN required (OC_V5_PROOF_TEST_DATABASE_URL or TEST_DATABASE_URL); no commercial default fixture" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  box_cand="$(mktemp -d /tmp/ocv5-box-success-cand.XXXXXX)"
+  if ! git -C "$REPO_ROOT" archive --format=tar "$full_sha" | tar -x -C "$box_cand"; then
+    echo "✗ box success recovery: git archive $full_sha failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! timeout 900 npm --prefix "$box_cand" ci --ignore-scripts --no-audit --no-fund; then
+    echo "✗ box success recovery: npm ci inside the frozen archive failed; refusing the checkout and donor node_modules" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha"); then
+    echo "✗ pinned box success recovery behavioral gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha"); then
+    echo "✗ pinned box multitool continuation gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="$box_dsn" \
+      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha"); then
+    echo "✗ pinned box incident proofs gate failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  if ! (cd "$box_cand" && timeout 126 env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL -u TEST_DATABASE_URL \
+      -u OC_V5_PROOF_TEST_DATABASE_URL \
+      npx --no-install tsx scripts/check-v5-grok-cli-compatibility.ts --candidate-sha "$full_sha"); then
+    echo "✗ pinned Grok CLI compatibility gate (INC-20261001-GROK-CLI-426) failed" >&2
+    rm -rf "$box_cand"
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
+  rm -rf "$box_cand"
   if ! ssh "$KL_HOST" "set -e; cd '$staging' && npx --no-install tsx scripts/check-v5-taskboard-commercial-gate.ts"; then
     echo "✗ pinned taskboard commercial gate (OC_TASKBOARD_ENABLED=0 / empty-board digest) failed" >&2
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
@@ -6014,8 +6076,8 @@ assert_target_runtime_image_ready() {
     return 1
   }
   actual_grok="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$TARGET_RUNTIME_IMAGE' --version")" || return 1
-  [[ "$actual_grok" == grok\ 1.0.5\ * ]] || {
-    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.5 (...)'" >&2
+  [[ "$actual_grok" == grok\ 1.0.13\ * ]] || {
+    echo "✗ target runtime image Grok binary=$actual_grok,expected='grok 1.0.13 (...)'" >&2
     return 1
   }
   [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] \
@@ -6877,7 +6939,40 @@ smoke() {
 }
 
 # ───────────────────────── bootstrap:首次建立 v5 ─────────────────────────
+assert_bootstrap_complete_env() {
+  # Full candidate schema is bootstrap-only, never a repair/recovery lease gate.
+  assert_mutation_lease_alive "bootstrap-env" || return 86
+  if [[ "$DRY" == 1 ]]; then
+    echo "  [dry-run] require complete pre-provisioned bootstrap V5 env"
+    return 0
+  fi
+  local artifact digest compressed
+  artifact="$(node "$REPO_ROOT/scripts/lib/build-v5-bootstrap-validator.mjs")" || return 79
+  digest="${artifact%% *}"; compressed="${artifact#* }"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && -n "$compressed" ]] || return 79
+  ssh "$KL_HOST" bash -s -- "$V5_ENV" "$digest" "$compressed" <<'BOOTSTRAP_ENV'
+set -Eeuo pipefail
+env_file="$1"; expected_sha="$2"; compressed="$3"
+[[ "$(id -u)" == 0 && -f "$env_file" && ! -L "$env_file" &&
+   "$(stat -c '%u:%a' "$env_file")" == "0:600" ]] || exit 77
+umask 077
+tmp="$(mktemp)" || exit 77
+trap 'rm -f "$tmp"' EXIT
+printf '%s' "$compressed" | base64 -d | gzip -d >"$tmp" || exit 79
+actual_sha="$(sha256sum "$tmp")"; actual_sha="${actual_sha%% *}"
+[[ "$actual_sha" == "$expected_sha" ]] || { echo "bootstrap: validator SHA-256 mismatch" >&2; exit 79; }
+# No public/live source, unit, env or dependency installation in validation.
+timeout --signal=KILL --kill-after=1 20 bash -c '
+  set -euo pipefail
+  set -a; . "$1"; set +a
+  export NODE_ENV=production
+  exec node "$2"
+' bootstrap-env "$env_file" "$tmp"
+BOOTSTRAP_ENV
+}
+
 bootstrap() {
+  assert_bootstrap_complete_env || return $?
   echo "══ v5 bootstrap on $KL_HOST ══"
   echo "── 守卫:overrides 不得含 REMOVE_KEYS ──"
   assert_overrides_no_remove_keys
@@ -8639,19 +8734,19 @@ activate_staged_inner() {
     [[ "$image_commit" =~ ^[0-9a-f]{7,40}$ && "$expected_full_commit" == "$image_commit"* ]] || {
       echo "✗ runtime image source_commit=$image_commit is not target commit $expected_full_commit 的前缀" >&2; exit 1;
     }
-    [[ "$image_codex_version" == "0.153.3" ]] || {
-      echo "✗ runtime image codex label=$image_codex_version,expected=0.153.3" >&2; exit 1;
+    [[ "$image_codex_version" == "0.159.2" ]] || {
+      echo "✗ runtime image codex label=$image_codex_version,expected=0.159.2" >&2; exit 1;
     }
     [[ "$image_include_grok" == 1 ]] || {
       echo "✗ runtime image 缺 official Grok binary label(oc.runtime.include_grok=1)" >&2; exit 1;
     }
     actual_codex_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint codex '$runtime_image' --version")"
-    [[ "$actual_codex_version" == "codex-cli 0.153.3" ]] || {
-      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.153.3'" >&2; exit 1;
+    [[ "$actual_codex_version" == "codex-cli 0.159.2" ]] || {
+      echo "✗ runtime image codex binary=$actual_codex_version,expected='codex-cli 0.159.2'" >&2; exit 1;
     }
     actual_grok_version="$(ssh "$KL_HOST" "docker run --rm --entrypoint grok-native '$runtime_image' --version")"
-    [[ "$actual_grok_version" == grok\ 1.0.5\ * ]] || {
-      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.5 (...)'" >&2; exit 1;
+    [[ "$actual_grok_version" == grok\ 1.0.13\ * ]] || {
+      echo "✗ runtime image Grok binary=$actual_grok_version,expected='grok 1.0.13 (...)'" >&2; exit 1;
     }
     echo "  ✓ runtime image source=$image_commit,codex=$actual_codex_version,grok=$actual_grok_version"
   fi

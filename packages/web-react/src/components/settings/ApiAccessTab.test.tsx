@@ -334,6 +334,30 @@ describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
     );
   });
 
+  test("轻量位按家族优先级选，不被服务端数组中的 sonnet 抢先", () => {
+    const priorities = [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/] as const;
+    expect(pickDefaultModel(["sonnet-5", "gemini-3.8-flash", "haiku-4.5"], "missing", priorities)).toBe("haiku-4.5");
+    expect(pickDefaultModel(["gemini-3.8-flash", "sonnet-5", "haiku-4.5"], "missing", priorities)).toBe("haiku-4.5");
+  });
+
+  test("缺 haiku 时 flash 优先于更早的 sonnet，没有 flash 才选 sonnet", () => {
+    const priorities = [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/] as const;
+    expect(pickDefaultModel(["sonnet-5", "gemini-3.8-flash"], "missing", priorities)).toBe("gemini-3.8-flash");
+    expect(pickDefaultModel(["opus-5", "sonnet-5"], "missing", priorities)).toBe("sonnet-5");
+  });
+
+  test("有序 fallback 不覆盖首选项，缺失或空列表仍用首选", () => {
+    const priorities = [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/] as const;
+    expect(pickDefaultModel(["haiku-4.5", "gemini-3.8-flash"], "gemini-3.8-flash", priorities)).toBe("gemini-3.8-flash");
+    expect(pickDefaultModel(null, "haiku-4.5", priorities)).toBe("haiku-4.5");
+    expect(pickDefaultModel([], "haiku-4.5", priorities)).toBe("haiku-4.5");
+  });
+
+  test("所有有序 fallback 未命中或空模式组仍保留原列表首项兜底", () => {
+    expect(pickDefaultModel(["opus-5", "grok-4.6"], "missing", [/^haiku-/, /^gemini-/, /^sonnet-/])).toBe("opus-5");
+    expect(pickDefaultModel(["grok-4.6", "opus-5"], "missing", [])).toBe("grok-4.6");
+  });
+
   test("familyGuideList:未加载/空 → 默认五家族;有列表 → 交集且按默认集顺序;交集为空 → 退回实际列表", () => {
     const DEFAULTS = ["fable-5.1", "opus-5", "opus-4.8", "sonnet-5", "haiku-4.5"];
     // 拉取失败 / 尚未加载 / 空列表 → 静态默认集(说明性质)。

@@ -26,6 +26,7 @@
  *  10. preCheck 释放兜底:Redis TTL=300s,即使 finalize 漏调也自动清
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
@@ -216,8 +217,110 @@ export const SIZE_LIMITS = {
   tools: 2 * 1024 * 1024,
 } as const;
 
-/** 总 body 上限(JSON 全文 byteLength)。超过 → 413。 */
+/** 总 body 上限(JSON 全文 byteLength)。超过 → 413。未验签 / 非 Box 仍用这个值。 */
 export const MAX_BODY_BYTES_DEFAULT = 16 * 1024 * 1024;
+
+/**
+ * OCV5-296 资源包络。`legacy` 是原预算。`box-native-v1` 只在验签后的精确 Box
+ * 路由上生效,不能由 body.model 或请求头自报。
+ *
+ * 读取分配:身份通过后、签名判定前,HTTP 正文最多分配
+ * `MAX_BODY_BYTES_HARD_CEILING`(24 MiB,服务器常量)。这不是“未分配”。
+ * 签后按所选包络再卡总 body / messages;不合格请求最终仍受 legacy。
+ * system / tools 两档都是 2 MiB。2000 条消息上限不在这里放宽。
+ */
+export type ProxyByteBudgetId = "legacy" | "box-native-v1";
+export interface ProxyByteBudget {
+  readonly id: ProxyByteBudgetId;
+  readonly messages: number;
+  readonly system: number;
+  readonly tools: number;
+  readonly totalBody: number;
+  /** Stable context / request fingerprint JSON, not the assistant-content hash. */
+  readonly contextHash: number;
+  /** Box text-plan history snapshot only. stdin / system files stay 8 MiB. */
+  readonly snapshot: number;
+}
+export const PROXY_BYTE_BUDGET_LEGACY: ProxyByteBudget = {
+  id: "legacy",
+  messages: SIZE_LIMITS.messages,
+  system: SIZE_LIMITS.system,
+  tools: SIZE_LIMITS.tools,
+  totalBody: MAX_BODY_BYTES_DEFAULT,
+  contextHash: 16 * 1024 * 1024,
+  snapshot: 8 * 1024 * 1024,
+};
+export const PROXY_BYTE_BUDGET_BOX_NATIVE_V1: ProxyByteBudget = {
+  id: "box-native-v1",
+  messages: 16 * 1024 * 1024,
+  system: SIZE_LIMITS.system,
+  tools: SIZE_LIMITS.tools,
+  totalBody: 24 * 1024 * 1024,
+  contextHash: 24 * 1024 * 1024,
+  snapshot: 24 * 1024 * 1024,
+};
+/** Fixed pre-signature read ceiling. Allocated up to this many bytes. */
+export const MAX_BODY_BYTES_HARD_CEILING = PROXY_BYTE_BUDGET_BOX_NATIVE_V1.totalBody;
+export const BOX_NATIVE_CONTEXT_OWNER = "box-native-v1";
+
+const verifiedProxyByteBudget = new AsyncLocalStorage<ProxyByteBudget>();
+
+/** Legacy unless the handler entered `runWithVerifiedProxyByteBudget`. */
+export function currentVerifiedProxyByteBudget(): ProxyByteBudget {
+  return verifiedProxyByteBudget.getStore() ?? PROXY_BYTE_BUDGET_LEGACY;
+}
+
+export function runWithVerifiedProxyByteBudget<T>(
+  budget: ProxyByteBudget,
+  fn: () => T,
+): T {
+  return verifiedProxyByteBudget.run(budget, fn);
+}
+
+/**
+ * Strict read of `capabilityProfile.ccb.contextOwner`. Absent or any other
+ * value is not this envelope. Does not look at headers or body.model.
+ * Catalog declaration alone does not select the enlarged budget; the handler
+ * also requires the issuance ready bit and the verified signed envelope.
+ */
+export function readBoxNativeContextOwner(
+  capabilityProfile: unknown,
+): typeof BOX_NATIVE_CONTEXT_OWNER | null {
+  if (!capabilityProfile || typeof capabilityProfile !== "object" || Array.isArray(capabilityProfile)) {
+    return null;
+  }
+  const ccb = (capabilityProfile as Record<string, unknown>).ccb;
+  if (!ccb || typeof ccb !== "object" || Array.isArray(ccb)) return null;
+  const owner = (ccb as Record<string, unknown>).contextOwner;
+  return owner === BOX_NATIVE_CONTEXT_OWNER ? BOX_NATIVE_CONTEXT_OWNER : null;
+}
+
+export interface VerifiedBoxEnvelopeInput {
+  /** `gate.authorityKind` after signature verification. Not a header. */
+  authorityKind: string | null | undefined;
+  /** `selectUpstreamRoute().kind`. Not body.model. */
+  routeKind: string | null | undefined;
+  canonicalModel?: string | null;
+  providerId?: string | null;
+  /** Catalog declaration. Not sufficient by itself. */
+  declaredContextOwner?: string | null;
+  /** Full authority envelope only. Null means lease-only or local catalog. */
+  verifiedSignedContextOwner?: string | null;
+  /** Issuance `BOX_NATIVE_CONTEXT_ROUTE_READY`. Not `OC_BOX_MODEL_API`. */
+  routeReady: boolean;
+}
+
+/** Mirrors `issueBoxNativeContextOwner` plus the verified signed token. */
+export function selectVerifiedBoxByteBudget(input: VerifiedBoxEnvelopeInput): ProxyByteBudget {
+  if (input.routeReady !== true) return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.authorityKind !== "bridge_signed") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.routeKind !== "box") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.providerId !== "box_cli") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.canonicalModel !== "box-api-claude-opus-5-5") return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.declaredContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return PROXY_BYTE_BUDGET_LEGACY;
+  if (input.verifiedSignedContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return PROXY_BYTE_BUDGET_LEGACY;
+  return PROXY_BYTE_BUDGET_BOX_NATIVE_V1;
+}
 
 /** messages / tools 数量上限。
  *
@@ -278,8 +381,9 @@ export const proxyBodySchema = z
     temperature: z.number().min(0).max(2).optional(),
     top_p: z.number().min(0).max(1).optional(),
     top_k: z.number().int().nonnegative().max(500).optional(),
-    /** stream 强制为 true(我们只跑流式;非流接口 MVP 不开)。 */
-    stream: z.literal(true).optional(),
+    /** Explicit false is parsed only so Box can reattach the SAME prior paid
+     * call as JSON. All other routes reject it before external dispatch. */
+    stream: z.boolean().optional(),
     /** Claude SDK 会在 system + messages 之外塞 thinking;允许透传 */
     thinking: z.unknown().optional(),
     /**
@@ -342,8 +446,16 @@ export function applyModelDefaultEffort(
  * 用 Buffer.byteLength(JSON.stringify(...), 'utf8'):base64 image 自然计入,符合 R3 口径。
  * 任意维超限 → throw HttpError(413, "BODY_FIELD_TOO_LARGE", ...)。
  */
-export function enforceFieldByteBudgets(body: ProxyBody): void {
-  const checks: Array<[keyof typeof SIZE_LIMITS, unknown]> = [
+export function enforceFieldByteBudgets(
+  body: ProxyBody,
+  budget: ProxyByteBudget = PROXY_BYTE_BUDGET_LEGACY,
+): void {
+  const limits = {
+    messages: budget.messages,
+    system: budget.system,
+    tools: budget.tools,
+  } as const;
+  const checks: Array<[keyof typeof limits, unknown]> = [
     ["messages", body.messages],
     ["system", body.system],
     ["tools", body.tools],
@@ -351,7 +463,7 @@ export function enforceFieldByteBudgets(body: ProxyBody): void {
   for (const [field, value] of checks) {
     if (value === undefined) continue;
     const bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
-    const limit = SIZE_LIMITS[field];
+    const limit = limits[field];
     if (bytes > limit) {
       throw new HttpError(
         413,
@@ -360,6 +472,36 @@ export function enforceFieldByteBudgets(body: ProxyBody): void {
       );
     }
   }
+}
+
+/** Raw HTTP body length against the selected envelope. Does not shrink a buffer already read. */
+export function enforceTotalBodyBudget(byteLength: number, budget: ProxyByteBudget): void {
+  if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > budget.totalBody) {
+    throw new HttpError(
+      413,
+      "PAYLOAD_TOO_LARGE",
+      `request body exceeds ${budget.totalBody} bytes`,
+    );
+  }
+}
+
+/**
+ * Pre-signature ceiling: reject only what even the largest server envelope
+ * cannot admit. Does not grant that envelope.
+ */
+export function enforcePreAuthByteCeiling(body: ProxyBody, rawBodyBytes: number): void {
+  enforceTotalBodyBudget(rawBodyBytes, PROXY_BYTE_BUDGET_BOX_NATIVE_V1);
+  enforceFieldByteBudgets(body, PROXY_BYTE_BUDGET_BOX_NATIVE_V1);
+}
+
+/** Post-signature subdivision. Unqualified requests pass the legacy budget. */
+export function enforceVerifiedProxyBudget(
+  body: ProxyBody,
+  rawBodyBytes: number,
+  budget: ProxyByteBudget,
+): void {
+  enforceTotalBodyBudget(rawBodyBytes, budget);
+  enforceFieldByteBudgets(body, budget);
 }
 
 /**
@@ -928,15 +1070,20 @@ class UsageObserver {
     }
     // message_start: { type, message: { ..., usage: {...}}}
     // message_delta: { type, delta:{...}, usage: {...}}
-    const usage =
-      ev.event === "message_start"
-        ? extractUsageFromMessageStart(parsed)
-        : extractUsageFromMessageDelta(parsed);
-    if (!usage) return;
+    const startUsage = ev.event === "message_start" ? extractUsageFromMessageStart(parsed) : null;
+    const deltaUsage = ev.event === "message_delta" ? extractUsageFromMessageDelta(parsed) : null;
+    if (!startUsage && !deltaUsage) return;
     // message_delta 携 stop_reason 时视为 final
     const isFinal =
       ev.event === "message_delta" && hasStopReason(parsed);
-    this.latest = { kind: isFinal ? "final" : "partial", usage };
+    // Anthropic message_delta normally carries cumulative output_tokens but
+    // omits input/cache fields already sent in message_start. Absence means
+    // "unchanged", not zero; replacing the entire object underbills caching.
+    const prior: TokenUsage = this.latest.kind === "none"
+      ? { input_tokens: 0n, output_tokens: 0n, cache_read_tokens: 0n, cache_write_tokens: 0n }
+      : this.latest.usage;
+    this.latest = { kind: isFinal ? "final" : "partial",
+      usage: startUsage ?? { ...prior, ...(deltaUsage ?? {}) } };
   }
 }
 
@@ -977,15 +1124,17 @@ function extractUsageFromMessageStart(parsed: unknown): TokenUsage | null {
   };
 }
 
-function extractUsageFromMessageDelta(parsed: unknown): TokenUsage | null {
+function extractUsageFromMessageDelta(parsed: unknown): Partial<TokenUsage> | null {
   if (!isObj(parsed)) return null;
   const u = parsed.usage;
   if (!isObj(u)) return null;
   return {
-    input_tokens: readNonNegInt(u.input_tokens),
-    output_tokens: readNonNegInt(u.output_tokens),
-    cache_read_tokens: readNonNegInt(u.cache_read_input_tokens),
-    cache_write_tokens: readNonNegInt(u.cache_creation_input_tokens),
+    ...(u.input_tokens === undefined ? {} : { input_tokens: readNonNegInt(u.input_tokens) }),
+    ...(u.output_tokens === undefined ? {} : { output_tokens: readNonNegInt(u.output_tokens) }),
+    ...(u.cache_read_input_tokens === undefined ? {}
+      : { cache_read_tokens: readNonNegInt(u.cache_read_input_tokens) }),
+    ...(u.cache_creation_input_tokens === undefined ? {}
+      : { cache_write_tokens: readNonNegInt(u.cache_creation_input_tokens) }),
   };
 }
 
@@ -1497,11 +1646,38 @@ export interface AnthropicProxyDeps {
    * concurrencyLimiter.
    */
   fallbackLimiter?: FallbackRateLimiter;
+  /** OCV5-297: per-uid pool for Box-routed requests (from BoxCapacityPolicy).
+   * A Box request moves from the shared slot to this pool once the route is
+   * known. Omitted → Box stays on the shared per-uid pool (commercial). */
+  boxConcurrencyLimiter?: ConcurrencyLimiter;
+  /** OCV5-297: Box-route rate limit, counted on its own key after routing.
+   * Omitted → single shared rate limit, unchanged. */
+  boxRateLimit?: RateLimitConfig;
   /** identity authorize 与 model-authority gate 共用的 epoch-aware 权威加载器。 */
   loadUserModelAuthz: import("../../auth/userModelAuthz.js").UserModelAuthzLoader;
   rateLimitRedis: RateLimitRedis;
   /** 注入 fetch(测试用)。 */
   fetchImpl?: typeof fetch;
+  /** Optional, off-by-default Box CLI model transport. The proxy retains
+   * identity/authority/precheck/finalizer; this component owns only the Box
+   * invocation and its independent cross-HTTP account-capacity lease. */
+  boxModel?: {
+    toolBridgeReady?: boolean;
+    fetch(args: { uid: bigint; sessionId: string | null; requestId: string;
+      canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
+      url: string; init: RequestInit;
+      prepared?: import("./boxPreparedContinuation.js").PreparedContinuation }): Promise<Response>;
+  };
+  /** Read-only same-round capsule replay, independent of the Box launch flag. */
+  boxReplay?: {
+    lookup(args: { uid: bigint; canonicalModel: string; canonicalBody: ProxyBody;
+      upstreamModel: string;
+      trustedAuthority?: import("./boxPreparedContinuation.js").AuthorityProjection;
+      prepared?: import("./boxPreparedContinuation.js").PreparedContinuation }): Promise<import("./boxReplayCompleted.js").BoxReplayLookup>;
+    /** OCV5-306: how long a same-request retry waits for a still-resolving
+     * Box call before answering BOX_REPLAY_PENDING. Absent = do not wait. */
+    pendingWait?: { budgetMs: number; intervalMs: number };
+  };
   /** 上游 endpoint;默认 api.anthropic.com */
   upstreamEndpoint?: string;
   /** 限流配置覆盖 */
@@ -1690,7 +1866,10 @@ export interface AnthropicProxyHandler {
 
 // ─── 小工具:body 读 + JSON parse(带上限) ──────────────────────────────
 
-export async function readBoundedJson(req: IncomingMessage, maxBytes: number): Promise<unknown> {
+export async function readBoundedJsonMeasured(
+  req: IncomingMessage,
+  maxBytes: number,
+): Promise<{ value: unknown; byteLength: number }> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -1706,10 +1885,14 @@ export async function readBoundedJson(req: IncomingMessage, maxBytes: number): P
   }
   const text = Buffer.concat(chunks, total).toString("utf-8");
   try {
-    return JSON.parse(text);
+    return { value: JSON.parse(text), byteLength: total };
   } catch (err) {
     throw new HttpError(400, "INVALID_JSON", `body is not valid JSON: ${(err as Error).message}`);
   }
+}
+
+export async function readBoundedJson(req: IncomingMessage, maxBytes: number): Promise<unknown> {
+  return (await readBoundedJsonMeasured(req, maxBytes)).value;
 }
 
 // ─── err response helper(不走 router 的 sendError,因为 proxy 不走 router) ──

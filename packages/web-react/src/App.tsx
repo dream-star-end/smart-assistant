@@ -36,7 +36,9 @@ import {
   type ImageEditSubmit,
 } from "./components/chat/imageEditActions";
 import { extractLatestTodos, PinnedTaskTracker } from "./components/chat/PinnedTaskTracker";
+import { QueuedSendList } from "./components/chat/QueuedSendList";
 import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
+import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
 import { EmptyState } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
@@ -2565,6 +2567,20 @@ export function App() {
           },
       onRetrySend: demo ? undefined : retrySend,
       onEditResend: (m) => setComposerPrefill({ text: m.text || "", nonce: Date.now() }),
+      onEditQueued: (m) => {
+        const text = activeId
+          ? (sockRef.current?.editQueuedMessage(activeId, m.id) ?? m.text ?? "")
+          : (m.text || "");
+        setComposerPrefill({ text, nonce: Date.now() });
+      },
+      onDeleteQueued: (m) => {
+        if (!activeId) return;
+        sockRef.current?.discardQueuedMessage(activeId, m.id);
+      },
+      onSendQueuedNow: (m) => {
+        if (!activeId) return;
+        sockRef.current?.sendQueuedNow(activeId, m.id);
+      },
       onOpenModelPicker: () => setModelPickerOpen(true),
       onContinueInterrupted: demo ? undefined : continueInterrupted,
       resolveInterruptedContinuation: demo ? undefined : resolveInterruptedContinuation,
@@ -2637,12 +2653,19 @@ export function App() {
     }
   } else {
     for (let i = wsMessages.length - 1; i >= 0; i--) {
-      if (wsMessages[i].role === "user" && wsMessages[i].text) {
-        lastUserText = wsMessages[i].text;
+      const message = wsMessages[i];
+      if (message.role === "user" && message.status !== "queued" && message.text) {
+        lastUserText = message.text;
         break;
       }
     }
   }
+  const timelineMessages = wsMessages.filter(
+    (message) => message.role !== "user" || message.status !== "queued",
+  );
+  const queuedOutgoing = wsMessages.filter(
+    (message) => message.role === "user" && message.status === "queued",
+  );
 
   // 视频任务能力探测:登录后拉一次。仅在服务端明确回答 available:false 时隐藏入口;
   // 请求失败/未知保持可见(任务中心内部有「暂未开放」兜底),避免网络抖动误藏功能。
@@ -3337,7 +3360,8 @@ export function App() {
     historyError: !demo && historyError !== null,
   });
 
-  // 统一真实时间线分页：仅显式按钮加载，滚动绝不发请求。
+  // 更早对话仍只靠显式按钮，滚动不发请求。
+  // 本轮处理步骤按游标自动补齐，不在过程区放「加载更早的处理步骤」。
   // demo / 无选中会话时不下发(MessageList 退化为纯本地翻页)。
   const messageListArchive: MessageListArchive | undefined =
     !demo && activeId
@@ -3347,9 +3371,8 @@ export function App() {
           error: archiveError,
           onLoadOlder: onLoadOlderHistory,
           liveHasMoreBefore: activeSess?._liveUnitsHasMoreBefore === true,
-          onLoadOlderLiveUnits: async () => {
-            await chat.loadOlderLiveUnits(activeId);
-          },
+          liveUnitsCursor: activeSess?._liveUnitsBeforeCursor ?? null,
+          onLoadOlderLiveUnits: () => chat.loadOlderLiveUnits(activeId),
         }
       : undefined;
 
@@ -3773,6 +3796,7 @@ export function App() {
                   </div>
                 )}
                 <MessageList
+                  processDisclosure
                   key={activeId}
                   messages={wsMessages}
                   sending={wsSending}
@@ -3802,10 +3826,13 @@ export function App() {
               初始展开全部 → ~3s 自动折叠成「正在执行的一条」;无任务或本轮已收口时组件自渲染
               null(收口后由 MessageRenderer 的 inline 只读 TodoWrite/plan 卡兜底)。 */}
           {!demo && !gated && (
+            <PinnedGoalBar messages={timelineMessages} />
+          )}
+          {!demo && !gated && (
             <PinnedTaskTracker
-              todos={extractLatestTodos(wsMessages)}
+              todos={extractLatestTodos(timelineMessages)}
               active={wsSending}
-              settled={currentTurnSettled(wsMessages)}
+              settled={currentTurnSettled(timelineMessages)}
               tokenUsage={activeSess?._liveTurnUsage?.usage}
             />
           )}
@@ -3896,6 +3923,14 @@ export function App() {
                 </div>
               </Alert>
             </div>
+          )}
+          {!demo && !gated && queuedOutgoing.length > 0 && (
+            <QueuedSendList
+              messages={queuedOutgoing}
+              onEdit={(message) => cardCallbacks.onEditQueued?.(message)}
+              onDelete={(message) => cardCallbacks.onDeleteQueued?.(message)}
+              onSendNow={(message) => cardCallbacks.onSendQueuedNow?.(message)}
+            />
           )}
           <Composer
             onSend={(text, media, replyTo) =>

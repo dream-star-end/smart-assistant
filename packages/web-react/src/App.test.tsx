@@ -709,8 +709,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       model: 'gpt-5.6-terra',
       text: '先设目标再执行',
     }))
-    if (!navigate) await waitFor(() => expect(screen.getAllByTestId('user-row')).toHaveLength(1))
-    else expect(screen.queryAllByTestId('user-row')).toHaveLength(0)
+    if (!navigate) {
+      await waitFor(() => expect(screen.getAllByTestId('queued-send-row')).toHaveLength(1))
+      expect(screen.getByTestId('queued-send-row').querySelector('p')?.textContent).toBe('先设目标再执行')
+    } else expect(screen.queryAllByTestId('queued-send-row')).toHaveLength(0)
+    expect(screen.queryAllByTestId('user-row')).toHaveLength(0)
   })
 
   test('team mode switch persists while reopening the agent picker', async () => {

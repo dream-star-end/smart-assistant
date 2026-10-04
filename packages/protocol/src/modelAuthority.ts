@@ -94,6 +94,12 @@ export type JsonValue =
 
 export type ModelAuthorityEngine = 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
 
+/** Signed Box context-owner token. Absent means the server did not issue it. */
+export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
+export type BoxNativeContextOwner = typeof BOX_NATIVE_CONTEXT_OWNER
+/** Exact canonical model that may carry the token. Not a prefix. */
+export const BOX_NATIVE_CONTEXT_MODEL = 'box-api-claude-opus-5-5'
+
 /**
  * 该模型的**完整规范化执行语义**(方案 §2 R2-B3):容器该 turn 的 engine/capability/
  * context/effort/vision **全部取自这里**,不查本地 catalog —— 自包含 = master 与容器
@@ -803,6 +809,7 @@ function parseDescriptor(raw: unknown): ModelExecutionDescriptor {
   if (o.codexDefaultEffort !== undefined && typeof o.codexDefaultEffort !== 'string') {
     throw new ModelAuthorityError('BadShape', 'descriptor: codexDefaultEffort not a string')
   }
+  assertCcbContextOwner(profile)
   const descriptor: ModelExecutionDescriptor = {
     capabilityProfile: profile as { [key: string]: JsonValue },
     capabilitySchemaVersion: int(o, 'capabilitySchemaVersion'),
@@ -822,6 +829,16 @@ function parseDescriptor(raw: unknown): ModelExecutionDescriptor {
     'supportsVision',
   ])
   return descriptor
+}
+
+function assertCcbContextOwner(profile: object): void {
+  const ccb = (profile as { ccb?: unknown }).ccb
+  if (ccb === undefined || ccb === null || typeof ccb !== 'object' || Array.isArray(ccb)) return
+  const owner = (ccb as { contextOwner?: unknown }).contextOwner
+  if (owner === undefined) return
+  if (owner !== BOX_NATIVE_CONTEXT_OWNER) {
+    throw new ModelAuthorityError('BadShape', 'descriptor: ccb.contextOwner must be box-native-v1')
+  }
 }
 
 function asObject(raw: unknown, what: string): Record<string, unknown> {

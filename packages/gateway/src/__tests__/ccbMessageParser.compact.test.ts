@@ -9,12 +9,16 @@ import {
   type SessionStreamEvent,
 } from '../ccbMessageParser.js'
 
-function createParser(opts?: { onNativeCompactionSummary?: (summaryText: string) => void }) {
+function createParser(opts?: {
+  onNativeCompactionSummary?: (summaryText: string) => void
+  onIdleArtifactReceipt?: (receipt: { opId: string; digest: string }) => void
+}) {
   const events: SessionStreamEvent[] = []
   const parser = new CcbMessageParser({
     toolUseIdToName: new Map(),
     onEvent: (e) => events.push(e),
     onNativeCompactionSummary: opts?.onNativeCompactionSummary,
+    onIdleArtifactReceipt: opts?.onIdleArtifactReceipt,
     onFinish: () => {},
     sessionTotals: { totalCostUSD: 0, turns: 0, _lastCcbCumulativeCost: 0 },
   })
@@ -85,5 +89,21 @@ describe('CcbMessageParser compact capture', () => {
       total_cost_usd: 0,
     } as any)
     assert.match(summary, /decisions and next steps/)
+  })
+
+  it('passes an idle artifact receipt and ignores a bare applied flag', () => {
+    let receipt: { opId: string; digest: string } | undefined
+    const { parser } = createParser({ onIdleArtifactReceipt: (value) => { receipt = value } })
+    parser.parse({
+      type: 'system', subtype: 'compact_boundary', applied: true,
+      compact_metadata: { trigger: 'manual' },
+    } as any)
+    assert.equal(receipt, undefined)
+    const digest = 'ab'.repeat(32)
+    parser.parse({
+      type: 'system', subtype: 'compact_boundary',
+      compact_metadata: { idle_op_id: digest, idle_receipt_digest: digest },
+    } as any)
+    assert.deepEqual(receipt, { opId: digest, digest })
   })
 })

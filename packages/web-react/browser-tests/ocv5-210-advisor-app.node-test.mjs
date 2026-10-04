@@ -130,7 +130,10 @@ test("actual App new-session advisor/team send materializes session before colla
       await page.getByRole("dialog").waitFor({ state: "hidden" });
       await page.getByPlaceholder(/和「全能助手」对话/).fill("顾问首发不要 404");
       await page.getByRole("button", { name: "发送" }).click();
-      await page.getByTestId("user-row").waitFor();
+      await page.getByTestId("queued-send-row").waitFor();
+      assert.equal(await page.getByTestId("queued-send-row").count(), 1);
+      assert.equal(await page.getByTestId("queued-send-row").locator("p").textContent(), "顾问首发不要 404");
+      assert.equal(await page.getByTestId("user-row").count(), 0);
       const sessionIdx = calls.findIndex((row) => row.kind === "session");
       const collabIdx = calls.findIndex((row) => row.kind === "collab" && row.mode === "advisor");
       assert.ok(sessionIdx >= 0, "must PUT client session");
@@ -147,7 +150,10 @@ test("actual App new-session advisor/team send materializes session before colla
       await page.getByRole("dialog").waitFor({ state: "hidden" });
       await page.getByPlaceholder(/和「全能助手」对话/).fill("团队首发不要 404");
       await page.getByRole("button", { name: "发送" }).click();
-      await page.getByTestId("user-row").filter({ hasText: "团队首发不要 404" }).waitFor();
+      await page.getByTestId("queued-send-row").filter({ hasText: "团队首发不要 404" }).waitFor();
+      assert.equal(await page.getByTestId("queued-send-row").count(), 1);
+      assert.equal(await page.getByTestId("queued-send-row").locator("p").textContent(), "团队首发不要 404");
+      assert.equal(await page.getByTestId("user-row").count(), 0);
       const teamSession = calls.map((row, i) => ({ ...row, i })).filter((row) => row.kind === "session");
       const teamCollab = calls.find((row) => row.kind === "collab" && row.mode === "team");
       assert.ok(teamCollab, "team collab PUT");

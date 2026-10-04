@@ -1,0 +1,628 @@
+import assert from "node:assert/strict";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { test } from "node:test";
+import { fileURLToPath } from "node:url";
+import tailwindcss from "@tailwindcss/vite";
+import { build as viteBuild } from "vite";
+import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
+
+const require = createRequire(import.meta.url);
+const { build } = require("esbuild");
+const { chromium } = require("playwright-core");
+const here = dirname(fileURLToPath(import.meta.url));
+const shots = process.env.OC_PROCESS_SHOT_DIR || "/home/agent/.openclaude/generated";
+
+test("OCV5-265 process disclosure: real MessageList, production CSS, red/green entry", { timeout: 180000 }, async () => {
+  mkdirSync(shots, { recursive: true });
+  const out = join(tmpdir(), `oc-process-disclosure-${process.pid}`);
+  mkdirSync(out, { recursive: true });
+  const bundle = await build({
+    entryPoints: [join(here, "process-disclosure-harness.tsx")],
+    bundle: true,
+    write: false,
+    format: "iife",
+    jsx: "automatic",
+    loader: { ".css": "empty" },
+    alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
+    define: {
+      "process.env.NODE_ENV": '"production"',
+      "import.meta.env.MODE": '"production"',
+    },
+    logLevel: "silent",
+  });
+  await viteBuild({
+    root: join(here, ".."),
+    configFile: false,
+    logLevel: "silent",
+    plugins: [tailwindcss()],
+    build: {
+      outDir: out,
+      emptyOutDir: true,
+      cssCodeSplit: false,
+      rollupOptions: {
+        input: join(here, "preview-styles.ts"),
+        output: { assetFileNames: "styles[extname]" },
+      },
+    },
+  });
+  const css = readFileSync(join(out, readdirSync(out).find((name) => name.endsWith(".css"))), "utf8");
+  const browser = await chromium.launch({
+    executablePath: resolveBrowserExecutable(),
+    headless: true,
+    args: ["--no-sandbox"],
+  });
+  try {
+    async function open(width, touch) {
+      const context = await browser.newContext({
+        timezoneId: "Asia/Shanghai",
+        viewport: { width, height: touch ? 844 : 900 },
+        isMobile: touch,
+        hasTouch: touch,
+        deviceScaleFactor: 1,
+      });
+      const page = await context.newPage();
+      const errors = [];
+      page.on("pageerror", (error) => errors.push(error.message));
+      await page.setContent(`<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style><div id="root"></div>`);
+      await page.addScriptTag({ content: bundle.outputFiles[0].text });
+      await page.getByTestId("process-harness").waitFor();
+      return { context, page, errors };
+    }
+
+    async function frameInView(page, locator) {
+      await locator.waitFor();
+      const visible = await locator.evaluate((el) => {
+        const scroller = el.closest(".chat-scroll-area") || document.scrollingElement;
+        if (!(el instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        const box = scroller instanceof HTMLElement ? scroller.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+        const row = el.getBoundingClientRect();
+        if (scroller instanceof HTMLElement) scroller.scrollTop += row.top - box.top - 28;
+        else window.scrollTo(0, window.scrollY + row.top - 28);
+        const next = el.getBoundingClientRect();
+        const view = scroller instanceof HTMLElement ? scroller.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
+        return {
+          ok: next.height > 8 && next.top >= view.top - 2 && next.top <= view.bottom - 24,
+          top: Math.round(next.top),
+          bottom: Math.round(next.bottom),
+          height: Math.round(next.height),
+          viewTop: Math.round(view.top),
+          viewBottom: Math.round(view.bottom),
+          text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 80),
+        };
+      });
+      assert.ok(visible.ok, `target not in view: ${JSON.stringify(visible)}`);
+      return visible;
+    }
+
+    const desktop = await open(1280, false);
+    try {
+      await desktop.page.evaluate(() => window.__processPage.setMode("legacy"));
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-mode") === "legacy");
+      assert.equal(await desktop.page.getByTestId("process-disclosure").count(), 0, "legacy entry has no disclosure");
+      await desktop.page.getByText("summarize-stock.mjs").waitFor();
+      await desktop.page.getByText("看板已经做好").waitFor();
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-legacy-desktop.png") });
+
+      await desktop.page.evaluate(() => window.__processPage.setMode("manus"));
+      await desktop.page.getByTestId("process-toggle").waitFor();
+      assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "tool stays folded");
+      assert.equal(await desktop.page.getByText("paper.pdf").count(), 0, "pdf execution log is not a deliverable");
+      await desktop.page.getByText("看板已经做好").waitFor();
+      await desktop.page.getByTitle("HTML 沙盒预览").waitFor();
+      await desktop.page.getByText(/inventory-board-north-south/).waitFor();
+      const meta = desktop.page.getByTestId("assistant-meta").filter({ hasText: "2023-11-15" });
+      await meta.waitFor();
+      const metaBox = await meta.evaluate((el) => {
+        const time = el.querySelector("time.tabular-nums");
+        const credits = [...el.querySelectorAll("span")].find((node) => node.textContent?.includes("积分"));
+        const timeRect = time?.getBoundingClientRect();
+        const creditRect = credits?.getBoundingClientRect();
+        return {
+          fontSize: time ? getComputedStyle(time).fontSize : "",
+          rowHeight: el.getBoundingClientRect().height,
+          sameLine: !!timeRect && !!creditRect && Math.abs(timeRect.top - creditRect.top) < 8,
+          credits: el.textContent ?? "",
+        };
+      });
+      assert.equal(metaBox.fontSize, "11px", "old absolute date must use caption size");
+      assert.ok(metaBox.rowHeight < 36, `meta row too tall: ${metaBox.rowHeight}`);
+      assert.equal(metaBox.sameLine, true, "date and credits share one compact row");
+      assert.match(metaBox.credits, /12\s*积分/);
+      assert.doesNotMatch(metaBox.credits, /token/i);
+      await desktop.page.getByText("刚刚").waitFor();
+      const collapsedShot = join(shots, "ocv5-265-manus-desktop-collapsed.png");
+      await desktop.page.screenshot({ path: collapsedShot });
+
+      await desktop.page.getByTestId("process-toggle").click();
+      await desktop.page.getByText("先按北仓和南仓核对可售口径").waitFor();
+      assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "level 2 is narrative and counts only");
+      await desktop.page.getByTestId("process-detail-toggle").click();
+      await desktop.page.getByText("summarize-stock.mjs").waitFor();
+      await desktop.page.screenshot({ path: join(shots, "ocv5-265-manus-desktop-expanded.png") });
+
+      await desktop.page.getByTestId("process-toggle").focus();
+      await desktop.page.keyboard.press("Enter");
+      await desktop.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
+      assert.equal(desktop.errors.length, 0, desktop.errors.join("\n"));
+    } finally {
+      await desktop.context.close();
+    }
+
+    const mobile = await open(390, true);
+    try {
+      await mobile.page.getByTestId("process-toggle").waitFor();
+      const box = await mobile.page.getByTestId("process-toggle").boundingBox();
+      assert.ok(box && box.height >= 44, `touch target too small: ${JSON.stringify(box)}`);
+      assert.ok(box.x >= -1 && box.x + box.width <= 391, `toggle overflows viewport: ${JSON.stringify(box)}`);
+      await mobile.page.getByText("看板已经做好").waitFor();
+      assert.equal(await mobile.page.getByText("summarize-stock.mjs").count(), 0);
+      await mobile.page.getByText(/acceptance-fixture\.csv/).waitFor();
+      const overflow = await mobile.page.getByTestId("process-harness").evaluate((el) => el.scrollWidth - el.clientWidth);
+      assert.ok(overflow <= 1, `mobile harness overflows by ${overflow}px`);
+      await mobile.page.screenshot({ path: join(shots, "ocv5-265-manus-mobile-collapsed.png") });
+      const userBefore = await mobile.page.getByText("做一版库存看板").boundingBox();
+      await mobile.page.getByTestId("process-toggle").tap();
+      const stableGroup = mobile.page.getByTestId("process-detail-toggle");
+      assert.equal(await stableGroup.count(), 1);
+      const stableGeometry = await stableGroup.evaluate(async (el) => {
+        const appearance = el.closest(".oc-reveal");
+        const animations = (appearance?.getAnimations() ?? []).filter((animation) =>
+          animation.playState === "running" && animation.effect?.getComputedTiming().iterations !== Infinity);
+        const motion = animations.map((animation) => ({ name: animation.animationName,
+          duration: animation.effect?.getComputedTiming().duration, playState: animation.playState }));
+        await Promise.all(animations.map((animation) => animation.finished));
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const rect = el.getBoundingClientRect();
+        return { motion, detail: { y: rect.y, height: rect.height }, rootTop: document.getElementById("root")?.scrollTop };
+      });
+      console.log("MOBILE_GROUP_STABLE", JSON.stringify(stableGeometry));
+      await stableGroup.tap();
+      await mobile.page.getByText("summarize-stock.mjs").waitFor();
+      const userAfter = await mobile.page.getByText("做一版库存看板").boundingBox();
+      assert.ok(userBefore && userAfter && Math.abs(userBefore.y - userAfter.y) < 80, "mobile expand stays on this turn");
+      const detail = await mobile.page.getByTestId("process-details").boundingBox();
+      assert.ok(detail && detail.x >= -1 && detail.x + detail.width <= 391, `details overflow: ${JSON.stringify(detail)}`);
+      await mobile.page.screenshot({ path: join(shots, "ocv5-265-manus-mobile-expanded.png") });
+      assert.equal(mobile.errors.length, 0, mobile.errors.join("\n"));
+    } finally {
+      await mobile.context.close();
+    }
+
+    const stream = await open(1280, false);
+    try {
+      await stream.page.evaluate(() => window.__processPage.setScene("stream"));
+      await stream.page.getByTestId("process-chat-scroll").waitFor();
+      await stream.page.getByText("STREAM_TAIL_MARKER").waitFor();
+      assert.equal(await stream.page.getByTestId("process-disclosure").count(), 1, "streaming turn split into more than one shell");
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "active turn hides the current stage");
+      const clipped = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => {
+        const inProcess = !!node.closest("[data-testid=process-disclosure]");
+        const inAnswer = !!node.closest("[data-testid=assistant-row]");
+        let lineClamp = false;
+        let el = node.parentElement;
+        while (el) {
+          const clamp = getComputedStyle(el).webkitLineClamp;
+          if (clamp && clamp !== "none") lineClamp = true;
+          el = el.parentElement;
+        }
+        return { lineClamp, inProcess, inAnswer };
+      });
+      assert.equal(clipped.lineClamp, false, "streaming answer must not be line-clamped");
+      assert.equal(clipped.inProcess, true, "streaming answer left the work area");
+      assert.equal(clipped.inAnswer, false, "streaming answer was promoted to the final card");
+      const streamChrome = await stream.page.evaluate(() => {
+        const process = document.querySelector("[data-testid=process-disclosure]");
+        const footer = document.querySelector("[data-testid=turn-activity-footer]");
+        const avatar = document.querySelector("[data-testid=assistant-row] .bg-grad-cta, [data-testid=turn-activity-footer] .bg-grad-cta, [data-testid=process-disclosure] .bg-grad-cta");
+        return {
+          marginLeft: process ? getComputedStyle(process).marginLeft : "",
+          avatar: !!avatar,
+          thinking: (footer?.textContent || "").includes("思考中"),
+        };
+      });
+      assert.equal(streamChrome.marginLeft, "0px", "process still reserves the avatar column");
+      assert.equal(streamChrome.avatar, false, "response avatar is still painted");
+      assert.equal(streamChrome.thinking, false, "thinking block repeats under the live body");
+      await frameInView(stream.page, stream.page.getByText("STREAM_TAIL_MARKER"));
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-body.png") });
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-stream-body.png") });
+      await stream.page.evaluate(() => {
+        const el = document.querySelector("[data-testid=process-chat-scroll]");
+        if (!(el instanceof HTMLElement)) throw new Error("missing scroller");
+        el.scrollTop = 0;
+        el.dispatchEvent(new Event("scroll"));
+      });
+      try {
+        await stream.page.waitForFunction(() => document.querySelector("[data-testid=scroll-to-bottom-dock]")?.getAttribute("data-visible") === "true", { timeout: 4000 });
+      } catch (error) {
+        const info = await stream.page.evaluate(() => {
+          const el = document.querySelector("[data-testid=process-chat-scroll]");
+          return {
+            scrollTop: el instanceof HTMLElement ? el.scrollTop : null,
+            scrollHeight: el instanceof HTMLElement ? el.scrollHeight : null,
+            clientHeight: el instanceof HTMLElement ? el.clientHeight : null,
+            visible: document.querySelector("[data-testid=scroll-to-bottom-dock]")?.getAttribute("data-visible") ?? null,
+          };
+        });
+        throw new Error(`${error instanceof Error ? error.message : error} ${JSON.stringify(info)}`);
+      }
+      const parked = await stream.page.getByTestId("process-chat-scroll").evaluate((el) => el.scrollTop);
+      await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
+      await stream.page.getByText("尾部仍在增长").waitFor();
+      const stayed = await stream.page.getByTestId("process-chat-scroll").evaluate((el) => el.scrollTop);
+      assert.ok(stayed < parked + 40, `new tokens yanked the reader: ${parked} -> ${stayed}`);
+      await stream.page.getByTestId("scroll-to-bottom").click({ force: true });
+      await stream.page.waitForFunction(() => {
+        const el = document.querySelector("[data-testid=process-chat-scroll]");
+        if (!(el instanceof HTMLElement)) return false;
+        return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+      });
+      await stream.page.getByTestId("process-toggle").click();
+      await stream.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "false");
+      await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
+      await stream.page.waitForTimeout(200);
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "false", "tokens reopened a closed process");
+      await stream.page.getByTestId("process-toggle").click();
+      await stream.page.waitForFunction(() => document.querySelector("[data-testid=process-toggle]")?.getAttribute("aria-expanded") === "true");
+      await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
+      await stream.page.getByText("尾部仍在增长").waitFor();
+      await stream.page.evaluate(() => window.__processPage.setSending(false));
+      await stream.page.getByText("尾部仍在增长").waitFor();
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "manual open collapsed when the turn finished");
+      const finished = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => !!node.closest("[data-testid=assistant-row]") && !node.closest("[data-testid=process-disclosure]"));
+      assert.equal(finished, true, "finished answer did not become the only top-level reply");
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-manus-stream-answer.png") });
+      await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-finished.png") });
+      assert.equal(stream.errors.length, 0, stream.errors.join("\n"));
+    } finally {
+      await stream.context.close();
+    }
+
+    const parallel = await open(1280, false);
+    try {
+      await parallel.page.evaluate(() => window.__processPage.setScene("parallel"));
+      await parallel.page.getByTestId("process-step-live").waitFor();
+      const live = await parallel.page.getByTestId("process-step-live").innerText();
+      assert.match(live, /正在读取文件/);
+      assert.doesNotMatch(live, /STILL_RUNNING_FILE/);
+      assert.doesNotMatch(live, /Read/);
+      assert.doesNotMatch(live, /已完成/);
+      assert.doesNotMatch(live, /工具执行完成/);
+      assert.equal(await parallel.page.getByText("LATER_DONE_SECRET").count(), 0);
+      await frameInView(parallel.page, parallel.page.getByTestId("process-step-live"));
+      await parallel.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-parallel.png") });
+      await parallel.page.setViewportSize({ width: 390, height: 844 });
+      await frameInView(parallel.page, parallel.page.getByTestId("process-step-live"));
+      await parallel.page.screenshot({ path: join(shots, "ocv5-265-avatar-polish-parallel-390.png") });
+      assert.equal(parallel.errors.length, 0, parallel.errors.join("\n"));
+    } finally {
+      await parallel.context.close();
+    }
+
+    const find = await open(1280, false);
+    try {
+      await find.page.evaluate(() => window.__processPage.setScene("find"));
+      await find.page.getByTestId("process-chat-scroll").waitFor();
+      await find.page.waitForFunction(() => {
+        const el = document.querySelector("[data-testid=process-chat-scroll]");
+        return !!el && el.scrollHeight > el.clientHeight + 80;
+      });
+      assert.equal(await find.page.getByText("阶段锚点ALPHATOKEN").count(), 0, "folded stage is not mounted yet");
+      await find.page.getByLabel("在会话中查找").fill("阶段锚点ALPHATOKEN");
+      await find.page.keyboard.press("Enter");
+      await find.page.waitForFunction(() => {
+        const scroller = document.querySelector("[data-testid=process-chat-scroll]");
+        const stage = document.querySelector("[data-find-member]");
+        if (!(scroller instanceof HTMLElement) || !(stage instanceof HTMLElement)) return false;
+        const view = scroller.getBoundingClientRect();
+        const row = stage.getBoundingClientRect();
+        const input = document.querySelector("[aria-label='在会话中查找']");
+        const bar = input instanceof HTMLElement ? input.getBoundingClientRect() : null;
+        const top = bar && bar.height > 0 ? bar.bottom : view.top;
+        return row.height > 8 && row.top >= top - 2 && row.bottom > top + 8 && row.top < view.bottom - 8;
+      });
+      await find.page.screenshot({ path: join(shots, "ocv5-265-manus-find-stage.png") });
+      assert.equal(find.errors.length, 0, find.errors.join("\n"));
+    } finally {
+      await find.context.close();
+    }
+
+    const attention = await open(1280, false);
+    try {
+      await attention.page.evaluate(() => window.__processPage.setScene("attention"));
+      await attention.page.getByTestId("permission-card").waitFor();
+      await attention.page.getByText("任务待你确认").waitFor();
+      assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
+      const attentionProcess = attention.page.getByTestId("process-disclosure");
+      assert.equal(await attentionProcess.count(), 1);
+      const attentionToggle = attentionProcess.getByTestId("process-toggle");
+      assert.equal(await attentionToggle.getAttribute("aria-expanded"), "false");
+      await attentionToggle.click();
+      const attentionGroup = attentionProcess.getByTestId("process-detail-toggle");
+      assert.equal(await attentionGroup.count(), 1);
+      assert.equal(await attentionGroup.getAttribute("aria-expanded"), "false");
+      assert.equal(await attentionProcess.getByTestId("process-group-missed").count(), 0);
+      assert.equal(await attentionProcess.getByText(/步未成功/).count(), 0);
+      assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
+      await attentionGroup.click();
+      const failed = attentionProcess.getByTestId("tool-step").filter({ hasText: "未成功" });
+      assert.equal(await failed.count(), 1);
+      const quiet = failed.getByText("未成功", { exact: true });
+      await quiet.waitFor();
+      assert.equal(await quiet.evaluate((node) => node.classList.contains("text-faint")), true);
+      assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
+      const failedToggle = failed.getByRole("button").first();
+      if (await failedToggle.getAttribute("aria-expanded") !== "true") await failedToggle.click();
+      const failedOutput = failed.locator("pre");
+      assert.equal(await failedOutput.count(), 1);
+      await failedOutput.waitFor({ state: "visible" });
+      assert.ok((await failedOutput.textContent()).split("\n").includes("probe-error-detail"));
+      await attention.page.getByRole("button", { name: "拒绝" }).click();
+      await attention.page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-respond-count") === "1");
+      await attention.page.waitForTimeout(200);
+      assert.equal(await attention.page.getByTestId("process-harness").getAttribute("data-respond-count"), "1");
+      await attention.page.screenshot({ path: join(shots, "ocv5-265-manus-attention.png") });
+      assert.equal(attention.errors.length, 0, attention.errors.join("\n"));
+    } finally {
+      await attention.context.close();
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test("completed goal diagnostics stay folded, exact raw survives and current dock is unique", { timeout: 180000 }, async (t) => {
+  mkdirSync(shots, { recursive: true });
+  const out = join(tmpdir(), "oc-goal-diagnostic-" + process.pid);
+  mkdirSync(out, { recursive: true });
+  const negative = process.env.OC_GOAL_DIAGNOSTIC_NEGATIVE === "1";
+  const sourcePath = join(here, "../src/components/MessageRenderer.tsx");
+  const currentSource = readFileSync(sourcePath, "utf8");
+  const historicalSource = execFileSync("git", [
+    "show", "1935342a5bb212e26fbc9a7d13c36292ea39f2bd:packages/web-react/src/components/MessageRenderer.tsx",
+  ], { cwd: join(here, "../../.."), encoding: "utf8" });
+  const goalBranch = /      case "goal":\n[\s\S]*?(?=      case "permission":)/;
+  const currentBranch = currentSource.match(goalBranch)?.[0];
+  const historicalBranch = historicalSource.match(goalBranch)?.[0];
+  assert.ok(currentBranch && historicalBranch, "exact goal branches must exist");
+  assert.notEqual(currentBranch, historicalBranch, "negative control must restore the real historical branch");
+  const bundledSource = negative ? currentSource.replace(goalBranch, historicalBranch) : currentSource;
+  const sourceSha = createHash("sha256").update(bundledSource).digest("hex");
+  const bundle = await build({
+    entryPoints: [join(here, "process-disclosure-harness.tsx")],
+    bundle: true, write: false, format: "iife", jsx: "automatic",
+    loader: { ".css": "empty" },
+    alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
+    define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },
+    plugins: [{
+      name: "goal-diagnostic-exact-source",
+      setup(api) {
+        api.onLoad({ filter: /[/\\]MessageRenderer\.tsx$/ }, (args) => {
+          assert.equal(args.path, sourcePath);
+          return { contents: bundledSource, loader: "tsx", resolveDir: dirname(args.path) };
+        });
+      },
+    }],
+    logLevel: "silent",
+  });
+  await viteBuild({
+    root: join(here, ".."), configFile: false, logLevel: "silent", plugins: [tailwindcss()],
+    build: { outDir: out, emptyOutDir: true, cssCodeSplit: false,
+      rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } } },
+  });
+  const css = readFileSync(join(out, readdirSync(out).find((name) => name.endsWith(".css"))), "utf8");
+  const browser = await chromium.launch({
+    executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"],
+  });
+  try {
+    for (const width of [1280, 390]) {
+      await t.test("viewport " + width, async () => {
+        const context = await browser.newContext({
+          viewport: { width, height: width === 390 ? 844 : 900 },
+          isMobile: width === 390, hasTouch: width === 390, deviceScaleFactor: 1,
+        });
+        const page = await context.newPage();
+        const errors = [];
+        const report = { width, negative, sourceSha, checkpoints: [], complete: false };
+        page.on("pageerror", (error) => errors.push(error.message));
+        const activate = async (locator) => width === 390 ? locator.tap() : locator.click();
+        try {
+          await page.setContent('<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><style>' + css + '</style><div id="root"></div>');
+          await page.addScriptTag({ content: bundle.outputFiles[0].text });
+          await page.getByTestId("process-harness").waitFor();
+          await page.evaluate(() => window.__processPage.setScene("goals"));
+          await page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-scene") === "goals");
+          await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          const process = page.getByTestId("process-disclosure");
+          assert.equal(await process.count(), 1);
+          const toggle = process.getByTestId("process-toggle");
+          assert.equal(await toggle.getAttribute("aria-expanded"), "false");
+          assert.match(await toggle.innerText(), /目标 1 项/);
+          assert.doesNotMatch(await toggle.innerText(), /目标 [234]/);
+          assert.equal(await page.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count(), 0);
+          assert.equal(await page.getByRole("button", { name: "查看原始目标记录" }).count(), 0);
+          report.checkpoints.push("collapsed");
+          const dock = page.getByTestId("pinned-goal");
+          assert.equal(await dock.count(), 1);
+          assert.equal(await dock.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 1);
+          assert.match(await dock.innerText(), /阻塞/);
+          assert.match(await dock.innerText(), /120\/1,000/);
+          for (const hidden of ["CURRENT_ACTIVE_NOT_IN_TRANSCRIPT", "CURRENT_PAUSED_NOT_IN_TRANSCRIPT", "CLEARED_RECORD_NOT_VISIBLE"]) {
+            assert.equal(await page.getByText(hidden, { exact: true }).count(), 0);
+          }
+          assert.equal(await process.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
+          assert.equal(errors.length, 0, errors.join("\n"));
+          report.checkpoints.push("current-dock");
+          await activate(toggle);
+          const historical = process.getByTestId("process-goal");
+          await historical.waitFor({ state: "attached" });
+          report.historicalTextCount = await historical.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count();
+          assert.equal(report.historicalTextCount, 1, "completed historical goal must not render an empty process shell");
+          report.checkpoints.push("historical-open");
+          assert.equal(await historical.locator("pre").count(), 0);
+          await activate(historical.getByRole("button", { name: "查看原始目标记录" }));
+          const raw = await historical.locator("pre").textContent();
+          const expectedRaw = JSON.stringify([{ type: "goal.updated", status: "completed",
+            objective: "COMPLETED_GOAL_DIAGNOSTIC", marker: "RAW_GOAL_MARKER" }], null, 2);
+          assert.equal(raw, expectedRaw, "raw event history must survive exactly");
+          await activate(historical.getByRole("button", { name: "收起原始目标记录" }));
+          assert.equal(await historical.locator("pre").count(), 0);
+          report.checkpoints.push("raw");
+          await page.evaluate(() => window.__processPage.clearLatestGoal());
+          await page.waitForFunction(() => !document.querySelector("[data-testid=pinned-goal]"));
+          assert.equal(await page.getByText("CURRENT_BLOCKED_DOCK_ONLY", { exact: true }).count(), 0);
+          assert.equal(await page.getByText("LATEST_CLEARED_NO_FALLBACK", { exact: true }).count(), 0);
+          assert.equal(await historical.getByText("COMPLETED_GOAL_DIAGNOSTIC", { exact: true }).count(), 1);
+          assert.match(await toggle.innerText(), /目标 1 项/);
+          assert.equal(await page.getByText("目标更新不是普通回答。", { exact: true }).count(), 1);
+          report.checkpoints.push("clear");
+          assert.equal(errors.length, 0, errors.join("\n"));
+          report.complete = true;
+          await page.screenshot({ path: join(shots, "ocv5-308-goal-diagnostic-" + width + ".png") });
+        } finally {
+          report.pageErrors = errors;
+          writeFileSync(join(shots, "ocv5-308-goal-diagnostic-" + (negative ? "negative-" : "positive-") + width + ".json"), JSON.stringify(report, null, 2));
+          await context.close();
+        }
+      });
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test("live status is single and readable in both themes and accessibility media", { timeout: 180000 }, async (t) => {
+  const sourceFiles = ["../src/styles.css", "../src/components/ToolCard.tsx", "../src/components/chat/ProcessDisclosure.tsx", "../src/components/chat/cards.tsx"];
+  const sourceHash = createHash("sha256").update(sourceFiles.map((path) => readFileSync(join(here, path), "utf8")).join("\n")).digest("hex");
+  const bundle = await build({
+    entryPoints: [join(here, "process-disclosure-harness.tsx")], bundle: true, write: false,
+    format: "iife", jsx: "automatic", loader: { ".css": "empty" },
+    alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
+    define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' }, logLevel: "silent",
+  });
+  const out = join(tmpdir(), `oc-status-readability-${process.pid}`);
+  const red = process.env.OC_STATUS_SHINE_RED === "1";
+  let reverted = 0;
+  const redPlugin = {
+    name: "status-shine-red-control", enforce: "pre",
+    transform(code, id) {
+      if (!red || id.split("?")[0] !== join(here, "../src/styles.css")) return;
+      const selector = ".oc-swap-in:not(.oc-live-status-shine)";
+      assert.equal(code.split(selector).length - 1, 1, "exact current product selector");
+      reverted += 1;
+      return code.replace(selector, ".oc-swap-in");
+    },
+  };
+  await viteBuild({
+    root: join(here, ".."), configFile: false, logLevel: "silent", plugins: [redPlugin, tailwindcss()],
+    build: { outDir: out, emptyOutDir: true, cssCodeSplit: false,
+      rollupOptions: { input: join(here, "preview-styles.ts"), output: { assetFileNames: "styles[extname]" } } },
+  });
+  assert.equal(reverted, red ? 1 : 0, "only the requested CSS input is reverted");
+  const css = readFileSync(join(out, readdirSync(out).find((name) => name.endsWith(".css"))), "utf8");
+  const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
+  const reports = [];
+  try {
+    for (const theme of ["light", "dark"]) for (const mode of ["normal", "reduce", "forced"]) {
+      await t.test(`${theme}/${mode}`, async () => {
+        const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true,
+          reducedMotion: mode === "reduce" ? "reduce" : "no-preference", forcedColors: mode === "forced" ? "active" : "none" });
+        const errors = [];
+        try {
+          const page = await context.newPage();
+          page.on("pageerror", (error) => errors.push(error.message));
+          await page.setContent(`<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1"><style>${css}</style><div id="root"></div>`);
+          await page.evaluate((theme) => document.documentElement.classList.toggle("dark", theme === "dark"), theme);
+          await page.addScriptTag({ content: bundle.outputFiles[0].text });
+          await page.getByTestId("process-harness").waitFor();
+          await page.evaluate(() => window.__processPage.setScene("parallel"));
+          const shell = page.getByTestId("process-disclosure");
+          await page.getByTestId("process-step-live").waitFor();
+          assert.equal(await shell.count(), 1);
+          const toggle = shell.getByTestId("process-toggle");
+          if (await toggle.getAttribute("aria-expanded") === "true") await toggle.tap();
+          assert.equal(await toggle.getAttribute("aria-expanded"), "false");
+          assert.equal(await shell.getByTestId("process-group-summary").count(), 0);
+          const phases = [];
+          const checkStatus = async (phase, text) => {
+            assert.equal(await text.count(), 1, `${phase}: unique live status`);
+            assert.ok((await text.innerText()).trim().length > 0);
+            const report = await text.evaluate((el) => {
+            const s = getComputedStyle(el);
+            let parent = el;
+            while (parent && getComputedStyle(parent).backgroundColor === "rgba(0, 0, 0, 0)") parent = parent.parentElement;
+            const bg = parent ? getComputedStyle(parent).backgroundColor : getComputedStyle(document.body).backgroundColor;
+            const rgb = (color) => {
+              const canvas = document.createElement("canvas"); canvas.width = canvas.height = 1;
+              const ctx = canvas.getContext("2d"); ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1);
+              return Array.from(ctx.getImageData(0, 0, 1, 1).data).slice(0, 3);
+            };
+            const luminance = (color) => rgb(color).map((c) => c / 255).map((c) => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4).reduce((sum, c, i) => sum + c * [0.2126, 0.7152, 0.0722][i], 0);
+            const faint = s.getPropertyValue("--faint").trim();
+            const a = luminance(faint), b = luminance(bg);
+            return { text: el.textContent, animation: s.animationName, background: s.backgroundImage, color: s.color, fill: s.webkitTextFillColor,
+              faint, bg, contrast: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), rect: { width: el.getBoundingClientRect().width, height: el.getBoundingClientRect().height } };
+          });
+            assert.ok(report.rect.width > 0 && report.rect.height > 0);
+            if (mode === "normal") {
+              assert.equal(report.animation, "oc-live-status-sweep");
+              assert.match(report.background, /linear-gradient/);
+              assert.equal(report.fill, "rgba(0, 0, 0, 0)");
+              assert.ok(report.contrast >= 4.5, `actual faint/background contrast: ${JSON.stringify(report)}`);
+            } else {
+              assert.equal(report.animation, "none");
+              assert.equal(report.background, "none");
+              assert.notEqual(report.color, "rgba(0, 0, 0, 0)");
+              assert.notEqual(report.fill, "rgba(0, 0, 0, 0)");
+            }
+
+            mkdirSync(shots, { recursive: true });
+            await page.screenshot({ path: join(shots, `ocv5-308-status-${theme}-${mode}-${phase}.png`) });
+            phases.push({ phase, ...report });
+          };
+          // Collapsed phase keeps the exact oc-swap-in CSS negative control meaningful.
+          assert.equal(await shell.locator(".oc-live-status-shine").count(), 1);
+          await checkStatus("collapsed", toggle.locator(".oc-live-status-shine"));
+          await toggle.tap();
+          assert.equal(await toggle.getAttribute("aria-expanded"), "true");
+          const summary = shell.getByTestId("process-group-summary");
+          assert.equal(await summary.count(), 1);
+          assert.equal(await summary.getAttribute("data-live-working"), "true");
+          assert.equal(await toggle.locator(".oc-live-status-shine").count(), 0, "expanded shell title is quiet");
+          assert.equal(await shell.locator(".oc-live-status-shine").count(), 1, "only the working group shines");
+          await checkStatus("expanded", summary);
+          const group = shell.getByTestId("process-detail-toggle");
+          assert.equal(await group.count(), 1);
+          if (await group.getAttribute("aria-expanded") !== "true") await group.tap();
+          assert.equal(await shell.getByTestId("process-details").locator(".oc-live-status-shine").count(), 0, "tool/internal rows never duplicate shimmer");
+          const tool = shell.getByTestId("tool-step").filter({ hasText: "STILL_RUNNING_FILE" });
+          assert.equal(await tool.count(), 1);
+          const header = tool.getByRole("button");
+          assert.equal(await header.count(), 1);
+          const box = await header.boundingBox();
+          assert.ok(box && box.height >= 44, `commercial mobile tool target: ${JSON.stringify(box)}`);
+          await page.evaluate(() => window.__processPage.setScene("stream"));
+          await page.getByText(/STREAM_TAIL_MARKER/).waitFor();
+          assert.equal(await page.locator(".oc-live-status-shine").count(), 0, "writing prose is not working-step shimmer");
+          await page.evaluate(() => window.__processPage.setSending(false));
+          await page.waitForFunction(() => document.querySelector("[data-testid=process-disclosure]")?.getAttribute("data-process-active") === "false");
+          assert.equal(await page.locator(".oc-live-status-shine").count(), 0, "terminal turn has no shimmer");
+          const report = { phases };
+          assert.deepEqual(errors, []);
+          mkdirSync(shots, { recursive: true });
+          await page.screenshot({ path: join(shots, `ocv5-308-status-${theme}-${mode}.png`) });
+          reports.push({ theme, mode, red, sourceHash, cssHash: createHash("sha256").update(css).digest("hex"), toolHeight: box.height, ...report });
+        } finally { await context.close(); }
+      });
+    }
+  } finally {
+    await browser.close();
+    console.log("STATUS_READABILITY", JSON.stringify(reports));
+  }
+  assert.equal(reports.length, 6, "all six real theme/media combinations executed");
+});

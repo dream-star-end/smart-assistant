@@ -400,7 +400,6 @@ export function PermissionCard({
   } else {
     statusText = "已受理";
   }
-  const tone = !resolved ? "neutral" : behavior === "allow" ? "allow" : behavior === "deny" ? "deny" : "neutral";
 
   // 工具中文标签 + 图标(F5):resolveToolMeta 单一权威;无 toolName → 「未知工具」。
   const meta = msg.toolName ? resolveToolMeta(msg.toolName, input) : null;
@@ -417,18 +416,23 @@ export function PermissionCard({
       data-testid={showCard ? "permission-card" : "permission-modal-host"}
       data-permission-request={msg.requestId}
       className={cn(
-        showCard && "rounded-lg border bg-surface animate-in",
-        tone === "allow" && "border-success/40",
-        tone === "deny" && "border-danger/40",
-        tone === "neutral" && "border-accent/40",
+        // OCV5-307:已处理的卡与工具卡同一套中性外框(结果由状态图标的绿/红表达),
+        // 不再用整圈绿/红边框跳出过程流;只有仍需用户操作的卡保留强调色边框。
+        showCard && "rounded-md border bg-surface animate-in",
+        showCard && (resolved ? "border-border/80" : "border-accent/40"),
       )}
     >
       {showCard ? <>
       {/* 卡头(审计 PC-01):390px 下标题 / 工具片 / 状态 / 倒计时四段挤一行会把「退出计划模式」竖排、
           把工具片截成半个字。改成可换行:标题与工具片不折字,状态 + 倒计时 ml-auto 整组挤不下就整组换到下一行右对齐。 */}
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-3.5 py-2.5">
-        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">
-          {questions ? <HelpCircle size={14} /> : <ShieldCheck size={14} />}
+      <div className="flex min-h-10 flex-wrap items-center gap-x-2.5 gap-y-1 px-3 py-2">
+        <span
+          className={cn(
+            "flex size-6 shrink-0 items-center justify-center rounded-[7px]",
+            resolved ? "bg-hover text-muted" : "bg-accent-soft text-accent",
+          )}
+        >
+          {questions ? <HelpCircle size={13} /> : <ShieldCheck size={13} />}
         </span>
         <span className="whitespace-nowrap text-body font-medium text-fg">
           {questions ? "用户问答" : isExitPlan ? "退出计划模式" : "权限请求"}
@@ -468,7 +472,7 @@ export function PermissionCard({
       {!resolved && !isExitPlan && !inputTruncated && (questions ? (
         <div
           data-testid="permission-pending-question"
-          className="border-t border-border px-3.5 py-2 text-body text-fg"
+          className="border-t border-border/70 px-3 py-2 text-body text-fg"
         >
           <span className="line-clamp-2">{questions[0].question}</span>
           {questions.length > 1 && (
@@ -476,7 +480,7 @@ export function PermissionCard({
           )}
         </div>
       ) : pendingSummary ? (
-        <div data-testid="permission-pending-summary" className="border-t border-border px-3.5 py-2">
+        <div data-testid="permission-pending-summary" className="border-t border-border/70 px-3 py-2">
           {pendingSummary.kind === "command" ? (
             <pre className="line-clamp-2 whitespace-pre-wrap break-all font-mono text-meta text-fg">
               <span className="text-success">$ </span>
@@ -493,7 +497,7 @@ export function PermissionCard({
 
       {/* 待审批：内联快捷 + 打开审批框。历史未答卡不自动弹，但保留这颗显式按钮。 */}
       {canAnswer && (
-        <div className="flex items-center gap-2 border-t border-border px-3.5 py-2">
+        <div className="flex items-center gap-2 border-t border-border/70 px-3 py-2">
           <Button
             size="sm"
             variant="accent"
@@ -519,12 +523,12 @@ export function PermissionCard({
         </div>
       )}
       {!resolved && readOnly && (
-        <div className="border-t border-border px-3.5 py-2 text-caption text-faint">
+        <div className="border-t border-border/70 px-3 py-2 text-caption text-faint">
           只读查看 · 需由用户在原会话中处理
         </div>
       )}
       {!resolved && !readOnly && expired && !livePrompt && (
-        <div className="border-t border-border px-3.5 py-2 text-caption text-faint">
+        <div className="border-t border-border/70 px-3 py-2 text-caption text-faint">
           提问已过期，无法再作答
         </div>
       )}
@@ -533,7 +537,7 @@ export function PermissionCard({
       {!resolved && !readOnly && expired && livePrompt && canAnswer && (
         <div
           data-testid="permission-expired-failsafe"
-          className="border-t border-border px-3.5 py-2 text-caption text-faint"
+          className="border-t border-border/70 px-3 py-2 text-caption text-faint"
         >
           按本机时间已超过等待时限；若智能体仍在等待（时钟可能有偏差），仍可作答。
         </div>
@@ -542,7 +546,7 @@ export function PermissionCard({
       {!resolved && isExitPlan && planMarkdown && (
         <div
           data-testid="exit-plan-preview"
-          className="relative max-h-28 overflow-hidden border-t border-border px-3.5 py-2 text-meta text-muted"
+          className="relative max-h-28 overflow-hidden border-t border-border/70 px-3 py-2 text-meta text-muted"
         >
           <Markdown>{planMarkdown}</Markdown>
           {/* 预览被 max-h 截断时给一层渐隐(PC-09),而不是一刀切断;完整计划在「审阅计划」里。 */}
@@ -555,7 +559,7 @@ export function PermissionCard({
 
       {/* 已解析：AskUserQuestion 展示问答摘要；普通展示 inputPreview */}
       {resolved && questions && behavior === "allow" && (
-        <div className="space-y-1.5 border-t border-border px-3.5 py-2.5">
+        <div className="space-y-1.5 border-t border-border/70 px-3 py-2.5">
           {questions.map((q, i) => (
             <div key={i} className="text-body">
               <div className="text-muted">{q.question}</div>
@@ -567,13 +571,13 @@ export function PermissionCard({
       {resolved && !questions && isExitPlan && planMarkdown && (
         <div
           data-testid="exit-plan-markdown"
-          className="max-h-64 overflow-auto border-t border-border px-3.5 py-2"
+          className="max-h-64 overflow-auto border-t border-border/70 px-3 py-2"
         >
           <Markdown>{planMarkdown}</Markdown>
         </div>
       )}
       {resolved && !questions && !isExitPlan && (input || msg.inputPreview) && (
-        <div className="border-t border-border px-3.5 py-2">
+        <div className="border-t border-border/70 px-3 py-2">
           <PermissionInputSummary
             toolName={msg.toolName || ""}
             input={input}
@@ -582,7 +586,7 @@ export function PermissionCard({
         </div>
       )}
       {resolved && msg._settledReason && msg._settledReason !== "remote" && (
-        <div className="border-t border-border px-3.5 py-1.5 text-caption text-faint">
+        <div className="border-t border-border/70 px-3 py-1.5 text-caption text-faint">
           {settledReasonLabel(msg._settledReason)}
         </div>
       )}
@@ -590,7 +594,7 @@ export function PermissionCard({
       {inputTruncated && !resolved && (
         <div
           data-testid="permission-input-loading"
-          className="border-t border-border px-3.5 py-2 text-caption text-faint"
+          className="border-t border-border/70 px-3 py-2 text-caption text-faint"
         >
           完整问题仍在加载，加载完成前不能提交。
         </div>

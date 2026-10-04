@@ -98,8 +98,11 @@ type Waiver = {
 function fail(message: string): never {
   throw new Error(`[incident-regressions] ${message}`);
 }
+// execFileSync 默认 maxBuffer 1 MiB;trailer 门的 `git log start..HEAD` 带完整 body,
+// 分支长到一定程度就 ENOBUFS,整道门在检查任何提交之前就抛。
+const GIT_MAX_BUFFER = 256 * 1024 * 1024;
 function git(...args: string[]): string {
-  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
+  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER }).trim();
 }
 function commitFiles(sha: string): string[] {
   return git("show", "--format=", "--name-only", sha).split("\n").map((line) => line.trim()).filter(Boolean);
@@ -185,12 +188,13 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     return { status: "pending", runner: `夜跑 ${shard}(v5-integ-nightly.yml,非 PR 门)` };
   }
   // unit:按包落到具体 CI job,落不到就是新增了没人跑的测试目录。
-  // test:gateway 是 `find packages/gateway/src -name "*.test.ts"`,子目录(如 taskboard/__tests__)
-  // 同样被跑;这里按 runner 的真实口径放行,不再只认顶层 __tests__。
-  if (/^packages\/gateway\/src\/(?:[^/]+\/)*__tests__\/[^/]+\.test\.ts$/.test(path)) {
+  // test:gateway 是 `find packages/gateway/src -type f -name "*.test.ts"`:src 下任何位置的
+  // *.test.ts 都被跑(含与源码同目录的 engine/*.test.ts),这里按 runner 的真实口径放行。
+  if (/^packages\/gateway\/src\/(?:[^/]+\/)*[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:gateway", "CI job gateway → npm run test:gateway");
   }
-  if (/^packages\/protocol\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
+  // test:protocol 是 `find packages/protocol/src -type f -name "*.test.ts"`,CI 的 protocol job 调用它。
+  if (/^packages\/protocol\/src\/(?:[^/]+\/)*[^/]+\.test\.ts$/.test(path)) {
     return requireCi("test:protocol", "CI job protocol → npm run test:protocol");
   }
   if (/^packages\/storage\/src\/__tests__\/[^/]+\.test\.ts$/.test(path)) {
@@ -210,8 +214,6 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
     if (!ROOT_PACKAGE_JSON.includes(path)) fail(`${path} 未列进 npm run test:v5:ops 的文件清单`);
     return { status: "wired", runner: "CI job v5-ops → npm run test:v5:ops" };
   }
-  // packages/protocol/src/__tests__ 当前没有任何 npm script 收它(2026-07-26 核实),
-  // 谁把它当证据登记,谁必须先补 runner。
   fail(`${path} 映射不到任何 runner(layer=${layer});先把它接进 CI 再登记为证据`);
 }
 
@@ -415,25 +417,19 @@ const IMPORTED_TRAILER_HISTORY_TIPS = [
   // 格式非法,源提交不可改写,只豁免其不可变祖先。之后的新提交仍逐条走 trailer 门
   // (已 mutation 验证:tip 之上再加一条坏 trailer 的 fix(v5) 仍会红)。
   "8ab8a57c82eee96028fe4d9b1015d3593c9e9334",
-  // 2026-09-19 full forward sync freeze: selfhost 839ad4420 is live
-  // (rel-839ad4420-20260918-161252, live sourceCommit). The batch imports 626
-  // selfhost commits (OCV5-158..OCV5-225, web-react a11y/UI audit, apps/windows
-  // desktop, 0278/0279 migrations); several fix(v5) sources predate this gate and
-  // cannot be amended because they are already shipped. Only their immutable
-  // ancestors are exempted; commits after this tip still go through the trailer
-  // gate one by one.
-  "839ad442098f8e68e0b9fd2b0e8f01519334031e",
-  // 2026-09-19 chase: selfhost b019bfb00 (stuck restore banner) is on
-  // origin/feat/v5-selfhost and cannot be amended. Freeze this tip so the
-  // imported fix(v5) passes check:v5:incidents; later commits still gate.
+  // 2026-09-19: selfhost rel-b019bfb00-20260918-182002 is live (restore-banner
+  // fix(v5) shipped without Incident trailer). Freeze this tip only; cherry-picks
+  // after it still go through the trailer gate (OCV5-224 registered separately).
   "b019bfb00be9c9d3363d37050e9e5b2e9c8ea5c1",
-  // 2026-09-20 full forward sync freeze: selfhost f4f143088 is live
-  // (origin/feat/v5-selfhost). Imports OCV5-232..242 (official CC switch/version
-  // pin, Sand Box default, Grok resume, extra-prompt tz, CC beta headers,
-  // Claude quota reset, opus-4-8 rewrite, false SERVICE_RESTART, expired-authority
-  // lease). Source SHAs cannot be amended; only immutable ancestors of this tip
-  // are exempted.
+  // 2026-10-01: 197735db7 was pushed to feat/v5-selfhost before the trailer
+  // gate ran. Shared branch forbids rewriting it. Deploy failed before it
+  // became live. Freeze this tip only; later commits still go through the gate.
+  "197735db77dfbf05280c526963ae04846544cabe",
+
+  // OCV5-308: preserve all immutable commercial fences and freeze imported selfhost history.
+  "839ad442098f8e68e0b9fd2b0e8f01519334031e",
   "f4f1430885612c9d377b7495831fb08375d0c6cb",
+  "3772295e774a6c50406e3d975f5136f590834be3",
 ] as const;
 
 // OCV5-180: user-approved (2026-09-08) exact immutable format repair, not an
@@ -559,6 +555,15 @@ function checkTrailerClosure(): number {
     }
     trailer = normalizedTrailer;
     if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(trailer)) {
+      // fbb9020fd was pushed as Incident: OCV5-276. The shared branch forbids
+      // rewriting it. The waiver records the user-approved smoke-only fix.
+      const ticketWaiver = waivers.get(sha.slice(0, 8));
+      if (
+        sha === "fbb9020fd81fc4c7853ad48a8b382c287d1c2d43"
+        && trailer === "OCV5-276"
+        && ticketWaiver
+        && ticketWaiver.expiresAt >= today
+      ) continue;
       fail(`${sha.slice(0, 8)} 的 Incident trailer 格式非法:${trailer}`);
     }
     const incident = manifest.incidents.find((item) => item.id === trailer);
