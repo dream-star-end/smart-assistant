@@ -4063,7 +4063,7 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
-  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH -u DATABASE_URL \
+  if ! (cd "$box_cand" && env -u NODE_OPTIONS -u NODE_PATH \
       TEST_DATABASE_URL="$box_dsn" \
       npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha"); then
     echo "✗ pinned box incident proofs gate failed" >&2

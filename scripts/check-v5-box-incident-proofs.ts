@@ -1070,14 +1070,24 @@ async function proveSpoolReadTransient(api: Api): Promise<string> {
   return "[ocv5-306-spool-read-transient] PASS — a dropped spool read is read again at the same offset";
 }
 
+/** The explicit test DSN, checked before any product module is loaded: a
+ * loopback *_test database that is not this process's DATABASE_URL. The
+ * ambient database and Redis settings are then removed, so nothing imported
+ * below can reach a persistent store by default. */
+async function testDatabase(): Promise<unknown> {
+  const gate = await import(pathToFileURL(join(CANDIDATE, "scripts/check-v5-box-success-recovery.ts")).href);
+  const { config } = gate.parseTestDatabase(process.env.TEST_DATABASE_URL);
+  for (const key of ["DATABASE_URL", "TEST_DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE",
+    "PGSERVICE", "PGOPTIONS", "REDIS_URL"]) delete process.env[key];
+  return config;
+}
+
 /** One pinned session on the explicit loopback test database. The journal's
  * tables are session-local TEMP tables built from the product's own schema
  * mirror, so nothing here can reach or outlive into a persistent schema. */
-async function withJournalDatabase<T>(run: (db: Db) => Promise<T>): Promise<T> {
-  const gate = await import(pathToFileURL(join(CANDIDATE, "scripts/check-v5-box-success-recovery.ts")).href);
-  const { config } = gate.parseTestDatabase(process.env.TEST_DATABASE_URL);
+async function withJournalDatabase<T>(config: unknown, run: (db: Db) => Promise<T>): Promise<T> {
   const pg = await import("pg");
-  const pool = new (pg.default ?? pg).Pool({ ...config, max: 1 });
+  const pool = new (pg.default ?? pg).Pool({ ...(config as object), max: 1 });
   const client = await pool.connect();
   try {
     const ddl = readFileSync(join(CANDIDATE, "packages/commercial/src/billing/boxBillingRecoveryTempSchema.sql"), "utf8");
@@ -1399,6 +1409,20 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
   if (kept !== "BOX_TOOL_OWNER_UNKNOWN" || parked.host.count.launch !== 1 || parkedRow?.ctx.boxRecoveredBy !== undefined) {
     fail(`RECOVERED_UNPROVEN_STOP_${kept}_${String(parkedRow?.ctx.boxRecoveredBy)}`);
   }
+  // a recovery that claimed the exchange and ended before it was ever admitted does not keep it
+  const stale = { uid: 900_000_311n, containerId: 311n, sessionId: "session-stale-claim" };
+  await user(stale.uid, "stale-claim");
+  const abandoned = boxTurn(api, db, journal, stale, "box-stale", "a".repeat(64), undefined,
+    { dispatchId: endedOf(stale.uid), nextSpool: spoolOf([cliInit, ...FINAL_ANSWER]) });
+  await abandoned.first();
+  await prechecked(api, db, { ...stale, requestId: "box-stale-2", turnKey: "b".repeat(64), dispatchId: runningOf(stale.uid) });
+  if (await journal.claimOrphanRecovery({ requestId: "box-stale-1", uid: stale.uid, by: "box-stale-2" } as never) !== true) {
+    fail("RECOVERED_STALE_SETUP");
+  }
+  await db.query("UPDATE request_finalize_journal SET state='aborted' WHERE request_id='box-stale-2'");
+  const takeover = await must("RECOVERED_STALE_CLAIM_KEPT", abandoned.next("box-stale-3", "c".repeat(64), runningOf(stale.uid)));
+  if (!(await must("RECOVERED_STALE_CLAIM_STREAM", takeover.text())).includes("done")
+    || (await journalRow(db, "box-stale-1"))?.ctx.boxRecoveredBy !== "box-stale-3") fail("RECOVERED_STALE_CLAIM_NOT_TAKEN");
   // an exchange the user is stopping is the user's: the recovery neither claims nor continues it
   const stopping = { uid: 900_000_310n, containerId: 310n, sessionId: "session-user-stop" };
   await user(stopping.uid, "user-stop");
@@ -1418,11 +1442,12 @@ async function main(): Promise<void> {
     console.error("[box-incident-proofs] deadline exceeded");
     process.exit(1);
   }, LIMIT_MS);
+  const database = await testDatabase();
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveSpoolReadTransient(api),
-    ...await withJournalDatabase(async (db) => [await proveRejectedStreamWedge(api, db),
+    ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db)])];
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
