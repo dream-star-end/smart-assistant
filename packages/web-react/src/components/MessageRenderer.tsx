@@ -1544,7 +1544,7 @@ export function MessageList({
 }) {
   // 还没开始发送的用户消息不进对话流，改由输入框上方的待发送列表呈现。
   messages = messages.filter((message) => message.role !== "user" || message.status !== "queued");
-  // 用户问答卡已经展示了问题和回答;同一次调用的 AskUserQuestion 工具行只是重复,
+  // 用户问答 / 退出计划模式卡已经展示了问题(计划)和结果;同一次调用的工具行只是重复,
   // 留着会被当成交互工具挂在「处理过程」外面。按 tool_use id 精确配对才隐藏。
   const shadowedAskTools = promptShadowedToolIds(messages);
   if (shadowedAskTools.size > 0) messages = messages.filter((message) => !shadowedAskTools.has(message.id));

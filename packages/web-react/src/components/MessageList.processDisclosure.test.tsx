@@ -378,6 +378,72 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText(/User has answered your questions/)).not.toBeInTheDocument();
   });
 
+  test("已确认的计划卡和它同一次调用的 ExitPlanMode 工具行：工具行不再漏在过程外，计划书仍在卡里", () => {
+    renderList([
+      row("u", "user", "先出个方案", { status: "replied" }),
+      row("read", "tool", "读取", {
+        _clientMessageId: "u",
+        toolName: "Read",
+        inputJson: { file_path: "/tmp/a.ts" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("plan-card", "permission", "退出计划模式", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        requestId: "req-plan",
+        toolUseId: "toolu_plan",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { plan: "# PLAN_BODY 改前端分组规则" },
+      }),
+      row("plan-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_plan",
+        _completed: true,
+        inputJson: { plan: "# PLAN_BODY 改前端分组规则" },
+        output: "User has approved your plan. You can now start coding.",
+      }),
+      row("final", "assistant", "按计划改完了", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    // 过程收起时,外面不应再挂一张「退出计划模式」工具卡。
+    expect(screen.queryByText("退出计划模式")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getAllByText("退出计划模式")).toHaveLength(1);
+    const cards = screen.getAllByTestId("permission-card");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.closest("[data-testid=process-card]")).not.toBeNull();
+    expect(cards[0]?.textContent ?? "").toContain("PLAN_BODY");
+    expect(screen.queryByText(/User has approved your plan/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/PLAN_BODY/)).toHaveLength(1);
+  });
+
+  test("问答卡不吞同编号的其他工具行：配对必须工具名也一致", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("ask-card", "permission", "问题？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-x",
+        toolUseId: "toolu_same",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "问题？", options: [{ label: "好" }] }] },
+      }),
+      row("plan-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_same",
+        _completed: true,
+        inputJson: { plan: "# LONE_PLAN" },
+        output: "User has approved your plan.",
+      }),
+    ]);
+    expect(screen.getAllByText("退出计划模式").length).toBeGreaterThan(0);
+  });
+
   test("没有配对问答卡的 AskUserQuestion 工具行照常显示（不同 tool_use id 不算配对）", () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),

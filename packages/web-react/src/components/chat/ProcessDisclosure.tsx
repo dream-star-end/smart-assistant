@@ -375,30 +375,38 @@ function interactiveTool(message: ChatMessage): boolean {
   return INTERACTIVE_TOOL_RE.test(message.toolName ?? "");
 }
 
+/** CCB tools whose prompt card (role=permission) fully replaces the tool row. */
+const PROMPT_CARD_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
 /**
- * A CCB question lands twice: the 用户问答 card (role=permission, bound to the
- * engine tool_use by `toolUseId`) and the AskUserQuestion tool row of that same
- * call (its result is the raw "User has answered your questions: …" echo). The
- * card already shows the question and the answer, and owns the pending /
- * answered state, so the tool row is a duplicate. Left in place it is caught by
- * `interactiveTool` and sits outside 处理过程 under the answered card.
+ * A CCB question or plan review lands twice: the prompt card (用户问答 /
+ * 退出计划模式, role=permission, bound to the engine tool_use by `toolUseId`)
+ * and the tool row of that same call (its result is the raw engine echo —
+ * "User has answered your questions: …", "User has approved your plan…",
+ * "User rejected the plan"). The card already shows the question / plan and
+ * the outcome, and owns the pending / answered state, so the tool row is a
+ * duplicate. Left in place it is caught by `interactiveTool` and sits outside
+ * 处理过程 under the answered card.
  *
- * Returns the ids of tool rows to drop. Only an exact tool_use id pairing
- * counts; a tool row whose card is missing (paged out, lost history) stays.
+ * Returns the ids of tool rows to drop. Only an exact pairing counts — same
+ * tool name and same tool_use id; a tool row whose card is missing (paged out,
+ * lost history) stays.
  */
 export function promptShadowedToolIds(messages: readonly ChatMessage[]): Set<string> {
-  const promptToolUseIds = new Set<string>();
+  const promptKeys = new Set<string>();
   for (const message of messages) {
-    if (message.role === "permission" && message.toolName === "AskUserQuestion" && message.toolUseId) {
-      promptToolUseIds.add(message.toolUseId);
+    const toolName = message.toolName ?? "";
+    if (message.role === "permission" && PROMPT_CARD_TOOLS.has(toolName) && message.toolUseId) {
+      promptKeys.add(`${toolName}\u0000${message.toolUseId}`);
     }
   }
   const ids = new Set<string>();
-  if (promptToolUseIds.size === 0) return ids;
+  if (promptKeys.size === 0) return ids;
   for (const message of messages) {
-    if (message.role !== "tool" || message.toolName !== "AskUserQuestion") continue;
+    const toolName = message.toolName ?? "";
+    if (message.role !== "tool" || !PROMPT_CARD_TOOLS.has(toolName)) continue;
     const toolUseId = message.toolUseId ?? message.blockId;
-    if (toolUseId && promptToolUseIds.has(toolUseId)) ids.add(message.id);
+    if (toolUseId && promptKeys.has(`${toolName}\u0000${toolUseId}`)) ids.add(message.id);
   }
   return ids;
 }
