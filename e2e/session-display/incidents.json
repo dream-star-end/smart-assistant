@@ -5875,7 +5875,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
-          "assertion": "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message runs"
+          "assertion": "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message passes submit"
         },
         {
           "layer": "unit",
@@ -5922,6 +5922,11 @@
       "rootFixCommit": "f3c91504",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation"
+        },
         {
           "layer": "unit",
           "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",

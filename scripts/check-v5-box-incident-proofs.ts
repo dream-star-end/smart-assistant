@@ -9,11 +9,13 @@
  * recorded in the receipt and not compared here.
  * Incidents whose fix lives in the durable journal run against real Postgres:
  * TEST_DATABASE_URL must name a loopback *_test database (the same explicit
- * DSN the neighbouring success-recovery gate requires); only session-local
- * TEMP tables are created. The Box account itself is simulated at its exec
- * endpoint; everything between the request and that endpoint is product code.
+ * DSN the neighbouring success-recovery gate requires). The journal uses
+ * session-local TEMP tables; the sessions backend needs several connections,
+ * so it gets a randomly named schema that is dropped when the proof ends.
+ * The Box account itself is simulated at its exec endpoint; everything
+ * between the request and that endpoint is product code.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
@@ -78,14 +80,21 @@ type Api = {
   finishIdle: (session: unknown, source: { sessionId: string; turnKey: string }, dir: string) => Promise<void>;
   idle: IdleFiles;
   boxNative: { model: string; owner: string };
+  gatewaySource: string;
+  sessionsBackend: (pool: unknown) => SessionsBackend;
+  tape: { version: number; partBytes: number };
 };
+type SessionsBackend = { admitUserTurn: (input: unknown) => Promise<{ kind: string }>;
+  stageLosslessTurnTapePart: (userId: string, request: unknown, bytes: Buffer) => Promise<unknown>;
+  finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }> };
 type RouteHandler = (req: unknown, res: unknown, ctx: { hostUuid: string; boundIp: string }) => Promise<void>;
 type IdleOp = { runnerKilledAt?: number; disposition?: string; abandonReason?: string; [key: string]: unknown };
 type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
   readIdleCandidate: (dir: string, key: string) => unknown; readPendingIdle: (dir: string, key: string) => unknown;
   readIdleOp: (dir: string, key: string, revision: string) => IdleOp | undefined;
   writeIdleOp: (dir: string, op: IdleOp) => void; writeIdleCandidate: (dir: string, candidate: unknown) => void;
-  startIdleOp: (input: unknown) => { op: IdleOp }; writeIdleNative: (dir: string, native: unknown) => void };
+  startIdleOp: (input: unknown) => { op: IdleOp }; writeIdleNative: (dir: string, native: unknown) => void;
+  idleHistoryStillBlocked: (input: { candidate: unknown; pending: unknown; recovered: unknown }) => boolean };
 type ReplayLookup = { kind: string; response?: Response;
   identity?: { state?: string; rootLaunchPermit?: boolean; invocationMode?: string } };
 type Db = { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
@@ -149,6 +158,8 @@ async function load(): Promise<Api> {
   const idleFiles = await import(pathToFileURL(join(GATEWAY, "boxIdleCompact.ts")).href);
   const sessions = await import(pathToFileURL(join(GATEWAY, "sessionManager.ts")).href);
   const authority = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/modelAuthority.ts")).href);
+  const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
+  const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
@@ -186,7 +197,10 @@ async function load(): Promise<Api> {
     fetchIdleProof: idleClient.fetchBoxIdleProof,
     finishIdle: (session, source, dir) => sessions.SessionManager.prototype.finishIdleUnderLock.call({}, session, source, dir),
     idle: idleFiles,
-    boxNative: { model: authority.BOX_NATIVE_CONTEXT_MODEL, owner: authority.BOX_NATIVE_CONTEXT_OWNER } };
+    boxNative: { model: authority.BOX_NATIVE_CONTEXT_MODEL, owner: authority.BOX_NATIVE_CONTEXT_OWNER },
+    gatewaySource: readFileSync(join(GATEWAY, "sessionManager.ts"), "utf8"),
+    sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
+    tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES } };
 }
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -1510,6 +1524,33 @@ async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigi
     } };
 }
 
+/** The session as SessionManager's idle step sees it. Its CCB idle turn, when
+ * one is dispatched, ends normally with no summary. */
+function idleSession(api: Api, sessionKey: string, counters: { submits: number; shutdowns: number },
+  shutdown: () => Promise<void> = async () => {}) {
+  return { sessionKey, model: api.boxNative.model, _boxContextOwner: api.boxNative.owner,
+    runner: Object.assign(new EventEmitter(), {
+      submitTurn: () => { counters.submits++; return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }; },
+      shutdown: () => { counters.shutdowns++; return shutdown(); } }) };
+}
+/** The idle gate every message passes in SessionManager.submit(), step for step
+ * with the product's own functions: durable idle work is driven first, and the
+ * message is refused with IDLE_HISTORY_PENDING ("消息未开始处理") while the
+ * session's history is still pending. */
+async function submitIdleGate(api: Api, session: { sessionKey: string }, dir: string): Promise<"admitted" | "IDLE_HISTORY_PENDING"> {
+  if (!/const still = readIdleCandidate\(paths\.home, session\.sessionKey\)[\s\S]{0,300}idleHistoryStillBlocked\(\{ candidate: still, pending: pendingIdle, recovered \}\)\) \{\s*throw new IdleCompactRejected\('IDLE_HISTORY_PENDING'\)/
+    .test(api.gatewaySource)) fail("SUBMIT_IDLE_GATE_CHANGED");
+  const pending = api.idle.readPendingIdle(dir, session.sessionKey) as { sourceSessionId: string; sourceTurnKey: string;
+    revision: string } | undefined;
+  const candidate = api.idle.readIdleCandidate(dir, session.sessionKey) as { sessionId: string; turnKey: string } | undefined;
+  if (!pending && !candidate) return "admitted";
+  await api.finishIdle(session, { sessionId: pending?.sourceSessionId ?? candidate!.sessionId,
+    turnKey: pending?.sourceTurnKey ?? candidate!.turnKey }, dir);
+  const still = api.idle.readIdleCandidate(dir, session.sessionKey);
+  const recovered = pending ? api.idle.readIdleOp(dir, session.sessionKey, pending.revision) : undefined;
+  return api.idle.idleHistoryStillBlocked({ candidate: still, pending, recovered }) ? "IDLE_HISTORY_PENDING" : "admitted";
+}
+
 // INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE, live #72191544: egress refused a
 // continuation with a deterministic 409 before any Box call. Claude Code ended
 // the turn on it, but the Box CLI that had handed off the tool calls stayed
@@ -1537,8 +1578,15 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     409, code, "continuation rejected", "dc1551b789864b0500d6bd581ffd538b");
   if (!wire.includes(code)) fail("REJECT_WIRE_BODY");
   const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-308-reject-"));
+  const counters = { submits: 0, shutdowns: 0 };
+  const session = idleSession(api, "reject-session", counters);
+  // the turn's own submit left the session's idle candidate, as for every Box native turn
+  api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
   try {
     if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("REJECT_NOT_PARKED");
+    // while the Box turn is parked, a message to this session is refused: the incident
+    if (await submitIdleGate(api, session, dir) !== "IDLE_HISTORY_PENDING") fail("REJECT_PARKED_TURN_DID_NOT_BLOCK");
     const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
       setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
     const adapter = api.ccbAdapter(runner);
@@ -1548,7 +1596,7 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: 409 ${wire}` });
     if ((await ccbTurn.summary)?.isError !== true) fail("REJECT_TURN_NOT_ENDED");
     await routes.settled();
-    if (!isDeepStrictEqual(routes.calls, ["/internal/box/idle-proof", "/internal/box/stop"])) {
+    if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) {
       fail(`REJECT_PARKED_TURN_NOT_STOPPED_${routes.calls.join(",")}`);
     }
     const parked = await journalRow(db, "box-rej-1");
@@ -1556,6 +1604,10 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     // what the session's idle candidate waits for, read the way the gateway reads it
     const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
     if (idle.status !== "failed") fail(`REJECT_IDLE_${idle.status}`);
+    // the next message passes submit's idle gate: the candidate is cleared, nothing is compacted
+    if (await submitIdleGate(api, session, dir) !== "admitted") fail("REJECT_NEXT_MESSAGE_STILL_BLOCKED");
+    if (api.idle.readIdleCandidate(dir, session.sessionKey) !== undefined || counters.submits !== 0) fail("REJECT_CANDIDATE_KEPT");
+    if (await submitIdleGate(api, session, dir) !== "admitted") fail("REJECT_NEXT_MESSAGE_BLOCKED_AGAIN");
     // a transient Box answer of the same shape is not a continuation reject and stops nothing
     const other = api.ccbAdapter(runner);
     const otherTurn = other.submitTurn({ input: "run it", turnKey: "e".repeat(64), onEvent: () => {},
@@ -1568,15 +1620,16 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) fail("REJECT_TRANSIENT_STOPPED");
   } finally {
     await routes.close();
+    rmSync(dir, { recursive: true, force: true });
   }
-  // the next message of the session starts and is answered
+  // and egress admits, launches and answers it
   await prechecked(api, db, { ...who, requestId: "box-rej-next", turnKey: "d".repeat(64) });
   const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
     real: { journal, ...who, accountId: who.containerId, requestId: "box-rej-next", turnKey: "d".repeat(64) } });
   if ((await must("REJECT_NEXT_MESSAGE", next.round())).kind !== "final" || !next.sse().includes("done")) {
     fail("REJECT_NEXT_MESSAGE_NO_ANSWER");
   }
-  return "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message runs";
+  return "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message passes submit";
 }
 
 // INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION: a session's idle compaction
@@ -1612,14 +1665,9 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
   const routes = await egressInternalRoutes(api, journal, who, source.target, store.read);
   const dir = join(root, "recovery");
   const counters = { submits: 0, shutdowns: 0 };
-  /** The session as the idle step sees it; its CCB idle turn ends normally with no summary. */
-  const session = (sessionKey: string, shutdown: () => Promise<void> = async () => {}) => ({ sessionKey,
-    model: api.boxNative.model, _boxContextOwner: api.boxNative.owner,
-    runner: Object.assign(new EventEmitter(), {
-      submitTurn: () => { counters.submits++; return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }; },
-      shutdown: () => { counters.shutdowns++; return shutdown(); } }) });
-  const finish = (sessionKey: string, shutdown?: () => Promise<void>) =>
-    api.finishIdle(session(sessionKey, shutdown), { sessionId: who.sessionId, turnKey: sourceTurn }, dir);
+  const session = (sessionKey: string, shutdown?: () => Promise<void>) => idleSession(api, sessionKey, counters, shutdown);
+  /** A message arrives for the session: SessionManager.submit()'s idle gate. */
+  const submit = (sessionKey: string, shutdown?: () => Promise<void>) => submitIdleGate(api, session(sessionKey, shutdown), dir);
   try {
     const proof = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey: sourceTurn }) as {
       status: string; revision?: string; compactRequired?: boolean };
@@ -1628,22 +1676,23 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     const key = "idle-no-summary";
     api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: key, sessionId: who.sessionId, turnKey: sourceTurn });
     const before = Date.now();
-    await finish(key);
+    // the idle turn is dispatched and ends without a summary; inside the grace window the session waits
+    if (await submit(key) !== "IDLE_HISTORY_PENDING") fail("IDLE_ADMITTED_INSIDE_GRACE");
     const recorded = api.idle.readIdleOp(dir, key, revision);
     if (counters.submits !== 1) fail(`IDLE_TURN_DISPATCHES_${counters.submits}`);
     if (counters.shutdowns !== 1 || !((recorded?.runnerKilledAt ?? 0) >= before)) fail("IDLE_NO_SHUTDOWN_EVIDENCE");
     if (recorded?.disposition !== undefined || !api.idle.readPendingIdle(dir, key)) fail("IDLE_SETTLED_INSIDE_GRACE");
     // after the grace window egress still has no row for the idle turn: the op settles and stops blocking submit
     api.idle.writeIdleOp(dir, { ...recorded!, runnerKilledAt: Date.now() - api.idle.IDLE_STOPPED_GRACE_MS - 1 });
-    await finish(key);
+    if (await submit(key) !== "admitted") fail("IDLE_SESSION_STILL_BLOCKED");
     const settled = api.idle.readIdleOp(dir, key, revision);
     if (settled?.abandonReason !== "idle_turn_never_sent" || api.idle.readPendingIdle(dir, key) !== undefined
       || api.idle.readIdleCandidate(dir, key) !== undefined) fail(`IDLE_SESSION_STILL_BLOCKED_${String(settled?.abandonReason)}`);
     if (counters.submits !== 1) fail("IDLE_TURN_REDISPATCHED");
     // a shutdown that fails is no evidence: nothing is recorded and nothing settles on the clock alone
     api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: "idle-stuck", sessionId: who.sessionId, turnKey: sourceTurn });
-    await finish("idle-stuck", async () => { throw new Error("busy"); });
-    if (api.idle.readIdleOp(dir, "idle-stuck", revision)?.runnerKilledAt !== undefined
+    const stuck = await submit("idle-stuck", async () => { throw new Error("busy"); });
+    if (stuck !== "IDLE_HISTORY_PENDING" || api.idle.readIdleOp(dir, "idle-stuck", revision)?.runnerKilledAt !== undefined
       || !api.idle.readPendingIdle(dir, "idle-stuck")) fail("IDLE_SETTLED_WITHOUT_EVIDENCE");
     // an op stranded by older code in a container that no longer exists: written before this
     // runtime started, so that start is its shutdown evidence and the next submit settles it
@@ -1656,7 +1705,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     const long = new Date(Date.UTC(2001, 0, 1));
     utimesSync(join(dir, "idle-ops", encodeURIComponent(stranded), `${revision}.json`), long, long);
     const submits = counters.submits;
-    await finish(stranded);
+    if (await submit(stranded) !== "admitted") fail("IDLE_STRANDED_OP_BLOCKS");
     const released = api.idle.readIdleOp(dir, stranded, revision);
     if (released?.disposition !== "abandoned" || released.abandonReason !== "idle_turn_never_sent"
       || api.idle.readPendingIdle(dir, stranded) !== undefined || counters.submits !== submits) {
@@ -1670,7 +1719,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     api.idle.writeIdleNative(dir, { v: 1, opId: lostTurn, revision, sessionId: who.sessionId, modelCalls: 0,
       modelStarted: true, frozenTail: [], attachments: [] });
     utimesSync(join(dir, "idle-ops", encodeURIComponent(lost), `${revision}.json`), long, long);
-    await api.finishIdle(session(lost), { sessionId: who.sessionId, turnKey: lostSource }, dir);
+    if (await submit(lost) !== "admitted") fail("IDLE_LOST_SOURCE_OP_BLOCKS");
     if (api.idle.readIdleOp(dir, lost, revision)?.abandonReason !== "idle_turn_never_sent"
       || api.idle.readPendingIdle(dir, lost) !== undefined || counters.submits !== submits) fail("IDLE_LOST_SOURCE_OP");
     return "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released";
@@ -1678,6 +1727,139 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
     await routes.close();
     rmSync(root, { recursive: true, force: true });
   }
+}
+
+/** The sessions backend on its own schema of the test database, built from the
+ * product's migrations the way its integration suite builds it. The schema has
+ * a random name and is dropped again; nothing else in the database is touched. */
+async function withSessionsBackend<T>(api: Api, config: unknown,
+  run: (backend: SessionsBackend, db: Db) => Promise<T>): Promise<T> {
+  const pg = await import("pg");
+  const Pool = (pg.default ?? pg).Pool;
+  const schema = `oc_incident_proof_${randomBytes(6).toString("hex")}`;
+  const admin = new Pool({ ...(config as object), max: 1 });
+  await admin.query("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public");
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const pool = new Pool({ ...(config as object), max: 6, options: `-c search_path=${schema}` });
+  try {
+    const migrate = async (...names: string[]) => {
+      for (const name of names) {
+        await pool.query(readFileSync(join(CANDIDATE, "packages/commercial/src/db/migrations", name), "utf8"));
+      }
+    };
+    await migrate("0066_wechat_pointer_outbox_audit.sql", "0078_wechat_outbox_backoff_hol.sql",
+      "0134_sessions_master_pg.sql", "0147_lossless_turn_tapes.sql", "0159_goal_state.sql",
+      "0157_lossless_runtime_batches.sql");
+    // 0170 alters three billing/observability tables this schema does not otherwise need
+    await pool.query(`CREATE TABLE request_finalize_journal (request_id TEXT PRIMARY KEY);
+      CREATE TABLE usage_records (id BIGSERIAL PRIMARY KEY, user_id BIGINT, turn_key TEXT, status TEXT,
+        output_tokens BIGINT NOT NULL DEFAULT 0, cache_read_tokens BIGINT NOT NULL DEFAULT 0);
+      CREATE TABLE turn_traces (trace_id TEXT PRIMARY KEY)`);
+    await migrate("0170_durable_turn_dispatch.sql", "0173_client_session_model.sql",
+      "0175_client_session_history_revision.sql", "0176_direct_turn_timeline.sql", "0177_unified_client_timeline.sql");
+    await pool.query("CREATE TABLE users (id BIGINT PRIMARY KEY)");
+    await migrate("0181_turn_tape_recovery_links.sql", "0196_client_session_workspace_mode.sql",
+      "0201_durable_live_turn_frames.sql", "0202_turn_recovery_control.sql", "0228_turn_visible_finalize.sql",
+      "0229_turn_finalize_integrity.sql", "0230_chat_projects.sql", "0231_turn_tape_materialization_resilience.sql",
+      "0233_client_session_list_archived_at.sql", "0239_turn_dispatch_shutdown_ctx.sql",
+      "0240_client_session_last_read_at.sql", "0241_raise_last_read_watermark.sql", "0243_live_unit_checkpoints.sql",
+      "0246_chat_project_board_bind.sql");
+    // columns and tables the backend's SQL reads that belong to migration chains outside this slice
+    await pool.query(`CREATE TABLE agent_containers (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+        state TEXT NOT NULL, runtime_kind TEXT NOT NULL DEFAULT 'docker');
+      CREATE TABLE admin_audit (id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL, target TEXT,
+        before JSONB, after JSONB, ip INET, user_agent TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+      ALTER TABLE turn_dispatches ADD COLUMN IF NOT EXISTS agent_container_id BIGINT REFERENCES agent_containers(id);
+      ALTER TABLE turn_dispatches ADD COLUMN IF NOT EXISTS runtime_kind TEXT;
+      ALTER TABLE chat_projects ADD COLUMN IF NOT EXISTS is_research_default BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE client_session_turn_tapes ADD COLUMN waive_reason TEXT;
+      CREATE TABLE turn_waivers (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, turn_key TEXT NOT NULL,
+        reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', refunded_credits BIGINT NOT NULL DEFAULT 0,
+        record_count INTEGER NOT NULL DEFAULT 0, inbox_message_id BIGINT, applied_at TIMESTAMPTZ,
+        UNIQUE (user_id, turn_key))`);
+    await pool.query(`INSERT INTO sessions_store_migration_state
+      (singleton, authority, generation, cutover_id, source_digest, completed_at)
+      VALUES (true, 'pg_authoritative', 1, 'proof-cutover', 'proof-digest', $1)`, [Date.now()]);
+    return await run(api.sessionsBackend(pool), pool as Db);
+  } finally {
+    await pool.end().catch(() => {});
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+    await admin.end();
+  }
+}
+
+// INC-20261003-BOX-SETTLED-TOOLS-MANUAL-RESUME, live #b6df9aee: a Box Claude
+// turn ran Bash and Skill to completion, then the next model call failed with
+// ENGINE_ERROR. The master declined automatic recovery as checkpoint_unsafe,
+// because Bash never has a gateway effect proof, and the user had to click
+// 「从断点继续」. Finalizing such a turn must schedule the automatic checkpoint
+// continuation itself, with a short budget, and only when nothing is open.
+async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise<string> {
+  return withSessionsBackend(api, database, async (backend, db) => {
+    const uid = 9n, sessionUser = "c:9";
+    const settled = [
+      { blockId: "toolu_317_bash", toolName: "Bash", inputJson: { command: "git status --short" }, output: "M a.ts", completed: true },
+      { blockId: "toolu_317_skill", toolName: "Skill", inputJson: { skill: "v5-selfhost-shared-worktree-deploy-discipline" },
+        output: "Launching skill: v5-selfhost-shared-worktree-deploy-discipline", completed: true }];
+    let turns = 0;
+    /** One user turn admitted by the master and its finalized tape, as the gateway uploads it. */
+    const finalized = async (name: string, shape: { tools: unknown[]; errorCode: string; status?: string;
+      recoveryAttempt?: number }) => {
+      const sessionId = `s-ocv5-317-${name}`, clientMessageId = `cm-ocv5-317-${name}`;
+      const turnKey = createHash("sha256").update(`ocv5-317:${name}:${++turns}`).digest("hex");
+      const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId,
+        agentId: "main", model: MODEL, requestHash: "h".repeat(64), billingRequestId: `brq-${clientMessageId}`,
+        dispatchId: randomUUID(), ownerId: "conn-A",
+        message: { id: clientMessageId, role: "user", text: "refactor the sidebar", ts: 1,
+          _routing: { model: MODEL, effortLevel: null, teamMode: false },
+          ...(shape.recoveryAttempt ? { _automaticRecovery: true, _automaticRecoveryAttempt: shape.recoveryAttempt,
+            _automaticRecoveryRootClientMessageId: `cm-ocv5-317-root-${name}` } : {}) } });
+      if (admitted.kind !== "admitted") fail(`SETTLED_${name}_NOT_ADMITTED`);
+      const canonical = Buffer.from(JSON.stringify({ sessionId, agentId: "main", turnIndex: 1,
+        status: shape.status ?? "completed", turnKey, clientMessageId, text: "API Error: 409", tools: shape.tools,
+        errorCode: shape.errorCode, createdAt: 1_783_950_150_000, usage: { inputTokens: 6, outputTokens: 872 } }), "utf8");
+      const hash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+      const partCount = Math.ceil(canonical.length / api.tape.partBytes);
+      const base = { protocolVersion: api.tape.version, sessionId, agentId: "main", turnIndex: 1,
+        status: shape.status ?? "completed", turnKey, tapeId: hash(`proof-tape\0${turnKey}`), tapeSha256: hash(canonical),
+        totalBytes: canonical.length, partCount, createdAt: 1_783_950_150_000 };
+      for (let partIndex = 0; partIndex < partCount; partIndex++) {
+        const bytes = canonical.subarray(partIndex * api.tape.partBytes, (partIndex + 1) * api.tape.partBytes);
+        await backend.stageLosslessTurnTapePart(sessionUser, { ...base, action: "part", partIndex,
+          partSha256: hash(bytes), data: bytes.toString("base64") }, bytes);
+      }
+      if ((await backend.finalizeLosslessTurnTape(sessionUser, { ...base, action: "finalize" })).applied !== "finalized") {
+        fail(`SETTLED_${name}_NOT_FINALIZED`);
+      }
+      const jobs = (await db.query(`SELECT recovery_mode AS mode, semantic_recovery_attempt AS attempt
+        FROM turn_recovery_jobs WHERE user_id=$1 AND session_id=$2`, [uid.toString(), sessionId])).rows;
+      const messages = JSON.parse(String((await db.query("SELECT messages FROM client_sessions WHERE id=$1",
+        [sessionId])).rows[0]?.messages ?? "[]")) as Array<{ id?: string }>;
+      return { jobs: jobs.map((job) => `${String(job.mode)}#${String(job.attempt)}`),
+        gaveUp: messages.some((message) => String(message.id).startsWith("m-recovery-giveup-")) };
+    };
+    // the live tape: Bash and Skill finished, then the model call failed
+    const live = await finalized("live", { tools: settled, errorCode: "ENGINE_ERROR" });
+    if (!isDeepStrictEqual(live.jobs, ["checkpoint#1"]) || live.gaveUp) fail(`SETTLED_LEFT_ON_MANUAL_CARD_${live.jobs.join(",")}`);
+    for (const errorCode of ["UPSTREAM_TIMEOUT", "RATE_LIMITED"]) {
+      const other = await finalized(errorCode.toLowerCase().replace("_", "-"), { tools: settled, errorCode });
+      if (!isDeepStrictEqual(other.jobs, ["checkpoint#1"])) fail(`SETTLED_${errorCode}_${other.jobs.join(",")}`);
+    }
+    // a tool that never finished keeps the turn on the manual path
+    const open = await finalized("open-tool", { errorCode: "ENGINE_ERROR", status: "interrupted",
+      tools: [settled[0], { ...settled[1], output: "", completed: false }] });
+    if (open.jobs.length !== 0) fail(`SETTLED_OPEN_TOOL_RESUMED_${open.jobs.join(",")}`);
+    // losing the runner is not a model-plane failure, and a turn with no tools has nothing to resume over
+    const runner = await finalized("runner-lost", { tools: settled, errorCode: "RUNNER_CRASHED" });
+    const bare = await finalized("no-tools", { tools: [], errorCode: "ENGINE_ERROR" });
+    if (runner.jobs.length !== 0 || bare.jobs.length !== 0) fail("SETTLED_WIDENED_TO_OTHER_FAILURES");
+    // the automatic budget is three: the third failure of a lineage shows the card instead of ten bubbles
+    const second = await finalized("second-retry", { tools: settled, errorCode: "ENGINE_ERROR", recoveryAttempt: 2 });
+    const third = await finalized("third-retry", { tools: settled, errorCode: "ENGINE_ERROR", recoveryAttempt: 3 });
+    if (!isDeepStrictEqual(second.jobs, ["checkpoint#3"]) || second.gaveUp) fail(`SETTLED_BUDGET_SECOND_${second.jobs.join(",")}`);
+    if (third.jobs.length !== 0 || !third.gaveUp) fail(`SETTLED_BUDGET_THIRD_${third.jobs.join(",")}_${third.gaveUp}`);
+    return "[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation";
+  });
 }
 
 async function main(): Promise<void> {
@@ -1693,7 +1875,8 @@ async function main(): Promise<void> {
     await proveSpoolReadTransient(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
-      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db)])];
+      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db)]),
+    await proveSettledToolsAutoResume(api, database)];
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }
