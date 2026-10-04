@@ -1947,9 +1947,12 @@ export class BoxDurableJournal implements BoxJournalPort {
             WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
               AND ctx->>'model'=$4
               AND ctx->>'boxState' IN ('resuming','unknown','linked')
+              AND NOT (ctx ? 'boxCancelIntent')
             LIMIT 1`,
           [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
             input.canonicalModel]);
+        // A cancelled chain has no live resume: its rounds must not read as one
+        // in progress, or the orphan release (BOX_TOOL_OWNER_UNKNOWN) is never tried.
         if (consumed.rowCount) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
       }

@@ -1065,9 +1065,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.claimToolResume({
       requestId: `box-cancel-child-${suffix}`, uid: 3n,
       canonicalModel: basis.model, canonicalBody: afterCancelBody }),
-    // The cancelled chain still holds its consumed (linked) round, so the claim
-    // reads as a resume in progress, not as an unknown owner (since 5ae79fe71).
-    /BOX_RESUME_IN_PROGRESS/);
+    /BOX_TOOL_OWNER_UNKNOWN/);
     const linkedProbe = (await journal.listStoppedFailureProbeCandidates(20))
       .find((item) => item.requestId === `box-h-${suffix}`);
     assert.ok(linkedProbe);
