@@ -22,9 +22,21 @@ const TUTORIAL_MEDIA_V3 = new Set<TutorialMediaKey>([
   "team-mode",
   "models-reasoning",
   "sessions-history",
+  "advisor-mode",
+  "billing-usage",
+  "taskboard",
 ]);
-const TUTORIAL_MEDIA_V4 = new Set<TutorialMediaKey>(["agents", "chat-basics"]);
-const TUTORIAL_MEDIA_V5 = new Set<TutorialMediaKey>(["container-web-preview"]);
+const TUTORIAL_MEDIA_V4 = new Set<TutorialMediaKey>([
+  "agents",
+  "chat-basics",
+  "sessions-history",
+  "team-mode",
+]);
+const TUTORIAL_MEDIA_V5 = new Set<TutorialMediaKey>([
+  "container-web-preview",
+  "agents",
+  "chat-basics",
+]);
 
 export const TUTORIAL_MEDIA: Record<
   TutorialMediaKey,

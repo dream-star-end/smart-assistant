@@ -80,6 +80,7 @@ test('start launches exact deploy arguments in a production-shaped transient uni
         FAKE_LOG: log,
         OC_V5_RELEASE_QUEUE_ID: 'rq-20260807T000000Z-abcdef123456',
         KL_HOST: 'kl-test',
+        OC_V5_PROOF_TEST_DATABASE_URL: 'postgres://fixture@127.0.0.1:55432/detached_test',
       },
     })
     assert.equal(
@@ -107,6 +108,12 @@ test('start launches exact deploy arguments in a production-shaped transient uni
     assert.ok(args.includes('--setenv=GH_CONFIG_DIR=/root/.config/gh'))
     assert.ok(args.includes('--setenv=OC_V5_RELEASE_QUEUE_ID=rq-20260807T000000Z-abcdef123456'))
     assert.ok(args.includes('--setenv=KL_HOST=kl-test'))
+    // build_release 的 Box 事故证明门只认显式测试库;transient unit 不继承调用方环境。
+    assert.ok(
+      args.includes(
+        '--setenv=OC_V5_PROOF_TEST_DATABASE_URL=postgres://fixture@127.0.0.1:55432/detached_test',
+      ),
+    )
     assert.deepEqual(args.slice(-4), [
       '/usr/bin/bash',
       path.join(root, 'scripts/deploy-v5.sh'),
