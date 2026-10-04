@@ -30,6 +30,10 @@ type Api = {
   echo: (expected: readonly EchoExpected[]) => { accept: (raw: unknown) => void;
     verifyDeferred: () => Promise<void>; assertComplete: () => void };
   decoder: (model: string, tools: unknown[]) => Decoder;
+  pollSpool: (input: { exec: unknown; access: unknown; startOffset: number; deadlineMs: number;
+    pollIntervalMs: number; retryDelaysMs?: readonly number[] }) => AsyncGenerator<{ text: string; endOffset: number }>;
+  spoolAccess: () => unknown;
+  transportError: (code: string) => Error;
 };
 type Decoder = {
   push: (chunk: string) => { sse: string; candidate: { toolUses: ReadonlyArray<{ id: string; clientName: string }>;
@@ -60,11 +64,17 @@ async function load(): Promise<Api> {
   const echo = await import(pathToFileURL(join(PROXY, "boxToolResultEcho.ts")).href);
   const handoff = await import(pathToFileURL(join(PROXY, "boxCliToolHandoff.ts")).href);
   const catalog = await import(pathToFileURL(join(PROXY, "boxToolCatalog.ts")).href);
+  const poller = await import(pathToFileURL(join(PROXY, "boxSpoolPoller.ts")).href);
+  const access = await import(pathToFileURL(join(PROXY, "boxDetachedRunAccess.ts")).href);
+  const transport = await import(pathToFileURL(join(PROXY, "boxExecTransport.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
     decoder: (model, tools) => new handoff.BoxCliToolHandoffDecoder(model,
-      catalog.compileBoxToolCatalog(tools, "natural")) };
+      catalog.compileBoxToolCatalog(tools, "natural")),
+    pollSpool: poller.pollBoxSpoolLines,
+    spoolAccess: () => access.makeBoxDetachedRunAccess({ runNonce: "a".repeat(24), detachedRunnerHash: "b".repeat(64) }),
+    transportError: (code) => new transport.BoxExecTransportError(code, false) };
 }
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -418,6 +428,48 @@ function proveCliRejectedCall(api: Api): string {
   return "[ocv5-301-cli-rejected-call] PASS — a call the CLI rejects is retried inside one visible turn";
 }
 
+// INC-20261001-BOX-SPOOL-READ-TRANSIENT, live #2ee979cd: about 25 tool rounds
+// into a long turn one exec request that reads the Box stdout spool was dropped
+// at the network layer, and that single failed read ended the whole turn. The
+// poller must read the same offset again and deliver the line; errors that say
+// something about the account or the run itself are never retried.
+async function proveSpoolReadTransient(api: Api): Promise<string> {
+  const line = Buffer.from('{"type":"assistant"}\n', "utf8");
+  const reply = (bytes: Buffer, offset: number) => ({ stdout: JSON.stringify({
+    data: bytes.toString("base64"), offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 as const });
+  const poll = (run: (offset: number, call: number) => unknown) => {
+    const offsets: number[] = [];
+    const exec = { run: async (request: { args: string[] }) => {
+      const offset = Number(request.args[7]);
+      offsets.push(offset);
+      return run(offset, offsets.length);
+    } };
+    return { offsets, lines: api.pollSpool({ exec, access: api.spoolAccess(), startOffset: 7,
+      deadlineMs: 5000, pollIntervalMs: 1, retryDelaysMs: [1, 1] }) };
+  };
+  const dropped = poll((offset, call) => {
+    if (call === 1) throw api.transportError("BOX_EXEC_TRANSPORT_UNKNOWN");
+    if (call === 2) throw api.transportError("BOX_EXEC_HTTP_502");
+    return reply(call === 3 ? line : Buffer.alloc(0), offset);
+  });
+  let first: IteratorResult<{ text: string; endOffset: number }>;
+  try { first = await dropped.lines.next(); } catch (error) {
+    fail(`SPOOL_DROPPED_READ_ENDED_TURN_${String((error as { code?: unknown }).code ?? "THREW")}`);
+  }
+  await dropped.lines.return(undefined);
+  if (first.value?.text !== line.toString("utf8") || first.value.endOffset !== 7 + line.length) fail("SPOOL_LINE_LOST");
+  if (!isDeepStrictEqual(dropped.offsets, [7, 7, 7])) fail("SPOOL_OFFSET_MOVED");
+  const surfaces = async (code: string, expectCalls: number, label: string) => {
+    const run = poll(() => { throw api.transportError(code); });
+    const seen = await echoCode(async () => { await run.lines.next(); });
+    if (seen !== code) fail(`${label}_${seen}`);
+    if (run.offsets.length !== expectCalls) fail(`${label}_CALLS_${run.offsets.length}`);
+  };
+  await surfaces("BOX_EXEC_ACCOUNT_GUARD_FAILED", 1, "SPOOL_ACCOUNT_GUARD_RETRIED");
+  await surfaces("BOX_EXEC_TRANSPORT_UNKNOWN", 3, "SPOOL_RETRY_UNBOUNDED");
+  return "[ocv5-306-spool-read-transient] PASS — a dropped spool read is read again at the same offset";
+}
+
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -426,7 +478,8 @@ async function main(): Promise<void> {
   }, LIMIT_MS);
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), await proveResultRewriteEcho(api), proveCliRejectedCall(api)];
+    proveImageCaption(api), await proveResultRewriteEcho(api), proveCliRejectedCall(api),
+    await proveSpoolReadTransient(api)];
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }
