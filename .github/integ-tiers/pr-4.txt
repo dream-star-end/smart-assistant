@@ -12,15 +12,16 @@
 # 4 个文件串行，每个父超时 180000ms。mutex 900s 覆盖 4*180s+120s 清理。
 # job 20min 再留安装余量。这些是拟上界，不是 2 核实测。
 # min-tests: 13
-# max-minutes: 20
+# max-minutes: 30
 # file-timeout-ms: 180000
-# mutex-timeout-seconds: 1500
+# mutex-timeout-seconds: 1620
 packages/commercial/src/http/proxy/boxIdleProof.integ.test.ts
 packages/commercial/src/http/proxy/boxRejectedStream.integ.test.ts
 packages/commercial/src/http/proxy/boxOrphanHandoff.integ.test.ts
 packages/commercial/src/http/proxy/boxIdleSet.integ.test.ts
 # OCV5-313：会话不再被读不到证明的 Box run 永久占住（过期无证明终态 6 例、
-# 各 unknown 阶段限时停止的候选 1 例）。7 个文件串行时 mutex 取 7*180s+120s 上界。
+# 各 unknown 阶段限时停止的候选 1 例）。本片现为 8 个文件串行：mutex 取 8*180s+120s=1560s
+# 以上，job 30min 含安装余量（同为拟上界，不是 2 核实测）。
 packages/commercial/src/http/proxy/boxRunExpiredUnproven.integ.test.ts
 packages/commercial/src/http/proxy/boxStaleResumeStop.integ.test.ts
 packages/commercial/src/http/proxy/boxResourceEnvelope.pipeline.integ.test.ts

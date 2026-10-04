@@ -381,7 +381,7 @@ jobs:
           - shard: pr-3
             timeout: 20
           - shard: pr-4
-            timeout: 20
+            timeout: 30
           - shard: pr-5
             timeout: 70
           - shard: pr-6
