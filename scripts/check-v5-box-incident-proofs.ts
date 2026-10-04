@@ -1749,18 +1749,26 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
   const Pool = (pg.default ?? pg).Pool;
   const schema = `oc_incident_proof_${randomBytes(6).toString("hex")}`;
   const admin = new Pool({ ...(config as object), max: 1 });
-  const pool = new Pool({ ...(config as object), max: 6, options: `-c search_path=${schema}` });
-  /** Dropping the schema is part of the result: a schema left behind fails the gate. */
-  const drop = async (): Promise<void> => {
-    await pool.end().catch(() => {});
+  const pool = new Pool({ ...(config as object), max: 6, options: `-c search_path=${schema}`,
+    application_name: schema });
+  /** Dropping the schema is part of the result: a schema left behind fails the gate. It does not
+   * wait for the backend's pool: its sessions are ended from the admin connection first, so a
+   * stuck query cannot keep the schema alive. Runs once however many paths ask for it. */
+  let dropping: Promise<void> | undefined;
+  const drop = (): Promise<void> => dropping ??= (async () => {
+    void pool.end().catch(() => {});
     try {
+      await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+        WHERE application_name=$1 AND pid <> pg_backend_pid()`, [schema]);
       await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       const left = await admin.query("SELECT 1 FROM pg_namespace WHERE nspname=$1", [schema]);
       if (left.rows.length !== 0) fail("SESSIONS_SCHEMA_LEFT_BEHIND");
     } finally {
-      await admin.end().catch(() => {});
+      void admin.end().catch(() => {});
     }
-  };
+  })();
+  // the pool's sessions are ended on purpose during cleanup
+  pool.on("error", () => {});
   cleanups.add(drop);
   await admin.query("CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public");
   await admin.query(`CREATE SCHEMA ${schema}`);
@@ -1884,12 +1892,15 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
   });
 }
 
-/** Things this run created outside its own memory; each is undone exactly once. */
+/** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
+/** Every cleanup is attempted; the first failure is reported after all of them ran. */
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
-  for (const undo of pending.reverse()) await undo();
+  const results = await Promise.allSettled(pending.reverse().map(async (undo) => undo()));
+  const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failed) throw failed.reason;
 }
 
 async function main(): Promise<void> {
