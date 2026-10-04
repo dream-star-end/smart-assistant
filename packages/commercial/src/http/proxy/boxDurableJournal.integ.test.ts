@@ -483,8 +483,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       canonicalBody: { ...resumeBody, messages: [...resumeBody.messages.slice(0, -1),
         { role: "user", content: [
           { type: "tool_result", tool_use_id: "toolu_B", content: "second" }] }] } }),
+    // One of two results: the prepared classification refuses the incomplete
+    // answer set before the journal compares result bytes (since 5ae79fe71).
     (error: unknown) => error instanceof BoxDurableJournalError
-      && error.code === "BOX_TOOL_RESULT_MISMATCH");
+      && error.code === "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model,
       canonicalBody: { ...resumeBody, tools: [{ ...toolDeclarations[0]!,
@@ -1063,7 +1065,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.claimToolResume({
       requestId: `box-cancel-child-${suffix}`, uid: 3n,
       canonicalModel: basis.model, canonicalBody: afterCancelBody }),
-    /BOX_TOOL_OWNER_UNKNOWN/);
+    // The cancelled chain still holds its consumed (linked) round, so the claim
+    // reads as a resume in progress, not as an unknown owner (since 5ae79fe71).
+    /BOX_RESUME_IN_PROGRESS/);
     const linkedProbe = (await journal.listStoppedFailureProbeCandidates(20))
       .find((item) => item.requestId === `box-h-${suffix}`);
     assert.ok(linkedProbe);

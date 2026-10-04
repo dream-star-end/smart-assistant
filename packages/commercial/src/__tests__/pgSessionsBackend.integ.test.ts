@@ -6530,9 +6530,14 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
   });
 
   maybe("checkpoint continuation admits uncertain durable actions and never replays them", async () => {
-    const cases: Array<{ suffix: string; record: MessageLike }> = [
+    // INC-20260920-OFFICIAL-CC-FALSE-SERVICE-RESTART (2116af09f): a tape with an
+    // unfinished tool is no longer checkpointed automatically; the user's own
+    // 「从断点继续」 still is. A finished tool before a model-plane error
+    // (OCV5-317) and a tape without tool rows stay automatic.
+    const cases: Array<{ suffix: string; manualOnly: boolean; record: MessageLike }> = [
       {
         suffix: "incomplete-tool",
+        manualOnly: true,
         record: {
           id: "tool-incomplete",
           role: "tool",
@@ -6543,6 +6548,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "unknown-outcome",
+        manualOnly: false,
         record: {
           id: "tool-unknown",
           role: "tool",
@@ -6554,6 +6560,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "permission",
+        manualOnly: false,
         record: {
           id: "permission-pending",
           role: "permission",
@@ -6564,6 +6571,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "runtime-incomplete",
+        manualOnly: false,
         record: {
           id: "runtime-incomplete",
           role: "runtime-event",
@@ -6594,7 +6602,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         ],
       });
       const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
-      const recovered = await backend.admitUserTurn(admitInput({
+      const admit = (automatic: boolean) => backend.admitUserTurn(admitInput({
         sessionId,
         clientMessageId: identity.clientMessageId,
         billingRequestId: `brq-${identity.clientMessageId}`,
@@ -6604,22 +6612,36 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           text: "checkpoint — verify state before any write",
           ts: 3,
         } as MessageLike & { id: string },
-        recovery: {
-          sourceClientMessageId,
-          mode: "checkpoint",
-          automatic: true,
-          rootClientMessageId: sourceClientMessageId,
-          attempt: 1,
-          max: 10,
-        },
+        recovery: automatic
+          ? {
+              sourceClientMessageId,
+              mode: "checkpoint",
+              automatic: true,
+              rootClientMessageId: sourceClientMessageId,
+              attempt: 1,
+              max: 10,
+            }
+          : { sourceClientMessageId, mode: "checkpoint", automatic: false },
       }));
+      if (testCase.manualOnly) {
+        assert.deepEqual(await admit(true), {
+          kind: "recovery_conflict",
+          reason: "automatic_checkpoint_unsafe",
+        }, testCase.suffix);
+        const declined = await pool.query(
+          "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
+          [UID, sessionId, identity.clientMessageId],
+        );
+        assert.equal(declined.rowCount, 0, testCase.suffix);
+      }
+      const recovered = await admit(!testCase.manualOnly);
       assert.equal(recovered.kind, "admitted", testCase.suffix);
       const stored = await backend.getClientSession(sessionId, CUSER);
       assert.equal(
         (stored!.messages as MessageLike[]).some((message) =>
           message.id === identity.clientMessageId &&
           message._recoveryMode === "checkpoint" &&
-          message._automaticRecovery === true),
+          (message._automaticRecovery === true) === !testCase.manualOnly),
         true,
         testCase.suffix,
       );

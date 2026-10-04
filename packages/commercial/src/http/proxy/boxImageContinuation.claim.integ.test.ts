@@ -76,7 +76,8 @@ test("second TEMP claim keeps the client sibling and does not advance on failure
     assert.equal(Number(where.rows[0]?.port), 55432);
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
     const located = await client.query<{ name: string; nspname: string }>(
@@ -209,7 +210,8 @@ test("TEMP authority mismatch and a second request id do not publish twice", asy
     assert.equal(Number(where.rows[0]?.port), 55432);
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
     const located = await client.query<{ name: string; nspname: string }>(
@@ -331,7 +333,8 @@ test("raw image sibling publishes once, then final and a new user gain no second
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(),
+      state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
       error_msg text, failure_code text, final_credits bigint)`);
     await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
     const located = await client.query<{ nspname: string }>(
@@ -494,7 +497,9 @@ test("raw image sibling publishes once, then final and a new user gain no second
         stderrBytes: 0, exitCode: 0 as const };
     } };
     const continued = await runBoxToolContinuation({
-      published: { claim: next, target: { accountId: 20n, exec: contExec },
+      // A native pointer is recorded only for a Box whose CLI build has
+      // verified native resume (OCV5-313).
+      published: { claim: next, target: { accountId: 20n, exec: contExec, cliVersion: "2.1.280" },
         access: makeBoxDetachedRunAccess({ runNonce: next.runNonce,
           detachedRunnerHash: next.detachedRunnerHash }) },
       uid: 3n, requestId: grand, canonicalBody: second, upstreamModel: cliModel,
@@ -634,7 +639,8 @@ test("raw image sibling publishes once, then final and a new user gain no second
       virtualMcpAsset: Buffer.from("print('virtual')\n"),
       detachedRunnerAsset: Buffer.from("print('runner')\n"),
       journal, maxOutputTokensForModel: () => 128,
-      resolveTarget: async () => ({ accountId: 20n, exec: nativeExec, dispose: async () => {} }) as never,
+      resolveTarget: async () => ({ accountId: 20n, exec: nativeExec, cliVersion: "2.1.280",
+        dispose: async () => {} }) as never,
       onUnknown: async () => { seenLaunch.staged += "\nUNKNOWN"; },
       retainUnknownTarget: () => { seenLaunch.staged += "\nRETAIN"; },
       retainCleanupTarget: () => {},
@@ -678,7 +684,8 @@ test("commit failure, lost ack, and a rebuilt journal do not gain a publish", as
   try {
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
-      state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
+      state text NOT NULL, ctx jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now())`);
     await client.query("CREATE TEMP TABLE usage_records (request_id text NOT NULL, user_id bigint NOT NULL)");
     const journal = new BoxDurableJournal({ connect: async () => ({
       query: client.query.bind(client), release: () => {} }),

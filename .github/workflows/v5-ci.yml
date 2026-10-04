@@ -453,6 +453,12 @@ jobs:
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts
 
+      - name: Install redis-server for the isolated reservation test
+        # preCheckLongTtl starts its own redis-server on a unix socket; the
+        # service container only offers a TCP port.
+        if: matrix.shard == 'pr-2'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server
+
       - name: Prepare idle box project directory
         if: contains(fromJSON('["pr-5","pr-6","pr-7"]'), matrix.shard)
         run: sudo mkdir -p /home/box/.claude/projects
