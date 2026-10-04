@@ -14,8 +14,10 @@
  * endpoint; everything between the request and that endpoint is product code.
  */
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import { deflateSync } from "node:zlib";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -66,7 +68,24 @@ type Api = {
     signal: AbortSignal; now?: () => number; sleep?: (ms: number, signal: AbortSignal) => Promise<void> }) => Promise<ReplayLookup>;
   cleanupWorker: (deps: unknown) => { reconcileStoppedFailures: () => Promise<{ recovered: number; pending: number }> };
   replayStore: (root: string) => { write: unknown; read: unknown };
+  stopHandler: (deps: unknown) => RouteHandler;
+  idleProofHandler: (deps: unknown) => RouteHandler;
+  jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
+  ccbAdapter: (runner: unknown) => { submitTurn: (input: unknown) => { submitted: Promise<void>;
+    summary: Promise<{ isError?: boolean } | undefined>; end: () => void }; shutdown: () => Promise<void> };
+  fetchIdleProof: (input: { sessionId: string; turnKey: string }) => Promise<{ status: string }>;
+  /** SessionManager's idle step, which only works from durable state and needs no instance. */
+  finishIdle: (session: unknown, source: { sessionId: string; turnKey: string }, dir: string) => Promise<void>;
+  idle: IdleFiles;
+  boxNative: { model: string; owner: string };
 };
+type RouteHandler = (req: unknown, res: unknown, ctx: { hostUuid: string; boundIp: string }) => Promise<void>;
+type IdleOp = { runnerKilledAt?: number; disposition?: string; abandonReason?: string; [key: string]: unknown };
+type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
+  readIdleCandidate: (dir: string, key: string) => unknown; readPendingIdle: (dir: string, key: string) => unknown;
+  readIdleOp: (dir: string, key: string, revision: string) => IdleOp | undefined;
+  writeIdleOp: (dir: string, op: IdleOp) => void; writeIdleCandidate: (dir: string, candidate: unknown) => void;
+  startIdleOp: (input: unknown) => { op: IdleOp }; writeIdleNative: (dir: string, native: unknown) => void };
 type ReplayLookup = { kind: string; response?: Response;
   identity?: { state?: string; rootLaunchPermit?: boolean; invocationMode?: string } };
 type Db = { query: (sql: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>>; rowCount?: number | null }> };
@@ -121,6 +140,15 @@ async function load(): Promise<Api> {
   const replayWait = await import(pathToFileURL(join(PROXY, "boxReplayWait.ts")).href);
   const worker = await import(pathToFileURL(join(PROXY, "boxRemoteCleanupWorker.ts")).href);
   const replaySetup = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/egress/boxReplaySetup.ts")).href);
+  const stopRoute = await import(pathToFileURL(join(PROXY, "boxUserStopHandler.ts")).href);
+  const idleRoute = await import(pathToFileURL(join(PROXY, "boxIdleProofHandler.ts")).href);
+  const shared = await import(pathToFileURL(join(PROXY, "shared.ts")).href);
+  const GATEWAY = join(CANDIDATE, "packages/gateway/src");
+  const ccb = await import(pathToFileURL(join(GATEWAY, "engine/ccbAdapter.ts")).href);
+  const idleClient = await import(pathToFileURL(join(GATEWAY, "engine/boxIdleProofClient.ts")).href);
+  const idleFiles = await import(pathToFileURL(join(GATEWAY, "boxIdleCompact.ts")).href);
+  const sessions = await import(pathToFileURL(join(GATEWAY, "sessionManager.ts")).href);
+  const authority = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/modelAuthority.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
@@ -151,7 +179,14 @@ async function load(): Promise<Api> {
     waitReplay: replayWait.waitForBoxReplay,
     cleanupWorker: (deps) => new worker.BoxRemoteCleanupWorker(deps),
     replayStore: (root) => ({ write: replaySetup.createBoxReplayWriter(true, root),
-      read: replaySetup.createBoxReplayReader(root) }) };
+      read: replaySetup.createBoxReplayReader(root) }),
+    stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
+    jsonError: shared.sendJsonError,
+    ccbAdapter: (runner) => new ccb.CcbAdapter({}, runner),
+    fetchIdleProof: idleClient.fetchBoxIdleProof,
+    finishIdle: (session, source, dir) => sessions.SessionManager.prototype.finishIdleUnderLock.call({}, session, source, dir),
+    idle: idleFiles,
+    boxNative: { model: authority.BOX_NATIVE_CONTEXT_MODEL, owner: authority.BOX_NATIVE_CONTEXT_OWNER } };
 }
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -1436,6 +1471,215 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
   return "[ocv5-304-recovered-tool-exchange] PASS — a recovery turn stops the orphaned run and continues its tool exchange once";
 }
 
+/** Egress's two container-authenticated internal routes, served on loopback
+ * by the product's own handlers over the real journal, and the environment a
+ * user container has for reaching them. The gateway code under test calls
+ * them with its own clients. */
+async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigint; containerId: bigint },
+  target: unknown, readCapsule?: unknown) {
+  const identity = { resolve: async () => ({ uid: who.uid, containerId: who.containerId, apiKey: null }) };
+  const routes: Record<string, RouteHandler> = {
+    "/internal/box/stop": api.stopHandler({ identity, journal, coordinator: api.stopCoordinator(journal, target) }),
+    "/internal/box/idle-proof": api.idleProofHandler({ identity, journal, ...(readCapsule ? { readCapsule } : {}) }) };
+  const calls: string[] = [];
+  let idle: Promise<void> = Promise.resolve();
+  const server = createServer((req, res) => {
+    const path = (req.url ?? "").split("?")[0] ?? "";
+    calls.push(path);
+    // one journal session: requests are served one after another
+    idle = idle.then(() => routes[path]
+      ? routes[path]!(req, res, { hostUuid: "proof-host", boundIp: "127.0.0.1" })
+      : void res.writeHead(404).end()).catch(() => { if (!res.headersSent) res.writeHead(500).end(); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") fail("EGRESS_ROUTES_NO_PORT");
+  const keys = ["ANTHROPIC_BASE_URL", "OPENCLAUDE_V3_MASTER_BASE_URL", "OPENCLAUDE_V3_CONTAINER_TOKEN",
+    "OC_BOX_IDLE_PROOF_WAIT_MS"] as const;
+  const before = keys.map((key) => process.env[key]);
+  process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${address.port}/`;
+  process.env.OPENCLAUDE_V3_MASTER_BASE_URL = process.env.ANTHROPIC_BASE_URL;
+  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = "oc-v3.proof-token";
+  process.env.OC_BOX_IDLE_PROOF_WAIT_MS = "0";
+  return { calls,
+    /** Every request received so far has been answered. */
+    settled: async () => { await tick(50); await idle; },
+    close: async () => {
+      keys.forEach((key, i) => { if (before[i] === undefined) delete process.env[key]; else process.env[key] = before[i]; });
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    } };
+}
+
+// INC-20261003-BOX-REJECT-BLOCKS-NEXT-MESSAGE, live #72191544: egress refused a
+// continuation with a deterministic 409 before any Box call. Claude Code ended
+// the turn on it, but the Box CLI that had handed off the tool calls stayed
+// parked waiting for their results. Its idle proof stayed pending, so every
+// next message of the session was refused ("消息未开始处理") until the CLI timed
+// out hours later. The gateway must settle that turn like a browser Stop.
+async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_315n, containerId: 315n, sessionId: "session-reject" };
+  const turnKey = "5".repeat(64);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'reject@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-rej", turnKey);
+  await turn.first();
+  // the continuation the client sent: the tool result plus text egress cannot attribute to it
+  const answer = turn.answer("box-rej-2").canonicalBody as Body;
+  const refused = { ...answer, messages: [...(answer.messages as unknown[]).slice(0, 2), { role: "user", content: [
+    { type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" }, text("and now deploy it") ] }] };
+  const verdict = api.classify(refused);
+  const code = verdict.rejectCode ?? "";
+  if (verdict.classification !== "reject" || !/^BOX_[A-Z0-9_]+$/.test(code)) fail(`REJECT_NOT_REFUSED_${verdict.classification}`);
+  // egress answers it with these bytes; Claude Code ends the turn with them as its error result
+  let wire = "";
+  api.jsonError({ headersSent: false, writeHead: () => {}, setHeader: () => {}, end: (body: string) => { wire = body; } },
+    409, code, "continuation rejected", "dc1551b789864b0500d6bd581ffd538b");
+  if (!wire.includes(code)) fail("REJECT_WIRE_BODY");
+  const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
+  try {
+    if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("REJECT_NOT_PARKED");
+    const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
+      setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
+    const adapter = api.ccbAdapter(runner);
+    const ccbTurn = adapter.submitTurn({ input: "run it", turnKey, onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() });
+    await ccbTurn.submitted;
+    runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: 409 ${wire}` });
+    if ((await ccbTurn.summary)?.isError !== true) fail("REJECT_TURN_NOT_ENDED");
+    await routes.settled();
+    if (!isDeepStrictEqual(routes.calls, ["/internal/box/idle-proof", "/internal/box/stop"])) {
+      fail(`REJECT_PARKED_TURN_NOT_STOPPED_${routes.calls.join(",")}`);
+    }
+    const parked = await journalRow(db, "box-rej-1");
+    if (parked?.ctx.boxState !== "failed_stopped" || turn.host.count.stop !== 1) fail(`REJECT_ROW_${String(parked?.ctx.boxState)}`);
+    // what the session's idle candidate waits for, read the way the gateway reads it
+    const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
+    if (idle.status !== "failed") fail(`REJECT_IDLE_${idle.status}`);
+    // a transient Box answer of the same shape is not a continuation reject and stops nothing
+    const other = api.ccbAdapter(runner);
+    const otherTurn = other.submitTurn({ input: "run it", turnKey: "e".repeat(64), onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() });
+    await otherTurn.submitted;
+    runner.emit("message", { type: "result", subtype: "success", is_error: true, result:
+      'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"},"request_id":"x"}' });
+    await otherTurn.summary;
+    await routes.settled();
+    if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) fail("REJECT_TRANSIENT_STOPPED");
+  } finally {
+    await routes.close();
+  }
+  // the next message of the session starts and is answered
+  await prechecked(api, db, { ...who, requestId: "box-rej-next", turnKey: "d".repeat(64) });
+  const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+    real: { journal, ...who, accountId: who.containerId, requestId: "box-rej-next", turnKey: "d".repeat(64) } });
+  if ((await must("REJECT_NEXT_MESSAGE", next.round())).kind !== "final" || !next.sse().includes("done")) {
+    fail("REJECT_NEXT_MESSAGE_NO_ANSWER");
+  }
+  return "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message runs";
+}
+
+// INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION: a session's idle compaction
+// was dispatched; CCB's compact fallback request carried `temperature: 1`,
+// egress refused it (BOX_PARAMETER_UNMAPPED) and CCB ended the idle turn
+// normally with no summary. The runner was never shut down, the idle op had no
+// shutdown evidence, its not_found proof could never settle it, and every
+// message of the session was refused ("消息未开始处理") until an operator reset;
+// recreating the container did not help.
+async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const root = mkdtempSync(join(tmpdir(), "ocv5-308-idle-"));
+  const who = { uid: 900_000_319n, containerId: 319n, sessionId: "session-idle" };
+  const sourceTurn = "1".repeat(64);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'idle@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const store = api.replayStore(join(root, "state"));
+  // the source turn: a finished Box turn whose context is large enough to need compaction
+  const large = [start("msg_big", 400_000), ...say("msg_big", 0, "done"), ...stop("end_turn", 4, 400_000),
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 400_000, output_tokens: 4 } }];
+  await prechecked(api, db, { ...who, requestId: "box-idle-src", turnKey: sourceTurn });
+  const source = boxHost(api, spoolOf([cliInit, ...large]),
+    { real: { journal, ...who, accountId: who.containerId, requestId: "box-idle-src", turnKey: sourceTurn } });
+  if ((await must("IDLE_SOURCE_TURN", api.firstRound({ ...source.call, emit: () => {} },
+    { ...source.deps, writeMessage: store.write }))).kind !== "final") fail("IDLE_SOURCE_TURN");
+  // the proxy's billing finalizer commits a settled row
+  await db.query("UPDATE request_finalize_journal SET state='committed' WHERE request_id='box-idle-src'");
+  // the compact fallback request is refused before admission, so egress never has a row for the idle turn
+  if (api.gate({ model: MODEL, stream: true, max_tokens: 64, temperature: 1,
+    messages: [{ role: "user", content: "summarize the conversation" }] }, true) !== "BOX_PARAMETER_UNMAPPED") {
+    fail("IDLE_COMPACT_FALLBACK_ADMITTED");
+  }
+  const routes = await egressInternalRoutes(api, journal, who, source.target, store.read);
+  const dir = join(root, "recovery");
+  const counters = { submits: 0, shutdowns: 0 };
+  /** The session as the idle step sees it; its CCB idle turn ends normally with no summary. */
+  const session = (sessionKey: string, shutdown: () => Promise<void> = async () => {}) => ({ sessionKey,
+    model: api.boxNative.model, _boxContextOwner: api.boxNative.owner,
+    runner: Object.assign(new EventEmitter(), {
+      submitTurn: () => { counters.submits++; return { submitted: Promise.resolve(), end: () => {}, summary: Promise.resolve({}) }; },
+      shutdown: () => { counters.shutdowns++; return shutdown(); } }) });
+  const finish = (sessionKey: string, shutdown?: () => Promise<void>) =>
+    api.finishIdle(session(sessionKey, shutdown), { sessionId: who.sessionId, turnKey: sourceTurn }, dir);
+  try {
+    const proof = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey: sourceTurn }) as {
+      status: string; revision?: string; compactRequired?: boolean };
+    if (proof.status !== "terminal" || proof.compactRequired !== true || !proof.revision) fail(`IDLE_SOURCE_PROOF_${proof.status}`);
+    const revision = proof.revision;
+    const key = "idle-no-summary";
+    api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: key, sessionId: who.sessionId, turnKey: sourceTurn });
+    const before = Date.now();
+    await finish(key);
+    const recorded = api.idle.readIdleOp(dir, key, revision);
+    if (counters.submits !== 1) fail(`IDLE_TURN_DISPATCHES_${counters.submits}`);
+    if (counters.shutdowns !== 1 || !((recorded?.runnerKilledAt ?? 0) >= before)) fail("IDLE_NO_SHUTDOWN_EVIDENCE");
+    if (recorded?.disposition !== undefined || !api.idle.readPendingIdle(dir, key)) fail("IDLE_SETTLED_INSIDE_GRACE");
+    // after the grace window egress still has no row for the idle turn: the op settles and stops blocking submit
+    api.idle.writeIdleOp(dir, { ...recorded!, runnerKilledAt: Date.now() - api.idle.IDLE_STOPPED_GRACE_MS - 1 });
+    await finish(key);
+    const settled = api.idle.readIdleOp(dir, key, revision);
+    if (settled?.abandonReason !== "idle_turn_never_sent" || api.idle.readPendingIdle(dir, key) !== undefined
+      || api.idle.readIdleCandidate(dir, key) !== undefined) fail(`IDLE_SESSION_STILL_BLOCKED_${String(settled?.abandonReason)}`);
+    if (counters.submits !== 1) fail("IDLE_TURN_REDISPATCHED");
+    // a shutdown that fails is no evidence: nothing is recorded and nothing settles on the clock alone
+    api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: "idle-stuck", sessionId: who.sessionId, turnKey: sourceTurn });
+    await finish("idle-stuck", async () => { throw new Error("busy"); });
+    if (api.idle.readIdleOp(dir, "idle-stuck", revision)?.runnerKilledAt !== undefined
+      || !api.idle.readPendingIdle(dir, "idle-stuck")) fail("IDLE_SETTLED_WITHOUT_EVIDENCE");
+    // an op stranded by older code in a container that no longer exists: written before this
+    // runtime started, so that start is its shutdown evidence and the next submit settles it
+    const stranded = "idle-stranded";
+    const idleTurn = createHash("sha256").update(`${stranded}:${revision}`).digest("hex");
+    api.idle.startIdleOp({ dir, sessionKey: stranded, sourceSessionId: who.sessionId, sourceTurnKey: sourceTurn,
+      revision, idleTurnKey: idleTurn, frozenTail: [], attachments: [] });
+    api.idle.writeIdleNative(dir, { v: 1, opId: idleTurn, revision, sessionId: who.sessionId, modelCalls: 0,
+      modelStarted: true, frozenTail: [], attachments: [] });
+    const long = new Date(Date.UTC(2001, 0, 1));
+    utimesSync(join(dir, "idle-ops", encodeURIComponent(stranded), `${revision}.json`), long, long);
+    const submits = counters.submits;
+    await finish(stranded);
+    const released = api.idle.readIdleOp(dir, stranded, revision);
+    if (released?.disposition !== "abandoned" || released.abandonReason !== "idle_turn_never_sent"
+      || api.idle.readPendingIdle(dir, stranded) !== undefined || counters.submits !== submits) {
+      fail(`IDLE_STRANDED_OP_${String(released?.disposition)}`);
+    }
+    // the incident's own shape: after the slot switch egress knows neither the source nor the idle turn
+    const lost = "idle-lost-source", lostSource = "2".repeat(64);
+    const lostTurn = createHash("sha256").update(`${lost}:${revision}`).digest("hex");
+    api.idle.startIdleOp({ dir, sessionKey: lost, sourceSessionId: who.sessionId, sourceTurnKey: lostSource,
+      revision, idleTurnKey: lostTurn, frozenTail: [], attachments: [] });
+    api.idle.writeIdleNative(dir, { v: 1, opId: lostTurn, revision, sessionId: who.sessionId, modelCalls: 0,
+      modelStarted: true, frozenTail: [], attachments: [] });
+    utimesSync(join(dir, "idle-ops", encodeURIComponent(lost), `${revision}.json`), long, long);
+    await api.finishIdle(session(lost), { sessionId: who.sessionId, turnKey: lostSource }, dir);
+    if (api.idle.readIdleOp(dir, lost, revision)?.abandonReason !== "idle_turn_never_sent"
+      || api.idle.readPendingIdle(dir, lost) !== undefined || counters.submits !== submits) fail("IDLE_LOST_SOURCE_OP");
+    return "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released";
+  } finally {
+    await routes.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -1448,7 +1692,8 @@ async function main(): Promise<void> {
     proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveSpoolReadTransient(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
-      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db)])];
+      await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
+      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db)])];
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }

@@ -5873,6 +5873,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message runs"
+        },
+        {
           "layer": "unit",
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
           "assertion": "OCV5-315 a Box continuation reject settles the parked Box turn once"
@@ -5942,6 +5947,11 @@
       "rootFixCommit": "599ce66b",
       "coverageCommits": [],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-319-idle-no-summary] PASS — an idle turn that ends without a summary leaves evidence and the session is released"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/boxIdleOcv5319.test.ts",
