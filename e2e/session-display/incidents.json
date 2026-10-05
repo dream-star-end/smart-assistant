@@ -5806,6 +5806,24 @@
           "assertion": "the version read is a request the real Box exec transport sends"
         }
       ]
+    },
+    {
+      "id": "INC-20261005-SAND-INSTALL-RESEND",
+      "occurredAt": "2026-10-04",
+      "severity": "P2",
+      "symptom": "selfhost（2026-10-04 01:02Z 起）：账号 25 的 Cursor Box 主程序布局比 relay 安装器新，安装器每次都以 FileNotFoundError（/home/box/sand-host/ 不存在）失败。Box 接受了安装 prompt（submitted），15 分钟内装不出能力，协调器就换 nonce 把同一份安装器再发一遍，每 15 分钟一次、一百多次零成功；用户在 Box 应用的「OpenClaude Sand Relay」Bot 里反复看到同一条报错（2026-10-05 08:58 反馈）。修复：已被同一个 Box 主进程接受过的安装不再重发，标 INSTALL_UNCONFIRMED，能力探针照常；Box 主进程重启或 relay 模块换版后才允许一次新尝试。投递结果未知与 Box 进程已换的重试（INC-20260921-SAND-UOR-LOOP）保持不变。安装器对新 Box 布局的适配不在本次范围。",
+      "rootFixCommit": "7f8e925e",
+      "proofPending": {
+        "reason": "回归在 unit 层（真实协调器对假 Box 网关的发送计数）；线上证据是发布后状态日志里该 operation 进入 INSTALL_UNCONFIRMED 且不再有新的 submitted，属一次性只读核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-05"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "an accepted install that leaves no capability is not sent again to the same host process"
+        }
+      ]
     }
   ]
 }
