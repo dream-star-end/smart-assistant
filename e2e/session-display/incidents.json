@@ -5824,6 +5824,63 @@
           "assertion": "an accepted install that leaves no capability is not sent again to the same host process"
         }
       ]
+    },
+    {
+      "id": "INC-20261005-BOX-CC-FOLLOWUP-TURN",
+      "occurredAt": "2026-10-05",
+      "severity": "P1",
+      "symptom": "商业 rel-97e6472b5（box-claude-haiku-4-5 / sonnet-5 / opus-5-5 于 02:0xZ 激活）：同一会话第一轮正常，第二轮起返回『服务正在更新，本轮已中断，请直接重试本条消息』（service_restart；容器日志 turn terminal error『子进程被信号 SIGKILL 终止』），再下一轮显示的是上一条问题的回答（错位一轮）；用户 2026-10-05 10:26 CST 反馈『续聊有问题』，canary 03:59Z 复现（会话 g48mtmuuq0s79）。根因：Box 常驻官方 CLI 走 official-cc harness 且没有 authorityEngine，runner 把它当成 engine=ccb 代理通道，每轮 lease 不同→spawn env 指纹变化→每个后续 turn 提交前先 shutdown 进程；Box 桥在 stdin 关闭时什么都不做（Box 启动脚本持有 fifo，claude 收不到 EOF），3 秒后被 SIGKILL，该退出落到新一轮头上；Box 里的 claude 从未被通知停止，继续挂在同一会话上并回答下一条输入，进程残留。修复：runner 不再把 Box CLI 归入代理通道（submit 与 lease 续期）；桥在 stdin 关闭时结束自己启动的 claude（读该 fifo 的进程，TERM 后 KILL）并以 0 退出；启动时先结束同一会话遗留的旧 claude。",
+      "rootFixCommit": "f6061a3f",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "个人版这里只有 unit 层（真实 runner 对假子进程、真实 Box 脚本对本机 fifo）。deploy-gate 证明和线上多轮对话证据在商业树（611cf330，scripts/check-v5-box-incident-proofs.ts 的 ocv5-315-box-cli-follow-up-turn；个人版没有这份发布门脚本）。个人版发布后的真实多轮 turn 是一次性核对，不是可重复执行的产物。",
+        "since": "2026-10-05"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerBoxCcTurnReuse.test.ts",
+          "assertion": "a second turn with a new lease goes to the same process"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "closing stdin ends the box Claude and the bridge exits 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261005-BOX-CC-LARGE-LINE",
+      "occurredAt": "2026-10-05",
+      "severity": "P1",
+      "symptom": "商业 rel-e4d81bfac：uid 4 的会话 webmuto22pxriblcd 切到 box-claude-opus-5-5 时带 496 条历史（injected historical context for provider switch），05:45Z、05:50Z 两次都是静默约 303 秒后 runner_crashed『子进程异常退出 (code 1)』，之后用户改用别的模型；同一用户的新会话正常。根因：Box 桥把每一行 stdin 放进写入 exec 的一个环境变量（OC_BOX_CC_LINE），Linux 单个 argv/环境字符串上限 128KiB（本机实测 131000 字节可以、140000 字节 E2BIG），超过后写入 exec 根本起不来；桥只读完响应、不看退出码，所以没有任何报错，Box 里的 claude 一直等输入，直到 launch 流约 300 秒后断开。长对话切模型、贴大段文字、带图片（base64 在同一行）都会触发。桥的 stderr 当时没有进日志，线上没有直接看到 E2BIG，根因由该会话时间线加本机复现确定。修复：一行切成每片 60000 字节的 base64、每次 exec 四片；需要多次 exec 的行先按偏移写进 <fifo>.in，最后一次 exec 一次性写入 fifo；桥检查每次写入 exec 的退出码，非 0 立即报 BOX_CC_WRITE_FAILED 并结束；launch / stop 脚本清掉没写完的暂存。",
+      "rootFixCommit": "2e42b686",
+      "proofPending": {
+        "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-05"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "box scripts: a line larger than one environment string reaches the box Claude whole"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "the bridge sends a large line as ordered parts before it waits for the answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "a write the box did not complete stops the bridge at once"
+        }
+      ]
     }
   ]
 }
