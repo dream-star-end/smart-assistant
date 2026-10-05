@@ -5858,11 +5858,12 @@
       "id": "INC-20261005-BOX-CC-LARGE-LINE",
       "occurredAt": "2026-10-05",
       "severity": "P1",
-      "symptom": "商业 rel-e4d81bfac：uid 4 的会话 webmuto22pxriblcd 切到 box-claude-opus-5-5 时带 496 条历史（injected historical context for provider switch），05:45Z、05:50Z 两次都是静默约 303 秒后 runner_crashed『子进程异常退出 (code 1)』，之后用户改用别的模型；同一用户的新会话正常。根因：Box 桥把每一行 stdin 放进写入 exec 的一个环境变量（OC_BOX_CC_LINE），Linux 单个 argv/环境字符串上限 128KiB（本机实测 131000 字节可以、140000 字节 E2BIG），超过后写入 exec 根本起不来；桥只读完响应、不看退出码，所以没有任何报错，Box 里的 claude 一直等输入，直到 launch 流约 300 秒后断开。长对话切模型、贴大段文字、带图片（base64 在同一行）都会触发。桥的 stderr 当时没有进日志，线上没有直接看到 E2BIG，根因由该会话时间线加本机复现确定。修复：一行切成每片 60000 字节的 base64、每次 exec 四片；需要多次 exec 的行先按偏移写进 <fifo>.in，最后一次 exec 一次性写入 fifo；桥检查每次写入 exec 的退出码，非 0 立即报 BOX_CC_WRITE_FAILED 并结束；launch / stop 脚本清掉没写完的暂存。独立审查补充（同日，两轮）：响应丢失或超时后重发的写入请求会让同一行写两次。桥给每行编号；Box 写入脚本全程持 <fifo>.lock，写 fifo 前记『n pending』、写完记『n done』；重发的请求先等持锁的那次结束，已送达则直接成功，前一次死在写入中途则以 4 退出、不再写、桥立即结束本轮（此时无法知道 claude 收到了多少）。",
+      "symptom": "商业 rel-e4d81bfac：uid 4 的会话 webmuto22pxriblcd 切到 box-claude-opus-5-5 时带 496 条历史（injected historical context for provider switch），05:45Z、05:50Z 两次都是静默约 303 秒后 runner_crashed『子进程异常退出 (code 1)』，之后用户改用别的模型；同一用户的新会话正常。根因：Box 桥把每一行 stdin 放进写入 exec 的一个环境变量（OC_BOX_CC_LINE），Linux 单个 argv/环境字符串上限 128KiB（本机实测 131000 字节可以、140000 字节 E2BIG），超过后写入 exec 根本起不来；桥只读完响应、不看退出码，所以没有任何报错，Box 里的 claude 一直等输入，直到 launch 流约 300 秒后断开。长对话切模型、贴大段文字、带图片（base64 在同一行）都会触发。桥的 stderr 当时没有进日志，线上没有直接看到 E2BIG，根因由该会话时间线加本机复现确定。修复：一行切成每片 60000 字节的 base64、每次 exec 四片；需要多次 exec 的行先按偏移写进 <fifo>.in，最后一次 exec 一次性写入 fifo；桥检查每次写入 exec 的退出码，非 0 立即报 BOX_CC_WRITE_FAILED 并结束；launch / stop 脚本清掉没写完的暂存。独立审查补充（同日，两轮）：响应丢失或超时后重发的写入请求会让同一行写两次。桥给每行编号；Box 写入脚本全程持 <fifo>.lock，写 fifo 前记『n pending』、写完记『n done』；重发的请求先等持锁的那次结束，已送达则直接成功，前一次死在写入中途则以 4 退出、不再写、桥立即结束本轮（此时无法知道 claude 收到了多少）。第三轮：写入脚本原先用追加方式打开 fifo 路径，fifo 已被删除时会新建普通文件并报成功；改为只打开已存在且有读端的 fifo，否则失败。",
       "rootFixCommit": "2e42b686",
       "coverageCommits": [
         "74984cbf",
-        "92acb899"
+        "92acb899",
+        "dc1ea28c"
       ],
       "proofPending": {
         "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
@@ -5893,6 +5894,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
           "assertion": "box scripts: a repeated write waits for the first attempt and never writes the line a second time"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "box scripts: a write goes only into a fifo that has a reader"
         }
       ]
     }
