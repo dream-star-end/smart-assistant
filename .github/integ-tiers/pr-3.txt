@@ -30,4 +30,3 @@ packages/commercial/src/__tests__/modelReleaseOperator.groupB.integ.test.ts
 packages/commercial/src/__tests__/modelReleaseOperator.groupC.integ.test.ts
 packages/commercial/src/__tests__/modelReleaseOperator.groupD.integ.test.ts
 packages/commercial/src/__tests__/modelReleaseOperator.groupE.integ.test.ts
-packages/commercial/src/http/proxy/boxParallelAdmission.integ.test.ts
