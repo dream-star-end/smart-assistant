@@ -23,6 +23,7 @@ import {
   stripBoxCcParentAuth,
   writeBoxCcControlFile,
   type BoxCcControl,
+  type BoxCcExecRequest,
 } from '../engine/cursorBoxCc.js'
 import { runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
 import { BOX_CC_WRITE_PART_BYTES, BOX_CC_WRITE_PARTS_PER_EXEC } from '../engine/cursorBoxCcExec.js'
@@ -171,12 +172,14 @@ test('exec frames survive a split chunk and the user line stays out of argv', ()
     cwd: '/workspace',
   }
   const line = '{"type":"user","message":{"role":"user","content":"hello"}}\n'
-  const writes = boxCcWriteExecs(control, line.trimEnd())
+  const writes = boxCcWriteExecs(control, line.trimEnd(), 1)
   assert.equal(writes.length, 1)
   const write = writes[0]!
   assert.equal(write.args.join(' ').includes('hello'), false)
   assert.equal(writeExecBytes(write.environment).toString('utf8'), line)
+  assert.equal(write.environment.OC_BOX_CC_SEQ, '1')
   assert.equal(write.environment.OC_BOX_CC_OFFSET, '0')
+  assert.throws(() => boxCcWriteExecs(control, line, 0), /BOX_CC_LINE_SEQ_INVALID/)
   assert.equal(write.environment.OC_BOX_CC_LAST, '1')
   const launch = boxCcLaunchExec(control, remoteClaudeArgs(['--model', 'claude-opus-4-8']))
   assert.equal(launch.environment.ANTHROPIC_API_KEY, undefined)
@@ -482,7 +485,7 @@ test('box scripts: stop ends the launched Claude, and a new launch retires the o
 
     let echoed = ''
     secondLaunch.stdout?.on('data', (chunk: Buffer) => { echoed += chunk.toString('utf8') })
-    for (const write of boxCcWriteExecs(second, '{"type":"user"}')) assert.equal(await exited(run(write)), 0)
+    for (const write of boxCcWriteExecs(second, '{"type":"user"}', 1)) assert.equal(await exited(run(write)), 0)
     assert.equal(await until(() => echoed.includes('{"type":"user"}')), true)
 
     const secondGone = exited(secondLaunch)
@@ -561,47 +564,59 @@ test('box scripts: a line larger than one environment string reaches the box Cla
     const launch = run(boxCcLaunchExec(control, []))
     const received: Buffer[] = []
     launch.stdout?.on('data', (chunk: Buffer) => { received.push(chunk) })
-    const send = async (line: string): Promise<number> => {
-      const writes = boxCcWriteExecs(control, line)
+    let seq = 0
+    const send = async (line: string): Promise<BoxCcExecRequest[]> => {
+      const writes = boxCcWriteExecs(control, line, ++seq)
       for (const write of writes) {
         for (const [name, value] of Object.entries(write.environment)) {
           assert.ok(Buffer.byteLength(`${name}=${value}`) < 128 * 1024, `${name} fits one environment string`)
         }
         assert.equal(await exited(run(write)), 0)
       }
-      return writes.length
+      return writes
     }
-    assert.equal(await send('{"type":"user","n":1}'), 1)
-    assert.equal(await send(large), Math.ceil(largeBytes / (BOX_CC_WRITE_PART_BYTES * BOX_CC_WRITE_PARTS_PER_EXEC)))
+    const small = await send('{"type":"user","n":1}')
+    assert.equal(small.length, 1)
+    // The response to a write is lost after the box ran it: the bridge sends
+    // the same request again, and Claude must not read the line twice.
+    assert.equal(await exited(run(small[0]!)), 0)
+
+    const parts = await send(large)
+    assert.equal(parts.length, Math.ceil(largeBytes / (BOX_CC_WRITE_PART_BYTES * BOX_CC_WRITE_PARTS_PER_EXEC)))
+    assert.ok(parts.length >= 3)
     assert.equal(existsSync(`${control.fifo}.in`), false, 'the collected line is removed once Claude has it')
+    // The same for the last request of a collected line, and for all of them.
+    assert.equal(await exited(run(parts[parts.length - 1]!)), 0)
+    for (const write of parts) assert.equal(await exited(run(write)), 0)
+    assert.equal(existsSync(`${control.fifo}.in`), false)
 
-    // A request the transport repeats writes the same bytes at the same offset.
-    const again = boxCcWriteExecs(control, large)
-    assert.equal(await exited(run(again[0]!)), 0)
-    for (const write of again) assert.equal(await exited(run(write)), 0)
-
-    // A later part without the earlier ones is refused and Claude gets nothing.
-    assert.equal(await exited(run(again[2]!)), 3)
-    assert.equal(await send('{"type":"user","n":2}'), 1)
+    // A new line whose first request is sent twice still arrives once, and a
+    // later part without the earlier ones is refused: Claude gets nothing.
+    const next = boxCcWriteExecs(control, large, ++seq)
+    assert.equal(await exited(run(next[2]!)), 3)
+    assert.equal(await exited(run(next[0]!)), 0)
+    for (const write of next) assert.equal(await exited(run(write)), 0)
+    await send('{"type":"user","n":2}')
 
     const expected = `{"type":"user","n":1}\n${large}${large}{"type":"user","n":2}\n`
     assert.equal(await until(() => Buffer.concat(received).length >= Buffer.byteLength(expected), 15_000), true)
-    assert.equal(Buffer.concat(received).toString('utf8') === expected, true, 'every line arrives whole and in order')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(Buffer.concat(received).toString('utf8') === expected, true, 'every line arrives once, whole and in order')
 
     const gone = exited(launch)
     assert.equal(await exited(run(boxCcStopExec(control))), 0)
     await gone
     assert.equal(existsSync(control.fifo), false)
     assert.equal(existsSync(`${control.fifo}.in`), false)
+    assert.equal(existsSync(`${control.fifo}.seq`), false)
   } finally {
     for (const child of children) child.kill('SIGKILL')
-    rmSync(control.fifo, { force: true })
-    rmSync(`${control.fifo}.in`, { force: true })
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp']) rmSync(`${control.fifo}${suffix}`, { force: true })
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-function largeLineBridge(writeExit: number): {
+function largeLineBridge(writeExit: number, loseFirstResponse = false): {
   run: Promise<number>
   stdin: PassThrough
   stderr: () => string
@@ -641,7 +656,9 @@ function largeLineBridge(writeExit: number): {
       }
       if (body.command === 'python3') {
         writes.push(body.environment)
-        if (writeExit === 0 && body.environment.OC_BOX_CC_LAST === '1') endLaunch?.()
+        if (loseFirstResponse && writes.length === 1) throw new Error('socket hang up')
+        if (writeExit === 0 && body.environment.OC_BOX_CC_LAST === '1'
+          && body.environment.OC_BOX_CC_SEQ === '2') endLaunch?.()
         return new Response(Uint8Array.from(exit(writeExit)))
       }
       // The launch stream stays open until Claude exits or the bridge gives up.
@@ -660,18 +677,34 @@ test('the bridge sends a large line as ordered parts before it waits for the ans
   const bridge = largeLineBridge(0)
   const line = `${JSON.stringify({ type: 'user', image: randomBytes(400_000).toString('base64') })}\n`
   bridge.stdin.write(line)
+  bridge.stdin.write('{"type":"user","n":2}\n')
   assert.equal(await bridge.run, 0)
-  assert.ok(bridge.writes.length > 1)
+  const first = bridge.writes.filter((environment) => environment.OC_BOX_CC_SEQ === '1')
+  assert.ok(first.length > 1)
+  assert.equal(bridge.writes.length, first.length + 1, 'the second line is numbered 2 and follows the first')
+  assert.equal(bridge.writes[first.length]?.OC_BOX_CC_SEQ, '2')
   let offset = 0
   const sent: Buffer[] = []
-  bridge.writes.forEach((environment, index) => {
+  first.forEach((environment, index) => {
     assert.equal(environment.OC_BOX_CC_OFFSET, String(offset))
-    assert.equal(environment.OC_BOX_CC_LAST, index === bridge.writes.length - 1 ? '1' : '0')
+    assert.equal(environment.OC_BOX_CC_LAST, index === first.length - 1 ? '1' : '0')
     const bytes = writeExecBytes(environment)
     offset += bytes.length
     sent.push(bytes)
   })
   assert.equal(Buffer.concat(sent).toString('utf8'), line)
+})
+
+test('a write whose response was lost is sent again as the same numbered line', async () => {
+  const bridge = largeLineBridge(0, true)
+  bridge.stdin.write('{"type":"user","n":1}\n')
+  bridge.stdin.write('{"type":"user","n":2}\n')
+  assert.equal(await bridge.run, 0)
+  assert.equal(bridge.writes.length, 3)
+  assert.deepEqual(bridge.writes[1], bridge.writes[0], 'the repeat is the identical request')
+  assert.equal(bridge.writes[0]?.OC_BOX_CC_SEQ, '1')
+  assert.equal(bridge.writes[2]?.OC_BOX_CC_SEQ, '2')
+  assert.equal(bridge.stderr(), '')
 })
 
 test('a write the box did not complete stops the bridge at once', async () => {

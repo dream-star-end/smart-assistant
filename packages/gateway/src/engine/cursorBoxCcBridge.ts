@@ -81,9 +81,10 @@ export async function runBoxCcBridge(opts: {
   const launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
   let exitCode = 1
   let sawExit = false
-  // The write runs as its own exec in the box. A request the transport lost
-  // is sent once more; an exec that ran and did not exit 0 wrote nothing
-  // Claude can read, so the bridge stops instead of waiting for an answer.
+  // The write runs as its own exec in the box. A request whose response the
+  // transport lost is sent once more: the box script skips a line it already
+  // delivered. An exec that ran and did not exit 0 wrote nothing Claude can
+  // read, so the bridge stops instead of waiting for an answer.
   const writeExec = async (body: BoxCcExecRequest): Promise<void> => {
     let last: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -105,9 +106,10 @@ export async function runBoxCcBridge(opts: {
     }
     throw last instanceof Error ? last : new Error('BOX_CC_WRITE_FAILED')
   }
+  let lineSeq = 0
   const deliverLine = async (line: string): Promise<void> => {
     try {
-      for (const body of boxCcWriteExecs(control, line)) await writeExec(body)
+      for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body)
     } catch (err) {
       if (abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'

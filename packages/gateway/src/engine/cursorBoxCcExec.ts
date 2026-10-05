@@ -95,9 +95,9 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'for old in "${fifo%.*.fifo}".*.fifo; do',
   '  if [ "$old" = "$fifo" ] || [ ! -p "$old" ]; then continue; fi',
   '  reap "$old"',
-  '  rm -f "$old" "$old.in"',
+  '  rm -f "$old" "$old.in" "$old.seq"',
   'done',
-  'rm -f "$fifo" "$fifo.in"',
+  'rm -f "$fifo" "$fifo.in" "$fifo.seq"',
   'mkfifo -m 600 "$fifo"',
   // Hold both ends for the life of claude. A later writer then cannot block
   // in open(), and closing that writer does not deliver EOF mid-turn.
@@ -107,7 +107,7 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'status=$?',
   'set -e',
   'exec 3>&-',
-  'rm -f "$fifo" "$fifo.in"',
+  'rm -f "$fifo" "$fifo.in" "$fifo.seq"',
   'exit "$status"',
 ].join('\n')
 
@@ -115,7 +115,7 @@ export const BOX_CC_STOP_SCRIPT = [
   'set -eu',
   ...BOX_CC_REAP_FUNCTION,
   'reap "$1"',
-  'rm -f "$1" "$1.in"',
+  'rm -f "$1" "$1.in" "$1.seq"',
 ].join('\n')
 
 const SPAWN_FIFO_NONCE = /^[a-f0-9]{8,32}$/
@@ -180,15 +180,18 @@ export function boxCcStopExec(control: BoxCcControl): BoxCcExecRequest {
  * The exec API carries data only in argv and environment, and the kernel
  * refuses any single string over 128 KiB (MAX_ARG_STRLEN), so a line is cut
  * into base64 parts well under that. A line that needs several requests is
- * collected in `<fifo>.in`, each request writing at its own offset so a
- * repeated request changes nothing, and reaches the fifo in one write by the
- * last request. The script waits until the launch script has created the
- * fifo: opening it earlier races the mkfifo and then leaves Claude blocked
- * on a reader that never gets a writer. */
+ * collected in `<fifo>.in`, each request writing at its own offset, and
+ * reaches the fifo in one write by the last request. Lines are numbered by
+ * the bridge and `<fifo>.seq` holds the number of the last line Claude got,
+ * so a request repeated after a lost response changes nothing: Claude never
+ * reads a line twice. The script waits until the launch script has created
+ * the fifo: opening it earlier races the mkfifo and then leaves Claude
+ * blocked on a reader that never gets a writer. */
 export const BOX_CC_WRITE_SCRIPT = [
   'import base64,os,time',
   'e=os.environ',
   'p=e["OC_BOX_CC_FIFO"]',
+  'seq=int(e["OC_BOX_CC_SEQ"])',
   'off=int(e["OC_BOX_CC_OFFSET"])',
   'last=e["OC_BOX_CC_LAST"]=="1"',
   'data=b"".join(base64.b64decode(e["OC_BOX_CC_PART_%d"%i]) for i in range(int(e["OC_BOX_CC_PARTS"])))',
@@ -196,6 +199,10 @@ export const BOX_CC_WRITE_SCRIPT = [
   'while not os.path.exists(p):',
   '    if time.time()>end: raise SystemExit(1)',
   '    time.sleep(0.05)',
+  'try:',
+  '    with open(p+".seq") as f: done=int(f.read())',
+  'except (OSError,ValueError): done=0',
+  'if done>=seq: raise SystemExit(0)',
   'if off or not last:',
   '    f=os.fdopen(os.open(p+".in",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600),"r+b")',
   '    if os.fstat(f.fileno()).st_size<off: raise SystemExit(3)',
@@ -209,6 +216,8 @@ export const BOX_CC_WRITE_SCRIPT = [
   '    f.close()',
   'if last:',
   '    with open(p,"ab") as f: f.write(data)',
+  '    with os.fdopen(os.open(p+".seq.tmp",os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600),"w") as f: f.write(str(seq))',
+  '    os.replace(p+".seq.tmp",p+".seq")',
 ].join('\n')
 
 /** Bytes of the line per environment string (80 000 base64 characters). */
@@ -216,7 +225,9 @@ export const BOX_CC_WRITE_PART_BYTES = 60_000
 /** Environment strings per exec request. */
 export const BOX_CC_WRITE_PARTS_PER_EXEC = 4
 
-export function boxCcWriteExecs(control: BoxCcControl, line: string): BoxCcExecRequest[] {
+/** `seq` numbers the lines of one bridge process from 1. */
+export function boxCcWriteExecs(control: BoxCcControl, line: string, seq: number): BoxCcExecRequest[] {
+  if (!Number.isSafeInteger(seq) || seq < 1) throw new Error('BOX_CC_LINE_SEQ_INVALID')
   const bytes = Buffer.from(line.endsWith('\n') ? line : `${line}\n`, 'utf8')
   const perExec = BOX_CC_WRITE_PART_BYTES * BOX_CC_WRITE_PARTS_PER_EXEC
   const out: BoxCcExecRequest[] = []
@@ -225,6 +236,7 @@ export function boxCcWriteExecs(control: BoxCcControl, line: string): BoxCcExecR
     const environment: Record<string, string> = {
       HOME: BOX_CC_HOME,
       OC_BOX_CC_FIFO: control.fifo,
+      OC_BOX_CC_SEQ: String(seq),
       OC_BOX_CC_OFFSET: String(offset),
       OC_BOX_CC_LAST: offset + perExec >= bytes.length ? '1' : '0',
       OC_BOX_CC_PARTS: String(Math.ceil(slice.length / BOX_CC_WRITE_PART_BYTES)),
