@@ -211,11 +211,10 @@ describe("migrate.runMigrations", () => {
         WHERE engine = 'cursor' AND state = 'active' AND context_window = 1000000
           AND model_id ~ '^cursor-(opus-5|opus-4\\.8|fable-5|fable-5\\.1)-'`,
     );
-    // 0258 switched every opus/fable row to 1M (30 at the time). 0271 retired the five
-    // cursor-fable-5-* rows and 0290 the other 25 for Box Claude (disabled + hidden,
-    // never `retired`), so no opus/fable row is active; the 0258 invariant itself is
-    // re-asserted below as "no active non-1M row".
-    assert.equal(cursorOpusFable1m.rows[0].cnt, "0", "0258+0271+0290: no active cursor opus/fable row");
+    // 0258 switched every opus/fable row to 1M (30 at the time). 0271 retires the five
+    // cursor-fable-5-* rows (disabled + hidden, never `retired`), so the live lineage is
+    // 25; the 0258 invariant itself is re-asserted below as "no active non-1M row".
+    assert.equal(cursorOpusFable1m.rows[0].cnt, "25", "0258+0271: 25 active cursor opus/fable rows, all 1M");
     const cursorOpusFableNon1m = await query<{ cnt: string }>(
       `SELECT COUNT(*)::text AS cnt FROM model_catalog
         WHERE engine = 'cursor' AND state = 'active' AND context_window <> 1000000
@@ -1097,13 +1096,8 @@ describe("migrate.runMigrations", () => {
       `SELECT c.state,p.enabled,p.visibility,p.default_effort,c.capability_profile
          FROM model_catalog c
          JOIN model_pricing p ON p.model_id=c.model_id
-        WHERE c.model_id='gpt-6-luna' AND c.state='active'`,
+        WHERE c.model_id='gpt-5.6-luna' AND c.state='active'`,
     );
-    // 0288 retired gpt-5.6-luna; the row 0183/0184 activated lives on as gpt-6-luna.
-    const retiredLuna = await query(
-      `SELECT 1 FROM model_catalog WHERE model_id='gpt-5.6-luna' AND state='active'`,
-    );
-    assert.equal(retiredLuna.rows.length, 0);
     assert.deepEqual(luna.rows, [{
       state: "active",
       enabled: true,

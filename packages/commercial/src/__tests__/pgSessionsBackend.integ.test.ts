@@ -6552,8 +6552,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         },
       },
       {
+        // Commercial fence (f867b11d2): a completed tool whose own result object
+        // says its outcome is unknown is not settled evidence either.
         suffix: "unknown-outcome",
-        manualOnly: false,
+        manualOnly: true,
         record: {
           id: "tool-unknown",
           role: "tool",

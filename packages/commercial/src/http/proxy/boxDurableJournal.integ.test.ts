@@ -494,20 +494,21 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       uid: 3n, canonicalModel: basis.model, canonicalBody: missingResult }),
     (error: unknown) => error instanceof BoxDurableJournalError
       && error.code === "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
-    // Equal cardinality and legal IDs pass pure classification. The locked
-    // journal must still reject duplicated B/missing A rather than publish.
+    // Since OCV5-322 the pure classification pairs results one to one with the
+    // handed-off calls and already refuses a duplicated id. The locked journal
+    // must still reject duplicated B/missing A rather than publish.
     const duplicateResults = { ...resumeBody, messages: [...resumeBody.messages.slice(0, -1),
       { role: "user", content: [
         { type: "tool_result", tool_use_id: "toolu_B", content: "second" },
         { type: "tool_result", tool_use_id: "toolu_B", content: "duplicate" }] }] };
     const duplicatePrepared = prepareBoxContinuation({ uid: 3n, canonicalModel: basis.model,
       rawBody: duplicateResults, authorityKind: "local_catalog", authorityTurnId: null });
-    assert.equal(duplicatePrepared.classification, "continuation_candidate");
-    assert.deepEqual(duplicatePrepared.toolIds, ["toolu_B", "toolu_B"]);
+    assert.equal(duplicatePrepared.classification, "reject");
+    assert.equal(duplicatePrepared.rejectCode, "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     await assert.rejects(() => journal.claimToolResume({ requestId: `box-d-${suffix}`,
       uid: 3n, canonicalModel: basis.model, canonicalBody: duplicateResults }),
     (error: unknown) => error instanceof BoxDurableJournalError
-      && error.code === "BOX_TOOL_RESULT_MISMATCH");
+      && error.code === "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     const ownerAfterInvalidResults = await client.query<{ state: string; ctx: Record<string, unknown> }>(
       "SELECT state,ctx FROM request_finalize_journal WHERE request_id=$1", [toolCall.requestId]);
     const childAfterInvalidResults = await client.query<{ state: string; ctx: Record<string, unknown> }>(
@@ -1099,7 +1100,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await assert.rejects(() => journal.claimToolResume({
       requestId: `box-cancel-child-${suffix}`, uid: 3n,
       canonicalModel: basis.model, canonicalBody: afterCancelBody }),
-    (error: unknown) => error instanceof BoxDurableJournalError && error.code === "BOX_RESUME_IN_PROGRESS");
+    // e721098fe (OCV5-313): a cancelled chain no longer reads as a resume in progress
+    (error: unknown) => error instanceof BoxDurableJournalError && error.code === "BOX_TOOL_OWNER_UNKNOWN");
     const canceledAfterResume = await client.query<{ request_id: string; state: string; ctx: Record<string, unknown> }>(
       "SELECT request_id,state,ctx FROM request_finalize_journal WHERE request_id=ANY($1::text[]) ORDER BY request_id",
       [canceledRowIds]);

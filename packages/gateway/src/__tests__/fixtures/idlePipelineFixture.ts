@@ -380,6 +380,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       CREATE TABLE ${SCHEMA}.request_finalize_journal (
         request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint, state text NOT NULL,
         ctx jsonb, precheck_credits bigint, dispatch_id text, attempt_no integer,
+        created_at timestamptz NOT NULL DEFAULT NOW(),
         updated_at timestamptz NOT NULL DEFAULT NOW(), final_credits bigint, ledger_id bigint,
         usage_id bigint, failure_code text, error_msg text);
       CREATE TABLE ${SCHEMA}.authority_turn_dispatches (
