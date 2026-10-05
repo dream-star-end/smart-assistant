@@ -16,13 +16,14 @@ const sqlPath = fileURLToPath(new URL(`../db/migrations/${NAME}.sql`, import.met
 const OLD = ["MiniMax-M3", "gpt-5.6-sol"];
 
 const requirements = async () => (await query<{ pair: string }>(
-  "SELECT model_id || ':' || requirement AS pair FROM model_runtime_requirements ORDER BY 1")).rows.map((r) => r.pair);
+  "SELECT model_id || ':' || requirement AS pair FROM model_runtime_requirements")).rows.map((r) => r.pair).sort();
 const autoDream = async () => (await query<{ v: string }>(
   "SELECT value #>> '{}' AS v FROM system_settings WHERE key='auto_dream_model'")).rows[0]?.v;
 const autoDreamRow = async () => (await query("SELECT to_jsonb(t) AS row FROM system_settings t WHERE key='auto_dream_model'")).rows[0]!.row;
+// rows are sorted in JS (code point order): ORDER BY on text follows the database collation, which differs between hosts
 const normalize = async () => (await query<{ row: string }>(
   `SELECT subject_kind || '|' || old_model_id || '|' || new_model_id || '|' || rewritten || '|' || COALESCE(skipped_reason,'-') AS row
-     FROM fn_0296_normalize_retired_model_refs() ORDER BY 1`)).rows.map((r) => r.row);
+     FROM fn_0296_normalize_retired_model_refs()`)).rows.map((r) => r.row).sort();
 const prefs = async () => Object.fromEntries((await query<{ email: string; m: string; theme: string }>(
   `SELECT u.email, p.prefs->>'default_model' AS m, p.prefs->>'theme' AS theme
      FROM user_preferences p JOIN users u ON u.id=p.user_id ORDER BY 1`)).rows.map((r) => [r.email, `${r.m}/${r.theme}`]));
@@ -30,7 +31,7 @@ const sessions = async () => Object.fromEntries((await query<{ id: string; model
   "SELECT id, model_id, updated_at::text FROM client_sessions ORDER BY 1")).rows.map((r) => [r.id, `${r.model_id}@${r.updated_at}`]));
 const snapshots = async () => (await query<{ row: string }>(
   `SELECT subject_kind || '|' || subject_key || '|' || original_model_id || '|' || COALESCE(replacement_model_id,'-') AS row
-     FROM model_0296_transition_snapshots WHERE subject_kind IN ('runtime_requirement','system_setting') ORDER BY 1`)).rows.map((r) => r.row);
+     FROM model_0296_transition_snapshots WHERE subject_kind IN ('runtime_requirement','system_setting')`)).rows.map((r) => r.row).sort();
 // every catalog and pricing row, to show the migration itself takes nothing offline
 const catalog = async () => (await query(
   `SELECT (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.entry_id) FROM model_catalog c) AS catalog,
