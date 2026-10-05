@@ -18,6 +18,10 @@ const requirements = async () => (await query<{ pair: string }>(
   "SELECT model_id || ':' || requirement AS pair FROM model_runtime_requirements ORDER BY 1")).rows.map((r) => r.pair);
 const autoDream = async () => (await query<{ v: string }>(
   "SELECT value #>> '{}' AS v FROM system_settings WHERE key='auto_dream_model'")).rows[0]?.v;
+const autoDreamRow = async () => (await query("SELECT to_jsonb(t) AS row FROM system_settings t WHERE key='auto_dream_model'")).rows[0]!.row;
+const normalize = async () => (await query<{ row: string }>(
+  `SELECT subject_kind || '|' || old_model_id || '|' || new_model_id || '|' || rewritten || '|' || COALESCE(skipped_reason,'-') AS row
+     FROM fn_0296_normalize_retired_model_refs() ORDER BY 1`)).rows.map((r) => r.row);
 const prefs = async () => Object.fromEntries((await query<{ email: string; m: string; theme: string }>(
   `SELECT u.email, p.prefs->>'default_model' AS m, p.prefs->>'theme' AS theme
      FROM user_preferences p JOIN users u ON u.id=p.user_id ORDER BY 1`)).rows.map((r) => [r.email, `${r.m}/${r.theme}`]));
@@ -117,10 +121,26 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
 
       // the guard itself is unchanged: it still refuses a model that carries a requirement
       await assert.rejects(disable("gpt-6-astra"), /required runtime models must remain active and priced: gpt-6-astra:default_codex_engine/);
+      // the old release still serves between the migration and the disable: a user picks a retired model again
+      const late = await user("late@example.test", "gpt-5.6-sol");
+      await session("late-mm", late, "MiniMax-M3");
+      await query(`UPDATE user_preferences p SET prefs = jsonb_set(p.prefs,'{default_model}','"MiniMax-M3"'), updated_at = now()
+                    FROM users u WHERE u.id=p.user_id AND u.email='minimax@example.test'`);
       for (const model of OLD) {
         await disable(model);
         assert.equal((await query("SELECT 1 FROM model_catalog WHERE model_id=$1 AND state='active'", [model])).rowCount, 0, model);
       }
+      // the operator's call after the disable picks those up; nothing names a retired model afterwards
+      assert.deepEqual(await normalize(), [
+        "client_sessions|MiniMax-M3|deepseek-v4-flash|1|-",
+        "client_sessions|gpt-5.6-sol|gpt-6.1-sol|0|-",
+        "user_preferences|MiniMax-M3|deepseek-v4-flash|1|-",
+        "user_preferences|gpt-5.6-sol|gpt-6.1-sol|1|-",
+      ]);
+      assert.equal((await query("SELECT 1 FROM user_preferences WHERE prefs->>'default_model' = ANY($1::text[])", [OLD])).rowCount, 0);
+      assert.equal((await query("SELECT 1 FROM client_sessions WHERE deleted_at IS NULL AND model_id = ANY($1::text[])", [OLD])).rowCount, 0);
+      assert.equal((await prefs())["late@example.test"], "gpt-6.1-sol/dark");
+      assert.match((await sessions())["late-mm"]!, /^deepseek-v4-flash@/);
     });
 
   test("a replacement users cannot pick yet leaves their default and sessions as they are", { timeout: 180000 }, async (t) => {
@@ -131,6 +151,11 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     assert.equal((await prefs())["sol@example.test"], "gpt-5.6-sol/dark");
     assert.equal((await sessions())["live-sol"], "gpt-5.6-sol@1000");
     assert.equal((await prefs())["minimax@example.test"], "deepseek-v4-flash/dark");
+    // the function says so instead of passing over it; the operator must not disable that model then
+    assert.deepEqual((await normalize()).filter((r) => r.includes("gpt-5.6-sol")), [
+      "client_sessions|gpt-5.6-sol|gpt-6.1-sol|0|replacement_not_selectable",
+      "user_preferences|gpt-5.6-sol|gpt-6.1-sol|0|replacement_not_selectable",
+    ]);
   });
 
   test("the manual rollback in the migration header restores every recorded value", { timeout: 180000 }, async (t) => {
@@ -140,15 +165,30 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
       "SELECT entry_id::text, lock_version FROM model_catalog WHERE model_id='gpt-6.1-sol' AND state='staged'")).rows[0]!;
     await query("SELECT fn_model_activate_entry($1::bigint,$2,NULL::bigint)", [staged.entry_id, staged.lock_version]);
     await seedUsers();
-    const before = { prefs: await prefs(), requirements: await requirements(), autoDream: await autoDream() };
+    const before = { prefs: await prefs(), requirements: await requirements(), autoDream: await autoDreamRow() };
     assert.deepEqual((await runMigrations()).applied, [NAME]);
     const sql = await readFile(sqlPath, "utf8");
     const block = /-- BEGIN MANUAL ROLLBACK 0296[^\n]*\n([\s\S]*?)-- END MANUAL ROLLBACK 0296/.exec(sql)![1]!;
     await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
-    assert.deepEqual({ prefs: await prefs(), requirements: await requirements(), autoDream: await autoDream() }, before);
+    // the settings row is compared whole: value, description and updated_at
+    assert.deepEqual({ prefs: await prefs(), requirements: await requirements(), autoDream: await autoDreamRow() }, before);
+    assert.equal((await query("SELECT to_regprocedure('fn_0296_normalize_retired_model_refs()') AS f")).rows[0]!.f, null);
     const after = await sessions();
     assert.match(after["live-sol"]!, /^gpt-5\.6-sol@/);
     assert.match(after["live-mm"]!, /^MiniMax-M3@/);
     assert.equal(after["deleted-sol"], "gpt-5.6-sol@1000");
+  });
+
+  test("the rollback keeps a successor requirement that was there before 0296", { timeout: 180000 }, async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    await resetAndMigrateBefore("0296");
+    await query("INSERT INTO model_runtime_requirements(model_id, requirement) VALUES ('gpt-6-astra','default_codex_engine')");
+    const before = await requirements();
+    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.ok(!(await requirements()).includes("gpt-5.6-sol:default_codex_engine"));
+    const sql = await readFile(sqlPath, "utf8");
+    const block = /-- BEGIN MANUAL ROLLBACK 0296[^\n]*\n([\s\S]*?)-- END MANUAL ROLLBACK 0296/.exec(sql)![1]!;
+    await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
+    assert.deepEqual(await requirements(), before);
   });
 });
