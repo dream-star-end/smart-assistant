@@ -61,7 +61,7 @@ describe("0294 prepares the commercial Box model route without offering it", () 
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0294");
     const before = await others();
-    assert.deepEqual((await runMigrations()).applied, ["0294_commercial_box_api_model", "0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol"]);
+    assert.deepEqual((await runMigrations()).applied, ["0294_commercial_box_api_model", "0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol", "0297_commercial_minimax_refs_to_grok_build"]);
     assert.deepEqual(await others(), before);
     assert.equal((await prepared()).state, "staged");
   });

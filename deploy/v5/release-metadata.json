@@ -167,7 +167,8 @@
     "0293_commercial_new_models_prepare",
     "0294_commercial_box_api_model",
     "0295_commercial_box_api_sonnet_haiku",
-    "0296_commercial_retire_minimax_m3_gpt56_sol"
+    "0296_commercial_retire_minimax_m3_gpt56_sol",
+    "0297_commercial_minimax_refs_to_grok_build"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

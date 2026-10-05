@@ -148,8 +148,9 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       // 结构更稳、少臆造且长上下文更合适;通过版本 bump 让 current_approved_version_id 指向新默认。
       // 1.0.2(OCV5-322):承接模型从 MiniMax-M3 切到 deepseek-v4-flash(1M 上下文,已是 official_seed_agent
       // 必需模型),MiniMax-M3 随后下线。
-      version: '1.0.2',
-      model: 'deepseek-v4-flash',
+      // 1.0.3(OCV5-326):承接模型改为 grok-build(Grok 4.7,grok 引擎;0297 给它加 official_seed_agent)。
+      version: '1.0.3',
+      model: 'grok-build',
       toolsets: ['core'],
       capabilities: [],
       skillDeps: [],

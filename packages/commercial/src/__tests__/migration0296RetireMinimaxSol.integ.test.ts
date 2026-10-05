@@ -8,12 +8,14 @@ import { getPool } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { PLATFORM_SEED_MODEL_IDS } from "../http/internalModelCatalog.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("commercial_retire_minimax_sol_0296_test");
 const NAME = "0296_commercial_retire_minimax_m3_gpt56_sol";
 const sqlPath = fileURLToPath(new URL(`../db/migrations/${NAME}.sql`, import.meta.url));
 const OLD = ["MiniMax-M3", "gpt-5.6-sol"];
+// 0297 changes where MiniMax-M3 goes; the upgrade cases here stop at 0296 to show what 0296 itself does
+const only0296 = await migrationsDirBefore("0297");
 
 const requirements = async () => (await query<{ pair: string }>(
   "SELECT model_id || ':' || requirement AS pair FROM model_runtime_requirements")).rows.map((r) => r.pair).sort();
@@ -75,7 +77,8 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     assert.equal(await autoDream(), DEFAULT_AUTO_DREAM_MODEL);
     assert.deepEqual(await snapshots(), [
       "runtime_requirement|default_codex_engine|gpt-5.6-sol|gpt-6-astra",
-      "runtime_requirement|official_seed_agent|MiniMax-M3|-",
+      // 0296 recorded no successor here; 0297 added grok-build's requirement and wrote it into this row
+      "runtime_requirement|official_seed_agent|MiniMax-M3|grok-build",
       "system_setting|auto_dream_model|MiniMax-M3|deepseek-v4-flash",
     ]);
     // the models the release itself needs are not the two being retired
@@ -96,7 +99,7 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
       for (const model of OLD) await assert.rejects(disable(model), /required runtime models must remain active and priced/, model);
       const before = await catalog();
 
-      assert.deepEqual((await runMigrations()).applied, [NAME]);
+      assert.deepEqual((await runMigrations({ dir: only0296 })).applied, [NAME]);
 
       assert.deepEqual(await catalog(), before);
       assert.deepEqual(await prefs(), {
@@ -190,7 +193,7 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     const staged = (await query<{ entry_id: string; lock_version: number }>(
       "SELECT entry_id::text, lock_version FROM model_catalog WHERE model_id='gpt-6.1-sol' AND state='staged'")).rows[0]!;
     await query("SELECT fn_model_activate_entry($1::bigint,$2,NULL::bigint)", [staged.entry_id, staged.lock_version]);
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: only0296 })).applied, [NAME]);
     await seedUsers();
     assert.deepEqual(await prefs(), {
       "minimax@example.test": "MiniMax-M3/dark", "other@example.test": "glm-5.3/dark", "sol@example.test": "gpt-5.6-sol/dark" });
@@ -202,7 +205,7 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0296"); // gpt-6.1-sol is only staged here
     await seedUsers();
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: only0296 })).applied, [NAME]);
     assert.equal((await prefs())["sol@example.test"], "gpt-5.6-sol/dark");
     assert.equal((await sessions())["live-sol"], "gpt-5.6-sol@1000");
     assert.equal((await prefs())["minimax@example.test"], "deepseek-v4-flash/dark");
@@ -221,7 +224,7 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     await query("SELECT fn_model_activate_entry($1::bigint,$2,NULL::bigint)", [staged.entry_id, staged.lock_version]);
     await seedUsers();
     const before = { prefs: await prefs(), requirements: await requirements(), autoDream: await autoDreamRow() };
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: only0296 })).applied, [NAME]);
     const sql = await readFile(sqlPath, "utf8");
     const block = /-- BEGIN MANUAL ROLLBACK 0296[^\n]*\n([\s\S]*?)-- END MANUAL ROLLBACK 0296/.exec(sql)![1]!;
     await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
@@ -243,7 +246,7 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
       "SELECT entry_id::text, lock_version FROM model_catalog WHERE model_id='gpt-6.1-sol' AND state='staged'")).rows[0]!;
     await query("SELECT fn_model_activate_entry($1::bigint,$2,NULL::bigint)", [staged.entry_id, staged.lock_version]);
     await seedUsers();
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: only0296 })).applied, [NAME]);
     // in the window the same user and the same session move to the other retired model
     await query(`UPDATE user_preferences p SET prefs = jsonb_set(p.prefs,'{default_model}','"MiniMax-M3"'), updated_at = now()
                   FROM users u WHERE u.id=p.user_id AND u.email='sol@example.test'`);
@@ -262,7 +265,7 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     await resetAndMigrateBefore("0296");
     await query("INSERT INTO model_runtime_requirements(model_id, requirement) VALUES ('gpt-6-astra','default_codex_engine')");
     const before = await requirements();
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: only0296 })).applied, [NAME]);
     assert.ok(!(await requirements()).includes("gpt-5.6-sol:default_codex_engine"));
     const sql = await readFile(sqlPath, "utf8");
     const block = /-- BEGIN MANUAL ROLLBACK 0296[^\n]*\n([\s\S]*?)-- END MANUAL ROLLBACK 0296/.exec(sql)![1]!;
