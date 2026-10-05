@@ -234,6 +234,68 @@ test("stale submitted retries sendPrompt on the same agent instead of looping UN
   }
 });
 
+test("an accepted install that leaves no capability is not sent again to the same host process", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sand-unconfirmed-"));
+  const token = "x." + Buffer.from(JSON.stringify({ type: "session", sub: "unconfirmed-principal", exp: 2_000_000_000 })).toString("base64url") + ".y";
+  const moduleHash = "d".repeat(64), machine = "a".repeat(32);
+  let now = Date.now(), creates = 0, sends = 0, pid = 321, installed = false;
+  const agents: any[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []; req.on("data", (x) => chunks.push(x));
+    req.on("end", () => {
+      const path = req.url!, body = Buffer.concat(chunks).toString();
+      const reply = (value: unknown, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); };
+      if (path.endsWith("GetSandBoxRunState")) return reply({ state: "SAND_BOX_RUN_STATE_RUNNING" });
+      if (path.endsWith("EnsureSandBox")) return reply({ gatewayUrl: base + "/box", gatewayToken: "GATE", networkToken: "NET" });
+      if (path.endsWith("/health")) return reply({ ok: true, pid, isBusy: false });
+      if (path.endsWith("InferenceService/Stream")) return installed ? reply({ protocol: "oc-sand-relay-v2", moduleSha256: moduleHash, nonce: req.headers["x-oc-sand-box-probe-nonce"], active: 0, maxConcurrent: 4 }) : reply({}, 404);
+      if (path.endsWith("/listAgents")) return reply(agents);
+      if (path.endsWith("/createAgent")) {
+        creates++;
+        agents.push({ id: "owned-maintenance-bot", description: JSON.parse(body).description, isRunning: false });
+        return reply({ agent: { id: "owned-maintenance-bot" }, transcript: [] });
+      }
+      // The Box takes the prompt; the installer then fails inside it, which the parent cannot see.
+      if (path.endsWith("/sendPrompt")) { sends++; return reply({ accepted: true }); }
+      return reply({}, 404);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = "http://127.0.0.1:" + (server.address() as { port: number }).port;
+  const row: any = { id: 1n, provider: "cursor", status: "active", cursor_sand_enabled: true, runtime_channel: "v5" };
+  const coordinator = new CursorSandLifecycleCoordinator({
+    authDir: dir, moduleHash, listAccounts: async () => [row], getAccount: async () => row,
+    getTokenSnapshot: async () => ({ id: 1n, token: Buffer.from(token), refresh: null, credential_kind: "session" as const, machine_id: machine, expires_at: null }),
+    clientFor: async () => ({ client: new CursorSandProvisionClient({ fetchImpl: fetch, apiBase: base, allowTestLoopback: true }) }),
+    installerPrompt: () => "synthetic deterministic installer", onChange: () => {}, now: () => now,
+  });
+  const op = () => Object.values(readSandLifecycleState(dir).operations)[0];
+  try {
+    await coordinator.tick();
+    assert.deepEqual({ creates, sends, phase: op().phase, hostPid: op().hostPid }, { creates: 1, sends: 1, phase: "submitted", hostPid: 321 });
+    // Four more stale windows on the same host process: nothing is sent again.
+    for (let i = 0; i < 4; i++) { now += 15 * 60_000 + 1; await coordinator.tick(); }
+    assert.deepEqual({ creates, sends }, { creates: 1, sends: 1 }, "the same host process must not get the installer twice");
+    assert.deepEqual({ phase: op().phase, errorCode: op().errorCode }, { phase: "error", errorCode: "INSTALL_UNCONFIRMED" });
+    const account = readSandLifecycleState(dir).accounts["1"];
+    assert.deepEqual({ phase: account.phase, errorCode: account.errorCode }, { phase: "error", errorCode: "INSTALL_UNCONFIRMED" });
+    // A restarted Box host has not seen the installer: it gets one attempt, and again only one.
+    pid = 322; now += 60_001; await coordinator.tick();
+    assert.deepEqual({ creates, sends, phase: op().phase, hostPid: op().hostPid }, { creates: 1, sends: 2, phase: "submitted", hostPid: 322 });
+    for (let i = 0; i < 3; i++) { now += 15 * 60_000 + 1; await coordinator.tick(); }
+    assert.deepEqual({ creates, sends, phase: op().phase }, { creates: 1, sends: 2, phase: "error" });
+    // The capability probe still decides readiness after the error.
+    installed = true; now += 60_001; await coordinator.tick();
+    assert.equal(readSandLifecycleState(dir).accounts["1"].phase, "ready");
+    assert.deepEqual({ creates, sends }, { creates: 1, sends: 2 });
+  } finally {
+    await coordinator.stop();
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("API-key exchange transient failures retain exact ready expiry; expiry and explicit rejection still withdraw", async () => {
   const dir = mkdtempSync(join(tmpdir(), "sand-exchange-recheck-"));
   const key = "crsr_" + "a".repeat(64), machine = "b".repeat(32), subject = sandHash("api-principal"), moduleHash = "c".repeat(64);
