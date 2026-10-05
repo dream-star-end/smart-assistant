@@ -164,7 +164,8 @@
     "0282_scnet_glm53_flash",
     "0283_cursor_gpt56_luna_sand",
     "0285_content_review_strikes",
-    "0293_commercial_new_models_prepare"
+    "0293_commercial_new_models_prepare",
+    "0294_commercial_box_api_model"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
