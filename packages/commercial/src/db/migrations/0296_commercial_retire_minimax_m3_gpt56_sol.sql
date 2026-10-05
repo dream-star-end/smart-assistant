@@ -24,6 +24,11 @@
 -- that no default or live session names either model. A pair whose replacement users cannot pick
 -- is reported with skipped_reason and left as it is; do not disable that model then.
 --
+-- After the disable a stale client can still send one of the two ids (the preferences endpoint does
+-- not check the catalog). Two BEFORE triggers rewrite such a write to the replacement, in the way
+-- 0219 fenced deepseek-v4-pro. They act only while the old model has no active catalog row and the
+-- replacement is one every user may pick, so nothing changes where the two models are still active.
+--
 -- Not handled here: an installed marketplace agent pinned to a version whose manifest names one of
 -- the two models. A version is pinned by artifact hash and is not rewritten. Installing does not
 -- look at the model catalog, so the operator checks twice: before disabling (no active listing's
@@ -38,6 +43,8 @@
 -- does not remove a row this migration did not add.
 --
 -- BEGIN MANUAL ROLLBACK 0296 (exercised by migration0296RetireMinimaxSol.integ.test.ts)
+-- DROP TRIGGER IF EXISTS trg_0296_fence_user_default_model ON user_preferences;
+-- DROP TRIGGER IF EXISTS trg_0296_fence_client_session_model ON client_sessions;
 -- UPDATE user_preferences AS p
 --    SET prefs = jsonb_set(p.prefs, '{default_model}', to_jsonb(s.original_model_id), true),
 --        updated_at = clock_timestamp()
@@ -63,6 +70,9 @@
 --  WHERE s.subject_kind = 'runtime_requirement'
 -- ON CONFLICT DO NOTHING;
 -- DROP FUNCTION fn_0296_normalize_retired_model_refs();
+-- DROP FUNCTION fn_0296_fence_user_default_model();
+-- DROP FUNCTION fn_0296_fence_client_session_model();
+-- DROP FUNCTION fn_0296_retired_model_replacement(TEXT);
 -- END MANUAL ROLLBACK 0296
 
 LOCK TABLE model_catalog, model_pricing, model_runtime_requirements,
@@ -140,6 +150,106 @@ END
 $function$;
 
 REVOKE ALL ON FUNCTION fn_0296_normalize_retired_model_refs() FROM PUBLIC;
+
+-- NULL unless p_old is one of the two ids, has no active catalog row any more, and its replacement
+-- is active, priced, public and without a plan gate.
+CREATE OR REPLACE FUNCTION fn_0296_retired_model_replacement(p_old TEXT)
+RETURNS TEXT
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+  SELECT t.new_id
+    FROM (VALUES ('gpt-5.6-sol', 'gpt-6.1-sol'), ('MiniMax-M3', 'deepseek-v4-flash')) AS t(old_id, new_id)
+   WHERE t.old_id = p_old
+     AND NOT EXISTS (SELECT 1 FROM public.model_catalog c WHERE c.model_id = t.old_id AND c.state = 'active')
+     AND EXISTS (
+       SELECT 1 FROM public.model_catalog c JOIN public.model_pricing p USING (model_id)
+        WHERE c.model_id = t.new_id AND c.state = 'active' AND p.enabled IS TRUE
+          AND p.visibility = 'public' AND p.min_plan_code IS NULL)
+$function$;
+
+CREATE OR REPLACE FUNCTION fn_0296_fence_user_default_model()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  v_requested TEXT := NEW.prefs->>'default_model';
+  v_new       TEXT;
+  v_marker    TIMESTAMPTZ;
+BEGIN
+  IF v_requested IS NULL OR v_requested NOT IN ('gpt-5.6-sol', 'MiniMax-M3') THEN
+    RETURN NEW;
+  END IF;
+  v_new := public.fn_0296_retired_model_replacement(v_requested);
+  IF v_new IS NULL THEN
+    RETURN NEW;
+  END IF;
+  v_marker := clock_timestamp();
+  INSERT INTO public.model_0296_transition_snapshots AS s(
+    subject_kind, subject_key, original_model_id, replacement_model_id, normalized_at)
+  VALUES ('user_preferences', NEW.user_id::text, v_requested, v_new, v_marker)
+  ON CONFLICT ON CONSTRAINT model_0296_transition_snapshots_pkey DO UPDATE
+    SET normalized_at = EXCLUDED.normalized_at,
+        replacement_model_id = EXCLUDED.replacement_model_id;
+  NEW.prefs := jsonb_set(NEW.prefs, '{default_model}', to_jsonb(v_new), true);
+  NEW.updated_at := v_marker;
+  RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION fn_0296_fence_client_session_model()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  v_requested TEXT := NEW.model_id;
+  v_new       TEXT;
+  v_marker    BIGINT;
+BEGIN
+  IF v_requested IS NULL OR v_requested NOT IN ('gpt-5.6-sol', 'MiniMax-M3') OR NEW.deleted_at IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+  v_new := public.fn_0296_retired_model_replacement(v_requested);
+  IF v_new IS NULL THEN
+    RETURN NEW;
+  END IF;
+  v_marker := floor(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+  IF TG_OP = 'UPDATE' THEN
+    v_marker := GREATEST(v_marker, COALESCE(OLD.updated_at, 0) + 1, COALESCE(NEW.updated_at, 0));
+  ELSE
+    v_marker := GREATEST(v_marker, COALESCE(NEW.updated_at, 0));
+  END IF;
+  INSERT INTO public.model_0296_transition_snapshots AS s(
+    subject_kind, subject_key, original_model_id, replacement_model_id, normalized_at_ms)
+  VALUES ('client_sessions', NEW.id, v_requested, v_new, v_marker)
+  ON CONFLICT ON CONSTRAINT model_0296_transition_snapshots_pkey DO UPDATE
+    SET normalized_at_ms = EXCLUDED.normalized_at_ms,
+        replacement_model_id = EXCLUDED.replacement_model_id;
+  NEW.model_id := v_new;
+  NEW.updated_at := v_marker;
+  RETURN NEW;
+END
+$function$;
+
+REVOKE ALL ON FUNCTION fn_0296_retired_model_replacement(TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION fn_0296_fence_user_default_model() FROM PUBLIC;
+REVOKE ALL ON FUNCTION fn_0296_fence_client_session_model() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS trg_0296_fence_user_default_model ON user_preferences;
+CREATE TRIGGER trg_0296_fence_user_default_model
+BEFORE INSERT OR UPDATE OF prefs ON user_preferences
+FOR EACH ROW EXECUTE FUNCTION fn_0296_fence_user_default_model();
+
+DROP TRIGGER IF EXISTS trg_0296_fence_client_session_model ON client_sessions;
+CREATE TRIGGER trg_0296_fence_client_session_model
+BEFORE INSERT OR UPDATE OF model_id ON client_sessions
+FOR EACH ROW EXECUTE FUNCTION fn_0296_fence_client_session_model();
 
 DO $transition$
 DECLARE

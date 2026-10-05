@@ -4,6 +4,7 @@ import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
 import { DEFAULT_AUTO_DREAM_MODEL } from "../billing/autoDreamModels.js";
+import { getPool } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { PLATFORM_SEED_MODEL_IDS } from "../http/internalModelCatalog.js";
@@ -141,7 +142,60 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
       assert.equal((await query("SELECT 1 FROM client_sessions WHERE deleted_at IS NULL AND model_id = ANY($1::text[])", [OLD])).rowCount, 0);
       assert.equal((await prefs())["late@example.test"], "gpt-6.1-sol/dark");
       assert.match((await sessions())["late-mm"]!, /^deepseek-v4-flash@/);
+
+      // after that, a stale client that still sends a retired id is fenced at the write
+      await query(`UPDATE user_preferences p SET prefs = jsonb_set(p.prefs,'{default_model}','"gpt-5.6-sol"'), updated_at = now()
+                    FROM users u WHERE u.id=p.user_id AND u.email='other@example.test'`);
+      const stale = await user("stale@example.test", "MiniMax-M3");
+      await session("stale-sol", stale, "gpt-5.6-sol");
+      await query("UPDATE client_sessions SET model_id='MiniMax-M3', updated_at=updated_at+1 WHERE id='live-other'");
+      await session("stale-deleted", stale, "gpt-5.6-sol", true);
+      const fenced = await prefs();
+      assert.equal(fenced["other@example.test"], "gpt-6.1-sol/dark");
+      assert.equal(fenced["stale@example.test"], "deepseek-v4-flash/dark");
+      const fencedSessions = await sessions();
+      assert.match(fencedSessions["stale-sol"]!, /^gpt-6\.1-sol@/);
+      assert.match(fencedSessions["live-other"]!, /^deepseek-v4-flash@/);
+      assert.equal(fencedSessions["stale-deleted"], "gpt-5.6-sol@1000");
+      assert.equal((await query("SELECT 1 FROM user_preferences WHERE prefs->>'default_model' = ANY($1::text[])", [OLD])).rowCount, 0);
+      assert.equal((await query("SELECT 1 FROM client_sessions WHERE deleted_at IS NULL AND model_id = ANY($1::text[])", [OLD])).rowCount, 0);
+      // the fence also holds for a role that may write preferences but has no right on the ledger or the catalog
+      const client = await getPool().connect();
+      try {
+        await client.query("DROP ROLE IF EXISTS oc_migration0296_app");
+        await client.query("CREATE ROLE oc_migration0296_app");
+        await client.query("GRANT USAGE ON SCHEMA public TO oc_migration0296_app");
+        await client.query("GRANT SELECT, UPDATE ON user_preferences TO oc_migration0296_app");
+        await client.query("BEGIN");
+        await client.query("SET LOCAL ROLE oc_migration0296_app");
+        await client.query(`UPDATE user_preferences SET prefs = jsonb_set(prefs,'{default_model}','"MiniMax-M3"') WHERE user_id=$1`, [stale]);
+        await client.query("COMMIT");
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined);
+        await client.query("REVOKE ALL ON user_preferences FROM oc_migration0296_app").catch(() => undefined);
+        await client.query("REVOKE ALL ON SCHEMA public FROM oc_migration0296_app").catch(() => undefined);
+        await client.query("DROP ROLE IF EXISTS oc_migration0296_app").catch(() => undefined);
+        client.release();
+      }
+      assert.equal((await prefs())["stale@example.test"], "deepseek-v4-flash/dark");
+      // a write that names any other model is not touched
+      await query(`UPDATE user_preferences p SET prefs = jsonb_set(p.prefs,'{default_model}','"glm-5.3"') FROM users u WHERE u.id=p.user_id AND u.email='other@example.test'`);
+      assert.equal((await prefs())["other@example.test"], "glm-5.3/dark");
     });
+
+  test("while the two models are still active a write that names them is left alone", { timeout: 180000 }, async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    await resetAndMigrateBefore("0296");
+    const staged = (await query<{ entry_id: string; lock_version: number }>(
+      "SELECT entry_id::text, lock_version FROM model_catalog WHERE model_id='gpt-6.1-sol' AND state='staged'")).rows[0]!;
+    await query("SELECT fn_model_activate_entry($1::bigint,$2,NULL::bigint)", [staged.entry_id, staged.lock_version]);
+    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    await seedUsers();
+    assert.deepEqual(await prefs(), {
+      "minimax@example.test": "MiniMax-M3/dark", "other@example.test": "glm-5.3/dark", "sol@example.test": "gpt-5.6-sol/dark" });
+    assert.equal((await sessions())["live-sol"], "gpt-5.6-sol@1000");
+    assert.equal((await sessions())["live-mm"], "MiniMax-M3@1000");
+  });
 
   test("a replacement users cannot pick yet leaves their default and sessions as they are", { timeout: 180000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
@@ -173,6 +227,8 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     // the settings row is compared whole: value, description and updated_at
     assert.deepEqual({ prefs: await prefs(), requirements: await requirements(), autoDream: await autoDreamRow() }, before);
     assert.equal((await query("SELECT to_regprocedure('fn_0296_normalize_retired_model_refs()') AS f")).rows[0]!.f, null);
+    assert.equal((await query("SELECT 1 FROM pg_trigger WHERE tgname LIKE 'trg_0296_%' AND NOT tgisinternal")).rowCount, 0);
+    assert.equal((await query("SELECT 1 FROM pg_proc WHERE proname LIKE 'fn_0296_%'")).rowCount, 0);
     const after = await sessions();
     assert.match(after["live-sol"]!, /^gpt-5\.6-sol@/);
     assert.match(after["live-mm"]!, /^MiniMax-M3@/);
