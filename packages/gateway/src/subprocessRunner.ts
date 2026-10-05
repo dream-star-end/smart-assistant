@@ -136,6 +136,19 @@ export function _boxCcOneShotExitSkipsCrashLoop(args: {
   return args.boxResidentCc && args.code === 0 && args.signal == null
 }
 
+/** The engine=ccb official-cc lane puts per-turn headers in the spawn env and
+ * respawns when they change. Cursor Sand and the box-resident CLI never read
+ * that env: Sand uses its loopback relay, the box uses the box's own login. */
+export function _officialCcProxyLane(args: {
+  harness: 'ccb' | 'official-cc'
+  authorityEngine: 'ccb' | 'cursor' | undefined
+  boxResidentCc: boolean
+}): boolean {
+  return args.harness === 'official-cc'
+    && args.authorityEngine !== 'cursor'
+    && !args.boxResidentCc
+}
+
 /**
  * 构造容器侧 OC_REMOTE_* env。
  *
@@ -2336,7 +2349,11 @@ export class SubprocessRunner extends EventEmitter {
       ? JSON.stringify(runtime.descriptor)
       : ''
     const harness = resolveCcbHarness(this.opts.harness)
-    const officialCcProxyLane = harness === 'official-cc' && this.opts.authorityEngine !== 'cursor'
+    const officialCcProxyLane = _officialCcProxyLane({
+      harness,
+      authorityEngine: this.opts.authorityEngine,
+      boxResidentCc: this.opts.boxResidentCc === true,
+    })
     if (officialCcProxyLane) {
       const spawnEnv = buildOfficialCcProxySpawnEnv({
         headers: runtime.headers,
@@ -2411,6 +2428,12 @@ export class SubprocessRunner extends EventEmitter {
       }
       if (this.opts.authorityEngine === 'cursor') {
         throw new Error('OFFICIAL_CC_LEASE_NOOP_OUTSIDE_CURSOR_SAND')
+      }
+      if (this.opts.boxResidentCc) {
+        // The box CLI never sees these headers. Marking the process stale here
+        // would only make the next turn kill a healthy box process.
+        void leaseEnvelope
+        return
       }
       // engine=ccb official-cc: stock CLI cannot hot-apply. Stash the renewed
       // bundle and invalidate the spawn fingerprint so the next submit recycles.

@@ -5,11 +5,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { chmodSync, existsSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs'
 import {
+  BOX_CC_STOP_SCRIPT,
   boxCcControlSummary,
   boxCcLaunchExec,
   boxCcSpawnFifo,
+  boxCcStopExec,
   boxCcWriteExec,
   cursorBoxCcEnabled,
   cursorBoxCcSelectionEligible,
@@ -288,6 +292,204 @@ test('control file is private and the bridge copies one stdin line to stdout', a
     rmSync(dir, { recursive: true, force: true })
     if (previousNoProxy === undefined) delete process.env.NO_PROXY
     else process.env.NO_PROXY = previousNoProxy
+  }
+})
+
+// INC-20261005-BOX-CC-FOLLOWUP-TURN: closing stdin used to do nothing. The
+// runner then SIGKILLed the bridge, the next turn was reported as a crash,
+// and the box Claude stayed alive on the session.
+async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
+  code: number | 'pending'
+  out: string
+  launchFifo: string
+  stopFifos: string[]
+}> {
+  const previousNoProxy = process.env.NO_PROXY
+  process.env.NO_PROXY = '127.0.0.1,localhost'
+  const launch: { res: ServerResponse | null } = { res: null }
+  let launchFifo = ''
+  const stopFifos: string[] = []
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).subarray(5).toString('utf8')) as {
+        command: string
+        args: string[]
+        environment: Record<string, string>
+      }
+      res.writeHead(200, { 'content-type': 'application/connect+json' })
+      if (body.command === 'python3') {
+        res.end(frame({ exitEvent: {} }))
+        launch.res?.write(frame({ stdoutEvent: { data: '{"type":"result","subtype":"success"}\n' } }))
+      } else if (body.args[1] === BOX_CC_STOP_SCRIPT) {
+        stopFifos.push(String(body.args[3]))
+        res.end(frame({ exitEvent: {} }))
+        if (remoteEndsOnStop) launch.res?.end(frame({ exitEvent: { exitCode: 143 } }))
+      } else {
+        launchFifo = String(body.args[3])
+        launch.res = res
+        res.flushHeaders()
+      }
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('no port')
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  let out = ''
+  stdout.on('data', (chunk) => { out += chunk.toString('utf8') })
+  try {
+    const running = runBoxCcBridge({
+      control: {
+        execUrl: `http://127.0.0.1:${address.port}/agent.v1.ControlService/Exec`,
+        execToken: 'local',
+        networkToken: 'net-token',
+        remoteClaude: '/home/box/.local/bin/claude',
+        fifo: '/tmp/oc-box-cc-0123456789abcdef.fifo',
+        cwd: '/workspace',
+      },
+      args: ['--model', 'box-claude-haiku-4-5'],
+      stdin,
+      stdout,
+      stderr: new PassThrough(),
+    })
+    stdin.write('{"type":"user","message":{"role":"user","content":"first"}}\n')
+    for (let i = 0; i < 200 && !out.includes('"result"'); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    // The turn is over and the process is idle. Now the gateway retires it.
+    stdin.end()
+    const code = await Promise.race([
+      running,
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 2_000)),
+    ])
+    return { code, out, launchFifo, stopFifos }
+  } finally {
+    stdin.destroy()
+    launch.res?.destroy()
+    server.closeAllConnections()
+    server.close()
+    if (previousNoProxy === undefined) delete process.env.NO_PROXY
+    else process.env.NO_PROXY = previousNoProxy
+  }
+}
+
+test('closing stdin ends the box Claude and the bridge exits 0', async () => {
+  const run = await bridgeAgainstFakeBox(true)
+  assert.match(run.out, /"result"/)
+  assert.equal(run.code, 0)
+  assert.match(run.launchFifo, /^\/tmp\/oc-box-cc-0123456789abcdef\.[a-f0-9]{16}\.fifo$/)
+  assert.deepEqual(run.stopFifos, [run.launchFifo])
+})
+
+test('closing stdin exits 0 even when the box never reports the exit', async () => {
+  const run = await bridgeAgainstFakeBox(false)
+  assert.equal(run.code, 0)
+  assert.deepEqual(run.stopFifos, [run.launchFifo])
+})
+
+function stdinReaders(fifo: string): number[] {
+  const pids: number[] = []
+  for (const entry of readdirSync('/proc')) {
+    if (!/^\d+$/.test(entry)) continue
+    try {
+      if (readlinkSync(`/proc/${entry}/fd/0`) === fifo) pids.push(Number(entry))
+    } catch { /* gone, or not ours */ }
+  }
+  return pids
+}
+
+async function until(check: () => boolean, ms = 5_000): Promise<boolean> {
+  const end = Date.now() + ms
+  while (Date.now() < end) {
+    if (check()) return true
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return check()
+}
+
+test('box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-box-cc-scripts-'))
+  const fakeClaude = join(dir, 'claude')
+  // Stands in for `claude -p --input-format=stream-json`: reads stdin forever.
+  writeFileSync(fakeClaude, '#!/bin/sh\nwhile IFS= read -r line; do printf "%s\\n" "$line"; done\n')
+  chmodSync(fakeClaude, 0o755)
+  const control = (session: string): BoxCcControl => ({
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: fakeClaude,
+    fifo: boxCcSpawnFifo(`/tmp/oc-box-cc-${session}.fifo`, randomBytes(8).toString('hex')),
+    cwd: dir,
+  })
+  const children: ChildProcess[] = []
+  const run = (request: { command: string; args: string[]; environment: Record<string, string> }): ChildProcess => {
+    const child = spawn(request.command, request.args, {
+      cwd: dir,
+      env: { ...request.environment, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    children.push(child)
+    return child
+  }
+  const exited = (child: ChildProcess): Promise<number | null> =>
+    new Promise((resolve) => child.once('exit', (code) => resolve(code)))
+  const session = randomBytes(8).toString('hex')
+  const other = randomBytes(8).toString('hex')
+  const first = control(session)
+  const second = control(session)
+  const bystander = control(other)
+  try {
+    const firstLaunch = run(boxCcLaunchExec(first, []))
+    const bystanderLaunch = run(boxCcLaunchExec(bystander, []))
+    // dash counts twice (the launch shell holds the redirect too); bash once.
+    const settled = async (fifo: string): Promise<number> => {
+      await until(() => stdinReaders(fifo).length > 0)
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      return stdinReaders(fifo).length
+    }
+    assert.ok(await settled(first.fifo) >= 1)
+    const bystanders = await settled(bystander.fifo)
+    assert.ok(bystanders >= 1)
+
+    // The first bridge was killed without a stop. The session's next launch
+    // must not leave two Claudes on one transcript.
+    const firstGone = exited(firstLaunch)
+    const secondLaunch = run(boxCcLaunchExec(second, []))
+    assert.ok(await settled(second.fifo) >= 1)
+    await firstGone
+    assert.deepEqual(stdinReaders(first.fifo), [])
+    assert.equal(existsSync(first.fifo), false)
+    assert.equal(stdinReaders(bystander.fifo).length, bystanders, 'another session is not touched')
+
+    let echoed = ''
+    secondLaunch.stdout?.on('data', (chunk: Buffer) => { echoed += chunk.toString('utf8') })
+    await exited(run(boxCcWriteExec(second, '{"type":"user"}')))
+    assert.equal(await until(() => echoed.includes('{"type":"user"}')), true)
+
+    const secondGone = exited(secondLaunch)
+    assert.equal(await exited(run(boxCcStopExec(second))), 0)
+    await secondGone
+    assert.deepEqual(stdinReaders(second.fifo), [])
+    assert.equal(existsSync(second.fifo), false)
+    assert.equal(stdinReaders(bystander.fifo).length, bystanders)
+
+    const bystanderGone = exited(bystanderLaunch)
+    assert.equal(await exited(run(boxCcStopExec(bystander))), 0)
+    await bystanderGone
+  } finally {
+    for (const child of children) child.kill('SIGKILL')
+    for (const c of [first, second, bystander]) {
+      for (const pid of stdinReaders(c.fifo)) {
+        try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
+      }
+      rmSync(c.fifo, { force: true })
+    }
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
