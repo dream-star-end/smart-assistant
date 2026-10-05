@@ -193,9 +193,12 @@ export function boxCcStopExec(control: BoxCcControl): BoxCcExecRequest {
  *
  * The script waits until the launch script has created the fifo: opening it
  * earlier races the mkfifo and then leaves Claude blocked on a reader that
- * never gets a writer. */
+ * never gets a writer. It opens the path without creating it and only as a
+ * fifo that has a reader: once the launch script has removed the fifo there
+ * is no Claude to write to, and the request fails instead of leaving the
+ * line in a file nobody reads. */
 export const BOX_CC_WRITE_SCRIPT = [
-  'import base64,fcntl,os,time',
+  'import base64,fcntl,os,stat,time',
   'e=os.environ',
   'p=e["OC_BOX_CC_FIFO"]',
   'seq=int(e["OC_BOX_CC_SEQ"])',
@@ -228,8 +231,11 @@ export const BOX_CC_WRITE_SCRIPT = [
   '        os.unlink(p+".in")',
   '    f.close()',
   'if last:',
+  '    fd=os.open(p,os.O_WRONLY|os.O_NONBLOCK|os.O_NOFOLLOW)',
+  '    if not stat.S_ISFIFO(os.fstat(fd).st_mode): raise SystemExit(5)',
+  '    fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)&~os.O_NONBLOCK)',
   '    mark("pending")',
-  '    with open(p,"ab") as f: f.write(data)',
+  '    with os.fdopen(fd,"wb") as f: f.write(data)',
   '    mark("done")',
 ].join('\n')
 

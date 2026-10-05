@@ -674,6 +674,44 @@ test('box scripts: a repeated write waits for the first attempt and never writes
   }
 })
 
+test('box scripts: a write goes only into a fifo that has a reader', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-box-cc-nofifo-'))
+  const control: BoxCcControl = {
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: '/bin/true',
+    fifo: boxCcSpawnFifo(`/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, randomBytes(8).toString('hex')),
+    cwd: dir,
+  }
+  const code = (request: BoxCcExecRequest): Promise<number | null> => new Promise((resolve) => {
+    spawn(request.command, request.args, {
+      cwd: dir,
+      env: { ...request.environment, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      stdio: 'ignore',
+    }).once('exit', (exit) => resolve(exit))
+  })
+  const [write] = boxCcWriteExecs(control, '{"type":"user"}', 1)
+  try {
+    // Claude exited and the launch script removed the fifo; something else is
+    // at that path. The line must not be left in a file nobody reads.
+    writeFileSync(control.fifo, '')
+    assert.equal(await code(write!), 5)
+    assert.equal(readFileSync(control.fifo, 'utf8'), '')
+    assert.equal(existsSync(`${control.fifo}.seq`), false, 'nothing is recorded as delivered')
+    rmSync(control.fifo)
+    // A fifo nobody reads: the write fails at once instead of blocking.
+    assert.equal(spawnSync('mkfifo', ['-m', '600', control.fifo]).status, 0)
+    assert.equal(await code(write!), 1)
+    assert.equal(existsSync(`${control.fifo}.seq`), false)
+  } finally {
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp', '.lock']) rmSync(`${control.fifo}${suffix}`, { force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 function largeLineBridge(writeExit: number, loseFirstResponse = false): {
   run: Promise<number>
   stdin: PassThrough
