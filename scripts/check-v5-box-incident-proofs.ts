@@ -15,8 +15,11 @@
  * The Box account itself is simulated at its exec endpoint; everything
  * between the request and that endpoint is product code.
  */
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, utimesSync,
+  writeFileSync } from "node:fs";
+import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
@@ -73,6 +76,10 @@ type Api = {
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
+  /** The box-resident Claude CLI lane (box-claude-*): the gateway runner and its stdio bridge. */
+  boxCli: { runner: (opts: unknown) => { submit: (text: string, requestId: undefined, authority: unknown,
+      turnKey: string) => Promise<void>; updateTurnLease: (lease: string) => Promise<void> };
+    bridge: (opts: unknown) => Promise<number> };
   ccbAdapter: (runner: unknown) => { submitTurn: (input: unknown) => { submitted: Promise<void>;
     summary: Promise<{ isError?: boolean } | undefined>; end: () => void }; shutdown: () => Promise<void> };
   fetchIdleProof: (input: { sessionId: string; turnKey: string }) => Promise<{ status: string }>;
@@ -157,6 +164,8 @@ async function load(): Promise<Api> {
   const shared = await import(pathToFileURL(join(PROXY, "shared.ts")).href);
   const GATEWAY = join(CANDIDATE, "packages/gateway/src");
   const ccb = await import(pathToFileURL(join(GATEWAY, "engine/ccbAdapter.ts")).href);
+  const boxRunner = await import(pathToFileURL(join(GATEWAY, "subprocessRunner.ts")).href);
+  const boxBridge = await import(pathToFileURL(join(GATEWAY, "engine/cursorBoxCcBridge.ts")).href);
   const idleClient = await import(pathToFileURL(join(GATEWAY, "engine/boxIdleProofClient.ts")).href);
   const idleFiles = await import(pathToFileURL(join(GATEWAY, "boxIdleCompact.ts")).href);
   const sessions = await import(pathToFileURL(join(GATEWAY, "sessionManager.ts")).href);
@@ -201,6 +210,7 @@ async function load(): Promise<Api> {
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
     jsonError: shared.sendJsonError,
+    boxCli: { runner: (opts) => new boxRunner.SubprocessRunner(opts), bridge: boxBridge.runBoxCcBridge },
     ccbAdapter: (runner) => new ccb.CcbAdapter({}, runner),
     fetchIdleProof: idleClient.fetchBoxIdleProof,
     finishIdle: (session, source, dir) => sessions.SessionManager.prototype.finishIdleUnderLock.call({}, session, source, dir),
@@ -1892,6 +1902,98 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
   });
 }
 
+/** INC-20261005-BOX-CC-FOLLOWUP-TURN. Production rel-97e6472b5: on box-claude-* the second turn of a session
+ * ended as "服务正在更新，本轮已中断" (子进程被信号 SIGKILL 终止). The runner took the box CLI for the
+ * engine=ccb proxy lane and recycled it before every turn; the bridge ignored its closed stdin, was SIGKILLed,
+ * and the box Claude stayed alive on the session. The Box here is an exec endpoint that really runs what the
+ * bridge sends (the product's launch, write and stop scripts) around a stand-in for the Claude binary. */
+async function proveBoxCliFollowUpTurn(api: Api): Promise<string> {
+  const descriptor = { canonicalModel: "box-claude-opus-5-5", contextWindow: 200_000, capabilityZero: true,
+    supportsThinking: true, supportsVision: true, supportedEfforts: [] };
+  const turn = (lease: string) => ({ authorityEnvelope: `authority-${lease}`, leaseEnvelope: lease,
+    executionDescriptor: descriptor });
+  // A wrong recycle SIGKILLs the child's process group: give it a real one of its own.
+  const sleeper = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+  cleanups.add(() => { try { process.kill(-sleeper.pid!, "SIGKILL"); } catch { /* already gone */ } });
+  const written: string[] = [];
+  let stdinEnded = false;
+  const child = Object.assign(new EventEmitter(), { pid: sleeper.pid, exitCode: null, signalCode: null,
+    stdin: Object.assign(new EventEmitter(), { writable: true, end: () => { stdinEnded = true; },
+      write: (line: string, done?: (error?: Error | null) => void) => { written.push(line); done?.(null); return true; } }),
+    stdout: new EventEmitter(), stderr: new EventEmitter(), kill: () => true });
+  const runner = api.boxCli.runner({ sessionKey: "agent:main:webchat:dm:ocv5-315", agentId: "main",
+    agentBaseDir: api.home, model: "box-claude-opus-5-5", config: {}, harness: "official-cc", boxResidentCc: true });
+  Object.assign(runner, { proc: child, closed: false, spawnedExecutionDescriptor: descriptor });
+  await runner.submit("first", undefined, turn("lease-1"), "turn-1");
+  await runner.updateTurnLease("lease-1-renewed");
+  await runner.submit("second", undefined, turn("lease-2"), "turn-2");
+  if ((runner as unknown as { proc: unknown }).proc !== child || stdinEnded || written.length !== 2) {
+    fail(`FOLLOWUP_TURN_RECYCLED_BOX_PROCESS_${written.length}_${stdinEnded}`);
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-315-box-"));
+  cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
+  const claude = join(dir, "claude");
+  writeFileSync(claude, "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n", { mode: 0o755 });
+  const fifoBase = `/tmp/oc-box-cc-${randomBytes(8).toString("hex")}`;
+  const readers = (): number[] => readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).filter((pid) => {
+    try { return readlinkSync(`/proc/${pid}/fd/0`).startsWith(`${fifoBase}.`); } catch { return false; }
+  }).map(Number);
+  const execs = new Set<ChildProcess>();
+  cleanups.add(() => {
+    for (const run of execs) run.kill("SIGKILL");
+    for (const pid of readers()) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    for (const name of readdirSync("/tmp")) if (`/tmp/${name}`.startsWith(`${fifoBase}.`)) rmSync(`/tmp/${name}`, { force: true });
+  });
+  const execFrame = (body: unknown): Buffer => {
+    const payload = Buffer.from(JSON.stringify(body));
+    const head = Buffer.alloc(5);
+    head.writeUInt32BE(payload.length, 1);
+    return Buffer.concat([head, payload]);
+  };
+  const box = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).subarray(5).toString("utf8")) as { command: string;
+        args: string[]; environment: Record<string, string> };
+      const run = spawn(body.command, body.args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"],
+        env: { ...body.environment, PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+      execs.add(run);
+      res.writeHead(200, { "content-type": "application/connect+json" });
+      res.flushHeaders();
+      run.stdout!.on("data", (chunk: Buffer) => res.write(execFrame({ stdoutEvent: { data: chunk.toString("utf8") } })));
+      run.on("close", (code) => { execs.delete(run); res.end(execFrame({ exitEvent: code ? { exitCode: code } : {} })); });
+    });
+  });
+  await new Promise<void>((resolve) => box.listen(0, "127.0.0.1", () => resolve()));
+  cleanups.add(() => { box.closeAllConnections(); box.close(); });
+  const address = box.address();
+  if (!address || typeof address === "string") fail("FOLLOWUP_BOX_ENDPOINT");
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  let answered = "";
+  stdout.on("data", (chunk: Buffer) => { answered += chunk.toString("utf8"); });
+  const bridge = api.boxCli.bridge({ control: { execUrl: `http://127.0.0.1:${address.port}/agent.v1.ControlService/Exec`,
+    execToken: "exec", networkToken: "network", remoteClaude: claude, fifo: `${fifoBase}.fifo`, cwd: dir },
+    args: ["--model", "box-claude-opus-5-5"], stdin, stdout, stderr: new PassThrough() });
+  const answer = async (marker: string): Promise<void> => {
+    stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content: marker } })}\n`);
+    for (let i = 0; i < 200 && !answered.includes(marker); i++) await tick(25);
+    if (!answered.includes(marker)) fail(`FOLLOWUP_TURN_NOT_ANSWERED_${marker}`);
+  };
+  await answer("turn-one");
+  const serving = readers();
+  await answer("turn-two");
+  if (serving.length === 0 || !isDeepStrictEqual(readers(), serving)) fail("FOLLOWUP_TURN_CHANGED_BOX_CLAUDE");
+  // the gateway retires the process: shutdown, model switch, idle recycle
+  stdin.end();
+  const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
+  if (code !== 0) fail(`FOLLOWUP_STDIN_CLOSE_${code}`);
+  if (readers().length !== 0) fail("FOLLOWUP_BOX_CLAUDE_LEFT_RUNNING");
+  return "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it";
+}
+
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
@@ -1918,7 +2020,7 @@ async function main(): Promise<void> {
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
-    await proveSpoolReadTransient(api),
+    await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db)]),

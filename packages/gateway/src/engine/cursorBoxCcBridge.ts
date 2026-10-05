@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import {
   boxCcLaunchExec,
   boxCcSpawnFifo,
+  boxCcStopExec,
   boxCcWriteExec,
   encodeExecRequest,
   parseExecFrames,
@@ -17,6 +18,10 @@ import {
 } from './cursorBoxCcExec.js'
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>
+
+// Both must fit inside the runner's 3s shutdown grace.
+const STOP_EXEC_TIMEOUT_MS = 2_000
+const STOP_STREAM_GRACE_MS = 300
 
 function readControl(path: string): BoxCcControl {
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<BoxCcControl>
@@ -95,10 +100,32 @@ export async function runBoxCcBridge(opts: {
     opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
     abort.abort()
   }
+  // Closed stdin is the gateway retiring this process (shutdown, model switch,
+  // idle recycle). Claude in the box cannot see that EOF, so end it there and
+  // report a clean exit; otherwise the runner has to SIGKILL this bridge and
+  // the box Claude lives on, still attached to the session.
+  let stopRequested = false
+  const stopRemote = async (): Promise<void> => {
+    if (abort.signal.aborted) return
+    stopRequested = true
+    const stopper = new AbortController()
+    const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
+    try {
+      const response = await postExec(control, boxCcStopExec(control), fetchImpl, stopper.signal)
+      await response.arrayBuffer()
+    } catch {
+      // The next launch for this session ends whatever is left.
+    } finally {
+      clearTimeout(timer)
+    }
+    // The launch stream normally ends by itself once Claude is gone.
+    const cut = setTimeout(() => abort.abort(), STOP_STREAM_GRACE_MS)
+    cut.unref?.()
+  }
   const pending = bufferLines(opts.stdin, async (line) => {
     if (abort.signal.aborted) return
     await deliverLine(line)
-  })
+  }).then(stopRemote)
   try {
     const response = await postExec(control, launch, fetchImpl, abort.signal)
     const reader = response.body!.getReader()
@@ -118,6 +145,8 @@ export async function runBoxCcBridge(opts: {
         }
       }
     }
+  } catch (error) {
+    if (!stopRequested) throw error
   } finally {
     abort.abort()
     opts.signal?.removeEventListener('abort', onAbort)
@@ -126,6 +155,7 @@ export async function runBoxCcBridge(opts: {
     }
     await pending.catch(() => undefined)
   }
+  if (stopRequested) return 0
   return sawExit ? exitCode : 1
 }
 
