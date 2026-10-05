@@ -1353,7 +1353,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/autoDreamModels.test.ts",
-          "assertion": "unifies the optimizer and legacy memory organizer on MiniMax M3"
+          "assertion": "unifies the optimizer and legacy memory organizer on DeepSeek V4 Flash"
         }
       ]
     },

@@ -146,8 +146,11 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       tags: ['办公', '文档', 'PPT', 'Excel', '周报', '公文'],
       // 1.0.1:基于 2026-07 v5 预置 agent 横评,办公类纪要/材料整理 MiniMax-M3
       // 结构更稳、少臆造且长上下文更合适;通过版本 bump 让 current_approved_version_id 指向新默认。
-      version: '1.0.1',
-      model: 'MiniMax-M3',
+      // 1.0.2(OCV5-322):承接模型从 MiniMax-M3 切到 deepseek-v4-flash(1M 上下文,已是 official_seed_agent
+      // 必需模型),MiniMax-M3 随后下线。
+      // 1.0.3(OCV5-326):承接模型改为 grok-build(Grok 4.7,grok 引擎;0297 给它加 official_seed_agent)。
+      version: '1.0.3',
+      model: 'grok-build',
       toolsets: ['core'],
       capabilities: [],
       skillDeps: [],

@@ -54,11 +54,12 @@ const DEFAULT_REFRESH_TIMEOUT_MS = 3_000
 const MIN_REFRESH_TIMEOUT_MS = 500
 const MAX_REFRESH_TIMEOUT_MS = 8_000
 
-// ── MiniMax vision backend(默认 backend）─────────────────────────────────────
-// understand_image 默认用 **MiniMax-M3**(订阅制,2026-06-17 实测其 Anthropic 端点准确识图),
-// 经容器 internal anthropic proxy(ANTHROPIC_BASE_URL + oc-v3 容器 bearer)调用 —— minimax key
-// 留 master,容器只用身份 bearer。codex(GPT-5.6)backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
-const MINIMAX_VISION_MODEL = 'MiniMax-M3'
+// ── 静态模型 vision backend(默认 backend;env 值仍叫 'minimax',沿用历史名)─────────
+// understand_image 默认用 **k3-256k**(Kimi K3 256K,moonshot,supportsVision=true)。OCV5-322 起
+// 不再用 MiniMax-M3(该模型下线);2026-10-05 生产实测 k3-256k 经同一条 proxy 路径读出图中随机数字。
+// 经容器 internal anthropic proxy(ANTHROPIC_BASE_URL + oc-v3 容器 bearer)调用 —— 上游 key
+// 留 master,容器只用身份 bearer。codex backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
+export const STATIC_VISION_MODEL = 'k3-256k'
 const MINIMAX_VISION_MAX_TOKENS = 1024
 const DEFAULT_MINIMAX_TIMEOUT_MS = 60_000
 // master proxy messages body budget = 8MB(shared.ts);base64 膨胀 ~1.33x → raw cap 5MB → base64 ~6.7MB < 8MB。
@@ -66,7 +67,7 @@ const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 const MINIMAX_MAX_IMAGE_HARD_CAP = 6 * 1024 * 1024
 
 function visionBackend(): 'minimax' | 'codex' {
-  // 商业版与 selfhost 统一默认 MiniMax-M3。Codex 仅保留为显式诊断/回退选项，
+  // 默认走静态模型 backend(STATIC_VISION_MODEL)。Codex 仅保留为显式诊断/回退选项，
   // 禁止再让某一实例的隐式默认值漂移到另一实例。
   const configured = process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase()
   if (configured === 'minimax' || configured === 'codex') return configured
@@ -801,7 +802,7 @@ async function readAnthropicSseText(resp: Response): Promise<string> {
   return out
 }
 
-// MiniMax-M3 vision backend:经容器 internal anthropic proxy 发 MiniMax-M3 + image content block,
+// 静态模型 vision backend:经容器 internal anthropic proxy 发 STATIC_VISION_MODEL + image content block,
 // 复用 master 的路由/计费/authz/key 管理。**不 spawn 子进程、不写 auth.json、不碰 minimax key。**
 async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
   const release = acquireVisionLock(input.timeoutMs)
@@ -851,7 +852,7 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
     if (!ext) throw new Error('image_file is not a supported raster image (PNG/JPEG/GIF/WebP)')
 
     const body = {
-      model: MINIMAX_VISION_MODEL,
+      model: STATIC_VISION_MODEL,
       max_tokens: MINIMAX_VISION_MAX_TOKENS,
       messages: [
         {
@@ -907,7 +908,7 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
 
 export const runMinimaxVisionForTest = runMinimaxVision
 
-// backend 路由:默认 MiniMax-M3(boss 2026-06-17);OPENCLAUDE_VISION_BACKEND=codex 时走 gpt-5.5。
+// backend 路由:默认静态模型 backend(STATIC_VISION_MODEL);OPENCLAUDE_VISION_BACKEND=codex 时走 codex。
 // **不做自动 fallback**:minimax 业务错误(4xx/余额/413)不绕到 codex(避免绕过 authz/计费语义),
 // 直接把错误返回给调用方模型。
 export async function runVision(input: ResolvedVisionInput): Promise<string> {

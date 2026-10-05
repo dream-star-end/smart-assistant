@@ -166,7 +166,7 @@ describe('runMinimaxVision', () => {
     _setModelCatalogClientForTests(null)
   })
 
-  it('经 anthropic proxy 发 MiniMax-M3 + image,解析 SSE text_delta', async () => {
+  it('经 anthropic proxy 发 k3-256k + image,解析 SSE text_delta', async () => {
     const p = join(uploads, 'c.png')
     writeFileSync(p, PNG)
     const sse = [
@@ -208,7 +208,8 @@ describe('runMinimaxVision', () => {
     // 被 anthropic proxy 以 MODEL_AUTHORITY_INVALID 拒(2026-07-16 巡检根因)。
     assert.equal(captured.init?.headers[LOCAL_CATALOG_HEADER], 'cat-tok')
     const body = JSON.parse(captured.init?.body as string)
-    assert.equal(body.model, 'MiniMax-M3')
+    assert.equal(body.model, 'k3-256k')
+    assert.equal(vision.STATIC_VISION_MODEL, 'k3-256k')
     assert.ok(typeof body.max_tokens === 'number' && body.max_tokens > 0)
     const content = body.messages[0].content
     assert.equal(content[0].type, 'image')
