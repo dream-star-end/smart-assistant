@@ -30,7 +30,7 @@ export {
   boxCcLaunchExec,
   boxCcSpawnFifo,
   boxCcStopExec,
-  boxCcWriteExec,
+  boxCcWriteExecs,
   boxOfficialClaudeModel,
   encodeExecRequest,
   isBoxClaudeCatalogModel,
