@@ -6043,6 +6043,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled"
+        },
+        {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "OCV5-321 settled-tools checkpoint survives leftover live tool frames"
@@ -6060,6 +6065,11 @@
         "81c3fe9a"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-322-answered-exchange-prompt] PASS — a prompt merged behind an answered tool exchange runs as a new invocation over that exchange"
+        },
         {
           "layer": "integration",
           "path": "packages/commercial/src/http/proxy/boxCapacityAdmission.integ.test.ts",
@@ -6086,6 +6096,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-323-resume-unsent-parked] PASS — a run parked behind a publish that never left is stopped and its session continues"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
           "assertion": "unsent resume leaf: intent, keeper stop, proof, then the existing chain CAS"
@@ -6106,6 +6121,11 @@
       "coverageCommits": [],
       "regressions": [
         {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-310-fresh-projects-dir] PASS — history stages on a Box whose Claude has no projects directory yet"
+        },
+        {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
           "assertion": "history stages on a never-used Box that has no projects directory yet"
@@ -6125,11 +6145,7 @@
           "path": "packages/commercial/src/http/proxy/boxStageFiles.test.ts",
           "assertion": "INIT refuses a symlinked projects directory instead of following it"
         }
-      ],
-      "proofPending": {
-        "reason": "已在账号 25 真实 Box 用零付费 boxPrelaunchLiveProbe（修复前失败、修复后通过）和一次合成历史回放（boxTextStreamProbe，OCV5_289_STREAM_HISTORY_ACK=1）验证。这两个探针需要真实 Box 账号凭据，接不进 CI 的 browser/live-e2e/deploy-gate runner。selfhost 上线后需用真实用户的带历史 Box 回合验收。",
-        "since": "2026-10-04"
-      }
+      ]
     },
     {
       "id": "INC-20261004-BOX-UNKNOWN-NEVER-CLOSED",
@@ -6143,6 +6159,11 @@
         "353fd2ac"
       ],
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-313-unknown-never-closed] PASS — the 2.1.288 image echo continues and an abandoned unknown run is stopped or expired so its session continues"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolResultEcho.cli.test.ts",
@@ -6176,11 +6197,12 @@
       "severity": "P1",
       "symptom": "线上（v5-0ee3b3710，2026-10-04 12:42Z 起）：8563617b 的 Box CLI 版本闸门读版本时向 exec 传输层要 64 字节响应，而传输层的下限是 1024，请求在本机就以 BOX_EXEC_REQUEST_INVALID 被拒、从未发出。闸门把任何失败都读成 BOX_CLI_VERSION_UNREADABLE，于是任意 Box 上的新启动都会在准入前被拒（不占槽、不启动、不计费，但 Box Claude 无法开新回合）。上线后到发现前没有用户回合撞到；由账号 25 的线上只读探针在 14:22Z 发现（单测用的假 exec 没有这道校验）。修复：读取改要 1024 字节，解析仍只接受一行精确版本号；新增用例让读取走真实 BoxExecTransport 并要求请求到达 fetch。",
       "rootFixCommit": "7721c063",
-      "proofPending": {
-        "reason": "回归在 unit 层（真实 BoxExecTransport 的请求校验）；线上证据是一次性的运维只读探针（账号 25 读到 2.1.288 并放行），不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-04"
-      },
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-313-cli-version-read] PASS — the Box CLI version read leaves through the real exec transport and a supported Box is admitted"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
@@ -6194,11 +6216,12 @@
       "severity": "P2",
       "symptom": "selfhost（2026-10-04 01:02Z 起）：账号 25 的 Cursor Box 主程序布局比 relay 安装器新，安装器每次都以 FileNotFoundError（/home/box/sand-host/ 不存在）失败。Box 接受了安装 prompt（submitted），15 分钟内装不出能力，协调器就换 nonce 把同一份安装器再发一遍，每 15 分钟一次、一百多次零成功；用户在 Box 应用的「OpenClaude Sand Relay」Bot 里反复看到同一条报错（2026-10-05 08:58 反馈）。修复：已被同一个 Box 主进程接受过的安装不再重发，标 INSTALL_UNCONFIRMED，能力探针照常；Box 主进程重启或 relay 模块换版后才允许一次新尝试。投递结果未知与 Box 进程已换的重试（INC-20260921-SAND-UOR-LOOP）保持不变。安装器对新 Box 布局的适配不在本次范围。",
       "rootFixCommit": "7f8e925e",
-      "proofPending": {
-        "reason": "回归在 unit 层（真实协调器对假 Box 网关的发送计数）；线上证据是发布后状态日志里该 operation 进入 INSTALL_UNCONFIRMED 且不再有新的 submitted，属一次性只读核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-05"
-      },
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-314-sand-install-resend] PASS — an installer the Box accepted is not sent again to the same Box host process"
+        },
         {
           "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
@@ -6217,11 +6240,12 @@
         "92acb899",
         "dc1ea28c"
       ],
-      "proofPending": {
-        "reason": "回归在 unit 层，其中一条用真实的 launch / write / stop 脚本对本机 fifo 跑完整的一行 900KB 输入。个人版没有 Box 事故的 deploy-gate 脚本；发布后的真实大消息 turn 是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
-        "since": "2026-10-05"
-      },
       "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-317-box-cli-large-line] PASS — a 900 KB stdin line reaches the box Claude whole and a failed write ends the turn at once"
+        },
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",

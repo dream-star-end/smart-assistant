@@ -15,11 +15,12 @@
  * The Box account itself is simulated at its exec endpoint; everything
  * between the request and that endpoint is product code.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, utimesSync,
-  writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync,
+  statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
@@ -37,7 +38,8 @@ type Body = Record<string, unknown>;
 type Expected = { id: string; boxName: string; clientName: string; input: Record<string, unknown> };
 type Api = {
   gate: (body: Body, toolBridgeEnabled: boolean) => string | null;
-  classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[] };
+  classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[];
+    answeredToolIds?: readonly string[] };
   match: (body: Body, expected: readonly Expected[]) => ReadonlyArray<Matched>;
   fitForCli: (results: readonly Matched[]) => Promise<readonly Matched[]>;
   echo: (expected: readonly EchoExpected[]) => { accept: (raw: unknown) => void;
@@ -71,7 +73,7 @@ type Api = {
   observeUnknown: (input: unknown, deps: unknown) => Promise<string>;
   waitReplay: (first: ReplayLookup, lookup: () => Promise<ReplayLookup>, opts: { budgetMs: number; intervalMs: number;
     signal: AbortSignal; now?: () => number; sleep?: (ms: number, signal: AbortSignal) => Promise<void> }) => Promise<ReplayLookup>;
-  cleanupWorker: (deps: unknown) => { reconcileStoppedFailures: () => Promise<{ recovered: number; pending: number }> };
+  cleanupWorker: (deps: unknown) => { reconcileStoppedFailures: (limit?: number) => Promise<{ recovered: number; pending: number }> };
   replayStore: (root: string) => { write: unknown; read: unknown };
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
@@ -92,7 +94,28 @@ type Api = {
   home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
   tape: { version: number; partBytes: number };
+  /** The Box CLI version gate and the exec transport its read goes through. */
+  cliVersion: { gate: () => { read: (target: unknown) => Promise<string> };
+    launchResolver: (resolve: (args: { requiredAccountId?: bigint; box: unknown }) => Promise<unknown>,
+      gate: unknown) => (args: { requiredAccountId?: bigint; box: unknown }) => Promise<{ cliVersion?: string }>;
+    transport: (fetchImpl: (url: string, init: { body: Uint8Array }) => Promise<Response>) => unknown };
+  /** The requests a guarded launch sends to a Box before Claude starts, and the staged-file plan. */
+  prelaunch: { bootstrap: (identity: PrelaunchIdentity) => BoxRequest;
+    parse: (stdout: string, identity: PrelaunchIdentity) => PrelaunchReceipt;
+    init: (receipt: PrelaunchReceipt, project: string) => BoxRequest;
+    guard: (request: BoxRequest, receipt: PrelaunchReceipt) => BoxRequest;
+    cleanup: (receipt: PrelaunchReceipt) => BoxRequest };
+  stageFiles: (input: { cwd: string; project: string; files: Array<{ path: string; raw: Buffer; hash: string }> }) =>
+    { requests: BoxRequest[]; cleanup: BoxRequest };
+  /** The Sand lifecycle coordinator, its provisioning client and the state file it keeps. */
+  sand: { coordinator: (deps: unknown) => { tick: () => Promise<void>; stop: () => Promise<void> };
+    client: (opts: unknown) => unknown;
+    state: (dir: string) => { operations: Record<string, { phase: string; errorCode?: string; hostPid?: number }>;
+      accounts: Record<string, { phase: string; errorCode?: string }> } };
 };
+type BoxRequest = { command: string; args: string[]; cwd: string; environment: Record<string, string> };
+type PrelaunchIdentity = { runNonce: string; leaseEpoch: string; controlId: string; accountId: string };
+type PrelaunchReceipt = PrelaunchIdentity & { identityHash: string };
 type SessionsBackend = { admitUserTurn: (input: unknown) => Promise<{ kind: string }>;
   stageLosslessTurnTapePart: (userId: string, request: unknown, bytes: Buffer) => Promise<unknown>;
   finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }>;
@@ -162,6 +185,13 @@ async function load(): Promise<Api> {
   const stopRoute = await import(pathToFileURL(join(PROXY, "boxUserStopHandler.ts")).href);
   const idleRoute = await import(pathToFileURL(join(PROXY, "boxIdleProofHandler.ts")).href);
   const shared = await import(pathToFileURL(join(PROXY, "shared.ts")).href);
+  const cliVersion = await import(pathToFileURL(join(PROXY, "boxCliVersion.ts")).href);
+  const prelaunch = await import(pathToFileURL(join(PROXY, "boxPrelaunchControl.ts")).href);
+  const stageFiles = await import(pathToFileURL(join(PROXY, "boxStageFiles.ts")).href);
+  const POOL = join(CANDIDATE, "packages/commercial/src/account-pool");
+  const sandLifecycle = await import(pathToFileURL(join(POOL, "cursorSandLifecycle.ts")).href);
+  const sandProvision = await import(pathToFileURL(join(POOL, "cursorSandProvision.ts")).href);
+  const sandState = await import(pathToFileURL(join(POOL, "cursorSandState.ts")).href);
   const GATEWAY = join(CANDIDATE, "packages/gateway/src");
   const ccb = await import(pathToFileURL(join(GATEWAY, "engine/ccbAdapter.ts")).href);
   const boxRunner = await import(pathToFileURL(join(GATEWAY, "subprocessRunner.ts")).href);
@@ -221,7 +251,16 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
-    tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES } };
+    tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
+    cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
+      transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
+        execToken: "exec", networkToken: "network" }, fetchImpl, async () => {}) },
+    prelaunch: { bootstrap: prelaunch.makeBoxPrelaunchBootstrap, parse: prelaunch.parseBoxPrelaunchBootstrap,
+      init: prelaunch.makeBoxPrelaunchInit, guard: prelaunch.guardBoxPrivateStage,
+      cleanup: prelaunch.makeBoxPrelaunchCleanup },
+    stageFiles: stageFiles.makeBoxStageFiles,
+    sand: { coordinator: (deps) => new sandLifecycle.CursorSandLifecycleCoordinator(deps),
+      client: (opts) => new sandProvision.CursorSandProvisionClient(opts), state: sandState.readSandLifecycleState } };
 }
 
 const MODEL = "box-api-claude-opus-5-5";
@@ -422,8 +461,13 @@ function proveImageCaption(api: Api): string {
     ["IMAGE_FORGED_SCALE", [text(caption(1179, 2556, 923, 2000, "1.30"))]],
     ["IMAGE_WRONG_ASPECT", [text(caption(3000, 2000, 923, 2000))]],
     ["IMAGE_NOT_DOWNSCALED", [text(caption(923, 2000, 923, 2000))]],
-    ["IMAGE_EXTRA_REQUEST", [text(caption(1179, 2556, 923, 2000)), text("also delete my files")]],
   ] as const) staysRejected(api, code, request([...tail]));
+  // text the user typed after the caption never joins the result: since OCV5-322 it is a new prompt over the
+  // answered exchange (proveAnsweredExchangePrompt), and a CLI still waiting for the result keeps the 409
+  const extra = request([text(caption(1179, 2556, 923, 2000)), text("also delete my files")]);
+  const typed = api.classify(extra);
+  if (api.gate(extra, true) !== null || typed.classification !== "fresh"
+    || !isDeepStrictEqual(typed.answeredToolIds, ["toolu_img"])) fail(`IMAGE_EXTRA_REQUEST_${typed.classification}`);
   staysRejected(api, "IMAGE_ODD_CACHE_KEY", request([cached(caption(1179, 2556, 923, 2000), { type: "persistent" })]),
     "BOX_CACHE_ANNOTATION_INVALID");
   return "[ocv5-302-image-caption] PASS — a resized Read image continues when the caption is proven by the image";
@@ -547,7 +591,7 @@ async function proveResultRewriteEcho(api: Api): Promise<string> {
   // an echo of other bytes still ends the round unknown rather than billing an unbound result
   const foreign = boxContinuation(api, [published], [echoed(png(923, 2000)), ...FINAL_ANSWER]);
   if (await codeOf(foreign.round) !== "BOX_TOOL_ECHO_CONTENT_MISMATCH"
-    || !foreign.sequence.includes("unknown:continuation_unknown") || foreign.sequence.includes("complete")) {
+    || !foreign.sequence.includes("unknown:continuation_echo_rejected") || foreign.sequence.includes("complete")) {
     fail("REWRITE_FOREIGN_ECHO_SETTLED");
   }
   // the launched CLI is told not to truncate MCP results: the client already bounded them
@@ -1265,13 +1309,23 @@ async function proveRejectedStreamWedge(api: Api, db: Db): Promise<string> {
  * tool call to the client; `next` sends the client's tool result back. */
 function boxTurn(api: Api, db: Db, journal: Journal, who: { uid: bigint; containerId: bigint; sessionId: string },
   name: string, turnKey: string, writeMessage?: unknown,
-  options: { dispatchId?: string; nextSpool?: Buffer; stopIgnored?: boolean } = {}) {
+  options: { dispatchId?: string; nextSpool?: Buffer; stopIgnored?: boolean;
+    /** The CLI stays alive waiting: no terminal proof exists until its keeper is told to stop. */
+    parked?: "until-stopped" | "unreadable";
+    /** The Box account cannot be reached for a continuation publish. */
+    unreachable?: { active: boolean } } = {}) {
   const cut = { active: false };
-  const host = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
+  const { parked, unreachable, ...hostOptions } = options;
+  const host: ReturnType<typeof boxHost> = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
+    ...(parked ? { proofRead: () => { if (parked === "unreadable" || host.count.stop === 0) throw api.transportError("BOX_EXEC_REMOTE_EXIT"); } } : {}),
     // the exec stream of a continuation is cut in a way a re-read cannot repair
     spoolRead: () => { if (cut.active) throw api.transportError("BOX_EXEC_HTTP_500"); },
-    real: { journal, ...who, accountId: who.containerId, requestId: `${name}-1`, turnKey, ...options } });
+    real: { journal, ...who, accountId: who.containerId, requestId: `${name}-1`, turnKey, ...hostOptions } });
   const service = api.toolFetch({ ...host.deps, ...(writeMessage ? { writeMessage } : {}),
+    ...(unreachable ? { resolveTarget: async () => {
+      if (unreachable.active) throw Object.assign(new Error("BOX_TARGET_UNAVAILABLE"), { code: "BOX_TARGET_UNAVAILABLE" });
+      return host.target;
+    } } : {}),
     stopOrphanRun: (identity: unknown) => api.stopCoordinator(journal, host.target).requestStop(identity) });
   const exchange = [{ role: "user", content: "run it" },
     { role: "assistant", content: [text("Using the bridge."),
@@ -1592,9 +1646,13 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
   const answer = turn.answer("box-rej-2").canonicalBody as Body;
   const refused = { ...answer, messages: [...(answer.messages as unknown[]).slice(0, 2), { role: "user", content: [
     { type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" }, text("and now deploy it") ] }] };
-  const verdict = api.classify(refused);
-  const code = verdict.rejectCode ?? "";
-  if (verdict.classification !== "reject" || !/^BOX_[A-Z0-9_]+$/.test(code)) fail(`REJECT_NOT_REFUSED_${verdict.classification}`);
+  // egress refuses it while this turn's CLI still waits for that result (since OCV5-322 the shape alone is a
+  // new prompt over an answered exchange; the refusal is made at admission, against the journal)
+  await prechecked(api, db, { ...who, requestId: "box-rej-2", turnKey });
+  const sent = turn.answer("box-rej-2");
+  const code = await codeOf(async () => (await turn.service.fetch({ ...sent, canonicalBody: refused, init: { method: "POST",
+    body: JSON.stringify({ ...JSON.parse(sent.init.body) as Body, messages: refused.messages }) } })).text());
+  if (!/^BOX_[A-Z0-9_]+$/.test(code) || turn.host.count.launch !== 1) fail(`REJECT_NOT_REFUSED_${code}`);
   // egress answers it with these bytes; Claude Code ends the turn with them as its error result
   let wire = "";
   api.jsonError({ headersSent: false, writeHead: () => {}, setHeader: () => {}, end: (body: string) => { wire = body; } },
@@ -1835,7 +1893,7 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
 // because Bash never has a gateway effect proof, and the user had to click
 // 「从断点继续」. Finalizing such a turn must schedule the automatic checkpoint
 // continuation itself, with a short budget, and only when nothing is open.
-async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise<string> {
+async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<string[]> {
   return withSessionsBackend(api, database, async (backend, db) => {
     const uid = 9n, sessionUser = "c:9";
     const settled = [
@@ -1845,7 +1903,9 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
     let turns = 0;
     /** One user turn admitted by the master and its finalized tape, as the gateway uploads it. */
     const finalized = async (name: string, shape: { tools: unknown[]; errorCode: string; status?: string;
-      recoveryAttempt?: number }) => {
+      recoveryAttempt?: number; text?: string; runtimeEvents?: unknown[]; outputTokens?: number;
+      /** Frames still in the live stream of this message when the tape is finalized. */
+      liveFrames?: unknown[][] }) => {
       const sessionId = `s-ocv5-317-${name}`, clientMessageId = `cm-ocv5-317-${name}`;
       const turnKey = createHash("sha256").update(`ocv5-317:${name}:${++turns}`).digest("hex");
       const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId,
@@ -1856,10 +1916,25 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
           ...(shape.recoveryAttempt ? { _automaticRecovery: true, _automaticRecoveryAttempt: shape.recoveryAttempt,
             _automaticRecoveryRootClientMessageId: `cm-ocv5-317-root-${name}` } : {}) } });
       if (admitted.kind !== "admitted") fail(`SETTLED_${name}_NOT_ADMITTED`);
-      const canonical = Buffer.from(JSON.stringify({ sessionId, agentId: "main", turnIndex: 1,
-        status: shape.status ?? "completed", turnKey, clientMessageId, text: "API Error: 409", tools: shape.tools,
-        errorCode: shape.errorCode, createdAt: 1_783_950_150_000, usage: { inputTokens: 6, outputTokens: 872 } }), "utf8");
       const hash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+      if (shape.liveFrames) {
+        const sessionKey = `agent:main:webchat:dm:${sessionId}`, streamKey = `legacy:621:${sessionKey}`;
+        await db.query(`INSERT INTO client_session_live_streams
+          (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
+          VALUES ($1,$2,$3,$4,'gateway','live','interrupted')`, [streamKey, sessionId, sessionUser, clientMessageId]);
+        for (const [index, blocks] of shape.liveFrames.entries()) {
+          const payload = Buffer.from(JSON.stringify({ type: "outbound.message", clientMessageId, blocks }));
+          await db.query(`INSERT INTO client_session_live_frames
+            (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+            VALUES ($1,'gateway',621,$2,$3,$4,$5)`, [streamKey, sessionKey, index + 1, payload, hash(payload)]);
+        }
+      }
+      const canonical = Buffer.from(JSON.stringify({ sessionId, agentId: "main", turnIndex: 1,
+        status: shape.status ?? "completed", turnKey, clientMessageId, text: shape.text ?? "API Error: 409",
+        tools: shape.tools, errorCode: shape.errorCode, createdAt: 1_783_950_150_000,
+        usage: shape.outputTokens === undefined ? { inputTokens: 6, outputTokens: 872 }
+          : { inputTokens: 0, outputTokens: shape.outputTokens },
+        ...(shape.runtimeEvents ? { runtimeEvents: shape.runtimeEvents } : {}) }), "utf8");
       const partCount = Math.ceil(canonical.length / api.tape.partBytes);
       const base = { protocolVersion: api.tape.version, sessionId, agentId: "main", turnIndex: 1,
         status: shape.status ?? "completed", turnKey, tapeId: hash(`proof-tape\0${turnKey}`), tapeSha256: hash(canonical),
@@ -1898,8 +1973,96 @@ async function proveSettledToolsAutoResume(api: Api, database: unknown): Promise
     const third = await finalized("third-retry", { tools: settled, errorCode: "ENGINE_ERROR", recoveryAttempt: 3 });
     if (!isDeepStrictEqual(second.jobs, ["checkpoint#3"]) || second.gaveUp) fail(`SETTLED_BUDGET_SECOND_${second.jobs.join(",")}`);
     if (third.jobs.length !== 0 || !third.gaveUp) fail(`SETTLED_BUDGET_THIRD_${third.jobs.join(",")}_${third.gaveUp}`);
-    return "[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation";
+
+    // INC-20261003-BOX-LEFTOVER-TOOL-FRAMES, live #611729fb: the same settled tape, but when the master decided,
+    // the live stream of the message still held its tool_use and tool_result frames. Each leftover tool_use was
+    // read as an open tool with no id, the turn was declared checkpoint_unsafe and the user got the red card with
+    // a manual 「从断点继续」. Leftover frames must pair by id; a block that cannot be paired still blocks.
+    const read = { blockId: "toolu_321_read", toolName: "Read", inputJson: { file_path: "a.ts" }, output: "x", completed: true };
+    const bash = { blockId: "toolu_321_bash", toolName: "Bash", inputJson: { command: "ls" }, output: "a.ts", completed: true };
+    const use = (tool: typeof read, extra: Record<string, unknown> = {}) =>
+      ({ kind: "tool_use", blockId: tool.blockId, toolName: tool.toolName, inputJson: tool.inputJson, ...extra });
+    const result = (tool: typeof read) => ({ kind: "tool_result", blockId: `${tool.blockId}:result`,
+      toolUseBlockId: tool.blockId, toolName: tool.toolName, isError: false, output: tool.output });
+    const leftover = await finalized("leftover-frames", { tools: [read, bash], errorCode: "ENGINE_ERROR", liveFrames: [
+      [{ kind: "tool_use", blockId: read.blockId, toolName: "Read", partial: true }], [use(read)], [result(read)],
+      [{ kind: "text", text: "Quick update: both changes are written." }, use(bash)], [result(bash)]] });
+    if (!isDeepStrictEqual(leftover.jobs, ["checkpoint#1"]) || leftover.gaveUp) {
+      fail(`LEFTOVER_FRAMES_LEFT_ON_MANUAL_CARD_${leftover.jobs.join(",")}`);
+    }
+    // a leftover call whose result never arrived is an open tool: no automatic continuation over it
+    const unanswered = await finalized("leftover-open", { tools: [read, bash], errorCode: "ENGINE_ERROR", liveFrames: [
+      [use(read)], [result(read)], [use(bash)]] });
+    if (unanswered.jobs.length !== 0) fail(`LEFTOVER_OPEN_TOOL_RESUMED_${unanswered.jobs.join(",")}`);
+
+    // INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT, second half: each automatic 「从断点继续」 failed within a second
+    // with the same Box 409 and recorded nothing but Claude Code's own API Error row; the master took every one
+    // for a new chance and sent ten in twenty seconds. Such an empty repeat has the short budget of three.
+    const empty = (attempt: number) => finalized(`empty-recovery-${attempt}`, { tools: [], errorCode: "ENGINE_ERROR",
+      recoveryAttempt: attempt, outputTokens: 0, text: 'API Error: 409 {"error":{"code":"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION"}}',
+      runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb",
+        payload: { type: "result", is_error: true, num_turns: 1 } }] });
+    const retried = await empty(2), stopped = await empty(3);
+    if (!isDeepStrictEqual(retried.jobs.map((job) => job.split("#")[1]), ["3"]) || stopped.jobs.length !== 0) {
+      fail(`ANSWERED_EMPTY_RECOVERY_BUDGET_${retried.jobs.join(",")}_${stopped.jobs.join(",")}`);
+    }
+    return ["[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation",
+      "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled"];
   });
+}
+
+/** A Box for the resident CLI lane: an exec endpoint that really runs what the bridge sends (the product's
+ * launch, write and stop scripts) around a stand-in for the Claude binary. `refuse.writes` makes the Box
+ * answer a stdin write with exit 1 without running it. */
+async function boxCliBox(tag: string, claudeScript: string) {
+  const dir = mkdtempSync(join(tmpdir(), `${tag}-box-`));
+  cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
+  const claude = join(dir, "claude");
+  writeFileSync(claude, claudeScript, { mode: 0o755 });
+  const fifoBase = `/tmp/oc-box-cc-${randomBytes(8).toString("hex")}`;
+  const readers = (): number[] => readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).filter((pid) => {
+    try { return readlinkSync(`/proc/${pid}/fd/0`).startsWith(`${fifoBase}.`); } catch { return false; }
+  }).map(Number);
+  const execs = new Set<ChildProcess>();
+  const refuse = { writes: false };
+  cleanups.add(() => {
+    for (const run of execs) run.kill("SIGKILL");
+    for (const pid of readers()) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
+    for (const name of readdirSync("/tmp")) if (`/tmp/${name}`.startsWith(`${fifoBase}.`)) rmSync(`/tmp/${name}`, { force: true });
+  });
+  const execFrame = (body: unknown): Buffer => {
+    const payload = Buffer.from(JSON.stringify(body));
+    const head = Buffer.alloc(5);
+    head.writeUInt32BE(payload.length, 1);
+    return Buffer.concat([head, payload]);
+  };
+  const box = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).subarray(5).toString("utf8")) as { command: string;
+        args: string[]; environment: Record<string, string> };
+      res.writeHead(200, { "content-type": "application/connect+json" });
+      if (refuse.writes && body.environment.OC_BOX_CC_SEQ !== undefined) {
+        res.end(execFrame({ exitEvent: { exitCode: 1 } }));
+        return;
+      }
+      const run = spawn(body.command, body.args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"],
+        env: { ...body.environment, PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+      execs.add(run);
+      res.flushHeaders();
+      // a pipe chunk can end inside a multi-byte character
+      const utf8 = new StringDecoder("utf8");
+      run.stdout!.on("data", (chunk: Buffer) => res.write(execFrame({ stdoutEvent: { data: utf8.write(chunk) } })));
+      run.on("close", (code) => { execs.delete(run); res.end(execFrame({ exitEvent: code ? { exitCode: code } : {} })); });
+    });
+  });
+  await new Promise<void>((resolve) => box.listen(0, "127.0.0.1", () => resolve()));
+  cleanups.add(() => { box.closeAllConnections(); box.close(); });
+  const address = box.address();
+  if (!address || typeof address === "string") fail("BOX_CLI_ENDPOINT");
+  return { readers, refuse, control: { execUrl: `http://127.0.0.1:${address.port}/agent.v1.ControlService/Exec`,
+    execToken: "exec", networkToken: "network", remoteClaude: claude, fifo: `${fifoBase}.fifo`, cwd: dir } };
 }
 
 /** INC-20261005-BOX-CC-FOLLOWUP-TURN. Production rel-97e6472b5: on box-claude-* the second turn of a session
@@ -1931,51 +2094,14 @@ async function proveBoxCliFollowUpTurn(api: Api): Promise<string> {
     fail(`FOLLOWUP_TURN_RECYCLED_BOX_PROCESS_${written.length}_${stdinEnded}`);
   }
 
-  const dir = mkdtempSync(join(tmpdir(), "ocv5-315-box-"));
-  cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
-  const claude = join(dir, "claude");
-  writeFileSync(claude, "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n", { mode: 0o755 });
-  const fifoBase = `/tmp/oc-box-cc-${randomBytes(8).toString("hex")}`;
-  const readers = (): number[] => readdirSync("/proc").filter((entry) => /^\d+$/.test(entry)).filter((pid) => {
-    try { return readlinkSync(`/proc/${pid}/fd/0`).startsWith(`${fifoBase}.`); } catch { return false; }
-  }).map(Number);
-  const execs = new Set<ChildProcess>();
-  cleanups.add(() => {
-    for (const run of execs) run.kill("SIGKILL");
-    for (const pid of readers()) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
-    for (const name of readdirSync("/tmp")) if (`/tmp/${name}`.startsWith(`${fifoBase}.`)) rmSync(`/tmp/${name}`, { force: true });
-  });
-  const execFrame = (body: unknown): Buffer => {
-    const payload = Buffer.from(JSON.stringify(body));
-    const head = Buffer.alloc(5);
-    head.writeUInt32BE(payload.length, 1);
-    return Buffer.concat([head, payload]);
-  };
-  const box = createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
-      const body = JSON.parse(Buffer.concat(chunks).subarray(5).toString("utf8")) as { command: string;
-        args: string[]; environment: Record<string, string> };
-      const run = spawn(body.command, body.args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"],
-        env: { ...body.environment, PATH: process.env.PATH ?? "/usr/bin:/bin" } });
-      execs.add(run);
-      res.writeHead(200, { "content-type": "application/connect+json" });
-      res.flushHeaders();
-      run.stdout!.on("data", (chunk: Buffer) => res.write(execFrame({ stdoutEvent: { data: chunk.toString("utf8") } })));
-      run.on("close", (code) => { execs.delete(run); res.end(execFrame({ exitEvent: code ? { exitCode: code } : {} })); });
-    });
-  });
-  await new Promise<void>((resolve) => box.listen(0, "127.0.0.1", () => resolve()));
-  cleanups.add(() => { box.closeAllConnections(); box.close(); });
-  const address = box.address();
-  if (!address || typeof address === "string") fail("FOLLOWUP_BOX_ENDPOINT");
+  const box = await boxCliBox("ocv5-315",
+    "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n");
+  const readers = box.readers;
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   let answered = "";
   stdout.on("data", (chunk: Buffer) => { answered += chunk.toString("utf8"); });
-  const bridge = api.boxCli.bridge({ control: { execUrl: `http://127.0.0.1:${address.port}/agent.v1.ControlService/Exec`,
-    execToken: "exec", networkToken: "network", remoteClaude: claude, fifo: `${fifoBase}.fifo`, cwd: dir },
+  const bridge = api.boxCli.bridge({ control: box.control,
     args: ["--model", "box-claude-opus-5-5"], stdin, stdout, stderr: new PassThrough() });
   const answer = async (marker: string): Promise<void> => {
     stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content: marker } })}\n`);
@@ -1992,6 +2118,488 @@ async function proveBoxCliFollowUpTurn(api: Api): Promise<string> {
   if (code !== 0) fail(`FOLLOWUP_STDIN_CLOSE_${code}`);
   if (readers().length !== 0) fail("FOLLOWUP_BOX_CLAUDE_LEFT_RUNNING");
   return "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it";
+}
+
+/** INC-20261005-BOX-CC-LARGE-LINE. Production rel-e4d81bfac: a session switched to box-claude-opus-5-5 with
+ * 496 history messages; twice the turn was silent for about 303 s and ended as runner_crashed. The bridge put
+ * each stdin line into one environment variable of the write exec; above 128 KiB the kernel does not start
+ * that process, and the bridge never looked at the exit code. A line of any size must reach the box Claude
+ * whole, once and in order, and a write the Box did not complete must end the turn at once. */
+async function proveBoxCliLargeLine(api: Api): Promise<string> {
+  const line = (content: string) => `${JSON.stringify({ type: "user", message: { role: "user", content } })}\n`;
+  const large = line("历史🙂 context ".repeat(45_000));
+  if (Buffer.byteLength(large) < 800_000) fail("LARGE_LINE_FIXTURE");
+  // the recorded shape: the kernel refuses to start a process with this line as one environment string
+  const before = spawnSync("python3", ["-c", "pass"],
+    { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", OC_BOX_CC_LINE: large } });
+  if ((before.error as NodeJS.ErrnoException | undefined)?.code !== "E2BIG") fail("LARGE_LINE_SHAPE_STARTED_A_PROCESS");
+
+  const box = await boxCliBox("ocv5-317", "#!/bin/sh\nexec cat\n");
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const received: Buffer[] = [];
+  stdout.on("data", (chunk: Buffer) => received.push(chunk));
+  const bridge = api.boxCli.bridge({ control: box.control, args: ["--model", "box-claude-opus-5-5"], stdin, stdout,
+    stderr: new PassThrough() });
+  const expected = Buffer.from(`${line("before")}${large}${line("after")}`);
+  stdin.write(line("before"));
+  stdin.write(large);
+  stdin.write(line("after"));
+  const size = () => received.reduce((sum, chunk) => sum + chunk.length, 0);
+  for (let i = 0; i < 800 && size() < expected.length; i++) await tick(25);
+  await tick(200);
+  if (!Buffer.concat(received).equals(expected)) fail(`LARGE_LINE_NOT_WHOLE_${size()}_OF_${expected.length}`);
+  stdin.end();
+  const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
+  if (code !== 0 || box.readers().length !== 0) fail(`LARGE_LINE_CLOSE_${code}`);
+
+  // the Box does not complete a write: the bridge reports it and ends, instead of waiting for an answer
+  const failing = await boxCliBox("ocv5-317-refused", "#!/bin/sh\nexec cat\n");
+  failing.refuse.writes = true;
+  const input = new PassThrough();
+  const errors = new PassThrough();
+  let reported = "";
+  errors.on("data", (chunk: Buffer) => { reported += chunk.toString("utf8"); });
+  const refused = api.boxCli.bridge({ control: failing.control, args: [], stdin: input, stdout: new PassThrough(),
+    stderr: errors });
+  input.write(line("never delivered"));
+  const outcome = await Promise.race([refused.then((exit) => `exit-${exit}`, () => "failed"),
+    tick(5_000).then(() => "still-waiting")]);
+  if (outcome !== "failed" || !reported.includes("BOX_CC_WRITE_FAILED")) fail(`LARGE_LINE_WRITE_FAILURE_${outcome}`);
+  return "[ocv5-317-box-cli-large-line] PASS — a 900 KB stdin line reaches the box Claude whole and a failed write ends the turn at once";
+}
+
+/** INC-20261004-BOX-CLI-VERSION-UNREADABLE. Production v5-0ee3b3710: the version gate asked the exec transport
+ * for a 64-byte response; the transport's floor is 1024, so the read was refused before it left and every Box
+ * read as unreadable: no new Box turn could start. The read here goes through the real transport to a Box that
+ * answers in the exec stream format. The gate of INC-20261004-BOX-UNKNOWN-NEVER-CLOSED is checked beside it:
+ * an unlisted build still refuses a new launch and never a run that already exists. */
+async function proveCliVersionRead(api: Api): Promise<string> {
+  const frame = (flag: number, body: unknown): Buffer => {
+    const payload = Buffer.from(JSON.stringify(body));
+    const head = Buffer.alloc(5);
+    head[0] = flag;
+    head.writeUInt32BE(payload.length, 1);
+    return Buffer.concat([head, payload]);
+  };
+  const boxRunning = (version: string, accountId = 25n) => {
+    const state = { sent: 0, disposed: 0 };
+    const exec = api.cliVersion.transport(async (_url, init) => {
+      state.sent++;
+      const request = JSON.parse(Buffer.from(init.body).subarray(5).toString("utf8")) as { command?: string };
+      if (request.command !== "/usr/bin/python3") fail("CLI_VERSION_READ_REQUEST");
+      return new Response(new Uint8Array(Buffer.concat([frame(0, { stdoutEvent: { data: `${version}\n` } }),
+        frame(0, { exitEvent: {} }), frame(2, {})])));
+    });
+    return { state, target: { accountId, exec, dispose: async () => { state.disposed++; } } };
+  };
+  const current = boxRunning("2.1.288");
+  const version = await must("CLI_VERSION_READ", api.cliVersion.gate().read(current.target));
+  if (version !== "2.1.288" || current.state.sent !== 1) fail(`CLI_VERSION_READ_${version}_${current.state.sent}`);
+  // a new launch on that Box is admitted with its version; an unlisted build is refused before admission
+  const resolve = api.cliVersion.launchResolver(async (args) => (args.box as ReturnType<typeof boxRunning>).target,
+    api.cliVersion.gate());
+  const admitted = await must("CLI_VERSION_LAUNCH", resolve({ box: boxRunning("2.1.288") }));
+  if (admitted.cliVersion !== "2.1.288") fail("CLI_VERSION_LAUNCH_NOT_ANNOTATED");
+  // (the gate trusts a supported result per account for a while, so the other Box is another account)
+  const unlisted = boxRunning("2.1.999", 26n);
+  const refusal = await codeOf(() => resolve({ box: unlisted }));
+  if (refusal !== "BOX_CLI_VERSION_UNSUPPORTED" || unlisted.state.sent !== 1 || unlisted.state.disposed !== 1) {
+    fail(`CLI_VERSION_UNLISTED_${refusal}_${unlisted.state.disposed}`);
+  }
+  // a run that exists (continuation publish, stop, cleanup) is never refused by the gate
+  const pinned = await must("CLI_VERSION_PINNED", resolve({ box: boxRunning("2.1.999", 27n), requiredAccountId: 27n }));
+  if (pinned.cliVersion !== undefined) fail("CLI_VERSION_PINNED_ANNOTATED");
+  return "[ocv5-313-cli-version-read] PASS — the Box CLI version read leaves through the real exec transport and a supported Box is admitted";
+}
+
+/** INC-20261004-BOX-FRESH-PROJECTS-DIR. Selfhost v5-5ef67b4d8: a newly added account's Box had ~/.claude but no
+ * ~/.claude/projects (its Claude had never persisted a session). Every turn with history stages the session
+ * snapshot under that directory, so prelaunch INIT failed with BOX_EXEC_REMOTE_EXIT before Claude started.
+ * The product's own bootstrap, INIT, stage and cleanup requests run here against such a home directory. */
+function proveFreshProjectsDir(api: Api): string {
+  const execute = (request: BoxRequest) => {
+    if (request.args.some((arg) => Buffer.byteLength(arg) >= 70_000)) fail("FRESH_PROJECTS_ARG_TOO_LARGE");
+    return spawnSync(request.command, request.args, { cwd: request.cwd, env: request.environment, encoding: "utf8",
+      timeout: 7_000, maxBuffer: 128 * 1024 });
+  };
+  const sha = (raw: Buffer) => createHash("sha256").update(raw).digest("hex");
+  /** A Box home that exists only under /tmp: the requests are sent with their paths moved there. */
+  const boxHome = () => {
+    const home = `/tmp/ocv5-310-box-home-${randomBytes(8).toString("hex")}`;
+    const projects = `${home}/.claude/projects`;
+    const at = (suffix: string) => `('tmp','${home.slice("/tmp/".length)}','.claude'${suffix})`;
+    const relocate = (request: BoxRequest): BoxRequest => ({ ...request,
+      args: request.args.map((arg) => arg.replaceAll("/home/box/.claude/projects", projects)
+        .replaceAll("('home','box','.claude','projects')", at(",'projects'"))
+        .replaceAll("('home','box','.claude')", at(""))) });
+    cleanups.add(() => rmSync(home, { recursive: true, force: true }));
+    return { home, projects, relocate };
+  };
+  const identity = (): PrelaunchIdentity => {
+    const runNonce = randomBytes(12).toString("hex");
+    for (const kind of ["stage", "run"]) {
+      cleanups.add(() => rmSync(`/tmp/ocv5-289-${kind}-${runNonce}`, { recursive: true, force: true }));
+    }
+    return { runNonce, leaseEpoch: randomBytes(16).toString("hex"), controlId: randomBytes(16).toString("hex"),
+      accountId: "25" };
+  };
+  const sid = "12345678-1234-4123-8123-123456789abc";
+  const snapshot = Buffer.from("synthetic-history\n");
+
+  // the guarded launch path: bootstrap, INIT, staged history, cleanup
+  const fresh = boxHome();
+  mkdirSync(`${fresh.home}/.claude`, { recursive: true, mode: 0o755 });
+  const who = identity();
+  const cwd = `/tmp/ocv5-289-run-${who.runNonce}`;
+  const project = `/home/box/.claude/projects/-tmp-ocv5-289-run-${who.runNonce}`;
+  const staged = `${fresh.projects}/-tmp-ocv5-289-run-${who.runNonce}`;
+  const boot = execute(fresh.relocate(api.prelaunch.bootstrap(who)));
+  if (boot.status !== 0) fail(`FRESH_PROJECTS_BOOTSTRAP_${boot.status}`);
+  const receipt = api.prelaunch.parse(boot.stdout, who);
+  if (!existsSync(fresh.projects) || (statSync(fresh.projects).mode & 0o777) !== 0o700) fail("FRESH_PROJECTS_DIR_NOT_CREATED");
+  const init = execute(fresh.relocate(api.prelaunch.init(receipt, project)));
+  if (init.status !== 0 || init.stdout.trim() !== "ready") fail(`FRESH_PROJECTS_INIT_${init.status}`);
+  const plan = api.stageFiles({ cwd, project, files: [{ path: `${project}/${sid}.jsonl`, raw: snapshot,
+    hash: sha(snapshot) }] });
+  for (const step of plan.requests.slice(1)) {
+    const result = execute(fresh.relocate(api.prelaunch.guard(fresh.relocate(step), receipt)));
+    if (result.status !== 0) fail(`FRESH_PROJECTS_STAGE_${result.status}`);
+  }
+  if (!readFileSync(`${staged}/${sid}.jsonl`).equals(snapshot)) fail("FRESH_PROJECTS_HISTORY_NOT_STAGED");
+  const clean = execute(fresh.relocate(api.prelaunch.cleanup(receipt)));
+  if (clean.status !== 0 || clean.stdout.trim() !== `cleaned:${receipt.identityHash}` || existsSync(staged)
+    || !existsSync(fresh.projects)) fail(`FRESH_PROJECTS_CLEANUP_${clean.status}`);
+
+  // the text path: its stage INIT creates the same one parent directory
+  const text = boxHome();
+  mkdirSync(`${text.home}/.claude`, { recursive: true, mode: 0o755 });
+  const textRun = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  cleanups.add(() => rmSync(textRun, { recursive: true, force: true }));
+  const textProject = `/home/box/.claude/projects/${textRun.replaceAll("/", "-")}`;
+  const textPlan = api.stageFiles({ cwd: textRun, project: textProject, files: [{ path: `${textProject}/${sid}.jsonl`,
+    raw: snapshot, hash: sha(snapshot) }] });
+  for (const step of textPlan.requests) {
+    const result = execute(text.relocate(step));
+    if (result.status !== 0) fail(`FRESH_PROJECTS_TEXT_STAGE_${result.status}`);
+  }
+  if (!existsSync(text.projects) || (statSync(text.projects).mode & 0o777) !== 0o700
+    || !readFileSync(`${text.projects}/${textRun.replaceAll("/", "-")}/${sid}.jsonl`).equals(snapshot)) {
+    fail("FRESH_PROJECTS_TEXT_HISTORY_NOT_STAGED");
+  }
+
+  // what must stay refused: a missing ~/.claude is never created, a symlinked one is never followed
+  const bare = boxHome();
+  const elsewhere = `${bare.home}-elsewhere`;
+  cleanups.add(() => rmSync(elsewhere, { recursive: true, force: true }));
+  mkdirSync(bare.home, { mode: 0o700 });
+  mkdirSync(elsewhere, { mode: 0o700 });
+  const bootstrap = () => {
+    const next = identity();
+    const run = execute(bare.relocate(api.prelaunch.bootstrap(next)));
+    if (run.status !== 0) fail(`FRESH_PROJECTS_BARE_BOOTSTRAP_${run.status}`);
+    return api.prelaunch.parse(run.stdout, next);
+  };
+  bootstrap();
+  if (existsSync(`${bare.home}/.claude`)) fail("FRESH_PROJECTS_CREATED_CLAUDE_HOME");
+  symlinkSync(elsewhere, `${bare.home}/.claude`);
+  const linked = bootstrap();
+  const refused = execute(bare.relocate(api.prelaunch.init(linked,
+    `/home/box/.claude/projects/-tmp-ocv5-289-run-${linked.runNonce}`)));
+  if (existsSync(`${elsewhere}/projects`) || refused.status === 0) fail("FRESH_PROJECTS_FOLLOWED_SYMLINK");
+  return "[ocv5-310-fresh-projects-dir] PASS — history stages on a Box whose Claude has no projects directory yet";
+}
+
+/** INC-20261005-SAND-INSTALL-RESEND. Selfhost: the relay installer failed inside the Box of account 25 every
+ * time (the Box host layout is newer than the installer). The Box accepted the prompt, no capability appeared
+ * within 15 minutes, and the coordinator sent the same installer again under a new nonce, more than a hundred
+ * times; the user saw the same error in the Box app over and over. The real coordinator runs here against a
+ * Box gateway that accepts the prompt and never gains the capability. */
+async function proveSandInstallNotResent(api: Api): Promise<string> {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-314-sand-"));
+  cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
+  const token = `x.${Buffer.from(JSON.stringify({ type: "session", sub: "ocv5-314-principal",
+    exp: 2_000_000_000 })).toString("base64url")}.y`;
+  const moduleHash = "d".repeat(64);
+  const box = { creates: 0, sends: 0, pid: 321, installed: false };
+  const agents: unknown[] = [];
+  let base = "";
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      const path = req.url ?? "";
+      const answer = (value: unknown, status = 200) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(value));
+      };
+      if (path.endsWith("GetSandBoxRunState")) return answer({ state: "SAND_BOX_RUN_STATE_RUNNING" });
+      if (path.endsWith("EnsureSandBox")) return answer({ gatewayUrl: `${base}/box`, gatewayToken: "GATE", networkToken: "NET" });
+      if (path.endsWith("/health")) return answer({ ok: true, pid: box.pid, isBusy: false });
+      if (path.endsWith("InferenceService/Stream")) {
+        return box.installed ? answer({ protocol: "oc-sand-relay-v2", moduleSha256: moduleHash,
+          nonce: req.headers["x-oc-sand-box-probe-nonce"], active: 0, maxConcurrent: 4 }) : answer({}, 404);
+      }
+      if (path.endsWith("/listAgents")) return answer(agents);
+      if (path.endsWith("/createAgent")) {
+        box.creates++;
+        agents.push({ id: "owned-maintenance-bot", isRunning: false,
+          description: (JSON.parse(Buffer.concat(chunks).toString("utf8")) as { description?: string }).description });
+        return answer({ agent: { id: "owned-maintenance-bot" }, transcript: [] });
+      }
+      // the Box takes the prompt; the installer then fails inside it, which the coordinator cannot see
+      if (path.endsWith("/sendPrompt")) { box.sends++; return answer({ accepted: true }); }
+      return answer({}, 404);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  cleanups.add(() => { server.closeAllConnections(); server.close(); });
+  const address = server.address();
+  if (!address || typeof address === "string") fail("SAND_BOX_ENDPOINT");
+  base = `http://127.0.0.1:${address.port}`;
+  let now = Date.now();
+  const row = { id: 1n, provider: "cursor", status: "active", cursor_sand_enabled: true, runtime_channel: "v5" };
+  const coordinator = api.sand.coordinator({ authDir: dir, moduleHash, listAccounts: async () => [row],
+    getAccount: async () => row,
+    getTokenSnapshot: async () => ({ id: 1n, token: Buffer.from(token), refresh: null, credential_kind: "session",
+      machine_id: "a".repeat(32), expires_at: null }),
+    clientFor: async () => ({ client: api.sand.client({ fetchImpl: fetch, apiBase: base, allowTestLoopback: true }) }),
+    installerPrompt: () => "synthetic deterministic installer", onChange: () => {}, now: () => now });
+  cleanups.add(() => coordinator.stop());
+  const operation = () => Object.values(api.sand.state(dir).operations)[0];
+  const seen = () => `${box.creates}/${box.sends}/${operation()?.phase}/${operation()?.errorCode ?? ""}`;
+  await coordinator.tick();
+  if (seen() !== "1/1/submitted/" || operation()?.hostPid !== 321) fail(`SAND_INSTALL_FIRST_${seen()}`);
+  // four more stale windows on the same Box host process: the incident sent the installer in each of them
+  for (let i = 0; i < 4; i++) { now += 15 * 60_000 + 1; await coordinator.tick(); }
+  if (seen() !== "1/1/error/INSTALL_UNCONFIRMED") fail(`SAND_INSTALL_RESENT_${seen()}`);
+  const account = api.sand.state(dir).accounts["1"];
+  if (account?.phase !== "error" || account.errorCode !== "INSTALL_UNCONFIRMED") fail("SAND_INSTALL_ACCOUNT_STATE");
+  // a restarted Box host has not seen the installer: it gets one attempt, and again only one
+  box.pid = 322; now += 60_001; await coordinator.tick();
+  if (seen() !== "1/2/submitted/" || operation()?.hostPid !== 322) fail(`SAND_INSTALL_AFTER_RESTART_${seen()}`);
+  for (let i = 0; i < 3; i++) { now += 15 * 60_000 + 1; await coordinator.tick(); }
+  if (box.sends !== 2 || operation()?.phase !== "error") fail(`SAND_INSTALL_RESENT_AFTER_RESTART_${seen()}`);
+  // the capability probe still decides readiness after the error
+  box.installed = true; now += 60_001; await coordinator.tick();
+  if (api.sand.state(dir).accounts["1"]?.phase !== "ready" || box.sends !== 2 || box.creates !== 1) {
+    fail(`SAND_INSTALL_READY_${seen()}`);
+  }
+  await coordinator.stop();
+  return "[ocv5-314-sand-install-resend] PASS — an installer the Box accepted is not sent again to the same Box host process";
+}
+
+/** INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT, live #7da201bd/#2a81a2fe: a Box turn's tool results had been
+ * sent when the turn failed. Claude Code drops its own API Error rows, so every later message of the session,
+ * the automatic 「从断点继续」 included, was merged into that tool-result message (tool_result + text + text…).
+ * Egress answered each with 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION and each failure added one more text
+ * block: the session could never continue. Such a request must run as a new invocation with the answered
+ * exchange as history, unless a CLI of this turn is still waiting for exactly those results. */
+async function proveAnsweredExchangePrompt(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const prompts = ["上一条消息因上游瞬时错误中断，请继续完成该任务。", "继续完成刚才因临时异常中断的任务。"];
+  const toolResult = { type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" };
+  /** The request Claude Code sends once later prompts were merged into the tool-result message. */
+  const merged = (turn: ReturnType<typeof boxTurn>, requestId: string, key: string, last: unknown[]) => {
+    const call = turn.answer(requestId, key);
+    const base = JSON.parse(call.init.body) as Body;
+    const body = { ...base, messages: [...(base.messages as unknown[]).slice(0, 2), { role: "user", content: last }] };
+    return { ...call, canonicalBody: { ...body, model: MODEL }, init: { method: "POST", body: JSON.stringify(body) } };
+  };
+  const tail = [toolResult, ...prompts.map(text)];
+  const who = { uid: 900_000_322n, containerId: 322n, sessionId: "session-answered" };
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'answered@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-ans", "a".repeat(64), undefined,
+    { nextSpool: spoolOf([cliInit, ...FINAL_ANSWER]) });
+  await turn.first();
+  // the client's tool result reached the CLI, which echoed it and finished: nothing waits for it any more
+  turn.host.write([echoOf("toolu_good_1", "ok"), ...FINAL_ANSWER]);
+  const answered = await must("ANSWERED_EXCHANGE_SETUP", turn.next("box-ans-2").then((response) => response.text()));
+  if (!answered.includes("done")) fail("ANSWERED_EXCHANGE_SETUP_NO_ANSWER");
+  const request = merged(turn, "box-ans-3", "b".repeat(64), tail);
+  const verdict = api.classify(request.canonicalBody as Body);
+  if (verdict.classification !== "fresh" || !isDeepStrictEqual(verdict.answeredToolIds, ["toolu_good_1"])) {
+    fail(`ANSWERED_EXCHANGE_CLASSIFIED_${verdict.classification}_${String(verdict.rejectCode)}`);
+  }
+  await prechecked(api, db, { ...who, requestId: "box-ans-3", turnKey: "b".repeat(64) });
+  const resumed = await must("ANSWERED_EXCHANGE_REJECTED", turn.service.fetch(request));
+  const sse = await must("ANSWERED_EXCHANGE_STREAM", resumed.text());
+  if (resumed.status !== 200 || !sse.includes("done") || turn.host.count.launch !== 2) {
+    fail(`ANSWERED_EXCHANGE_NO_ANSWER_${resumed.status}_${turn.host.count.launch}`);
+  }
+  // the new CLI has the exchange as history and only the prompts as its input
+  const row = await journalRow(db, "box-ans-3");
+  const run = `/tmp/ocv5-289-run-${String(row?.ctx.boxRunNonce)}`;
+  const stdin = turn.host.files.get(`${run}/stdin.jsonl`)?.toString("utf8") ?? "";
+  const history = [...turn.host.files].filter(([path]) => path.endsWith(".jsonl") && !path.startsWith(run))
+    .map(([, raw]) => raw.toString("utf8")).join("\n");
+  if (row?.ctx.boxState !== "terminal" || prompts.some((prompt) => !stdin.includes(prompt))
+    || stdin.includes("toolu_good_1")) fail(`ANSWERED_EXCHANGE_PROMPT_${String(row?.ctx.boxState)}`);
+  if ((history.match(/toolu_good_1/g) ?? []).length !== 2 || !history.includes('"tool_result"')) fail("ANSWERED_EXCHANGE_HISTORY");
+
+  // a CLI of this very turn still waits for these results: the request stays a rejected live continuation
+  const waiting = { uid: 900_000_323n, containerId: 323n, sessionId: "session-answered-waiting" };
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'waiting@test.invalid','unused',10000)",
+    [waiting.uid.toString()]);
+  const parked = boxTurn(api, db, journal, waiting, "box-wait", "c".repeat(64));
+  await parked.first();
+  await prechecked(api, db, { ...waiting, requestId: "box-wait-2", turnKey: "c".repeat(64) });
+  const kept = await codeOf(async () => (await parked.service.fetch(merged(parked, "box-wait-2", "c".repeat(64), tail))).text());
+  if (kept !== LIVE_ONLY || parked.host.count.launch !== 1 || parked.host.count.stop !== 0) {
+    fail(`ANSWERED_EXCHANGE_WAITING_CLI_${kept}_${parked.host.count.launch}`);
+  }
+  // any other mixture of results and content keeps the old rejection
+  for (const last of [[text(prompts[1]!), toolResult], [toolResult, text("  ")],
+    [toolResult, text("<system-reminder>\nhook\n</system-reminder>")]]) {
+    const other = api.classify(merged(turn, "box-ans-x", "d".repeat(64), last).canonicalBody as Body);
+    if (other.classification !== "reject" || other.rejectCode !== LIVE_ONLY) {
+      fail(`ANSWERED_EXCHANGE_WIDENED_${other.classification}`);
+    }
+  }
+  return "[ocv5-322-answered-exchange-prompt] PASS — a prompt merged behind an answered tool exchange runs as a new invocation over that exchange";
+}
+
+/** The cleanup worker egress runs, on the real journal, reaching each run's own Box account. */
+function boxCleanupWorker(api: Api, journal: Journal, turns: ReadonlyArray<ReturnType<typeof boxTurn>>) {
+  return api.cleanupWorker({ journal, staleResumeProofWaitMs: 300,
+    resolver: { resolve: async (args: { requiredAccountId: bigint }) => {
+      const turn = turns.find((item) => item.host.target.accountId === args.requiredAccountId);
+      if (!turn) throw Object.assign(new Error("BOX_ACCOUNT_UNAVAILABLE"), { code: "BOX_ACCOUNT_UNAVAILABLE" });
+      return turn.host.target;
+    } } });
+}
+/** The journal row has been in its state this long, as the worker's listing reads it. */
+const aged = (db: Db, requestId: string, interval: string, created = false) => db.query(
+  `UPDATE request_finalize_journal SET updated_at=NOW()-$2::interval${created ? ", created_at=NOW()-$2::interval" : ""}
+    WHERE request_id=$1`, [requestId, interval]);
+/** After a parked run was closed: its idle proof reads failed and the session's next message runs. */
+async function sessionReleased(api: Api, db: Db, journal: Journal,
+  who: { uid: bigint; containerId: bigint; sessionId: string }, turnKey: string, label: string): Promise<void> {
+  const idle = await journal.readIdleProof({ ...who, turnKey });
+  if (idle.status !== "failed") fail(`${label}_IDLE_${idle.status}`);
+  const requestId = `${label.toLowerCase().replaceAll("_", "-")}-next`;
+  await prechecked(api, db, { ...who, requestId, turnKey: "d".repeat(64) });
+  const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+    real: { journal, ...who, accountId: who.containerId, requestId, turnKey: "d".repeat(64) } });
+  if ((await must(`${label}_NEXT_MESSAGE`, next.round())).kind !== "final" || !next.sse().includes("done")) {
+    fail(`${label}_NEXT_MESSAGE_NO_ANSWER`);
+  }
+}
+
+/** INC-20261004-BOX-RESUME-UNSENT-PARKED, session webmusk512gnvx22z: the claim of a tool-result publish was
+ * written, then the Box target could not be resolved and not one exec ran. The leaf went unknown while the
+ * keeper, supervisor and CLI stayed alive waiting for results that would never be published. Until the
+ * four-hour supervisor deadline the run held the session's Box slot (409 BOX_CAPACITY_HELD on the retry) and
+ * kept its idle proof pending, so every later message was refused as IDLE_HISTORY_PENDING. */
+async function proveResumeUnsentParked(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const park = async (uid: bigint, label: string) => {
+    const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    const unreachable = { active: false };
+    const turn = boxTurn(api, db, journal, who, `box-${label}`, "a".repeat(64), undefined, { parked: "until-stopped", unreachable });
+    await turn.first();
+    unreachable.active = true;
+    const code = await codeOf(async () => (await turn.next(`box-${label}-2`)).text());
+    unreachable.active = false;
+    const leaf = await journalRow(db, `box-${label}-2`);
+    if (code !== "BOX_TARGET_UNAVAILABLE" || leaf?.ctx.boxState !== "unknown"
+      || leaf.ctx.boxUnknownPhase !== "resume_publish_unsent" || turn.host.count.stop !== 0) {
+      fail(`UNSENT_${label}_${code}_${String(leaf?.ctx.boxState)}_${String(leaf?.ctx.boxUnknownPhase)}`);
+    }
+    if ((await journal.readIdleProof({ ...who, turnKey: "a".repeat(64) })).status !== "pending") fail(`UNSENT_${label}_NOT_PARKED`);
+    return { who, turn };
+  };
+  // seconds after the failed publish the run may still be reached by a retry: it is left alone
+  const young = await park(900_000_331n, "unsent-young");
+  const old = await park(900_000_332n, "unsent");
+  await aged(db, "box-unsent-2", "30 seconds");
+  const worker = boxCleanupWorker(api, journal, [young.turn, old.turn]);
+  await worker.reconcileStoppedFailures(50);
+  if (young.turn.host.count.stop !== 0 || (await journalRow(db, "box-unsent-young-2"))?.ctx.boxState !== "unknown") {
+    fail("UNSENT_YOUNG_RUN_STOPPED");
+  }
+  // the parked run was told to stop by its own keeper and the chain closed on that keeper's proof
+  const leaf = await journalRow(db, "box-unsent-2");
+  const intent = leaf?.ctx.boxStaleResumeStop as { phase?: string } | undefined;
+  const proof = leaf?.ctx.boxTerminalProof as { reason?: string } | undefined;
+  if (old.turn.host.count.stop !== 1 || intent?.phase !== "resume_publish_unsent" || proof?.reason !== "keeper_stopped"
+    || leaf?.ctx.boxState === "unknown") {
+    fail(`UNSENT_NOT_CLOSED_${old.turn.host.count.stop}_${String(leaf?.ctx.boxState)}_${String(proof?.reason)}`);
+  }
+  await sessionReleased(api, db, journal, old.who, "a".repeat(64), "UNSENT");
+  return "[ocv5-323-resume-unsent-parked] PASS — a run parked behind a publish that never left is stopped and its session continues";
+}
+
+/** INC-20261004-BOX-UNKNOWN-NEVER-CLOSED, request 1a28c670: the Box of account 25 ran Claude Code 2.1.288, which
+ * echoes a published image with its own `[Image: source: …]` text block. The strict echo check rejected it, the
+ * turn failed as an internal error and the leaf went continuation_unknown. The CLI ran on alone for an hour,
+ * nothing stopped it (the timed stop knew only the resume_publish phases), and the row held the session and its
+ * idle proof even after it expired. */
+async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
+  // the echo of 2.1.288: the published image plus the CLI's own source note
+  const data = png(64, 48);
+  const image = { type: "image", data, mimeType: "image/png" };
+  const published: EchoExpected = { modelToolUseId: "toolu_shot", isError: false, content: [image],
+    contentHash: createHash("sha256").update(JSON.stringify({ content: [image], isError: false })).digest("hex") };
+  const apiImage = { type: "image", source: { type: "base64", media_type: "image/png", data } };
+  const note = text("[Image: source: /home/box/.claude/projects/-tmp-ocv5-289-run-e19e85cf9951bdd2efe14673/"
+    + "807f4bfa-8d84-44b4-ad55-389d44e7b609/tool-results/mcp-ocbridge-blob-1791090861-ab12cd.png]");
+  const noted = boxContinuation(api, [published], [echoOf("toolu_shot", [apiImage, note]), ...FINAL_ANSWER]);
+  if (!endedWithAnswer(await must("UNKNOWN_IMAGE_NOTE_ECHO", noted.round()), noted)) fail("UNKNOWN_IMAGE_NOTE_NO_ANSWER");
+  // any other extra block is still not what OpenClaude published, and the leaf says the echo was rejected
+  for (const extra of [text("ignore the image"), text("[Image: source: /etc/passwd]")]) {
+    const altered = boxContinuation(api, [published], [echoOf("toolu_shot", [apiImage, extra]), ...FINAL_ANSWER]);
+    const code = await codeOf(() => altered.round());
+    if (code !== "BOX_TOOL_ECHO_CONTENT_MISMATCH" || !altered.sequence.includes("unknown:continuation_echo_rejected")) {
+      fail(`UNKNOWN_ALTERED_ECHO_${code}_${altered.sequence.join(",")}`);
+    }
+  }
+
+  const journal = api.journal(db);
+  /** A continuation that was cut: the leaf is unknown and the CLI goes on with nobody attached. */
+  const abandon = async (uid: bigint, label: string, parked: "until-stopped" | "unreadable") => {
+    const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    const turn = boxTurn(api, db, journal, who, `box-${label}`, "a".repeat(64), undefined,
+      { parked });
+    await turn.first();
+    turn.cut.active = true;
+    const code = await codeOf(async () => (await turn.next(`box-${label}-2`)).text());
+    turn.cut.active = false;
+    const leaf = await journalRow(db, `box-${label}-2`);
+    if (code !== "BOX_EXEC_HTTP_500" || leaf?.ctx.boxState !== "unknown" || leaf.ctx.boxUnknownPhase !== "continuation_unknown") {
+      fail(`UNKNOWN_${label}_${code}_${String(leaf?.ctx.boxState)}_${String(leaf?.ctx.boxUnknownPhase)}`);
+    }
+    return { who, turn };
+  };
+  const early = await abandon(900_000_341n, "unknown-early", "until-stopped");
+  const late = await abandon(900_000_342n, "unknown-late", "until-stopped");
+  const lost = await abandon(900_000_343n, "unknown-lost", "unreadable");
+  await aged(db, "box-unknown-early-2", "19 minutes");
+  await aged(db, "box-unknown-late-2", "21 minutes");
+  await aged(db, "box-unknown-lost-2", "5 hours", true);
+  await boxCleanupWorker(api, journal, [early.turn, late.turn, lost.turn]).reconcileStoppedFailures(50);
+  // within twenty minutes a retry of the same request may still attach to the run
+  if (early.turn.host.count.stop !== 0 || (await journalRow(db, "box-unknown-early-2"))?.ctx.boxState !== "unknown") {
+    fail("UNKNOWN_EARLY_RUN_STOPPED");
+  }
+  const leaf = await journalRow(db, "box-unknown-late-2");
+  const proof = leaf?.ctx.boxTerminalProof as { reason?: string } | undefined;
+  if (late.turn.host.count.stop !== 1 || proof?.reason !== "keeper_stopped" || leaf?.ctx.boxState === "unknown") {
+    fail(`UNKNOWN_NOT_STOPPED_${late.turn.host.count.stop}_${String(leaf?.ctx.boxState)}_${String(proof?.reason)}`);
+  }
+  await sessionReleased(api, db, journal, late.who, "a".repeat(64), "UNKNOWN");
+  // a run past its maximum lifetime whose keeper never proves anything ends as expired, without an invented proof
+  const expired = await journalRow(db, "box-unknown-lost-2");
+  if (expired?.ctx.boxState === "unknown" || expired?.ctx.boxTerminalProof !== undefined) {
+    fail(`UNKNOWN_EXPIRED_${String(expired?.ctx.boxState)}_${expired?.ctx.boxTerminalProof === undefined}`);
+  }
+  if ((await journal.readIdleProof({ ...lost.who, turnKey: "a".repeat(64) })).status !== "failed") fail("UNKNOWN_EXPIRED_IDLE");
+  return "[ocv5-313-unknown-never-closed] PASS — the 2.1.288 image echo continues and an abandoned unknown run is stopped or expired so its session continues";
 }
 
 /** Things this run created outside its own memory. */
@@ -2020,11 +2628,14 @@ async function main(): Promise<void> {
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
-    await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api),
+    await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
+    await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
-      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db)]),
-    await proveSettledToolsAutoResume(api, database)];
+      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
+      await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
+      await proveUnknownNeverClosed(api, db)]),
+    ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
