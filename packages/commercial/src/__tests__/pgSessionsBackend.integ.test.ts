@@ -161,9 +161,14 @@ before(async () => {
   await pool.query(
     "CREATE TABLE IF NOT EXISTS request_finalize_journal (request_id TEXT PRIMARY KEY)",
   );
-  // Automatic recovery reads successful usage for the source turn key.
-  await pool.query(`CREATE TABLE IF NOT EXISTS usage_records (id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT, turn_key TEXT, status TEXT, output_tokens BIGINT, cache_read_tokens BIGINT)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS usage_records (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT,
+    turn_key TEXT,
+    status TEXT,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0
+  )`);
   await pool.query("CREATE TABLE IF NOT EXISTS turn_traces (trace_id TEXT PRIMARY KEY)");
   await pool.query(await readFile(MIGRATION_0170, { encoding: "utf8" }));
   // 0173:client_sessions.model_id(会话级模型选择;本套件的读写 SQL 均已含该列)。
@@ -6547,8 +6552,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         },
       },
       {
+        // Commercial fence (f867b11d2): a completed tool whose own result object
+        // says its outcome is unknown is not settled evidence either.
         suffix: "unknown-outcome",
-        manualOnly: false,
+        manualOnly: true,
         record: {
           id: "tool-unknown",
           role: "tool",

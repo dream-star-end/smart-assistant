@@ -336,12 +336,30 @@ function topLevelNonTerminal(row: Record<string, unknown>): boolean {
   return false
 }
 
+// Exact engine result objects are stronger evidence than a completed envelope.
+// Do not inspect input/command/text or parse strings: a Bash output mentioning
+// a business status is not itself a pending tool execution.
+function structuredResultNonTerminal(value: unknown, seen = new Set<unknown>()): boolean {
+  if (!value || typeof value !== 'object' || seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) return value.some((item) => structuredResultNonTerminal(item, seen))
+  const row = value as Record<string, unknown>
+  return topLevelNonTerminal(row) ||
+    Object.values(row).some((item) => structuredResultNonTerminal(item, seen))
+}
+
+function settledToolHasNonTerminalState(row: Record<string, unknown>): boolean {
+  return topLevelNonTerminal(row) || structuredResultNonTerminal(row.outputJson) ||
+    structuredResultNonTerminal(row._toolEffect)
+}
+
 function childToolsSettled(value: unknown): boolean {
   if (!Array.isArray(value)) return true
   return value.every((item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return true
     const child = item as Record<string, unknown>
-    if (child.kind === 'tool_use' && (child._completed !== true || topLevelNonTerminal(child))) {
+    if (child.kind === 'tool_use' &&
+      (child._completed !== true || settledToolHasNonTerminalState(child))) {
       return false
     }
     return childToolsSettled(child.childBlocks)
@@ -369,7 +387,7 @@ export function modelPlaneFailureAfterSettledTools(
     if (role === 'tool') {
       sawTool = true
       const id = toolObservationId(record)
-      if (!id || record._completed !== true || topLevelNonTerminal(record)) return false
+      if (!id || record._completed !== true || settledToolHasNonTerminalState(record)) return false
       settled.add(id)
     } else if (role === 'agent-group' || role === 'delegate-progress') {
       sawTool = true

@@ -66,4 +66,43 @@ describe('OCV5-317 model-plane failure after settled tools', () => {
       status: 'interrupted', errorCode: 'service_restart', leftoverBacked: true, records: live,
     }), false)
   })
+
+  it('keeps explicitly unknown structured results on the manual path', () => {
+    const cases: unknown[][] = [
+      [...live, tool('unknown_root', 'Bash', { outputJson: { outcome: 'unknown' } })],
+      [...live, tool('pending_nested', 'Bash', { outputJson: { result: [{ status: 'pending' }] } })],
+      [...live, tool('unknown_nested', 'Bash', { outputJson: [{ result: { kind: 'unknown' } }] })],
+      [...live, tool('unknown_effect', 'Bash', { _toolEffect: { outcome: 'unknown' } })],
+      [...live, { role: 'agent-group', _completed: true, childBlocks: [
+        { kind: 'tool_use', id: 'child', _completed: true, outputJson: { outcome: 'unknown' } },
+      ] }],
+      [...live, { role: 'delegate-progress', _completed: true, childBlocks: [
+        { kind: 'agent-group', childBlocks: [
+          { kind: 'tool_use', id: 'nested_child', _completed: true,
+            outputJson: { result: { status: 'pending' } } },
+        ] },
+      ] }],
+    ]
+    for (const records of cases) {
+      assert.equal(modelPlaneFailureAfterSettledTools('upstream_failed', records), false)
+      assert.equal(allowUnsafeAutomaticCheckpoint({
+        status: 'completed', errorCode: 'upstream_failed', leftoverBacked: false, records,
+      }), false)
+    }
+  })
+
+  it('does not infer tool lifecycle from input or ordinary result strings', () => {
+    for (const extra of [
+      { text: 'status: pending', output: '{"outcome":"unknown"}', preview: 'kind=queued' },
+      { inputJson: { status: 'pending', nested: { outcome: 'unknown' } }, command: 'status=pending' },
+      { outputJson: '{"status":"pending"}' },
+      { outputJson: { stdout: 'status: pending', results: ['outcome=unknown'] } },
+    ]) {
+      const records = [...live, tool('ordinary_result', 'Bash', extra)]
+      assert.equal(modelPlaneFailureAfterSettledTools('upstream_failed', records), true)
+      assert.equal(allowUnsafeAutomaticCheckpoint({
+        status: 'completed', errorCode: 'upstream_failed', leftoverBacked: false, records,
+      }), true)
+    }
+  })
 })
