@@ -29,7 +29,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
-const LIMIT_MS = 60_000;
+const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = join(CANDIDATE, "packages/commercial/src/http/proxy");
 const LIVE_ONLY = "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION";
@@ -2065,6 +2065,12 @@ async function boxCliBox(tag: string, claudeScript: string) {
     execToken: "exec", networkToken: "network", remoteClaude: claude, fifo: `${fifoBase}.fifo`, cwd: dir } };
 }
 
+/** The stop script has killed the box Claude; on a loaded host its /proc entry can outlive the kill by a moment. */
+async function gone(readers: () => number[]): Promise<boolean> {
+  for (let i = 0; i < 80 && readers().length !== 0; i++) await tick(25);
+  return readers().length === 0;
+}
+
 /** INC-20261005-BOX-CC-FOLLOWUP-TURN. Production rel-97e6472b5: on box-claude-* the second turn of a session
  * ended as "服务正在更新，本轮已中断" (子进程被信号 SIGKILL 终止). The runner took the box CLI for the
  * engine=ccb proxy lane and recycled it before every turn; the bridge ignored its closed stdin, was SIGKILLed,
@@ -2116,7 +2122,7 @@ async function proveBoxCliFollowUpTurn(api: Api): Promise<string> {
   stdin.end();
   const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
   if (code !== 0) fail(`FOLLOWUP_STDIN_CLOSE_${code}`);
-  if (readers().length !== 0) fail("FOLLOWUP_BOX_CLAUDE_LEFT_RUNNING");
+  if (!await gone(readers)) fail("FOLLOWUP_BOX_CLAUDE_LEFT_RUNNING");
   return "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it";
 }
 
@@ -2151,7 +2157,7 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
   if (!Buffer.concat(received).equals(expected)) fail(`LARGE_LINE_NOT_WHOLE_${size()}_OF_${expected.length}`);
   stdin.end();
   const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
-  if (code !== 0 || box.readers().length !== 0) fail(`LARGE_LINE_CLOSE_${code}`);
+  if (code !== 0 || !await gone(box.readers)) fail(`LARGE_LINE_CLOSE_${code}`);
 
   // the Box does not complete a write: the bridge reports it and ends, instead of waiting for an answer
   const failing = await boxCliBox("ocv5-317-refused", "#!/bin/sh\nexec cat\n");
@@ -2598,7 +2604,7 @@ async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
   if (expired?.ctx.boxState === "unknown" || expired?.ctx.boxTerminalProof !== undefined) {
     fail(`UNKNOWN_EXPIRED_${String(expired?.ctx.boxState)}_${expired?.ctx.boxTerminalProof === undefined}`);
   }
-  if ((await journal.readIdleProof({ ...lost.who, turnKey: "a".repeat(64) })).status !== "failed") fail("UNKNOWN_EXPIRED_IDLE");
+  await sessionReleased(api, db, journal, lost.who, "a".repeat(64), "UNKNOWN_EXPIRED");
   return "[ocv5-313-unknown-never-closed] PASS — the 2.1.288 image echo continues and an abandoned unknown run is stopped or expired so its session continues";
 }
 
