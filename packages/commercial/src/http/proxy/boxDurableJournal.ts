@@ -1,6 +1,8 @@
 /** Box invocation fence on the existing request_finalize_journal.ctx JSONB.
  * No schema change. This is deliberately stricter than HTTP idempotency: an
  * identical body in one signed turn remains ambiguous and is never re-run. */
+import { BOX_API_MODELS, boxApiUpstreamModelFor, isBoxApiModel, isBoxApiModelPair,
+  isBoxApiUpstreamModel, type BoxApiModelId, type BoxApiUpstreamModelId } from "@openclaude/protocol";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { Pool, PoolClient } from "pg";
@@ -222,8 +224,8 @@ export interface BoxDetachedUnknownRecovery {
   readonly leaseEpoch: string;
   readonly sessionId: string;
   readonly turnKey: string;
-  readonly model: "box-api-claude-opus-5-5";
-  readonly upstreamModel: "claude-opus-5-5";
+  readonly model: BoxApiModelId;
+  readonly upstreamModel: BoxApiUpstreamModelId;
   readonly roundNo: number;
   readonly spoolOffset: number;
   readonly catalogHash: string;
@@ -249,6 +251,13 @@ function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): bool
   return state === "terminal" ? proof.reason === "worker_complete"
     : state === "failed_stopped" && proof.reason !== "worker_complete";
 }
+
+// The listed Box models as SQL. The ids are fixed strings from the protocol
+// table (charset checked there), never request data.
+const BOX_MODEL_IDS_SQL = BOX_API_MODELS.map((m) => `'${m.id}'`).join(",");
+/** The row's upstream id is the one its own canonical model maps to. */
+const BOX_MODEL_PAIR_SQL = `(${BOX_API_MODELS.map((m) =>
+  `(ctx->>'model'='${m.id}' AND ctx->>'boxUpstreamModel'='${m.upstreamModel}')`).join(" OR ")})`;
 
 // A rejected_stream settlement (OCV5-300) carries the keeper's real proof,
 // possibly worker_complete; it is never a cleanup candidate here.
@@ -276,13 +285,13 @@ const CLEANUP_REPLAY_FENCE = `(ctx->>'boxState'<>'terminal'
 const CLEANUP_MODE_FENCE = `(ctx->>'boxInvocationMode'='detached_tool'
   OR (ctx->>'boxInvocationMode'='text'
     AND ctx->>'boxLaunchPermit'='true'
-    AND ctx->>'boxUpstreamModel'='claude-opus-5-5'
+    AND ${BOX_MODEL_PAIR_SQL}
     AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'))`;
 const STOP_MODE_FENCE = CLEANUP_MODE_FENCE;
 function stoppedRunMode(ctx: Record<string, unknown>): boolean {
   return ctx.boxInvocationMode === "detached_tool"
     || (ctx.boxInvocationMode === "text" && ctx.boxLaunchPermit === true
-      && ctx.boxUpstreamModel === "claude-opus-5-5"
+      && isBoxApiModelPair(ctx.model, ctx.boxUpstreamModel)
       && typeof ctx.boxDetachedRunnerHash === "string"
       && /^[a-f0-9]{64}$/.test(ctx.boxDetachedRunnerHash));
 }
@@ -817,8 +826,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           && (!detachedRunnerHash || !catalogHash))
         || (mode === "text" && (detachedRunnerHash !== undefined
           || original.boxLaunchPermit !== undefined)
-          && (typeof upstreamModel !== "string"
-            || upstreamModel !== "claude-opus-5-5"))
+          && !isBoxApiModelPair(original.model, upstreamModel))
         || ![...ACTIVE, "terminal", "failed_stopped", "prestart_stopped"]
           .includes(String(original.boxState))) {
         throw new BoxDurableJournalError("BOX_REPLAY_EVIDENCE_INVALID");
@@ -932,7 +940,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         WHERE state='inflight' AND ctx->>'boxInvocationRecovery'='v1'
           AND ctx->>'boxInvocationMode'='text' AND ctx->>'boxState'='unknown'
           AND ctx->>'boxLaunchPermit'='true'
-          AND ctx->>'boxUpstreamModel'='claude-opus-5-5'
+          AND ${BOX_MODEL_PAIR_SQL}
           AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'
           AND (ctx->>'boxAccountId') ~ '^[1-9][0-9]{0,19}$'
           AND (ctx->>'boxRunNonce') ~ '^[a-f0-9]{24}$'
@@ -955,14 +963,15 @@ export class BoxDurableJournal implements BoxJournalPort {
         || !ctx || typeof ctx.boxAccountId !== "string"
         || typeof ctx.boxRunNonce !== "string"
         || typeof ctx.boxLeaseEpoch !== "string"
-        || typeof ctx.boxDetachedRunnerHash !== "string") return [];
+        || typeof ctx.boxDetachedRunnerHash !== "string"
+        || !isBoxApiModelPair(ctx.model, ctx.boxUpstreamModel)) return [];
       return [{ requestId: row.request_id, rootRequestId: row.request_id,
         uid: BigInt(row.user_id), accountId: BigInt(ctx.boxAccountId),
         runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch,
         invocationMode: "text", state: "unknown", roundNo: 1,
         spoolOffset: 0, rootLaunchPermit: true,
         detachedRunnerHash: ctx.boxDetachedRunnerHash,
-        upstreamModel: "claude-opus-5-5" }];
+        upstreamModel: ctx.boxUpstreamModel as BoxApiUpstreamModelId }];
     });
   }
 
@@ -975,7 +984,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
       || typeof input.detachedRunnerHash !== "string"
       || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
-      || input.upstreamModel !== "claude-opus-5-5") {
+      || !isBoxApiUpstreamModel(input.upstreamModel)) {
       throw new BoxDurableJournalError("BOX_TEXT_OBSERVER_IDENTITY_INVALID");
     }
     const changed = await this.pool.query(
@@ -1011,8 +1020,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       && input.detachedRunnerHash !== undefined;
     if (detachedText ? (typeof input.detachedRunnerHash !== "string"
       || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
-      || input.model !== "box-api-claude-opus-5-5"
-      || input.upstreamModel !== "claude-opus-5-5"
+      || !isBoxApiModelPair(input.model, input.upstreamModel)
       || input.catalogHash !== undefined)
       : input.upstreamModel !== undefined) {
       throw new BoxDurableJournalError("BOX_TEXT_DETACHED_BINDING_INVALID");
@@ -1231,7 +1239,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
       || !/^[a-f0-9]{32}$/.test(input.leaseEpoch)
       || !/^[a-f0-9]{64}$/.test(input.detachedRunnerHash)
-      || input.upstreamModel !== "claude-opus-5-5") {
+      || !isBoxApiUpstreamModel(input.upstreamModel)) {
       throw new BoxDurableJournalError("BOX_TEXT_LAUNCH_IDENTITY_INVALID");
     }
     const changed = await this.pool.query(
@@ -2758,8 +2766,9 @@ export class BoxDurableJournal implements BoxJournalPort {
       || ctx.boxReplayMessage !== undefined || ctx.boxTerminalProof !== undefined) {
       return { ok: false, reason: "BOX_RECOVERY_NOT_UNKNOWN_LEAF" };
     }
-    if (ctx.model !== "box-api-claude-opus-5-5"
-      || (ctx.boxUpstreamModel !== undefined && ctx.boxUpstreamModel !== "claude-opus-5-5")) {
+    const recoveryUpstream = boxApiUpstreamModelFor(ctx.model);
+    if (!isBoxApiModel(ctx.model) || recoveryUpstream === undefined
+      || (ctx.boxUpstreamModel !== undefined && ctx.boxUpstreamModel !== recoveryUpstream)) {
       return { ok: false, reason: "BOX_RECOVERY_MODEL_UNMAPPED" };
     }
     if (typeof ctx.boxSessionId !== "string" || ctx.boxSessionId.length < 1
@@ -2785,11 +2794,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         || row.ctx.boxLeaseEpoch !== ctx.boxLeaseEpoch
         || row.ctx.boxSessionId !== ctx.boxSessionId
         || row.ctx.boxTurnKey !== ctx.boxTurnKey
-        || row.ctx.model !== "box-api-claude-opus-5-5"
+        || row.ctx.model !== ctx.model
         || (row.ctx.boxUpstreamModel !== undefined
-          && row.ctx.boxUpstreamModel !== "claude-opus-5-5")) {
+          && row.ctx.boxUpstreamModel !== recoveryUpstream)) {
         return { ok: false, reason: row?.ctx?.model !== undefined
-          && row.ctx.model !== "box-api-claude-opus-5-5"
+          && row.ctx.model !== ctx.model
           ? "BOX_RECOVERY_MODEL_UNMAPPED" : "BOX_RECOVERY_CHAIN_INVALID" };
       }
       rows.push(row);
@@ -2841,7 +2850,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       requestId: leaf.request_id, uid: input.uid, accountId: input.accountId,
       runNonce: input.runNonce, leaseEpoch: input.leaseEpoch,
       sessionId: ctx.boxSessionId as string, turnKey: ctx.boxTurnKey as string,
-      model: "box-api-claude-opus-5-5", upstreamModel: "claude-opus-5-5",
+      model: ctx.model, upstreamModel: recoveryUpstream,
       roundNo: Number(roundNo), spoolOffset: Number(spoolOffset),
       catalogHash: ctx.boxCatalogHash as string,
       detachedRunnerHash: ctx.boxDetachedRunnerHash as string,
@@ -2868,7 +2877,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       || row.ctx.boxSessionId !== input.sessionId
       || row.ctx.boxTurnKey !== input.turnKey
       || row.ctx.model !== input.model
-      || input.model !== "box-api-claude-opus-5-5"
+      || !isBoxApiModel(input.model)
       || row.ctx.boxInvocationRecovery !== "v1"
       || row.ctx.boxInvocationMode !== "detached_tool") return null;
     const storedRound = row.ctx.boxRoundNo === undefined ? 1 : row.ctx.boxRoundNo;
@@ -2939,7 +2948,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       `SELECT request_id,ctx FROM request_finalize_journal
         WHERE user_id=$1 AND container_id=$2
           AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
-          AND ctx->>'model'='box-api-claude-opus-5-5'
+          AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
           AND ctx->>'boxInvocationRecovery'='v1'
           AND ${STOP_MODE_FENCE}
           AND ${STOP_PROBE_STATE_FENCE}
@@ -2985,7 +2994,7 @@ export class BoxDurableJournal implements BoxJournalPort {
            FROM request_finalize_journal
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
-            AND ctx->>'model'='box-api-claude-opus-5-5'
+            AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
             AND ctx->>'boxInvocationRecovery'='v1'`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId, input.turnKey]);
       const open = await client.query<{ request_id: string }>(

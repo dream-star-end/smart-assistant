@@ -30,7 +30,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
-import { getStaticProvider, type StaticProviderKeys } from "@openclaude/protocol";
+import { getStaticProvider, isBoxApiModel, type StaticProviderKeys } from "@openclaude/protocol";
 
 import { type Logger } from "../../logging/logger.js";
 import {
@@ -316,7 +316,7 @@ export function selectVerifiedBoxByteBudget(input: VerifiedBoxEnvelopeInput): Pr
   if (input.authorityKind !== "bridge_signed") return PROXY_BYTE_BUDGET_LEGACY;
   if (input.routeKind !== "box") return PROXY_BYTE_BUDGET_LEGACY;
   if (input.providerId !== "box_cli") return PROXY_BYTE_BUDGET_LEGACY;
-  if (input.canonicalModel !== "box-api-claude-opus-5-5") return PROXY_BYTE_BUDGET_LEGACY;
+  if (!isBoxApiModel(input.canonicalModel)) return PROXY_BYTE_BUDGET_LEGACY;
   if (input.declaredContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return PROXY_BYTE_BUDGET_LEGACY;
   if (input.verifiedSignedContextOwner !== BOX_NATIVE_CONTEXT_OWNER) return PROXY_BYTE_BUDGET_LEGACY;
   return PROXY_BYTE_BUDGET_BOX_NATIVE_V1;

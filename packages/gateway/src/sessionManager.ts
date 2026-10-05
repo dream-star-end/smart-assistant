@@ -1,3 +1,4 @@
+import { isBoxApiModel } from '@openclaude/protocol'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
@@ -690,10 +691,8 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 /** One admitted Box detached tool chain may live four hours. Give its owner
  * turn five minutes to observe the keeper's terminal proof before interrupt. */
 export const BOX_ACTIVE_TURN_IDLE_MS = 4 * 60 * 60_000 + 5 * 60_000
-const BOX_CANONICAL_MODEL = 'box-api-claude-opus-5-5'
-
 function isBoxActiveTurn(engineId?: string, modelId?: string): boolean {
-  return engineId === 'ccb' && modelId === BOX_CANONICAL_MODEL
+  return engineId === 'ccb' && isBoxApiModel(modelId)
 }
 
 export function pickTurnSilentBackstopMs(engineId?: string, modelId?: string): number {

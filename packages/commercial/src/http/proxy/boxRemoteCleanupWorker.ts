@@ -1,6 +1,7 @@
 /** Shared-leader, flag-independent Box privacy cleanup recovery. Only a
  * terminal-proof journal candidate may reach remote Exec; no CLI launch,
  * tool publication or paid retry exists in this worker. */
+import { BOX_API_RESOLVE_MODEL } from "./boxNativeContextOwner.js";
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate, BoxStaleResumePhase,
   BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
@@ -78,7 +79,7 @@ export class BoxRemoteCleanupWorker {
     const abort = new AbortController();
     const pending = this.deps.resolver.resolve({ uid: candidate.uid,
       sessionId: null, requestId: candidate.requestId,
-      upstreamModel: "claude-opus-5-5", requiredAccountId: candidate.accountId,
+      upstreamModel: BOX_API_RESOLVE_MODEL, requiredAccountId: candidate.accountId,
       allowWakeIfHibernated: false, signal: abort.signal });
     let abandoned = false;
     let completed: BoxResolvedTarget | null = null;

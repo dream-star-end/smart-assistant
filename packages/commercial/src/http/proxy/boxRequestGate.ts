@@ -2,6 +2,7 @@
  * Later tool/vision/effort support must be added with protocol evidence, not
  * silently stripped from an authenticated Claude Code request.
  */
+import { boxApiModelByEitherId } from "@openclaude/protocol";
 import type { ProxyBody } from "./shared.js";
 import { BoxMessagesShapeError, compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { compileBoxToolCatalog, mapBoxCliEffort } from "./boxToolCatalog.js";
@@ -9,11 +10,17 @@ import { isBoxNoopContextManagement } from "./boxCacheAnnotations.js";
 import { classifyBoxContinuation, preparedMatchesBody,
   type PreparedContinuation } from "./boxPreparedContinuation.js";
 
+/** A listed model that takes no effort (Haiku 4.5). The body names either id. */
+function boxModelWithoutEffort(body: ProxyBody): boolean {
+  return boxApiModelByEitherId(body.model)?.supportsEffort === false;
+}
+
 export function validateBoxTextRequest(body: ProxyBody,
   options: { resumeToolResults?: boolean } = {}): string | null {
   if (body.stream !== true) return "BOX_STREAM_REQUIRED";
   if (body.tools?.length || body.tool_choice !== undefined) return "BOX_TOOLS_REQUIRE_LIVE_BRIDGE";
   if (body.thinking !== undefined || body.output_config !== undefined) {
+    if (boxModelWithoutEffort(body)) return "BOX_EFFORT_UNMAPPED";
     // OCV5-305: an effort the Box CLI can run natively (see mapBoxCliEffort).
     try { mapBoxCliEffort(body.thinking, body.output_config); }
     catch { return "BOX_EFFORT_UNMAPPED"; }
@@ -64,6 +71,7 @@ export function validateBoxToolRequest(body: ProxyBody,
   try {
     compileBoxToolCatalog(body.tools);
     if (body.thinking !== undefined || body.output_config !== undefined) {
+      if (boxModelWithoutEffort(body)) return "BOX_EFFORT_UNMAPPED";
       mapBoxCliEffort(body.thinking, body.output_config);
     }
     if (prepared && !preparedMatchesBody(prepared, body)) return "BOX_PREPARED_STALE";

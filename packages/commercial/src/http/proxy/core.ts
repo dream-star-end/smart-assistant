@@ -60,7 +60,7 @@ import {
 } from "../../admin/metrics.js";
 import { recordProviderHealthSample } from "./providerHealthSink.js";
 import { recordUpstreamPerformance } from "../../ws/turnPerformance.js";
-import { findRouteProviderForModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, isBoxApiModel } from "@openclaude/protocol";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPreparedContinuation.js";
 import { BoxTextFetchError } from "./boxTextFetch.js";
@@ -586,7 +586,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
   } catch (err) {
     const continuationConflict = err instanceof BoxContinuationDecisionError
       || (err instanceof BoxDurableJournalError && isContinuationConflict(err.code));
-    const boxCapacityHeld = body.model === "box-api-claude-opus-5-5"
+    const boxCapacityHeld = isBoxApiModel(body.model)
       && ((err instanceof BoxDurableJournalError
         || err instanceof BoxTextFetchError) && err.code === "BOX_CAPACITY_HELD"
         || err instanceof BoxInvocationConflict

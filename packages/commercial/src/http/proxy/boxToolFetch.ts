@@ -2,6 +2,7 @@
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
+import { BOX_API_RESOLVE_MODEL } from "./boxNativeContextOwner.js";
 import type { BoxMcpAliasMode } from "./boxToolCatalog.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
   BoxPrelaunchRecoveryCandidate, BoxNativeGcCandidate } from "./boxDurableJournal.js";
@@ -217,7 +218,7 @@ export class BoxToolFetch {
     const pending = Promise.resolve().then(() => this.deps.resolveTarget({ uid: candidate.uid,
       sessionId: null, requestId: candidate.requestId,
       upstreamModel: "pointer" in candidate ? candidate.pointer.upstreamModel
-        : "claude-opus-5-5", requiredAccountId: candidate.accountId,
+        : BOX_API_RESOLVE_MODEL, requiredAccountId: candidate.accountId,
       signal: abort.signal }));
     let abandoned = false, completed: BoxResolvedTarget | null = null;
     void pending.then((target) => {

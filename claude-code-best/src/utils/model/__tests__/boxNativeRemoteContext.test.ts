@@ -124,3 +124,28 @@ describe('box native remote context', () => {
     }), /invalid shape/)
   })
 })
+
+describe('box native remote context: every listed model', () => {
+  afterEach(() => {
+    delete process.env[ENV]
+  })
+
+  for (const model of ['box-api-claude-sonnet-5-5', 'box-api-claude-haiku-4-5']) {
+    it(`${model} owns a live tool continuation under its own descriptor`, () => {
+      process.env[ENV] = JSON.stringify({ ...descriptor, canonicalModel: model })
+      assert.equal(boxNativeRemoteContextOwnsHistory({ model, querySource: 'sdk', messages: liveChain }), true)
+      assert.equal(boxNativeRemoteContextOwnsHistory({
+        model, querySource: 'sdk', messages: freshAfterCompletedTools }), false)
+      assert.equal(boxNativeRemoteContextOwnsHistory({ model, querySource: 'compact', messages: liveChain }), false)
+    })
+  }
+
+  it('a descriptor of another model, or a model outside the list, does not own history', () => {
+    process.env[ENV] = JSON.stringify(descriptor)
+    assert.equal(boxNativeRemoteContextOwnsHistory({
+      model: 'box-api-claude-sonnet-5-5', querySource: 'sdk', messages: liveChain }), false)
+    process.env[ENV] = JSON.stringify({ ...descriptor, canonicalModel: 'box-api-claude-sonnet-5' })
+    assert.equal(boxNativeRemoteContextOwnsHistory({
+      model: 'box-api-claude-sonnet-5', querySource: 'sdk', messages: liveChain }), false)
+  })
+})

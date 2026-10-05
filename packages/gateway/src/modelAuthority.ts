@@ -1,3 +1,4 @@
+import { isBoxApiModel } from '@openclaude/protocol'
 /**
  * modelAuthority(容器侧)—— master 签发的**模型执行权威**的验签消费端。
  *
@@ -519,7 +520,7 @@ export class ModelAuthorityConsumer {
       if (ccb.contextOwner !== undefined && ccb.contextOwner !== 'box-native-v1') {
         throw new AuthorityRejected('bad_shape', 'CCB contextOwner is not box-native-v1')
       }
-      if (ccb.contextOwner === 'box-native-v1' && payload.canonicalModel !== 'box-api-claude-opus-5-5') {
+      if (ccb.contextOwner === 'box-native-v1' && !isBoxApiModel(payload.canonicalModel)) {
         throw new AuthorityRejected(
           'bad_shape',
           'box-native-v1 contextOwner requires the signed Box model',

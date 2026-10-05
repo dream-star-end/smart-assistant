@@ -1,3 +1,4 @@
+import { isBoxApiModel, isBoxApiModelPair } from "@openclaude/protocol";
 import { createHash } from "node:crypto";
 import { parseBoxReplayMessagePointer, type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_EXPIRED_UNPROVEN_STATE, parseBoxExpiredClose } from "./boxExpiredClose.js";
@@ -142,7 +143,7 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 function stoppableMode(ctx: Record<string, unknown>): boolean {
   return ctx.boxInvocationMode === "detached_tool"
     || (ctx.boxInvocationMode === "text" && ctx.boxLaunchPermit === true
-      && ctx.boxUpstreamModel === "claude-opus-5-5"
+      && isBoxApiModelPair(ctx.model, ctx.boxUpstreamModel)
       && typeof ctx.boxDetachedRunnerHash === "string" && HEX64.test(ctx.boxDetachedRunnerHash));
 }
 
@@ -332,7 +333,7 @@ export function projectBoxIdleChain(input: {
 }): BoxIdleProof {
   const scoped = input.rows.filter((row) => row.ctx.boxSessionId === input.sessionId
     && row.ctx.boxTurnKey === input.turnKey
-    && row.ctx.model === "box-api-claude-opus-5-5"
+    && isBoxApiModel(row.ctx.model)
     && row.ctx.boxInvocationRecovery === "v1");
   if (scoped.length === 0) return { status: "not_found" };
   if (scoped.length > 128) return { status: "pending", reason: "cycle" };

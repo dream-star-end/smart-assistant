@@ -1,3 +1,4 @@
+import { BOX_API_MODELS, isBoxApiModel } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -514,7 +515,8 @@ const REQUIRE_AUTHORITY_ENV = 'OC_MODEL_AUTHORITY'
 export const MODEL_EXECUTION_DESCRIPTOR_ENV = 'OC_MODEL_EXECUTION_DESCRIPTOR'
 
 export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
-export const BOX_NATIVE_CONTEXT_MODEL = 'box-api-claude-opus-5-5'
+/** One listed Box model, kept for fixtures and proofs. Checks use isBoxApiModel. */
+export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id
 
 export interface CcbExecutionDescriptor {
   readonly canonicalModel: string
@@ -611,7 +613,7 @@ export function _buildUpdateEnvStdinLine(vars: Record<string, string>): string {
  *
  *   - bridge turn(有 descriptor)      → 默认只挂长命 lease。egress 在同 turn 有效
  *     lease 下仍接受已过期的短 authority(OCV5-242),所以已验签 Box 主 turn
- *     (expectedEngine=ccb、执行模型与 descriptor 都是 box-api-claude-opus-5-5、
+ *     (expectedEngine=ccb、执行模型与 descriptor 是 BOX_API_MODELS 里的同一个模型、
  *     contextOwner=box-native-v1)保留原始 authority+lease 双头。其它模型、缺 cap、
  *     cursor、local 仍只投影原有那一张,不重签。
  *   - 本地路径 turn(cron/synthetic/delegate)且 flag 开 → 现取 `x-oc-local-catalog` token
@@ -625,8 +627,8 @@ function boxNativeDualHeaderTurn(
   expectedEngine: 'ccb' | 'cursor',
 ): boolean {
   return expectedEngine === 'ccb'
-    && model === BOX_NATIVE_CONTEXT_MODEL
-    && authority.executionDescriptor.canonicalModel === BOX_NATIVE_CONTEXT_MODEL
+    && isBoxApiModel(model)
+    && authority.executionDescriptor.canonicalModel === model
     && authority.executionDescriptor.contextOwner === BOX_NATIVE_CONTEXT_OWNER
 }
 
@@ -1122,7 +1124,7 @@ export function projectCcbExecutionDescriptor(input: {
   if (ccb.contextOwner !== undefined && ccb.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
-  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && input.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL) {
+  if (ccb.contextOwner === BOX_NATIVE_CONTEXT_OWNER && !isBoxApiModel(input.canonicalModel)) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }
   return {
@@ -1149,8 +1151,8 @@ export function applyBoxNativeHarness(input: {
 }): 'ccb' | 'official-cc' | undefined {
   if (input.descriptor?.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) return input.harness
   if (
-    input.model !== BOX_NATIVE_CONTEXT_MODEL ||
-    input.descriptor.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL
+    !isBoxApiModel(input.model) ||
+    input.descriptor.canonicalModel !== input.model
   ) {
     throw new BoxNativeHarnessError('BOX_NATIVE_CONTEXT_MISMATCH')
   }

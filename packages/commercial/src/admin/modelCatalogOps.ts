@@ -29,6 +29,7 @@
  * 或在影子路径上打到 OAuth 池的行。
  */
 
+import { BOX_API_MODELS, isBoxApiModelPair } from "@openclaude/protocol";
 import type { PoolClient } from "pg";
 import {
   STATIC_KEY_PROVIDERS,
@@ -244,10 +245,8 @@ export function validateVersionSemantics(
       `provider_id='${providerId ?? "null"}' ∉ engine='${engine}' 的服务端机制集 [${allowed.join(",")}]`,
     );
   }
-  if (providerId === "box_cli"
-    && (modelId !== "box-api-claude-opus-5-5"
-      || v.upstream_model_id !== "claude-opus-5-5")) {
-    out.push("box_cli 目前仅接线 box-api-claude-opus-5-5 → claude-opus-5-5");
+  if (providerId === "box_cli" && !isBoxApiModelPair(modelId, v.upstream_model_id)) {
+    out.push(`box_cli 仅接线 ${BOX_API_MODELS.map((m) => `${m.id} → ${m.upstreamModel}`).join("、")}`);
   }
 
   // ② capability ⊆ provider 机制上限(codex engine 不走 anthropic proxy 机制,跳过)
