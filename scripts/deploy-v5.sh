@@ -11380,8 +11380,13 @@ run_mutation_lane_supervised() { # <function> [args...]
     while same_supervised_process "$outer_pid" "$outer_start" \
         && same_supervised_process "$MUTATION_LEASE_PID" "$MUTATION_LEASE_START" \
         && same_supervised_process "$MUTATION_LEASE_TTL_PID" "$MUTATION_LEASE_TTL_START" \
-        && { [[ -e "$anchor_release" ]] \
-          || same_supervised_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START"; }; do
+        && { same_supervised_process "$MUTATION_LANE_ANCHOR_PID" "$MUTATION_LANE_ANCHOR_START" \
+          || [[ -e "$anchor_release" ]]; }; do
+      # Sentinel first, release file second. The sentinel exits only after the
+      # leader has written the release file, so a sentinel seen gone here with
+      # the file present is the controlled end. The other order could read "no
+      # file", then miss a sentinel that was released and exited in between,
+      # and KILL the leader after its marker clear (deploy rc=86 with rc=137).
       sleep 0.02
     done
     if same_process_identity "$MUTATION_LANE_PID" "$MUTATION_LANE_START" \

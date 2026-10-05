@@ -318,6 +318,30 @@ describe('v5 production-mutation lease: TTL + fencing + reclaim (local flock mod
     }
   })
 
+  test('repeated normal lanes never lose the leader or the lease to the watchdog at sentinel release', async () => {
+    // The watchdog used to read "no release file" and then find the sentinel
+    // gone when the leader released it in between. It then KILLed the leader
+    // after its marker clear (rc=86 from rc=137) or ended the lease under a
+    // finished lane. About one normal lane in 75 hit it on the dev host.
+    const fx = await fixture(600)
+    const out = orchestrate(
+      [
+        'lane_ok() { return 0; }',
+        'acquire_production_mutation_lease 5 >/dev/null',
+        'bad=0',
+        'for i in $(seq 1 40); do',
+        '  run_mutation_lane_supervised lane_ok >/dev/null; rc=$?',
+        `  if [ "$rc" != 0 ] || [ -e "${fx.laneMarker}" ] || ! mutation_lease_live; then bad=$((bad+1)); echo "LANE_$i rc=$rc"; break; fi`,
+        'done',
+        'echo "LANES=$i BAD=$bad"',
+        'release_production_mutation_lease',
+      ].join('\n'),
+      fx.env,
+      120_000,
+    )
+    assert.match(out.stdout, /LANES=40 BAD=0/, `${out.stdout}\n${out.stderr}`)
+  })
+
   test('in-flight arm durability failure rejects the payload before any mutation starts', async () => {
     const fx = await fixture(30)
     const attempted = path.join(fx.dir, 'payload-attempted')
