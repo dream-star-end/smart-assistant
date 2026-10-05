@@ -26,7 +26,7 @@ export class BoxAccountResolverError extends Error {
   }
 }
 
-type FetchFn = (url: string, init: RequestInit, dispatcher: Dispatcher) => Promise<Response>;
+type FetchFn = (url: string, init: RequestInit, dispatcher: Dispatcher | undefined) => Promise<Response>;
 type AccountGetter = (id: bigint) => Promise<AccountRow | null>;
 type TokenGetter = (id: bigint) => Promise<AccountToken | null>;
 type SnapshotGetter = (id: bigint) => Promise<CursorTokenSnapshot | null>;
@@ -37,7 +37,9 @@ export interface BoxAccountResolverDeps {
   token: TokenGetter;
   snapshot: SnapshotGetter;
   egress: (id: bigint, token: AccountToken) => Promise<EgressResolution>;
-  uidProxy: (uid: bigint) => string;
+  /** The proxy an account without an egress binding leaves through for this user. Null: this deployment has
+   * no per-user proxy and such an account uses the host's own egress (boxUnboundProxy). */
+  uidProxy: (uid: bigint) => string | null;
   makeProxyAgent: (uri: string) => Pick<ProxyAgent, "destroy"> & Dispatcher;
   fetch: FetchFn;
   now?: () => number;
@@ -193,13 +195,16 @@ export class BoxAccountResolver {
         route = await this.deps.egress(accountId, initial);
       } finally { initial.token.fill(0); initial.refresh?.fill(0); }
       if (route.kind === "unavailable") throw new BoxAccountResolverError("BOX_EGRESS_UNAVAILABLE");
-      let dispatcher: Dispatcher;
+      let dispatcher: Dispatcher | undefined;
       if (route.kind === "ready") dispatcher = route.dispatcher;
       else {
         const proxy = this.deps.uidProxy(args.uid);
-        proxyHash = digest([proxy]);
-        dispatcher = this.deps.makeProxyAgent(proxy);
-        owner = new OwnedProxy(dispatcher);
+        if (proxy !== null) {
+          proxyHash = digest([proxy]);
+          const agent = this.deps.makeProxyAgent(proxy);
+          dispatcher = agent;
+          owner = new OwnedProxy(agent);
+        }
       }
       const originalDispatcher = dispatcher;
       const assertCurrent = async (): Promise<void> => {
@@ -229,8 +234,11 @@ export class BoxAccountResolver {
             throw new BoxAccountResolverError("BOX_EGRESS_CHANGED");
           }
         } finally { latest.token.fill(0); latest.refresh?.fill(0); }
-        if (proxyHash !== null && !same(proxyHash, digest([this.deps.uidProxy(args.uid)]))) {
-          throw new BoxAccountResolverError("BOX_EGRESS_CHANGED");
+        if (route.kind === "unbound") {
+          const proxy = this.deps.uidProxy(args.uid);
+          if (proxy === null ? proxyHash !== null : proxyHash === null || !same(proxyHash, digest([proxy]))) {
+            throw new BoxAccountResolverError("BOX_EGRESS_CHANGED");
+          }
         }
         if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
       };
@@ -269,6 +277,17 @@ function targetCauseTag(error: unknown): string {
   return "non_error";
 }
 
+/** Where an account without an egress binding leaves from. Selfhost keeps one root-owned proxy file per user
+ * and fails closed without it: the Box identity must not share the master's egress there. Commercial hosts have
+ * no such files; OC_BOX_UNBOUND_EGRESS=host says so, and an unbound account then uses the host's own egress, as
+ * the Sand lifecycle and the box-resident CLI lane already do on that host. Any other value keeps the file. */
+export function boxUnboundProxy(env: NodeJS.ProcessEnv = process.env): (uid: bigint) => string | null {
+  const setting = env.OC_BOX_UNBOUND_EGRESS;
+  if (setting === "host") return () => null;
+  if (setting !== undefined && setting !== "") log.error("BOX_UNBOUND_EGRESS_INVALID");
+  return readBoxUidProxy;
+}
+
 export function createProductionBoxAccountResolver(): BoxAccountResolver {
   return new BoxAccountResolver({
     list: () => listAccounts({ provider: "cursor", status: "active", limit: 500 }),
@@ -278,7 +297,7 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
     egress: (id, token) => resolveAccountEgressDispatcher(id, {
       egressProxy: token.egress_proxy, egressTarget: token.egress_target,
       egressProxyId: token.egress_proxy_id, egressHostUuid: token.egress_host_uuid }),
-    uidProxy: readBoxUidProxy,
+    uidProxy: boxUnboundProxy(),
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,
       { ...init, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>,
