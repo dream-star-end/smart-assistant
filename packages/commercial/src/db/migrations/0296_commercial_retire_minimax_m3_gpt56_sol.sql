@@ -25,11 +25,15 @@
 -- is reported with skipped_reason and left as it is; do not disable that model then.
 --
 -- Not handled here: an installed marketplace agent pinned to a version whose manifest names one of
--- the two models. Versions are immutable and signed; the operator checks before disabling that no
--- live install pins such a version.
+-- the two models. A version is pinned by artifact hash and is not rewritten. Installing does not
+-- look at the model catalog, so the operator checks twice: before disabling (no active listing's
+-- current approved version and no live install names either model) and again after disabling; if
+-- an install appeared in between, the disable of that model is undone through the catalog admin
+-- path until the install is dealt with.
 --
--- Every rewritten value is recorded in model_0296_transition_snapshots (first write wins; a later
--- rewrite of the same subject only refreshes the marker the rollback compares against). For a moved
+-- Every rewritten value is recorded in model_0296_transition_snapshots. original_model_id is the
+-- first value seen for that subject (what it was before 0296); a later rewrite of the same subject
+-- refreshes the replacement and the marker the rollback compares against. For a moved
 -- requirement, replacement_model_id is NULL when the successor row already existed, so the rollback
 -- does not remove a row this migration did not add.
 --
@@ -109,8 +113,8 @@ BEGIN
     SELECT 'user_preferences', p.user_id::text, v_pair.old_id, v_pair.new_id, v_now
       FROM user_preferences p WHERE p.prefs->>'default_model' = v_pair.old_id
     ON CONFLICT ON CONSTRAINT model_0296_transition_snapshots_pkey DO UPDATE
-      SET normalized_at = EXCLUDED.normalized_at
-      WHERE s.original_model_id = EXCLUDED.original_model_id;
+      SET normalized_at = EXCLUDED.normalized_at,
+          replacement_model_id = EXCLUDED.replacement_model_id;
     UPDATE user_preferences p
        SET prefs = jsonb_set(p.prefs, '{default_model}', to_jsonb(v_pair.new_id::text), true),
            updated_at = v_now
@@ -123,8 +127,8 @@ BEGIN
     SELECT 'client_sessions', c.id, v_pair.old_id, v_pair.new_id, GREATEST(v_now_ms, COALESCE(c.updated_at, 0) + 1)
       FROM client_sessions c WHERE c.deleted_at IS NULL AND c.model_id = v_pair.old_id
     ON CONFLICT ON CONSTRAINT model_0296_transition_snapshots_pkey DO UPDATE
-      SET normalized_at_ms = EXCLUDED.normalized_at_ms
-      WHERE s.original_model_id = EXCLUDED.original_model_id;
+      SET normalized_at_ms = EXCLUDED.normalized_at_ms,
+          replacement_model_id = EXCLUDED.replacement_model_id;
     UPDATE client_sessions c
        SET model_id = v_pair.new_id,
            updated_at = GREATEST(v_now_ms, COALESCE(c.updated_at, 0) + 1)

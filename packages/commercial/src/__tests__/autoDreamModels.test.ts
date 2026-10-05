@@ -11,6 +11,8 @@ describe('isAutoDreamOptimizerModel', () => {
   test('unifies the optimizer and legacy memory organizer on DeepSeek V4 Flash', () => {
     assert.equal(DEFAULT_AUTO_DREAM_MODEL, 'deepseek-v4-flash')
     assert.equal(LEGACY_AUTO_DREAM_MODEL, 'deepseek-v4-flash')
+    // the property INC-20260810-AUTODREAM-STALE-REPORT relies on: one model for both paths
+    assert.equal(DEFAULT_AUTO_DREAM_MODEL, LEGACY_AUTO_DREAM_MODEL)
   })
 
   test('accepts only the rollback-compatible Terra/Codex and static-provider/CCB pairs', () => {

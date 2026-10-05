@@ -179,6 +179,27 @@ describe("0296 moves the platform's own needs off MiniMax-M3 and gpt-5.6-sol", (
     assert.equal(after["deleted-sol"], "gpt-5.6-sol@1000");
   });
 
+  test("the rollback restores the pre-0296 value of a subject that was rewritten twice", { timeout: 180000 }, async (t) => {
+    if (db.skipIfUnavailable(t)) return;
+    await resetAndMigrateBefore("0296");
+    const staged = (await query<{ entry_id: string; lock_version: number }>(
+      "SELECT entry_id::text, lock_version FROM model_catalog WHERE model_id='gpt-6.1-sol' AND state='staged'")).rows[0]!;
+    await query("SELECT fn_model_activate_entry($1::bigint,$2,NULL::bigint)", [staged.entry_id, staged.lock_version]);
+    await seedUsers();
+    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    // in the window the same user and the same session move to the other retired model
+    await query(`UPDATE user_preferences p SET prefs = jsonb_set(p.prefs,'{default_model}','"MiniMax-M3"'), updated_at = now()
+                  FROM users u WHERE u.id=p.user_id AND u.email='sol@example.test'`);
+    await query("UPDATE client_sessions SET model_id='MiniMax-M3', updated_at=updated_at+1 WHERE id='live-sol'");
+    await normalize();
+    assert.equal((await prefs())["sol@example.test"], "deepseek-v4-flash/dark");
+    const sql = await readFile(sqlPath, "utf8");
+    const block = /-- BEGIN MANUAL ROLLBACK 0296[^\n]*\n([\s\S]*?)-- END MANUAL ROLLBACK 0296/.exec(sql)![1]!;
+    await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
+    assert.equal((await prefs())["sol@example.test"], "gpt-5.6-sol/dark");
+    assert.match((await sessions())["live-sol"]!, /^gpt-5\.6-sol@/);
+  });
+
   test("the rollback keeps a successor requirement that was there before 0296", { timeout: 180000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0296");
