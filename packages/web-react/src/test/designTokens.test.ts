@@ -52,6 +52,12 @@ function tokensOf(selector: string): Record<string, string> {
     if (m[1].startsWith("color-")) continue;
     out[m[1]] = m[2];
   }
+  // 同一块里用 var() 指向本块另一个颜色 token 的别名(如 .dark 的 --shine-base: var(--faint))
+  // 也是「定义了」,取被指向 token 的值;指向本块没有的 token 仍算缺失。
+  for (const m of body.matchAll(/--([\w-]+):\s*var\(--([\w-]+)\);/g)) {
+    if (m[1].startsWith("color-") || out[m[1]] !== undefined) continue;
+    if (out[m[2]] !== undefined) out[m[1]] = out[m[2]];
+  }
   return out;
 }
 
