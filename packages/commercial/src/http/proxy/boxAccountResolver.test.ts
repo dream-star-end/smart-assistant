@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { Dispatcher, ProxyAgent } from "undici";
 import type { AccountRow, AccountToken, CursorTokenSnapshot } from "../../account-pool/store.js";
-import { BoxAccountResolver, BoxAccountResolverError, type BoxAccountResolverDeps } from "./boxAccountResolver.js";
+import { BoxAccountResolver, BoxAccountResolverError, boxUnboundProxy, readBoxUidProxy,
+  type BoxAccountResolverDeps } from "./boxAccountResolver.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 
 const now = Date.now();
@@ -19,13 +20,15 @@ function frame(value: unknown, flag = 0): Buffer {
 
 function fixture() {
   let credential = session("box-account-20");
-  let proxy = "http://127.0.0.1:18888";
+  let proxy: string | null = "http://127.0.0.1:18888";
   let row = { id: 20n, provider: "cursor", status: "active", cursor_sand_enabled: true,
     cursor_credential_kind: "session", cursor_sand_access_state: "SAND_ACCESS_STATE_GRANTED",
     oauth_expires_at: new Date(now + 3_600_000), cooldown_until: null,
     cursor_sand_usage_pct: 0, cursor_sand_next_reset_at: null,
     cursor_billing_cycle_end: null } as AccountRow;
   const calls: string[] = [];
+  const dispatchers: unknown[] = [];
+  let made = 0;
   let closed = 0;
   let boxState = "SAND_BOX_RUN_STATE_RUNNING";
   let wakeOnEnsure = true;
@@ -44,9 +47,10 @@ function fixture() {
     egress: async () => route === "unbound" ? { kind: "unbound" }
       : { kind: "unavailable", reason: "synthetic disabled egress" },
     uidProxy: () => proxy,
-    makeProxyAgent: () => ({ destroy: async () => { closed++; } } as unknown as ProxyAgent & Dispatcher),
-    fetch: async (url) => {
+    makeProxyAgent: () => { made++; return { destroy: async () => { closed++; } } as unknown as ProxyAgent & Dispatcher; },
+    fetch: async (url, _init, dispatcher) => {
       calls.push(url);
+      dispatchers.push(dispatcher);
       if (url.endsWith("/GetSandBoxRunState")) {
         return Response.json({ state: boxState });
       }
@@ -66,11 +70,11 @@ function fixture() {
   const resolver = new BoxAccountResolver(deps);
   const args = { uid: 3n, sessionId: "synthetic-session", requestId: "synthetic-request",
     upstreamModel: "claude-opus-5-5", signal: new AbortController().signal };
-  return { resolver, deps, args, calls, getClosed: () => closed,
+  return { resolver, deps, args, calls, dispatchers, getMade: () => made, getClosed: () => closed,
     setCredential: (value: string) => { credential = value; },
     setRow: (value: AccountRow) => { row = value; },
     setStatus: (value: AccountRow["status"]) => { row = { ...row, status: value }; },
-    setProxy: (value: string) => { proxy = value; },
+    setProxy: (value: string | null) => { proxy = value; },
     setBoxState: (value: string) => { boxState = value; },
     setWakeOnEnsure: (value: boolean) => { wakeOnEnsure = value; },
     setRoute: (value: "unbound" | "unavailable") => { route = value; } };
@@ -242,4 +246,43 @@ test("failed pre-handoff private-proxy close remains owned for explicit retry", 
   assert.equal(closes, 1);
   assert.equal(await resolver.retryFailedAgentCleanup(), 0);
   assert.equal(closes, 2);
+});
+
+// OCV5-316: commercial hosts have no /etc/openclaude/cursor-v5-u<uid>/.https-proxy. With the selfhost rule every
+// Box request of an unbound account would fail there as BOX_TARGET_UNAVAILABLE before reaching Cursor.
+test("a deployment without per-user proxies sends an unbound account through the host egress", async () => {
+  const f = fixture(); f.setProxy(null);
+  const target = await f.resolver.resolve(f.args);
+  const result = await target.exec.run({ command: "/usr/bin/python3",
+    args: ["--version"], cwd: "/tmp", environment: {} }, { timeoutMs: 2000 });
+  assert.equal(result.stdout, "synthetic-exec-ok");
+  assert.deepEqual(f.calls.map((url) => url.split("/").at(-1)), ["GetSandBoxRunState", "EnsureSandBox", "Exec"]);
+  assert.deepEqual(f.dispatchers, [undefined, undefined, undefined], "no proxy dispatcher: the host default applies");
+  assert.equal(f.getMade(), 0);
+  assert.equal(target.dispose, undefined, "nothing is owned, so nothing is left to close");
+});
+
+test("a target resolved for one egress is refused once the unbound egress of the deployment differs", async () => {
+  const host = fixture(); host.setProxy(null);
+  const viaHost = await host.resolver.resolve(host.args);
+  host.setProxy("http://127.0.0.1:18888");
+  await assert.rejects(viaHost.exec.run({ command: "/usr/bin/python3", args: ["--version"], cwd: "/tmp",
+    environment: {} }, { timeoutMs: 2000 }), (error: unknown) => error instanceof BoxExecTransportError
+      && error.code === "BOX_EXEC_ACCOUNT_GUARD_FAILED");
+  const proxied = fixture();
+  const viaProxy = await proxied.resolver.resolve(proxied.args);
+  proxied.setProxy(null);
+  await assert.rejects(viaProxy.exec.run({ command: "/usr/bin/python3", args: ["--version"], cwd: "/tmp",
+    environment: {} }, { timeoutMs: 2000 }), (error: unknown) => error instanceof BoxExecTransportError
+      && error.code === "BOX_EXEC_ACCOUNT_GUARD_FAILED");
+  assert.equal(proxied.calls.filter((url) => url.endsWith("/Exec")).length, 0, "no exec left through the other egress");
+  await viaProxy.dispose?.();
+});
+
+test("only OC_BOX_UNBOUND_EGRESS=host gives up the per-user proxy file", () => {
+  assert.equal(boxUnboundProxy({ OC_BOX_UNBOUND_EGRESS: "host" })(3n), null);
+  for (const env of [{}, { OC_BOX_UNBOUND_EGRESS: "" }, { OC_BOX_UNBOUND_EGRESS: "1" },
+    { OC_BOX_UNBOUND_EGRESS: "HOST" }, { OC_BOX_UNBOUND_EGRESS: "direct" }]) {
+    assert.equal(boxUnboundProxy(env), readBoxUidProxy, JSON.stringify(env));
+  }
 });

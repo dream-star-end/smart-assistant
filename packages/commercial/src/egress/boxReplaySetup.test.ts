@@ -60,3 +60,46 @@ test("existing symlink or public capsule directory fails closed", async () => {
     await rm(decoy, { recursive: true, force: true });
   }
 });
+
+// OCV5-316: the commercial egress has no OC_PLATFORM_ROOT. With Box on it threw
+// BOX_REPLAY_STATE_ROOT_MISSING at startup, which on that host stops every model.
+test("OC_BOX_REPLAY_DIR names the capsule directory where there is no platform root", async () => {
+  const state = await mkdtemp(path.join(tmpdir(), "ocv5-box-state-"));
+  try {
+    const directory = path.join(state, "capsules");
+    const env = { OC_BOX_REPLAY_DIR: directory };
+    assert.equal(createBoxReplayWriter(false, undefined, env), undefined);
+    assert.equal(createBoxReplayRecoveryWriter(undefined, env), undefined, "recovery never creates the directory");
+    assert.deepEqual(await readdir(state), []);
+    const writer = createBoxReplayWriter(true, undefined, env);
+    assert.ok(writer);
+    assert.equal((await stat(directory)).mode & 0o777, 0o700);
+    assert.ok(createBoxReplayRecoveryWriter(undefined, env));
+    const message = { type: "message", role: "assistant", id: "msg_explicit",
+      model: "claude-opus-5-5", content: [{ type: "text", text: "synthetic" }],
+      stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } };
+    const pointer = await writer!({ uid: "3", requestId: "explicit-test",
+      runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32), roundNo: 1 }, message);
+    assert.deepEqual(await createBoxReplayReader(undefined, env)!(pointer), message);
+    // when it is set it alone decides: a platform root beside it is not used
+    const platform = path.join(state, "platform");
+    assert.ok(createBoxReplayWriter(true, platform, env));
+    assert.deepEqual((await readdir(state)).sort(), ["capsules"]);
+  } finally { await rm(state, { recursive: true, force: true }); }
+});
+
+test("an OC_BOX_REPLAY_DIR that is not a clean absolute path is no directory", async () => {
+  const state = await mkdtemp(path.join(tmpdir(), "ocv5-box-state-"));
+  try {
+    for (const value of ["relative/capsules", "/", `${state}/a/../capsules`, `${state}/capsules/`]) {
+      const env = { OC_BOX_REPLAY_DIR: value };
+      assert.throws(() => createBoxReplayWriter(true, path.join(state, "platform"), env),
+        /BOX_REPLAY_STATE_ROOT_MISSING/, value);
+      assert.equal(createBoxReplayReader(path.join(state, "platform"), env), undefined, value);
+    }
+    assert.deepEqual(await readdir(state), [], "the platform root is not a fallback for a bad value");
+    // unset or empty keeps the platform root rule
+    assert.ok(createBoxReplayWriter(true, path.join(state, "platform"), { OC_BOX_REPLAY_DIR: "" }));
+    assert.deepEqual(await readdir(state), ["box-replay-messages"]);
+  } finally { await rm(state, { recursive: true, force: true }); }
+});
