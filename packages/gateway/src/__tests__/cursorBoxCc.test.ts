@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 import { createHash, randomBytes } from 'node:crypto'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { chmodSync, existsSync, readdirSync, readlinkSync, writeFileSync } from 'node:fs'
 import {
   BOX_CC_STOP_SCRIPT,
@@ -14,7 +14,7 @@ import {
   boxCcLaunchExec,
   boxCcSpawnFifo,
   boxCcStopExec,
-  boxCcWriteExec,
+  boxCcWriteExecs,
   cursorBoxCcEnabled,
   cursorBoxCcSelectionEligible,
   encodeExecRequest,
@@ -23,8 +23,10 @@ import {
   stripBoxCcParentAuth,
   writeBoxCcControlFile,
   type BoxCcControl,
+  type BoxCcExecRequest,
 } from '../engine/cursorBoxCc.js'
 import { runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
+import { BOX_CC_WRITE_PART_BYTES, BOX_CC_WRITE_PARTS_PER_EXEC } from '../engine/cursorBoxCcExec.js'
 import { cursorVariantFor } from '../engine/cursorRoutingAdapter.js'
 import {
   cursorSandBoxCcResumeInnerId,
@@ -35,6 +37,15 @@ import type { CursorCredentialSelection } from '../engine/cursorCredentialSelect
 import type { CursorSandBoxPolicy } from '../engine/cursorSandBox.js'
 
 const machine = 'abcdefghijklmnopqrstuvwxyz'
+
+/** The bytes one write exec carries, as the box script decodes them. */
+function writeExecBytes(environment: Record<string, string>): Buffer {
+  const parts: Buffer[] = []
+  for (let i = 0; i < Number(environment.OC_BOX_CC_PARTS); i++) {
+    parts.push(Buffer.from(environment[`OC_BOX_CC_PART_${i}`] ?? '', 'base64'))
+  }
+  return Buffer.concat(parts)
+}
 const selection: CursorCredentialSelection = {
   slot: 20,
   keyName: 'api-key.20',
@@ -161,9 +172,15 @@ test('exec frames survive a split chunk and the user line stays out of argv', ()
     cwd: '/workspace',
   }
   const line = '{"type":"user","message":{"role":"user","content":"hello"}}\n'
-  const write = boxCcWriteExec(control, line.trimEnd())
+  const writes = boxCcWriteExecs(control, line.trimEnd(), 1)
+  assert.equal(writes.length, 1)
+  const write = writes[0]!
   assert.equal(write.args.join(' ').includes('hello'), false)
-  assert.equal(write.environment.OC_BOX_CC_LINE, line)
+  assert.equal(writeExecBytes(write.environment).toString('utf8'), line)
+  assert.equal(write.environment.OC_BOX_CC_SEQ, '1')
+  assert.equal(write.environment.OC_BOX_CC_OFFSET, '0')
+  assert.throws(() => boxCcWriteExecs(control, line, 0), /BOX_CC_LINE_SEQ_INVALID/)
+  assert.equal(write.environment.OC_BOX_CC_LAST, '1')
   const launch = boxCcLaunchExec(control, remoteClaudeArgs(['--model', 'claude-opus-4-8']))
   assert.equal(launch.environment.ANTHROPIC_API_KEY, undefined)
   assert.equal(launch.args.includes('/home/box/.local/bin/claude'), true)
@@ -212,7 +229,7 @@ test('control file is private and the bridge copies one stdin line to stdout', a
       assert.equal(req.headers.authorization, 'Bearer local')
       assert.equal(req.headers['x-anyrun-network-token'], 'net-token')
       if (body.command === 'python3') {
-        lines.push(body.environment.OC_BOX_CC_LINE)
+        lines.push(writeExecBytes(body.environment).toString('utf8'))
         assert.equal(body.args.join(' ').includes('hello-from-web'), false)
         res.writeHead(200, { 'content-type': 'application/connect+json' })
         res.end(frame({ exitEvent: { exitCode: 0 } }))
@@ -221,7 +238,7 @@ test('control file is private and the bridge copies one stdin line to stdout', a
         if (longRes) {
           longRes.write(stdout)
           longRes.end(done)
-        } else queued.push(body.environment.OC_BOX_CC_LINE)
+        } else queued.push(writeExecBytes(body.environment).toString('utf8'))
       } else {
         assert.equal(body.args.includes('/home/box/.local/bin/claude'), true)
         assert.equal(body.environment.ANTHROPIC_BASE_URL, undefined)
@@ -468,7 +485,7 @@ test('box scripts: stop ends the launched Claude, and a new launch retires the o
 
     let echoed = ''
     secondLaunch.stdout?.on('data', (chunk: Buffer) => { echoed += chunk.toString('utf8') })
-    await exited(run(boxCcWriteExec(second, '{"type":"user"}')))
+    for (const write of boxCcWriteExecs(second, '{"type":"user"}', 1)) assert.equal(await exited(run(write)), 0)
     assert.equal(await until(() => echoed.includes('{"type":"user"}')), true)
 
     const secondGone = exited(secondLaunch)
@@ -501,3 +518,297 @@ function frame(body: unknown): Buffer {
   payload.copy(out, 5)
   return out
 }
+
+// INC-20261005-BOX-CC-LARGE-LINE: each stdin line used to travel in one
+// environment string. Linux refuses a string over 128 KiB, the write exec
+// never started, nobody looked at its exit code, and the turn sat silent
+// until the launch stream was cut about five minutes later.
+test('box scripts: a line larger than one environment string reaches the box Claude whole', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-box-cc-large-'))
+  const fakeClaude = join(dir, 'claude')
+  // Stands in for `claude -p --input-format=stream-json`: copies stdin to stdout.
+  writeFileSync(fakeClaude, '#!/bin/sh\nexec cat\n')
+  chmodSync(fakeClaude, 0o755)
+  const control: BoxCcControl = {
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: fakeClaude,
+    fifo: boxCcSpawnFifo(`/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, randomBytes(8).toString('hex')),
+    cwd: dir,
+  }
+  const children: ChildProcess[] = []
+  const run = (request: { command: string; args: string[]; environment: Record<string, string> }): ChildProcess => {
+    const child = spawn(request.command, request.args, {
+      cwd: dir,
+      env: { ...request.environment, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    children.push(child)
+    return child
+  }
+  const exited = (child: ChildProcess): Promise<number | null> =>
+    new Promise((resolve) => child.once('exit', (code) => resolve(code)))
+  // A switch from a long conversation: one user line of about 900 KB with
+  // multi-byte text, between two ordinary lines.
+  const large = `${JSON.stringify({ type: 'user', message: { role: 'user', content: '历史🙂 context '.repeat(45_000) } })}\n`
+  const largeBytes = Buffer.byteLength(large)
+  assert.ok(largeBytes > 800_000)
+  try {
+    // The shape that failed: the kernel does not start a process with it.
+    const before = spawnSync('python3', ['-c', 'pass'], { env: { PATH: process.env.PATH ?? '/usr/bin:/bin', OC_BOX_CC_LINE: large } })
+    assert.equal((before.error as NodeJS.ErrnoException | undefined)?.code, 'E2BIG')
+
+    const launch = run(boxCcLaunchExec(control, []))
+    const received: Buffer[] = []
+    launch.stdout?.on('data', (chunk: Buffer) => { received.push(chunk) })
+    let seq = 0
+    const send = async (line: string): Promise<BoxCcExecRequest[]> => {
+      const writes = boxCcWriteExecs(control, line, ++seq)
+      for (const write of writes) {
+        for (const [name, value] of Object.entries(write.environment)) {
+          assert.ok(Buffer.byteLength(`${name}=${value}`) < 128 * 1024, `${name} fits one environment string`)
+        }
+        assert.equal(await exited(run(write)), 0)
+      }
+      return writes
+    }
+    const small = await send('{"type":"user","n":1}')
+    assert.equal(small.length, 1)
+    // The response to a write is lost after the box ran it: the bridge sends
+    // the same request again, and Claude must not read the line twice.
+    assert.equal(await exited(run(small[0]!)), 0)
+
+    const parts = await send(large)
+    assert.equal(parts.length, Math.ceil(largeBytes / (BOX_CC_WRITE_PART_BYTES * BOX_CC_WRITE_PARTS_PER_EXEC)))
+    assert.ok(parts.length >= 3)
+    assert.equal(existsSync(`${control.fifo}.in`), false, 'the collected line is removed once Claude has it')
+    // The same for the last request of a collected line, and for all of them.
+    assert.equal(await exited(run(parts[parts.length - 1]!)), 0)
+    for (const write of parts) assert.equal(await exited(run(write)), 0)
+    assert.equal(existsSync(`${control.fifo}.in`), false)
+
+    // A new line whose first request is sent twice still arrives once, and a
+    // later part without the earlier ones is refused: Claude gets nothing.
+    const next = boxCcWriteExecs(control, large, ++seq)
+    assert.equal(await exited(run(next[2]!)), 3)
+    assert.equal(await exited(run(next[0]!)), 0)
+    for (const write of next) assert.equal(await exited(run(write)), 0)
+    await send('{"type":"user","n":2}')
+
+    const expected = `{"type":"user","n":1}\n${large}${large}{"type":"user","n":2}\n`
+    assert.equal(await until(() => Buffer.concat(received).length >= Buffer.byteLength(expected), 15_000), true)
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(Buffer.concat(received).toString('utf8') === expected, true, 'every line arrives once, whole and in order')
+
+    const gone = exited(launch)
+    assert.equal(await exited(run(boxCcStopExec(control))), 0)
+    await gone
+    assert.equal(existsSync(control.fifo), false)
+    assert.equal(existsSync(`${control.fifo}.in`), false)
+    assert.equal(existsSync(`${control.fifo}.seq`), false)
+    assert.equal(existsSync(`${control.fifo}.lock`), false)
+  } finally {
+    for (const child of children) child.kill('SIGKILL')
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp', '.lock']) rmSync(`${control.fifo}${suffix}`, { force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('box scripts: a repeated write waits for the first attempt and never writes the line a second time', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-box-cc-repeat-'))
+  const fakeClaude = join(dir, 'claude')
+  // A Claude that is busy and not reading stdin: the write blocks in the fifo.
+  writeFileSync(fakeClaude, '#!/bin/sh\nexec sleep 60\n')
+  chmodSync(fakeClaude, 0o755)
+  const control: BoxCcControl = {
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: fakeClaude,
+    fifo: boxCcSpawnFifo(`/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, randomBytes(8).toString('hex')),
+    cwd: dir,
+  }
+  const children: ChildProcess[] = []
+  const run = (request: BoxCcExecRequest): ChildProcess => {
+    const child = spawn(request.command, request.args, {
+      cwd: dir,
+      env: { ...request.environment, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      stdio: 'ignore',
+    })
+    children.push(child)
+    return child
+  }
+  const exited = (child: ChildProcess): Promise<number | null> =>
+    new Promise((resolve) => child.once('exit', (code) => resolve(code)))
+  try {
+    run(boxCcLaunchExec(control, []))
+    // Larger than the pipe buffer, one exec.
+    const [write] = boxCcWriteExecs(control, `{"type":"user","text":"${'x'.repeat(200_000)}"}`, 1)
+    const first = run(write!)
+    assert.equal(await until(() => {
+      try { return readFileSync(`${control.fifo}.seq`, 'utf8') === '1 pending' } catch { return false }
+    }), true, 'the first attempt is in the fifo write')
+    // The bridge timed out and sends the request again while the first
+    // attempt is still writing. The repeat must not write next to it.
+    const repeat = run(write!)
+    let repeatCode: number | null | undefined
+    void exited(repeat).then((code) => { repeatCode = code })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(repeatCode, undefined, 'the repeat waits for the attempt that holds the line')
+    assert.equal(first.exitCode, null)
+    // The first attempt dies mid-write: how much Claude got is unknown.
+    first.kill('SIGKILL')
+    assert.equal(await until(() => repeatCode !== undefined), true)
+    assert.equal(repeatCode, 4, 'the line is not written again; the bridge is told to stop')
+    assert.equal(readFileSync(`${control.fifo}.seq`, 'utf8'), '1 pending')
+    assert.equal(await exited(run(write!)), 4)
+  } finally {
+    for (const child of children) child.kill('SIGKILL')
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp', '.lock']) rmSync(`${control.fifo}${suffix}`, { force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('box scripts: a write goes only into a fifo that has a reader', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-box-cc-nofifo-'))
+  const control: BoxCcControl = {
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: '/bin/true',
+    fifo: boxCcSpawnFifo(`/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, randomBytes(8).toString('hex')),
+    cwd: dir,
+  }
+  const code = (request: BoxCcExecRequest): Promise<number | null> => new Promise((resolve) => {
+    spawn(request.command, request.args, {
+      cwd: dir,
+      env: { ...request.environment, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      stdio: 'ignore',
+    }).once('exit', (exit) => resolve(exit))
+  })
+  const [write] = boxCcWriteExecs(control, '{"type":"user"}', 1)
+  try {
+    // Claude exited and the launch script removed the fifo; something else is
+    // at that path. The line must not be left in a file nobody reads.
+    writeFileSync(control.fifo, '')
+    assert.equal(await code(write!), 5)
+    assert.equal(readFileSync(control.fifo, 'utf8'), '')
+    assert.equal(existsSync(`${control.fifo}.seq`), false, 'nothing is recorded as delivered')
+    rmSync(control.fifo)
+    // A fifo nobody reads: the write fails at once instead of blocking.
+    assert.equal(spawnSync('mkfifo', ['-m', '600', control.fifo]).status, 0)
+    assert.equal(await code(write!), 1)
+    assert.equal(existsSync(`${control.fifo}.seq`), false)
+  } finally {
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp', '.lock']) rmSync(`${control.fifo}${suffix}`, { force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+function largeLineBridge(writeExit: number, loseFirstResponse = false): {
+  run: Promise<number>
+  stdin: PassThrough
+  stderr: () => string
+  writes: Array<Record<string, string>>
+} {
+  const control: BoxCcControl = {
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: '/home/box/.local/bin/claude',
+    fifo: '/tmp/oc-box-cc-abcdef.fifo',
+    cwd: '/workspace',
+  }
+  const exit = (code: number): Buffer => {
+    const payload = Buffer.from(JSON.stringify({ exitEvent: { exitCode: code } }))
+    const out = Buffer.alloc(5 + payload.length)
+    out.writeUInt32BE(payload.length, 1)
+    payload.copy(out, 5)
+    return out
+  }
+  const writes: Array<Record<string, string>> = []
+  let endLaunch: (() => void) | undefined
+  const stdin = new PassThrough()
+  const stderr = new PassThrough()
+  let err = ''
+  stderr.on('data', (chunk) => { err += chunk.toString('utf8') })
+  const run = runBoxCcBridge({
+    control,
+    args: [],
+    stdin,
+    stdout: new PassThrough(),
+    stderr,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(Buffer.from(init.body as Uint8Array).subarray(5).toString('utf8')) as {
+        command: string
+        environment: Record<string, string>
+      }
+      if (body.command === 'python3') {
+        writes.push(body.environment)
+        if (loseFirstResponse && writes.length === 1) throw new Error('socket hang up')
+        if (writeExit === 0 && body.environment.OC_BOX_CC_LAST === '1'
+          && body.environment.OC_BOX_CC_SEQ === '2') endLaunch?.()
+        return new Response(Uint8Array.from(exit(writeExit)))
+      }
+      // The launch stream stays open until Claude exits or the bridge gives up.
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          endLaunch = () => { controller.enqueue(Uint8Array.from(exit(0))); controller.close() }
+          init.signal?.addEventListener('abort', () => controller.error(new Error('aborted')))
+        },
+      }))
+    },
+  })
+  return { run, stdin, stderr: () => err, writes }
+}
+
+test('the bridge sends a large line as ordered parts before it waits for the answer', async () => {
+  const bridge = largeLineBridge(0)
+  const line = `${JSON.stringify({ type: 'user', image: randomBytes(400_000).toString('base64') })}\n`
+  bridge.stdin.write(line)
+  bridge.stdin.write('{"type":"user","n":2}\n')
+  assert.equal(await bridge.run, 0)
+  const first = bridge.writes.filter((environment) => environment.OC_BOX_CC_SEQ === '1')
+  assert.ok(first.length > 1)
+  assert.equal(bridge.writes.length, first.length + 1, 'the second line is numbered 2 and follows the first')
+  assert.equal(bridge.writes[first.length]?.OC_BOX_CC_SEQ, '2')
+  let offset = 0
+  const sent: Buffer[] = []
+  first.forEach((environment, index) => {
+    assert.equal(environment.OC_BOX_CC_OFFSET, String(offset))
+    assert.equal(environment.OC_BOX_CC_LAST, index === first.length - 1 ? '1' : '0')
+    const bytes = writeExecBytes(environment)
+    offset += bytes.length
+    sent.push(bytes)
+  })
+  assert.equal(Buffer.concat(sent).toString('utf8'), line)
+})
+
+test('a write whose response was lost is sent again as the same numbered line', async () => {
+  const bridge = largeLineBridge(0, true)
+  bridge.stdin.write('{"type":"user","n":1}\n')
+  bridge.stdin.write('{"type":"user","n":2}\n')
+  assert.equal(await bridge.run, 0)
+  assert.equal(bridge.writes.length, 3)
+  assert.deepEqual(bridge.writes[1], bridge.writes[0], 'the repeat is the identical request')
+  assert.equal(bridge.writes[0]?.OC_BOX_CC_SEQ, '1')
+  assert.equal(bridge.writes[2]?.OC_BOX_CC_SEQ, '2')
+  assert.equal(bridge.stderr(), '')
+})
+
+test('a write the box did not complete stops the bridge at once', async () => {
+  const bridge = largeLineBridge(1)
+  const started = Date.now()
+  bridge.stdin.write('{"type":"user"}\n')
+  await assert.rejects(bridge.run)
+  assert.ok(Date.now() - started < 5_000)
+  assert.equal(bridge.writes.length, 1, 'an exec that ran and failed is not sent again')
+  assert.match(bridge.stderr(), /BOX_CC_WRITE_FAILED BOX_CC_WRITE_EXIT_1/)
+})

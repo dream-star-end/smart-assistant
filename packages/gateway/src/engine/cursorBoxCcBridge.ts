@@ -9,8 +9,9 @@ import {
   boxCcLaunchExec,
   boxCcSpawnFifo,
   boxCcStopExec,
-  boxCcWriteExec,
+  boxCcWriteExecs,
   encodeExecRequest,
+  execExitCode,
   parseExecFrames,
   remoteClaudeArgs,
   type BoxCcControl,
@@ -80,25 +81,41 @@ export async function runBoxCcBridge(opts: {
   const launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
   let exitCode = 1
   let sawExit = false
-  const deliverLine = async (line: string): Promise<void> => {
+  // The write runs as its own exec in the box. A request whose response the
+  // transport lost is sent once more: the box script never writes a numbered
+  // line twice. An exec that ran and did not exit 0 did not deliver the line,
+  // so the bridge stops instead of waiting for an answer.
+  const writeExec = async (body: BoxCcExecRequest): Promise<void> => {
     let last: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
       if (abort.signal.aborted) return
       const writer = new AbortController()
       const timer = setTimeout(() => writer.abort(), 20_000)
+      let code: number | null
       try {
-        const response = await postExec(control, boxCcWriteExec(control, line), fetchImpl, writer.signal)
-        await response.arrayBuffer()
-        return
+        const response = await postExec(control, body, fetchImpl, writer.signal)
+        code = execExitCode(Buffer.from(await response.arrayBuffer()))
       } catch (err) {
         last = err
+        continue
       } finally {
         clearTimeout(timer)
       }
+      if (code === 0) return
+      throw new Error(`BOX_CC_WRITE_EXIT_${code ?? 'MISSING'}`)
     }
-    const message = last instanceof Error ? last.message : 'BOX_CC_WRITE_FAILED'
-    opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
-    abort.abort()
+    throw last instanceof Error ? last : new Error('BOX_CC_WRITE_FAILED')
+  }
+  let lineSeq = 0
+  const deliverLine = async (line: string): Promise<void> => {
+    try {
+      for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body)
+    } catch (err) {
+      if (abort.signal.aborted) return
+      const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
+      opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
+      abort.abort()
+    }
   }
   // Closed stdin is the gateway retiring this process (shutdown, model switch,
   // idle recycle). Claude in the box cannot see that EOF, so end it there and
