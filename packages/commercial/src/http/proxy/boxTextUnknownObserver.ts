@@ -1,5 +1,6 @@
 /** Resume observation of one *already launched* detached no-tool text run.
  * HTTP retries and background reconciliation share this read-only path. */
+import { isBoxApiUpstreamModel } from "@openclaude/protocol";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { observeBoxDetachedText } from "./boxDetachedTextObserve.js";
 import { BoxDurableJournalError, type BoxDurableJournal,
@@ -26,7 +27,7 @@ export async function observeBoxTextUnknown(input: {
   if (id.invocationMode !== "text" || id.state !== "unknown"
     || !id.rootLaunchPermit || id.messagePointer) return "pending";
   if (id.roundNo !== 1 || !id.detachedRunnerHash
-    || id.upstreamModel !== "claude-opus-5-5") {
+    || !isBoxApiUpstreamModel(id.upstreamModel)) {
     throw new BoxTextUnknownObserverError("BOX_TEXT_OBSERVER_EVIDENCE_INVALID");
   }
   const budget = deps.budgetMs ?? 20_000;

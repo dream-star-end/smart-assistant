@@ -163,3 +163,36 @@ test("CCB system hook after tool_result is the same live continuation", () => {
         cache_control: { type: "ephemeral" } }] }] } as ProxyBody),
   "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
 });
+
+test("every listed Box model passes the gate; a model without effort takes none", () => {
+  const tools = [{ name: "local_echo", description: "synthetic local tool",
+    input_schema: { type: "object", properties: { value: { type: "string" } } } }];
+  const keepAll = { edits: [{ type: "clear_thinking_20251015", keep: "all" }] };
+  for (const model of ["box-api-claude-sonnet-5-5", "claude-sonnet-5-5"]) {
+    const body = { ...base, model } as ProxyBody;
+    assert.equal(validateBoxTextRequest(body), null, model);
+    assert.equal(validateBoxTextRequest({ ...body, context_management: keepAll }), null, model);
+    assert.equal(validateBoxTextRequest({ ...body, thinking: { type: "adaptive", display: "omitted" },
+      output_config: { effort: "low" } }), null, model);
+    assert.equal(validateBoxToolRequest({ ...body, tools, tool_choice: { type: "auto" },
+      thinking: { type: "adaptive" }, output_config: { effort: "max" } } as ProxyBody), null, model);
+  }
+  for (const model of ["box-api-claude-haiku-4-5", "claude-haiku-4-5-20251001"]) {
+    const body = { ...base, model } as ProxyBody;
+    assert.equal(validateBoxTextRequest(body), null, model);
+    assert.equal(validateBoxTextRequest({ ...body, context_management: keepAll }), null, model);
+    assert.equal(validateBoxToolRequest({ ...body, tools, tool_choice: { type: "auto" } } as ProxyBody),
+      null, model);
+    // Haiku 4.5 has no effort parameter: the request is refused, not run without it.
+    assert.equal(validateBoxTextRequest({ ...body, output_config: { effort: "high" } }),
+      "BOX_EFFORT_UNMAPPED", model);
+    assert.equal(validateBoxTextRequest({ ...body, thinking: { type: "adaptive" },
+      output_config: { effort: "low" } }), "BOX_EFFORT_UNMAPPED", model);
+    assert.equal(validateBoxToolRequest({ ...body, tools, tool_choice: { type: "auto" },
+      thinking: { type: "adaptive" }, output_config: { effort: "low" } } as ProxyBody),
+    "BOX_EFFORT_UNMAPPED", model);
+  }
+  // A model outside the table gets no keep-all exception.
+  assert.equal(validateBoxTextRequest({ ...base, model: "box-api-claude-sonnet-5",
+    context_management: keepAll } as ProxyBody), "BOX_PARAMETER_UNMAPPED");
+});

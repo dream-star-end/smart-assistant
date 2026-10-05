@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { BOX_NATIVE_CONTEXT_MODEL, BOX_NATIVE_CONTEXT_OWNER } from '@openclaude/protocol'
+import { BOX_NATIVE_CONTEXT_OWNER, isBoxApiModel } from '@openclaude/protocol'
 import type { IdleProofResponse } from './engine/boxIdleProofClient.js'
 
 export const IDLE_COMPACT_PROMPT =
@@ -98,7 +98,7 @@ export function assembleIdleArtifact(input: {
 }
 
 export function boxTurnMayIdle(input: { model?: string; contextOwner?: string }): boolean {
-  return input.model === BOX_NATIVE_CONTEXT_MODEL && input.contextOwner === BOX_NATIVE_CONTEXT_OWNER
+  return isBoxApiModel(input.model) && input.contextOwner === BOX_NATIVE_CONTEXT_OWNER
 }
 
 function opPath(dir: string, op: { sessionKey: string; revision: string }): string {

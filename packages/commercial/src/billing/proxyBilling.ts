@@ -32,6 +32,7 @@
  *     debitedCredits/balanceAfter 退化为 null(无法重算)
  */
 
+import { isBoxApiModel } from "@openclaude/protocol";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import type { Logger } from "../logging/logger.js";
@@ -624,7 +625,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         // not hand its reserved balance to another request while the paid CLI
         // still has no settled usage. An uncertain status retains until TTL.
         let retainBoxReservation = false;
-        if (ctx.model === "box-api-claude-opus-5-5" && out.state === "aborted") {
+        if (isBoxApiModel(ctx.model) && out.state === "aborted") {
           try { retainBoxReservation = await shouldRetainBoxPrecheck(
             deps.pgPool, ctx.requestId, ctx.userId); }
           catch { retainBoxReservation = true; }

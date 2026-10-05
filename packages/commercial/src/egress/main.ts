@@ -22,6 +22,7 @@
  * OC_EGRESS_SECRET,任一缺失拒启(比"静默半配跑起来"好排查)。
  */
 
+import { boxApiModelById } from "@openclaude/protocol";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -335,7 +336,7 @@ export async function startEgress(): Promise<void> {
     journal: boxJournal,
     writeMessage: boxReplayWriter,
     maxOutputTokensForModel: (model) =>
-      model === "box-api-claude-opus-5-5" ? 128_000 : null,
+      boxApiModelById(model)?.maxOutputTokens ?? null,
     resolveTarget: (args) => resolveBoxLaunch!({ ...args,
       allowWakeIfHibernated: true }),
     onUnknown: reportBoxUnknown,
@@ -356,7 +357,7 @@ export async function startEgress(): Promise<void> {
       journal: boxJournal,
       writeMessage: boxReplayWriter,
       maxOutputTokensForModel: (model) =>
-        model === "box-api-claude-opus-5-5" ? 128_000 : null,
+        boxApiModelById(model)?.maxOutputTokens ?? null,
       resolveTarget: (args) => resolveBoxLaunch!(args),
       onUnknown: reportBoxUnknown,
       // OCV5-299: a locally rejected first-round stream is stopped through the

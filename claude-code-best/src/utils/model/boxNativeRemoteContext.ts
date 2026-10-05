@@ -1,7 +1,15 @@
 import { getAuthorityModelCapabilities } from './staticKeyModels.js'
 
 export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1'
-export const BOX_NATIVE_CONTEXT_MODEL = 'box-api-claude-opus-5-5'
+/** Mirror of the ids in packages/protocol/src/boxApiModels.ts (this tree
+ * cannot import that package). boxApiModels.test.ts there compares the two. */
+export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
+  'box-api-claude-opus-5-5',
+  'box-api-claude-sonnet-5-5',
+  'box-api-claude-haiku-4-5',
+]
+/** One listed model, kept for tests. */
+export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!
 
 type ChainMessage = {
   type?: string
@@ -101,11 +109,12 @@ export function boxNativeRemoteContextOwnsHistory(input: {
     return false
   }
   if (source !== 'sdk' && !source.startsWith('repl_main_thread')) return false
-  if (!input.model || input.model.trim().toLowerCase() !== BOX_NATIVE_CONTEXT_MODEL) {
+  const model = input.model?.trim().toLowerCase()
+  if (!model || !BOX_NATIVE_CONTEXT_MODELS.includes(model)) {
     return false
   }
-  const authority = getAuthorityModelCapabilities(input.model)
-  if (!authority || authority.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL) return false
+  const authority = getAuthorityModelCapabilities(input.model!)
+  if (!authority || authority.canonicalModel !== model) return false
   if (authority.contextOwner !== BOX_NATIVE_CONTEXT_OWNER) return false
   return isLiveToolChainContinuation(input.messages)
 }

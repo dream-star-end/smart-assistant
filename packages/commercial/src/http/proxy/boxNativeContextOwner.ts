@@ -1,7 +1,13 @@
+import { BOX_API_MODELS, isBoxApiModel } from "@openclaude/protocol";
+
 /** Same token as protocol BOX_NATIVE_CONTEXT_OWNER. Kept local so this package does not require a new protocol export at test resolution time. */
 export const BOX_NATIVE_CONTEXT_OWNER = "box-native-v1" as const;
 export type BoxNativeContextOwner = typeof BOX_NATIVE_CONTEXT_OWNER;
-export const BOX_NATIVE_CONTEXT_MODEL = "box-api-claude-opus-5-5";
+/** One listed Box model, kept for fixtures. Checks use isBoxApiModel. */
+export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id;
+/** Cleanup, stop and probe paths resolve the account the row already pins.
+ * The model there only selects the account family (any Claude model). */
+export const BOX_API_RESOLVE_MODEL = BOX_API_MODELS[0].upstreamModel;
 
 /**
  * Source route-ready projection. True lets a verified gate issue the owner
@@ -37,8 +43,8 @@ export interface SignedCcbCapability {
 
 /**
  * Put the token on the signed descriptor only when the server route is ready,
- * the catalog provider is the Box route, the canonical model is the exact Box
- * model, and the catalog itself declared the same token. A client body or env
+ * the catalog provider is the Box route, the canonical model is one of the
+ * listed Box models, and the catalog itself declared the same token. A client body or env
  * value is not an input.
  */
 export function issueBoxNativeContextOwner(input: {
@@ -49,7 +55,7 @@ export function issueBoxNativeContextOwner(input: {
 }): BoxNativeContextOwner | undefined {
   if (input.routeReady !== true) return undefined;
   if (input.providerId !== "box_cli") return undefined;
-  if (input.canonicalModel !== BOX_NATIVE_CONTEXT_MODEL) return undefined;
+  if (!isBoxApiModel(input.canonicalModel)) return undefined;
   if (input.declared !== BOX_NATIVE_CONTEXT_OWNER) return undefined;
   return BOX_NATIVE_CONTEXT_OWNER;
 }
