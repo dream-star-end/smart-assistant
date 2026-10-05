@@ -428,6 +428,12 @@
       "reason": "A resolved CCB plan review showed its ExitPlanMode tool row (raw 'User has approved your plan' / rejected / timed-out echo) outside 处理过程, duplicating the 退出计划模式 card that already shows the plan and outcome. The tool row is now hidden only when a card with the same tool name and tool_use id exists. Display-only; covered by a MessageList component regression test, no engine or protocol change.",
       "approvedBy": "user 2026-10-05 一起改下（退出计划模式卡同样重复）",
       "expiresAt": "2026-11-04"
+    },
+    {
+      "commit": "98e7e988728643c380d7e1ba40c1fb39716fa014",
+      "reason": "During a turn the 已送达 label under the user's message kept appearing and disappearing: every live frame carrying the turn's clientMessageId re-ran admission confirmation, which rewrote the row from read back to sent until the next answer block. Admission now never downgrades read/replied. Display-only client status change; covered by a socket regression test, no gateway or protocol change.",
+      "approvedBy": "user 2026-10-05 v5个人版用户消息底下的已送达会反复出现和消失",
+      "expiresAt": "2026-11-04"
     }
   ]
 }
