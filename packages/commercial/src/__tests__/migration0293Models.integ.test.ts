@@ -14,11 +14,13 @@ const manifest = JSON.parse(await readFile(manifestPath,"utf8")) as {new_models:
 const specs = manifest.new_models;
 const ids = specs.map(x=>x.model_id as string);
 const keys = [...new Set(specs.map(x=>x.group_key as string))];
+// Rows of later commercial migrations in the same chain (0294) are not "old" rows of this one.
+const later = ["box-api-claude-opus-5-5"];
 
 async function oldSnapshot() {
   return (await query(
     "SELECT (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.entry_id) FROM model_catalog c WHERE NOT(c.model_id=ANY($1::text[]))) AS catalog,(SELECT jsonb_agg(to_jsonb(p) ORDER BY p.model_id) FROM model_pricing p WHERE NOT(p.model_id=ANY($1::text[]))) AS pricing,(SELECT jsonb_agg(to_jsonb(gm) ORDER BY gm.group_id,gm.model_id) FROM account_group_models gm WHERE NOT(gm.model_id=ANY($2::text[]))) AS bindings",
-    [ids,keys])).rows[0];
+    [[...ids,...later],keys])).rows[0];
 }
 
 async function assertPrepared() {
@@ -66,7 +68,7 @@ describe("0293 commercial prepare new models without activating or changing old 
     }
     const before=await oldSnapshot();
     const result=await runMigrations();
-    assert.deepEqual(result.applied,["0293_commercial_new_models_prepare"]);
+    assert.deepEqual(result.applied,["0293_commercial_new_models_prepare","0294_commercial_box_api_model"]);
     assert.deepEqual(await oldSnapshot(),before);
     assert.equal((await query("SELECT 1 FROM model_pricing WHERE model_id='gpt-6-astra-1m' AND enabled IS TRUE")).rowCount,0);
     await assertPrepared();
