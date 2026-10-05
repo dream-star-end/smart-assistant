@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import type { ComponentProps } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, test } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { operationSummary } from "./chat/ProcessDisclosure";
@@ -338,6 +338,134 @@ describe("MessageList Manus 过程披露", () => {
     expect(done?.closest("[data-testid=process-card]")).not.toBeNull();
     expect(done?.className).toContain("border-border/80");
     expect(open?.className).toContain("border-accent/40");
+  });
+
+  test("已回答的问答卡和它同一次调用的 AskUserQuestion 工具行：工具行不再漏在过程外", () => {
+    renderList([
+      row("u", "user", "上线吧", { status: "replied" }),
+      row("bash", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "git status" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("ask-card", "permission", "怎么处理？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-ship",
+        toolUseId: "toolu_ship",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "怎么处理？", options: [{ label: "现在合并并部署" }] }] },
+      }),
+      row("ask-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        blockId: "toolu_ship",
+        _completed: true,
+        inputJson: { questions: [{ question: "怎么处理？", options: [{ label: "现在合并并部署" }] }] },
+        output: 'User has answered your questions: "怎么处理？"="现在合并并部署".',
+      }),
+      row("final", "assistant", "已合并", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.queryByText("向用户提问")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    const card = screen.getAllByTestId("permission-card").find((el) => el.getAttribute("data-permission-request") === "req-ship");
+    expect(card?.closest("[data-testid=process-card]")).not.toBeNull();
+    expect(screen.queryByText("向用户提问")).not.toBeInTheDocument();
+    expect(screen.queryByText(/User has answered your questions/)).not.toBeInTheDocument();
+  });
+
+  test("已确认的计划卡和它同一次调用的 ExitPlanMode 工具行：工具行不再漏在过程外，计划书仍在卡里", () => {
+    renderList([
+      row("u", "user", "先出个方案", { status: "replied" }),
+      row("read", "tool", "读取", {
+        _clientMessageId: "u",
+        toolName: "Read",
+        inputJson: { file_path: "/tmp/a.ts" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("plan-card", "permission", "退出计划模式", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        requestId: "req-plan",
+        toolUseId: "toolu_plan",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { plan: "# PLAN_BODY 改前端分组规则" },
+      }),
+      row("plan-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_plan",
+        _completed: true,
+        inputJson: { plan: "# PLAN_BODY 改前端分组规则" },
+        output: "User has approved your plan. You can now start coding.",
+      }),
+      row("final", "assistant", "按计划改完了", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+    // 过程收起时,外面不应再挂一张「退出计划模式」工具卡。
+    expect(screen.queryByText("退出计划模式")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    expect(screen.getAllByText("退出计划模式")).toHaveLength(1);
+    const cards = screen.getAllByTestId("permission-card");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.closest("[data-testid=process-card]")).not.toBeNull();
+    expect(cards[0]?.textContent ?? "").toContain("PLAN_BODY");
+    expect(screen.queryByText(/User has approved your plan/)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/PLAN_BODY/)).toHaveLength(1);
+  });
+
+  test("问答卡不吞同编号的其他工具行：配对必须工具名也一致", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("ask-card", "permission", "问题？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-x",
+        toolUseId: "toolu_same",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "问题？", options: [{ label: "好" }] }] },
+      }),
+      row("plan-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "ExitPlanMode",
+        toolUseId: "toolu_same",
+        _completed: true,
+        inputJson: { plan: "# LONE_PLAN" },
+        output: "User has approved your plan.",
+      }),
+    ]);
+    expect(screen.getAllByText("退出计划模式").length).toBeGreaterThan(0);
+  });
+
+  test("没有配对问答卡的 AskUserQuestion 工具行照常显示（不同 tool_use id 不算配对）", () => {
+    renderList([
+      row("u", "user", "继续", { status: "replied" }),
+      row("ask-card", "permission", "另一个问题？", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        requestId: "req-other",
+        toolUseId: "toolu_other",
+        _resolved: true,
+        _behavior: "allow",
+        inputJson: { questions: [{ question: "另一个问题？", options: [{ label: "好" }] }] },
+      }),
+      row("ask-tool", "tool", "", {
+        _clientMessageId: "u",
+        toolName: "AskUserQuestion",
+        blockId: "toolu_lonely",
+        _completed: true,
+        inputJson: { questions: [{ question: "孤立的问题？", options: [{ label: "好" }] }] },
+        output: "User has answered your questions.",
+      }),
+    ]);
+    expect(screen.getAllByText("向用户提问").length).toBeGreaterThan(0);
   });
 
   // OCV5-307:已回答的提问是这一轮的一个步骤,收进过程作为常显步骤;待审批 / 后台子任务仍在顶层。
@@ -1150,6 +1278,51 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByTestId("process-goal")).not.toBeInTheDocument();
   });
 
+  // OCV5-320:#0498a304 实况 —— Codex 目标模式在回答之后回写一条进行中的目标(只在输入框上方钉住,
+  // 正文不画),随后又跑了 2 步。这条看不见的目标行不能把步骤挤到回答下面另开一个「已执行 N 个步骤」。
+  test("OCV5-320: 回答后的进行中目标回写不把后续步骤推到回答下面", () => {
+    const bash = (id: string, command: string) => row(id, "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command },
+      _completed: true,
+      output: "ok",
+    });
+    renderList([
+      row("u", "user", "完成 OCV5-308", { status: "replied" }),
+      bash("before", "probe-before"),
+      row("answer", "assistant", "OCV5-308 已处理完", { _clientMessageId: "u" }),
+      row("goal", "goal", "完成 OCV5-308", { _clientMessageId: "u", goalStatus: "active", cleared: false }),
+      bash("after-1", "probe-after-1"),
+      bash("after-2", "probe-after-2"),
+    ]);
+    const shells = screen.getAllByTestId("process-disclosure");
+    expect(shells).toHaveLength(1);
+    const answerRow = screen.getByText("OCV5-308 已处理完").closest("[data-testid=assistant-row]");
+    expect(answerRow).not.toBeNull();
+    expect(shells[0]!.compareDocumentPosition(answerRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(screen.getByTestId("process-toggle"));
+    fireEvent.click(screen.getByTestId("process-detail-toggle"));
+    expect(screen.getByTestId("process-details").textContent ?? "").toMatch(/probe-before[\s\S]*probe-after-1[\s\S]*probe-after-2/);
+  });
+
+  test("OCV5-320: 进行中轮次里的目标回写不把过程拆成两节", () => {
+    const bash = (id: string, command: string) => row(id, "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command },
+      _completed: true,
+      output: "ok",
+    });
+    renderList([
+      row("u", "user", "完成 OCV5-308", { status: "sent" }),
+      bash("one", "probe-one"),
+      row("goal", "goal", "完成 OCV5-308", { _clientMessageId: "u", goalStatus: "active", cleared: false }),
+      bash("two", "probe-two"),
+    ], { sending: true, turnActivity: { startedAt: Date.now(), agentName: "助手" } });
+    expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+  });
+
   test("进行中的目标和待确认不收进过程，普通句子里的目标二字也不当目标卡", () => {
     renderList([
       row("u", "user", "继续", { status: "replied" }),
@@ -1486,6 +1659,131 @@ describe("MessageList Manus 过程披露", () => {
     expect(working.getAttribute("data-live-working")).toBe("true");
     expect(working.className).toContain("oc-live-status-shine");
     expect(working.className).toContain("text-muted");
+  });
+
+  describe("长步骤 / 步骤间隙的活性信号", () => {
+    const T0 = 1_790_000_000_000;
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
+      vi.setSystemTime(T0);
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const user = row("u", "user", "清理磁盘", { status: "sent", ts: T0 - 60_000 });
+    const done = row("c1", "tool", "终端", {
+      _clientMessageId: "u",
+      toolName: "Bash",
+      inputJson: { command: "du -sh /tmp" },
+      _completed: true,
+      output: "1G",
+      ts: T0 - 50_000,
+    });
+
+    test("叙述段写完后静默超过 3 秒，时间轴末尾挂一行活的「正在思考下一步」，新步骤一来就消失", () => {
+      const mid = row("m", "assistant", "临时目录占了 1G，接下来清缓存。", { _clientMessageId: "u", ts: T0 - 1_000 });
+      const activity = { startedAt: T0 - 60_000, lastFrameAt: T0 - 1_000, agentName: "助手" };
+      const view = renderList([user, done, mid], { sending: true, turnActivity: activity });
+      // 刚写完:还在「组织回复」,不挂尾行,也不挂流光(流式文字本身就是信号)。
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在组织回复");
+      expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(0);
+
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      const tail = screen.getByTestId("process-live-tail");
+      expect(tail).toHaveTextContent("正在思考下一步");
+      expect(tail).toHaveTextContent("4 秒");
+      expect(screen.getByTestId("process-step-live")).toHaveTextContent("正在思考下一步");
+      // 一轮仍只有一处在扫:展开时是尾行。
+      expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
+      expect(tail.querySelector(".oc-live-status-shine")).not.toBeNull();
+
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(screen.getByTestId("process-live-tail")).toHaveTextContent("14 秒");
+
+      // 下一条命令到了:尾行消失,流光落到这条命令所在段的摘要行。
+      const next = row("c2", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "rm -rf /tmp/cache" },
+        _completed: false,
+        ts: Date.now(),
+      });
+      view.rerender(
+        <MessageList
+          processDisclosure
+          messages={[user, done, mid, next]}
+          sending
+          sessionId="session-a"
+          cb={{}}
+          onRespondPermission={() => {}}
+          turnActivity={{ ...activity, lastFrameAt: Date.now() }}
+        />,
+      );
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+      expect(document.querySelectorAll(".oc-live-status-shine")).toHaveLength(1);
+    });
+
+    test("命令连续运行超过 5 秒，在干活的摘要行旁显示每秒在走的「已运行 N 秒」", () => {
+      const running = row("c2", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "npm test" },
+        _completed: false,
+        ts: T0,
+      });
+      const activity = { startedAt: T0 - 60_000, lastFrameAt: T0, agentName: "助手" };
+      renderList([user, done, row("m", "assistant", "跑一下测试。", { _clientMessageId: "u", ts: T0 - 2_000 }), running], {
+        sending: true,
+        turnActivity: activity,
+      });
+      expect(screen.queryByTestId("process-step-running-for")).not.toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(screen.getByTestId("process-step-running-for")).toHaveTextContent("已运行 5 秒");
+      act(() => {
+        vi.advanceTimersByTime(70_000);
+      });
+      expect(screen.getByTestId("process-step-running-for")).toHaveTextContent("已运行 1 分 15 秒");
+      // 只挂在正在干活的那一段;已完成的段没有。
+      expect(screen.getAllByTestId("process-step-running-for")).toHaveLength(1);
+      // 静默时长不影响命令段(不是叙述段),不会冒出「正在思考下一步」尾行。
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+    });
+
+    test("没有会话级帧时刻(历史轮 / 缺省)时两种信号都不出现", () => {
+      const mid = row("m", "assistant", "临时目录占了 1G。", { _clientMessageId: "u", ts: T0 - 60_000 });
+      const running = row("c2", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "npm test" },
+        _completed: false,
+        ts: T0 - 60_000,
+      });
+      renderList([user, done, mid], { sending: true, turnActivity: { startedAt: T0 - 60_000, agentName: "助手" } });
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+
+      cleanup();
+      renderList([user, done, running], { sending: true, turnActivity: { startedAt: T0 - 60_000, agentName: "助手" } });
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(screen.queryByTestId("process-step-running-for")).not.toBeInTheDocument();
+
+      cleanup();
+      renderList([user, done, mid], { sending: false, turnActivity: { startedAt: T0 - 60_000, lastFrameAt: T0 - 60_000, agentName: "助手" } });
+      expect(screen.queryByTestId("process-live-tail")).not.toBeInTheDocument();
+    });
   });
 
   test("刷新后上一轮的过程和回答不并进最新一轮的处理过程，旧问答卡回到自己那轮（OCV5-313）", () => {

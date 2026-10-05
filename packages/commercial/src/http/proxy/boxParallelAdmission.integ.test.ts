@@ -16,6 +16,7 @@ test("one Box account admits two independent runs, not three or a second same-se
       await client.query(`CREATE TEMP TABLE request_finalize_journal (
         request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
         state text NOT NULL, ctx jsonb NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
         updated_at timestamptz NOT NULL DEFAULT now(), error_msg text,
         failure_code text, final_credits bigint)`);
       const sameConnection = { connect: async () => ({

@@ -65,6 +65,7 @@ import {
   supportsAutomaticTurnRecovery,
   allowUnsafeAutomaticCheckpoint,
   modelPlaneFailureAfterSettledTools,
+  emptyRecoveryRepeatsModelPlaneFailure,
   SETTLED_TOOLS_CHECKPOINT_RETRY_MAX,
   shouldDeclineLiveServiceRestartRecovery,
   shouldPauseSilentAutomaticRecovery,
@@ -1868,8 +1869,14 @@ async function sessionTurnHasSuccessfulUsage(
   return (row.rowCount ?? 0) > 0;
 }
 
-function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
+export function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[] {
   const records: Array<Record<string, unknown>> = [];
+  // OCV5-321 (#611729fb): a live stream carries a tool_use block and later its
+  // tool_result (toolUseBlockId → tool_use.blockId). Unpaired id-less rows made
+  // every Box turn with tools look unsettled, so the OCV5-317 settled-tools
+  // checkpoint was declined as checkpoint_unsafe. Pair by id; blocks without
+  // an id keep the old fail-closed shape.
+  const toolsById = new Map<string, Record<string, unknown>>();
   for (const payload of payloads) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
     const frame = payload as Record<string, unknown>;
@@ -1891,10 +1898,20 @@ function leftoverFramesToRecoveryRecords(payloads: readonly unknown[]): unknown[
         continue;
       }
       if (kind === "tool_use" || kind === "tool_result") {
-        records.push({
+        const rawId = kind === "tool_use" ? item.blockId : item.toolUseBlockId;
+        const id = typeof rawId === "string" && rawId.length > 0 ? rawId : null;
+        const known = id ? toolsById.get(id) : undefined;
+        if (known) {
+          if (kind === "tool_result") known._completed = true;
+          continue;
+        }
+        const record: Record<string, unknown> = {
           role: "tool",
+          ...(id ? { toolUseId: id } : {}),
           _completed: kind === "tool_result",
-        });
+        };
+        if (id) toolsById.set(id, record);
+        records.push(record);
         continue;
       }
       if (kind === "delegate_progress") {
@@ -2256,8 +2273,15 @@ async function scheduleAutomaticRecoveryForFinalizedTurn(
   // OCV5-317: a checkpoint admitted only because every tool had settled keeps
   // a short automatic budget (tools ran, so the old no-progress rule never
   // overlaps this one).
-  const retryLimit = assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
-      modelPlaneFailureAfterSettledTools(errorCode, [...recoveryRecords, ...leftoverRecords])
+  // OCV5-322: an empty automatic recovery that failed on the model plane
+  // again is deterministic too (#7da201bd: ten 409s in twenty seconds).
+  const retryLimit = (assessment.mode === "checkpoint" && !assessment.checkpointSafe &&
+      modelPlaneFailureAfterSettledTools(errorCode, [...recoveryRecords, ...leftoverRecords])) ||
+      emptyRecoveryRepeatsModelPlaneFailure({
+        errorCode,
+        currentAttempt,
+        records: [...recoveryRecords, ...leftoverRecords],
+      })
     ? SETTLED_TOOLS_CHECKPOINT_RETRY_MAX
     : AUTOMATIC_TURN_RETRY_MAX;
   if (currentAttempt >= retryLimit) {

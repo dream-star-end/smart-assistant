@@ -8,7 +8,8 @@ import { rootLogger } from "../../logging/logger.js";
 import { BOX_RUNS_CEILING, validRunCapacity, type BoxRunCapacity } from "./boxCapacityPolicy.js";
 import type { BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { parseBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
-import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, withVerifiedCapsule,
+import { capsuleSummaryText, idleSetLeafIds, projectBoxIdleChain, validExpiredChainIds,
+  withVerifiedCapsule,
   type BoxIdleProof, type IdleChainRow } from "./boxIdleChain.js";
 import { parseBillingPricing } from "../../billing/persistedBillingPricing.js";
 import { parseBoxBillingContext } from "./boxBillingContext.js";
@@ -22,7 +23,7 @@ import type { ProxyBody } from "./shared.js";
 import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
 import { projectRootCliSession } from "./boxToolProgress.js";
 import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_SPOOL_MAX_BYTES,
-  reserveBoxToolEcho } from "./boxToolCapacity.js";
+  reserveBoxToolEcho, BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { authorityFromJournalCtx, consumePrepared, isContinuationConflict,
   PreparedConsumptionError, trustedIdentitiesBind,
   type AuthorityProjection, type PreparedContinuation,
@@ -33,9 +34,14 @@ import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
 import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
+import { BOX_EXPIRED_UNPROVEN_STATE, BOX_OPERATOR_UNREACHABLE_CLOSED_STATE,
+  isBoxExpiredCloseCause, isBoxUnknownPhase, parseBoxExpiredClose,
+  parseBoxOperatorUnreachableClose } from "./boxExpiredClose.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
+/** OCV5-322: past this age (from its first active row) a run cannot be alive. */
+export const BOX_RUN_EXPIRED_AFTER_MS = BOX_TOOL_MAX_WALL_MS + 15 * 60 * 1000;
 
 export class BoxDurableJournalError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxDurableJournalError"; }
@@ -184,6 +190,21 @@ export interface BoxStoppedFailureProbeCandidate {
   readonly runNonce: string;
   readonly leaseEpoch: string;
   readonly linked: boolean;
+  /** OCV5-323: an inflight unknown resume leaf without a handoff. Its CLI
+   * waits for tool results that no request will publish again.
+   * OCV5-313: every launched detached-tool unknown leaf, whatever its phase. */
+  readonly staleResume?: { readonly phase: BoxStaleResumePhase; readonly unknownForMs: number };
+  /** OCV5-313: the row is older than BOX_RUN_EXPIRED_AFTER_MS, so its run
+   * cannot be alive any more (same rule as admission capacity). */
+  readonly expired?: boolean;
+}
+/** Any value isBoxUnknownPhase accepts. */
+export type BoxStaleResumePhase = string;
+export interface BoxExpiredCloseResult {
+  readonly action: "closed" | "would_close" | "already_closed";
+  readonly shape: "unbilled_leaf" | "billed_handoff";
+  readonly priorBoxState: string;
+  readonly ancestors: number;
 }
 export type BoxRecoveryRejectReason =
   | "BOX_RECOVERY_NOT_UNKNOWN_LEAF"
@@ -427,6 +448,23 @@ export class BoxDurableJournal implements BoxJournalPort {
    * stopped ("failed_stopped"). "claimed" when another recovery owns it,
    * "live" when it cannot be proven finished, "none" when no such record.
    */
+  /** OCV5-322: a handoff of this very turn still waits for exactly these
+   * tool results, so the request is a live continuation, never a fresh run. */
+  async hasWaitingToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
+    toolIds: readonly string[] }): Promise<boolean> {
+    const want = [...input.toolIds].sort().join(",");
+    const rows = await this.pool.query<{ ctx: Record<string, unknown> }>(
+      `SELECT ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
+          AND ctx->>'boxState'='handoff'
+          AND state IN ('inflight','finalizing','committed')`,
+      [input.uid.toString(), input.sessionId, input.turnKey]);
+    return rows.rows.some((row) => {
+      const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
+      return handoff === null || handoff.toolUses.map((use) => use.id).sort().join(",") === want;
+    });
+  }
+
   async findOrphanToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
     toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" } | { kind: "claimed" }
     | { kind: "orphan"; stopped: boolean; staleClaim?: string; identity: { requestId: string;
@@ -1031,10 +1069,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       // counted once per nonce:epoch. A malformed active row cannot be proven
       // to share a run, so it occupies one slot by itself (never NULL, never
       // merged) instead of blocking the whole account.
+      // OCV5-322: the Box supervisor kills every CLI at its --deadline
+      // (<= BOX_TOOL_MAX_WALL_MS after launch; a chain's rounds share one CLI).
+      // A run whose first active row is older than that plus a grace cannot
+      // still execute, so an unprovable unknown/handoff row no longer pins the
+      // session or eats account/user slots forever (#7da201bd: a 09:00 chain
+      // held its session for hours; 10-01 rows still held account 20).
       const occupied = await client.query<{ same_session: boolean;
         account_occupied: string; user_occupied: string; malformed_ids: string[] | null }>(
-        `WITH active AS (
-           SELECT request_id, user_id,
+        `WITH rows AS (
+           SELECT request_id, user_id, created_at,
              ctx->>'boxSessionId' AS session_id, ctx->>'boxAccountId' AS account_id,
              CASE WHEN COALESCE(ctx->>'boxRunNonce','') ~ '^[a-f0-9]{24}$'
                     AND COALESCE(ctx->>'boxLeaseEpoch','') ~ '^[a-f0-9]{32}$'
@@ -1048,7 +1092,11 @@ export class BoxDurableJournal implements BoxJournalPort {
                     AND ctx->>'boxSessionId' IS NOT NULL) AS malformed
            FROM request_finalize_journal
            WHERE ctx->>'boxState' = ANY($1::text[])
-             AND (ctx->>'boxAccountId' = $2 OR user_id = $3))
+             AND (ctx->>'boxAccountId' = $2 OR user_id = $3)),
+         active AS (
+           SELECT * FROM rows
+            WHERE run_key IN (SELECT run_key FROM rows GROUP BY run_key
+              HAVING MIN(created_at) > NOW() - make_interval(secs => $5::double precision)))
          SELECT
            COALESCE(bool_or(user_id = $3 AND session_id = $4), false) AS same_session,
            COUNT(DISTINCT run_key) FILTER (WHERE account_id = $2) AS account_occupied,
@@ -1056,7 +1104,7 @@ export class BoxDurableJournal implements BoxJournalPort {
            (array_agg(request_id ORDER BY request_id) FILTER (WHERE malformed))[1:5] AS malformed_ids
          FROM active`,
         [ACTIVE, input.accountId.toString(), input.uid.toString(),
-          input.fingerprint.sessionId]);
+          input.fingerprint.sessionId, BOX_RUN_EXPIRED_AFTER_MS / 1000]);
       const usage = occupied.rows[0];
       if (!usage || usage.same_session) throw new BoxDurableJournalError("BOX_CAPACITY_HELD");
       if (usage.malformed_ids?.length) {
@@ -1899,9 +1947,12 @@ export class BoxDurableJournal implements BoxJournalPort {
             WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
               AND ctx->>'model'=$4
               AND ctx->>'boxState' IN ('resuming','unknown','linked')
+              AND NOT (ctx ? 'boxCancelIntent')
             LIMIT 1`,
           [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
             input.canonicalModel]);
+        // A cancelled chain has no live resume: its rounds must not read as one
+        // in progress, or the orphan release (BOX_TOOL_OWNER_UNKNOWN) is never tried.
         if (consumed.rowCount) throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
         throw new BoxDurableJournalError("BOX_TOOL_OWNER_UNKNOWN");
       }
@@ -2364,12 +2415,192 @@ export class BoxDurableJournal implements BoxJournalPort {
     }
   }
 
+  /** OCV5-313: close a run that cannot be alive any more and whose keeper
+   * proof cannot be read (disabled or unreachable account, proof files gone).
+   * Nothing is proven and nothing remote is touched: the leaf and its waiting
+   * ancestors only stop being unknown forever. The chain must pass every
+   * check of the proof-based closers for its round type; the proof is replaced
+   * by the leaf's own age. An unbilled leaf is aborted with no charge, a billed
+   * handoff keeps its settlement. apply=false runs the same locks, reads and
+   * updates and rolls back. `operatorClosed` additionally accepts the leaf the
+   * OCV5-312 operator close left in operator_unreachable_closed. */
+  async markRunExpiredUnproven(input: Pick<BoxJournalAdmission,
+    "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> & {
+    cause: string; operatorClosed?: true; apply?: boolean }): Promise<BoxExpiredCloseResult> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxExpiredCloseCause(input.cause)) {
+      throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_IDENTITY_INVALID");
+    }
+    const uid = input.uid.toString(), accountId = input.accountId.toString();
+    const expirySec = BOX_RUN_EXPIRED_AFTER_MS / 1000;
+    const invalid = (): never => {
+      throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_CHAIN_INVALID");
+    };
+    const client = await this.pool.connect();
+    let finished = false;
+    try {
+      await client.query("BEGIN");
+      const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
+      type Row = { request_id: string; state: string; final_credits: string | null;
+        failure_code: string | null; expired: boolean; ctx: Record<string, unknown> };
+      const rows: Row[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = input.requestId;
+      while (cursor !== null) {
+        if (rows.length >= BOX_TOOL_MAX_ROUNDS || seen.has(cursor)) invalid();
+        seen.add(cursor);
+        const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
+          `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx,
+              created_at <= NOW() - make_interval(secs => $3::double precision) AS expired
+             FROM request_finalize_journal
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`, [cursor, uid, expirySec]);
+        const row = found.rows[0];
+        if (found.rowCount !== 1 || !row?.ctx || row.ctx.boxInvocationRecovery !== "v1"
+          || !stoppedRunMode(row.ctx) || row.ctx.boxRunNonce !== input.runNonce
+          || row.ctx.boxLeaseEpoch !== input.leaseEpoch
+          || row.ctx.boxAccountId !== accountId) invalid();
+        rows.push(row!);
+        const parent: unknown = row!.ctx.boxOwnerRequestId;
+        if (parent === undefined) cursor = null;
+        else if (typeof parent === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(parent)) cursor = parent;
+        else invalid();
+      }
+      const leaf = rows[0]!, basis = leaf.ctx;
+      const linked = basis.boxOwnerRequestId !== undefined;
+      const handoff = basis.boxToolHandoff === undefined ? null
+        : parseBoxStoredToolHandoff(basis.boxToolHandoff);
+      if ((basis.boxToolHandoff !== undefined && !handoff) || basis.boxSessionId !== lockedSessionId) {
+        invalid();
+      }
+      if (basis.boxTerminalProof !== undefined || basis.boxResumeRequestId !== undefined
+        || basis.settlementClaimId !== undefined) {
+        throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_EVIDENCE_PRESENT");
+      }
+      const resumable = ["inflight", "finalizing", "committed"].includes(leaf.state);
+      const shape = handoff ? "billed_handoff" as const : "unbilled_leaf" as const;
+      const closed = parseBoxExpiredClose(basis.boxExpiredClose);
+      if (basis.boxState === BOX_EXPIRED_UNPROVEN_STATE) {
+        // Idempotent only for the complete end state this method writes, as
+        // judged by the same projection the idle proof uses.
+        const valid = validExpiredChainIds(rows.map((row) => ({ requestId: row.request_id,
+          state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
+          failureCode: row.failure_code })));
+        if (!closed || rows.some((row) => !valid.has(row.request_id))) invalid();
+        await client.query("ROLLBACK"); finished = true;
+        return { action: "already_closed", shape, priorBoxState: closed!.priorBoxState,
+          ancestors: rows.length - 1 };
+      }
+      if (basis.boxExpiredClose !== undefined) invalid();
+      const actual = String(basis.boxState);
+      let prior = actual;
+      if (actual === BOX_OPERATOR_UNREACHABLE_CLOSED_STATE) {
+        const operatorPrior = parseBoxOperatorUnreachableClose(basis.boxOperatorUnreachableClose);
+        if (input.operatorClosed !== true || !operatorPrior) invalid();
+        prior = operatorPrior!;
+      } else if (basis.boxOperatorUnreachableClose !== undefined) invalid();
+      // The same leaf states the proof-based closers accept per round type.
+      const priorAllowed = handoff ? ["handoff", "unknown"]
+        : linked ? ["linked", "unknown"] : ["running", "unknown"];
+      if (!priorAllowed.includes(prior) || (handoff ? !resumable : leaf.state !== "inflight")
+        || (!handoff && leaf.final_credits !== null)) invalid();
+      if (linked) {
+        const roundNo = basis.boxRoundNo;
+        if (rows.some((row) => row.ctx.boxInvocationMode !== "detached_tool")
+          || !Number.isSafeInteger(roundNo) || Number(roundNo) < 2
+          || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || rows.length !== roundNo
+          || (handoff && (handoff.roundNo !== roundNo
+            || typeof basis.boxHandoffRevision !== "string"
+            || !UUID_V4.test(basis.boxHandoffRevision)
+            || handoff.catalogHash !== basis.boxCatalogHash
+            || handoff.detachedRunnerHash !== basis.boxDetachedRunnerHash))
+          || typeof basis.boxCatalogHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(basis.boxCatalogHash)
+          || typeof basis.boxDetachedRunnerHash !== "string"
+          || !/^[a-f0-9]{64}$/.test(basis.boxDetachedRunnerHash)) invalid();
+        for (let i = 1; i < rows.length; i++) {
+          const child = rows[i - 1]!, parent = rows[i]!, ctx = parent.ctx;
+          const stored = parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+          if (!stored || stored.roundNo !== Number(roundNo) - i
+            || stored.catalogHash !== basis.boxCatalogHash
+            || stored.detachedRunnerHash !== basis.boxDetachedRunnerHash
+            || !["inflight", "finalizing", "committed"].includes(parent.state)
+            || !["resuming", "unknown"].includes(String(ctx.boxState))
+            // A proof anywhere in the chain belongs to the proof-based closers.
+            || ctx.boxTerminalProof !== undefined
+            || ctx.boxResumeRequestId !== child.request_id
+            || typeof ctx.boxResumeRevision !== "string"
+            || !UUID_V4.test(ctx.boxResumeRevision)
+            || typeof child.ctx.boxParentResumeRevision !== "string"
+            || !UUID_V4.test(child.ctx.boxParentResumeRevision)
+            || ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision
+            || ctx.boxSessionId !== basis.boxSessionId
+            || ctx.boxTurnKey !== basis.boxTurnKey
+            || ctx.model !== basis.model) invalid();
+        }
+      } else if (rows.length !== 1 || (handoff && (handoff.roundNo !== 1
+        || basis.boxInvocationMode !== "detached_tool"
+        || typeof basis.boxHandoffRevision !== "string"
+        || !UUID_V4.test(basis.boxHandoffRevision)))) invalid();
+      if (!leaf.expired) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_RUN_NOT_EXPIRED");
+      if (!handoff) {
+        const usage = await client.query(
+          `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
+          [leaf.request_id, uid]);
+        if (usage.rowCount) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_USAGE_CONFLICT");
+      }
+      const params = [leaf.request_id, uid, input.leaseEpoch, input.runNonce, actual,
+        BOX_EXPIRED_UNPROVEN_STATE, prior, input.cause, expirySec];
+      const marker = `ctx || jsonb_build_object('boxState',$6::text,
+              'boxExpiredClose',jsonb_build_object('v',1,
+                'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
+                'priorBoxState',$7::text,'cause',$8::text))`;
+      const fence = `request_id=$1 AND user_id=$2
+            AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxState'=$5
+            AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxResumeRequestId')
+            AND NOT (ctx ? 'settlementClaimId') AND NOT (ctx ? 'boxExpiredClose')
+            AND created_at <= NOW() - make_interval(secs => $9::double precision)`;
+      const changed = handoff ? await client.query(
+        `UPDATE request_finalize_journal SET ctx=${marker}
+          WHERE ${fence} AND ctx ? 'boxToolHandoff'
+            AND state IN ('inflight','finalizing','committed')`, params)
+        : await client.query(
+          `UPDATE request_finalize_journal
+              SET state='aborted', failure_code='STREAM_FAILED', final_credits=0,
+                  ctx=${marker}, updated_at=NOW()
+            WHERE ${fence} AND NOT (ctx ? 'boxToolHandoff')
+              AND state='inflight' AND final_credits IS NULL`, params);
+      if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_FENCE_LOST");
+      for (const ancestor of rows.slice(1)) {
+        const moved = await client.query(
+          `UPDATE request_finalize_journal
+              SET ctx=ctx || jsonb_build_object('boxState',$4::text), updated_at=NOW()
+            WHERE request_id=$1 AND user_id=$2 AND ctx->>'boxLeaseEpoch'=$3
+              AND ctx->>'boxState' IN ('resuming','unknown')
+              AND ctx ? 'boxToolHandoff' AND NOT (ctx ? 'boxTerminalProof')`,
+          [ancestor.request_id, uid, input.leaseEpoch, BOX_EXPIRED_UNPROVEN_STATE]);
+        if (moved.rowCount !== 1) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_FENCE_LOST");
+      }
+      const apply = input.apply !== false;
+      await client.query(apply ? "COMMIT" : "ROLLBACK"); finished = true;
+      return { action: apply ? "closed" : "would_close", shape, priorBoxState: prior,
+        ancestors: rows.length - 1 };
+    } finally {
+      if (!finished) await client.query("ROLLBACK").catch(() => {});
+      client.release();
+    }
+  }
+
   /** Bounded, shared-leader discovery only. These rows are unknown until a
    * pinned Box read returns a valid terminal marker; no paid call is retried. */
   async listStoppedFailureProbeCandidates(limit = 10): Promise<BoxStoppedFailureProbeCandidate[]> {
     const found = await this.pool.query<{ request_id: string; user_id: string;
+      state: string; unknown_for_ms: string; expired: boolean;
       ctx: Record<string, unknown> }>(
-      `SELECT request_id,user_id::text,ctx FROM request_finalize_journal
+      `SELECT request_id,user_id::text,state,ctx,
+          GREATEST(0,(EXTRACT(EPOCH FROM (NOW()-updated_at))*1000))::bigint::text AS unknown_for_ms,
+          created_at <= NOW() - make_interval(secs => $2::double precision) AS expired
+        FROM request_finalize_journal
         WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
           AND ${STOP_MODE_FENCE}
           AND request_id ~ '^[A-Za-z0-9_-]{1,64}$' AND user_id>0
@@ -2393,7 +2624,8 @@ export class BoxDurableJournal implements BoxJournalPort {
             AND (ctx->>'boxStopProbeLastAttemptMs') ~ '^[0-9]{13}$'
           THEN (ctx->>'boxStopProbeLastAttemptMs')::bigint ELSE 0 END ASC,
           updated_at ASC LIMIT $1`,
-      [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10))]);
+      [Math.max(1, Math.min(20, Number.isSafeInteger(limit) ? limit : 10)),
+        BOX_RUN_EXPIRED_AFTER_MS / 1000]);
     const candidates: BoxStoppedFailureProbeCandidate[] = [];
     for (const row of found.rows) {
       const ctx = row.ctx;
@@ -2408,11 +2640,52 @@ export class BoxDurableJournal implements BoxJournalPort {
         || (ctx.boxOwnerRequestId !== undefined
           && (typeof ctx.boxOwnerRequestId !== "string"
             || !/^[A-Za-z0-9_-]{1,64}$/.test(ctx.boxOwnerRequestId)))) continue;
+      const unknownForMs = Number(row.unknown_for_ms);
+      const staleResume = row.state === "inflight" && ctx.boxState === "unknown"
+        && ctx.boxInvocationMode === "detached_tool"
+        && ctx.boxToolHandoff === undefined
+        // A first round is stoppable only once its launch permit was granted;
+        // before that no keeper exists and prelaunch recovery owns the row.
+        && (ctx.boxOwnerRequestId !== undefined || ctx.boxLaunchPermit === true)
+        && isBoxUnknownPhase(ctx.boxUnknownPhase)
+        && Number.isSafeInteger(unknownForMs)
+        ? { phase: ctx.boxUnknownPhase, unknownForMs } : undefined;
       candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
         accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
-        leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined });
+        leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined,
+        ...(staleResume ? { staleResume } : {}),
+        ...(row.expired === true ? { expired: true } : {}) });
     }
     return candidates;
+  }
+
+  /** OCV5-323: durable intent before the worker asks the original keeper to
+   * stop an abandoned resume leaf (same rule as the explicit user stop: intent
+   * commits before the remote stop). Only the first marker is kept. A stop
+   * request is never terminal evidence. Does not change billing age. */
+  async recordStaleResumeStop(input: BoxStoppedFailureProbeCandidate &
+    { phase: BoxStaleResumePhase }): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxUnknownPhase(input.phase)) {
+      throw new BoxDurableJournalError("BOX_STALE_RESUME_IDENTITY_INVALID");
+    }
+    const changed = await this.pool.query(
+      `UPDATE request_finalize_journal
+          SET ctx=ctx || jsonb_build_object('boxStaleResumeStop',
+            COALESCE(ctx->'boxStaleResumeStop', jsonb_build_object('phase',$6::text,
+              'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint)))
+        WHERE request_id=$1 AND user_id=$2 AND state='inflight'
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxInvocationMode'='detached_tool'
+          AND ctx->>'boxState'='unknown' AND ctx->>'boxUnknownPhase'=$6
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND NOT (ctx ? 'boxToolHandoff') AND NOT (ctx ? 'boxTerminalProof')
+          AND NOT (ctx ? 'boxResumeRequestId')`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, input.phase]);
+    return changed.rowCount === 1;
   }
 
   /** Cross-worker CAS with a durable retry clock; never changes billing age. */
@@ -2702,9 +2975,14 @@ export class BoxDurableJournal implements BoxJournalPort {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-      const found = await client.query<{ request_id: string; state: string;
-        ctx: Record<string, unknown> }>(
-        `SELECT request_id,state,ctx FROM request_finalize_journal
+      type IdleRow = { request_id: string; state: string; final_credits: string | null;
+        failure_code: string | null; ctx: Record<string, unknown> };
+      const idleRow = (row: IdleRow): IdleChainRow => ({ requestId: row.request_id,
+        state: row.state, ctx: row.ctx, finalCredits: row.final_credits,
+        failureCode: row.failure_code });
+      const found = await client.query<IdleRow>(
+        `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx
+           FROM request_finalize_journal
           WHERE user_id=$1 AND container_id=$2
             AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
             AND ctx->>'model'='box-api-claude-opus-5-5'
@@ -2722,15 +3000,27 @@ export class BoxDurableJournal implements BoxJournalPort {
               OR (ctx->>'boxState'='prestart_stopped' AND ctx ? 'boxLaunchPermit')
             )`,
         [input.uid.toString(), input.containerId.toString(), input.sessionId]);
+      // OCV5-313: a run closed as expired_unproven stops holding the session,
+      // but only as a whole, structurally valid chain (exact marker, linkage,
+      // identity). The state name alone releases nothing.
+      const expired = await client.query<IdleRow>(
+        `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx
+           FROM request_finalize_journal
+          WHERE user_id=$1 AND container_id=$2
+            AND ctx->>'boxSessionId'=$3
+            AND ctx->>'boxInvocationRecovery'='v1'
+            AND ctx->>'boxState'=$4`,
+        [input.uid.toString(), input.containerId.toString(), input.sessionId,
+          BOX_EXPIRED_UNPROVEN_STATE]);
       await client.query("COMMIT");
-      const rows: IdleChainRow[] = found.rows.map((row) => ({
-        requestId: row.request_id, state: row.state, ctx: row.ctx,
-      }));
+      const released = validExpiredChainIds(expired.rows.map(idleRow));
+      const rows: IdleChainRow[] = found.rows.map(idleRow);
       const proof = projectBoxIdleChain({
         sessionId: input.sessionId,
         turnKey: input.turnKey,
         rows,
-        otherOpenRequestIds: open.rows.map((row) => row.request_id),
+        otherOpenRequestIds: open.rows.map((row) => row.request_id)
+          .filter((id) => !released.has(id)),
       });
       if (!readCapsule) return proof;
       if (proof.status === "terminal") {

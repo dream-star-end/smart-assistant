@@ -8,11 +8,14 @@ import { createProductionBoxAccountResolver } from
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 import { assessUnknownProbeQuarantine,
   type UnknownObservationSnapshot } from "./boxUnknownQuarantinePolicy.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
-const LOCK = "/var/lib/openclaude/ocv5-289-box-operator/account-20.json";
-const MUTEX = "/var/lib/openclaude/ocv5-289-box-operator/account-20.mutex";
+// The operator names the exact account; evidence files are per account.
+const OPERATOR = requireBoxOperatorAccount("BOX_INSPECT_ACK_REQUIRED");
 const DIR = "/var/lib/openclaude/ocv5-289-box-operator";
-const SNAPSHOT = `${DIR}/account-20.unknown-observation.json`;
+const LOCK = `${DIR}/account-${OPERATOR.text}.json`;
+const MUTEX = `${DIR}/account-${OPERATOR.text}.mutex`;
+const SNAPSHOT = `${DIR}/account-${OPERATOR.text}.unknown-observation.json`;
 const READ = String.raw`import hashlib,json,os,re,stat,sys
 nonce,*assets=sys.argv[1:]
 if not re.fullmatch(r'[a-f0-9]{24}',nonce) or len(assets)!=4:raise SystemExit(126)
@@ -332,7 +335,7 @@ out={'run':inspect('/tmp/ocv5-289-run-'+nonce),
 print(json.dumps(out,separators=(',',':'))) `;
 
 async function main(): Promise<void> {
-  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== "20"
+  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== OPERATOR.text
     || process.env.OCV5_289_ACK_USER_ID !== "3"
     || process.env.OCV5_289_INSPECT_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_INSPECT_ACK_REQUIRED");
@@ -366,7 +369,7 @@ async function main(): Promise<void> {
   }
   const rawLock = readFileSync(LOCK, "utf8");
   const record = JSON.parse(rawLock) as Record<string, unknown>;
-  if (record.accountId !== "20" || record.uid !== "3"
+  if (record.accountId !== OPERATOR.text || record.uid !== "3"
     || typeof record.runNonce !== "string"
     || !/^[a-f0-9]{24}$/.test(record.runNonce)
     || typeof record.leaseEpoch !== "string"
@@ -385,10 +388,10 @@ async function main(): Promise<void> {
   const resolver = createProductionBoxAccountResolver();
   const target = await resolver.resolve({ uid: 3n, sessionId: null,
     requestId: `ocv5-289-inspect-${record.runNonce}`,
-    upstreamModel: "claude-opus-5-5", requiredAccountId: 20n,
+    upstreamModel: "claude-opus-5-5", requiredAccountId: OPERATOR.id,
     signal: new AbortController().signal });
   try {
-    if (target.accountId !== 20n) throw new Error("BOX_INSPECT_ACCOUNT_MISMATCH");
+    if (target.accountId !== OPERATOR.id) throw new Error("BOX_INSPECT_ACCOUNT_MISMATCH");
     const result = await target.exec.run({ command: "/usr/bin/python3",
       args: ["-I", "-c", READ, record.runNonce, ...assets], cwd: "/tmp",
       environment: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" } },
@@ -469,7 +472,7 @@ async function main(): Promise<void> {
         writeOnce(SNAPSHOT, JSON.stringify(assessed.snapshot));
         awaitingSecondObservation = true;
       } else {
-        const archive = `${DIR}/account-20.quarantined-${record.runNonce}.json`;
+        const archive = `${DIR}/account-${OPERATOR.text}.quarantined-${record.runNonce}.json`;
         const archiveRecord = { kind: "synthetic_unknown_cli_error",
           terminalProof: false, settledUsage: false, replayAllowed: false,
           originalLock: record, first: previous, second: assessed.snapshot,
@@ -526,7 +529,7 @@ async function main(): Promise<void> {
         quarantinedLock = true;
       }
     }
-    process.stdout.write(JSON.stringify({ accountId: "20", runNonce: record.runNonce,
+    process.stdout.write(JSON.stringify({ accountId: OPERATOR.text, runNonce: record.runNonce,
       observed, clearedLock, quarantinedLock, awaitingSecondObservation }) + "\n");
   } finally { await target.dispose?.(); }
   } finally {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
+import { OFFICIAL_CC_CLI_VERSION } from '../account-pool/persona.js'
 
 const dockerfile = readFileSync(
   resolve(process.cwd(), 'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime'),
@@ -16,10 +17,14 @@ const selfhostProfile = readFileSync(
   'utf8',
 )
 
+// One pin: the persona constant. The image default and the selfhost profile
+// must name the same build, so a bump that misses one of them fails here.
+const pinned = OFFICIAL_CC_CLI_VERSION.replaceAll('.', '\\.')
+
 describe('official Claude Code runtime pin', () => {
   test('Dockerfile keeps the stock CLI opt-in, pinned, and build-verified', () => {
     assert.match(dockerfile, /ARG OC_INCLUDE_OFFICIAL_CLAUDE=0/)
-    assert.match(dockerfile, /ARG OC_OFFICIAL_CLAUDE_VERSION=2\.1\.280/)
+    assert.match(dockerfile, new RegExp(`ARG OC_OFFICIAL_CLAUDE_VERSION=${pinned}\n`))
     assert.match(dockerfile, /@anthropic-ai\/claude-code@\$\{OC_OFFICIAL_CLAUDE_VERSION\}/)
     assert.match(dockerfile, /claude --version/)
     assert.match(dockerfile, /test -x \/usr\/local\/bin\/claude/)
@@ -42,6 +47,6 @@ describe('official Claude Code runtime pin', () => {
 
   test('selfhost rebuild profile opts into exactly the audited official version', () => {
     assert.match(selfhostProfile, /^OC_INCLUDE_OFFICIAL_CLAUDE=1$/m)
-    assert.match(selfhostProfile, /^OC_OFFICIAL_CLAUDE_VERSION=2\.1\.280$/m)
+    assert.match(selfhostProfile, new RegExp(`^OC_OFFICIAL_CLAUDE_VERSION=${pinned}$`, 'm'))
   })
 })

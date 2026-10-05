@@ -67,6 +67,7 @@ import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
 import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
 import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
+import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
 import { makeBoxIdleProofHandler } from "../http/proxy/boxIdleProofHandler.js";
 import { startLatencyProber } from "./latencyProber.js";
@@ -318,6 +319,13 @@ export async function startEgress(): Promise<void> {
     log.error("box_model_outcome_unknown", { uid: uid.toString(),
       accountId: accountId.toString(), requestId, phase });
   };
+  // OCV5-313: only these two model launch paths go through the CLI version
+  // gate. Stop, cleanup and recovery keep the plain resolver (boxStopResolver).
+  const boxCliGate = new BoxCliVersionGate({ onRejected: (info) =>
+    log.error("box_cli_version_unsupported", info) });
+  const resolveBoxLaunch = boxResolver ? gateBoxLaunchResolver(
+    (args: Parameters<typeof boxResolver.resolve>[0]) => boxResolver.resolve(args),
+    boxCliGate) : null;
   const boxTextModel = boxResolver && boxJournal ? new BoxTextFetch({
     supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
     keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
@@ -328,7 +336,7 @@ export async function startEgress(): Promise<void> {
     writeMessage: boxReplayWriter,
     maxOutputTokensForModel: (model) =>
       model === "box-api-claude-opus-5-5" ? 128_000 : null,
-    resolveTarget: (args) => boxResolver.resolve({ ...args,
+    resolveTarget: (args) => resolveBoxLaunch!({ ...args,
       allowWakeIfHibernated: true }),
     onUnknown: reportBoxUnknown,
   }) : undefined;
@@ -349,7 +357,7 @@ export async function startEgress(): Promise<void> {
       writeMessage: boxReplayWriter,
       maxOutputTokensForModel: (model) =>
         model === "box-api-claude-opus-5-5" ? 128_000 : null,
-      resolveTarget: (args) => boxResolver.resolve(args),
+      resolveTarget: (args) => resolveBoxLaunch!(args),
       onUnknown: reportBoxUnknown,
       // OCV5-299: a locally rejected first-round stream is stopped through the
       // same explicit-stop coordinator as a user Stop (declared below; only

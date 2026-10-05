@@ -242,6 +242,12 @@ export const DURABLE_TABLES: readonly string[] = [
   // rows overwritten by heartbeat/attach). Live state, no time-based sweep.
   "chatgpt_proxy_credentials",
   "desktop_tunnel_owners",
+  // 0285 content review (strike count, appeal, account ban): live moderation
+  // state per user. A row changes by status UPDATE (revoked / decided) and is
+  // read for the user's current count; there is no time-based sweep.
+  "content_review_account_bans",
+  "content_review_appeals",
+  "content_review_strikes",
 ] as const;
 
 /**

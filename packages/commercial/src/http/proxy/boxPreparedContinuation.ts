@@ -47,6 +47,9 @@ export interface PreparedContinuation {
   readonly catalog: BoxToolCatalog | null;
   /** Assistant content frozen for the existing comparison projection. */
   readonly assistantContent: unknown;
+  /** OCV5-322: a fresh request whose current message carries this answered
+   * tool exchange before the new prompt (see classifyBoxContinuation). */
+  readonly answeredToolIds?: readonly string[];
 }
 
 export function decisionMayPublish(decision: { readonly kind: string }): boolean {
@@ -213,8 +216,31 @@ export function boxRequestTailShape(body: ProxyBody, count = 3): string {
   }).join(" | ").slice(0, 400);
 }
 
+/** Text Claude Code itself injects beside tool results (image captions,
+ * hook / budget reminders, Skill bodies). Alone it is never a user prompt;
+ * an unfolded one must keep the live-continuation rejection (OCV5-302/303). */
+const CCB_INJECTED_TEXT = /^(?:<system-reminder>|<total_tokens>|\[Image[: ]|\[Request interrupted|Base directory for this skill:)/;
+
+/** OCV5-322: tool results followed only by non-empty text blocks, at least
+ * one of which is not text Claude Code injected itself. */
+export function answeredExchangeSplit(content: readonly unknown[]):
+  { results: Record<string, unknown>[]; texts: Record<string, unknown>[] } | null {
+  let cut = 0;
+  while (cut < content.length && record(content[cut])
+    && (content[cut] as Record<string, unknown>).type === "tool_result") cut += 1;
+  const results = content.slice(0, cut) as Record<string, unknown>[];
+  const texts = content.slice(cut);
+  if (results.length < 1 || texts.length < 1 || !texts.every((block) => record(block)
+    && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)
+    || texts.every((block) => CCB_INJECTED_TEXT.test(((block as { text: string }).text).trimStart()))) {
+    return null;
+  }
+  return { results, texts: texts as Record<string, unknown>[] };
+}
+
 export function classifyBoxContinuation(body: ProxyBody): Pick<PreparedContinuation,
-  "classification" | "rejectCode" | "effectiveBody" | "toolIds" | "priorContextHash" | "nextContextHash"> {
+  "classification" | "rejectCode" | "effectiveBody" | "toolIds" | "priorContextHash"
+  | "nextContextHash" | "answeredToolIds"> {
   let effective: ProxyBody;
   try { effective = normalizeBoxSemanticBody(body); }
   catch (error) {
@@ -241,17 +267,31 @@ export function classifyBoxContinuation(body: ProxyBody): Pick<PreparedContinuat
     classification: "reject" as const, rejectCode, effectiveBody: effective,
     toolIds: [] as const, priorContextHash: null, nextContextHash: null,
   });
+  const assistant = messages[currentIndex - 1];
+  const useIds = record(assistant) && assistant.role === "assistant" ? toolUseIds(assistant) : null;
+  const pairs = (ids: unknown[]): boolean => !!useIds && ids.length === useIds.length
+    && ids.every((id) => typeof id === "string" && useIds.includes(id))
+    && new Set(ids).size === ids.length;
+  // OCV5-322: the answered exchange of a turn that failed before the model
+  // read it, followed by a new user prompt. Claude Code drops its own API
+  // error rows, so a later prompt (e.g. a recovery "继续") is merged into the
+  // tool-result message. No live CLI can take text, so it runs fresh with the
+  // exchange staged as history (BoxToolFetch first proves no handoff waits).
+  // Trailing system hints (e.g. the CCB budget) become fresh system prompt.
+  const split = Array.isArray(content) && messages.slice(currentIndex + 1)
+    .every((message) => record(message) && message.role === "system")
+    ? answeredExchangeSplit(content) : null;
+  if (split && pairs(split.results.map((block) => block.tool_use_id))) {
+    return { ...fresh, answeredToolIds: split.results.map((block) => block.tool_use_id as string) };
+  }
   // A legal budget/hook tail is already folded away. Anything still sitting
   // after the current user message is an unapproved boundary, not a resume.
   if (currentIndex !== messages.length - 1 || !Array.isArray(content) || content.length < 1
     || content.some((block) => !record(block) || block.type !== "tool_result")) {
     return rejected("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
   }
-  const assistant = messages[currentIndex - 1];
-  const useIds = record(assistant) && assistant.role === "assistant" ? toolUseIds(assistant) : null;
   const resultIds = content.map((block) => record(block) ? block.tool_use_id : null);
-  if (!useIds || resultIds.length !== useIds.length
-    || resultIds.some((id) => typeof id !== "string" || !useIds.includes(id))) {
+  if (!pairs(resultIds)) {
     return rejected("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
   }
   if (!Array.isArray(body.tools) || body.tools.length < 1) {
@@ -326,6 +366,8 @@ export function prepareBoxContinuation(input: {
     fallbackAlias,
     catalog: catalog ? structuredClone(catalog) : null,
     assistantContent,
+    ...(classification === "fresh" && classified.answeredToolIds
+      ? { answeredToolIds: [...classified.answeredToolIds] } : {}),
   };
   freezeDeep(prepared);
   return prepared;

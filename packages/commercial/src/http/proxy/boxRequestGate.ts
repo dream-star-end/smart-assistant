@@ -75,6 +75,8 @@ export function validateBoxToolRequest(body: ProxyBody,
       compileBoxCliSyntheticTurn(textBody, {
         cwd: "/tmp/ocv5-289-run-000000000000000000000000",
         cliVersion: "2.1.280",
+        // OCV5-322: validate the staged answered exchange + prompt it will run.
+        ...(classified.answeredToolIds?.length ? { resumeToolResults: true } : {}),
       });
       if (classified.classification === "reject") {
         return classified.rejectCode ?? "BOX_PREPARED_REJECT";

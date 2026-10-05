@@ -14,6 +14,7 @@ test("prelaunch cleanup CAS cannot cross a durable launch permit", { skip: !url 
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL,
       state text NOT NULL, ctx jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now())`);
     const same = { connect: async () => ({ query: client.query.bind(client), release: () => {} }),
       query: client.query.bind(client) } as never;

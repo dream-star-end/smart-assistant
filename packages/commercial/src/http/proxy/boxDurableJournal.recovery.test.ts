@@ -5,8 +5,12 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { BoxDurableJournal } from "./boxDurableJournal.js";
 
+// The unit gate sets REQUIRE_TEST_DB without a URL; it then means the shared
+// fixture, as for every other DB-gated test, and a missing fixture fails.
+const requireTestDb = process.env.CI === "true" || process.env.REQUIRE_TEST_DB === "1";
 const testDatabaseUrl = process.env.OCV5_289_JOURNAL_TEST_DATABASE_URL
-  ?? process.env.TEST_DATABASE_URL;
+  ?? process.env.TEST_DATABASE_URL
+  ?? (requireTestDb ? "postgres://test:test@127.0.0.1:55432/openclaude_test" : undefined);
 const usage = { inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0 };
 const handoffUsage = { inputTokens: 4, outputTokens: 5, cacheReadTokens: 6, cacheWriteTokens: 7 };
 

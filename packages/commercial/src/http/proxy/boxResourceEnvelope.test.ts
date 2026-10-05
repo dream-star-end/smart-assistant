@@ -632,8 +632,11 @@ test("isolated production handlers gate the envelope with false and true from th
     catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),
     box: true,
   }, { [AUTHORITY_HEADER]: signAuthorityWithOwner() });
+  // Route-ready is on (22a13a58e): the verified owner admits these bytes, so
+  // the request passes the envelope and stops at the stubbed precheck instead.
   assert.equal(signedCap.launches, 0);
-  assert.equal(signedCap.res.statusCode, 413, "signed token does not override route-ready false");
+  assert.notEqual(signedCap.res.statusCode, 413, "signed capability admits the enlarged envelope");
+  assert.ok(signedCap.thrown instanceof Error, "signed capability still stops before Box fetch");
 
   const withinLegacy = await call(bodyOf([{ role: "user", content: "hi" }]), {
     catalog: catalog("box_cli", BOX_NATIVE_CONTEXT_OWNER),

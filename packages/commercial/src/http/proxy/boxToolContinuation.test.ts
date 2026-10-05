@@ -63,7 +63,8 @@ const echoHash = createHash("sha256").update(JSON.stringify({
   content: [{ type: "text", text: localResult }], isError: false })).digest("hex");
 
 function fixture(kind: "tool" | "final", failComplete = false,
-  trailing = false, omitEcho = false, largeEcho = false, native = false) {
+  trailing = false, omitEcho = false, largeEcho = false, native = false,
+  cliVersion: string | null = "2.1.280") {
   const sequence: string[] = [], emitted: string[] = [];
   const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
   const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
@@ -87,7 +88,8 @@ function fixture(kind: "tool" | "final", failComplete = false,
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
   const proof = { runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch,
     keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 };
-  const target = { accountId: 20n, exec: { run: async (request: { args: string[] }) => {
+  const target = { accountId: 20n, ...(cliVersion === null ? {} : { cliVersion }),
+    exec: { run: async (request: { args: string[] }) => {
     const args = request.args;
     if (args[5] === "--read") {
       sequence.push("spool-read");
@@ -493,4 +495,52 @@ test("wrong parent, tool name, outer session, missing binding, and late phase st
     completeToolChain: async () => { throw new Error("settle"); },
     markUnknown: async () => {} } as never,
   retainUnknownTarget: () => {}, onUnknown: async () => {} }), /BOX_TOOL_RECORD_INVALID/);
+});
+
+// OCV5-313: see boxCliVersion — a pointer is evidence about the CLI build that
+// wrote the transcript, so an unverified or unread build records none.
+test("OCV5-313 a final on a Box without verified native resume records no native pointer", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    for (const cliVersion of ["2.1.288", null]) {
+      const f = fixture("final", false, false, false, false, true, cliVersion);
+      const result = await runBoxToolContinuation(f.input, f.deps);
+      assert.equal(result.kind, "final");
+      assert.equal(result.kind === "final" && result.nativePointer, undefined);
+      assert.equal(f.sequence.includes("native-inspect"), false);
+      assert.equal(f.sequence.includes("native-attach"), false);
+      assert.ok(f.sequence.includes("terminal-journal"));
+    }
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
+// OCV5-313 (#1a28c670): the phase tells the stop paths that this run's echo was
+// rejected, so it is stopped at once instead of after the generic grace.
+test("OCV5-313 a rejected result echo is journaled as continuation_echo_rejected", async () => {
+  const phases: string[] = [];
+  const rejected = fixture("final");
+  const claim = (rejected.input.published as unknown as { claim: {
+    results: Array<Record<string, unknown>> } }).claim;
+  claim.results = [{ ...claim.results[0]!, content: [{ type: "text", text: "other bytes" }],
+    contentHash: "0".repeat(64) }];
+  await assert.rejects(runBoxToolContinuation(rejected.input, { ...rejected.deps,
+    journal: { ...(rejected.deps.journal as object),
+      markUnknown: async (input: { phase: string }) => { phases.push(input.phase); } } as never }),
+  /BOX_TOOL_ECHO_CONTENT_MISMATCH/);
+  const incomplete = fixture("final", false, false, true);
+  await assert.rejects(runBoxToolContinuation(incomplete.input, { ...incomplete.deps,
+    journal: { ...(incomplete.deps.journal as object),
+      markUnknown: async (input: { phase: string }) => { phases.push(input.phase); } } as never }),
+  /BOX_TOOL_ECHO_INCOMPLETE/);
+  const other = fixture("final", true);
+  await assert.rejects(runBoxToolContinuation(other.input, { ...other.deps,
+    journal: { ...(other.deps.journal as object),
+      markUnknown: async (input: { phase: string }) => { phases.push(input.phase); } } as never }),
+  /synthetic journal failure/);
+  assert.deepEqual(phases, ["continuation_echo_rejected", "continuation_echo_rejected",
+    "continuation_unknown"]);
 });

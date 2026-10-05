@@ -1,4 +1,5 @@
 import test from "node:test";
+import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import assert from "node:assert/strict";
 import { validateBoxTextRequest, validateBoxRequest,
   validateBoxToolRequest } from "./boxRequestGate.js";
@@ -101,10 +102,14 @@ test("real CCB hook context beside a tool result remains a live continuation", (
       { type: "text", text: hook + "\n[id:abc123]" }] }, body.messages.at(-1)!] } as ProxyBody;
   assert.equal(validateBoxToolRequest(tagged), null,
     "CCB HISTORY_SNIP may tag the merged non-meta user text block");
-  assert.equal(validateBoxToolRequest({ ...body, messages: [...prefix,
+  // OCV5-322: real user text after the results is a new prompt over an
+  // answered exchange. The shape is valid; BoxToolFetch still answers 409
+  // while a handoff of this turn waits (boxAnsweredExchange.test.ts).
+  const extra = { ...body, messages: [...prefix,
     { role: "user", content: [result,
-      { type: "text", text: "actual extra user instruction" }] }, body.messages.at(-1)!] }),
-  "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+      { type: "text", text: "actual extra user instruction" }] }, body.messages.at(-1)!] } as ProxyBody;
+  assert.equal(validateBoxToolRequest(extra), null);
+  assert.deepEqual(classifyBoxContinuation(extra).answeredToolIds, ["toolu_hook_a"]);
   assert.equal(validateBoxToolRequest({ ...body,
     messages: body.messages.slice(0, -1) }), null,
   "hook folding must survive when no budget hint is present");

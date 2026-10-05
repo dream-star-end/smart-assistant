@@ -19,12 +19,40 @@ type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string;
  *  - text over the MCP 50k-char limit -> the CLI's own `<persisted-output>`
  *    message (buildLargeToolResultMessage/generatePreview), rebuilt here.
  * Images are never relaxed: boxToolResultImages publishes them within the
- * CLI limits, so the CLI passes their bytes through unchanged. */
+ * CLI limits, so the CLI passes their bytes through unchanged.
+ * OCV5-313: Claude Code 2.1.288 also saves each MCP image under its own
+ * tool-results directory and adds a text block naming that file after the
+ * image. Only those notes may be extra; every published block must still be
+ * echoed byte for byte and in order. */
 const EMPTY_MARKER = /^\(mcp__ocbridge__[A-Za-z0-9_-]{1,48} completed with no output\)$/;
 const CLI_PREVIEW_BYTES = 2000;
 /** Claude Code persists an MCP result only when the summed text length
  * (toolResultStorage.contentSize) exceeds min(MCP 100k, default 50k). */
 const CLI_PERSIST_THRESHOLD_CHARS = 50_000;
+
+const IMAGE_SOURCE_NOTE = new RegExp(String.raw`^\[Image: source: /home/box/\.claude/projects/`
+  + String.raw`[A-Za-z0-9._-]{1,256}/[A-Za-z0-9-]{1,64}/tool-results/[A-Za-z0-9._-]{1,128}\]$`);
+
+/** The echo is the published blocks, in order, plus the CLI's own image source
+ * notes. A published block is always matched first; a note is only an extra
+ * text block that follows an already echoed image. The echo parser's 64-block
+ * limit still bounds published blocks plus notes. */
+function imageSourceNoted(echoed: EchoBlock[], published: EchoBlock[]): boolean {
+  let next = 0, images = 0, notes = 0;
+  for (const block of echoed) {
+    const want = published[next];
+    if (want && block.type === want.type && (block.type === "text"
+      ? block.text === (want as { text: string }).text
+      : block.data === (want as { data: string }).data
+        && block.mimeType === (want as { mimeType: string }).mimeType)) {
+      next++;
+      if (block.type === "image") images++;
+    } else if (block.type === "text" && notes < images && IMAGE_SOURCE_NOTE.test(block.text)) {
+      notes++;
+    } else return false;
+  }
+  return next === published.length && notes > 0;
+}
 
 function cliFileSize(bytes: number): string {
   const kb = bytes / 1024;
@@ -63,6 +91,7 @@ function persistedMatches(echo: string, published: Array<{ type: "text"; text: s
 
 /** Synchronous shape test: could this echo be one of the CLI rewrites at all? */
 function possibleCliRewrite(echoed: EchoBlock[], published: EchoBlock[]): boolean {
+  if (imageSourceNoted(echoed, published)) return true;
   return echoed.length === 1 && echoed[0]!.type === "text"
     && published.every((block) => block.type === "text")
     && (EMPTY_MARKER.test(echoed[0]!.text) || echoed[0]!.text.startsWith("<persisted-output>\n"));
@@ -71,6 +100,7 @@ function possibleCliRewrite(echoed: EchoBlock[], published: EchoBlock[]): boolea
 function cliTransformed(echoed: EchoBlock[], expected: ExpectedEcho): boolean {
   const published = expected.content as EchoBlock[] | undefined;
   if (!published || !possibleCliRewrite(echoed, published)) return false;
+  if (imageSourceNoted(echoed, published)) return true;
   const text = (echoed[0] as { text: string }).text;
   if (EMPTY_MARKER.test(text)) {
     return published.every((block) => (block as { text: string }).text.trim() === "");

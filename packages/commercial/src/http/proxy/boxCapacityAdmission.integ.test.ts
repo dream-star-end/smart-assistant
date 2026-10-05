@@ -175,3 +175,37 @@ test("duplicate fingerprint is still rejected for the same user and scoped by us
     otherUser.fingerprint = { ...otherUser.fingerprint, replayFingerprint: first.fingerprint.replayFingerprint };
     await j.admit(otherUser);
   });
+
+// OCV5-322 (#7da201bd): a 09:00 chain stayed "unknown" (its stop probe could
+// never prove a stop), so its session was BOX_CAPACITY_HELD for hours and
+// stale rows from days before kept eating the account's ten slots.
+test("runs past the supervisor deadline no longer hold their session, account or user",
+  { skip: !available }, async () => {
+    const accountId = 6000n;
+    const uid = 34n;
+    const j = journal({ maxRunsPerAccount: 10, maxRunsPerUser: 10 });
+    const stuck = await candidate(uid, accountId, `stuck-${randomBytes(3).toString("hex")}`);
+    await j.admit(stuck);
+    // nine more unprovable runs of other sessions fill account and user caps
+    for (let i = 0; i < 9; i++) {
+      await pool.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
+        VALUES ($1,$2,'committed',$3::jsonb)`, [`stale-${i}-${schema}`,
+        uid.toString(), JSON.stringify({ boxState: i % 2 ? "handoff" : "resuming", boxAccountId: "6000",
+          boxSessionId: `old-${i}`, boxRunNonce: hex(i, 4) + "e".repeat(20), boxLeaseEpoch: "f".repeat(32) })]);
+    }
+    await pool.query(`UPDATE request_finalize_journal SET ctx = ctx || '{"boxState":"unknown"}'::jsonb
+      WHERE request_id=$1`, [stuck.requestId]);
+    const sameSession = () => candidate(uid, accountId, stuck.fingerprint.sessionId);
+    await assert.rejects(async () => j.admit(await sameSession()), held);
+    await assert.rejects(async () => j.admit(await candidate(uid, accountId,
+      `fresh-${randomBytes(3).toString("hex")}`)), held);
+    // 4h15m after their first row the supervisor has killed them all
+    await pool.query(`UPDATE request_finalize_journal SET created_at = now() - interval '4 hours 16 minutes'
+      WHERE user_id=$1 AND ctx ? 'boxState'`, [uid.toString()]);
+    await j.admit(await sameSession());
+    for (let i = 0; i < 9; i++) {
+      await j.admit(await candidate(uid, accountId, `fresh-${i}-${randomBytes(3).toString("hex")}`));
+    }
+    await assert.rejects(async () => j.admit(await candidate(uid, accountId,
+      `eleventh-${randomBytes(3).toString("hex")}`)), held);
+  });

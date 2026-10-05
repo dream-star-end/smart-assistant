@@ -9,7 +9,7 @@ import { ProxyAgent, fetch as undiciFetch, type Dispatcher } from "undici";
 import { getAccount, getCursorTokenSnapshot, getTokenForUse, listAccounts,
   type AccountRow, type AccountToken, type CursorTokenSnapshot } from "../../account-pool/store.js";
 import { resolveAccountEgressDispatcher, type EgressResolution } from "../../account-pool/egressDispatcher.js";
-import { CursorSandProvisionClient, sandPrincipal } from "../../account-pool/cursorSandProvision.js";
+import { CursorSandProvisionClient, SandProvisionError, sandPrincipal } from "../../account-pool/cursorSandProvision.js";
 import { selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
 import { BoxExecTransport } from "./boxExecTransport.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -19,7 +19,11 @@ const log = rootLogger.child({ subsys: "box-account-resolver" });
 const MIN_REMAINING_MS = 60_000;
 
 export class BoxAccountResolverError extends Error {
-  constructor(readonly code: string) { super(code); this.name = "BoxAccountResolverError"; }
+  /** Safe cause tag (error name and provision code only, never a message). */
+  constructor(readonly code: string, readonly causeTag?: string) {
+    super(causeTag ? `${code} cause=${causeTag}` : code);
+    this.name = "BoxAccountResolverError";
+  }
 }
 
 type FetchFn = (url: string, init: RequestInit, dispatcher: Dispatcher) => Promise<Response>;
@@ -245,11 +249,24 @@ export class BoxAccountResolver {
     } catch (error) {
       if (error instanceof BoxAccountResolverError) throw error;
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
-      throw new BoxAccountResolverError("BOX_TARGET_UNAVAILABLE");
+      throw new BoxAccountResolverError("BOX_TARGET_UNAVAILABLE", targetCauseTag(error));
     } finally {
       if (owner && !handedOff) this.closeFailedResolve(owner);
     }
   }
+}
+
+// OCV5-321: #611729fb lost the reason a resume target failed to resolve.
+function targetCauseTag(error: unknown): string {
+  if (error instanceof SandProvisionError) {
+    return `SandProvisionError:${error.code}${error.httpStatus ? `:${error.httpStatus}` : ""}`;
+  }
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    const tag = typeof code === "string" && /^[A-Z0-9_]{1,48}$/.test(code) ? `:${code}` : "";
+    return `${error.name.replace(/[^A-Za-z0-9_]/g, "").slice(0, 48)}${tag}`;
+  }
+  return "non_error";
 }
 
 export function createProductionBoxAccountResolver(): BoxAccountResolver {

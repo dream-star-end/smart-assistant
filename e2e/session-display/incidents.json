@@ -4357,7 +4357,9 @@
           "assertion": "oauth + fallback-credit 多值 → 全过"
         }
       ],
-      "coverageCommits": [],
+      "coverageCommits": [
+        "41918388"
+      ],
       "proofPending": {
         "reason": "unit coverage on official CC anthropic-beta fallback-credit allowlist; live proof after commercial runtime image rebuild",
         "since": "2026-09-20"
@@ -4381,7 +4383,9 @@
           "assertion": "oauth + thinking-token-count 多值 → 全过"
         }
       ],
-      "coverageCommits": [],
+      "coverageCommits": [
+        "6b22b40d"
+      ],
       "proofPending": {
         "reason": "unit coverage on official CC anthropic-beta thinking-token-count allowlist; live proof after commercial runtime image rebuild",
         "since": "2026-09-20"
@@ -4410,7 +4414,9 @@
           "assertion": "5h 占用 96% 且 resets_at 为空 → no_active"
         }
       ],
-      "coverageCommits": [],
+      "coverageCommits": [
+        "d08669ae"
+      ],
       "proofPending": {
         "reason": "unit coverage on Claude quota-window reset not kicking the account; live proof on commercial pool after a 5h window rollover",
         "since": "2026-09-20"
@@ -4439,7 +4445,9 @@
           "assertion": "非 claude-* 的未知型号即使有票也不改写"
         }
       ],
-      "coverageCommits": [],
+      "coverageCommits": [
+        "a63fbe79"
+      ],
       "proofPending": {
         "reason": "unit coverage rewriting in-flight claude-opus-4-8 to the turn canonical; live proof on official-cc harness",
         "since": "2026-09-20"
@@ -4452,7 +4460,8 @@
       "symptom": "官方 CC 活回合被误判 SERVICE_RESTART：黄卡「任务已中断」但进程仍在出活、过一会又自动续跑。",
       "rootFixCommit": "2116af09",
       "coverageCommits": [
-        "b08aa77b"
+        "b08aa77b",
+        "2116af09"
       ],
       "regressions": [
         {
@@ -4478,7 +4487,8 @@
       "symptom": "官方 CC 长工具空闲后 403 model authority expired（sleep 240 > 120s TTL，过期 envelope 与有效 lease 同带）；随后 leftover/unpublished 磁带仍 SERVICE_RESTART 自动恢复出黄卡「任务已中断」，进程继续出 token。",
       "rootFixCommit": "ac3dc10d",
       "coverageCommits": [
-        "4a6812df"
+        "4a6812df",
+        "ac3dc10d"
       ],
       "regressions": [
         {
@@ -5085,7 +5095,8 @@
         "daeb5627",
         "ed815301",
         "f229790e",
-        "77794a8c"
+        "77794a8c",
+        "e721098f"
       ],
       "regressions": [
         {
@@ -6018,6 +6029,178 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
           "assertion": "box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-LEFTOVER-TOOL-FRAMES",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #611729fb（v5-a1d06cff1 发布前，09:00Z）：Box Claude Opus 5.5 回合执行 79 步后，一次工具结果续接时 Box exec 目标解析失败（BOX_TARGET_UNAVAILABLE → resume_publish_unknown → 500），CCB 重试被 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝，红卡『任务执行失败 / 内部错误』且只能手点『从断点继续』。所有工具均已完成，按 OCV5-317 应自动断点续接，但 master 判 checkpoint_unsafe：残留 live 帧里每个 tool_use 块被转成无 id、未完成的 tool 记录，凡决策时 live 帧尚在的带工具回合都被当成有未完成工具。修复：残留 tool_use / tool_result 按 id 配对（tool_result.toolUseBlockId → tool_use.blockId），无 id 的块仍按原规则 fail-closed；BOX_TARGET_UNAVAILABLE 附带安全的原因标签（仅错误名/供给码）。",
+      "rootFixCommit": "bcaa4772",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-321 settled-tools checkpoint survives leftover live tool frames"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT",
+      "occurredAt": "2026-10-03",
+      "severity": "P1",
+      "symptom": "线上 #7da201bd/#2a81a2fe（v5-bc4b6f432 上线后，13:03Z）：会话 webmus5cc8xo8xspo 在 09:00 有一轮 Box 工具结果已提交但模型未读到就失败。CCB 丢弃自己的 API Error 行，之后每条用户消息（含自动『从断点继续』提示）都被合并进那条 tool_result 消息（尾形 user:tool_result+text+text…），egress 一律 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，且每次失败再多一个 text 块，会话永久无法继续；master 把每次空的自动续接都当新机会，20 秒内连发 10 次（『模型繁忙，正在重试中 8/10』、两张灰卡、红卡）。修复：已回答的工具交换 + 仅文本尾判为 fresh（answeredToolIds），BoxToolFetch 先证明本回合没有在等这些结果的 handoff、孤儿 handoff 已认领并停止，再以 resumeToolResults 把交换落为历史、文本作为新提示冷启动；空的自动续接再次以模型面错误失败时只给 3 次预算（CLI 自己的 API Error 行不算进展）；停止探针失败原因写日志。",
+      "rootFixCommit": "cafdfc81",
+      "coverageCommits": [
+        "10c5bd71",
+        "81c3fe9a"
+      ],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxCapacityAdmission.integ.test.ts",
+          "assertion": "runs past the supervisor deadline no longer hold their session, account or user"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAnsweredExchange.test.ts",
+          "assertion": "with no waiting handoff the prompt runs fresh over the staged exchange"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "OCV5-322 empty automatic recovery attempt ${attempt} ${scheduled ? \"retries\" : \"stops\"}"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261004-BOX-RESUME-UNSENT-PARKED",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "线上（v5-2d8b60e30 上线后，2026-10-03 16:00Z / 台北 00:00）：会话 webmusk512gnvx22z 全能助手 Box Claude Opus。第 32 轮工具结果恢复发布已写入 claim，随后解析 Box 目标失败（BOX_TARGET_UNAVAILABLE / SandProvisionError:REQUEST_FAILED），一次 exec 都没跑。该叶子被标为 unknown（resume_publish_unknown），但 keeper/supervisor/CLI 仍活着，在等一份永远不会再发布的工具结果。直到 4 小时 supervisor 截止前，这个 run 一直占着会话的 Box 槽：CCB 重试（『模型繁忙，正在重试中』）45 秒后得到 409 BOX_CAPACITY_HELD，回合以 upstream_failed 结束。它也让 idle proof 一直 pending，自动续接和之后每条消息都被 IDLE_HISTORY_PENDING 拒绝（『消息未开始处理，已确认未计费』）。修复：未解析到目标即失败的发布记为 resume_publish_unsent。清理 worker 读不到 proof 时，对 unsent 叶子（10 秒后）和普通 resume_publish_unknown 叶子（20 分钟后）先在 journal 写停止意图，再请原 nonce/epoch keeper 停止，读到它自己的终止 proof 后走既有 markToolChainStoppedFailure 关链，释放槽位并让 idle proof 变为 failed。",
+      "rootFixCommit": "cf9ae2ae",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "unsent resume leaf: intent, keeper stop, proof, then the existing chain CAS"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxStaleResumeStop.integ.test.ts",
+          "assertion": "stale resume leaves are listed with phase and age and take one stop intent"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261004-BOX-FRESH-PROJECTS-DIR",
+      "occurredAt": "2026-10-04",
+      "severity": "P2",
+      "symptom": "线上 selfhost（v5-5ef67b4d8）：2026-10-04 新加 Cursor 账号 25，Sand 生命周期已 ready、Box RUNNING、Box 内 Claude Code 2.1.288 可执行，但该 Box 从未持久化过 Claude 会话：~/.claude 存在，~/.claude/projects 不存在。零付费运维探针 boxPrelaunchLiveProbe（run 2e8943bf85258d42fb192640）在 prelaunch INIT 以 BOX_EXEC_REMOTE_EXIT 失败。带历史的回合都要把会话快照暂存到该目录下，所以已有会话切到新账号时会在 Claude 启动前失败；账号 20 没暴露是因为早期探针已在它的 Box 里建过该目录。本次由探针在用户回合命中前发现，没有对应的用户失败回合。修复：守卫路径由 prelaunch bootstrap（每个守卫 run 唯一不进批的 Exec）在 ~/.claude 属于本用户时尽力创建 projects 目录（0700，逐级 O_NOFOLLOW，绝不创建 ~/.claude），INIT/stage/cleanup 仍只打开不创建；文本路径的 stage INIT 以同样方式只创建这一层父目录，并拒绝符号链接的 projects。修复后同一探针在账号 25 真实 Box 通过，并经产品 BoxTextFetch 路径完成合成历史回放。",
+      "rootFixCommit": "d66309cf",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "history stages on a never-used Box that has no projects directory yet"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxPrelaunchControl.test.ts",
+          "assertion": "bootstrap never creates a missing ~/.claude or follows a symlinked one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStageFiles.test.ts",
+          "assertion": "history stages on a never-used Box that has no projects directory yet"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStageFiles.test.ts",
+          "assertion": "INIT refuses a symlinked projects directory instead of following it"
+        }
+      ],
+      "proofPending": {
+        "reason": "已在账号 25 真实 Box 用零付费 boxPrelaunchLiveProbe（修复前失败、修复后通过）和一次合成历史回放（boxTextStreamProbe，OCV5_289_STREAM_HISTORY_ACK=1）验证。这两个探针需要真实 Box 账号凭据，接不进 CI 的 browser/live-e2e/deploy-gate runner。selfhost 上线后需用真实用户的带历史 Box 回合验收。",
+        "since": "2026-10-04"
+      }
+    },
+    {
+      "id": "INC-20261004-BOX-UNKNOWN-NEVER-CLOSED",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "线上（v5-0fabfe865，2026-10-04 05:14Z / 台北 13:14）：账号 25 的 Box 装的是 Claude Code 2.1.288，而 Box 链路全部按 2.1.280 验证。请求 1a28c670（第 2 轮，Read 一张 png）发布的工具结果是一个 image 块，2.1.288 回显成 image 加它自己写的 `[Image: source: …/tool-results/<file>]` 文本块，严格回显校验抛 BOX_TOOL_ECHO_CONTENT_MISMATCH，回合以『内部错误』失败，叶子记为 continuation_unknown。CLI 无人接管地继续跑：又发了两个没人应答的工具调用（各等 MCP 1800 秒超时），一小时后自己结束。OCV5-323 的限时停止只认 resume_publish_* 阶段，stop-probe 每 3 分钟只打一条 BOX_EXEC_REMOTE_EXIT；证明出现后恢复又撞上同一个回显，静默返回 pending。这一行一直占着会话和它的 idle proof，过期后仍被 idle proof 当成未结束的链。钉在已禁用账号 20 上的行同样没有终态（BOX_ACCOUNT_UNAVAILABLE，OCV5-312 只能人工收尾）。修复：回显接受 CLI 自己加的图片来源注记（其余仍逐字节绑定）；回显被拒时立即经显式停止路径停掉 CLI，叶子记 continuation_echo_rejected；限时停止覆盖所有 unknown 阶段；已结束但不可能产出可交付结果的 run 按未计费 rejected_stream 收尾；超过最大存活时间且读不到证明的 run 进入新终态 expired_unproven（不伪造证明）；idle proof 把它读成 failed；新启动先校验 Box 上的 Claude Code 版本，不在支持列表就在准入前拒绝；2.1.288 上不再记录或认领标成 2.1.280 的 native pointer。",
+      "rootFixCommit": "8563617b",
+      "coverageCommits": [
+        "4e9db60a",
+        "c59c3fdc",
+        "353fd2ac"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResultEcho.cli.test.ts",
+          "assertion": "OCV5-313 the CLI's own image source note is the only extra block an image echo may carry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "OCV5-313 a rejected result echo stops the run through the explicit-stop path before the request fails"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-313 every unknown phase gets the timed stop; a rejected echo is stopped at once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "a new launch is refused before anything is admitted unless the installed CLI is supported"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxRunExpiredUnproven.integ.test.ts",
+          "assertion": "an expired linked chain closes once: unbilled leaf aborted, waiting ancestors released"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261004-BOX-CLI-VERSION-UNREADABLE",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "线上（v5-0ee3b3710，2026-10-04 12:42Z 起）：8563617b 的 Box CLI 版本闸门读版本时向 exec 传输层要 64 字节响应，而传输层的下限是 1024，请求在本机就以 BOX_EXEC_REQUEST_INVALID 被拒、从未发出。闸门把任何失败都读成 BOX_CLI_VERSION_UNREADABLE，于是任意 Box 上的新启动都会在准入前被拒（不占槽、不启动、不计费，但 Box Claude 无法开新回合）。上线后到发现前没有用户回合撞到；由账号 25 的线上只读探针在 14:22Z 发现（单测用的假 exec 没有这道校验）。修复：读取改要 1024 字节，解析仍只接受一行精确版本号；新增用例让读取走真实 BoxExecTransport 并要求请求到达 fetch。",
+      "rootFixCommit": "7721c063",
+      "proofPending": {
+        "reason": "回归在 unit 层（真实 BoxExecTransport 的请求校验）；线上证据是一次性的运维只读探针（账号 25 读到 2.1.288 并放行），不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-04"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "the version read is a request the real Box exec transport sends"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261005-SAND-INSTALL-RESEND",
+      "occurredAt": "2026-10-04",
+      "severity": "P2",
+      "symptom": "selfhost（2026-10-04 01:02Z 起）：账号 25 的 Cursor Box 主程序布局比 relay 安装器新，安装器每次都以 FileNotFoundError（/home/box/sand-host/ 不存在）失败。Box 接受了安装 prompt（submitted），15 分钟内装不出能力，协调器就换 nonce 把同一份安装器再发一遍，每 15 分钟一次、一百多次零成功；用户在 Box 应用的「OpenClaude Sand Relay」Bot 里反复看到同一条报错（2026-10-05 08:58 反馈）。修复：已被同一个 Box 主进程接受过的安装不再重发，标 INSTALL_UNCONFIRMED，能力探针照常；Box 主进程重启或 relay 模块换版后才允许一次新尝试。投递结果未知与 Box 进程已换的重试（INC-20260921-SAND-UOR-LOOP）保持不变。安装器对新 Box 布局的适配不在本次范围。",
+      "rootFixCommit": "7f8e925e",
+      "proofPending": {
+        "reason": "回归在 unit 层（真实协调器对假 Box 网关的发送计数）；线上证据是发布后状态日志里该 operation 进入 INSTALL_UNCONFIRMED 且不再有新的 submitted，属一次性只读核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-05"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "an accepted install that leaves no capability is not sent again to the same host process"
         }
       ]
     }

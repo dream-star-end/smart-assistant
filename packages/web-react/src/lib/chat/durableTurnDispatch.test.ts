@@ -440,6 +440,52 @@ describe("detectServerTerminalTurns (persist)", () => {
   });
 });
 
+describe("admission 重确认不回退用户行状态", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+  });
+
+  test("回复开始后,无正文的状态/用量帧不把 read 拉回 sent(已送达不闪烁)", () => {
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    sock.sendMessage({ sessId: "s1", agentId: "main", text: "长任务" });
+    const s = sock.sessions.get("s1")!;
+    const cmid = s.messages.find((m) => m.role === "user")!.id;
+    const userRow = () => s.messages.find((m) => m.role === "user" && m.id === cmid)!;
+    const peer = { id: "s1", kind: "dm" };
+    const base = { sessionKey: "agent:main:webchat:dm:s1", channel: "webchat", peer, clientMessageId: cmid };
+
+    ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", admitted: true, peer, clientMessageId: cmid }) });
+    expect(userRow().status).toBe("sent");
+
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      clientMessageId: cmid, frameSeq: 1, ts: Date.now(),
+      blocks: [{ kind: "text", blockId: "b1", text: "开始处理" }],
+    })) });
+    expect(userRow().status).toBe("read");
+
+    ws.onmessage?.({ data: JSON.stringify({ ...base, type: "outbound.turn_status", status: "compacting" }) });
+    expect(userRow().status).toBe("read");
+    ws.onmessage?.({ data: JSON.stringify({ ...base, type: "outbound.turn_usage", usage: { totalTokens: 1 } }) });
+    expect(userRow().status).toBe("read");
+    ws.onmessage?.({ data: JSON.stringify({
+      ...base, type: "outbound.call_usage",
+      call: { callId: "c1", targetIds: ["b1"], usage: { totalTokens: 1 } },
+    }) });
+    expect(userRow().status).toBe("read");
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ clientMessageId: cmid, frameSeq: 2, ts: Date.now(), blocks: [] })) });
+    expect(userRow().status).toBe("read");
+    ws.onmessage?.({ data: JSON.stringify({ type: "outbound.ack", admitted: true, peer, clientMessageId: cmid }) });
+    expect(userRow().status).toBe("read");
+    expect(s._sendingInFlight).toBe(true);
+    sock.stop();
+  });
+});
+
 describe("REST sync 终态收敛 applyServerMessages (RFC §5 M5)", () => {
   afterEach(() => {
     FakeWS.instances = [];

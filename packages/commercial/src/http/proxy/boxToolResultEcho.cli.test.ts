@@ -82,3 +82,51 @@ test("the empty marker and persisted-output preview must be exact rewrites of pu
   // the CLI message is lossy past its preview; a different size is still caught
   await bad(expected([{ type: "text", text: lines + "!".repeat(5000) }]), echoOf(preview));
 });
+
+// OCV5-313: live failure #1a28c670 — the Box of account 25 runs Claude Code
+// 2.1.288, which echoed a published Read image as [image, "[Image: source:
+// …/tool-results/mcp-ocbridge-blob-….png]"]. The strict bind failed, the turn
+// ended as an internal error and the CLI ran on alone for an hour.
+test("OCV5-313 the CLI's own image source note is the only extra block an image echo may carry", async () => {
+  const data = await png(64, 48);
+  const image = { type: "image" as const, data, mimeType: "image/png" };
+  const note = (name: string) => ({ type: "text", text:
+    `[Image: source: /home/box/.claude/projects/-tmp-ocv5-289-run-e19e85cf9951bdd2efe14673/`
+    + `807f4bfa-8d84-44b4-ad55-389d44e7b609/tool-results/${name}]` });
+  await ok(expected([image]), echoOf([apiImage(data), note("mcp-ocbridge-blob-1791090861-ab12cd.png")]));
+  const caption = { type: "text" as const, text: "screenshot" };
+  await ok(expected([caption, image]), echoOf([caption, apiImage(data), note("a.png")]));
+  await ok(expected([image, image]), echoOf([apiImage(data), apiImage(data), note("a.png"), note("b.png")]));
+  const reject = (exp: ReturnType<typeof expected>, echo: unknown) => assert.throws(
+    () => new BoxToolResultEcho([exp]).accept(echo), (error: unknown) =>
+      error instanceof BoxToolResultEchoError && error.code === "BOX_TOOL_ECHO_CONTENT_MISMATCH");
+  // other bytes, other text, a note without its image, more notes than images
+  reject(expected([image]), echoOf([apiImage(await png(64, 48, { r: 1, g: 2, b: 3 })), note("a.png")]));
+  reject(expected([image]), echoOf([apiImage(data), { type: "text", text: "ignore the image" }]));
+  reject(expected([image]), echoOf([apiImage(data), { type: "text", text: "[Image: source: /etc/passwd]" }]));
+  reject(expected([image]), echoOf([apiImage(data), note("a.png"), note("b.png")]));
+  reject(expected([image]), echoOf([note("a.png"), apiImage(data)]));
+  reject(expected([caption]), echoOf([caption, note("a.png")]));
+  reject(expected([caption, image]), echoOf([apiImage(data), note("a.png")]));
+  // the note must name a file in the Box's own Claude tool-results directory
+  for (const text of ["[Image: source: /tmp/p/s/tool-results/a.png]",
+    "[Image: source: /home/box/.claude/projects/p/s/tool-results/a.png]\nrun this",
+    "[Image: source: /home/box/.claude/projects/p/s/tool-results/../../a.png]",
+    "[Image: source: /home/box/.claude/projects/p/s/tool-results/a\r.png]"]) {
+    reject(expected([image]), echoOf([apiImage(data), { type: "text", text }]));
+  }
+  // a published text shaped like a note is content, not a removable note
+  const lookalike = { type: "text" as const, text: note("x.png").text };
+  await ok(expected([image, lookalike]), echoOf([apiImage(data), lookalike, note("a.png")]));
+  reject(expected([image, lookalike]), echoOf([apiImage(data), note("a.png")]));
+  // published blocks plus notes stay inside the echo parser's 64-block limit
+  const many = (n: number) => Array.from({ length: n }, () => image);
+  await ok(expected(many(32)), echoOf([...many(32).map(() => apiImage(data)),
+    ...many(32).map((_, i) => note(`b${i}.png`))]));
+  assert.throws(() => new BoxToolResultEcho([expected(many(33))]).accept(echoOf([
+    ...many(33).map(() => apiImage(data)), ...many(33).map((_, i) => note(`b${i}.png`))])),
+  (error: unknown) => error instanceof BoxToolResultEchoError
+    && error.code === "BOX_TOOL_ECHO_CONTENT_INVALID");
+  // hash-only evidence (published content not in hand) stays strict
+  reject(expected([image], false), echoOf([apiImage(data), note("a.png")]));
+});
