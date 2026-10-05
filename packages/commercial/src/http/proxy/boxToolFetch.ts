@@ -20,6 +20,11 @@ import type { BoxReplayMessageWriter } from "./boxReplayMessageFile.js";
 import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
+import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
+import { rootLogger } from "../../logging/logger.js";
+
+const fetchLog = rootLogger.child({ subsys: "box-tool-fetch" });
 
 type FetchArgs = { uid: bigint; sessionId: string | null; requestId: string;
   canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
@@ -77,10 +82,42 @@ export class BoxToolFetch {
     cleanupResolveTimeoutMs?: number;
     /** OCV5-299: explicit stop for a locally rejected first-round stream. */
     stopRejectedRun?: Parameters<First>[1]["stopRejectedRun"];
+    /** OCV5-313: how long a failed continuation waits for stopRejectedRun. */
+    echoStopWaitMs?: number;
     /** OCV5-304: stop an orphaned handoff exactly as the user's Stop does. */
     stopOrphanRun?: (identity: { requestId: string; uid: bigint; accountId: bigint;
       runNonce: string; leaseEpoch: string }) => Promise<"stopped_proven" | "completed_unsettled" | "pending">;
   }) {}
+
+  /** OCV5-313 (#1a28c670): the CLI echoed tool results this request cannot
+   * bind, so the request fails and nothing the CLI writes afterwards can be
+   * delivered. Left alone it kept running for an hour and held the session.
+   * Stop it through the same explicit-stop path as a user Stop (durable intent,
+   * original keeper, keeper proof, failed_stopped chain). The wait is bounded;
+   * a stop that takes longer keeps running and is still observed. An unproven
+   * stop leaves the leaf unknown (phase continuation_echo_rejected) for the
+   * cleanup worker. */
+  private async stopEchoRejected(args: FetchArgs, claim: BoxToolResumeClaim): Promise<void> {
+    const stop = this.deps.stopRejectedRun;
+    if (!stop) return;
+    const waitMs = this.deps.echoStopWaitMs ?? 25_000;
+    const fields = { requestId: args.requestId, accountId: claim.accountId.toString() };
+    let late = false;
+    const observed = Promise.resolve().then(() => stop({ requestId: args.requestId,
+      uid: args.uid, accountId: claim.accountId, runNonce: claim.runNonce,
+      leaseEpoch: claim.leaseEpoch })).then((outcome) => {
+      fetchLog.warn("box_echo_rejected_stop", { ...fields, outcome, late });
+    }, (error: unknown) => {
+      fetchLog.error("box_echo_rejected_stop", { ...fields, outcome: "error", late,
+        reason: error instanceof Error && /^[A-Z0-9_]{1,64}$/.test(error.message)
+          ? error.message : "error" });
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try { await Promise.race([observed, new Promise<void>((resolve) => {
+      timer = setTimeout(() => { late = true; resolve(); }, waitMs);
+    })]); }
+    finally { if (timer) clearTimeout(timer); }
+  }
 
   /** OCV5-304: a recovered dispatch resent tool results that only the earlier,
    * finished dispatch's handoff could have received. Claim that exchange (one
@@ -88,10 +125,9 @@ export class BoxToolFetch {
    * and let this request continue it as a fresh invocation. Returns false,
    * keeping the original rejection, unless all of that is proven. */
   private async releaseOrphanedExchange(args: FetchArgs, error: unknown): Promise<boolean> {
-    const journal = this.deps.journal;
-    if (!(error instanceof Error) || (error as { code?: unknown }).code !== "BOX_TOOL_OWNER_UNKNOWN"
-      || !this.deps.stopOrphanRun || !journal.findOrphanToolHandoff
-      || !journal.claimOrphanRecovery || !journal.releaseOrphanRecovery) return false;
+    if (!(error instanceof Error) || (error as { code?: unknown }).code !== "BOX_TOOL_OWNER_UNKNOWN") {
+      return false;
+    }
     let toolIds: readonly string[], sessionId: string, turnKey: string;
     try {
       const classified = classifyBoxContinuation(args.canonicalBody);
@@ -99,20 +135,47 @@ export class BoxToolFetch {
       if (classified.classification !== "continuation_candidate") return false;
       toolIds = classified.toolIds; sessionId = fingerprint.sessionId; turnKey = fingerprint.turnKey;
     } catch { return false; }
-    const orphan = await journal.findOrphanToolHandoff({ uid: args.uid, sessionId, turnKey, toolIds });
+    return await this.releaseOrphan(args, { toolIds, sessionId, turnKey }) === "released";
+  }
+
+  /** OCV5-322: an answered exchange arrives together with a new prompt. It may
+   * run fresh only when no handoff of this turn still waits for the results
+   * and any orphaned earlier handoff is claimed and proven stopped first. */
+  private async admitAnsweredExchange(args: FetchArgs, toolIds: readonly string[]): Promise<void> {
+    const journal = this.deps.journal;
+    let sessionId: string, turnKey: string;
+    try {
+      ({ sessionId, turnKey } = deriveBoxCallFingerprint(args.uid, args.canonicalBody));
+    } catch {
+      throw new BoxContinuationDecisionError("reject", "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    }
+    if (!journal.hasWaitingToolHandoff
+      || await journal.hasWaitingToolHandoff({ uid: args.uid, sessionId, turnKey, toolIds })
+      || await this.releaseOrphan(args, { toolIds, sessionId, turnKey }) === "held") {
+      throw new BoxContinuationDecisionError("reject", "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    }
+  }
+
+  private async releaseOrphan(args: FetchArgs, exchange: { toolIds: readonly string[];
+    sessionId: string; turnKey: string }): Promise<"released" | "none" | "held"> {
+    const journal = this.deps.journal;
+    if (!this.deps.stopOrphanRun || !journal.findOrphanToolHandoff
+      || !journal.claimOrphanRecovery || !journal.releaseOrphanRecovery) return "held";
+    const orphan = await journal.findOrphanToolHandoff({ uid: args.uid, ...exchange });
     if (orphan.kind === "claimed") throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
-    if (orphan.kind !== "orphan") return false;
+    if (orphan.kind === "none") return "none";
+    if (orphan.kind !== "orphan") return "held";
     const claim = { requestId: orphan.identity.requestId, uid: args.uid, by: args.requestId };
     if (!(await journal.claimOrphanRecovery({ ...claim,
       ...(orphan.staleClaim ? { replacing: orphan.staleClaim } : {}) }))) {
       throw new BoxDurableJournalError("BOX_RESUME_IN_PROGRESS");
     }
-    if (orphan.stopped) return true;
+    if (orphan.stopped) return "released";
     let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
     try { outcome = await this.deps.stopOrphanRun(orphan.identity); } catch { /* unproven */ }
-    if (outcome === "stopped_proven") return true;
+    if (outcome === "stopped_proven") return "released";
     await journal.releaseOrphanRecovery(claim).catch(() => {});
-    return false;
+    return "held";
   }
 
   private own(nonce: string, target: BoxResolvedTarget, uid: bigint,
@@ -456,7 +519,15 @@ export class BoxToolFetch {
         void (async () => {
           let published: BoxToolPublishedResume | null = null;
           let resumeToolResults = false;
-          if (routeClass(args) === "continuation_candidate") {
+          const route = routeClass(args);
+          const answered = route === "fresh" ? (args.prepared
+            ? args.prepared.answeredToolIds
+            : classifyBoxContinuation(args.canonicalBody).answeredToolIds) : undefined;
+          if (answered?.length) {
+            await this.admitAnsweredExchange(args, answered);
+            resumeToolResults = true;
+          }
+          if (route === "continuation_candidate") {
             try {
             published = await (this.deps.publishResume
               ?? publishBoxToolResume)({ ...args, init }, {
@@ -478,6 +549,7 @@ export class BoxToolFetch {
             this.own(published.claim.runNonce, published.target,
               args.uid, published.claim.leaseEpoch);
             acknowledge(); // the existing CLI received the durable tool-result handoff
+            const claim = published.claim;
             const result = await (this.deps.runContinuation ?? runBoxToolContinuation)({
               published, uid: args.uid, requestId: args.requestId,
               canonicalBody: args.canonicalBody, upstreamModel: args.upstreamModel,
@@ -487,7 +559,12 @@ export class BoxToolFetch {
               retainUnknownTarget: ({ published: held }) =>
                 this.own(held.claim.runNonce, held.target,
                   args.uid, held.claim.leaseEpoch),
-              onUnknown: this.deps.onUnknown });
+              onUnknown: this.deps.onUnknown }).catch(async (error: unknown) => {
+              if (error instanceof BoxToolResultEchoError) {
+                await this.stopEchoRejected(args, claim);
+              }
+              throw error;
+            });
             if (result.kind === "final") {
               await this.releaseAfterProof({ requestId: args.requestId,
                 uid: args.uid, accountId: published.claim.accountId,

@@ -95,9 +95,9 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'for old in "${fifo%.*.fifo}".*.fifo; do',
   '  if [ "$old" = "$fifo" ] || [ ! -p "$old" ]; then continue; fi',
   '  reap "$old"',
-  '  rm -f "$old"',
+  '  rm -f "$old" "$old.in" "$old.seq" "$old.lock"',
   'done',
-  'rm -f "$fifo"',
+  'rm -f "$fifo" "$fifo.in" "$fifo.seq" "$fifo.lock"',
   'mkfifo -m 600 "$fifo"',
   // Hold both ends for the life of claude. A later writer then cannot block
   // in open(), and closing that writer does not deliver EOF mid-turn.
@@ -107,7 +107,7 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'status=$?',
   'set -e',
   'exec 3>&-',
-  'rm -f "$fifo"',
+  'rm -f "$fifo" "$fifo.in" "$fifo.seq" "$fifo.lock"',
   'exit "$status"',
 ].join('\n')
 
@@ -115,7 +115,7 @@ export const BOX_CC_STOP_SCRIPT = [
   'set -eu',
   ...BOX_CC_REAP_FUNCTION,
   'reap "$1"',
-  'rm -f "$1"',
+  'rm -f "$1" "$1.in" "$1.seq" "$1.lock"',
 ].join('\n')
 
 const SPAWN_FIFO_NONCE = /^[a-f0-9]{8,32}$/
@@ -176,31 +176,98 @@ export function boxCcStopExec(control: BoxCcControl): BoxCcExecRequest {
   }
 }
 
-/** Wait until the launch script has created the fifo. Opening it immediately
- * races the mkfifo and then leaves Claude blocked on a reader that never
- * gets a writer. */
+/** One stdin line for the box Claude, sent as one or more exec requests.
+ * The exec API carries data only in argv and environment, and the kernel
+ * refuses any single string over 128 KiB (MAX_ARG_STRLEN), so a line is cut
+ * into base64 parts well under that. A line that needs several requests is
+ * collected in `<fifo>.in`, each request writing at its own offset, and
+ * reaches the fifo in one write by the last request.
+ *
+ * Claude must never read a line twice, also when the bridge repeats a
+ * request whose response it lost. The bridge numbers its lines; under
+ * `<fifo>.lock` the script records `<n> pending` in `<fifo>.seq` before the
+ * fifo write and `<n> done` after it. A repeated request waits for the
+ * attempt that holds the lock, then exits 0 if the line is done and 4 if the
+ * earlier attempt died between the two marks (it is unknown how much Claude
+ * received, so the line is not written again and the bridge stops).
+ *
+ * The script waits until the launch script has created the fifo: opening it
+ * earlier races the mkfifo and then leaves Claude blocked on a reader that
+ * never gets a writer. It opens the path without creating it and only as a
+ * fifo that has a reader: once the launch script has removed the fifo there
+ * is no Claude to write to, and the request fails instead of leaving the
+ * line in a file nobody reads. */
 export const BOX_CC_WRITE_SCRIPT = [
-  'import os,time',
-  'p=os.environ["OC_BOX_CC_FIFO"]',
+  'import base64,fcntl,os,stat,time',
+  'e=os.environ',
+  'p=e["OC_BOX_CC_FIFO"]',
+  'seq=int(e["OC_BOX_CC_SEQ"])',
+  'off=int(e["OC_BOX_CC_OFFSET"])',
+  'last=e["OC_BOX_CC_LAST"]=="1"',
+  'data=b"".join(base64.b64decode(e["OC_BOX_CC_PART_%d"%i]) for i in range(int(e["OC_BOX_CC_PARTS"])))',
   'end=time.time()+15',
   'while not os.path.exists(p):',
   '    if time.time()>end: raise SystemExit(1)',
   '    time.sleep(0.05)',
-  'open(p,"a",encoding="utf-8").write(os.environ["OC_BOX_CC_LINE"])',
+  'fcntl.flock(os.open(p+".lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600),fcntl.LOCK_EX)',
+  'try:',
+  '    with open(p+".seq") as f: done,state=f.read().split()',
+  '    done=int(done)',
+  'except (OSError,ValueError): done,state=0,"done"',
+  'if done>seq or (done==seq and state=="done"): raise SystemExit(0)',
+  'if done==seq: raise SystemExit(4)',
+  'def mark(state):',
+  '    with os.fdopen(os.open(p+".seq.tmp",os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600),"w") as f: f.write("%d %s"%(seq,state))',
+  '    os.replace(p+".seq.tmp",p+".seq")',
+  'if off or not last:',
+  '    f=os.fdopen(os.open(p+".in",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600),"r+b")',
+  '    if os.fstat(f.fileno()).st_size<off: raise SystemExit(3)',
+  '    f.seek(off)',
+  '    f.write(data)',
+  '    f.truncate()',
+  '    if last:',
+  '        f.seek(0)',
+  '        data=f.read()',
+  '        os.unlink(p+".in")',
+  '    f.close()',
+  'if last:',
+  '    fd=os.open(p,os.O_WRONLY|os.O_NONBLOCK|os.O_NOFOLLOW)',
+  '    if not stat.S_ISFIFO(os.fstat(fd).st_mode): raise SystemExit(5)',
+  '    fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)&~os.O_NONBLOCK)',
+  '    mark("pending")',
+  '    with os.fdopen(fd,"wb") as f: f.write(data)',
+  '    mark("done")',
 ].join('\n')
 
-export function boxCcWriteExec(control: BoxCcControl, line: string): BoxCcExecRequest {
-  const text = line.endsWith('\n') ? line : `${line}\n`
-  return {
-    command: 'python3',
-    args: ['-c', BOX_CC_WRITE_SCRIPT],
-    cwd: control.cwd,
-    environment: {
+/** Bytes of the line per environment string (80 000 base64 characters). */
+export const BOX_CC_WRITE_PART_BYTES = 60_000
+/** Environment strings per exec request. */
+export const BOX_CC_WRITE_PARTS_PER_EXEC = 4
+
+/** `seq` numbers the lines of one bridge process from 1. */
+export function boxCcWriteExecs(control: BoxCcControl, line: string, seq: number): BoxCcExecRequest[] {
+  if (!Number.isSafeInteger(seq) || seq < 1) throw new Error('BOX_CC_LINE_SEQ_INVALID')
+  const bytes = Buffer.from(line.endsWith('\n') ? line : `${line}\n`, 'utf8')
+  const perExec = BOX_CC_WRITE_PART_BYTES * BOX_CC_WRITE_PARTS_PER_EXEC
+  const out: BoxCcExecRequest[] = []
+  for (let offset = 0; offset < bytes.length; offset += perExec) {
+    const slice = bytes.subarray(offset, offset + perExec)
+    const environment: Record<string, string> = {
       HOME: BOX_CC_HOME,
       OC_BOX_CC_FIFO: control.fifo,
-      OC_BOX_CC_LINE: text,
-    },
+      OC_BOX_CC_SEQ: String(seq),
+      OC_BOX_CC_OFFSET: String(offset),
+      OC_BOX_CC_LAST: offset + perExec >= bytes.length ? '1' : '0',
+      OC_BOX_CC_PARTS: String(Math.ceil(slice.length / BOX_CC_WRITE_PART_BYTES)),
+    }
+    for (let part = 0; part * BOX_CC_WRITE_PART_BYTES < slice.length; part++) {
+      environment[`OC_BOX_CC_PART_${part}`] = slice
+        .subarray(part * BOX_CC_WRITE_PART_BYTES, (part + 1) * BOX_CC_WRITE_PART_BYTES)
+        .toString('base64')
+    }
+    out.push({ command: 'python3', args: ['-c', BOX_CC_WRITE_SCRIPT], cwd: control.cwd, environment })
   }
+  return out
 }
 
 export function boxCcControlSummary(control: BoxCcControl): {
@@ -255,6 +322,15 @@ export function parseExecFrames(buffer: Buffer): { events: ExecFrame[]; rest: Bu
     }
   }
   return { events, rest: buffer.subarray(offset) }
+}
+
+/** Exit code of a finished exec response; null when it carries no exit event. */
+export function execExitCode(buffer: Buffer): number | null {
+  let code: number | null = null
+  for (const event of parseExecFrames(buffer).events) {
+    if (event.kind === 'exit') code = event.code ?? 0
+  }
+  return code
 }
 
 /** Strict decoder for paid Box model API traffic. The older CLI bridge keeps

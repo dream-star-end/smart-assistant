@@ -9,7 +9,7 @@
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
-import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections } from "./chat/ProcessDisclosure";
+import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections, promptShadowedToolIds } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
   memo,
@@ -932,6 +932,15 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
     // A cleared goal is not a row, a count, or a shell. Skipping it must not
     // seal the current process or move the owner/page boundary.
     if (rows.length > 0 && rows.every(isClearedGoalRecord)) continue;
+    // OCV5-320: a current goal (active / paused / blocked echo) lives in the
+    // composer dock and paints nothing here. Codex goal mode emits one at turn
+    // end, often between the answer and the steps that follow it; treating it
+    // as a top-level row ended the carry and opened a second 已执行 N 个步骤
+    // under the answer. Keep the item but let it touch no shell state.
+    if (rows.length > 0 && rows.every((message) => message.role === "goal" && !isHistoricalGoalRecord(message))) {
+      out.push(item);
+      continue;
+    }
     const advanced = advanceDisclosureBoundary(rows, owner);
     owner = advanced.owner;
     const nextBoundary = advanced.boundary;
@@ -1541,6 +1550,10 @@ export function MessageList({
 }) {
   // 还没开始发送的用户消息不进对话流，改由输入框上方的待发送列表呈现。
   messages = messages.filter((message) => message.role !== "user" || message.status !== "queued");
+  // 用户问答 / 退出计划模式卡已经展示了问题(计划)和结果;同一次调用的工具行只是重复,
+  // 留着会被当成交互工具挂在「处理过程」外面。按 tool_use id 精确配对才隐藏。
+  const shadowedAskTools = promptShadowedToolIds(messages);
+  if (shadowedAskTools.size > 0) messages = messages.filter((message) => !shadowedAskTools.has(message.id));
   // MessageList owns expansion so virtual unmounts and live→history updates cannot reset user intent.
   const [disclosureState, setDisclosureState] = useState<{ session?: string; values: Record<string, boolean> }>({ values: {} });
   const disclosureValues = disclosureState.session === sessionId ? disclosureState.values : {};
@@ -2631,6 +2644,7 @@ export function MessageList({
           eagerDeferred={eager}
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
           startedAt={it.active ? turnActivity?.startedAt ?? null : null}
+          lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
         />
       );
     }

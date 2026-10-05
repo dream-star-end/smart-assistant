@@ -6535,10 +6535,14 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
   });
 
   maybe("checkpoint continuation admits uncertain durable actions and never replays them", async () => {
-    const cases: Array<{ suffix: string; record: MessageLike; expectConflict: boolean }> = [
+    // INC-20260920-OFFICIAL-CC-FALSE-SERVICE-RESTART (2116af09f): a tape with an
+    // unfinished tool is no longer checkpointed automatically; the user's own
+    // 「从断点继续」 still is. A finished tool before a model-plane error
+    // (OCV5-317) and a tape without tool rows stay automatic.
+    const cases: Array<{ suffix: string; manualOnly: boolean; record: MessageLike }> = [
       {
         suffix: "incomplete-tool",
-        expectConflict: true,
+        manualOnly: true,
         record: {
           id: "tool-incomplete",
           role: "tool",
@@ -6548,8 +6552,10 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         },
       },
       {
+        // Commercial fence (f867b11d2): a completed tool whose own result object
+        // says its outcome is unknown is not settled evidence either.
         suffix: "unknown-outcome",
-        expectConflict: true,
+        manualOnly: true,
         record: {
           id: "tool-unknown",
           role: "tool",
@@ -6561,7 +6567,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "permission",
-        expectConflict: false,
+        manualOnly: false,
         record: {
           id: "permission-pending",
           role: "permission",
@@ -6572,7 +6578,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       },
       {
         suffix: "runtime-incomplete",
-        expectConflict: false,
+        manualOnly: false,
         record: {
           id: "runtime-incomplete",
           role: "runtime-event",
@@ -6603,7 +6609,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
         ],
       });
       const identity = turnRecoveryIdentity(sessionId, sourceClientMessageId);
-      const recovered = await backend.admitUserTurn(admitInput({
+      const admit = (automatic: boolean) => backend.admitUserTurn(admitInput({
         sessionId,
         clientMessageId: identity.clientMessageId,
         billingRequestId: `brq-${identity.clientMessageId}`,
@@ -6613,29 +6619,36 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
           text: "checkpoint — verify state before any write",
           ts: 3,
         } as MessageLike & { id: string },
-        recovery: {
-          sourceClientMessageId,
-          mode: "checkpoint",
-          automatic: true,
-          rootClientMessageId: sourceClientMessageId,
-          attempt: 1,
-          max: 10,
-        },
+        recovery: automatic
+          ? {
+              sourceClientMessageId,
+              mode: "checkpoint",
+              automatic: true,
+              rootClientMessageId: sourceClientMessageId,
+              attempt: 1,
+              max: 10,
+            }
+          : { sourceClientMessageId, mode: "checkpoint", automatic: false },
       }));
-      if (testCase.expectConflict) {
-        assert.deepEqual(recovered, {
+      if (testCase.manualOnly) {
+        assert.deepEqual(await admit(true), {
           kind: "recovery_conflict",
           reason: "automatic_checkpoint_unsafe",
         }, testCase.suffix);
-        continue;
+        const declined = await pool.query(
+          "SELECT 1 FROM turn_dispatches WHERE user_id=$1 AND session_id=$2 AND client_message_id=$3",
+          [UID, sessionId, identity.clientMessageId],
+        );
+        assert.equal(declined.rowCount, 0, testCase.suffix);
       }
+      const recovered = await admit(!testCase.manualOnly);
       assert.equal(recovered.kind, "admitted", testCase.suffix);
       const stored = await backend.getClientSession(sessionId, CUSER);
       assert.equal(
         (stored!.messages as MessageLike[]).some((message) =>
           message.id === identity.clientMessageId &&
           message._recoveryMode === "checkpoint" &&
-          message._automaticRecovery === true),
+          (message._automaticRecovery === true) === !testCase.manualOnly),
         true,
         testCase.suffix,
       );
@@ -6883,6 +6896,143 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
     assert.equal(jobs.rows[0]!.semantic_recovery_attempt, 1);
   });
+
+  // OCV5-321 (#611729fb): same settled Box tape, but the live stream for the
+  // source message still holds tool_use + tool_result frames when finalize
+  // decides. Those leftovers must pair by id instead of reading as open tools.
+  maybe("OCV5-321 settled-tools checkpoint survives leftover live tool frames", async () => {
+    const sessionId = "s-ocv5-321-leftover";
+    const sourceClientMessageId = "cm-ocv5-321-leftover-source";
+    const sessionKey = `agent:main:webchat:dm:${sessionId}`;
+    const sourceAdmission = await backend.admitUserTurn(admitInput({
+      sessionId,
+      clientMessageId: sourceClientMessageId,
+      billingRequestId: `brq-${sourceClientMessageId}`,
+      message: {
+        id: sourceClientMessageId,
+        role: "user",
+        text: "add the tests",
+        ts: 1,
+        _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+      } as MessageLike & { id: string },
+    }));
+    assert.equal(sourceAdmission.kind, "admitted");
+    await pool.query(
+      `INSERT INTO client_session_live_streams
+         (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
+       VALUES ($1,$2,$3,$4,'gateway','live','interrupted')`,
+      [`legacy:621:${sessionKey}`, sessionId, CUSER, sourceClientMessageId],
+    );
+    const frames = [
+      [{ kind: "tool_use", blockId: "toolu_ocv5_321_read", toolName: "Read", partial: true }],
+      [{ kind: "tool_use", blockId: "toolu_ocv5_321_read", toolName: "Read", inputJson: { file_path: "a.ts" } }],
+      [{ kind: "tool_result", blockId: "toolu_ocv5_321_read:result",
+        toolUseBlockId: "toolu_ocv5_321_read", toolName: "Read", isError: false, output: "x" }],
+      [{ kind: "text", text: "Quick update: both changes are written." },
+        { kind: "tool_use", blockId: "toolu_ocv5_321_bash", toolName: "Bash", inputJson: { command: "ls" } }],
+      [{ kind: "tool_result", blockId: "toolu_ocv5_321_bash:result",
+        toolUseBlockId: "toolu_ocv5_321_bash", toolName: "Bash", isError: false, output: "a.ts" }],
+    ];
+    for (const [index, blocks] of frames.entries()) {
+      const payload = Buffer.from(JSON.stringify({
+        type: "outbound.message",
+        clientMessageId: sourceClientMessageId,
+        blocks,
+      }));
+      await pool.query(
+        `INSERT INTO client_session_live_frames
+           (stream_key,source,agent_container_id,session_key,frame_seq,payload,payload_sha256)
+         VALUES ($1,'gateway',621,$2,$3,$4,$5)`,
+        [`legacy:621:${sessionKey}`, sessionKey, index + 1, payload, sha256(payload)],
+      );
+    }
+    await stageAndFinalize(CUSER, buildTape({
+      sessionId,
+      agentId: "main",
+      turnIndex: 1,
+      status: "completed",
+      turnKey: "6".repeat(64),
+      clientMessageId: sourceClientMessageId,
+      text: "API Error: 409",
+      tools: [{
+        blockId: "toolu_ocv5_321_read",
+        toolName: "Read",
+        inputJson: { file_path: "a.ts" },
+        output: "x",
+        completed: true,
+      }, {
+        blockId: "toolu_ocv5_321_bash",
+        toolName: "Bash",
+        inputJson: { command: "ls" },
+        output: "a.ts",
+        completed: true,
+      }],
+      errorCode: "ENGINE_ERROR",
+      createdAt: 1_783_950_160_000,
+      usage: { inputTokens: 6, outputTokens: 872 },
+    }));
+    const jobs = await pool.query<{ recovery_mode: string }>(
+      `SELECT recovery_mode FROM turn_recovery_jobs
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+      [UID, sessionId, sourceClientMessageId],
+    );
+    assert.equal(jobs.rowCount, 1);
+    assert.equal(jobs.rows[0]!.recovery_mode, "checkpoint");
+  });
+
+  // OCV5-322 (#7da201bd): every automatic 「从断点继续」 failed within a second
+  // with the same Box 409; the only record was Claude Code's own "API Error"
+  // row. Such an empty repeat gets the short budget, not ten attempts.
+  for (const [attempt, scheduled] of [[2, true], [3, false]] as const) {
+    maybe(`OCV5-322 empty automatic recovery attempt ${attempt} ${scheduled ? "retries" : "stops"}`, async () => {
+      const sessionId = `s-ocv5-322-empty-${attempt}`;
+      const root = `cm-ocv5-322-root-${attempt}`;
+      const sourceClientMessageId = turnRecoveryAttemptIdentity(sessionId, root, attempt).clientMessageId;
+      const admission = await backend.admitUserTurn(admitInput({
+        sessionId,
+        clientMessageId: sourceClientMessageId,
+        billingRequestId: `brq-${sourceClientMessageId}`,
+        message: {
+          id: sourceClientMessageId,
+          role: "user",
+          text: "继续完成刚才因临时异常中断的任务。",
+          ts: 1,
+          _routing: { model: "box-api-claude-opus-5-5", effortLevel: null, teamMode: false },
+          _automaticRecovery: true,
+          _automaticRecoveryAttempt: attempt,
+          _automaticRecoveryRootClientMessageId: root,
+          _recoveryOfClientMessageId: root,
+        } as MessageLike & { id: string },
+      }));
+      assert.equal(admission.kind, "admitted");
+      await stageAndFinalize(CUSER, buildTape({
+        sessionId,
+        agentId: "main",
+        turnIndex: 1,
+        status: "completed",
+        turnKey: (attempt === 2 ? "8" : "9").repeat(64),
+        clientMessageId: sourceClientMessageId,
+        text: "API Error: 409 {\"error\":{\"code\":\"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION\"}}",
+        errorCode: "ENGINE_ERROR",
+        createdAt: 1_783_950_170_000 + attempt,
+        usage: { inputTokens: 0, outputTokens: 0 },
+        // the CLI's own result event, as on the live tape
+        runtimeEvents: [{
+          ordinal: 1,
+          observedAt: 1_783_950_170_100,
+          source: "ccb",
+          payload: { type: "result", is_error: true, num_turns: 1 },
+        }],
+      }));
+      const jobs = await pool.query<{ semantic_recovery_attempt: number }>(
+        `SELECT semantic_recovery_attempt FROM turn_recovery_jobs
+          WHERE user_id=$1 AND session_id=$2`,
+        [UID, sessionId],
+      );
+      assert.deepEqual(jobs.rows.map((row) => row.semantic_recovery_attempt),
+        scheduled ? [attempt + 1] : []);
+    });
+  }
 
   maybe("silent liveness recovery resets native state once, then pauses the durable lineage", async () => {
     const sessionId = "s-dd-recovery-silent-streak";

@@ -162,6 +162,12 @@
      grad-cta endpoints kept dark enough for white text ≥4.5:1 (WCAG AA). */
   --aurora: linear-gradient(135deg, #c9bcff 0%, #a9c2ff 42%, #ffc2d8 100%);
   --grad-cta: linear-gradient(120deg, #6d4af0 0%, #4a63d6 100%);
+  /* 进行中状态字流光(.oc-live-status-shine)的底色 / 光带色。浅色主题反着扫:
+     深灰字(=--muted)上掠过一道浅光。原先沿用深色主题的「--faint → --fg」,
+     白底上只是灰字短暂变黑,几乎看不出在动。写成字面值而非 var():
+     自定义属性在声明处求值后再继承,写 var(--muted) 会把浅色值带进深色容器。 */
+  --shine-base: #51515c;
+  --shine-peak: #a9a9b3;
 }
 
 /* ── Dark — Aurora: deep near-black, inverted ink (light) primary,
@@ -183,6 +189,9 @@
   --fg: #f2f2f6;
   --muted: #bcbcc7;
   --faint: #92929b; /* was #8a8a94 — vs accent-soft@elevated(#2b293f) 4.12 / hover@surface 4.29;现 4.56 / 4.75,vs surface 5.89 */
+  /* 深色主题保持原样:灰字上掠过一道亮白。 */
+  --shine-base: var(--faint);
+  --shine-peak: var(--fg);
   --accent: #9a8aff;
   --accent-soft: #9a8aff1f;
   --accent-strong: #ab9cff;
@@ -329,9 +338,12 @@ body {
 
 /* 进行中的状态字流光(OCV5-311 / OCV5-312)。一轮里只有一处在扫:处理过程里「正在干活」的那一段摘要行
    (「运行 3 条命令」「思考」…,就在最新进展处);过程折叠时改由外壳标题的动作短语承担;过程外独立的思考卡
-   标题照旧。过程文字整体取 --faint,与流光静止色一致,agent 回复正文(--fg)因此更突出。
-   - 基色 = --faint、高光 = --fg:最淡一刻也是 --faint 本身(该 token 按全站规则 ≥4.5:1,浅 ≈5.8、深 ≈6.0),
-     流光只是在可读的灰字上扫过一道实色,不牺牲可读性(--muted 作基色时与 --fg 太接近,扫光几乎看不见);
+   标题照旧。过程文字整体取 --faint,agent 回复正文(--fg)因此更突出。
+   - 颜色走 --shine-base / --shine-peak(按主题定义,见 :root / .dark):
+     深色主题 = --faint 底、--fg 光带,灰字上扫过一道亮白,最淡一刻也是 --faint(≥4.5:1);
+     浅色主题 = --muted 底(≈7.6:1)、浅灰光带(≈2.4:1),深灰字上掠过一道浅光。白底上「灰→黑」的
+     加深几乎看不出在动(用户反馈),「深→浅」的提亮才读得出流动;光带只在每个字上停留一瞬,
+     其余时间字色比其他过程行(--faint)更实,「哪一行在干活」也更醒目;
    - 宽而柔的光带从左往右扫一遍(缓入缓出)后停顿,2.4s 一轮,像呼吸而不是进度条;
    - 减少动态效果:整段不生效,文字保持原色;不支持 background-clip:text 的浏览器(@supports)同样保持原色,
      不会出现「透明字没被裁出来」的空白;Windows 高对比(forced-colors):回落系统文字色;
@@ -341,11 +353,11 @@ body {
   .oc-live-status-shine {
     background-image: linear-gradient(
       100deg,
-      var(--faint) 0%,
-      var(--faint) 34%,
-      var(--fg) 50%,
-      var(--faint) 66%,
-      var(--faint) 100%
+      var(--shine-base) 0%,
+      var(--shine-base) 34%,
+      var(--shine-peak) 50%,
+      var(--shine-base) 66%,
+      var(--shine-base) 100%
     );
     background-size: 250% 100%;
     background-position: 115% 0;
@@ -505,6 +517,8 @@ body {
   --fg: #f5f4ed;
   --muted: #aeb1a8;
   --faint: #8a9086; /* was #777d73 — vs surface 4.38 / elevated 4.16,低于 AA(shell 审计 S-05) */
+  --shine-base: var(--faint);
+  --shine-peak: var(--fg);
   --accent: #c7ff64;
   --accent-soft: rgba(199, 255, 100, 0.1);
   --accent-strong: #d7ff91;

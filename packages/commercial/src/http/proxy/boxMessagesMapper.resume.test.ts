@@ -29,8 +29,15 @@ test("without the flag, with other content, or unpaired ids the old rejection st
   const readBody = { model: "claude-opus-5-5", max_tokens: 64, messages: [
     { role: "user", content: "read" }, { role: "assistant", content: [read] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_R", content: "file" },
-      { type: "text", text: "and more" }] }] } as unknown as ProxyBody;
+      { type: "text", text: "and more" }, { type: "tool_result", tool_use_id: "toolu_R", content: "again" }] }] } as unknown as ProxyBody;
   fails(readBody, { resumeToolResults: true }, "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  // OCV5-322: trailing text is a new prompt, staged only under the flag
+  const prompted = structuredClone(readBody) as { messages: { content: unknown[] }[] };
+  prompted.messages[2]!.content.pop();
+  fails(prompted as unknown as ProxyBody, {}, "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  const turn = compileBoxCliSyntheticTurn(prompted as unknown as ProxyBody,
+    { cwd, cliVersion: "2.1.280", resumeToolResults: true });
+  assert.deepEqual(JSON.parse(turn.stdinJsonl).message.content, [{ type: "text", text: "and more" }]);
   fails(body([{ ...result, tool_use_id: "toolu_other" }]), { resumeToolResults: true },
     "BOX_TOOL_HISTORY_INVALID");
 });

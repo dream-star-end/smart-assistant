@@ -12,10 +12,13 @@ import { makeBoxKeeperStop } from
 import { readBoxTerminalProof } from
   "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
+// The operator names the exact account; evidence files are per account.
+const OPERATOR = requireBoxOperatorAccount("BOX_OPERATOR_STOP_ACK_REQUIRED");
 const DIR = "/var/lib/openclaude/ocv5-289-box-operator";
-const LOCK = `${DIR}/account-20.json`;
-const MUTEX = `${DIR}/account-20.mutex`;
+const LOCK = `${DIR}/account-${OPERATOR.text}.json`;
+const MUTEX = `${DIR}/account-${OPERATOR.text}.mutex`;
 
 function syncDir(): void {
   const fd = openSync(DIR, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -35,7 +38,7 @@ function writeOnce(path: string, raw: string): void {
 async function main(): Promise<void> {
   if (getRuntimeChannel() !== "v5"
     || process.env.OCV5_289_OPERATOR_STOP_ACK !== "1"
-    || process.env.OCV5_289_ACK_ACCOUNT_ID !== "20"
+    || process.env.OCV5_289_ACK_ACCOUNT_ID !== OPERATOR.text
     || process.env.OCV5_289_ACK_USER_ID !== "3") {
     throw new Error("BOX_OPERATOR_STOP_ACK_REQUIRED");
   }
@@ -48,7 +51,7 @@ async function main(): Promise<void> {
     }
     const raw = readFileSync(LOCK, "utf8");
     const record = JSON.parse(raw) as Record<string, unknown>;
-    if (record.accountId !== "20" || record.uid !== "3"
+    if (record.accountId !== OPERATOR.text || record.uid !== "3"
       || record.state !== "unresolved"
       || record.runNonce !== process.env.OCV5_289_EXPECTED_RUN_NONCE
       || record.leaseEpoch !== process.env.OCV5_289_EXPECTED_LEASE_EPOCH
@@ -63,8 +66,8 @@ async function main(): Promise<void> {
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
-    const intentPath = `${DIR}/account-20.stop-intent-${record.runNonce}.json`;
-    const intent = { kind: "synthetic_operator_user_stop", accountId: "20", uid: "3",
+    const intentPath = `${DIR}/account-${OPERATOR.text}.stop-intent-${record.runNonce}.json`;
+    const intent = { kind: "synthetic_operator_user_stop", accountId: OPERATOR.text, uid: "3",
       firstId: record.firstId, runNonce: record.runNonce,
       leaseEpoch: record.leaseEpoch,
       lockSha256: createHash("sha256").update(raw).digest("hex") };
@@ -89,7 +92,7 @@ async function main(): Promise<void> {
     const abort = new AbortController();
     const pendingTarget = resolver.resolve({ uid: 3n, sessionId: null,
       requestId: String(record.firstId), upstreamModel: "claude-opus-5-5",
-      requiredAccountId: 20n, signal: abort.signal });
+      requiredAccountId: OPERATOR.id, signal: abort.signal });
     let abandoned = false;
     void pendingTarget.then((late) => {
       if (abandoned) void Promise.resolve().then(() => late.dispose?.()).catch(() => {});
@@ -103,7 +106,7 @@ async function main(): Promise<void> {
     catch (error) { abandoned = true; throw error; }
     finally { if (resolveTimer) clearTimeout(resolveTimer); }
     try {
-      if (target.accountId !== 20n) throw new Error("BOX_OPERATOR_ACCOUNT_MISMATCH");
+      if (target.accountId !== OPERATOR.id) throw new Error("BOX_OPERATOR_ACCOUNT_MISMATCH");
       let stopAck = "unknown";
       try {
         const result = await target.exec.run(makeBoxKeeperStop(record.runNonce,
@@ -117,7 +120,7 @@ async function main(): Promise<void> {
       do {
         try {
           const proof = await readBoxTerminalProof({ target,
-            expectedAccountId: 20n, runNonce: record.runNonce,
+            expectedAccountId: OPERATOR.id, runNonce: record.runNonce,
             leaseEpoch: record.leaseEpoch });
           proofReason = proof.reason;
           break;

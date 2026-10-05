@@ -41,7 +41,7 @@ test("old pr-1 keeps 180000/3600 and its own max-minutes", () => {
 
 test("pr-4..7 budgets cover serial files plus cleanup and leave install room", () => {
   const expect: Record<string, { file: number; mutex: number; job: number; files: number; min: number }> = {
-    "pr-4.txt": { file: 180_000, mutex: 900, job: 20, files: 4, min: 4 },
+    "pr-4.txt": { file: 180_000, mutex: 1260, job: 30, files: 6, min: 11 },
     "pr-5.txt": { file: 3_000_000, mutex: 3300, job: 70, files: 1, min: 5 },
     "pr-6.txt": { file: 1_200_000, mutex: 1500, job: 40, files: 1, min: 1 },
     "pr-7.txt": { file: 3_600_000, mutex: 3900, job: 90, files: 1, min: 1 },

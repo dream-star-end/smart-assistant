@@ -67,7 +67,7 @@ test("a later plain user message stays fresh even when history has tool results"
   assert.deepEqual(view.toolIds, []);
 });
 
-test("unknown current tool text and a missing catalog do not fall through to fresh", () => {
+test("unknown current tool content and a missing catalog do not fall through to fresh", () => {
   const unknown = body([
     { role: "assistant", content: [{ type: "tool_use", id: "toolu_img_owner",
       name: "Read", input: { file_path: "a.png" } }] },
@@ -76,8 +76,21 @@ test("unknown current tool text and a missing catalog do not fall through to fre
       { type: "text", text: "please also change the plan" },
     ] },
   ]);
-  assert.equal(classifyBoxContinuation(unknown).classification, "reject");
-  assert.equal(classifyBoxContinuation(unknown).rejectCode, "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  // OCV5-322: trailing user text is a new prompt after an answered exchange.
+  // It is fresh only with answeredToolIds, which BoxToolFetch must clear
+  // against a still-waiting handoff (boxAnsweredExchange.test.ts).
+  assert.equal(classifyBoxContinuation(unknown).classification, "fresh");
+  assert.deepEqual(classifyBoxContinuation(unknown).answeredToolIds, ["toolu_img_owner"]);
+  const nonText = body([
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_img_owner",
+      name: "Read", input: { file_path: "a.png" } }] },
+    { role: "user", content: [
+      { type: "tool_result", tool_use_id: "toolu_img_owner", content: "ok" },
+      { type: "document", source: { type: "text", media_type: "text/plain", data: "x" } },
+    ] },
+  ]);
+  assert.equal(classifyBoxContinuation(nonText).classification, "reject");
+  assert.equal(classifyBoxContinuation(nonText).rejectCode, "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
   const bare = { ...imageTurn, tools: [] } as ProxyBody;
   const missing = classifyBoxContinuation(bare);
   assert.equal(missing.classification, "reject");

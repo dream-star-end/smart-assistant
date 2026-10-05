@@ -10,10 +10,13 @@ import { makeBoxRunCleanup } from
 import { readBoxTerminalProof } from
   "../../packages/commercial/src/http/proxy/boxTerminalProof.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
+// The operator names the exact account; evidence files are per account.
+const OPERATOR = requireBoxOperatorAccount("BOX_OPERATOR_COMPLETE_ACK_REQUIRED");
 const DIR = "/var/lib/openclaude/ocv5-289-box-operator";
-const LOCK = `${DIR}/account-20.json`;
-const MUTEX = `${DIR}/account-20.mutex`;
+const LOCK = `${DIR}/account-${OPERATOR.text}.json`;
+const MUTEX = `${DIR}/account-${OPERATOR.text}.mutex`;
 
 function syncDir(): void {
   const fd = openSync(DIR, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -47,7 +50,7 @@ function readOwned(path: string, maxBytes: number): string {
 async function main(): Promise<void> {
   if (getRuntimeChannel() !== "v5"
     || process.env.OCV5_289_OPERATOR_COMPLETE_ACK !== "1"
-    || process.env.OCV5_289_ACK_ACCOUNT_ID !== "20"
+    || process.env.OCV5_289_ACK_ACCOUNT_ID !== OPERATOR.text
     || process.env.OCV5_289_ACK_USER_ID !== "3") {
     throw new Error("BOX_OPERATOR_COMPLETE_ACK_REQUIRED");
   }
@@ -56,7 +59,7 @@ async function main(): Promise<void> {
     const lockStat = lstatSync(LOCK);
     const rawLock = readOwned(LOCK, 4096);
     const lock = JSON.parse(rawLock) as Record<string, unknown>;
-    if (lock.accountId !== "20" || lock.uid !== "3" || lock.state !== "unresolved"
+    if (lock.accountId !== OPERATOR.text || lock.uid !== "3" || lock.state !== "unresolved"
       || lock.runNonce !== process.env.OCV5_289_EXPECTED_RUN_NONCE
       || lock.leaseEpoch !== process.env.OCV5_289_EXPECTED_LEASE_EPOCH
       || lock.firstId !== process.env.OCV5_289_EXPECTED_FIRST_ID
@@ -69,14 +72,14 @@ async function main(): Promise<void> {
     try { process.kill(lock.pid, 0); throw new Error("BOX_OPERATOR_PROBE_STILL_RUNNING"); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
     syncDir();
-    const stopIntentPath = `${DIR}/account-20.stop-intent-${lock.runNonce}.json`;
+    const stopIntentPath = `${DIR}/account-${OPERATOR.text}.stop-intent-${lock.runNonce}.json`;
     try { lstatSync(stopIntentPath); throw new Error("BOX_OPERATOR_STOP_INTENT_PRESENT"); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const resolver = createProductionBoxAccountResolver();
     const abort = new AbortController();
     const pending = resolver.resolve({ uid: 3n, sessionId: null,
       requestId: String(lock.firstId), upstreamModel: "claude-opus-5-5",
-      requiredAccountId: 20n, signal: abort.signal });
+      requiredAccountId: OPERATOR.id, signal: abort.signal });
     let abandoned = false;
     void pending.then((late) => {
       if (abandoned) void Promise.resolve().then(() => late.dispose?.()).catch(() => {});
@@ -90,11 +93,11 @@ async function main(): Promise<void> {
     catch (error) { abandoned = true; throw error; }
     finally { if (timer) clearTimeout(timer); }
     try {
-      if (target.accountId !== 20n) throw new Error("BOX_OPERATOR_ACCOUNT_MISMATCH");
-      const proof = await readBoxTerminalProof({ target, expectedAccountId: 20n,
+      if (target.accountId !== OPERATOR.id) throw new Error("BOX_OPERATOR_ACCOUNT_MISMATCH");
+      const proof = await readBoxTerminalProof({ target, expectedAccountId: OPERATOR.id,
         runNonce: lock.runNonce, leaseEpoch: lock.leaseEpoch });
       if (proof.reason !== "worker_complete") throw new Error("BOX_OPERATOR_COMPLETE_PROOF_INVALID");
-      const archivePath = `${DIR}/account-20.completed-${lock.runNonce}.json`;
+      const archivePath = `${DIR}/account-${OPERATOR.text}.completed-${lock.runNonce}.json`;
       const archive = { kind: "synthetic_operator_completed", originalLock: lock,
         terminalProof: proof, settledUsage: false, replayAllowed: false };
       try { writeOnce(archivePath, JSON.stringify(archive)); }

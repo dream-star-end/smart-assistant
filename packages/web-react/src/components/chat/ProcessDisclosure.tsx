@@ -375,6 +375,42 @@ function interactiveTool(message: ChatMessage): boolean {
   return INTERACTIVE_TOOL_RE.test(message.toolName ?? "");
 }
 
+/** CCB tools whose prompt card (role=permission) fully replaces the tool row. */
+const PROMPT_CARD_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
+/**
+ * A CCB question or plan review lands twice: the prompt card (用户问答 /
+ * 退出计划模式, role=permission, bound to the engine tool_use by `toolUseId`)
+ * and the tool row of that same call (its result is the raw engine echo —
+ * "User has answered your questions: …", "User has approved your plan…",
+ * "User rejected the plan"). The card already shows the question / plan and
+ * the outcome, and owns the pending / answered state, so the tool row is a
+ * duplicate. Left in place it is caught by `interactiveTool` and sits outside
+ * 处理过程 under the answered card.
+ *
+ * Returns the ids of tool rows to drop. Only an exact pairing counts — same
+ * tool name and same tool_use id; a tool row whose card is missing (paged out,
+ * lost history) stays.
+ */
+export function promptShadowedToolIds(messages: readonly ChatMessage[]): Set<string> {
+  const promptKeys = new Set<string>();
+  for (const message of messages) {
+    const toolName = message.toolName ?? "";
+    if (message.role === "permission" && PROMPT_CARD_TOOLS.has(toolName) && message.toolUseId) {
+      promptKeys.add(`${toolName}\u0000${message.toolUseId}`);
+    }
+  }
+  const ids = new Set<string>();
+  if (promptKeys.size === 0) return ids;
+  for (const message of messages) {
+    const toolName = message.toolName ?? "";
+    if (message.role !== "tool" || !PROMPT_CARD_TOOLS.has(toolName)) continue;
+    const toolUseId = message.toolUseId ?? message.blockId;
+    if (toolUseId && promptKeys.has(`${toolName}\u0000${toolUseId}`)) ids.add(message.id);
+  }
+  return ids;
+}
+
 /**
  * OCV5-307: a question / approval the user has already answered (allow or
  * skip/deny). It no longer needs the user, so it reads as one more step of the
@@ -884,6 +920,36 @@ function useElapsed(startedAt: number | null | undefined, active: boolean): stri
   return formatElapsed(ms);
 }
 
+/** 1s 一跳的「现在」。只在有可信时间源时开表,结束即停。 */
+function useNowTicker(enabled: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    setNow(Date.now());
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [enabled]);
+  return now;
+}
+
+/** 叙述段写完、下一步还没冒出来时,静默多久才在时间轴末尾挂「正在思考下一步」(避免步骤间闪一下)。 */
+const QUIET_TAIL_MS = 3_000;
+/** 当前步骤里的工具连续跑多久才在摘要行旁显示「已运行 N 秒」。 */
+const RUNNING_META_MS = 5_000;
+
+/** 当前段里仍在运行的工具中最早的开始时刻(行的 ts = 工具调用到达浏览器的时刻)。不早于本轮起点。 */
+function earliestRunningSince(messages: readonly ChatMessage[], turnStartedAt: number | null | undefined): number | null {
+  let since: number | null = null;
+  for (const message of messages) {
+    if (!toolStillRunning(message)) continue;
+    const ts = message.ts;
+    if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) continue;
+    if (typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) && ts < turnStartedAt) continue;
+    if (since === null || ts < since) since = ts;
+  }
+  return since;
+}
+
 function stepItemCount<T>(sections: readonly ProcessSection<T>[], messagesOf: (item: T) => ChatMessage[]): number {
   let count = 0;
   for (const section of sections) {
@@ -908,10 +974,15 @@ function kindTally<T>(sections: readonly ProcessSection<T>[], messagesOf: (item:
 }
 
 /** 外壳标题上的实时动作:当前那一段的最新动作;一步刚跑完、下一步还没来时是「正在思考下一步」。 */
-function shellLivePhrase<T>(sections: readonly ProcessSection<T>[], currentIndex: number): { text: string; pending: boolean } {
+function shellLivePhrase<T>(
+  sections: readonly ProcessSection<T>[],
+  currentIndex: number,
+  narrativeSettled = false,
+): { text: string; pending: boolean } {
   const current = sections[currentIndex];
   if (!current) return { text: "正在处理", pending: true };
-  if (current.narrative) return { text: "正在组织回复", pending: true };
+  // 叙述段已经写完一阵、下一步还没来:模型在想下一步,不是还在写这段话。
+  if (current.narrative) return { text: narrativeSettled ? "正在思考下一步" : "正在组织回复", pending: true };
   const status = stepLiveStatus(current.messages);
   if (!status.text) return { text: "正在处理", pending: true };
   if (status.pending) return status;
@@ -1027,6 +1098,7 @@ export function ProcessDisclosure<T>({
   eagerDeferred,
   olderSteps,
   startedAt,
+  lastFrameAt,
 }: {
   sections: ProcessSection<T>[];
   active: boolean;
@@ -1043,6 +1115,12 @@ export function ProcessDisclosure<T>({
   olderSteps?: ReactNode;
   /** 本轮活动起点(TurnActivity.startedAt)。只用于进行中的计时,缺省则不显示时长。 */
   startedAt?: number | null;
+  /**
+   * 本会话最近一帧到达浏览器的时刻(会话级 _lastFrameAt)。只用于进行中的「静默多久」判断:
+   * 叙述段写完后迟迟没有下一步时,在时间轴末尾挂一行「正在思考下一步」;工具长时间运行时在
+   * 摘要行旁显示已运行时长。缺省(历史轮、单测)则两者都不出现。
+   */
+  lastFrameAt?: number | null;
 }) {
   const messages = sections.flatMap((section) => section.messages);
   const summary = operationSummary(messages);
@@ -1058,7 +1136,19 @@ export function ProcessDisclosure<T>({
   const steps = stepItemCount(sections, messagesOf);
   const tally = kindTally(sections, messagesOf);
   const elapsed = useElapsed(startedAt, active);
-  const live = active ? shellLivePhrase(sections, currentIndex) : null;
+  // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
+  // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
+  // 用户只能看到一段静止的文字(外壳标题的计时在长过程里早已滚出视口)。
+  const liveClock = active && typeof lastFrameAt === "number" && Number.isFinite(lastFrameAt) && lastFrameAt > 0;
+  const now = useNowTicker(liveClock);
+  const currentSection = currentIndex >= 0 ? sections[currentIndex] : undefined;
+  const quietMs = liveClock ? Math.max(0, now - (lastFrameAt as number)) : 0;
+  const narrativeSettled = liveClock && !!currentSection?.narrative && quietMs >= QUIET_TAIL_MS;
+  const runningSince =
+    liveClock && currentSection && !currentSection.narrative ? earliestRunningSince(currentSection.messages, startedAt) : null;
+  const runningMs = runningSince === null ? 0 : now - runningSince;
+  const runningFor = runningSince !== null && runningMs >= RUNNING_META_MS && runningMs <= 24 * 3600_000 ? formatElapsed(runningMs) : "";
+  const live = active ? shellLivePhrase(sections, currentIndex, narrativeSettled) : null;
   const title = active ? "处理过程" : "工作过程";
   // 历史轮挂载时不播入场动画,只有进行中新冒出来的步骤才轻轻浮入。
   const lastSection = sections.at(-1);
@@ -1254,6 +1344,17 @@ export function ProcessDisclosure<T>({
                       >
                         {naturalSummary(section.items.map(messagesOf))}
                       </span>
+                      {working && runningFor ? (
+                        // 长命令 / 长工具:流光之外再给一个每秒在走的数字,一眼看出「还在跑、跑了多久」。
+                        // 读屏不播报每秒变化的时长。
+                        <span
+                          aria-hidden
+                          data-testid="process-step-running-for"
+                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
+                        >
+                          {`已运行 ${runningFor}`}
+                        </span>
+                      ) : null}
                       <span className="sr-only">{operationSummary(section.messages)}</span>
                       {/* OCV5-313: 不在摘要行单独点出「N 步未成功」——中途个别步骤没成功是正常流程,
                           事实留在展开后的步骤行里(安静的灰字),整轮失败另有顶层错误卡。 */}
@@ -1274,6 +1375,18 @@ export function ProcessDisclosure<T>({
                 </div>
               );
             }) : null}
+            {open && narrativeSettled ? (
+              // 叙述段写完、下一步还没到:在最新进展处挂一行活的「正在思考下一步」+ 静默时长。
+              // 下一步一冒出来(新帧到达、当前段换成步骤组)这行就消失,流光随之落到那一段的摘要行上。
+              <RailRow key="__live-tail" testId="process-live-tail" node={<StepNode Icon={Brain} tone="live" />} enter>
+                <div className="flex min-h-9 items-center gap-2 py-1.5 [@media(hover:none)]:min-h-11">
+                  <span className="oc-live-status-shine min-w-0 truncate text-body text-muted">正在思考下一步</span>
+                  <span aria-hidden className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint">
+                    {formatElapsed(quietMs)}
+                  </span>
+                </div>
+              </RailRow>
+            ) : null}
           </div>
         ) : null}
     </section>

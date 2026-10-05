@@ -8,7 +8,8 @@ import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
 import { makeBoxPendingRead, parseBoxPendingCall } from "./boxToolResultPlan.js";
 import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
-import { BoxToolResultEcho } from "./boxToolResultEcho.js";
+import { BoxToolResultEcho, BoxToolResultEchoError } from "./boxToolResultEcho.js";
+import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
 import type { BoxToolPublishedResume } from "./boxToolResumePublish.js";
 import { isTransientBoxSpoolReadError, pollBoxSpoolLines } from "./boxSpoolPoller.js";
 import { readBoxSpoolChunk } from "./boxSpoolRead.js";
@@ -209,7 +210,8 @@ export async function runBoxToolContinuation(input: {
           uid: input.uid, leaseEpoch: claim.leaseEpoch, proof, usage,
           ...(messagePointer ? { messagePointer } : {}) }));
         let nativePointer: BoxNativePointer | undefined;
-        if (boxFastPathEnabled() && final.assistantContentHash
+        if (boxFastPathEnabled() && boxCliNativeResumeVerified(target.cliVersion)
+          && final.assistantContentHash
           && claim.nativeSessionId && claim.nativeCliCwd
           && deps.journal.attachNativePointer) {
           try {
@@ -244,7 +246,10 @@ export async function runBoxToolContinuation(input: {
     }
     throw new BoxToolContinuationError("BOX_TOOL_STREAM_INCOMPLETE");
   } catch (error) {
-    await unknown("continuation_unknown");
+    // OCV5-313: a rejected result echo is named so the stop paths can end
+    // this run at once; nothing it writes afterwards can be delivered.
+    await unknown(error instanceof BoxToolResultEchoError
+      ? "continuation_echo_rejected" : "continuation_unknown");
     throw error;
   } finally {
     clearTimeout(timer);

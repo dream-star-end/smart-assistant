@@ -198,7 +198,9 @@ export async function publishBoxToolResume(input: {
     }
     return { claim, access, target };
   } catch (error) {
-    if (claim) await unknown("resume_publish_unknown");
+    // OCV5-323: without a resolved target no pending read or result write ran,
+    // so the CLI is still parked on results this plane never re-publishes.
+    if (claim) await unknown(target ? "resume_publish_unknown" : "resume_publish_unsent");
     throw error;
   } finally {
     clearTimeout(timer);

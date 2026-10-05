@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import { parseBoxReplayMessagePointer, type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
+import { BOX_EXPIRED_UNPROVEN_STATE, parseBoxExpiredClose } from "./boxExpiredClose.js";
+import { parseBoxStoredToolHandoff } from "./boxStoredToolHandoff.js";
+import { BOX_TOOL_MAX_ROUNDS } from "./boxToolCapacity.js";
 
 /** Real autocompact floor for a 200k window minus the stock buffer. Not a test override. */
 export const IDLE_COMPACT_USAGE_FLOOR = 167_000;
@@ -8,6 +11,10 @@ export interface IdleChainRow {
   requestId: string;
   state: string;
   ctx: Record<string, unknown>;
+  /** Journal settlement columns (final_credits as text). Only the
+   * expired_unproven projection reads them. */
+  finalCredits?: string | null;
+  failureCode?: string | null;
 }
 
 export type BoxIdleProof =
@@ -32,7 +39,8 @@ export type BoxIdleProof =
     }
   /** OCV5-297: the whole chain ended in a proven stop with no model result.
    * Only the exact failure shapes written by the journal state machine
-   * qualify; anything unknown or malformed stays pending. */
+   * qualify; anything unknown or malformed stays pending.
+   * OCV5-313: also a chain closed as expired_unproven. */
   | {
       status: "failed";
       sessionId: string;
@@ -93,6 +101,7 @@ function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): Id
       && ctx.boxOwnerRequestId === undefined && ctx.boxResumeRequestId === undefined
       ? chain : null;
   }
+  if (ctx.boxState === BOX_EXPIRED_UNPROVEN_STATE) return projectExpiredChain(chain);
   if (ctx.boxState !== "failed_stopped") return null;
   const proof = ctx.boxTerminalProof as { reason?: unknown; runNonce?: unknown; leaseEpoch?: unknown } | undefined;
   // OCV5-300: a first round whose stream egress rejected is settled with the
@@ -123,6 +132,108 @@ function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): Id
       || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) return null;
   }
   return chain;
+}
+
+const HEX64 = /^[a-f0-9]{64}$/;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** Same rule as the journal's stop fence: a detached tool run, or the durably
+ * armed detached text lane. */
+function stoppableMode(ctx: Record<string, unknown>): boolean {
+  return ctx.boxInvocationMode === "detached_tool"
+    || (ctx.boxInvocationMode === "text" && ctx.boxLaunchPermit === true
+      && ctx.boxUpstreamModel === "claude-opus-5-5"
+      && typeof ctx.boxDetachedRunnerHash === "string" && HEX64.test(ctx.boxDetachedRunnerHash));
+}
+
+/** OCV5-313: only the exact end state markRunExpiredUnproven writes, checked
+ * as strictly as that method checks the chain before it writes: settlement
+ * columns of an unbilled leaf, round numbers, handoff/catalog/runner binding,
+ * revisions, one identity. The run ended without a keeper proof, so there is
+ * no model result to wait for. Anything else stays pending. */
+function projectExpiredChain(chain: IdleChainRow[]): IdleChainRow[] | null {
+  const leaf = chain[0]!, ctx = leaf.ctx;
+  const marker = parseBoxExpiredClose(ctx.boxExpiredClose);
+  if (!marker || ctx.boxTerminalProof !== undefined || ctx.boxResumeRequestId !== undefined
+    || ctx.settlementClaimId !== undefined
+    || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+    || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)
+    || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)) {
+    return null;
+  }
+  const linked = ctx.boxOwnerRequestId !== undefined;
+  const handoff = ctx.boxToolHandoff === undefined ? null
+    : parseBoxStoredToolHandoff(ctx.boxToolHandoff);
+  if (ctx.boxToolHandoff !== undefined && !handoff) return null;
+  if (handoff) {
+    if (!RESUMABLE_STATES.has(leaf.state) || !["handoff", "unknown"].includes(marker.priorBoxState)
+      || typeof ctx.boxHandoffRevision !== "string" || !UUID_V4.test(ctx.boxHandoffRevision)) {
+      return null;
+    }
+  } else if (leaf.state !== "aborted" || leaf.failureCode !== "STREAM_FAILED"
+    || leaf.finalCredits !== "0"
+    || !(linked ? ["linked", "unknown"] : ["running", "unknown"]).includes(marker.priorBoxState)) {
+    return null;
+  }
+  for (const row of chain) {
+    if (row.ctx.boxInvocationRecovery !== "v1" || !stoppableMode(row.ctx)
+      || row.ctx.boxRunNonce !== ctx.boxRunNonce || row.ctx.boxLeaseEpoch !== ctx.boxLeaseEpoch
+      || row.ctx.boxAccountId !== ctx.boxAccountId || row.ctx.boxSessionId !== ctx.boxSessionId
+      || row.ctx.boxTurnKey !== ctx.boxTurnKey || row.ctx.model !== ctx.model) return null;
+  }
+  if (!linked) {
+    return chain.length === 1 && (!handoff
+      || (handoff.roundNo === 1 && ctx.boxInvocationMode === "detached_tool")) ? chain : null;
+  }
+  const roundNo = ctx.boxRoundNo;
+  if (chain.some((row) => row.ctx.boxInvocationMode !== "detached_tool")
+    || !Number.isSafeInteger(roundNo) || Number(roundNo) < 2
+    || Number(roundNo) > BOX_TOOL_MAX_ROUNDS || chain.length !== roundNo
+    || typeof ctx.boxCatalogHash !== "string" || !HEX64.test(ctx.boxCatalogHash)
+    || typeof ctx.boxDetachedRunnerHash !== "string" || !HEX64.test(ctx.boxDetachedRunnerHash)
+    || (handoff && (handoff.roundNo !== roundNo || handoff.catalogHash !== ctx.boxCatalogHash
+      || handoff.detachedRunnerHash !== ctx.boxDetachedRunnerHash))) return null;
+  for (let i = 1; i < chain.length; i++) {
+    const parent = chain[i]!, child = chain[i - 1]!;
+    const stored = parseBoxStoredToolHandoff(parent.ctx.boxToolHandoff);
+    if (parent.ctx.boxState !== BOX_EXPIRED_UNPROVEN_STATE || !stored
+      || stored.roundNo !== Number(roundNo) - i
+      || stored.catalogHash !== ctx.boxCatalogHash
+      || stored.detachedRunnerHash !== ctx.boxDetachedRunnerHash
+      || !RESUMABLE_STATES.has(parent.state)
+      || parent.ctx.boxTerminalProof !== undefined
+      || parent.ctx.boxResumeRequestId !== child.requestId
+      || typeof parent.ctx.boxResumeRevision !== "string"
+      || !UUID_V4.test(parent.ctx.boxResumeRevision)
+      || parent.ctx.boxResumeRevision !== child.ctx.boxParentResumeRevision) return null;
+  }
+  return chain;
+}
+
+/** OCV5-313: request ids of the session's expired_unproven rows that form a
+ * complete, valid expired chain within their own turn. Used to decide which
+ * closed runs stop counting as another open chain; a row with a missing or
+ * malformed marker, a broken linkage or a missing ancestor is not returned. */
+export function validExpiredChainIds(rows: readonly IdleChainRow[]): Set<string> {
+  const byTurn = new Map<string, IdleChainRow[]>();
+  for (const row of rows) {
+    const turnKey = row.ctx.boxTurnKey;
+    if (row.ctx.boxState !== BOX_EXPIRED_UNPROVEN_STATE || typeof turnKey !== "string") continue;
+    const group = byTurn.get(turnKey);
+    if (group) group.push(row); else byTurn.set(turnKey, [row]);
+  }
+  const valid = new Set<string>();
+  for (const group of byTurn.values()) {
+    const byId = new Map(group.map((row) => [row.requestId, row]));
+    if (byId.size !== group.length) continue;
+    const owners = new Set(group.map((row) => row.ctx.boxOwnerRequestId));
+    for (const leaf of group) {
+      if (owners.has(leaf.requestId)) continue;
+      const chain = projectFailedChain(leaf.requestId, byId);
+      if (chain) for (const row of chain) valid.add(row.requestId);
+    }
+  }
+  return valid;
 }
 
 type ChainFailure = { ok: false; reason: string };

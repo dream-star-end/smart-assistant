@@ -2,6 +2,8 @@
  * BoxAccountResolver -> BoxTextFetch -> Connect Exec path intended for the
  * internal Messages route, without opening a catalog model or user traffic.
  * An ambiguous result is NEVER retried; do not use this as a reconciler.
+ * OCV5_289_STREAM_HISTORY_ACK=1 instead sends a completed synthetic exchange so
+ * the answer must come from the staged session snapshot (history path).
  */
 import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -13,19 +15,20 @@ import { readBoxTerminalProof } from "../../packages/commercial/src/http/proxy/b
 import { BOX_INTERNAL_ENDPOINT } from "../../packages/commercial/src/http/proxy/upstream.js";
 import { _UsageObserver, type ProxyBody } from "../../packages/commercial/src/http/proxy/shared.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
-const ACCOUNT_ID = 20n;
 const UID = 3n;
 const MODEL = "claude-opus-5-5";
-function requireAck(): void {
-  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== String(ACCOUNT_ID)
-    || process.env.OCV5_289_ACK_USER_ID !== String(UID)
+function requireAck(): bigint {
+  const operator = requireBoxOperatorAccount("BOX_STREAM_OPERATOR_ACK_REQUIRED");
+  if (process.env.OCV5_289_ACK_USER_ID !== String(UID)
     || process.env.OCV5_289_STREAM_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_STREAM_OPERATOR_ACK_REQUIRED");
+  return operator.id;
 }
 
 async function main(): Promise<void> {
-  requireAck();
+  const ACCOUNT_ID = requireAck();
   const supervisorAsset = readFileSync(new URL("./box_supervisor.py", import.meta.url));
   const keeperAsset = readFileSync(new URL("./box_keeper.py", import.meta.url));
   const resolver: BoxAccountResolver = createProductionBoxAccountResolver();
@@ -33,6 +36,7 @@ async function main(): Promise<void> {
     leaseMs: 900_000 });
   const requestId = `ocv5-289-probe-${randomBytes(12).toString("hex")}`;
   const expected = `ocv5-289-${randomBytes(12).toString("hex")}`;
+  const historyReplay = process.env.OCV5_289_STREAM_HISTORY_ACK === "1";
   const startedAt = process.hrtime.bigint();
   let modelTerminalAt: bigint | null = null;
   let proofIdentity: { runNonce: string; leaseEpoch: string } | null = null;
@@ -72,7 +76,13 @@ async function main(): Promise<void> {
     metadata: { user_id: JSON.stringify({ oc_turn_key: randomBytes(32).toString("hex"),
       session_id: requestId }) },
     system: "Synthetic OpenClaude Box model transport verification. No tools.",
-    messages: [{ role: "user", content:
+    messages: historyReplay ? [
+      { role: "user", content:
+        `Remember this token for later: ${expected}. Reply with only: stored` },
+      { role: "assistant", content: "stored" },
+      { role: "user", content:
+        "Return exactly the token I asked you to remember, with no other words." },
+    ] : [{ role: "user", content:
       `Return exactly this token, with no other words: ${expected}` }] };
   const response = await service.fetch({ uid: UID, sessionId: requestId, requestId,
     canonicalModel: MODEL, canonicalBody: body, upstreamModel: MODEL,
@@ -127,7 +137,7 @@ async function main(): Promise<void> {
     if (proof.reason !== "worker_complete") throw new Error("BOX_PROBE_RECOVERY_INVALID");
   } finally { await recovered.dispose?.(); }
   process.stdout.write(JSON.stringify({ route: "box-text-fetch-live", accountId: String(ACCOUNT_ID),
-    modelId, exact: true, firstDeltaBeforeModelTerminal: true,
+    modelId, exact: true, historyReplay, firstDeltaBeforeModelTerminal: true,
     crossRequestProof: true,
     firstDeltaMs: Number((firstDeltaAt - startedAt) / 1_000_000n),
     modelTerminalMs: Number((modelTerminalAt - startedAt) / 1_000_000n),

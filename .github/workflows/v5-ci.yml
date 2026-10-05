@@ -456,7 +456,7 @@ jobs:
           - shard: pr-3
             timeout: 20
           - shard: pr-4
-            timeout: 20
+            timeout: 30
           - shard: pr-5
             timeout: 70
           - shard: pr-6
@@ -549,6 +549,12 @@ jobs:
         if: contains(fromJSON('["pr-4","pr-5","pr-6","pr-7","pr-8","pr-9"]'), matrix.shard)
         working-directory: claude-code-best
         run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Install redis-server for the isolated reservation test
+        # preCheckLongTtl starts its own redis-server on a unix socket; the
+        # service container only offers a TCP port.
+        if: matrix.shard == 'pr-2'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-server
 
       - name: Prepare idle box project directory
         if: contains(fromJSON('["pr-5","pr-6","pr-7"]'), matrix.shard)

@@ -1850,7 +1850,12 @@ export class ChatSocket {
     this.clearPendingDispatch(sessId, clientMessageId);
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
-    if (user) user.status = "sent";
+    // Every live frame carrying this cmid (outbound.message / turn_status /
+    // turn_usage / call_usage) re-confirms admission. Admission only moves the
+    // row forward out of its transport states; once answer blocks have marked
+    // it read/replied, a later status-only or usage frame must not drag it back
+    // to sent — that made「已送达」flicker on and off for the whole turn.
+    if (user && user.status !== "read" && user.status !== "replied") user.status = "sent";
     if (
       user?._routing?.modelSwitchId &&
       sess._preparedModelSwitch?.id === user._routing.modelSwitchId

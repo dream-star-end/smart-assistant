@@ -6,11 +6,12 @@ import { createProductionBoxAccountResolver } from
   "../../packages/commercial/src/http/proxy/boxAccountResolver.js";
 import { getRuntimeChannel } from "../../packages/commercial/src/runtimeChannel.js";
 import { makeBoxDetachedProbePlan } from "./boxDetachedProbePlan.js";
+import { requireBoxOperatorAccount } from "./boxOperatorAccount.js";
 
-const ACCOUNT_ID = 20n, UID = 3n;
+const UID = 3n;
 async function main(): Promise<void> {
-  if (process.env.OCV5_289_ACK_ACCOUNT_ID !== String(ACCOUNT_ID)
-    || process.env.OCV5_289_ACK_USER_ID !== String(UID)
+  const ACCOUNT_ID = requireBoxOperatorAccount("BOX_DETACHED_ACK_REQUIRED").id;
+  if (process.env.OCV5_289_ACK_USER_ID !== String(UID)
     || process.env.OCV5_289_DETACHED_ACK !== "1"
     || getRuntimeChannel() !== "v5") throw new Error("BOX_DETACHED_ACK_REQUIRED");
   const requestId = `ocv5-289-detached-${randomBytes(12).toString("hex")}`;

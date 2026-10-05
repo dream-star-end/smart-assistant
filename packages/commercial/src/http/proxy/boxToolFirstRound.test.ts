@@ -75,7 +75,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer };
   spoolPrefix?: Buffer;
   spoolBody?: Buffer;
-  compactUsingLaunchSession?: boolean } = {}) {
+  compactUsingLaunchSession?: boolean;
+  /** Claude Code build the resolver read on this Box; null = not read. */
+  cliVersion?: string | null } = {}) {
   let launchedSession = "";
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
@@ -88,6 +90,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   let admittedStart: unknown = null;
   let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
+    ...(options.cliVersion === null ? {} : { cliVersion: options.cliVersion ?? "2.1.280" }),
     exec: { run: async (request: { args: string[] }) => {
       const args = request.args;
       if (args[2]?.includes("identity['identityHash']")) {
@@ -179,7 +182,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
     } } };
   const journal = {
-    findNativeCandidate: async () => options.nativeCandidate ?? null,
+    findNativeCandidate: async () => {
+      sequence.push("native-lookup"); return options.nativeCandidate ?? null;
+    },
     admit: async (identity: { runNonce: string; leaseEpoch: string;
       nativeClaim?: unknown; nativeStart?: unknown }) => {
       sequence.push("admit"); currentNonce = identity.runNonce;
@@ -871,4 +876,40 @@ test("other decoder failures never trigger the explicit stop", async () => {
   await assert.rejects(() => runBoxToolFirstRound(f.input, deps), /BOX_TOOL_RECORD_INVALID/);
   assert.equal(stops, 0);
   assert.ok(f.sequence.includes("unknown"));
+});
+
+// OCV5-313: account 25's Box runs Claude Code 2.1.288. Native resume is only
+// verified on 2.1.280, and 7865e13d recorded a pointer labelled 2.1.280 there.
+test("OCV5-313 a Box without verified native resume never looks up, claims or records a native pointer", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: model, cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"9".repeat(24)}`, transcriptSha256: "f".repeat(64),
+      contextHashBeforeFinal: "a".repeat(64), assistantContentHash: "b".repeat(64),
+      catalogHash: "c".repeat(64), expiresAtMs: Date.now() + 60_000 })!;
+    for (const cliVersion of ["2.1.288", "2.1.999", null]) {
+      const f = fixture({ directFinal: true, cliVersion,
+        nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+      const result = await runBoxToolFirstRound(f.input, f.deps);
+      assert.equal(result.kind, "final");
+      if (result.kind !== "final") return;
+      assert.equal(result.nativePointer, undefined);
+      assert.equal(f.admittedNative, null, "no native claim is admitted");
+      for (const step of ["native-lookup", "native-inspect", "native-attach"]) {
+        assert.equal(f.sequence.includes(step), false, `${String(cliVersion)}: ${step}`);
+      }
+      assert.equal(f.launches, 1);
+    }
+    const verified = fixture({ directFinal: true });
+    const result = await runBoxToolFirstRound(verified.input, verified.deps);
+    assert.equal(result.kind === "final" && result.nativePointer?.cliVersion, "2.1.280");
+    assert.ok(verified.sequence.includes("native-lookup"));
+    assert.ok(verified.sequence.includes("native-attach"));
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
 });

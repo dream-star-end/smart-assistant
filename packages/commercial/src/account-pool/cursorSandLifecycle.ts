@@ -161,7 +161,14 @@ export class CursorSandLifecycleCoordinator {
           // owned agent and retry sendPrompt, or start a new create if none.
           // Box sendPrompt is idempotent on clientNonce=nonce+"-install"; reuse
           // accepts without executing. Rotate nonce, keep agentId/agentMarker.
-          if (op.agentId) {
+          // An accepted prompt already ran in this host process and left no
+          // capability; the same bytes would end the same way there. Stop
+          // sending. The probe above still promotes a later natural restart.
+          if (op.agentId && op.phase === "submitted" && (await client.health(connection, signal)).pid === op.hostPid) {
+            this.check();
+            op.phase = "error"; op.errorCode = "INSTALL_UNCONFIRMED";
+            this.save(state);
+          } else if (op.agentId) {
             op.nonce = nonce();
             op.phase = "created";
             op.startedAt = this.now();
@@ -176,8 +183,14 @@ export class CursorSandLifecycleCoordinator {
           }
         }
       }
-      if (op.phase === "error") throw new SandProvisionError(op.errorCode ?? "INSTALL_REJECTED");
       const health = await client.health(connection, signal); this.check();
+      // An unconfirmed install gets one new attempt per host process or relay module.
+      if (op.phase === "error" && op.errorCode === "INSTALL_UNCONFIRMED" && op.agentId
+        && (health.pid !== op.hostPid || op.moduleHash !== this.deps.moduleHash)) {
+        op.nonce = nonce(); op.phase = "created"; op.startedAt = this.now(); op.nextAttemptAt = 0; delete op.errorCode;
+        this.save(state);
+      }
+      if (op.phase === "error") throw new SandProvisionError(op.errorCode ?? "INSTALL_REJECTED");
       if (health.isBusy || agents.some((a) => a.isRunning === true)) throw new SandProvisionError("BOX_BUSY");
       if (op.phase === "ready" || op.moduleHash !== this.deps.moduleHash) {
         op = state.operations[principal.subjectHash] = { ...op, nonce: nonce(), phase: "idle", moduleHash: this.deps.moduleHash, startedAt: this.now(), nextAttemptAt: 0 };
