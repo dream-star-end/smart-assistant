@@ -68,7 +68,7 @@ describe("0293 commercial prepare new models without activating or changing old 
     }
     const before=await oldSnapshot();
     const result=await runMigrations();
-    assert.deepEqual(result.applied,["0293_commercial_new_models_prepare","0294_commercial_box_api_model","0295_commercial_box_api_sonnet_haiku"]);
+    assert.deepEqual(result.applied,["0293_commercial_new_models_prepare","0294_commercial_box_api_model","0295_commercial_box_api_sonnet_haiku","0296_commercial_retire_minimax_m3_gpt56_sol"]);
     assert.deepEqual(await oldSnapshot(),before);
     assert.equal((await query("SELECT 1 FROM model_pricing WHERE model_id='gpt-6-astra-1m' AND enabled IS TRUE")).rowCount,0);
     await assertPrepared();

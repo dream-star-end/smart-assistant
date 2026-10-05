@@ -5,7 +5,7 @@
  *   oc-vision understand <image_file> [--prompt "问题"]
  *
  * 复用 mcpVisionServer 的 resolveVisionInput + runVision 核心(与旧 openclaude-vision
- * MCP 同一后端:默认 MiniMax-M3,经容器 internal anthropic proxy;OPENCLAUDE_VISION_BACKEND=codex
+ * MCP 同一后端:默认 k3-256k,经容器 internal anthropic proxy;OPENCLAUDE_VISION_BACKEND=codex
  * 时走 gpt-5.5)。**一次性进程,无常驻 stdio 传输** —— 取代旧的常驻 MCP stdio server
  * (被 console 污染 / 崩溃即整条传输死掉、codex 死等 turn 被掐的脆弱点)。
  *

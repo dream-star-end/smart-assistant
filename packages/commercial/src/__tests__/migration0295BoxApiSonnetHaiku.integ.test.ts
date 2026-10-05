@@ -73,7 +73,7 @@ describe("0295 prepares Sonnet 5.5 and Haiku 4.5 on the commercial Box model rou
     await resetAndMigrateBefore("0295");
     const before = await others();
     assert.equal((await query("SELECT 1 FROM model_catalog WHERE model_id=ANY($1::text[])", [IDS])).rowCount, 0);
-    assert.deepEqual((await runMigrations()).applied, ["0295_commercial_box_api_sonnet_haiku"]);
+    assert.deepEqual((await runMigrations()).applied, ["0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol"]);
     assert.deepEqual(await others(), before);
     for (const model of IDS) assert.equal((await prepared(model)).state, "staged", model);
   });
