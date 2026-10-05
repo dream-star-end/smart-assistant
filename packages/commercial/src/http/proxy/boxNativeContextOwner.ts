@@ -1,13 +1,17 @@
-import { BOX_API_MODELS, isBoxApiModel } from "@openclaude/protocol";
-
 /** Same token as protocol BOX_NATIVE_CONTEXT_OWNER. Kept local so this package does not require a new protocol export at test resolution time. */
 export const BOX_NATIVE_CONTEXT_OWNER = "box-native-v1" as const;
 export type BoxNativeContextOwner = typeof BOX_NATIVE_CONTEXT_OWNER;
-/** One listed Box model, kept for fixtures. Checks use isBoxApiModel. */
-export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id;
-/** Cleanup, stop and probe paths resolve the account the row already pins.
- * The model there only selects the account family (any Claude model). */
-export const BOX_API_RESOLVE_MODEL = BOX_API_MODELS[0].upstreamModel;
+/** Mirror of the ids in packages/protocol/src/boxApiModels.ts. This file takes
+ * no import: the idle pipeline fixture loads it outside the workspace, where
+ * the protocol package does not resolve. boxApiModels.test.ts in protocol
+ * compares the two lists. */
+export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
+  "box-api-claude-opus-5-5",
+  "box-api-claude-sonnet-5-5",
+  "box-api-claude-haiku-4-5",
+];
+/** One listed model, kept for fixtures. Checks read the list. */
+export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!;
 
 /**
  * Source route-ready projection. True lets a verified gate issue the owner
@@ -55,7 +59,7 @@ export function issueBoxNativeContextOwner(input: {
 }): BoxNativeContextOwner | undefined {
   if (input.routeReady !== true) return undefined;
   if (input.providerId !== "box_cli") return undefined;
-  if (!isBoxApiModel(input.canonicalModel)) return undefined;
+  if (!BOX_NATIVE_CONTEXT_MODELS.includes(input.canonicalModel)) return undefined;
   if (input.declared !== BOX_NATIVE_CONTEXT_OWNER) return undefined;
   return BOX_NATIVE_CONTEXT_OWNER;
 }

@@ -2,7 +2,7 @@
  * HTTP disconnect alone must not call this. The stop request never constitutes
  * terminal evidence; only the original keeper's strict proof can close a row.
  */
-import { BOX_API_RESOLVE_MODEL } from "./boxNativeContextOwner.js";
+import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
 import type { BoxDurableJournal, BoxJournalAdmission,
   BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";

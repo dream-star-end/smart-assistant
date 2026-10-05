@@ -12,9 +12,11 @@
  *
  * Every fence that used to name one model reads this table. A model that is
  * not listed cannot run on the route, whatever the catalog says.
- * claude-code-best cannot import this package and keeps a mirror of the ids
- * (src/utils/model/boxNativeRemoteContext.ts); boxApiModels.test.ts compares
- * the two.
+ * Two files cannot import this package and keep a mirror of the ids:
+ * claude-code-best/src/utils/model/boxNativeRemoteContext.ts (separate tree)
+ * and packages/commercial/src/http/proxy/boxNativeContextOwner.ts (loaded
+ * outside the workspace by the idle pipeline fixture). boxApiModels.test.ts
+ * compares both with this table.
  */
 export interface BoxApiModel {
   readonly id: string
