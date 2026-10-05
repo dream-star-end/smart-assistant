@@ -57,20 +57,65 @@ export function remoteClaudeArgs(argv: readonly string[]): string[] {
   return out
 }
 
+/** End the Claude that reads one fifo: the process whose stdin is that path.
+ * The launch script keeps the fifo open, so closing a writer never ends it.
+ * dash applies a foreground redirect to itself while the command runs, so the
+ * launch shell is a reader too and goes with its Claude; callers remove the
+ * fifo. TERM first; KILL whatever still reads the fifo two seconds later. */
+const BOX_CC_REAP_FUNCTION = [
+  'reap() {',
+  '  pids=""',
+  '  for d in /proc/[0-9]*; do',
+  '    if [ "$(readlink "$d/fd/0" 2>/dev/null || true)" = "$1" ]; then pids="$pids ${d#/proc/}"; fi',
+  '  done',
+  '  if [ -z "$pids" ]; then return 0; fi',
+  '  kill -TERM $pids 2>/dev/null || true',
+  '  n=0',
+  '  while [ "$n" -lt 20 ]; do',
+  '    alive=""',
+  '    for p in $pids; do',
+  '      if [ "$(readlink "/proc/$p/fd/0" 2>/dev/null || true)" = "$1" ]; then alive="$alive $p"; fi',
+  '    done',
+  '    if [ -z "$alive" ]; then return 0; fi',
+  '    sleep 0.1',
+  '    n=$((n + 1))',
+  '  done',
+  '  kill -KILL $alive 2>/dev/null || true',
+  '}',
+] as const
+
 export const BOX_CC_LAUNCH_SCRIPT = [
   'set -eu',
   'fifo="$1"',
   'claude="$2"',
   'shift 2',
+  ...BOX_CC_REAP_FUNCTION,
+  // A bridge that was killed leaves its Claude running on the old fifo, still
+  // attached to this session's transcript. One session keeps one Claude.
+  'for old in "${fifo%.*.fifo}".*.fifo; do',
+  '  if [ "$old" = "$fifo" ] || [ ! -p "$old" ]; then continue; fi',
+  '  reap "$old"',
+  '  rm -f "$old"',
+  'done',
   'rm -f "$fifo"',
   'mkfifo -m 600 "$fifo"',
   // Hold both ends for the life of claude. A later writer then cannot block
   // in open(), and closing that writer does not deliver EOF mid-turn.
   'exec 3<>"$fifo"',
+  'set +e',
   '"$claude" "$@" <"$fifo"',
   'status=$?',
+  'set -e',
   'exec 3>&-',
+  'rm -f "$fifo"',
   'exit "$status"',
+].join('\n')
+
+export const BOX_CC_STOP_SCRIPT = [
+  'set -eu',
+  ...BOX_CC_REAP_FUNCTION,
+  'reap "$1"',
+  'rm -f "$1"',
 ].join('\n')
 
 const SPAWN_FIFO_NONCE = /^[a-f0-9]{8,32}$/
@@ -100,6 +145,8 @@ export interface BoxCcControl {
   cwd: string
 }
 
+const BOX_CC_PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
 export function boxCcLaunchExec(
   control: BoxCcControl,
   remoteArgs: readonly string[],
@@ -110,8 +157,21 @@ export function boxCcLaunchExec(
     cwd: control.cwd,
     environment: {
       HOME: BOX_CC_HOME,
-      PATH: '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      PATH: BOX_CC_PATH,
       LANG: 'C.UTF-8',
+    },
+  }
+}
+
+/** Ends the Claude this bridge launched. Used when the gateway closes stdin. */
+export function boxCcStopExec(control: BoxCcControl): BoxCcExecRequest {
+  return {
+    command: 'sh',
+    args: ['-c', BOX_CC_STOP_SCRIPT, 'sh', control.fifo],
+    cwd: control.cwd,
+    environment: {
+      HOME: BOX_CC_HOME,
+      PATH: BOX_CC_PATH,
     },
   }
 }
