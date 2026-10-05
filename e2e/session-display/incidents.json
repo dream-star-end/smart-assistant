@@ -691,12 +691,10 @@
       "symptom": "上下文耗尽的 turn 落成 ENGINE_ERROR 被前端当作可自动恢复;master 原子拒绝为 source_not_recoverable 后,REST 全量同步又暴露同一 source 错误并无限次重新排程。",
       "rootFixCommit": "83681d59",
       "coverageCommits": [
-        "8f04bb2d"
+        "8f04bb2d",
+        "dda24a1e",
+        "55dc8cfe"
       ],
-      "proofPending": {
-        "reason": "触发链=上下文耗尽→ENGINE_ERROR→自动恢复→source_not_recoverable→REST 同步后重复排程。10-stop-turn 只证用户 Stop 终态,语义不匹配,已撤销;恢复围栏跨刷新持久化目前只有 unit 覆盖,尚无覆盖该恢复重试环的 live-e2e/browser/deploy-gate。",
-        "since": "2026-07-26"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -707,6 +705,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "automatic checkpoint keeps the exact old tape and skipped ACK removes only its optimistic child"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/recovery-retry-loop.node-test.mjs",
+          "assertion": "INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence"
         }
       ]
     },
@@ -5614,7 +5617,9 @@
       "severity": "P1",
       "symptom": "#b6df9aee 中断后没有自动恢复，只能手点『从断点继续』：master 判 checkpoint_unsafe。回合 Read（有 read_only 证明）、Bash、Skill 均已完成并有结果，随后下一次模型调用 ENGINE_ERROR；自动断点续接要求每个工具都有网关副作用证明，Bash 永远没有，于是所有用过 Bash 的 Box Claude 回合遇模型错误都停在手动卡。修复：模型面错误（upstream_failed/error/timeout、network_error、rate_limited、model_capacity、engine_error）且所有工具/委派/权限都已收口、每个 tool_use 都有完成记录时，允许自动断点续接（续接不重跑工具，提示词要求先查可观察状态）；此类自动续接最多 3 次；未完成/未知工具、runner 丢失、服务重启仍走原规则。",
       "rootFixCommit": "f3c91504",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "78368a61"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -5630,6 +5635,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "OCV5-317 finalize schedules a checkpoint after settled Bash/Skill and a model-plane error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
+          "assertion": "keeps explicitly unknown structured results on the manual path"
         }
       ]
     },
