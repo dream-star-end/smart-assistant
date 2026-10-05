@@ -13,7 +13,7 @@
  *   1) 确定性(不靠模型,Node 读 PNG 字节 + 可选 Pillow 像素统计):分辨率/DPI、
  *      主背景占比(取景过空)、背景主色是否异常(非中性)、画布边缘内容比例(元素被裁)。
  *      这些低级翻车确定性一抓一个准,不消耗模型额度。
- *   2) vision 审图(复用 mcpVisionServer.runVision,默认 MiniMax-M3 后端;实测其对
+ *   2) vision 审图(复用 mcpVisionServer.runVision,默认 k3-256k 后端;其对
  *      科研图版式缺陷识别准确):按图类型给"顶刊审稿人"prompt,逐条找会被审稿挑剔或
  *      影响理解的问题。
  *
@@ -34,7 +34,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { DEFAULT_CODEX_ENGINE_MODEL } from '@openclaude/protocol'
 import { checkSpec, parseFigSpec, specFollowUpQuestions, type FigSpec } from './figSpec.js'
-import { resolveVisionInput, runVision } from './mcpVisionServer.js'
+import { STATIC_VISION_MODEL, resolveVisionInput, runVision } from './mcpVisionServer.js'
 import { exitWithCliHelp, fail, isCliHelpArg, parseFlags } from './ocResearchClient.js'
 
 const TOOL = 'oc-figcheck'
@@ -279,7 +279,7 @@ async function main(): Promise<void> {
         kind,
         ...(specReport ? { spec: specReport } : {}),
         deterministic: { checks: det, issues },
-        vision: { backend: process.env.OPENCLAUDE_VISION_BACKEND === 'codex' ? `codex(${DEFAULT_CODEX_ENGINE_MODEL})` : 'minimax-m3', pass: visionPass, review: visionText },
+        vision: { backend: process.env.OPENCLAUDE_VISION_BACKEND === 'codex' ? `codex(${DEFAULT_CODEX_ENGINE_MODEL})` : STATIC_VISION_MODEL, pass: visionPass, review: visionText },
         verdict,
         hint:
           verdict === 'PASS'

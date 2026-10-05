@@ -8,9 +8,9 @@ import {
 } from '../billing/autoDreamModels.js'
 
 describe('isAutoDreamOptimizerModel', () => {
-  test('unifies the optimizer and legacy memory organizer on MiniMax M3', () => {
-    assert.equal(DEFAULT_AUTO_DREAM_MODEL, 'MiniMax-M3')
-    assert.equal(LEGACY_AUTO_DREAM_MODEL, 'MiniMax-M3')
+  test('unifies the optimizer and legacy memory organizer on DeepSeek V4 Flash', () => {
+    assert.equal(DEFAULT_AUTO_DREAM_MODEL, 'deepseek-v4-flash')
+    assert.equal(LEGACY_AUTO_DREAM_MODEL, 'deepseek-v4-flash')
   })
 
   test('accepts only the rollback-compatible Terra/Codex and static-provider/CCB pairs', () => {

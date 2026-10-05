@@ -3,8 +3,10 @@ import { getModelCatalogCache } from './modelCatalogRuntime.js'
 export const TERRA_AUTO_DREAM_MODEL = 'gpt-5.6-terra'
 export const DEEPSEEK_AUTO_DREAM_MODEL = 'deepseek-v4-flash'
 export const MINIMAX_AUTO_DREAM_MODEL = 'MiniMax-M3'
-export const DEFAULT_AUTO_DREAM_MODEL = MINIMAX_AUTO_DREAM_MODEL
-export const LEGACY_AUTO_DREAM_MODEL = MINIMAX_AUTO_DREAM_MODEL
+// OCV5-322: the default and the legacy organizer moved off MiniMax M3 so that model can be taken offline.
+// MiniMax stays in the optimizer map below: a row that still names it resolves while the model is active.
+export const DEFAULT_AUTO_DREAM_MODEL = DEEPSEEK_AUTO_DREAM_MODEL
+export const LEGACY_AUTO_DREAM_MODEL = DEEPSEEK_AUTO_DREAM_MODEL
 const AUTO_DREAM_OPTIMIZER_ENGINES = new Map<string, 'codex' | 'ccb'>([
   [TERRA_AUTO_DREAM_MODEL, 'codex'],
   [DEEPSEEK_AUTO_DREAM_MODEL, 'ccb'],
@@ -24,7 +26,7 @@ export function isAutoDreamOptimizerModel(
   return canonicalModel === modelId && AUTO_DREAM_OPTIMIZER_ENGINES.get(modelId) === engine
 }
 
-/** Auto-Dream defaults to MiniMax while retaining the two previous rollback-compatible models. */
+/** Auto-Dream defaults to DeepSeek V4 Flash while retaining the other rollback-compatible models. */
 export async function listAutoDreamModelOptions(): Promise<AutoDreamModelOption[]> {
   const cache = await getModelCatalogCache()
   const snapshot = await cache.assertFresh()

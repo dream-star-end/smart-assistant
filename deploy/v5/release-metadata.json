@@ -166,7 +166,8 @@
     "0285_content_review_strikes",
     "0293_commercial_new_models_prepare",
     "0294_commercial_box_api_model",
-    "0295_commercial_box_api_sonnet_haiku"
+    "0295_commercial_box_api_sonnet_haiku",
+    "0296_commercial_retire_minimax_m3_gpt56_sol"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -153,6 +153,8 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // P0 containment debt. Same class as model_default_transition_snapshots —
   // small, immutable ops ledgers; deleting them would drop rollback proof.
   "model_dsv4pro_transition_snapshots",
+  // 2026-10-06 OCV5-322: before-images of the 0296 MiniMax-M3 / gpt-5.6-sol transition (rollback proof).
+  "model_0296_transition_snapshots",
   "model_flash_opencode_subject_snapshots",
   "model_flash_opencode_transition",
   "model_k3_256k_transition",
