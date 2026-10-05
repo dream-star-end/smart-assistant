@@ -82,9 +82,9 @@ export async function runBoxCcBridge(opts: {
   let exitCode = 1
   let sawExit = false
   // The write runs as its own exec in the box. A request whose response the
-  // transport lost is sent once more: the box script skips a line it already
-  // delivered. An exec that ran and did not exit 0 wrote nothing Claude can
-  // read, so the bridge stops instead of waiting for an answer.
+  // transport lost is sent once more: the box script never writes a numbered
+  // line twice. An exec that ran and did not exit 0 did not deliver the line,
+  // so the bridge stops instead of waiting for an answer.
   const writeExec = async (body: BoxCcExecRequest): Promise<void> => {
     let last: unknown
     for (let attempt = 0; attempt < 2; attempt++) {

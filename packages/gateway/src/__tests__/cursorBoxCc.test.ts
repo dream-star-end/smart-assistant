@@ -609,9 +609,67 @@ test('box scripts: a line larger than one environment string reaches the box Cla
     assert.equal(existsSync(control.fifo), false)
     assert.equal(existsSync(`${control.fifo}.in`), false)
     assert.equal(existsSync(`${control.fifo}.seq`), false)
+    assert.equal(existsSync(`${control.fifo}.lock`), false)
   } finally {
     for (const child of children) child.kill('SIGKILL')
-    for (const suffix of ['', '.in', '.seq', '.seq.tmp']) rmSync(`${control.fifo}${suffix}`, { force: true })
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp', '.lock']) rmSync(`${control.fifo}${suffix}`, { force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('box scripts: a repeated write waits for the first attempt and never writes the line a second time', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oc-box-cc-repeat-'))
+  const fakeClaude = join(dir, 'claude')
+  // A Claude that is busy and not reading stdin: the write blocks in the fifo.
+  writeFileSync(fakeClaude, '#!/bin/sh\nexec sleep 60\n')
+  chmodSync(fakeClaude, 0o755)
+  const control: BoxCcControl = {
+    execUrl: 'https://box.cursorvm.com/agent.v1.ControlService/Exec',
+    execToken: 'local',
+    networkToken: 'net',
+    remoteClaude: fakeClaude,
+    fifo: boxCcSpawnFifo(`/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, randomBytes(8).toString('hex')),
+    cwd: dir,
+  }
+  const children: ChildProcess[] = []
+  const run = (request: BoxCcExecRequest): ChildProcess => {
+    const child = spawn(request.command, request.args, {
+      cwd: dir,
+      env: { ...request.environment, PATH: process.env.PATH ?? '/usr/bin:/bin' },
+      stdio: 'ignore',
+    })
+    children.push(child)
+    return child
+  }
+  const exited = (child: ChildProcess): Promise<number | null> =>
+    new Promise((resolve) => child.once('exit', (code) => resolve(code)))
+  try {
+    run(boxCcLaunchExec(control, []))
+    // Larger than the pipe buffer, one exec.
+    const [write] = boxCcWriteExecs(control, `{"type":"user","text":"${'x'.repeat(200_000)}"}`, 1)
+    const first = run(write!)
+    assert.equal(await until(() => {
+      try { return readFileSync(`${control.fifo}.seq`, 'utf8') === '1 pending' } catch { return false }
+    }), true, 'the first attempt is in the fifo write')
+    // The bridge timed out and sends the request again while the first
+    // attempt is still writing. The repeat must not write next to it.
+    const repeat = run(write!)
+    let repeatCode: number | null | undefined
+    void exited(repeat).then((code) => { repeatCode = code })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(repeatCode, undefined, 'the repeat waits for the attempt that holds the line')
+    assert.equal(first.exitCode, null)
+    // The first attempt dies mid-write: how much Claude got is unknown.
+    first.kill('SIGKILL')
+    assert.equal(await until(() => repeatCode !== undefined), true)
+    assert.equal(repeatCode, 4, 'the line is not written again; the bridge is told to stop')
+    assert.equal(readFileSync(`${control.fifo}.seq`, 'utf8'), '1 pending')
+    assert.equal(await exited(run(write!)), 4)
+  } finally {
+    for (const child of children) child.kill('SIGKILL')
+    for (const suffix of ['', '.in', '.seq', '.seq.tmp', '.lock']) rmSync(`${control.fifo}${suffix}`, { force: true })
     rmSync(dir, { recursive: true, force: true })
   }
 })

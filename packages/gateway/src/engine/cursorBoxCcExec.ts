@@ -95,9 +95,9 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'for old in "${fifo%.*.fifo}".*.fifo; do',
   '  if [ "$old" = "$fifo" ] || [ ! -p "$old" ]; then continue; fi',
   '  reap "$old"',
-  '  rm -f "$old" "$old.in" "$old.seq"',
+  '  rm -f "$old" "$old.in" "$old.seq" "$old.lock"',
   'done',
-  'rm -f "$fifo" "$fifo.in" "$fifo.seq"',
+  'rm -f "$fifo" "$fifo.in" "$fifo.seq" "$fifo.lock"',
   'mkfifo -m 600 "$fifo"',
   // Hold both ends for the life of claude. A later writer then cannot block
   // in open(), and closing that writer does not deliver EOF mid-turn.
@@ -107,7 +107,7 @@ export const BOX_CC_LAUNCH_SCRIPT = [
   'status=$?',
   'set -e',
   'exec 3>&-',
-  'rm -f "$fifo" "$fifo.in" "$fifo.seq"',
+  'rm -f "$fifo" "$fifo.in" "$fifo.seq" "$fifo.lock"',
   'exit "$status"',
 ].join('\n')
 
@@ -115,7 +115,7 @@ export const BOX_CC_STOP_SCRIPT = [
   'set -eu',
   ...BOX_CC_REAP_FUNCTION,
   'reap "$1"',
-  'rm -f "$1" "$1.in" "$1.seq"',
+  'rm -f "$1" "$1.in" "$1.seq" "$1.lock"',
 ].join('\n')
 
 const SPAWN_FIFO_NONCE = /^[a-f0-9]{8,32}$/
@@ -181,14 +181,21 @@ export function boxCcStopExec(control: BoxCcControl): BoxCcExecRequest {
  * refuses any single string over 128 KiB (MAX_ARG_STRLEN), so a line is cut
  * into base64 parts well under that. A line that needs several requests is
  * collected in `<fifo>.in`, each request writing at its own offset, and
- * reaches the fifo in one write by the last request. Lines are numbered by
- * the bridge and `<fifo>.seq` holds the number of the last line Claude got,
- * so a request repeated after a lost response changes nothing: Claude never
- * reads a line twice. The script waits until the launch script has created
- * the fifo: opening it earlier races the mkfifo and then leaves Claude
- * blocked on a reader that never gets a writer. */
+ * reaches the fifo in one write by the last request.
+ *
+ * Claude must never read a line twice, also when the bridge repeats a
+ * request whose response it lost. The bridge numbers its lines; under
+ * `<fifo>.lock` the script records `<n> pending` in `<fifo>.seq` before the
+ * fifo write and `<n> done` after it. A repeated request waits for the
+ * attempt that holds the lock, then exits 0 if the line is done and 4 if the
+ * earlier attempt died between the two marks (it is unknown how much Claude
+ * received, so the line is not written again and the bridge stops).
+ *
+ * The script waits until the launch script has created the fifo: opening it
+ * earlier races the mkfifo and then leaves Claude blocked on a reader that
+ * never gets a writer. */
 export const BOX_CC_WRITE_SCRIPT = [
-  'import base64,os,time',
+  'import base64,fcntl,os,time',
   'e=os.environ',
   'p=e["OC_BOX_CC_FIFO"]',
   'seq=int(e["OC_BOX_CC_SEQ"])',
@@ -199,10 +206,16 @@ export const BOX_CC_WRITE_SCRIPT = [
   'while not os.path.exists(p):',
   '    if time.time()>end: raise SystemExit(1)',
   '    time.sleep(0.05)',
+  'fcntl.flock(os.open(p+".lock",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600),fcntl.LOCK_EX)',
   'try:',
-  '    with open(p+".seq") as f: done=int(f.read())',
-  'except (OSError,ValueError): done=0',
-  'if done>=seq: raise SystemExit(0)',
+  '    with open(p+".seq") as f: done,state=f.read().split()',
+  '    done=int(done)',
+  'except (OSError,ValueError): done,state=0,"done"',
+  'if done>seq or (done==seq and state=="done"): raise SystemExit(0)',
+  'if done==seq: raise SystemExit(4)',
+  'def mark(state):',
+  '    with os.fdopen(os.open(p+".seq.tmp",os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600),"w") as f: f.write("%d %s"%(seq,state))',
+  '    os.replace(p+".seq.tmp",p+".seq")',
   'if off or not last:',
   '    f=os.fdopen(os.open(p+".in",os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600),"r+b")',
   '    if os.fstat(f.fileno()).st_size<off: raise SystemExit(3)',
@@ -215,9 +228,9 @@ export const BOX_CC_WRITE_SCRIPT = [
   '        os.unlink(p+".in")',
   '    f.close()',
   'if last:',
+  '    mark("pending")',
   '    with open(p,"ab") as f: f.write(data)',
-  '    with os.fdopen(os.open(p+".seq.tmp",os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600),"w") as f: f.write(str(seq))',
-  '    os.replace(p+".seq.tmp",p+".seq")',
+  '    mark("done")',
 ].join('\n')
 
 /** Bytes of the line per environment string (80 000 base64 characters). */
