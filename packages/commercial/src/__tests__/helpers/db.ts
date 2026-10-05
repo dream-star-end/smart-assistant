@@ -256,7 +256,7 @@ function productionMigrationsDir(): string {
  * 造一个临时目录,symlink 进所有 version < `beforeVersion` 的迁移 .sql。
  * 同一前缀在同一进程内复用同一个目录(migration 测试通常在 before 里调一次)。
  */
-async function migrationsDirBefore(beforeVersion: string): Promise<string> {
+export async function migrationsDirBefore(beforeVersion: string): Promise<string> {
   const cached = subsetDirCache.get(beforeVersion);
   if (cached) return cached;
   const src = productionMigrationsDir();
