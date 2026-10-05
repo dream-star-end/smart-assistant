@@ -26,3 +26,18 @@ Only an explicitly authorized existing OC_V5_MODEL_RELEASE_DATABASE_URL is accep
 CLI outputs are root-only exclusive files; UNKNOWN COMMIT exits75 and provides reconciliation identity, never automatic apply.
 
 Historical SQL evidence: schema_migrations records only version/applied_at, NOT a historical applied checksum. prepareSqlSha256 binds the current root-trusted release SQL and explicitly authorized readiness evidence; preparation is checked by version ledger plus exact current catalog/pricing/binding state. No claim of a PG historical checksum is made.
+
+## Disposition (2026-10-05) — the operator was never run in production
+`OC_V5_MODEL_RELEASE_DATABASE_URL` was never provisioned on either host, and the prohibitions above (no app/deploy fallback, secret discovery, SET ROLE, owner fallback or GRANT) rule out every existing role, so no operator observe/apply/compensate has touched production. The manifest stays as the frozen input of migration 0293 and of the operator's tests; it is no longer an all-17 activation set, and an operator observe against production would now refuse on drift.
+
+The rows below went live through the product's catalog authority instead (`admin/modelCatalogOps` `activateEntry` / `switchVersion` over `MODEL_CATALOG_ADMIN_DATABASE_URL`, `admin/pricing` `patchPricing`): the calls behind the admin model-catalog and pricing endpoints, which `scripts/v5-change-route.sh` names as the route for catalog changes. Each run was made from the live release under the production mutation lease, one model at a time, checked every catalog and pricing field against this manifest first, and left `admin_audit` rows.
+
+| Rows | State on commercial | admin_audit |
+|---|---|---|
+| box-claude-haiku-4-5, box-claude-opus-5-5, box-claude-sonnet-5 | active | 3201–3203 |
+| gpt-6.1-sol, gpt-6.1-sol-1m, gpt-6-luna, gpt-6-luna-1m, grok-build-fast | active | 3204–3207, 3210 |
+| grok-build (standard) | grok-4.7, "Grok 4.7", multiplier 2; kept columns unchanged per the allowlist | 3208 switch, 3209 pricing |
+| claude-opus-5-5 | disabled: activated, its canary turn failed (the only Claude subscription account had an expired login and the product disabled it on first use), disabled again | 3211, 3212 |
+| cursor-grok-4.7-* (8 rows) | staged: commercial has no working Cursor inference transport for cursor-* models | — |
+
+Scripts, review records and canary evidence: task workspace `ocv5-308`, prefixes `g46-` and `g47-`.
