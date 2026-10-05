@@ -5990,6 +5990,36 @@
           "assertion": "the incident shape: an op stranded by a previous container settles on the next submit"
         }
       ]
+    },
+    {
+      "id": "INC-20261005-BOX-CC-FOLLOWUP-TURN",
+      "occurredAt": "2026-10-05",
+      "severity": "P1",
+      "symptom": "商业 rel-97e6472b5（box-claude-haiku-4-5 / sonnet-5 / opus-5-5 于 02:0xZ 激活）：同一会话第一轮正常，第二轮起返回『服务正在更新，本轮已中断，请直接重试本条消息』（service_restart；容器日志 turn terminal error『子进程被信号 SIGKILL 终止』），再下一轮显示的是上一条问题的回答（错位一轮）；用户 2026-10-05 10:26 CST 反馈『续聊有问题』，canary 03:59Z 复现（会话 g48mtmuuq0s79）。根因：Box 常驻官方 CLI 走 official-cc harness 且没有 authorityEngine，runner 把它当成 engine=ccb 代理通道，每轮 lease 不同→spawn env 指纹变化→每个后续 turn 提交前先 shutdown 进程；Box 桥在 stdin 关闭时什么都不做（Box 启动脚本持有 fifo，claude 收不到 EOF），3 秒后被 SIGKILL，该退出落到新一轮头上；Box 里的 claude 从未被通知停止，继续挂在同一会话上并回答下一条输入，进程残留。修复：runner 不再把 Box CLI 归入代理通道（submit 与 lease 续期）；桥在 stdin 关闭时结束自己启动的 claude（读该 fifo 的进程，TERM 后 KILL）并以 0 退出；启动时先结束同一会话遗留的旧 claude。",
+      "rootFixCommit": "611cf330",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/subprocessRunnerBoxCcTurnReuse.test.ts",
+          "assertion": "a second turn with a new lease goes to the same process"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "closing stdin ends the box Claude and the bridge exits 0"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCc.test.ts",
+          "assertion": "box scripts: stop ends the launched Claude, and a new launch retires the old one of the same session"
+        }
+      ]
     }
   ]
 }
