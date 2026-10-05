@@ -2,7 +2,7 @@
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
-import { BOX_API_RESOLVE_MODEL } from "./boxNativeContextOwner.js";
+import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxMcpAliasMode } from "./boxToolCatalog.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
   BoxPrelaunchRecoveryCandidate, BoxNativeGcCandidate } from "./boxDurableJournal.js";

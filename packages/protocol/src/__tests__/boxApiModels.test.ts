@@ -63,12 +63,18 @@ describe('boxApiModels', () => {
     assert.equal(isBoxApiModelPair('box-api-claude-haiku-4-5', 'claude-haiku-4-5'), false)
   })
 
-  it('claude-code-best mirrors the same ids in the same order', () => {
-    const mirror = readFileSync(fileURLToPath(new URL(
-      '../../../../claude-code-best/src/utils/model/boxNativeRemoteContext.ts', import.meta.url)), 'utf8')
-    const block = /export const BOX_NATIVE_CONTEXT_MODELS: readonly string\[\] = \[([^\]]*)\]/.exec(mirror)
-    assert.ok(block, 'mirror list not found')
-    const ids = [...block[1]!.matchAll(/'([^']+)'/g)].map((hit) => hit[1])
-    assert.deepEqual(ids, [...BOX_API_MODEL_IDS])
-  })
+  for (const mirrorPath of [
+    '../../../../claude-code-best/src/utils/model/boxNativeRemoteContext.ts',
+    '../../../commercial/src/http/proxy/boxNativeContextOwner.ts',
+  ]) {
+    it(`${mirrorPath.split('/').slice(-1)[0]} mirrors the same ids in the same order`, () => {
+      const mirror = readFileSync(fileURLToPath(new URL(mirrorPath, import.meta.url)), 'utf8')
+      const block = /export const BOX_NATIVE_CONTEXT_MODELS: readonly string\[\] = \[([^\]]*)\]/.exec(mirror)
+      assert.ok(block, 'mirror list not found')
+      const ids = [...block[1]!.matchAll(/['"]([^'"]+)['"]/g)].map((hit) => hit[1])
+      assert.deepEqual(ids, [...BOX_API_MODEL_IDS])
+      // the mirror file must stay loadable without the workspace
+      if (mirrorPath.includes('commercial')) assert.doesNotMatch(mirror, /^import /m)
+    })
+  }
 })

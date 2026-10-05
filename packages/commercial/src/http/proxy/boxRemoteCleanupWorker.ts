@@ -1,7 +1,7 @@
 /** Shared-leader, flag-independent Box privacy cleanup recovery. Only a
  * terminal-proof journal candidate may reach remote Exec; no CLI launch,
  * tool publication or paid retry exists in this worker. */
-import { BOX_API_RESOLVE_MODEL } from "./boxNativeContextOwner.js";
+import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate, BoxStaleResumePhase,
   BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
