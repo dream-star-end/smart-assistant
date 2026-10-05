@@ -1,6 +1,7 @@
 /** CCB prompt-cache markers are placement hints, not model history. Remove
  * only validated wrapper-level hints; never recurse into tool input/result
  * payloads, where a key named cache_control may be real user/tool data. */
+import { boxApiModelByEitherId } from "@openclaude/protocol";
 import type { ProxyBody } from "./shared.js";
 
 export class BoxCacheAnnotationError extends Error {
@@ -61,13 +62,11 @@ export function normalizeBoxAssistantContent(raw: unknown): unknown {
 export function normalizeBoxToolResultBlock(raw: unknown): unknown {
   return block(raw, ["tool_result"]);
 }
-/** Anthropic context editing with keep=all makes no edit for Opus 5.5.
+/** Anthropic context editing with keep=all makes no edit on any Box model.
  * Accept only the exact current CCB2.1.280 shape; all other policies require
  * a separately proved mapping and remain rejected before any paid launch. */
 export function isBoxNoopContextManagement(body: ProxyBody): boolean {
-  if (body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5") {
-    return false;
-  }
+  if (!boxApiModelByEitherId(body.model)) return false;
   const ctx = body.context_management;
   if (!object(ctx) || Object.keys(ctx).join(",") !== "edits"
     || !Array.isArray(ctx.edits) || ctx.edits.length !== 1
@@ -369,8 +368,7 @@ function stripEmbeddedBudget(last: Record<string, unknown>): Record<string, unkn
   return { ...last, content };
 }
 function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
-  if ((body.model !== "box-api-claude-opus-5-5" && body.model !== "claude-opus-5-5")
-    || !Array.isArray(body.messages)) return body;
+  if (!boxApiModelByEitherId(body.model) || !Array.isArray(body.messages)) return body;
   for (let i = 0; i < body.messages.length; i++) {
     if (!Object.hasOwn(body.messages, i)) return body;
   }
@@ -540,8 +538,8 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
  * local two-CLI tool loop); the outer hint is not a new user instruction.
  * Recognize only this exact shape at each handoff boundary. Every other
  * system message stays in the body and fails the resume gate if misplaced. */
-function opusModel(body: ProxyBody): boolean {
-  return body.model === "box-api-claude-opus-5-5" || body.model === "claude-opus-5-5";
+function boxModel(body: ProxyBody): boolean {
+  return boxApiModelByEitherId(body.model) !== undefined;
 }
 function handoffPair(result: unknown, assistant: unknown): boolean {
   return object(result) && result.role === "user"
@@ -552,7 +550,7 @@ function handoffPair(result: unknown, assistant: unknown): boolean {
     && assistant.content.some((part: unknown) => object(part) && part.type === "tool_use");
 }
 function handoffNeighbors(body: ProxyBody, index: number): boolean {
-  if (!opusModel(body) || !Array.isArray(body.messages) || index < 2 || index >= body.messages.length) {
+  if (!boxModel(body) || !Array.isArray(body.messages) || index < 2 || index >= body.messages.length) {
     return false;
   }
   if (!Object.hasOwn(body.messages, index)
@@ -715,7 +713,7 @@ function skillBodyBlocks(content: unknown): Array<{ type: "text"; text: string }
   return out;
 }
 export function foldBoxCcbSkillBody(body: ProxyBody): ProxyBody {
-  if (!opusModel(body) || !Array.isArray(body.messages) || !denseArray(body.messages)) return body;
+  if (!boxModel(body) || !Array.isArray(body.messages) || !denseArray(body.messages)) return body;
   const messages: unknown[] = [];
   let changed = false;
   for (let i = 0; i < body.messages.length; i++) {
@@ -770,7 +768,7 @@ export function foldBoxCcbSkillBody(body: ProxyBody): ProxyBody {
 }
 
 function rejectUnapprovedToolBoundary(body: ProxyBody): void {
-  if (!opusModel(body) || !Array.isArray(body.messages)) return;
+  if (!boxModel(body) || !Array.isArray(body.messages)) return;
   for (let index = 2; index < body.messages.length; index++) {
     if (!handoffNeighbors(body, index)) continue;
     const tail = body.messages[index];
@@ -835,13 +833,13 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
   // folded before the Skill fold can claim their text.
   semanticBody = stripBoxCcbToolBudgetTail(
     foldBoxCcbSkillBody(stripBoxCcbToolBudgetTail(semanticBody)));
-  // Opus 5.5 defaults adaptive display to "omitted". The actual Box CLI plan
+  // The effort-capable Box models (Opus 5.5, Sonnet 5.5) default adaptive
+  // display to "omitted". The actual Box CLI plan
   // maps both request forms to the same effort and response behavior; normalize
   // only this verified equivalence so a retry/continuation cannot evade its
   // paid replay fence by adding the redundant display key.
   const thinking = semanticBody.thinking;
-  if ((semanticBody.model === "box-api-claude-opus-5-5"
-      || semanticBody.model === "claude-opus-5-5")
+  if (boxApiModelByEitherId(semanticBody.model)?.supportsEffort === true
     && object(thinking) && Object.keys(thinking).sort().join(",") === "display,type"
     && thinking.type === "adaptive" && thinking.display === "omitted") {
     semanticBody = { ...semanticBody, thinking: { type: "adaptive" } } as ProxyBody;

@@ -165,7 +165,8 @@
     "0283_cursor_gpt56_luna_sand",
     "0285_content_review_strikes",
     "0293_commercial_new_models_prepare",
-    "0294_commercial_box_api_model"
+    "0294_commercial_box_api_model",
+    "0295_commercial_box_api_sonnet_haiku"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

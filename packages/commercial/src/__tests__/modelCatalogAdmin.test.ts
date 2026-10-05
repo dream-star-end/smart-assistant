@@ -353,3 +353,24 @@ describe("model catalog admin — 审计登记", () => {
     }
   });
 });
+
+test("box_cli accepts each listed model only with its own upstream id", () => {
+  const profile = (supported: string[]) => ({ supports_vision: false,
+    reasoning: { supported, codex_model_default: null },
+    ccb: { capability_zero: true, supports_thinking: false, context_owner: "box-native-v1" } });
+  const row = (model_id: string, upstream_model_id: string, supported: string[] = []) => ({ model_id,
+    engine: "ccb", provider_id: "box_cli", upstream_model_id, context_window: 200_000,
+    capability_profile: profile(supported) });
+  const wired = (input: ReturnType<typeof row>) =>
+    validateVersionSemantics(normalizeVersionInput(input), true).filter((item) => item.includes("仅接线"));
+  const all = ["low", "medium", "high", "xhigh", "max"];
+  assert.deepEqual(validateVersionSemantics(normalizeVersionInput(
+    row("box-api-claude-sonnet-5-5", "claude-sonnet-5-5", all)), true), []);
+  assert.deepEqual(validateVersionSemantics(normalizeVersionInput(
+    row("box-api-claude-haiku-4-5", "claude-haiku-4-5-20251001")), true), []);
+  assert.deepEqual(wired(row("box-api-claude-opus-5-5", "claude-opus-5-5", all)), []);
+  assert.equal(wired(row("box-api-claude-sonnet-5-5", "claude-opus-5-5")).length, 1);
+  assert.equal(wired(row("box-api-claude-opus-5-5", "claude-sonnet-5-5")).length, 1);
+  assert.equal(wired(row("box-api-claude-haiku-4-5", "claude-haiku-4-5")).length, 1);
+  assert.equal(wired(row("box-api-claude-sonnet-5", "claude-sonnet-5")).length, 1);
+});

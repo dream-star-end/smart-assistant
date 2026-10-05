@@ -15,6 +15,7 @@
 // (验签)共同 import —— 签名格式、规范编码、错误语义必须单一权威,任何一侧另抄一份
 // 编码规则 = 签名互不认账。私钥逻辑**不在本文件**(master 独占)。
 
+import { BOX_API_MODELS } from './boxApiModels.js'
 import { createHash, createPublicKey, verify as cryptoVerify } from 'node:crypto'
 
 import type { PlatformReasoningEffort } from './engineModels.js'
@@ -97,8 +98,9 @@ export type ModelAuthorityEngine = 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
 /** Signed Box context-owner token. Absent means the server did not issue it. */
 export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
 export type BoxNativeContextOwner = typeof BOX_NATIVE_CONTEXT_OWNER
-/** Exact canonical model that may carry the token. Not a prefix. */
-export const BOX_NATIVE_CONTEXT_MODEL = 'box-api-claude-opus-5-5'
+/** One model that may carry the token, kept for fixtures and proofs. The
+ * models that may carry it are BOX_API_MODELS; checks use isBoxApiModel. */
+export const BOX_NATIVE_CONTEXT_MODEL = BOX_API_MODELS[0].id
 
 /**
  * 该模型的**完整规范化执行语义**(方案 §2 R2-B3):容器该 turn 的 engine/capability/

@@ -16,6 +16,7 @@
  *
  * 硬约束:CCB stream-json SdkMessage 形状不跨出本模块。
  */
+import { isBoxApiModel } from '@openclaude/protocol'
 import { EventEmitter } from 'node:events'
 import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -768,7 +769,7 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
    * calls this notifier. The gateway owns it beyond the CLI interrupt. */
   private _notifyBoxStop(turn: CcbTurnContext, cause: 'user' | 'continuation_rejected'): void {
     const nativeSessionId = this.runner.sessionId
-    if (turn.boxStopNotified || this.model !== 'box-api-claude-opus-5-5'
+    if (turn.boxStopNotified || !isBoxApiModel(this.model)
       || !turn.turnKey || !nativeSessionId) return
     turn.boxStopNotified = true
     this._boxStopPending = notifyBoxUserStop({ sessionId: nativeSessionId,

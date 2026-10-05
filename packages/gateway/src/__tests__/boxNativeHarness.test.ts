@@ -77,3 +77,25 @@ describe('box native harness', () => {
     )
   })
 })
+
+describe('box native harness: every listed model', () => {
+  for (const model of ['box-api-claude-sonnet-5-5', 'box-api-claude-haiku-4-5']) {
+    test(`${model} carries the token and runs on ccb`, () => {
+      const descriptor = projectCcbExecutionDescriptor({ ...base, canonicalModel: model })
+      assert.equal(descriptor.contextOwner, 'box-native-v1')
+      assert.equal(applyBoxNativeHarness({ model, descriptor, harness: 'official-cc', spawned: false }), 'ccb')
+    })
+  }
+
+  test('a descriptor of one listed model does not cover a turn on another', () => {
+    const descriptor = projectCcbExecutionDescriptor(base)
+    assert.throws(
+      () => applyBoxNativeHarness({ model: 'box-api-claude-sonnet-5-5', descriptor, harness: undefined, spawned: false }),
+      (err: unknown) => err instanceof BoxNativeHarnessError && err.code === 'BOX_NATIVE_CONTEXT_MISMATCH',
+    )
+    assert.throws(
+      () => projectCcbExecutionDescriptor({ ...base, canonicalModel: 'box-api-claude-sonnet-5' }),
+      (err: unknown) => err instanceof BoxNativeHarnessError && err.code === 'BOX_NATIVE_CONTEXT_MISMATCH',
+    )
+  })
+})

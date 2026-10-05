@@ -12,13 +12,15 @@ import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js
 const db = useDedicatedTestDatabase("commercial_box_api_model_0294_test");
 const sqlPath = fileURLToPath(new URL("../db/migrations/0294_commercial_box_api_model.sql", import.meta.url));
 const MODEL = "box-api-claude-opus-5-5";
+// Rows of the next commercial migration in the same chain (0295) are not "other" rows of this one.
+const LATER = ["box-api-claude-sonnet-5-5", "box-api-claude-haiku-4-5"];
 
 async function others() {
   return (await query(
-    `SELECT (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.entry_id) FROM model_catalog c WHERE c.model_id<>$1) AS catalog,
-            (SELECT jsonb_agg(to_jsonb(p) ORDER BY p.model_id) FROM model_pricing p WHERE p.model_id<>$1) AS pricing,
+    `SELECT (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.entry_id) FROM model_catalog c WHERE c.model_id<>$1 AND NOT(c.model_id=ANY($2::text[]))) AS catalog,
+            (SELECT jsonb_agg(to_jsonb(p) ORDER BY p.model_id) FROM model_pricing p WHERE p.model_id<>$1 AND NOT(p.model_id=ANY($2::text[]))) AS pricing,
             (SELECT jsonb_agg(to_jsonb(gm) ORDER BY gm.group_id,gm.model_id) FROM account_group_models gm) AS bindings`,
-    [MODEL])).rows[0];
+    [MODEL, LATER])).rows[0];
 }
 
 async function prepared() {
@@ -59,7 +61,7 @@ describe("0294 prepares the commercial Box model route without offering it", () 
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0294");
     const before = await others();
-    assert.deepEqual((await runMigrations()).applied, ["0294_commercial_box_api_model"]);
+    assert.deepEqual((await runMigrations()).applied, ["0294_commercial_box_api_model", "0295_commercial_box_api_sonnet_haiku"]);
     assert.deepEqual(await others(), before);
     assert.equal((await prepared()).state, "staged");
   });

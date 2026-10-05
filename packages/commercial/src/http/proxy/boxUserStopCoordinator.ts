@@ -2,6 +2,7 @@
  * HTTP disconnect alone must not call this. The stop request never constitutes
  * terminal evidence; only the original keeper's strict proof can close a row.
  */
+import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
 import type { BoxDurableJournal, BoxJournalAdmission,
   BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
@@ -70,7 +71,7 @@ export class BoxUserStopCoordinator {
   private async resolvePinned(leaf: BoxStoppedFailureProbeCandidate): Promise<BoxResolvedTarget> {
     const abort = new AbortController();
     const pending = this.deps.resolver.resolve({ uid: leaf.uid, sessionId: null,
-      requestId: leaf.requestId, upstreamModel: "claude-opus-5-5",
+      requestId: leaf.requestId, upstreamModel: BOX_API_RESOLVE_MODEL,
       requiredAccountId: leaf.accountId, signal: abort.signal });
     let abandoned = false;
     let completed: BoxResolvedTarget | null = null;
