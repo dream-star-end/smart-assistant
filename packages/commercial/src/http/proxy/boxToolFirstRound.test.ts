@@ -946,3 +946,33 @@ test("INC-20261006 a synthetic CLI turn inside a message is stopped and settled,
   assert.equal(settled.length, 1);
   assert.deepEqual(g.unknownPhases, []);
 });
+
+const upstreamRefusalRaw = Buffer.from([records[0], ...readFileSync(new URL(
+  "./__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl", import.meta.url), "utf8")
+  .trim().split("\n").map((line) => JSON.parse(line) as unknown)]
+  .map((record) => JSON.stringify(record) + "\n").join(""));
+
+test("INC-20261006 a CLI usage-limit refusal is stopped and settled unbilled, not left to hold the session", async () => {
+  const f = fixture({ spoolBody: upstreamRefusalRaw });
+  let stops = 0;
+  const deps = { ...f.deps, stopRejectedRun: async () => { stops++; return "stopped_proven" as const; } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  assert.equal(stops, 1);
+  assert.ok(!f.sequence.includes("unknown"));
+  assert.ok(!f.sequence.includes("durable-handoff"), "nothing is handed to the client");
+  assert.deepEqual(f.unknownPhases, []);
+  assert.equal(f.retained, false);
+  // the CLI already finished on its own: settled from its keeper proof, not billed
+  const g = fixture({ spoolBody: upstreamRefusalRaw });
+  const settled: unknown[] = [];
+  const d = { ...g.deps, stopRejectedRun: async () => "completed_unsettled" as const,
+    readTerminalProof: (async (args: { runNonce: string; leaseEpoch: string }) => ({
+      reason: "worker_complete", runNonce: args.runNonce, leaseEpoch: args.leaseEpoch })) as never,
+    journal: { ...(g.deps.journal as object), markFirstRoundRejectedStream: async (input: unknown) => {
+      settled.push(input); } } as never };
+  await assert.rejects(() => runBoxToolFirstRound(g.input, d),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  assert.equal(settled.length, 1);
+  assert.deepEqual(g.unknownPhases, []);
+});

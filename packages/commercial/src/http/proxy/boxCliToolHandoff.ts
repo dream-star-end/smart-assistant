@@ -6,6 +6,7 @@
  */
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliSyntheticUser } from "./boxCliCompaction.js";
+import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
@@ -353,6 +354,8 @@ export class BoxCliToolHandoffDecoder {
     if (this.candidate || this.finalCandidate) {
       throw new BoxCliToolHandoffError("BOX_TOOL_AFTER_HANDOFF");
     }
+    const refusal = boxCliUpstreamRefusal(record);
+    if (refusal) throw new BoxCliToolHandoffError(refusal);
     if (this.compaction) {
       try {
         if (this.compaction.take(record, this.started ? "in-model" : "pre-model")) return "";

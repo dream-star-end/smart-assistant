@@ -18,6 +18,7 @@ import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
 import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
+import { BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED } from "./boxCliUpstreamRefusal.js";
 import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
@@ -58,6 +59,9 @@ type Journal = Pick<BoxDurableJournal, "admit" |
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
 const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID",
+  // The CLI answered an upstream refusal (usage window exhausted, API error)
+  // with its own synthetic message: nothing was generated, nothing is billed.
+  BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED,
   // The CLI's own synthetic user turns (output-limit resume, empty-answer
   // nudge) inside a model message are not a stream this request can deliver.
   "BOX_CLI_COMPACT_PHASE", "BOX_CLI_COMPACT_UNBOUND", "BOX_CLI_COMPACT_DUPLICATE",
