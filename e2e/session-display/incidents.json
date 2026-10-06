@@ -6288,7 +6288,8 @@
         "3308d969",
         "ec4f24d9",
         "30515820",
-        "6d524ba6"
+        "6d524ba6",
+        "71eec4c8"
       ],
       "regressions": [
         {
@@ -6310,6 +6311,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxRefusalMemory.test.ts",
           "assertion": "a refused Box call is remembered for its own logical turn only, for ten minutes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRefusalMemory.test.ts",
+          "assertion": "the client sees a 503 with Retry-After for a usage-limit refusal and for any other refusal"
         },
         {
           "layer": "unit",
