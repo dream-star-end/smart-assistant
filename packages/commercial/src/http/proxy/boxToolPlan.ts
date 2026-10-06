@@ -66,7 +66,8 @@ export function makeBoxToolPlan(input: {
   }
   const catalog = compileBoxToolCatalog(input.body.tools, input.toolAliasMode);
   const effort = input.body.thinking === undefined && input.body.output_config === undefined
-    ? null : mapBoxCliEffort(input.body.thinking, input.body.output_config);
+    ? null : mapBoxCliEffort(input.body.thinking, input.body.output_config,
+      input.body.max_tokens);
   const runNonce = input.runNonce ?? randomBytes(12).toString("hex");
   if (!/^[0-9a-f]{24}$/.test(runNonce)) throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   const catalogRaw = Buffer.from(catalog.json, "utf8");

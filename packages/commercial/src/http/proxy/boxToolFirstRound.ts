@@ -57,7 +57,12 @@ type Journal = Pick<BoxDurableJournal, "admit" |
 
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
-const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID"]);
+const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID",
+  // The CLI's own synthetic user turns (output-limit resume, empty-answer
+  // nudge) inside a model message are not a stream this request can deliver.
+  "BOX_CLI_COMPACT_PHASE", "BOX_CLI_COMPACT_UNBOUND", "BOX_CLI_COMPACT_DUPLICATE",
+  "BOX_CLI_COMPACT_INTERRUPTED", "BOX_CLI_COMPACT_SUMMARY_INVALID",
+  "BOX_CLI_COMPACT_BOUNDARY_INVALID"]);
 
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
