@@ -72,8 +72,9 @@ export class BoxProfileHealth {
   }
 
   observe(key: string, signal: BoxProfileSignal): void {
-    const at = this.now();
     const held = this.states.get(key);
+    // Strictly increasing per login, so the store's newer-wins guard can order writes that land out of order.
+    const at = Math.max(this.now(), (held?.updatedAtMs ?? 0) + 1);
     const next: BoxProfileHealthState = { utilization: held?.utilization ?? null,
       cooldownUntilMs: held?.cooldownUntilMs ?? null, lastReason: held?.lastReason ?? null,
       updatedAtMs: at, windowResetsAtMs: held?.windowResetsAtMs ?? null };

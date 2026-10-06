@@ -163,7 +163,7 @@ export async function writeBoxProfileHealth(accountId: bigint, profile: string,
       `UPDATE box_claude_profiles SET utilization = $3::real,
          cooldown_until = $4::timestamptz, last_reason = $5, health_updated_at = $6::timestamptz
        WHERE account_id = $1::bigint AND profile = $2 AND (health_updated_at IS NULL
-         OR health_updated_at <= $6::timestamptz)`,
+         OR health_updated_at < $6::timestamptz)`,
       [accountId.toString(), profile, state.utilization,
         state.cooldownUntilMs === null ? null : new Date(state.cooldownUntilMs).toISOString(),
         state.lastReason, new Date(state.updatedAtMs).toISOString()]);
