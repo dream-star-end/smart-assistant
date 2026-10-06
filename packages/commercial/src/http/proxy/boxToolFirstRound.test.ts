@@ -1032,6 +1032,8 @@ test("a native claim lost to a concurrent turn degrades to a cold start, not an 
     if (result.kind !== "final") return;
     assert.equal(f.sequence.filter((step) => step === "admit").length, 2, "admitted again, cold");
     assert.equal(f.admittedNative, null);
+    assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId, cliCwd: result.plan.cliCwd,
+      cliVersion: "2.1.280" }, "the cold admission names the plan that launches");
     assert.notEqual(result.plan.sessionId, pointer.nativeSessionId, "a fresh CLI session, not the claimed transcript");
     assert.deepEqual(decisions.map((item) => item.reason), ["ok", "claim_lost"]);
     assert.equal(f.launches, 1);

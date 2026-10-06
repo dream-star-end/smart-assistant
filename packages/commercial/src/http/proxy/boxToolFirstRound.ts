@@ -377,7 +377,8 @@ export async function runBoxToolFirstRound(input: {
       catch (error) {
         // Another turn claimed the predecessor transcript (or it moved) while
         // this one waited: not an error for the user, a cold start is always valid.
-        if (!nativeClaim || (error as { code?: unknown } | null)?.code !== "BOX_NATIVE_CLAIM_LOST") throw error;
+        if (!nativeClaim || signal.aborted
+          || (error as { code?: unknown } | null)?.code !== "BOX_NATIVE_CLAIM_LOST") throw error;
         plan = coldPlan; nativeClaim = undefined;
         deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
           reason: "claim_lost", cliVersion: String(launchCliVersion) });
