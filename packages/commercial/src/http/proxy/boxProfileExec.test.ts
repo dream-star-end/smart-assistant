@@ -155,3 +155,15 @@ test("a resumed run's output is attributed to the login it was launched under, n
   await c.run(readReq(NONCE_B), opts);                                                                                   // unknown run: this target
   assert.equal(health.cooldownActive("7:b"), true);
 });
+
+test("two targets re-reading the same rejection (no usable reset) share one bench and do not extend it", async () => {
+  let now = 50_000;
+  const health = new BoxProfileHealth(() => now);
+  const bare = '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}\n';
+  const reply = () => ({ run: async () => ({ stdout: spoolBytes(Buffer.from(bare), 0), stderrBytes: 0, exitCode: 0 as const }) } as never);
+  await scopeBoxExecToProfile(reply(), { key: "7:b", profile: "b", health }).run(readReq(NONCE_A), opts);
+  const until = health.get("7:b")!.cooldownUntilMs;
+  now += 120_000;
+  await scopeBoxExecToProfile(reply(), { key: "7:b", profile: "b", health }).run(readReq(NONCE_A), opts);   // a resumed run: new target, new reader
+  assert.equal(health.get("7:b")!.cooldownUntilMs, until);
+});

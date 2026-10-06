@@ -101,3 +101,16 @@ test("re-reading the same login or unsafe evidence does not push the bench out",
   health.observe("a", { kind: "login_required" });
   assert.ok(health.get("a")!.cooldownUntilMs! > until!);
 });
+
+test("a rejection without a trustworthy reset does not extend an active quota bench", () => {
+  let now = 10_000;
+  const health = new BoxProfileHealth(() => now);
+  health.observe("a", { kind: "rate_limit", status: "rejected", utilization: null, resetsAtMs: null });
+  const until = health.get("a")!.cooldownUntilMs;
+  now += 300_000;
+  health.observe("a", { kind: "rate_limit", status: "rejected", utilization: null, resetsAtMs: null });
+  assert.equal(health.get("a")!.cooldownUntilMs, until);
+  // a rejection that carries a trustworthy reset is still honoured
+  health.observe("a", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: now + 7_200_000 });
+  assert.equal(health.get("a")!.cooldownUntilMs, now + 7_200_000);
+});
