@@ -73,6 +73,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
   nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer };
+  /** The first native claim is lost to a concurrent turn (admission fence). */
+  claimLostOnce?: boolean;
   spoolPrefix?: Buffer;
   spoolBody?: Buffer;
   compactUsingLaunchSession?: boolean;
@@ -193,6 +195,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       currentEpoch = identity.leaseEpoch;
       admittedNative = identity.nativeClaim ?? null;
       admittedStart = identity.nativeStart ?? null;
+      if (options.claimLostOnce && identity.nativeClaim) {
+        throw Object.assign(new Error("BOX_NATIVE_CLAIM_LOST"), { code: "BOX_NATIVE_CLAIM_LOST" });
+      }
       if (options.rejectAdmission) throw new Error("synthetic admission denied"); },
     recordPrelaunchControl: async () => { sequence.push("prelaunch-journal"); },
     armGuardedLaunch: async () => { sequence.push("launch-arm");
@@ -994,4 +999,44 @@ test("INC-20261006 a CLI usage-limit refusal is stopped and settled unbilled, no
     (error: unknown) => (error as { code?: string }).code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
   assert.equal(settled.length, 1);
   assert.deepEqual(g.unknownPhases, []);
+});
+
+test("a native claim lost to a concurrent turn degrades to a cold start, not an error", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const priorBody = { ...canonicalBody,
+      messages: [{ role: "user", content: "prior question" }] } as ProxyBody;
+    const basis = makeBoxNativeHistoryBasis(priorBody, [{ type: "text", text: "READY" }]);
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: model, cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "f".repeat(64), ...basis,
+      catalogHash: compileBoxToolCatalog(canonicalBody.tools).bindingSha256,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const f = fixture({ directFinal: true, claimLostOnce: true,
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const next = { ...canonicalBody, messages: [
+      { role: "user", content: "prior question" },
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "new question" },
+    ] } as ProxyBody;
+    const decisions: Array<{ reason: string }> = [];
+    const input = { ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } };
+    const result = await runBoxToolFirstRound(input,
+      { ...f.deps, onNativeDecision: (info) => { decisions.push(info); } });
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(f.sequence.filter((step) => step === "admit").length, 2, "admitted again, cold");
+    assert.equal(f.admittedNative, null);
+    assert.notEqual(result.plan.sessionId, pointer.nativeSessionId, "a fresh CLI session, not the claimed transcript");
+    assert.deepEqual(decisions.map((item) => item.reason), ["ok", "claim_lost"]);
+    assert.equal(f.launches, 1);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
 });
