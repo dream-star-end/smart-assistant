@@ -96,7 +96,7 @@ export async function observeBoxToolTerminalOnly(input: {
           if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
         } catch (error) {
           if (error instanceof BoxCliCompactionError) {
-            return { status: "pending", reason: error.code };
+            return { status: "pending", reason: error.code, undeliverable: true };
           }
           throw error;
         }

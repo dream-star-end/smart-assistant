@@ -156,7 +156,8 @@ export function makeBoxTextPlan(input: {
   if (unsupported) throw new BoxTextPlanError(unsupported);
   // OCV5-305: a text-only turn runs at the user's effort too.
   const effort = input.body.thinking === undefined && input.body.output_config === undefined
-    ? null : mapBoxCliEffort(input.body.thinking, input.body.output_config);
+    ? null : mapBoxCliEffort(input.body.thinking, input.body.output_config,
+      input.body.max_tokens);
   if (!/^claude-[a-z0-9-]{3,64}$/.test(input.upstreamModel)
     || input.supervisorAsset.length === 0 || input.supervisorAsset.length > 32768
     || input.keeperAsset.length === 0 || input.keeperAsset.length > 32768

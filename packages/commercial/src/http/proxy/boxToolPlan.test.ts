@@ -9,7 +9,7 @@ import type { ProxyBody } from "./shared.js";
 const supervisorAsset = readFileSync(new URL("../../../../../scripts/ocv5-289/box_supervisor.py", import.meta.url));
 const keeperAsset = readFileSync(new URL("../../../../../scripts/ocv5-289/box_keeper.py", import.meta.url));
 const virtualMcpAsset = readFileSync(new URL("../../../../../scripts/ocv5-289/box_virtual_mcp.py", import.meta.url));
-const body: ProxyBody = { model: "box-api-claude-opus-5-5", max_tokens: 128,
+const body: ProxyBody = { model: "box-api-claude-opus-5-5", max_tokens: 64_000,
   stream: true, messages: [{ role: "user", content: "Use local_echo on ping" }],
   tools: [{ name: "local_echo", description: "OpenClaude local-only echo",
     input_schema: { type: "object", properties: { value: { type: "string" } } } }],
@@ -129,4 +129,13 @@ test("OCV5-329: the notice sends unlisted mcp__ tools through ExecuteExtraTool, 
   const without = boxToolAliasNotice(makeBoxToolPlan({ ...assets, body }).catalog);
   assert.ok(!without.includes("ExecuteExtraTool"), "no pointer to a tool the run does not have");
   assert.ok(!without.includes("delegate_task"));
+});
+
+test("INC-20261006 a compaction-sized output cap runs the CLI at low effort, the main loop at the user's effort", () => {
+  const max = { ...body, output_config: { effort: "max" } } as ProxyBody;
+  const main = makeBoxToolPlan({ ...assets, body: max });
+  assert.equal(main.run.args[main.run.args.indexOf("--effort") + 1], "max");
+  const compact = makeBoxToolPlan({ ...assets, body: { ...max, max_tokens: 20_000,
+    thinking: undefined } as ProxyBody });
+  assert.equal(compact.run.args[compact.run.args.indexOf("--effort") + 1], "low");
 });

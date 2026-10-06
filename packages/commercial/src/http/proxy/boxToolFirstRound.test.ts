@@ -913,3 +913,36 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
+
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD: the CLI's own synthetic user turn inside
+// a model message (here without a trusted native session, so it is unbound) is a
+// property of this stream: stop the run and settle it, never leave it unknown.
+const syntheticTurnRaw = Buffer.from([records[0], records[1],
+  { type: "user", isSynthetic: true, parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "text",
+      text: "Output token limit hit. Resume directly" }] } },
+  ...records.slice(2)].map((record) => JSON.stringify(record) + "\n").join(""));
+
+test("INC-20261006 a synthetic CLI turn inside a message is stopped and settled, not left unknown", async () => {
+  const f = fixture({ spoolBody: syntheticTurnRaw });
+  let stops = 0;
+  const deps = { ...f.deps, stopRejectedRun: async () => { stops++; return "stopped_proven" as const; } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_COMPACT_UNBOUND");
+  assert.equal(stops, 1);
+  assert.ok(!f.sequence.includes("unknown"));
+  assert.deepEqual(f.unknownPhases, []);
+  assert.equal(f.retained, false);
+  // the run finished on its own: settled from its keeper proof, not billed
+  const g = fixture({ spoolBody: syntheticTurnRaw });
+  const settled: unknown[] = [];
+  const d = { ...g.deps, stopRejectedRun: async () => "completed_unsettled" as const,
+    readTerminalProof: (async (args: { runNonce: string; leaseEpoch: string }) => ({
+      reason: "worker_complete", runNonce: args.runNonce, leaseEpoch: args.leaseEpoch })) as never,
+    journal: { ...(g.deps.journal as object), markFirstRoundRejectedStream: async (input: unknown) => {
+      settled.push(input); } } as never };
+  await assert.rejects(() => runBoxToolFirstRound(g.input, d),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_COMPACT_UNBOUND");
+  assert.equal(settled.length, 1);
+  assert.deepEqual(g.unknownPhases, []);
+});

@@ -1304,6 +1304,55 @@ async function proveRejectedStreamWedge(api: Api, db: Db): Promise<string> {
   return "[ocv5-300-rejected-stream-wedge] PASS — a rejected stream whose CLI finished settles unbilled and the next message runs";
 }
 
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD, live 2026-10-06 06:51Z (uid 4): Claude
+// Code's context compaction asks for 20000 output tokens and forwards the
+// user's `max` effort. The Box CLI spent the cap on thinking, wrote its own
+// synthetic "Output token limit hit" user turn inside the message and the
+// stream was rejected. The row stayed unknown, pinned the session, and every
+// later message ended in BOX_CAPACITY_HELD ("消息未开始处理") until someone
+// closed it by hand. A rejected stream of that kind settles unbilled and the
+// next message runs.
+async function proveSyntheticTurnHeld(api: Api, db: Db): Promise<string> {
+  const who = { uid: 900_000_320n, containerId: 320n, sessionId: "session-synthetic-turn" };
+  const journal = api.journal(db);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'synthetic-turn@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const before = await money(db, who.uid);
+  const turnKey = "5".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-synthetic-turn", turnKey });
+  const nudge = { type: "user", isSynthetic: true, parent_tool_use_id: null,
+    message: { role: "user", content: [{ type: "text",
+      text: "Output token limit hit. Resume directly — no apology, no recap of what you were doing." }] } };
+  const spool = [cliInit, start("msg_a"), nudge, start("msg_b"), ...say("msg_b", 0, "summary"),
+    ...stop("end_turn", 4)];
+  let stops = 0;
+  const host = boxHost(api, spoolOf(spool), { real: { journal, ...who, requestId: "box-synthetic-turn", turnKey,
+    // the CLI finished by itself: its keeper proof says worker_complete
+    proofReason: "worker_complete",
+    stopRejectedRun: async (identity) => { stops++; return api.stopCoordinator(journal, host.target).requestStop(identity); } } });
+  const rejected = await codeOf(host.round);
+  if (!/^BOX_CLI_COMPACT_/.test(rejected)) fail(`SYNTHETIC_TURN_NOT_REJECTED_${rejected}`);
+  if (stops !== 1 || host.count.launch !== 1) fail("SYNTHETIC_TURN_STOP_OR_LAUNCH_COUNT");
+  const row = await journalRow(db, "box-synthetic-turn");
+  if (row?.state !== "aborted" || row.failure_code !== "STREAM_FAILED" || row.credits !== "0"
+    || row.ctx.boxState !== "failed_stopped" || row.ctx.boxStopOutcome !== "rejected_stream"
+    || (row.ctx.boxTerminalProof as { reason?: string } | undefined)?.reason !== "worker_complete") {
+    fail(`SYNTHETIC_TURN_ROW_${row?.state}_${String(row?.ctx.boxState)}_${String(row?.ctx.boxStopOutcome)}`);
+  }
+  if (await money(db, who.uid) !== before) fail("SYNTHETIC_TURN_BILLED");
+  const idle = await journal.readIdleProof({ ...who, turnKey });
+  if (idle.status !== "failed" || !isDeepStrictEqual(idle.requestIds, ["box-synthetic-turn"])) fail(`SYNTHETIC_TURN_IDLE_${idle.status}`);
+  // the user's next message in that session is admitted, launched and answered
+  const nextKey = "6".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-synthetic-turn-next", turnKey: nextKey });
+  const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+    real: { journal, ...who, requestId: "box-synthetic-turn-next", turnKey: nextKey } });
+  const answered = await must("SYNTHETIC_TURN_NEXT_MESSAGE", next.round());
+  if (answered.kind !== "final" || !next.sse().includes("done")) fail("SYNTHETIC_TURN_NEXT_MESSAGE_NO_ANSWER");
+  if ((await journalRow(db, "box-synthetic-turn-next"))?.ctx.boxState !== "terminal") fail("SYNTHETIC_TURN_NEXT_MESSAGE_NOT_SETTLED");
+  return "[inc-20261006-synthetic-turn-held] PASS — a stream with the CLI's own synthetic turn settles unbilled and the next message runs";
+}
+
 /** A Box tool turn as egress serves it: the product's BoxToolFetch on the real
  * journal, with one Box account behind it. `first` is the round that hands the
  * tool call to the client; `next` sends the client's tool result back. */
@@ -2640,7 +2689,7 @@ async function main(): Promise<void> {
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
-      await proveUnknownNeverClosed(api, db)]),
+      await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);
