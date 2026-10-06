@@ -8,16 +8,16 @@ import { getPool } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { issueBoxNativeContextOwner } from "../http/proxy/boxNativeContextOwner.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("commercial_box_api_sonnet_haiku_0295_test");
 const sqlPath = fileURLToPath(new URL("../db/migrations/0295_commercial_box_api_sonnet_haiku.sql", import.meta.url));
-// model -> [upstream, efforts, the commercial box-claude row whose price it takes, display name]
-const MODELS: Record<string, { upstream: string; efforts: string[]; replaces: string; display: string }> = {
+// model -> [upstream, efforts, the commercial box-claude row whose price it takes, display name, window after 0298]
+const MODELS: Record<string, { upstream: string; efforts: string[]; replaces: string; display: string; context: number }> = {
   "box-api-claude-sonnet-5-5": { upstream: "claude-sonnet-5-5", efforts: ["low", "medium", "high", "xhigh", "max"],
-    replaces: "box-claude-sonnet-5", display: "Claude Sonnet 5.5" },
+    replaces: "box-claude-sonnet-5", display: "Claude Sonnet 5.5", context: 1000000 },
   "box-api-claude-haiku-4-5": { upstream: "claude-haiku-4-5-20251001", efforts: [],
-    replaces: "box-claude-haiku-4-5", display: "Claude Haiku 4.5" },
+    replaces: "box-claude-haiku-4-5", display: "Claude Haiku 4.5", context: 200000 },
 };
 const IDS = Object.keys(MODELS);
 
@@ -43,7 +43,7 @@ describe("0295 prepares Sonnet 5.5 and Haiku 4.5 on the commercial Box model rou
       const row = await prepared(model);
       assert.equal(row.state, "staged", model);
       assert.deepEqual({ engine: row.engine, provider: row.provider_id, upstream: row.upstream_model_id,
-        context: row.context_window }, { engine: "ccb", provider: "box_cli", upstream: want.upstream, context: 200000 }, model);
+        context: row.context_window }, { engine: "ccb", provider: "box_cli", upstream: want.upstream, context: want.context }, model);
       // the id pair is one the product's route table lists
       assert.equal(boxApiModelById(model)?.upstreamModel, want.upstream, model);
       assert.deepEqual(row.capability_profile.reasoning.supported, want.efforts, model);
@@ -73,7 +73,7 @@ describe("0295 prepares Sonnet 5.5 and Haiku 4.5 on the commercial Box model rou
     await resetAndMigrateBefore("0295");
     const before = await others();
     assert.equal((await query("SELECT 1 FROM model_catalog WHERE model_id=ANY($1::text[])", [IDS])).rowCount, 0);
-    assert.deepEqual((await runMigrations()).applied, ["0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol", "0297_commercial_minimax_refs_to_grok_build"]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0298") })).applied, ["0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol", "0297_commercial_minimax_refs_to_grok_build"]);
     assert.deepEqual(await others(), before);
     for (const model of IDS) assert.equal((await prepared(model)).state, "staged", model);
   });

@@ -7,7 +7,7 @@ import { getPool } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { issueBoxNativeContextOwner } from "../http/proxy/boxNativeContextOwner.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("commercial_box_api_model_0294_test");
 const sqlPath = fileURLToPath(new URL("../db/migrations/0294_commercial_box_api_model.sql", import.meta.url));
@@ -36,7 +36,7 @@ describe("0294 prepares the commercial Box model route without offering it", () 
     const row = await prepared();
     assert.equal(row.state, "staged");
     assert.deepEqual({ engine: row.engine, provider: row.provider_id, upstream: row.upstream_model_id,
-      context: row.context_window }, { engine: "ccb", provider: "box_cli", upstream: "claude-opus-5-5", context: 200000 });
+      context: row.context_window }, { engine: "ccb", provider: "box_cli", upstream: "claude-opus-5-5", context: 1000000 });
     // the price of the box-claude-opus-5-5 row this model replaces for commercial users (0293)
     const replaced = (await query("SELECT to_jsonb(p) AS pricing FROM model_pricing p WHERE model_id='box-claude-opus-5-5'")).rows[0]!.pricing;
     for (const key of ["display_name", "input_per_mtok", "output_per_mtok", "cache_read_per_mtok", "cache_write_per_mtok",
@@ -61,7 +61,7 @@ describe("0294 prepares the commercial Box model route without offering it", () 
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0294");
     const before = await others();
-    assert.deepEqual((await runMigrations()).applied, ["0294_commercial_box_api_model", "0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol", "0297_commercial_minimax_refs_to_grok_build"]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0298") })).applied, ["0294_commercial_box_api_model", "0295_commercial_box_api_sonnet_haiku", "0296_commercial_retire_minimax_m3_gpt56_sol", "0297_commercial_minimax_refs_to_grok_build"]);
     assert.deepEqual(await others(), before);
     assert.equal((await prepared()).state, "staged");
   });
