@@ -32,6 +32,7 @@ try:
   if not set(entries)<=({filename,sid} if filename in entries else set()):
    print('blocked');raise SystemExit(0)
   subtree=None
+  idents={}
   if sid in entries:
    top=os.stat(sid,dir_fd=project,follow_symlinks=False)
    if not stat.S_ISDIR(top.st_mode) or top.st_uid!=os.getuid():
@@ -54,6 +55,7 @@ try:
        seen=os.stat(item,dir_fd=tfd,follow_symlinks=False)
        if not stat.S_ISREG(seen.st_mode) or seen.st_uid!=os.getuid() or seen.st_nlink!=1:
         print('blocked');raise SystemExit(0)
+       idents[item]=(seen.st_dev,seen.st_ino,seen.st_size)
      finally:os.close(tfd)
     subtree=(top.st_dev,top.st_ino,kids,files)
    finally:os.close(sfd)
@@ -85,12 +87,20 @@ try:
      if subtree[2]:
       tfd=os.open('tool-results',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=sfd)
       try:
-       if sorted(os.listdir(tfd))!=sorted(subtree[3]):raise SystemExit(126)
-       for item in subtree[3]:os.unlink(item,dir_fd=tfd)
+       if sorted(os.listdir(tfd))!=sorted(subtree[3]) or os.listdir(sfd)!=['tool-results']:raise SystemExit(126)
+       def same(item):
+        now=os.stat(item,dir_fd=tfd,follow_symlinks=False)
+        return stat.S_ISREG(now.st_mode) and now.st_uid==os.getuid() and now.st_nlink==1 and (now.st_dev,now.st_ino,now.st_size)==idents[item]
+       if not all(same(item) for item in subtree[3]):raise SystemExit(126)
+       for item in subtree[3]:
+        if not same(item):raise SystemExit(126)
+        os.unlink(item,dir_fd=tfd)
       finally:os.close(tfd)
       os.rmdir('tool-results',dir_fd=sfd)
     finally:os.close(sfd)
     os.rmdir(sid,dir_fd=project)
+   again=os.stat(filename,dir_fd=project,follow_symlinks=False)
+   if (again.st_dev,again.st_ino,again.st_size)!=(st.st_dev,st.st_ino,st.st_size):raise SystemExit(126)
    os.unlink(filename,dir_fd=project);os.fsync(project)
   current=os.stat(name,dir_fd=parent,follow_symlinks=False)
   if (current.st_dev,current.st_ino)!=(before.st_dev,before.st_ino):raise SystemExit(126)
