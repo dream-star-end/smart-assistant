@@ -117,7 +117,8 @@ import {
 } from "./shared.js";
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
-import { runUpstreamRoundTrip } from "./core.js";
+import { runUpstreamRoundTrip, sendBoxUpstreamRefusal } from "./core.js";
+import { recentBoxRefusal, rememberBoxRefusal } from "./boxRefusalMemory.js";
 import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./boxNativeContextOwner.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
 import { waitForBoxReplay } from "./boxReplayWait.js";
@@ -973,6 +974,12 @@ export function makeAnthropicProxyHandler(
           }
         }
         if (body.stream !== true) {
+          // CCB's non-streaming fallback after a refused streaming call: say
+          // what happened instead of "not found" (nothing was launched or charged).
+          const refused = boxPrepared.sessionId && boxPrepared.turnKey
+            ? recentBoxRefusal({ uid, sessionId: boxPrepared.sessionId,
+              turnKey: boxPrepared.turnKey, model: body.model }) : null;
+          if (refused) { sendBoxUpstreamRefusal(res, refused, requestId); return; }
           sendJsonError(res, 409, "BOX_REPLAY_NOT_FOUND",
             "previous Box call not found", requestId);
           return;
@@ -1740,6 +1747,9 @@ export function makeAnthropicProxyHandler(
         body,
         session,
         noHistoryRewriteRetry: route.kind === "box",
+        ...(boxPrepared?.sessionId && boxPrepared.turnKey ? { onBoxRefusal: (code: string) =>
+          rememberBoxRefusal({ uid, sessionId: boxPrepared!.sessionId!,
+            turnKey: boxPrepared!.turnKey!, model: body.model }, code) } : {}),
         quotaProbeProviderId,
         finalize,
         sessionId,
