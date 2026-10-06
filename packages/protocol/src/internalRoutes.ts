@@ -51,6 +51,8 @@ export const PROMPT_QUEUE_CLAIM_PATH = '/internal/v5/prompt-queue/claim'
 // ── v3 容器→master 面 ──────────────────────────────────────────────────────
 export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
 export const CODEX_TOKEN_REFRESH_PATH = '/internal/v3/codex/token-refresh'
+/** 识图后端(understand_image / oc-vision):容器交图片+问题,master 调 Grok 4.7 并计费。 */
+export const GROK_VISION_PATH = '/internal/v3/grok-vision'
 export const TURN_LEASE_RENEW_PATH = '/internal/v3/turn-lease/renew'
 export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
 export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
@@ -234,6 +236,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/masterTurnLease.ts', 'commercial/src/http/internalTurnLeaseRenew.ts'],
+  },
+  {
+    path: GROK_VISION_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/mcpVisionServer.ts', 'commercial/src/grok/visionProxy.ts'],
   },
   {
     path: MODEL_CATALOG_PATH,

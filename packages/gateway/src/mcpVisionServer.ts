@@ -5,9 +5,9 @@
  * CCB-compatible image understanding bridge for text-only models (DeepSeek,
  * custom Anthropic-compatible providers). v1 intentionally supports only
  * local files that the gateway saved under paths.uploadsDir; URL input is
- * rejected to avoid SSRF. The backend is Codex CLI image input, hidden behind
- * this MCP abstraction so future deployments can swap the implementation
- * without changing the agent-facing tool name.
+ * rejected to avoid SSRF. The default backend is Grok 4.7 through the master
+ * (see runGrokVision); it is hidden behind this MCP abstraction so deployments
+ * can swap the implementation without changing the agent-facing tool name.
  */
 
 // 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
@@ -34,6 +34,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import {
   CODEX_TOKEN_REFRESH_PATH,
   DEFAULT_CODEX_ENGINE_MODEL,
+  GROK_VISION_PATH,
   findRouteProviderForModel,
 } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
@@ -54,9 +55,17 @@ const DEFAULT_REFRESH_TIMEOUT_MS = 3_000
 const MIN_REFRESH_TIMEOUT_MS = 500
 const MAX_REFRESH_TIMEOUT_MS = 8_000
 
-// ── 静态模型 vision backend(默认 backend;env 值仍叫 'minimax',沿用历史名)─────────
-// understand_image 默认用 **k3-256k**(Kimi K3 256K,moonshot,supportsVision=true)。OCV5-322 起
-// 不再用 MiniMax-M3(该模型下线);2026-10-05 生产实测 k3-256k 经同一条 proxy 路径读出图中随机数字。
+// ── Grok vision backend(默认 backend,OCV5-327)──────────────────────────────────────
+// understand_image 默认用 **Grok 4.7**(产品型号 grok-build)。Grok 引擎本身只收文本 prompt,
+// 所以不是起一个 Grok 引擎回合,而是把图片和问题交给 master 的 /internal/v3/grok-vision:
+// master 用账号池里的 Grok 订阅账号调 Grok 4.7 的 Responses API,并按 grok-build 目录价计费
+// (预扣 → journal → 按上游返回的用量结算)。订阅 token 留 master,容器只用身份 bearer。
+// 2026-10-06 个人版实测同一上游调用读出图中随机数字。
+export const GROK_VISION_MODEL = 'grok-build'
+const DEFAULT_GROK_TIMEOUT_MS = 120_000
+
+// ── 静态模型 vision backend(OPENCLAUDE_VISION_BACKEND=minimax 显式启用;env 值沿用历史名)──
+// **k3-256k**(Kimi K3 256K,moonshot,supportsVision=true),OCV5-322 到 OCV5-327 之间的默认 backend。
 // 经容器 internal anthropic proxy(ANTHROPIC_BASE_URL + oc-v3 容器 bearer)调用 —— 上游 key
 // 留 master,容器只用身份 bearer。codex backend 仅 OPENCLAUDE_VISION_BACKEND=codex 显式启用。
 export const STATIC_VISION_MODEL = 'k3-256k'
@@ -66,12 +75,21 @@ const DEFAULT_MINIMAX_TIMEOUT_MS = 60_000
 const DEFAULT_MINIMAX_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 const MINIMAX_MAX_IMAGE_HARD_CAP = 6 * 1024 * 1024
 
-function visionBackend(): 'minimax' | 'codex' {
-  // 默认走静态模型 backend(STATIC_VISION_MODEL)。Codex 仅保留为显式诊断/回退选项，
+export type VisionBackend = 'grok' | 'minimax' | 'codex'
+
+export function visionBackend(): VisionBackend {
+  // 默认走 Grok backend(GROK_VISION_MODEL)。静态模型与 Codex 仅保留为显式诊断/回退选项，
   // 禁止再让某一实例的隐式默认值漂移到另一实例。
   const configured = process.env.OPENCLAUDE_VISION_BACKEND?.trim().toLowerCase()
-  if (configured === 'minimax' || configured === 'codex') return configured
-  return 'minimax'
+  if (configured === 'grok' || configured === 'minimax' || configured === 'codex') return configured
+  return 'grok'
+}
+
+/** 当前 backend 实际用的模型(oc-figcheck 报告里的 vision.backend 字段)。 */
+export function visionBackendLabel(): string {
+  const backend = visionBackend()
+  if (backend === 'codex') return `codex(${DEFAULT_CODEX_ENGINE_MODEL})`
+  return backend === 'grok' ? GROK_VISION_MODEL : STATIC_VISION_MODEL
 }
 
 export const OPENCLAUDE_VISION_MCP_ID = 'openclaude-vision'
@@ -266,18 +284,24 @@ export function resolveVisionInput(args: VisionToolArgs): ResolvedVisionInput {
   if (!rawPath) throw new Error('image_file is required')
   if (!rawPath.startsWith('/')) throw new Error('image_file must be an absolute local path')
 
-  // backend-aware:minimax 经 proxy(messages 8MB budget)→ raw cap 5MB / 默认超时 60s;
-  // codex(gpt-5.5)→ 20MB / 120s。
-  const minimaxBackend = visionBackend() === 'minimax'
+  // backend-aware:grok / minimax 都经 master(JSON body 预算)→ raw cap 5MB;
+  // 默认超时 grok 120s(master 侧上游超时 90s,容器先放弃会出现“已扣费但没拿到结果”)、
+  // minimax 60s;codex(gpt-5.5)→ 20MB / 120s。
+  const backend = visionBackend()
+  const viaMaster = backend !== 'codex'
   const maxImageBytes = parseBoundedInt(
     process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
-    minimaxBackend ? DEFAULT_MINIMAX_MAX_IMAGE_BYTES : DEFAULT_MAX_IMAGE_BYTES,
+    viaMaster ? DEFAULT_MINIMAX_MAX_IMAGE_BYTES : DEFAULT_MAX_IMAGE_BYTES,
     MIN_CONFIGURED_IMAGE_BYTES,
-    minimaxBackend ? MINIMAX_MAX_IMAGE_HARD_CAP : MAX_CONFIGURED_IMAGE_BYTES,
+    viaMaster ? MINIMAX_MAX_IMAGE_HARD_CAP : MAX_CONFIGURED_IMAGE_BYTES,
   )
   const timeoutMs = parseBoundedInt(
     process.env.OPENCLAUDE_VISION_TIMEOUT_MS,
-    minimaxBackend ? DEFAULT_MINIMAX_TIMEOUT_MS : DEFAULT_TIMEOUT_MS,
+    backend === 'grok'
+      ? DEFAULT_GROK_TIMEOUT_MS
+      : backend === 'minimax'
+        ? DEFAULT_MINIMAX_TIMEOUT_MS
+        : DEFAULT_TIMEOUT_MS,
     10_000,
     300_000,
   )
@@ -908,11 +932,85 @@ async function runMinimaxVision(input: ResolvedVisionInput): Promise<string> {
 
 export const runMinimaxVisionForTest = runMinimaxVision
 
-// backend 路由:默认静态模型 backend(STATIC_VISION_MODEL);OPENCLAUDE_VISION_BACKEND=codex 时走 codex。
-// **不做自动 fallback**:minimax 业务错误(4xx/余额/413)不绕到 codex(避免绕过 authz/计费语义),
+// Grok vision backend:把图片 + 问题 POST 给 master 的 GROK_VISION_PATH,拿回识图文本。
+// 路由/authz/计费/Grok 订阅 token 全在 master。**不 spawn 子进程、不拿 relay route、不碰 Grok token。**
+async function runGrokVision(input: ResolvedVisionInput): Promise<string> {
+  const release = acquireVisionLock(input.timeoutMs)
+  try {
+    let endpoint: { masterBaseUrl: string; containerToken: string }
+    try {
+      const endpointEnv: NodeJS.ProcessEnv = { ...process.env }
+      // 与 minimax backend 同一 token-file 优先级:Codex 注入把安全的文件路径放进 env,
+      // 不能误选一个过期的裸 token。
+      if (process.env.OPENCLAUDE_V3_CONTAINER_TOKEN_FILE?.trim()) {
+        endpointEnv.OPENCLAUDE_V3_CONTAINER_TOKEN = undefined
+      }
+      endpoint = resolveConnectorEndpoint(endpointEnv)
+    } catch {
+      throw new Error('grok vision backend unavailable: container endpoint unavailable')
+    }
+
+    const buf = readFileSync(input.imagePath)
+    if (buf.length > input.maxImageBytes) {
+      throw new Error(
+        `image exceeds ${Math.round(input.maxImageBytes / 1024 / 1024)}MB grok vision limit`,
+      )
+    }
+    const ext = rasterImageExtension(buf)
+    if (!ext) throw new Error('image_file is not a supported raster image (PNG/JPEG/GIF/WebP)')
+
+    const body = {
+      image: { mediaType: mediaTypeForExtension(ext), data: buf.toString('base64') },
+      prompt: input.prompt,
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), input.timeoutMs)
+    try {
+      const resp = await fetch(`${endpoint.masterBaseUrl}${GROK_VISION_PATH}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${endpoint.containerToken}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+      const raw = await resp.text()
+      if (!resp.ok) {
+        throw new Error(`grok vision upstream ${resp.status}${raw ? `: ${raw.slice(0, 300)}` : ''}`)
+      }
+      let text: unknown
+      try {
+        text = (JSON.parse(raw) as { text?: unknown }).text
+      } catch {
+        throw new Error('grok vision returned invalid JSON')
+      }
+      const out = typeof text === 'string' ? text.trim() : ''
+      if (!out) throw new Error('empty vision response')
+      return out
+    } catch (err) {
+      if (controller.signal.aborted) {
+        throw new Error(`grok vision timed out after ${input.timeoutMs}ms`)
+      }
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+  } finally {
+    release()
+  }
+}
+
+export const runGrokVisionForTest = runGrokVision
+
+// backend 路由:默认 Grok backend(GROK_VISION_MODEL);OPENCLAUDE_VISION_BACKEND=minimax 走静态模型
+// backend(STATIC_VISION_MODEL),=codex 走 codex。
+// **不做自动 fallback**:业务错误(4xx/余额/413)不绕到别的 backend(避免绕过 authz/计费语义),
 // 直接把错误返回给调用方模型。
 export async function runVision(input: ResolvedVisionInput): Promise<string> {
-  return visionBackend() === 'codex' ? runCodexVision(input) : runMinimaxVision(input)
+  const backend = visionBackend()
+  if (backend === 'codex') return runCodexVision(input)
+  return backend === 'grok' ? runGrokVision(input) : runMinimaxVision(input)
 }
 
 async function runCodexVision(input: ResolvedVisionInput): Promise<string> {
