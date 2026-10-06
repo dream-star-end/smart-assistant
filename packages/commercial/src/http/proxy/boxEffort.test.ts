@@ -34,7 +34,7 @@ test("the Box route ceiling offers exactly the CLI's efforts", () => {
 
 test("a text-only Box turn runs at the selected effort", () => {
   const asset = (name: string) => readFileSync(new URL(`../../../../../scripts/ocv5-289/${name}`, import.meta.url));
-  const body = { model: "box-api-claude-opus-5-5", max_tokens: 128, stream: true,
+  const body = { model: "box-api-claude-opus-5-5", max_tokens: 64_000, stream: true,
     messages: [{ role: "user", content: "hi" }], output_config: { effort: "xhigh" } } as unknown as ProxyBody;
   assert.equal(validateBoxTextRequest(body), null);
   const plan = makeBoxTextPlan({ body, upstreamModel: "claude-opus-5-5", maxOutputTokensLimit: 128_000,
@@ -45,6 +45,11 @@ test("a text-only Box turn runs at the selected effort", () => {
     upstreamModel: "claude-opus-5-5", maxOutputTokensLimit: 128_000,
     supervisorAsset: asset("box_supervisor.py"), keeperAsset: asset("box_keeper.py") });
   assert.ok(!none.run.args.includes("--effort"), "no selection keeps the CLI's own default");
+  // INC-20261006: a compaction-sized output cap cannot afford the thinking
+  const small = makeBoxTextPlan({ body: { ...body, max_tokens: 20_000 } as unknown as ProxyBody,
+    upstreamModel: "claude-opus-5-5", maxOutputTokensLimit: 128_000,
+    supervisorAsset: asset("box_supervisor.py"), keeperAsset: asset("box_keeper.py") });
+  assert.equal(small.run.args[small.run.args.indexOf("--effort") + 1], "low");
   assert.equal(validateBoxTextRequest({ ...body, output_config: { effort: "ultra" } } as unknown as ProxyBody),
     "BOX_EFFORT_UNMAPPED");
 });

@@ -58,7 +58,7 @@ type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
   "claimRemoteCleanup" | "markRemoteCleaned"> & Partial<Pick<BoxDurableJournal,
     "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
     "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" |
-    "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
+    "markFirstRoundRejectedStream" | "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
     "readRecoveryWinner" | "recordStaleResumeStop" | "markRunExpiredUnproven">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
@@ -167,6 +167,17 @@ export class BoxRemoteCleanupWorker {
             // result echo or a malformed record: no final can come of it.
             await journal.markToolChainStoppedFailure({ requestId: candidate.requestId,
               uid: candidate.uid, leaseEpoch: candidate.leaseEpoch, proof, rejectedStream: true });
+            recovered++;
+          } else if (outcome.status === "undeliverable" && !candidate.linked
+            && outcome.reason.startsWith("BOX_CLI_COMPACT_")
+            && journal.markFirstRoundRejectedStream) {
+            // A first round whose finished CLI wrote a synthetic user turn
+            // inside its message (output-limit resume, empty-answer nudge)
+            // pinned the session as unknown for good. Same unbilled close as
+            // the live path; the journal refuses a row that already handed
+            // off. An intermediate handoff keeps the success-recovery contract.
+            await journal.markFirstRoundRejectedStream({ requestId: candidate.requestId,
+              uid: candidate.uid, leaseEpoch: candidate.leaseEpoch, proof });
             recovered++;
           } else if (outcome.status !== "committed") {
             pending++;

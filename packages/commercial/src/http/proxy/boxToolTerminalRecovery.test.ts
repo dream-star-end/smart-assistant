@@ -309,7 +309,9 @@ test("terminal recovery bills the final message after a pre-model compact and re
     journal: { complete: async () => { throw new Error("must not complete"); },
       completeToolChain: async () => { throw new Error("must not complete"); },
       readRecoveryWinner: async () => null } as never });
-  assert.deepEqual(mid, { status: "pending", reason: "BOX_CLI_COMPACT_PHASE" });
+  // INC-20261006-BOX-SYNTHETIC-TURN-HELD: a finished run whose message carries
+  // a synthetic CLI turn can never be delivered; it must close, not wait.
+  assert.deepEqual(mid, { status: "pending", reason: "BOX_CLI_COMPACT_PHASE", undeliverable: true });
 });
 
 // OCV5-313 (#1a28c670): only what the finished spool itself rules out is

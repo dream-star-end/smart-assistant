@@ -367,6 +367,12 @@ function provedSuccessWorker(input: { linked: boolean;
         assert.equal(stop.proof.reason, "worker_complete");
         sequence.push("rejected-stream-CAS");
       },
+      markFirstRoundRejectedStream: async (stop: { requestId: string;
+        proof: { reason: string } }) => {
+        assert.equal(stop.requestId, probe.requestId);
+        assert.equal(stop.proof.reason, "worker_complete");
+        sequence.push("first-round-rejected-stream-CAS");
+      },
       markRunExpiredUnproven: async () => { throw new Error("a proven run is never unproven"); },
       listRemoteCleanupCandidates: async () => [],
       claimRemoteCleanup: async () => false,
@@ -482,4 +488,23 @@ test("OCV5-313 an expired run on a reachable Box is closed only when no proof ca
   const young = expiredWorker({ expired: false, resolve: "no-proof" });
   assert.deepEqual(await young.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
   assert.deepEqual(young.closes, []);
+});
+
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD: the CLI wrote its own synthetic user
+// turn inside a model message (output-limit resume), the stream was rejected
+// and the finished run's first round stayed unknown, so every later message of
+// the session ended in BOX_CAPACITY_HELD ("消息未开始处理").
+test("INC-20261006 a finished first round with a synthetic CLI turn closes as an unbilled rejected stream", async () => {
+  const synthetic = { status: "undeliverable" as const, reason: "BOX_CLI_COMPACT_PHASE" };
+  const first = provedSuccessWorker({ linked: false, outcome: synthetic });
+  assert.deepEqual(await first.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(first.sequence, ["recover", "first-round-rejected-stream-CAS"]);
+  const linked = provedSuccessWorker({ linked: true, outcome: synthetic });
+  assert.deepEqual(await linked.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(linked.sequence, ["recover", "rejected-stream-CAS"]);
+  // an intermediate handoff of a first round keeps the success-recovery contract
+  const handoff = provedSuccessWorker({ linked: false,
+    outcome: { status: "undeliverable", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF" } });
+  assert.deepEqual(await handoff.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(handoff.sequence, ["recover"]);
 });
