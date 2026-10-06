@@ -9,6 +9,8 @@ export interface BoxProfileHealthState {
   cooldownUntilMs: number | null;
   lastReason: string | null;
   updatedAtMs: number;
+  /** When the quota window the utilization belongs to resets (epoch ms); not persisted. */
+  windowResetsAtMs?: number | null;
 }
 
 export interface BoxProfileHealthSink {
@@ -22,6 +24,7 @@ export const BOX_PROFILE_DEFAULT_COOLDOWN_MS = 15 * 60_000;
 export const BOX_PROFILE_MAX_COOLDOWN_MS = 7 * 24 * 3_600_000;
 const LOGIN_COOLDOWN_MS = 30 * 60_000;
 const UNSAFE_COOLDOWN_MS = 60 * 60_000;
+const UTILIZATION_MAX_AGE_MS = 5 * 3_600_000 + 60_000;
 
 export class BoxProfileHealth {
   private readonly states = new Map<string, BoxProfileHealthState>();
@@ -51,6 +54,18 @@ export class BoxProfileHealth {
     return (this.launches.get(key) ?? []).filter((t) => at - t < LAUNCH_WINDOW_MS).length;
   }
 
+  /** Utilization worth acting on: a reading from a window that has since reset, or from before the
+   * last 5-hour window could still apply, says nothing about the login now (it must be re-learned). */
+  utilization(key: string): number | null {
+    const state = this.states.get(key);
+    if (!state || state.utilization === null) return null;
+    const at = this.now();
+    if (state.windowResetsAtMs != null && at >= state.windowResetsAtMs) return null;
+    if (state.cooldownUntilMs != null && state.cooldownUntilMs <= at && state.lastReason === "quota_exhausted") return null;
+    if (at - state.updatedAtMs > UTILIZATION_MAX_AGE_MS) return null;
+    return state.utilization;
+  }
+
   cooldownActive(key: string): boolean {
     const until = this.states.get(key)?.cooldownUntilMs;
     return until !== undefined && until !== null && until > this.now();
@@ -75,8 +90,12 @@ export class BoxProfileHealth {
       next.cooldownUntilMs = until;
       next.utilization = Math.max(signal.utilization ?? 1, 1);
       next.lastReason = "quota_exhausted";
+      next.windowResetsAtMs = signal.resetsAtMs;
     } else if (signal.status === "allowed" || signal.status === "allowed_warning") {
-      if (signal.utilization !== null) next.utilization = signal.utilization;
+      if (signal.utilization !== null) {
+        next.utilization = signal.utilization;
+        next.windowResetsAtMs = signal.resetsAtMs;
+      }
       // A successful read after a reset clears an expired bench.
       if (next.cooldownUntilMs !== null && next.cooldownUntilMs <= at) {
         next.cooldownUntilMs = null; next.lastReason = null;

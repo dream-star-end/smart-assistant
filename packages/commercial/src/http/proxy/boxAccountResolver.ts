@@ -178,16 +178,18 @@ export class BoxAccountResolver {
     if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < cacheMs) {
       stored = this.profileCache.rows;
     } else {
-      try { stored = await profiles.list(ids); }
-      catch {
+      try {
+        stored = await profiles.list(ids);
+        this.profileCache = { atMs: nowMs, ids: idsKey, rows: stored };
+      } catch {
         // Fail closed: a read error must not turn an account whose logins were all switched off
-        // into an implicit default. Only the identical account set, seen very recently, is reused.
+        // into an implicit default. Only the identical account set, last READ successfully within
+        // 60s, is reused; a failed attempt never refreshes that timestamp.
         log.error("BOX_PROFILE_LIST_FAILED");
         if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < 60_000) {
           stored = this.profileCache.rows;
         } else throw new BoxAccountResolverError("BOX_PROFILE_STORE_UNAVAILABLE");
       }
-      this.profileCache = { atMs: nowMs, ids: idsKey, rows: stored };
     }
     if (stored.length === 0) return "legacy";
     const candidates: BoxProfileCandidate[] = [];
@@ -211,7 +213,7 @@ export class BoxAccountResolver {
             lastReason: durable.lastReason, updatedAtMs: durable.healthUpdatedAt.getTime() });
         }
         candidates.push({ accountId: row.id, profile: login.profile, isDefault: login.isDefault,
-          weight, utilization: profiles.health.get(key)?.utilization ?? null,
+          weight, utilization: profiles.health.utilization(key),
           cooldownActive: profiles.health.cooldownActive(key),
           loginLoad: profiles.health.recentLaunches(key), boxLoad: 0 });
       }
