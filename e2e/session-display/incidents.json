@@ -5985,6 +5985,50 @@
           "assertion": "红卡带部分回答正文 / 属于别的轮 / 无状态卡 → 不收起"
         }
       ]
+    },
+    {
+      "id": "INC-20261006-BOX-BIGCTX-QUOTA",
+      "occurredAt": "2026-10-06",
+      "severity": "P1",
+      "symptom": "商业（2026-10-06，同类缺陷在个人版 Box 路线同样存在）：Box 的 Claude 账号五小时额度耗尽后，CLI 不再流出模型消息，只写一条合成 assistant 记录（model <synthetic>，rate_limit）和 429 result；解码器把它当成 BOX_TOOL_SNAPSHOT_INVALID，首轮记 unknown，客户端重试撞 BOX_CAPACITY_HELD 只看到匿名 500；已结算的未计费失败行还被重放查重当成“仍在处理”，等满 240 秒；非流式回退得到 409 BOX_REPLAY_NOT_FOUND。长上下文成本侧：Box CLI 为 2.1.288 但原生续接未验证，且候选查找拿 OpenClaude 会话 id 去查按 CLI 会话 id 记账的 journal，从未命中，三轮 35 万 token 对话把账号窗口从 3% 推到 42%。修复（商业 PR 599/600/602/603/605/606/607，个人版按净补丁同步）：合成 assistant 记录由两个解码器按 BOX_CLI_UPSTREAM_RATE_LIMITED / BOX_CLI_UPSTREAM_REFUSED 拒绝并归入首轮本地拒绝流，立即停止并未计费收尾；客户端收到 503 BOX_UPSTREAM_RATE_LIMITED（带 Retry-After），非流式回退按进程内 10 分钟拒绝记忆回同一个 503；已结算的未计费失败行不再算原始调用；2.1.288 标为原生续接已验证，指针带 CLI 版本；候选改用请求里的 CLI 会话 id，claim 被并发回合抢走时退回冷启动。商业线上验证：3 轮 35 万 token 上下文 cache_read 约 36.7 万、单轮 265→23 积分，用量、journal、ledger 三处对账一致。",
+      "rootFixCommit": "3d0e67f5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "INC-20261006 a CLI usage-limit refusal is stopped and settled unbilled, not left to hold the session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "a native claim lost to a concurrent turn degrades to a cold start, not an error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRefusalMemory.test.ts",
+          "assertion": "a refused Box call is remembered for its own logical turn only, for ten minutes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRefusalMemory.test.ts",
+          "assertion": "the client sees a 503 with Retry-After for a usage-limit refusal and for any other refusal"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliSse.test.ts",
+          "assertion": "a CLI usage-limit refusal is one named code, not an order violation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "a CLI usage-limit refusal before any model message is a named code, not a snapshot violation"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层，其中一条用 Box 上抓到的真实“额度耗尽”记录（__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl）走完首轮解码和未计费收尾。商业版在真实 Postgres 上有部署门禁证明（scripts/check-v5-box-incident-proofs.ts，红绿对照），个人版没有 Box 事故的 deploy-gate 脚本，canary 也用不了 box-claude-*，所以个人版暂无 browser/live-e2e/deploy-gate 层产物。",
+        "since": "2026-10-07"
+      }
     }
   ]
 }
