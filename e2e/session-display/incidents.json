@@ -5911,6 +5911,55 @@
           "assertion": "box scripts: a write goes only into a fifo that has a reader"
         }
       ]
+    },
+    {
+      "id": "INC-20261006-BOX-MIXED-CALL-TURN-CUT",
+      "occurredAt": "2026-10-06",
+      "severity": "P1",
+      "symptom": "个人版 #27da48a8（box-api-claude-opus-5-5，已执行 77 步，08:17–08:44 CST）：第 64 轮模型在同一条消息里调用了 ExecuteExtraTool，又直接点名调用了两次本次运行未暴露的 mcp__openclaude-memory__delegate_task。decoder 只合并“整条消息都是未暴露调用”的情况，混在一起时在文本块已转发之后抛 BOX_TOOL_ID_OR_NAME_INVALID；代理不带错误地结束了响应，CCB 把“若干完整 content block 之后干净 EOF”当成回合结束，回合显示已完成、最后一句是“I'll test the other models in that route the same way.”。该运行此后占着会话的 Box 名额 21 分钟才被清理。修复：decoder 把同一条消息里的未暴露调用隐藏、只交接已暴露调用，并在 journal 里记下被隐藏调用的 id 和名字，下一轮（在线、terminal recovery、unknown observer）在模型消息之前只接受 Claude Code 对这些调用的 No such tool available 回答；代理在 message_delta/message_stop 之前断流时补一帧 SSE error；decoder 拒绝的续轮按 continuation_stream_rejected 立即停止。",
+      "rootFixCommit": "cdcd1cfb",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "回归在 unit / integration 层，其中一条用 Box 上 Claude Code 2.1.288 对同形态消息的真实输出（一次已暴露调用加两次未暴露调用）走完两轮解码。个人版 canary 用不了仅管理员可见的 box-api-claude-opus-5-5，个人版也没有 Box 事故的 deploy-gate 脚本；对真实 CCB 构建做的“干净截断 / 带 error 帧”对照是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-06"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.mixed.test.ts",
+          "assertion": "an exposed call followed by unexposed calls hands off the exposed one only"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.mixed.test.ts",
+          "assertion": "the next round takes the CLI's answers to the hidden calls before its model message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.mixed.test.ts",
+          "assertion": "a real Claude Code capture of a mixed message runs through both rounds"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-328 a round continues past the CLI's own answers to hidden calls"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-328 a missing, foreign or altered answer to a hidden call fails closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "OCV5-328 a stream the decoder rejects stops the run like a rejected echo"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyCore.unit.test.ts",
+          "assertion": "中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成"
+        }
+      ]
     }
   ]
 }
