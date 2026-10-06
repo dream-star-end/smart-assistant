@@ -115,6 +115,8 @@ export const ADMIN_AUDIT_ACTIONS = {
   "egress_proxy.patch": { kind: "write", mode: "best-effort" },
   "egress_proxy.delete": { kind: "write", mode: "best-effort" },
   "oauth.exchange": { kind: "write", mode: "best-effort" },
+  "box_claude_profiles.discover": { kind: "write", mode: "best-effort" },
+  "box_claude_profiles.select": { kind: "write", mode: "best-effort" },
 
   // ── 容器/compute host 运维──────────────────────────────────────────
   "agent_container.restart": { kind: "write", mode: "best-effort" },

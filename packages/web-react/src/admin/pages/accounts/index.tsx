@@ -26,6 +26,7 @@ import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
 import { AccountFormModal } from "./AccountFormModal";
+import { BoxClaudeProfilesModal } from "./BoxClaudeProfilesModal";
 import { CursorUsageModal, GrokUsageModal, RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
 import {
   AccountWarningChips,
@@ -125,6 +126,7 @@ export default function AccountsPage() {
   const [recentAcc, setRecentAcc] = useState<{ id: string; label: string } | null>(null);
   const [cursorUsageAcc, setCursorUsageAcc] = useState<{ id: string; label: string } | null>(null);
   const [grokUsageAcc, setGrokUsageAcc] = useState<{ id: string; label: string } | null>(null);
+  const [boxClaudeAcc, setBoxClaudeAcc] = useState<{ id: string; label: string } | null>(null);
 
   const onStatusChange = useCallback((v: string) => {
     setStatus(v);
@@ -310,6 +312,11 @@ export default function AccountsPage() {
                 </DropdownMenuItem>
               )}
               {a.provider === "cursor" && a.cursor_credential_kind === "session" && (
+                <DropdownMenuItem onSelect={() => setBoxClaudeAcc({ id: a.id, label: a.label })}>
+                  Box 内的 Claude Code 账号
+                </DropdownMenuItem>
+              )}
+              {a.provider === "cursor" && a.cursor_credential_kind === "session" && (
                 <DropdownMenuItem onSelect={() => doRefreshCursorUsage(a)}>
                   立即刷新 Sand 用量
                 </DropdownMenuItem>
@@ -490,6 +497,12 @@ export default function AccountsPage() {
         onOpenChange={(o) => !o && setCursorUsageAcc(null)}
         accountId={cursorUsageAcc?.id ?? null}
         accountLabel={cursorUsageAcc?.label ?? ""}
+      />
+      <BoxClaudeProfilesModal
+        open={boxClaudeAcc !== null}
+        onOpenChange={(o) => !o && setBoxClaudeAcc(null)}
+        accountId={boxClaudeAcc?.id ?? null}
+        accountLabel={boxClaudeAcc?.label ?? ""}
       />
       <GrokUsageModal
         open={grokUsageAcc !== null}

@@ -169,7 +169,8 @@
     "0295_commercial_box_api_sonnet_haiku",
     "0296_commercial_retire_minimax_m3_gpt56_sol",
     "0297_commercial_minimax_refs_to_grok_build",
-    "0298_commercial_box_api_context_1m"
+    "0298_commercial_box_api_context_1m",
+    "0299_commercial_box_claude_profiles"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

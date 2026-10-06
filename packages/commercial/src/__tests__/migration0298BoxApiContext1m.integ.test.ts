@@ -58,7 +58,7 @@ describe("0298 sets the Box route's Opus 5.5 and Sonnet 5.5 to a 1M window and l
     const before = await snapshot();
     const priceBefore = (await query("SELECT to_jsonb(p) - 'updated_at' - 'lock_version' AS p FROM model_pricing p WHERE model_id=ANY($1::text[]) ORDER BY model_id", [BOX])).rows;
     const haikuBefore = await live(HAIKU);
-    assert.deepEqual((await runMigrations()).applied, ["0298_commercial_box_api_context_1m"]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0299") })).applied, ["0298_commercial_box_api_context_1m"]);
     for (const model of [OPUS, SONNET]) {
       const now = await live(model);
       assert.equal(now.state, "active", model);
@@ -82,7 +82,7 @@ describe("0298 sets the Box route's Opus 5.5 and Sonnet 5.5 to a 1M window and l
     await activateAll();
     const row = await live(OPUS);
     await query("SELECT fn_model_disable_entry($1::bigint,$2,NULL::bigint)", [String(row.entry_id), row.lock_version]);
-    await runMigrations();
+    await runMigrations({ dir: await migrationsDirBefore("0299") });
     const now = await live(OPUS);
     assert.equal(now.state, "staged");
     assert.equal(now.context_window, 1000000);
@@ -93,7 +93,7 @@ describe("0298 sets the Box route's Opus 5.5 and Sonnet 5.5 to a 1M window and l
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0298");
     await query("UPDATE model_catalog SET context_window=300000 WHERE model_id=$1", [SONNET]);
-    await assert.rejects(runMigrations(), /unexpected context_window 300000/);
+    await assert.rejects(runMigrations({ dir: await migrationsDirBefore("0299") }), /unexpected context_window 300000/);
     assert.equal((await live(OPUS)).context_window, 200000);
     assert.equal((await live(SONNET)).context_window, 300000);
   });
@@ -102,7 +102,7 @@ describe("0298 sets the Box route's Opus 5.5 and Sonnet 5.5 to a 1M window and l
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0298");
     await activateAll();
-    await runMigrations();
+    await runMigrations({ dir: await migrationsDirBefore("0299") });
     await query(await rollbackBlock());
     for (const model of [OPUS, SONNET]) {
       const now = await live(model);

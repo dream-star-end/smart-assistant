@@ -82,6 +82,8 @@ export const DURABLE_TABLES: readonly string[] = [
   // FK 级联于 ttl 父表 agent_tool_rollup_reports(有效离场由父表 90d TTL 决定)。
   "agent_tool_rollup_counts",
   "api_relay_credentials",
+  // Lifetime follows claude_accounts via ON DELETE CASCADE; rows are edited by the admin page, never swept by age.
+  "box_claude_profiles",
   "chat_session_account_pin",
   "claude_accounts",
   "client_session_archive_chunks",

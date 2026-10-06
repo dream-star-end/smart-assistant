@@ -10,8 +10,14 @@ import { getAccount, getCursorTokenSnapshot, getTokenForUse, listAccounts,
   type AccountRow, type AccountToken, type CursorTokenSnapshot } from "../../account-pool/store.js";
 import { resolveAccountEgressDispatcher, type EgressResolution } from "../../account-pool/egressDispatcher.js";
 import { CursorSandProvisionClient, SandProvisionError, sandPrincipal } from "../../account-pool/cursorSandProvision.js";
-import { selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
-import { BoxExecTransport } from "./boxExecTransport.js";
+import { cursorSelectableAccounts, selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
+import { BoxExecTransport, BoxExecTransportError } from "./boxExecTransport.js";
+import { BOX_DEFAULT_PROFILE, boxProfileKey } from "./boxClaudeProfile.js";
+import { listBoxProfiles, writeBoxProfileHealth, type BoxProfileRow } from "./boxClaudeProfileStore.js";
+import { BoxProfileHealth } from "./boxProfileHealth.js";
+import { BOX_PROFILE_GUARD_REFUSED, makeBoxProfileGuard } from "./boxProfileDiscovery.js";
+import { scopeBoxExecToProfile } from "./boxProfileExec.js";
+import { pickBoxProfile, type BoxProfileCandidate, type BoxProfilePolicy } from "./boxProfileScheduler.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -24,6 +30,12 @@ export class BoxAccountResolverError extends Error {
     super(causeTag ? `${code} cause=${causeTag}` : code);
     this.name = "BoxAccountResolverError";
   }
+}
+
+/** The Box-side guard refused a non-default login (it logged out, or its projects dir is no longer the
+ * shared one). Raised before any lease or admission, so the caller can pick another login. */
+class BoxProfileUnsafeError extends BoxAccountResolverError {
+  constructor(readonly key: string) { super("BOX_PROFILE_UNSAFE"); }
 }
 
 type FetchFn = (url: string, init: RequestInit, dispatcher: Dispatcher | undefined) => Promise<Response>;
@@ -41,6 +53,14 @@ export interface BoxAccountResolverDeps {
    * no per-user proxy and such an account uses the host's own egress (boxUnboundProxy). */
   uidProxy: (uid: bigint) => string | null;
   makeProxyAgent: (uri: string) => Pick<ProxyAgent, "destroy"> & Dispatcher;
+  /** Claude Code logins per Box account. Absent: every account runs its default
+   * login exactly as before (selfhost, unit fixtures). */
+  profiles?: {
+    list: (accountIds: readonly bigint[]) => Promise<BoxProfileRow[]>;
+    health: BoxProfileHealth;
+    policy?: BoxProfilePolicy;
+    cacheMs?: number;
+  };
   fetch: FetchFn;
   now?: () => number;
   random?: () => number;
@@ -138,6 +158,101 @@ export class BoxAccountResolver {
     return this.orphanedAgents.size;
   }
 
+  private profileCache: { atMs: number; ids: string; rows: BoxProfileRow[] } | null = null;
+  private readonly guardOkUntil = new Map<string, number>();
+
+  /** Account x login choice: affinity first (one user keeps one login), then
+   * quota/health/load fallback. See boxProfileScheduler. "legacy" = no saved logins
+   * anywhere in the candidate set (or no table): the original random pick, unchanged. */
+  private async chooseLogin(rows: AccountRow[], args: { uid: bigint; requestId: string;
+    upstreamModel: string }, nowMs: number, skip: ReadonlySet<string>):
+    Promise<{ accountId: bigint; profile: string } | "legacy" | null> {
+    const profiles = this.deps.profiles!;
+    const selectable = cursorSelectableAccounts({ accounts: rows, model: args.upstreamModel,
+      now: new Date(nowMs), cooled: new Set() });
+    if (selectable.length === 0) return null;
+    const ids = selectable.map((item) => item.row.id);
+    const idsKey = ids.map(String).sort().join(",");
+    const cacheMs = profiles.cacheMs ?? 5_000;
+    let stored: BoxProfileRow[];
+    if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < cacheMs) {
+      stored = this.profileCache.rows;
+    } else {
+      try {
+        stored = await profiles.list(ids);
+        this.profileCache = { atMs: nowMs, ids: idsKey, rows: stored };
+      } catch {
+        // Fail closed: a read error must not turn an account whose logins were all switched off
+        // into an implicit default. Only the identical account set, last READ successfully within
+        // 60s, is reused; a failed attempt never refreshes that timestamp.
+        log.error("BOX_PROFILE_LIST_FAILED");
+        if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < 60_000) {
+          stored = this.profileCache.rows;
+        } else throw new BoxAccountResolverError("BOX_PROFILE_STORE_UNAVAILABLE");
+      }
+    }
+    if (stored.length === 0) return "legacy";
+    const candidates: BoxProfileCandidate[] = [];
+    for (const { row, weight } of selectable) {
+      const own = stored.filter((item) => item.accountId === row.id);
+      // This account has no saved logins: it predates profiles and runs its default login.
+      const logins = own.length === 0
+        ? [{ profile: BOX_DEFAULT_PROFILE, isDefault: true }]
+        // Defence in depth behind the admin API: a row edited by hand can never route traffic to a
+        // login that is logged out or whose projects dir is not the shared one (a developer dir).
+        : own.filter((item) => item.enabled && item.loginState === "logged_in"
+          && (item.projectsMode === "root" || item.projectsMode === "shared"))
+          .map((item) => ({ profile: item.profile, isDefault: item.isDefault }));
+      for (const login of logins) {
+        const key = boxProfileKey(row.id, login.profile);
+        if (skip.has(key)) continue;
+        const durable = own.find((item) => item.profile === login.profile);
+        if (durable?.healthUpdatedAt) {
+          profiles.health.load(key, { utilization: durable.utilization,
+            cooldownUntilMs: durable.cooldownUntil?.getTime() ?? null,
+            lastReason: durable.lastReason, updatedAtMs: durable.healthUpdatedAt.getTime() });
+        }
+        candidates.push({ accountId: row.id, profile: login.profile, isDefault: login.isDefault,
+          weight, utilization: profiles.health.utilization(key),
+          cooldownActive: profiles.health.cooldownActive(key),
+          loginLoad: profiles.health.recentLaunches(key), boxLoad: 0 });
+      }
+    }
+    for (const candidate of candidates) {
+      candidate.boxLoad = candidates.filter((other) => other.accountId === candidate.accountId)
+        .reduce((sum, other) => sum + other.loginLoad, 0);
+    }
+    const pick = pickBoxProfile({ candidates, affinityKey: args.uid.toString(),
+      ...(profiles.policy ? { policy: profiles.policy } : {}) });
+    if (!pick) return null;
+    log.info("box_login_picked", { accountId: pick.candidate.accountId.toString(),
+      profile: pick.candidate.profile, reason: pick.reason, candidates: candidates.length });
+    return { accountId: pick.candidate.accountId, profile: pick.candidate.profile };
+  }
+
+  /** Live check, on the Box and immediately before the target is handed out, that a non-default
+   * login is still logged in and still shares the product's projects directory. A positive result is
+   * reused for 30s; discovery data in the database is never the safety boundary. */
+  private async guardLogin(transport: Pick<BoxExecTransport, "run">, accountId: bigint,
+    profile: string, signal: AbortSignal): Promise<void> {
+    const key = boxProfileKey(accountId, profile);
+    const at = (this.deps.now ?? Date.now)();
+    if ((this.guardOkUntil.get(key) ?? 0) > at) return;
+    try {
+      const result = await transport.run(makeBoxProfileGuard(profile),
+        { timeoutMs: 10_000, maxResponseBytes: 1024, signal });
+      if (result.stdout.trim() !== "ok") throw new BoxProfileUnsafeError(key);
+    } catch (error) {
+      if (error instanceof BoxProfileUnsafeError) throw error;
+      if (error instanceof BoxExecTransportError && error.remoteExitCode === BOX_PROFILE_GUARD_REFUSED) {
+        this.guardOkUntil.delete(key);
+        throw new BoxProfileUnsafeError(key);
+      }
+      throw error;
+    }
+    this.guardOkUntil.set(key, at + 30_000);
+  }
+
   private closeFailedResolve(owner: OwnedProxy): void {
     this.orphanedAgents.add(owner);
     void owner.close().then(() => { this.orphanedAgents.delete(owner); }, () => {
@@ -151,15 +266,55 @@ export class BoxAccountResolver {
      * leave this false so they cannot wake a hibernated account. */
     allowWakeIfHibernated?: boolean;
     /** Operator-only exact account fence, checked before the first Box control request. */
-    requiredAccountId?: bigint }): Promise<BoxResolvedTarget> {
+    requiredAccountId?: bigint;
+    /** Admin discovery/maintenance on a Box: no login scheduling, so a Box whose
+     * every login is benched can still be inspected. Never set on model traffic. */
+    adminProbe?: boolean }): Promise<BoxResolvedTarget> {
+    const refused = new Set<string>();
+    for (let attempt = 0; ; attempt++) {
+      try { return await this.resolveOnce(args, refused); }
+      catch (error) {
+        if (!(error instanceof BoxProfileUnsafeError)) throw error;
+        // The guard refused this login: bench it and let the scheduler pick another.
+        this.deps.profiles?.health.observe(error.key, { kind: "profile_unsafe" });
+        refused.add(error.key);
+        if (attempt >= 3) throw new BoxAccountResolverError("BOX_ACCOUNT_UNAVAILABLE", "profile_unsafe");
+      }
+    }
+  }
+
+  private async resolveOnce(args: { uid: bigint; sessionId: string | null; requestId: string;
+    upstreamModel: string; signal: AbortSignal;
+    /** Explicitly authorized real model-call path only. Cleanup/stop/probes
+     * leave this false so they cannot wake a hibernated account. */
+    allowWakeIfHibernated?: boolean;
+    /** Operator-only exact account fence, checked before the first Box control request. */
+    requiredAccountId?: bigint;
+    /** Admin discovery/maintenance on a Box: no login scheduling, so a Box whose
+     * every login is benched can still be inspected. Never set on model traffic. */
+    adminProbe?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
     const rows = (await this.deps.list()).filter((row) => eligible(row, now())
       && (args.requiredAccountId === undefined || row.id === args.requiredAccountId));
-    const picked = selectCursorAccount({ accounts: rows, model: args.upstreamModel,
-      now: new Date(now()), cooled: new Set(), sticky: null, random: this.deps.random });
-    if (!picked) throw new BoxAccountResolverError("BOX_ACCOUNT_UNAVAILABLE");
-    const accountId = picked.id;
+    let accountId: bigint;
+    let profile = BOX_DEFAULT_PROFILE;
+    // Cleanup, stop and observer paths pin an account and do not launch (they never wake a Box): a benched
+    // or refused login must not stop them from reaching the Box to clean up.
+    const inspectOnly = args.adminProbe === true
+      || (args.requiredAccountId !== undefined && args.allowWakeIfHibernated !== true);
+    const choice = this.deps.profiles && !inspectOnly
+      ? await this.chooseLogin(rows, args, now(), refused) : "legacy";
+    if (choice === null) throw new BoxAccountResolverError("BOX_ACCOUNT_UNAVAILABLE");
+    if (choice === "legacy") {
+      const picked = selectCursorAccount({ accounts: rows, model: args.upstreamModel,
+        now: new Date(now()), cooled: new Set(), sticky: null, random: this.deps.random });
+      if (!picked) throw new BoxAccountResolverError("BOX_ACCOUNT_UNAVAILABLE");
+      accountId = picked.id;
+    } else {
+      accountId = choice.accountId;
+      profile = choice.profile;
+    }
     const snapshot = await this.deps.snapshot(accountId);
     if (!snapshot) throw new BoxAccountResolverError("BOX_ACCOUNT_UNAVAILABLE");
     let credential: string;
@@ -250,10 +405,16 @@ export class BoxAccountResolver {
       const descriptor = await client.resolveBoxExec(credential, machine, args.signal,
         { allowWakeIfHibernated: args.allowWakeIfHibernated === true });
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
-      const exec = new BoxExecTransport(descriptor, fetchImpl, assertCurrent);
+      const transport = new BoxExecTransport(descriptor, fetchImpl, assertCurrent);
+      if (this.deps.profiles && !inspectOnly && profile !== BOX_DEFAULT_PROFILE) {
+        await this.guardLogin(transport, accountId, profile, args.signal);
+      }
+      const exec = this.deps.profiles
+        ? scopeBoxExecToProfile(transport, { key: boxProfileKey(accountId, profile), profile,
+          health: this.deps.profiles.health }) : transport;
       const owned = owner;
       handedOff = true;
-      return { accountId, exec, ...(owned ? { dispose: () => owned.close() } : {}) };
+      return { accountId, exec, profile, ...(owned ? { dispose: () => owned.close() } : {}) };
     } catch (error) {
       if (error instanceof BoxAccountResolverError) throw error;
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
@@ -288,6 +449,19 @@ export function boxUnboundProxy(env: NodeJS.ProcessEnv = process.env): (uid: big
   return readBoxUidProxy;
 }
 
+let sharedHealth: BoxProfileHealth | null = null;
+/** One health view per process: the resolver writes launches, the admin page reads it. */
+export function productionBoxProfileHealth(): BoxProfileHealth {
+  return sharedHealth ??= new BoxProfileHealth(Date.now, (key, state) => {
+    const at = key.indexOf(":");
+    const accountId = /^[1-9][0-9]{0,18}$/.test(key.slice(0, at)) ? BigInt(key.slice(0, at)) : null;
+    if (accountId === null) return;
+    void writeBoxProfileHealth(accountId, key.slice(at + 1), state).catch(() => {
+      log.error("BOX_PROFILE_HEALTH_PERSIST_FAILED");
+    });
+  });
+}
+
 export function createProductionBoxAccountResolver(): BoxAccountResolver {
   return new BoxAccountResolver({
     list: () => listAccounts({ provider: "cursor", status: "active", limit: 500 }),
@@ -298,6 +472,8 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
       egressProxy: token.egress_proxy, egressTarget: token.egress_target,
       egressProxyId: token.egress_proxy_id, egressHostUuid: token.egress_host_uuid }),
     uidProxy: boxUnboundProxy(),
+    profiles: { list: (ids) => listBoxProfiles(ids),
+      health: productionBoxProfileHealth() },
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,
       { ...init, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>,
