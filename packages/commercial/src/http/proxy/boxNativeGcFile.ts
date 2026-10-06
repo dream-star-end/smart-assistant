@@ -79,6 +79,7 @@ try:
     current=os.stat(filename,dir_fd=project,follow_symlinks=False)
     if (current.st_dev,current.st_ino,current.st_size)!=(st.st_dev,st.st_ino,st.st_size):raise SystemExit(126)
    finally:os.close(fd)
+   if sorted(os.listdir(project))!=sorted(entries):raise SystemExit(126)
    if subtree:
     sfd=os.open(sid,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=project)
     try:
