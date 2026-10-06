@@ -100,8 +100,11 @@ export class BoxProfileHealth {
       next.lastReason = "login_required";
     } else if (signal.status === "rejected") {
       const reset = signal.resetsAtMs;
-      const until = reset !== null && reset > at && reset - at <= BOX_PROFILE_MAX_COOLDOWN_MS
-        ? reset : at + BOX_PROFILE_DEFAULT_COOLDOWN_MS;
+      const trusted = reset !== null && reset > at && reset - at <= BOX_PROFILE_MAX_COOLDOWN_MS;
+      // Evidence without a usable reset time must not push an existing quota bench further out
+      // (the same rejection can be read again by a resumed run).
+      if (!trusted && benched("quota_exhausted")) return;
+      const until = trusted ? reset! : at + BOX_PROFILE_DEFAULT_COOLDOWN_MS;
       next.cooldownUntilMs = until;
       next.utilization = Math.max(signal.utilization ?? 1, 1);
       next.lastReason = "quota_exhausted";
