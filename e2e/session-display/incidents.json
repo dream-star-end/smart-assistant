@@ -6297,7 +6297,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
-          "assertion": "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once and the next message runs"
+          "assertion": "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once, its retries are not seen as still resolving, and the next message runs"
         },
         {
           "layer": "unit",

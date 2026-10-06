@@ -1389,6 +1389,26 @@ async function proveUpstreamRefusal(api: Api, db: Db): Promise<string> {
   if (await money(db, who.uid) !== before) fail("UPSTREAM_REFUSAL_BILLED");
   const idle = await journal.readIdleProof({ ...who, turnKey });
   if (idle.status !== "failed" || !isDeepStrictEqual(idle.requestIds, ["box-upstream-refusal"])) fail(`UPSTREAM_REFUSAL_IDLE_${idle.status}`);
+  // CCB's same-request retries (streaming again, then the non-streaming fallback) must not
+  // find the settled attempt "still resolving": it has nothing to replay, and a second failed
+  // attempt of the same call must not make the call ambiguous either.
+  const replayDeps = { journal, readMessage: async () => { throw new Error("NO_MESSAGE"); } };
+  const lookupOf = (stream: boolean) => api.findReplay({ uid: who.uid, canonicalModel: MODEL,
+    upstreamModel: CLI_MODEL, canonicalBody: { ...host.call.canonicalBody, stream } as never }, replayDeps as never);
+  for (const stream of [false, true]) {
+    const found = await must(`UPSTREAM_REFUSAL_REPLAY_${stream}`, lookupOf(stream));
+    if (found.kind !== "missing") fail(`UPSTREAM_REFUSAL_REPLAY_${stream}_${found.kind}`);
+  }
+  await prechecked(api, db, { ...who, requestId: "box-upstream-refusal-2", turnKey });
+  const again = boxHost(api, spoolOf([cliInit, ...captured]), { real: { journal, ...who,
+    requestId: "box-upstream-refusal-2", turnKey, proofReason: "worker_complete",
+    stopRejectedRun: async (identity) => api.stopCoordinator(journal, again.target).requestStop(identity) } });
+  const secondCode = await codeOf(again.round);
+  if (secondCode !== "BOX_CLI_UPSTREAM_RATE_LIMITED") fail(`UPSTREAM_REFUSAL_SECOND_ATTEMPT_${secondCode}`);
+  for (const stream of [false, true]) {
+    const found = await must(`UPSTREAM_REFUSAL_REPLAY2_${stream}`, lookupOf(stream));
+    if (found.kind !== "missing") fail(`UPSTREAM_REFUSAL_REPLAY2_${stream}_${found.kind}`);
+  }
   const nextKey = "8".repeat(64);
   await prechecked(api, db, { ...who, requestId: "box-upstream-refusal-next", turnKey: nextKey });
   const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
@@ -1396,7 +1416,7 @@ async function proveUpstreamRefusal(api: Api, db: Db): Promise<string> {
   const answered = await must("UPSTREAM_REFUSAL_NEXT_MESSAGE", next.round());
   if (answered.kind !== "final" || !next.sse().includes("done")) fail("UPSTREAM_REFUSAL_NEXT_MESSAGE_NO_ANSWER");
   if ((await journalRow(db, "box-upstream-refusal-next"))?.ctx.boxState !== "terminal") fail("UPSTREAM_REFUSAL_NEXT_MESSAGE_NOT_SETTLED");
-  return "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once and the next message runs";
+  return "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once, its retries are not seen as still resolving, and the next message runs";
 }
 
 /** A Box tool turn as egress serves it: the product's BoxToolFetch on the real
