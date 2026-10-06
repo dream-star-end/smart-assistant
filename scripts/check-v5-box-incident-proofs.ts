@@ -1353,6 +1353,52 @@ async function proveSyntheticTurnHeld(api: Api, db: Db): Promise<string> {
   return "[inc-20261006-synthetic-turn-held] PASS — a stream with the CLI's own synthetic turn settles unbilled and the next message runs";
 }
 
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD (cause of the canary's "snapshot without
+// stream" rounds, found 2026-10-06 10:52Z): the Box account's five hour usage
+// window was exhausted. The CLI runs without retries, so it streamed no model
+// message and wrote its own synthetic assistant record ("You've hit your
+// session limit") plus an error result. The decoder called that a snapshot
+// violation; the row waited for the cleanup worker and the next message met
+// BOX_CAPACITY_HELD. The refusal is one named code, settles unbilled at once
+// and the next message is admitted. The spool is the capture from the Box.
+async function proveUpstreamRefusal(api: Api, db: Db): Promise<string> {
+  const who = { uid: 900_000_321n, containerId: 321n, sessionId: "session-upstream-refusal" };
+  const journal = api.journal(db);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'upstream-refusal@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const before = await money(db, who.uid);
+  const turnKey = "7".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-upstream-refusal", turnKey });
+  const captured = readFileSync(fileURLToPath(new URL(
+    "../packages/commercial/src/http/proxy/__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl",
+    import.meta.url)), "utf8").trim().split("\n").map((line) => JSON.parse(line) as unknown);
+  let stops = 0;
+  const host = boxHost(api, spoolOf([cliInit, ...captured]), { real: { journal, ...who,
+    requestId: "box-upstream-refusal", turnKey,
+    // the CLI finished by itself: its keeper proof says worker_complete
+    proofReason: "worker_complete",
+    stopRejectedRun: async (identity) => { stops++; return api.stopCoordinator(journal, host.target).requestStop(identity); } } });
+  const rejected = await codeOf(host.round);
+  if (rejected !== "BOX_CLI_UPSTREAM_RATE_LIMITED") fail(`UPSTREAM_REFUSAL_NOT_NAMED_${rejected}`);
+  if (stops !== 1 || host.count.launch !== 1) fail("UPSTREAM_REFUSAL_STOP_OR_LAUNCH_COUNT");
+  const row = await journalRow(db, "box-upstream-refusal");
+  if (row?.state !== "aborted" || row.failure_code !== "STREAM_FAILED" || row.credits !== "0"
+    || row.ctx.boxState !== "failed_stopped" || row.ctx.boxStopOutcome !== "rejected_stream") {
+    fail(`UPSTREAM_REFUSAL_ROW_${row?.state}_${String(row?.ctx.boxState)}_${String(row?.ctx.boxStopOutcome)}`);
+  }
+  if (await money(db, who.uid) !== before) fail("UPSTREAM_REFUSAL_BILLED");
+  const idle = await journal.readIdleProof({ ...who, turnKey });
+  if (idle.status !== "failed" || !isDeepStrictEqual(idle.requestIds, ["box-upstream-refusal"])) fail(`UPSTREAM_REFUSAL_IDLE_${idle.status}`);
+  const nextKey = "8".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-upstream-refusal-next", turnKey: nextKey });
+  const next = boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+    real: { journal, ...who, requestId: "box-upstream-refusal-next", turnKey: nextKey } });
+  const answered = await must("UPSTREAM_REFUSAL_NEXT_MESSAGE", next.round());
+  if (answered.kind !== "final" || !next.sse().includes("done")) fail("UPSTREAM_REFUSAL_NEXT_MESSAGE_NO_ANSWER");
+  if ((await journalRow(db, "box-upstream-refusal-next"))?.ctx.boxState !== "terminal") fail("UPSTREAM_REFUSAL_NEXT_MESSAGE_NOT_SETTLED");
+  return "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once and the next message runs";
+}
+
 /** A Box tool turn as egress serves it: the product's BoxToolFetch on the real
  * journal, with one Box account behind it. `first` is the round that hands the
  * tool call to the client; `next` sends the client's tool result back. */
@@ -2689,7 +2735,8 @@ async function main(): Promise<void> {
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
-      await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db)]),
+      await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
+      await proveUpstreamRefusal(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);

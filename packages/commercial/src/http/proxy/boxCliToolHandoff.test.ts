@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { hashBoxAssistantContent } from "./boxCallFingerprint.js";
@@ -516,4 +517,24 @@ test("same chunk stops at message_stop and leaves the next heartbeat", () => {
   assert.equal(decoded.sse.includes("heartbeat"), false);
   const unbound = new BoxCliToolHandoffDecoder(model, catalog, { alreadyInitialized: true });
   assert.throws(() => unbound.push(JSON.stringify(prior) + "\n"), /BOX_TOOL_RECORD_INVALID/);
+});
+
+// Captured on the Box (Claude Code 2.1.288, 2026-10-06): usage window exhausted.
+const refusalRecords = readFileSync(new URL(
+  "./__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl", import.meta.url), "utf8")
+  .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+
+test("a CLI usage-limit refusal before any model message is a named code, not a snapshot violation", () => {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  decoder.push(JSON.stringify({ type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] }) + "\n");
+  assert.throws(() => decoder.push(refusalRecords.map((item) => JSON.stringify(item)).join("\n") + "\n"),
+    (error: unknown) => error instanceof BoxCliToolHandoffError
+      && error.code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  const other = new BoxCliToolHandoffDecoder(model, catalog);
+  other.push(JSON.stringify({ type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] }) + "\n");
+  const synthetic = JSON.parse(JSON.stringify(refusalRecords[1])) as { error?: string };
+  delete synthetic.error;
+  assert.throws(() => other.push(JSON.stringify(synthetic) + "\n"),
+    (error: unknown) => error instanceof BoxCliToolHandoffError
+      && error.code === "BOX_CLI_UPSTREAM_REFUSED");
 });

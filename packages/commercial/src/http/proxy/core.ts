@@ -65,6 +65,7 @@ import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxContinuationDecisionError, isContinuationConflict } from "./boxPreparedContinuation.js";
 import { BoxTextFetchError } from "./boxTextFetch.js";
 import { BoxInvocationConflict } from "./boxInvocationRegistry.js";
+import { BOX_CLI_UPSTREAM_RATE_LIMITED, isBoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
 import {
   clearProviderQuotaBlock,
   isMoonshotBillingQuotaExhausted,
@@ -592,6 +593,12 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         || err instanceof BoxInvocationConflict
           && ["BOX_USER_CAPACITY_FULL", "BOX_ACCOUNT_CAPACITY_FULL",
             "BOX_SESSION_BUSY"].includes(err.code));
+    // The Box CLI answered with its own upstream refusal (usage window
+    // exhausted, API error): nothing was generated or billed. Say so instead
+    // of an anonymous 500 the client retries blindly.
+    const boxUpstreamRefusal = isBoxApiModel(body.model)
+      ? (isBoxCliUpstreamRefusalCode((err as { code?: unknown } | null)?.code)
+        ? (err as { code: string }).code : null) : null;
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
     if (continuationConflict) {
@@ -626,6 +633,12 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         sendJsonError(res, 409, code, "continuation not republished", requestId);
       } else if (boxCapacityHeld) {
         sendJsonError(res, 409, "BOX_CAPACITY_HELD", "Box slot busy", requestId);
+      } else if (boxUpstreamRefusal) {
+        const limited = boxUpstreamRefusal === BOX_CLI_UPSTREAM_RATE_LIMITED;
+        sendJsonError(res, 503, limited ? "BOX_UPSTREAM_RATE_LIMITED" : "BOX_UPSTREAM_REFUSED",
+          limited ? "Box Claude usage window is exhausted; nothing was charged, retry later"
+            : "Box Claude upstream refused the request; nothing was charged", requestId,
+          { "retry-after": limited ? "300" : "30" });
       } else sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
     } else {
       try {
