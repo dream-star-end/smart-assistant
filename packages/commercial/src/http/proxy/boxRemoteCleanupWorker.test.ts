@@ -339,6 +339,12 @@ test("OCV5-313 every unknown phase gets the timed stop; a rejected echo is stopp
   const echo = staleResumeWorker({ phase: "continuation_echo_rejected", unknownForMs: 11_000 });
   assert.deepEqual(await echo.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
   assert.deepEqual(echo.sequence, stopped);
+  // OCV5-328: a stream the handoff decoder rejected is as undeliverable.
+  const fresh = staleResumeWorker({ phase: "continuation_stream_rejected", unknownForMs: 2_000 });
+  assert.deepEqual(await fresh.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  const stream = staleResumeWorker({ phase: "continuation_stream_rejected", unknownForMs: 11_000 });
+  assert.deepEqual(await stream.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(stream.sequence, stopped);
   // A launched first round closes through the first-round CAS.
   const first = staleResumeWorker({ phase: "first_round_unknown", unknownForMs: 21 * 60_000,
     linked: false });

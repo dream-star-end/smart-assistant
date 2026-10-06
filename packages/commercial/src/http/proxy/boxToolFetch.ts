@@ -22,6 +22,7 @@ import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
+import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -96,7 +97,8 @@ export class BoxToolFetch {
    * Stop it through the same explicit-stop path as a user Stop (durable intent,
    * original keeper, keeper proof, failed_stopped chain). The wait is bounded;
    * a stop that takes longer keeps running and is still observed. An unproven
-   * stop leaves the leaf unknown (phase continuation_echo_rejected) for the
+   * stop leaves the leaf unknown (phase continuation_echo_rejected, or
+   * continuation_stream_rejected for a decoder rejection, OCV5-328) for the
    * cleanup worker. */
   private async stopEchoRejected(args: FetchArgs, claim: BoxToolResumeClaim): Promise<void> {
     const stop = this.deps.stopRejectedRun;
@@ -561,7 +563,10 @@ export class BoxToolFetch {
                 this.own(held.claim.runNonce, held.target,
                   args.uid, held.claim.leaseEpoch),
               onUnknown: this.deps.onUnknown }).catch(async (error: unknown) => {
-              if (error instanceof BoxToolResultEchoError) {
+              // OCV5-328: a stream the decoder rejects is as undeliverable
+              // as a rejected echo; stop the run instead of holding the slot.
+              if (error instanceof BoxToolResultEchoError
+                || error instanceof BoxCliToolHandoffError) {
                 await this.stopEchoRejected(args, claim);
               }
               throw error;

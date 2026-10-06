@@ -52,3 +52,23 @@ test("duplicate IDs, duplicate pending, raw args and sparse arrays fail closed",
   const beyondCap = evidence(); beyondCap.roundNo = 129;
   assert.equal(parseBoxStoredToolHandoff(beyondCap), null);
 });
+
+// OCV5-328: a message may also carry calls to tools the run does not expose.
+test("hidden calls of the same message are stored by id and name only", () => {
+  const hidden = { ...evidence(), rejectedToolUses: [
+    { id: "toolu_H", name: "mcp__openclaude-memory__delegate_task" }] };
+  assert.deepEqual(parseBoxStoredToolHandoff(hidden), hidden);
+  const all = { ...hidden, assistantEchoHash: "b".repeat(64), assistantNoCallerHash: "c".repeat(64) };
+  assert.deepEqual(parseBoxStoredToolHandoff(all), all);
+  const bad = (rejectedToolUses: unknown) =>
+    assert.equal(parseBoxStoredToolHandoff({ ...evidence(), rejectedToolUses }), null);
+  bad([]);
+  bad("toolu_H");
+  bad([{ id: "toolu_A", name: "Read" }]);                       // an exposed call's id
+  bad([{ id: "toolu_H", name: "Read" }, { id: "toolu_H", name: "Grep" }]);
+  bad([{ id: "toolu_H", name: "mcp__ocbridge__t0" }]);         // an exposed tool's name
+  bad([{ id: "toolu_H", name: "bad name" }]);
+  bad([{ id: "call_H", name: "Read" }]);
+  bad([{ id: "toolu_H", name: "Read", input: { secret: "must-not-enter-PG" } }]);
+  bad(Array.from({ length: 33 }, (_, i) => ({ id: `toolu_H${i}`, name: "Read" })));
+});

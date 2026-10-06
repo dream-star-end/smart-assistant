@@ -128,6 +128,8 @@ export interface BoxToolResumeClaim {
   readonly durableRevision: string;
   readonly results: readonly BoxMatchedToolResult[];
   readonly toolUses: readonly BoxToolUseDigest[];
+  /** OCV5-328: hidden calls of the owner's message the CLI answers itself. */
+  readonly rejectedToolUses?: readonly { id: string; name: string }[];
   readonly nativeSessionId?: string;
   readonly nativeCliCwd?: string;
 }
@@ -157,6 +159,8 @@ export interface BoxReplayIdentity {
   /** Immediate previous owner's stored tool digests. Omitted unless that
    * handoff matches this row's catalog, round, runner, and spool offset. */
   readonly priorToolUses?: readonly BoxToolUseDigest[];
+  /** OCV5-328: that same handoff's hidden calls, answered by the CLI itself. */
+  readonly priorRejectedToolUses?: readonly { id: string; name: string }[];
   /** CLI session stored on the admitted root run. Not the outer CCB session. */
   readonly nativeSessionId?: string;
 }
@@ -237,6 +241,8 @@ export interface BoxDetachedUnknownRecovery {
   /** Immediate owner's stored tool digests. Not persisted and not taken from
    * the HTTP body. Omitted when that handoff does not match this leaf. */
   readonly priorToolUses?: readonly BoxToolUseDigest[];
+  /** OCV5-328: that same handoff's hidden calls, answered by the CLI itself. */
+  readonly priorRejectedToolUses?: readonly { id: string; name: string }[];
   /** Valid root CLI session only. A child value never fills a missing root. */
   readonly nativeSessionId?: string;
 }
@@ -420,20 +426,23 @@ function parseRecoveryResultHashes(raw: unknown):
  * from the root row. Nothing here is written back. */
 function recoveryProgress(rows: readonly { ctx: Record<string, unknown> }[],
   roundNo: number, spoolOffset: number, catalogHash: unknown, runnerHash: unknown):
-  Pick<BoxDetachedUnknownRecovery, "priorToolUses" | "nativeSessionId"> {
+  Pick<BoxDetachedUnknownRecovery, "priorToolUses" | "priorRejectedToolUses" | "nativeSessionId"> {
   const root = rows[rows.length - 1];
   const nativeSessionId = root ? projectRootCliSession(root.ctx.boxNativeSessionId,
     rows.slice(0, -1).flatMap((row) => Object.hasOwn(row.ctx, "boxNativeSessionId")
       ? [row.ctx.boxNativeSessionId] : [])) : undefined;
   let priorToolUses: BoxDetachedUnknownRecovery["priorToolUses"];
+  let priorRejectedToolUses: BoxDetachedUnknownRecovery["priorRejectedToolUses"];
   if (roundNo > 1 && rows[1]) {
     const stored = parseBoxStoredToolHandoff(rows[1].ctx.boxToolHandoff);
     if (stored && stored.catalogHash === catalogHash && stored.detachedRunnerHash === runnerHash
       && stored.roundNo + 1 === roundNo && stored.spoolOffset === spoolOffset) {
       priorToolUses = stored.toolUses;
+      priorRejectedToolUses = stored.rejectedToolUses;
     }
   }
   return { ...(priorToolUses ? { priorToolUses } : {}),
+    ...(priorRejectedToolUses ? { priorRejectedToolUses } : {}),
     ...(nativeSessionId ? { nativeSessionId } : {}) };
 }
 
@@ -834,6 +843,7 @@ export class BoxDurableJournal implements BoxJournalPort {
       let row = matched;
       const seen = new Set<string>();
       let priorToolUses: BoxReplayIdentity["priorToolUses"];
+      let priorRejectedToolUses: BoxReplayIdentity["priorRejectedToolUses"];
       const descendantSessions: unknown[] = [];
       for (let hop = 0; hop < BOX_TOOL_MAX_ROUNDS; hop++) {
         if (seen.has(row.request_id)
@@ -873,6 +883,7 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(typeof upstreamModel === "string" ? { upstreamModel } : {}),
              ...(resultHashes ? { resultHashes } : {}),
              ...(priorToolUses ? { priorToolUses } : {}),
+             ...(priorRejectedToolUses ? { priorRejectedToolUses } : {}),
              ...(nativeSessionId ? { nativeSessionId } : {}) };
         }
         if (Object.hasOwn(row.ctx, "boxNativeSessionId")) {
@@ -916,6 +927,7 @@ export class BoxDurableJournal implements BoxJournalPort {
               && stored.roundNo + 1 === Number(roundNo)
               && stored.spoolOffset === Number(spoolOffset)) {
               priorToolUses = stored.toolUses;
+              priorRejectedToolUses = stored.rejectedToolUses;
             }
           }
         }
@@ -1758,6 +1770,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         leaseEpoch: input.leaseEpoch, roundNo });
     const toolUses = candidate && Array.isArray(candidate.toolUses) ? candidate.toolUses : [];
     const ids = toolUses.map((use) => use?.id ?? "");
+    // OCV5-328: hidden calls of the same message; shape is checked by the
+    // shared stored-handoff validator below.
+    const rejected = candidate?.rejectedToolUses === undefined ? undefined
+      : Array.isArray(candidate.rejectedToolUses)
+        ? candidate.rejectedToolUses.map((use) => ({ id: use?.id, name: use?.name })) : null;
     const pending = input.verifiedPendingToolUseIds;
     const usage = { inputTokens: candidate?.inputTokens,
       outputTokens: candidate?.outputTokens,
@@ -1775,6 +1792,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           || !/^[a-f0-9]{64}$/.test(candidate.assistantEchoHash)))
       || typeof candidate.assistantNoCallerHash !== "string"
       || !/^[a-f0-9]{64}$/.test(candidate.assistantNoCallerHash)
+      || rejected === null || (rejected !== undefined && rejected.length < 1)
       || ids.length < 1 || ids.length > 32 || new Set(ids).size !== ids.length
       || ids.some((id) => typeof id !== "string"
         || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(id))
@@ -1813,7 +1831,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       spoolOffset: input.spoolOffset,
       detachedRunnerHash: input.detachedRunnerHash,
       catalogHash: input.catalogHash,
-      toolUses: digests, verifiedPendingToolUseIds: pendingIds, usage };
+      toolUses: digests, ...(rejected ? { rejectedToolUses: rejected } : {}),
+      verifiedPendingToolUseIds: pendingIds, usage };
     if (!parseBoxStoredToolHandoff(frozen)) {
       throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
     }
@@ -2125,6 +2144,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         detachedRunnerHash: handoff.detachedRunnerHash,
          catalogHash: handoff.catalogHash,
          toolUses: digests,
+         ...(handoff.rejectedToolUses ? { rejectedToolUses: handoff.rejectedToolUses } : {}),
          ...(nativeSessionId === undefined ? {} : {
            nativeSessionId: nativeSessionId as string,
            nativeCliCwd: nativeCliCwd as string }) };

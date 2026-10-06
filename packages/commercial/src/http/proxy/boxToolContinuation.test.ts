@@ -64,7 +64,10 @@ const echoHash = createHash("sha256").update(JSON.stringify({
 
 function fixture(kind: "tool" | "final", failComplete = false,
   trailing = false, omitEcho = false, largeEcho = false, native = false,
-  cliVersion: string | null = "2.1.280") {
+  cliVersion: string | null = "2.1.280",
+  // OCV5-328: hidden calls of the owner's message and the CLI's own answers
+  hidden: { rejected?: Array<{ id: string; name: string }>;
+    beforeEcho?: unknown[]; afterEcho?: unknown[] } = {}) {
   const sequence: string[] = [], emitted: string[] = [];
   const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
   const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
@@ -81,9 +84,11 @@ function fixture(kind: "tool" | "final", failComplete = false,
       inputHash: "f".repeat(64) }],
     results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: resultText }],
       isError: false, contentHash: currentHash }],
+    ...(hidden.rejected ? { rejectedToolUses: hidden.rejected } : {}),
     ...(native ? { nativeSessionId: "12345678-1234-4123-8123-123456789abc",
       nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}` } : {}) };
-  const bytes = Buffer.concat([raw([...(omitEcho ? [] : [currentEcho]),
+  const bytes = Buffer.concat([raw([...(hidden.beforeEcho ?? []),
+    ...(omitEcho ? [] : [currentEcho]), ...(hidden.afterEcho ?? []),
     ...(kind === "tool" ? toolRecords : finalRecords)]),
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
   const proof = { runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch,
@@ -543,4 +548,58 @@ test("OCV5-313 a rejected result echo is journaled as continuation_echo_rejected
   /synthetic journal failure/);
   assert.deepEqual(phases, ["continuation_echo_rejected", "continuation_echo_rejected",
     "continuation_unknown"]);
+});
+
+// OCV5-328 (#27da48a8): the owner's message also called tools the run does not
+// expose. Claude Code answers those itself once the exposed call has its
+// result, so its answers sit next to the published-result echo.
+const hiddenName = "mcp__openclaude-memory__delegate_task";
+const cliNoSuchTool = (toolUseId: string, name = hiddenName) => ({ type: "user",
+  message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, is_error: true,
+    content: `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>` }] } });
+const rejected = [{ id: "toolu_hidden_1", name: hiddenName }, { id: "toolu_hidden_2", name: hiddenName }];
+const withHidden = (kind: "tool" | "final", hidden: Parameters<typeof fixture>[7]) =>
+  fixture(kind, false, false, false, false, false, "2.1.280", hidden);
+
+test("OCV5-328 a round continues past the CLI's own answers to hidden calls", async () => {
+  const answers = [cliNoSuchTool("toolu_hidden_1"), cliNoSuchTool("toolu_hidden_2")];
+  for (const kind of ["tool", "final"] as const) {
+    for (const order of [{ afterEcho: answers }, { beforeEcho: answers },
+      { beforeEcho: [answers[0]], afterEcho: [answers[1]] }]) {
+      const f = withHidden(kind, { rejected, ...order });
+      const result = await runBoxToolContinuation(f.input, f.deps);
+      assert.equal(result.kind, kind === "tool" ? "tool_handoff" : "final");
+      assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+      assert.ok(!f.emitted.join("").includes("No such tool"), "the answers never reach the client");
+      assert.equal(f.sequence.includes("unknown"), false);
+    }
+  }
+});
+
+test("OCV5-328 a missing, foreign or altered answer to a hidden call fails closed", async () => {
+  const run = async (hidden: Parameters<typeof fixture>[7]) => {
+    const f = withHidden("final", hidden);
+    const phases: string[] = [];
+    let failure: unknown;
+    try { await runBoxToolContinuation(f.input, { ...f.deps,
+      journal: { ...(f.deps.journal as object),
+        markUnknown: async (input: { phase: string }) => { phases.push(input.phase); } } as never }); }
+    catch (error) { failure = error; }
+    return { message: failure instanceof Error ? failure.message : "no error", phases,
+      emitted: f.emitted.join("") };
+  };
+  // the model message arrives although one hidden call has no answer yet
+  const missing = await run({ rejected, afterEcho: [cliNoSuchTool("toolu_hidden_1")] });
+  assert.equal(missing.message, "BOX_TOOL_CLI_ERROR_MISSING");
+  assert.deepEqual(missing.phases, ["continuation_stream_rejected"]);
+  assert.equal(missing.emitted, "", "nothing of the next message was forwarded");
+  // an answer for a call this claim does not know is still an unbound echo
+  const foreign = await run({ afterEcho: [cliNoSuchTool("toolu_hidden_1")] });
+  assert.equal(foreign.message, "BOX_TOOL_ECHO_ID_INVALID");
+  assert.deepEqual(foreign.phases, ["continuation_echo_rejected"]);
+  // anything but Claude Code's exact unknown-tool error for that call
+  const altered = await run({ rejected: [rejected[0]!],
+    afterEcho: [cliNoSuchTool("toolu_hidden_1", "Bash")] });
+  assert.equal(altered.message, "BOX_TOOL_CLI_ERROR_INVALID");
+  assert.deepEqual(altered.phases, ["continuation_stream_rejected"]);
 });

@@ -17,6 +17,9 @@ export interface BoxStoredToolHandoff {
   detachedRunnerHash: string;
   catalogHash: string;
   toolUses: BoxToolUseDigest[];
+  /** OCV5-328: calls of the same message to tools the run does not expose;
+   * only present when there are any. The CLI answers them by itself. */
+  rejectedToolUses?: { id: string; name: string }[];
   verifiedPendingToolUseIds: string[];
   usage: BoxUsageEvidence;
 }
@@ -34,7 +37,7 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
       "assistantContentHash,assistantEchoHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
       "assistantContentHash,assistantNoCallerHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
       "assistantContentHash,assistantEchoHash,assistantNoCallerHash,catalogHash,detachedRunnerHash,messageId,roundNo,spoolOffset,toolUses,usage,verifiedPendingToolUseIds,version",
-    ].includes(Object.keys(raw).sort().join(","))
+    ].includes(Object.keys(raw).filter((key) => key !== "rejectedToolUses").sort().join(","))
     || raw.version !== 1 || !Number.isSafeInteger(raw.roundNo)
     || Number(raw.roundNo) < 1 || Number(raw.roundNo) > BOX_TOOL_MAX_ROUNDS
     || typeof raw.messageId !== "string" || raw.messageId.length < 1
@@ -69,6 +72,21 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
       || item.clientName.length > 128
       || typeof item.inputHash !== "string" || !/^[a-f0-9]{64}$/.test(item.inputHash)) return null;
     ids.add(item.id);
+  }
+  if (Object.hasOwn(raw, "rejectedToolUses")) {
+    const rejected = raw.rejectedToolUses;
+    if (!Array.isArray(rejected) || !dense(rejected, 32)) return null;
+    const hidden = new Set<string>();
+    for (const item of rejected) {
+      if (!record(item) || Object.keys(item).sort().join(",") !== "id,name"
+        || typeof item.id !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.id)
+        || ids.has(item.id) || hidden.has(item.id)
+        || typeof item.name !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(item.name)
+        || raw.toolUses.some((use) => (use as { boxName: string }).boxName === item.name)) {
+        return null;
+      }
+      hidden.add(item.id);
+    }
   }
   const pending = new Set<string>();
   for (const id of raw.verifiedPendingToolUseIds) {

@@ -76,7 +76,9 @@ export async function observeBoxToolTerminalOnly(input: {
       : undefined;
     const decoder = new BoxCliToolHandoffDecoder(id.upstreamModel, catalog,
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
-        ...(progress ? { progress } : {}) });
+        ...(progress ? { progress } : {}),
+        ...(id.roundNo > 1 && id.priorRejectedToolUses
+          ? { priorRejectedToolUses: id.priorRejectedToolUses } : {}) });
     // OCV5-302: see boxPublishedResults — evidence, never authority.
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(await withPublishedBoxResults(
       input.target.exec, access.cwd, id.resultHashes!, abort.signal)) : null;
@@ -103,7 +105,8 @@ export async function observeBoxToolTerminalOnly(input: {
       }
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "user"
-        && !(modelStarted && decoder.awaitingCliToolError())) {
+        && !(modelStarted && decoder.awaitingCliToolError())
+        && !decoder.priorCliToolErrorDue(record)) {
         if (!echo || modelStarted) {
           return { status: "pending", reason: "BOX_RECOVERY_ECHO_UNEXPECTED", undeliverable: true };
         }

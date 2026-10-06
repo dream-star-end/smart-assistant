@@ -95,7 +95,9 @@ export async function observeBoxToolUnknown(input: {
       : undefined;
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
       { alreadyInitialized: id.roundNo > 1, allowFinal: true,
-        ...(progress ? { progress } : {}) });
+        ...(progress ? { progress } : {}),
+        ...(id.roundNo > 1 && id.priorRejectedToolUses
+          ? { priorRejectedToolUses: id.priorRejectedToolUses } : {}) });
     // OCV5-302: with the hash-verified published results the echo can tell
     // Claude Code's exact rewrites (image resize, empty, persisted) apart.
     const echo = id.roundNo > 1 ? new BoxToolResultEcho(await withPublishedBoxResults(
@@ -121,7 +123,8 @@ export async function observeBoxToolUnknown(input: {
         }
         if (record && typeof record === "object" && !Array.isArray(record)
           && (record as { type?: unknown }).type === "user"
-          && !(modelStarted && decoder.awaitingCliToolError())) {
+          && !(modelStarted && decoder.awaitingCliToolError())
+        && !decoder.priorCliToolErrorDue(record)) {
           if (!echo || modelStarted) {
             throw new BoxToolUnknownObserverError("BOX_OBSERVER_ECHO_UNEXPECTED");
           }

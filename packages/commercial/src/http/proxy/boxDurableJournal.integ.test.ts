@@ -685,8 +685,25 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     await client.query(`UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxLaunchPermit":true}'::jsonb WHERE request_id=$1`,
     [toolCall.requestId]);
+    // OCV5-328: the same message also called a tool the run does not expose.
+    const hiddenCalls = [{ id: "toolu_hidden_1", name: "mcp__openclaude-memory__delegate_task" }];
+    for (const bad of [[], [{ id: "toolu_C", name: "Read" }],
+      [{ id: "toolu_hidden_1", name: secondToolUses[0]!.boxName }],
+      [{ id: "toolu_hidden_1", name: "bad name" }]]) {
+      await assert.rejects(() => journal.recordToolHandoff({
+        requestId: `box-d-${suffix}`, uid: 3n, leaseEpoch: toolCall.leaseEpoch,
+        candidate: { ...secondCandidate, rejectedToolUses: bad as never }, roundNo: 2,
+        spoolOffset: 2345, detachedRunnerHash: "f".repeat(64), catalogHash,
+        messagePointer: messagePointer(`box-d-${suffix}`, toolCall.runNonce,
+          toolCall.leaseEpoch, 2), verifiedPendingToolUseIds: ["toolu_C"] }),
+      (error: unknown) => error instanceof BoxDurableJournalError
+        && error.code === "BOX_TOOL_HANDOFF_EVIDENCE_INVALID");
+    }
     await journal.recordToolHandoff({ requestId: `box-d-${suffix}`, uid: 3n,
-      leaseEpoch: toolCall.leaseEpoch, candidate: secondCandidate, roundNo: 2,
+      leaseEpoch: toolCall.leaseEpoch,
+      // only id and name are kept; a call's arguments never enter the journal
+      candidate: { ...secondCandidate, rejectedToolUses: hiddenCalls.map((use) =>
+        ({ ...use, input: { secret: privateMarker } })) }, roundNo: 2,
       spoolOffset: 2345, detachedRunnerHash: "f".repeat(64),
       messagePointer: messagePointer(`box-d-${suffix}`, toolCall.runNonce,
         toolCall.leaseEpoch, 2),
@@ -696,6 +713,8 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-d-${suffix}`]);
     assert.equal(recoveredSecond.rows[0]?.ctx.boxState, "handoff",
       "read-only observer may commit exact unknown linked round only once");
+    assert.deepEqual((recoveredSecond.rows[0]?.ctx.boxToolHandoff as {
+      rejectedToolUses?: unknown }).rejectedToolUses, hiddenCalls);
     const replayedHandoff = await journal.findReplayIdentity({ uid: 3n,
       canonicalModel: basis.model, canonicalBody: resumeBody as ProxyBody });
     assert.deepEqual(replayedHandoff?.messagePointer,
@@ -730,6 +749,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(secondResume.ownerRequestId, `box-d-${suffix}`);
     assert.equal(secondResume.spoolOffset, 2345);
     assert.equal(secondResume.roundNo, 3);
+    assert.deepEqual(secondResume.rejectedToolUses, hiddenCalls,
+      "the next round learns which calls the CLI answers by itself");
+    assert.equal(Object.hasOwn(resumed, "rejectedToolUses"), false);
     const third = await client.query<{ ctx: Record<string, unknown> }>(
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-e-${suffix}`]);
     assert.equal(third.rows[0]?.ctx.boxRoundNo, 3);

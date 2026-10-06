@@ -2,7 +2,7 @@
  * Delivers either the next durable tool handoff or a remotely-proven final
  * message. The caller retains the Box target until terminal cleanup. */
 import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
+import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
@@ -101,7 +101,8 @@ export async function runBoxToolContinuation(input: {
       ? { toolUses: claim.toolUses, nativeSessionId: claim.nativeSessionId, catalog }
       : undefined;
     const decoder = new BoxCliToolHandoffDecoder(input.upstreamModel, catalog,
-      { alreadyInitialized: true, allowFinal: true, ...(progress ? { progress } : {}) });
+      { alreadyInitialized: true, allowFinal: true, ...(progress ? { progress } : {}),
+        ...(claim.rejectedToolUses ? { priorRejectedToolUses: claim.rejectedToolUses } : {}) });
     const compaction = claim.nativeSessionId ? new BoxCliCompaction(claim.nativeSessionId) : null;
     const echo = new BoxToolResultEcho(claim.results);
     let modelStarted = false;
@@ -122,7 +123,8 @@ export async function runBoxToolContinuation(input: {
       }
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "user"
-        && !(modelStarted && decoder.awaitingCliToolError())) {
+        && !(modelStarted && decoder.awaitingCliToolError())
+        && !decoder.priorCliToolErrorDue(record)) {
         // OCV5-301: after the model starts, only Claude Code's own error for a
         // rejected call may appear; the decoder validates and merges it.
         if (modelStarted) throw new BoxToolContinuationError("BOX_TOOL_ECHO_AFTER_MODEL");
@@ -248,8 +250,11 @@ export async function runBoxToolContinuation(input: {
   } catch (error) {
     // OCV5-313: a rejected result echo is named so the stop paths can end
     // this run at once; nothing it writes afterwards can be delivered.
-    await unknown(error instanceof BoxToolResultEchoError
-      ? "continuation_echo_rejected" : "continuation_unknown");
+    // OCV5-328: the same holds when the decoder rejects the stream itself:
+    // re-reading the spool fails the same way, so the run is stopped at once.
+    await unknown(error instanceof BoxToolResultEchoError ? "continuation_echo_rejected"
+      : error instanceof BoxCliToolHandoffError ? "continuation_stream_rejected"
+        : "continuation_unknown");
     throw error;
   } finally {
     clearTimeout(timer);

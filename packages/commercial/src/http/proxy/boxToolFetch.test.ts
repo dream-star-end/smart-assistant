@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
 import { BoxToolFirstRoundError } from "./boxToolFirstRound.js";
 import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
+import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import type { ProxyBody } from "./shared.js";
 import type { BoxNativePointer } from "./boxNativePointer.js";
@@ -617,7 +618,8 @@ test("cleanup status query failure never poisons an already-final SSE response",
 const resultBody = { ...firstBody, messages: [{ role: "user", content: "first" },
   ...nextBody.messages.slice(0, 2)], metadata: { user_id: JSON.stringify({
   session_id: "session", oc_turn_key: "ab".repeat(32) }) } } as ProxyBody;
-function echoRejectedService(stop: (identity: unknown) => Promise<string>, echoStopWaitMs = 200) {
+function echoRejectedService(stop: (identity: unknown) => Promise<string>, echoStopWaitMs = 200,
+  failure: Error = new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH")) {
   const calls: string[] = [];
   const target = { accountId: 25n,
     exec: { run: async () => ({ stdout: "clean\n", stderrBytes: 0, exitCode: 0 as const }) },
@@ -633,7 +635,7 @@ function echoRejectedService(stop: (identity: unknown) => Promise<string>, echoS
     publishResume: (async () => ({ claim, target, access: {} })) as never,
     runContinuation: (async () => {
       calls.push("continuation");
-      throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
+      throw failure;
     }) as never,
     stopRejectedRun: (async (identity: unknown) => {
       calls.push("stop"); return stop(identity);
@@ -695,4 +697,18 @@ test("OCV5-313 other continuation failures do not request a stop", async () => {
   const response = await service.fetch(call(resultBody));
   await assert.rejects(response.text(), /BOX_TOOL_STREAM_INCOMPLETE/);
   assert.deepEqual(calls, []);
+});
+
+// OCV5-328 (#27da48a8): the handoff decoder rejected the model stream. The
+// request failed the same way; the run held the session's Box slot for 21 min.
+test("OCV5-328 a stream the decoder rejects stops the run like a rejected echo", async () => {
+  let identity: unknown;
+  const { service, calls, claim } = echoRejectedService(async (seen) => {
+    identity = seen; return "stopped_proven";
+  }, 200, new BoxCliToolHandoffError("BOX_TOOL_ID_OR_NAME_INVALID"));
+  const response = await service.fetch(call(resultBody));
+  await assert.rejects(response.text(), /BOX_TOOL_ID_OR_NAME_INVALID/);
+  assert.deepEqual(calls, ["continuation", "stop"]);
+  assert.deepEqual(identity, { requestId: "box-next", uid: 3n, accountId: claim.accountId,
+    runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch });
 });

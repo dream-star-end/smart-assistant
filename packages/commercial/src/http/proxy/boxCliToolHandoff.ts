@@ -44,6 +44,12 @@ function cliNoSuchToolText(content: unknown, name: string): boolean {
     && (content[0] as Obj).text === expected;
 }
 
+/** A call the CLI rejects by itself: never shown, executed or billed apart. */
+export interface BoxRejectedToolUse {
+  readonly id: string;
+  readonly name: string;
+}
+const REJECTED_TOOL_NAME = /^[A-Za-z0-9_.:-]{1,128}$/;
 export interface BoxToolUse {
   readonly id: string;
   readonly boxName: string;
@@ -59,6 +65,10 @@ export interface BoxToolHandoffCandidate {
   /** CCB may keep thinking while omitting only tool_use.caller. */
   readonly assistantNoCallerHash: string;
   readonly toolUses: readonly BoxToolUse[];
+  /** OCV5-328: calls in this same message to tools the run does not expose.
+   * Claude Code answers them itself after the exposed calls have results;
+   * the next round expects exactly these answers before the model goes on. */
+  readonly rejectedToolUses?: readonly BoxRejectedToolUse[];
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheReadTokens: number;
@@ -156,12 +166,18 @@ export class BoxCliToolHandoffDecoder {
    * call and the CLI's error are dropped, text/thinking already streamed in
    * that message stay (as native shows them), later blocks keep their visible
    * order, and usage is the sum of every segment (each was a paid call). A
-   * segment with any exposed (valid) call is never merged. */
+   * segment with any exposed (valid) call is never merged.
+   * OCV5-328: a message may mix exposed and unexposed calls. The exposed
+   * calls are handed off as usual and the unexposed ones stay hidden; the
+   * CLI answers those only after the exposed results arrive, so the next
+   * round takes these answers (`priorCliErrors`) before its model message. */
   private segments = 0;
   private segmentStart = 0;
   private readonly messageIds = new Set<string>();
   /** Rejected call id -> its tool name, until the CLI's own answer arrives. */
   private awaitingCliErrors: Map<string, string> | null = null;
+  /** OCV5-328: hidden calls of the previous round's handed-off message. */
+  private priorCliErrors: Map<string, string> | null = null;
   private awaitingNextMessage = false;
   private baseInput = 0;
   private baseOutput = 0;
@@ -171,10 +187,22 @@ export class BoxCliToolHandoffDecoder {
   constructor(private readonly expectedModel: string,
     private readonly catalog: BoxToolCatalog,
     private readonly options: { alreadyInitialized?: boolean; allowFinal?: boolean;
-      progress?: BoxToolProgressBinding; trustedNativeSessionId?: string } = {}) {
+      progress?: BoxToolProgressBinding; trustedNativeSessionId?: string;
+      priorRejectedToolUses?: readonly BoxRejectedToolUse[] } = {}) {
     if (!/^claude-[a-z0-9-]{3,64}$/.test(expectedModel)
       || catalog.tools.length < 1) {
       throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_INVALID");
+    }
+    const prior = options.priorRejectedToolUses;
+    if (prior !== undefined && prior.length > 0) {
+      if (!Array.isArray(prior) || prior.length > 32 || options.alreadyInitialized !== true
+        || prior.some((use) => !use || typeof use.id !== "string" || !TOOL_ID.test(use.id)
+          || typeof use.name !== "string" || !REJECTED_TOOL_NAME.test(use.name)
+          || catalog.clientNameByBoxName.has(use.name))
+        || new Set(prior.map((use) => use.id)).size !== prior.length) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_DECODER_INVALID");
+      }
+      this.priorCliErrors = new Map(prior.map((use) => [use.id, use.name]));
     }
     this.initSeen = options.alreadyInitialized === true;
     this.compaction = options.trustedNativeSessionId
@@ -308,6 +336,22 @@ export class BoxCliToolHandoffDecoder {
     return this.awaitingCliErrors !== null;
   }
 
+  /** OCV5-328: true for a pre-model `user` record that answers only hidden
+   * calls of the previous round's message. Feed loops pass it to the decoder;
+   * every other pre-model `user` record is a published-result echo. */
+  priorCliToolErrorDue(record: unknown): boolean {
+    const prior = this.priorCliErrors;
+    if (!prior || this.started || this.failed || !record || typeof record !== "object"
+      || Array.isArray(record) || (record as Obj).type !== "user") return false;
+    const message = (record as Obj).message;
+    const content = message && typeof message === "object" && !Array.isArray(message)
+      ? (message as Obj).content : undefined;
+    return Array.isArray(content) && content.length >= 1 && content.every((item) =>
+      !!item && typeof item === "object" && !Array.isArray(item)
+      && typeof (item as Obj).tool_use_id === "string"
+      && prior.has((item as Obj).tool_use_id as string));
+  }
+
   private totals(): { inputTokens: number; outputTokens: number;
     cacheReadTokens: number; cacheWriteTokens: number } {
     return { inputTokens: this.baseInput + this.inputTokens,
@@ -320,8 +364,7 @@ export class BoxCliToolHandoffDecoder {
     return this.blocks.filter((block) => !block.hidden).map((block) => block.visible);
   }
 
-  private acceptCliToolErrors(record: Obj): void {
-    const awaiting = this.awaitingCliErrors;
+  private acceptCliToolErrors(record: Obj, awaiting: Map<string, string> | null): void {
     const message = obj(record.message);
     const content = message.content;
     if (!awaiting || record.isSynthetic === true || message.role !== "user"
@@ -337,7 +380,10 @@ export class BoxCliToolHandoffDecoder {
       }
       awaiting.delete(item.tool_use_id);
     }
-    if (awaiting.size === 0) {
+    if (awaiting.size > 0) return;
+    if (awaiting === this.priorCliErrors) {
+      this.priorCliErrors = null;
+    } else {
       this.awaitingCliErrors = null;
       this.awaitingNextMessage = true;
     }
@@ -392,8 +438,13 @@ export class BoxCliToolHandoffDecoder {
     }
     if (record.type === "system" || record.type === "rate_limit_event") return "";
     if (record.type === "user") {
-      if (!this.awaitingCliErrors) throw new BoxCliToolHandoffError("BOX_TOOL_RECORD_INVALID");
-      this.acceptCliToolErrors(record);
+      if (this.awaitingCliErrors) {
+        this.acceptCliToolErrors(record, this.awaitingCliErrors);
+      } else if (this.priorCliErrors && !this.started) {
+        this.acceptCliToolErrors(record, this.priorCliErrors);
+      } else {
+        throw new BoxCliToolHandoffError("BOX_TOOL_RECORD_INVALID");
+      }
       return "";
     }
     if (this.awaitingCliErrors) throw new BoxCliToolHandoffError("BOX_TOOL_CLI_ERROR_MISSING");
@@ -445,6 +496,8 @@ export class BoxCliToolHandoffDecoder {
       if (!this.initSeen || (this.started && !this.awaitingNextMessage)) {
         throw new BoxCliToolHandoffError("BOX_TOOL_ORDER_INVALID");
       }
+      // The model cannot continue before every prior call has its answer.
+      if (this.priorCliErrors) throw new BoxCliToolHandoffError("BOX_TOOL_CLI_ERROR_MISSING");
       const message = obj(event.message);
       if (message.model !== this.expectedModel || message.role !== "assistant"
         || typeof message.id !== "string" || !message.id || this.messageIds.has(message.id)
@@ -514,12 +567,13 @@ export class BoxCliToolHandoffDecoder {
         thinking: typeof block.thinking === "string" ? block.thinking : undefined,
         signature: typeof block.signature === "string" ? block.signature : undefined };
       if (type === "tool_use" && typeof block.id === "string" && TOOL_ID.test(block.id)
-        && typeof block.name === "string" && /^[A-Za-z0-9_.:-]{1,128}$/.test(block.name)
+        && typeof block.name === "string" && REJECTED_TOOL_NAME.test(block.name)
         && !this.catalog.clientNameByBoxName.has(block.name)
-        && !this.holdToolFrames && this.segments < BOX_CLI_REJECTED_SEGMENTS_MAX) {
+        && this.segments < BOX_CLI_REJECTED_SEGMENTS_MAX) {
         // OCV5-301: Claude Code answers this call itself (`No such tool
         // available`) and the model retries. Consume it silently; it is never
-        // shown, executed, or handed to the client.
+        // shown, executed, or handed to the client. OCV5-328: also beside
+        // exposed calls of the same message (before or after them).
         active.id = block.id;
         active.boxName = block.name;
         active.rejected = true;
@@ -532,8 +586,7 @@ export class BoxCliToolHandoffDecoder {
       if (type === "tool_use") {
         if (typeof block.id !== "string" || !TOOL_ID.test(block.id)
           || typeof block.name !== "string"
-          || !this.catalog.clientNameByBoxName.has(block.name)
-          || this.blocks.slice(this.segmentStart).some((item) => item.hidden)) {
+          || !this.catalog.clientNameByBoxName.has(block.name)) {
           throw new BoxCliToolHandoffError("BOX_TOOL_ID_OR_NAME_INVALID");
         }
         active.id = block.id;
@@ -678,11 +731,12 @@ export class BoxCliToolHandoffDecoder {
       this.verifySnapshot();
       const uses = this.blocks.flatMap((block) => block.use ? [block.use] : []);
       const rejected = this.blocks.slice(this.segmentStart).filter((block) => block.hidden);
-      if (rejected.length > 0) {
-        if (this.stopReason !== "tool_use"
-          || this.blocks.slice(this.segmentStart).some((block) => block.use)) {
-          throw new BoxCliToolHandoffError("BOX_TOOL_ID_OR_NAME_INVALID");
-        }
+      const mixed = rejected.length > 0
+        && this.blocks.slice(this.segmentStart).some((block) => block.use);
+      if (rejected.length > 0 && this.stopReason !== "tool_use") {
+        throw new BoxCliToolHandoffError("BOX_TOOL_ID_OR_NAME_INVALID");
+      }
+      if (rejected.length > 0 && !mixed) {
         this.segments++;
         this.awaitingCliErrors = new Map(rejected.map((block) =>
           [block.upstream.id as string, block.upstream.name as string]));
@@ -695,7 +749,12 @@ export class BoxCliToolHandoffDecoder {
           assistantContentHash: this.visibleAssistantContentHash(),
           assistantEchoHash: hashBoxAssistantEchoContent(this.visibleBlocks()),
           assistantNoCallerHash: hashBoxAssistantNoCallerContent(this.visibleBlocks()),
-          toolUses: uses, ...this.totals() };
+          toolUses: uses,
+          // OCV5-328: the CLI runs the exposed calls first and answers these
+          // itself afterwards; the next round must see exactly those answers.
+          ...(mixed ? { rejectedToolUses: rejected.map((block) => ({
+            id: block.upstream.id as string, name: block.upstream.name as string })) } : {}),
+          ...this.totals() };
         this.expectedToolIds = uses.map((use) => use.id);
       } else if (uses.length > 0 || !this.options.allowFinal) {
         throw new BoxCliToolHandoffError("BOX_TOOL_STOP_REASON_INVALID");
