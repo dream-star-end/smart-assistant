@@ -3,7 +3,6 @@
  * or skips ahead to a later result. The caller owns the pinned target. */
 import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
-import { isBoxCliUpstreamRefusalCode } from "./boxCliUpstreamRefusal.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { BoxDurableJournalError, type BoxDetachedUnknownRecovery,
   type BoxDurableJournal, type BoxRecoveryWinner } from "./boxDurableJournal.js";
@@ -184,11 +183,10 @@ export async function observeBoxToolTerminalOnly(input: {
     if (error instanceof BoxToolResultEchoError) {
       return { status: "pending", reason: error.code, undeliverable: true };
     }
-    // OCV5-377: a model safety stop or upstream refusal written in the finished
-    // spool is final for this call (the CLI does not retry it): no final can
-    // come of it, so the round is settled as a stopped failure, unbilled.
-    if (error instanceof BoxCliToolHandoffError && isBoxCliUpstreamRefusalCode(error.message)) {
-      return { status: "pending", reason: error.message, undeliverable: true };
+    // The run finished: its spool no longer changes, so a decoder rejection
+    // (an assistant snapshot without its stream, a malformed block) is final.
+    if (error instanceof BoxCliToolHandoffError) {
+      return { status: "pending", reason: error.code, undeliverable: true };
     }
     return { status: "pending", reason: error instanceof Error
       ? error.message : "BOX_RECOVERY_OBSERVE_FAILED" };
