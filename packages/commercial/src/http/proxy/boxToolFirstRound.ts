@@ -290,6 +290,7 @@ export async function runBoxToolFirstRound(input: {
       throw error;
     }
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
+    const launchCliVersion = target.cliVersion;
     // A resumed tool exchange must be staged from history: a native
     // transcript stops at the unanswered tool_use (OCV5-304).
     // OCV5-313: only where this Box's CLI build has verified native resume.
@@ -356,8 +357,8 @@ export async function runBoxToolFirstRound(input: {
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
           cliCwd: plan.cliCwd,
-          ...(boxCliNativeResumeVerified(target.cliVersion)
-            ? { cliVersion: target.cliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
+          ...(boxCliNativeResumeVerified(launchCliVersion)
+            ? { cliVersion: launchCliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
