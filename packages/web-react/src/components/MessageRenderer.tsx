@@ -32,6 +32,8 @@ import {
   HIDDEN_REVIEWER_AGENT_ID,
   isRedundantRuntimeEnvelope,
   isTurnStatusSuppressedByTape,
+  collectTurnStatusRecordTurnIds,
+  isErrorCardSupersededByTurnStatus,
   messageKind,
   safeMessageSignature,
 } from "../lib/chat/render";
@@ -2102,6 +2104,7 @@ export function MessageList({
   // their canonical immutable Agent blocks are the user-facing timeline.
   const safeMessages = sanitizeChatMessages(messages, sessionId);
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
+  const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
   // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. Automatic
   // and manual children are both hidden. While a child exists, its source
@@ -2158,7 +2161,8 @@ export function MessageList({
       ) &&
       !(m._errorHeldForRecovery === true && m._errorCardSnapshot?.disposition !== "card") &&
       !isRedundantRuntimeEnvelope(m) &&
-      !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds),
+      !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
+      !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
   ));
   const visibleUserIds = new Set(
     renderableMessages
