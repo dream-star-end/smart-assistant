@@ -22,7 +22,7 @@
 
 import { randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { GROK_VISION_PATH, grokExecutionUpstream } from "@openclaude/protocol";
+import { GROK_VISION_PATH } from "@openclaude/protocol";
 import type { Pool } from "pg";
 import type { Dispatcher } from "undici";
 import { request as undiciRequest } from "undici";
@@ -192,6 +192,12 @@ function sniffMediaType(buf: Buffer): VisionMediaType | null {
     return "image/webp";
   }
   return null;
+}
+
+/** Selfhost runs grok-build on a single fixed upstream (the grok adapter maps it to the same id). */
+function grokExecutionUpstream(canonicalModel: string, upstream: unknown): string {
+  if (canonicalModel === GROK_VISION_MODEL && upstream === "grok-4.7") return upstream;
+  throw new Error("GROK_VISION_UPSTREAM_INVALID: canonical/upstream mismatch");
 }
 
 export function grokVisionBody(input: {
