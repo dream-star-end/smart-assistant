@@ -40,7 +40,14 @@ function reasonText(p: BoxClaudeProfile): string {
 
 function Health({ p, ceiling }: { p: BoxClaudeProfile; ceiling: number }) {
   if (p.cooldown_until) {
-    const why = p.cooldown_reason === "login_required" ? "登录失效" : "额度用尽";
+    const why =
+      p.cooldown_reason === "login_required"
+        ? "登录失效"
+        : p.cooldown_reason === "profile_unsafe"
+          ? "目录校验失败(登录或共享目录被改动)"
+          : p.cooldown_reason === "quota_exhausted"
+            ? "额度用尽"
+            : "暂不可用";
     return <Badge tone="danger">{`${why},${fmtDateTime(p.cooldown_until)} 前不参与`}</Badge>;
   }
   if (p.utilization === null) return <span className="text-muted">暂无数据</span>;

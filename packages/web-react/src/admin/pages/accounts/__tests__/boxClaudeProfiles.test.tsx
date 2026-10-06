@@ -114,4 +114,12 @@ describe("BoxClaudeProfilesModal", () => {
     expect(screen.queryByText("/home/box/.claude-zzz")).toBeNull();
     expect(screen.getByText("/home/box/.claude-b")).toBeTruthy();
   });
+
+  test("a login the Box-side guard refused is not reported as out of quota", async () => {
+    const until = new Date(Date.now() + 3_600_000).toISOString();
+    adminGet.mockResolvedValue(view([{ ...base, cooldown_until: until, cooldown_reason: "profile_unsafe" }]));
+    open();
+    expect(await screen.findByText(/目录校验失败.*前不参与/)).toBeTruthy();
+    expect(screen.queryByText(/额度用尽,.*前不参与/)).toBeNull();
+  });
 });
