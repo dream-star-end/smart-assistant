@@ -93,6 +93,35 @@ export function isTurnStatusSuppressedByTape(
   );
 }
 
+/**
+ * 同一轮已有服务端核实的 dispatch 失败状态记录(_turnStatusRecord,已确认未计费)时,
+ * 该轮另带 _errorCode 的 assistant 红卡是同一次失败的第二张卡:只留状态卡(文案说明未计费、可重试),
+ * 红卡隐藏,避免一次失败两张卡、两个重试按钮。红卡带模型已产出的部分回答正文时不隐藏。
+ */
+export function collectTurnStatusRecordTurnIds(messages: readonly ChatMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const m of messages) {
+    if (m?._turnStatusRecord === true && typeof m._clientMessageId === "string" && m._clientMessageId.length > 0) {
+      ids.add(m._clientMessageId);
+    }
+  }
+  return ids;
+}
+
+export function isErrorCardSupersededByTurnStatus(
+  m: Pick<ChatMessage, "role" | "_errorCode" | "_clientMessageId" | "_turnStatusRecord" | "text">,
+  statusTurnIds: Set<string>,
+): boolean {
+  return (
+    m.role === "assistant" &&
+    m._turnStatusRecord !== true &&
+    !!m._errorCode &&
+    typeof m._clientMessageId === "string" &&
+    statusTurnIds.has(m._clientMessageId) &&
+    !(m.text ?? "").trim()
+  );
+}
+
 // ═══════════════ immutable turn tape lazy process controls ═══════════════
 
 /** 该行是否为真实过程记录的惰性入口。 */
