@@ -358,6 +358,7 @@ export async function startEgress(): Promise<void> {
         boxApiModelById(model)?.maxOutputTokens ?? null,
       resolveTarget: (args) => resolveBoxLaunch!(args),
       onUnknown: reportBoxUnknown,
+      onNativeDecision: (info) => log.info("box_native_decision", info),
       // OCV5-299: a locally rejected first-round stream is stopped through the
       // same explicit-stop coordinator as a user Stop (declared below; only
       // called at request time, after startup).

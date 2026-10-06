@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { completedBoxCliToSse, createBoxCliSseDecoder, BoxCliSseError } from "./boxCliSse.js";
 import { _UsageObserver } from "./shared.js";
 import { BoxExecTransport } from "./boxExecTransport.js";
@@ -395,4 +396,30 @@ test("converter SSE drives existing billing observer with input/cache intact", (
       cache_read_tokens: 100n, cache_write_tokens: 20n,
     });
   }
+});
+
+// Captured on the Box (Claude Code 2.1.288, 2026-10-06): the account's five hour
+// usage window was exhausted, so the CLI streamed no model message and answered
+// with its own synthetic assistant record and an error result.
+const refusalRecords = readFileSync(new URL(
+  "./__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl", import.meta.url), "utf8")
+  .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+
+test("a CLI usage-limit refusal is one named code, not an order violation", () => {
+  const init = { type: "system", subtype: "init", tools: [], mcp_servers: [] };
+  rejected([init, ...refusalRecords], "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  const decoder = createBoxCliSseDecoder(model);
+  decoder.push(JSON.stringify(init) + "\n");
+  assert.throws(() => decoder.push(refusalRecords.map((item) => JSON.stringify(item)).join("\n") + "\n"),
+    (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  // a synthetic API error message without the rate limit tag is still a refusal, never model output
+  const other = JSON.parse(JSON.stringify(refusalRecords[1])) as { error?: string };
+  other.error = "invalid_request";
+  rejected([init, other], "BOX_CLI_UPSTREAM_REFUSED");
+  // the CLI's local command output uses the same sentinel model but is no API error
+  const local = JSON.parse(JSON.stringify(refusalRecords[1])) as { error?: string; is_api_error_message?: boolean };
+  delete local.error; delete local.is_api_error_message;
+  rejected([init, local], "BOX_CLI_ASSISTANT_MISMATCH");
+  // a real model message in the same stream is untouched
+  assert.equal(completedBoxCliToSse(jsonl(records()), model).outputTokens, 7);
 });

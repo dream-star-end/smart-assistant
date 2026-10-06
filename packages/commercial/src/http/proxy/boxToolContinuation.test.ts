@@ -67,7 +67,8 @@ function fixture(kind: "tool" | "final", failComplete = false,
   cliVersion: string | null = "2.1.280",
   // OCV5-328: hidden calls of the owner's message and the CLI's own answers
   hidden: { rejected?: Array<{ id: string; name: string }>;
-    beforeEcho?: unknown[]; afterEcho?: unknown[] } = {}) {
+    beforeEcho?: unknown[]; afterEcho?: unknown[] } = {},
+  claimVersion: string | null = "2.1.280") {
   const sequence: string[] = [], emitted: string[] = [];
   const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
   const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
@@ -86,7 +87,8 @@ function fixture(kind: "tool" | "final", failComplete = false,
       isError: false, contentHash: currentHash }],
     ...(hidden.rejected ? { rejectedToolUses: hidden.rejected } : {}),
     ...(native ? { nativeSessionId: "12345678-1234-4123-8123-123456789abc",
-      nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}` } : {}) };
+      nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      ...(claimVersion === null ? {} : { nativeCliVersion: claimVersion }) } : {}) };
   const bytes = Buffer.concat([raw([...(hidden.beforeEcho ?? []),
     ...(omitEcho ? [] : [currentEcho]), ...(hidden.afterEcho ?? []),
     ...(kind === "tool" ? toolRecords : finalRecords)]),
@@ -508,7 +510,7 @@ test("OCV5-313 a final on a Box without verified native resume records no native
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
   try {
-    for (const cliVersion of ["2.1.288", null]) {
+    for (const cliVersion of ["2.1.999", null]) {
       const f = fixture("final", false, false, false, false, true, cliVersion);
       const result = await runBoxToolContinuation(f.input, f.deps);
       assert.equal(result.kind, "final");
@@ -516,6 +518,29 @@ test("OCV5-313 a final on a Box without verified native resume records no native
       assert.equal(f.sequence.includes("native-inspect"), false);
       assert.equal(f.sequence.includes("native-attach"), false);
       assert.ok(f.sequence.includes("terminal-journal"));
+    }
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
+// A pointer is labelled with the build that wrote the transcript (recorded at
+// admission), not the build installed when the chain ends.
+test("a final tool round labels its native pointer with the build that wrote the transcript", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const same = fixture("final", false, false, false, false, true, "2.1.288", {}, "2.1.288");
+    const result = await runBoxToolContinuation(same.input, same.deps);
+    assert.equal(result.kind === "final" && result.nativePointer?.cliVersion, "2.1.288");
+    for (const [installed, wrote] of [["2.1.288", "2.1.280"], ["2.1.280", "2.1.288"], ["2.1.288", null]] as const) {
+      const f = fixture("final", false, false, false, false, true, installed, {}, wrote);
+      const upgraded = await runBoxToolContinuation(f.input, f.deps);
+      assert.equal(upgraded.kind, "final");
+      assert.equal(upgraded.kind === "final" && upgraded.nativePointer, undefined,
+        `${String(wrote)} transcript on a ${installed} Box records no pointer`);
+      assert.equal(f.sequence.includes("native-attach"), false);
     }
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;

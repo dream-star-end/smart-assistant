@@ -26,32 +26,40 @@ export function makeBoxNativeHistoryBasis(previousBody: ProxyBody,
  * and never permission to replay an ambiguous paid invocation. */
 export function matchesBoxNativeHistory(nextBody: ProxyBody,
   basis: BoxNativeHistoryBasis): boolean {
+  return explainBoxNativeHistory(nextBody, basis) === "ok";
+}
+
+/** Why a next request does or does not continue a native transcript. Content
+ * free: a reason code only, so a miss can be logged and diagnosed. */
+export function explainBoxNativeHistory(nextBody: ProxyBody,
+  basis: BoxNativeHistoryBasis): "ok" | "shape" | "roles" | "tool_result" | "context" | "assistant" | "error" {
   try {
     const rawMessages = nextBody.messages;
     if (!Array.isArray(rawMessages) || rawMessages.length < 3
-      || !Object.hasOwn(rawMessages, rawMessages.length - 1)) return false;
+      || !Object.hasOwn(rawMessages, rawMessages.length - 1)) return "shape";
     const rawCurrent = rawMessages.at(-1);
     if (!rawCurrent || typeof rawCurrent !== "object" || Array.isArray(rawCurrent)
-      || !Object.hasOwn(rawCurrent, "content")) return false;
+      || !Object.hasOwn(rawCurrent, "content")) return "shape";
     const normalized = normalizeBoxSemanticBody(nextBody);
     const messages = normalized.messages;
-    if (!Array.isArray(messages) || messages.length < 3) return false;
+    if (!Array.isArray(messages) || messages.length < 3) return "shape";
     const previousUser = messages.at(-3);
     const assistant = messages.at(-2);
     const currentUser = messages.at(-1);
     if (!hasRoleAndContent(previousUser, "user")
       || !hasRoleAndContent(assistant, "assistant")
-      || !hasRoleAndContent(currentUser, "user")) return false;
+      || !hasRoleAndContent(currentUser, "user")) return "roles";
     const currentContent = currentUser.content;
     if (Array.isArray(currentContent) && currentContent.some((part) => part
-      && typeof part === "object" && "type" in part && part.type === "tool_result")) return false;
+      && typeof part === "object" && "type" in part && part.type === "tool_result")) return "tool_result";
     const prefixBody = { ...normalized, messages: messages.slice(0, -2) } as ProxyBody;
     // Semantic normalization collapses a one-block text assistant to a string.
     // The existing assistant hash takes block arrays, so restore that exact
     // text-block representation rather than weakening the hash comparison.
     const assistantBlocks = typeof assistant.content === "string"
       ? [{ type: "text", text: assistant.content }] : assistant.content;
-    return deriveBoxContextHash(prefixBody) === basis.contextHashBeforeFinal
-      && hashBoxAssistantContent(assistantBlocks) === basis.assistantContentHash;
-  } catch { return false; }
+    if (deriveBoxContextHash(prefixBody) !== basis.contextHashBeforeFinal) return "context";
+    if (hashBoxAssistantContent(assistantBlocks) !== basis.assistantContentHash) return "assistant";
+    return "ok";
+  } catch { return "error"; }
 }

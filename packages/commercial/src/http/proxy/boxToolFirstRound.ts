@@ -18,12 +18,13 @@ import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
 import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
+import { BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED } from "./boxCliUpstreamRefusal.js";
 import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { randomBytes } from "node:crypto";
-import { matchesBoxNativeHistory } from "./boxNativeHistory.js";
+import { explainBoxNativeHistory } from "./boxNativeHistory.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -57,7 +58,10 @@ type Journal = Pick<BoxDurableJournal, "admit" |
 
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
-const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID"]);
+const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID",
+  // The CLI answered an upstream refusal (usage window exhausted, API error)
+  // with its own synthetic message: nothing was generated, nothing is billed.
+  BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED]);
 
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
@@ -97,6 +101,9 @@ export async function runBoxToolFirstRound(input: {
   retainCleanupTarget: (handle: { target: BoxResolvedTarget;
     pending: Promise<void>; uid: bigint; requestId: string; phase: string }) => void;
   budgetMs?: number;
+  /** Content-free record of the native resume decision (hit, or why not). */
+  onNativeDecision?: (info: { requestId: string; decision: "resume" | "miss";
+    reason: string; cliVersion: string }) => void;
   /** OCV5-299: stop a launched run whose stream this decoder deterministically
    * rejected (e.g. a tool name outside this invocation's catalog). Returns the
    * explicit-stop outcome; only "stopped_proven" means the row is now a proven
@@ -281,15 +288,20 @@ export async function runBoxToolFirstRound(input: {
       throw error;
     }
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
+    const launchCliVersion = target.cliVersion;
+    const coldPlan = plan;
     // A resumed tool exchange must be staged from history: a native
     // transcript stops at the unanswered tool_use (OCV5-304).
     // OCV5-313: only where this Box's CLI build has verified native resume.
     if (nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)
-      && input.sessionId && deps.journal.findNativeCandidate
+      && fingerprint.sessionId && deps.journal.findNativeCandidate
       && !input.resumeToolResults) {
       let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
       try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
-        sessionId: input.sessionId, currentRequestId: input.requestId,
+        // The journal keys a row by the CLI session of the request metadata
+        // (the call fingerprint), not by the OpenClaude session id this input
+        // carries; looking up the latter never matched, so native resume never ran.
+        sessionId: fingerprint.sessionId, currentRequestId: input.requestId,
         canonicalModel: input.canonicalModel })); }
       catch (error) {
         if (signal.aborted) throw error;
@@ -300,10 +312,16 @@ export async function runBoxToolFirstRound(input: {
       // the staged MCP catalog stay identical across the rolling deploy.
       const pointerCatalog = candidate
         ? boxCatalogMatching(plan.catalog, candidate.pointer.catalogHash) : null;
-      if (candidate && pointerCatalog
-        && candidate.pointer.accountId === target.accountId.toString()
-        && candidate.pointer.upstreamModel === input.upstreamModel
-        && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
+      const miss = !candidate ? "no_candidate"
+        : candidate.pointer.accountId !== target.accountId.toString() ? "account"
+        : candidate.pointer.upstreamModel !== input.upstreamModel ? "model"
+        // a transcript written by another CLI build is not resumed (cache miss)
+        : candidate.pointer.cliVersion !== target.cliVersion ? "build"
+        : !pointerCatalog ? "catalog"
+        : explainBoxNativeHistory(input.canonicalBody, candidate.pointer);
+      deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
+        reason: miss, cliVersion: String(target.cliVersion) });
+      if (candidate && pointerCatalog && miss === "ok") {
         const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
           keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
@@ -328,23 +346,40 @@ export async function runBoxToolFirstRound(input: {
           if (signal.aborted || error instanceof BoxToolFirstRoundError
             && error.code === "BOX_TOOL_ABORTED") throw error;
           // Preflight is read-only/no paid CLI. A miss falls back exactly once.
+          deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+            reason: "preflight", cliVersion: String(target.cliVersion) });
         }
       }
     }
     // OCV5-301: the same session's previous turn may still be settling.
     const admitAccountId = target.accountId;
-    const pendingAdmission = waitingForBoxCapacity(() => deps.journal.admit({
+    const admitInput = () => ({
       requestId: input.requestId, uid: input.uid,
       accountId: admitAccountId, model: input.canonicalModel, fingerprint,
       canonicalBody: input.canonicalBody,
       replayRequired: deps.writeMessage !== undefined,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
-      invocationMode: "detached_tool", contextHash,
+      invocationMode: "detached_tool" as const, contextHash,
       detachedRunnerHash: plan.detachedRunnerHash,
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
-          cliCwd: plan.cliCwd } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
+          cliCwd: plan.cliCwd,
+          ...(boxCliNativeResumeVerified(launchCliVersion)
+            ? { cliVersion: launchCliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) });
+    const pendingAdmission = waitingForBoxCapacity(async () => {
+      try { return await deps.journal.admit(admitInput()); }
+      catch (error) {
+        // Another turn claimed the predecessor transcript (or it moved) while
+        // this one waited: not an error for the user, a cold start is always valid.
+        if (!nativeClaim || signal.aborted
+          || (error as { code?: unknown } | null)?.code !== "BOX_NATIVE_CLAIM_LOST") throw error;
+        plan = coldPlan; nativeClaim = undefined;
+        deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+          reason: "claim_lost", cliVersion: String(launchCliVersion) });
+        return await deps.journal.admit(admitInput());
+      }
+    }, signal, { maxWaitMs: deps.capacityWaitMs });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
@@ -506,7 +541,7 @@ export async function runBoxToolFirstRound(input: {
             const file = parseBoxNativeFileEvidence(inspected.stdout);
             const candidate = parseBoxNativePointer({ version: 1,
               accountId: target.accountId.toString(), upstreamModel: input.upstreamModel,
-              cliVersion: "2.1.280", nativeSessionId: plan.sessionId,
+              cliVersion: target.cliVersion, nativeSessionId: plan.sessionId,
               cliCwd: plan.cliCwd, transcriptSha256: file.sha256,
               contextHashBeforeFinal: contextHash,
               assistantContentHash: final.assistantContentHash,

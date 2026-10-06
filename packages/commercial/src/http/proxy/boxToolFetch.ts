@@ -78,6 +78,8 @@ export class BoxToolFetch {
     onUnknown: (args: { uid: bigint; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
     runFirst?: First;
+    onNativeDecision?: (info: { requestId: string; decision: "resume" | "miss";
+      reason: string; cliVersion: string }) => void;
     publishResume?: Publish;
     runContinuation?: Continue;
     /** Test-only shortening of the bounded restart-cleanup resolver wait. */
@@ -590,6 +592,7 @@ export class BoxToolFetch {
               journal: this.deps.journal,
               writeMessage: this.deps.writeMessage,
               maxOutputTokensForModel: this.deps.maxOutputTokensForModel,
+              ...(this.deps.onNativeDecision ? { onNativeDecision: this.deps.onNativeDecision } : {}),
               resolveTarget: (input) => this.deps.resolveTarget({ ...input,
                 allowWakeIfHibernated: true }),
               onUnknown: this.deps.onUnknown,

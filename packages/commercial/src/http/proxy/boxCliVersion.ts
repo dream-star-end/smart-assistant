@@ -9,10 +9,16 @@ import type { BoxResolvedTarget } from "./boxTextFetch.js";
 
 /** nativeResume: `--resume` of a transcript this CLI wrote is verified. Where
  * it is not, no native pointer is recorded or claimed and every turn stages
- * the synthetic history instead. */
+ * the synthetic history instead. That fallback is expensive on a long context:
+ * the CLI appends its environment block (with the per-run cwd) after the last
+ * message and puts the only cache marker on it, so no turn ever reads the
+ * history from the prompt cache and a 350k-token conversation rewrites 350k
+ * tokens per turn (INC-20261006-BOX-SYNTHETIC-TURN-HELD, usage window).
+ * 2.1.288: scripts/ocv5-289/ccNativeResumeOfflineProbe.ts passes against it and
+ * the request prefix of a native resume is cache-stable (see that script). */
 export const BOX_CLI_VERSIONS: Readonly<Record<string, { readonly nativeResume: boolean }>> = {
   "2.1.280": { nativeResume: true },
-  "2.1.288": { nativeResume: false },
+  "2.1.288": { nativeResume: true },
 };
 
 export function boxCliNativeResumeVerified(version: string | undefined): boolean {

@@ -110,7 +110,9 @@ export interface BoxJournalAdmission {
   nativeClaim?: { ownerRequestId: string; pointer: BoxNativePointer;
     upstreamModel: string };
   /** First native invocation mints an opaque Claude UUID in its own run cwd. */
-  nativeStart?: { sessionId: string; cliCwd: string };
+  nativeStart?: { sessionId: string; cliCwd: string;
+    /** The build that writes the transcript; absent where native resume is unverified. */
+    cliVersion?: BoxNativePointer["cliVersion"] };
 }
 export interface BoxNativeCandidate {
   readonly ownerRequestId: string;
@@ -132,6 +134,8 @@ export interface BoxToolResumeClaim {
   readonly rejectedToolUses?: readonly { id: string; name: string }[];
   readonly nativeSessionId?: string;
   readonly nativeCliCwd?: string;
+  /** The build that wrote the native transcript; absent for chains admitted before it was recorded. */
+  readonly nativeCliVersion?: BoxNativePointer["cliVersion"];
 }
 export type BoxResumeDecision =
   | { readonly kind: "new_claim"; readonly claim: BoxToolResumeClaim }
@@ -373,7 +377,9 @@ function goodId(input: BoxJournalAdmission): void {
       && (!input.detachedRunnerHash || !input.catalogHash))
     || (input.nativeStart !== undefined && (input.nativeClaim !== undefined
       || !UUID_V4.test(input.nativeStart.sessionId)
-      || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`))
+      || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`
+      || (input.nativeStart.cliVersion !== undefined
+        && input.nativeStart.cliVersion !== "2.1.280" && input.nativeStart.cliVersion !== "2.1.288")))
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -754,7 +760,11 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   /** Find the original round before precharge or account selection. This only
    * reads committed evidence; the caller must separately observe the pinned
-   * spool/proof or load a completed Message before returning any answer. */
+   * spool/proof or load a completed Message before returning any answer.
+   * An attempt that settled as an aborted, unbilled stopped run (no completed
+   * Message) has nothing to replay and is not an original: the same call sent
+   * again is a new launch, and several such attempts must not read as an
+   * ambiguous call. */
   async findReplayIdentity(input: { uid: bigint; canonicalModel: string;
     canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
     prepared?: PreparedContinuation }): Promise<BoxReplayIdentity | null> {
@@ -794,7 +804,10 @@ export class BoxDurableJournal implements BoxJournalPort {
         `SELECT request_id,ctx FROM request_finalize_journal
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
             AND ctx->>'boxTurnKey'=$3 AND ctx->>'model'=$4
-            AND ctx->>$5=$6 LIMIT 2`,
+            AND ctx->>$5=$6
+            AND NOT (state='aborted' AND NOT (ctx ? 'boxReplayMessage')
+              AND COALESCE(ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))
+          LIMIT 2`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
           input.canonicalModel, column, key]);
       if (found.rows.length > 1) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
@@ -1072,11 +1085,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       ]);
       // Fingerprint and fallback alias are both derived from the uid, so the
       // user filter keeps the check exact and lets it use idx_rfj_user_time.
+      // A settled, unbilled stopped attempt without a completed Message is
+      // dead: the same call sent again is a new launch, not a duplicate.
       const duplicate = await client.query(
         `SELECT 1 FROM request_finalize_journal
           WHERE user_id = $3 AND ctx->>'boxInvocationRecovery' = 'v1'
             AND (ctx->>'boxReplayFingerprint' = $1
-             OR ctx->>'boxFallbackAlias' = $2) LIMIT 1`,
+             OR ctx->>'boxFallbackAlias' = $2)
+            AND NOT (state = 'aborted' AND NOT (ctx ? 'boxReplayMessage')
+              AND COALESCE(ctx->>'boxState', '') IN ('failed_stopped', 'prestart_stopped'))
+          LIMIT 1`,
         [input.fingerprint.replayFingerprint, fallbackAlias ?? null, input.uid.toString()]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       const policy = this.capacity(input.uid, input.accountId);
@@ -1202,9 +1220,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         boxRunNonce: input.runNonce, boxLeaseEpoch: input.leaseEpoch,
         ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
           boxNativeSessionId: native.pointer.nativeSessionId,
-          boxNativeCliCwd: native.pointer.cliCwd } : {}),
+          boxNativeCliCwd: native.pointer.cliCwd,
+          boxNativeCliVersion: native.pointer.cliVersion } : {}),
         ...(input.nativeStart ? { boxNativeSessionId: input.nativeStart.sessionId,
-          boxNativeCliCwd: input.nativeStart.cliCwd } : {}) };
+          boxNativeCliCwd: input.nativeStart.cliCwd,
+          ...(input.nativeStart.cliVersion ? { boxNativeCliVersion: input.nativeStart.cliVersion } : {}) } : {}) };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
@@ -1986,6 +2006,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       const owner = owners.rows[0]!, ctx = owner.ctx;
       const nativeSessionId = ctx.boxNativeSessionId;
       const nativeCliCwd = ctx.boxNativeCliCwd;
+      const nativeCliVersion = ctx.boxNativeCliVersion === "2.1.280" || ctx.boxNativeCliVersion === "2.1.288"
+        ? ctx.boxNativeCliVersion : undefined;
       if (ctx.model !== input.canonicalModel
         || ctx.boxInvocationMode !== "detached_tool"
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -2128,7 +2150,8 @@ export class BoxDurableJournal implements BoxJournalPort {
              boxParentResumeRevision: durableRevision,
              ...(nativeSessionId === undefined ? {} : {
                boxNativeSessionId: nativeSessionId,
-               boxNativeCliCwd: nativeCliCwd }) })]);
+               boxNativeCliCwd: nativeCliCwd,
+               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}) }) })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
@@ -2147,7 +2170,8 @@ export class BoxDurableJournal implements BoxJournalPort {
          ...(handoff.rejectedToolUses ? { rejectedToolUses: handoff.rejectedToolUses } : {}),
          ...(nativeSessionId === undefined ? {} : {
            nativeSessionId: nativeSessionId as string,
-           nativeCliCwd: nativeCliCwd as string }) };
+           nativeCliCwd: nativeCliCwd as string,
+           ...(nativeCliVersion ? { nativeCliVersion } : {}) }) };
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();

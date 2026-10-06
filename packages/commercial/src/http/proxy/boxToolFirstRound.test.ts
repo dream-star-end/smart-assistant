@@ -73,6 +73,8 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   stageFailureCode?: string; failCleanup?: boolean; ambiguousArm?: boolean;
   badAssetManifest?: boolean;
   nativeCandidate?: { ownerRequestId: string; pointer: BoxNativePointer };
+  /** The first native claim is lost to a concurrent turn (admission fence). */
+  claimLostOnce?: boolean;
   spoolPrefix?: Buffer;
   spoolBody?: Buffer;
   compactUsingLaunchSession?: boolean;
@@ -87,6 +89,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   let controlHash = "";
   let retained = false, cleanupRetained = false;
   let admittedNative: unknown = null;
+  const nativeLookups: string[] = [];
   let admittedStart: unknown = null;
   let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
@@ -182,8 +185,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
     } } };
   const journal = {
-    findNativeCandidate: async () => {
-      sequence.push("native-lookup"); return options.nativeCandidate ?? null;
+    findNativeCandidate: async (args: { sessionId: string }) => {
+      sequence.push("native-lookup"); nativeLookups.push(args.sessionId);
+      return options.nativeCandidate ?? null;
     },
     admit: async (identity: { runNonce: string; leaseEpoch: string;
       nativeClaim?: unknown; nativeStart?: unknown }) => {
@@ -191,6 +195,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       currentEpoch = identity.leaseEpoch;
       admittedNative = identity.nativeClaim ?? null;
       admittedStart = identity.nativeStart ?? null;
+      if (options.claimLostOnce && identity.nativeClaim) {
+        throw Object.assign(new Error("BOX_NATIVE_CLAIM_LOST"), { code: "BOX_NATIVE_CLAIM_LOST" });
+      }
       if (options.rejectAdmission) throw new Error("synthetic admission denied"); },
     recordPrelaunchControl: async () => { sequence.push("prelaunch-journal"); },
     armGuardedLaunch: async () => { sequence.push("launch-arm");
@@ -224,7 +231,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     onUnknown: async () => { sequence.push("notify-unknown"); },
     retainUnknownTarget: () => { retained = true; sequence.push("retain-unknown"); },
     retainCleanupTarget: () => { cleanupRetained = true; sequence.push("retain-cleanup"); } };
-  const input = { uid: 3n, sessionId: "session-synthetic", requestId: "box-synthetic",
+  const input = { uid: 3n, sessionId: "openclaude-peer-session", requestId: "box-synthetic",
     canonicalModel: canonicalBody.model, canonicalBody, upstreamModel: model,
     url: BOX_INTERNAL_ENDPOINT, init: { method: "POST", body: JSON.stringify(upstreamBody) },
     emit: (sse: string) => { sequence.push("emit"); emitted.push(sse); } };
@@ -232,7 +239,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     get disposed() { return disposed; }, get launches() { return launches; },
     get recordedOffset() { return recordedOffset; },
     get retained() { return retained; },
-    get admittedNative() { return admittedNative; },
+    get admittedNative() { return admittedNative; }, nativeLookups,
     get admittedStart() { return admittedStart; },
     get cleanupRetained() { return cleanupRetained; } };
 }
@@ -386,7 +393,7 @@ test("selfhost default runs native and both batches in one paid first round", as
     assert.equal(f.sequence.filter((step) => step === "input-batch").length, 1);
     assert.equal(f.sequence.filter((step) => step === "input-stage").length, 0);
     assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId,
-      cliCwd: result.plan.cliCwd });
+      cliCwd: result.plan.cliCwd, cliVersion: "2.1.280" });
     assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
@@ -456,6 +463,8 @@ test("warm native hit preflights one UUID and atomically claims before one paid 
     assert.equal((f.admittedNative as { ownerRequestId: string }).ownerRequestId,
       "native-owner");
     assert.equal(f.admittedStart, null);
+    assert.deepEqual(f.nativeLookups, ["session-synthetic"],
+      "the candidate is looked up by the CLI session of the request metadata (the journal key), not the OpenClaude peer id");
     assert.equal(f.sequence.filter((step) => step === "native-inspect").length, 2);
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("admit"));
     assert.equal(f.launches, 1);
@@ -878,8 +887,9 @@ test("other decoder failures never trigger the explicit stop", async () => {
   assert.ok(f.sequence.includes("unknown"));
 });
 
-// OCV5-313: account 25's Box runs Claude Code 2.1.288. Native resume is only
-// verified on 2.1.280, and 7865e13d recorded a pointer labelled 2.1.280 there.
+// OCV5-313: a Box whose CLI build has no verified native resume (an unlisted or
+// unread version) neither records nor claims a pointer. 2.1.288 is verified
+// (offline probe + cache-stable request prefix) since the long-context quota work.
 test("OCV5-313 a Box without verified native resume never looks up, claims or records a native pointer", async () => {
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
@@ -890,7 +900,7 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
       cliCwd: `/tmp/ocv5-289-run-${"9".repeat(24)}`, transcriptSha256: "f".repeat(64),
       contextHashBeforeFinal: "a".repeat(64), assistantContentHash: "b".repeat(64),
       catalogHash: "c".repeat(64), expiresAtMs: Date.now() + 60_000 })!;
-    for (const cliVersion of ["2.1.288", "2.1.999", null]) {
+    for (const cliVersion of ["2.1.999", null]) {
       const f = fixture({ directFinal: true, cliVersion,
         nativeCandidate: { ownerRequestId: "native-owner", pointer } });
       const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -908,6 +918,91 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
     assert.equal(result.kind === "final" && result.nativePointer?.cliVersion, "2.1.280");
     assert.ok(verified.sequence.includes("native-lookup"));
     assert.ok(verified.sequence.includes("native-attach"));
+    // 2.1.288 records a pointer labelled with its own build
+    const next = fixture({ directFinal: true, cliVersion: "2.1.288" });
+    const written = await runBoxToolFirstRound(next.input, next.deps);
+    assert.equal(written.kind === "final" && written.nativePointer?.cliVersion, "2.1.288");
+    // a pointer written by another build is a cache miss, not a resume
+    const stale = fixture({ directFinal: true, cliVersion: "2.1.288",
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const decisions: unknown[] = [];
+    const staleResult = await runBoxToolFirstRound(stale.input,
+      { ...stale.deps, onNativeDecision: (info) => { decisions.push(info); } });
+    assert.deepEqual(decisions, [{ requestId: stale.input.requestId, decision: "miss",
+      reason: "build", cliVersion: "2.1.288" }], "the miss says why, without content");
+    assert.equal(staleResult.kind, "final");
+    assert.equal(stale.admittedNative, null, "no native claim across CLI builds");
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+const upstreamRefusalRaw = Buffer.from([records[0], ...readFileSync(new URL(
+  "./__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl", import.meta.url), "utf8")
+  .trim().split("\n").map((line) => JSON.parse(line) as unknown)]
+  .map((record) => JSON.stringify(record) + "\n").join(""));
+
+test("INC-20261006 a CLI usage-limit refusal is stopped and settled unbilled, not left to hold the session", async () => {
+  const f = fixture({ spoolBody: upstreamRefusalRaw });
+  let stops = 0;
+  const deps = { ...f.deps, stopRejectedRun: async () => { stops++; return "stopped_proven" as const; } };
+  await assert.rejects(() => runBoxToolFirstRound(f.input, deps),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  assert.equal(stops, 1);
+  assert.ok(!f.sequence.includes("unknown"));
+  assert.ok(!f.sequence.includes("durable-handoff"), "nothing is handed to the client");
+  assert.deepEqual(f.unknownPhases, []);
+  assert.equal(f.retained, false);
+  // the CLI already finished on its own: settled from its keeper proof, not billed
+  const g = fixture({ spoolBody: upstreamRefusalRaw });
+  const settled: unknown[] = [];
+  const d = { ...g.deps, stopRejectedRun: async () => "completed_unsettled" as const,
+    readTerminalProof: (async (args: { runNonce: string; leaseEpoch: string }) => ({
+      reason: "worker_complete", runNonce: args.runNonce, leaseEpoch: args.leaseEpoch })) as never,
+    journal: { ...(g.deps.journal as object), markFirstRoundRejectedStream: async (input: unknown) => {
+      settled.push(input); } } as never };
+  await assert.rejects(() => runBoxToolFirstRound(g.input, d),
+    (error: unknown) => (error as { code?: string }).code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
+  assert.equal(settled.length, 1);
+  assert.deepEqual(g.unknownPhases, []);
+});
+
+test("a native claim lost to a concurrent turn degrades to a cold start, not an error", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const priorBody = { ...canonicalBody,
+      messages: [{ role: "user", content: "prior question" }] } as ProxyBody;
+    const basis = makeBoxNativeHistoryBasis(priorBody, [{ type: "text", text: "READY" }]);
+    const pointer = parseBoxNativePointer({ version: 1, accountId: "20",
+      upstreamModel: model, cliVersion: "2.1.280",
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc",
+      cliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
+      transcriptSha256: "f".repeat(64), ...basis,
+      catalogHash: compileBoxToolCatalog(canonicalBody.tools).bindingSha256,
+      expiresAtMs: Date.now() + 24 * 60 * 60 * 1000 });
+    assert.ok(pointer);
+    const f = fixture({ directFinal: true, claimLostOnce: true,
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const next = { ...canonicalBody, messages: [
+      { role: "user", content: "prior question" },
+      { role: "assistant", content: [{ type: "text", text: "READY" }] },
+      { role: "user", content: "new question" },
+    ] } as ProxyBody;
+    const decisions: Array<{ reason: string }> = [];
+    const input = { ...f.input, canonicalBody: next,
+      init: { ...f.input.init, body: JSON.stringify({ ...next, model }) } };
+    const result = await runBoxToolFirstRound(input,
+      { ...f.deps, onNativeDecision: (info) => { decisions.push(info); } });
+    assert.equal(result.kind, "final");
+    if (result.kind !== "final") return;
+    assert.equal(f.sequence.filter((step) => step === "admit").length, 2, "admitted again, cold");
+    assert.equal(f.admittedNative, null);
+    assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId, cliCwd: result.plan.cliCwd,
+      cliVersion: "2.1.280" }, "the cold admission names the plan that launches");
+    assert.notEqual(result.plan.sessionId, pointer.nativeSessionId, "a fresh CLI session, not the claimed transcript");
+    assert.deepEqual(decisions.map((item) => item.reason), ["ok", "claim_lost"]);
+    assert.equal(f.launches, 1);
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
     else process.env.OC_BOX_FAST_NATIVE = previous;
