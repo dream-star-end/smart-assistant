@@ -120,14 +120,21 @@ describe('vision gating 派生自 protocol supportsVision(反漂移)', () => {
   })
 })
 
-describe('vision backend cap/timeout(商业版与 selfhost 默认 MiniMax-M3)', () => {
-  it('默认(无 env)→ MiniMax cap 5MB / 60s', async () => {
+describe('vision backend cap/timeout(商业版与 selfhost 默认 Grok 4.7)', () => {
+  it('默认(无 env)→ grok backend,cap 5MB / 120s', async () => {
     await withEnv({ OPENCLAUDE_VISION_BACKEND: undefined }, () => {
       const p = join(uploads, 'a.png')
       writeFileSync(p, PNG)
       const r = vision.resolveVisionInput({ image_file: p })
+      assert.equal(vision.visionBackend(), 'grok')
+      assert.equal(vision.visionBackendLabel(), 'grok-build')
       assert.equal(r.maxImageBytes, 5 * 1024 * 1024)
-      assert.equal(r.timeoutMs, 60_000)
+      assert.equal(r.timeoutMs, 120_000)
+    })
+  })
+  it('未知的 OPENCLAUDE_VISION_BACKEND 值不改变默认(仍是 grok)', async () => {
+    await withEnv({ OPENCLAUDE_VISION_BACKEND: 'k3' }, () => {
+      assert.equal(vision.visionBackend(), 'grok')
     })
   })
   it('OPENCLAUDE_VISION_BACKEND=minimax 显式固定 → cap 5MB / 60s', async () => {
@@ -135,6 +142,7 @@ describe('vision backend cap/timeout(商业版与 selfhost 默认 MiniMax-M3)', 
       const p = join(uploads, 'a2.png')
       writeFileSync(p, PNG)
       const r = vision.resolveVisionInput({ image_file: p })
+      assert.equal(vision.visionBackendLabel(), 'k3-256k')
       assert.equal(r.maxImageBytes, 5 * 1024 * 1024)
       assert.equal(r.timeoutMs, 60_000)
     })
