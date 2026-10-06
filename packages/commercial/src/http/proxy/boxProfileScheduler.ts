@@ -17,6 +17,11 @@ export interface BoxProfileCandidate {
   weight: number;
   utilization: number | null;
   cooldownActive: boolean;
+  /** The bench is only a quota bench (the login works, it is out of quota until a known time). Such a login is
+   * still tried when nothing else is usable: the CLI then fails at once, free of charge, with the usage-limit
+   * refusal the user is shown, and it recovers by itself the moment the quota is back. A login that is logged
+   * out or refused by the guard is never tried. */
+  cooldownQuotaOnly?: boolean;
   /** Launches on this login in the recent window. */
   loginLoad: number;
   /** Launches on the whole Box (all its logins) in the recent window. */
@@ -38,7 +43,7 @@ export interface BoxProfilePolicy {
 export const BOX_PROFILE_POLICY: BoxProfilePolicy = {
   utilizationCeiling: 0.92, loginSpillLoad: 10, boxSpillLoad: 14, defaultBonus: 1.5 };
 
-export type BoxProfilePickReason = "affinity" | "spill_unhealthy" | "spill_load" | "last_resort";
+export type BoxProfilePickReason = "affinity" | "spill_unhealthy" | "spill_load" | "last_resort" | "quota_benched";
 export interface BoxProfilePick { candidate: BoxProfileCandidate; reason: BoxProfilePickReason }
 
 function unitHash(parts: string[]): number {
@@ -65,7 +70,13 @@ export function pickBoxProfile(args: { candidates: readonly BoxProfileCandidate[
   affinityKey: string; policy?: BoxProfilePolicy }): BoxProfilePick | null {
   const policy = args.policy ?? BOX_PROFILE_POLICY;
   const usable = args.candidates.filter((c) => !c.cooldownActive);
-  if (usable.length === 0) return null;
+  if (usable.length === 0) {
+    // Everything is benched. Quota-only benches are still tried (the refusal is immediate and unbilled, and the
+    // real state may have changed); anything else means there is truly nothing to launch on.
+    const tryable = args.candidates.filter((c) => c.cooldownQuotaOnly === true);
+    if (tryable.length === 0) return null;
+    return { candidate: rankBoxProfiles(tryable, args.affinityKey, policy)[0]!, reason: "quota_benched" };
+  }
   const ranked = rankBoxProfiles(usable, args.affinityKey, policy);
   const roomy = (c: BoxProfileCandidate): boolean => c.loginLoad < policy.loginSpillLoad
     && c.boxLoad < policy.boxSpillLoad;

@@ -159,7 +159,7 @@ test("when one Box has every login benched its users go to the other Box", async
 });
 
 test("nothing usable is a clean refusal; an admin probe still reaches the Box", async () => {
-  const f = fixture([20n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "quota_exhausted" })]);
+  const f = fixture([20n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "login_required" })]);
   await assert.rejects(f.launch(7n), (e: unknown) => e instanceof BoxAccountResolverError && e.code === "BOX_ACCOUNT_UNAVAILABLE");
   const out = await f.launch(7n, { adminProbe: true, requiredAccountId: 20n });
   assert.equal(out.accountId, 20n);
@@ -218,7 +218,7 @@ test("a profile-store failure fails closed unless the same account set was read 
 });
 
 test("cleanup-style resolves (pinned account, no wake) reach the Box even when every login is benched", async () => {
-  const f = fixture([20n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "quota_exhausted" })]);
+  const f = fixture([20n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "login_required" })]);
   await assert.rejects(f.launch(7n, { requiredAccountId: 20n, allowWakeIfHibernated: true }),
     (e: unknown) => e instanceof BoxAccountResolverError, "a launch-capable resolve still honours the bench");
   const out = await f.launch(7n, { requiredAccountId: 20n, allowWakeIfHibernated: false });
@@ -245,4 +245,13 @@ test("a login that was benched for quota takes traffic again once its window has
   f.health.observe("20:b", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: Date.now() + 86_400_000 });
   f.advance(86_400_000 + 1_000_000);   // past the window's reset
   for (const uid of uids) assert.equal((await f.launch(uid)).profile, before.get(uid), "affinity restored, stale 1.04 ignored");
+});
+
+test("when the only login is out of quota the request still reaches it, so the user gets the real usage-limit refusal", async () => {
+  const f = fixture([20n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "quota_exhausted" })]);
+  const out = await f.launch(7n);
+  assert.deepEqual([out.accountId, out.profile], [20n, "default"]);
+  const g = fixture([20n, 21n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "quota_exhausted" }),
+    stored(21n, "default")]);
+  for (const uid of uids.slice(0, 20)) assert.equal((await g.launch(uid)).accountId, 21n, "a usable Box always wins");
 });
