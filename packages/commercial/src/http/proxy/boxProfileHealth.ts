@@ -29,6 +29,7 @@ const UTILIZATION_MAX_AGE_MS = 5 * 3_600_000 + 60_000;
 export class BoxProfileHealth {
   private readonly states = new Map<string, BoxProfileHealthState>();
   private readonly launches = new Map<string, number[]>();
+  private readonly runOwners = new Map<string, string>();
   constructor(private readonly now: () => number = Date.now,
     private readonly persist: BoxProfileHealthSink = () => {}) {}
 
@@ -39,6 +40,15 @@ export class BoxProfileHealth {
     const held = this.states.get(key);
     if (!held || held.updatedAtMs < state.updatedAtMs) this.states.set(key, { ...state });
   }
+
+  /** Which login a run (by its 24-hex nonce) was launched under, so its output is attributed to it even
+   * when a later request for the same run is served through another login. Process-local, bounded. */
+  noteRun(nonce: string, key: string): void {
+    this.runOwners.delete(nonce);
+    this.runOwners.set(nonce, key);
+    if (this.runOwners.size > 4096) this.runOwners.delete(this.runOwners.keys().next().value!);
+  }
+  runKey(nonce: string): string | undefined { return this.runOwners.get(nonce); }
 
   recordLaunch(key: string): void {
     const at = this.now();
@@ -78,10 +88,14 @@ export class BoxProfileHealth {
     const next: BoxProfileHealthState = { utilization: held?.utilization ?? null,
       cooldownUntilMs: held?.cooldownUntilMs ?? null, lastReason: held?.lastReason ?? null,
       updatedAtMs: at, windowResetsAtMs: held?.windowResetsAtMs ?? null };
+    // Re-reading the same evidence (a replayed spool, a resumed run) must not push a bench further out.
+    const benched = (reason: string): boolean => held?.lastReason === reason && (held.cooldownUntilMs ?? 0) > at;
     if (signal.kind === "profile_unsafe") {
+      if (benched("profile_unsafe")) return;
       next.cooldownUntilMs = at + UNSAFE_COOLDOWN_MS;
       next.lastReason = "profile_unsafe";
     } else if (signal.kind === "login_required") {
+      if (benched("login_required")) return;
       next.cooldownUntilMs = at + LOGIN_COOLDOWN_MS;
       next.lastReason = "login_required";
     } else if (signal.status === "rejected") {

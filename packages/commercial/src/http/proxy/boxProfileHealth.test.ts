@@ -83,3 +83,21 @@ test("two observations in the same millisecond still get distinct, increasing ti
   health.observe("a", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: null });
   assert.ok(health.get("a")!.updatedAtMs > first);
 });
+
+test("re-reading the same login or unsafe evidence does not push the bench out", () => {
+  let now = 10_000;
+  const health = new BoxProfileHealth(() => now);
+  health.observe("a", { kind: "login_required" });
+  const until = health.get("a")!.cooldownUntilMs;
+  now += 60_000;
+  health.observe("a", { kind: "login_required" });
+  assert.equal(health.get("a")!.cooldownUntilMs, until);
+  health.observe("b", { kind: "profile_unsafe" });
+  const unsafeUntil = health.get("b")!.cooldownUntilMs;
+  now += 60_000;
+  health.observe("b", { kind: "profile_unsafe" });
+  assert.equal(health.get("b")!.cooldownUntilMs, unsafeUntil);
+  now = until! + 1;                                   // after it lapsed, a new sighting benches again
+  health.observe("a", { kind: "login_required" });
+  assert.ok(health.get("a")!.cooldownUntilMs! > until!);
+});

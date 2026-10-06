@@ -109,3 +109,49 @@ test("an ordinary spool read and junk that only looks like one are ignored", asy
   for (let i = 0; i < 3; i++) await exec.run({ command: "/p", args: [], cwd: "/tmp", environment: {} }, opts);
   assert.equal(health.get("k"), undefined);
 });
+
+const cwdOf = (nonce: string) => `/tmp/ocv5-289-run-${nonce}`;
+const NONCE_A = "a".repeat(24), NONCE_B = "b".repeat(24);
+const readReq = (nonce: string) => ({ command: "/p", args: ["--read", cwdOf(nonce), "0", "65536"], cwd: "/tmp", environment: {} });
+const spoolBytes = (bytes: Buffer, start: number) => JSON.stringify({ offset: start + bytes.length, data: bytes.toString("base64") });
+
+test("a read that ends inside a multi-byte character neither corrupts positions nor drops the line", async () => {
+  const line = Buffer.from(NOT_LOGGED_IN, "utf8");
+  const cut = line.indexOf(Buffer.from("\u00b7")) + 1;                     // between the two bytes of the middle dot
+  const replies = [spoolBytes(line.subarray(0, cut), 0), spoolBytes(line.subarray(cut), cut)];
+  const health = new BoxProfileHealth();
+  const exec = scopeBoxExecToProfile({ run: async () => ({ stdout: replies.shift()!, stderrBytes: 0, exitCode: 0 as const }) } as never,
+    { key: "k", profile: "b", health });
+  await exec.run(readReq(NONCE_A), opts);
+  await exec.run(readReq(NONCE_A), opts);
+  assert.equal(health.get("k")!.lastReason, "login_required");
+});
+
+test("a replayed or overlapping read adds nothing and never extends a bench", async () => {
+  let now = 1_000;
+  const health = new BoxProfileHealth(() => now);
+  const bytes = Buffer.from(NOT_LOGGED_IN, "utf8");
+  const replies = [spoolBytes(bytes, 0), spoolBytes(bytes, 0), spoolBytes(bytes.subarray(10), 10)];
+  const exec = scopeBoxExecToProfile({ run: async () => ({ stdout: replies.shift()!, stderrBytes: 0, exitCode: 0 as const }) } as never,
+    { key: "k", profile: "b", health });
+  await exec.run(readReq(NONCE_A), opts);
+  const until = health.get("k")!.cooldownUntilMs;
+  now += 600_000;
+  await exec.run(readReq(NONCE_A), opts);
+  await exec.run(readReq(NONCE_A), opts);
+  assert.equal(health.get("k")!.cooldownUntilMs, until, "same evidence, same bench");
+});
+
+test("a resumed run's output is attributed to the login it was launched under, not to the target that reads it", async () => {
+  const health = new BoxProfileHealth();
+  const runner = (replies: string[]) => ({ run: async () => ({ stdout: replies.shift() ?? "", stderrBytes: 0, exitCode: 0 as const }) } as never);
+  const a = scopeBoxExecToProfile(runner([""]), { key: "7:a", profile: "a", health });
+  await a.run({ command: "/p", args: [], cwd: cwdOf(NONCE_A), environment: { CLAUDE_CODE_MAX_RETRIES: "0" } }, opts);   // launched under a
+  const b = scopeBoxExecToProfile(runner([spoolBytes(Buffer.from(REJECTED), 0)]), { key: "7:b", profile: "b", health });
+  await b.run(readReq(NONCE_A), opts);                                                                                   // read through b
+  assert.equal(health.cooldownActive("7:a"), true);
+  assert.equal(health.cooldownActive("7:b"), false);
+  const c = scopeBoxExecToProfile(runner([spoolBytes(Buffer.from(REJECTED), 0)]), { key: "7:b", profile: "b", health });
+  await c.run(readReq(NONCE_B), opts);                                                                                   // unknown run: this target
+  assert.equal(health.cooldownActive("7:b"), true);
+});
