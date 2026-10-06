@@ -8,7 +8,7 @@ import { BoxProfileHealth } from "./boxProfileHealth.js";
 
 const now = Date.now();
 const session = (subject: string) => `x.${Buffer.from(JSON.stringify({ sub: subject, type: "session",
-  exp: Math.floor((now + 3_600_000) / 1000) })).toString("base64url")}.y`;
+  exp: Math.floor((now + 172_800_000) / 1000) })).toString("base64url")}.y`;
 const frame = (value: unknown, flag = 0): Buffer => {
   const raw = Buffer.from(JSON.stringify(value));
   const out = Buffer.alloc(5 + raw.length);
@@ -17,7 +17,7 @@ const frame = (value: unknown, flag = 0): Buffer => {
 };
 const row = (id: bigint): AccountRow => ({ id, provider: "cursor", status: "active", cursor_sand_enabled: true,
   cursor_credential_kind: "session", cursor_sand_access_state: "SAND_ACCESS_STATE_GRANTED",
-  oauth_expires_at: new Date(now + 3_600_000), cooldown_until: null, cursor_sand_usage_pct: 0,
+  oauth_expires_at: new Date(now + 172_800_000), cooldown_until: null, cursor_sand_usage_pct: 0,
   cursor_sand_next_reset_at: null, cursor_billing_cycle_end: null } as AccountRow);
 const stored = (accountId: bigint, profile: string, over: Partial<BoxProfileRow> = {}): BoxProfileRow => ({
   accountId, profile, enabled: true, isDefault: profile === "default", loginState: "logged_in",
@@ -41,14 +41,14 @@ function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0) {
     return jwt ? String(JSON.parse(Buffer.from(jwt, "base64url").toString()).sub).replace("box-", "") : "0";
   };
   const resolver = new BoxAccountResolver({
-    now: () => now, random: () => random,
+    now: () => clock.t, random: () => random,
     list: async () => accounts.map(row), account: async (id) => row(id),
     token: async (id) => ({ id, plan: "pro", token: Buffer.from(session(`box-${id}`)), refresh: Buffer.from("r"),
-      expires_at: new Date(now + 3_600_000), egress_proxy: null, egress_target: null, egress_proxy_id: null,
+      expires_at: new Date(now + 172_800_000), egress_proxy: null, egress_target: null, egress_proxy_id: null,
       egress_host_uuid: null }) as AccountToken,
     snapshot: async (id) => ({ id, token: Buffer.from(session(`box-${id}`)), credential_kind: "session",
       machine_id: "0123456789abcdef0123456789abcdef", refresh: Buffer.from("r"),
-      expires_at: new Date(now + 3_600_000) }) as CursorTokenSnapshot,
+      expires_at: new Date(now + 172_800_000) }) as CursorTokenSnapshot,
     egress: async () => ({ kind: "unbound" }), uidProxy: () => null,
     makeProxyAgent: () => ({ destroy: async () => {} }) as unknown as ProxyAgent & Dispatcher,
     profiles: { list: async (ids) => { if (storeFails) throw new Error("db down"); return current.filter((r) => ids.includes(r.accountId)); }, health, cacheMs: 0 },
@@ -86,7 +86,7 @@ function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0) {
     await target.dispose?.();
     return out;
   };
-  return { launch, health, guard, guarded, setStoreFails: (v: boolean) => { storeFails = v; }, tick: () => { clock.t += 91_000; }, setRows: (r: BoxProfileRow[]) => { current = r; }, setStdout: (s: string) => { stdout = s; }, resolver, args };
+  return { launch, advance: (ms: number) => { clock.t += ms; }, health, guard, guarded, setStoreFails: (v: boolean) => { storeFails = v; }, tick: () => { clock.t += 91_000; }, setRows: (r: BoxProfileRow[]) => { current = r; }, setStdout: (s: string) => { stdout = s; }, resolver, args };
 }
 
 const uids = Array.from({ length: 60 }, (_, i) => BigInt(500 + i));
@@ -198,7 +198,11 @@ test("a login the Box-side guard refuses is benched before anything is leased an
 test("a login that passes the guard runs, and the guard is not repeated for 30s", async () => {
   const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
   const onB = [];
-  for (const uid of uids) if ((await f.launch(uid)).profile === "b") onB.push(uid);
+  for (const uid of uids) {          // resolve only: no clock movement, so the 30s guard cache holds
+    const target = await f.resolver.resolve(f.args(uid));
+    if (target.profile === "b") onB.push(uid);
+    await target.dispose?.();
+  }
   assert.ok(onB.length > 3);
   assert.equal(f.guarded.filter((n) => n === "b").length, 1);
 });
@@ -208,9 +212,9 @@ test("a profile-store failure fails closed unless the same account set was read 
   f.setStoreFails(true);
   await assert.rejects(f.launch(7n), (e: unknown) => e instanceof BoxAccountResolverError && e.code === "BOX_PROFILE_STORE_UNAVAILABLE");
   const g = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
-  await g.launch(7n);          // populates the cache for this account set
+  await (await g.resolver.resolve(g.args(7n))).dispose?.();          // populates the cache for this account set
   g.setStoreFails(true);
-  assert.equal((await g.launch(7n)).accountId, 20n);
+  assert.equal((await g.resolver.resolve(g.args(7n))).accountId, 20n);
 });
 
 test("cleanup-style resolves (pinned account, no wake) reach the Box even when every login is benched", async () => {
@@ -219,4 +223,26 @@ test("cleanup-style resolves (pinned account, no wake) reach the Box even when e
     (e: unknown) => e instanceof BoxAccountResolverError, "a launch-capable resolve still honours the bench");
   const out = await f.launch(7n, { requiredAccountId: 20n, allowWakeIfHibernated: false });
   assert.equal(out.accountId, 20n);
+});
+
+test("the store-failure fallback expires 60s after the last successful read, however often it is retried", async () => {
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+  await f.resolver.resolve(f.args(7n)).then((t) => t.dispose?.());       // successful read at t0
+  f.setStoreFails(true);
+  for (const step of [20_000, 20_000]) {                                     // t0+20s, t0+40s: still inside the window
+    f.advance(step);
+    await f.resolver.resolve(f.args(7n)).then((t) => t.dispose?.());
+  }
+  f.advance(25_000);                                                         // t0+65s: failed attempts must not have extended it
+  await assert.rejects(f.resolver.resolve(f.args(7n)),
+    (e: unknown) => e instanceof BoxAccountResolverError && e.code === "BOX_PROFILE_STORE_UNAVAILABLE");
+});
+
+test("a login that was benched for quota takes traffic again once its window has reset", async () => {
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+  const before = new Map<bigint, string>();
+  for (const uid of uids) before.set(uid, (await f.launch(uid)).profile!);
+  f.health.observe("20:b", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: Date.now() + 86_400_000 });
+  f.advance(86_400_000 + 1_000_000);   // past the window's reset
+  for (const uid of uids) assert.equal((await f.launch(uid)).profile, before.get(uid), "affinity restored, stale 1.04 ignored");
 });
