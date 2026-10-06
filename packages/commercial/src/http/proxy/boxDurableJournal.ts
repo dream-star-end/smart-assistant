@@ -745,7 +745,11 @@ export class BoxDurableJournal implements BoxJournalPort {
 
   /** Find the original round before precharge or account selection. This only
    * reads committed evidence; the caller must separately observe the pinned
-   * spool/proof or load a completed Message before returning any answer. */
+   * spool/proof or load a completed Message before returning any answer.
+   * An attempt that settled as an aborted, unbilled stopped run (no completed
+   * Message) has nothing to replay and is not an original: the same call sent
+   * again is a new launch, and several such attempts must not read as an
+   * ambiguous call. */
   async findReplayIdentity(input: { uid: bigint; canonicalModel: string;
     canonicalBody: ProxyBody; trustedAuthority?: AuthorityProjection;
     prepared?: PreparedContinuation }): Promise<BoxReplayIdentity | null> {
@@ -785,7 +789,10 @@ export class BoxDurableJournal implements BoxJournalPort {
         `SELECT request_id,ctx FROM request_finalize_journal
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2
             AND ctx->>'boxTurnKey'=$3 AND ctx->>'model'=$4
-            AND ctx->>$5=$6 LIMIT 2`,
+            AND ctx->>$5=$6
+            AND NOT (state='aborted' AND NOT (ctx ? 'boxReplayMessage')
+              AND COALESCE(ctx->>'boxState','') IN ('failed_stopped','prestart_stopped'))
+          LIMIT 2`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey,
           input.canonicalModel, column, key]);
       if (found.rows.length > 1) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
@@ -1060,11 +1067,16 @@ export class BoxDurableJournal implements BoxJournalPort {
       ]);
       // Fingerprint and fallback alias are both derived from the uid, so the
       // user filter keeps the check exact and lets it use idx_rfj_user_time.
+      // A settled, unbilled stopped attempt without a completed Message is
+      // dead: the same call sent again is a new launch, not a duplicate.
       const duplicate = await client.query(
         `SELECT 1 FROM request_finalize_journal
           WHERE user_id = $3 AND ctx->>'boxInvocationRecovery' = 'v1'
             AND (ctx->>'boxReplayFingerprint' = $1
-             OR ctx->>'boxFallbackAlias' = $2) LIMIT 1`,
+             OR ctx->>'boxFallbackAlias' = $2)
+            AND NOT (state = 'aborted' AND NOT (ctx ? 'boxReplayMessage')
+              AND COALESCE(ctx->>'boxState', '') IN ('failed_stopped', 'prestart_stopped'))
+          LIMIT 1`,
         [input.fingerprint.replayFingerprint, fallbackAlias ?? null, input.uid.toString()]);
       if (duplicate.rowCount) throw new BoxDurableJournalError("BOX_CALL_AMBIGUOUS");
       const policy = this.capacity(input.uid, input.accountId);
