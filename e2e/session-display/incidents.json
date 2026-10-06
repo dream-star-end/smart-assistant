@@ -5960,6 +5960,31 @@
           "assertion": "中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成"
         }
       ]
+    },
+    {
+      "id": "INC-20261006-DOUBLE-FAILURE-CARD",
+      "occurredAt": "2026-10-06",
+      "severity": "P2",
+      "symptom": "商业（2026-10-06）：uid 4 的 Box Claude Opus 5.5 会话在一轮没能开始处理时，同一个失败同时显示两张卡片：『消息未开始处理，已确认未计费』（带重新尝试）和『任务执行失败，内部错误，你的消息已保留』（带重新尝试），两个重试按钮，红卡还让人以为消息丢失或已计费。根因：前端既渲染服务端核实的 dispatch 状态记录（_turnStatusRecord），又渲染同一轮的 assistant 错误行（_errorCode），两者互不抑制。修复：同一轮已有状态记录时，不带部分回答正文的 assistant 错误行不再渲染，只留说明未计费、可重试的状态卡；带部分回答正文、属于别的轮、或没有状态记录的错误行不受影响。",
+      "rootFixCommit": "6117c45e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/double-failure-card.node-test.mjs",
+          "assertion": "exactly one retry button"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "同轮已有核实的未计费状态卡 → 同一次失败的 assistant 红卡被收起,只剩一张卡"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "红卡带部分回答正文 / 属于别的轮 / 无状态卡 → 不收起"
+        }
+      ]
     }
   ]
 }
