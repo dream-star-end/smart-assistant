@@ -6277,6 +6277,41 @@
           "assertion": "box scripts: a write goes only into a fifo that has a reader"
         }
       ]
+    },
+    {
+      "id": "INC-20261006-BOX-SYNTHETIC-TURN-HELD",
+      "occurredAt": "2026-10-06",
+      "severity": "P1",
+      "symptom": "商业 rel-7560b1136（2026-10-06 06:41Z 与 06:51Z，台北 14:41 / 14:51）：uid 4 的会话 webmuw9epbc9 用 Claude Opus 5.5 最高档，发送『请重写报告』后一直显示『消息未开始处理，已确认未计费』『任务执行失败，内部错误』『模型繁忙，正在重试中(1/10)』，之后每条消息都一样。根因：会话上下文过长，Claude Code 在回合内做上下文压缩，压缩请求的输出上限是 20000 个 token、思考关闭，但仍把用户的『最高』档位带给 Box；Box 里的 claude 把这 20000 个 token 全部花在自适应思考上，自己写入合成用户轮『Output token limit hit. Resume directly』，流被产品按 BOX_CLI_COMPACT_PHASE 拒绝。这个拒绝不在首轮『本地拒绝流』集合内，首轮记为 unknown；claude 随后自己跑完（worker_complete），清理 worker 的成功恢复再次遇到同一条记录，只返回 pending 而不标 undeliverable，首轮又从不在这条路径上收尾，于是该行永远 inflight，占着会话和账号槽，之后每条消息都被 BOX_CAPACITY_HELD 拒绝（未计费，客户端自动重试 10 次）。全程没有 usage_records 与 credit_ledger 记录（06:16Z 之后无扣费）。本机复现：--effort max 配 6000 token 上限写出三条合成轮并失败；low 或不带该参数一条消息答完。修复：输出上限不超过 20000 token 的请求，Box CLI 一律以 low 档位运行（文本与工具两条计划）；压缩类解码错误归入首轮『本地拒绝流』，立即停止并按未计费 rejected_stream 收尾；恢复观察器把它标为 undeliverable，清理 worker 把首轮这类行按未计费 rejected_stream 关闭（关联叶子原本就这样关）；首轮的中间 handoff 仍保持成功恢复的约定。已卡住的行在发布后由清理 worker 自动关闭。",
+      "rootFixCommit": "fe14f38e",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261006-synthetic-turn-held] PASS — a stream with the CLI's own synthetic turn settles unbilled and the next message runs"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "INC-20261006 a synthetic CLI turn inside a message is stopped and settled, not left unknown"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "INC-20261006 a finished first round with a synthetic CLI turn closes as an unbilled rejected stream"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolCatalog.test.ts",
+          "assertion": "INC-20261006 a small output cap never runs above low effort"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolPlan.test.ts",
+          "assertion": "INC-20261006 a compaction-sized output cap runs the CLI at low effort, the main loop at the user's effort"
+        }
+      ]
     }
   ]
 }
