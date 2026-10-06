@@ -502,6 +502,11 @@ test("INC-20261006 a finished first round with a synthetic CLI turn closes as an
   const linked = provedSuccessWorker({ linked: true, outcome: synthetic });
   assert.deepEqual(await linked.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
   assert.deepEqual(linked.sequence, ["recover", "rejected-stream-CAS"]);
+  // any decoder rejection of a finished spool is final, not only the compact ones
+  const snapshot = provedSuccessWorker({ linked: false,
+    outcome: { status: "undeliverable", reason: "BOX_TOOL_SNAPSHOT_INVALID" } });
+  assert.deepEqual(await snapshot.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(snapshot.sequence, ["recover", "first-round-rejected-stream-CAS"]);
   // an intermediate handoff of a first round keeps the success-recovery contract
   const handoff = provedSuccessWorker({ linked: false,
     outcome: { status: "undeliverable", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF" } });
