@@ -1,5 +1,6 @@
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliSyntheticUser } from "./boxCliCompaction.js";
+import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
 
 /** Convert a completed, supervised Claude CLI stream-json call back to
  * Anthropic Messages SSE. Visible block indexes are renumbered only after
@@ -83,6 +84,8 @@ export function createBoxCliSseDecoder(expectedModel: string,
     try { record = object(JSON.parse(line)); }
     catch { throw new BoxCliSseError("BOX_CLI_STREAM_INVALID"); }
     if (resultSeen) throw new BoxCliSseError("BOX_CLI_RECORD_AFTER_RESULT");
+    const refusal = boxCliUpstreamRefusal(record);
+    if (refusal) throw new BoxCliSseError(refusal);
     if (compaction) {
       try {
         if (compaction.take(record, started ? "in-model" : "pre-model")) return "";
