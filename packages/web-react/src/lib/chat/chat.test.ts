@@ -353,8 +353,20 @@ describe("模型权威拒帧的用户向文案(MODEL_CONFIG_CHANGED_RETRY_TURN �
     );
     const msg = friendlyBridgeErrorMessage("MODEL_CONFIG_CHANGED_RETRY_TURN");
     expect(msg).toMatch(/模型配置/);
-    expect(msg).toMatch(/重试|重发/); // 指向用户气泡下方既有的「重试」入口(原样重发)
+    expect(msg).toMatch(/重发/);
     expect(msg).not.toMatch(/系统暂时不可用/);
+  });
+
+  // 2026-10-06 个人版:一轮 Box 回合跑了 22 次调用(275 积分)后,第 23 次被 egress 的 epoch fence 拒掉,
+  // 卡片却写「本轮已停止(不计费)」。拒帧可以发生在回合中途,整轮不计费这句话不成立;
+  // 且该码 retryable:false,卡片只会出「重新尝试」兜底按钮,不会出精确「重试」。
+  test("MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致", () => {
+    const msg = friendlyBridgeErrorMessage("MODEL_CONFIG_CHANGED_RETRY_TURN");
+    expect(msg).not.toMatch(/本轮已停止（不计费）|本轮不计费|本轮未扣费|本轮不收费/);
+    expect(msg).toMatch(/已完成的调用照常计费/);
+    expect(msg).toMatch(/被拒的这一次不计费/);
+    expect(msg).toMatch(/「重新尝试」/);
+    expect(msg).not.toMatch(/「重试」/);
   });
 
   test("MODEL_NOT_AVAILABLE / UNRESOLVED_AGENT_MODEL → 引导换模型,而非「稍后重试」", () => {
