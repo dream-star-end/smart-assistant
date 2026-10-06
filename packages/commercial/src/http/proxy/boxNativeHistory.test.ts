@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { ProxyBody } from "./shared.js";
-import { makeBoxNativeHistoryBasis, matchesBoxNativeHistory } from "./boxNativeHistory.js";
+import { explainBoxNativeHistory, makeBoxNativeHistoryBasis, matchesBoxNativeHistory } from "./boxNativeHistory.js";
 import { deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerprint.js";
 
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
@@ -66,4 +66,18 @@ test("omitted thinking and pending tool results are cache misses, not permissive
   assert.equal(matchesBoxNativeHistory(body([user("x"), assistant("answer"),
     { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_x",
       content: "pending" }] }]), plain), false);
+});
+
+test("a native history miss names its reason without content", () => {
+  const basis = makeBoxNativeHistoryBasis(body([user("prior question")]), [{ type: "text", text: "READY" }]);
+  const turn = (messages: unknown[], extra: object = {}) => explainBoxNativeHistory(
+    { ...body(messages), ...extra } as ProxyBody, basis);
+  assert.equal(turn([user("prior question"), assistant("READY"), user("new")]), "ok");
+  assert.equal(turn([user("prior question"), user("new")]), "shape");
+  assert.equal(turn([user("prior question"), user("again"), user("new")]), "roles");
+  assert.equal(turn([user("edited"), assistant("READY"), user("new")]), "context");
+  assert.equal(turn([user("prior question"), assistant("READY"), user("new")], { system: "other" }), "context");
+  assert.equal(turn([user("prior question"), assistant("forged"), user("new")]), "assistant");
+  assert.equal(turn([user("prior question"), assistant("READY"), { role: "user", content: [
+    { type: "tool_result", tool_use_id: "t", content: "x" }] }]), "tool_result");
 });

@@ -24,7 +24,7 @@ import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { randomBytes } from "node:crypto";
-import { matchesBoxNativeHistory } from "./boxNativeHistory.js";
+import { explainBoxNativeHistory } from "./boxNativeHistory.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -106,6 +106,9 @@ export async function runBoxToolFirstRound(input: {
   retainCleanupTarget: (handle: { target: BoxResolvedTarget;
     pending: Promise<void>; uid: bigint; requestId: string; phase: string }) => void;
   budgetMs?: number;
+  /** Content-free record of the native resume decision (hit, or why not). */
+  onNativeDecision?: (info: { requestId: string; decision: "resume" | "miss";
+    reason: string; cliVersion: string }) => void;
   /** OCV5-299: stop a launched run whose stream this decoder deterministically
    * rejected (e.g. a tool name outside this invocation's catalog). Returns the
    * explicit-stop outcome; only "stopped_proven" means the row is now a proven
@@ -310,12 +313,16 @@ export async function runBoxToolFirstRound(input: {
       // the staged MCP catalog stay identical across the rolling deploy.
       const pointerCatalog = candidate
         ? boxCatalogMatching(plan.catalog, candidate.pointer.catalogHash) : null;
-      if (candidate && pointerCatalog
-        && candidate.pointer.accountId === target.accountId.toString()
-        && candidate.pointer.upstreamModel === input.upstreamModel
+      const miss = !candidate ? "no_candidate"
+        : candidate.pointer.accountId !== target.accountId.toString() ? "account"
+        : candidate.pointer.upstreamModel !== input.upstreamModel ? "model"
         // a transcript written by another CLI build is not resumed (cache miss)
-        && candidate.pointer.cliVersion === target.cliVersion
-        && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
+        : candidate.pointer.cliVersion !== target.cliVersion ? "build"
+        : !pointerCatalog ? "catalog"
+        : explainBoxNativeHistory(input.canonicalBody, candidate.pointer);
+      deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
+        reason: miss, cliVersion: String(target.cliVersion) });
+      if (candidate && pointerCatalog && miss === "ok") {
         const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
           keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
@@ -340,6 +347,8 @@ export async function runBoxToolFirstRound(input: {
           if (signal.aborted || error instanceof BoxToolFirstRoundError
             && error.code === "BOX_TOOL_ABORTED") throw error;
           // Preflight is read-only/no paid CLI. A miss falls back exactly once.
+          deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+            reason: "preflight", cliVersion: String(target.cliVersion) });
         }
       }
     }
