@@ -115,3 +115,18 @@ test("OCV5-299: the staged system prompt maps every plain tool name to its alias
   assert.ok(staged.includes('"name":"mcp__ocbridge__t0"'), "history call is staged under its alias");
   assert.ok(!staged.includes('"name":"local_echo"'), "no plain historical call name is staged");
 });
+
+test("OCV5-329: the notice sends unlisted mcp__ tools through ExecuteExtraTool, and only when it is exposed", () => {
+  const schema = { type: "object", properties: {} };
+  const withExec = makeBoxToolPlan({ ...assets, body: { ...body, tools: [
+    { name: "Bash", description: "shell", input_schema: schema },
+    { name: "ExecuteExtraTool", description: "run a deferred tool", input_schema: schema }] } });
+  const notice = boxToolAliasNotice(withExec.catalog);
+  assert.match(notice, /- ExecuteExtraTool → mcp__ocbridge__t1/);
+  assert.match(notice, /mcp__openclaude-memory__delegate_task/);
+  assert.match(notice, /Only the tools listed above exist in this run/);
+  assert.match(notice, /"tool_name": "<full tool name>"/);
+  const without = boxToolAliasNotice(makeBoxToolPlan({ ...assets, body }).catalog);
+  assert.ok(!without.includes("ExecuteExtraTool"), "no pointer to a tool the run does not have");
+  assert.ok(!without.includes("delegate_task"));
+});
