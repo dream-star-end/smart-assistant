@@ -66,6 +66,8 @@ const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID",
   // with its own synthetic message: nothing was generated, nothing is billed.
   BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED,
   // OCV5-377: the model's safety stop is final for this call as well.
+  "BOX_CLI_COMPACT_PHASE", "BOX_CLI_COMPACT_UNBOUND", "BOX_CLI_COMPACT_DUPLICATE",
+  "BOX_CLI_COMPACT_INTERRUPTED", "BOX_CLI_COMPACT_SUMMARY_INVALID", "BOX_CLI_COMPACT_BOUNDARY_INVALID",
   BOX_CLI_MODEL_REFUSED]);
 
 export async function runBoxToolFirstRound(input: {
