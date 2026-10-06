@@ -30,7 +30,14 @@ export function boxToolAliasNotice(catalog: Pick<BoxToolCatalog, "boxNameByClien
     "In this session every tool is provided by the MCP server \"ocbridge\" under an alias.",
     "Wherever the instructions, tool descriptions or earlier messages name a tool by its plain name,",
     "call its alias instead. Plain names are not callable here and fail with \"No such tool available\".",
-    ...lines, "</tool-naming>"].join("\n");
+    ...lines,
+    ...(catalog.boxNameByClientName.has("ExecuteExtraTool") ? [
+      "Only the tools listed above exist in this run. Platform and MCP tools that are not listed",
+      "(mcp__<server>__<tool>, e.g. mcp__openclaude-memory__delegate_task) are deferred tools: calling them",
+      "by their own name fails with \"No such tool available\". Reach them through the listed ExecuteExtraTool",
+      "alias with {\"tool_name\": \"<full tool name>\", \"params\": {...}}, and use SearchExtraTools first when unsure of the name.",
+    ] : []),
+    "</tool-naming>"].join("\n");
 }
 
 /** OCV5-302: effectively disables Claude Code's MCP output truncation. */
