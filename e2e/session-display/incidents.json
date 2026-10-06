@@ -6029,6 +6029,31 @@
         "reason": "回归在 unit 层，其中一条用 Box 上抓到的真实“额度耗尽”记录（__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl）走完首轮解码和未计费收尾。商业版在真实 Postgres 上有部署门禁证明（scripts/check-v5-box-incident-proofs.ts，红绿对照），个人版没有 Box 事故的 deploy-gate 脚本，canary 也用不了 box-claude-*，所以个人版暂无 browser/live-e2e/deploy-gate 层产物。",
         "since": "2026-10-07"
       }
+    },
+    {
+      "id": "INC-20261006-MODEL-CONFIG-CARD-BILLING-COPY",
+      "occurredAt": "2026-10-06",
+      "severity": "P2",
+      "symptom": "个人版（2026-10-06 05:22–05:28Z，uid 3，box-api-claude-opus-5-5）：一轮 Box 回合跑了 22 次上游调用、计 275 积分（usage_records / request_finalize_journal / credit_ledger 三处一致），随后助手在同一轮里跑运维脚本禁用 6 个目录模型，model_catalog 触发器把 security epoch 166→167，egress 每请求 fence 把第 23 次调用拒为 409 MODEL_CONFIG_CHANGED_RETRY_TURN（设计内的 fail-closed）。卡片却写「本轮已停止（不计费）」，与 275 积分的账单矛盾；还让用户「点它下方的「重试」」，而该码 retryable:false，卡片只会出「重新尝试」兜底按钮。修复：文案改为「停止前已完成的调用照常计费，被拒的这一次不计费」并按实际按钮名指引；fence 不动。",
+      "rootFixCommit": "b7e91d34",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
+          "assertion": "the card must not claim the whole turn was unbilled"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
+          "assertion": "the card does not name a button that is not there"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致"
+        }
+      ]
     }
   ]
 }
