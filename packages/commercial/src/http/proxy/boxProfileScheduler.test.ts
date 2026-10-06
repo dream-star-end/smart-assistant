@@ -78,7 +78,14 @@ test("everything hot or full still returns the least-loaded healthy login; all b
   const exhausted = three({ "1:default": { utilization: 0.99 }, "1:b": { utilization: 0.97 }, "2:default": { utilization: 0.995 } });
   assert.equal(label(pickBoxProfile({ candidates: exhausted, affinityKey: "7" })!.candidate), "1:b");
   const none = three({ "1:default": { cooldownActive: true }, "1:b": { cooldownActive: true }, "2:default": { cooldownActive: true } });
-  assert.equal(pickBoxProfile({ candidates: none, affinityKey: "7" }), null);
+  assert.equal(pickBoxProfile({ candidates: none, affinityKey: "7" }), null, "logged-out / unsafe logins are never tried");
+  const quota = three({ "1:default": { cooldownActive: true, cooldownQuotaOnly: true }, "1:b": { cooldownActive: true, cooldownQuotaOnly: true },
+    "2:default": { cooldownActive: true } });
+  const tried = pickBoxProfile({ candidates: quota, affinityKey: "7" })!;
+  assert.equal(tried.reason, "quota_benched");
+  assert.notEqual(label(tried.candidate), "2:default", "only the quota-benched logins are tried");
+  const mixed = three({ "1:default": { cooldownActive: true, cooldownQuotaOnly: true } });
+  assert.notEqual(pickBoxProfile({ candidates: mixed, affinityKey: "7" })!.reason, "quota_benched", "a usable login always wins over a benched one");
 });
 
 test("ranking is deterministic and ignores load and utilization (weights stay static)", () => {
