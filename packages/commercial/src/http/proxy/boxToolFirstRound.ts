@@ -294,15 +294,19 @@ export async function runBoxToolFirstRound(input: {
     }
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
     const launchCliVersion = target.cliVersion;
+    const coldPlan = plan;
     // A resumed tool exchange must be staged from history: a native
     // transcript stops at the unanswered tool_use (OCV5-304).
     // OCV5-313: only where this Box's CLI build has verified native resume.
     if (nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)
-      && input.sessionId && deps.journal.findNativeCandidate
+      && fingerprint.sessionId && deps.journal.findNativeCandidate
       && !input.resumeToolResults) {
       let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
       try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
-        sessionId: input.sessionId, currentRequestId: input.requestId,
+        // The journal keys a row by the CLI session of the request metadata
+        // (the call fingerprint), not by the OpenClaude session id this input
+        // carries; looking up the latter never matched, so native resume never ran.
+        sessionId: fingerprint.sessionId, currentRequestId: input.requestId,
         canonicalModel: input.canonicalModel })); }
       catch (error) {
         if (signal.aborted) throw error;
@@ -354,20 +358,33 @@ export async function runBoxToolFirstRound(input: {
     }
     // OCV5-301: the same session's previous turn may still be settling.
     const admitAccountId = target.accountId;
-    const pendingAdmission = waitingForBoxCapacity(() => deps.journal.admit({
+    const admitInput = () => ({
       requestId: input.requestId, uid: input.uid,
       accountId: admitAccountId, model: input.canonicalModel, fingerprint,
       canonicalBody: input.canonicalBody,
       replayRequired: deps.writeMessage !== undefined,
       runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
-      invocationMode: "detached_tool", contextHash,
+      invocationMode: "detached_tool" as const, contextHash,
       detachedRunnerHash: plan.detachedRunnerHash,
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
           cliCwd: plan.cliCwd,
           ...(boxCliNativeResumeVerified(launchCliVersion)
-            ? { cliVersion: launchCliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
+            ? { cliVersion: launchCliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) });
+    const pendingAdmission = waitingForBoxCapacity(async () => {
+      try { return await deps.journal.admit(admitInput()); }
+      catch (error) {
+        // Another turn claimed the predecessor transcript (or it moved) while
+        // this one waited: not an error for the user, a cold start is always valid.
+        if (!nativeClaim || signal.aborted
+          || (error as { code?: unknown } | null)?.code !== "BOX_NATIVE_CLAIM_LOST") throw error;
+        plan = coldPlan; nativeClaim = undefined;
+        deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+          reason: "claim_lost", cliVersion: String(launchCliVersion) });
+        return await deps.journal.admit(admitInput());
+      }
+    }, signal, { maxWaitMs: deps.capacityWaitMs });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
