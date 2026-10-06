@@ -298,11 +298,14 @@ export async function runBoxToolFirstRound(input: {
     // transcript stops at the unanswered tool_use (OCV5-304).
     // OCV5-313: only where this Box's CLI build has verified native resume.
     if (nativeEnabled && boxCliNativeResumeVerified(target.cliVersion)
-      && input.sessionId && deps.journal.findNativeCandidate
+      && fingerprint.sessionId && deps.journal.findNativeCandidate
       && !input.resumeToolResults) {
       let candidate: Awaited<ReturnType<BoxDurableJournal["findNativeCandidate"]>> = null;
       try { candidate = await race(deps.journal.findNativeCandidate({ uid: input.uid,
-        sessionId: input.sessionId, currentRequestId: input.requestId,
+        // The journal keys a row by the CLI session of the request metadata
+        // (the call fingerprint), not by the OpenClaude session id this input
+        // carries; looking up the latter never matched, so native resume never ran.
+        sessionId: fingerprint.sessionId, currentRequestId: input.requestId,
         canonicalModel: input.canonicalModel })); }
       catch (error) {
         if (signal.aborted) throw error;

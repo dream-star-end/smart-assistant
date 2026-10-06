@@ -87,6 +87,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   let controlHash = "";
   let retained = false, cleanupRetained = false;
   let admittedNative: unknown = null;
+  const nativeLookups: string[] = [];
   let admittedStart: unknown = null;
   let assetIndex = -1, inputIndex = -1;
   const target = { accountId: 20n, dispose: async () => { disposed = true; },
@@ -182,8 +183,9 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
     } } };
   const journal = {
-    findNativeCandidate: async () => {
-      sequence.push("native-lookup"); return options.nativeCandidate ?? null;
+    findNativeCandidate: async (args: { sessionId: string }) => {
+      sequence.push("native-lookup"); nativeLookups.push(args.sessionId);
+      return options.nativeCandidate ?? null;
     },
     admit: async (identity: { runNonce: string; leaseEpoch: string;
       nativeClaim?: unknown; nativeStart?: unknown }) => {
@@ -224,7 +226,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     onUnknown: async () => { sequence.push("notify-unknown"); },
     retainUnknownTarget: () => { retained = true; sequence.push("retain-unknown"); },
     retainCleanupTarget: () => { cleanupRetained = true; sequence.push("retain-cleanup"); } };
-  const input = { uid: 3n, sessionId: "session-synthetic", requestId: "box-synthetic",
+  const input = { uid: 3n, sessionId: "openclaude-peer-session", requestId: "box-synthetic",
     canonicalModel: canonicalBody.model, canonicalBody, upstreamModel: model,
     url: BOX_INTERNAL_ENDPOINT, init: { method: "POST", body: JSON.stringify(upstreamBody) },
     emit: (sse: string) => { sequence.push("emit"); emitted.push(sse); } };
@@ -232,7 +234,7 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
     get disposed() { return disposed; }, get launches() { return launches; },
     get recordedOffset() { return recordedOffset; },
     get retained() { return retained; },
-    get admittedNative() { return admittedNative; },
+    get admittedNative() { return admittedNative; }, nativeLookups,
     get admittedStart() { return admittedStart; },
     get cleanupRetained() { return cleanupRetained; } };
 }
@@ -456,6 +458,8 @@ test("warm native hit preflights one UUID and atomically claims before one paid 
     assert.equal((f.admittedNative as { ownerRequestId: string }).ownerRequestId,
       "native-owner");
     assert.equal(f.admittedStart, null);
+    assert.deepEqual(f.nativeLookups, ["session-synthetic"],
+      "the candidate is looked up by the CLI session of the request metadata (the journal key), not the OpenClaude peer id");
     assert.equal(f.sequence.filter((step) => step === "native-inspect").length, 2);
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("admit"));
     assert.equal(f.launches, 1);
