@@ -75,3 +75,11 @@ test("a later unrelated bench keeps the reading's window boundary", () => {
   now += 600_001;
   assert.equal(health.utilization("a"), null, "the 1.04 belonged to a window that has reset");
 });
+
+test("two observations in the same millisecond still get distinct, increasing timestamps", () => {
+  const health = new BoxProfileHealth(() => 5_000);
+  health.observe("a", { kind: "rate_limit", status: "allowed", utilization: 0.1, resetsAtMs: null });
+  const first = health.get("a")!.updatedAtMs;
+  health.observe("a", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: null });
+  assert.ok(health.get("a")!.updatedAtMs > first);
+});

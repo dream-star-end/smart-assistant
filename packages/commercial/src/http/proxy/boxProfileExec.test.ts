@@ -69,3 +69,43 @@ test("an endless line without a newline cannot grow the buffer without bound", a
   await exec.run(launch, opts);
   assert.equal(health.cooldownActive("k"), false);
 });
+
+const spool = (text: string, offset: number) => {
+  const bytes = Buffer.from(text, "utf8");
+  return JSON.stringify({ offset: offset + bytes.length, data: bytes.toString("base64") });   // the runner prints offset first
+};
+
+test("detached runs: the CLI lines inside spool read envelopes are read, also across two reads", async () => {
+  const replies = [spool(REJECTED.slice(0, 90), 0), spool(REJECTED.slice(90), Buffer.byteLength(REJECTED.slice(0, 90)))];
+  const health = new BoxProfileHealth();
+  const exec = scopeBoxExecToProfile({ run: async () => ({ stdout: replies.shift()!, stderrBytes: 0, exitCode: 0 as const }) } as never,
+    { key: "k", profile: "b", health });
+  const read = { command: "/p", args: [], cwd: "/tmp", environment: { PATH: "/usr/bin" } };
+  await exec.run(read, opts);
+  assert.equal(health.cooldownActive("k"), false, "half a line is not yet a signal");
+  await exec.run(read, opts);
+  assert.equal(health.cooldownActive("k"), true);
+});
+
+test("detached runs: a logged-out stream in the spool benches the login; non-contiguous reads never glue lines", async () => {
+  const health = new BoxProfileHealth();
+  const exec = scopeBoxExecToProfile({ run: async (r: { args: string[] }) => ({ stdout: r.args[0] === "1" ? spool(NOT_LOGGED_IN, 0)
+    : spool(REJECTED.slice(40), 5000), stderrBytes: 0, exitCode: 0 as const }) } as never, { key: "k", profile: "b", health });
+  await exec.run({ command: "/p", args: ["1"], cwd: "/tmp", environment: {} }, opts);
+  assert.equal(health.get("k")!.lastReason, "login_required");
+  const other = new BoxProfileHealth();
+  const exec2 = scopeBoxExecToProfile({ run: async (r: { args: string[] }) => ({ stdout: r.args[0] === "1" ? spool(REJECTED.slice(0, 40), 0)
+    : spool(REJECTED.slice(40), 9000), stderrBytes: 0, exitCode: 0 as const }) } as never, { key: "k", profile: "b", health: other });
+  await exec2.run({ command: "/p", args: ["1"], cwd: "/tmp", environment: {} }, opts);
+  await exec2.run({ command: "/p", args: ["2"], cwd: "/tmp", environment: {} }, opts);
+  assert.equal(other.cooldownActive("k"), false);
+});
+
+test("an ordinary spool read and junk that only looks like one are ignored", async () => {
+  const health = new BoxProfileHealth();
+  const outs = [spool('{"type":"assistant","message":{"model":"claude-opus-5-5","content":[]}}\n', 0), '{"offset":2,"data":"!!"}', '{"offset":0,"data":"","x":1}'];
+  const exec = scopeBoxExecToProfile({ run: async () => ({ stdout: outs.shift()!, stderrBytes: 0, exitCode: 0 as const }) } as never,
+    { key: "k", profile: "b", health });
+  for (let i = 0; i < 3; i++) await exec.run({ command: "/p", args: [], cwd: "/tmp", environment: {} }, opts);
+  assert.equal(health.get("k"), undefined);
+});
