@@ -118,7 +118,7 @@ import {
 import { trackModelRequestStart, trackModelRequestEnd } from "./inflightTracker.js";
 
 import { runUpstreamRoundTrip, sendBoxUpstreamRefusal } from "./core.js";
-import { recentBoxRefusal, rememberBoxRefusal } from "./boxRefusalMemory.js";
+import { forgetBoxRefusal, recentBoxRefusal, rememberBoxRefusal } from "./boxRefusalMemory.js";
 import { BOX_NATIVE_CONTEXT_ROUTE_READY, selectBoxNativeByteBudget } from "./boxNativeContextOwner.js";
 import { validateBoxRequest } from "./boxRequestGate.js";
 import { waitForBoxReplay } from "./boxReplayWait.js";
@@ -983,6 +983,11 @@ export function makeAnthropicProxyHandler(
           sendJsonError(res, 409, "BOX_REPLAY_NOT_FOUND",
             "previous Box call not found", requestId);
           return;
+        }
+        // A new streaming launch of this turn supersedes an earlier refusal.
+        if (boxPrepared.sessionId && boxPrepared.turnKey) {
+          forgetBoxRefusal({ uid, sessionId: boxPrepared.sessionId,
+            turnKey: boxPrepared.turnKey, model: body.model });
         }
         if (boxPrepared.classification === "reject") {
           // OCV5-317: the raw 409 reached only container logs and the request

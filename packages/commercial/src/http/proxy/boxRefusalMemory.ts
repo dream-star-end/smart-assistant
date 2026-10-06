@@ -29,4 +29,7 @@ export function recentBoxRefusal(key: BoxRefusalKey, nowMs = Date.now()): string
   return found.code;
 }
 
+/** A new streaming launch of the turn supersedes an earlier refusal. */
+export function forgetBoxRefusal(key: BoxRefusalKey): void { entries.delete(keyOf(key)); }
+
 export function _resetBoxRefusalMemoryForTest(): void { entries.clear(); }

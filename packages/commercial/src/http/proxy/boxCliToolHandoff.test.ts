@@ -537,4 +537,12 @@ test("a CLI usage-limit refusal before any model message is a named code, not a 
   assert.throws(() => other.push(JSON.stringify(synthetic) + "\n"),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_CLI_UPSTREAM_REFUSED");
+  // the CLI's local command output uses the same sentinel model but is no API error
+  const local = new BoxCliToolHandoffDecoder(model, catalog);
+  local.push(JSON.stringify({ type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] }) + "\n");
+  const plain = JSON.parse(JSON.stringify(refusalRecords[1])) as { error?: string; is_api_error_message?: boolean };
+  delete plain.error; delete plain.is_api_error_message;
+  assert.throws(() => local.push(JSON.stringify(plain) + "\n"),
+    (error: unknown) => error instanceof BoxCliToolHandoffError
+      && error.code === "BOX_TOOL_SNAPSHOT_INVALID");
 });
