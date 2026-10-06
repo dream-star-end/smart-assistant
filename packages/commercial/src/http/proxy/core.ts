@@ -100,7 +100,18 @@ import {
  *     这些都已闭包进 `finalize`,core 没必要二次持有。
  *   - `ac` / `onClose` — 内部全生命周期,handler 无感知。
  */
+/** The client-facing answer to a Box CLI upstream refusal: nothing was charged. */
+export function sendBoxUpstreamRefusal(res: ServerResponse, code: string, requestId: string): void {
+  const limited = code === BOX_CLI_UPSTREAM_RATE_LIMITED;
+  sendJsonError(res, 503, limited ? "BOX_UPSTREAM_RATE_LIMITED" : "BOX_UPSTREAM_REFUSED",
+    limited ? "Box Claude usage window is exhausted; nothing was charged, retry later"
+      : "Box Claude upstream refused the request; nothing was charged", requestId,
+    { "retry-after": limited ? "300" : "30" });
+}
+
 export interface RoundTripCtx {
+  /** Called once when the Box CLI refused the call (see sendBoxUpstreamRefusal). */
+  onBoxRefusal?: (code: string) => void;
   pgPool: Pool;
   fetchFn: typeof fetch;
   appendCostCredits?: (
@@ -634,11 +645,8 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       } else if (boxCapacityHeld) {
         sendJsonError(res, 409, "BOX_CAPACITY_HELD", "Box slot busy", requestId);
       } else if (boxUpstreamRefusal) {
-        const limited = boxUpstreamRefusal === BOX_CLI_UPSTREAM_RATE_LIMITED;
-        sendJsonError(res, 503, limited ? "BOX_UPSTREAM_RATE_LIMITED" : "BOX_UPSTREAM_REFUSED",
-          limited ? "Box Claude usage window is exhausted; nothing was charged, retry later"
-            : "Box Claude upstream refused the request; nothing was charged", requestId,
-          { "retry-after": limited ? "300" : "30" });
+        ctx.onBoxRefusal?.(boxUpstreamRefusal);
+        sendBoxUpstreamRefusal(res, boxUpstreamRefusal, requestId);
       } else sendJsonError(res, 500, "INTERNAL", "internal error", requestId);
     } else {
       try {

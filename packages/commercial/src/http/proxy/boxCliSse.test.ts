@@ -412,10 +412,14 @@ test("a CLI usage-limit refusal is one named code, not an order violation", () =
   decoder.push(JSON.stringify(init) + "\n");
   assert.throws(() => decoder.push(refusalRecords.map((item) => JSON.stringify(item)).join("\n") + "\n"),
     (error: unknown) => error instanceof BoxCliSseError && error.code === "BOX_CLI_UPSTREAM_RATE_LIMITED");
-  // a synthetic message without the rate limit tag is still a refusal, never model output
+  // a synthetic API error message without the rate limit tag is still a refusal, never model output
   const other = JSON.parse(JSON.stringify(refusalRecords[1])) as { error?: string };
   other.error = "invalid_request";
   rejected([init, other], "BOX_CLI_UPSTREAM_REFUSED");
+  // the CLI's local command output uses the same sentinel model but is no API error
+  const local = JSON.parse(JSON.stringify(refusalRecords[1])) as { error?: string; is_api_error_message?: boolean };
+  delete local.error; delete local.is_api_error_message;
+  rejected([init, local], "BOX_CLI_ASSISTANT_MISMATCH");
   // a real model message in the same stream is untouched
   assert.equal(completedBoxCliToSse(jsonl(records()), model).outputTokens, 7);
 });

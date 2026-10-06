@@ -20,10 +20,14 @@ export function isBoxCliUpstreamRefusalCode(code: unknown): code is BoxCliUpstre
 /** The refusal code for a CLI record, or null for every other record. */
 export function boxCliUpstreamRefusal(record: unknown): BoxCliUpstreamRefusalCode | null {
   if (!record || typeof record !== "object" || Array.isArray(record)) return null;
-  const item = record as { type?: unknown; error?: unknown; message?: unknown };
+  const item = record as { type?: unknown; error?: unknown; message?: unknown;
+    is_api_error_message?: unknown };
   if (item.type !== "assistant") return null;
   const message = item.message;
   if (!message || typeof message !== "object" || Array.isArray(message)
     || (message as { model?: unknown }).model !== "<synthetic>") return null;
+  // `<synthetic>` also marks the CLI's local command output; only an API error
+  // message carries the error tag and flag (see the capture fixture).
+  if (item.is_api_error_message !== true && typeof item.error !== "string") return null;
   return item.error === "rate_limit" ? BOX_CLI_UPSTREAM_RATE_LIMITED : BOX_CLI_UPSTREAM_REFUSED;
 }
