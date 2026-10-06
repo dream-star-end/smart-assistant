@@ -5,7 +5,7 @@ export interface BoxNativePointer {
   readonly version: 1;
   readonly accountId: string;
   readonly upstreamModel: string;
-  readonly cliVersion: "2.1.280";
+  readonly cliVersion: "2.1.280" | "2.1.288";
   readonly nativeSessionId: string;
   /** The original private run cwd becomes the stable Claude project key. */
   readonly cliCwd: string;
@@ -28,7 +28,7 @@ export function parseBoxNativePointer(value: unknown, nowMs = Date.now(),
   if (Object.keys(item).sort().join(",") !== ["accountId", "assistantContentHash",
     "catalogHash", "cliCwd", "cliVersion", "contextHashBeforeFinal", "expiresAtMs",
     "nativeSessionId", "transcriptSha256", "upstreamModel", "version"].join(",")) return null;
-  if (item.version !== 1 || item.cliVersion !== "2.1.280"
+  if (item.version !== 1 || (item.cliVersion !== "2.1.280" && item.cliVersion !== "2.1.288")
     || typeof item.accountId !== "string" || !/^[1-9][0-9]{0,18}$/.test(item.accountId)
     || typeof item.upstreamModel !== "string"
     || !/^claude-[a-z0-9-]{3,64}$/.test(item.upstreamModel)

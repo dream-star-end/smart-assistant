@@ -122,7 +122,7 @@ test("second TEMP claim keeps the client sibling and does not advance on failure
       boxHandoffRevision: "rev-1", boxToolHandoff: handoff, boxState: "handoff",
       boxSessionId: session, boxTurnKey: turn, billingPricing: pricing, boxBillingContext: billing,
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
-      boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}` })]);
+      boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}`, boxNativeCliVersion: "2.1.280" })]);
     const childBasis = { model, boxInvocationRecovery: "v1", billingPricing: pricing,
       boxBillingContext: billing };
     await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
@@ -255,7 +255,7 @@ test("TEMP authority mismatch and a second request id do not publish twice", asy
       boxHandoffRevision: "rev-1", boxToolHandoff: handoff, boxState: "handoff",
       boxSessionId: session, boxTurnKey: turn, billingPricing: pricing, boxBillingContext: billing,
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
-      boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}` })]);
+      boxNativeCliCwd: `/tmp/ocv5-289-run-${nonce}`, boxNativeCliVersion: "2.1.280" })]);
     await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
       VALUES ($1,3,'inflight',$2::jsonb)`, [child, JSON.stringify({ model,
       authorityKind: "bridge_signed", authorityTurnId: "cd".repeat(16),
@@ -378,7 +378,7 @@ test("raw image sibling publishes once, then final and a new user gain no second
       boxToolHandoff: handoff, boxState: "handoff", boxSessionId: session, boxTurnKey: turn,
       billingPricing: pricing, boxBillingContext: billing,
       boxNativeSessionId: "12345678-1234-4123-8123-123456789abc",
-      boxNativeCliCwd: runDir })]);
+      boxNativeCliCwd: runDir, boxNativeCliVersion: "2.1.280" })]);
     const childBasis = { model, boxInvocationRecovery: "v1", billingPricing: pricing,
       boxBillingContext: billing };
     await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
@@ -720,7 +720,7 @@ test("commit failure, lost ack, and a rebuilt journal do not gain a publish", as
       boxRunNonce: localNonce, boxLeaseEpoch: epoch, boxContextHash: prepared.priorContextHash,
       boxHandoffRevision: "rev-1", boxToolHandoff: handoff, boxState: "handoff",
       boxSessionId: session, boxTurnKey: turn, billingPricing: pricing, boxBillingContext: billing,
-      boxNativeSessionId: "12345678-1234-4123-8123-123456789abc", boxNativeCliCwd: runDir })]);
+      boxNativeSessionId: "12345678-1234-4123-8123-123456789abc", boxNativeCliCwd: runDir, boxNativeCliVersion: "2.1.280" })]);
     await client.query(`INSERT INTO request_finalize_journal(request_id,user_id,state,ctx)
       VALUES ($1,3,'inflight',$2::jsonb)`, [child, JSON.stringify({ model,
       boxInvocationRecovery: "v1", billingPricing: pricing, boxBillingContext: billing })]);

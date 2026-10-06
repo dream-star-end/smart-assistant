@@ -6,9 +6,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const claude = "/usr/local/bin/claude";
-if (execFileSync(claude, ["--version"], { encoding: "utf8" }).trim()
-  !== "2.1.280 (Claude Code)") throw new Error("CLI_VERSION_NOT_PINNED");
+// Builds whose native resume this probe has passed (boxCliVersion.ts lists the
+// same ones). OCV5_NATIVE_PROBE_CLAUDE points at the build under test.
+const claude = process.env.OCV5_NATIVE_PROBE_CLAUDE ?? "/usr/local/bin/claude";
+const cliVersion = execFileSync(claude, ["--version"], { encoding: "utf8" }).trim();
+if (cliVersion !== "2.1.280 (Claude Code)" && cliVersion !== "2.1.288 (Claude Code)") {
+  throw new Error("CLI_VERSION_NOT_PINNED");
+}
 const root = `/tmp/ocv5-291-native-${randomBytes(12).toString("hex")}`;
 const cwd = join(root, "stable-cwd"), config = join(root, "config");
 const sessionId = randomUUID();
@@ -16,9 +20,13 @@ const secret = `native-${randomBytes(12).toString("hex")}`;
 const system = "Synthetic native resume test. No external tools or user data.";
 const firstPrompt = `Remember this marker, then reply READY only: ${secret}`;
 const secondPrompt = "Recall the prior marker exactly, no other words.";
+const thirdPrompt = "Once more: the marker exactly, no other words.";
 mkdirSync(cwd, { recursive: true, mode: 0o700 });
 mkdirSync(config, { recursive: true, mode: 0o700 });
 let requests = 0, secondHistoryExact = false;
+// Every request body the CLI sent, for the prompt-cache prefix check below.
+const sentBodies: Array<Array<{ role?: string; content?: unknown }>> = [];
+const sentFixed: string[] = [];
 function visibleText(content: unknown): string | null {
   if (typeof content === "string") return content;
   if (!Array.isArray(content) || content.some((block) => !block || typeof block !== "object"
@@ -34,8 +42,12 @@ const server = createServer(async (req, res) => {
   }
   requests++;
   const sent = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
-    messages?: Array<{ role?: string; content?: unknown }>;
+    messages?: Array<{ role?: string; content?: unknown }>; system?: unknown; tools?: unknown;
   };
+  sentBodies.push(sent.messages ?? []);
+  // system prompt and tool schemas are part of the cache key too
+  sentFixed.push(JSON.stringify({ system: sent.system, tools: sent.tools },
+    (key, value) => key === "cache_control" ? undefined : value));
   const history = (sent.messages ?? []).filter((message) => message.role !== "system"
     && !(process.env.OCV5_291_NEGATIVE_DROP_ASSISTANT === "1"
       && message.role === "assistant"));
@@ -44,6 +56,7 @@ const server = createServer(async (req, res) => {
     && history[1]?.role === "assistant" && visibleText(history[1].content) === "READY"
     && history[2]?.role === "user" && visibleText(history[2].content) === secondPrompt;
   const reply = requests === 1 ? "READY" : secondHistoryExact ? secret : "HISTORY_MISSING";
+  // (request 3 repeats the second answer; its history is checked by the prefix test)
   const event = (type: string, data: unknown) => res.write(
     `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
   res.writeHead(200, { "content-type": "text/event-stream" });
@@ -61,12 +74,13 @@ const server = createServer(async (req, res) => {
   res.end();
 });
 
-async function round(port: number, number: 1 | 2): Promise<{
+async function round(port: number, number: 1 | 2 | 3): Promise<{
   exit: number | null; result: string; reportedSessionId: string | null;
 }> {
   const stdin = join(root, `round-${number}.jsonl`);
   writeFileSync(stdin, JSON.stringify({ type: "user", message: { role: "user",
-    content: [{ type: "text", text: number === 1 ? firstPrompt : secondPrompt }] } }) + "\n",
+    content: [{ type: "text", text: number === 1 ? firstPrompt
+      : number === 2 ? secondPrompt : thirdPrompt }] } }) + "\n",
   { flag: "wx", mode: 0o600 });
   const argv = ["-p", number === 1 ? "--session-id" : "--resume", sessionId,
     "--input-format", "stream-json", "--output-format", "stream-json",
@@ -107,10 +121,34 @@ try {
   const second = persistedAfterFirst && first.result === "READY"
     ? await round(port, 2) : null;
   const secondBytes = second ? readFileSync(transcript).length : 0;
-  const good = requests === 2 && secondHistoryExact && persistedAfterFirst
+  const third = second?.result === secret ? await round(port, 3) : null;
+  // Prompt-cache continuity: the API only reads a cached prefix that was
+  // written at an earlier cache marker, so everything up to the last marker of
+  // request 2 must come back byte for byte (markers themselves aside) in
+  // request 3. A synthetic-history run puts its only marker on a trailing
+  // environment block that carries the per-run cwd, and fails exactly here.
+  // (a string content and a single text block render the same prompt tokens)
+  const plain = (message: { role?: string; content?: unknown }): string => JSON.stringify({
+    ...message, content: typeof message.content === "string"
+      ? [{ type: "text", text: message.content }] : message.content },
+  (key, value) => key === "cache_control" ? undefined : value);
+  const marked = (message: { content?: unknown }): boolean => Array.isArray(message.content)
+    && message.content.some((block) => block && typeof block === "object"
+      && "cache_control" in (block as object));
+  const second2 = sentBodies[1] ?? [], third3 = sentBodies[2] ?? [];
+  const lastMarked = second2.findLastIndex(marked);
+  const userTexts = (messages: Array<{ role?: string; content?: unknown }>) => messages
+    .filter((message) => message.role === "user").map((message) => visibleText(message.content));
+  const cachePrefixStable = lastMarked === second2.length - 1 && third3.length > lastMarked
+    && sentFixed[1] === sentFixed[2]
+    && second2.slice(0, lastMarked + 1).every((message, i) => plain(message) === plain(third3[i]!))
+    && userTexts(third3).length >= 3 && userTexts(third3).at(-1) === thirdPrompt
+    && userTexts(third3).some((text) => text?.includes(firstPrompt));
+  const good = requests === 3 && cachePrefixStable && third?.result === secret
+    && secondHistoryExact && persistedAfterFirst
     && first.result === "READY" && second?.result === secret && secondBytes > firstBytes
     && first.reportedSessionId === sessionId && second?.reportedSessionId === sessionId;
-  process.stdout.write(JSON.stringify({ cli: "2.1.280", requests, persistedAfterFirst,
+  process.stdout.write(JSON.stringify({ cli: cliVersion, requests, cachePrefixStable, persistedAfterFirst,
     firstBytes, secondBytes, nativeSessionReused: secondBytes > firstBytes,
     secondHistoryExact, sessionIdsExact: first.reportedSessionId === sessionId
       && second?.reportedSessionId === sessionId,

@@ -386,7 +386,7 @@ test("selfhost default runs native and both batches in one paid first round", as
     assert.equal(f.sequence.filter((step) => step === "input-batch").length, 1);
     assert.equal(f.sequence.filter((step) => step === "input-stage").length, 0);
     assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId,
-      cliCwd: result.plan.cliCwd });
+      cliCwd: result.plan.cliCwd, cliVersion: "2.1.280" });
     assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
@@ -878,8 +878,9 @@ test("other decoder failures never trigger the explicit stop", async () => {
   assert.ok(f.sequence.includes("unknown"));
 });
 
-// OCV5-313: account 25's Box runs Claude Code 2.1.288. Native resume is only
-// verified on 2.1.280, and 7865e13d recorded a pointer labelled 2.1.280 there.
+// OCV5-313: a Box whose CLI build has no verified native resume (an unlisted or
+// unread version) neither records nor claims a pointer. 2.1.288 is verified
+// (offline probe + cache-stable request prefix) since the long-context quota work.
 test("OCV5-313 a Box without verified native resume never looks up, claims or records a native pointer", async () => {
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
@@ -890,7 +891,7 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
       cliCwd: `/tmp/ocv5-289-run-${"9".repeat(24)}`, transcriptSha256: "f".repeat(64),
       contextHashBeforeFinal: "a".repeat(64), assistantContentHash: "b".repeat(64),
       catalogHash: "c".repeat(64), expiresAtMs: Date.now() + 60_000 })!;
-    for (const cliVersion of ["2.1.288", "2.1.999", null]) {
+    for (const cliVersion of ["2.1.999", null]) {
       const f = fixture({ directFinal: true, cliVersion,
         nativeCandidate: { ownerRequestId: "native-owner", pointer } });
       const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -908,6 +909,16 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
     assert.equal(result.kind === "final" && result.nativePointer?.cliVersion, "2.1.280");
     assert.ok(verified.sequence.includes("native-lookup"));
     assert.ok(verified.sequence.includes("native-attach"));
+    // 2.1.288 records a pointer labelled with its own build
+    const next = fixture({ directFinal: true, cliVersion: "2.1.288" });
+    const written = await runBoxToolFirstRound(next.input, next.deps);
+    assert.equal(written.kind === "final" && written.nativePointer?.cliVersion, "2.1.288");
+    // a pointer written by another build is a cache miss, not a resume
+    const stale = fixture({ directFinal: true, cliVersion: "2.1.288",
+      nativeCandidate: { ownerRequestId: "native-owner", pointer } });
+    const staleResult = await runBoxToolFirstRound(stale.input, stale.deps);
+    assert.equal(staleResult.kind, "final");
+    assert.equal(stale.admittedNative, null, "no native claim across CLI builds");
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
     else process.env.OC_BOX_FAST_NATIVE = previous;

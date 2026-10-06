@@ -213,6 +213,9 @@ export async function runBoxToolContinuation(input: {
         if (boxFastPathEnabled() && boxCliNativeResumeVerified(target.cliVersion)
           && final.assistantContentHash
           && claim.nativeSessionId && claim.nativeCliCwd
+          // the pointer is evidence about the build that wrote the transcript: a
+          // chain admitted before the build was recorded, or across an upgrade, records none
+          && claim.nativeCliVersion !== undefined && claim.nativeCliVersion === target.cliVersion
           && deps.journal.attachNativePointer) {
           try {
             const inspected = await target.exec.run(makeBoxNativeFileInspect({
@@ -221,7 +224,7 @@ export async function runBoxToolContinuation(input: {
             const file = parseBoxNativeFileEvidence(inspected.stdout);
             const candidate = parseBoxNativePointer({ version: 1,
               accountId: claim.accountId.toString(), upstreamModel: input.upstreamModel,
-              cliVersion: "2.1.280", nativeSessionId: claim.nativeSessionId,
+              cliVersion: claim.nativeCliVersion, nativeSessionId: claim.nativeSessionId,
               cliCwd: claim.nativeCliCwd, transcriptSha256: file.sha256,
               contextHashBeforeFinal: input.prepared
                 && preparedMatchesBody(input.prepared, input.canonicalBody)

@@ -63,3 +63,41 @@ test("native GC refuses mismatched digest, extra files and symlink without mutat
     assert.ok(readdirSync(project).includes(`${sid}.jsonl`));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("native GC removes the 2.1.288 image tree with the transcript and refuses anything else under it", () => {
+  const root = mkdtempSync(join(tmpdir(), "box-native-gc-"));
+  const project = join(root, cwd.replaceAll("/", "-"));
+  try {
+    const request = makeBoxNativeGcDelete(pointer);
+    const script = request.args[2]!.replace("/home/box/.claude/projects", root);
+    const run = () => spawnSync("/usr/bin/python3", ["-I", "-c", script, cwd, sid, sha], { encoding: "utf8" });
+    const build = (extra: (tree: string) => void) => {
+      rmSync(project, { recursive: true, force: true });
+      mkdirSync(project, { mode: 0o700 });
+      writeFileSync(join(project, `${sid}.jsonl`), data, { mode: 0o600 });
+      mkdirSync(join(project, sid), { mode: 0o755 });
+      mkdirSync(join(project, sid, "tool-results"), { mode: 0o755 });
+      extra(join(project, sid, "tool-results"));
+    };
+    // the exact tree Claude Code 2.1.288 writes for an MCP image result
+    build((tree) => writeFileSync(join(tree, "mcp-image-1.png"), "png", { mode: 0o644 }));
+    assert.equal(parseBoxNativeGcResult(run().stdout), "deleted");
+    assert.deepEqual(readdirSync(root), []);
+    assert.equal(parseBoxNativeGcResult(run().stdout), "absent");
+    // a symlink, a nested directory or a foreign entry blocks without touching anything
+    for (const bad of [
+      (tree: string) => symlinkSync(join(root, "decoy"), join(tree, "link.png")),
+      (tree: string) => mkdirSync(join(tree, "nested")),
+      (tree: string) => writeFileSync(join(tree, "..", "other.txt"), "x"),
+    ]) {
+      build(bad);
+      assert.equal(parseBoxNativeGcResult(run().stdout), "blocked");
+      assert.ok(readdirSync(project).includes(`${sid}.jsonl`), "transcript untouched");
+      assert.ok(readdirSync(join(project, sid)).length > 0, "tree untouched");
+    }
+    // a session directory with no transcript is not ours to remove
+    rmSync(project, { recursive: true, force: true });
+    mkdirSync(join(project, sid), { recursive: true, mode: 0o700 });
+    assert.equal(parseBoxNativeGcResult(run().stdout), "blocked");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

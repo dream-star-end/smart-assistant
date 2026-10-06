@@ -1,5 +1,8 @@
 /** Delete only an expired, journal-unreferenced native transcript. The caller
- * must first hold a durable GC claim; this helper never starts Claude. */
+ * must first hold a durable GC claim; this helper never starts Claude.
+ * Claude Code 2.1.288 stores an MCP image result as a file under
+ * <project>/<session id>/tool-results/; exactly that tree (regular, single-link
+ * files owned by the Box user, no symlinks) is removed with the transcript. */
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 
@@ -26,8 +29,36 @@ try:
  try:
   before=os.fstat(project)
   entries=os.listdir(project)
-  if entries not in ([],[filename]):
+  if not set(entries)<=({filename,sid} if filename in entries else set()):
    print('blocked');raise SystemExit(0)
+  subtree=None
+  idents={}
+  if sid in entries:
+   top=os.stat(sid,dir_fd=project,follow_symlinks=False)
+   if not stat.S_ISDIR(top.st_mode) or top.st_uid!=os.getuid():
+    print('blocked');raise SystemExit(0)
+   sfd=os.open(sid,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=project)
+   try:
+    kids=os.listdir(sfd)
+    if kids not in ([],['tool-results']):
+     print('blocked');raise SystemExit(0)
+    files=[]
+    if kids:
+     tfd=os.open('tool-results',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=sfd)
+     try:
+      if os.fstat(tfd).st_uid!=os.getuid():
+       print('blocked');raise SystemExit(0)
+      files=os.listdir(tfd)
+      if len(files)>1024:
+       print('blocked');raise SystemExit(0)
+      for item in files:
+       seen=os.stat(item,dir_fd=tfd,follow_symlinks=False)
+       if not stat.S_ISREG(seen.st_mode) or seen.st_uid!=os.getuid() or seen.st_nlink!=1:
+        print('blocked');raise SystemExit(0)
+       idents[item]=(seen.st_dev,seen.st_ino,seen.st_size)
+     finally:os.close(tfd)
+    subtree=(top.st_dev,top.st_ino,kids,files)
+   finally:os.close(sfd)
   if entries:
    listed=os.stat(filename,dir_fd=project,follow_symlinks=False)
    if not stat.S_ISREG(listed.st_mode):
@@ -48,6 +79,29 @@ try:
     current=os.stat(filename,dir_fd=project,follow_symlinks=False)
     if (current.st_dev,current.st_ino,current.st_size)!=(st.st_dev,st.st_ino,st.st_size):raise SystemExit(126)
    finally:os.close(fd)
+   if sorted(os.listdir(project))!=sorted(entries):raise SystemExit(126)
+   if subtree:
+    sfd=os.open(sid,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=project)
+    try:
+     again=os.fstat(sfd)
+     if (again.st_dev,again.st_ino)!=subtree[:2]:raise SystemExit(126)
+     if subtree[2]:
+      tfd=os.open('tool-results',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=sfd)
+      try:
+       if sorted(os.listdir(tfd))!=sorted(subtree[3]) or os.listdir(sfd)!=['tool-results']:raise SystemExit(126)
+       def same(item):
+        now=os.stat(item,dir_fd=tfd,follow_symlinks=False)
+        return stat.S_ISREG(now.st_mode) and now.st_uid==os.getuid() and now.st_nlink==1 and (now.st_dev,now.st_ino,now.st_size)==idents[item]
+       if not all(same(item) for item in subtree[3]):raise SystemExit(126)
+       for item in subtree[3]:
+        if not same(item):raise SystemExit(126)
+        os.unlink(item,dir_fd=tfd)
+      finally:os.close(tfd)
+      os.rmdir('tool-results',dir_fd=sfd)
+    finally:os.close(sfd)
+    os.rmdir(sid,dir_fd=project)
+   again=os.stat(filename,dir_fd=project,follow_symlinks=False)
+   if (again.st_dev,again.st_ino,again.st_size)!=(st.st_dev,st.st_ino,st.st_size):raise SystemExit(126)
    os.unlink(filename,dir_fd=project);os.fsync(project)
   current=os.stat(name,dir_fd=parent,follow_symlinks=False)
   if (current.st_dev,current.st_ino)!=(before.st_dev,before.st_ino):raise SystemExit(126)

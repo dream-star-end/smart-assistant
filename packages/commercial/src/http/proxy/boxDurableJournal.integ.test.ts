@@ -361,7 +361,11 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       fingerprint: { ...fingerprint, replayFingerprint: "9".repeat(64) },
       runNonce: "3".repeat(24), leaseEpoch: "4".repeat(32),
       nativeStart: { sessionId: "12345678-1234-4123-8123-123456789abc",
-        cliCwd: `/tmp/ocv5-289-run-${"3".repeat(24)}` } };
+        cliCwd: `/tmp/ocv5-289-run-${"3".repeat(24)}`, cliVersion: "2.1.288" as const } };
+    await assert.rejects(() => journal.admit({ ...toolCall, requestId: `box-c-${suffix}-badver`,
+      nativeStart: { ...toolCall.nativeStart, cliVersion: "2.1.999" as never } }),
+    (error: unknown) => error instanceof BoxDurableJournalError
+      && error.code === "BOX_JOURNAL_IDENTITY_INVALID", "an unlisted build is no native writer");
     await journal.admit(toolCall);
     await client.query(`UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxReplayRequired":true}'::jsonb WHERE request_id=$1`,
@@ -592,6 +596,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     assert.equal(resumed.roundNo, 2);
     assert.equal(resumed.nativeSessionId, toolCall.nativeStart.sessionId);
     assert.equal(resumed.nativeCliCwd, toolCall.nativeStart.cliCwd);
+    assert.equal(resumed.nativeCliVersion, "2.1.288", "the claim carries the build that wrote the transcript");
     assert.equal(resumed.detachedRunnerHash, "f".repeat(64));
     assert.deepEqual(resumed.results.map((result) => result.modelToolUseId),
       ["toolu_A", "toolu_B"]);
@@ -649,6 +654,10 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       deriveBoxFallbackAlias(3n, resumeBody as ProxyBody));
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxNativeSessionId,
       toolCall.nativeStart.sessionId);
+    assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxNativeCliVersion,
+      "2.1.288", "the linked row keeps the build that wrote the transcript");
+    assert.equal(linked.rows.find((row) => row.request_id === toolCall.requestId)?.ctx.boxNativeCliVersion,
+      "2.1.288");
     assert.equal(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)?.ctx.boxRoundNo,
       2);
     assert.deepEqual(linked.rows.find((row) => row.request_id === `box-d-${suffix}`)

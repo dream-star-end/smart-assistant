@@ -290,6 +290,7 @@ export async function runBoxToolFirstRound(input: {
       throw error;
     }
     let nativeClaim: Parameters<Journal["admit"]>[0]["nativeClaim"];
+    const launchCliVersion = target.cliVersion;
     // A resumed tool exchange must be staged from history: a native
     // transcript stops at the unanswered tool_use (OCV5-304).
     // OCV5-313: only where this Box's CLI build has verified native resume.
@@ -312,6 +313,8 @@ export async function runBoxToolFirstRound(input: {
       if (candidate && pointerCatalog
         && candidate.pointer.accountId === target.accountId.toString()
         && candidate.pointer.upstreamModel === input.upstreamModel
+        // a transcript written by another CLI build is not resumed (cache miss)
+        && candidate.pointer.cliVersion === target.cliVersion
         && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
         const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
@@ -353,7 +356,9 @@ export async function runBoxToolFirstRound(input: {
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
-          cliCwd: plan.cliCwd } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
+          cliCwd: plan.cliCwd,
+          ...(boxCliNativeResumeVerified(launchCliVersion)
+            ? { cliVersion: launchCliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
@@ -515,7 +520,7 @@ export async function runBoxToolFirstRound(input: {
             const file = parseBoxNativeFileEvidence(inspected.stdout);
             const candidate = parseBoxNativePointer({ version: 1,
               accountId: target.accountId.toString(), upstreamModel: input.upstreamModel,
-              cliVersion: "2.1.280", nativeSessionId: plan.sessionId,
+              cliVersion: target.cliVersion, nativeSessionId: plan.sessionId,
               cliCwd: plan.cliCwd, transcriptSha256: file.sha256,
               contextHashBeforeFinal: contextHash,
               assistantContentHash: final.assistantContentHash,
