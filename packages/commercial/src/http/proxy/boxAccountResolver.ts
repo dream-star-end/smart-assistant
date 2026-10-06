@@ -215,6 +215,7 @@ export class BoxAccountResolver {
         candidates.push({ accountId: row.id, profile: login.profile, isDefault: login.isDefault,
           weight, utilization: profiles.health.utilization(key),
           cooldownActive: profiles.health.cooldownActive(key),
+          cooldownQuotaOnly: profiles.health.get(key)?.lastReason === "quota_exhausted",
           loginLoad: profiles.health.recentLaunches(key), boxLoad: 0 });
       }
     }
