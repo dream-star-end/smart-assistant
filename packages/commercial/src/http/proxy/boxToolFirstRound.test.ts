@@ -916,7 +916,11 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
     // a pointer written by another build is a cache miss, not a resume
     const stale = fixture({ directFinal: true, cliVersion: "2.1.288",
       nativeCandidate: { ownerRequestId: "native-owner", pointer } });
-    const staleResult = await runBoxToolFirstRound(stale.input, stale.deps);
+    const decisions: unknown[] = [];
+    const staleResult = await runBoxToolFirstRound(stale.input,
+      { ...stale.deps, onNativeDecision: (info) => { decisions.push(info); } });
+    assert.deepEqual(decisions, [{ requestId: stale.input.requestId, decision: "miss",
+      reason: "build", cliVersion: "2.1.288" }], "the miss says why, without content");
     assert.equal(staleResult.kind, "final");
     assert.equal(stale.admittedNative, null, "no native claim across CLI builds");
   } finally {
