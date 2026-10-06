@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { getPool } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("commercial_new_models_0293_test");
 const manifestPath = fileURLToPath(new URL("../../../../ops/ocv5-308/model-release-manifest.json", import.meta.url));
@@ -67,7 +67,7 @@ describe("0293 commercial prepare new models without activating or changing old 
       if(provider==="codex") await query("INSERT INTO account_group_models(group_id,model_id) VALUES($1,'gpt-5.6-luna')",[group.id]);
     }
     const before=await oldSnapshot();
-    const result=await runMigrations();
+    const result=await runMigrations({dir:await migrationsDirBefore("0298")});
     assert.deepEqual(result.applied,["0293_commercial_new_models_prepare","0294_commercial_box_api_model","0295_commercial_box_api_sonnet_haiku","0296_commercial_retire_minimax_m3_gpt56_sol","0297_commercial_minimax_refs_to_grok_build"]);
     assert.deepEqual(await oldSnapshot(),before);
     assert.equal((await query("SELECT 1 FROM model_pricing WHERE model_id='gpt-6-astra-1m' AND enabled IS TRUE")).rowCount,0);

@@ -116,7 +116,7 @@ describe("0297 points what used to name MiniMax-M3 at grok-build", () => {
     const before = await catalog();
     const sessionsBefore = await sessions();
 
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0298") })).applied, [NAME]);
 
     // no catalog or pricing row changes, and auto-dream stays where 0296 put it
     assert.deepEqual(await catalog(), before);
@@ -171,7 +171,7 @@ describe("0297 points what used to name MiniMax-M3 at grok-build", () => {
     await productionLikeBefore0297({ grokSelectable: false });
     await query("UPDATE model_pricing SET visibility = 'admin' WHERE model_id='grok-build'");
     const before = [await prefs(), await sessions(), (await ledger()).filter((r) => !r.startsWith("runtime_requirement"))];
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0298") })).applied, [NAME]);
     assert.deepEqual([await prefs(), await sessions(), (await ledger()).filter((r) => !r.startsWith("runtime_requirement"))], before);
     assert.deepEqual((await normalize()).filter((r) => r.includes("MiniMax-M3")), [
       "client_sessions|MiniMax-M3|grok-build|0|replacement_not_selectable",
@@ -187,7 +187,7 @@ describe("0297 points what used to name MiniMax-M3 at grok-build", () => {
     if (db.skipIfUnavailable(t)) return;
     await productionLikeBefore0297({ grokSelectable: true });
     const before = { prefs: await prefs(), sessions: await sessionModels(), requirements: await requirements(), ledger: await ledger() };
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0298") })).applied, [NAME]);
     assert.notDeepEqual(await prefs(), before.prefs);
 
     await query(await rollbackBlock());
@@ -203,7 +203,7 @@ describe("0297 points what used to name MiniMax-M3 at grok-build", () => {
   test("after 0297 the 0296 rollback still restores the pre-0296 values", { timeout: 180000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
     await productionLikeBefore0297({ grokSelectable: true });
-    assert.deepEqual((await runMigrations()).applied, [NAME]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0298") })).applied, [NAME]);
     const sql = await readFile(SQL_0296, "utf8");
     const block = /-- BEGIN MANUAL ROLLBACK 0296[^\n]*\n([\s\S]*?)-- END MANUAL ROLLBACK 0296/.exec(sql)![1]!;
     await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
