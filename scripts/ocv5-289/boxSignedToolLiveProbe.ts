@@ -197,7 +197,7 @@ export async function startSignedLoopback(args: { pool: Pool; redis: Redis;
   pricing._setForTests([args.price]);
   const entry: ModelCatalogEntry = {
     entryId: 289, modelId: MODEL, engine: "ccb", providerId: "box_cli",
-    upstreamModelId: UPSTREAM, contextWindow: 200_000,
+    upstreamModelId: UPSTREAM, contextWindow: 1_000_000,
     capabilityProfile: { supportsVision: false,
       reasoning: { supported: [], codexModelDefault: null },
       ccb: { capabilityZero: true, supportsThinking: false } },
