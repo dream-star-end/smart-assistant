@@ -312,6 +312,8 @@ export async function runBoxToolFirstRound(input: {
       if (candidate && pointerCatalog
         && candidate.pointer.accountId === target.accountId.toString()
         && candidate.pointer.upstreamModel === input.upstreamModel
+        // a transcript written by another CLI build is not resumed (cache miss)
+        && candidate.pointer.cliVersion === target.cliVersion
         && matchesBoxNativeHistory(input.canonicalBody, candidate.pointer)) {
         const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
@@ -515,7 +517,7 @@ export async function runBoxToolFirstRound(input: {
             const file = parseBoxNativeFileEvidence(inspected.stdout);
             const candidate = parseBoxNativePointer({ version: 1,
               accountId: target.accountId.toString(), upstreamModel: input.upstreamModel,
-              cliVersion: "2.1.280", nativeSessionId: plan.sessionId,
+              cliVersion: target.cliVersion, nativeSessionId: plan.sessionId,
               cliCwd: plan.cliCwd, transcriptSha256: file.sha256,
               contextHashBeforeFinal: contextHash,
               assistantContentHash: final.assistantContentHash,

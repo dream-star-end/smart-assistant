@@ -221,7 +221,7 @@ export async function runBoxToolContinuation(input: {
             const file = parseBoxNativeFileEvidence(inspected.stdout);
             const candidate = parseBoxNativePointer({ version: 1,
               accountId: claim.accountId.toString(), upstreamModel: input.upstreamModel,
-              cliVersion: "2.1.280", nativeSessionId: claim.nativeSessionId,
+              cliVersion: target.cliVersion, nativeSessionId: claim.nativeSessionId,
               cliCwd: claim.nativeCliCwd, transcriptSha256: file.sha256,
               contextHashBeforeFinal: input.prepared
                 && preparedMatchesBody(input.prepared, input.canonicalBody)

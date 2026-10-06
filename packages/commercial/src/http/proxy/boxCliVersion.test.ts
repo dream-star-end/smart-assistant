@@ -26,7 +26,7 @@ test("the version read is a fixed read-only request and only an exact version li
     "2.1.288\nrm -rf\n"]) assert.equal(parseBoxCliVersion(bad), null, JSON.stringify(bad));
   assert.deepEqual(Object.keys(BOX_CLI_VERSIONS).sort(), ["2.1.280", "2.1.288"]);
   assert.equal(boxCliNativeResumeVerified("2.1.280"), true);
-  assert.equal(boxCliNativeResumeVerified("2.1.288"), false);
+  assert.equal(boxCliNativeResumeVerified("2.1.288"), true);
   assert.equal(boxCliNativeResumeVerified("2.1.999"), false);
   assert.equal(boxCliNativeResumeVerified(undefined), false);
   assert.equal(boxCliNativeResumeVerified("constructor"), false);

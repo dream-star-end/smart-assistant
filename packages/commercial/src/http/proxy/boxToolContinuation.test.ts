@@ -503,7 +503,7 @@ test("OCV5-313 a final on a Box without verified native resume records no native
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
   try {
-    for (const cliVersion of ["2.1.288", null]) {
+    for (const cliVersion of ["2.1.999", null]) {
       const f = fixture("final", false, false, false, false, true, cliVersion);
       const result = await runBoxToolContinuation(f.input, f.deps);
       assert.equal(result.kind, "final");
