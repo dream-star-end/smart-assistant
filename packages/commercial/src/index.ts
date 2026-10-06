@@ -596,6 +596,11 @@ import {
   makeGrokWebSearchHandler,
   type GrokWebSearchHandler,
 } from "./grok/webSearchProxy.js";
+import {
+  GROK_VISION_PATH,
+  makeGrokVisionHandler,
+  type GrokVisionHandler,
+} from "./grok/visionProxy.js";
 import { MediaGenerationService } from "./media-generation/service.js";
 import {
   MEDIA_GENERATION_INTERNAL_PREFIX,
@@ -2363,6 +2368,24 @@ export async function registerCommercial(
       const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
         identityRepo,
       });
+      // /internal/v3/grok-vision — 识图后端(understand_image / oc-vision / oc-figcheck)。
+      // 容器只交图片和问题;master 借一个 Grok 账号调 Grok 4.7,并按 grok-build 目录价
+      // 走 预扣 → journal → 结算(用量取上游响应)。订阅 token 和计费请求号都不出 master。
+      const grokVisionHandler: GrokVisionHandler = makeGrokVisionHandler({
+        identityRepo,
+        getPool,
+        preCheckRedis,
+        pricing,
+        catalog: {
+          async assertFresh() {
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+            return cache.assertFresh();
+          },
+        },
+        loadUserModelAuthz,
+        recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
+      });
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -2867,6 +2890,9 @@ export async function registerCommercial(
         }
         if (path === GROK_WEB_SEARCH_PATH) {
           return grokWebSearchHandler(req, res, ctx);
+        }
+        if (path === GROK_VISION_PATH) {
+          return grokVisionHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
           return codexTokenRefreshHandler(req, res, ctx);

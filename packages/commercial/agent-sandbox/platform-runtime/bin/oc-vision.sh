@@ -1,8 +1,8 @@
 #!/bin/sh
 # oc-vision — in-container CLI for image understanding (text-only models / when
 # the model needs to look at a local image). Thin wrapper → gateway tsx entry.
-# Reuses the mcpVisionServer core (default k3-256k backend via the container
-# internal anthropic proxy). Replaces the retired long-lived openclaude-vision
+# Reuses the mcpVisionServer core (default Grok 4.7 / grok-build backend via the
+# master's /internal/v3/grok-vision). Replaces the retired long-lived openclaude-vision
 # MCP stdio server (a fragile persistent transport). See the `oc-vision` baseline skill.
 set -e
 # 单次调用版本自钉(设计 §1.2 R2-M5):readlink -f 穿透 current symlink → rev-pinned bundle 根。
