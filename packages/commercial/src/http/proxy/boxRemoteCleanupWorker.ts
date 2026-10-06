@@ -169,11 +169,12 @@ export class BoxRemoteCleanupWorker {
               uid: candidate.uid, leaseEpoch: candidate.leaseEpoch, proof, rejectedStream: true });
             recovered++;
           } else if (outcome.status === "undeliverable" && !candidate.linked
-            && outcome.reason.startsWith("BOX_CLI_COMPACT_")
+            && /^BOX_(CLI|TOOL)_(?!ECHO_)[A-Z0-9_]{1,56}$/.test(outcome.reason)
             && journal.markFirstRoundRejectedStream) {
-            // A first round whose finished CLI wrote a synthetic user turn
-            // inside its message (output-limit resume, empty-answer nudge)
-            // pinned the session as unknown for good. Same unbilled close as
+            // A first round whose finished CLI left a stream the decoder
+            // rejects (a synthetic user turn inside its message, an assistant
+            // snapshot without its stream) pinned the session as unknown for
+            // good. Same unbilled close as
             // the live path; the journal refuses a row that already handed
             // off. An intermediate handoff keeps the success-recovery contract.
             await journal.markFirstRoundRejectedStream({ requestId: candidate.requestId,

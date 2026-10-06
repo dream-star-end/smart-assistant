@@ -2,7 +2,7 @@
  * A new tool handoff is out of scope: this function never writes a handoff
  * or skips ahead to a later result. The caller owns the pinned target. */
 import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
-import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
+import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { BoxDurableJournalError, type BoxDetachedUnknownRecovery,
   type BoxDurableJournal, type BoxRecoveryWinner } from "./boxDurableJournal.js";
@@ -176,6 +176,11 @@ export async function observeBoxToolTerminalOnly(input: {
   } catch (error) {
     if (abort.signal.aborted) return { status: "pending", reason: "BOX_RECOVERY_ABORTED" };
     if (error instanceof BoxToolResultEchoError) {
+      return { status: "pending", reason: error.code, undeliverable: true };
+    }
+    // The run finished: its spool no longer changes, so a decoder rejection
+    // (an assistant snapshot without its stream, a malformed block) is final.
+    if (error instanceof BoxCliToolHandoffError) {
       return { status: "pending", reason: error.code, undeliverable: true };
     }
     return { status: "pending", reason: error instanceof Error
