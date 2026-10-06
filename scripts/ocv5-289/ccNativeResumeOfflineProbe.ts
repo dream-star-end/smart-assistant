@@ -26,6 +26,7 @@ mkdirSync(config, { recursive: true, mode: 0o700 });
 let requests = 0, secondHistoryExact = false;
 // Every request body the CLI sent, for the prompt-cache prefix check below.
 const sentBodies: Array<Array<{ role?: string; content?: unknown }>> = [];
+const sentFixed: string[] = [];
 function visibleText(content: unknown): string | null {
   if (typeof content === "string") return content;
   if (!Array.isArray(content) || content.some((block) => !block || typeof block !== "object"
@@ -41,9 +42,12 @@ const server = createServer(async (req, res) => {
   }
   requests++;
   const sent = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
-    messages?: Array<{ role?: string; content?: unknown }>;
+    messages?: Array<{ role?: string; content?: unknown }>; system?: unknown; tools?: unknown;
   };
   sentBodies.push(sent.messages ?? []);
+  // system prompt and tool schemas are part of the cache key too
+  sentFixed.push(JSON.stringify({ system: sent.system, tools: sent.tools },
+    (key, value) => key === "cache_control" ? undefined : value));
   const history = (sent.messages ?? []).filter((message) => message.role !== "system"
     && !(process.env.OCV5_291_NEGATIVE_DROP_ASSISTANT === "1"
       && message.role === "assistant"));
@@ -133,8 +137,13 @@ try {
       && "cache_control" in (block as object));
   const second2 = sentBodies[1] ?? [], third3 = sentBodies[2] ?? [];
   const lastMarked = second2.findLastIndex(marked);
-  const cachePrefixStable = lastMarked >= 0 && third3.length > lastMarked
-    && second2.slice(0, lastMarked + 1).every((message, i) => plain(message) === plain(third3[i]!));
+  const userTexts = (messages: Array<{ role?: string; content?: unknown }>) => messages
+    .filter((message) => message.role === "user").map((message) => visibleText(message.content));
+  const cachePrefixStable = lastMarked === second2.length - 1 && third3.length > lastMarked
+    && sentFixed[1] === sentFixed[2]
+    && second2.slice(0, lastMarked + 1).every((message, i) => plain(message) === plain(third3[i]!))
+    && userTexts(third3).length >= 3 && userTexts(third3).at(-1) === thirdPrompt
+    && userTexts(third3).some((text) => text?.includes(firstPrompt));
   const good = requests === 3 && cachePrefixStable && third?.result === secret
     && secondHistoryExact && persistedAfterFirst
     && first.result === "READY" && second?.result === secret && secondBytes > firstBytes

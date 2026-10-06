@@ -386,7 +386,7 @@ test("selfhost default runs native and both batches in one paid first round", as
     assert.equal(f.sequence.filter((step) => step === "input-batch").length, 1);
     assert.equal(f.sequence.filter((step) => step === "input-stage").length, 0);
     assert.deepEqual(f.admittedStart, { sessionId: result.plan.sessionId,
-      cliCwd: result.plan.cliCwd });
+      cliCwd: result.plan.cliCwd, cliVersion: "2.1.280" });
     assert.ok(f.sequence.indexOf("terminal-journal") < f.sequence.indexOf("native-inspect"));
     assert.ok(f.sequence.indexOf("native-inspect") < f.sequence.indexOf("native-attach"));
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));

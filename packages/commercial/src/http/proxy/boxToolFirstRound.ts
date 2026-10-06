@@ -355,7 +355,9 @@ export async function runBoxToolFirstRound(input: {
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
-          cliCwd: plan.cliCwd } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
+          cliCwd: plan.cliCwd,
+          ...(boxCliNativeResumeVerified(target.cliVersion)
+            ? { cliVersion: target.cliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) }), signal, { maxWaitMs: deps.capacityWaitMs });
     // A timed-out admission can commit after the HTTP caller has left. No
     // model launch follows it, so its late success is safe to prestart-close.
     void pendingAdmission.then(() => {
