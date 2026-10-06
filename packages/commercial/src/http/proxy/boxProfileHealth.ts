@@ -76,7 +76,7 @@ export class BoxProfileHealth {
     const held = this.states.get(key);
     const next: BoxProfileHealthState = { utilization: held?.utilization ?? null,
       cooldownUntilMs: held?.cooldownUntilMs ?? null, lastReason: held?.lastReason ?? null,
-      updatedAtMs: at };
+      updatedAtMs: at, windowResetsAtMs: held?.windowResetsAtMs ?? null };
     if (signal.kind === "profile_unsafe") {
       next.cooldownUntilMs = at + UNSAFE_COOLDOWN_MS;
       next.lastReason = "profile_unsafe";
