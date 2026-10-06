@@ -98,10 +98,19 @@ export function isTurnStatusSuppressedByTape(
  * 该轮另带 _errorCode 的 assistant 红卡是同一次失败的第二张卡:只留状态卡(文案说明未计费、可重试),
  * 红卡隐藏,避免一次失败两张卡、两个重试按钮。红卡带模型已产出的部分回答正文时不隐藏。
  */
-export function collectTurnStatusRecordTurnIds(messages: readonly ChatMessage[]): Set<string> {
+export function collectTurnStatusRecordTurnIds(
+  messages: readonly ChatMessage[],
+  resolvedTurnIds: Set<string> = new Set(),
+): Set<string> {
   const ids = new Set<string>();
   for (const m of messages) {
-    if (m?._turnStatusRecord === true && typeof m._clientMessageId === "string" && m._clientMessageId.length > 0) {
+    // 已被同轮真实 tape 抑制的过时状态卡不再渲染,不能再替它收起同轮红卡(否则两张都不显示)。
+    if (
+      m?._turnStatusRecord === true &&
+      typeof m._clientMessageId === "string" &&
+      m._clientMessageId.length > 0 &&
+      !resolvedTurnIds.has(m._clientMessageId)
+    ) {
       ids.add(m._clientMessageId);
     }
   }

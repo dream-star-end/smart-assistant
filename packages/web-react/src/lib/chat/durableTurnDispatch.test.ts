@@ -765,6 +765,17 @@ describe("durable failure status 渲染 (RFC §5)", () => {
     expect(isErrorCardSupersededByTurnStatus(redCard, ids)).toBe(true);
     expect(isErrorCardSupersededByTurnStatus(status, ids)).toBe(false);
   });
+  test("状态卡已被同轮真实 tape 抑制 → 不再收起同轮红卡(部分回答 + 红卡不能一起消失)", () => {
+    const status = srvRow({ id: "turn-status:d1", role: "system", _turnStatusRecord: true,
+      _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: "cm1" });
+    const partial = srvRow({ id: "srv-a-t1-s0", text: "已经写出的部分", _clientMessageId: "cm1" });
+    const redCard = srvRow({ id: "srv-err-1", _errorCode: "engine_error", _clientMessageId: "cm1" });
+    const all = [status, partial, redCard];
+    const resolved = collectResolvedDispatchTurnIds(all);
+    expect(isTurnStatusSuppressedByTape(status, resolved)).toBe(true);
+    const ids = collectTurnStatusRecordTurnIds(all, resolved);
+    expect(isErrorCardSupersededByTurnStatus(redCard, ids)).toBe(false);
+  });
   test("红卡带部分回答正文 / 属于别的轮 / 无状态卡 → 不收起", () => {
     const status = srvRow({ id: "turn-status:d1", role: "system", _turnStatusRecord: true,
       _dispatchTerminal: true, _errorCode: "dispatch_lost", _clientMessageId: "cm1" });

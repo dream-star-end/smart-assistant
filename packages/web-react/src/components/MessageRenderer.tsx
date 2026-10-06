@@ -2110,7 +2110,7 @@ export function MessageList({
   // their canonical immutable Agent blocks are the user-facing timeline.
   const safeMessages = sanitizeChatMessages(messages, sessionId);
   const resolvedDispatchTurnIds = collectResolvedDispatchTurnIds(safeMessages);
-  const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages);
+  const statusRecordTurnIds = collectTurnStatusRecordTurnIds(safeMessages, resolvedDispatchTurnIds);
   // Recovery child user turns remain in memory/IndexedDB/PG as exact lineage,
   // but are transport controls rather than another user utterance. Automatic
   // and manual children are both hidden. While a child exists, its source
