@@ -66,3 +66,12 @@ test("a utilization reading stops counting once its window has reset or it is to
   health.load("c", { utilization: 0.97, cooldownUntilMs: null, lastReason: null, updatedAtMs: now - 6 * 3_600_000 });
   assert.equal(health.utilization("c"), null, "a durable reading older than a window is not trusted");
 });
+
+test("a later unrelated bench keeps the reading's window boundary", () => {
+  let now = 1_000_000;
+  const health = new BoxProfileHealth(() => now);
+  health.observe("a", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: now + 600_000 });
+  health.observe("a", { kind: "profile_unsafe" });
+  now += 600_001;
+  assert.equal(health.utilization("a"), null, "the 1.04 belonged to a window that has reset");
+});
