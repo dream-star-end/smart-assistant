@@ -313,11 +313,12 @@ export async function runBoxToolFirstRound(input: {
       // the staged MCP catalog stay identical across the rolling deploy.
       const pointerCatalog = candidate
         ? boxCatalogMatching(plan.catalog, candidate.pointer.catalogHash) : null;
-      const miss = !candidate ? "no_candidate" : !pointerCatalog ? "catalog"
+      const miss = !candidate ? "no_candidate"
         : candidate.pointer.accountId !== target.accountId.toString() ? "account"
         : candidate.pointer.upstreamModel !== input.upstreamModel ? "model"
         // a transcript written by another CLI build is not resumed (cache miss)
         : candidate.pointer.cliVersion !== target.cliVersion ? "build"
+        : !pointerCatalog ? "catalog"
         : explainBoxNativeHistory(input.canonicalBody, candidate.pointer);
       deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
         reason: miss, cliVersion: String(target.cliVersion) });
