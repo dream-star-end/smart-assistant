@@ -366,7 +366,7 @@ export async function runBoxToolFirstRound(input: {
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
           cliCwd: plan.cliCwd,
           ...(boxCliNativeResumeVerified(launchCliVersion)
-            ? { cliVersion: launchCliVersion as "2.1.280" | "2.1.288" } : {}) } } : {}) });
+            ? { cliVersion: launchCliVersion } : {}) } } : {}) });
     const pendingAdmission = waitingForBoxCapacity(async () => {
       try { return await deps.journal.admit(admitInput()); }
       catch (error) {

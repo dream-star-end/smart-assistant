@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BOX_CLI_VERSIONS, BoxCliVersionError, BoxCliVersionGate, boxCliNativeResumeVerified,
+import { BoxCliVersionError, BoxCliVersionGate, boxCliNativeResumeVerified,
   gateBoxLaunchResolver, makeBoxCliVersionRead, parseBoxCliVersion } from "./boxCliVersion.js";
 import { BoxExecTransport } from "./boxExecTransport.js";
 
@@ -24,15 +24,14 @@ test("the version read is a fixed read-only request and only an exact version li
   assert.equal(parseBoxCliVersion("2.1.288\n"), "2.1.288");
   for (const bad of ["2.1.288", "2.1.288 (Claude Code)\n", "v2.1.288\n", "2.1\n", "\n", "2.1.288\n\n",
     "2.1.288\nrm -rf\n"]) assert.equal(parseBoxCliVersion(bad), null, JSON.stringify(bad));
-  assert.deepEqual(Object.keys(BOX_CLI_VERSIONS).sort(), ["2.1.280", "2.1.288"]);
   assert.equal(boxCliNativeResumeVerified("2.1.280"), true);
   assert.equal(boxCliNativeResumeVerified("2.1.288"), true);
-  assert.equal(boxCliNativeResumeVerified("2.1.999"), false);
+  assert.equal(boxCliNativeResumeVerified("2.1.999"), true);
   assert.equal(boxCliNativeResumeVerified(undefined), false);
   assert.equal(boxCliNativeResumeVerified("constructor"), false);
 });
 
-test("a new launch is refused before anything is admitted unless the installed CLI is supported", async () => {
+test("a new launch is refused before anything is admitted only when the CLI version cannot be read", async () => {
   const rejected: unknown[] = [];
   const gate = new BoxCliVersionGate({ onRejected: (info) => rejected.push(info) });
   const supported = box(25n, ["2.1.288\n"]);
@@ -43,11 +42,9 @@ test("a new launch is refused before anything is admitted unless the installed C
   assert.equal(supported.disposed(), 0);
 
   const newer = box(26n, ["2.1.300\n"]);
-  await assert.rejects(resolve({ box: newer }), (error: unknown) =>
-    error instanceof BoxCliVersionError && error.code === "BOX_CLI_VERSION_UNSUPPORTED"
-      && error.observed === "2.1.300");
-  assert.equal(newer.disposed(), 1, "the unused target is closed");
-  assert.equal(newer.cliVersion(), undefined);
+  const admitted = await resolve({ box: newer });
+  assert.equal(admitted.cliVersion, "2.1.300");
+  assert.equal(newer.disposed(), 0, "a readable build is admitted");
 
   for (const unreadable of [box(27n, ["not a version\n"]), box(28n, [new Error("BOX_EXEC_REMOTE_EXIT")])]) {
     await assert.rejects(resolve({ box: unreadable }), (error: unknown) =>
@@ -55,7 +52,6 @@ test("a new launch is refused before anything is admitted unless the installed C
     assert.equal(unreadable.disposed(), 1);
   }
   assert.deepEqual(rejected, [
-    { accountId: "26", code: "BOX_CLI_VERSION_UNSUPPORTED", observed: "2.1.300" },
     { accountId: "27", code: "BOX_CLI_VERSION_UNREADABLE", observed: "unreadable" },
     { accountId: "28", code: "BOX_CLI_VERSION_UNREADABLE", observed: "unreadable" },
   ]);
@@ -65,10 +61,10 @@ test("a pinned resolve (continuation, cleanup, stop) is only annotated and never
   const gate = new BoxCliVersionGate();
   const resolve = gateBoxLaunchResolver(async (args: { requiredAccountId?: bigint; box: ReturnType<typeof box> }) =>
     args.box.target, gate);
-  const unsupported = box(30n, ["2.1.300\n"]);
-  const pinned = await resolve({ requiredAccountId: 30n, box: unsupported });
-  assert.equal(pinned.cliVersion, undefined, "unknown build: no native pointer downstream");
-  assert.equal(unsupported.disposed(), 0, "the existing run keeps its target");
+  const readable = box(30n, ["2.1.300\n"]);
+  const pinned = await resolve({ requiredAccountId: 30n, box: readable });
+  assert.equal(pinned.cliVersion, "2.1.300", "a readable build is annotated");
+  assert.equal(readable.disposed(), 0, "the existing run keeps its target");
   const unreadable = box(31n, [new Error("BOX_EXEC_TIMEOUT")]);
   assert.equal((await resolve({ requiredAccountId: 31n, box: unreadable })).cliVersion, undefined);
   assert.equal(unreadable.disposed(), 0);
@@ -87,7 +83,7 @@ test("a supported result is cached per account for the TTL; a refusal is never c
   const other = box(26n, ["2.1.280\n"]);
   assert.equal(await gate.read(other.target), "2.1.280", "the cache is per account");
   now += 2;
-  await assert.rejects(gate.read(a.target), BoxCliVersionError, "after the TTL the new build is seen");
+  assert.equal(await gate.read(a.target), "2.1.300", "after the TTL the new build is seen");
   assert.equal(a.reads(), 2);
   const flaky = box(27n, [new Error("BOX_EXEC_TIMEOUT"), "2.1.280\n"]);
   await assert.rejects(gate.read(flaky.target), BoxCliVersionError);

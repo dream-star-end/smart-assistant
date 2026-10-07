@@ -379,7 +379,7 @@ function goodId(input: BoxJournalAdmission): void {
       || !UUID_V4.test(input.nativeStart.sessionId)
       || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`
       || (input.nativeStart.cliVersion !== undefined
-        && input.nativeStart.cliVersion !== "2.1.280" && input.nativeStart.cliVersion !== "2.1.288")))
+        && !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(input.nativeStart.cliVersion))))
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -2006,7 +2006,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       const owner = owners.rows[0]!, ctx = owner.ctx;
       const nativeSessionId = ctx.boxNativeSessionId;
       const nativeCliCwd = ctx.boxNativeCliCwd;
-      const nativeCliVersion = ctx.boxNativeCliVersion === "2.1.280" || ctx.boxNativeCliVersion === "2.1.288"
+      const nativeCliVersion = typeof ctx.boxNativeCliVersion === "string"
+        && /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(ctx.boxNativeCliVersion)
         ? ctx.boxNativeCliVersion : undefined;
       if (ctx.model !== input.canonicalModel
         || ctx.boxInvocationMode !== "detached_tool"

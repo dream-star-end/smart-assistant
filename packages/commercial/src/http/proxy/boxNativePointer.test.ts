@@ -27,7 +27,7 @@ test("malformed, expired and path-swapped native pointers are cache misses", () 
     { ...valid, transcriptSha256: "0".repeat(63) },
     { ...valid, contextHashBeforeFinal: "prompt plaintext" },
     { ...valid, catalogHash: "wrong" },
-    { ...valid, cliVersion: "2.1.281" },
+    { ...valid, cliVersion: "latest" },
     { ...valid, expiresAtMs: now - 1 },
     { ...valid, expiresAtMs: now + 31 * 24 * 60 * 60 * 1000 },
     { ...valid, token: "must-not-be-stored" },

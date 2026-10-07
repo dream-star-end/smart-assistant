@@ -5,7 +5,7 @@ export interface BoxNativePointer {
   readonly version: 1;
   readonly accountId: string;
   readonly upstreamModel: string;
-  readonly cliVersion: "2.1.280" | "2.1.288";
+  readonly cliVersion: string;
   readonly nativeSessionId: string;
   /** The original private run cwd becomes the stable Claude project key. */
   readonly cliCwd: string;
@@ -17,6 +17,7 @@ export interface BoxNativePointer {
 }
 
 const HEX64 = /^[a-f0-9]{64}$/;
+const CLI_VERSION = /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/;
 const CWD = /^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -28,7 +29,7 @@ export function parseBoxNativePointer(value: unknown, nowMs = Date.now(),
   if (Object.keys(item).sort().join(",") !== ["accountId", "assistantContentHash",
     "catalogHash", "cliCwd", "cliVersion", "contextHashBeforeFinal", "expiresAtMs",
     "nativeSessionId", "transcriptSha256", "upstreamModel", "version"].join(",")) return null;
-  if (item.version !== 1 || (item.cliVersion !== "2.1.280" && item.cliVersion !== "2.1.288")
+  if (item.version !== 1 || typeof item.cliVersion !== "string" || !CLI_VERSION.test(item.cliVersion)
     || typeof item.accountId !== "string" || !/^[1-9][0-9]{0,18}$/.test(item.accountId)
     || typeof item.upstreamModel !== "string"
     || !/^claude-[a-z0-9-]{3,64}$/.test(item.upstreamModel)
