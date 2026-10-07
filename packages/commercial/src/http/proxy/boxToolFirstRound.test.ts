@@ -887,10 +887,9 @@ test("other decoder failures never trigger the explicit stop", async () => {
   assert.ok(f.sequence.includes("unknown"));
 });
 
-// OCV5-313: a Box whose CLI build has no verified native resume (an unlisted or
-// unread version) neither records nor claims a pointer. 2.1.288 is verified
-// (offline probe + cache-stable request prefix) since the long-context quota work.
-test("OCV5-313 a Box without verified native resume never looks up, claims or records a native pointer", async () => {
+// OCV5-313: an unread CLI version neither records nor claims a pointer.
+// Any version the read parsed does, including one that was never allowlisted.
+test("OCV5-313 an unread CLI version never looks up, claims or records a native pointer", async () => {
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
   try {
@@ -900,7 +899,7 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
       cliCwd: `/tmp/ocv5-289-run-${"9".repeat(24)}`, transcriptSha256: "f".repeat(64),
       contextHashBeforeFinal: "a".repeat(64), assistantContentHash: "b".repeat(64),
       catalogHash: "c".repeat(64), expiresAtMs: Date.now() + 60_000 })!;
-    for (const cliVersion of ["2.1.999", null]) {
+    for (const cliVersion of [null]) {
       const f = fixture({ directFinal: true, cliVersion,
         nativeCandidate: { ownerRequestId: "native-owner", pointer } });
       const result = await runBoxToolFirstRound(f.input, f.deps);
@@ -922,6 +921,9 @@ test("OCV5-313 a Box without verified native resume never looks up, claims or re
     const next = fixture({ directFinal: true, cliVersion: "2.1.288" });
     const written = await runBoxToolFirstRound(next.input, next.deps);
     assert.equal(written.kind === "final" && written.nativePointer?.cliVersion, "2.1.288");
+    const anyBuild = fixture({ directFinal: true, cliVersion: "2.1.999" });
+    const anyWritten = await runBoxToolFirstRound(anyBuild.input, anyBuild.deps);
+    assert.equal(anyWritten.kind === "final" && anyWritten.nativePointer?.cliVersion, "2.1.999");
     // a pointer written by another build is a cache miss, not a resume
     const stale = fixture({ directFinal: true, cliVersion: "2.1.288",
       nativeCandidate: { ownerRequestId: "native-owner", pointer } });

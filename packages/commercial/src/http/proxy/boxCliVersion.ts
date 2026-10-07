@@ -1,34 +1,20 @@
-/** OCV5-313: the Claude Code build on a Box is part of the contract. The Box
- * of account 25 ran 2.1.288 while everything here was verified on 2.1.280; the
- * newer CLI echoes an MCP image with an extra block and the turn failed after
- * it was billed. A new launch now reads the installed version first and is
- * refused before admission (no slot, no launch, no bill) unless that version
- * is listed here. Add a version only after its probes pass. */
+/** OCV5-313: a new launch reads the Claude Code build on the Box first. Any
+ * version that reads is admitted and may use native resume. A transcript
+ * written by another build is still a cache miss. A version that cannot be
+ * read is refused before admission (no slot, no launch, no bill). */
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 
-/** nativeResume: `--resume` of a transcript this CLI wrote is verified. Where
- * it is not, no native pointer is recorded or claimed and every turn stages
- * the synthetic history instead. That fallback is expensive on a long context:
- * the CLI appends its environment block (with the per-run cwd) after the last
- * message and puts the only cache marker on it, so no turn ever reads the
- * history from the prompt cache and a 350k-token conversation rewrites 350k
- * tokens per turn (INC-20261006-BOX-SYNTHETIC-TURN-HELD, usage window).
- * 2.1.288: scripts/ocv5-289/ccNativeResumeOfflineProbe.ts passes against it and
- * the request prefix of a native resume is cache-stable (see that script). */
-export const BOX_CLI_VERSIONS: Readonly<Record<string, { readonly nativeResume: boolean }>> = {
-  "2.1.280": { nativeResume: true },
-  "2.1.288": { nativeResume: true },
-};
+const CLI_VERSION = /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/;
 
+/** True for any build the version read actually parsed. There is no allowlist. */
 export function boxCliNativeResumeVerified(version: string | undefined): boolean {
-  return version !== undefined && Object.hasOwn(BOX_CLI_VERSIONS, version)
-    && BOX_CLI_VERSIONS[version]!.nativeResume;
+  return version !== undefined && CLI_VERSION.test(version);
 }
 
 export class BoxCliVersionError extends Error {
-  constructor(readonly code: "BOX_CLI_VERSION_UNSUPPORTED" | "BOX_CLI_VERSION_UNREADABLE",
-    /** Content-free: a version number or `unreadable`. */
+  constructor(readonly code: "BOX_CLI_VERSION_UNREADABLE",
+    /** Content-free: `unreadable`. */
     readonly observed: string) {
     super(code); this.name = "BoxCliVersionError";
   }
@@ -57,13 +43,13 @@ export function parseBoxCliVersion(stdout: string): string | null {
 export class BoxCliVersionGate {
   private readonly seen = new Map<string, { version: string; atMs: number }>();
   constructor(private readonly opts: {
-    /** A supported result is trusted this long per account. The Box has
+    /** A readable result is trusted this long per account. The Box has
      * auto-update off, so a build only changes with a new installation. */
     ttlMs?: number; now?: () => number; timeoutMs?: number;
     onRejected?: (info: { accountId: string; code: string; observed: string }) => void;
   } = {}) {}
 
-  /** The supported version installed on this Box, or BoxCliVersionError. */
+  /** The version installed on this Box, or BoxCliVersionError when unreadable. */
   async read(target: Pick<BoxResolvedTarget, "accountId" | "exec">,
     signal?: AbortSignal): Promise<string> {
     const key = target.accountId.toString();
@@ -81,10 +67,8 @@ export class BoxCliVersionGate {
         ...(signal ? { signal } : {}) });
       version = parseBoxCliVersion(result.stdout);
     } catch { version = null; }
-    if (version === null || !Object.hasOwn(BOX_CLI_VERSIONS, version)) {
-      const error = version === null
-        ? new BoxCliVersionError("BOX_CLI_VERSION_UNREADABLE", "unreadable")
-        : new BoxCliVersionError("BOX_CLI_VERSION_UNSUPPORTED", version);
+    if (version === null) {
+      const error = new BoxCliVersionError("BOX_CLI_VERSION_UNREADABLE", "unreadable");
       this.opts.onRejected?.({ accountId: key, code: error.code, observed: error.observed });
       throw error;
     }
@@ -94,7 +78,7 @@ export class BoxCliVersionGate {
 }
 
 /** Wrap the resolver the model launch paths use. A call that picks an account
- * for a new launch (no requiredAccountId) must find a supported CLI or it
+ * for a new launch (no requiredAccountId) must read a CLI version or it
  * fails before anything is admitted. A pinned call (continuation publish,
  * cleanup, stop) is only annotated and never fails here: its run exists. */
 export function gateBoxLaunchResolver<A extends { requiredAccountId?: bigint;
@@ -104,7 +88,7 @@ export function gateBoxLaunchResolver<A extends { requiredAccountId?: bigint;
     const target = await resolve(args);
     if (args.requiredAccountId !== undefined) {
       try { target.cliVersion = await gate.read(target, args.signal); }
-      catch { /* unknown version: no native pointer is recorded or claimed */ }
+      catch { /* unreadable version: no native pointer is recorded or claimed */ }
       return target;
     }
     try { target.cliVersion = await gate.read(target, args.signal); }

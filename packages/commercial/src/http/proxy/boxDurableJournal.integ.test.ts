@@ -363,9 +363,9 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       nativeStart: { sessionId: "12345678-1234-4123-8123-123456789abc",
         cliCwd: `/tmp/ocv5-289-run-${"3".repeat(24)}`, cliVersion: "2.1.288" as const } };
     await assert.rejects(() => journal.admit({ ...toolCall, requestId: `box-c-${suffix}-badver`,
-      nativeStart: { ...toolCall.nativeStart, cliVersion: "2.1.999" as never } }),
+      nativeStart: { ...toolCall.nativeStart, cliVersion: "not-a-version" as never } }),
     (error: unknown) => error instanceof BoxDurableJournalError
-      && error.code === "BOX_JOURNAL_IDENTITY_INVALID", "an unlisted build is no native writer");
+      && error.code === "BOX_JOURNAL_IDENTITY_INVALID", "a non-version is no native writer");
     await journal.admit(toolCall);
     await client.query(`UPDATE request_finalize_journal
       SET ctx=ctx || '{"boxReplayRequired":true}'::jsonb WHERE request_id=$1`,

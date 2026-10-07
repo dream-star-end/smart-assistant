@@ -2294,7 +2294,7 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
  * for a 64-byte response; the transport's floor is 1024, so the read was refused before it left and every Box
  * read as unreadable: no new Box turn could start. The read here goes through the real transport to a Box that
  * answers in the exec stream format. The gate of INC-20261004-BOX-UNKNOWN-NEVER-CLOSED is checked beside it:
- * an unlisted build still refuses a new launch and never a run that already exists. */
+ * any readable build is admitted on a new launch and annotated on a run that already exists. */
 async function proveCliVersionRead(api: Api): Promise<string> {
   const frame = (flag: number, body: unknown): Buffer => {
     const payload = Buffer.from(JSON.stringify(body));
@@ -2317,20 +2317,20 @@ async function proveCliVersionRead(api: Api): Promise<string> {
   const current = boxRunning("2.1.288");
   const version = await must("CLI_VERSION_READ", api.cliVersion.gate().read(current.target));
   if (version !== "2.1.288" || current.state.sent !== 1) fail(`CLI_VERSION_READ_${version}_${current.state.sent}`);
-  // a new launch on that Box is admitted with its version; an unlisted build is refused before admission
+  // a new launch on that Box is admitted with its version; any readable build is admitted
   const resolve = api.cliVersion.launchResolver(async (args) => (args.box as ReturnType<typeof boxRunning>).target,
     api.cliVersion.gate());
   const admitted = await must("CLI_VERSION_LAUNCH", resolve({ box: boxRunning("2.1.288") }));
   if (admitted.cliVersion !== "2.1.288") fail("CLI_VERSION_LAUNCH_NOT_ANNOTATED");
-  // (the gate trusts a supported result per account for a while, so the other Box is another account)
+  // (the gate trusts a readable result per account for a while, so the other Box is another account)
   const unlisted = boxRunning("2.1.999", 26n);
-  const refusal = await codeOf(() => resolve({ box: unlisted }));
-  if (refusal !== "BOX_CLI_VERSION_UNSUPPORTED" || unlisted.state.sent !== 1 || unlisted.state.disposed !== 1) {
-    fail(`CLI_VERSION_UNLISTED_${refusal}_${unlisted.state.disposed}`);
+  const admittedUnlisted = await must("CLI_VERSION_UNLISTED", resolve({ box: unlisted }));
+  if (admittedUnlisted.cliVersion !== "2.1.999" || unlisted.state.sent !== 1 || unlisted.state.disposed !== 0) {
+    fail(`CLI_VERSION_UNLISTED_${admittedUnlisted.cliVersion}_${unlisted.state.disposed}`);
   }
   // a run that exists (continuation publish, stop, cleanup) is never refused by the gate
   const pinned = await must("CLI_VERSION_PINNED", resolve({ box: boxRunning("2.1.999", 27n), requiredAccountId: 27n }));
-  if (pinned.cliVersion !== undefined) fail("CLI_VERSION_PINNED_ANNOTATED");
+  if (pinned.cliVersion !== "2.1.999") fail("CLI_VERSION_PINNED_NOT_ANNOTATED");
   return "[ocv5-313-cli-version-read] PASS — the Box CLI version read leaves through the real exec transport and a supported Box is admitted";
 }
 
