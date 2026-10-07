@@ -118,19 +118,20 @@ export async function runBoxCcBridge(opts: {
   }
   if (!launch) launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
 
-  // An interactive host gets no line until this bridge has seen it report
-  // ready: until then every line is held here. Before the host hands its
-  // first line to the mod it prints BOX_INTERACTIVE_HANDOFF; the exec stream
-  // is ordered, so once the host's stream has ended the bridge knows whether
-  // any line reached Claude. If none did, every line goes to `-p` instead;
-  // if one did, a failure is a failure, as on `-p`. No turn runs on both.
+  // Two phases, so no turn can run twice or vanish:
+  // - until this bridge has seen the host report READY, it sends the host
+  //   nothing and holds every line here; if the host ends first (a dialog,
+  //   the ready timeout, a crash, held input over the cap), the held lines
+  //   go to `-p` in order and nothing ran interactively;
+  // - once READY is seen, the held lines go out first and the bridge behaves
+  //   exactly as on `-p`: a failed write or a dead host ends it, and the
+  //   next turn resumes.
   let held: string[] | null = interactive ? [] : null
   let heldBytes = 0
   const holdMax = positiveInt(env.OC_BOX_INTERACTIVE_HOLD_MAX_BYTES) ?? 64 * 1024 * 1024
-  /** Lines written to the interactive host, in order (replayed on fallback). */
-  const sentToHost: string[] = []
-  let handedToMod = false
-  let interactiveBroken: string | null = null
+  let readySeen = false
+  let abandoned: string | null = null
+  let hostStreamEnded = false
   let sawStdout = false
   let gate: Promise<void> = Promise.resolve()
 
@@ -163,27 +164,47 @@ export async function runBoxCcBridge(opts: {
   }
   let lineSeq = 0
   const writeLine = async (line: string): Promise<void> => {
-    if (interactive) {
-      if (interactiveBroken) {
-        sentToHost.push(line)
-        return
-      }
-      sentToHost.push(line)
-    }
     try {
       for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body)
     } catch (err) {
       if (abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
-      if (interactive) {
-        // Not delivered, or not known to be: end the host and decide once its
-        // stream is over (fallback only if it handed nothing to the mod).
-        abandonInteractive(`write_failed ${message}`)
-        return
-      }
       opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
+      // An interactive host would otherwise keep its tmux session until this
+      // chat's next launch reaps it; end it now (best effort, as stopRemote).
+      if (interactive) {
+        const stopper = new AbortController()
+        setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS).unref?.()
+        void postExec(control, boxCcStopExec(control), fetchImpl, stopper.signal)
+          .then((response) => response.arrayBuffer())
+          .catch(() => undefined)
+      }
       abort.abort()
     }
+  }
+  /** Ends a host that is not ready yet without ending the bridge. The launch
+   * may not have started it, so the abandon exec repeats until its stream
+   * has ended; the fallback below then runs. */
+  const abandonInteractive = (why: string): void => {
+    if (abandoned || readySeen) return
+    abandoned = why
+    opts.stderr.write(`BOX_INTERACTIVE_ABANDON ${why}\n`)
+    const hostControl = control
+    void (async () => {
+      for (let attempt = 0; attempt < 30 && !hostStreamEnded && !abort.signal.aborted; attempt++) {
+        const stopper = new AbortController()
+        const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
+        try {
+          const response = await postExec(hostControl, boxCcInteractiveAbandonExec(hostControl), fetchImpl, stopper.signal)
+          await response.arrayBuffer()
+        } catch {
+          // Tried again below while the host's stream is open.
+        } finally {
+          clearTimeout(timer)
+        }
+        if (!hostStreamEnded) await new Promise((r) => setTimeout(r, 1_000))
+      }
+    })()
   }
   const deliverLine = async (line: string): Promise<void> => {
     await gate
@@ -233,30 +254,6 @@ export async function runBoxCcBridge(opts: {
     const cut = setTimeout(() => abort.abort(), STOP_STREAM_GRACE_MS)
     cut.unref?.()
   }
-  let interactiveEnded = false
-  /** Ends the interactive host without ending the bridge. The launch may not
-   * have started the host yet, so this is repeated until its stream ends. */
-  const abandonInteractive = (why: string): void => {
-    if (!interactive || interactiveBroken) return
-    interactiveBroken = why
-    opts.stderr.write(`BOX_INTERACTIVE_ABANDON ${why}\n`)
-    const hostControl = control
-    void (async () => {
-      for (let attempt = 0; attempt < 30 && !interactiveEnded && !abort.signal.aborted; attempt++) {
-        const stopper = new AbortController()
-        const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
-        try {
-          const response = await postExec(hostControl, boxCcInteractiveAbandonExec(hostControl), fetchImpl, stopper.signal)
-          await response.arrayBuffer()
-        } catch {
-          // Tried again below while the host's stream is open.
-        } finally {
-          clearTimeout(timer)
-        }
-        if (!interactiveEnded) await new Promise((r) => setTimeout(r, 1_000))
-      }
-    })()
-  }
   const streamLaunch = async (request: BoxCcExecRequest): Promise<void> => {
     const response = await postExec(control, request, fetchImpl, abort.signal)
     const reader = response.body!.getReader()
@@ -274,10 +271,10 @@ export async function runBoxCcBridge(opts: {
           opts.stdout.write(event.data)
         } else if (event.kind === 'stderr' && event.data) {
           opts.stderr.write(event.data)
-          if (interactive) {
+          if (held && !abandoned) {
             errTail = (errTail + event.data).slice(-4096)
-            if (errTail.includes('BOX_INTERACTIVE_HANDOFF')) handedToMod = true
-            if (held && !interactiveBroken && errTail.includes('BOX_INTERACTIVE_READY')) {
+            if (errTail.includes('BOX_INTERACTIVE_READY')) {
+              readySeen = true
               const lines = held
               held = null
               heldBytes = 0
@@ -297,12 +294,12 @@ export async function runBoxCcBridge(opts: {
   }).then(stopRemote)
   try {
     await streamLaunch(launch)
-    interactiveEnded = true
-    if (interactive && !handedToMod && !sawStdout && !stopRequested && !abort.signal.aborted) {
-      // -p takes over: a fresh fifo, every line so far first, in order.
-      opts.stderr.write(`BOX_INTERACTIVE_FALLBACK ${interactiveBroken ?? 'not_ready'}\n`)
+    hostStreamEnded = true
+    if (interactive && !readySeen && !sawStdout && !stopRequested && !abort.signal.aborted) {
+      // The host never got a line: -p takes them all, on a fresh fifo, in order.
+      opts.stderr.write(`BOX_INTERACTIVE_FALLBACK ${abandoned ?? 'not_ready'}\n`)
       noteInteractiveFailure(stateDir)
-      const lines = [...sentToHost, ...(held ?? [])]
+      const lines = held ?? []
       held = null
       interactive = false
       sawExit = false
@@ -312,10 +309,6 @@ export async function runBoxCcBridge(opts: {
       const streaming = streamLaunch(boxCcLaunchExec(control, remoteClaudeArgs(opts.args)))
       await flushFirst(lines)
       await streaming
-    } else if (interactive && interactiveBroken && !stopRequested && !abort.signal.aborted) {
-      // Something reached Claude before the host failed: report it as -p would.
-      opts.stderr.write(`BOX_CC_WRITE_FAILED ${interactiveBroken}\n`)
-      sawExit = false
     }
   } catch (error) {
     if (!stopRequested) throw error

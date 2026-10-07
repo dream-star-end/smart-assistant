@@ -31,6 +31,7 @@ import {
   BOX_CC_INTERACTIVE_LAUNCH_SCRIPT,
   boxBridgeModDigest,
   boxBridgeModRoot,
+  boxCcInteractiveAbandonExec,
   boxCcInteractiveLaunchExec,
   boxCcRunnerFromEnv,
   loadBoxBridgeMod,
@@ -593,11 +594,14 @@ async function bridgeRun(
     stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: `turn ${i}` }] } })}\n`)
   }
   const results = (): any[] => out.trim() ? out.trim().split('\n').map((l) => JSON.parse(l)).filter((m) => m.type === 'result') : []
-  let code: number
+  let code: number | string
   if (opts.expectResults === false) {
-    // The bridge ends by itself (the turn failed); then the gateway closes stdin.
-    code = await running
+    // The bridge ends by itself (the turn failed, rejecting as on -p); then
+    // the gateway closes stdin.
+    code = await running.catch((e: unknown) => `rejected: ${e instanceof Error ? e.message : String(e)}`)
     stdin.end()
+    // The interactive host is stopped on the way out; give it a moment.
+    await until(() => (leftovers(control.fifo).length === 0 ? true : undefined), 15_000).catch(() => undefined)
   } else {
     await until(() => (results().length >= opts.lines ? true : undefined), 40_000)
     stdin.end()
@@ -663,7 +667,6 @@ test('bridge: once a line went to a ready host, its failure is not replayed on -
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
   const r = await bridgeRun('die-on-line', { lines: 1, expectResults: false })
   assert.notEqual(r.code, 0)
-  assert.match(r.err, /BOX_INTERACTIVE_HANDOFF/)
   assert.deepEqual(r.results, [])
   assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
   assert.equal(r.cooled, false)
@@ -681,15 +684,14 @@ test('host: a session whose tap is gone stops instead of piling up input', { tim
   assert.ok(!existsSync(h.fifo))
 })
 
-test('bridge: READY seen but the first write cannot reach the host: -p gets the turn once', { timeout: 90_000 }, async (t) => {
+test('bridge: after READY a failed write ends the bridge as on -p, never a second run', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
-  const r = await bridgeRun('ready', { lines: 2, failWritesToFirstLaunch: true })
-  assert.equal(r.code, 0)
-  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2']])
-  assert.match(r.err, /BOX_INTERACTIVE_ABANDON write_failed/)
-  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK write_failed/)
-  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_HANDOFF/)
-  assert.deepEqual(leftovers(r.fifoBase), [])
+  const r = await bridgeRun('ready', { lines: 2, failWritesToFirstLaunch: true, expectResults: false })
+  assert.equal(r.code, 'rejected: aborted')
+  assert.deepEqual(r.results, [])
+  assert.match(r.err, /BOX_CC_WRITE_FAILED BOX_CC_WRITE_EXIT_1/)
+  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
+  assert.deepEqual(leftovers(r.fifoBase), [], 'host stopped on the way out')
 })
 
 test('bridge: held input over OC_BOX_INTERACTIVE_HOLD_MAX_BYTES switches to -p before the host is ready', { timeout: 90_000 }, async (t) => {
@@ -700,4 +702,32 @@ test('bridge: held input over OC_BOX_INTERACTIVE_HOLD_MAX_BYTES switches to -p b
   assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2'], ['p', 'turn 3']])
   assert.match(r.err, /BOX_INTERACTIVE_FALLBACK held_overflow/)
   assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+test('abandon exec: signals only a host whose argv names the run dir', { timeout: 30_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const base = `/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`
+  const fifo = boxCcSpawnFifo(base, randomBytes(4).toString('hex'))
+  const run = `${fifo.slice(0, -'.fifo'.length)}.d`
+  const control: BoxCcControl = { execUrl: 'https://x', execToken: 't', networkToken: 'n', remoteClaude: '/bin/true', fifo, cwd: '/tmp' }
+  const req = boxCcInteractiveAbandonExec(control)
+  const run1 = (): number | null => spawnSync(req.command, req.args, { env: req.environment }).status
+  try {
+    assert.equal(run1(), 3, 'no host yet')
+    spawnSync('mkdir', ['-m', '700', run])
+    // A pid file naming some other process (here: a sleeper without the run dir in argv).
+    const other = spawn('sleep', ['30'])
+    writeFileSync(`${run}/host.pid`, String(other.pid))
+    assert.equal(run1(), 5, 'not that host')
+    assert.equal(other.exitCode, null)
+    other.kill()
+    // The real shape: argv carries the run dir.
+    const host = spawn('python3', ['-c', 'import time; time.sleep(30)', run])
+    const ended = new Promise<string | null>((resolve) => host.on('exit', (_code, signal) => resolve(signal)))
+    writeFileSync(`${run}/host.pid`, String(host.pid))
+    assert.equal(run1(), 0)
+    assert.equal(await Promise.race([ended, new Promise((r) => setTimeout(() => r('timeout'), 5_000))]), 'SIGTERM')
+  } finally {
+    rmSync(run, { recursive: true, force: true })
+  }
 })

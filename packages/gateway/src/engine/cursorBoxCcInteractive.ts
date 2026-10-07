@@ -124,15 +124,20 @@ export const BOX_CC_INTERACTIVE_LAUNCH_SCRIPT = [
   'exit "$status"',
 ].join('\n')
 
-/** Ends one interactive host by the pid it wrote into its run dir, nothing
- * else. Unlike the stop exec it leaves the fifo alone: a stop that removes
- * the fifo while a launch is starting leaves the host reading a deleted
- * path, which no later reap can match. */
+/** Ends one interactive host by the pid it wrote into its run dir, and only
+ * if that pid's argv still names the run dir (no stale or substituted pid).
+ * Unlike the stop exec it leaves the fifo alone: a stop that removes the
+ * fifo while a launch is starting leaves the host reading a deleted path,
+ * which no later reap can match. Exit 3: no host yet; 4/5: not that host. */
 export const BOX_CC_INTERACTIVE_ABANDON_SCRIPT = [
   'set -eu',
-  'pidfile="${1%.fifo}.d/host.pid"',
-  '[ -f "$pidfile" ] || exit 3',
-  'kill -TERM "$(cat "$pidfile")" 2>/dev/null || true',
+  'run="${1%.fifo}.d"',
+  'pidfile="$run/host.pid"',
+  'if [ ! -f "$pidfile" ] || [ -L "$pidfile" ]; then exit 3; fi',
+  'pid="$(cat "$pidfile")"',
+  'case "$pid" in ""|*[!0-9]*) exit 4;; esac',
+  'tr "\\000" "\\n" < "/proc/$pid/cmdline" 2>/dev/null | grep -qxF "$run" || exit 5',
+  'kill -TERM "$pid" 2>/dev/null || true',
 ].join('\n')
 
 export function boxCcInteractiveAbandonExec(control: BoxCcControl): BoxCcExecRequest {
