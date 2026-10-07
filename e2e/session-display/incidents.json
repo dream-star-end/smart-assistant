@@ -6125,6 +6125,39 @@
           "assertion": "null 清态帧丢失:单凭 working(thinking) 也结束 engine_*,其它 working 不动启动态"
         }
       ]
+    },
+    {
+      "id": "INC-20261007-SAND-INSTALLER-HOST-F95DBFB",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "selfhost（2026-10-04 起）：Cursor 账号池每次同步都写 0 个账号，个人版所有 cursor-* 回合在选账号时失败（oc-cursor：Cursor CLI is not enabled for this account）。唯一 Sand 账号 25 的生命周期停在 INSTALL_UNCONFIRMED：Cursor 把 Box 主程序升到 f95dbfb，主程序搬到 /opt/sand/sand-host/，安装器和安装 prompt 仍写死 /home/box/sand-host/；网关鉴权多了 WebAuthn 代理令牌分支，旧 AUTH 锚点匹配 0 次（UNSUPPORTED_HOST_LAYOUT）。2026-10-07 外机 cc3 重启 Sand host 后同样失败，确认不是一次性状态。修复：安装器布局 V3，按预期主程序 PID 的 cwd 在已知目录中选主程序（新路径优先，保留旧路径），安装 prompt 也优先在该目录暂存；Sand relay 路由插在 WebAuthn 代理分支之前并自带主网关令牌校验，代理令牌永远到不了 relay，未配置令牌时失败关闭；重跑时路由不在代理分支之前就拒绝；relay.cjs 自身的令牌校验保留为第二道闸。",
+      "rootFixCommit": "7f99c559",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host f95dbfb layout: relay answers only the primary gateway token, never the WebAuthn proxy token"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host f95dbfb layout: the installer's own route gate holds even when the relay module has no token check"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "re-run refuses an f95dbfb host whose relay route sits after the proxy gate"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host path follows the expected PID's cwd among known Sand host directories"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层（真实 installer.py 对 f95dbfb 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌，含无自身鉴权的 relay 替身）；线上证据要账号 25 真实 Box：发布后 Sand host 换 PID、生命周期 ready、能力探针命中、账号池写入 ≥1，属一次性运维核对，接不进 browser/live-e2e/deploy-gate runner。",
+        "since": "2026-10-08"
+      }
     }
   ]
 }
