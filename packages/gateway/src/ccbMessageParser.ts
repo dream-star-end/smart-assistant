@@ -130,6 +130,15 @@ export type GatewayEngineErrorEvent = Omit<
  * 新代码应直接用权威名。gateway 侧不再有任何跨 engine/ 边界的受控 cast。
  */
 export type GatewayTurnPhase = EngineTurnPhase
+
+/** Main-agent model progress observed on the stream before any visible block:
+ *  `call_start` = message_start (the engine is up and the model is answering),
+ *  `thinking_start` / `thinking_stop` = a thinking block opened / closed. Fired
+ *  even when the thinking text is empty (Box Opus max-effort returns empty
+ *  thinking), so the gateway can end its cold-start phase and show that the
+ *  model is thinking instead of "starting the engine". Side channel only:
+ *  never a content event, never persisted. */
+export type ModelProgressPhase = 'call_start' | 'thinking_start' | 'thinking_stop'
 export type GatewayStreamEvent = SessionStreamEvent
 
 /** 校验底座 fake-SDK retrying 状态携带的 retry 载荷;形状非法返回 null(调用方
@@ -471,6 +480,10 @@ export class CcbMessageParser {
    *  重复触发桥接;又保证子 agent bg bash 的 tail 能被路由层正确归位(否则 fail-closed
    *  会把活跃 turn 内的子 agent bash tail 也误丢)。 */
   private onBashToolObserved?: (toolUseId: string) => void
+  /** Main-agent model progress side channel (see ModelProgressPhase). */
+  private onModelProgress?: (phase: ModelProgressPhase) => void
+  /** Stream index of the open main-agent thinking block, if any. */
+  private openThinkingIndex: number | null = null
   private onPostFinalRuntimeEvent?: (
     event: DurableRuntimeEvent,
     block: OutboundContentBlock,
@@ -514,6 +527,7 @@ export class CcbMessageParser {
     onIdleArtifactReceipt?: (receipt: { opId: string; digest: string }) => void
     /** F5 — 见字段级注释:所有 Bash tool_use(含子 agent)的归属登记回调。 */
     onBashToolObserved?: (toolUseId: string) => void
+    onModelProgress?: (phase: ModelProgressPhase) => void
     onPostFinalRuntimeEvent?: (
       event: DurableRuntimeEvent,
       block: OutboundContentBlock,
@@ -559,6 +573,7 @@ export class CcbMessageParser {
     this.onNativeCompactionSummary = opts.onNativeCompactionSummary
     this.onIdleArtifactReceipt = opts.onIdleArtifactReceipt
     this.onBashToolObserved = opts.onBashToolObserved
+    this.onModelProgress = opts.onModelProgress
     this.onPostFinalRuntimeEvent = opts.onPostFinalRuntimeEvent
     this.onFinish = opts.onFinish
     this._sessionTotals = opts.sessionTotals
@@ -969,6 +984,7 @@ export class CcbMessageParser {
         this.currentCallUsage = mergeTokenUsage(this.currentCallUsage, patch)
         this._emitLiveTokenUsage()
       }
+      if (!parentToolUseId) this.onModelProgress?.('call_start')
       return
     }
     if (ev.type === 'message_delta') {
@@ -984,6 +1000,7 @@ export class CcbMessageParser {
     }
     if (ev.type === 'message_stop') {
       this._settleCurrentCallUsage()
+      if (!parentToolUseId) this._closeMainThinking()
       return
     }
 
@@ -1016,6 +1033,17 @@ export class CcbMessageParser {
 
     if (ev.type === 'content_block_start') {
       const cb = ev.content_block
+      if (
+        !parentToolUseId &&
+        (cb?.type === 'thinking' || cb?.type === 'redacted_thinking') &&
+        typeof ev.index === 'number'
+      ) {
+        this._closeMainThinking()
+        this.openThinkingIndex = ev.index
+        this.onModelProgress?.('thinking_start')
+        return
+      }
+      if (!parentToolUseId) this._closeMainThinking()
       if (cb?.type === 'tool_use' && cb.id && cb.name) {
         this.toolUseIdToName.set(cb.id, cb.name)
         this.streamingToolUses.set(cb.id, { name: cb.name, partialJson: '', done: false })
@@ -1160,6 +1188,7 @@ export class CcbMessageParser {
     }
 
     if (ev.type === 'content_block_stop') {
+      if (!parentToolUseId && ev.index === this.openThinkingIndex) this._closeMainThinking()
       const toolId = this.indexToToolId.get(ev.index as number)
       if (toolId) {
         const tool = this.streamingToolUses.get(toolId)
@@ -1167,6 +1196,12 @@ export class CcbMessageParser {
       }
       return
     }
+  }
+
+  private _closeMainThinking(): void {
+    if (this.openThinkingIndex === null) return
+    this.openThinkingIndex = null
+    this.onModelProgress?.('thinking_stop')
   }
 
   private _settleCurrentCallUsage(): void {

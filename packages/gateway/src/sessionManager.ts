@@ -194,6 +194,7 @@ import type {
   GatewayEngineErrorEvent,
   GatewayTerminalErrorCode,
   GatewayTurnPhase,
+  ModelProgressPhase,
 } from './ccbMessageParser.js'
 import { isCcbSlashCommandPrompt } from './ccbNativeCompaction.js'
 import {
@@ -1360,6 +1361,13 @@ export function isNativeEngineTransientContinuationSafe(input: {
 
 // Re-export from ccbMessageParser so existing imports keep working
 export type { SessionStreamEvent } from './ccbMessageParser.js'
+
+/** `turn_status` working detail meaning "the model is thinking" (empty or
+ *  visible thinking). web-react `MODEL_THINKING_WORKING_DETAIL` mirrors it. */
+export const MODEL_THINKING_WORKING_DETAIL = 'thinking'
+/** Keepalive period while a thinking block is open; well under the browser's
+ *  12s "generating" and 30s silence-warning thresholds. */
+export const MODEL_THINKING_KEEPALIVE_MS = 10_000
 
 /** preheatRunner 的结构化结果(engine_preheat 观测:区分未触发/排队/失败/已热)。 */
 export type PreheatOutcome =
@@ -6808,6 +6816,42 @@ export class SessionManager {
         startupPhaseActive = false
         onEvent({ kind: 'turn_status', status: null })
       }
+      // Model-thinking visibility: Box Opus max-effort thinks for minutes with
+      // EMPTY thinking text, so no visible block arrives and the startup phase
+      // used to stick ("正在启动引擎 (136s)"). The adapter's model_progress
+      // side channel reports message_start / thinking open-close; message_start
+      // ends the startup phase, and while a main-agent thinking block is open
+      // a `working` keepalive (detail=thinking) tells the browser the model is
+      // thinking. Ticks stop with the turn, so a dead stream still escalates
+      // to the client's silence warning.
+      let thinkingKeepalive: ReturnType<typeof setInterval> | null = null
+      const emitThinkingStatus = (): void => {
+        onEvent({
+          kind: 'turn_status',
+          status: { status: 'working', detail: MODEL_THINKING_WORKING_DETAIL },
+        })
+      }
+      const stopThinkingStatus = (clear: boolean): void => {
+        if (!thinkingKeepalive) return
+        clearInterval(thinkingKeepalive)
+        thinkingKeepalive = null
+        if (clear) onEvent({ kind: 'turn_status', status: null })
+      }
+      const handleModelProgress = (phase: ModelProgressPhase): void => {
+        if (detached) return
+        clearStartupPhase()
+        if (phase === 'thinking_start') {
+          if (thinkingKeepalive) return
+          emitThinkingStatus()
+          thinkingKeepalive = setInterval(() => {
+            if (detached) stopThinkingStatus(false)
+            else emitThinkingStatus()
+          }, MODEL_THINKING_KEEPALIVE_MS)
+          thinkingKeepalive.unref?.()
+        } else if (phase === 'thinking_stop') {
+          stopThinkingStatus(true)
+        }
+      }
       const handleEngineEvent = (e: EngineEvent) => {
         if (startupPhaseActive) {
           if (e.kind === 'turn_status') {
@@ -6827,6 +6871,9 @@ export class SessionManager {
           ) {
             clearStartupPhase()
           }
+        }
+        if (e.kind === 'permission_request' || e.kind === 'error' || e.kind === 'final') {
+          stopThinkingStatus(false)
         }
         if (
           e.kind === 'turn_status' &&
@@ -7099,6 +7146,8 @@ export class SessionManager {
         runner.off('exit', handleExit)
         runner.off('parse_error', handleParseError)
         runner.off('spawn', handleSpawn)
+        runner.off('model_progress', handleModelProgress)
+        stopThinkingStatus(false)
       }
 
       const retainedTerminalErrors = new Set<string>()
@@ -8353,6 +8402,7 @@ export class SessionManager {
       runner.on('exit', handleExit)
       runner.on('parse_error', handleParseError)
       runner.on('spawn', handleSpawn)
+      runner.on('model_progress', handleModelProgress)
 
       // Engine not running yet → this turn pays a cold start (CCB ~20s
       // bun+JSONL resume, codex app-server init, cursor/grok one-shot CLI

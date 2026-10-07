@@ -18,7 +18,7 @@ import {
   type RecoveryStatusState,
   type TurnStatusState,
 } from "../../lib/chat/model";
-import { computeTypingLabel } from "../../lib/chat/pure";
+import { computeTypingLabel, MODEL_THINKING_WORKING_DETAIL } from "../../lib/chat/pure";
 import { cn } from "../../lib/utils";
 
 /**
@@ -94,7 +94,10 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     kitchenTurnRef.current = info.startedAt;
     kitchenStickyRef.current = "";
   }
-  if (info.progressHint) kitchenStickyRef.current = info.progressHint;
+  // 「深度思考中」是阶段态不是厨房动作:不进 sticky,思考结束后不得回落成「执行操作」。
+  if (info.progressHint && info.progressHint !== MODEL_THINKING_WORKING_DETAIL) {
+    kitchenStickyRef.current = info.progressHint;
+  }
 
   // 自动重试软提示优先级最高。所有底座/跨 turn 恢复只呈现这一行，不再各自
   // 插 assistant notice、synthetic user bubble 或倒计时变体。

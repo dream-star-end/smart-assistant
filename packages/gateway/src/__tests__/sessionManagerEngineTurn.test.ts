@@ -19,6 +19,8 @@ import { EventEmitter } from "node:events";
 import {
   SessionManager,
   TRANSIENT_RETRY_INPUT,
+  MODEL_THINKING_KEEPALIVE_MS,
+  MODEL_THINKING_WORKING_DETAIL,
   isNativeEngineTransientContinuationSafe,
   type AgentSession,
 } from "../sessionManager.js";
@@ -4498,6 +4500,166 @@ describe("engine cold-start turn_status", () => {
     assert.equal(statuses[0], "engine_starting");
     assert.equal(statuses[1], null);
     assert.equal((statuses[2] as { status?: string } | null)?.status, "retrying");
+  });
+});
+
+// ── 模型已开始应答:空思考也要结束「启动引擎」并显示「深度思考中」──────────────
+// 商业截图:Box Opus 5.5 最高档思考 ~150s 且思考正文为空,启动态一直挂到正文出来。
+
+describe("model progress ends engine startup (empty thinking)", () => {
+  function statusesOf(events: SessionStreamEvent[]): unknown[] {
+    return events
+      .filter((e): e is Extract<SessionStreamEvent, { kind: "turn_status" }> => e.kind === "turn_status")
+      .map((e) => e.status);
+  }
+  const THINKING = { status: "working", detail: MODEL_THINKING_WORKING_DETAIL };
+  function streamEvent(event: Record<string, unknown>, parent?: string): Record<string, unknown> {
+    return {
+      type: "stream_event",
+      event,
+      ...(parent ? { parent_tool_use_id: parent } : {}),
+    };
+  }
+  function messageStart(r: FakeCcbRunner, parent?: string): void {
+    r.msg(streamEvent({
+      type: "message_start",
+      message: { id: "msg_1", role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 1 } },
+    }, parent));
+  }
+  function emptyThinkingStart(r: FakeCcbRunner, index = 0, parent?: string): void {
+    r.msg(streamEvent({
+      type: "content_block_start",
+      index,
+      content_block: { type: "thinking", thinking: "", signature: "" },
+    }, parent));
+  }
+  function blockStop(r: FakeCcbRunner, index = 0, parent?: string): void {
+    r.msg(streamEvent({ type: "content_block_stop", index }, parent));
+  }
+
+  test("冷 runner:message_start 前保持 engine_starting;空思考开始即清启动态并发 thinking,思考结束发 null", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    let beforeModelStart: unknown[] = [];
+    let duringThinking: unknown[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        r.emit("spawn", { resumed: false });
+        beforeModelStart = statusesOf(events);
+        messageStart(r);
+        emptyThinkingStart(r, 0);
+        duringThinking = statusesOf(events);
+        blockStop(r, 0);
+        r.text("answer after long thinking");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+
+    assert.deepEqual(beforeModelStart, ["engine_starting", "engine_starting"]);
+    assert.deepEqual(duringThinking, ["engine_starting", "engine_starting", null, THINKING]);
+    assert.equal(
+      events.filter((e) => e.kind === "block").length > 0 &&
+        events.findIndex((e) => e.kind === "block") >
+          events.findIndex((e) => e.kind === "turn_status" && e.status === null),
+      true,
+      "启动态必须在任何可见内容块之前被清",
+    );
+    assert.deepEqual(statusesOf(events), ["engine_starting", "engine_starting", null, THINKING, null]);
+  });
+
+  test("message_start 本身(无思考块)即清启动态", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    let afterStart: unknown[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        messageStart(r);
+        afterStart = statusesOf(events);
+        r.text("plain answer");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    assert.deepEqual(afterStart, ["engine_starting", null]);
+    assert.deepEqual(statusesOf(events), ["engine_starting", null]);
+  });
+
+  test("思考期间按 keepalive 周期重发 thinking(计时持续推进),思考结束后停", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let ticksDuring = 0;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          messageStart(r);
+          emptyThinkingStart(r, 0);
+          t.mock.timers.tick(MODEL_THINKING_KEEPALIVE_MS);
+          t.mock.timers.tick(MODEL_THINKING_KEEPALIVE_MS);
+          ticksDuring = statusesOf(events).filter((s) => JSON.stringify(s) === JSON.stringify(THINKING)).length;
+          blockStop(r, 0);
+          t.mock.timers.tick(MODEL_THINKING_KEEPALIVE_MS * 3);
+          r.text("done");
+          r.result();
+        });
+      });
+      const session = makeSession(runner);
+      await runOneTurn(sm, session, events);
+      assert.equal(ticksDuring, 3, "开始一次 + 两个 keepalive 周期");
+      const statuses = statusesOf(events);
+      assert.equal(statuses.filter((s) => JSON.stringify(s) === JSON.stringify(THINKING)).length, 3);
+      assert.equal(statuses[statuses.length - 1], null);
+    } finally {
+      t.mock.timers.reset();
+    }
+  });
+
+  test("思考块未关就收尾(final):停止 keepalive,不再发 thinking", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          messageStart(r);
+          emptyThinkingStart(r, 0);
+          r.result();
+        });
+      });
+      const session = makeSession(runner);
+      // 无可见输出的收尾会被判 PHANTOM_TURN 拒绝 —— 这同样是终态,keepalive 必须停。
+      await runOneTurn(sm, session, events).catch(() => {});
+      const before = statusesOf(events).length;
+      t.mock.timers.tick(MODEL_THINKING_KEEPALIVE_MS * 5);
+      assert.equal(statusesOf(events).length, before);
+    } finally {
+      t.mock.timers.reset();
+    }
+  });
+
+  test("子 agent 的 message_start/思考块不影响主 turn 阶段态", async () => {
+    const sm = new SessionManager(makeConfigStub());
+    const events: SessionStreamEvent[] = [];
+    let afterSubagent: unknown[] = [];
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        messageStart(r, "toolu_parent");
+        emptyThinkingStart(r, 0, "toolu_parent");
+        blockStop(r, 0, "toolu_parent");
+        afterSubagent = statusesOf(events);
+        r.text("main answer");
+        r.result();
+      });
+    });
+    runner.isRunning = false;
+    const session = makeSession(runner);
+    await runOneTurn(sm, session, events);
+    assert.deepEqual(afterSubagent, ["engine_starting"]);
   });
 });
 
