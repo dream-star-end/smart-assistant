@@ -74,6 +74,10 @@ export const STALE_WARN_MS = 30_000;
 export const STALE_DANGER_MS = 90_000;
 /** 首字未出但帧仍在跳(keepalive)时,按已耗时升级「深度思考中」预期管理文案的阈值。 */
 export const LONG_THINKING_HINT_SECS = 20;
+/** outbound.turn_status `working` detail = 模型正在思考(gateway sessionManager
+ *  `MODEL_THINKING_WORKING_DETAIL` 镜像)。思考内容为空(Box Opus 最高档)时也会发,
+ *  并按 10s keepalive 续命,所以静默升级文案只在流真的断了时才出现。 */
+export const MODEL_THINKING_WORKING_DETAIL = "thinking";
 
 // ═══════════════ partialJson offset 累加器（websocket.js:654-666）═══════════════
 
@@ -520,6 +524,16 @@ export function computeTypingLabel(p: {
   if (silenceMs >= STALE_WARN_MS) {
     const sil = Math.round(silenceMs / 1000);
     return { text: `${name} 深度思考中 (${secs}s · ${sil}s 无新数据)`, cls: "stale-warn" };
+  }
+  // 模型已开始应答、思考块进行中(gateway 权威):明确告诉用户在深度思考,不是在启动。
+  if (progressHint === MODEL_THINKING_WORKING_DETAIL) {
+    if (secs >= LONG_THINKING_HINT_SECS) {
+      return {
+        text: `${name} 深度思考中 (${secs}s) · 复杂问题可能需要一两分钟,可随时停止${hint}`,
+        cls: "long-thinking",
+      };
+    }
+    return { text: `${name} 深度思考中${secs >= 3 ? ` (${secs}s)` : ""}${hint}`, cls: "" };
   }
   const progress =
     formatLiveActivityAction(progressHint) || formatLiveActivityAction(kitchenStickyHint);

@@ -520,6 +520,12 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
         this._registerToolOrigin(toolUseId, ctx)
       },
       onToolResult: (result) => params.onEvent({ kind: 'tool_result_detected', result }),
+      // Model-start / thinking side channel (not a content event): lets the
+      // gateway end its cold-start phase on message_start even when the
+      // thinking text is empty. Scoped to the routed, unfinished turn.
+      onModelProgress: (phase) => {
+        if (this._routeTurn === ctx && !ctx.parser.finalized) this.emit('model_progress', phase)
+      },
       onNativeCompactionSummary: (summaryText) => { nativeCompactionSummary = summaryText },
       onIdleArtifactReceipt: (receipt) => { nativeIdleReceipt = receipt },
       onPostFinalRuntimeEvent: params.onPostTerminalRuntimeEvent,

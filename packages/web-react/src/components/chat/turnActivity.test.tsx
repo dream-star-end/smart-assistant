@@ -73,6 +73,19 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(text).not.toContain("思考中");
   });
 
+  test("模型思考中(working detail=thinking)→ 深度思考中;结束后不回落「执行操作」", () => {
+    const startedAt = Date.now() - 12_000;
+    const { rerender } = render(
+      <TurnActivity info={{ startedAt, agentName: "助手", lastFrameAt: Date.now(), progressHint: "thinking" }} />,
+    );
+    const during = screen.getByLabelText("生成中").textContent ?? "";
+    expect(during).toContain("深度思考中");
+    expect(during).not.toContain("启动引擎");
+    rerender(<TurnActivity info={{ startedAt, agentName: "助手", lastFrameAt: Date.now() }} />);
+    const after = screen.getByLabelText("生成中").textContent ?? "";
+    expect(after).not.toContain("执行操作");
+  });
+
   test("engine_resuming → 正在恢复会话(长等待也不升级成深度思考)", () => {
     renderTA({ startedAt: Date.now() - 35_000, turnStatus: "engine_resuming" });
     const text = screen.getByLabelText("生成中").textContent ?? "";
