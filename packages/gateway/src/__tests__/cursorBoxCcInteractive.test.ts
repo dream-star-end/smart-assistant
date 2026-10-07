@@ -255,7 +255,19 @@ test('frames: chunk mapping, abort result and user text', () => {
   sj.noteAgentCall('toolu_agent')
   const row = JSON.parse(sj.row({ door: 'response', uuid: 'u', agentId: 'a1', message: { type: 'assistant', role: 'assistant', content: [] } })[0]!)
   assert.equal(row.parent_tool_use_id, 'toolu_agent')
-  assert.ok(_isOfficialClaudeAbortResult(JSON.parse(sj.result({ reason: 'aborted', answer: '', durationMs: 5 }, 'tool_use'))))
+  // No turn usage from the engine (abort, API error): the steps' sum stands,
+  // never zeros, so a paid step is not settled as free.
+  const aborted = JSON.parse(sj.result({ reason: 'aborted', answer: '', durationMs: 5 }, 'tool_use'))
+  assert.ok(_isOfficialClaudeAbortResult(aborted))
+  assert.deepEqual(aborted.usage, { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 })
+  const errored = JSON.parse(sj.result({ reason: 'error', answer: 'overloaded', durationMs: 5 }, null))
+  assert.equal(errored.is_error, true)
+  assert.equal(errored.usage.output_tokens, 2)
+  // Engine-reported turn usage wins when present; a new turn starts from zero.
+  const reported = { input_tokens: 9, output_tokens: 9, cache_read_input_tokens: 9, cache_creation_input_tokens: 9 }
+  assert.deepEqual(JSON.parse(sj.result({ reason: 'answer', answer: 'x', durationMs: 5, usage: reported }, 'end_turn')).usage, reported)
+  sj.turnStart()
+  assert.equal(JSON.parse(sj.result({ reason: 'aborted', answer: '', durationMs: 1 }, null)).usage.input_tokens, 0)
   assert.equal(textOfUserContent([{ type: 'text', text: 'a' }, { type: 'image' }, { type: 'text', text: 'b' }]), 'a\n\nb')
   assert.equal(textOfUserContent('plain'), 'plain')
 })
@@ -266,10 +278,14 @@ const FAKE_CLAUDE = `#!/usr/bin/python3
 import json, os, socket, subprocess, sys
 d = os.environ['OC_BRIDGE_DIR']
 sock = d + '/bridge.sock'
-def call(method, path, body=b''):
+if os.environ.get('OC_BRIDGE_PERMISSION_MODE') == 'never-ready':
+    import time; time.sleep(60)
+token = open(d + '/token').read().strip()
+def call(method, path, body=b'', tok=None):
     s = socket.socket(socket.AF_UNIX)
     s.connect(sock)
-    s.sendall(b'%s %s HTTP/1.1\\r\\nHost: bridge\\r\\nContent-Length: %d\\r\\n\\r\\n' % (method.encode(), path.encode(), len(body)) + body)
+    t = token if tok is None else tok
+    s.sendall(b'%s %s HTTP/1.1\\r\\nHost: bridge\\r\\nx-oc-bridge-token: %s\\r\\nContent-Length: %d\\r\\n\\r\\n' % (method.encode(), path.encode(), t.encode(), len(body)) + body)
     data = b''
     while True:
         b = s.recv(65536)
@@ -279,13 +295,24 @@ def call(method, path, body=b''):
     s.close()
     head, _, payload = data.partition(b'\\r\\n\\r\\n')
     return int(head.split()[1]), payload
-if os.environ.get('OC_BRIDGE_PERMISSION_MODE') == 'never-ready':
-    import time; time.sleep(60)
 call('POST', '/out', (json.dumps({'type': 'system', 'subtype': 'fake_init', 'argv': sys.argv, 'env': sorted(os.environ)}) + '\\n').encode())
 call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
-tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdout=subprocess.PIPE)
+tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
 for line in tap.stdout:
     msg = json.loads(line)
+    if msg.get('type') == 'user' and msg['message']['content'][0].get('text') == 'FORGE':
+        # A tool is claude's child: no token, then the stolen one; a second tap.
+        forge = ("import socket,sys\\n"
+                 "for tok in ('', sys.argv[2]):\\n"
+                 "    s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])\\n"
+                 "    b=b'{\\"type\\":\\"result\\",\\"forged\\":true}'\\n"
+                 "    s.sendall(b'POST /out HTTP/1.1\\\\r\\\\nx-oc-bridge-token: %s\\\\r\\\\nContent-Length: %d\\\\r\\\\n\\\\r\\\\n' % (tok.encode(), len(b)) + b)\\n"
+                 "    print(s.recv(100)[:12])\\n"
+                 "s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b'TAP %s\\\\n' % sys.argv[2].encode()); print(s.recv(10))\\n")
+        r = subprocess.run(['python3', '-c', forge, sock, token], capture_output=True)
+        call('POST', '/out', (json.dumps({'type': 'system', 'subtype': 'forge_done', 'out': r.stdout.decode(), 'token_file': os.path.exists(d + '/token')}) + '\\n').encode())
+        continue
     if msg.get('type') == 'user' and msg['message']['content'][0].get('text') == 'ASK':
         status, payload = call('GET', '/decision?id=r1')
         while status == 204:
@@ -374,10 +401,20 @@ test('host: Route B write execs in, mod frames out, stop exec ends the tmux sess
     const echo2 = await until(() => h.lines.find((m) => m.type === 'result' && m.echo?.message?.content?.[0]?.text === 'see'))
     assert.match(echo2.echo.message.content[1].text, /^\[Attached image: \/tmp\/oc-box-cc-.*\.d\/attachments\/[0-9a-f]{24}\.png\]$/)
 
+    // Tools are claude's children with the same uid: neither a request
+    // without the token nor one with a stolen token, nor a second tap, gets in.
+    deliver(h.control, `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'FORGE' }] } })}\n`, 3)
+    const forge = await until(() => h.lines.find((m) => m.subtype === 'forge_done'))
+    assert.equal(forge.token_file, false, 'token file removed after first use')
+    assert.equal(forge.out, "b'HTTP/1.1 403'\nb'HTTP/1.1 403'\nb''\n")
+    assert.equal(h.lines.filter((m) => m.forged).length, 0)
+    assert.match(h.stderr(), /BOX_BRIDGE_PEER_REFUSED http/)
+    assert.match(h.stderr(), /BOX_BRIDGE_TAP_REFUSED second tap/)
+
     // A web decision reaches the mod's long-poll, never the tap.
-    deliver(h.control, `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'ASK' }] } })}\n`, 3)
+    deliver(h.control, `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'ASK' }] } })}\n`, 4)
     await new Promise((r) => setTimeout(r, 300))
-    deliver(h.control, `${JSON.stringify({ type: 'control_response', response: { request_id: 'r1', subtype: 'success', response: { behavior: 'allow' } } })}\n`, 4)
+    deliver(h.control, `${JSON.stringify({ type: 'control_response', response: { request_id: 'r1', subtype: 'success', response: { behavior: 'allow' } } })}\n`, 5)
     const decided = await until(() => h.lines.find((m) => m.type === 'control_response'))
     assert.equal(decided.response.response.behavior, 'allow')
   } finally {
@@ -467,15 +504,17 @@ if mode == 'exit':
     sys.exit(3)
 d = os.environ['OC_BRIDGE_DIR']
 sock = d + '/bridge.sock'
+token = open(d + '/token').read().strip()
 def call(method, path, body=b''):
     s = socket.socket(socket.AF_UNIX)
     s.connect(sock)
-    s.sendall(b'%s %s HTTP/1.1\\r\\nContent-Length: %d\\r\\n\\r\\n' % (method.encode(), path.encode(), len(body)) + body)
+    s.sendall(b'%s %s HTTP/1.1\\r\\nx-oc-bridge-token: %s\\r\\nContent-Length: %d\\r\\n\\r\\n' % (method.encode(), path.encode(), token.encode(), len(body)) + body)
     while s.recv(65536):
         pass
     s.close()
 call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
-tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdout=subprocess.PIPE)
+tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
 for line in tap.stdout:
     call('POST', '/out', (json.dumps({'type': 'result', 'runner': 'interactive', 'echo': json.loads(line)}) + '\\n').encode())
 `

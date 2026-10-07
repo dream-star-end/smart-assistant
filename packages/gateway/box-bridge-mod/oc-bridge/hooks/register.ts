@@ -18,6 +18,8 @@ const BATCH_BYTES = 256 * 1024
 export const register: Register = (on) => {
   const sj = new StreamJson()
   let sock = ''
+  /** The host's capability for this session; tools never see it. */
+  let auth: Record<string, string> = {}
   let active = false
   let running: string | undefined
   let lastStopReason: string | null = null
@@ -76,6 +78,10 @@ export const register: Register = (on) => {
     const dir = await $.env.get('OC_BRIDGE_DIR')
     if (!dir) return started
     sock = `${dir}/bridge.sock`
+    // Read once; the host deletes the file at our first request, before any
+    // tool can run, and accepts requests only from this process.
+    const token = (await $.fs.read(`${dir}/token`)).trim()
+    auth = { 'x-oc-bridge-token': token }
     active = true
     sj.sessionId = await $.session.id()
     sj.model = await $.session.model()
@@ -98,7 +104,7 @@ export const register: Register = (on) => {
           continue
         }
         try {
-          const res = await $.http.fetch('http://bridge/out', { method: 'POST', socketPath: sock, body: batch.body })
+          const res = await $.http.fetch('http://bridge/out', { method: 'POST', socketPath: sock, headers: auth, body: batch.body })
           if (!res.ok) throw new Error(`status ${res.status}`)
           queue.splice(0, batch.n)
           failures = 0
@@ -114,12 +120,13 @@ export const register: Register = (on) => {
     await $.http.fetch('http://bridge/ready', {
       method: 'POST',
       socketPath: sock,
+      headers: auth,
       body: JSON.stringify({ sessionId: sj.sessionId, model: sj.model, isInteractive: e.isInteractive, plugins: sj.plugins }),
     })
     // Tap: the host streams gateway lines to this child's stdout.
     void (async () => {
       let buf = ''
-      for await (const piece of $.process.spawn({ argv: ['python3', `${dir}/tap.py`, sock] })) {
+      for await (const piece of $.process.spawn({ argv: ['python3', `${dir}/tap.py`, sock], input: `${token}\n` })) {
         if (piece.stream !== 'stdout') continue
         buf += piece.text
         for (let nl = buf.indexOf('\n'); nl >= 0; nl = buf.indexOf('\n')) {
@@ -202,7 +209,7 @@ export const register: Register = (on) => {
     let decision: any = null
     for (;;) {
       if (next.signal.aborted) break
-      const res = await $.http.fetch(`http://bridge/decision?id=${encodeURIComponent(requestId)}`, { socketPath: sock })
+      const res = await $.http.fetch(`http://bridge/decision?id=${encodeURIComponent(requestId)}`, { socketPath: sock, headers: auth })
       const got = decisionOf(res.status, res.text)
       if (got.done) {
         decision = got.value
@@ -228,7 +235,7 @@ export const register: Register = (on) => {
     let decision: any = null
     for (;;) {
       if (next.signal.aborted) break
-      const res = await $.http.fetch(`http://bridge/decision?id=${encodeURIComponent(requestId)}`, { socketPath: sock })
+      const res = await $.http.fetch(`http://bridge/decision?id=${encodeURIComponent(requestId)}`, { socketPath: sock, headers: auth })
       const got = decisionOf(res.status, res.text)
       if (got.done) {
         decision = got.value

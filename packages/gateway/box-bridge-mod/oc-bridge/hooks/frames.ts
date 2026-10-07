@@ -85,6 +85,10 @@ export class StreamJson {
   private uuidSeq = 0
   private steps = new Map<string, Step>()
   private mainSteps = 0
+  /** Main-loop step usage this turn: the result's usage when the engine
+   * reports none for the turn (an abort, an API error), so no paid step is
+   * ever settled as free. */
+  private turnUsage: Usage = { ...ZERO }
   /** subagent id -> the Agent tool_use id that started it */
   private parents = new Map<string, string>()
   private pendingAgentCalls: string[] = []
@@ -138,6 +142,7 @@ export class StreamJson {
 
   turnStart(): void {
     this.mainSteps = 0
+    this.turnUsage = { ...ZERO }
   }
 
   private event(event: Record<string, unknown>, parent: string | null): string {
@@ -204,6 +209,10 @@ export class StreamJson {
     // Kept until the next step: the response's rows may land after its stop.
     const step = this.steps.get(key)
     if (agentId || !step) return []
+    const used = usageOf(res?.usage)
+    for (const k of Object.keys(used) as (keyof Usage)[]) {
+      if (k !== 'model') (this.turnUsage[k] as number) += used[k] as number
+    }
     const out: string[] = []
     for (const index of [...step.open.keys()].sort((a, b) => a - b)) {
       out.push(this.event({ type: 'content_block_stop', index }, null))
@@ -268,7 +277,7 @@ export class StreamJson {
       stop_reason: aborted ? null : lastStopReason,
       session_id: this.sessionId,
       total_cost_usd: 0,
-      usage: usageOf(e.usage),
+      usage: e.usage ? usageOf(e.usage) : { ...this.turnUsage },
       permission_denials: [],
       ...(aborted ? { terminal_reason: 'aborted_streaming' } : {}),
       ...(e.reason === 'error' ? { errors: [e.answer || 'turn ended on an API error'] } : {}),

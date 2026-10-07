@@ -13,13 +13,14 @@ env : OC_BOX_MOD_FILES  JSON {relpath: base64} of the mod, written into run_dir
       OC_BOX_READY_MS   ready timeout (default 20000)
       OC_BOX_CLAUDE_CONFIG_DIR  test-only passthrough; never set by the gateway
 """
-import base64, hashlib, json, os, shutil, signal, socket, socketserver, subprocess, sys, threading, time
+import base64, collections, hashlib, hmac, json, os, secrets, shutil, signal, socket, socketserver, struct, subprocess, sys, threading, time
 
 TAP_SOURCE = r'''
-import os, socket, sys
+import socket, sys
+token = sys.stdin.readline().strip()
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect(sys.argv[1])
-s.sendall(b"TAP %d\n" % os.getppid())
+s.sendall(b"TAP %s\n" % token.encode())
 while True:
     b = s.recv(65536)
     if not b:
@@ -29,6 +30,8 @@ while True:
 '''
 
 MAX_REQ = 64 * 1024 * 1024
+DECISION_TTL = 600
+DECISION_MAX = 256
 # Text of the native dialogs that draw before any hook runs (P0).
 DIALOGS = ('trust this folder', 'Bypass Permissions mode')
 PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
@@ -59,8 +62,12 @@ class Host:
         self.sock_path = os.path.join(run_dir, 'bridge.sock')
         self.out_lock = threading.Lock()
         self.cv = threading.Condition()
-        self.inbound = []          # lines for the tap, in order
-        self.decisions = {}        # request_id -> control_response line
+        self.inbound = collections.deque()  # lines not yet handed to the tap
+        self.decisions = {}        # request_id -> (received_at, control_response line)
+        # Capability for the mod: written to the run dir before claude starts,
+        # removed at the mod's first request, i.e. before any tool can run.
+        self.token = secrets.token_hex(32)
+        self.token_path = os.path.join(run_dir, 'token')
         self.tap_taken = False
         self.ready = threading.Event()
         self.stdin_closed = False
@@ -102,7 +109,12 @@ class Host:
             rid = (msg.get('response') or {}).get('request_id')
             if isinstance(rid, str):
                 with self.cv:
-                    self.decisions[rid] = line
+                    now = time.time()
+                    for k in [k for k, (at, _) in self.decisions.items() if now - at > DECISION_TTL]:
+                        del self.decisions[k]
+                    if len(self.decisions) >= DECISION_MAX:
+                        del self.decisions[min(self.decisions, key=lambda k: self.decisions[k][0])]
+                    self.decisions[rid] = (now, line)
                     self.cv.notify_all()
             return
         if msg.get('type') == 'user':
@@ -138,18 +150,15 @@ class Host:
         return json.dumps(msg).encode()
 
     # ---- socket ---------------------------------------------------------
-    def peer_ok(self, conn):
+    def peer_pid(self, conn):
         try:
-            import struct
             cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
             pid, uid, _ = struct.unpack('3i', cred)
         except OSError:
-            return False
-        if uid != os.getuid():
-            return False
-        if self.claude_pid is None:
-            return False
-        # The peer is claude itself (mod fetch) or a descendant (the tap).
+            return None
+        return pid if uid == os.getuid() else None
+
+    def descends_from_claude(self, pid):
         p = pid
         for _ in range(8):
             if p == self.claude_pid:
@@ -163,23 +172,41 @@ class Host:
                 return False
         return False
 
+    def token_ok(self, presented):
+        if not presented or not hmac.compare_digest(presented.encode(), self.token.encode()):
+            return False
+        try:
+            os.unlink(self.token_path)
+        except OSError:
+            pass
+        return True
+
     def serve(self):
         host = self
 
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
+                # Tools run as the same user and inherit the run dir's name,
+                # so uid is no boundary: requests must come from the claude
+                # process itself (the mod's fetch) with the token, and the tap
+                # (claude's child) must present the token, once.
                 conn = self.request
-                if not host.peer_ok(conn):
+                pid = host.peer_pid(conn)
+                if pid is None or host.claude_pid is None:
                     err('BOX_BRIDGE_PEER_REFUSED')
                     return
                 first = self.rfile.readline(65536)
                 if first.startswith(b'TAP '):
+                    if not host.descends_from_claude(pid) or not host.token_ok(first[4:].decode('latin-1').strip()):
+                        err('BOX_BRIDGE_PEER_REFUSED tap')
+                        return
                     return host.handle_tap(conn)
                 parts = first.decode('latin-1').split()
                 if len(parts) < 2:
                     return
                 method, target = parts[0], parts[1]
                 length = 0
+                presented = ''
                 while True:
                     h = self.rfile.readline(65536)
                     if h in (b'\r\n', b'\n', b''):
@@ -187,6 +214,11 @@ class Host:
                     k, _, v = h.decode('latin-1').partition(':')
                     if k.strip().lower() == 'content-length':
                         length = int(v.strip())
+                    elif k.strip().lower() == 'x-oc-bridge-token':
+                        presented = v.strip()
+                if pid != host.claude_pid or not host.token_ok(presented):
+                    err('BOX_BRIDGE_PEER_REFUSED http')
+                    return self.reply(403, b'')
                 if length > MAX_REQ:
                     return self.reply(413, b'')
                 body = self.rfile.read(length) if length else b''
@@ -194,7 +226,7 @@ class Host:
                 self.reply(status, payload)
 
             def reply(self, status, payload):
-                reason = {200: 'OK', 204: 'No Content', 404: 'Not Found', 413: 'Too Large'}.get(status, 'X')
+                reason = {200: 'OK', 204: 'No Content', 403: 'Forbidden', 404: 'Not Found', 413: 'Too Large'}.get(status, 'X')
                 head = 'HTTP/1.1 %d %s\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n' % (
                     status, reason, len(payload))
                 self.wfile.write(head.encode() + payload)
@@ -234,8 +266,8 @@ class Host:
                     if left <= 0:
                         return 204, b''
                     self.cv.wait(left)
-                line = self.decisions.pop(rid, None)
-            return (200, line) if line is not None else (204, b'')
+                got = self.decisions.pop(rid, None)
+            return (200, got[1]) if got is not None else (204, b'')
         return 404, b''
 
     def handle_tap(self, conn):
@@ -244,17 +276,16 @@ class Host:
                 err('BOX_BRIDGE_TAP_REFUSED second tap')
                 return
             self.tap_taken = True
-        sent = 0
         while True:
             with self.cv:
-                while sent >= len(self.inbound) and not self.stdin_closed:
+                while not self.inbound and not self.stdin_closed:
                     self.cv.wait()
-                batch = self.inbound[sent:]
-                sent = len(self.inbound)
+                batch = list(self.inbound)
+                self.inbound.clear()
                 closed = self.stdin_closed
             for line in batch:
                 conn.sendall(line + b'\n')
-            if closed and sent >= len(self.inbound):
+            if closed and not batch:
                 return
 
     # ---- claude under tmux ---------------------------------------------
@@ -263,6 +294,9 @@ class Host:
                               capture_output=True, text=True, **kw)
 
     def launch(self):
+        fd = os.open(self.token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, 'w') as f:
+            f.write(self.token)
         mode = 'default'
         if '--permission-mode' in self.args:
             i = self.args.index('--permission-mode')
