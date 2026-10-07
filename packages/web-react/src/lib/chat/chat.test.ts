@@ -25,6 +25,7 @@ import {
   computeTypingLabel,
   isPlatedAssistantMessage,
   problemCardPresentation,
+  MODEL_THINKING_WORKING_DETAIL,
   STALE_WARN_MS,
 } from "./pure";
 import {
@@ -613,6 +614,67 @@ describe("applyTurnStatus retrying 判别联合", () => {
     const s = sess();
     applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Bash npx tsc" }));
     clearTurnTiming(s);
+    expect(s._turnProgressHint).toBeUndefined();
+  });
+});
+
+describe("模型思考阶段(空思考也要让用户感知 agent 在响应)", () => {
+  test("engine_starting → null → working(thinking):阶段态清空,hint 记为 thinking", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_starting" }));
+    applyTurnStatus(s, turnStatusFrame({ status: null }));
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: MODEL_THINKING_WORKING_DETAIL }));
+    expect(s._turnStatus).toBeNull();
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+  });
+
+  test("null 清态帧丢失:单凭 working(thinking) 也结束 engine_*,其它 working 不动启动态", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_resuming" }));
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Bash npx tsc" }));
+    expect(s._turnStatus).toBe("engine_resuming");
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: MODEL_THINKING_WORKING_DETAIL }));
+    expect(s._turnStatus).toBeNull();
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+  });
+
+  test("思考中:文案为「深度思考中 (Ns)」,不再是「正在启动引擎」,也不是「执行操作」", () => {
+    const out = computeTypingLabel({
+      name: "全能助手",
+      secs: 8,
+      silenceMs: 2_000,
+      progressHint: MODEL_THINKING_WORKING_DETAIL,
+    });
+    expect(out.text).toBe("全能助手 深度思考中 (8s)");
+    const long = computeTypingLabel({
+      name: "全能助手",
+      secs: 136,
+      silenceMs: 4_000,
+      progressHint: MODEL_THINKING_WORKING_DETAIL,
+    });
+    expect(long.text).toContain("深度思考中 (136s)");
+    expect(long.text).not.toContain("启动引擎");
+    expect(long.text).not.toContain("无新数据");
+    expect(long.cls).toBe("long-thinking");
+  });
+
+  test("keepalive 断了(真静默)仍按静默升级,不假装在动", () => {
+    const out = computeTypingLabel({
+      name: "助手",
+      secs: 136,
+      silenceMs: STALE_WARN_MS,
+      progressHint: MODEL_THINKING_WORKING_DETAIL,
+    });
+    expect(out.text).toContain("无新数据");
+  });
+
+  test("null 复位帧丢失:正文内容帧兜底清 thinking hint,思考增量帧不清", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: MODEL_THINKING_WORKING_DETAIL }));
+    applyOutboundMessage(s, msgFrame({ blocks: [{ kind: "thinking", text: "思考增量" }], frameSeq: 1 }), {});
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+    applyOutboundMessage(s, msgFrame({ blocks: [{ kind: "text", text: "正文" }], frameSeq: 2 }), {});
     expect(s._turnProgressHint).toBeUndefined();
   });
 });

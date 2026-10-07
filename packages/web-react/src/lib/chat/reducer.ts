@@ -22,6 +22,7 @@ import {
   getFrameSeqCursor,
   isBridgeAuthControlError,
   isSilentTurnErrorCode,
+  MODEL_THINKING_WORKING_DETAIL,
   normalizeBridgeErrorCode,
   problemCardPresentation,
   REPORT_EXEMPT_TURN_ERR_CODES,
@@ -1783,6 +1784,14 @@ export function applyOutboundMessage(
     (isRetryingTurnStatus(sess._turnStatus) || isEngineStartupTurnStatus(sess._turnStatus))
   )
     sess._turnStatus = null;
+  // 「深度思考中」同理兜底:非思考内容到达 = 思考已结束,防 gateway 的 null 复位帧丢失时粘住。
+  if (
+    hasBlocks &&
+    !lifecycleSidebandFrame &&
+    sess._turnProgressHint === MODEL_THINKING_WORKING_DETAIL &&
+    frame.blocks!.some((b) => (b as { kind?: unknown }).kind !== "thinking")
+  )
+    sess._turnProgressHint = undefined;
   // thinking-safety：通过守卫的非 final 帧重置；isFinal 清（由 socket 持 timer）。tail-only 帧不触发。
   if (sess._sendingInFlight && !frame.isFinal && !lifecycleSidebandFrame) effects.onLiveFrame?.(sess);
 
@@ -2449,6 +2458,11 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
     // and still call markFrameReceived above.
     const detail = typeof frame.detail === "string" ? frame.detail.trim() : "";
     if (detail) sess._turnProgressHint = detail;
+    // 模型已在思考 = 引擎必然已就绪:即使 gateway 先发的 null 清态帧丢了(断线/ring 淘汰,
+    // 重连只补当前 working),也不能继续挂「正在启动引擎」。
+    if (detail === MODEL_THINKING_WORKING_DETAIL && isEngineStartupTurnStatus(sess._turnStatus)) {
+      sess._turnStatus = null;
+    }
   } else {
     sess._turnStatus = null;
     sess._turnProgressHint = undefined;

@@ -14,6 +14,8 @@ import type { GrokExecutionDescriptor } from '@openclaude/protocol'
  *                                   refresh 信号 —— 与旧 runner 'message' 逐条对齐,
  *                                   包括 parser 会忽略的消息)
  *   - 'billing'    (EngineBillingEvent) engine-reported 计费侧信道(M1 codex 接线)
+ *   - 'model_progress' (ModelProgressPhase) 主 agent 模型已开始应答 / 思考块开合
+ *                                   (CCB 可选;空思考也会触发,用于结束冷启动阶段态)
  *
  * 硬约束:底座原生消息形状(CCB stream-json SdkMessage、codex fake-SDK
  * RunnerMessage)只允许存在于各 adapter 内部,不得跨出 engine/ 模块。
