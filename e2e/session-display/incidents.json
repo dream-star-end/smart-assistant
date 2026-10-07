@@ -6419,6 +6419,9 @@
       "severity": "P2",
       "symptom": "商业（2026-10-07）：uid 4 用 Box Claude Opus 5.5 最高档提问，引擎约 16 秒就绪，之后模型思考约 150 秒且思考正文为空，活动行一直显示『正在启动引擎 (136s)…』直到正文出来，用户以为启动卡死。根因：gateway 的 engine_starting/engine_resuming 阶段态只在首个可见块、权限卡、后继 turn_status、错误或终态时清除；CCB parser 丢弃 message_start 和思考块 content_block_start，空思考没有任何事件能清掉启动态。修复：parser 把主 agent 的 message_start 与思考块开合作为 model_progress 侧信道上报；sessionManager 在 message_start 结束启动态，思考块打开期间立即并每 10 秒发 turn_status working(detail=thinking)，思考块关闭发 null，权限/错误/终态/detach 时停止；web-react 把它显示为『深度思考中 (Ns)』，正文帧兜底清除，不进厨房粘滞动作。",
       "rootFixCommit": "1d38b018",
+      "coverageCommits": [
+        "1c2f408d"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -6439,6 +6442,16 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "思考中:文案为「深度思考中 (Ns)」,不再是「正在启动引擎」,也不是「执行操作」"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "思考中途后继阶段态(compacting)接管:停 keepalive,thinking_stop 不再发 null 覆盖它"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "null 清态帧丢失:单凭 working(thinking) 也结束 engine_*,其它 working 不动启动态"
         }
       ]
     }
