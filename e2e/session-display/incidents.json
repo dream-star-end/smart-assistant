@@ -6182,7 +6182,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
-          "assertion": "a new launch is refused before anything is admitted unless the installed CLI is supported"
+          "assertion": "a new launch is refused before anything is admitted only when the CLI version cannot be read"
         },
         {
           "layer": "integration",
@@ -6385,6 +6385,31 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
           "assertion": "红卡带部分回答正文 / 属于别的轮 / 无状态卡 → 不收起"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261007-BOX-CLI-VERSION-ALLOWLIST",
+      "occurredAt": "2026-10-07",
+      "severity": "P2",
+      "symptom": "个人版与商业版 Box Claude：安装的 CLI 版本不在白名单时，入场前被拒为 BOX_CLI_VERSION_UNSUPPORTED，界面停在「模型繁忙，正在重试」。同一道白名单还让未列出的版本不走原生续写。修复：去掉版本白名单。能读到的 x.y.z 一律放行并允许原生续写；读不到版本仍在入场前拒绝；另一构建写下的 transcript 仍是缓存未命中。个人版先合入 49a1cd7c1，商业版按同一行为同步。",
+      "rootFixCommit": "9aa73389",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "admittedUnlisted.cliVersion !== \"2.1.999\""
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "a new launch is refused before anything is admitted only when the CLI version cannot be read"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "anyWritten.kind === \"final\" && anyWritten.nativePointer?.cliVersion, \"2.1.999\""
         }
       ]
     }
