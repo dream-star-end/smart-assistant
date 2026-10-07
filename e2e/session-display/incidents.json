@@ -6182,7 +6182,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
-          "assertion": "a new launch is refused before anything is admitted unless the installed CLI is supported"
+          "assertion": "a new launch is refused before anything is admitted only when the CLI version cannot be read"
         },
         {
           "layer": "integration",
