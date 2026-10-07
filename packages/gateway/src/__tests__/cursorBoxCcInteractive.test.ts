@@ -462,7 +462,8 @@ test('host: a mod that does not match its digest never launches', { timeout: 30_
 
 /** Runs each exec request on this machine and answers in the exec API's
  * Connect framing, the way the Box's exec daemon does. */
-function localExec(opts: { delayStderrMs?: number } = {}): (url: string, init: RequestInit) => Promise<Response> {
+function localExec(opts: { delayStderrMs?: number; failWritesToFirstLaunch?: boolean } = {}): (url: string, init: RequestInit) => Promise<Response> {
+  let firstFifo: string | undefined
   const frame = (body: unknown): Uint8Array => {
     const payload = Buffer.from(JSON.stringify(body))
     const out = Buffer.alloc(5 + payload.length)
@@ -473,6 +474,11 @@ function localExec(opts: { delayStderrMs?: number } = {}): (url: string, init: R
   return async (_url, init) => {
     const raw = Buffer.from(init.body as Uint8Array)
     const req = JSON.parse(raw.subarray(5).toString('utf8')) as { command: string; args: string[]; cwd: string; environment: Record<string, string> }
+    if (req.command === 'sh' && req.args[0] === '-c' && req.args[1]?.includes('mkfifo')) firstFifo ??= req.args[3]
+    if (opts.failWritesToFirstLaunch && req.command === 'python3' && req.environment.OC_BOX_CC_FIFO === firstFifo) {
+      // The write exec ran and could not deliver (the fifo was gone).
+      return new Response(new Blob([Buffer.from(frame({ exitEvent: { exitCode: 1 } }))]).stream(), { status: 200 })
+    }
     const child = spawn(req.command, req.args, { cwd: req.cwd, env: req.environment, stdio: ['ignore', 'pipe', 'pipe'] })
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -510,6 +516,8 @@ if '-p' in sys.argv:
 if mode == 'exit':
     sys.exit(3)
 import time
+if mode == 'slow-ready':
+    time.sleep(30)
 d = os.environ['OC_BRIDGE_DIR']
 sock = d + '/bridge.sock'
 token = open(d + '/token').read().strip()
@@ -541,8 +549,16 @@ for line in tap.stdout:
 `
 
 async function bridgeRun(
-  mode: 'exit' | 'ready' | 'ready-exit' | 'die-on-line',
-  opts: { cooled?: boolean; lines: number; mod?: ReturnType<typeof loadBoxBridgeMod>; delayStderrMs?: number; expectResults?: boolean },
+  mode: 'exit' | 'ready' | 'ready-exit' | 'die-on-line' | 'slow-ready',
+  opts: {
+    cooled?: boolean
+    lines: number
+    mod?: ReturnType<typeof loadBoxBridgeMod>
+    delayStderrMs?: number
+    failWritesToFirstLaunch?: boolean
+    env?: NodeJS.ProcessEnv
+    expectResults?: boolean
+  },
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'ocb-bridge-'))
   const state = join(dir, 'state')
@@ -566,10 +582,10 @@ async function bridgeRun(
     control,
     args: ['--model', 'box-claude-haiku-4-5', '--permission-mode', 'bypassPermissions'],
     stdin, stdout, stderr,
-    fetchImpl: localExec({ delayStderrMs: opts.delayStderrMs }),
+    fetchImpl: localExec({ delayStderrMs: opts.delayStderrMs, failWritesToFirstLaunch: opts.failWritesToFirstLaunch }),
     runner: 'interactive',
     stateDir: state,
-    env: {},
+    env: opts.env ?? {},
     ...(opts.mod ? { bridgeMod: opts.mod } : {}),
   })
   // The gateway writes the turn at once, before anything is ready.
@@ -647,6 +663,7 @@ test('bridge: once a line went to a ready host, its failure is not replayed on -
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
   const r = await bridgeRun('die-on-line', { lines: 1, expectResults: false })
   assert.notEqual(r.code, 0)
+  assert.match(r.err, /BOX_INTERACTIVE_HANDOFF/)
   assert.deepEqual(r.results, [])
   assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
   assert.equal(r.cooled, false)
@@ -662,4 +679,25 @@ test('host: a session whose tap is gone stops instead of piling up input', { tim
   assert.match(h.stderr(), /BOX_INTERACTIVE_INPUT_LOST tap_lost/)
   assert.notEqual(spawnSync('tmux', ['-L', 'oc-box', 'has-session', '-t', `=${h.session}`]).status, 0)
   assert.ok(!existsSync(h.fifo))
+})
+
+test('bridge: READY seen but the first write cannot reach the host: -p gets the turn once', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const r = await bridgeRun('ready', { lines: 2, failWritesToFirstLaunch: true })
+  assert.equal(r.code, 0)
+  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2']])
+  assert.match(r.err, /BOX_INTERACTIVE_ABANDON write_failed/)
+  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK write_failed/)
+  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_HANDOFF/)
+  assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+test('bridge: held input over OC_BOX_INTERACTIVE_HOLD_MAX_BYTES switches to -p before the host is ready', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const started = Date.now()
+  const r = await bridgeRun('slow-ready', { lines: 3, env: { OC_BOX_INTERACTIVE_HOLD_MAX_BYTES: '200' } })
+  assert.ok(Date.now() - started < 20_000, 'did not wait for the ready timeout')
+  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2'], ['p', 'turn 3']])
+  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK held_overflow/)
+  assert.deepEqual(leftovers(r.fifoBase), [])
 })

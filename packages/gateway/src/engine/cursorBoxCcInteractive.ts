@@ -124,6 +124,26 @@ export const BOX_CC_INTERACTIVE_LAUNCH_SCRIPT = [
   'exit "$status"',
 ].join('\n')
 
+/** Ends one interactive host by the pid it wrote into its run dir, nothing
+ * else. Unlike the stop exec it leaves the fifo alone: a stop that removes
+ * the fifo while a launch is starting leaves the host reading a deleted
+ * path, which no later reap can match. */
+export const BOX_CC_INTERACTIVE_ABANDON_SCRIPT = [
+  'set -eu',
+  'pidfile="${1%.fifo}.d/host.pid"',
+  '[ -f "$pidfile" ] || exit 3',
+  'kill -TERM "$(cat "$pidfile")" 2>/dev/null || true',
+].join('\n')
+
+export function boxCcInteractiveAbandonExec(control: BoxCcControl): BoxCcExecRequest {
+  return {
+    command: 'sh',
+    args: ['-c', BOX_CC_INTERACTIVE_ABANDON_SCRIPT, 'sh', control.fifo],
+    cwd: control.cwd,
+    environment: { HOME: BOX_CC_HOME, PATH: BOX_CC_PATH },
+  }
+}
+
 const BOX_CC_PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 /** The kernel refuses any single argv/env string over 128 KiB. */
 const MAX_EXEC_STRING = 120 * 1024

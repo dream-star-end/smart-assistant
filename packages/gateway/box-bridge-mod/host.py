@@ -74,6 +74,7 @@ class Host:
         self.token = secrets.token_hex(32)
         self.token_path = os.path.join(run_dir, 'token')
         self.tap_taken = False
+        self.handed = False
         self.ready = threading.Event()
         self.stdin_closed = False
         self.claude_pid = None
@@ -311,6 +312,11 @@ class Host:
                 self.inbound.clear()
                 self.inbound_bytes = 0
                 closed = self.stdin_closed
+            if batch and not self.handed:
+                # Before the first line reaches the mod: the bridge reads this
+                # to know whether a fallback to -p could run a turn twice.
+                self.handed = True
+                err('BOX_INTERACTIVE_HANDOFF')
             try:
                 for line in batch:
                     conn.sendall(line + b'\n')
@@ -393,6 +399,9 @@ def main():
         return 1
     os.makedirs(run_dir, mode=0o700, exist_ok=True)
     os.chmod(run_dir, 0o700)
+    # For the bridge's abandon exec, which ends this host and nothing else.
+    with open(os.path.join(run_dir, 'host.pid'), 'w') as f:
+        f.write(str(os.getpid()))
     mod_root = os.path.join(run_dir, 'mod', 'oc-bridge')
     for rel, data in files.items():
         if rel.startswith('/') or '..' in rel.split('/'):
