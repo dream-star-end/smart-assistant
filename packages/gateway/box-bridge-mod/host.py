@@ -29,6 +29,8 @@ while True:
 '''
 
 MAX_REQ = 64 * 1024 * 1024
+# Text of the native dialogs that draw before any hook runs (P0).
+DIALOGS = ('trust this folder', 'Bypass Permissions mode')
 PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 
@@ -365,9 +367,14 @@ def run(host, srv, stopping):
 
     ready_ms = int(os.environ.get('OC_BOX_READY_MS', '20000'))
     deadline = time.time() + ready_ms / 1000.0
+    ticks = 0
     while not host.ready.is_set():
         why = 'stopped' if stopping.is_set() else 'timeout' if time.time() > deadline else \
             'exited' if not host.alive() else None
+        ticks += 1
+        # A dialog never clears by itself: stop waiting once one is drawn.
+        if not why and ticks % 10 == 0 and any(d in host.pane() for d in DIALOGS):
+            why = 'dialog'
         if why:
             pane = host.pane()
             # A dialog drawn before the hooks run cannot be answered by the mod;

@@ -19,21 +19,11 @@ import {
 
 export type BoxCcRunner = 'p' | 'interactive'
 
-/** `OC_BOX_INTERACTIVE=1` enables the runner; `OC_BOX_INTERACTIVE_MODELS`
- * lists the catalog ids that use it (comma-separated). Everything else, the
- * default included, stays on `claude -p`. The per-row catalog `runner` field
- * replaces the model list in P2. */
-export function boxCcRunner(env: NodeJS.ProcessEnv, catalogModel: string | undefined): BoxCcRunner {
-  if (env.OC_BOX_INTERACTIVE !== '1' || !catalogModel) return 'p'
-  const models = (env.OC_BOX_INTERACTIVE_MODELS ?? '').split(',').map((m) => m.trim()).filter(Boolean)
-  return models.includes(catalogModel) ? 'interactive' : 'p'
-}
-
-/** The value after `flag` in an argv, as Commander reads it. */
-export function argValue(argv: readonly string[], flag: string): string | undefined {
-  const i = argv.indexOf(flag)
-  const value = i >= 0 ? argv[i + 1] : undefined
-  return value && !value.startsWith('-') ? value : undefined
+/** The runner the gateway resolved for this bridge (`OC_BOX_CC_RUNNER`, set
+ * by stripBoxCcParentAuth from the catalog and the ops override). Anything
+ * but `interactive` is `-p`. */
+export function boxCcRunnerFromEnv(env: NodeJS.ProcessEnv): BoxCcRunner {
+  return env.OC_BOX_CC_RUNNER === 'interactive' ? 'interactive' : 'p'
 }
 
 const SAFE_FLAG = new Set(['--model', '--resume', '--permission-mode'])

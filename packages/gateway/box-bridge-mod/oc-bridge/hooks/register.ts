@@ -109,6 +109,13 @@ export const register: Register = (on) => {
       }
     })()
 
+    // Ready first: the host relays no gateway line before it, so a session
+    // that never gets here has seen none and the bridge can replay them on -p.
+    await $.http.fetch('http://bridge/ready', {
+      method: 'POST',
+      socketPath: sock,
+      body: JSON.stringify({ sessionId: sj.sessionId, model: sj.model, isInteractive: e.isInteractive, plugins: sj.plugins }),
+    })
     // Tap: the host streams gateway lines to this child's stdout.
     void (async () => {
       let buf = ''
@@ -148,11 +155,6 @@ export const register: Register = (on) => {
       }
     })()
 
-    await $.http.fetch('http://bridge/ready', {
-      method: 'POST',
-      socketPath: sock,
-      body: JSON.stringify({ sessionId: sj.sessionId, model: sj.model, isInteractive: e.isInteractive, plugins: sj.plugins }),
-    })
     return started
   })
 

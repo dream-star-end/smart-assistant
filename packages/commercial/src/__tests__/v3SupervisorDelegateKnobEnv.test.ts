@@ -32,11 +32,12 @@ const KEYS = [
   'OC_CURSOR_SAND_OFFICIAL_CC',
   'OC_CURSOR_SAND_BOX_CC',
   'OC_CCB_OFFICIAL_CC',
+  'OC_BOX_INTERACTIVE',
 ] as const
 
 describe('buildDelegateKnobContainerEnv', () => {
-  test('exported key list matches the seventeen knobs and feature flags', () => {
-    assert.equal(KEYS.length, 17)
+  test('exported key list matches the eighteen knobs and feature flags', () => {
+    assert.equal(KEYS.length, 18)
     assert.deepEqual([...DELEGATE_KNOB_CONTAINER_ENV_KEYS], [...KEYS])
   })
 
@@ -118,6 +119,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       OC_CURSOR_SAND_OFFICIAL_CC: '1',
       OC_CURSOR_SAND_BOX_CC: '1',
       OC_CCB_OFFICIAL_CC: '1',
+      OC_BOX_INTERACTIVE: '0',
     })
     assert.deepEqual(out, [
       'OC_DELEGATE_SM=1',
@@ -131,6 +133,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       'OC_CURSOR_SAND_OFFICIAL_CC=1',
       'OC_CURSOR_SAND_BOX_CC=1',
       'OC_CCB_OFFICIAL_CC=1',
+      'OC_BOX_INTERACTIVE=0',
     ])
   })
 

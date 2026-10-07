@@ -7,6 +7,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { boxClaudeRunner } from '@openclaude/protocol'
 import type { CursorCredentialSelection } from './cursorCredentialSelection.js'
 import { readCursorApiKey } from './cursorSandRelay.js'
 import {
@@ -74,15 +75,30 @@ const STRIPPED_PARENT_AUTH = [
   '_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL',
 ] as const
 
+/** Which Box process a box-claude-* turn gets. The catalog row's `runner`
+ * decides; `OC_BOX_INTERACTIVE` (a master knob passed to the container) lets
+ * ops force either side: `0` always `-p`, `1` interactive for every row.
+ * Interactive always keeps the bridge's automatic `-p` fallback. */
+export function resolveBoxCcRunner(
+  catalogModel: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): 'p' | 'interactive' {
+  if (env.OC_BOX_INTERACTIVE === '0') return 'p'
+  if (env.OC_BOX_INTERACTIVE === '1') return 'interactive'
+  return boxClaudeRunner(catalogModel) ?? 'p'
+}
+
 /** The local bridge must not inherit the container's Anthropic route.
  * The box process uses the login the user configures inside the box. */
 export function stripBoxCcParentAuth(
   env: Record<string, string>,
   controlPath: string,
+  catalogModel?: string,
 ): Record<string, string> {
   const next = { ...env }
   for (const key of STRIPPED_PARENT_AUTH) delete next[key]
   next.OC_BOX_CC_CONTROL = controlPath
+  next.OC_BOX_CC_RUNNER = resolveBoxCcRunner(catalogModel, env)
   return next
 }
 

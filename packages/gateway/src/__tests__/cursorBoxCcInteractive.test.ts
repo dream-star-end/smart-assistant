@@ -14,7 +14,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { spawn, spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,24 +32,51 @@ import {
   boxBridgeModDigest,
   boxBridgeModRoot,
   boxCcInteractiveLaunchExec,
-  boxCcRunner,
+  boxCcRunnerFromEnv,
   loadBoxBridgeMod,
   remoteInteractiveClaudeArgs,
 } from '../engine/cursorBoxCcInteractive.js'
+import { interactiveCoolingDown, noteInteractiveFailure, runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
+import { resolveBoxCcRunner, stripBoxCcParentAuth } from '../engine/cursorBoxCc.js'
+import { boxClaudeRunner, CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
+import { PassThrough } from 'node:stream'
 import { StreamJson, textOfUserContent } from '../../box-bridge-mod/oc-bridge/hooks/frames.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const FIXTURES = join(HERE, 'fixtures')
 
-test('runner stays -p unless enabled for that catalog model', () => {
-  assert.equal(boxCcRunner({}, 'box-claude-opus-5-5'), 'p')
-  assert.equal(boxCcRunner({ OC_BOX_INTERACTIVE: '1' }, 'box-claude-opus-5-5'), 'p')
-  assert.equal(boxCcRunner({ OC_BOX_INTERACTIVE: '0', OC_BOX_INTERACTIVE_MODELS: 'box-claude-opus-5-5' }, 'box-claude-opus-5-5'), 'p')
-  const on = { OC_BOX_INTERACTIVE: '1', OC_BOX_INTERACTIVE_MODELS: 'box-claude-opus-5-5, box-claude-haiku-4-5' }
-  assert.equal(boxCcRunner(on, 'box-claude-opus-5-5'), 'interactive')
-  assert.equal(boxCcRunner(on, 'box-claude-haiku-4-5'), 'interactive')
-  assert.equal(boxCcRunner(on, 'box-claude-sonnet-5'), 'p')
-  assert.equal(boxCcRunner(on, undefined), 'p')
+test('runner: catalog row decides, OC_BOX_INTERACTIVE forces either side, the bridge reads the result', () => {
+  const box = CURSOR_ENGINE_MODELS.filter((m: { id: string }) => m.id.startsWith('box-claude-'))
+  assert.equal(box.length, 3)
+  for (const m of box) {
+    const row = boxClaudeRunner(m.id)
+    assert.ok(row === 'p' || row === 'interactive', m.id)
+    assert.equal(resolveBoxCcRunner(m.id, {}), row)
+    assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '0' }), 'p')
+    assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '1' }), 'interactive')
+  }
+  // Only box-claude rows carry a runner; anything else is -p.
+  assert.equal(boxClaudeRunner('cursor-opus-5-high'), undefined)
+  assert.equal(resolveBoxCcRunner('cursor-opus-5-high', {}), 'p')
+  assert.equal(resolveBoxCcRunner(undefined, {}), 'p')
+  const env = stripBoxCcParentAuth({ PATH: '/usr/bin', OC_BOX_INTERACTIVE: '1' }, '/tmp/c.json', 'box-claude-opus-5-5')
+  assert.equal(env.OC_BOX_CC_RUNNER, 'interactive')
+  assert.equal(stripBoxCcParentAuth({ PATH: '/usr/bin', OC_BOX_INTERACTIVE: '0' }, '/tmp/c.json', 'box-claude-opus-5-5').OC_BOX_CC_RUNNER, 'p')
+  assert.equal(boxCcRunnerFromEnv({ OC_BOX_CC_RUNNER: 'interactive' }), 'interactive')
+  assert.equal(boxCcRunnerFromEnv({ OC_BOX_CC_RUNNER: 'p' }), 'p')
+  assert.equal(boxCcRunnerFromEnv({}), 'p')
+})
+
+test('cooldown marker: set by a fallback, honoured for OC_BOX_INTERACTIVE_COOLDOWN_SEC', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ocb-cool-'))
+  try {
+    assert.equal(interactiveCoolingDown(dir, {}), false)
+    noteInteractiveFailure(dir)
+    assert.equal(interactiveCoolingDown(dir, {}), true)
+    assert.equal(interactiveCoolingDown(dir, { OC_BOX_INTERACTIVE_COOLDOWN_SEC: '0' }), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('interactive argv keeps -p\'s adapter-owned flags and drops the stream-json ones', () => {
@@ -387,4 +414,146 @@ test('host: a mod that does not match its digest never launches', { timeout: 30_
   assert.equal(code, 1)
   assert.match(h.stderr(), /BOX_INTERACTIVE_MOD_DIGEST_MISMATCH/)
   assert.notEqual(spawnSync('tmux', ['-L', 'oc-box', 'has-session', '-t', `=${h.session}`]).status, 0)
+})
+
+// ---- the bridge end to end: interactive, or -p when interactive cannot start
+
+/** Runs each exec request on this machine and answers in the exec API's
+ * Connect framing, the way the Box's exec daemon does. */
+function localExec(): (url: string, init: RequestInit) => Promise<Response> {
+  const frame = (body: unknown): Uint8Array => {
+    const payload = Buffer.from(JSON.stringify(body))
+    const out = Buffer.alloc(5 + payload.length)
+    out.writeUInt32BE(payload.length, 1)
+    payload.copy(out, 5)
+    return out
+  }
+  return async (_url, init) => {
+    const raw = Buffer.from(init.body as Uint8Array)
+    const req = JSON.parse(raw.subarray(5).toString('utf8')) as { command: string; args: string[]; cwd: string; environment: Record<string, string> }
+    const child = spawn(req.command, req.args, { cwd: req.cwd, env: req.environment, stdio: ['ignore', 'pipe', 'pipe'] })
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let open = true
+        const push = (b: Uint8Array): void => { if (open) controller.enqueue(b) }
+        child.stdout.on('data', (d: Buffer) => push(frame({ stdoutEvent: { data: d.toString('utf8') } })))
+        child.stderr.on('data', (d: Buffer) => push(frame({ stderrEvent: { data: d.toString('utf8') } })))
+        child.on('close', (code) => {
+          push(frame(code ? { exitEvent: { exitCode: code } } : { exitEvent: {} }))
+          if (open) { open = false; controller.close() }
+        })
+        init.signal?.addEventListener('abort', () => {
+          if (open) { open = false; controller.error(new Error('aborted')) }
+        })
+      },
+    })
+    return new Response(body, { status: 200 })
+  }
+}
+
+/** One fake `claude` for both runners. `-p`: echo each stdin line as a
+ * result. Interactive (under the host): per the `mode` file beside it,
+ * `exit` dies before ready, `ready` behaves like the mod. */
+const FAKE_BOTH = `#!/usr/bin/python3
+import json, os, socket, subprocess, sys
+mode = open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'mode')).read().strip()
+if '-p' in sys.argv:
+    for line in sys.stdin:
+        print(json.dumps({'type': 'result', 'runner': 'p', 'echo': json.loads(line)}), flush=True)
+    sys.exit(0)
+if mode == 'exit':
+    sys.exit(3)
+d = os.environ['OC_BRIDGE_DIR']
+sock = d + '/bridge.sock'
+def call(method, path, body=b''):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock)
+    s.sendall(b'%s %s HTTP/1.1\\r\\nContent-Length: %d\\r\\n\\r\\n' % (method.encode(), path.encode(), len(body)) + body)
+    while s.recv(65536):
+        pass
+    s.close()
+call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
+tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdout=subprocess.PIPE)
+for line in tap.stdout:
+    call('POST', '/out', (json.dumps({'type': 'result', 'runner': 'interactive', 'echo': json.loads(line)}) + '\\n').encode())
+`
+
+async function bridgeRun(mode: 'exit' | 'ready', opts: { cooled?: boolean; lines: number; mod?: ReturnType<typeof loadBoxBridgeMod> }) {
+  const dir = mkdtempSync(join(tmpdir(), 'ocb-bridge-'))
+  const state = join(dir, 'state')
+  const fake = join(dir, 'claude')
+  writeFileSync(fake, FAKE_BOTH)
+  chmodSync(fake, 0o755)
+  writeFileSync(join(dir, 'mode'), mode)
+  if (opts.cooled) noteInteractiveFailure(state)
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  let out = ''
+  let err = ''
+  stdout.on('data', (b: Buffer) => { out += b.toString('utf8') })
+  stderr.on('data', (b: Buffer) => { err += b.toString('utf8') })
+  const control: BoxCcControl = {
+    execUrl: 'https://exec.example', execToken: 't', networkToken: 'n', remoteClaude: fake,
+    fifo: `/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, cwd: dir,
+  }
+  const running = runBoxCcBridge({
+    control,
+    args: ['--model', 'box-claude-haiku-4-5', '--permission-mode', 'bypassPermissions'],
+    stdin, stdout, stderr,
+    fetchImpl: localExec(),
+    runner: 'interactive',
+    stateDir: state,
+    env: {},
+    ...(opts.mod ? { bridgeMod: opts.mod } : {}),
+  })
+  // The gateway writes the turn at once, before anything is ready.
+  for (let i = 1; i <= opts.lines; i++) {
+    stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: `turn ${i}` }] } })}\n`)
+  }
+  const results = (): any[] => out.trim() ? out.trim().split('\n').map((l) => JSON.parse(l)).filter((m) => m.type === 'result') : []
+  await until(() => (results().length >= opts.lines ? true : undefined), 40_000)
+  stdin.end()
+  const code = await running
+  const cooled = interactiveCoolingDown(state, {})
+  rmSync(dir, { recursive: true, force: true })
+  return { code, results: results(), err, cooled, fifoBase: control.fifo }
+}
+
+function leftovers(fifoBase: string): string[] {
+  const prefix = fifoBase.slice('/tmp/'.length, -'.fifo'.length)
+  return readdirSync('/tmp').filter((n) => n.startsWith(prefix))
+}
+
+test('bridge: an interactive host that dies before ready hands the pending turns to -p, in order', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const r = await bridgeRun('exit', { lines: 2 })
+  assert.equal(r.code, 0)
+  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2']])
+  assert.match(r.err, /BOX_INTERACTIVE_NOT_READY exited/)
+  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK not_ready/)
+  assert.equal(r.cooled, true, 'cooldown marker written')
+  assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+test('bridge: a ready interactive host serves the turn, no fallback', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const r = await bridgeRun('ready', { lines: 2 })
+  assert.equal(r.code, 0)
+  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['interactive', 'turn 1'], ['interactive', 'turn 2']])
+  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
+  assert.equal(r.cooled, false)
+  assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+test('bridge: during cooldown, or with an unusable mod, the turn goes straight to -p', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const cooled = await bridgeRun('ready', { lines: 1, cooled: true })
+  assert.deepEqual(cooled.results.map((m) => m.runner), ['p'])
+  assert.match(cooled.err, /BOX_INTERACTIVE_FALLBACK cooldown/)
+  const mod = { ...loadBoxBridgeMod(), hostPy: '#'.repeat(130 * 1024) }
+  const bad = await bridgeRun('ready', { lines: 1, mod })
+  assert.deepEqual(bad.results.map((m) => m.runner), ['p'])
+  assert.match(bad.err, /BOX_INTERACTIVE_FALLBACK BOX_INTERACTIVE_MOD_TOO_LARGE/)
+  assert.equal(bad.cooled, true)
 })

@@ -585,6 +585,9 @@ export const DELEGATE_KNOB_CONTAINER_ENV_KEYS = [
   "OC_CURSOR_SAND_OFFICIAL_CC",
   "OC_CURSOR_SAND_BOX_CC",
   "OC_CCB_OFFICIAL_CC",
+  // Route B Box runner override: 0 forces `-p`, 1 forces interactive;
+  // unset leaves it to each box-claude-* catalog row.
+  "OC_BOX_INTERACTIVE",
 ] as const;
 
 export function buildDelegateKnobContainerEnv(

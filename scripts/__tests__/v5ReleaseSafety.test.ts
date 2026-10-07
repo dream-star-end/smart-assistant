@@ -9198,6 +9198,18 @@ describe('v5 container gateway precompile survives runtime prune', () => {
       true,
       'pruned staging missing oc-memory CLI builder',
     )
+    // The Box interactive runner reads its mod and host from beside the
+    // gateway at run time (cursorBoxCcInteractive.ts boxBridgeModRoot), in the
+    // user container: they must survive the runtime prune.
+    for (const rel of [
+      'packages/gateway/box-bridge-mod/host.py',
+      'packages/gateway/box-bridge-mod/oc-bridge/.claude-plugin/plugin.json',
+      'packages/gateway/box-bridge-mod/oc-bridge/hooks/hooks.json',
+      'packages/gateway/box-bridge-mod/oc-bridge/hooks/register.ts',
+      'packages/gateway/box-bridge-mod/oc-bridge/hooks/frames.ts',
+    ]) {
+      assert.equal(existsSync(path.join(staging, rel)), true, `pruned staging missing ${rel}`)
+    }
     assert.equal(
       existsSync(path.join(staging, 'packages/mcp-memory/src/index.ts')),
       true,

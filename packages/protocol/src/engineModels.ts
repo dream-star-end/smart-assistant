@@ -1053,6 +1053,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Opus 5.5',
     effort: null,
     fast: false,
+    runner: 'p',
   },
   {
     id: 'box-claude-sonnet-5',
@@ -1062,6 +1063,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Sonnet 5',
     effort: null,
     fast: false,
+    runner: 'p',
   },
   {
     id: 'box-claude-haiku-4-5',
@@ -1071,6 +1073,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Haiku 4.5',
     effort: null,
     fast: false,
+    runner: 'p',
   },
 ] as const
 
@@ -1082,6 +1085,16 @@ export const DEFAULT_CURSOR_ENGINE_MODEL: CursorEngineModelId = CURSOR_ENGINE_MO
 export function isCursorEngineModel(modelId: string | null | undefined): boolean {
   return typeof modelId === 'string' &&
     (CURSOR_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+}
+
+/** How the Box runs a box-claude-* row: `p` (headless `claude -p`) or
+ * `interactive` (interactive Claude Code + the oc-bridge mod, with an
+ * automatic `-p` fallback). Undefined for every other model. */
+export type BoxClaudeRunner = 'p' | 'interactive'
+
+export function boxClaudeRunner(modelId: string | null | undefined): BoxClaudeRunner | undefined {
+  const model = cursorModelById(modelId)
+  return model && 'runner' in model ? model.runner : undefined
 }
 
 export function cursorModelById(modelId: string | null | undefined): CursorEngineModel | undefined {

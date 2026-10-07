@@ -12,7 +12,7 @@ Legend: ✅ same, verified · ✅* same by construction (code path untouched) ·
 
 | # | Route B behaviour (today, from code) | Interactive runner | Status / evidence |
 |---|---|---|---|
-| 1 | Selection: catalog `box-claude-*` → `CursorBoxCcAdapter` (session-credential Cursor slot with `machineId`) | Unchanged. Runner chosen **inside the bridge**: `OC_BOX_INTERACTIVE=1` **and** model in `OC_BOX_INTERACTIVE_MODELS`; default `p` | ✅ test `runner stays -p unless enabled`. Catalog `runner` field replaces the model list in P2 ⏳ |
+| 1 | Selection: catalog `box-claude-*` → `CursorBoxCcAdapter` (session-credential Cursor slot with `machineId`) | Unchanged adapter. Runner = catalog row `runner` (`p`/`interactive`, protocol `CURSOR_ENGINE_MODELS`), ops override knob `OC_BOX_INTERACTIVE` (`0` force `-p`, `1` force interactive; master→container passthrough). Resolved in the gateway, handed to the bridge as `OC_BOX_CC_RUNNER` | ✅ test `runner: catalog row decides…` (P2) |
 | 2 | Gateway↔Box channel: Cursor exec API, control file 0600, `execUrl/execToken/networkToken` | Same control, same `postExec` | ✅* (D9 resolved: **reuse Route B's channel**, no new transport) |
 | 3 | Inbound: per-line write execs, 60 KB×4 base64 parts, seq/lock de-dup, 15 s fifo wait, fail fast | Same execs into the same fifo; host is the reader | ✅ host test delivers a **1.2 MB multi-byte line** via `boxCcWriteExecs` and gets it back byte-equal; real CLI 300 KB byte-equal in transcript (P0) |
 | 4 | Stop: stdin EOF → stop exec → TERM/KILL fifo readers, rm fifo | Same stop exec; host is a fifo reader → TERM → kills its tmux session; next launch also reaps an orphaned session by name | ✅ host test: no tmux session, run dir or fifo left |
@@ -36,7 +36,11 @@ Legend: ✅ same, verified · ✅* same by construction (code path untouched) ·
 | 22 | Startup dialogs: none under `-p` | Bypass confirmation suppressed by `--settings`; **trust dialog for `/workspace` must be pre-accepted in the product config** (ops step, needs approval); otherwise `BOX_INTERACTIVE_NOT_READY … dialog=trust` | ⏳ ops prerequisite before enabling (P0 finding) |
 | 23 | Errors surfaced by `-p` as `system/api_retry`, `system/status`, `task_notification`, `bash_output_tail` | Not emitted (hooks don't expose API retries; background-task deliveries ⏳) | ⚠ status/UX lines only; billing unaffected. P2 ⏳ |
 | 24 | `assistant.message.usage` per message | Zeroed (usage is carried on `message_delta`/`result`, which the parser uses) | ✅ parser test |
-| 25 | Fallback to `-p` | Not automatic yet: NOT_READY fails that launch | ⏳ P2: bridge relaunches `-p` and replays undelivered lines when the host exits NOT_READY before any stdout |
+| 25 | Fallback to `-p` | **Automatic.** The mod posts `ready` before it reads any input, so until the host prints `BOX_INTERACTIVE_READY` no line has reached Claude. The bridge keeps those lines; if the host ends before ready (dialog, timeout, crash, missing mod/tmux, mod digest), it starts `-p` on a fresh fifo, replays them in order, then continues. Launch build failures (mod missing/too large) go straight to `-p`. After a fallback the container skips interactive for `OC_BOX_INTERACTIVE_COOLDOWN_SEC` (default 600). A write that failed before ready is replayed on fallback, or fails the bridge loudly if the host then gets ready (no silent loss) | ✅ end-to-end bridge tests with a local exec emulator: dies-before-ready → `-p` replays 2 turns in order; ready → no fallback; cooldown / bad mod → `-p` (P2) |
+
+## Release packaging (P2)
+
+The user container runs the **precompiled** gateway from the runtime release (`/var/lib/openclaude-v5-selfhost/runtime-releases/rel-*` → `/opt/openclaude`). That release is `git archive` + `rsync --exclude-from=packages/commercial/agent-sandbox/runtime-src-excludes.txt`; nothing there excludes `packages/gateway/box-bridge-mod/`, and `dist/engine/*.js` sits at the same depth as `src/engine`, so `boxBridgeModRoot()` finds the mod in the container. Locked by `scripts/__tests__/v5ReleaseSafety.test.ts` (archive + prune keeps host.py and all four mod files). If the mod were ever missing, the bridge falls back to `-p` (`BOX_INTERACTIVE_FALLBACK BOX_INTERACTIVE_MOD_MISSING`). Existing user containers only get it after a container rebuild (release-verify §3).
 
 ## Product rules touched (SCHEME §7.4), as actually needed
 
