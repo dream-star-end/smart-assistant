@@ -8,7 +8,7 @@
       "@openclaude/protocol": ["../protocol/src/index.ts"]
     }
   },
-  "include": ["src"],
+  "include": ["src", "box-bridge-mod/oc-bridge/hooks/frames.ts"],
   "references": [
     { "path": "../protocol" },
     { "path": "../plugin-sdk" },

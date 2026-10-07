@@ -1,0 +1,1 @@
+{ "name": "oc-bridge", "version": "0.1.0", "description": "OpenClaude Box bridge: drives an interactive session over the Route B stream-json contract" }

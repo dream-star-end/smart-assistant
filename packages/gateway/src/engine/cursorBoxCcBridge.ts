@@ -17,6 +17,15 @@ import {
   type BoxCcControl,
   type BoxCcExecRequest,
 } from './cursorBoxCcExec.js'
+import {
+  argValue,
+  boxCcInteractiveLaunchExec,
+  boxCcRunner,
+  loadBoxBridgeMod,
+  remoteInteractiveClaudeArgs,
+  type BoxBridgeMod,
+  type BoxCcRunner,
+} from './cursorBoxCcInteractive.js'
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>
 
@@ -69,6 +78,10 @@ export async function runBoxCcBridge(opts: {
   stderr: NodeJS.WritableStream
   fetchImpl?: FetchFn
   signal?: AbortSignal
+  /** `interactive` launches the mod-driven TTY session instead of `-p`;
+   * every other step (writes, stop, stdout) is the same. */
+  runner?: BoxCcRunner
+  bridgeMod?: BoxBridgeMod
 }): Promise<number> {
   const fetchImpl = opts.fetchImpl ?? fetch
   const abort = new AbortController()
@@ -78,7 +91,9 @@ export async function runBoxCcBridge(opts: {
     ...opts.control,
     fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')),
   }
-  const launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
+  const launch = opts.runner === 'interactive'
+    ? boxCcInteractiveLaunchExec(control, remoteInteractiveClaudeArgs(opts.args), opts.bridgeMod ?? loadBoxBridgeMod())
+    : boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
   let exitCode = 1
   let sawExit = false
   // The write runs as its own exec in the box. A request whose response the
@@ -218,6 +233,7 @@ if (invokedDirectly) {
   runBoxCcBridge({
     control: readControl(controlPath),
     args: process.argv.slice(2),
+    runner: boxCcRunner(process.env, argValue(process.argv.slice(2), '--model')),
     stdin: process.stdin,
     stdout: process.stdout,
     stderr: process.stderr,
