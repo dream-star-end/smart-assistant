@@ -2792,6 +2792,36 @@ await check("T48 引擎冷启动阶段显示启动/恢复文案，首内容清�
   }
 });
 
+await check("T70 empty thinking clears engine starting and shows deep thinking", async () => {
+  // INC-20261007-ENGINE-STARTING-THINKING:Box Opus 最高档思考 ~150s 且思考正文为空,活动行曾一直挂「正在启动引擎 (136s)…」。
+  const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
+  if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
+    throw new Error(`模型思考证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
+  }
+  await page.evaluate(() => window.__replayDrive.pushEngineStartupStatus("engine_starting"));
+  await replayRoot.getByText(/正在启动引擎/).waitFor({ state: "visible", timeout: 3000 });
+  await page.evaluate(() => window.__replayDrive.pushModelThinking(true));
+  const activity = replayRoot.getByLabel("生成中");
+  await activity.getByText(/深度思考中/).waitFor({ state: "visible", timeout: 3000 });
+  if (await replayRoot.getByText(/正在启动引擎/).count()) {
+    throw new Error("模型已开始思考,活动行仍挂着「正在启动引擎」");
+  }
+  if (await activity.getByText(/无新数据|执行操作/).count()) {
+    throw new Error("思考态被渲染成卡住或工具动作");
+  }
+  await page.evaluate(() => window.__replayDrive.pushModelThinking(false));
+  await page.waitForFunction(
+    () => !/深度思考中|执行操作/.test(document.querySelector('[aria-label="生成中"]')?.textContent ?? ""),
+    null,
+    { timeout: 3000 },
+  );
+  await page.evaluate(() => window.__replayDrive.pushRetrySuccess());
+  await waitForReplay((state) => !state.sending, "模型思考证明轮没有被 final 正常收尾");
+  if (await replayRoot.getByText(/正在启动引擎|深度思考中/).count()) {
+    throw new Error("终态后启动/思考文案仍粘在时间线上");
+  }
+});
+
 await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交", async () => {
   await page.evaluate(() => window.__setComposerState(true, false));
   const stop = primaryComposer.getByRole("button", { name: "停止", exact: true });

@@ -213,6 +213,8 @@ declare global {
       pushWaitingForUserStatus: () => void;
       /** Push an engine cold-start phase status for the in-flight turn. */
       pushEngineStartupStatus: (status: "engine_starting" | "engine_resuming") => void;
+      /** Push the gateway model-thinking keepalive (working, detail=thinking) or its null reset. */
+      pushModelThinking: (active: boolean) => void;
       /** Complete the same turn with a live text block plus final terminator. */
       pushRetrySuccess: () => void;
       /** Reproduce page1 → WS N → page2(N) during durable journal hydration. */
@@ -443,6 +445,7 @@ window.__replayDrive = {
   pushRetryStatus: () => {},
   pushWaitingForUserStatus: () => {},
   pushEngineStartupStatus: () => {},
+  pushModelThinking: () => {},
   pushRetrySuccess: () => {},
   runDurableOverlap: async () => {
     throw new Error("durable overlap probe 未挂载");
@@ -1859,6 +1862,8 @@ function ReplayTimelineProbe() {
         turnActivity={sending ? {
           startedAt: session?._turnStartedAt ?? null,
           lastFrameAt: session?._lastFrameAt,
+          // 与 App.tsx turnActivity 同源:working detail(含模型思考态)走 progressHint。
+          progressHint: session?._turnProgressHint,
           turnStatus: session?._turnStatus ?? null,
           agentName: "助手",
         } : null}
@@ -2044,6 +2049,25 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         peer: { id: REPLAY_SESSION_ID, kind: "dm" },
         status,
       });
+    },
+    pushModelThinking: (active) => {
+      const session = replaySocket.sessions.get(REPLAY_SESSION_ID);
+      if (!session || !session._sendingInFlight) {
+        throw new Error("模型思考态注入前没有真实在途 turn");
+      }
+      const routing = {
+        type: "outbound.turn_status" as const,
+        sessionKey: `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`,
+        channel: "webchat",
+        peer: { id: REPLAY_SESSION_ID, kind: "dm" as const },
+      };
+      // 与 gateway sessionManager 同序:message_start 先清启动态(null),再发思考 keepalive。
+      if (active) {
+        live().deliver({ ...routing, status: null });
+        live().deliver({ ...routing, status: "working", detail: "thinking" });
+      } else {
+        live().deliver({ ...routing, status: null });
+      }
     },
     pushRetrySuccess: () => {
       if (!activeClientMessageId) throw new Error("retry success 注入前缺 clientMessageId");
