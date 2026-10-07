@@ -6866,7 +6866,16 @@ export class SessionManager {
             clearStartupPhase()
           }
         }
-        if (e.kind === 'permission_request' || e.kind === 'error' || e.kind === 'final') {
+        // A successor phase (retrying / compacting / waiting_for_user / null)
+        // owns the activity row: stop the thinking keepalive WITHOUT a null so
+        // neither a later tick nor thinking_stop overwrites that phase (or the
+        // server's reconnect cache of it).
+        if (
+          e.kind === 'turn_status' ||
+          e.kind === 'permission_request' ||
+          e.kind === 'error' ||
+          e.kind === 'final'
+        ) {
           stopThinkingStatus(false)
         }
         if (

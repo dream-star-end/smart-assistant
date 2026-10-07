@@ -2061,9 +2061,9 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         channel: "webchat",
         peer: { id: REPLAY_SESSION_ID, kind: "dm" as const },
       };
-      // 与 gateway sessionManager 同序:message_start 先清启动态(null),再发思考 keepalive。
+      // 只发思考 keepalive,不先发 null:gateway 的 null 清态帧可能在断线/ring 淘汰中丢失,
+      // 前端必须单凭 working(thinking) 结束启动态(gateway 发帧顺序由单测锁)。
       if (active) {
-        live().deliver({ ...routing, status: null });
         live().deliver({ ...routing, status: "working", detail: "thinking" });
       } else {
         live().deliver({ ...routing, status: null });

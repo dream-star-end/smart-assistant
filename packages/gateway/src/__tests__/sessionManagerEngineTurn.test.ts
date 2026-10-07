@@ -4597,6 +4597,32 @@ describe("model progress ends engine startup (empty thinking)", () => {
     }
   });
 
+  test("思考中途后继阶段态(compacting)接管:停 keepalive,thinking_stop 不再发 null 覆盖它", async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      let afterStop: unknown[] = [];
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => {
+          messageStart(r);
+          emptyThinkingStart(r, 0);
+          r.msg({ type: "system", subtype: "status", status: "compacting" });
+          t.mock.timers.tick(MODEL_THINKING_KEEPALIVE_MS * 3);
+          blockStop(r, 0);
+          afterStop = statusesOf(events);
+          r.text("after compact");
+          r.result();
+        });
+      });
+      const session = makeSession(runner);
+      await runOneTurn(sm, session, events);
+      assert.deepEqual(afterStop, [THINKING, "compacting"]);
+    } finally {
+      t.mock.timers.reset();
+    }
+  });
+
   test("子 agent 的 message_start/思考块不影响主 turn 阶段态", async () => {
     const sm = new SessionManager(makeConfigStub());
     const events: SessionStreamEvent[] = [];
