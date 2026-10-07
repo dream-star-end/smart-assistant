@@ -2458,6 +2458,11 @@ export function applyTurnStatus(sess: ChatSession, frame: OutboundTurnStatusWire
     // and still call markFrameReceived above.
     const detail = typeof frame.detail === "string" ? frame.detail.trim() : "";
     if (detail) sess._turnProgressHint = detail;
+    // 模型已在思考 = 引擎必然已就绪:即使 gateway 先发的 null 清态帧丢了(断线/ring 淘汰,
+    // 重连只补当前 working),也不能继续挂「正在启动引擎」。
+    if (detail === MODEL_THINKING_WORKING_DETAIL && isEngineStartupTurnStatus(sess._turnStatus)) {
+      sess._turnStatus = null;
+    }
   } else {
     sess._turnStatus = null;
     sess._turnProgressHint = undefined;

@@ -628,6 +628,16 @@ describe("模型思考阶段(空思考也要让用户感知 agent 在响应)", (
     expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
   });
 
+  test("null 清态帧丢失:单凭 working(thinking) 也结束 engine_*,其它 working 不动启动态", () => {
+    const s = sess();
+    applyTurnStatus(s, turnStatusFrame({ status: "engine_resuming" }));
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: "Bash npx tsc" }));
+    expect(s._turnStatus).toBe("engine_resuming");
+    applyTurnStatus(s, turnStatusFrame({ status: "working", detail: MODEL_THINKING_WORKING_DETAIL }));
+    expect(s._turnStatus).toBeNull();
+    expect(s._turnProgressHint).toBe(MODEL_THINKING_WORKING_DETAIL);
+  });
+
   test("思考中:文案为「深度思考中 (Ns)」,不再是「正在启动引擎」,也不是「执行操作」", () => {
     const out = computeTypingLabel({
       name: "全能助手",
