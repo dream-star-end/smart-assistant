@@ -1043,6 +1043,9 @@ export const CURSOR_ENGINE_MODELS = [
   },
   // Official Claude Code inside the account Grok Bot box. These ids are not
   // Cursor Sand slugs; upstreamModel is the id the box CLI accepts.
+  // runner: personal default is the interactive terminal + oc-bridge mod;
+  // the bridge falls back to `claude -p` by itself when that cannot start,
+  // and the OC_BOX_INTERACTIVE master knob (0/1) forces either side.
   // One family each: the picker collapses a family to a single effort row,
   // and these three names are different models, not effort levels.
   {
@@ -1053,7 +1056,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Opus 5.5',
     effort: null,
     fast: false,
-    runner: 'p',
+    runner: 'interactive',
   },
   {
     id: 'box-claude-sonnet-5',
@@ -1063,7 +1066,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Sonnet 5',
     effort: null,
     fast: false,
-    runner: 'p',
+    runner: 'interactive',
   },
   {
     id: 'box-claude-haiku-4-5',
@@ -1073,7 +1076,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Haiku 4.5',
     effort: null,
     fast: false,
-    runner: 'p',
+    runner: 'interactive',
   },
 ] as const
 

@@ -55,6 +55,8 @@ test('runner: catalog row decides, OC_BOX_INTERACTIVE forces either side, the br
     assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '0' }), 'p')
     assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '1' }), 'interactive')
   }
+  // Personal default: every box-claude row prefers the interactive runner.
+  assert.deepEqual(box.map((m: { id: string }) => boxClaudeRunner(m.id)), ['interactive', 'interactive', 'interactive'])
   // Only box-claude rows carry a runner; anything else is -p.
   assert.equal(boxClaudeRunner('cursor-opus-5-high'), undefined)
   assert.equal(resolveBoxCcRunner('cursor-opus-5-high', {}), 'p')
