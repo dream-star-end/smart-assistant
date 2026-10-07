@@ -30,6 +30,9 @@ while True:
 '''
 
 MAX_REQ = 64 * 1024 * 1024
+# Lines wait here only until the tap takes them; more than this undelivered
+# means the session is not reading its input, and the host gives up on it.
+MAX_INBOUND = 64 * 1024 * 1024
 DECISION_TTL = 600
 DECISION_MAX = 256
 # Text of the native dialogs that draw before any hook runs (P0).
@@ -63,6 +66,8 @@ class Host:
         self.out_lock = threading.Lock()
         self.cv = threading.Condition()
         self.inbound = collections.deque()  # lines not yet handed to the tap
+        self.inbound_bytes = 0
+        self.fatal = None          # why the session can no longer take input
         self.decisions = {}        # request_id -> (received_at, control_response line)
         # Capability for the mod: written to the run dir before claude starts,
         # removed at the mod's first request, i.e. before any tool can run.
@@ -120,7 +125,13 @@ class Host:
         if msg.get('type') == 'user':
             line = self.stage_attachments(msg)
         with self.cv:
-            self.inbound.append(line)
+            if self.fatal:
+                return
+            if self.inbound_bytes + len(line) > MAX_INBOUND:
+                self.fatal = 'inbound_overflow'
+            else:
+                self.inbound.append(line)
+                self.inbound_bytes += len(line)
             self.cv.notify_all()
 
     def stage_attachments(self, msg):
@@ -276,15 +287,39 @@ class Host:
                 err('BOX_BRIDGE_TAP_REFUSED second tap')
                 return
             self.tap_taken = True
+
+        def watch():
+            # The tap sends nothing after its hello: EOF means it is gone.
+            try:
+                while conn.recv(4096):
+                    pass
+            except OSError:
+                pass
+            with self.cv:
+                if not self.stdin_closed:
+                    self.fatal = self.fatal or 'tap_lost'
+                self.cv.notify_all()
+
+        threading.Thread(target=watch, daemon=True).start()
         while True:
             with self.cv:
-                while not self.inbound and not self.stdin_closed:
+                while not self.inbound and not self.stdin_closed and not self.fatal:
                     self.cv.wait()
+                if self.fatal:
+                    return
                 batch = list(self.inbound)
                 self.inbound.clear()
+                self.inbound_bytes = 0
                 closed = self.stdin_closed
-            for line in batch:
-                conn.sendall(line + b'\n')
+            try:
+                for line in batch:
+                    conn.sendall(line + b'\n')
+            except OSError:
+                # The tap is the session's only input and cannot reconnect.
+                with self.cv:
+                    self.fatal = self.fatal or 'tap_lost'
+                    self.cv.notify_all()
+                return
             if closed and not batch:
                 return
 
@@ -428,6 +463,10 @@ def run(host, srv, stopping):
     while True:
         if stopping.is_set():
             code = 143
+            break
+        if host.fatal:
+            err('BOX_INTERACTIVE_INPUT_LOST %s' % host.fatal)
+            code = 1
             break
         if not host.alive():
             try:

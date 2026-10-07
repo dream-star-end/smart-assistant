@@ -117,16 +117,15 @@ export async function runBoxCcBridge(opts: {
   }
   if (!launch) launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
 
-  // Until the interactive host reports ready, no line has reached Claude: the
-  // mod reads its input only after `ready`. Those lines are kept so a host
-  // that never got ready can hand them to `-p` instead.
-  let replay: string[] | null = interactive ? [] : null
-  let hostReady = false
-  let preReadyWriteFailed: string | null = null
+  // An interactive host gets no line until this bridge has seen it report
+  // ready: until then every line is held here. A host that ends before any
+  // line was sent to it has run nothing, so the held lines go to `-p`
+  // instead; once one was sent, a failure is a failure, as on `-p`, so no
+  // turn can ever run on both.
+  let held: string[] | null = interactive ? [] : null
+  let attemptedToHost = false
   let sawStdout = false
   let gate: Promise<void> = Promise.resolve()
-  let phase = new AbortController()
-  let inflight: Promise<void> = Promise.resolve()
 
   let exitCode = 1
   let sawExit = false
@@ -134,14 +133,12 @@ export async function runBoxCcBridge(opts: {
   // transport lost is sent once more: the box script never writes a numbered
   // line twice. An exec that ran and did not exit 0 did not deliver the line,
   // so the bridge stops instead of waiting for an answer.
-  const writeExec = async (body: BoxCcExecRequest, phaseSignal: AbortSignal): Promise<void> => {
+  const writeExec = async (body: BoxCcExecRequest): Promise<void> => {
     let last: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
-      if (abort.signal.aborted || phaseSignal.aborted) return
+      if (abort.signal.aborted) return
       const writer = new AbortController()
       const timer = setTimeout(() => writer.abort(), 20_000)
-      const cut = (): void => writer.abort()
-      phaseSignal.addEventListener('abort', cut)
       let code: number | null
       try {
         const response = await postExec(control, body, fetchImpl, writer.signal)
@@ -151,38 +148,47 @@ export async function runBoxCcBridge(opts: {
         continue
       } finally {
         clearTimeout(timer)
-        phaseSignal.removeEventListener('abort', cut)
       }
       if (code === 0) return
       throw new Error(`BOX_CC_WRITE_EXIT_${code ?? 'MISSING'}`)
     }
-    if (phaseSignal.aborted) return
     throw last instanceof Error ? last : new Error('BOX_CC_WRITE_FAILED')
   }
   let lineSeq = 0
-  const deliverLine = async (line: string): Promise<void> => {
-    await gate
-    if (abort.signal.aborted) return
-    if (replay && !hostReady) replay.push(line)
-    const signal = phase.signal
-    const run = (async () => {
-      for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body, signal)
-    })()
-    inflight = run.catch(() => undefined)
+  const writeLine = async (line: string): Promise<void> => {
+    if (interactive) attemptedToHost = true
     try {
-      await run
+      for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body)
     } catch (err) {
-      if (abort.signal.aborted || signal.aborted) return
-      // A host that is not ready yet takes this line to -p if it falls back;
-      // if it gets ready instead, the line is lost and the bridge stops (below).
-      if (replay && !hostReady) {
-        preReadyWriteFailed = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
-        return
-      }
+      if (abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
       opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
       abort.abort()
     }
+  }
+  const deliverLine = async (line: string): Promise<void> => {
+    await gate
+    if (abort.signal.aborted) return
+    if (held) {
+      held.push(line)
+      return
+    }
+    await writeLine(line)
+  }
+  /** Sends `lines` first; later lines wait behind them. */
+  const flushFirst = (lines: string[]): Promise<void> => {
+    let release!: () => void
+    gate = new Promise((resolveGate) => { release = resolveGate })
+    return (async () => {
+      try {
+        for (const line of lines) {
+          if (abort.signal.aborted) break
+          await writeLine(line)
+        }
+      } finally {
+        release()
+      }
+    })()
   }
   // Closed stdin is the gateway retiring this process (shutdown, model switch,
   // idle recycle). Claude in the box cannot see that EOF, so end it there and
@@ -222,18 +228,15 @@ export async function runBoxCcBridge(opts: {
           sawStdout = true
           opts.stdout.write(event.data)
         } else if (event.kind === 'stderr' && event.data) {
-          if (replay && !hostReady) {
+          opts.stderr.write(event.data)
+          if (held && interactive) {
             errTail = (errTail + event.data).slice(-4096)
             if (errTail.includes('BOX_INTERACTIVE_READY')) {
-              hostReady = true
-              replay = null
-              if (preReadyWriteFailed) {
-                opts.stderr.write(`BOX_CC_WRITE_FAILED ${preReadyWriteFailed}\n`)
-                abort.abort()
-              }
+              const lines = held
+              held = null
+              void flushFirst(lines)
             }
           }
-          opts.stderr.write(event.data)
         } else if (event.kind === 'exit') {
           sawExit = true
           exitCode = event.code ?? 0
@@ -241,45 +244,26 @@ export async function runBoxCcBridge(opts: {
       }
     }
   }
-  // -p takes over from a host that ended before it was ready: new fifo,
-  // the kept lines first and in order, then whatever the gateway sends next.
-  const fallBackToP = async (): Promise<void> => {
-    let release!: () => void
-    gate = new Promise((resolveGate) => { release = resolveGate })
-    phase.abort()
-    await inflight
-    const lines = replay ?? []
-    replay = null
-    interactive = false
-    sawExit = false
-    exitCode = 1
-    control = freshControl()
-    lineSeq = 0
-    phase = new AbortController()
-    const streaming = streamLaunch(boxCcLaunchExec(control, remoteClaudeArgs(opts.args)))
-    try {
-      for (const line of lines) {
-        for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body, phase.signal)
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
-      opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
-      abort.abort()
-    } finally {
-      release()
-    }
-    await streaming
-  }
   const pending = bufferLines(opts.stdin, async (line) => {
     if (abort.signal.aborted) return
     await deliverLine(line)
   }).then(stopRemote)
   try {
     await streamLaunch(launch)
-    if (interactive && !hostReady && !sawStdout && !stopRequested && !abort.signal.aborted) {
+    if (interactive && !attemptedToHost && !sawStdout && !stopRequested && !abort.signal.aborted) {
+      // -p takes over: a fresh fifo, the held lines first, in order.
       opts.stderr.write('BOX_INTERACTIVE_FALLBACK not_ready\n')
       noteInteractiveFailure(stateDir)
-      await fallBackToP()
+      const lines = held ?? []
+      held = null
+      interactive = false
+      sawExit = false
+      exitCode = 1
+      control = freshControl()
+      lineSeq = 0
+      const streaming = streamLaunch(boxCcLaunchExec(control, remoteClaudeArgs(opts.args)))
+      await flushFirst(lines)
+      await streaming
     }
   } catch (error) {
     if (!stopRequested) throw error

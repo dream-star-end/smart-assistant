@@ -280,6 +280,7 @@ d = os.environ['OC_BRIDGE_DIR']
 sock = d + '/bridge.sock'
 if os.environ.get('OC_BRIDGE_PERMISSION_MODE') == 'never-ready':
     import time; time.sleep(60)
+TAP_DIES = os.environ.get('OC_BRIDGE_PERMISSION_MODE') == 'tap-dies'
 token = open(d + '/token').read().strip()
 def call(method, path, body=b'', tok=None):
     s = socket.socket(socket.AF_UNIX)
@@ -299,6 +300,8 @@ call('POST', '/out', (json.dumps({'type': 'system', 'subtype': 'fake_init', 'arg
 call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
 tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
+if TAP_DIES:
+    import time; time.sleep(0.5); tap.kill(); time.sleep(60)
 for line in tap.stdout:
     msg = json.loads(line)
     if msg.get('type') == 'user' and msg['message']['content'][0].get('text') == 'FORGE':
@@ -459,7 +462,7 @@ test('host: a mod that does not match its digest never launches', { timeout: 30_
 
 /** Runs each exec request on this machine and answers in the exec API's
  * Connect framing, the way the Box's exec daemon does. */
-function localExec(): (url: string, init: RequestInit) => Promise<Response> {
+function localExec(opts: { delayStderrMs?: number } = {}): (url: string, init: RequestInit) => Promise<Response> {
   const frame = (body: unknown): Uint8Array => {
     const payload = Buffer.from(JSON.stringify(body))
     const out = Buffer.alloc(5 + payload.length)
@@ -476,7 +479,11 @@ function localExec(): (url: string, init: RequestInit) => Promise<Response> {
         let open = true
         const push = (b: Uint8Array): void => { if (open) controller.enqueue(b) }
         child.stdout.on('data', (d: Buffer) => push(frame({ stdoutEvent: { data: d.toString('utf8') } })))
-        child.stderr.on('data', (d: Buffer) => push(frame({ stderrEvent: { data: d.toString('utf8') } })))
+        child.stderr.on('data', (d: Buffer) => {
+          const f = frame({ stderrEvent: { data: d.toString('utf8') } })
+          if (opts.delayStderrMs) setTimeout(() => push(f), opts.delayStderrMs)
+          else push(f)
+        })
         child.on('close', (code) => {
           push(frame(code ? { exitEvent: { exitCode: code } } : { exitEvent: {} }))
           if (open) { open = false; controller.close() }
@@ -502,6 +509,7 @@ if '-p' in sys.argv:
     sys.exit(0)
 if mode == 'exit':
     sys.exit(3)
+import time
 d = os.environ['OC_BRIDGE_DIR']
 sock = d + '/bridge.sock'
 token = open(d + '/token').read().strip()
@@ -515,11 +523,27 @@ def call(method, path, body=b''):
 call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
 tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
+if mode == 'ready-exit':
+    # Take whatever the tap hands over for a moment (a turn that ran), then die.
+    import select
+    end = time.time() + 1.0
+    while time.time() < end:
+        if select.select([tap.stdout], [], [], 0.1)[0]:
+            line = tap.stdout.readline()
+            if line:
+                with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'executed'), 'a') as f:
+                    f.write(line.decode())
+    sys.exit(3)
 for line in tap.stdout:
+    if mode == 'die-on-line':
+        sys.exit(3)
     call('POST', '/out', (json.dumps({'type': 'result', 'runner': 'interactive', 'echo': json.loads(line)}) + '\\n').encode())
 `
 
-async function bridgeRun(mode: 'exit' | 'ready', opts: { cooled?: boolean; lines: number; mod?: ReturnType<typeof loadBoxBridgeMod> }) {
+async function bridgeRun(
+  mode: 'exit' | 'ready' | 'ready-exit' | 'die-on-line',
+  opts: { cooled?: boolean; lines: number; mod?: ReturnType<typeof loadBoxBridgeMod>; delayStderrMs?: number; expectResults?: boolean },
+) {
   const dir = mkdtempSync(join(tmpdir(), 'ocb-bridge-'))
   const state = join(dir, 'state')
   const fake = join(dir, 'claude')
@@ -542,7 +566,7 @@ async function bridgeRun(mode: 'exit' | 'ready', opts: { cooled?: boolean; lines
     control,
     args: ['--model', 'box-claude-haiku-4-5', '--permission-mode', 'bypassPermissions'],
     stdin, stdout, stderr,
-    fetchImpl: localExec(),
+    fetchImpl: localExec({ delayStderrMs: opts.delayStderrMs }),
     runner: 'interactive',
     stateDir: state,
     env: {},
@@ -553,12 +577,21 @@ async function bridgeRun(mode: 'exit' | 'ready', opts: { cooled?: boolean; lines
     stdin.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: `turn ${i}` }] } })}\n`)
   }
   const results = (): any[] => out.trim() ? out.trim().split('\n').map((l) => JSON.parse(l)).filter((m) => m.type === 'result') : []
-  await until(() => (results().length >= opts.lines ? true : undefined), 40_000)
-  stdin.end()
-  const code = await running
+  let code: number
+  if (opts.expectResults === false) {
+    // The bridge ends by itself (the turn failed); then the gateway closes stdin.
+    code = await running
+    stdin.end()
+  } else {
+    await until(() => (results().length >= opts.lines ? true : undefined), 40_000)
+    stdin.end()
+    code = await running
+  }
   const cooled = interactiveCoolingDown(state, {})
+  const executedPath = join(dir, 'executed')
+  const executed = existsSync(executedPath) ? readFileSync(executedPath, 'utf8') : ''
   rmSync(dir, { recursive: true, force: true })
-  return { code, results: results(), err, cooled, fifoBase: control.fifo }
+  return { code, results: results(), err, cooled, fifoBase: control.fifo, executed }
 }
 
 function leftovers(fifoBase: string): string[] {
@@ -597,4 +630,36 @@ test('bridge: during cooldown, or with an unusable mod, the turn goes straight t
   assert.deepEqual(bad.results.map((m) => m.runner), ['p'])
   assert.match(bad.err, /BOX_INTERACTIVE_FALLBACK BOX_INTERACTIVE_MOD_TOO_LARGE/)
   assert.equal(bad.cooled, true)
+})
+
+test('bridge: a host that took /ready and died before the bridge saw READY never runs a turn twice', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  // READY reaches the bridge only after the host is gone: the lines were
+  // still held here, so -p runs each exactly once and interactive runs none.
+  const r = await bridgeRun('ready-exit', { lines: 2, delayStderrMs: 3_000 })
+  assert.equal(r.executed, '', 'no turn reached the interactive session')
+  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2']])
+  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK not_ready/)
+  assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+test('bridge: once a line went to a ready host, its failure is not replayed on -p', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const r = await bridgeRun('die-on-line', { lines: 1, expectResults: false })
+  assert.notEqual(r.code, 0)
+  assert.deepEqual(r.results, [])
+  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
+  assert.equal(r.cooled, false)
+  assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+test('host: a session whose tap is gone stops instead of piling up input', { timeout: 60_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const h = startHost({}, 'tap-dies')
+  const code = await h.exited
+  rmSync(h.dir, { recursive: true, force: true })
+  assert.equal(code, 1)
+  assert.match(h.stderr(), /BOX_INTERACTIVE_INPUT_LOST tap_lost/)
+  assert.notEqual(spawnSync('tmux', ['-L', 'oc-box', 'has-session', '-t', `=${h.session}`]).status, 0)
+  assert.ok(!existsSync(h.fifo))
 })
