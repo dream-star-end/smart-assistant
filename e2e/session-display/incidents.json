@@ -6054,6 +6054,35 @@
           "assertion": "MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致"
         }
       ]
+    },
+    {
+      "id": "INC-20261007-BOX-CLI-VERSION-ALLOWLIST",
+      "occurredAt": "2026-10-07",
+      "severity": "P2",
+      "symptom": "个人版 Box Claude：安装的 CLI 版本不在白名单时，入场前被拒为 BOX_CLI_VERSION_UNSUPPORTED，界面停在「模型繁忙，正在重试」。同一道白名单还让未列出的版本不走原生续写。修复：去掉版本白名单。能读到的 x.y.z 一律放行并允许原生续写；读不到版本仍在入场前拒绝；另一构建写下的 transcript 仍是缓存未命中。",
+      "rootFixCommit": "49a1cd7c",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "行为由商业包单测锁住（可读版本放行并记原生指针，不可读仍拒绝）。本回合只删校验，不补浏览器证明。",
+        "since": "2026-10-07"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "a new launch is refused before anything is admitted only when the CLI version cannot be read"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "boxCliNativeResumeVerified(\"2.1.999\"), true"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "anyWritten.kind === \"final\" && anyWritten.nativePointer?.cliVersion, \"2.1.999\""
+        }
+      ]
     }
   ]
 }
