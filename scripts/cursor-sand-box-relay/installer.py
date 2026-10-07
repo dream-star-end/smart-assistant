@@ -29,6 +29,12 @@ AUTH = '''    if (deps.authToken != null && !isAuthorized(req, deps.authToken)) 
       return respondError(res, 401, "unauthorized");
     }
     if (isPrepareUpgrade) {'''
+# Host f95dbfb (2026-10): the gateway token gate grew a WebAuthn proxy branch.
+AUTH_V3 = '''    if (deps.authToken != null && !isAuthorized(req, deps.authToken)) {
+      if (deps.webAuthnProxyToken == null || !isAuthorized(req, deps.webAuthnProxyToken)) {
+        return respondError(res, 401, "unauthorized");
+      }
+      const refusal2 = webAuthnProxyRefusal({'''
 SERVICE = '''      log: (message) => context2.host.log(message),
       credentials: context2.host.environment.auth
     });
@@ -65,6 +71,17 @@ ROUTE = '''    if (isSandStreamRelay) {
       return handleSandStreamRelay(deps, req, res);
     }
 '''
+# Placed before the f95dbfb gate, so the WebAuthn proxy token never reaches the
+# relay: only the primary gateway token does, and a missing token fails closed.
+ROUTE_V3 = '''    if (isSandStreamRelay) {
+      if (deps.authToken == null || !isAuthorized(req, deps.authToken)) {
+        return respondError(res, 401, "unauthorized");
+      }
+      return handleSandStreamRelay(deps, req, res);
+    }
+'''
+# Known host directories, newest first. The expected host PID's cwd picks one.
+HOST_DIRS = (Path("/opt/sand/sand-host"), Path("/home/box/sand-host"))
 
 
 def fail(code):
@@ -77,19 +94,23 @@ def digest(data):
 
 def layout_anchors(source):
     if source.count(HANDLE_V2) == 1:
-        return HANDLE_V2, GROUP_V2, SERVICE_V2
+        if source.count(AUTH_V3) == 1:
+            return HANDLE_V2, GROUP_V2, SERVICE_V2, AUTH_V3, ROUTE_V3
+        return HANDLE_V2, GROUP_V2, SERVICE_V2, AUTH, ROUTE
     if source.count(HANDLE) == 1:
-        return HANDLE, GROUP, SERVICE
+        return HANDLE, GROUP, SERVICE, AUTH, ROUTE
     fail("UNSUPPORTED_HOST_LAYOUT")
 
 
 def patch_source(source):
-    handle, group, service = layout_anchors(source)
+    handle, group, service, auth, route = layout_anchors(source)
     if "handleSandStreamRelay" in source:
         old_hook = 'const __ocv5Relay = require("./ocv5-197-relay.cjs").createRelay({'
         old_body = 'function handleSandStreamRelay(deps, req, res) {\n  return __ocv5Relay(deps, req, res);\n}'
         owned = HOOK in source or (old_hook in source and old_body in source)
-        if not owned or source.count(handle) != 1 or REGISTER not in source or ROUTE not in source:
+        if not owned or source.count(handle) != 1 or REGISTER not in source or route not in source:
+            fail("UNSUPPORTED_EXISTING_HOOK")
+        if auth is AUTH_V3 and (source.count(route) != 1 or source.index(route) > source.index(auth)):
             fail("UNSUPPORTED_EXISTING_HOOK")
         # Add a GET-only capability route without changing the original auth gate.
         if source.count(OLD_ROUTE_KIND) == 1:
@@ -97,7 +118,7 @@ def patch_source(source):
         if source.count(ROUTE_KIND) != 1:
             fail("UNSUPPORTED_EXISTING_HOOK")
         return source
-    for anchor in [handle, CLASSIFY, group, AUTH, service]:
+    for anchor in [handle, CLASSIFY, group, auth, service]:
         if source.count(anchor) != 1:
             fail("UNSUPPORTED_HOST_LAYOUT")
     for name in ["createNodeHttpClient", "isAuthorized", "createCursorChecksum"]:
@@ -106,7 +127,10 @@ def patch_source(source):
     source = source.replace(handle, HOOK + handle, 1)
     source = source.replace(CLASSIFY, CLASSIFY + '\n' + ROUTE_KIND, 1)
     source = source.replace(group, group.replace(") {", " || isSandStreamRelay) {"), 1)
-    source = source.replace(AUTH, AUTH.replace("    if (isPrepareUpgrade) {", ROUTE + "    if (isPrepareUpgrade) {"), 1)
+    if auth is AUTH_V3:
+        source = source.replace(auth, route + auth, 1)
+    else:
+        source = source.replace(auth, auth.replace("    if (isPrepareUpgrade) {", route + "    if (isPrepareUpgrade) {"), 1)
     source = source.replace(service, service.replace("    context2.onStop(() => service.dispose());", REGISTER), 1)
     return source
 
@@ -225,6 +249,15 @@ def source_predates_process(host, identity):
     return host.stat().st_mtime < started - 1
 
 
+def resolve_host(pid, dirs=HOST_DIRS):
+    # Process metadata only: the directory the expected host PID runs in.
+    cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    for directory in dirs:
+        if not directory.is_symlink() and directory.is_dir() and directory.resolve() == cwd:
+            return directory / "host-main.cjs"
+    fail("HOST_PID_MISMATCH")
+
+
 def queue_native_restart(host, mailbox, nonce, agent_id, module_hash, check_owner):
     """One fixed-ID native restart, no overwrite or replay after unknown delivery.
 
@@ -263,14 +296,14 @@ def queue_native_restart(host, mailbox, nonce, agent_id, module_hash, check_owne
         temporary.unlink(missing_ok=True)
 
 
-def apply_payload(payload, host=Path("/home/box/sand-host/host-main.cjs"),
+def apply_payload(payload, host=None,
                   supervisor=Path("/usr/local/bin/sand-supervisor.mjs"),
                   mailbox=Path("/tmp/sand-supervisor/command.json"),
                   identify=pid_identity, predates=source_predates_process):
-    host, supervisor = Path(host), Path(supervisor)
     pid, agent_id = payload["expectedPid"], payload.get("agentId")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         fail("HOST_PID_INVALID")
+    host, supervisor = Path(host) if host is not None else resolve_host(pid), Path(supervisor)
     if not isinstance(agent_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", agent_id):
         fail("MAINTENANCE_AGENT_INVALID")
     identity = identify(pid, host.parent)
