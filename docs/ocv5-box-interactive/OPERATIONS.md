@@ -5,10 +5,11 @@
 Personal `box-claude-opus-5-5`, `box-claude-sonnet-5` and `box-claude-haiku-4-5` have `runner: 'interactive'` in the protocol catalog (`packages/protocol/src/engineModels.ts`).
 A turn on these models runs interactive Claude Code in `tmux -L oc-box` on the Box, driven by the oc-bridge mod. The gateway sees the same stream-json as with `claude -p`.
 
-**`-p` stays the safety net, automatically.** The bridge runs a turn on `claude -p` when:
+**`-p` stays the safety net, automatically, but only before the interactive session is up.** The bridge sends the interactive host nothing until it has seen `BOX_INTERACTIVE_READY`, so a fallback never runs a turn twice. After READY, failures behave as they do on `-p` (the turn errors; the next message resumes). The bridge runs a turn on `claude -p` when:
 
 - the interactive host ends before it reports ready (a dialog, a 20 s ready timeout, a crash, no tmux or python3, a mod digest mismatch). The lines held so far are replayed to `-p` in order. Stderr shows `BOX_INTERACTIVE_NOT_READY <why>` and then `BOX_INTERACTIVE_FALLBACK not_ready`;
 - the mod cannot be loaded or sent (`BOX_INTERACTIVE_FALLBACK BOX_INTERACTIVE_MOD_*`);
+- held input before READY exceeded `OC_BOX_INTERACTIVE_HOLD_MAX_BYTES` (default 64 MiB) (`BOX_INTERACTIVE_ABANDON held_overflow`);
 - a fallback happened in that container in the last `OC_BOX_INTERACTIVE_COOLDOWN_SEC` seconds (default 600; marker `/tmp/oc-box-cc/interactive-down` inside the user container) (`BOX_INTERACTIVE_FALLBACK cooldown`).
 
 Both runners use the same cwd (`/workspace`) and the same Box login, so a chat moves between them with its history intact (`--resume` works either way).

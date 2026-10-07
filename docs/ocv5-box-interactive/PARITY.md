@@ -36,7 +36,21 @@ Legend: ✅ same, verified · ✅* same by construction (code path untouched) ·
 | 22 | Startup dialogs: none under `-p` | Bypass confirmation suppressed by `--settings`; **trust dialog for `/workspace` must be pre-accepted in the product config** (ops step, needs approval); otherwise `BOX_INTERACTIVE_NOT_READY … dialog=trust` | ⏳ ops prerequisite before enabling (P0 finding) |
 | 23 | Errors surfaced by `-p` as `system/api_retry`, `system/status`, `task_notification`, `bash_output_tail` | Not emitted (hooks don't expose API retries; background-task deliveries ⏳) | ⚠ status/UX lines only; billing unaffected. P2 ⏳ |
 | 24 | `assistant.message.usage` per message | Zeroed (usage is carried on `message_delta`/`result`, which the parser uses) | ✅ parser test |
-| 25 | Fallback to `-p` | **Automatic.** The mod posts `ready` before it reads any input, so until the host prints `BOX_INTERACTIVE_READY` no line has reached Claude. The bridge keeps those lines; if the host ends before ready (dialog, timeout, crash, missing mod/tmux, mod digest), it starts `-p` on a fresh fifo, replays them in order, then continues. Launch build failures (mod missing/too large) go straight to `-p`. After a fallback the container skips interactive for `OC_BOX_INTERACTIVE_COOLDOWN_SEC` (default 600). A write that failed before ready is replayed on fallback, or fails the bridge loudly if the host then gets ready (no silent loss) | ✅ end-to-end bridge tests with a local exec emulator: dies-before-ready → `-p` replays 2 turns in order; ready → no fallback; cooldown / bad mod → `-p` (P2) |
+| 25 | Fallback to `-p` | **Automatic, two phases.** Until the bridge has seen the host print `BOX_INTERACTIVE_READY`, it sends the host nothing and holds every line. If the host ends first (dialog, ready timeout, crash, missing tmux/python, mod digest, held input over `OC_BOX_INTERACTIVE_HOLD_MAX_BYTES`), all held lines go to `-p` on a fresh fifo, in order. Nothing ran interactively, so nothing runs twice and nothing is lost. After READY the bridge behaves exactly like `-p` (a failed write or dead host ends it; the next turn resumes); in interactive mode it also stops the host. Launch-build failures (mod missing/too large) go straight to `-p`. After a fallback, the container skips interactive for `OC_BOX_INTERACTIVE_COOLDOWN_SEC` (600) | ✅ bridge tests through a local exec emulator: dies before ready; READY delayed past host death (red on an earlier design); post-READY write failure; overflow; cooldown/bad mod. 3 consecutive green runs |
+| 26 | Who can write the gateway's stream: under `-p` only the CLI's stdout (a same-uid tool could still write `/proc/<claude>/fd/1`) | Bridge socket serves HTTP only to the exact claude pid with a per-session token (read once by the mod, deleted before any tool runs); tap token on stdin, accepted once; tools get 403 | ✅ forge test (no token / stolen token / second tap). Residual same-uid ptrace risk = `-p` status quo (D4) |
+| 27 | `result.usage` = CLI's turn aggregate | Engine turn usage when reported, else Σ main-step usage (abort / API error) — never zero for paid steps | ✅ frames test (review round 1) |
+
+## Independent review (codex, read-only), 5 rounds
+
+| Round | Findings | Outcome |
+|---|---|---|
+| 1 | tools could forge stream-json via the socket; zero usage on turn.complete without usage; unbounded host queues | fixed (exact-pid + token auth; Σ step usage; destructive/bounded queues) |
+| 2 | READY-observation race could run a turn twice; tap loss unbounded | fixed (hold until READY; tap loss terminal) |
+| 3 | first write after READY could lose a turn; hold buffer unbounded | fixed, then superseded in round 4 |
+| 4 | four corner cases in post-READY recovery | **replaced** by the two-phase design (row 25) |
+| 5 | **NO BLOCKING ISSUES**; plain `-p` path materially identical to upstream; compatible with the new upstream parser | one medium accepted (below) |
+
+**Accepted limitation (medium):** the pre-READY cap is checked per line after the shared `bufferLines()` has already split a burst, so a single very large burst during startup can exceed it. The same unbounded buffering exists in the `-p` bridge today. The gateway writes about one line per user message, and fixing it means adding backpressure to code shared with `-p`. Separate ticket.
 
 ## Release packaging (P2)
 
