@@ -23,6 +23,32 @@ export const PROJECT_RECIPES = [
 
 export type ProjectRecipeKey = (typeof PROJECT_RECIPES)[number]["key"];
 
+/**
+ * 定时快捷任务（P5c，OC_P5_RECIPE_SCHEDULE）：一键建一个固定在本项目看板上的定时任务。
+ * label 同时是定时任务的标签，用来判断这个项目里是不是已经建过同一个。
+ * schedule 是北京时间的 5 段 cron（服务时区，同定时任务页）；when 是给人看的说法。
+ */
+export const SCHEDULED_RECIPES = [
+  {
+    key: "weekly-friday",
+    label: "每周五生成项目周报",
+    schedule: "0 17 * * 5",
+    when: "每周五 17:00（北京时间）",
+    prompt:
+      "请根据这个项目本周的会话、文件和看板任务，生成一份本周周报，包括：本周完成、进行中、风险与问题、下周计划。",
+  },
+  {
+    key: "daily-progress",
+    label: "每天汇总进展",
+    schedule: "0 18 * * 1-5",
+    when: "每个工作日（周一至周五）18:00（北京时间）",
+    prompt:
+      "请汇总这个项目今天的进展：完成了什么、正在进行什么、明天要做什么，并列出需要我决定或确认的事项。",
+  },
+] as const;
+
+export type ScheduledRecipe = (typeof SCHEDULED_RECIPES)[number];
+
 /** 会话的最近活动时刻（服务端 lastAt 优先，缺省回落 updatedAt）。 */
 export function sessionRecency(s: Pick<Session, "lastAt" | "updatedAt">): number {
   if (typeof s.lastAt === "number" && Number.isFinite(s.lastAt)) return s.lastAt;

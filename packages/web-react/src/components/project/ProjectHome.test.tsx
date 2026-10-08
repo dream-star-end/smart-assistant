@@ -497,3 +497,95 @@ describe("ProjectHome activity (P3)", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 });
+
+describe("ProjectHome scheduled recipes (P5c)", () => {
+  const board = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const withBoard = { ...project, boardProjectId: board };
+
+  it("hidden when the flag is off, without a board, or in demo", () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    renderHome({ project: withBoard, onPrepareBoard: async () => true, onShowSurface: vi.fn() } as Overrides);
+    expect(screen.queryByRole("button", { name: "每周五生成项目周报" })).toBeNull();
+    cleanup();
+    renderHome({ recipeSchedule: true, onPrepareBoard: async () => true, onShowSurface: vi.fn() } as Overrides);
+    expect(screen.queryByRole("button", { name: "每周五生成项目周报" })).toBeNull();
+    cleanup();
+    renderHome({ recipeSchedule: true, demo: true, project: withBoard, onPrepareBoard: async () => true, onShowSurface: vi.fn() } as Overrides);
+    expect(screen.queryByRole("button", { name: "每天汇总进展" })).toBeNull();
+  });
+
+  it("confirm → prepare the board → create one fixed cron job for this board, then toast", async () => {
+    const order: string[] = [];
+    const onPrepareBoard = vi.fn(async () => {
+      order.push("prepare");
+      return true;
+    });
+    // 最近活动也会读 listCron；这里只看确认之后的那次。
+    const list = vi.spyOn(api, "listCron").mockImplementation(async () => {
+      order.push("list");
+      return [{ id: "c0", label: "别的任务" }] as never;
+    });
+    const create = vi.spyOn(api, "createCron").mockImplementation(async () => {
+      order.push("create");
+      return { ok: true, job: { id: "c1" } };
+    });
+    renderHome({ recipeSchedule: true, project: withBoard, onPrepareBoard, onShowSurface: vi.fn() } as Overrides);
+    fireEvent.click(screen.getByRole("button", { name: "每周五生成项目周报" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByTestId("scheduled-recipe-when")).toHaveTextContent("每周五 17:00（北京时间）");
+    const box = within(dialog).getByRole("textbox", { name: "定时任务指令" });
+    fireEvent.change(box, { target: { value: "  请写本周周报  " } });
+    await waitFor(() => expect(list).toHaveBeenCalled());
+    order.length = 0;
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建定时任务" }));
+    await screen.findByText("已创建定时任务");
+    expect(order).toEqual(["prepare", "list", "create"]);
+    expect(list).toHaveBeenLastCalledWith(expect.anything(), { boardProjectId: board });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledWith(expect.anything(), {
+      schedule: "0 17 * * 5",
+      prompt: "请写本周周报",
+      label: "每周五生成项目周报",
+      deliver: "webchat",
+      oneshot: false,
+      projectMode: "fixed",
+      boardProjectId: board,
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("weekday recipe uses a Monday–Friday schedule", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    const create = vi.spyOn(api, "createCron").mockResolvedValue({ ok: true });
+    renderHome({ recipeSchedule: true, project: withBoard, onPrepareBoard: async () => true, onShowSurface: vi.fn() } as Overrides);
+    fireEvent.click(screen.getByRole("button", { name: "每天汇总进展" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByTestId("scheduled-recipe-when")).toHaveTextContent("周一至周五");
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建定时任务" }));
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    expect(create.mock.calls[0][1]).toMatchObject({ schedule: "0 18 * * 1-5", label: "每天汇总进展", oneshot: false });
+  });
+
+  it("an existing job with the same label on this board is reported, not duplicated", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([
+      { id: "c9", label: "每周五生成项目周报", boardProjectId: board },
+    ] as never);
+    const create = vi.spyOn(api, "createCron");
+    renderHome({ recipeSchedule: true, project: withBoard, onPrepareBoard: async () => true, onShowSurface: vi.fn() } as Overrides);
+    fireEvent.click(screen.getByRole("button", { name: "每周五生成项目周报" }));
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "创建定时任务" }));
+    await screen.findByText(/已经有「每周五生成项目周报」定时任务了/);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("board not ready → stays in the dialog with an error, nothing created", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    const create = vi.spyOn(api, "createCron");
+    renderHome({ recipeSchedule: true, project: withBoard, onPrepareBoard: async () => false, onShowSurface: vi.fn() } as Overrides);
+    fireEvent.click(screen.getByRole("button", { name: "每周五生成项目周报" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "创建定时任务" }));
+    await within(dialog).findByText("项目看板暂时打不开，请稍后再试");
+    expect(create).not.toHaveBeenCalled();
+  });
+});

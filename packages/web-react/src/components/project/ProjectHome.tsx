@@ -43,6 +43,7 @@ import { cn } from "../../lib/utils";
 import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
 import { useSignedDownload } from "../chat/media";
 import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
+import { ScheduledRecipeChips } from "./ScheduledRecipes";
 import {
   Alert,
   Badge,
@@ -115,6 +116,8 @@ export type ProjectHomeProps = {
    */
   onPrepareBoard?: () => Promise<boolean>;
   onShowSurface?: (surface: ProjectSurface) => void;
+  /** P5c（OC_P5_RECIPE_SCHEDULE）：快捷开始旁出现「定时」快捷任务。需要看板入口（上面两个）。 */
+  recipeSchedule?: boolean;
 };
 
 export type ProjectSurface = "board" | "memory" | "skills" | "cron";
@@ -163,6 +166,7 @@ export function ProjectHome(props: ProjectHomeProps) {
     onPrepareBoard,
     onShowSurface,
     onExpandSidebar,
+    recipeSchedule = false,
   } = props;
 
   const [confirmDialog, confirmEl] = useConfirm();
@@ -339,6 +343,14 @@ export function ProjectHome(props: ProjectHomeProps) {
                 {r.label}
               </Chip>
             ))}
+            {recipeSchedule && !demo && project.boardProjectId && onPrepareBoard && surfaces.open && (
+              <ScheduledRecipeChips
+                boardProjectId={project.boardProjectId}
+                authSession={authSession}
+                onPrepareBoard={onPrepareBoard}
+                onOpenCron={() => void surfaces.open?.("cron")}
+              />
+            )}
             {lastSession && (
               <Chip
                 onClick={() => onOpenSession(lastSession.id)}

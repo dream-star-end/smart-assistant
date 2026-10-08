@@ -3887,6 +3887,7 @@ export function App() {
                   ? undefined
                   : () => prepareProjectBoard(homeProject.boardProjectId as string)
               }
+              recipeSchedule={serverFeatures.recipeSchedule}
               onShowSurface={(surface) => {
                 setProjectHome(null);
                 if (surface === "board") setBoardOpen(true);
