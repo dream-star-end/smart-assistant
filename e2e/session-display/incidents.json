@@ -6365,6 +6365,56 @@
           "assertion": "a registration queued while a flush is sending is not lost"
         }
       ]
+    },
+    {
+      "id": "INC-20261002-COMPLETED-GOAL-DIAGNOSTIC-EMPTY",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium双视口与React回归复现（非声称生产用户报障）：completed历史目标进入处理过程后，MessageRenderer将所有goal返回null，展开只有空壳、正文与原始记录不可查看；仅恢复completed历史纯文本及精确原始记录，当前active/paused/blocked目标仍只在唯一dock展示，cleared不复活。（个人版 OCV5-343 挑自商业 f00e0564：个人版缺此修复，前端单测/浏览器回归长期红。）",
+      "rootFixCommit": "0ac746ff",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "已清除目标不占过程，只剩它时没有空壳，普通句子里的同样字句还在"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "completed goal diagnostics stay folded, exact raw survives and current dock is unique"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-LIVE-STATUS-CASCADE",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户报障）：live状态同时带oc-swap-in与oc-live-status-shine，后置入场fade-in覆盖扫光动画，并覆盖forced-colors要求的animation:none。仅将入场selector排除shine，其他入场行为保留；六主题/媒体正控全部通过，独立旧CSS输入负控在两主题normal/forced四叶精准红，父级失败仅为成功reports汇总，reduced与原过程/历史目标证明继续通过。（个人版 OCV5-343 挑自商业 98760e9e：个人版缺此修复，前端单测/浏览器回归长期红。）",
+      "rootFixCommit": "3789a1a5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "live status is single and readable in both themes and accessibility media"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261002-TOOL-HIT-TARGET",
+      "occurredAt": "2026-10-02",
+      "severity": "P2",
+      "symptom": "OCV5-308候选真实Chromium回归复现（非声称生产用户报障）：工具卡默认头部只有40px，低于原44px键盘/指针命中合同；恢复44px。（个人版 OCV5-343 挑自商业 5abf0dfd：个人版缺此修复，前端单测/浏览器回归长期红。）",
+      "rootFixCommit": "a492e45d",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度"
+        }
+      ]
     }
   ]
 }
