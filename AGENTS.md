@@ -120,3 +120,13 @@ For any `claudeai.chat` / OpenClaude v3 commercial code or deploy task:
 - explicitly classify touched paths and answer whether a runtime image rebuild is required
 - never treat manual rsync + systemctl restart as final deployment
 - deploy only with `scripts/deploy-v3.sh` from `/opt/openclaude/openclaude-v3`
+
+## 用例卫生(BLOCKING,2026-10-08 OCV5-343)
+
+- 改动让已有用例**过期**(产品行为有意改变)或**无用**(覆盖的功能/界面已删除、与其它用例重复),必须在
+  **同一个 PR / 同一串提交**里更新断言或删除该用例,不得留作"基线失败"。
+- 三分判定:过期 → 把断言改成现行意图;无用 → 删除;断言仍然正确 → 是产品缺陷,修产品,不改用例。
+  改断言或删用例要在提交说明里写依据(哪个提交、为什么改了行为)。禁止为了变绿而放宽或删除一条仍然正确的用例。
+- `packages/web-react` 全量 vitest(`npm run test:web-react`)必须保持全绿。"失败集与基线相同、0 新增"
+  不是合格结论:基线红就先按上面三分清掉。商业版由 v5-ci 的 required `web-react` job 守;个人版由
+  `.github/workflows/v5-selfhost-web-react.yml` 在 push / PR 到 `feat/v5-selfhost` 时跑同一命令。
