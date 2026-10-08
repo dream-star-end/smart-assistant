@@ -284,6 +284,8 @@ esac
     PATH: `${bin}:${process.env.PATH}`,
     ALLOW_ANY_BRANCH: '1',
     KL_HOST: 'kl-preflight-fixture',
+    // 默认关掉 nightly 提示,别让用例去打真 GitHub;专门的用例用假 gh 打开。
+    OC_V5_PREFLIGHT_NIGHTLY: '0',
     FAKE_EGRESS_SHA: egressSha,
     OC_V5_RELEASE_QUEUE_DB: path.join(dir, 'queue.db'),
     OC_V5_RELEASE_QUEUE_LOCK: path.join(dir, 'queue.lock'),
@@ -310,7 +312,8 @@ function activePinnedQueue(fx: ReturnType<typeof preflightFixture>, sha: string)
 }
 
 function runPreflight(env: NodeJS.ProcessEnv, args: string[]) {
-  return spawnSync(preflight, ['--', ...args], { cwd: root, encoding: 'utf8', env })
+  // 外层上限:回归时让用例确定性失败(ETIMEDOUT),而不是把测试进程挂住。
+  return spawnSync(preflight, ['--', ...args], { cwd: root, encoding: 'utf8', env, timeout: 60_000 })
 }
 
 test('preflight passes a ready release and writes nothing to stdout', () => {
@@ -523,5 +526,133 @@ test('queue check is read-only and reports an unreadable queue as undecidable (e
     assert.throws(() => readFileSync(path.join(dir, 'queue.lock')))
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── 发车预检的 nightly 红提示(只提示、不阻断)──
+function nightlyGh(dir: string, runs: Array<{ conclusion: string; databaseId: number; createdAt: string }>, failGh = false): string {
+  const bin = path.join(dir, 'nightly-bin')
+  spawnSync('mkdir', ['-p', bin])
+  writeFileSync(path.join(dir, 'runs.json'), JSON.stringify(runs))
+  writeFileSync(
+    path.join(bin, 'gh'),
+    `#!/usr/bin/env bash
+${failGh ? 'exit 1' : ''}
+if [[ "$1 $2" == "run list" ]]; then
+  jq_expr=""; while [[ $# -gt 0 ]]; do [[ "$1" == --jq ]] && jq_expr="$2"; shift; done
+  jq -r "$jq_expr" "${dir}/runs.json"; exit 0
+fi
+if [[ "$1" == api ]]; then printf '%s\\n' 'integ nightly-3, integ nightly-5'; exit 0; fi
+exit 1
+`,
+  )
+  chmodSync(path.join(bin, 'gh'), 0o755)
+  return bin
+}
+
+test('preflight warns (never blocks) when integ nightly has been red, with streak and red shards', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const bin = nightlyGh(path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB)), [
+    { conclusion: 'failure', databaseId: 3, createdAt: '2026-10-07T23:28:47Z' },
+    { conclusion: 'failure', databaseId: 2, createdAt: '2026-10-06T22:55:05Z' },
+    { conclusion: 'success', databaseId: 1, createdAt: '2026-10-05T22:00:00Z' },
+    { conclusion: 'failure', databaseId: 0, createdAt: '2026-10-04T22:00:00Z' },
+  ])
+  try {
+    const r = runPreflight({ ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: '1' }, ['--rollback'])
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.stdout, '')
+    assert.match(r.stderr, /integ nightly 已连续 2 次红\(最早 2026-10-06,最近 2026-10-07 run 3;红分片:integ nightly-3, integ nightly-5\)/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('no nightly warning when the latest nightly is green, when gh fails, or when disabled', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const dir = path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB))
+  try {
+    const green = nightlyGh(path.join(dir, 'g'), [{ conclusion: 'success', databaseId: 9, createdAt: '2026-10-08T00:00:00Z' }])
+    const failing = nightlyGh(path.join(dir, 'f'), [], true)
+    const red = nightlyGh(path.join(dir, 'r'), [{ conclusion: 'failure', databaseId: 9, createdAt: '2026-10-08T00:00:00Z' }])
+    for (const [bin, enabled] of [[green, '1'], [failing, '1'], [red, '0']] as const) {
+      const r = runPreflight({ ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: enabled }, ['--rollback'])
+      assert.equal(r.status, 0, r.stderr)
+      assert.doesNotMatch(r.stderr, /integ nightly/)
+    }
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('a failing preflight still fails; the nightly advisory never turns a refusal into a pass', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const bin = nightlyGh(path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB)), [{ conclusion: 'failure', databaseId: 3, createdAt: '2026-10-07T23:28:47Z' }])
+  try {
+    const r = runPreflight({ ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: '1' }, ['--with-dist'])
+    assert.equal(r.status, 2, r.stderr)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('a gh that hangs and ignores TERM cannot hold up the preflight (hard kill after the timeout)', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const bin = path.join(path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB)), 'hang-bin')
+  spawnSync('mkdir', ['-p', bin])
+  writeFileSync(path.join(bin, 'gh'), "#!/usr/bin/env bash\ntrap '' TERM\nsleep 60\n")
+  chmodSync(path.join(bin, 'gh'), 0o755)
+  try {
+    const started = Date.now()
+    const r = runPreflight(
+      { ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: '1', OC_V5_PREFLIGHT_NIGHTLY_TIMEOUT: '1', OC_V5_PREFLIGHT_NIGHTLY_KILL_AFTER: '1' },
+      ['--rollback'],
+    )
+    assert.equal(r.status, 0, r.stderr)
+    assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started}ms`)
+    assert.doesNotMatch(r.stderr, /integ nightly/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('the second gh call (red shards) hanging with a pipe-holding grandchild cannot hold up the preflight either', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const dir = path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB))
+  const bin = path.join(dir, 'hang2-bin')
+  spawnSync('mkdir', ['-p', bin])
+  writeFileSync(path.join(dir, 'runs2.json'), JSON.stringify([{ conclusion: 'failure', databaseId: 5, createdAt: '2026-10-07T23:00:00Z' }]))
+  writeFileSync(
+    path.join(bin, 'gh'),
+    `#!/usr/bin/env bash
+if [[ "$1 $2" == "run list" ]]; then
+  jq_expr=""; while [[ $# -gt 0 ]]; do [[ "$1" == --jq ]] && jq_expr="$2"; shift; done
+  jq -r "$jq_expr" "${dir}/runs2.json"; exit 0
+fi
+# api: leave a grandchild that inherits stdout, then ignore TERM and hang.
+( trap '' TERM; sleep 60 ) &
+trap '' TERM
+sleep 60
+`,
+  )
+  chmodSync(path.join(bin, 'gh'), 0o755)
+  try {
+    const started = Date.now()
+    const r = runPreflight(
+      { ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: '1', OC_V5_PREFLIGHT_NIGHTLY_TIMEOUT: '1', OC_V5_PREFLIGHT_NIGHTLY_KILL_AFTER: '1' },
+      ['--rollback'],
+    )
+    assert.equal(r.error, undefined, 'preflight hung')
+    assert.equal(r.status, 0, r.stderr)
+    assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started}ms`)
+    // run list answered, so the advisory still prints (shards unknown).
+    assert.match(r.stderr, /integ nightly 已连续 1 次红.*红分片:\?/)
+  } finally {
+    fx.cleanup()
   }
 })
