@@ -2726,6 +2726,63 @@ async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
+/** INC-20261008-BOX-NATIVE-RESUME-UNSTOPPABLE, commercial u1870 run 7d17585d: a native resume launches the keeper in
+ * the CLI cwd of the run that wrote the transcript, and the keeper stop accepted only a keeper in the run's own
+ * directory. Every stop exited 125 (BOX_EXEC_REMOTE_EXIT), the parked run stayed in handoff and the session's
+ * next messages were refused as IDLE_HISTORY_PENDING until the four-hour deadline. Here a real keeper process
+ * runs in another run's directory and is stopped by the real coordinator, journal leaf and stop script. */
+async function proveNativeResumedStop(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_334n, containerId: 334n, sessionId: "session-native-stop" };
+  const turnKey = "7".repeat(64);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'native-stop@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-nstop", turnKey);
+  await turn.first();
+  const nonce = turn.host.runNonce, epoch = turn.host.leaseEpoch;
+  const run = `/tmp/ocv5-289-run-${nonce}`, proofDir = `/tmp/ocv5-289-proof-${nonce}`;
+  const native = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const keeperPath = `/tmp/ocv5-289-v2-keeper-${randomBytes(8).toString("hex")}.py`;
+  const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${randomBytes(8).toString("hex")}.py`;
+  for (const dir of [run, proofDir, native]) {
+    mkdirSync(dir, { mode: 0o700 });
+    cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
+  }
+  writeFileSync(keeperPath, "import signal,time,sys\nsignal.signal(signal.SIGTERM,lambda *_:sys.exit(0))\n" +
+    "open('ready','w').close()\nwhile True:time.sleep(.1)\n", { mode: 0o600 });
+  cleanups.add(() => rmSync(keeperPath, { force: true }));
+  const keeper = spawn("/usr/bin/python3", ["-I", keeperPath, supervisorPath, "--proof-dir", proofDir,
+    "--lease-epoch", epoch], { cwd: native, stdio: "ignore" });
+  cleanups.add(() => { if (keeper.exitCode === null) keeper.kill("SIGKILL"); });
+  for (let i = 0; i < 200 && !existsSync(`${native}/ready`); i++) await tick(10);
+  writeFileSync(`${proofDir}/stop.ready`, JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
+    keeperPid: keeper.pid, cliPid: keeper.pid, revision: 1 }) + "\n", { mode: 0o600 });
+  // the journal records the resumed transcript's cwd, as claimToolResume writes it for a native resume
+  await db.query(`UPDATE request_finalize_journal SET ctx=ctx || jsonb_build_object('boxNativeCliCwd',$2::text,
+    'boxNativeSessionId',$3::text) WHERE request_id=$1`, ["box-nstop-1", native, randomUUID()]);
+  // the cleanup worker's listing carries the same cwd for its stale-resume stop
+  await aged(db, "box-nstop-1", "3 hours");
+  const listed = (await journal.listStoppedFailureProbeCandidates(20))
+    .find((candidate: { requestId: string }) => candidate.requestId === "box-nstop-1") as { cliCwd?: string } | undefined;
+  if (listed?.cliCwd !== native) fail(`NATIVE_STOP_WORKER_CWD_${String(listed?.cliCwd)}`);
+  const sent: string[][] = [];
+  const local = { accountId: turn.host.target.accountId, exec: { run: async (request: ExecRequest & { command: string }) => {
+    if (request.args[3] !== nonce || request.args[4] !== epoch) throw api.transportError("BOX_EXEC_REMOTE_EXIT");
+    sent.push(request.args.slice(3));
+    const out = spawnSync(request.command, request.args, { cwd: "/tmp", encoding: "utf8", timeout: 5000 });
+    if (out.status !== 0) throw api.transportError("BOX_EXEC_REMOTE_EXIT");
+    return reply(out.stdout);
+  } } };
+  await api.stopCoordinator(journal, local).requestStop({ requestId: "box-nstop-1", uid: who.uid,
+    accountId: turn.host.target.accountId, runNonce: nonce, leaseEpoch: epoch });
+  const exited = keeper.exitCode !== null || await Promise.race([
+    new Promise<boolean>((resolve) => { keeper.once("exit", () => resolve(true)); }), tick(3000).then(() => false)]);
+  if (sent.length !== 1 || sent[0]![2] !== native || !exited) {
+    fail(`NATIVE_STOP_NOT_STOPPED_${sent.length}_${String(sent[0]?.[2])}_${exited}`);
+  }
+  return "[ocv5-334-native-resume-stop] PASS — a native-resumed run whose keeper runs in the transcript run directory is stopped";
+}
+
 /** INC-20261008-BOX-PARALLEL-IMAGE-CAPTION, commercial u1870 request 0e9b5222: five parallel Reads returned five
  * JPEG screenshots and Claude Code downscaled only one (2430x1131 -> 2000x931), so a single caption followed all
  * five results. The fold accepted only a message with exactly one image and the turn ended with 409. */
@@ -2788,7 +2845,7 @@ async function main(): Promise<void> {
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
-      await proveUpstreamRefusal(api, db)]),
+      await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);

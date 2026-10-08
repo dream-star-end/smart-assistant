@@ -63,3 +63,58 @@ test("stop binds a live keeper by nonce, epoch, pinned PID and cwd", async () =>
 test("stop rejects wrong epoch without signalling the original keeper", async () => {
   assert.throws(() => makeBoxKeeperStop("bad", "b".repeat(32)), /BOX_KEEPER_STOP_ID_INVALID/);
 });
+
+test("stop reaches a native-resumed keeper that runs in the transcript run directory", async () => {
+  const nonce = randomBytes(12).toString("hex");
+  const epoch = randomBytes(16).toString("hex");
+  const run = `/tmp/ocv5-289-run-${nonce}`;
+  const proof = `/tmp/ocv5-289-proof-${nonce}`;
+  const native = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const other = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const keeper = `/tmp/ocv5-289-v2-keeper-${randomBytes(8).toString("hex")}.py`;
+  const supervisor = `/tmp/ocv5-289-v2-supervisor-${randomBytes(8).toString("hex")}.py`;
+  for (const dir of [run, proof, native, other]) mkdirSync(dir, { mode: 0o700 });
+  writeFileSync(keeper, "import signal,time,sys\n" +
+    "signal.signal(signal.SIGTERM,lambda *_:sys.exit(0))\n" +
+    "open('ready','w').close()\n" +
+    "while True:time.sleep(.1)\n", { mode: 0o600 });
+  const child = spawn("/usr/bin/python3", ["-I", keeper, supervisor,
+    "--proof-dir", proof, "--lease-epoch", epoch], { cwd: native, stdio: "ignore" });
+  const exec = (request: ReturnType<typeof makeBoxKeeperStop>) => spawnSync(request.command,
+    request.args, { cwd: request.cwd, encoding: "utf8", timeout: 5000 });
+  try {
+    for (let i = 0; i < 100 && !existsSync(`${native}/ready`); i++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(existsSync(`${native}/ready`));
+    writeFileSync(`${proof}/stop.ready`, JSON.stringify({ runNonce: nonce,
+      leaseEpoch: epoch, keeperPid: child.pid, cliPid: child.pid,
+      revision: 1 }) + "\n", { mode: 0o600 });
+    assert.equal(exec(makeBoxKeeperStop(nonce, epoch)).status, 125,
+      "without the native cwd the keeper is not recognised");
+    assert.equal(exec(makeBoxKeeperStop(nonce, epoch, other)).status, 125,
+      "a different run directory is not the keeper's cwd");
+    assert.equal(child.exitCode, null);
+    const stopped = exec(makeBoxKeeperStop(nonce, epoch, native));
+    assert.equal(stopped.status, 0, stopped.stderr);
+    assert.equal(stopped.stdout.trim(), "stop-requested");
+    const closed = child.exitCode !== null ? true : await Promise.race([
+      new Promise<boolean>((resolve) => { child.once("exit", () => resolve(true)); }),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000)),
+    ]);
+    assert.equal(closed, true);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    for (const dir of [run, proof, native, other]) rmSync(dir, { recursive: true, force: true });
+    rmSync(keeper, { force: true });
+  }
+});
+
+test("the native cwd must be a run directory, and the own run directory adds no argument", () => {
+  const nonce = "a".repeat(24), epoch = "b".repeat(32);
+  assert.throws(() => makeBoxKeeperStop(nonce, epoch, "/tmp/elsewhere"), /BOX_KEEPER_STOP_ID_INVALID/);
+  assert.equal(makeBoxKeeperStop(nonce, epoch, `/tmp/ocv5-289-run-${nonce}`).args.length,
+    makeBoxKeeperStop(nonce, epoch).args.length);
+  assert.equal(makeBoxKeeperStop(nonce, epoch, `/tmp/ocv5-289-run-${"c".repeat(24)}`).args.at(-1),
+    `/tmp/ocv5-289-run-${"c".repeat(24)}`);
+});
