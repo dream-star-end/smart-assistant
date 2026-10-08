@@ -121,6 +121,16 @@ For any `claudeai.chat` / OpenClaude v3 commercial code or deploy task:
 - never treat manual rsync + systemctl restart as final deployment
 - deploy only with `scripts/deploy-v3.sh` from `/opt/openclaude/openclaude-v3`
 
+## 用例卫生(BLOCKING,2026-10-08 OCV5-343)
+
+- 改动让已有用例**过期**(产品行为有意改变)或**无用**(覆盖的功能/界面已删除、与其它用例重复),必须在
+  **同一个 PR / 同一串提交**里更新断言或删除该用例,不得留作"基线失败"。
+- 三分判定:过期 → 把断言改成现行意图;无用 → 删除;断言仍然正确 → 是产品缺陷,修产品,不改用例。
+  改断言或删用例要在提交说明里写依据(哪个提交、为什么改了行为)。禁止为了变绿而放宽或删除一条仍然正确的用例。
+- `packages/web-react` 全量 vitest(`npm run test:web-react`)必须保持全绿。"失败集与基线相同、0 新增"
+  不是合格结论:基线红就先按上面三分清掉。商业版由 v5-ci 的 required `web-react` job 守;个人版由
+  `.github/workflows/v5-selfhost-web-react.yml` 在 push / PR 到 `feat/v5-selfhost` 时跑同一命令。
+
 ## Codex review rubric(审查者模式,2026-10-08 用户批准)
 
 被要求「审查 / review / 审计」一个改动时按本节输出。本节只约束**审查输出**,不改任何门:CI required checks、事故证明门、`check-v5-fix-trailers.sh`、发车预检、发布脚本自己的门全部照旧。「Codex 审计 PASS」= 按本节输出 `APPROVED`。
@@ -129,7 +139,9 @@ For any `claudeai.chat` / OpenClaude v3 commercial code or deploy task:
 2. **严重度**:只有 P0/P1 阻断合并 —— 正确性(会出错的结果、崩溃、挂死、数据丢失)、安全、计费/积分、数据完整性、发布门被削弱或可被绕过。命名、风格、注释、可读性、"更好的写法"、缺少锦上添花的测试都是 P2 及以下:列在「非阻断」里,永不挡合并。
 3. **轮次记忆**:第 2 轮起,调用方会给出上一轮 findings 与「已定设计决定」。只做两件事:核对上一轮每条 P0/P1 是否真修好;只在本轮新增的 diff 里找新的 P0/P1。不重审全部代码;不重提已定设计决定,除非能给出它导致 P0/P1 的具体复现。
 4. **轮次上限**:小改动(单文件或 < ~150 行有效 diff)1 轮;大改动最多 3 轮。到上限仍有分歧,由发起审查的一方(外机 cc3 / 主控)裁决并留痕,不再循环。调用方在提示里写明「第 N 轮 / 上限 M」。
-5. **固定输出**:
+5. **用例卫生**:diff 改了行为却没有在同一 PR 里更新或删除因此过期/无用的用例,或让 `npm run test:web-react`
+   变红,按 P1(发布门被削弱)报,复现写出会失败的用例名。见上节「用例卫生」。
+6. **固定输出**:
    - 没有 P0/P1:**只输出一行 `APPROVED`**;可以另起「非阻断:」列 P2 及以下,每条一行。
    - 有 P0/P1:第一行 `REQUEST_CHANGES`,随后每条 finding 一项:`[P0|P1] 文件:行 — 原因 — 复现(输入/状态 → 错误结果)`。给不出复现的不算 P0/P1,降为非阻断。
    - 跑不了测试(沙箱只读等)就说明一次,按静态阅读下结论;不要把「环境跑不了」当成 finding。
