@@ -34,3 +34,18 @@ test("parses user-contract TAP and journey lines; prerequisite skips are not cou
   assert.deepEqual(s.checks["journey:J1-J5"], { runs: 1, pass: 1, fail: 0, classes: {} });
   assert.deepEqual(s.checks["journey:J5"], { runs: 1, pass: 0, fail: 1, classes: { ui_settle: 1 } });
 });
+
+test("post-grace UI failures are real (ui_after_backend), and every J5 grace start is counted", () => {
+  assert.equal(classify("Completed turn UI did not settle within 60000ms after backend completion: model=x"), "ui_after_backend");
+  assert.equal(classify("后端已有含探针的回复,但 UI 在宽限 60s 内仍未收尾(回复未在界面完成 = 真失败)"), "ui_after_backend");
+  const s = summarize(parseLog([
+    "[e2e] e2e-journey: J5 到 180s 未判定;后端已有含探针的 assistant 回复(assistant tape records with probe: 1),UI 判据不变,再等至多 60s",
+    "[e2e] e2e-journey: ✗ 步骤「J5 送达硬断言」失败: 后端已有含探针的回复,但 UI 在宽限 60s 内仍未收尾(回复未在界面完成 = 真失败)",
+    "[e2e] e2e-journey: J5 到 180s 未判定;后端已有含探针的 assistant 回复(n=1),UI 判据不变,再等至多 60s",
+    "[e2e] e2e-journey: warn slow_ui_settle J5 ui_settled_ms_after_backend=3000 turn_wait_ms=180000",
+    "[e2e] e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)",
+  ].join("\n")));
+  assert.equal(s.j5GraceStarted, 2);
+  assert.equal(s.slowUiSettleWarnings, 1);
+  assert.deepEqual(s.checks["journey:J5"], { runs: 1, pass: 0, fail: 1, classes: { ui_after_backend: 1 } });
+});
