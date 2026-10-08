@@ -239,7 +239,8 @@ export class BoxRemoteCleanupWorker {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await Promise.race([
-        target.exec.run(makeBoxKeeperStop(candidate.runNonce, candidate.leaseEpoch),
+        target.exec.run(makeBoxKeeperStop(candidate.runNonce, candidate.leaseEpoch,
+          candidate.cliCwd),
           { timeoutMs: 10_000, maxResponseBytes: 1024 }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error("BOX_STALE_RESUME_STOP_TIMEOUT")), 10_500);
