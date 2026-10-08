@@ -2726,6 +2726,38 @@ async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
+/** INC-20261008-BOX-PARALLEL-IMAGE-CAPTION, commercial u1870 request 0e9b5222: five parallel Reads returned five
+ * JPEG screenshots and Claude Code downscaled only one (2430x1131 -> 2000x931), so a single caption followed all
+ * five results. The fold accepted only a message with exactly one image and the turn ended with 409. */
+function proveParallelImageCaption(api: Api): string {
+  const ids = ["toolu_par_1", "toolu_par_2", "toolu_par_3", "toolu_par_4", "toolu_par_5"];
+  const sizes: Array<[number, number]> = [[1215, 566], [1215, 566], [1215, 566], [1822, 848], [2000, 931]];
+  const shots = sizes.map(([w, h]) => png(w, h));
+  const caption = (dw: number, dh: number) =>
+    `[Image: original 2430x1131, displayed at ${dw}x${dh}. Multiply coordinates by ${(2430 / dw).toFixed(2)} to map to original image.]`;
+  const request = (images: string[], tail: unknown[]): Body => ({ model: MODEL, stream: true, max_tokens: 64,
+    tools: [tool("Read")],
+    messages: [{ role: "user", content: "看这些截图" },
+      { role: "assistant", content: ids.map((id, n) => ({ type: "tool_use", id, name: "Read", input: { file_path: `/s${n}.jpg` } })) },
+      { role: "user", content: [...[4, 3, 0, 2, 1].map((n) => ({ type: "tool_result", tool_use_id: ids[n], content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: images[n] } }] })), ...tail] }] });
+  const cached = (value: string) => ({ ...text(value), cache_control: { type: "ephemeral" } });
+  const body = request(shots, [cached(caption(2000, 931))]);
+  const rejected = api.gate(body, true);
+  if (rejected !== null) fail(`PARALLEL_IMAGE_GATE_${rejected}`);
+  const classified = api.classify(body);
+  if (classified.classification !== "continuation_candidate") fail(`PARALLEL_IMAGE_CLASS_${classified.rejectCode}`);
+  const rows = api.match(body, ids.map((id, n) => ({ id, boxName: "mcp__ocbridge__Read", clientName: "Read",
+    input: { file_path: `/s${n}.jpg` } })));
+  const owner = rows.find((row) => row.modelToolUseId === ids[4]);
+  if (!owner || !isDeepStrictEqual(owner.content,
+    [{ type: "image", data: shots[4], mimeType: "image/png" }, text(caption(2000, 931))])) fail("PARALLEL_IMAGE_RESULT");
+  // a caption no image or two images match is not attributed
+  staysRejected(api, "PARALLEL_IMAGE_NO_MATCH", request(shots.map((shot, n) => n === 4 ? shots[0]! : shot), [cached(caption(2000, 931))]));
+  staysRejected(api, "PARALLEL_IMAGE_TWO_MATCH", request(shots.map((shot, n) => n === 0 ? shots[4]! : shot), [cached(caption(2000, 931))]));
+  return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
+}
+
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
@@ -2748,7 +2780,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    proveImageCaption(api), proveParallelImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
