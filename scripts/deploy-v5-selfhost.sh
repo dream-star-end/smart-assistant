@@ -1516,6 +1516,7 @@ build_runtime_release() {
 # master: $MASTER_RELEASES_ROOT),互不依赖;实测串行时 runtime 段约 3.5 分钟。
 # 后台段的输出落独立日志,收尾时整段回放,保持 train 日志可读;结果经结果文件回传父 shell。
 # 父 shell 无论成功失败退出,EXIT 清理都会先等后台段结束(不留在飞写 runtime-releases 的进程)。
+# 父进程被直接杀掉(不走 EXIT)时:后台段继承了发布锁 fd 8,锁会一直持有到它结束,不会有第二趟发布并发写。
 RUNTIME_BG_PID=""
 RUNTIME_BG_LOG=""
 RUNTIME_BG_RESULT=""

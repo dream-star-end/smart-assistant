@@ -12,7 +12,8 @@ const d=readFileSync(join(root,'scripts/deploy-v5-selfhost.sh'),'utf8'),m=readFi
 function fn(s,n){const match=s.match(new RegExp('^'+n+'\\(\\) \\{[^\\n]*\\n[\\s\\S]*?^\\}','m'));assert.ok(match,n);return match[0];}
 function block(s,startRe,endRe){const a=s.search(startRe);assert.ok(a>=0,String(startRe));const rest=s.slice(a);const b=rest.search(endRe);assert.ok(b>0,String(endRe));return rest.slice(0,b);}
 const q=s=>"'"+String(s).replaceAll("'","'\\''")+"'";
-const webLib=[block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned')].join('\n');
+const webLib=['MASTER_RELEASE_COMPLETE_SCHEMA_VERSION=2',block(m,/^WEB_DIST_REUSE_RECORD=/m,/^master_web_dist_key\(\)/m),fn(m,'master_web_dist_key'),fn(m,'web_dist_digest'),fn(m,'web_dist_donor_sealed'),fn(m,'find_web_dist_donor'),fn(m,'write_web_dist_reuse_record'),fn(m,'release_dir_is_poisoned'),fn(m,'release_artifact_digest'),fn(m,'write_strong_release_marker_local')].join('\n');
+const asRoot=typeof process.getuid==='function'&&process.getuid()===0;
 function fixture(t){
  const dir=mkdtempSync(join(tmpdir(),'oc-deploy-speed-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));const repo=join(dir,'repo');
  const env={PATH:process.env.PATH,HOME:dir,TMPDIR:dir,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',LC_ALL:'C.UTF-8'};
@@ -28,6 +29,16 @@ function bash(f,src,body){return spawnSync('bash',['-eu','-o','pipefail','-c',['
 function ok(o){assert.equal(o.status,0,o.stdout+'\n'+o.stderr);return o.stdout.trim();}
 const key=(f,sha)=>ok(bash(f,webLib,'master_web_dist_key '+q(sha)));
 
+test('web dist key also changes with build-time env that Vite inlines (VITE_*, NODE_ENV, BROWSERSLIST*)',t=>{
+ const f=fixture(t);const k0=key(f,f.base);
+ for(const env of[{VITE_TASKBOARD_ENABLED:'1'},{VITE_OC_FILECARD_SNIFF:'0'},{NODE_ENV:'development'},{BROWSERSLIST:'defaults'}]){
+  const o=spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),'mlog() { :; }; die() { exit 73; }',webLib,'master_web_dist_key '+q(f.base)].join('\n')],{env:{...f.env,...env},encoding:'utf8'});
+  assert.equal(o.status,0,o.stderr);assert.notEqual(o.stdout.trim(),k0,JSON.stringify(env));
+ }
+ const unrelated=spawnSync('bash',['-eu','-o','pipefail','-c',['REPO_ROOT='+q(f.repo),'mlog() { :; }; die() { exit 73; }',webLib,'master_web_dist_key '+q(f.base)].join('\n')],{env:{...f.env,SOME_OTHER_VAR:'x'},encoding:'utf8'});
+ assert.equal(unrelated.stdout.trim(),k0,'unrelated env must not change the key');
+});
+
 test('web dist key changes with every web build input and ignores unrelated backend changes',t=>{
  const f=fixture(t);const k0=key(f,f.base);assert.match(k0,/^[0-9a-f]{64}$/);
  const gw=f.commit('packages/gateway/src/x.ts','g-2\n');assert.equal(key(f,gw),k0,'gateway-only change must keep the key');
@@ -38,31 +49,40 @@ test('web dist key changes with every web build input and ignores unrelated back
  assert.equal(bash(f,webLib,'master_web_dist_key 0000000000000000000000000000000000000000').status===0,false,'unknown sha must not produce a key');
 });
 
-// Builds a sealed-looking release with a dist and (optionally) a reuse record written by production code.
-function release(f,name,{key:k,html='<html><head><meta name="oc-build" content="0123456789abcdef"></head></html>',complete=true,record=true,poison=false}={}){
+// Builds a really sealed release with production code: reuse record first, then write_strong_release_marker_local.
+function release(f,name,{key:k,html='<html><head><meta name="oc-build" content="0123456789abcdef"></head></html>',seal=true,record=true,poison=false}={}){
  const rel=join(f.dir,'releases',name),dist=join(rel,'packages/web-react/dist');mkdirSync(join(dist,'assets'),{recursive:true});
  writeFileSync(join(dist,'index.html'),html);writeFileSync(join(dist,'assets/main.js'),'console.log(1)\n');
- if(complete)writeFileSync(join(rel,'.complete'),'{}');if(poison)writeFileSync(join(rel,'.poisoned'),'');
+ mkdirSync(join(rel,'node_modules/tsx'),{recursive:true});mkdirSync(join(rel,'deploy/v5'),{recursive:true});
+ writeFileSync(join(rel,'package.json'),'{}');writeFileSync(join(rel,'deploy/v5/release-metadata.json'),'{}');
+ writeFileSync(join(rel,'VERSION.json'),JSON.stringify({commit:f.base.slice(0,9)}));
+ if(poison)writeFileSync(join(rel,'.poisoned'),'');
  if(record)ok(bash(f,webLib,'write_web_dist_reuse_record '+q(rel)+' '+q(k)+' built '+q(f.base)));
+ if(seal)ok(bash(f,webLib,'write_strong_release_marker_local '+q(rel)+' '+q(f.base)+' '+q(f.base.slice(0,9))+' 20261008-000000 2'));
  return rel;
 }
 
-test('donor search prefers live, re-verifies the dist digest, and rejects poisoned/incomplete/mismatched releases',t=>{
+test('donor search prefers live, re-verifies dist digest AND the release seal, rejects poisoned/unsealed/mismatched',{skip:!asRoot&&'needs root (seal requires 0:0)'},t=>{
  const f=fixture(t);const k=key(f,f.base);
  const live=release(f,'rel-live',{key:k});symlinkSync(live,join(f.dir,'live'));
  assert.equal(ok(bash(f,webLib,'find_web_dist_donor '+q(k))),live);
- // Tampered dist in live → skipped; an older intact release is used instead.
+ // dist tampered alone → dist digest mismatch → skipped; an older intact sealed release is used instead.
  const older=release(f,'rel-older',{key:k});
- writeFileSync(join(live,'packages/web-react/dist/assets/main.js'),'tampered\n');
+ chmodSync(join(live,'packages/web-react/dist/assets/main.js'),0o644);writeFileSync(join(live,'packages/web-react/dist/assets/main.js'),'tampered\n');
  assert.equal(ok(bash(f,webLib,'find_web_dist_donor '+q(k))),older);
- // Poisoned, incomplete, record-less and other-key releases are never donors.
- rmSync(older,{recursive:true,force:true});
- release(f,'rel-poison',{key:k,poison:true});release(f,'rel-incomplete',{key:k,complete:false});release(f,'rel-norecord',{key:k,record:false});
+ // dist AND reuse record tampered consistently → only the stale .complete seal can catch it.
+ const forged=join(older,'packages/web-react/dist/assets/main.js');chmodSync(forged,0o644);writeFileSync(forged,'forged\n');
+ chmodSync(join(older,'.web-dist-reuse.json'),0o644);
+ ok(bash(f,webLib,'write_web_dist_reuse_record '+q(older)+' '+q(k)+' built '+q(f.base)));
+ const forgedRun=bash(f,webLib,'find_web_dist_donor '+q(k));
+ assert.equal(forgedRun.status,1,forgedRun.stdout+forgedRun.stderr);assert.match(forgedRun.stderr,/封存复核失败/);
+ rmSync(join(f.dir,'releases'),{recursive:true,force:true});rmSync(join(f.dir,'live'),{force:true});
+ release(f,'rel-poison',{key:k,poison:true});release(f,'rel-unsealed',{key:k,seal:false});release(f,'rel-norecord',{key:k,record:false});
  release(f,'rel-otherkey',{key:'f'.repeat(64)});
  const none=bash(f,webLib,'find_web_dist_donor '+q(k));assert.equal(none.status,1,none.stdout+none.stderr);assert.equal(none.stdout,'');
 });
 
-test('build_master_release reuses a matching dist instead of running the web build, and records itself as a future donor',t=>{
+test('build_master_release reuses a matching dist instead of running the web build, and records itself as a future donor',{skip:!asRoot&&'needs root (seal requires 0:0)'},t=>{
  const f=fixture(t);const k=key(f,f.base);const live=release(f,'rel-live',{key:k});symlinkSync(live,join(f.dir,'live'));
  // Extract just the frontend section of build_master_release and run it against a staging dir.
  const bmr=fn(m,'build_master_release');
@@ -118,4 +138,20 @@ test('cmd_deploy wires the bg runtime build around build_master_release and the 
  assert.ok(cd.indexOf('collect_runtime_release_bg "$sha"')>cd.indexOf('build_master_release "$sha"')&&cd.indexOf('collect_runtime_release_bg "$sha"')<cd.indexOf('build_platform_bundle "$sha"'));
  assert.doesNotMatch(cd,/^\s+build_runtime_release "\$sha"/m);
  const cleanup=fn(d,'cleanup_selfhost_deploy');assert.ok(cleanup.indexOf('reap_runtime_release_bg')<cleanup.indexOf('lease_train_on_exit'),'reap before train/lock release');
+});
+
+test('if the parent is killed outright (no EXIT trap), the bg build keeps holding the deploy lock fd until it finishes',async t=>{
+ const f=fixture(t);const lock=join(f.dir,'deploy.lock');writeFileSync(lock,'');
+ const script=[bgSrc(),bgPrelude,'log() { :; }; die() { exit 73; }',
+  'exec 8<>'+q(lock),'flock -n 8','build_runtime_release() { sleep 2; touch '+q(join(f.dir,'bg-done'))+'; BUILT_RUNTIME_RELEASE=x; RUNTIME_IMAGE_ID=y; }',
+  'start_runtime_release_bg x','echo started','sleep 30'].join('\n');
+ const {spawn}=await import('node:child_process');
+ const child=spawn('bash',['-eu','-o','pipefail','-c','OC_HOTCFG_RELEASES_ROOT='+q(join(f.dir,'rt'))+'\nTEST_ROOT='+q(f.dir)+'\n'+script],{env:f.env,stdio:['ignore','pipe','pipe']});
+ await new Promise(r=>child.stdout.on('data',d=>{if(String(d).includes('started'))r()}));
+ child.kill('SIGKILL');await new Promise(r=>child.on('exit',r));
+ const held=spawnSync('flock',['-n',lock,'true']);assert.notEqual(held.status,0,'lock must still be held by the orphaned bg build');
+ for(let i=0;i<50&&!existsSync(join(f.dir,'bg-done'));i++)spawnSync('sleep',['0.1']);
+ assert.ok(existsSync(join(f.dir,'bg-done')),'bg build must run to completion');
+ spawnSync('sleep',['0.3']);
+ const free=spawnSync('flock',['-n',lock,'true']);assert.equal(free.status,0,'lock is released once the bg build exits');
 });

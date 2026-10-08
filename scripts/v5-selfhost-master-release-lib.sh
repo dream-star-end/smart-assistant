@@ -459,7 +459,9 @@ write_master_version_json() { # <staging> <short-sha>
 #   根 package-lock.json / package.json(依赖版本)
 #   本文件自身(构建步骤一变就作废所有旧 key)
 #   node --version
-# 复用前对 donor 的 dist 重算摘要,与 donor 构建时记下的摘要比对;不信任裸存在。
+#   构建进程环境里会进产物的变量:VITE_*(Vite 编译期内联)、NODE_ENV、BROWSERSLIST*
+# donor 必须是完整封存的 release:.complete 结构合法、根 0:0 且不可组/他写、release_artifact_digest
+# 复算等于 .complete.artifactSha256(覆盖 dist 与复用记录本身);再对 dist 重算摘要比对记录。不信任裸存在。
 # OC_V5_FORCE_WEB_BUILD=1 强制重建。
 WEB_DIST_REUSE_RECORD=".web-dist-reuse.json"
 WEB_DIST_REUSE_SCHEMA="web-dist-reuse-v1"
@@ -482,6 +484,8 @@ master_web_dist_key() { # <full-sha> → stdout 64-hex;任一输入取不到 →
   done
   node_ver="$(node --version 2>/dev/null)" || return 1
   parts+=$'\n'"node $node_ver"
+  # 只取名字合法的变量,按字节序排序;值原样进 key(不打印)。
+  parts+=$'\n'"env"$'\n'"$(env | LC_ALL=C grep -E '^(VITE_[A-Za-z0-9_]*|NODE_ENV|BROWSERSLIST[A-Za-z0-9_]*)=' | LC_ALL=C sort || true)"
   printf '%s' "$parts" | sha256sum | cut -d' ' -f1
 }
 
@@ -494,6 +498,20 @@ web_dist_digest() { # <dist-dir> → stdout 64-hex(相对路径 + 内容;拒绝�
 
 # stdout 只打印可复用 dist 的 release 绝对路径;找不到 rc=1。日志走 stderr。
 # 候选:live 优先,其次最近的已封存 rel-*(最多 8 份);拒绝 .poisoned / 缺 .complete / 记录不符 / 摘要不符。
+web_dist_donor_sealed() { # <release-root> → rc 0 = 完整封存且未被改动
+  local rel="$1" marker schema commit art root_uid root_gid root_mode got
+  marker="$rel/.complete"
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  schema="$(jq -er '.schemaVersion' "$marker" 2>/dev/null)" || return 1
+  commit="$(jq -er '.sourceCommit' "$marker" 2>/dev/null)" || return 1
+  art="$(jq -er '.artifactSha256' "$marker" 2>/dev/null)" || return 1
+  [[ "$schema" == "$MASTER_RELEASE_COMPLETE_SCHEMA_VERSION" && "$commit" =~ ^[0-9a-f]{40}$ && "$art" =~ ^[0-9a-f]{64}$ ]] || return 1
+  read -r root_uid root_gid root_mode < <(stat -Lc '%u %g %a' -- "$rel") || return 1
+  [[ "$root_uid" == 0 && "$root_gid" == 0 && $((8#$root_mode & 8#22)) -eq 0 ]] || return 1
+  got="$(release_artifact_digest "$rel" 2>/dev/null)" || return 1
+  [[ "$got" == "$art" ]]
+}
+
 find_web_dist_donor() { # <key>
   local key="$1" cand rec rkey rdigest got live=""
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -514,6 +532,11 @@ find_web_dist_donor() { # <key>
     got="$(web_dist_digest "$cand/packages/web-react/dist")" || continue
     if [[ "$got" != "$rdigest" ]]; then
       mlog "  web dist donor 摘要不符,跳过 $cand(recorded=${rdigest:0:12} got=${got:0:12})"
+      continue
+    fi
+    # 最后做最贵的一步:整份 release 的封存复核(key 匹配的候选通常只有 live 一份)。
+    if ! web_dist_donor_sealed "$cand"; then
+      mlog "  web dist donor 封存复核失败(.complete/属主/artifactSha256 不符),跳过 $cand"
       continue
     fi
     printf '%s\n' "$cand"
