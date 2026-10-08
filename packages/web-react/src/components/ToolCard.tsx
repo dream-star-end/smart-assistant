@@ -247,7 +247,7 @@ export function ToolCard({
       <HeaderTag
         {...toggle}
         className={cn(
-          "flex min-h-10 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
+          "flex min-h-11 min-w-0 flex-1 items-center gap-2.5 px-3 py-2 text-left outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11",
           hasBody && "cursor-pointer hover:bg-hover/60 active:bg-active/60",
         )}
       >
