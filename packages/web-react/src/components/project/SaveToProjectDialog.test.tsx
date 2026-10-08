@@ -117,8 +117,7 @@ describe("SaveToProjectDialog 记住这条", () => {
 
 describe("SaveToProjectDialog 存为项目技能", () => {
   it("creates the skill and adds it to the project, retrying once on 409", async () => {
-    vi.spyOn(api, "getSkill").mockRejectedValue(new ApiError({ status: 404, message: "skill not found" }));
-    const update = vi.spyOn(api, "updateSkill").mockResolvedValue({ ok: true });
+    const update = vi.spyOn(api, "createSkill").mockResolvedValue({ ok: true });
     vi.spyOn(taskboardApi, "getProjectContext")
       .mockResolvedValueOnce({ version: 1, skillOverlay: [] })
       .mockResolvedValueOnce({ version: 2, skillOverlay: [] });
@@ -142,13 +141,17 @@ describe("SaveToProjectDialog 存为项目技能", () => {
   });
 
   it("a taken name stays in the dialog with a field error", async () => {
-    vi.spyOn(api, "getSkill").mockResolvedValue({ name: "release-rules" } as never);
-    const update = vi.spyOn(api, "updateSkill");
+    // The server refuses the create (412); nothing is overwritten and the project is not touched.
+    const create = vi
+      .spyOn(api, "createSkill")
+      .mockRejectedValue(new ApiError({ status: 412, message: "skill already exists" }));
+    const put = vi.spyOn(taskboardApi, "putProjectContext");
     const h = setup("skill");
     const dialog = screen.getByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
     expect(await within(dialog).findByText("已有同名技能，换一个名字")).toBeInTheDocument();
-    expect(update).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(put).not.toHaveBeenCalled();
     expect(h.onClose).not.toHaveBeenCalled();
     fireEvent.change(within(dialog).getByRole("textbox", { name: /技能名/ }), { target: { value: "Release-Rules-2" } });
     expect((within(dialog).getByRole("textbox", { name: /技能名/ }) as HTMLInputElement).value).toBe("release-rules-2");
