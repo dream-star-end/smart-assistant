@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { act, cleanup, renderHook } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import {
   parseBoardPath,
@@ -6,6 +7,7 @@ import {
   parseBoardTicketType,
   parseBoardView,
   parsePanelParam,
+  parseProjectPath,
   parseTutorialCase,
   parseTutorialCommunity,
   parseTutorialStep,
@@ -13,7 +15,10 @@ import {
   parseTutorialTopic,
   parseTutorialWork,
   preferredBoardView,
+  projectPath,
   tutorialHref,
+  type UseAppRouteOptions,
+  useAppRoute,
   withBoardParams,
   withPanelParams,
   workspaceWantPath,
@@ -263,5 +268,161 @@ describe('任务面板 /board 深链', () => {
     expect(parseBoardTicketType(new URLSearchParams('ticketType=feature'))).toBe('feature')
     expect(parseBoardTicketType(new URLSearchParams('ticketType=kanban'))).toBeNull()
     expect(parseBoardTicketType(new URLSearchParams())).toBeNull()
+  })
+})
+
+describe('项目主页 /p/<id> 深链', () => {
+  afterEach(() => {
+    cleanup()
+    history.replaceState({}, '', '/')
+  })
+
+  it('解析 /p/<id> 与 /p/<id>/<tab>；概览不写页签段，未知页签与尾斜杠不认', () => {
+    expect(parseProjectPath('/p/abc-123')).toEqual({ projectId: 'abc-123', tab: 'overview' })
+    expect(parseProjectPath('/p/abc/chats')).toEqual({ projectId: 'abc', tab: 'chats' })
+    expect(parseProjectPath('/p/abc/files')).toEqual({ projectId: 'abc', tab: 'files' })
+    expect(parseProjectPath('/p/abc/outputs')).toEqual({ projectId: 'abc', tab: 'outputs' })
+    expect(parseProjectPath('/p/abc/overview')).toBeNull()
+    expect(parseProjectPath('/p/abc/settings')).toBeNull()
+    expect(parseProjectPath('/p/abc/')).toBeNull()
+    expect(parseProjectPath('/p/')).toBeNull()
+    expect(parseProjectPath('/p/a.b')).toBeNull()
+    expect(parseProjectPath('/s/abc')).toBeNull()
+    expect(parseBoardPath('/p/abc')).toBe(false)
+  })
+
+  it('project 工作区的 wantPath 是项目路径；缺位置时按对话处理', () => {
+    expect(projectPath({ projectId: 'p1', tab: 'overview' })).toBe('/p/p1')
+    expect(projectPath({ projectId: 'p1', tab: 'outputs' })).toBe('/p/p1/outputs')
+    expect(workspaceWantPath('project', 's1', false, { projectId: 'p1', tab: 'overview' })).toBe(
+      '/p/p1',
+    )
+    expect(workspaceWantPath('project', 's1', false, { projectId: 'p1', tab: 'files' })).toBe(
+      '/p/p1/files',
+    )
+    expect(workspaceWantPath('project', 's1', false, null)).toBe('/s/s1')
+    expect(workspaceWantPath('chat', 's1', false, { projectId: 'p1', tab: 'files' })).toBe('/s/s1')
+  })
+
+  const base = (over: Partial<UseAppRouteOptions> = {}): UseAppRouteOptions => ({
+    enabled: true,
+    inWorkspace: true,
+    activeId: undefined,
+    sessions: [],
+    serverListSettled: true,
+    pendingSessionId: null,
+    clearPendingSession: () => {},
+    selectSession: () => {},
+    onPopToRoot: () => {},
+    activePanel: null,
+    ...over,
+  })
+
+  it('进入项目主页 push，换页签 replace，换项目 push，回对话 push', () => {
+    const push = vi.spyOn(history, 'pushState')
+    const replace = vi.spyOn(history, 'replaceState')
+    const { rerender } = renderHook((o: UseAppRouteOptions) => useAppRoute(o), {
+      initialProps: base(),
+    })
+    push.mockClear()
+    replace.mockClear()
+
+    rerender(base({ workspace: 'project', projectRoute: { projectId: 'p1', tab: 'overview' } }))
+    expect(location.pathname).toBe('/p/p1')
+    expect(push).toHaveBeenCalledTimes(1)
+
+    rerender(base({ workspace: 'project', projectRoute: { projectId: 'p1', tab: 'outputs' } }))
+    expect(location.pathname).toBe('/p/p1/outputs')
+    expect(push).toHaveBeenCalledTimes(1)
+    expect(replace).toHaveBeenCalled()
+
+    rerender(base({ workspace: 'project', projectRoute: { projectId: 'p2', tab: 'overview' } }))
+    expect(location.pathname).toBe('/p/p2')
+    expect(push).toHaveBeenCalledTimes(2)
+
+    rerender(base({ workspace: 'chat' }))
+    expect(location.pathname).toBe('/')
+    expect(push).toHaveBeenCalledTimes(3)
+    push.mockRestore()
+    replace.mockRestore()
+  })
+
+  it('启动深链：等项目列表；存在则打开主页，列表落定仍不存在则放弃并回 /', () => {
+    history.replaceState({}, '', '/p/p1/files')
+    const onOpenProject = vi.fn()
+    const clearPendingProject = vi.fn()
+    const pending = { projectId: 'p1', tab: 'files' as const }
+    const { rerender } = renderHook((o: UseAppRouteOptions) => useAppRoute(o), {
+      initialProps: base({
+        pendingProject: pending,
+        clearPendingProject,
+        onOpenProject,
+        projectIds: [],
+        projectListSettled: false,
+      }),
+    })
+    // 列表未到：不打开、不放弃、不改 URL。
+    expect(onOpenProject).not.toHaveBeenCalled()
+    expect(clearPendingProject).not.toHaveBeenCalled()
+    expect(location.pathname).toBe('/p/p1/files')
+
+    rerender(
+      base({
+        pendingProject: pending,
+        clearPendingProject,
+        onOpenProject,
+        projectIds: ['p1'],
+        projectListSettled: true,
+      }),
+    )
+    expect(clearPendingProject).toHaveBeenCalledTimes(1)
+    expect(onOpenProject).toHaveBeenCalledWith(pending)
+  })
+
+  it('启动深链到不存在的项目：放弃后 URL 回 /（replace，不压栈）', () => {
+    history.replaceState({}, '', '/p/gone')
+    const push = vi.spyOn(history, 'pushState')
+    const clearPendingProject = vi.fn()
+    const onOpenProject = vi.fn()
+    const pending = { projectId: 'gone', tab: 'overview' as const }
+    const { rerender } = renderHook((o: UseAppRouteOptions) => useAppRoute(o), {
+      initialProps: base({
+        pendingProject: pending,
+        clearPendingProject,
+        onOpenProject,
+        projectIds: ['other'],
+        projectListSettled: true,
+      }),
+    })
+    expect(clearPendingProject).toHaveBeenCalledTimes(1)
+    expect(onOpenProject).not.toHaveBeenCalled()
+    rerender(base({ pendingProject: null, projectIds: ['other'], projectListSettled: true }))
+    expect(location.pathname).toBe('/')
+    expect(push).not.toHaveBeenCalled()
+    push.mockRestore()
+  })
+
+  it('popstate 到 /p/<id>：项目存在 → 切到项目工作区并打开；不存在 → 回空态并 replace 成 /', () => {
+    const onPopWorkspace = vi.fn()
+    const onOpenProject = vi.fn()
+    const onPopToRoot = vi.fn()
+    renderHook((o: UseAppRouteOptions) => useAppRoute(o), {
+      initialProps: base({ onPopWorkspace, onOpenProject, onPopToRoot, projectIds: ['p1'] }),
+    })
+    act(() => {
+      history.pushState({}, '', '/p/p1/chats')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(onPopWorkspace).toHaveBeenLastCalledWith('project')
+    expect(onOpenProject).toHaveBeenLastCalledWith({ projectId: 'p1', tab: 'chats' })
+
+    act(() => {
+      history.pushState({}, '', '/p/deleted')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(onPopWorkspace).toHaveBeenLastCalledWith('chat')
+    expect(onPopToRoot).toHaveBeenCalledTimes(1)
+    expect(onOpenProject).toHaveBeenCalledTimes(1)
+    expect(location.pathname).toBe('/')
   })
 })

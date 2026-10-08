@@ -174,6 +174,10 @@ export type SidebarProps = {
   unreadIds?: Set<string>;
   onMarkRead?: (id: string) => void;
   onOpenProjectSettings?: (p: ChatProject) => void;
+  /** 打开项目主页（点项目名）。不传则项目行整行只负责展开/折叠（旧行为）。 */
+  onOpenProject?: (projectId: string) => void;
+  /** 主区正在显示主页的项目（行高亮）；不在项目主页时为 null。 */
+  activeProjectId?: string | null;
   /** 打开某项目的资产面板；default 组传 null。 */
   onOpenProjectAssets?: (projectId: string | null) => void;
   /** 返回 Promise 时，reject 会回滚侧栏本地的乐观排序（S-03）。 */
@@ -247,6 +251,8 @@ export function Sidebar({
   unreadIds,
   onMarkRead,
   onOpenProjectSettings,
+  onOpenProject,
+  activeProjectId = null,
   onOpenProjectAssets,
   onReorderProjects,
   width,
@@ -771,7 +777,9 @@ export function Sidebar({
           canMoveUp={!isDefault && idx > 0}
           canMoveDown={!isDefault && idx >= 0 && idx < orderedProjects.length - 1}
           immutable={isDefault}
+          active={!isDefault && activeProjectId === p.id}
           onToggle={onToggleProjectCollapsed}
+          onOpen={isDefault ? undefined : onOpenProject}
           onRename={isDefault ? undefined : onRenameProject}
           onDelete={isDefault ? undefined : onDeleteProject}
           onOpenSettings={isDefault ? undefined : onOpenProjectSettings}

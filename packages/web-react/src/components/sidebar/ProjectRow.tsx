@@ -38,7 +38,9 @@ export function ProjectRow({
   canMoveUp,
   canMoveDown,
   immutable,
+  active = false,
   onToggle,
+  onOpen,
   onRename,
   onDelete,
   onOpenSettings,
@@ -66,7 +68,14 @@ export function ProjectRow({
   canMoveDown: boolean;
   /** 虚拟 default 分组：可折叠、可接收会话，不可改名/删除/改色/拖拽排序。 */
   immutable?: boolean;
+  /** 该项目主页正在主区打开（行高亮 + aria-current）。 */
+  active?: boolean;
   onToggle?: (id: string) => void;
+  /**
+   * 打开项目主页。传入时行拆成两个按钮：名字打开主页、箭头只负责展开/折叠；
+   * 不传（含 default 未分类组）保持整行切换展开的旧行为。
+   */
+  onOpen?: (id: string) => void;
   onRename?: (p: ChatProject) => void;
   onDelete?: (p: ChatProject) => void;
   onOpenSettings?: (p: ChatProject) => void;
@@ -88,6 +97,55 @@ export function ProjectRow({
     canMutate && Boolean(onRename || onDelete || onOpenSettings || showMoveInMenu);
   const showAssetsOnlyMenu = Boolean(immutable && onOpenAssets);
   const showMenu = showMutateMenu || showAssetsOnlyMenu;
+  const swatch = !immutable && PROJECT_COLORS.find((c) => c.key === p.color);
+  // 图标列与子会话的层级引导线同一中轴（SessionRow left-[15px]）：树形结构一眼可读。
+  const icon = (
+    <span className="flex size-3.5 shrink-0 items-center justify-center text-faint">
+      {swatch ? (
+        <span aria-hidden className={cn("size-2.5 rounded-full", swatch.dotClass)} />
+      ) : immutable ? (
+        <Inbox size={14} aria-hidden />
+      ) : collapsed ? (
+        <Folder size={14} aria-hidden />
+      ) : (
+        <FolderOpen size={14} aria-hidden />
+      )}
+    </span>
+  );
+  const chevron = (
+    <ChevronRight
+      size={12}
+      aria-hidden
+      className={cn(
+        "shrink-0 text-faint transition-transform duration-200 ease-standard",
+        !collapsed && "rotate-90",
+      )}
+    />
+  );
+  const trailing = (
+    <span
+      className={cn(
+        "flex shrink-0 items-center gap-1.5 transition-opacity duration-150",
+        // 桌面悬停 / 聚焦时让位给右侧操作钮（叠放，不再常年占宽）。
+        (onNewSession || showMenu) &&
+          "[@media(hover:hover)]:group-hover:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-0",
+      )}
+    >
+      {collapsed && runningCount > 0 && (
+        // 运行中数做成独立 pill，与右侧总数分开，不再被读成「12」（PR-01）。
+        <span
+          data-project-running={runningCount}
+          title={`${runningCount} 个运行中`}
+          aria-label={`${runningCount} 个运行中`}
+          className="flex shrink-0 items-center gap-1 rounded-full bg-info-soft px-1.5 py-px"
+        >
+          <SessionStatusDot running />
+          <span className="tabular-nums text-caption text-info">{runningCount}</span>
+        </span>
+      )}
+      <span className="tabular-nums text-caption text-faint">{count}</span>
+    </span>
+  );
   return (
     <div
       draggable={canMutate && allowDrag}
@@ -121,65 +179,60 @@ export function ProjectRow({
       <div
         className={cn(
           "group relative flex h-full items-center rounded-sm text-section transition-[background-color,box-shadow] duration-150 ease-standard",
-          dropActive ? "bg-accent-soft text-fg ring-1 ring-accent/40" : "text-fg hover:bg-hover",
+          dropActive
+            ? "bg-accent-soft text-fg ring-1 ring-accent/40"
+            : active
+              ? "bg-active text-fg"
+              : "text-fg hover:bg-hover",
         )}
       >
-        <button
-          type="button"
-          onClick={() => onToggle?.(p.id)}
-          aria-expanded={!collapsed}
-          className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pl-2 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {/* 图标列与子会话的层级引导线同一中轴（SessionRow left-[15px]）：树形结构一眼可读。 */}
-          <span className="flex size-3.5 shrink-0 items-center justify-center text-faint">
-            {(() => {
-              const swatch = !immutable && PROJECT_COLORS.find((c) => c.key === p.color);
-              if (swatch)
-                return (
-                  <span aria-hidden className={cn("size-2.5 rounded-full", swatch.dotClass)} />
-                );
-              if (immutable) return <Inbox size={14} aria-hidden />;
-              return collapsed ? (
-                <Folder size={14} aria-hidden />
-              ) : (
-                <FolderOpen size={14} aria-hidden />
-              );
-            })()}
-          </span>
-          <span className="min-w-0 truncate font-medium">{p.name}</span>
-          {/* 展开/折叠指示跟在名字后面、随状态旋转，左侧图标列留给项目身份（颜色 / 文件夹）。 */}
-          <ChevronRight
-            size={12}
-            aria-hidden
-            className={cn(
-              "shrink-0 text-faint transition-transform duration-200 ease-standard",
-              !collapsed && "rotate-90",
-            )}
-          />
-          <span className="min-w-0 flex-1" />
-          <span
-            className={cn(
-              "flex shrink-0 items-center gap-1.5 transition-opacity duration-150",
-              // 桌面悬停 / 聚焦时让位给右侧操作钮（叠放，不再常年占宽）。
-              (onNewSession || showMenu) &&
-                "[@media(hover:hover)]:group-hover:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-0",
-            )}
+        {onOpen && canMutate ? (
+          <>
+            <button
+              type="button"
+              data-project-open
+              onClick={() => onOpen(p.id)}
+              aria-current={active ? "page" : undefined}
+              title="打开项目主页"
+              className="flex h-full min-w-0 shrink items-center gap-2 rounded-sm pl-2 pr-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {icon}
+              <span className="min-w-0 truncate font-medium">{p.name}</span>
+            </button>
+            <button
+              type="button"
+              data-project-toggle
+              onClick={() => onToggle?.(p.id)}
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? `展开 ${p.name} 的会话` : `收起 ${p.name} 的会话`}
+              className="flex h-full shrink-0 items-center justify-center rounded-sm px-1 text-faint outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-w-9"
+            >
+              {chevron}
+            </button>
+            {/* 右侧留白 + 计数：鼠标点到也算打开主页（键盘走左侧名字按钮，不重复进 Tab 序）。 */}
+            <span
+              onClick={() => onOpen(p.id)}
+              className="flex h-full min-w-0 flex-1 cursor-pointer items-center pr-2"
+            >
+              <span className="min-w-0 flex-1" />
+              {trailing}
+            </span>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onToggle?.(p.id)}
+            aria-expanded={!collapsed}
+            className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm pl-2 pr-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
-            {collapsed && runningCount > 0 && (
-              // 运行中数做成独立 pill，与右侧总数分开，不再被读成「12」（PR-01）。
-              <span
-                data-project-running={runningCount}
-                title={`${runningCount} 个运行中`}
-                aria-label={`${runningCount} 个运行中`}
-                className="flex shrink-0 items-center gap-1 rounded-full bg-info-soft px-1.5 py-px"
-              >
-                <SessionStatusDot running />
-                <span className="tabular-nums text-caption text-info">{runningCount}</span>
-              </span>
-            )}
-            <span className="tabular-nums text-caption text-faint">{count}</span>
-          </span>
-        </button>
+            {icon}
+            <span className="min-w-0 truncate font-medium">{p.name}</span>
+            {/* 展开/折叠指示跟在名字后面、随状态旋转，左侧图标列留给项目身份（颜色 / 文件夹）。 */}
+            {chevron}
+            <span className="min-w-0 flex-1" />
+            {trailing}
+          </button>
+        )}
         <div
           className={cn(
             "absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity duration-150",

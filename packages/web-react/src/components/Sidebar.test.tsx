@@ -514,6 +514,56 @@ describe("Sidebar 项目分组", () => {
     expect(onCreateProjectFromSession.mock.calls[0][0].id).toBe("s-out");
   });
 
+  it("传入 onOpenProject 时：点项目名打开主页，箭头只展开/折叠；未分类组仍整行折叠", () => {
+    const onOpenProject = vi.fn();
+    const onToggle = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: onToggle,
+      onCreateProject: () => {},
+      onOpenProject,
+      activeProjectId: "p-work",
+    });
+    const open = screen.getByRole("button", { name: "工作" });
+    expect(open).toHaveAttribute("aria-current", "page");
+    expect(open).not.toHaveAttribute("aria-expanded");
+    fireEvent.click(open);
+    expect(onOpenProject).toHaveBeenCalledWith("p-work");
+    expect(onToggle).not.toHaveBeenCalled();
+
+    const chevron = screen.getByRole("button", { name: "收起 工作 的会话" });
+    expect(chevron).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(chevron);
+    expect(onToggle).toHaveBeenCalledWith("p-work");
+    expect(onOpenProject).toHaveBeenCalledTimes(1);
+
+    // 计数一侧的留白也算打开主页。
+    fireEvent.click(within(open.closest("[data-project-row]") as HTMLElement).getByText("1"));
+    expect(onOpenProject).toHaveBeenCalledTimes(2);
+
+    // default 未分类没有主页：整行仍是折叠开关。
+    fireEvent.click(screen.getByRole("button", { name: /未分类/ }));
+    expect(onToggle).toHaveBeenLastCalledWith(DEFAULT_PROJECT_ID);
+    expect(onOpenProject).toHaveBeenCalledTimes(2);
+  });
+
+  it("折叠时箭头读作展开", () => {
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(["p-work"]),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onOpenProject: () => {},
+    });
+    expect(screen.getByRole("button", { name: "展开 工作 的会话" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
   it("项目行提供在项目内新建会话入口，点击以项目 id 回调", () => {
     const onNewInProject = vi.fn();
     renderSidebar({

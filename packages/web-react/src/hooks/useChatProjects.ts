@@ -60,6 +60,11 @@ export const PROJECTS_RETRY_MS = 30_000;
 export type UseChatProjects = {
   projects: ChatProject[];
   collapsedIds: Set<string>;
+  /**
+   * 列表至少成功拉取过一次（demo 恒为 true）。判定「项目确实不存在」（深链 `/p/<id>`）的依据：
+   * 首次拉取未到或失败重试中都不能下结论。
+   */
+  projectsLoaded: boolean;
   /** 最近一次列表拉取失败（正在按 PROJECTS_RETRY_MS 自动重试；也可手动 reloadProjects）。 */
   projectsLoadFailed: boolean;
   /** 手动重拉项目列表（失败态的重试入口；成功后清失败态）。 */
@@ -90,6 +95,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
 
   const [projects, setProjects] = useState<ChatProject[]>([]);
   const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
+  const [projectsLoaded, setProjectsLoaded] = useState(demo);
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() =>
     userId ? readCollapsed(userId) : new Set(),
   );
@@ -119,6 +125,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         );
         listFailedRef.current = false;
         setProjectsLoadFailed(false);
+        setProjectsLoaded(true);
       } catch (e) {
         if (gen !== listGenRef.current) return;
         console.warn("listChatProjects failed", e);
@@ -139,7 +146,11 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     listGenRef.current += 1;
     listInflightRef.current = false;
     listFailedRef.current = false;
-    if (demo) return;
+    if (demo) {
+      setProjectsLoaded(true);
+      return;
+    }
+    setProjectsLoaded(false);
     if (!auth || !userId) {
       setProjects([]);
       setProjectsLoadFailed(false);
@@ -344,6 +355,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   return {
     projects,
     collapsedIds,
+    projectsLoaded,
     projectsLoadFailed,
     reloadProjects,
     toggleCollapsed,
