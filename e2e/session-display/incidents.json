@@ -6519,7 +6519,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
-          "assertion": "[ocv5-337-foreign-tool-history] PASS — a session switched to Box Claude from another model runs with its tool history"
+          "assertion": "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids"
         },
         {
           "layer": "unit",
@@ -6530,6 +6530,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
           "assertion": "other id shapes, unpaired history and a foreign current result stay rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "a foreign id whose renamed form is already used is refused"
         }
       ]
     }

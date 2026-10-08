@@ -41,6 +41,7 @@ type Api = {
   classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[];
     answeredToolIds?: readonly string[] };
   match: (body: Body, expected: readonly Expected[]) => ReadonlyArray<Matched>;
+  compile: (body: Body) => { snapshotJsonl: string };
   fitForCli: (results: readonly Matched[]) => Promise<readonly Matched[]>;
   echo: (expected: readonly EchoExpected[]) => { accept: (raw: unknown) => void;
     verifyDeferred: () => Promise<void>; assertComplete: () => void };
@@ -207,7 +208,9 @@ async function load(): Promise<Api> {
     attemptOnce: async () => fail("GATEWAY_SINK_USED") });
   const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
   const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
+  const mapper = await import(pathToFileURL(join(PROXY, "boxMessagesMapper.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
+    compile: (body: Body) => mapper.compileBoxCliSyntheticTurn(body, { cwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`, cliVersion: "2.1.280" }),
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
     decoder: (model, tools) => new handoff.BoxCliToolHandoffDecoder(model,
@@ -2830,6 +2833,18 @@ function proveForeignToolHistory(api: Api): string {
       { role: "assistant", content: [text("done")] }, current] });
   const admitted = api.gate(history({ role: "user", content: "now continue with Claude" }), true);
   if (admitted !== null) fail(`FOREIGN_HISTORY_GATE_${admitted}`);
+  // what the Box CLI is given: the same history, each call paired under one stable toolu_ id
+  const staged = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
+  const again = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
+  const ids = staged.match(/toolu_oc[0-9a-f]{32}/g) ?? [];
+  if (ids.length !== 4 || new Set(ids).size !== 2 || staged.includes("tool_Ab12Cd34Ef56") || staged.includes("call_9")
+    || !isDeepStrictEqual(again.match(/toolu_oc[0-9a-f]{32}/g), ids)) fail(`FOREIGN_HISTORY_STAGED_${ids.length}`);
+  // a pure Box history is staged byte for byte as before
+  const box = api.compile({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
+    { role: "assistant", content: [{ type: "tool_use", id: "toolu_keep_1", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_keep_1", content: "x" }] },
+    { role: "assistant", content: [text("ok")] }, { role: "user", content: "next" }] }).snapshotJsonl;
+  if (!box.includes('"toolu_keep_1"') || box.includes("toolu_oc")) fail("FOREIGN_HISTORY_BOX_CHANGED");
   const classified = api.classify(history({ role: "user", content: "now continue with Claude" }));
   if (classified.classification !== "fresh") fail(`FOREIGN_HISTORY_CLASS_${classified.classification}`);
   // a current tool result under a foreign id is no live Box exchange and stays refused
@@ -2838,7 +2853,7 @@ function proveForeignToolHistory(api: Api): string {
     { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }] };
   if (api.gate(live, true) === null || api.classify(live).classification === "continuation_candidate") fail("FOREIGN_LIVE_ADMITTED");
-  return "[ocv5-337-foreign-tool-history] PASS — a session switched to Box Claude from another model runs with its tool history";
+  return "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids";
 }
 
 async function cleanUp(): Promise<void> {
