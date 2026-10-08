@@ -6460,6 +6460,8 @@ export class Gateway {
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/workspace$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/workspace\/file$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/) ||
@@ -24173,6 +24175,8 @@ function normalizePath(p: string): string {
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
     .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
     .replace(/\/api\/board\/projects\/[^/]+\/ensure/, '/api/board/projects/:id/ensure')
+    .replace(/\/api\/board\/projects\/[^/]+\/workspace\/file/, '/api/board/projects/:id/workspace/file')
+    .replace(/\/api\/board\/projects\/[^/]+\/workspace$/, '/api/board/projects/:id/workspace')
     .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
     .replace(
       /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,

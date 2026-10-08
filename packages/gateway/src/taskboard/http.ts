@@ -122,6 +122,11 @@ import {
   buildPatrolSessionKey,
 } from './domain.js'
 import { parseEntryCondition } from './entryCondition.js'
+import {
+  listProjectWorkspaceDir,
+  openProjectWorkspaceFile,
+  resolveProjectWorkspaceRoot,
+} from './projectWorkspaceFiles.js'
 import { getSharedPatrolSlots, stageLoopCountOnProgress } from './guardrails.js'
 import {
   type AllowedMove,
@@ -700,6 +705,13 @@ async function dispatch(
     return sendJson(res, 200, { project })
   }
 
+  // Read-only view of the project's folder (项目主页 → 文件 → 项目文件夹).
+  const projectWorkspace = path.match(/^\/api\/board\/projects\/([^/]+)\/workspace(\/file)?$/)
+  if (projectWorkspace) {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return handleProjectWorkspace(res, url, db, decodeURIComponent(projectWorkspace[1]), Boolean(projectWorkspace[2]))
+  }
+
   const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)
   if (projectContextPreview) {
     if (method !== 'GET') return sendError(res, 405, 'method not allowed')
@@ -938,6 +950,48 @@ async function handleCreateProject(
     }
     throw err
   }
+}
+
+const WORKSPACE_ERROR_STATUS: Record<string, number> = {
+  no_workspace: 404,
+  invalid_path: 400,
+  not_found: 404,
+  not_directory: 400,
+  not_file: 400,
+  too_large: 413,
+}
+
+async function handleProjectWorkspace(
+  res: ServerResponse,
+  url: URL,
+  db: TaskboardDb,
+  idOrKey: string,
+  file: boolean,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const root = resolveProjectWorkspaceRoot(project)
+  if (!root.ok) return sendError(res, 404, root.error)
+  const rel = url.searchParams.get('path') ?? ''
+  if (!file) {
+    const listed = await listProjectWorkspaceDir(root.root, rel)
+    if (!listed.ok) return sendError(res, WORKSPACE_ERROR_STATUS[listed.error] ?? 400, listed.error)
+    return sendJson(res, 200, { kind: root.kind, shared: root.kind === 'default', ...listed })
+  }
+  const opened = await openProjectWorkspaceFile(root.root, rel)
+  if (!opened.ok) return sendError(res, WORKSPACE_ERROR_STATUS[opened.error] ?? 400, opened.error)
+  const { createReadStream } = await import('node:fs')
+  // Always a download, never rendered in the app origin.
+  res.writeHead(200, {
+    'content-type': 'application/octet-stream',
+    'content-length': String(opened.size),
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(opened.name)}`,
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
+  })
+  const stream = createReadStream(opened.abs)
+  stream.on('error', () => res.destroy())
+  stream.pipe(res)
 }
 
 function handleGetProject(res: ServerResponse, db: TaskboardDb, idOrKey: string): void {

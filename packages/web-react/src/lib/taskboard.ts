@@ -1240,7 +1240,42 @@ function ticketActionPath(idOrIdent: string, action: string): string {
   return `/api/board/tickets/${encodeURIComponent(idOrIdent)}/${action}`
 }
 
+export interface ProjectWorkspaceEntry {
+  name: string
+  type: 'dir' | 'file' | 'link' | 'other'
+  size: number | null
+  mtime: number | null
+}
+
+export interface ProjectWorkspaceListing {
+  kind: 'default' | 'isolated' | 'container_path'
+  /** 共用默认工作区：别的项目也在这里干活。 */
+  shared: boolean
+  path: string
+  entries: ProjectWorkspaceEntry[]
+  truncated: boolean
+}
+
 export const taskboardApi = {
+  /** 项目文件夹（只读）：列一个目录。path 相对项目文件夹根，'' 为根。 */
+  listProjectWorkspace: (a: AuthSession, projectId: string, path = '') =>
+    boardGet<ProjectWorkspaceListing>(
+      a,
+      `/api/board/projects/${encodeURIComponent(projectId)}/workspace${qs({ path: path || undefined })}`,
+    ),
+
+  /** 项目文件夹里的一个文件（≤50MB），整体取回。 */
+  fetchProjectWorkspaceFile: async (a: AuthSession, projectId: string, path: string): Promise<Blob> => {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(
+        `/api/board/projects/${encodeURIComponent(projectId)}/workspace/file${qs({ path })}`,
+        { credentials: 'include', headers: bearerHeaders(t) },
+      ),
+    )
+    if (!res.ok) await jsonOrThrow(Promise.resolve(res))
+    return res.blob()
+  },
+
   listProjects: (a: AuthSession, includeArchived = false) =>
     boardGet<{ items: Project[] }>(
       a,

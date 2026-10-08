@@ -39,6 +39,7 @@ import { PROJECT_COLORS } from "../../lib/projectColors";
 import type { AuthSession, ChatProject, ProjectAsset, Session } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
+import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
 import {
   Alert,
   Badge,
@@ -161,6 +162,8 @@ export function ProjectHome(props: ProjectHomeProps) {
   } = props;
 
   const [confirmDialog, confirmEl] = useConfirm();
+  // 项目文件夹里「加入常用」后重挂文件面板，让它重拉列表。
+  const [filesPanelKey, setFilesPanelKey] = useState(0);
   const [promptText, promptEl] = usePrompt();
   const assetsState = useProjectAssets({
     projectId: project.id,
@@ -389,14 +392,25 @@ export function ProjectHome(props: ProjectHomeProps) {
               />
             )}
             {tab === "files" && (
-              <ProjectAssetsPanel
-                projectId={project.id}
-                demo={demo}
-                auth={auth}
-                authSession={authSession}
-                sessions={sessions}
-                onOpenSession={onOpenSession}
-              />
+              <div className="flex min-w-0 flex-col gap-4">
+                <ProjectAssetsPanel
+                  key={filesPanelKey}
+                  projectId={project.id}
+                  demo={demo}
+                  auth={auth}
+                  authSession={authSession}
+                  sessions={sessions}
+                  onOpenSession={onOpenSession}
+                />
+                {!demo && project.boardProjectId && (
+                  <ProjectFolderBrowser
+                    chatProjectId={project.id}
+                    boardProjectId={project.boardProjectId}
+                    authSession={authSession}
+                    onPinned={() => setFilesPanelKey((k) => k + 1)}
+                  />
+                )}
+              </div>
             )}
             {tab === "outputs" && (
               <OutputsTab

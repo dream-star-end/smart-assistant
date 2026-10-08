@@ -336,6 +336,18 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/board/projects/:id/workspace',
+    re: /^\/api\/board\/projects\/[^/]+\/workspace$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/workspace/file',
+    re: /^\/api\/board\/projects\/[^/]+\/workspace\/file$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/board/projects/:id/context/preview',
     re: /^\/api\/board\/projects\/[^/]+\/context\/preview$/,
     methods: M('GET'),
