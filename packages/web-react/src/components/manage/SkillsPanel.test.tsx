@@ -111,12 +111,14 @@ describe("SkillsPanel 来源可辨与只读语义", () => {
 });
 
 describe("SkillsPanel 行头布局与命名一致", () => {
-  test("编辑 / 删除动作簇在窄屏整行换到行头下方,标题不再被压成两行截断", async () => {
+  test("编辑 / 删除动作簇在窄屏整行换到行头下方并与标题对齐,标题不再被压成两行截断", async () => {
     mountPanel();
     const edit = await screen.findByRole("button", { name: "编辑 写作助手" });
     const actions = edit.parentElement as HTMLElement;
     expect(actions.className).toContain("max-sm:basis-full");
-    expect(actions.className).toContain("max-sm:justify-end");
+    // OCV5-344:窄屏与标题左缘对齐(不再贴右留空),按钮带可见文字。
+    expect(actions.className).toContain("max-sm:justify-start");
+    expect(edit).toHaveTextContent("编辑");
     // 行头容器允许换行,标题按钮有最小宽度基准。
     expect(actions.parentElement?.className).toContain("flex-wrap");
   });

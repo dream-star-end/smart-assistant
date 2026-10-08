@@ -4228,6 +4228,8 @@ export function App() {
               setManageOpen(false);
               openMarketplace("browse", "connector");
             }}
+            // 「怎么用」：openTutorial 自己会先收起管理中心，避免两层弹层叠加。
+            onOpenHelp={(featureId) => openTutorial(featureId)}
             onRequireLogin={() => {
               // 未登录深链兜底（正常路径进不来：未登录时工作区根本不渲染）。
               setManageOpen(false);

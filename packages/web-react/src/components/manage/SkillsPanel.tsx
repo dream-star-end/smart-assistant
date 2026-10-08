@@ -22,7 +22,6 @@ import {
   Button,
   Card,
   EmptyState,
-  IconButton,
   ListSkeleton,
   PanelHeader,
   Skeleton,
@@ -370,28 +369,31 @@ function SkillRow({
               className={cn("mt-0.5 shrink-0 text-faint transition-transform", open && "rotate-90")}
             />
           </button>
-          {/* 只读技能点「编辑」一个字都改不了 —— 图标与可访问名按 writable 分叉。
-              触控靶(≥44px)与焦点环由 IconButton 原语内建,这里不再手写补丁。 */}
-          <div className="flex shrink-0 items-center gap-0.5 max-sm:basis-full max-sm:justify-end">
-            <IconButton
-              variant="muted"
+          {/* 只读技能点「编辑」一个字都改不了 —— 图标、文字与可访问名按 writable 分叉。
+              OCV5-344:图标改成「图标 + 文字」按钮,一眼看懂是编辑还是删除;窄屏换到行头下方时
+              与标题左缘对齐(不再孤零零贴右,留下一大块空白)。触控 44px 由 Button 原语内建。 */}
+          <div className="flex shrink-0 items-center gap-1 max-sm:basis-full max-sm:justify-start max-sm:pl-[38px]">
+            <Button
+              variant="ghost"
               size="sm"
-              shape="square"
               aria-label={`${skill.writable ? "编辑" : "查看"} ${skill.name}`}
               onClick={() => openWorkbench("body")}
+              className="gap-1 px-2 text-muted hover:text-fg"
             >
-              {skill.writable ? <Pencil size={14} /> : <Eye size={14} />}
-            </IconButton>
+              {skill.writable ? <Pencil size={14} aria-hidden="true" /> : <Eye size={14} aria-hidden="true" />}
+              {skill.writable ? "编辑" : "查看"}
+            </Button>
             {skill.writable && (
-              <IconButton
-                variant="danger"
+              <Button
+                variant="ghost"
                 size="sm"
-                shape="square"
                 aria-label={`删除 ${skill.name}`}
                 onClick={onDelete}
+                className="gap-1 px-2 text-danger hover:bg-danger-soft hover:text-danger"
               >
-                <Trash2 size={14} />
-              </IconButton>
+                <Trash2 size={14} aria-hidden="true" />
+                删除
+              </Button>
             )}
           </div>
         </div>

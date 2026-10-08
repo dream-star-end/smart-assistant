@@ -29,12 +29,18 @@ test('管理中心关闭按钮仅在粗指针扩大到 44px', () => {
   expect(screen.getByRole('button', { name: '关闭' })).toHaveClass('[@media(hover:none)]:size-11')
 })
 
-test('中心壳走 Modal 原语：定高 44rem + 与市场壳同宽 + 保留 visualViewport 契约', () => {
+test('中心壳走 Modal 原语：定高 + 桌面放宽容纳导航栏 + 保留 visualViewport 契约', () => {
   renderShell()
   const dialog = screen.getByRole('dialog')
   // 定高（非 max-h）：切 Tab 时高度不跳。vh 回退与 safe-area 由 .oc-center-dialog 承担，
   // 该类是未分层的普通 CSS 规则，会盖掉 top-1/2 / max-h 等工具类 —— 故壳体必须挂它。
-  expect(dialog).toHaveClass('oc-center-dialog', 'h-[min(85dvh,44rem)]', 'max-w-3xl')
+  // 桌面放宽到「导航栏 + 原分区宽度」(OCV5-344)，分区内容宽度不变。
+  expect(dialog).toHaveClass(
+    'oc-center-dialog',
+    'h-[min(85dvh,44rem)]',
+    'md:h-[min(88dvh,48rem)]',
+    'md:max-w-[min(1040px,calc(100vw-2rem))]',
+  )
 })
 
 test('首位 Tab 即默认落地页，且顺序/文案为已定案的六个分区', () => {
@@ -51,16 +57,65 @@ test('首位 Tab 即默认落地页，且顺序/文案为已定案的六个分�
   ])
   renderShell()
   const tabs = screen.getAllByRole('tab')
-  expect(tabs.map((t) => t.textContent)).toEqual(['记忆', '技能', '定时', '插件', '文献', '优化'])
+  // 名字只是分区名；一句话说明挂在 aria-describedby 上，不拼进名字（OCV5-344）。
+  expect(MANAGE_TABS.map((t) => t.label)).toEqual(['记忆', '技能', '定时', '插件', '文献', '优化'])
+  for (const [i, def] of MANAGE_TABS.entries()) {
+    expect(tabs[i]).toHaveAccessibleName(def.label)
+    expect(tabs[i]).toHaveAccessibleDescription(def.blurb)
+  }
   expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
 })
 
-test('主导航与市场壳同款：单行横滚（no-scrollbar + overflow-x-auto），不再折成宫格', () => {
+test('主导航：窄屏六等分一屏全见（不再横滚把「优化」藏到视口外），桌面竖排导航栏', () => {
   renderShell()
-  // 6 个中文 tab 单行放不进 390px → 靠横滚 + 原语内建的边缘渐隐/选中项居中，
-  // 而不是 3×2 宫格（占两行高度、热区摊薄，移动端审计后弃用）。
-  expect(screen.getByRole('tablist')).toHaveClass('overflow-x-auto', 'no-scrollbar')
-  expect(screen.getByRole('tablist')).not.toHaveClass('grid', 'grid-cols-3')
+  const tablist = screen.getByRole('tablist', { name: '管理分区' })
+  expect(tablist).toHaveClass('grid', 'grid-cols-6', 'md:flex', 'md:flex-col')
+  expect(tablist).not.toHaveClass('overflow-x-auto')
+  expect(screen.getAllByRole('tab')).toHaveLength(6)
+})
+
+test('方向键 / Home / End 在分区间移动并切换（roving tabindex）', () => {
+  const onTabChange = vi.fn<(t: ManageTab) => void>()
+  renderShell({ tab: 'skills', onTabChange })
+  const skills = screen.getByRole('tab', { name: '技能' })
+  expect(skills).toHaveAttribute('tabindex', '0')
+  expect(screen.getByRole('tab', { name: '记忆' })).toHaveAttribute('tabindex', '-1')
+  fireEvent.keyDown(skills, { key: 'ArrowDown' })
+  expect(onTabChange).toHaveBeenLastCalledWith('cron')
+  fireEvent.keyDown(skills, { key: 'ArrowLeft' })
+  expect(onTabChange).toHaveBeenLastCalledWith('memory')
+  fireEvent.keyDown(skills, { key: 'End' })
+  expect(onTabChange).toHaveBeenLastCalledWith('optimization')
+  fireEvent.keyDown(skills, { key: 'Home' })
+  expect(onTabChange).toHaveBeenLastCalledWith('memory')
+})
+
+test('作用范围只在记忆/技能/定时出现，并带可见说明；切到其他分区不显示', () => {
+  renderShell({ tab: 'memory' })
+  expect(screen.getByText('作用范围')).toBeInTheDocument()
+  cleanup()
+  renderShell({ tab: 'connectors' })
+  expect(screen.queryByText('作用范围')).not.toBeInTheDocument()
+})
+
+test('「怎么用」打开当前分区的教程；「优化」没有独立教程不挂入口；未传回调不渲染', () => {
+  const onOpenHelp = vi.fn()
+  const { unmount } = renderShell({ tab: 'cron', onOpenHelp })
+  fireEvent.click(screen.getByRole('button', { name: '怎么用' }))
+  expect(onOpenHelp).toHaveBeenCalledWith(MANAGE_TABS.find((t) => t.id === 'cron')?.featureId)
+  unmount()
+  renderShell({ tab: 'optimization', onOpenHelp })
+  expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
+  cleanup()
+  renderShell({ tab: 'cron' })
+  expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
+})
+
+test('导航栏底部「去市场添加」直达市场', () => {
+  const onOpenMarketplace = vi.fn()
+  renderShell({ onOpenMarketplace })
+  fireEvent.click(screen.getByRole('button', { name: /去市场添加/ }))
+  expect(onOpenMarketplace).toHaveBeenCalledTimes(1)
 })
 
 test('tablist 与面板建立 aria 关联，键盘可聚焦内容区', () => {
@@ -96,7 +151,7 @@ test('有待确认建议时「优化」Tab 挂计数徽标，为 0 则不渲染�
 test('窄屏下有待确认建议时补一行可点的待办提示，选中「优化」或计数为 0 时不渲染', () => {
   const onTabChange = vi.fn<(t: ManageTab) => void>()
   const { unmount } = renderShell({ optimizerPendingCount: 3, onTabChange })
-  // 390px 下第 6 个「优化」Tab 连同徽标整个在横滚视口外 —— 这一行是窄屏唯一能看见的信号。
+  // 窄屏导航上「优化」只放得下一个小圆点 —— 这一行把数量和出口说全。
   const hint = screen.getByRole('button', { name: /有 3 项优化建议待确认/ })
   expect(hint).toHaveClass('md:hidden')
   fireEvent.click(hint)

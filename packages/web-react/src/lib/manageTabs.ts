@@ -9,8 +9,10 @@ export type ManageTab = "memory" | "skills" | "cron" | "connectors" | "library" 
 
 export type ManageTabDef = {
   id: ManageTab;
-  /** 药丸标签。窄屏是 3 列宫格，必须两字可读 —— 长名一律不进这里。 */
+  /** 分区名。窄屏导航是图标 + 两字标签的六等分条，必须两字可读 —— 长名一律不进这里。 */
   label: string;
+  /** 一句话说明「这里管什么」（桌面导航栏副标题 / 读屏 aria-describedby）。用户向口语，不写实现名词。 */
+  blurb: string;
   featureId: ProductFeatureId;
 };
 
@@ -27,13 +29,16 @@ export type ManageTabDef = {
  *    同一概念五个叫法的问题：**「插件」是唯一用户向名词，绑定账号是它的动作而非它的名字**。
  */
 export const MANAGE_TABS: readonly ManageTabDef[] = [
-  { id: "memory", label: "记忆", featureId: PRODUCT_CAPABILITIES.memory.id },
-  { id: "skills", label: "技能", featureId: PRODUCT_CAPABILITIES.skills.id },
-  { id: "cron", label: "定时", featureId: PRODUCT_CAPABILITIES.schedules.id },
-  { id: "connectors", label: "插件", featureId: PRODUCT_CAPABILITIES.connectors.id },
-  { id: "library", label: "文献", featureId: PRODUCT_CAPABILITIES.research.id },
-  { id: "optimization", label: "优化", featureId: PRODUCT_CAPABILITIES.memory.id },
+  { id: "memory", label: "记忆", blurb: "它记住的关于你和项目的事", featureId: PRODUCT_CAPABILITIES.memory.id },
+  { id: "skills", label: "技能", blurb: "沉淀下来、可以反复用的做法", featureId: PRODUCT_CAPABILITIES.skills.id },
+  { id: "cron", label: "定时", blurb: "到点自动去做的任务", featureId: PRODUCT_CAPABILITIES.schedules.id },
+  { id: "connectors", label: "插件", blurb: "已连接的应用和账号", featureId: PRODUCT_CAPABILITIES.connectors.id },
+  { id: "library", label: "文献", blurb: "报告引用的资料库", featureId: PRODUCT_CAPABILITIES.research.id },
+  { id: "optimization", label: "优化", blurb: "等你确认的改进建议", featureId: PRODUCT_CAPABILITIES.memory.id },
 ];
+
+/** 作用范围（个人 / 工作项目）只对这几个分区生效；其余分区不显示范围选择。 */
+export const SCOPED_MANAGE_TABS: ReadonlySet<ManageTab> = new Set(["memory", "skills", "cron"]);
 
 /**
  * 默认落地页。**恒等于首位 Tab** —— 侧栏入口、App 初始态都取这里，不要再写字面量。
