@@ -150,6 +150,25 @@ export const miscP3Scenes: Scene[] = [
     ),
   },
   {
+    id: "misc-home-greeting",
+    label: "登录后新会话 · 按时段问候(有显示名)",
+    group: "工作区",
+    viewports: ["desktop", "mobile"],
+    api: {},
+    render: () => (
+      <div className="h-screen bg-bg text-fg">
+        <EmptyState
+          agent={DEFAULT_AGENT}
+          userName="林夏"
+          now={new Date(2026, 9, 8, 15, 0)}
+          onPrefill={noop}
+          onChangeAgent={noop}
+          onOpenGoal={noop}
+        />
+      </div>
+    ),
+  },
+  {
     id: "misc-demo-stream",
     label: "demo 模式 · 本地消息流(用户气泡 / 助手正文 / 流式中)",
     group: "工作区",

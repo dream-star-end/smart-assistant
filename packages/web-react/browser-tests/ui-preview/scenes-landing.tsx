@@ -112,7 +112,8 @@ function Home() {
 const LANDING_SECTIONS: { id: string; label: string; selector: string }[] = [
   { id: 'demo', label: '产品演示（#demo）', selector: '#demo' },
   { id: 'tutorials', label: '快速上手 / 开口第一句（#tutorials）', selector: '#tutorials' },
-  { id: 'workflow', label: '工作方式（四步）', selector: 'main > section:nth-of-type(2)' },
+  { id: 'deliverables', label: '成果跑马灯', selector: 'section[aria-label="从简能交付的成果"]' },
+  { id: 'workflow', label: '工作方式（四步）', selector: '#workflow' },
   { id: 'capabilities', label: '核心能力（#capabilities）', selector: '#capabilities' },
   { id: 'scenarios', label: '工作场景（#scenarios）', selector: '#scenarios' },
   { id: 'agents', label: '智能体与技能（#agents）', selector: '#agents' },
@@ -185,6 +186,18 @@ export const landingScenes: Scene[] = [
       ),
     }),
   ),
+  {
+    id: 'landing-hero-prompt-filled',
+    label: '落地页 · 英雄区输入框（点示例填入后聚焦）',
+    group: '工作区',
+    viewports: ['desktop', 'mobile'],
+    api: landingApi,
+    render: () => (
+      <AutoClick steps={[{ text: '数据分析', delay: 500 }]}>
+        <Home />
+      </AutoClick>
+    ),
+  },
   {
     id: 'landing-faq-open',
     label: '落地页 · FAQ 展开一条',

@@ -1,9 +1,9 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { api } from '../lib/api'
 import { BRAND } from '../lib/brand'
-import { Landing } from './Landing'
+import { LANDING_PROMPT_MAX, Landing } from './Landing'
 
 const base = { theme: 'light' as const, onCycleTheme: () => {}, onCreateOrg: () => {} }
 
@@ -69,12 +69,13 @@ describe('从简 Landing', () => {
     expect(screen.getByRole('button', { name: /开始使用，再去市场安装/ })).toBeInTheDocument()
   })
 
-  test('工作场景卡可以直接进入试用', () => {
+  test('工作场景卡可以直接进入试用，并把场景任务带过去', () => {
     const onStart = vi.fn()
     render(<Landing {...base} onStart={onStart} onLogin={() => {}} />)
 
     fireEvent.click(screen.getByRole('button', { name: /调研与决策/ }))
     expect(onStart).toHaveBeenCalledTimes(1)
+    expect(onStart).toHaveBeenCalledWith(expect.stringContaining('调研这个行业过去 30 天'))
   })
 
   // L-03:窄屏顶部导航整体隐藏时必须有替代入口;菜单点任一锚点 / Esc 收起。
@@ -138,6 +139,74 @@ describe('从简 Landing', () => {
     const toggle = screen.getByRole('button', { name: /切换主题/ })
     expect(toggle.parentElement?.className).toContain('hidden')
     expect(toggle.parentElement?.className).toContain('md:block')
+  })
+})
+
+describe('从简 Landing 英雄区输入框(OCV5-342)', () => {
+  const heroSubmit = () => {
+    const input = screen.getByLabelText('描述你想完成的任务')
+    const form = input.closest('form')
+    if (!form) throw new Error('hero prompt form missing')
+    return within(form).getByRole('button', { name: '免费开始' })
+  }
+
+  test('写下任务后「免费开始」把 trim 后的原文交给 onStart', () => {
+    const onStart = vi.fn()
+    render(<Landing {...base} onStart={onStart} onLogin={() => {}} />)
+    fireEvent.change(screen.getByLabelText('描述你想完成的任务'), {
+      target: { value: '  帮我做一份竞品分析  ' },
+    })
+    fireEvent.click(heroSubmit())
+    expect(onStart).toHaveBeenCalledWith('帮我做一份竞品分析')
+  })
+
+  test('空输入框提交等同普通「免费开始」(不带任务)', () => {
+    const onStart = vi.fn()
+    render(<Landing {...base} onStart={onStart} onLogin={() => {}} />)
+    fireEvent.change(screen.getByLabelText('描述你想完成的任务'), { target: { value: '   ' } })
+    fireEvent.click(heroSubmit())
+    expect(onStart).toHaveBeenCalledTimes(1)
+    expect(onStart.mock.calls[0][0]).toBeUndefined()
+  })
+
+  test('Enter 提交;Shift+Enter 与输入法组字中的 Enter 不提交', () => {
+    const onStart = vi.fn()
+    render(<Landing {...base} onStart={onStart} onLogin={() => {}} />)
+    const input = screen.getByLabelText('描述你想完成的任务')
+    fireEvent.change(input, { target: { value: '写一份周报' } })
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 })
+    expect(onStart).not.toHaveBeenCalled()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onStart).toHaveBeenCalledWith('写一份周报')
+  })
+
+  test('示例标签只填进输入框，不直接提交', () => {
+    const onStart = vi.fn()
+    render(<Landing {...base} onStart={onStart} onLogin={() => {}} />)
+    fireEvent.click(screen.getByRole('button', { name: '做小游戏' }))
+    const input = screen.getByLabelText('描述你想完成的任务') as HTMLTextAreaElement
+    expect(input.value).toContain('贪吃蛇')
+    expect(document.activeElement).toBe(input)
+    expect(onStart).not.toHaveBeenCalled()
+  })
+
+  test('输入框限长，超长任务不会整篇带走', () => {
+    const onStart = vi.fn()
+    render(<Landing {...base} onStart={onStart} onLogin={() => {}} />)
+    const input = screen.getByLabelText('描述你想完成的任务')
+    expect(input).toHaveAttribute('maxLength', String(LANDING_PROMPT_MAX))
+    fireEvent.change(input, { target: { value: 'x'.repeat(LANDING_PROMPT_MAX + 50) } })
+    fireEvent.click(heroSubmit())
+    expect(onStart.mock.calls[0][0]).toHaveLength(LANDING_PROMPT_MAX)
+  })
+
+  test('成果跑马灯是装饰，读屏读到的是同一份清单的文字', () => {
+    render(<Landing {...base} onStart={() => {}} onLogin={() => {}} />)
+    const region = screen.getByRole('region', { name: '从简能交付的成果' })
+    expect(region.querySelector('.cj-marquee')).toHaveAttribute('aria-hidden', 'true')
+    expect(region.textContent).toContain('可交付的成果包括：研究报告')
   })
 })
 

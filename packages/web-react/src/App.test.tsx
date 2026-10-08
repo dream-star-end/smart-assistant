@@ -1736,6 +1736,44 @@ describe('Aurora v5 — P7 最小路由', () => {
     sessionStorage.removeItem('oc_v5_pending_case')
   }, 30000)
 
+  test('首页输入框写下的任务：登录后带入输入框且不自动发送（OCV5-342）', async () => {
+    sessionStorage.removeItem('oc_v5_pending_case')
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    )
+    const input = await screen.findByLabelText('描述你想完成的任务', {}, { timeout: 15000 })
+    fireEvent.change(input, { target: { value: '  帮我写一份产品发布会的演讲稿  ' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // 「免费开始」落到注册表单;任务已按案例同一个 pending 键暂存
+    await waitFor(() => expect(screen.getByRole('button', { name: /创建账号/ })).toBeInTheDocument())
+    const pending = JSON.parse(sessionStorage.getItem('oc_v5_pending_case') || 'null') as {
+      source?: string
+      starterPrompt?: string
+    } | null
+    expect(pending).toEqual({ source: 'landing', starterPrompt: '帮我写一份产品发布会的演讲稿' })
+
+    // 已有账号:注册表单「返回登录」改走登录(与注册成功后进入工作区是同一个消费点)
+    fireEvent.click(screen.getByRole('button', { name: '返回登录' }))
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
+    const submit = screen.getByRole('button', { name: '登录' })
+    await waitFor(() => expect(submit).not.toBeDisabled())
+    await act(async () => {
+      fireEvent.click(submit)
+    })
+    await waitFor(() => expect(sessionStorage.getItem('oc_v5_pending_case')).toBeNull(), {
+      timeout: 15000,
+    })
+    const box = await screen.findByPlaceholderText('和「全能助手」对话…', {}, { timeout: 15000 })
+    expect(box).toHaveValue('帮我写一份产品发布会的演讲稿')
+    expect(screen.getByText('已带入你在首页写下的任务，不会自动发送')).toBeInTheDocument()
+  }, 30000)
+
   test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {
     await preloadLazyPanels()
     window.history.replaceState({}, '', '/?panel=help&topic=feedback-support')

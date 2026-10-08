@@ -40,7 +40,7 @@ import { QueuedSendList } from "./components/chat/QueuedSendList";
 import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
-import { EmptyState } from "./components/EmptyState";
+import { EmptyState, greetingName } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { sessionHistorySurface } from "./lib/chat/historyLoadState";
@@ -1803,16 +1803,21 @@ export function App() {
       return;
     }
     let text = "";
+    let fromLanding = false;
     try {
-      const parsed = JSON.parse(raw) as { starterPrompt?: unknown };
+      const parsed = JSON.parse(raw) as { starterPrompt?: unknown; source?: unknown };
       if (typeof parsed.starterPrompt === "string") text = parsed.starterPrompt;
+      fromLanding = parsed.source === "landing";
     } catch {
       return;
     }
     if (!text) return;
     handleNew();
     setComposerPrefill({ text, nonce: Date.now() });
-    toast("已带入案例指令，不会自动发送", "info");
+    toast(
+      fromLanding ? "已带入你在首页写下的任务，不会自动发送" : "已带入案例指令，不会自动发送",
+      "info",
+    );
   }, [inWorkspace, handleNew, toast]);
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
@@ -3174,7 +3179,18 @@ export function App() {
       <>
         <LazyBoundary fallback={<SplashFallback />}>
           <Landing
-            onStart={() => {
+            onStart={(prompt) => {
+              // 首页输入框 / 场景卡带来的任务:沿用案例的 pending 键,进入工作区后预填、不自动发送。
+              if (prompt) {
+                try {
+                  sessionStorage.setItem(
+                    "oc_v5_pending_case",
+                    JSON.stringify({ source: "landing", starterPrompt: prompt }),
+                  );
+                } catch {
+                  /* quota / private mode */
+                }
+              }
               // 「免费开始」直达注册表，少一次「立即注册」点击。
               setAuthMode("register");
               setView("app");
@@ -3735,6 +3751,7 @@ export function App() {
           ) : showEmpty || historySurface === "empty" ? (
             <EmptyState
               agent={agent}
+              userName={demo ? undefined : greetingName(user)}
               onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
               onChangeAgent={() => setPickerOpen(true)}
               onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
