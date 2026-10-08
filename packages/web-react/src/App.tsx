@@ -97,6 +97,7 @@ import {
   parseBoardTicket,
   parseBoardTicketType,
   parsePanelParam,
+  parseProjectPath,
   parseSessionPath,
   parseTutorialCase,
   parseTutorialCommunity,
@@ -105,6 +106,7 @@ import {
   parseTutorialTopic,
   parseTutorialWork,
   preferredBoardView,
+  type ProjectRoute,
   type TutorialTab,
   type TutorialWorkId,
   useAppRoute,
@@ -258,6 +260,10 @@ const CreateProjectDialog = lazy(() =>
 const ProjectSettingsDialog = lazy(() =>
   import("./components/ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
 );
+// 项目主页(/p/<id>)是并列工作区,点开项目才需要;带着 ProjectAssetsPanel,不能进入口闭包。
+const ProjectHome = lazy(() =>
+  import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
+);
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
 // loading 瞬间。首屏渲染完成后在浏览器空闲期预取这些懒块——Vite 对同一 specifier
@@ -374,9 +380,20 @@ export function App() {
     routingEnabled ? parseSessionPath(location.pathname) : null,
   );
   // 任务面板是并列工作区（整段替换 <main>），不是管理中心 Tab。boot 自 /board。
-  const [boardOpen, setBoardOpen] = useState(
+  const [boardOpen, setBoardOpenState] = useState(
     () => TASKBOARD_ENABLED && routingEnabled && location.pathname === "/board",
   );
+  // 项目主页(/p/<id>[/<tab>])：第三个并列工作区。null = 不在项目主页。
+  const [projectHome, setProjectHome] = useState<ProjectRoute | null>(null);
+  // 启动深链 /p/<id> 的未决目标：等项目列表到达再打开(useAppRoute),不存在则回 /。
+  const [pendingRouteProject, setPendingRouteProject] = useState<ProjectRoute | null>(() =>
+    routingEnabled ? parseProjectPath(location.pathname) : null,
+  );
+  // 所有「去对话 / 去任务面板」的入口都经这里：切工作区即离开项目主页。
+  const setBoardOpen = useCallback((open: boolean) => {
+    setBoardOpenState(open);
+    setProjectHome(null);
+  }, []);
   const [boardView, setBoardView] = useState<BoardViewParam>(() =>
     routingEnabled ? parseBoardView(params, preferredBoardView()) : preferredBoardView(),
   );
@@ -738,13 +755,13 @@ export function App() {
 
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
   const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
-  // 「打开项目」的唯一入口(顶栏项目、输入框项目标识)。项目主页上线前落到项目设置。
+  // 「打开项目」的唯一入口(侧栏项目名、顶栏项目、输入框项目标识)：打开项目主页。
+  // 项目设置仍可从主页的 ⋯ / 设置 与侧栏行的 ⋯ 进入。
   const projectsRef = useRef<ChatProject[]>([]);
   const openProject = useCallback((projectId: string) => {
-    const p = projectsRef.current.find((x) => x.id === projectId);
-    if (!p) return;
-    setUngroupedAssetsOpen(false);
-    setProjectSettings(p);
+    if (!projectsRef.current.some((x) => x.id === projectId)) return;
+    setBoardOpenState(false);
+    setProjectHome({ projectId, tab: "overview" });
   }, []);
   const projectSettingsOpen = projectSettings !== null || ungroupedAssetsOpen;
   const projectSettingsMounted = useMountedOnce(projectSettingsOpen);
@@ -754,6 +771,7 @@ export function App() {
 
   const {
     projects,
+    projectsLoaded,
     collapsedIds: collapsedProjectIds,
     toggleCollapsed: toggleProjectCollapsed,
     createProject,
@@ -783,6 +801,11 @@ export function App() {
   });
 
   projectsRef.current = projects;
+  const homeProject = projectHome ? projects.find((p) => p.id === projectHome.projectId) : undefined;
+  // 主页上的项目被删除(本页 ⋯ 删除或别处删除)：列表落定后不再存在 → 回对话。
+  useEffect(() => {
+    if (projectHome && projectsLoaded && !homeProject) setProjectHome(null);
+  }, [projectHome, projectsLoaded, homeProject]);
 
   const unreadSessions = useUnreadSessions({
     sessions,
@@ -790,7 +813,11 @@ export function App() {
     userId: user?.id ?? null,
     auth: demo ? null : auth,
     // sidebar-B UUS-01：系统通知点开后落到对应会话（hook 内已 window.focus()）。
-    onNotificationOpen: selectSession,
+    // 在项目主页时点系统通知：落到对应会话即离开主页(任务面板保持原行为)。
+    onNotificationOpen: (id: string) => {
+      setProjectHome(null);
+      selectSession(id);
+    },
   });
   const sidebarWidth = useSidebarWidth();
 
@@ -798,7 +825,7 @@ export function App() {
   // 展示与当前消息流无关的陈旧内容。
   useEffect(() => {
     setInspectTarget(null);
-  }, [activeId, boardOpen]);
+  }, [activeId, boardOpen, projectHome]);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -1381,6 +1408,47 @@ export function App() {
       setActiveId,
     ],
   );
+
+  // 项目主页「在 X 里开始…」/ 快捷开始：先进入该项目的空白草稿，再在草稿就位后发送首条消息。
+  // 不能与 newSessionInProject 同一拍调用 send：send 同步读 draftProjectRef，但 activeId 取自
+  // 闭包，同拍会把消息发进旧会话。effect 等「对话工作区 + 无选中 + 草稿归属该项目」成立才发，
+  // nonce 保证只发一次(重渲染 / 依赖抖动都不会重发)。
+  const [pendingProjectStart, setPendingProjectStart] = useState<
+    { projectId: string; text: string; nonce: number } | null
+  >(null);
+  const consumedProjectStartRef = useRef(0);
+  const startInProject = useCallback(
+    (projectId: string, text: string) => {
+      const t = text.trim();
+      if (!t) return;
+      setBoardOpen(false);
+      newSessionInProject(projectId);
+      setPendingProjectStart({ projectId, text: t, nonce: Date.now() + Math.random() });
+    },
+    [setBoardOpen, newSessionInProject],
+  );
+  useEffect(() => {
+    const p = pendingProjectStart;
+    if (!p || consumedProjectStartRef.current === p.nonce) return;
+    consumedProjectStartRef.current = p.nonce;
+    setPendingProjectStart(null);
+    // 草稿没就位(例如未登录时 newSession 直接返回)：丢弃，不把消息发进别的会话。
+    // demo 的 newSession 会立即建一条本地会话并选中，所以 demo 不要求 activeId 为空。
+    const draftReady =
+      (demo || activeId === undefined) &&
+      !boardOpen &&
+      !projectHome &&
+      draftProjectId === p.projectId;
+    if (!draftReady) return;
+    if (demo && activeId) {
+      // demo 的 send 不建会话也不落项目：把刚建的本地会话直接归入项目，侧栏与主页才看得到。
+      const title = p.text.slice(0, 40);
+      setSessions((c) =>
+        c.map((x) => (x.id === activeId ? { ...x, projectId: p.projectId, title, messageCount: 1 } : x)),
+      );
+    }
+    void send(p.text);
+  }, [pendingProjectStart, activeId, boardOpen, projectHome, draftProjectId, send, demo, setSessions]);
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
   const uploadMedia = useCallback(async (file: File): Promise<MediaRef> => {
@@ -3128,6 +3196,7 @@ export function App() {
           : orgOpen
             ? "org"
             : null;
+  const routeProjectIds = useMemo(() => projects.map((p) => p.id), [projects]);
   useAppRoute({
     enabled: routingEnabled,
     inWorkspace,
@@ -3172,11 +3241,23 @@ export function App() {
         setTutorialStep(null);
       }
     },
-    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : "chat",
+    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : projectHome ? "project" : "chat",
     boardView,
     boardTicket: boardTicketId,
     boardTicketType,
-    onPopWorkspace: (ws) => setBoardOpen(TASKBOARD_ENABLED && ws === "board"),
+    projectRoute: projectHome,
+    pendingProject: pendingRouteProject,
+    clearPendingProject: () => setPendingRouteProject(null),
+    projectIds: routeProjectIds,
+    projectListSettled: projectsLoaded,
+    onOpenProject: (route) => {
+      setBoardOpenState(false);
+      setProjectHome(route);
+    },
+    onPopWorkspace: (ws) => {
+      setBoardOpenState(TASKBOARD_ENABLED && ws === "board");
+      if (ws !== "project") setProjectHome(null);
+    },
     onPopBoardParams: (nextView, ticket, ticketType) => {
       setBoardView(nextView);
       setBoardTicketId(ticket);
@@ -3416,7 +3497,10 @@ export function App() {
   // rename/delete 的数据收口（三持有方）在 useSessionList。
   const sidebarProps = {
     sessions,
-    activeId,
+    // 项目主页时侧栏高亮项目行，而不是背后仍选中的会话。
+    activeId: homeProject ? undefined : activeId,
+    activeProjectId: homeProject ? homeProject.id : null,
+    onOpenProject: openProject,
     user,
     credits: user?.credits ?? null,
     onOpenAccount: demo ? undefined : () => openSettings(),
@@ -3583,6 +3667,10 @@ export function App() {
             newSessionInProject(projectId);
             setMobileNavOpen(false);
           }}
+          onOpenProject={(projectId) => {
+            openProject(projectId);
+            setMobileNavOpen(false);
+          }}
           onCollapse={() => setMobileNavOpen(false)}
           // sidebar-B S-06：抽屉里同一按钮语义是「关闭导航」，读屏名与桌面「折叠侧栏」区分。
           collapseLabel="关闭导航"
@@ -3637,6 +3725,38 @@ export function App() {
                 setUngroupedAssetsOpen(false);
                 setProjectSettings(p);
               }}
+            />
+          </LazyBoundary>
+        ) : homeProject && projectHome ? (
+          <LazyBoundary fallback={<SplashFallback />}>
+            <ProjectHome
+              project={homeProject}
+              tab={projectHome.tab}
+              onTabChange={(tab) => setProjectHome({ projectId: homeProject.id, tab })}
+              sessions={sessions}
+              demo={demo}
+              auth={auth}
+              authSession={authRef.current}
+              onStart={(text) => startInProject(homeProject.id, text)}
+              onNewSession={() => {
+                setBoardOpen(false);
+                newSessionInProject(homeProject.id);
+              }}
+              onOpenSession={(id) => {
+                if (!sessions.some((s) => s.id === id)) return;
+                setDraftProject(null);
+                setBoardOpen(false);
+                selectSession(id);
+              }}
+              onOpenSettings={() => {
+                setUngroupedAssetsOpen(false);
+                setProjectSettings(homeProject);
+              }}
+              onRename={() => void renameProjectPrompt(homeProject)}
+              onDelete={() => void deleteProjectConfirm(homeProject)}
+              onOpenMobileNav={() => setMobileNavOpen(true)}
+              sidebarCollapsed={collapsed}
+              onExpandSidebar={() => setCollapsed(false)}
             />
           </LazyBoundary>
         ) : (

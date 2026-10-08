@@ -1108,6 +1108,32 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     }
   })
 
+  // P1 项目主页:点侧栏项目名进主页;主页开始框在该项目开新会话并只发送一次首条消息。
+  test('项目主页:侧栏项目名打开主页,开始框发出的首条消息只发一次并回到对话', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    render(<App />)
+    fireEvent.click(screen.getAllByRole('button', { name: '新建项目' })[0])
+    fireEvent.change(await screen.findByPlaceholderText('例如：博士论文第三章'), { target: { value: '论文综述' } })
+    fireEvent.click(screen.getByRole('button', { name: '创建并开始' }))
+    const open = await screen.findByRole('button', { name: '论文综述' })
+    fireEvent.click(open)
+    expect(await screen.findByTestId('project-home')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: '论文综述' })).toBeInTheDocument()
+
+    const box = await screen.findByRole('textbox', { name: '在「论文综述」里开始' })
+    fireEvent.change(box, { target: { value: '整理文献清单' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByTestId('project-home')).toBeNull())
+    await waitFor(
+      () => expect(screen.getAllByText(/收到，关于「整理文献清单」/)).toHaveLength(1),
+      { timeout: 8000 },
+    )
+    // 等回放结束后再确认没有第二次发送。
+    await new Promise((r) => setTimeout(r, 300))
+    expect(screen.getAllByText(/收到，关于「整理文献清单」/)).toHaveLength(1)
+  }, 20000)
+
   test('⌘K 窄屏视口:仍打开会话导航抽屉(抽屉里有自己的搜索框)', async () => {
     window.history.replaceState({}, '', '/?demo=1')
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
