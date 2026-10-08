@@ -11,6 +11,7 @@ const BOX_OFFICIAL_MODELS: Record<string, string> = {
   'box-claude-opus-5-5': 'claude-opus-5-5',
   'box-claude-sonnet-5': 'claude-sonnet-5',
   'box-claude-haiku-4-5': 'claude-haiku-4-5',
+  'box-claude-haiku-5-5': 'claude-haiku-5-5',
 }
 
 /** Catalog ids for the box CLI. Old cursor-opus/sonnet/haiku/fable ids map
