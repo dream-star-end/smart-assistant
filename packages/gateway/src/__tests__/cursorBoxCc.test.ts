@@ -122,6 +122,7 @@ test('legacy Cursor Sand slugs map to the box CLI ids', () => {
   assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-fable-5.1-high']), [...head, '--model', 'claude-opus-5-5'])
   assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-sonnet-5-high']), [...head, '--model', 'claude-sonnet-5'])
   assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-haiku-4.5']), [...head, '--model', 'claude-haiku-4-5'])
+  assert.deepEqual(remoteClaudeArgs(['--model', 'box-claude-haiku-5-5']), [...head, '--model', 'claude-haiku-5-5'])
   assert.deepEqual(remoteClaudeArgs(['--model', 'cursor-grok-4.7-high']), [...head, '--model', 'cursor-grok-4.7-high'])
 })
 

@@ -7,6 +7,8 @@
  * exact `message.model` the CLI then reports: the stream decoders compare the
  * two byte for byte. Haiku carries its dated id for that reason. The CLI
  * accepts the alias claude-haiku-4-5 but reports claude-haiku-4-5-20251001.
+ * Haiku 5.5 has a fixed id with no date suffix, and the CLI (2.1.294) reports
+ * claude-haiku-5-5 as passed.
  * `maxOutputTokens` is the model's output cap. `supportsEffort` says whether a
  * request may carry thinking / output_config (mapped to the CLI's `--effort`).
  *
@@ -29,6 +31,7 @@ export const BOX_API_MODELS = [
   { id: 'box-api-claude-opus-5-5', upstreamModel: 'claude-opus-5-5', maxOutputTokens: 128_000, supportsEffort: true },
   { id: 'box-api-claude-sonnet-5-5', upstreamModel: 'claude-sonnet-5-5', maxOutputTokens: 128_000, supportsEffort: true },
   { id: 'box-api-claude-haiku-4-5', upstreamModel: 'claude-haiku-4-5-20251001', maxOutputTokens: 64_000, supportsEffort: false },
+  { id: 'box-api-claude-haiku-5-5', upstreamModel: 'claude-haiku-5-5', maxOutputTokens: 128_000, supportsEffort: true },
 ] as const satisfies readonly BoxApiModel[]
 
 export type BoxApiModelId = (typeof BOX_API_MODELS)[number]['id']

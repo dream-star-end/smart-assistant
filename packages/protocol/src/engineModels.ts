@@ -321,6 +321,7 @@ export type CursorEngineFamilyId =
   | 'box-claude-opus'
   | 'box-claude-sonnet'
   | 'box-claude-haiku'
+  | 'box-claude-haiku-5-5'
 
 export const CURSOR_ENGINE_MODELS = [
   {
@@ -1066,7 +1067,7 @@ export const CURSOR_ENGINE_MODELS = [
   // Official Claude Code inside the account Grok Bot box. These ids are not
   // Cursor Sand slugs; upstreamModel is the id the box CLI accepts.
   // One family each: the picker collapses a family to a single effort row,
-  // and these three names are different models, not effort levels.
+  // and these names are different models, not effort levels.
   {
     id: 'box-claude-opus-5-5',
     displayName: 'Claude Opus 5.5',
@@ -1091,6 +1092,15 @@ export const CURSOR_ENGINE_MODELS = [
     upstreamModel: 'claude-haiku-4-5',
     family: 'box-claude-haiku',
     familyLabel: 'Claude Haiku 4.5',
+    effort: null,
+    fast: false,
+  },
+  {
+    id: 'box-claude-haiku-5-5',
+    displayName: 'Claude Haiku 5.5',
+    upstreamModel: 'claude-haiku-5-5',
+    family: 'box-claude-haiku-5-5',
+    familyLabel: 'Claude Haiku 5.5',
     effort: null,
     fast: false,
   },
@@ -1363,7 +1373,8 @@ export function cursorFamilyDefaultEffort(
     family === 'gemini-3.1-pro' ||
     family === 'box-claude-opus' ||
     family === 'box-claude-sonnet' ||
-    family === 'box-claude-haiku'
+    family === 'box-claude-haiku' ||
+    family === 'box-claude-haiku-5-5'
   ) {
     return null
   }
