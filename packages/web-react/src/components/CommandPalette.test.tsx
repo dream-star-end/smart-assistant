@@ -328,6 +328,12 @@ describe("CommandPalette", () => {
     expect(props.onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("Esc while an input method is composing does not close the palette", () => {
+    const { input, props } = setup();
+    fireEvent.keyDown(input, { key: "Escape", isComposing: true, keyCode: 229 });
+    expect(props.onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
   it("renders as a full-screen sheet with 44px rows under md, with a 取消 button", () => {
     setup();
     const dialog = screen.getByTestId("command-palette");

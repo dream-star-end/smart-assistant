@@ -319,6 +319,11 @@ export function CommandPalette(props: CommandPaletteProps) {
             if (activatedRef.current) e.preventDefault();
           }}
           onEscapeKeyDown={(e) => {
+            // Esc while an input method is composing only cancels the candidate.
+            if (e.isComposing || e.keyCode === 229) {
+              e.preventDefault();
+              return;
+            }
             if (modeRef.current === "move") {
               e.preventDefault();
               backToList();
