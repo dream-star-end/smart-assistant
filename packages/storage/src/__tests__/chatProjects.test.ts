@@ -21,8 +21,12 @@ process.env.OPENCLAUDE_HOME = testHome
 const {
   CHAT_PROJECT_PER_USER_LIMIT,
   createChatProject,
+  createProjectAsset,
   deleteChatProject,
   deleteClientSession,
+  listDeletedChatProjects,
+  listProjectAssets,
+  restoreChatProject,
   getClientSession,
   getSessionsDb,
   listChatProjects,
@@ -172,6 +176,55 @@ describe('chat_projects CRUD', () => {
     assert.equal(list[0]?.sessionCount, 1)
     assert.equal(list[1]?.sessionCount, 0)
     assert.equal((await listChatProjects(OTHER)).length, 0)
+  })
+
+  it('delete keeps a manifest; restore relinks what is still ungrouped and returns the paused cron jobs', async () => {
+    const created = await createChatProject(USER, { name: 'Restorable' })
+    const other = await createChatProject(USER, { name: 'Elsewhere' })
+    assert.equal(created.ok && other.ok, true)
+    if (!created.ok || !other.ok) return
+    const pid = created.project.id
+    await upsertClientSession(baseSession('sess-r1'))
+    await upsertClientSession(baseSession('sess-r2'))
+    await patchClientSessionMeta('sess-r1', USER, { projectId: pid })
+    await patchClientSessionMeta('sess-r2', USER, { projectId: pid })
+    const asset = await createProjectAsset(USER, {
+      projectId: pid, source: 'upload', name: 'a.md', url: `/api/media/${'a'.repeat(64)}.md`,
+    })
+    assert.equal(asset.ok, true)
+    const del = await deleteChatProject(USER, pid, { pausedCronJobIds: ['job-1'] })
+    assert.equal(del.ok, true)
+    assert.equal((await listProjectAssets(USER, { projectId: null })).some((a) => a.name === 'a.md'), true)
+    const deleted = await listDeletedChatProjects(USER)
+    assert.equal(deleted.find((d) => d.id === pid)?.sessionCount, 2)
+    // The user files one chat elsewhere meanwhile; restore must not pull it back.
+    await patchClientSessionMeta('sess-r2', USER, { projectId: other.project.id })
+    const restored = await restoreChatProject(USER, pid)
+    assert.equal(restored.ok, true)
+    if (!restored.ok) return
+    assert.deepEqual(restored.pausedCronJobIds, ['job-1'])
+    assert.equal(restored.relinkedSessions, 1)
+    assert.equal(restored.relinkedAssets, 1)
+    const { sessions } = await listClientSessions(USER)
+    assert.equal(sessions.find((x) => x.id === 'sess-r1')?.projectId, pid)
+    assert.equal(sessions.find((x) => x.id === 'sess-r2')?.projectId, other.project.id)
+    assert.equal((await listDeletedChatProjects(USER)).some((d) => d.id === pid), false)
+    const again = await restoreChatProject(USER, pid)
+    assert.equal(again.ok, false)
+  })
+
+  it('restore after the window is refused; another user cannot restore', async () => {
+    const created = await createChatProject(USER, { name: 'Old' })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    await deleteChatProject(USER, created.project.id)
+    const foreign = await restoreChatProject(OTHER, created.project.id)
+    assert.equal(foreign.ok, false)
+    const db = await getSessionsDb()
+    db.prepare('UPDATE chat_projects SET deleted_at = ? WHERE id = ?').run(Date.now() - 31 * 86400000, created.project.id)
+    const late = await restoreChatProject(USER, created.project.id)
+    assert.equal(late.ok, false)
+    if (!late.ok) assert.equal(late.error, 'expired')
   })
 
   it('他人 PATCH/DELETE 项目 → not_found,不误写', async () => {

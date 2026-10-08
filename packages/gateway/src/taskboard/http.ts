@@ -674,6 +674,18 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  // Any project-scoped call on a reserved-but-not-yet-created board (settings,
+  // context, memory, board view) creates it first, the same way a turn does.
+  // Only a board the master knows as a chat project's is created.
+  const projectScoped = path.match(/^\/api\/board\/projects\/([^/]+)(?:\/|$)/)
+  if (projectScoped) {
+    const scopedId = parseBoardProjectId(decodeURIComponent(projectScoped[1]))
+    if ('present' in scopedId && scopedId.present && scopedId.value && !getProject(db, scopedId.value)) {
+      const { resolveTurnProjectContext } = await import('../projectContextRuntime.js')
+      await resolveTurnProjectContext({ boardProjectId: scopedId.value }).catch(() => null)
+    }
+  }
+
   // A chat project reserved this work-project id on the master; create the board
   // here on first use. Name and template come from the master, never the client.
   const projectEnsure = path.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/)

@@ -179,8 +179,10 @@ async function main(): Promise<void> {
         }
         const r5 = orphanRows.length
           ? await client.query(
-              `UPDATE project_assets SET project_id = NULL, updated_at = GREATEST(updated_at + 1, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint)
-                WHERE user_id = $1 AND id = ANY($2::text[]) AND deleted_at IS NULL`,
+              `UPDATE project_assets a SET project_id = NULL, updated_at = GREATEST(a.updated_at + 1, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint)
+                WHERE a.user_id = $1 AND a.id = ANY($2::text[]) AND a.deleted_at IS NULL AND a.project_id IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM chat_projects p
+                                   WHERE p.id = a.project_id AND p.user_id = a.user_id AND p.deleted_at IS NULL)`,
               [tenant, orphanRows.map((r) => r.id)],
             )
           : { rowCount: 0 }

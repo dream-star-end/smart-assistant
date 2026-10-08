@@ -120,6 +120,9 @@ import {
   type ChatProjectDeleteResult,
   type ChatProjectRuntimeBind,
   type ChatProjectTemplate,
+  type ChatProjectDeletedManifest,
+  type ChatProjectRestoreResult,
+  type DeletedChatProject,
   type ChatProjectUpdateResult,
   type PinnedAssetsPage,
   type ProjectAsset,
@@ -178,6 +181,8 @@ import {
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
   parseChatProjectTemplate,
+  parseDeletedManifest,
+  CHAT_PROJECT_RESTORE_WINDOW_MS,
   parseProjectAssetCreateInput,
   parseProjectAssetName,
   parseProjectAssetProjectId,
@@ -12749,6 +12754,7 @@ export function createPgSessionsBackend(
       const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
       const params: unknown[] = [];
       let n = 1;
+      let bindGuard: string | null = null;
       if (input.archived !== undefined) {
         if (typeof input.archived !== "boolean") return { ok: false, error: "invalid_flag" };
         sets.push(input.archived ? `archived_at = COALESCE(archived_at, ${CLOCK_MS_SQL})` : "archived_at = NULL");
@@ -12797,13 +12803,12 @@ export function createPgSessionsBackend(
         const bound = parseBoardProjectId(input.boardProjectId);
         if ("invalid" in bound) return { ok: false, error: "invalid_board_project_id" };
         if (bound.present) {
-          // A project keeps its work project for life (memory, skills, cron, billing hang off it).
-          const existing = await readPgChatProject(pool, userId, id);
-          if (existing?.boardProjectId && existing.boardProjectId !== bound.value) {
-            return { ok: false, error: "board_project_bound" };
-          }
+          // A project keeps its work project for life (memory, skills, cron, billing hang off it);
+          // enforced in the UPDATE itself so concurrent binds cannot both win.
+          if (bound.value === null) return { ok: false, error: "board_project_bound" };
           sets.push(`board_project_id = $${n++}`);
           params.push(bound.value);
+          bindGuard = bound.value;
         }
       }
       if (sets.length === 1) {
@@ -12812,13 +12817,29 @@ export function createPgSessionsBackend(
       }
       return withTx(pool, async (client) => {
         params.push(id, userId);
+        const idParam = n++;
+        const userParam = n++;
+        let guardSql = "";
+        if (bindGuard) {
+          params.push(bindGuard);
+          guardSql = ` AND (board_project_id IS NULL OR board_project_id = $${n})`;
+        }
         try {
           const res = await client.query(
             `UPDATE chat_projects SET ${sets.join(", ")}
-              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+              WHERE id = $${idParam} AND user_id = $${userParam} AND deleted_at IS NULL${guardSql}`,
             params,
           );
-          if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+          if ((res.rowCount ?? 0) === 0) {
+            if (bindGuard) {
+              const exists = await client.query(
+                "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+                [id, userId],
+              );
+              if ((exists.rowCount ?? 0) > 0) return { ok: false, error: "board_project_bound" };
+            }
+            return { ok: false, error: "not_found" };
+          }
         } catch (err) {
           const code = (err as { code?: string }).code;
           if (code === "23505") return { ok: false, error: "board_project_bound" };
@@ -12830,16 +12851,43 @@ export function createPgSessionsBackend(
       });
     },
 
-    async deleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+    async deleteChatProject(
+      userId: string,
+      id: string,
+      opts: { pausedCronJobIds?: string[] } = {},
+    ): Promise<ChatProjectDeleteResult> {
       return withTx(pool, async (client) => {
-        const res = await client.query(
-          `UPDATE chat_projects
-              SET deleted_at = ${CLOCK_MS_SQL},
-                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+        const live = await client.query(
+          "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
           [id, userId],
         );
-        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        if ((live.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        const sessionIds = (
+          await client.query<{ id: string }>(
+            "SELECT id FROM client_sessions WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL",
+            [userId, id],
+          )
+        ).rows.map((r) => r.id);
+        const assetIds = (
+          await client.query<{ id: string }>(
+            "SELECT id FROM project_assets WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL",
+            [userId, id],
+          )
+        ).rows.map((r) => r.id);
+        const manifest: ChatProjectDeletedManifest = {
+          sessionIds,
+          assetIds,
+          pausedCronJobIds: opts.pausedCronJobIds ?? [],
+          at: Date.now(),
+        };
+        await client.query(
+          `UPDATE chat_projects
+              SET deleted_at = ${CLOCK_MS_SQL},
+                  deleted_manifest = $3,
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [id, userId, JSON.stringify(manifest)],
+        );
         await client.query(
           `UPDATE client_sessions
               SET project_id = NULL,
@@ -12847,7 +12895,93 @@ export function createPgSessionsBackend(
             WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
           [userId, id],
         );
+        await client.query(
+          `UPDATE project_assets
+              SET project_id = NULL,
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
+          [userId, id],
+        );
         return { ok: true };
+      });
+    },
+
+    async listDeletedChatProjects(userId: string): Promise<DeletedChatProject[]> {
+      const rows = (
+        await pool.query<{ id: string; name: string; deleted_at: string; deleted_manifest: string | null }>(
+          `SELECT id, name, deleted_at, deleted_manifest FROM chat_projects
+            WHERE user_id = $1 AND deleted_at IS NOT NULL AND deleted_at >= $2
+              AND is_research_default IS NOT TRUE
+            ORDER BY deleted_at DESC`,
+          [userId, Date.now() - CHAT_PROJECT_RESTORE_WINDOW_MS],
+        )
+      ).rows;
+      return rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        deletedAt: bigIntNum(r.deleted_at, "deleted_at"),
+        sessionCount: parseDeletedManifest(r.deleted_manifest).sessionIds.length,
+      }));
+    },
+
+    async restoreChatProject(userId: string, id: string): Promise<ChatProjectRestoreResult> {
+      return withTx(pool, async (client) => {
+        const row = (
+          await client.query<{ deleted_at: string; deleted_manifest: string | null; board_project_id: string | null }>(
+            `SELECT deleted_at, deleted_manifest, board_project_id FROM chat_projects
+              WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL FOR UPDATE`,
+            [id, userId],
+          )
+        ).rows[0];
+        if (!row) return { ok: false, error: "not_found" };
+        if (Date.now() - bigIntNum(row.deleted_at, "deleted_at") > CHAT_PROJECT_RESTORE_WINDOW_MS) {
+          return { ok: false, error: "expired" };
+        }
+        const count = (
+          await client.query<{ n: string }>(
+            "SELECT COUNT(*)::text AS n FROM chat_projects WHERE user_id = $1 AND deleted_at IS NULL",
+            [userId],
+          )
+        ).rows[0];
+        if (Number(count?.n ?? 0) >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: "limit_exceeded" };
+        if (row.board_project_id) {
+          const taken = await client.query(
+            "SELECT 1 FROM chat_projects WHERE user_id = $1 AND board_project_id = $2 AND deleted_at IS NULL",
+            [userId, row.board_project_id],
+          );
+          if ((taken.rowCount ?? 0) > 0) return { ok: false, error: "board_project_bound" };
+        }
+        const manifest = parseDeletedManifest(row.deleted_manifest);
+        await client.query(
+          `UPDATE chat_projects SET deleted_at = NULL, deleted_manifest = NULL,
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE id = $1 AND user_id = $2`,
+          [id, userId],
+        );
+        // Only items still ungrouped come back; anything the user moved since stays where it is.
+        const rs = manifest.sessionIds.length
+          ? await client.query(
+              `UPDATE client_sessions SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE user_id = $2 AND id = ANY($3::text[]) AND project_id IS NULL AND deleted_at IS NULL`,
+              [id, userId, manifest.sessionIds],
+            )
+          : { rowCount: 0 };
+        const ra = manifest.assetIds.length
+          ? await client.query(
+              `UPDATE project_assets SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE user_id = $2 AND id = ANY($3::text[]) AND project_id IS NULL AND deleted_at IS NULL`,
+              [id, userId, manifest.assetIds],
+            )
+          : { rowCount: 0 };
+        const project = await readPgChatProject(client, userId, id);
+        if (!project) throw new Error("restored chat project vanished");
+        return {
+          ok: true,
+          project,
+          pausedCronJobIds: manifest.pausedCronJobIds,
+          relinkedSessions: rs.rowCount ?? 0,
+          relinkedAssets: ra.rowCount ?? 0,
+        };
       });
     },
 

@@ -455,6 +455,9 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!projCols.some(c => c.name === 'template')) {
       db.exec('ALTER TABLE chat_projects ADD COLUMN template TEXT DEFAULT NULL')
     }
+    if (!projCols.some(c => c.name === 'deleted_manifest')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN deleted_manifest TEXT DEFAULT NULL')
+    }
   } catch { /* table missing in extremely old fixtures; CREATE above already ran */ }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_user_board
@@ -2139,6 +2142,49 @@ export type ChatProjectUpdateError =
   | 'board_project_bound'
   | 'invalid_flag'
 export type ChatProjectDeleteError = 'not_found'
+export type ChatProjectRestoreError = 'not_found' | 'expired' | 'limit_exceeded' | 'board_project_bound'
+
+/** A deleted project can be restored this long after deletion. */
+export const CHAT_PROJECT_RESTORE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * What a delete unlinked, kept on the project row so a restore can put it
+ * back. pausedCronJobIds are the jobs the client paused (fenced) before the
+ * delete; a restore hands them back to be re-enabled.
+ */
+export type ChatProjectDeletedManifest = {
+  sessionIds: string[]
+  assetIds: string[]
+  pausedCronJobIds: string[]
+  at: number
+}
+
+export type ChatProjectRestoreResult =
+  | { ok: true; project: ChatProject; pausedCronJobIds: string[]; relinkedSessions: number; relinkedAssets: number }
+  | { ok: false; error: ChatProjectRestoreError }
+
+export type DeletedChatProject = { id: string; name: string; deletedAt: number; sessionCount: number }
+
+export function parseChatProjectCronJobIds(value: unknown): string[] | null {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value) || value.length > 200) return null
+  const out: string[] = []
+  for (const v of value) {
+    if (typeof v !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(v)) return null
+    if (!out.includes(v)) out.push(v)
+  }
+  return out
+}
+
+export function parseDeletedManifest(raw: unknown): ChatProjectDeletedManifest {
+  try {
+    const m = (typeof raw === 'string' ? JSON.parse(raw) : raw) as Partial<ChatProjectDeletedManifest> | null
+    const ids = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === 'string') : [])
+    return { sessionIds: ids(m?.sessionIds), assetIds: ids(m?.assetIds), pausedCronJobIds: ids(m?.pausedCronJobIds), at: Number(m?.at) || 0 }
+  } catch {
+    return { sessionIds: [], assetIds: [], pausedCronJobIds: [], at: 0 }
+  }
+}
 
 export type ChatProjectCreateResult =
   | { ok: true; project: ChatProject }
@@ -6189,6 +6235,7 @@ async function _sqliteUpdateChatProject(
 ): Promise<ChatProjectUpdateResult> {
   const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
   const params: unknown[] = [Date.now()]
+  let bindGuard: string | null = null
   if (input.archived !== undefined) {
     if (typeof input.archived !== 'boolean') return { ok: false, error: 'invalid_flag' }
     sets.push(input.archived ? 'archived_at = COALESCE(archived_at, ?)' : 'archived_at = NULL')
@@ -6237,13 +6284,12 @@ async function _sqliteUpdateChatProject(
     if ('invalid' in bound) return { ok: false, error: 'invalid_board_project_id' }
     if (bound.present) {
       // A project keeps its work project for life: memory, skills, cron and
-      // billing history hang off that id. Only an unbound project may bind.
-      const existing = await _sqliteGetChatProjectForUser(userId, id)
-      if (existing?.boardProjectId && existing.boardProjectId !== bound.value) {
-        return { ok: false, error: 'board_project_bound' }
-      }
+      // billing history hang off that id. Only an unbound project may bind;
+      // enforced in the UPDATE itself so concurrent binds cannot both win.
+      if (bound.value === null) return { ok: false, error: 'board_project_bound' }
       sets.push('board_project_id = ?')
       params.push(bound.value)
+      bindGuard = bound.value
     }
   }
   if (sets.length === 1) {
@@ -6256,15 +6302,22 @@ async function _sqliteUpdateChatProject(
     try {
       res = db.prepare(
         `UPDATE chat_projects SET ${sets.join(', ')}
-          WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
-      ).run(...params, id, userId)
+          WHERE id = ? AND user_id = ? AND deleted_at IS NULL${
+            bindGuard ? ' AND (board_project_id IS NULL OR board_project_id = ?)' : ''
+          }`,
+      ).run(...params, id, userId, ...(bindGuard ? [bindGuard] : []))
     } catch (err) {
       if (isUniqueConstraintError(err, 'idx_chat_projects_user_board')) {
         return { ok: false, error: 'board_project_bound' }
       }
       throw err
     }
-    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    if (res.changes === 0) {
+      const exists = bindGuard
+        ? db.prepare('SELECT 1 FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL').get(id, userId)
+        : null
+      return { ok: false, error: exists ? 'board_project_bound' : 'not_found' }
+    }
     const project = _sqliteReadChatProject(db, userId, id)
     if (!project) return { ok: false, error: 'not_found' }
     return { ok: true, project }
@@ -6277,22 +6330,107 @@ async function _sqliteGetChatProjectForUser(userId: string, id: string): Promise
   return _sqliteReadChatProject(db, userId, id)
 }
 
-async function _sqliteDeleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+async function _sqliteDeleteChatProject(
+  userId: string,
+  id: string,
+  opts: { pausedCronJobIds?: string[] } = {},
+): Promise<ChatProjectDeleteResult> {
   const db = await getSessionsDb()
   const now = Date.now()
   const txn = db.transaction((): ChatProjectDeleteResult => {
-    const res = db.prepare(
+    const live = db.prepare(
+      'SELECT 1 FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+    ).get(id, userId)
+    if (!live) return { ok: false, error: 'not_found' }
+    const sessionIds = (db.prepare(
+      'SELECT id FROM client_sessions WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL',
+    ).all(userId, id) as Array<{ id: string }>).map((r) => r.id)
+    const assetIds = (db.prepare(
+      'SELECT id FROM project_assets WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL',
+    ).all(userId, id) as Array<{ id: string }>).map((r) => r.id)
+    const manifest: ChatProjectDeletedManifest = {
+      sessionIds,
+      assetIds,
+      pausedCronJobIds: opts.pausedCronJobIds ?? [],
+      at: now,
+    }
+    db.prepare(
       `UPDATE chat_projects
-          SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+          SET deleted_at = ?, deleted_manifest = ?, updated_at = MAX(updated_at + 1, ?)
         WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
-    ).run(now, now, id, userId)
-    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    ).run(now, JSON.stringify(manifest), now, id, userId)
     db.prepare(
       `UPDATE client_sessions
           SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
         WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
     ).run(now, userId, id)
+    db.prepare(
+      `UPDATE project_assets
+          SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
+    ).run(now, userId, id)
     return { ok: true }
+  })
+  return txn()
+}
+
+async function _sqliteListDeletedChatProjects(userId: string): Promise<DeletedChatProject[]> {
+  const db = await getSessionsDb()
+  const since = Date.now() - CHAT_PROJECT_RESTORE_WINDOW_MS
+  const rows = db.prepare(
+    `SELECT id, name, deleted_at, deleted_manifest FROM chat_projects
+      WHERE user_id = ? AND deleted_at IS NOT NULL AND deleted_at >= ? AND is_research_default = 0
+      ORDER BY deleted_at DESC`,
+  ).all(userId, since) as Array<{ id: string; name: string; deleted_at: number; deleted_manifest: string | null }>
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    deletedAt: r.deleted_at,
+    sessionCount: parseDeletedManifest(r.deleted_manifest).sessionIds.length,
+  }))
+}
+
+async function _sqliteRestoreChatProject(userId: string, id: string): Promise<ChatProjectRestoreResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const txn = db.transaction((): ChatProjectRestoreResult => {
+    const row = db.prepare(
+      `SELECT deleted_at, deleted_manifest, board_project_id FROM chat_projects
+        WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL`,
+    ).get(id, userId) as { deleted_at: number; deleted_manifest: string | null; board_project_id: string | null } | undefined
+    if (!row) return { ok: false, error: 'not_found' }
+    if (now - row.deleted_at > CHAT_PROJECT_RESTORE_WINDOW_MS) return { ok: false, error: 'expired' }
+    const count = db.prepare(
+      'SELECT COUNT(*) AS n FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL',
+    ).get(userId) as { n: number }
+    if (count.n >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: 'limit_exceeded' }
+    if (row.board_project_id) {
+      const taken = db.prepare(
+        'SELECT 1 FROM chat_projects WHERE user_id = ? AND board_project_id = ? AND deleted_at IS NULL',
+      ).get(userId, row.board_project_id)
+      if (taken) return { ok: false, error: 'board_project_bound' }
+    }
+    const manifest = parseDeletedManifest(row.deleted_manifest)
+    db.prepare(
+      `UPDATE chat_projects SET deleted_at = NULL, deleted_manifest = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ?`,
+    ).run(now, id, userId)
+    // Only items still ungrouped come back; anything the user moved since stays where it is.
+    let relinkedSessions = 0
+    const relinkSession = db.prepare(
+      `UPDATE client_sessions SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND project_id IS NULL AND deleted_at IS NULL`,
+    )
+    for (const sid of manifest.sessionIds) relinkedSessions += relinkSession.run(id, now, sid, userId).changes
+    let relinkedAssets = 0
+    const relinkAsset = db.prepare(
+      `UPDATE project_assets SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND project_id IS NULL AND deleted_at IS NULL`,
+    )
+    for (const aid of manifest.assetIds) relinkedAssets += relinkAsset.run(id, now, aid, userId).changes
+    const project = _sqliteReadChatProject(db, userId, id)
+    if (!project) throw new Error('restored chat project vanished')
+    return { ok: true, project, pausedCronJobIds: manifest.pausedCronJobIds, relinkedSessions, relinkedAssets }
   })
   return txn()
 }
@@ -7333,6 +7471,8 @@ const sqliteBackend = {
   createChatProject: _sqliteCreateChatProject,
   updateChatProject: _sqliteUpdateChatProject,
   deleteChatProject: _sqliteDeleteChatProject,
+  listDeletedChatProjects: _sqliteListDeletedChatProjects,
+  restoreChatProject: _sqliteRestoreChatProject,
   listProjectAssets: _sqliteListProjectAssets,
   createProjectAsset: _sqliteCreateProjectAsset,
   updateProjectAsset: _sqliteUpdateProjectAsset,
@@ -7524,6 +7664,12 @@ export const updateChatProject: ClientSessionsBackend['updateChatProject'] =
 
 export const deleteChatProject: ClientSessionsBackend['deleteChatProject'] =
   (...args) => getActiveBackend().deleteChatProject(...args)
+
+export const listDeletedChatProjects: ClientSessionsBackend['listDeletedChatProjects'] =
+  (...args) => getActiveBackend().listDeletedChatProjects(...args)
+
+export const restoreChatProject: ClientSessionsBackend['restoreChatProject'] =
+  (...args) => getActiveBackend().restoreChatProject(...args)
 
 export const listProjectAssets: ClientSessionsBackend['listProjectAssets'] =
   (...args) => getActiveBackend().listProjectAssets(...args)

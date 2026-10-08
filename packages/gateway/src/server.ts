@@ -214,6 +214,9 @@ import {
   listChatProjects,
   createChatProject,
   isProjectContextEnabled,
+  listDeletedChatProjects,
+  parseChatProjectCronJobIds,
+  restoreChatProject,
   updateChatProject,
   deleteChatProject,
   parseChatProjectName,
@@ -4912,6 +4915,12 @@ export class Gateway {
     if (url.pathname === '/api/chat-projects') {
       const userId = this.getUserId(req)
       if (req.method === 'GET') {
+        if (url.searchParams.get('deleted') === '1') {
+          listDeletedChatProjects(userId)
+            .then((projects) => this.sendJson(res, 200, { projects }))
+            .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+          return
+        }
         listChatProjects(userId)
           .then((projects) => this.sendJson(res, 200, { projects }))
           .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
@@ -4956,6 +4965,29 @@ export class Gateway {
         return
       }
       this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const chatProjectRestore = url.pathname.match(/^\/api\/chat-projects\/([a-zA-Z0-9_-]{8,64})\/restore$/)
+    if (chatProjectRestore) {
+      if (req.method !== 'POST') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      restoreChatProject(this.getUserId(req), chatProjectRestore[1])
+        .then((result) => {
+          if (result.ok) {
+            this.sendJson(res, 200, {
+              project: result.project,
+              pausedCronJobIds: result.pausedCronJobIds,
+              relinkedSessions: result.relinkedSessions,
+              relinkedAssets: result.relinkedAssets,
+            })
+            return
+          }
+          const status = result.error === 'not_found' ? 404 : result.error === 'expired' ? 410 : 409
+          this.sendJson(res, status, { error: result.error.replace(/_/g, ' '), code: result.error })
+        })
+        .catch(() => this.sendJson(res, 500, { error: 'restore failed' }))
       return
     }
     const chatProjectMatch = url.pathname.match(/^\/api\/chat-projects\/([a-zA-Z0-9_-]{8,64})$/)
@@ -5031,11 +5063,30 @@ export class Gateway {
         return
       }
       if (req.method === 'DELETE') {
-        deleteChatProject(userId, projectId)
-          .then((result) => result.ok
-            ? this.sendJson(res, 200, { ok: true })
-            : this.sendJson(res, 404, { error: 'not found' }))
-          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
+        ;(async () => {
+          // Optional body: the cron jobs the client paused (fenced) before deleting,
+          // kept in the deletion manifest so a restore can hand them back.
+          let paused: string[] = []
+          const raw = await this.readBody(req, 16 * 1024).catch(() => '')
+          if (raw.trim()) {
+            let data: { pausedCronJobIds?: unknown }
+            try {
+              data = JSON.parse(raw)
+            } catch {
+              this.sendJson(res, 400, { error: 'invalid JSON' })
+              return
+            }
+            const parsed = parseChatProjectCronJobIds(data.pausedCronJobIds)
+            if (parsed === null) {
+              this.sendJson(res, 400, { error: 'pausedCronJobIds invalid' })
+              return
+            }
+            paused = parsed
+          }
+          const result = await deleteChatProject(userId, projectId, { pausedCronJobIds: paused })
+          if (result.ok) this.sendJson(res, 200, { ok: true })
+          else this.sendJson(res, 404, { error: 'not found' })
+        })().catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
         return
       }
       this.sendJson(res, 405, { error: 'method not allowed' })
@@ -24091,6 +24142,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+\/restore/, '/api/chat-projects/:id/restore')
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
