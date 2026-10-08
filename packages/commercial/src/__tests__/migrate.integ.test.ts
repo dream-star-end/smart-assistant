@@ -224,6 +224,8 @@ describe("migrate.runMigrations", () => {
     assert.equal(cursorOpusFableNon1m.rows[0].cnt, "0", "0258: every active cursor opus/fable row must be 1M");
     assert.deepEqual(cursorModels.rows, [
       { model_id: "box-claude-haiku-4-5", upstream_model_id: "claude-haiku-4-5", state: "active", enabled: true, visibility: "public" },
+      // 0300: born staged / disabled; activated after release by the catalog admin step
+      { model_id: "box-claude-haiku-5-5", upstream_model_id: "claude-haiku-5-5", state: "staged", enabled: false, visibility: "public" },
       { model_id: "box-claude-opus-5-5", upstream_model_id: "claude-opus-5-5", state: "active", enabled: true, visibility: "public" },
       { model_id: "box-claude-sonnet-5", upstream_model_id: "claude-sonnet-5", state: "active", enabled: true, visibility: "public" },
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
