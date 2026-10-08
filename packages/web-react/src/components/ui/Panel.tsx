@@ -22,7 +22,8 @@ export function PanelHeader({
   action?: ReactNode
 }) {
   return (
-    <div className="flex items-start justify-between gap-3 px-4 py-3">
+    // data-panel-header:给外壳按作用域调排版的钩子(管理中心把它当页面标题),本身不带样式。
+    <div data-panel-header="" className="flex items-start justify-between gap-3 px-4 py-3">
       <div className="min-w-0">
         <h3 className="text-title font-semibold text-fg">{title}</h3>
         {hint && <p className="mt-0.5 text-caption text-muted">{hint}</p>}

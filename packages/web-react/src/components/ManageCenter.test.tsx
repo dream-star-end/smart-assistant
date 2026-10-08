@@ -23,6 +23,12 @@ function renderShell(props: Partial<Parameters<typeof ManageCenter>[0]> = {}) {
   )
 }
 
+test('无障碍名仍是「管理中心」，可见标题在品牌块里，只有一个关闭按钮', () => {
+  renderShell()
+  expect(screen.getByRole('dialog', { name: '管理中心' })).toBeInTheDocument()
+  expect(screen.getAllByRole('button', { name: '关闭' })).toHaveLength(1)
+})
+
 test('管理中心关闭按钮仅在粗指针扩大到 44px', () => {
   renderShell()
   // 触控靶已下沉进 IconButton 原语（改造前是壳体手写的补丁）。
@@ -39,7 +45,8 @@ test('中心壳走 Modal 原语：定高 + 桌面放宽容纳导航栏 + 保留 
     'oc-center-dialog',
     'h-[min(85dvh,44rem)]',
     'md:h-[min(88dvh,48rem)]',
-    'md:max-w-[min(1040px,calc(100vw-2rem))]',
+    'md:max-w-[min(1060px,calc(100vw-2rem))]',
+    'oc-manage',
   )
 })
 
@@ -111,11 +118,13 @@ test('「怎么用」打开当前分区的教程；「优化」没有独立教�
   expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
 })
 
-test('桌面上下文条只在有内容（作用范围 / 怎么用）时出现，不重复导航栏里的说明', () => {
+test('分区说明只在导航栏出现一次；工具条是面包屑，窄屏无控件时整条隐藏', () => {
   renderShell({ tab: 'connectors' })
-  // 没有范围、没有帮助回调：桌面隐藏（窄屏仍保留一行分区说明）。
-  const blurbs = screen.getAllByText(/已连接的应用和账号/)
-  expect(blurbs.some((el) => el.closest('.md\\:hidden'))).toBe(true)
+  expect(screen.getAllByText('已连接的应用和账号')).toHaveLength(1)
+  const crumb = screen.getByText('管理中心', { selector: '.oc-manage-toolbar span span' })
+  expect(crumb.parentElement).toHaveTextContent('管理中心插件')
+  // 插件分区既无作用范围、也没传帮助回调：窄屏不渲染空工具条。
+  expect(document.querySelector('.oc-manage-toolbar')).toHaveClass('max-md:hidden')
 })
 
 test('导航栏底部「去市场添加」直达市场', () => {

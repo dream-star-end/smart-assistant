@@ -845,6 +845,109 @@ body {
   .tut-card:hover { transform: none; }
 }
 
+/* ── 管理中心(OCV5-344 第 2 轮视觉):与首页 / 教程中心同一套语言 ───────────────
+   只在 .oc-manage 作用域内生效。面板内部不逐个改写,而是:
+   ① 收紧圆角 token(卡片 22→14、控件 16→10):去掉「气泡卡 + 胖药丸下拉」的廉价感;
+   ② 分隔线降一档、卡片阴影改成一像素级的克制投影:层级靠留白和字号,不靠满屏描边;
+   ③ 面板标题(PanelHeader)提升为页面级标题。全部取语义 token,明暗主题自适应。 */
+.oc-manage {
+  --radius-xl: 14px;
+  --radius-lg: 10px;
+  --color-border: color-mix(in srgb, var(--border) 72%, transparent);
+  background:
+    radial-gradient(70% 300px at 78% -170px, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+    var(--surface);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--fg) 6%, transparent),
+    0 30px 80px -20px rgba(0, 0, 0, 0.35);
+}
+.oc-manage .shadow-soft {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.dark .oc-manage .shadow-soft {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+/* 导航栏:比内容区低半档的底色 + 顶部极淡的品牌光。窄屏是一条分段控件。 */
+.oc-manage-rail {
+  background:
+    radial-gradient(120% 220px at 0% -60px, color-mix(in srgb, var(--accent) 8%, transparent), transparent 70%),
+    color-mix(in srgb, var(--sidebar) 70%, var(--surface));
+}
+@media (max-width: 767px) {
+  .oc-manage-rail { background: transparent; }
+  .oc-manage-tablist { background: var(--hover); }
+}
+.oc-manage-tab[aria-selected="true"] {
+  background: var(--surface);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.06),
+    0 0 0 1px color-mix(in srgb, var(--fg) 7%, transparent);
+}
+.dark .oc-manage-tab[aria-selected="true"] {
+  background: color-mix(in srgb, var(--fg) 7%, var(--surface));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent);
+}
+@media (min-width: 768px) {
+  /* 桌面选中项左侧 accent 指示条。 */
+  .oc-manage-tab[aria-selected="true"]::before {
+    position: absolute;
+    left: -12px;
+    top: 50%;
+    width: 3px;
+    height: 20px;
+    border-radius: 0 3px 3px 0;
+    background: var(--accent);
+    content: "";
+    transform: translateY(-50%);
+  }
+}
+.oc-manage-tab-icon {
+  background: var(--grad-cta, var(--accent));
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.oc-manage-market {
+  border: 1px solid var(--color-border);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 6%, transparent), transparent 60%),
+    var(--surface);
+}
+.oc-manage-market:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  box-shadow: 0 6px 20px -10px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* 工具条:面包屑 + 紧凑的「作用范围」芯片。面板里的筛选 / 上下文下拉同款芯片;表单(<form>)里的字段保持原输入框样式,与同表单的文本框一致。触屏仍由原语保 44px。 */
+.oc-manage-toolbar {
+  border-bottom: 1px solid var(--color-border);
+}
+.oc-manage-scope select,
+.oc-manage-panel select:not(form select) {
+  height: 34px;
+  border-color: transparent;
+  background-color: var(--hover);
+  padding-left: 10px;
+  font-size: 13px;
+}
+.oc-manage-scope select:hover,
+.oc-manage-panel select:not(form select):hover { border-color: var(--color-border); }
+
+/* 面板标题 → 页面级标题。左右内距不动(分区契约 #1:标题左缘与列表行对齐)。 */
+.oc-manage-panel [data-panel-header] {
+  padding-top: 20px;
+  padding-bottom: 14px;
+}
+.oc-manage-panel [data-panel-header] h3 {
+  font-size: 19px;
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+}
+.oc-manage-panel [data-panel-header] h3 + p {
+  margin-top: 4px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 /* ── 高成本 turn 完成后的一次性「评分引导」脉冲(方案 a)：极轻光环,**无布局位移**
    (只动 box-shadow / border-radius),仅在用户未表达减少动效偏好时播放,播 2 次即止。
    --accent 随明暗主题自适应(见 :root / .dark 的 accent token);color-mix 保证光环柔和不刺眼。
