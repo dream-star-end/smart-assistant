@@ -76,6 +76,15 @@ start_run() {
   [[ -z "$dirty" ]] || die "V5 canonical 非 clean，拒绝 detached deploy"
   active_runner_exists && die "已有 detached V5 deploy unit 正在运行；保持只读并先查 status"
 
+  # 发车前只读预检:队列 / 证明门测试库 / egress 面这几类确定性错误在建 unit 之前就报,
+  # 不再等 unit 跑 20s–7min 才由 deploy-v5.sh 报同样的错。deploy-v5.sh 的门全部照跑。
+  # OC_V5_DETACHED_SKIP_PREFLIGHT=1 只在预检自身出故障时用;它不跳过 deploy-v5.sh 的任何门。
+  if [[ "${OC_V5_DETACHED_SKIP_PREFLIGHT:-0}" == 1 ]]; then
+    echo "! OC_V5_DETACHED_SKIP_PREFLIGHT=1:跳过发车预检(deploy-v5.sh 自身门照跑)" >&2
+  else
+    bash "$SCRIPT_DIR/v5-deploy-preflight.sh" -- "$@" || die "发车预检未通过,未创建 detached unit"
+  fi
+
   sha="$(git -C "$REPO_ROOT" rev-parse --short=8 HEAD)"
   mode="${1:---deploy}"
   mode="${mode#--}"
