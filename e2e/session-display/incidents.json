@@ -6454,6 +6454,46 @@
           "assertion": "null 清态帧丢失:单凭 working(thinking) 也结束 engine_*,其它 working 不动启动态"
         }
       ]
+    },
+    {
+      "id": "INC-20261008-BOX-PARALLEL-IMAGE-CAPTION",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "商业 rel-ac3dbe616 用户 1870：box-api-claude-opus-5-5 并行 Read 5 张截图，Claude Code 只缩放了其中一张（2430x1131→2000x931），唯一的尺寸说明排在 5 个结果之后；折叠只认整条消息恰好 1 张图，续接被拒 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION（模型服务暂时中断）",
+      "rootFixCommit": "f2315c66",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
+          "assertion": "OCV5-334 one caption among parallel image results continues the turn"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261008-BOX-NATIVE-RESUME-UNSTOPPABLE",
+      "occurredAt": "2026-10-08",
+      "severity": "P1",
+      "symptom": "商业 rel-ac3dbe616 用户 1870：续接被拒后 Box 运行停不掉，之后每条消息『消息未开始处理』（IDLE_HISTORY_PENDING），本应持续到 4 小时期限。原生续接把 keeper 启动在写 transcript 那次运行的目录，keeper 停止脚本只认自己运行目录，退出 125（BOX_EXEC_REMOTE_EXIT）；自 PR #605 起所有原生续接的运行都无法停止",
+      "rootFixCommit": "91849ecf",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-334-native-resume-stop] PASS — a native-resumed run whose keeper runs in the transcript run directory is stopped"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxKeeperStop.test.ts",
+          "assertion": "stop reaches a native-resumed keeper that runs in the transcript run directory"
+        }
+      ]
     }
   ]
 }
