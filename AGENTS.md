@@ -120,3 +120,18 @@ For any `claudeai.chat` / OpenClaude v3 commercial code or deploy task:
 - explicitly classify touched paths and answer whether a runtime image rebuild is required
 - never treat manual rsync + systemctl restart as final deployment
 - deploy only with `scripts/deploy-v3.sh` from `/opt/openclaude/openclaude-v3`
+
+## Codex review rubric(审查者模式,2026-10-08 用户批准)
+
+被要求「审查 / review / 审计」一个改动时按本节输出。本节只约束**审查输出**,不改任何门:CI required checks、事故证明门、`check-v5-fix-trailers.sh`、发车预检、发布脚本自己的门全部照旧。「Codex 审计 PASS」= 按本节输出 `APPROVED`。
+
+1. **范围**:只审这次 diff,以及 diff 直接影响到的调用方 / 被调用方。不审 diff 之外早已存在的代码;顺带看到的老问题最多一行列入「非阻断」,不算本次 finding。
+2. **严重度**:只有 P0/P1 阻断合并 —— 正确性(会出错的结果、崩溃、挂死、数据丢失)、安全、计费/积分、数据完整性、发布门被削弱或可被绕过。命名、风格、注释、可读性、"更好的写法"、缺少锦上添花的测试都是 P2 及以下:列在「非阻断」里,永不挡合并。
+3. **轮次记忆**:第 2 轮起,调用方会给出上一轮 findings 与「已定设计决定」。只做两件事:核对上一轮每条 P0/P1 是否真修好;只在本轮新增的 diff 里找新的 P0/P1。不重审全部代码;不重提已定设计决定,除非能给出它导致 P0/P1 的具体复现。
+4. **轮次上限**:小改动(单文件或 < ~150 行有效 diff)1 轮;大改动最多 3 轮。到上限仍有分歧,由发起审查的一方(外机 cc3 / 主控)裁决并留痕,不再循环。调用方在提示里写明「第 N 轮 / 上限 M」。
+5. **固定输出**:
+   - 没有 P0/P1:**只输出一行 `APPROVED`**;可以另起「非阻断:」列 P2 及以下,每条一行。
+   - 有 P0/P1:第一行 `REQUEST_CHANGES`,随后每条 finding 一项:`[P0|P1] 文件:行 — 原因 — 复现(输入/状态 → 错误结果)`。给不出复现的不算 P0/P1,降为非阻断。
+   - 跑不了测试(沙箱只读等)就说明一次,按静态阅读下结论;不要把「环境跑不了」当成 finding。
+
+统一调用:`scripts/codex-review.sh --base <ref> --round <N> --max-rounds <M> [--prev <上一轮输出>] [--decisions <已定设计文件>] [--focus <一句话>] -o <输出文件>`,它会拼好以上上下文并以只读沙箱调用 `codex exec`;`--print-prompt` 只打印提示不调用。
