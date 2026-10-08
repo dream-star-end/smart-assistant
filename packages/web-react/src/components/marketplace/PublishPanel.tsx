@@ -26,7 +26,7 @@ import type {
   SkillSummary,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { skillDisplayTitle } from "../manage/skillDisplay";
+import { SkillImportPicker } from "./SkillImportPicker";
 import {
   Alert,
   Badge,
@@ -946,8 +946,8 @@ function SkillPublishForm({
     // 导入会覆盖 IMPORT_OVERWRITES 里的每一个字段(不含商品信息)—— 其中任何一个已被
     // 用户写过就必须先确认,一次误点不能吃掉草稿。字段清单直接来自下面的 draft.set,
     // 两处改一处必改:漏一个就是"用户写的内容被静默替换"。
-    // 确认框与提示里的名字跟芯片一致(展示名),用户刚点的是什么就写什么(K-10)。
-    const shownName = skillDisplayTitle(sk).title;
+    // 确认框与选择项始终使用同一个技能名称，不将用途说明冒充标题。
+    const shownName = sk.name;
     if (draft.isDirty(IMPORT_OVERWRITES)) {
       const go = await confirmDialog({
         title: `用「${shownName}」覆盖当前内容？`,
@@ -1159,28 +1159,11 @@ function SkillPublishForm({
                   </Button>
                 </p>
               ) : (
-                <div className="flex flex-wrap gap-1.5">
-                  {/* 芯片用管理中心同一套展示名(描述首行),不再把 slug 当名字混排(K-10);
-                      slug 进 aria-label / title 供核对,与 manage 技能列表口径一致。 */}
-                  {mySkills.map((sk) => {
-                    const shown = skillDisplayTitle(sk);
-                    return (
-                      <Button
-                        key={sk.name}
-                        variant="secondary"
-                        size="sm"
-                        shape="pill"
-                        loading={importing === sk.name}
-                        disabled={importing !== null}
-                        onClick={() => void importSkill(sk)}
-                        aria-label={shown.caption ? `${shown.title}（${sk.name}）` : sk.name}
-                        title={shown.caption}
-                      >
-                        {shown.title}
-                      </Button>
-                    );
-                  })}
-                </div>
+                <SkillImportPicker
+                  skills={mySkills}
+                  importing={importing}
+                  onSelect={(skill) => void importSkill(skill)}
+                />
               )}
               {importNote && (
                 <p

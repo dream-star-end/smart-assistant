@@ -191,3 +191,20 @@
 
 /* Tailwind color aliases resolve where declared; rebind them inside the local theme. */
 .marketplace-window, .marketplace-detail { --color-accent:var(--accent); --color-accent-soft:var(--accent-soft); --color-accent-strong:var(--accent-strong); --color-accent-fg:var(--accent-fg); --color-ring:var(--ring); }
+
+/* Long local skill descriptions must not determine the publish form's min-content width. */
+.marketplace-workbench { width:100%; min-width:0; }
+.marketplace-import-picker { width:100%; min-width:0; }
+.marketplace-import-toggle { display:flex; width:100%; min-width:0; justify-content:flex-start; gap:8px; border-radius:10px; }
+.marketplace-import-count { margin-left:auto; color:var(--muted); font-size:11px; font-weight:400; }
+.marketplace-import-body { padding:12px; margin-top:8px; border:1px solid var(--border); border-radius:12px; background:var(--surface); min-width:0; }
+.marketplace-import-summary { margin:9px 0; color:var(--muted); font-size:11px; line-height:1.7; }
+.marketplace-import-list { max-height:240px; min-width:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; display:flex; flex-direction:column; gap:4px; padding:3px; }
+.marketplace-import-option { display:flex; flex-shrink:0; align-items:flex-start; gap:10px; width:100%; min-width:0; min-height:44px; padding:10px; text-align:left; border-radius:8px; border:1px solid transparent; outline:none; }
+.marketplace-import-option > svg { flex-shrink:0; margin-top:3px; color:var(--accent); }
+.marketplace-import-option:hover:not(:disabled) { background:var(--hover); }
+.marketplace-import-option:focus-visible { border-color:var(--ring); outline:2px solid var(--ring); outline-offset:-2px; }
+.marketplace-import-option:disabled { opacity:.55; cursor:wait; }
+.marketplace-import-text { flex:1; min-width:0; }
+.marketplace-import-name { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:600; }
+.marketplace-import-description { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; overflow-wrap:anywhere; white-space:normal; margin-top:3px; color:var(--muted); font-size:11px; line-height:1.7; }

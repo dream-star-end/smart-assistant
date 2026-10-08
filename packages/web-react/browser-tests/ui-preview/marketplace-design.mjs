@@ -53,8 +53,41 @@ else {
  const errors=[];const unmocked=new Set();let checks=0
  try {
   const page=await browser.newPage({viewport:{width:1440,height:1000}})
+  await page.addInitScript(() => localStorage.clear())
   page.on('pageerror',e=>errors.push(e.message))
   page.on('console',msg=>{if(msg.text().startsWith('[unmocked-api]'))unmocked.add(msg.text())})
+  if (process.argv.includes('--import-picker')) {
+    const red = process.argv.includes('--expect-overflow')
+    let overflowSeen = false
+    for (const width of [1920, 390]) for (const theme of ['light', 'dark']) {
+      await page.setViewportSize({width, height:width===1920?889:844})
+      await page.goto(`${url}?scene=market-publish-long-skills&theme=${theme}`)
+      await page.getByText('从我的技能导入', {exact:true}).waitFor()
+      await page.waitForTimeout(250)
+      const overflow = await page.locator('.marketplace-content').evaluate(e=>e.scrollWidth>e.clientWidth+2)
+      if (red) { overflowSeen ||= overflow; checks++; await page.screenshot({path:join(out,`import-before-${width}-${theme}.png`)}); continue }
+      assert.equal(overflow,false,`closed ${width}/${theme}`); checks++
+      assert.equal(await page.getByRole('button',{name:'导入 target-import-skill',exact:true}).count(),0); checks++
+      await page.getByRole('button',{name:'选择已有技能',exact:true}).click()
+      await page.getByRole('searchbox',{name:'搜索我的技能'}).waitFor()
+      assert.equal(await page.locator('.marketplace-content').evaluate(e=>e.scrollWidth>e.clientWidth+2),false); checks++
+      const box=await page.locator('.marketplace-import-list').boundingBox()
+      assert(box.height<=242, 'bounded list height'); checks++
+      await page.locator('.marketplace-content').evaluate(e => { const body=e.querySelector('.marketplace-import-body'); e.scrollTop += body.getBoundingClientRect().top-e.getBoundingClientRect().top-16 })
+      await page.screenshot({path:join(out,`import-open-${width}-${theme}.png`)})
+      await page.getByRole('searchbox',{name:'搜索我的技能'}).fill('没有匹配的关键词')
+      await page.getByText('没有找到匹配的技能', {exact:true}).waitFor();checks++
+      await page.getByRole('searchbox',{name:'搜索我的技能'}).fill('target-import')
+      assert.equal(await page.getByPlaceholder('例：学术翻译').inputValue(),''); checks++
+      await page.getByRole('button',{name:'导入 target-import-skill',exact:true}).click()
+      await page.getByPlaceholder('例：学术翻译').waitFor()
+      assert.equal(await page.getByPlaceholder('例：学术翻译').inputValue(),'target-import-skill');checks++
+      assert.equal(await page.getByPlaceholder(/描述这个技能何时触发/).inputValue(),'# 长列表导入正文');checks++
+      await page.screenshot({path:join(out,`import-filled-${width}-${theme}.png`)})
+    }
+    if (red) assert(overflowSeen, 'red control must reproduce the reported overflow')
+    assert.deepEqual(errors,[])
+  } else {
   for(const width of [1440,768,390,320]) for(const theme of ['light','dark']) {
     await page.setViewportSize({width,height:width<640?844:1000})
     await page.goto(`${url}?theme=${theme}`)
@@ -117,7 +150,8 @@ else {
   await page.getByRole('button',{name:'重试',exact:true}).waitFor();checks++
   assert.deepEqual(errors,[])
   assert.equal(unmocked.size,0,`missing fixtures: ${[...unmocked]}`)
-  await writeFile(join(out,'results.json'),JSON.stringify({checks,pageErrors:errors,viewports:[1440,768,390,320],themes:['light','dark']},null,2))
+  }
+  await writeFile(join(out,'results.json'),JSON.stringify({checks,pageErrors:errors,mode:process.argv.includes('--expect-overflow')?'expected-overflow':'regression',viewports:process.argv.includes('--import-picker')?[1920,390]:[1440,768,390,320],themes:['light','dark']},null,2))
   console.log(`PASS: ${checks} browser checks; screenshots: ${out}`)
  } finally {await browser.close();server.close()}
 }

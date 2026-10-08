@@ -1474,6 +1474,24 @@ export const marketScenes: Scene[] = [
 
   // —— 发布 ——
   {
+    id: 'market-publish-long-skills',
+    label: '发布 · 317 个技能与长说明（生产形态回归）',
+    group: '市场',
+    viewports: ['desktop', 'mobile'],
+    api: {
+      ...publishApi([]),
+      listSkills: ok(Array.from({ length: 317 }, (_, i) => ({
+        name: i === 316 ? 'target-import-skill' : `skill-${i}-${'long-identifier-'.repeat(8)}`,
+        description: '用于审查真实业务中的复杂技能。必须核对上下文、权限、恢复与计费边界。'.repeat(8) + 'UNBROKENTEXT'.repeat(30),
+        writable: true,
+        tags: ['办公', '回归'],
+      }))),
+      getSkill: ok({ body: '# 长列表导入正文', files: [] }),
+      getSkillEvals: ok(null),
+    },
+    render: () => <Market tab="publish" />,
+  },
+  {
     id: 'market-publish',
     label: '发布 · 技能表单（尚无发布记录）',
     group: '市场',
