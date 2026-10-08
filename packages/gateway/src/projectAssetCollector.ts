@@ -3,17 +3,24 @@
  *
  * 产出物:扫助手正文里的 `/home/agent/.openclaude/generated/...` 绝对路径,
  * 登记为 source='output' 的项目资产。失败不得影响回合收口。
+ *
+ * 容器里(有 master 地址与容器令牌)必须登记到 master:容器自己的 sessions
+ * 后端是本地 SQLite,界面读的是 master 的 PG,登记在本地等于没登记。项目
+ * 取回合开始时解析出的 chat project(冻结),不取登记那一刻会话所在项目。
+ * master 暂时不可达时重试,仍失败就写进本地待登记队列,下次归集时补发。
  */
-import { stat } from 'node:fs/promises'
-import { basename } from 'node:path'
-import { readFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import {
   createProjectAsset,
   parseProjectAssetContainerPath,
   parseProjectAssetExcerpt,
+  paths as storagePaths,
   PROJECT_ASSET_EXCERPT_MAX,
   PROJECT_ASSET_URL_RE,
 } from '@openclaude/storage'
+import { PROJECT_ASSETS_REGISTER_PATH } from '@openclaude/protocol'
+import { request as undiciRequest } from 'undici'
 import { parseDocument } from './documentParser.js'
 import { createLogger } from './logger.js'
 
@@ -150,35 +157,203 @@ export async function tryExtractProjectAssetExcerpt(opts: {
   }
 }
 
-export async function collectSessionOutputAssets(opts: {
+const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
+const ENV_CONTAINER_TOKEN = 'OPENCLAUDE_V3_CONTAINER_TOKEN'
+const REGISTER_TIMEOUT_MS = 5_000
+const REGISTER_RETRY_DELAYS_MS = [0, 1_000, 5_000]
+const SPOOL_MAX_ENTRIES = 500
+const SPOOL_FLUSH_MIN_INTERVAL_MS = 60_000
+
+export interface OutputAssetItem {
+  containerPath: string
+  name: string
+  mime?: string
+  size?: number
+}
+
+/** One registration request; also the shape of a pending spool line. */
+export interface OutputAssetRegistration {
+  sessionId: string
+  /** Chat project frozen at turn start; absent = unknown, master infers. */
+  projectId?: string | null
+  items: OutputAssetItem[]
+}
+
+export interface CollectSessionOutputAssetsOpts {
   userId: string
   sessionId: string
   assistantText: string
-}): Promise<void> {
+  /** Chat project the turn resolved when it started. undefined = not resolved (flag off). */
+  chatProjectId?: string | null
+  env?: NodeJS.ProcessEnv
+  fetcher?: typeof undiciRequest
+  sleep?: (ms: number) => Promise<void>
+  spoolFile?: string
+  /** Test seam: outputs live under /home/agent, which tests cannot create. */
+  statFile?: (path: string) => Promise<{ isFile(): boolean; size: number }>
+}
+
+type RegisterOutcome = 'registered' | 'rejected' | 'unreachable'
+
+export function outputAssetSpoolFile(): string {
+  return join(storagePaths.home, 'pending-output-assets.jsonl')
+}
+
+async function postRegistration(
+  reg: OutputAssetRegistration,
+  opts: CollectSessionOutputAssetsOpts,
+): Promise<RegisterOutcome> {
+  const env = opts.env ?? process.env
+  const base = env[ENV_MASTER_URL]
+  const bearer = env[ENV_CONTAINER_TOKEN]
+  if (!base || !bearer) return 'unreachable'
+  const fetcher = opts.fetcher ?? undiciRequest
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)))
+  const url = `${base.replace(/\/+$/, '')}${PROJECT_ASSETS_REGISTER_PATH}`
+  for (const delay of REGISTER_RETRY_DELAYS_MS) {
+    if (delay > 0) await sleep(delay)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), REGISTER_TIMEOUT_MS)
+    try {
+      const res = await fetcher(url, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' },
+        body: JSON.stringify(reg),
+        signal: controller.signal,
+      })
+      const text = await res.body.text().catch(() => '')
+      if (res.statusCode === 200) return 'registered'
+      // A 4xx will not change on retry (bad item, foreign session, identity).
+      if (res.statusCode >= 400 && res.statusCode < 500 && res.statusCode !== 408 && res.statusCode !== 429) {
+        log.warn('output asset registration rejected', {
+          sessionId: reg.sessionId,
+          status: res.statusCode,
+          body: text.slice(0, 200),
+        })
+        return 'rejected'
+      }
+    } catch {
+      /* network / timeout: retry */
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  return 'unreachable'
+}
+
+async function appendSpool(file: string, reg: OutputAssetRegistration): Promise<void> {
+  await mkdir(dirname(file), { recursive: true })
+  await appendFile(file, `${JSON.stringify(reg)}\n`, { encoding: 'utf8', mode: 0o600 })
+}
+
+let lastFlushAt = 0
+let flushing: Promise<void> | null = null
+
+/** Resend spooled registrations. Keeps whatever still fails; bounded. */
+export async function flushOutputAssetSpool(opts: CollectSessionOutputAssetsOpts, force = false): Promise<void> {
+  if (flushing) return flushing
+  if (!force && Date.now() - lastFlushAt < SPOOL_FLUSH_MIN_INTERVAL_MS) return
+  lastFlushAt = Date.now()
+  const file = opts.spoolFile ?? outputAssetSpoolFile()
+  flushing = (async () => {
+    let raw: string
+    try {
+      raw = await readFile(file, 'utf8')
+    } catch {
+      return
+    }
+    const pending: OutputAssetRegistration[] = []
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const reg = JSON.parse(line) as OutputAssetRegistration
+        if (reg && typeof reg.sessionId === 'string' && Array.isArray(reg.items)) pending.push(reg)
+      } catch {
+        /* drop a torn line */
+      }
+    }
+    const keep: OutputAssetRegistration[] = []
+    for (const reg of pending.slice(-SPOOL_MAX_ENTRIES)) {
+      const outcome = await postRegistration(reg, { ...opts, sleep: async () => {} })
+      if (outcome === 'unreachable') keep.push(reg)
+    }
+    const tmp = `${file}.tmp-${process.pid}`
+    await writeFile(tmp, keep.map((r) => `${JSON.stringify(r)}\n`).join(''), { encoding: 'utf8', mode: 0o600 })
+    await rename(tmp, file)
+  })()
+  try {
+    await flushing
+  } finally {
+    flushing = null
+  }
+}
+
+export async function collectSessionOutputAssets(opts: CollectSessionOutputAssetsOpts): Promise<void> {
+  const env = opts.env ?? process.env
+  const viaMaster = Boolean(env[ENV_MASTER_URL] && env[ENV_CONTAINER_TOKEN])
+  if (viaMaster) {
+    await flushOutputAssetSpool(opts).catch((err) => log.warn('output asset spool flush failed', {}, err))
+  }
   const paths = extractGeneratedOutputPaths(opts.assistantText)
   if (paths.length === 0) return
+  const items: OutputAssetItem[] = []
   for (const containerPath of paths) {
     try {
-      const st = await stat(containerPath)
+      const st = await (opts.statFile ?? stat)(containerPath)
       if (!st.isFile()) continue
       const name = basename(containerPath)
-      const result = await createProjectAsset(opts.userId, {
-        source: 'output',
-        sessionId: opts.sessionId,
-        name,
-        containerPath,
-        mime: mimeFromAssetName(name),
-        size: st.size,
-      })
-      if (!result.ok && result.error !== 'limit_exceeded') {
-        log.warn('collectSessionOutputAssets create failed', {
-          sessionId: opts.sessionId,
-          containerPath,
-          error: result.error,
-        })
-      }
+      const mime = mimeFromAssetName(name)
+      items.push({ containerPath, name, ...(mime ? { mime } : {}), size: st.size })
     } catch (err) {
       log.warn('collectSessionOutputAssets skipped', { sessionId: opts.sessionId, containerPath }, err)
     }
   }
+  if (items.length === 0) return
+
+  if (viaMaster) {
+    const reg: OutputAssetRegistration = {
+      sessionId: opts.sessionId,
+      ...(opts.chatProjectId !== undefined ? { projectId: opts.chatProjectId } : {}),
+      items,
+    }
+    const outcome = await postRegistration(reg, opts)
+    if (outcome === 'unreachable') {
+      await appendSpool(opts.spoolFile ?? outputAssetSpoolFile(), reg)
+      log.warn('output assets queued for later registration', {
+        sessionId: opts.sessionId,
+        count: items.length,
+      })
+    }
+    return
+  }
+
+  // Personal / test: the local sessions backend is the one the UI reads.
+  for (const item of items) {
+    try {
+      const result = await createProjectAsset(opts.userId, {
+        source: 'output',
+        sessionId: opts.sessionId,
+        ...(opts.chatProjectId !== undefined ? { projectId: opts.chatProjectId } : {}),
+        name: item.name,
+        containerPath: item.containerPath,
+        mime: item.mime,
+        size: item.size,
+      })
+      if (!result.ok && result.error !== 'limit_exceeded') {
+        log.warn('collectSessionOutputAssets create failed', {
+          sessionId: opts.sessionId,
+          containerPath: item.containerPath,
+          error: result.error,
+        })
+      }
+    } catch (err) {
+      log.warn('collectSessionOutputAssets skipped', { sessionId: opts.sessionId, containerPath: item.containerPath }, err)
+    }
+  }
+}
+
+/** Test seam. */
+export function _resetOutputAssetSpoolThrottleForTest(): void {
+  lastFlushAt = 0
+  flushing = null
 }

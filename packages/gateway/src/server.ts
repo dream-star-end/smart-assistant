@@ -20735,6 +20735,7 @@ export class Gateway {
       projectId: chatWorkspace.projectId,
       contextFingerprint: chatWorkspace.contextFingerprint,
       assetsRevision: chatWorkspace.assetsRevision,
+      turnChatProjectId: chatWorkspace.chatProjectId,
       runContext: webchatRunContext,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理

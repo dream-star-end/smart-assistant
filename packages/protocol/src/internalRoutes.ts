@@ -67,6 +67,8 @@ export const SKILL_FEEDBACK_PATH = '/internal/v3/marketplace/skill-feedback'
 export const SKILL_SHADOW_PATH = '/internal/v3/skill-shadow'
 export const PLATFORM_PROMPT_SLOTS_PATH = '/internal/v3/platform-prompt-slots'
 export const PROJECT_CONTEXT_PATH = '/internal/v3/project-context'
+/** Container → master: register turn outputs as project assets in the master sessions backend. */
+export const PROJECT_ASSETS_REGISTER_PATH = '/internal/v3/project-assets'
 export const CRON_INDEX_PATH = '/internal/v3/cron-index'
 export const CRON_ORIGIN_INJECT_PATH = '/internal/v3/cron-origin-inject'
 export const INBOX_POST_PATH = '/internal/v3/inbox-post'
@@ -320,6 +322,12 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/projectContextRuntime.ts', 'commercial/src/http/internalProjectContext.ts'],
+  },
+  {
+    path: PROJECT_ASSETS_REGISTER_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/projectAssetCollector.ts', 'commercial/src/http/internalProjectAssets.ts'],
   },
   {
     path: CRON_INDEX_PATH,

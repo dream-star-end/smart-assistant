@@ -843,12 +843,14 @@ function scheduleSessionOutputAssetCollection(opts: {
   assistantText: string
   sessionKey: string
   traceId?: string
+  chatProjectId?: string | null
 }): void {
   if (!opts.userId || !opts.assistantText) return
   void collectSessionOutputAssets({
     userId: opts.userId,
     sessionId: opts.sessionId,
     assistantText: opts.assistantText,
+    ...(opts.chatProjectId !== undefined ? { chatProjectId: opts.chatProjectId } : {}),
   }).catch((err) => {
     log.warn(
       'collectSessionOutputAssets failed',
@@ -910,6 +912,11 @@ export interface AgentSession {
   projectId?: string | null
   /** projectId + contextVersion + assetsRevision + manifest hashes. */
   contextFingerprint?: string
+  /**
+   * Chat project resolved at the start of the latest turn; its output assets
+   * are registered there. undefined = not resolved (flag off): master infers.
+   */
+  turnChatProjectId?: string | null
   runContext?: import('./runContextPersist.js').RunContextDescriptor
   frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /**
@@ -3101,6 +3108,7 @@ export class SessionManager {
       this._trackPersistence(persistence)
       scheduleSessionOutputAssetCollection({
         userId: session.userId,
+        chatProjectId: session.turnChatProjectId,
         sessionId: session.peerId,
         assistantText: args.assistantText,
         sessionKey: session.sessionKey,
@@ -3965,6 +3973,8 @@ export class SessionManager {
     projectId?: string | null
     contextFingerprint?: string
     assetsRevision?: number
+    /** See AgentSession.turnChatProjectId. Applied on every call, including undefined. */
+    turnChatProjectId?: string | null
     runContext?: import('./runContextPersist.js').RunContextDescriptor
     frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
     /**
@@ -4222,6 +4232,7 @@ export class SessionManager {
                 canonical.parentSessionKey = opts.parentSessionKey
               if (opts.projectId !== undefined) canonical.projectId = opts.projectId
               if (nextFingerprint) canonical.contextFingerprint = nextFingerprint
+              canonical.turnChatProjectId = opts.turnChatProjectId
               if (opts.runContext) canonical.runContext = opts.runContext
               canonical._identityCreationOpts = identityCreationOpts
               return canonical
@@ -4306,6 +4317,7 @@ export class SessionManager {
           existing.parentSessionKey = opts.parentSessionKey
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
         if (nextFingerprint) existing.contextFingerprint = nextFingerprint
+        existing.turnChatProjectId = opts.turnChatProjectId
         if (opts.runContext) existing.runContext = opts.runContext
         existing._identityCreationOpts = identityCreationOpts
         return existing
@@ -4408,6 +4420,7 @@ export class SessionManager {
       contextFingerprint:
         opts.contextFingerprint ??
         (await computeSessionContextFingerprint(opts.projectId, opts.assetsRevision)),
+      turnChatProjectId: opts.turnChatProjectId,
       runContext: opts.runContext,
       frozenProjectContext: opts.frozenProjectContext,
       repoSessionId,
@@ -7244,6 +7257,7 @@ export class SessionManager {
               session.turns = Math.max(session.turns, turnIndex)
               scheduleSessionOutputAssetCollection({
                 userId: session.userId,
+                chatProjectId: session.turnChatProjectId,
                 sessionId: session.peerId,
                 assistantText: partialAssistant.text,
                 sessionKey: session.sessionKey,
@@ -8091,6 +8105,7 @@ export class SessionManager {
             const turnIndex = session.turns
             scheduleSessionOutputAssetCollection({
               userId: session.userId,
+              chatProjectId: session.turnChatProjectId,
               sessionId: peerId,
               assistantText,
               sessionKey: session.sessionKey,

@@ -582,6 +582,11 @@ import {
   type InternalProjectContextHandler,
 } from "./http/internalProjectContext.js";
 import {
+  PROJECT_ASSETS_REGISTER_PATH,
+  makeInternalProjectAssetsHandler,
+  type InternalProjectAssetsHandler,
+} from "./http/internalProjectAssets.js";
+import {
   MINIMAX_MEDIA_PATH,
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
@@ -2345,6 +2350,10 @@ export async function registerCommercial(
         });
       const projectContextHandler: InternalProjectContextHandler =
         makeInternalProjectContextHandler({ identityRepo });
+      // /internal/v3/project-assets — 容器回合产出登记进 master sessions 后端(PG),
+      // 侧栏/资产面板读的就是它;容器本地 SQLite 没人读。租户只取容器身份。
+      const projectAssetsHandler: InternalProjectAssetsHandler =
+        makeInternalProjectAssetsHandler({ identityRepo });
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
       // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
@@ -2873,6 +2882,9 @@ export async function registerCommercial(
         }
         if (path === PROJECT_CONTEXT_PATH) {
           return projectContextHandler(req, res, ctx);
+        }
+        if (path === PROJECT_ASSETS_REGISTER_PATH) {
+          return projectAssetsHandler(req, res, ctx);
         }
         if (path === MINIMAX_MEDIA_PATH) {
           return minimaxMediaHandler(req, res, ctx);

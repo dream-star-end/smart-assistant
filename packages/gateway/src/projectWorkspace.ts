@@ -25,6 +25,11 @@ export interface ChatRunWorkspace {
   bound: boolean
   contextFingerprint: string
   assetsRevision: number
+  /**
+   * Chat project the turn resolved at start (bound or not). Frozen for the
+   * turn's output assets. undefined when not resolved (flag off).
+   */
+  chatProjectId?: string | null
   /** The project context could not be read; the caller must not run the turn as unbound. */
   unavailable?: ProjectContextUnavailableReason
 }
@@ -71,7 +76,7 @@ export async function resolveChatRunWorkspace(opts: {
   })
   if (resolved?.unavailable) return { ...UNBOUND, unavailable: resolved.unavailable }
   const projectId = resolved?.boardProjectId ?? null
-  if (!projectId || !resolved?.bound) return UNBOUND
+  if (!projectId || !resolved?.bound) return { ...UNBOUND, chatProjectId: resolved?.chatProjectId ?? null }
   const lookup = opts.getBoardProject ?? defaultGetBoardProject
   const project = await lookup(projectId)
   const spec =
@@ -102,6 +107,7 @@ export async function resolveChatRunWorkspace(opts: {
       bound: true,
       contextFingerprint,
       assetsRevision: resolved.assetsRevision,
+      chatProjectId: resolved.chatProjectId ?? null,
     }
   }
   return {
@@ -112,5 +118,6 @@ export async function resolveChatRunWorkspace(opts: {
     bound: true,
     contextFingerprint,
     assetsRevision: resolved.assetsRevision,
+    chatProjectId: resolved.chatProjectId ?? null,
   }
 }
