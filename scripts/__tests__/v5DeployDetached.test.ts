@@ -312,7 +312,8 @@ function activePinnedQueue(fx: ReturnType<typeof preflightFixture>, sha: string)
 }
 
 function runPreflight(env: NodeJS.ProcessEnv, args: string[]) {
-  return spawnSync(preflight, ['--', ...args], { cwd: root, encoding: 'utf8', env })
+  // 外层上限:回归时让用例确定性失败(ETIMEDOUT),而不是把测试进程挂住。
+  return spawnSync(preflight, ['--', ...args], { cwd: root, encoding: 'utf8', env, timeout: 60_000 })
 }
 
 test('preflight passes a ready release and writes nothing to stdout', () => {
@@ -614,6 +615,43 @@ test('a gh that hangs and ignores TERM cannot hold up the preflight (hard kill a
     assert.equal(r.status, 0, r.stderr)
     assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started}ms`)
     assert.doesNotMatch(r.stderr, /integ nightly/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('the second gh call (red shards) hanging with a pipe-holding grandchild cannot hold up the preflight either', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const dir = path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB))
+  const bin = path.join(dir, 'hang2-bin')
+  spawnSync('mkdir', ['-p', bin])
+  writeFileSync(path.join(dir, 'runs2.json'), JSON.stringify([{ conclusion: 'failure', databaseId: 5, createdAt: '2026-10-07T23:00:00Z' }]))
+  writeFileSync(
+    path.join(bin, 'gh'),
+    `#!/usr/bin/env bash
+if [[ "$1 $2" == "run list" ]]; then
+  jq_expr=""; while [[ $# -gt 0 ]]; do [[ "$1" == --jq ]] && jq_expr="$2"; shift; done
+  jq -r "$jq_expr" "${dir}/runs2.json"; exit 0
+fi
+# api: leave a grandchild that inherits stdout, then ignore TERM and hang.
+( trap '' TERM; sleep 60 ) &
+trap '' TERM
+sleep 60
+`,
+  )
+  chmodSync(path.join(bin, 'gh'), 0o755)
+  try {
+    const started = Date.now()
+    const r = runPreflight(
+      { ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: '1', OC_V5_PREFLIGHT_NIGHTLY_TIMEOUT: '1', OC_V5_PREFLIGHT_NIGHTLY_KILL_AFTER: '1' },
+      ['--rollback'],
+    )
+    assert.equal(r.error, undefined, 'preflight hung')
+    assert.equal(r.status, 0, r.stderr)
+    assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started}ms`)
+    // run list answered, so the advisory still prints (shards unknown).
+    assert.match(r.stderr, /integ nightly 已连续 1 次红.*红分片:\?/)
   } finally {
     fx.cleanup()
   }
