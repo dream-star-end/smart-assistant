@@ -1,5 +1,6 @@
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
+import { readServerFeatures } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import {
   constants as fsConstants,
@@ -6112,6 +6113,13 @@ export class Gateway {
         return
       }
     }
+    // Server-side feature flags for the web UI (env predicates, see protocol/serverFeatures).
+    // Its own route because /api/config stays host-only: the master proxies only this one.
+    if (url.pathname === '/api/features') {
+      if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+      this.sendJson(res, 200, { features: readServerFeatures(process.env) })
+      return
+    }
     if (url.pathname === '/api/config') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
@@ -6137,6 +6145,7 @@ export class Gateway {
           provider: activeProvider,
           auth: authInfo,
           mcpServers: activeMcps,
+          features: readServerFeatures(process.env),
         }),
       )
       return
@@ -24209,7 +24218,7 @@ const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
   '/api/sessions/read-all',
-  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/collaboration-config', '/api/search',
+  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/features', '/api/agents', '/api/collaboration-config', '/api/search',
   '/api/cron', '/api/cron/channels', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',

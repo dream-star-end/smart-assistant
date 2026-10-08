@@ -36,3 +36,4 @@ export * from './cursorSessionAuth.js'
 
 export * from './runCost.js'
 export * from './identityCompat.js'
+export * from './serverFeatures.js'

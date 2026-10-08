@@ -84,6 +84,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // Server-side feature flags for the web UI: three booleans read from the
+    // container env (protocol/serverFeatures). The rest of /api/config stays host-only.
+    label: '/api/features',
+    re: /^\/api\/features$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/collaboration-config',
     re: /^\/api\/collaboration-config$/,
     methods: M('GET', 'PUT'),

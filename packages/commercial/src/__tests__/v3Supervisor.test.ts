@@ -1168,6 +1168,40 @@ describe("provisionV3Container", () => {
     }
   });
 
+  test("selfhost master P5 web-UI flags are forwarded as =1 when on; off/unset stay out", async () => {
+    const keys = ["OC_RUNTIME_CHANNEL", "OC_PROMPT_QUEUE_V1", "OC_P5_CHIPS", "OC_P5_RECIPE_SCHEDULE", "OC_P5_UNFILED_SUGGEST"] as const;
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_PROMPT_QUEUE_V1 = "1";
+      process.env.OC_P5_CHIPS = "yes";
+      process.env.OC_P5_RECIPE_SCHEDULE = "0";
+      delete process.env.OC_P5_UNFILED_SUGGEST;
+      pool = new FakePool();
+      const { docker, captured } = makeDocker();
+      await provisionV3Container(
+        {
+          docker,
+          pool: pool as unknown as Pool,
+          image: TEST_IMAGE,
+          selfHostId: TEST_HOST,
+          randomIp: () => "172.31.5.44",
+          randomSecret: fixedSecret("d".repeat(64)),
+        },
+        779,
+      );
+      const env = (captured.containersCreated[0]?.Env ?? []) as string[];
+      assert.ok(env.includes("OC_P5_CHIPS=1"), "OC_P5_CHIPS=yes must reach the container as =1");
+      assert.ok(!env.some((e) => e.startsWith("OC_P5_RECIPE_SCHEDULE=")), "off flag must not be injected");
+      assert.ok(!env.some((e) => e.startsWith("OC_P5_UNFILED_SUGGEST=")), "unset flag must not be injected");
+    } finally {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+
   test("v5 empty managed Cursor pool provisions the same read-only bind before a key is ready", async () => {
     const keys = ["OC_RUNTIME_CHANNEL", "OC_V5_CURSOR_OWNER_UID", "OC_V5_CURSOR_CREDENTIAL_UIDS", "OC_V5_CURSOR_AUTH_DIR"] as const;
     const saved = new Map(keys.map((key) => [key, process.env[key]]));

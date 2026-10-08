@@ -54,7 +54,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
-import { OPENCLAUDE_CONTAINER_GATEWAY_PORT } from "@openclaude/protocol";
+import { OPENCLAUDE_CONTAINER_GATEWAY_PORT, serverFeatureContainerEnv } from "@openclaude/protocol";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import {
   RUNTIME_CHANNEL_LABEL_KEY,
@@ -2886,6 +2886,10 @@ export async function provisionV3Container(
     if (process.env.OC_RESEARCH_WORKSPACE === "1") {
       env.push("OC_RESEARCH_WORKSPACE=1");
     }
+    // P5 web-UI flags (OC_P5_CHIPS, OC_P5_RECIPE_SCHEDULE, OC_P5_UNFILED_SUGGEST):
+    // same selective injection, master accepts 1/true/yes/on and forwards =1.
+    // The container serves them to the browser at GET /api/features.
+    env.push(...serverFeatureContainerEnv(process.env));
     for (const key of [
       "OC_LOCAL_OBSERVABILITY_RETENTION",
       "OC_LOCAL_EVENT_RETENTION_DAYS",
