@@ -172,7 +172,8 @@
     "0289_luna_x04_opus55_match_retire_opus5",
     "0290_retire_cursor_sand_for_box_claude",
     "0291_box_claude_cursor_audit",
-    "0292_gpt61_sol_retire_gpt6_sol"
+    "0292_gpt61_sol_retire_gpt6_sol",
+    "0300_box_claude_haiku_5_5"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
