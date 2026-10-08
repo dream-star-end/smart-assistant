@@ -597,3 +597,24 @@ test('a failing preflight still fails; the nightly advisory never turns a refusa
     fx.cleanup()
   }
 })
+
+test('a gh that hangs and ignores TERM cannot hold up the preflight (hard kill after the timeout)', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  const bin = path.join(path.dirname(String(fx.env.OC_V5_RELEASE_QUEUE_DB)), 'hang-bin')
+  spawnSync('mkdir', ['-p', bin])
+  writeFileSync(path.join(bin, 'gh'), "#!/usr/bin/env bash\ntrap '' TERM\nsleep 60\n")
+  chmodSync(path.join(bin, 'gh'), 0o755)
+  try {
+    const started = Date.now()
+    const r = runPreflight(
+      { ...fx.env, PATH: `${bin}:${fx.env.PATH}`, OC_V5_PREFLIGHT_NIGHTLY: '1', OC_V5_PREFLIGHT_NIGHTLY_TIMEOUT: '1', OC_V5_PREFLIGHT_NIGHTLY_KILL_AFTER: '1' },
+      ['--rollback'],
+    )
+    assert.equal(r.status, 0, r.stderr)
+    assert.ok(Date.now() - started < 15_000, `took ${Date.now() - started}ms`)
+    assert.doesNotMatch(r.stderr, /integ nightly/)
+  } finally {
+    fx.cleanup()
+  }
+})

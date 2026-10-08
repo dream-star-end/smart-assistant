@@ -81,11 +81,12 @@ fi
 # 只提示、不阻断:integ nightly 连续红(2026-10-08 devflow-opt)。
 # nightly 梯队的 integ 只在 v5-integ-nightly.yml 跑,PR CI 不覆盖;它曾连续红 39/40 次没人看见。
 # 预检通过后让发车人看见它。查询失败/超时一律静默跳过,不影响发车;OC_V5_PREFLIGHT_NIGHTLY=0 关闭。
+# 每次 gh 调用硬上限 15s(TERM 后 2s 再 KILL),并关掉交互提示/分页,保证不会挂住发车。
 nightly_advisory() {
   [[ "${OC_V5_PREFLIGHT_NIGHTLY:-1}" == 1 ]] || return 0
   command -v gh >/dev/null 2>&1 || return 0
   local rows red=0 total=0 first="" latest_id="" latest_at="" c id at shards streak
-  rows="$(cd "$SCRIPT_DIR/.." && timeout 15 gh run list --workflow v5-integ-nightly.yml --limit 30 \
+  rows="$(cd "$SCRIPT_DIR/.." && GH_PROMPT_DISABLED=1 GH_PAGER=cat timeout --kill-after="${OC_V5_PREFLIGHT_NIGHTLY_KILL_AFTER:-2}" "${OC_V5_PREFLIGHT_NIGHTLY_TIMEOUT:-15}" gh run list --workflow v5-integ-nightly.yml --limit 30 \
     --json conclusion,createdAt,databaseId \
     --jq '.[] | select((.conclusion // "") != "") | "\(.conclusion) \(.databaseId) \(.createdAt)"' 2>/dev/null)" || return 0
   while read -r c id at; do
@@ -99,7 +100,7 @@ nightly_advisory() {
   (( red > 0 )) || return 0
   streak="$red"
   (( red == total && total >= 30 )) && streak="≥$red"   # 只查了最近 30 次,全红时真实连红更长
-  shards="$(cd "$SCRIPT_DIR/.." && timeout 15 gh api "repos/{owner}/{repo}/actions/runs/$latest_id/jobs" \
+  shards="$(cd "$SCRIPT_DIR/.." && GH_PROMPT_DISABLED=1 GH_PAGER=cat timeout --kill-after="${OC_V5_PREFLIGHT_NIGHTLY_KILL_AFTER:-2}" "${OC_V5_PREFLIGHT_NIGHTLY_TIMEOUT:-15}" gh api "repos/{owner}/{repo}/actions/runs/$latest_id/jobs" \
     --jq '[.jobs[] | select(.conclusion == "failure") | .name] | join(", ")' 2>/dev/null || true)"
   echo "  ⚠ 提示(不阻断):integ nightly 已连续 $streak 次红(最早 ${first%%T*},最近 ${latest_at%%T*} run $latest_id;红分片:${shards:-?})。" >&2
   echo "    这些 integ 只在 nightly 跑、PR CI 不覆盖;发车前确认本次改动没碰到它们:gh run view $latest_id --log-failed" >&2
