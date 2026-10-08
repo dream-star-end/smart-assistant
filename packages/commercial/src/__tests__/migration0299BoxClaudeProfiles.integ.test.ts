@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { generatePersona } from "../account-pool/persona.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 import { BoxProfileSelectionError, listBoxProfiles, recordBoxDiscovery, setBoxProfileSelection, boxProfilesAvailable,
   writeBoxProfileHealth, type BoxDiscoveredProfile } from "../http/proxy/boxClaudeProfileStore.js";
 
@@ -106,13 +106,13 @@ describe("0299 box_claude_profiles", () => {
   test("the rollback block removes the table and its ledger row, and the migration applies again", { timeout: 240000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0299");
-    assert.deepEqual((await runMigrations()).applied, ["0299_commercial_box_claude_profiles"]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0301") })).applied, ["0299_commercial_box_claude_profiles"]);
     await query(await rollbackBlock());
     assert.equal((await query("SELECT to_regclass('public.box_claude_profiles') AS t")).rows[0]!.t, null);
     assert.equal((await query("SELECT 1 FROM schema_migrations WHERE version='0299_commercial_box_claude_profiles'")).rowCount, 0);
     assert.deepEqual(await listBoxProfiles([1n]), [], "reads degrade to no rows when the table is gone");
     assert.equal(await boxProfilesAvailable(), false);
-    assert.deepEqual((await runMigrations()).applied, ["0299_commercial_box_claude_profiles"]);
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0301") })).applied, ["0299_commercial_box_claude_profiles"]);
     assert.equal(await boxProfilesAvailable(), true);
   });
 });
