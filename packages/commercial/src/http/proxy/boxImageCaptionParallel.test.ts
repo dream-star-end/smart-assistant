@@ -65,3 +65,13 @@ test("the caption joins a result whose matching image is not its first image", a
     { content: Array<{ type: string; text?: string }> };
   assert.equal(folded.content.at(-1)?.text, caption(2430, 1131, 2000, 931));
 });
+
+test("a matching image followed by another image in the same result stays rejected", async () => {
+  const small = await jpeg(1215, 566);
+  const shown = await jpeg(2000, 931);
+  const body = turn([small, small, shown, small, small], [text(caption(2430, 1131, 2000, 931))]) as unknown as
+    { messages: Array<{ content: Array<{ tool_use_id?: string; content?: unknown[] }> }> };
+  const owner = body.messages.at(-1)!.content.find((part) => part.tool_use_id === IDS[2])!;
+  owner.content = [...owner.content!, { type: "image", source: { type: "base64", media_type: "image/jpeg", data: small } }];
+  assert.notEqual(kind(body as unknown as ProxyBody), "continuation_candidate");
+});
