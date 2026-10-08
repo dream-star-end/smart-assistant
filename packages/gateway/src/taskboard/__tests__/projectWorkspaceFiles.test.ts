@@ -3,12 +3,13 @@
  * Run: npx tsx --test packages/gateway/src/taskboard/__tests__/projectWorkspaceFiles.test.ts
  */
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import {
+  PROJECT_WORKSPACE_FILE_MAX_BYTES,
   PROJECT_WORKSPACE_LIST_MAX,
   listProjectWorkspaceDir,
   openProjectWorkspaceFile,
@@ -63,6 +64,7 @@ describe('project workspace files', () => {
     // A link that resolves back inside the root is fine.
     const back = await openProjectWorkspaceFile(root, 'up/root/README.md')
     assert.ok(back.ok)
+    await back.handle.close()
   })
 
   test('opens a file inside the root; a folder or a missing file is not a file', async () => {
@@ -71,6 +73,8 @@ describe('project workspace files', () => {
     assert.ok(ok.ok)
     assert.equal(ok.name, 'plan.md')
     assert.equal(ok.size, 4)
+    assert.equal((await ok.handle.readFile('utf8')), 'plan')
+    await ok.handle.close()
     assert.deepEqual(await openProjectWorkspaceFile(root, 'docs'), { ok: false, error: 'not_file' })
     assert.deepEqual(await openProjectWorkspaceFile(root, 'nope.md'), { ok: false, error: 'not_found' })
     assert.deepEqual(await openProjectWorkspaceFile(root, ''), { ok: false, error: 'invalid_path' })
@@ -85,12 +89,38 @@ describe('project workspace files', () => {
     assert.equal(r.entries.length, PROJECT_WORKSPACE_LIST_MAX)
   })
 
-  test('a default-workspace project has a folder only when the default workspace is configured', () => {
+  test('files over the proxy limit are refused', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-wsfiles-big-'))
+    writeFileSync(join(root, 'big.bin'), Buffer.alloc(PROJECT_WORKSPACE_FILE_MAX_BYTES + 1))
+    writeFileSync(join(root, 'edge.bin'), Buffer.alloc(PROJECT_WORKSPACE_FILE_MAX_BYTES))
+    assert.deepEqual(await openProjectWorkspaceFile(root, 'big.bin'), { ok: false, error: 'too_large' })
+    const edge = await openProjectWorkspaceFile(root, 'edge.bin')
+    assert.ok(edge.ok)
+    await edge.handle.close()
+  })
+
+  test('the checked descriptor is what gets read, even if the path is swapped afterwards', async () => {
+    const { root, base } = tree()
+    const opened = await openProjectWorkspaceFile(root, 'README.md')
+    assert.ok(opened.ok)
+    rmSync(join(root, 'README.md'))
+    symlinkSync(join(base, 'secret.txt'), join(root, 'README.md'))
+    assert.equal(await opened.handle.readFile('utf8'), '# hi')
+    await opened.handle.close()
+    // A symlink at open time is refused outright.
+    assert.deepEqual(await openProjectWorkspaceFile(root, 'README.md'), { ok: false, error: 'invalid_path' })
+  })
+
+  test('a default-workspace project has a folder only when the default workspace is configured and exists', () => {
     const ws = mkdtempSync(join(tmpdir(), 'oc-wsfiles-default-'))
     assert.deepEqual(resolveProjectWorkspaceRoot({ id: ID, workspaceSpec: { kind: 'default' } }, {}), {
       ok: false,
       error: 'no_workspace',
     })
+    assert.deepEqual(
+      resolveProjectWorkspaceRoot({ id: ID, workspaceSpec: { kind: 'default' } }, { OPENCLAUDE_DEFAULT_WORKSPACE: join(ws, 'missing') }),
+      { ok: false, error: 'no_workspace' },
+    )
     const r = resolveProjectWorkspaceRoot({ id: ID, workspaceSpec: null }, { OPENCLAUDE_DEFAULT_WORKSPACE: ws })
     assert.deepEqual(r, { ok: true, root: ws, kind: 'default' })
   })

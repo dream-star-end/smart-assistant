@@ -1,10 +1,13 @@
 import { ChevronRight, Download, File as FileIcon, Folder, FolderOpen, Link2, Pin } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AuthEpochStaleError, api } from "../../lib/api";
 import { formatBytes, saveBlob } from "../../lib/chat/download";
 import type { ProjectWorkspaceListing } from "../../lib/taskboard";
 import type { AuthSession } from "../../lib/types";
 import { Alert, Button, Card, EmptyState, IconButton, Skeleton, TimeAgo, useToast } from "../ui";
+
+/** 与容器接口一致：经主服务代理最多带回 2 MB。 */
+const FOLDER_DOWNLOAD_MAX_BYTES = 2 * 1024 * 1024;
 
 /**
  * 项目文件夹（只读）：本项目会话干活的那个目录。可以逐级浏览、下载文件、把文件「加入常用」
@@ -27,8 +30,6 @@ export function ProjectFolderBrowser({
   const [listing, setListing] = useState<ProjectWorkspaceListing | null>(null);
   const [error, setError] = useState<"none" | "load" | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const authRef = useRef(authSession);
-  authRef.current = authSession;
 
   const load = useCallback(
     async (next: string) => {
@@ -74,14 +75,18 @@ export function ProjectFolderBrowser({
 
   const pin = async (name: string) => {
     const rel = childPath(name);
-    const started = authSession;
+    // The file belongs to the account that clicked. A logout or account switch
+    // reuses the same AuthSession object and bumps its epoch, so every step
+    // checks the epoch it started with (uploadFile pins it too).
+    const startEpoch = authSession.snapshot().epoch;
+    const switched = () => authSession.snapshot().epoch !== startEpoch;
     setBusy(rel);
     try {
       const blob = await fetchFile(rel);
-      if (authRef.current !== started) return;
-      const stored = await api.uploadFile(started, new File([blob], name, { type: blob.type }));
-      if (authRef.current !== started) return;
-      const asset = await api.createProjectAsset(started, {
+      if (switched()) return;
+      const stored = await api.uploadFile(authSession, new File([blob], name, { type: blob.type }));
+      if (switched()) return;
+      const asset = await api.createProjectAsset(authSession, {
         projectId: chatProjectId,
         source: "upload",
         name,
@@ -90,7 +95,8 @@ export function ProjectFolderBrowser({
         size: stored.size ?? blob.size,
         digest: stored.digest,
       });
-      await api.patchProjectAsset(started, asset.id, { pinned: true });
+      if (switched()) return;
+      await api.patchProjectAsset(authSession, asset.id, { pinned: true });
       toast(`已把「${name}」加入常用`, "success");
       onPinned?.();
     } catch (e) {
@@ -177,7 +183,10 @@ export function ProjectFolderBrowser({
                         <span className="min-w-0 truncate text-body">{e.name}</span>
                       </span>
                     )}
-                    {e.type === "file" && (
+                    {e.type === "file" && (e.size ?? 0) > FOLDER_DOWNLOAD_MAX_BYTES && (
+                      <span className="shrink-0 text-caption text-faint">{formatBytes(e.size)}，超过 2 MB 不能在这里下载</span>
+                    )}
+                    {e.type === "file" && (e.size ?? 0) <= FOLDER_DOWNLOAD_MAX_BYTES && (
                       <>
                         <span className="hidden shrink-0 text-caption text-faint sm:inline">{formatBytes(e.size)}</span>
                         {e.mtime != null && (

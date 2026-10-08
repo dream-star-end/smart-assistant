@@ -8,12 +8,14 @@
  * whose default workspace is not configured has no folder to show (the
  * fallback cwd is the gateway process directory, not the user's files).
  */
-import { lstat, readdir, realpath, stat } from 'node:fs/promises'
+import { constants, existsSync, realpathSync } from 'node:fs'
+import { type FileHandle, lstat, open, readdir, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { parseProjectWorkspace, resolveProjectCwd, type ProjectWorkspace } from '@openclaude/storage'
 
 export const PROJECT_WORKSPACE_LIST_MAX = 500
-export const PROJECT_WORKSPACE_FILE_MAX_BYTES = 50 * 1024 * 1024
+/** The master's container proxy carries at most 2 MiB of response body. */
+export const PROJECT_WORKSPACE_FILE_MAX_BYTES = 2 * 1024 * 1024
 
 export interface ProjectWorkspaceEntry {
   name: string
@@ -35,16 +37,29 @@ export type ProjectWorkspaceRootResult =
   | { ok: false; error: 'no_workspace' }
 
 export function resolveProjectWorkspaceRoot(
-  project: { id: string; workspaceSpec?: ProjectWorkspace | null; workspace?: string | null },
+  project: { id: string; workspaceSpec?: unknown; workspace?: string | null },
   env: NodeJS.ProcessEnv = process.env,
 ): ProjectWorkspaceRootResult {
-  const spec =
-    project.workspaceSpec ?? parseProjectWorkspace(project.workspace) ?? { kind: 'default' as const }
-  if (spec.kind === 'default' && !env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()) {
-    return { ok: false, error: 'no_workspace' }
-  }
+  // Same normalisation the turn uses (projectWorkspace.ts defaultGetBoardProject).
+  const spec: ProjectWorkspace =
+    parseProjectWorkspace(project.workspaceSpec ?? project.workspace) ?? { kind: 'default' }
   const cwd = resolveProjectCwd(spec, project.id, env)
   if (!cwd.ok) return { ok: false, error: 'no_workspace' }
+  if (spec.kind === 'default') {
+    // resolveProjectCwd falls back to the process cwd when the default
+    // workspace is unset or missing; that is never shown.
+    const ws = env.OPENCLAUDE_DEFAULT_WORKSPACE?.trim()
+    if (!ws || !existsSync(ws)) return { ok: false, error: 'no_workspace' }
+    let wsReal: string
+    let cwdReal: string
+    try {
+      wsReal = realpathSync(ws)
+      cwdReal = realpathSync(cwd.cwd)
+    } catch {
+      return { ok: false, error: 'no_workspace' }
+    }
+    if (wsReal !== cwdReal) return { ok: false, error: 'no_workspace' }
+  }
   return { ok: true, root: cwd.cwd, kind: spec.kind }
 }
 
@@ -108,19 +123,42 @@ export async function listProjectWorkspaceDir(
   return { ok: true, path: target.rel, entries, truncated }
 }
 
+/**
+ * Open one file for download. The file is opened first and the open
+ * descriptor is checked (its real path must still be inside the root, and it
+ * must be a regular file), so swapping the path for a symlink between the
+ * check and the read cannot point the read elsewhere. The caller closes the
+ * handle.
+ */
 export async function openProjectWorkspaceFile(
   root: string,
   rel: string,
-): Promise<{ ok: true; abs: string; name: string; size: number } | { ok: false; error: ProjectWorkspacePathError }> {
+): Promise<
+  | { ok: true; handle: FileHandle; name: string; size: number }
+  | { ok: false; error: ProjectWorkspacePathError }
+> {
   if (!rel) return { ok: false, error: 'invalid_path' }
   const target = await resolveInside(root, rel)
   if (!target.ok) return target
+  let handle: FileHandle
   try {
-    const st = await stat(target.abs)
-    if (!st.isFile()) return { ok: false, error: 'not_file' }
-    if (st.size > PROJECT_WORKSPACE_FILE_MAX_BYTES) return { ok: false, error: 'too_large' }
-    return { ok: true, abs: target.abs, name: target.rel.split('/').pop() || 'file', size: st.size }
+    handle = await open(target.abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   } catch {
     return { ok: false, error: 'not_found' }
+  }
+  const fail = async (error: ProjectWorkspacePathError) => {
+    await handle.close().catch(() => {})
+    return { ok: false as const, error }
+  }
+  try {
+    const rootReal = await realpath(root)
+    const opened = await realpath(`/proc/self/fd/${handle.fd}`)
+    if (!opened.startsWith(rootReal + sep)) return await fail('invalid_path')
+    const st = await handle.stat()
+    if (!st.isFile()) return await fail('not_file')
+    if (st.size > PROJECT_WORKSPACE_FILE_MAX_BYTES) return await fail('too_large')
+    return { ok: true, handle, name: opened.split(sep).pop() || 'file', size: st.size }
+  } catch {
+    return await fail('not_found')
   }
 }

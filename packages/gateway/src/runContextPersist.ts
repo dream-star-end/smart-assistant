@@ -69,6 +69,29 @@ export function webchatRunId(peerId: string, turnTraceId: string): string {
   return `webchat:${peerId}:${turnTraceId}`
 }
 
+/**
+ * A later turn of a live session brings a new descriptor. Engines keep the
+ * descriptor object they were built with and persist snapshots from it, so
+ * replacing the session's reference would leave them on the first turn's run
+ * id. When the run still targets the same project and session, carry the new
+ * run id into the object they hold; otherwise take the new descriptor.
+ */
+export function adoptRunContext(
+  current: RunContextDescriptor | undefined,
+  next: RunContextDescriptor,
+): RunContextDescriptor {
+  if (
+    current &&
+    current.boardProjectId === next.boardProjectId &&
+    current.sessionKey === next.sessionKey &&
+    current.channel === next.channel
+  ) {
+    current.runId = next.runId
+    return current
+  }
+  return next
+}
+
 export async function persistRunContextSnapshot(
   input: PersistRunContextInput,
 ): Promise<PersistRunContextResult> {

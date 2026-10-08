@@ -158,6 +158,7 @@ import { emptyCompletedTurnAssistantText, shouldFailClosedEmptyModelTurn } from 
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
+import { adoptRunContext } from './runContextPersist.js'
 import {
   deriveLosslessTurnKey,
   getV3MasterSinkOrNull,
@@ -4318,7 +4319,7 @@ export class SessionManager {
           existing.parentSessionKey = opts.parentSessionKey
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
         if (nextFingerprint) existing.contextFingerprint = nextFingerprint
-        if (opts.runContext) existing.runContext = opts.runContext
+        if (opts.runContext) existing.runContext = adoptRunContext(existing.runContext, opts.runContext)
         existing._identityCreationOpts = identityCreationOpts
         return existing
       }

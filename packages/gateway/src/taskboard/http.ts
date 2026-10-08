@@ -980,7 +980,6 @@ async function handleProjectWorkspace(
   }
   const opened = await openProjectWorkspaceFile(root.root, rel)
   if (!opened.ok) return sendError(res, WORKSPACE_ERROR_STATUS[opened.error] ?? 400, opened.error)
-  const { createReadStream } = await import('node:fs')
   // Always a download, never rendered in the app origin.
   res.writeHead(200, {
     'content-type': 'application/octet-stream',
@@ -989,7 +988,13 @@ async function handleProjectWorkspace(
     'x-content-type-options': 'nosniff',
     'cache-control': 'no-store',
   })
-  const stream = createReadStream(opened.abs)
+  if (opened.size === 0) {
+    await opened.handle.close().catch(() => {})
+    res.end()
+    return
+  }
+  // Stream from the descriptor that was checked, not from the path again.
+  const stream = opened.handle.createReadStream({ end: opened.size - 1 })
   stream.on('error', () => res.destroy())
   stream.pipe(res)
 }

@@ -76,6 +76,37 @@ describe("ProjectFolderBrowser", () => {
     expect(patch).toHaveBeenCalledWith(expect.anything(), "a1", { pinned: true });
   });
 
+  it("加入常用：取回文件后账号已切换就停下，不上传", async () => {
+    listProjectWorkspace.mockResolvedValue(ROOT);
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    fetchProjectWorkspaceFile.mockImplementation(async () => {
+      auth.beginIdentity();
+      return new Blob(["x"]);
+    });
+    const upload = vi.spyOn(api, "uploadFile");
+    render(
+      <ToastProvider>
+        <TooltipProvider>
+          <ProjectFolderBrowser chatProjectId="p1" boardProjectId={BOARD} authSession={auth} />
+        </TooltipProvider>
+      </ToastProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "把 README.md 加入常用" }));
+    await waitFor(() => expect(fetchProjectWorkspaceFile).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 20));
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it("超过 2 MB 的文件不给下载和加入常用", async () => {
+    listProjectWorkspace.mockResolvedValue({
+      ...ROOT,
+      entries: [{ name: "big.zip", type: "file", size: 3 * 1024 * 1024, mtime: 1 }],
+    });
+    renderBrowser();
+    expect(await screen.findByText(/超过 2 MB/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "下载 big.zip" })).toBeNull();
+  });
+
   it("没有自己的文件夹（404）时给出说明而不是报错", async () => {
     listProjectWorkspace.mockRejectedValue(Object.assign(new Error("no_workspace"), { status: 404 }));
     renderBrowser();

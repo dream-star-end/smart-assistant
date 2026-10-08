@@ -12,7 +12,8 @@ const home = mkdtempSync(join(tmpdir(), 'oc-persist-rc-'))
 process.env.OPENCLAUDE_HOME = home
 process.env.OC_PROJECT_CONTEXT = '1'
 
-const { persistRunContextSnapshot, createRunContextDescriptor, webchatRunId, readProjectRunContextFile } = await import('../runContextPersist.js')
+const { persistRunContextSnapshot, createRunContextDescriptor, webchatRunId, readProjectRunContextFile, adoptRunContext } =
+  await import('../runContextPersist.js')
 const { getTaskboardDb } = await import('../taskboard/db/index.js')
 const { createProject } = await import('../taskboard/db/projects.js')
 const { createTicket } = await import('../taskboard/db/tickets.js')
@@ -162,6 +163,28 @@ describe('persistRunContextSnapshot', () => {
 })
 
 describe('webchat run ids', () => {
+  it('a later turn moves the run id into the descriptor the engine already holds', () => {
+    const base = {
+      boardProjectId: '22222222-2222-4222-8222-222222222222',
+      channel: 'webchat',
+      agentId: 'main',
+      sessionKey: 'agent:main:webchat:dm:wsess-0123456789abcdef',
+      persistSnapshot: true,
+    }
+    const held = createRunContextDescriptor({ ...base, runId: 'webchat:wsess-0123456789abcdef:trace-a' })
+    const engineView = held
+    const next = createRunContextDescriptor({ ...base, runId: 'webchat:wsess-0123456789abcdef:trace-b' })
+    const adopted = adoptRunContext(held, next)
+    assert.equal(adopted, held)
+    assert.equal(engineView.runId, 'webchat:wsess-0123456789abcdef:trace-b')
+    // Another project: the new descriptor is taken as is, the old one untouched.
+    const other = createRunContextDescriptor({ ...base, boardProjectId: '33333333-3333-4333-8333-333333333333', runId: 'x' })
+    assert.equal(adoptRunContext(held, other), other)
+    assert.equal(held.runId, 'webchat:wsess-0123456789abcdef:trace-b')
+    assert.equal(adoptRunContext(undefined, next), next)
+  })
+
+
   it('two turns of one chat keep two snapshots instead of overwriting one', async () => {
     const board = '22222222-2222-4222-8222-222222222222'
     const ids = [webchatRunId('wsess-0123456789abcdef', 'trace-a'), webchatRunId('wsess-0123456789abcdef', 'trace-b')]
