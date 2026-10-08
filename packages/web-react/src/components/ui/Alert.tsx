@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "../../lib/utils";
 import { IconButton } from "./IconButton";
+import { StatusDot, useQuiet } from "./Quiet";
 
 /**
  * 行内提示横幅。语义色 info / success / warning / danger,可选 icon 与 title。
@@ -85,6 +86,7 @@ export function Alert({
   children,
   ...props
 }: AlertProps) {
+  const quiet = useQuiet();
   const hasTrailing = Boolean(action || onDismiss);
   const liveLevel = live ?? alertLiveFor(tone);
   const role = liveLevel === "off" ? undefined : liveLevel === "assertive" ? "alert" : "status";
@@ -95,12 +97,26 @@ export function Alert({
         alertVariants({ tone, density }),
         // 仅在有尾槽时才开启换行:无尾槽的存量调用渲染结果保持一字不差。
         hasTrailing && "flex-wrap items-start",
+        // 安静表面(管理中心):不画彩色描边框。中性下沉底 + 状态圆点;无标题的警告 / 错误
+        // 正文取语义色,其余用前景色 —— 颜色只承载「这是问题」这一件事。
+        quiet && "items-start gap-2.5 rounded-[10px] border-transparent bg-hover",
         className,
       )}
       {...props}
     >
-      {icon && <span className={cn("mt-0.5 shrink-0", iconTone[tone ?? "info"])}>{icon}</span>}
-      <div className={cn("min-w-0 flex-1 text-fg", hasTrailing && "basis-48")}>
+      {quiet ? (
+        <StatusDot tone={tone ?? "info"} className="mt-[7px]" />
+      ) : (
+        icon && <span className={cn("mt-0.5 shrink-0", iconTone[tone ?? "info"])}>{icon}</span>
+      )}
+      <div
+        className={cn(
+          "min-w-0 flex-1 text-fg",
+          hasTrailing && "basis-48",
+          quiet && !title && tone === "danger" && "text-danger",
+          quiet && !title && tone === "warning" && "text-warning",
+        )}
+      >
         {title && <div className="font-semibold">{title}</div>}
         {children && <div className={cn(title && "mt-0.5 text-muted")}>{children}</div>}
         {requestId && (

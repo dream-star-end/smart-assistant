@@ -1,9 +1,7 @@
 import {
   CalendarCheck,
-  CheckCircle2,
   ChevronRight,
   Clock,
-  PauseCircle,
   Pencil,
   Plus,
   RotateCcw,
@@ -41,7 +39,10 @@ import {
   Field,
   IconButton,
   Input,
+  ListGroup,
+  ListRow,
   ListSkeleton,
+  MetaLine,
   PanelHeader,
   Select,
   Switch,
@@ -161,13 +162,10 @@ function jobStatus(job: CronJob): JobStatus {
 }
 
 const STATUS_META = {
-  active: { label: "启用中", tone: "success", icon: Clock, chip: "bg-success-soft text-success" },
-  paused: { label: "已停用", tone: "neutral", icon: PauseCircle, chip: "bg-hover text-faint" },
-  done: { label: "已完成", tone: "accent", icon: CheckCircle2, chip: "bg-accent-soft text-accent" },
-} as const satisfies Record<
-  JobStatus,
-  { label: string; tone: "success" | "neutral" | "accent"; icon: typeof Clock; chip: string }
->;
+  active: { label: "启用中", tone: "success" },
+  paused: { label: "已停用", tone: "neutral" },
+  done: { label: "已完成", tone: "accent" },
+} as const satisfies Record<JobStatus, { label: string; tone: "success" | "neutral" | "accent" }>;
 
 function jobTitle(job: CronJob): string {
   return job.label || job.prompt || "未命名任务";
@@ -492,7 +490,6 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const renderJob = (job: CronJob) => {
     const status = jobStatus(job);
     const meta = STATUS_META[status];
-    const StatusIcon = meta.icon;
     const title = jobTitle(job);
     const name = shortTitle(title);
     const rowBusy = pending.includes(job.id);
@@ -500,140 +497,144 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
     // 翻得出中文就只显示中文，裸 cron 收进 Tooltip；翻不出来时原串本身才是唯一信息。
     const translated = !!human && human !== job.schedule;
     return (
-      <li key={job.id}>
-        <Card
-          padding="none"
-          tone={status === "active" ? "default" : "sunken"}
-          className={cn("overflow-hidden", job.id === highlightId && "animate-in")}
-        >
-          <div className="flex flex-wrap items-start gap-x-3 gap-y-2 px-3.5 py-3">
-            <span
-              aria-hidden="true"
-              className={cn(
-                "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg",
-                meta.chip,
-              )}
-            >
-              <StatusIcon size={15} />
-            </span>
-            <div className="flex min-w-0 flex-1 basis-48 flex-col gap-1">
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="truncate text-section font-medium text-fg">{title}</span>
-                <Badge tone={meta.tone} size="sm">
-                  {meta.label}
-                </Badge>
-              </div>
-              {/* 二级：这个任务什么时候跑 —— 一眼要看到的就这一行。 */}
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-meta text-fg">
-                {human &&
-                  (translated ? (
-                    // 触发器必须可聚焦、原始表达式必须进可访问名：Tooltip 只对鼠标悬停开口，
-                    // 键盘用户靠焦点触发，读屏用户直接从 aria-label 里听到 cron 原串。
-                    <Tooltip content={`Cron：${job.schedule}`}>
-                      <span
-                        // role=note:可聚焦却无角色的 span 读屏只念一段文字、不知道这是什么
-                        //(t-762 manage#3);note 表明它是附注而非可操作控件。触屏补 44px 命中高。
-                        role="note"
-                        // biome-ignore lint/a11y/noNoninteractiveTabindex: Tooltip 触发器需可聚焦（WCAG 1.4.13）
-                        tabIndex={0}
-                        aria-label={`${human}，Cron 表达式 ${job.schedule}`}
-                        className="inline-flex cursor-default items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-                      >
-                        {human}
-                      </span>
-                    </Tooltip>
-                  ) : (
-                    <code className="font-mono">{human}</code>
-                  ))}
-                {status === "active" ? <NextRunMeta nextRunAt={job.nextRunAt} /> : null}
-              </div>
-              {/* 三级：属性与历史。 */}
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-faint">
-                {job.oneshot && status !== "done" && <Badge size="sm">一次性</Badge>}
-                {job.heartbeat && (
-                  <Badge size="sm" tone="neutral">
-                    心跳探针
-                  </Badge>
+      // 安静表面(OCV5-344 第 3 轮):一行 = 标题 + 状态(圆点 + 文字)/ 排程 / 指令摘要 / 元信息,
+      // 不再有每张卡左上角的状态图标方块;停用 / 已完成的行标题降为弱化色,不另换底色。
+      <ListRow key={job.id} className={cn("px-0 py-0", job.id === highlightId && "animate-in")}>
+        <div className="flex flex-wrap items-start gap-x-4 gap-y-2.5 px-4 py-3">
+          <div className="flex min-w-0 flex-1 basis-56 flex-col gap-0.5">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span
+                className={cn(
+                  "truncate text-[14px] font-medium leading-5",
+                  status === "active" ? "text-fg" : "text-muted",
                 )}
-                {job.resume === "origin-session" && (
-                  <Badge size="sm" tone="accent">
-                    续跑本对话
-                  </Badge>
-                )}
-                {job.deliver && (
-                  <Badge size="sm" tone="accent">
-                    {deliverLabel(job.deliver)}
-                  </Badge>
-                )}
-                {job.lastRunAt ? (
-                  <span>
-                    上次 <TimeAgo value={job.lastRunAt} />
-                  </span>
-                ) : (
-                  <span>尚未执行过</span>
-                )}
-              </div>
-              {job.label && job.prompt && job.prompt !== job.label && (
-                <p className="line-clamp-2 text-meta text-muted">{job.prompt}</p>
-              )}
+              >
+                {title}
+              </span>
+              <Badge tone={meta.tone} size="sm">
+                {meta.label}
+              </Badge>
             </div>
-            <div className="flex shrink-0 items-center gap-2 max-sm:w-full max-sm:justify-end">
-              {status === "done" ? (
-                // 已完成的一次性任务：把开关拨回去毫无意义（那个时刻已经过去），
-                // 给一条真出口 —— 打开编辑表单并切到「某时一次」，选个新时间即可重跑。
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => startEdit(job, { mode: "once", at: "" })}
-                >
-                  <RotateCcw size={13} />
-                  再跑一次
-                </Button>
+            {/* 二级：这个任务什么时候跑 —— 一眼要看到的就这一行。 */}
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-body tabular-nums text-fg">
+              {human &&
+                (translated ? (
+                  // 触发器必须可聚焦、原始表达式必须进可访问名：Tooltip 只对鼠标悬停开口，
+                  // 键盘用户靠焦点触发，读屏用户直接从 aria-label 里听到 cron 原串。
+                  <Tooltip content={`Cron：${job.schedule}`}>
+                    <span
+                      // role=note:可聚焦却无角色的 span 读屏只念一段文字、不知道这是什么
+                      //(t-762 manage#3);note 表明它是附注而非可操作控件。触屏补 44px 命中高。
+                      role="note"
+                      // biome-ignore lint/a11y/noNoninteractiveTabindex: Tooltip 触发器需可聚焦（WCAG 1.4.13）
+                      tabIndex={0}
+                      aria-label={`${human}，Cron 表达式 ${job.schedule}`}
+                      className="inline-flex cursor-default items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:-my-3 [@media(hover:none)]:min-h-11"
+                    >
+                      {human}
+                    </span>
+                  </Tooltip>
+                ) : (
+                  <code className="font-mono text-meta">{human}</code>
+                ))}
+              {status === "active" ? (
+                <span className="text-meta">
+                  <NextRunMeta nextRunAt={job.nextRunAt} />
+                </span>
+              ) : null}
+            </div>
+            {job.label && job.prompt && job.prompt !== job.label && (
+              <p className="mt-0.5 line-clamp-2 max-w-[62ch] text-body text-muted">{job.prompt}</p>
+            )}
+            {/* 三级：属性与历史 —— 一条弱化元信息行,项之间自动「·」分隔。 */}
+            <MetaLine className="mt-1">
+              {job.oneshot && status !== "done" && <Badge size="sm">一次性</Badge>}
+              {job.heartbeat && (
+                <Badge size="sm" tone="neutral">
+                  心跳探针
+                </Badge>
+              )}
+              {job.resume === "origin-session" && (
+                <Badge size="sm" tone="accent">
+                  续跑本对话
+                </Badge>
+              )}
+              {job.deliver && (
+                <Badge size="sm" tone="accent">
+                  {deliverLabel(job.deliver)}
+                </Badge>
+              )}
+              {job.lastRunAt ? (
+                <span>
+                  上次 <TimeAgo value={job.lastRunAt} />
+                </span>
               ) : (
+                <span>尚未执行过</span>
+              )}
+            </MetaLine>
+          </div>
+          {/* 操作簇:桌面贴右、紧凑;窄屏整行落到内容下方、与文字同一左缘(不再右下角三件散落)。 */}
+          <div className="flex shrink-0 items-center gap-1 max-sm:-ml-1.5 max-sm:basis-full">
+            {status === "done" ? (
+              // 已完成的一次性任务：把开关拨回去毫无意义（那个时刻已经过去），
+              // 给一条真出口 —— 打开编辑表单并切到「某时一次」，选个新时间即可重跑。
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-1.5 px-2 font-normal text-muted hover:text-fg"
+                onClick={() => startEdit(job, { mode: "once", at: "" })}
+              >
+                <RotateCcw size={14} strokeWidth={1.75} />
+                再跑一次
+              </Button>
+            ) : (
+              <span className="flex items-center pr-1.5 max-sm:pl-1.5">
                 <Switch
                   checked={status === "active"}
                   disabled={rowBusy}
                   onCheckedChange={() => toggle(job)}
                   aria-label={`启用「${name}」`}
                 />
-              )}
-              <IconButton
-                size="sm"
-                shape="square"
-                variant="muted"
-                aria-label={`编辑「${name}」`}
-                onClick={() => startEdit(job)}
-                className={cn(editingId === job.id && "bg-accent-soft text-accent")}
-              >
-                <Pencil size={14} />
-              </IconButton>
-              <IconButton
-                size="sm"
-                shape="square"
-                variant="danger"
-                aria-label={`删除「${name}」`}
-                disabled={rowBusy}
-                onClick={() => remove(job)}
-              >
-                <Trash2 size={14} />
-              </IconButton>
-            </div>
+              </span>
+            )}
+            <IconButton
+              size="sm"
+              shape="square"
+              variant="muted"
+              aria-label={`编辑「${name}」`}
+              onClick={() => startEdit(job)}
+              className={cn(editingId === job.id && "bg-active text-fg")}
+            >
+              <Pencil size={15} strokeWidth={1.75} />
+            </IconButton>
+            <IconButton
+              size="sm"
+              shape="square"
+              variant="muted"
+              aria-label={`删除「${name}」`}
+              disabled={rowBusy}
+              onClick={() => remove(job)}
+              // 静止弱化;悬停 / 聚焦才转红 —— 红色留给确认框。
+              className="hover:bg-danger-soft hover:text-danger focus-visible:text-danger"
+            >
+              <Trash2 size={15} strokeWidth={1.75} />
+            </IconButton>
           </div>
-          {editingId === job.id && (
-            <div className="border-t border-border">
-              <CronForm
-                key={`edit-${job.id}-${formNonce}`}
-                auth={auth}
-                job={job}
-                seed={editSeed}
-                deliverSelect={deliverSelect}
-                onCancel={() => setEditingId(null)}
-                onSaved={(saved) => saved && handleUpdated(saved)}
-              />
-            </div>
-          )}
-        </Card>
-      </li>
+        </div>
+        {editingId === job.id && (
+          <div className="border-t border-border bg-bg/60">
+            <CronForm
+              key={`edit-${job.id}-${formNonce}`}
+              auth={auth}
+              job={job}
+              seed={editSeed}
+              deliverSelect={deliverSelect}
+              onCancel={() => setEditingId(null)}
+              onSaved={(saved) => saved && handleUpdated(saved)}
+            />
+          </div>
+        )}
+      </ListRow>
     );
   };
 
@@ -646,11 +647,12 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         action={
           cronBlocked ? undefined : (
             <Button
-              variant="secondary"
+              // 空态里已有「创建第一个定时任务」主按钮:页头不再放第二个同权重的黑按钮。
+              variant={creating || total === 0 ? "secondary" : "primary"}
               size="sm"
               onClick={() => (creating ? setCreating(false) : startCreate())}
             >
-              {creating ? <X size={14} /> : <Plus size={14} />}
+              {creating ? <X size={14} strokeWidth={1.75} /> : <Plus size={14} strokeWidth={1.75} />}
               {creating ? "取消" : "新建"}
             </Button>
           )
@@ -671,8 +673,8 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       )}
 
       {!cronBlocked && creating && (
-        <div className="px-4 pb-3">
-          <Card tone="sunken">
+        <div className="px-4 pb-5">
+          <Card tone="sunken" className="border-0">
             <CronForm
               key={`create-${formNonce}`}
               auth={auth}
@@ -711,18 +713,20 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
           title="还没有定时任务"
           hint="到点让智能体自动跑一件事，并把结果推给你。也可以在对话里直接说「每天 9 点推送…」。"
           action={
-            <div className="flex flex-col items-center gap-2.5">
+            <div className="flex flex-col items-start gap-3">
               <Button variant="primary" size="sm" onClick={() => startCreate()}>
-                <Plus size={14} />
+                <Plus size={14} strokeWidth={1.75} />
                 创建第一个定时任务
               </Button>
-              <div className="flex flex-wrap justify-center gap-1.5">
+              {/* 预设:安静的次级按钮,一行排开,与标题同一左缘。 */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="mr-1 text-meta text-faint">或从常用开始</span>
                 {QUICK_PRESETS.map((p) => (
                   <Button
                     key={p.chip}
-                    variant="subtle"
+                    variant="secondary"
                     size="sm"
-                    shape="pill"
+                    className="font-normal"
                     onClick={() => startCreate(p.seed)}
                   >
                     {p.chip}
@@ -736,47 +740,56 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         <>
           {total > 8 && (
             <Toolbar
-              count={filtered.length}
               search={query}
               onSearchChange={setQuery}
               searchPlaceholder="搜索任务标题 / 指令"
               debounceMs={150}
+              sticky={false}
+              // 安静表面:不画吸顶色带与底边线;计数是搜索框右侧的弱化等宽数字。
+              className="border-b-0 bg-transparent px-4 pb-4 pt-0"
+              actions={
+                <span className="text-meta tabular-nums text-faint">{filtered.length} 个任务</span>
+              }
             />
           )}
-          {/* 有工具条时才补上顶部留白;没有时由 PanelHeader 的 py-3 提供节奏。 */}
-          <ul className={cn("flex flex-col gap-2 px-4 pb-4", total > 8 && "pt-3")}>
+          <div className="flex flex-col gap-6 px-4 pb-4">
             {filtered.length === 0 ? (
-              <li className="flex flex-col items-center gap-2 py-8 text-meta text-muted">
-                <span>没有匹配「{query.trim()}」的任务</span>
+              <div className="flex flex-col items-start gap-3 py-2">
+                <p className="text-body text-muted">没有匹配「{query.trim()}」的任务</p>
                 <Button variant="secondary" size="sm" onClick={() => setQuery("")}>
                   清除筛选
                 </Button>
-              </li>
+              </div>
             ) : (
               <>
-                {activeJobs.map(renderJob)}
+                {activeJobs.length > 0 && <ListGroup>{activeJobs.map(renderJob)}</ListGroup>}
                 {restJobs.length > 0 && (
-                  <li>
+                  <section>
+                    {/* 折叠分组的组头即开关:与 GroupHeading 同字号,计数弱化等宽。 */}
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="w-full justify-start gap-1.5 px-2 text-faint"
+                      className="-ml-2 gap-1.5 px-2 text-[14px] font-semibold text-fg"
                       aria-expanded={restOpen}
                       onClick={() => setShowRest((v) => !v)}
                     >
                       <ChevronRight
                         size={14}
+                        strokeWidth={1.75}
                         aria-hidden="true"
-                        className={cn("transition-transform", restOpen && "rotate-90")}
+                        className={cn(
+                          "text-faint transition-transform duration-150 motion-reduce:transition-none",
+                          restOpen && "rotate-90",
+                        )}
                       />
-                      已停用 / 已完成 · {restJobs.length}
+                      已停用 / 已完成 <span className="font-normal tabular-nums text-faint">· {restJobs.length}</span>
                     </Button>
-                  </li>
+                    {restOpen && <ListGroup className="mt-2">{restJobs.map(renderJob)}</ListGroup>}
+                  </section>
                 )}
-                {restOpen && restJobs.map(renderJob)}
               </>
             )}
-          </ul>
+          </div>
         </>
       )}
     </div>

@@ -2,6 +2,8 @@ import type { LucideIcon } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/utils'
 import { Card } from './Card'
+import { useQuiet } from './Quiet'
+import { Skeleton } from './Skeleton'
 
 /**
  * 面板统一头部：标题 + 可选说明 + 可选右侧操作。管理中心/市场各分区共用，
@@ -21,6 +23,25 @@ export function PanelHeader({
   hint?: string
   action?: ReactNode
 }) {
+  const quiet = useQuiet()
+  if (quiet) {
+    // 安静表面:分区标题就是页面标题 —— 22/30 半粗 + 一行 13px 说明,下方 24px 后接内容。
+    // 标题里的「（8）」这类计数由调用方写在 title 里时原样保留;新代码请用 GroupHeading 的 count。
+    return (
+      <div
+        data-panel-header=""
+        className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 px-4 pb-5 pt-2 md:pt-1"
+      >
+        <div className="min-w-0 flex-1 basis-64">
+          <h3 className="text-[22px] font-semibold leading-[30px] tracking-[-0.01em] text-fg">
+            {title}
+          </h3>
+          {hint && <p className="mt-1 max-w-[60ch] text-body text-muted">{hint}</p>}
+        </div>
+        {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
+      </div>
+    )
+  }
   return (
     // data-panel-header:给外壳按作用域调排版的钩子(管理中心把它当页面标题),本身不带样式。
     <div data-panel-header="" className="flex items-start justify-between gap-3 px-4 py-3">
@@ -60,6 +81,16 @@ export function Panel({
   className?: string
   bodyClassName?: string
 }) {
+  const quiet = useQuiet()
+  if (quiet) {
+    return (
+      <section className={className}>
+        <PanelHeader title={title} hint={hint} action={action} />
+        <div className={cn('px-4 pb-4', bodyClassName)}>{children}</div>
+        {footer && <div className="border-t border-border px-4 py-3">{footer}</div>}
+      </section>
+    )
+  }
   return (
     <Card className={className}>
       <PanelHeader title={title} hint={hint} action={action} />
@@ -86,6 +117,35 @@ export function EmptyState({
   hint?: string
   action?: ReactNode
 }) {
+  const quiet = useQuiet()
+  if (quiet) {
+    // 安静表面的空态:不放「图标方块 + 一句话」的模板。上面两条淡化的骨架行预告
+    // 「这里将出现什么」,下面左对齐的标题 + 说明 + 行动按钮,与列表行同一条左缘。
+    // icon 参数保留(调用方契约不变),此形态下不渲染。
+    return (
+      <div data-empty-state="" className="px-4 py-2">
+        <div
+          aria-hidden="true"
+          className="oc-empty-ghost overflow-hidden rounded-[10px] border border-dashed border-border"
+        >
+          {[
+            ['w-2/5', 'w-3/5'],
+            ['w-1/3', 'w-1/2'],
+          ].map(([a, b]) => (
+            <div key={a} className="flex flex-col gap-2 px-4 py-3.5">
+              <Skeleton className={`h-2.5 ${a} rounded-full`} />
+              <Skeleton className={`h-2 ${b} rounded-full opacity-70`} />
+            </div>
+          ))}
+        </div>
+        <div className="pt-5">
+          <p className="text-[14px] font-semibold leading-5 text-fg">{title}</p>
+          {hint && <p className="mt-1 max-w-[46ch] text-body text-muted">{hint}</p>}
+          {action && <div className="mt-4 flex flex-wrap items-center gap-2">{action}</div>}
+        </div>
+      </div>
+    )
+  }
   return (
     <div className="flex flex-col items-center gap-2.5 px-5 py-12 text-center">
       <span className="flex size-11 items-center justify-center rounded-xl bg-accent-soft text-accent">

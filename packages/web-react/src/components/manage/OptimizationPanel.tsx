@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, ChevronRight, MoonStar, Play, Sparkles, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronRight, Play, Sparkles, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, apiErrorMessage } from '../../lib/api'
 import type {
@@ -13,13 +13,17 @@ import {
   Button,
   Card,
   EmptyState,
+  GroupHeading,
+  ListGroup,
+  ListRow,
   ListSkeleton,
+  MetaLine,
   Modal,
   Progress,
   Select,
   Skeleton,
+  StatusDot,
   TimeAgo,
-  cardVariants,
   useToast,
 } from '../ui'
 
@@ -30,8 +34,9 @@ import {
  * 改造前从上到下有四层几乎同义的标题：Dialog「管理中心」→ Tab「全面优化」→
  * PanelHeader「全面优化」→ 卡片「Auto‑Dream 全面审计」，合计吃掉近 290px，
  * 375×667 手机上留给待确认列表的只剩三行。Tab 已经命名了本分区，PanelHeader 是
- * 逐字重复，故删除；下面这张 hero 卡就是本面板的头部 —— 标题同样是 text-title(15px)、
- * 同样位于面板首位，与其余分区的 PanelHeader 处在同一层级，只是多带状态与主操作。
+ * 逐字重复，故删除；下面的审计头部就是本面板的页面标题 —— 与其余分区的 PanelHeader
+ * 同一层级（OCV5-344 第 3 轮：22px 页面标题，不再是渐变底卡片 + 实心图标方块），
+ * 只是多带状态与主操作。
  * 说明文案也合并成一句（改造前 PanelHeader hint 与卡片正文讲的是同一件事，且 hint
  * 里裸露了内部模型名）。
  *
@@ -286,87 +291,79 @@ export function OptimizationPanel({
   }
 
   return (
-    <div className="flex min-h-full flex-col gap-3 px-4 py-4">
-      <Card
-        tone="accent"
-        padding="md"
-        className="rounded-2xl border-accent/20 bg-gradient-to-br from-accent-soft via-surface to-surface"
-      >
-        <div className="flex items-start gap-3">
-          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg">
-            <MoonStar size={19} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-title font-semibold text-fg">Auto‑Dream 全面审计</h3>
+    <div className="flex min-h-full flex-col gap-4 px-4 pb-4 pt-2 md:pt-1">
+      <section aria-label="Auto‑Dream 全面审计">
+        <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+          <div className="min-w-0 flex-1 basis-64">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h3 className="text-[22px] font-semibold leading-[30px] tracking-[-0.01em] text-fg">
+                Auto‑Dream 全面审计
+              </h3>
               <StatusBadge state={state} />
-              {/* 窄屏放不下时整组换行(而不是 shrink-0 撑出横向滚动);切换器再压一档宽度。 */}
-              <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
-                {agents.length > 1 && (
-                  <Select
-                    aria-label="选择智能体"
-                    className="w-auto max-w-32 sm:max-w-40"
-                    inputSize="sm"
-                    value={effectiveAgent}
-                    onValueChange={setSelectedAgent}
-                    options={agents.map((agent) => ({ value: agent.id, label: agent.name }))}
-                  />
-                )}
-                {isRunning ? (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    loading={cancelling || stopping}
-                    onClick={() => void cancelRun()}
-                  >
-                    {!(cancelling || stopping) && <X size={14} />}
-                    {stopping ? '正在停止' : '停止审计'}
-                  </Button>
-                ) : (
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    loading={running}
-                    onClick={() => void runNow()}
-                  >
-                    {!running && <Play size={14} />}
-                    立即审计
-                  </Button>
-                )}
-              </div>
             </div>
-            <p className="mt-1.5 text-meta leading-relaxed text-muted">
+            <p className="mt-1 max-w-[60ch] text-body text-muted">
               每周自动审计你的记忆、设置、技能、规则、智能体、插件与定时任务，任何改动都会先问过你；平台层问题只以匿名、去内容的统计汇总给管理员。
             </p>
-            <p className="mt-2 flex flex-wrap items-center gap-x-1.5 text-caption text-faint">
+            <MetaLine className="mt-2">
               <span>每周自动</span>
               {state?.lastSuccessAt && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="inline-flex items-center gap-1">
-                    上次完成于 <TimeAgo value={state.lastSuccessAt} />
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span>{state.sessionsReviewed} 个会话</span>
-                  <span aria-hidden="true">·</span>
-                  <span>{state.pagesReviewed} 个批次</span>
-                </>
+                <span>
+                  上次完成于 <TimeAgo value={state.lastSuccessAt} />
+                </span>
               )}
-            </p>
-            {isRunning && state?.progress && (
-              <AuditProgress
-                progress={state.progress}
-                stopping={!!state.cancelRequestedAt}
-                refreshHiccup={pollFailures > 0 && pollFailures < 3}
+              {state?.lastSuccessAt && <span>{state.sessionsReviewed} 个会话</span>}
+              {state?.lastSuccessAt && <span>{state.pagesReviewed} 个批次</span>}
+            </MetaLine>
+          </div>
+          {/* 窄屏放不下时整组换行(而不是 shrink-0 撑出横向滚动);切换器再压一档宽度。 */}
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {agents.length > 1 && (
+              <Select
+                aria-label="选择智能体"
+                className="w-auto max-w-32 sm:max-w-40"
+                inputSize="sm"
+                value={effectiveAgent}
+                onValueChange={setSelectedAgent}
+                options={agents.map((agent) => ({ value: agent.id, label: agent.name }))}
               />
+            )}
+            {isRunning ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={cancelling || stopping}
+                onClick={() => void cancelRun()}
+              >
+                {!(cancelling || stopping) && <X size={14} />}
+                {stopping ? '正在停止' : '停止审计'}
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="primary"
+                loading={running}
+                onClick={() => void runNow()}
+              >
+                {!running && <Play size={14} />}
+                立即审计
+              </Button>
             )}
           </div>
         </div>
 
+        {isRunning && state?.progress && (
+          <AuditProgress
+            progress={state.progress}
+            stopping={!!state.cancelRequestedAt}
+            refreshHiccup={pollFailures > 0 && pollFailures < 3}
+          />
+        )}
+
+        {/* 审计结论：下沉底的引用块，不再是「卡里套卡」。 */}
         {state?.summary && (
-          <Card tone="sunken" padding="sm" className="mt-3">
+          <div className="mt-4 rounded-[10px] bg-hover px-4 py-3">
             <p className="text-body leading-relaxed text-fg">{state.summary}</p>
-          </Card>
+          </div>
         )}
 
         {state?.status === 'failed' && (
@@ -390,7 +387,7 @@ export function OptimizationPanel({
           </Alert>
         )}
 
-        {/* 立即审计 / 停止审计的失败贴在按钮所在的容器里，不再飞到面板顶部。 */}
+        {/* 立即审计 / 停止审计的失败贴在按钮所在的区块里，不再飞到面板顶部。 */}
         {actionError && (
           <Alert
             tone="danger"
@@ -411,7 +408,7 @@ export function OptimizationPanel({
             {actionError.message}
           </Alert>
         )}
-      </Card>
+      </section>
 
       {/* 轮询连续失败 ≥3 次才升级为面板级提示；danger 留给真正需要用户动作的失败。 */}
       {isRunning && pollFailures >= 3 && (
@@ -449,7 +446,7 @@ export function OptimizationPanel({
       ) : loadError && !state ? (
         // 错误态与空态互斥：改造前两者会同时出现（红条 + ✨「暂无待确认建议」），
         // 后者更像权威结论，用户会以为系统真的没建议给他。
-        <div className="my-auto">
+        <div className="-mx-4">
           <EmptyState
             icon={AlertTriangle}
             title="暂时读不到优化报告"
@@ -462,7 +459,7 @@ export function OptimizationPanel({
           />
         </div>
       ) : pending.length === 0 ? (
-        <div className="my-auto">
+        <div className="-mx-4">
           {isRunning ? (
             <EmptyState
               icon={Sparkles}
@@ -494,48 +491,39 @@ export function OptimizationPanel({
           )}
         </div>
       ) : (
-        <section>
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <h4 className="text-section font-semibold text-fg">待你确认</h4>
-            <span className="text-caption tabular-nums text-faint">{pending.length} 项</span>
-          </div>
-          <div className="flex flex-col gap-2">
+        <section className="mt-4">
+          <GroupHeading title="待你确认" count={pending.length} />
+          <ListGroup>
             {pending.map((proposal) => (
-              <button
-                key={proposal.id}
-                type="button"
-                onClick={() => setSelected(proposal)}
-                className={cn(
-                  cardVariants({ padding: 'sm', interactive: true }),
-                  'flex w-full items-center gap-3 text-left hover:border-accent/50',
-                )}
-              >
-                <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-                  {proposal.state === 'conflict' ? (
-                    <AlertTriangle size={15} />
-                  ) : (
-                    <Sparkles size={15} />
-                  )}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-2">
-                    <span className="truncate text-section font-medium text-fg">
-                      {proposal.title}
+              <ListRow key={proposal.id} className="p-0">
+                <button
+                  type="button"
+                  onClick={() => setSelected(proposal)}
+                  className="flex min-h-12 w-full items-center gap-3 px-4 py-3 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="flex min-w-0 flex-wrap items-baseline gap-x-2.5 gap-y-0.5">
+                      <span className="min-w-0 text-[14px] font-medium leading-5 text-fg">
+                        {proposal.title}
+                      </span>
+                      {proposal.state === 'conflict' ? (
+                        <span className="inline-flex shrink-0 items-center gap-1.5 text-meta text-warning">
+                          <StatusDot tone="warning" />
+                          有冲突
+                        </span>
+                      ) : (
+                        <span className="shrink-0 text-meta text-faint">
+                          {CATEGORY_LABELS[proposal.category] ?? proposal.category}
+                        </span>
+                      )}
                     </span>
-                    <Badge tone={proposal.state === 'conflict' ? 'warning' : 'neutral'} size="sm">
-                      {proposal.state === 'conflict'
-                        ? '有冲突'
-                        : (CATEGORY_LABELS[proposal.category] ?? proposal.category)}
-                    </Badge>
+                    <span className="mt-0.5 line-clamp-2 text-body text-muted">{proposal.reason}</span>
                   </span>
-                  <span className="mt-0.5 line-clamp-2 text-caption leading-relaxed text-muted">
-                    {proposal.reason}
-                  </span>
-                </span>
-                <ChevronRight size={15} className="shrink-0 text-faint" />
-              </button>
+                  <ChevronRight size={16} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />
+                </button>
+              </ListRow>
             ))}
-          </div>
+          </ListGroup>
         </section>
       )}
 
@@ -543,41 +531,36 @@ export function OptimizationPanel({
         <details className="group">
           {/* summary 自己就是点击目标:py-2 + text-meta 行高只有 ~32px,
               给外层加内距扩不出它的命中区,触屏下显式补到 44px。 */}
-          <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg py-2 text-meta font-medium text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden [@media(hover:none)]:min-h-11">
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-[8px] py-2 text-meta font-medium text-muted outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden [@media(hover:none)]:min-h-11">
             <ChevronRight
               size={14}
               aria-hidden="true"
-              className="shrink-0 transition-transform group-open:rotate-90"
+              className="shrink-0 transition-transform duration-150 group-open:rotate-90"
             />
             查看已处理建议（{history.length}）
           </summary>
-          <div className="mt-2 flex flex-col gap-1.5">
+          <ListGroup className="mt-2">
             {history.map((proposal) => (
-              <button
-                key={proposal.id}
-                type="button"
-                onClick={() => setSelected(proposal)}
-                className={cn(
-                  cardVariants({ padding: 'sm', interactive: true }),
-                  'flex w-full items-center gap-2 text-left',
-                )}
-              >
-                {proposal.state === 'applied' ? (
-                  <Check size={14} className="shrink-0 text-success" />
-                ) : (
-                  <X size={14} className="shrink-0 text-faint" />
-                )}
-                <span className="min-w-0 flex-1 truncate text-body text-fg">{proposal.title}</span>
-                <span className="shrink-0 text-caption text-faint">
-                  {proposal.state === 'applied' ? '已应用' : '已忽略'}
-                </span>
-                <TimeAgo
-                  value={proposal.appliedAt ?? proposal.createdAt}
-                  className="shrink-0 text-caption text-faint"
-                />
-              </button>
+              <ListRow key={proposal.id} className="p-0">
+                <button
+                  type="button"
+                  onClick={() => setSelected(proposal)}
+                  className="flex min-h-12 w-full items-center gap-3 px-4 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                >
+                  {proposal.state === 'applied' ? (
+                    <Check size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-success" />
+                  ) : (
+                    <X size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate text-body text-fg">{proposal.title}</span>
+                  <MetaLine className="shrink-0 flex-nowrap">
+                    <span>{proposal.state === 'applied' ? '已应用' : '已忽略'}</span>
+                    <TimeAgo value={proposal.appliedAt ?? proposal.createdAt} />
+                  </MetaLine>
+                </button>
+              </ListRow>
             ))}
-          </div>
+          </ListGroup>
         </details>
       )}
 

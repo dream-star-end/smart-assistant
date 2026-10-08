@@ -10,6 +10,7 @@ import {
 } from "react";
 import type { ProductFeatureId } from "../../lib/productCapabilities";
 import { cn } from "../../lib/utils";
+import { useQuiet } from "./Quiet";
 
 export interface TabItem {
   value: string;
@@ -129,6 +130,7 @@ export function Tabs({
   className?: string;
   "aria-label"?: string;
 }) {
+  const quiet = useQuiet();
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [edge, setEdge] = useState<"none" | "left" | "right" | "both">("none");
@@ -202,7 +204,13 @@ export function Tabs({
       aria-orientation="horizontal"
       onScroll={syncEdge}
       style={maskStyle}
-      className={cn(tabListVariants({ layout }), className)}
+      className={cn(
+        tabListVariants({ layout }),
+        // 安静表面:不是分段药丸,而是一条带发丝底线的文字页签;选中 = 前景色 + 2px 下划线。
+        quiet &&
+          "flex w-full gap-5 overflow-x-auto rounded-none border-b border-border bg-transparent p-0 md:flex md:w-full md:rounded-none",
+        className,
+      )}
     >
       {items.map((it, i) => {
         const active = it.value === value;
@@ -223,7 +231,12 @@ export function Tabs({
             tabIndex={active ? 0 : -1}
             onClick={() => onValueChange(it.value)}
             onKeyDown={(e) => onKeyDown(e, i)}
-            className={cn(tabVariants({ layout, active }))}
+            className={cn(
+              tabVariants({ layout, active }),
+              quiet &&
+                "relative -mb-px shrink-0 rounded-none border-b-2 bg-transparent px-0 pb-2.5 pt-1 shadow-none focus-visible:ring-offset-0 md:px-0",
+              quiet && (active ? "border-fg text-fg" : "border-transparent text-muted hover:text-fg"),
+            )}
           >
             {/* 宫格模式下列宽固定,需要一个可截断的块级容器承载省略号;
                 scroll 模式保持原样直接渲染 label,DOM 与改造前一致。 */}

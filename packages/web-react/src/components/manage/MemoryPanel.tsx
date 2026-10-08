@@ -1,5 +1,5 @@
-import { AlertTriangle, BarChart3, Brain, Check, ChevronRight, MoonStar, Plus, Search, Sparkles, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useId, useState } from "react";
+import { BarChart3, Brain, Check, ChevronRight, Plus, Search, Trash2 } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { isWorkScope } from "../../lib/projectScope";
@@ -24,7 +24,10 @@ import {
   EmptyState,
   Field,
   Input,
+  ListGroup,
+  ListRow,
   ListSkeleton,
+  MetaLine,
   Modal,
   PanelHeader,
   Select,
@@ -34,7 +37,6 @@ import {
   Tabs,
   Textarea,
   TimeAgo,
-  cardVariants,
   useConfirm,
   useToast,
 } from "../ui";
@@ -108,7 +110,8 @@ export function MemoryPanel({
           ) : undefined
         }
       />
-      <div className="min-w-0 overflow-x-auto border-t border-border px-4 py-3">
+      {/* 二级页签:安静表面下是一条带发丝底线的文字页签,底线只在内容列内(不再通栏)。 */}
+      <div className="min-w-0 px-4">
         <Tabs
           aria-label="记忆分区"
           idBase={TAB_ID_BASE}
@@ -138,7 +141,6 @@ export function MemoryPanel({
         role="tabpanel"
         id={`${TAB_ID_BASE}-panel-${tab}`}
         aria-labelledby={`${TAB_ID_BASE}-tab-${tab}`}
-        className="border-t border-border"
       >
         {tab === "core" ? (
           <>
@@ -283,17 +285,19 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
 
   if (!isWorkScope(scope) || !projectId) {
     return (
-      <div className="px-4 py-3 text-caption text-muted" data-testid="project-memory-panel">
+      <div className="px-4 pt-5 text-body text-muted" data-testid="project-memory-panel">
         选择工作项目后，这里显示该项目的记忆。
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col gap-3 px-4 py-3" data-testid="project-memory-panel">
-      <p className="text-caption text-muted">
-        智能体自动整理，注入该项目的所有会话，可随时废弃。
-      </p>
+    <div className="flex flex-col gap-3 px-4 pb-6 pt-5" data-testid="project-memory-panel">
+      <SectionHeading
+        title="生效中"
+        count={loading || loadErr ? undefined : official.length}
+        hint="智能体自动整理，注入该项目的所有会话，可随时废弃。"
+      />
       {loading ? (
         <ListSkeleton rows={3} />
       ) : loadErr ? (
@@ -311,44 +315,56 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
       ) : (
         <>
           {official.length === 0 ? (
-            <EmptyState
-              icon={Brain}
-              title="还没有项目记忆"
-              hint="智能体会把值得长期保留的项目信息整理进来，之后在这里可以看到并管理。"
-            />
+            <div className="-mx-4">
+              <EmptyState
+                icon={Brain}
+                title="还没有项目记忆"
+                hint="智能体会把值得长期保留的项目信息整理进来，之后在这里可以看到并管理。"
+              />
+            </div>
           ) : (
-            official.map((o) => (
-              <div
-                key={o.slug}
-                className="flex items-center justify-between gap-2 rounded-lg border border-border px-3 py-2"
-              >
-                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                  <span className="min-w-0 truncate text-body text-fg">{memoryTitle(o.slug)}</span>
-                  {o.tampered && (
-                    <Badge tone="warning" size="sm">
-                      文件被改动，未注入
-                    </Badge>
-                  )}
-                </div>
-                <Button size="sm" variant="secondary" onClick={() => void discard(o)}>
-                  废弃
-                </Button>
-              </div>
-            ))
+            <ListGroup aria-label="生效中的项目记忆">
+              {official.map((o) => (
+                <ListRow key={o.slug} className="flex items-center justify-between gap-3 py-2">
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-0.5">
+                    <span className="min-w-0 truncate text-[14px] font-medium leading-5 text-fg">
+                      {memoryTitle(o.slug)}
+                    </span>
+                    {o.tampered && (
+                      <Badge tone="warning" size="sm">
+                        文件被改动，未注入
+                      </Badge>
+                    )}
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => void discard(o)}
+                    className="shrink-0 text-muted hover:bg-danger-soft hover:text-danger"
+                  >
+                    废弃
+                  </Button>
+                </ListRow>
+              ))}
+            </ListGroup>
           )}
           {leftover.length > 0 && (
             <>
-              <h3 className="mt-1 text-section font-semibold">早前留下的待确认条目</h3>
-              <p className="text-caption text-muted">
-                这些是改为自动生效之前写下的，还没有生效。留下或忽略它们之后这一段就会消失。
-              </p>
+              <SectionHeading
+                as="h3"
+                className="mt-5"
+                title="早前留下的待确认条目"
+                count={leftover.length}
+                hint="这些是改为自动生效之前写下的，还没有生效。留下或忽略它们之后这一段就会消失。"
+              />
+              <ListGroup aria-label="待确认的项目记忆">
               {leftover.map((c) => (
-                <div key={c.id ?? c.file} className="rounded-lg border border-border p-3">
-                  <div className="text-body font-medium">{memoryTitle(c.slug)}</div>
-                  <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-caption text-muted">
+                <ListRow key={c.id ?? c.file}>
+                  <div className="text-[14px] font-medium leading-5 text-fg">{memoryTitle(c.slug)}</div>
+                  <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words font-sans text-body text-muted">
                     {(c.content ?? "").slice(0, 1200)}
                   </pre>
-                  <div className="mt-2 flex gap-2">
+                  <div className="mt-3 flex gap-2">
                     <Button
                       size="sm"
                       loading={busyId === (c.id ?? "")}
@@ -366,13 +382,48 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
                       忽略
                     </Button>
                   </div>
-                </div>
+                </ListRow>
               ))}
+              </ListGroup>
             </>
           )}
         </>
       )}
       {confirmEl}
+    </div>
+  );
+}
+
+/**
+ * 分组标题:14/600 标题 + 弱化的等宽计数 + 可选一行说明 + 右侧操作。
+ * 与 ui/GroupHeading 同档位,多一行说明 —— 页签下面不再悬一句孤零零的灰字,
+ * 说明归属到它描述的那一组。
+ */
+function SectionHeading({
+  title,
+  count,
+  hint,
+  action,
+  className,
+  as: Tag = "h4",
+}: {
+  title: string;
+  count?: number;
+  hint?: string;
+  action?: ReactNode;
+  className?: string;
+  as?: "h3" | "h4";
+}) {
+  return (
+    <div className={cn("flex flex-wrap items-end justify-between gap-x-4 gap-y-2 pb-1", className)}>
+      <div className="min-w-0 flex-1 basis-56">
+        <Tag className="flex items-baseline gap-2 text-[14px] font-semibold leading-5 tabular-nums text-fg">
+          {title}
+          {count !== undefined && <span className="text-meta font-normal text-faint">{count}</span>}
+        </Tag>
+        {hint && <p className="mt-0.5 text-meta text-muted">{hint}</p>}
+      </div>
+      {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
     </div>
   );
 }
@@ -419,12 +470,13 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
   const hitRate = retrievalEvents > 0 ? Math.round((hitEvents / retrievalEvents) * 100) : 0;
 
   return (
-    <div className="flex flex-col gap-4 px-4 py-3.5">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <p className="text-body font-medium text-fg">记忆在会话里如何被使用</p>
-          <p className="mt-1 text-caption text-muted">按记忆被检索、写入和注入的真实记录统计。</p>
-        </div>
+    <div className="flex flex-col gap-6 px-4 pb-6 pt-5">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <SectionHeading
+          className="pb-0"
+          title="记忆在会话里如何被使用"
+          hint="按记忆被检索、写入和注入的真实记录统计。"
+        />
         <Select
           aria-label="统计时间范围"
           value={String(days)}
@@ -456,76 +508,82 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
       {loading ? (
         <ListSkeleton rows={4} />
       ) : err ? null : !value || !totals || totals.events === 0 ? (
-        <EmptyState
-          icon={BarChart3}
-          title="还没有可统计的记忆操作"
-          hint="后续检索、写入和索引注入会自动出现在这里。"
-        />
+        <div className="-mx-4">
+          <EmptyState
+            icon={BarChart3}
+            title="还没有可统计的记忆操作"
+            hint="后续检索、写入和索引注入会自动出现在这里。"
+          />
+        </div>
       ) : (
         <>
           {totals.freshnessGaps > 0 && (
-            <Alert tone="warning" density="compact">
-              <span className="inline-flex items-center gap-1.5">
-                <AlertTriangle size={14} />
-                发现 {totals.freshnessGaps} 次“询问当前状态但仅使用历史记忆、未见实时证据”的影子风险。
-              </span>
-            </Alert>
+            // 警告是一行带圆点的彩色文字,不是一块着色的框。
+            <p className="flex items-start gap-2 text-body text-warning">
+              <span aria-hidden="true" className="mt-[7px] size-1.5 shrink-0 rounded-full bg-warning" />
+              发现 {totals.freshnessGaps} 次“询问当前状态但仅使用历史记忆、未见实时证据”的影子风险。
+            </p>
           )}
 
-          <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+          {/* 四个指标是一条分格的统计带(一个容器 + 发丝分隔),不是四张下沉小卡。 */}
+          <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-border bg-border lg:grid-cols-4">
             {[
               ["使用会话", totals.sessions],
               ["记忆操作", totals.events],
               ["检索命中率", `${hitRate}%`],
               ["新鲜度风险", totals.freshnessGaps],
             ].map(([label, metric]) => (
-              // 统计卡走设计系统档位：bg-hover 是面板内「下沉」块的既有底色（改造前写的
-              // bg-surface-subtle / text-foreground / text-body-sm 在 styles.css 里都不存在，
-              // Tailwind 不生成 CSS，卡片只剩描边、字号回落成继承值）。
-              <div key={String(label)} className="rounded-xl border border-border bg-hover px-3 py-2.5">
-                <div className="text-caption text-muted">{label}</div>
-                <div className="mt-1 text-title font-semibold tabular-nums text-fg">{metric}</div>
+              <div key={String(label)} className="flex flex-col gap-1 bg-surface px-4 py-3">
+                <dt className="text-meta text-faint">{label}</dt>
+                <dd className="text-[20px] font-semibold leading-7 tabular-nums tracking-[-0.01em] text-fg">
+                  {metric}
+                </dd>
               </div>
             ))}
-          </div>
+          </dl>
 
-          <section className="overflow-hidden rounded-xl border border-border">
-            <div className="border-b border-border px-3 py-2 text-body font-medium text-fg">按操作</div>
-            <div className="divide-y divide-border">
+          <section aria-label="按操作">
+            <SectionHeading title="按操作" count={value.byOperation.length} />
+            <ListGroup>
               {value.byOperation.map((row) => (
-                <div key={`${row.operation}:${row.memoryType}`} className="grid grid-cols-[1fr_auto] gap-3 px-3 py-2.5">
+                <ListRow
+                  key={`${row.operation}:${row.memoryType}`}
+                  className="grid grid-cols-[1fr_auto] items-center gap-4"
+                >
                   <div className="min-w-0">
-                    <div className="truncate text-body text-fg">
+                    <div className="truncate text-[14px] font-medium leading-5 text-fg">
                       {OPERATION_LABELS[row.operation] ?? row.operation}
                     </div>
-                    <div className="mt-0.5 text-caption text-muted">
-                      {row.sessions} 个会话 · p50 {row.p50Ms}ms · p95 {row.p95Ms}ms
-                    </div>
+                    <MetaLine className="mt-0.5">
+                      <span>{row.sessions} 个会话</span>
+                      <span>p50 {row.p50Ms}ms</span>
+                      <span>p95 {row.p95Ms}ms</span>
+                    </MetaLine>
                   </div>
-                  <div className="text-right text-body font-medium tabular-nums text-fg">{row.events} 次</div>
-                </div>
+                  <div className="text-right text-body tabular-nums text-fg">{row.events} 次</div>
+                </ListRow>
               ))}
-            </div>
+            </ListGroup>
           </section>
 
-          <section className="overflow-hidden rounded-xl border border-border">
-            <div className="border-b border-border px-3 py-2 text-body font-medium text-fg">最近会话</div>
-            <div className="divide-y divide-border">
+          <section aria-label="最近会话">
+            <SectionHeading title="最近会话" />
+            <ListGroup>
               {value.recentSessions.slice(0, 20).map((row) => (
-                <div key={row.sessionKey} className="px-3 py-2.5">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 truncate text-body text-fg">{row.title}</div>
-                    <TimeAgo value={row.lastAt} className="shrink-0 text-caption text-muted" />
+                <ListRow key={row.sessionKey}>
+                  <div className="flex items-baseline justify-between gap-3">
+                    <div className="min-w-0 truncate text-[14px] font-medium leading-5 text-fg">{row.title}</div>
+                    <TimeAgo value={row.lastAt} className="shrink-0 text-meta tabular-nums text-faint" />
                   </div>
-                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-caption text-muted">
+                  <MetaLine className="mt-0.5">
                     <span>{row.events} 次操作</span>
                     <span>{row.searches} 次检索</span>
                     <span>{row.writes} 次写入</span>
                     {row.freshnessGaps > 0 && <span className="text-warning">{row.freshnessGaps} 次新鲜度风险</span>}
-                  </div>
-                </div>
+                  </MetaLine>
+                </ListRow>
               ))}
-            </div>
+            </ListGroup>
           </section>
         </>
       )}
@@ -771,9 +829,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
   const failedCold = Boolean(err) && !index;
 
   return (
-    <div className="flex flex-col gap-3 px-4 py-3.5">
-      <p className="text-caption text-muted">该智能体自己的观察与经验，按智能体分别保存。</p>
-
+    <div className="flex flex-col gap-6 px-4 pb-6 pt-5">
       {err && (
         <Alert
           tone="danger"
@@ -790,41 +846,46 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
 
       {/* 梦境卡与列表是两条独立的异步链。给它预留等高占位,晚到时不会把整个列表往下顶。 */}
       {dreamLoading ? (
-        <Skeleton className="h-16 rounded-xl" />
+        <Skeleton className="h-[132px] rounded-[10px]" />
       ) : dream && dream.mode !== "optimizer_v2" ? (
         <AutoDreamReportCard value={dream} files={files} onOpenMemory={setEditing} />
       ) : null}
 
       {loading ? (
-        <>
+        <div className="flex flex-col gap-3">
           {coldStart && (
             <Alert tone="info" density="compact">
               正在唤醒你的智能体，首次打开大约需要 10 秒。
             </Alert>
           )}
           <ListSkeleton rows={3} />
-        </>
+        </div>
       ) : failedCold ? null : files.length === 0 ? (
-        <EmptyState
-          icon={Brain}
-          title="还没有核心记忆"
-          hint="智能体会在对话中自动记下值得长期保留的信息；你也可以现在手动补充一条。"
-          action={
-            <Button variant="secondary" size="sm" onClick={() => setCreating(true)}>
-              <Plus size={14} /> 新建记忆
-            </Button>
-          }
-        />
+        <div className="-mx-4">
+          <EmptyState
+            icon={Brain}
+            title="还没有核心记忆"
+            hint="智能体会在对话中自动记下值得长期保留的信息；你也可以现在手动补充一条。"
+            action={
+              <Button variant="secondary" size="sm" onClick={() => setCreating(true)}>
+                <Plus size={14} /> 新建记忆
+              </Button>
+            }
+          />
+        </div>
       ) : (
-        <>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-meta text-muted">
-              {q ? `${filtered.length} / ${files.length} 条记忆` : `${files.length} 条记忆`}
-            </span>
-            <Button variant="secondary" size="sm" onClick={() => setCreating(true)}>
-              <Plus size={14} /> 新建记忆
-            </Button>
-          </div>
+        <div className="flex flex-col gap-3">
+          {/* 分组标题 = 条数 + 一句作用域说明 + 新建;说明不再单独悬在页签下面。 */}
+          <SectionHeading
+            className="pb-0"
+            title={q ? `${filtered.length} / ${files.length} 条记忆` : `${files.length} 条记忆`}
+            hint="该智能体自己的观察与经验，按智能体分别保存。"
+            action={
+              <Button variant="secondary" size="sm" onClick={() => setCreating(true)}>
+                <Plus size={14} aria-hidden="true" /> 新建记忆
+              </Button>
+            }
+          />
 
           {dense && (
             <div className="relative">
@@ -845,25 +906,32 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
           )}
 
           {filtered.length === 0 ? (
-            <EmptyState
-              icon={Search}
-              title="没有匹配的记忆"
-              hint="换个关键词，或清除搜索看看全部记忆。"
-              action={
-                <Button variant="secondary" size="sm" onClick={() => setQuery("")}>
-                  清除搜索
-                </Button>
-              }
-            />
+            <div className="-mx-4">
+              <EmptyState
+                icon={Search}
+                title="没有匹配的记忆"
+                hint="换个关键词，或清除搜索看看全部记忆。"
+                action={
+                  <Button variant="secondary" size="sm" onClick={() => setQuery("")}>
+                    清除搜索
+                  </Button>
+                }
+              />
+            </div>
           ) : (
             groups.map((g) => (
-              <div key={g.key} className="flex flex-col gap-2">
-                {g.label && <p className="text-caption font-medium text-muted">{g.label}</p>}
-                <ul className="flex flex-col gap-2">
+              <div key={g.key} className={cn("flex flex-col", g.label && "pt-2")}>
+                {g.label && (
+                  <p className="pb-2 text-meta font-medium text-muted">
+                    {g.label}
+                    <span className="ml-2 font-normal tabular-nums text-faint">{g.items.length}</span>
+                  </p>
+                )}
+                <ListGroup>
                   {g.items.map((f) => (
                     <MemoryFileCard key={f.file} file={f} onOpen={() => setEditing(f)} />
                   ))}
-                </ul>
+                </ListGroup>
               </div>
             ))
           )}
@@ -875,7 +943,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
               text={indexText}
             />
           )}
-        </>
+        </div>
       )}
 
       {editing && (
@@ -954,13 +1022,11 @@ function Disclosure({
   );
 }
 
-const DREAM_ACTION_META: Record<
-  AutoDreamMemoryChange["action"],
-  { label: string; tone: "success" | "accent" | "neutral" }
-> = {
-  created: { label: "新增", tone: "success" },
-  updated: { label: "更新", tone: "accent" },
-  deleted: { label: "清理", tone: "neutral" },
+/** 变化动词:安静表面下是定宽的弱化文字列(不再是三种颜色的药丸),标题列因此纵向对齐。 */
+const DREAM_ACTION_META: Record<AutoDreamMemoryChange["action"], { label: string }> = {
+  created: { label: "新增" },
+  updated: { label: "更新" },
+  deleted: { label: "清理" },
 };
 
 function AutoDreamReportCard({
@@ -980,47 +1046,55 @@ function AutoDreamReportCard({
   return (
     // 渐变 hero 样式只保留在「全面优化」Tab —— 这里是整理**回执**,与那张待确认建议卡
     // 长得一模一样只会让用户以为是同一个东西的两个入口。
+    // 第 3 轮:与记忆列表同一种分组容器,没有图标方块;变化清单是容器内的发丝线列表。
     <section
       aria-label="Auto-Dream 梦境报告"
-      className={cn(cardVariants({ tone: running ? "accent" : "default" }), "overflow-hidden")}
+      aria-busy={running || undefined}
+      className="overflow-hidden rounded-[10px] border border-border bg-surface"
     >
-      <div className="flex items-start gap-2.5 p-3">
-        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          {running ? <Spinner size={16} /> : <MoonStar size={16} />}
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-            <span className="text-body font-semibold text-fg">Auto‑Dream 梦境报告</span>
-            {running ? (
-              <span className="inline-flex items-center gap-1 text-caption font-medium text-accent">
-                <Sparkles size={11} /> 正在整理近期对话
-              </span>
-            ) : report ? (
-              <TimeAgo value={report.finishedAt} className="text-caption text-muted" />
-            ) : null}
-          </div>
+      <div className="px-4 py-3.5">
+        <div className="flex items-baseline justify-between gap-3">
+          <h4 className="flex min-w-0 items-center gap-2 text-[14px] font-semibold leading-5 text-fg">
+            <span className="truncate">Auto‑Dream 梦境报告</span>
+            {running && <Spinner size={13} className="shrink-0 text-muted" />}
+          </h4>
           {running ? (
-            <p className="mt-1 text-meta text-muted">
-              正在提炼值得长期保留的信息。完成后会在这里显示变化，并发送一封站内梦境报告。
-            </p>
+            <span className="shrink-0 text-meta text-muted">正在整理近期对话</span>
           ) : report ? (
-            <DreamReportResult report={report} total={total} />
-          ) : (
-            <p className="mt-1 text-meta text-muted">
-              还没有整理过。智能体会在对话积累到一定量后自动整理，结果显示在这里。
-            </p>
-          )}
-          {!running && value.pendingSessions > 0 && (
-            <p className="mt-1 text-caption text-muted">
-              下一次整理已积累 {value.pendingSessions >= 101 ? "至少 101" : value.pendingSessions}{" "}
-              个新会话。
-            </p>
-          )}
+            <TimeAgo value={report.finishedAt} className="shrink-0 text-meta tabular-nums text-faint" />
+          ) : null}
         </div>
+        {running ? (
+          <p className="mt-1 text-body text-muted">
+            正在提炼值得长期保留的信息。完成后会在这里显示变化，并发送一封站内梦境报告。
+          </p>
+        ) : report ? (
+          <DreamReportResult report={report} total={total} />
+        ) : (
+          <p className="mt-1 text-body text-muted">
+            还没有整理过。智能体会在对话积累到一定量后自动整理，结果显示在这里。
+          </p>
+        )}
+        {(report && !running) || (!running && value.pendingSessions > 0) ? (
+          // 两条元信息在窄屏会折行:分隔点自己画、窄屏隐藏,避免第二行以「·」开头。
+          <p className="mt-2 flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta tabular-nums text-faint max-sm:flex-col">
+            {report && !running && <span>已参考 {report.sessionsReviewed} 个近期会话</span>}
+            {report && !running && value.pendingSessions > 0 && (
+              <span aria-hidden="true" className="max-sm:hidden">
+                ·
+              </span>
+            )}
+            {!running && value.pendingSessions > 0 && (
+              <span>
+                下一次整理已积累 {value.pendingSessions >= 101 ? "至少 101" : value.pendingSessions} 个新会话
+              </span>
+            )}
+          </p>
+        ) : null}
       </div>
 
       {!running && changes.length > 0 && (
-        <ul className="border-t border-border px-1.5 py-1.5">
+        <ul className="oc-list border-t border-border">
           {changes.map((change, index) => {
             const meta =
               change.action === "deleted"
@@ -1030,29 +1104,23 @@ function AutoDreamReportCard({
             const title = meta?.name?.trim() || change.file.replace(/\.md$/i, "");
             const content = (
               <>
-                <Badge tone={action.tone} size="sm">
-                  {action.label}
-                </Badge>
-                <span className="min-w-0 flex-1 truncate text-meta font-medium text-fg">
-                  {title}
-                </span>
-                {meta && <ChevronRight size={14} aria-hidden="true" className="shrink-0 text-muted" />}
+                <span className="w-8 shrink-0 text-meta text-faint">{action.label}</span>
+                <span className="min-w-0 flex-1 truncate text-body text-fg">{title}</span>
+                {meta && <ChevronRight size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />}
               </>
             );
             return (
-              <li key={`${change.action}:${change.file}:${index}`}>
+              <li key={`${change.action}:${change.file}:${index}`} className="oc-list-row">
                 {meta ? (
-                  // Button 原语顺带带来触控靶(粗指针下 ≥44px)与焦点环,不必逐处手写。
-                  <Button
-                    variant="ghost"
-                    size="sm"
+                  <button
+                    type="button"
                     onClick={() => onOpenMemory(meta)}
-                    className="h-auto w-full justify-start gap-2 px-2 py-2 text-left font-normal"
+                    className="flex min-h-11 w-full items-center gap-3 px-4 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   >
                     {content}
-                  </Button>
+                  </button>
                 ) : (
-                  <div className="flex items-center gap-2 px-2 py-2">{content}</div>
+                  <div className="flex min-h-11 items-center gap-3 px-4 py-2.5">{content}</div>
                 )}
               </li>
             );
@@ -1069,23 +1137,22 @@ function DreamReportResult({ report, total }: { report: AutoDreamLastReport; tot
       ? report.summary
       : "本次整理未完成，记忆没有改动。";
     return (
-      <>
-        <p className="mt-1 text-meta font-medium text-warning">{outcome}</p>
-        <p className="mt-1 text-caption text-muted">已参考 {report.sessionsReviewed} 个近期会话。</p>
-      </>
+      <p className="mt-1 flex items-center gap-2 text-body text-warning">
+        <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full bg-warning" />
+        {outcome}
+      </p>
     );
   }
   return (
     <>
-      <p className="mt-1 text-meta text-muted">
+      <p className="mt-1 text-body text-fg">
         {total === 0
           ? "已完成检查，没有发现值得长期保存的新信息。"
           : `已新增 ${report.created.length} 条、更新 ${report.updated.length} 条、清理 ${report.deleted.length} 条记忆。`}
       </p>
       {report.summary?.trim() && (
-        <p className="mt-1 line-clamp-2 text-caption text-muted">{report.summary}</p>
+        <p className="mt-1 line-clamp-2 max-w-[68ch] text-body text-muted">{report.summary}</p>
       )}
-      <p className="mt-1 text-caption text-muted">已参考 {report.sessionsReviewed} 个近期会话。</p>
     </>
   );
 }
@@ -1094,31 +1161,36 @@ function MemoryFileCard({ file, onOpen }: { file: MemoryFileMeta; onOpen: () => 
   const typeMeta = TYPE_META[file.type] ?? { label: file.type || "记忆", tone: "neutral" as const };
   const title = file.name?.trim() || file.file.replace(/\.md$/i, "");
   return (
-    <li>
-      {/* 卡面走 cardVariants(圆角/描边/表面/可点抬升/触控靶单一权威),不再手抄一套。 */}
+    // 分组容器里的一行(不是一张卡):整行可点,悬停给极淡底,右侧弱化的 › 提示可进入。
+    <ListRow className="p-0">
       <button
         type="button"
         onClick={onOpen}
-        className={cn(
-          cardVariants({ padding: "sm", interactive: true }),
-          "flex w-full flex-col gap-1 text-left",
-        )}
+        className="group flex w-full items-start gap-3 px-4 py-3 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [@media(hover:none)]:min-h-11"
       >
-        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-          <span className="min-w-0 truncate text-body font-semibold text-fg">{title}</span>
-          <Badge tone={typeMeta.tone} size="sm">
-            {typeMeta.label}
-          </Badge>
-        </div>
-        {file.description?.trim() && (
-          <p className="line-clamp-2 text-meta text-muted">{file.description}</p>
-        )}
-        {/* 文件名不再上卡面:它是存储实现,对用户没有含义(要看走编辑器的「编辑源码」)。 */}
-        <span className="text-caption text-muted">
-          更新于 <TimeAgo value={file.mtimeMs} className="text-caption text-muted" />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[14px] font-medium leading-5 text-fg">{title}</span>
+          {file.description?.trim() && (
+            <span className="mt-0.5 line-clamp-2 block text-body text-muted">{file.description}</span>
+          )}
+          {/* 文件名不再上卡面:它是存储实现,对用户没有含义(要看走编辑器的「编辑源码」)。 */}
+          <MetaLine className="mt-1">
+            <Badge tone={typeMeta.tone} size="sm" className="text-meta text-faint">
+              {typeMeta.label}
+            </Badge>
+            <span>
+              更新于 <TimeAgo value={file.mtimeMs} className="text-meta text-faint" />
+            </span>
+          </MetaLine>
         </span>
+        <ChevronRight
+          size={15}
+          strokeWidth={1.75}
+          aria-hidden="true"
+          className="mt-0.5 shrink-0 text-faint transition-colors group-hover:text-muted"
+        />
       </button>
-    </li>
+    </ListRow>
   );
 }
 
@@ -1796,13 +1868,12 @@ function UserProfileSection({ auth, agentId }: { auth: AuthSession; agentId: str
   }, [serverLatest]);
 
   return (
-    <div className="flex flex-col gap-3 px-4 py-3.5">
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge tone="neutral" size="sm">
-          所有智能体共享
-        </Badge>
-        <p className="text-caption text-muted">关于你的背景信息，切换智能体不会改变这里。</p>
-      </div>
+    <div className="flex flex-col gap-3 px-4 pb-6 pt-5">
+      <SectionHeading
+        className="pb-0"
+        title="所有智能体共享"
+        hint="关于你的背景信息，切换智能体不会改变这里。"
+      />
 
       {notice && (
         <Alert tone="info" density="compact" onDismiss={() => setNotice(null)}>

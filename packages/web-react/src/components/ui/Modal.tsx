@@ -3,6 +3,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { X } from "lucide-react";
 import { type ReactNode, useRef } from "react";
 import { cn } from "../../lib/utils";
+import { useQuiet } from "./Quiet";
 import { revealFocusedElement, useScrollBodyTabbable } from "./a11y";
 import { IconButton } from "./IconButton";
 
@@ -144,6 +145,7 @@ export function Modal({
 }: ModalProps) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
   const hasDescription = Boolean(title && description);
+  const quiet = useQuiet();
   // 正文滚动区:只在「溢出且没有可聚焦子孙」时进入 Tab 序(a11y shell#7),让纯文本长内容也能键盘滚动。
   const bodyRef = useRef<HTMLDivElement>(null);
   const bodyTabbable = useScrollBodyTabbable(bodyRef, open);
@@ -161,7 +163,9 @@ export function Modal({
           onCloseAutoFocus={onCloseAutoFocus}
           // Tab 回绕时 Radix 用 preventScroll 聚焦,目标若滚出了弹层可视区要自己滚回来(a11y shell#8)。
           onFocusCapture={revealFocusedElement}
-          className={cn(modalContentVariants({ size, fixedHeight, mobile }), className)}
+          // 安静表面里打开的子弹窗(工作台 / 确认框)走 portal,不在 .oc-manage 节点之下:
+          // 挂 oc-quiet 让它拿到同一套圆角 / 阴影 token。
+          className={cn(modalContentVariants({ size, fixedHeight, mobile }), quiet && "oc-quiet", className)}
         >
           {title ? (
             <div

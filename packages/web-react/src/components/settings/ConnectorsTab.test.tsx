@@ -417,9 +417,9 @@ function weiboWriteControl(
   }
 }
 
-/** 定位某 provider 目录卡的容器（label 文本 → 最近的卡片 div）。 */
+/** 定位某 provider 目录段的容器（label 文本 → 最近的插件段 section）。 */
 function providerCard(label: string): HTMLElement {
-  const el = screen.getByText(label).closest("div.rounded-xl");
+  const el = screen.getByText(label).closest("[data-connector-card]");
   expect(el).not.toBeNull();
   return el as HTMLElement;
 }

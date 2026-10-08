@@ -18,10 +18,11 @@ import { cn } from "../../lib/utils";
 import { AgentScopeSummary } from "../AgentScopePicker";
 import {
   Alert,
-  Badge,
   Button,
-  Card,
   EmptyState,
+  GroupHeading,
+  ListGroup,
+  ListRow,
   ListSkeleton,
   PanelHeader,
   Skeleton,
@@ -47,6 +48,12 @@ import { skillDisplayTitle } from "./skillDisplay";
  *    三重可辨;「只读」不再占一枚同形状 Badge,改为标题行的锁形图标。
  * 3. 只读技能的行尾图标由铅笔改眼睛(点了改不了字 = 点了没有预期反应)。
  * 4. 加载态换骨架屏、空态给可点出口、删除失败走 Toast(不再有一条陈旧错误挂到面板重开)。
+ *
+ * ── OCV5-344 第 3 轮(安静表面)─────────────────────────────────────────
+ * 每组技能是**一个**分组容器(ListGroup),行之间是发丝线,不再「每条一张卡 + 每行一个
+ * 星芒图标方块」。来源(自建 / 市场)与 slug、只读放进标题下的元信息行;展开的正文预览
+ * 落在同一行内、与标题左缘对齐。编辑 / 删除保留「图标 + 文字」(第 1 轮易用性),
+ * 但静止时是弱化色,删除只在悬停 / 聚焦时转红 —— 红色留给确认框。
  */
 export function SkillsPanel({
   auth,
@@ -147,7 +154,8 @@ export function SkillsPanel({
   const grouped = mine.length > 0 && hub.length > 0;
 
   const total = skills?.length ?? 0;
-  const title = q && total > 0 ? `技能（${visible.length}/${total}）` : total > 0 ? `技能（${total}）` : "技能";
+  // 计数不再塞进页面标题的全角括号里:放在搜索框右侧,等宽数字、弱化色。
+  const countLabel = q ? `${visible.length} / ${total}` : `${total} 个技能`;
 
   const renderRow = (sk: SkillSummary) => (
     <SkillRow
@@ -165,7 +173,7 @@ export function SkillsPanel({
     <div className="flex flex-col">
       {confirmDialogEl}
       <PanelHeader
-        title={title}
+        title="技能"
         hint="完成复杂任务后智能体会把流程沉淀成可复用技能；也可从市场安装。"
         action={
           onOpenMarketplace ? (
@@ -220,6 +228,10 @@ export function SkillsPanel({
             onSearchChange={setFilter}
             searchPlaceholder="按名称 / 描述 / 标签过滤…"
             debounceMs={120}
+            sticky={false}
+            // 安静表面:不画吸顶色带与底边线,搜索框与列表同一左缘。
+            className="border-b-0 bg-transparent px-4 pb-4 pt-0"
+            actions={<span className="text-meta tabular-nums text-faint">{countLabel}</span>}
           />
           {visible.length === 0 ? (
             <EmptyState
@@ -233,18 +245,20 @@ export function SkillsPanel({
               }
             />
           ) : grouped ? (
-            <div className="flex flex-col gap-3 px-4 pb-4 pt-3">
-              <section className="flex flex-col gap-1.5">
-                <h4 className="px-1 text-caption font-medium text-muted">自建（{mine.length}）</h4>
-                <ul className="flex flex-col gap-1.5">{mine.map(renderRow)}</ul>
+            <div className="flex flex-col gap-8 px-4 pb-4">
+              <section>
+                <GroupHeading title="自建" count={mine.length} />
+                <ListGroup>{mine.map(renderRow)}</ListGroup>
               </section>
-              <section className="flex flex-col gap-1.5">
-                <h4 className="px-1 text-caption font-medium text-muted">市场安装（{hub.length}）</h4>
-                <ul className="flex flex-col gap-1.5">{hub.map(renderRow)}</ul>
+              <section>
+                <GroupHeading title="市场安装" count={hub.length} />
+                <ListGroup>{hub.map(renderRow)}</ListGroup>
               </section>
             </div>
           ) : (
-            <ul className="flex flex-col gap-1.5 px-4 pb-4 pt-3">{visible.map(renderRow)}</ul>
+            <div className="px-4 pb-4">
+              <ListGroup>{visible.map(renderRow)}</ListGroup>
+            </div>
           )}
         </>
       )}
@@ -323,80 +337,105 @@ function SkillRow({
   const shownTags = tagsExpanded ? tags : tags.slice(0, 3);
 
   return (
-    <li>
-      <Card className="overflow-hidden">
-        {/* 行头:标题按钮独占一行的主宽度;来源徽章 / 只读锁降到标题下的第二行,
-            编辑 / 删除在窄屏换到行头下方(max-sm:basis-full)—— 390px 下标题不再被
-            "徽章 + 三个图标"压成 110px 两行截断。 */}
-        <div className="flex flex-wrap items-start gap-x-2.5 gap-y-1 px-3.5 py-3">
-          {/* 来源在图标层就可辨:自建=极光星芒 / 市场=店铺 */}
-          <span
-            className={cn(
-              "mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg",
-              isHub ? "bg-hover text-muted" : "bg-accent-soft text-accent",
-            )}
-          >
-            {isHub ? <Store size={14} /> : <Sparkles size={14} />}
-          </span>
+    <ListRow className="px-0 py-0">
+      {/* 行头:展开箭头在最左(披露控件的惯用位置),标题与元信息共用一条左缘(38px),
+          展开的正文与「适用」行都对齐到这条线。编辑 / 删除在窄屏换到标题下方、同一左缘。 */}
+      <div className="flex flex-wrap items-start gap-x-3 gap-y-1.5 px-4 py-3">
+        <div className="min-w-0 flex-1 basis-48">
           <button
             type="button"
             onClick={toggle}
             aria-expanded={open}
             // 面板未展开时不落 aria-controls —— 指向不存在的节点在读屏上是静默失败。
             aria-controls={open ? panelId : undefined}
-            className="flex min-w-0 flex-1 basis-48 items-start gap-2 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="flex w-full min-w-0 items-start gap-2 rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-surface"
           >
+            <ChevronRight
+              size={14}
+              strokeWidth={1.75}
+              aria-hidden="true"
+              className={cn(
+                "mt-[3px] shrink-0 text-faint transition-transform duration-150 ease-standard motion-reduce:transition-none",
+                open && "rotate-90",
+              )}
+            />
             <span className="min-w-0 flex-1">
-              <span className="line-clamp-2 text-section font-medium text-fg">{display.title}</span>
-              <span className="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5">
-                <Badge tone={isHub ? "neutral" : "accent"} size="sm">
+              <span className="line-clamp-2 text-[14px] font-medium leading-5 text-fg">{display.title}</span>
+              <span className="oc-meta mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-faint">
+                <span className="inline-flex shrink-0 items-center gap-1">
+                  {isHub && <Store size={12} strokeWidth={1.75} aria-hidden="true" />}
                   {isHub ? "市场" : "自建"}
-                </Badge>
+                </span>
                 {skill.writable === false && (
-                  <span className="flex shrink-0 items-center text-faint">
-                    <Lock size={12} role="img" aria-label="只读" />
+                  <span className="inline-flex shrink-0 items-center gap-1">
+                    <Lock size={11} strokeWidth={1.75} role="img" aria-label="只读" />
+                    <span aria-hidden="true">只读</span>
                   </span>
                 )}
                 {display.caption ? (
-                  <span className="min-w-0 truncate font-mono text-caption text-faint">
-                    {display.caption}
-                  </span>
+                  <span className="min-w-0 truncate font-mono text-[11.5px]">{display.caption}</span>
                 ) : null}
               </span>
             </span>
-            <ChevronRight
-              size={15}
-              className={cn("mt-0.5 shrink-0 text-faint transition-transform", open && "rotate-90")}
-            />
           </button>
-          {/* 只读技能点「编辑」一个字都改不了 —— 图标、文字与可访问名按 writable 分叉。
-              OCV5-344:图标改成「图标 + 文字」按钮,一眼看懂是编辑还是删除;窄屏换到行头下方时
-              与标题左缘对齐(不再孤零零贴右,留下一大块空白)。触控 44px 由 Button 原语内建。 */}
-          <div className="flex shrink-0 items-center gap-1 max-sm:basis-full max-sm:justify-start max-sm:pl-[38px]">
-            <Button
-              variant="ghost"
-              size="sm"
-              aria-label={`${skill.writable ? "编辑" : "查看"} ${skill.name}`}
-              onClick={() => openWorkbench("body")}
-              className="gap-1 px-2 text-muted hover:text-fg"
-            >
-              {skill.writable ? <Pencil size={14} aria-hidden="true" /> : <Eye size={14} aria-hidden="true" />}
-              {skill.writable ? "编辑" : "查看"}
-            </Button>
-            {skill.writable && (
-              <Button
-                variant="ghost"
-                size="sm"
-                aria-label={`删除 ${skill.name}`}
-                onClick={onDelete}
-                className="gap-1 px-2 text-danger hover:bg-danger-soft hover:text-danger"
-              >
-                <Trash2 size={14} aria-hidden="true" />
-                删除
-              </Button>
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[22px]">
+            <span className="inline-flex items-center gap-1.5 text-meta text-faint">
+              适用 <AgentScopeSummary agentIds={skill.agentIds} agents={agents} />
+            </span>
+            {/* 标签与「适用」智能体刻意不同形:# 前缀的弱化文字,一眼分得开"给谁用"与"是什么"。 */}
+            {tags.length > 0 && (
+              <span className="inline-flex flex-wrap items-center gap-x-1.5 text-meta text-faint">
+                {shownTags.map((t) => (
+                  <span key={t}>#{t}</span>
+                ))}
+                {tags.length > 3 && (
+                  <button
+                    type="button"
+                    onClick={() => setTagsExpanded((v) => !v)}
+                    aria-expanded={tagsExpanded}
+                    // 「+1」两个字符桌面只有 12px 宽,触屏根本点不中(t-762 manage#1):触控档补 44px 最小宽
+                    // 并居中;桌面 hover 可用时只多 4px 内距。
+                    className="inline-flex items-center justify-center rounded-sm px-0.5 tabular-nums text-muted outline-none hover:text-fg hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:-my-3 [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
+                  >
+                    {tagsExpanded ? "收起" : `+${tags.length - 3}`}
+                  </button>
+                )}
+              </span>
             )}
           </div>
         </div>
+        {/* 只读技能点「编辑」一个字都改不了 —— 图标、文字与可访问名按 writable 分叉。
+            「图标 + 文字」按钮(第 1 轮易用性)静止为弱化色;删除只在悬停 / 聚焦时转红。
+            窄屏换到行头下方时与标题左缘对齐。触控 44px 由 Button 原语内建。 */}
+        <div className="-mr-2 -mt-1 flex shrink-0 items-center gap-0.5 max-sm:-ml-2 max-sm:mr-0 max-sm:mt-0 max-sm:basis-full max-sm:justify-start max-sm:pl-[22px]">
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={`${skill.writable ? "编辑" : "查看"} ${skill.name}`}
+            onClick={() => openWorkbench("body")}
+            className="gap-1.5 px-2 font-normal text-muted hover:text-fg"
+          >
+            {skill.writable ? (
+              <Pencil size={14} strokeWidth={1.75} aria-hidden="true" />
+            ) : (
+              <Eye size={14} strokeWidth={1.75} aria-hidden="true" />
+            )}
+            {skill.writable ? "编辑" : "查看"}
+          </Button>
+          {skill.writable && (
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={`删除 ${skill.name}`}
+              onClick={onDelete}
+              className="gap-1.5 px-2 font-normal text-muted hover:bg-danger-soft hover:text-danger focus-visible:text-danger"
+            >
+              <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
+              删除
+            </Button>
+          )}
+        </div>
+      </div>
         <SkillEditor
           auth={auth}
           skillName={skill.name}
@@ -412,33 +451,8 @@ function SkillRow({
             onChanged();
           }}
         />
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3.5 pb-2.5">
-          <span className="inline-flex items-center gap-1 text-meta text-muted">
-            适用：<AgentScopeSummary agentIds={skill.agentIds} agents={agents} />
-          </span>
-          {/* 标签与「适用」智能体芯片刻意不同形:# 前缀的弱化文字,一眼分得开"给谁用"与"是什么"。 */}
-          {tags.length > 0 && (
-            <span className="inline-flex flex-wrap items-center gap-x-1.5 text-caption text-faint">
-              {shownTags.map((t) => (
-                <span key={t}>#{t}</span>
-              ))}
-              {tags.length > 3 && (
-                <button
-                  type="button"
-                  onClick={() => setTagsExpanded((v) => !v)}
-                  aria-expanded={tagsExpanded}
-                  // 「+1」两个字符桌面只有 12px 宽,触屏根本点不中(t-762 manage#1):触控档补 44px 最小宽
-                  // 并居中;桌面 hover 可用时只多 4px 内距。
-                  className="inline-flex items-center justify-center rounded-sm px-0.5 text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:min-w-11"
-                >
-                  {tagsExpanded ? "收起" : `+${tags.length - 3}`}
-                </button>
-              )}
-            </span>
-          )}
-        </div>
         {open && (
-          <div id={panelId} className="border-t border-border px-3.5 py-3">
+          <div id={panelId} className="mb-3 ml-[38px] mr-4 border-t border-border pt-3">
             {loading ? (
               <div className="flex flex-col gap-2">
                 <Skeleton className="h-4 w-24 rounded-full" />
@@ -466,7 +480,7 @@ function SkillRow({
                     {detail.files.slice(0, 4).map((f) => (
                       <span
                         key={f}
-                        className="inline-flex items-center gap-1 rounded-md bg-hover px-1.5 py-0.5 font-mono text-caption text-muted"
+                        className="inline-flex items-center gap-1 font-mono text-caption text-muted"
                       >
                         {f}
                       </span>
@@ -476,7 +490,7 @@ function SkillRow({
                     )}
                   </div>
                 )}
-                <pre className="whitespace-pre-wrap break-words rounded-md bg-code px-3 py-2 font-mono text-meta leading-relaxed text-fg">
+                <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-[8px] bg-bg px-3 py-2.5 font-mono text-meta leading-relaxed text-fg">
                   {preview || "（无正文）"}
                 </pre>
                 {bodyLines.length > PREVIEW_LINES && (
@@ -486,13 +500,13 @@ function SkillRow({
                 )}
                 <div className="flex flex-wrap items-center gap-1.5">
                   <Button size="sm" variant="secondary" onClick={() => openWorkbench("body")}>
-                    <PanelsTopLeft size={13} /> 在工作台中打开
+                    <PanelsTopLeft size={14} strokeWidth={1.75} /> 在工作台中打开
                   </Button>
                   {/* 自建可写技能无评测用例 → 克制的「未配评测」入口(点击直落工作台评测页签)。
                       只读/市场技能不显示;已配评测(true)或未探测(null)时不显示。 */}
                   {showEvalHint && hasEvals === false && (
                     <Button size="sm" variant="ghost" onClick={() => openWorkbench("evals")}>
-                      <FlaskConical size={13} /> 未配评测，去配置
+                      <FlaskConical size={14} strokeWidth={1.75} /> 未配评测，去配置
                     </Button>
                   )}
                 </div>
@@ -500,7 +514,6 @@ function SkillRow({
             )}
           </div>
         )}
-      </Card>
-    </li>
+    </ListRow>
   );
 }

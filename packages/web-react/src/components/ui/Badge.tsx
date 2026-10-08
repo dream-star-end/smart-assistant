@@ -1,6 +1,7 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import type { HTMLAttributes } from "react";
 import { cn } from "../../lib/utils";
+import { StatusDot, useQuiet } from "./Quiet";
 
 /**
  * 状态徽章。tone 直接吃 styles.css 的语义色 token(已按 WCAG AA 重定过值,
@@ -38,5 +39,31 @@ export function Badge({
   size,
   ...props
 }: HTMLAttributes<HTMLSpanElement> & VariantProps<typeof badgeVariants>) {
+  const quiet = useQuiet();
+  if (quiet) {
+    // 安静表面(管理中心):不画彩色药丸。状态色(成功/警告/危险)= 6px 圆点 + 弱化文字;
+    // 中性 / 强调 / 信息 = 纯文字(分类标签不是状态,不配圆点)。相邻徽章之间由 CSS 自动插「·」(.oc-qbadge + .oc-qbadge)。
+    // 调用方自带的图标在有圆点时隐藏(.oc-qbadge > svg),避免「圆点 + 图标」重复表达。
+    const t = tone ?? "neutral";
+    const dotted = t === "success" || t === "warning" || t === "danger";
+    const { children, ...rest } = props;
+    return (
+      <span
+        data-tone={t}
+        className={cn(
+          "oc-qbadge inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap tabular-nums text-muted",
+          size === "sm" ? "text-caption" : "text-meta",
+          dotted && "oc-qbadge-dot",
+          className,
+          // 调用方给药丸写的底色 / 内距 / 圆角在安静表面一律不要。
+          "rounded-none bg-transparent p-0",
+        )}
+        {...rest}
+      >
+        {dotted && <StatusDot tone={t} />}
+        {children}
+      </span>
+    );
+  }
   return <span className={cn(badgeVariants({ tone, size }), className)} {...props} />;
 }

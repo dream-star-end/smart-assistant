@@ -22,6 +22,7 @@ import { ManageCenter, type ManageTab } from '../../src/components/ManageCenter'
 import { AgentProjectPreview } from '../../src/components/manage/AgentProjectPreview'
 import { ProjectAssetsManagePanel } from '../../src/components/manage/ProjectAssetsManagePanel'
 import { SkillEditor, type WorkbenchTab } from '../../src/components/manage/SkillEditor'
+import { QuietSurface } from '../../src/components/ui'
 import { ProjectScopeProvider } from '../../src/hooks/useProjectScope'
 import { ApiError } from '../../src/lib/api'
 import { createMemoryAuthSession } from '../../src/lib/authSession'
@@ -717,23 +718,26 @@ const skillBase: ApiMockTable = {
 }
 
 function workbench(tab: WorkbenchTab, extra: Partial<Record<string, unknown>> = {}): ReactNode {
+  // 线上工作台只从管理中心的技能行打开(QuietSurface 之内),预览同样包一层。
   return (
-    <SkillEditor
-      auth={auth}
-      skillName={(extra.skillName as string) ?? 'v5-commercial-deploy'}
-      open
-      initialTab={tab}
-      rates={{
-        modelId: 'deepseek-v4-flash',
-        displayName: 'DeepSeek V4 Flash',
-        inputPerKtok: 0.3,
-        outputPerKtok: 1.1,
-        cacheReadPerKtok: 0,
-        cacheWritePerKtok: 0,
-      }}
-      onClose={() => {}}
-      onChanged={() => {}}
-    />
+    <QuietSurface>
+      <SkillEditor
+        auth={auth}
+        skillName={(extra.skillName as string) ?? 'v5-commercial-deploy'}
+        open
+        initialTab={tab}
+        rates={{
+          modelId: 'deepseek-v4-flash',
+          displayName: 'DeepSeek V4 Flash',
+          inputPerKtok: 0.3,
+          outputPerKtok: 1.1,
+          cacheReadPerKtok: 0,
+          cacheWritePerKtok: 0,
+        }}
+        onClose={() => {}}
+        onChanged={() => {}}
+      />
+    </QuietSurface>
   )
 }
 

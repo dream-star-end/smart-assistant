@@ -1,5 +1,6 @@
 import { cn } from "../../lib/utils";
 import { Card } from "./Card";
+import { useQuiet } from "./Quiet";
 import { Skeleton } from "./Skeleton";
 
 /**
@@ -45,6 +46,28 @@ export function ListSkeleton({
   className?: string;
 }) {
   const items = Array.from({ length: Math.max(0, rows) }, (_, i) => i);
+  const quiet = useQuiet();
+  if (quiet && variant === "row") {
+    // 安静表面:骨架与真实列表同一几何 —— 一个分组容器 + 发丝线,行内只有标题条与元信息条,
+    // 没有图标方块(真实行也没有),数据到达时不跳版。
+    return (
+      <output
+        aria-busy="true"
+        className={cn("oc-list block overflow-hidden rounded-[10px] border border-border", className)}
+      >
+        <span className="sr-only">加载中…</span>
+        {items.map((i) => {
+          const [titleW, descW] = ROW_WIDTHS[i % ROW_WIDTHS.length];
+          return (
+            <div key={i} className="oc-list-row flex min-h-12 flex-col justify-center gap-2 px-4 py-3.5">
+              <Skeleton className={cn("h-3", titleW)} />
+              <Skeleton className={cn("h-2.5 opacity-70", descW)} />
+            </div>
+          );
+        })}
+      </output>
+    );
+  }
   return (
     // <output>(隐含 role=status)+ sr-only 文案:骨架本身对读屏是噪音(每个 Skeleton
     // 都 aria-hidden),但"正在加载"这件事必须播报,否则读屏用户只听到一片沉默。

@@ -1,6 +1,7 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import { type ButtonHTMLAttributes, forwardRef } from "react";
 import { cn } from "../../lib/utils";
+import { useQuiet } from "./Quiet";
 import { Spinner } from "./Spinner";
 
 /**
@@ -86,6 +87,9 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     ref,
   ) => {
     const busy = loading === true;
+    // 安静表面(管理中心):工作面里没有彩色 / 渐变实心按钮 —— accent、gradient 一律落成近黑主按钮。
+    const quiet = useQuiet();
+    const v = quiet && (variant === "accent" || variant === "gradient") ? "primary" : variant;
     return (
       <button
         ref={ref}
@@ -94,7 +98,12 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
         disabled={disabled || busy}
         // 只在忙时落 aria-busy —— 默认 false 会给全站按钮凭空加 aria-busy="false"。
         aria-busy={busy || undefined}
-        className={cn(buttonVariants({ variant, size, shape, loading: busy }), className)}
+        className={cn(
+          buttonVariants({ variant: v, size, shape, loading: busy }),
+          // 安静表面:禁用的主按钮不是一块半透明的灰砖,而是中性浅底 + 弱化字(忙态仍走 loading 视觉)。
+          quiet && v === "primary" && !busy && "disabled:bg-active disabled:text-faint disabled:opacity-100",
+          className,
+        )}
         {...props}
       >
         {busy ? <Spinner size={SPINNER_PX[size ?? "md"]} className="shrink-0" /> : null}

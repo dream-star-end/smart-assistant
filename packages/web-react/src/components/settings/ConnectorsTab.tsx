@@ -1,8 +1,6 @@
 import {
-  AlertTriangle,
   ArrowUpCircle,
   Check,
-  CheckCircle2,
   ExternalLink,
   Pencil,
   Plug,
@@ -12,7 +10,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError, api, apiErrorMessage } from '../../lib/api'
 import {
   type ConnectorConnection,
@@ -38,19 +36,22 @@ import {
 import type { AuthSession } from "../../lib/types";
 import {
   Alert,
-  Badge,
   Button,
-  Card,
   EmptyState,
   Field,
   IconButton,
   Input,
+  ListGroup,
+  ListRow,
   ListSkeleton,
+  MetaLine,
   Modal,
   PanelHeader,
   Sheet,
   Skeleton,
   Spinner,
+  StatusDot,
+  type StatusTone,
   Switch,
   TimeAgo,
   useConfirm,
@@ -858,31 +859,37 @@ export function ConnectorsTab({
           <ListSkeleton rows={3} />
         ) : (
           <>
-            {grouped && (
-              <div className="px-1 text-caption font-medium text-muted">
-                已连接（{connectedCards.length}）
-              </div>
+            {/* 每个插件是一段「标题 + 说明 + 元信息 + 它的账号列表」，段与段之间一条发丝线；
+                不再是「每个插件一张卡、卡里再套账号卡」。两组都非空时才出组标题。 */}
+            {connectedCards.length > 0 && (
+              <ConnectorGroup label={grouped ? '已连接' : undefined} count={connectedCards.length}>
+                {connectedCards.map(renderCard)}
+              </ConnectorGroup>
             )}
-            {connectedCards.map(renderCard)}
-            {grouped && (
-              <div className="px-1 pt-1 text-caption font-medium text-muted">
-                可添加（{availableCards.length}）
-              </div>
+            {availableCards.length > 0 && (
+              <ConnectorGroup
+                label={grouped ? '可添加' : undefined}
+                count={availableCards.length}
+                className={grouped ? 'mt-6' : undefined}
+              >
+                {availableCards.map(renderCard)}
+              </ConnectorGroup>
             )}
-            {availableCards.map(renderCard)}
             {!err && allCards.length === 0 && (
+              <div className="-mx-4">
               <EmptyState
                 icon={Plug}
                 title="还没有可用的应用连接"
                 hint="从 AI 市场安装连接器或 Plugin 后，就能把邮箱、网盘、笔记等账号交给助手使用。"
                 action={
                   onOpenMarketplace && (
-                    <Button size="sm" variant="accent" onClick={onOpenMarketplace}>
-                      <Store size={13} /> 去市场看看
+                    <Button size="sm" variant="primary" onClick={onOpenMarketplace}>
+                      <Store size={14} strokeWidth={1.75} /> 去市场看看
                     </Button>
                   )
                 }
               />
+              </div>
             )}
           </>
         )}
@@ -936,6 +943,108 @@ export function ConnectorsTab({
     </div>
   );
 }
+
+/** 插件分组：可选的弱化组标题（名称 + 等宽计数）+ 发丝线分隔的插件段。 */
+function ConnectorGroup({
+  label,
+  count,
+  className,
+  children,
+}: {
+  label?: string
+  count: number
+  className?: string
+  children: ReactNode
+}) {
+  return (
+    <div className={className}>
+      {label && (
+        <h4 className="flex items-baseline gap-2 border-b border-border pb-2 text-meta font-medium text-faint">
+          {label}
+          <span className="tabular-nums">{count}</span>
+        </h4>
+      )}
+      <div className="flex flex-col">{children}</div>
+    </div>
+  )
+}
+
+/**
+ * 插件段的头部：名称（14/600）+ 连接状态（圆点 + 文字）、说明、一行元信息（· 分隔），
+ * 右侧动作簇窄屏整行下沉并与名称左缘对齐（承接 manage 审计 M-09）。
+ * 图标裸放（不进色块）：邮箱 / 网盘 / 插件各自不同，是有信息量的。
+ */
+function ConnectorHead({
+  icon: Icon,
+  label,
+  status,
+  description,
+  meta,
+  detail,
+  actions,
+}: {
+  icon: ReturnType<typeof connectorIcon>
+  label: string
+  status?: { tone: StatusTone; text: string } | null
+  description: ReactNode
+  meta: ReactNode[]
+  /** 元信息下的一句补充（能力数 / 存储方式），弱化色。 */
+  detail?: ReactNode
+  actions?: ReactNode
+}) {
+  return (
+    <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
+      <div className="flex min-w-0 flex-1 basis-64 gap-3">
+        <span aria-hidden="true" className="mt-0.5 flex shrink-0 text-faint">
+          <Icon size={16} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span className="text-[14px] font-semibold leading-5 text-fg">{label}</span>
+            {status && (
+              <span className="inline-flex items-center gap-1.5 text-meta text-muted">
+                <StatusDot tone={status.tone} />
+                {status.text}
+              </span>
+            )}
+          </div>
+          <p className="mt-1 text-body text-muted">{description}</p>
+          {meta.length > 0 && (
+            <MetaLine className="mt-1.5">
+              {meta.map((m, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: 元信息顺序固定，无稳定 id
+                <span key={i}>{m}</span>
+              ))}
+            </MetaLine>
+          )}
+          {detail && <p className="mt-0.5 text-meta text-faint">{detail}</p>}
+        </div>
+      </div>
+      {actions && (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5 max-sm:basis-full max-sm:pl-7">
+          {actions}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 段内的提示行（禁用原因 / 下架说明等）：圆点 + 一句话，不画色块。 */
+function ConnectorNote({ tone, children }: { tone: StatusTone; children: ReactNode }) {
+  return (
+    <p
+      className={`mt-3 flex items-start gap-2 pl-7 text-meta ${
+        tone === 'warning' ? 'text-warning' : tone === 'danger' ? 'text-danger' : 'text-faint'
+      }`}
+    >
+      <StatusDot tone={tone} className="mt-[5px]" />
+      <span>{children}</span>
+    </p>
+  )
+}
+
+/** 段落容器：段与段之间一条发丝线（首段不画）。data-connector-card 是测试定位钩子。 */
+const CONNECTOR_SECTION = 'border-t border-border py-5 first:border-t-0 first:pt-3'
 
 function RuntimePluginCard({
   auth,
@@ -1082,129 +1191,106 @@ function RuntimePluginCard({
       setWriteBusyId(null)
     }
   }
+  const meta: ReactNode[] = [writeCount > 0 ? '可读写' : '只读']
+  if (plugin.installed) meta.push(`市场已安装 v${plugin.installedVersion}`)
+  if (plugin.pluginType === 'managed-browser') meta.push('隔离运行')
+  // 能力与存储说明是一句话，单独成行（不进 · 分隔的元信息，避免折行时行首挂一个「·」）。
+  const detail = `${readCount} 项读取${writeCount > 0 ? `、${writeCount} 项写入（默认关闭）` : ''}，${
+    plugin.accountMode === 'none' ? '无需账号' : '登录状态加密保存'
+  }`
   return (
-    <Card className="p-3.5">
-      {/* 卡头外层 flex-wrap + 动作簇窄屏整行下沉：390px 下三个按钮不让位会把描述压成
-          每行 6 个字的窄柱、高度翻三倍（承接 manage 审计 M-09）。桌面端不变。 */}
-      <div className="flex flex-wrap items-start gap-3">
-        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Icon size={18} />
-        </span>
-        <div className="min-w-0 flex-1">
-          {/* 标题行只放身份与能力标注；连接状态单独成行，避免四类信息平铺争夺注意力。 */}
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-section font-medium text-fg">{plugin.label}</span>
-            <Badge tone="neutral" size="sm">
-              {writeCount > 0 ? '可读写' : '只读'}
-            </Badge>
-            {plugin.installed ? (
-              <Badge tone="accent" size="sm">
-                市场已安装 · v{plugin.installedVersion}
-              </Badge>
-            ) : (
-              <Badge tone="warning" size="sm">
-                历史账号 · 当前未安装
-              </Badge>
-            )}
+    <section data-connector-card={plugin.slug} className={CONNECTOR_SECTION}>
+      <ConnectorHead
+        icon={Icon}
+        label={plugin.label}
+        status={
+          accounts.length > 0
+            ? brokenCount > 0
+              ? { tone: 'warning', text: `${brokenCount} 个账号待处理` }
+              : { tone: 'success', text: '已授权' }
+            : null
+        }
+        description={plugin.description}
+        meta={meta}
+        detail={detail}
+        actions={
+          <>
+            {/* 「可更新」与它的按钮放在一起（值 + 动作），不再是标题行里的又一枚药丸。 */}
             {plugin.updateAvailable && plugin.latestVersion && (
-              <Badge tone="accent" size="sm">
+              <span className="mr-1 text-meta tabular-nums text-muted">
                 {plugin.installed ? `可更新 v${plugin.latestVersion}` : '可重新安装'}
-              </Badge>
+              </span>
             )}
-            {plugin.pluginType === 'managed-browser' && (
-              <Badge tone="neutral" size="sm">
-                隔离运行
-              </Badge>
+            {plugin.updateAvailable && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => void runAction('update', onUpdate)}
+                loading={busyAction === 'update'}
+                disabled={blockedByAccounts || busyAction !== null}
+              >
+                <ArrowUpCircle size={14} strokeWidth={1.75} /> {plugin.installed ? '更新' : '重新安装'}
+              </Button>
             )}
-          </div>
-          <p className="mt-0.5 text-meta leading-snug text-faint">{plugin.description}</p>
-          <p className="mt-1 text-caption text-faint">
-            {readCount} 项读取能力{writeCount > 0 ? ` · ${writeCount} 项写入能力（默认关闭）` : ''}
-            {plugin.accountMode === 'none' ? ' · 无需账号' : ' · 账号登录状态加密保存'}
-          </p>
-          {accounts.length > 0 && (
-            <div className="mt-1.5">
-              {brokenCount > 0 ? (
-                <Badge tone="warning">
-                  <AlertTriangle size={11} aria-hidden="true" />
-                  {brokenCount} 个账号待处理
-                </Badge>
-              ) : (
-                <Badge tone="success">
-                  <CheckCircle2 size={11} aria-hidden="true" />
-                  已授权
-                </Badge>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="flex shrink-0 flex-wrap justify-end gap-1.5 max-sm:basis-full max-sm:justify-start max-sm:pt-1">
-          {plugin.updateAvailable && (
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => void runAction('update', onUpdate)}
-              loading={busyAction === 'update'}
-              disabled={blockedByAccounts || busyAction !== null}
-            >
-              <ArrowUpCircle size={13} /> {plugin.installed ? '更新' : '重新安装'}
-            </Button>
-          )}
-          {plugin.accountMode === 'required' && accounts.length === 0 && plugin.installedCurrent && (
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={onAuthorize}
-              disabled={!canSelfAuthorize}
-            >
-              <QrCode size={13} /> {canSelfAuthorize ? authorizeLabel : '暂不可授权'}
-            </Button>
-          )}
-          {plugin.installed && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-danger"
-              onClick={() => void runAction('uninstall', onUninstall)}
-              loading={busyAction === 'uninstall'}
-              disabled={blockedByAccounts || busyAction !== null}
-            >
-              <Trash2 size={13} /> 卸载
-            </Button>
-          )}
-        </div>
-      </div>
+            {plugin.accountMode === 'required' && accounts.length === 0 && plugin.installedCurrent && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={onAuthorize}
+                disabled={!canSelfAuthorize}
+              >
+                <QrCode size={14} strokeWidth={1.75} /> {canSelfAuthorize ? authorizeLabel : '暂不可授权'}
+              </Button>
+            )}
+            {plugin.installed && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted hover:bg-danger-soft hover:text-danger"
+                onClick={() => void runAction('uninstall', onUninstall)}
+                loading={busyAction === 'uninstall'}
+                disabled={blockedByAccounts || busyAction !== null}
+              >
+                卸载
+              </Button>
+            )}
+          </>
+        }
+      />
+      {!plugin.installed && (
+        <ConnectorNote tone="warning">历史账号 · 当前未安装</ConnectorNote>
+      )}
       {/* 禁用原因写成可见文字：title 属性在触屏上永远不出现，键盘与读屏用户也读不到。 */}
       {blockedByAccounts && (plugin.updateAvailable || plugin.installed) && (
-        <p className="mt-2 text-caption text-warning">
+        <ConnectorNote tone="warning">
           更新或卸载前需先解绑下方账号：重装会让已保存的登录状态失配。
-        </p>
+        </ConnectorNote>
       )}
       {plugin.accountMode === 'required' &&
         accounts.length === 0 &&
         plugin.installedCurrent &&
         !canSelfAuthorize && (
-          <p className="mt-2 text-caption text-faint">
+          <ConnectorNote tone="neutral">
             该 Plugin 暂未提供自助授权流程，请在对话中让助手引导完成绑定。
-          </p>
+          </ConnectorNote>
         )}
       {notice && (
         <Alert
           tone={notice.tone}
           density="compact"
-          className="mt-2"
+          className="mt-3 sm:ml-7"
           onDismiss={onDismissNotice}
         >
           {notice.text}
         </Alert>
       )}
       {!plugin.available && (
-        <Alert tone="warning" density="compact" className="mt-2">
+        <ConnectorNote tone="warning">
           该 Plugin 当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号或卸载。
-        </Alert>
+        </ConnectorNote>
       )}
       {accounts.length > 0 && (
-        <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">
+        <ListGroup aria-label={`${plugin.label}账号`} className="mt-4 sm:ml-7">
           {accounts.map((account, index) => {
             const accountState = accountStates[index] ?? pluginAccountState(account, plugin)
             const writePolicyStale =
@@ -1218,25 +1304,19 @@ function RuntimePluginCard({
               account.writeControl.preapproval.acceptedVersion !==
                 account.writeControl.preapproval.disclaimerVersion
             return (
-              <li key={account.id} className="flex flex-wrap items-center gap-2 py-2">
+              <ListRow key={account.id} className="flex flex-wrap items-center gap-x-3 gap-y-2">
                 <div className="min-w-0 flex-1 basis-40">
-                  <div className="truncate text-body text-fg">
+                  <div className="truncate text-[14px] font-medium leading-5 text-fg">
                     {account.displayName || plugin.label}
                   </div>
-                  <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
-                    {/* 颜色与文案同源（pluginAccountState），不再出现"绿色的需重新授权"。 */}
-                    <Badge tone={accountState.tone} size="sm">
-                      {accountState.tone === 'success' ? (
-                        <CheckCircle2 size={11} aria-hidden="true" />
-                      ) : (
-                        <AlertTriangle size={11} aria-hidden="true" />
-                      )}
+                  {/* 颜色与文案同源（pluginAccountState），不再出现"绿色的需重新授权"。 */}
+                  <MetaLine className="mt-0.5">
+                    <span className="inline-flex items-center gap-1.5 text-muted">
+                      <StatusDot tone={accountState.tone} />
                       {accountState.label}
-                    </Badge>
-                    {account.accountHint && (
-                      <span className="truncate text-caption text-faint">{account.accountHint}</span>
-                    )}
-                  </div>
+                    </span>
+                    {account.accountHint && <span className="truncate">{account.accountHint}</span>}
+                  </MetaLine>
                 </div>
                 {canSelfAuthorize &&
                   (accountState.needsReauth || isQrRelinkProvider(qrProvider)) && (
@@ -1247,12 +1327,12 @@ function RuntimePluginCard({
                     loading={busyAction === `reauth:${account.id}`}
                     disabled={busyAction !== null}
                   >
-                    <QrCode size={13} />
+                    <QrCode size={14} strokeWidth={1.75} />
                     {isQrRelinkProvider(qrProvider) ? '重新扫码登录' : '重新扫码授权'}
                   </Button>
                 )}
                 {account.writeControl && (
-                  <div className="flex items-center gap-2 text-caption text-muted">
+                  <div className="flex items-center gap-2 text-meta text-muted">
                     <span className={writePolicyStale ? 'text-warning' : undefined}>
                       {writePolicyStale
                         ? '写入条款已更新，需重新同意'
@@ -1277,22 +1357,26 @@ function RuntimePluginCard({
                   </div>
                 )}
                 <IconButton
-                  variant="danger"
                   size="sm"
                   aria-label="解绑"
                   title="解绑"
+                  className="text-faint hover:bg-danger-soft hover:text-danger"
                   disabled={busyAction !== null}
                   onClick={() => void runAction(`revoke:${account.id}`, () => onRevoke(account))}
                 >
-                  {busyAction === `revoke:${account.id}` ? <Spinner size={14} /> : <Trash2 size={14} />}
+                  {busyAction === `revoke:${account.id}` ? (
+                    <Spinner size={14} />
+                  ) : (
+                    <Trash2 size={15} strokeWidth={1.75} />
+                  )}
                 </IconButton>
                 {account.writeControl?.preapproval?.available && (
-                  <Card tone="sunken" padding="sm" className="basis-full">
+                  <div className="basis-full border-t border-border pt-3">
                     <div className="flex flex-wrap items-center gap-2">
                       <div className="min-w-0 flex-1 basis-40">
-                        <div className="text-caption font-medium text-fg">免逐次确认</div>
+                        <div className="text-body font-medium text-fg">免逐次确认</div>
                         <div
-                          className={`mt-0.5 text-caption leading-relaxed ${
+                          className={`mt-0.5 text-meta ${
                             preapprovalPolicyStale ? 'text-warning' : 'text-faint'
                           }`}
                         >
@@ -1303,7 +1387,7 @@ function RuntimePluginCard({
                               : '开启后，Agent 直接执行写入，不展示确认卡；默认关闭。'}
                         </div>
                       </div>
-                      <span className="text-caption text-muted">
+                      <span className="text-meta text-muted">
                         {preapprovalPolicyStale
                           ? '需重新同意'
                           : account.writeControl.preapproval.enabled
@@ -1329,15 +1413,15 @@ function RuntimePluginCard({
                         }}
                       />
                     </div>
-                  </Card>
+                  </div>
                 )}
                 {/* 自动回复外提：账号行只留一行摘要 + 入口，847 行的规则子系统去 Sheet 里展开。 */}
                 {plugin.slug === 'knowledge-planet' && account.status === 'active' && (
-                  <Card tone="sunken" padding="sm" className="basis-full">
+                  <div className="basis-full border-t border-border pt-3">
                     <div className="flex flex-wrap items-center gap-2">
                       <div className="min-w-0 flex-1 basis-40">
-                        <div className="text-caption font-medium text-fg">无人值守自动回复</div>
-                        <div className="mt-0.5 text-caption leading-relaxed text-faint">
+                        <div className="text-body font-medium text-fg">无人值守自动回复</div>
+                        <div className="mt-0.5 text-meta text-faint">
                           按规则自动回复星球里的新主题与提问；默认关闭，需单独同意免责声明。
                         </div>
                       </div>
@@ -1346,15 +1430,15 @@ function RuntimePluginCard({
                         size="sm"
                         onClick={() => setAutomationAccount(account)}
                       >
-                        <Settings2 size={13} /> 配置
+                        <Settings2 size={14} strokeWidth={1.75} /> 配置
                       </Button>
                     </div>
-                  </Card>
+                  </div>
                 )}
-              </li>
+              </ListRow>
             )
           })}
-        </ul>
+        </ListGroup>
       )}
       <Modal
         open={consentAccount != null}
@@ -1509,7 +1593,7 @@ function RuntimePluginCard({
           )}
         </div>
       </Sheet>
-    </Card>
+    </section>
   )
 }
 
@@ -1969,119 +2053,94 @@ function ProviderCard({
   };
   const broken = connections.filter((c) => c.status === "error").length;
   const orphanInstall = management?.installation === "orphan";
+  const meta: ReactNode[] = [capabilityLabel]
+  if (management?.installation === "default") meta.push("官方预装")
+  if (management?.installation === "marketplace")
+    meta.push(`市场已安装${management.installedVersion ? ` v${management.installedVersion}` : ""}`)
   return (
-    <Card className="p-3.5">
-      {/* 同 RuntimePluginCard：卡头 flex-wrap，动作簇窄屏整行下沉（manage 审计 M-09）。 */}
-      <div className="flex flex-wrap items-start gap-3">
-        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent">
-          <Icon size={18} />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-section font-medium text-fg">{label}</span>
-            <Badge tone="neutral" size="sm">
-              {capabilityLabel}
-            </Badge>
-            {management?.installation === "default" && (
-              <Badge tone="accent" size="sm">
-                官方预装
-              </Badge>
-            )}
-            {management?.installation === "marketplace" && (
-              <Badge tone="accent" size="sm">
-                市场已安装{management.installedVersion ? ` · v${management.installedVersion}` : ""}
-              </Badge>
-            )}
-            {orphanInstall && (
-              <Badge tone="warning" size="sm">
-                历史绑定 · 当前未安装
-              </Badge>
-            )}
+    <section data-connector-card={slug} className={CONNECTOR_SECTION}>
+      <ConnectorHead
+        icon={Icon}
+        label={label}
+        // 连接状态紧跟名称：段头不能永远绿着，失效必须一眼看得见。
+        status={
+          connections.length > 0
+            ? broken > 0
+              ? { tone: "warning", text: `${broken} 个账号需重新绑定` }
+              : { tone: "success", text: `已绑定 ${connections.length} 个账号` }
+            : null
+        }
+        description={description}
+        meta={meta}
+        actions={
+          <>
             {management?.updateAvailable && management.latestVersion && (
-              <Badge tone="accent" size="sm">
+              <span className="mr-1 text-meta tabular-nums text-muted">
                 可更新 v{management.latestVersion}
-              </Badge>
+              </span>
             )}
-          </div>
-          <p className="mt-0.5 text-meta leading-snug text-faint">{description}</p>
-          {/* 连接状态单独成行：卡片头不能永远绿着，失效必须一眼看得见。 */}
-          {connections.length > 0 && (
-            <div className="mt-1.5">
-              {broken > 0 ? (
-                <Badge tone="warning">
-                  <AlertTriangle size={11} aria-hidden="true" />
-                  {broken} 个账号需重新绑定
-                </Badge>
-              ) : (
-                <Badge tone="success">
-                  <CheckCircle2 size={11} aria-hidden="true" />
-                  已绑定 {connections.length} 个账号
-                </Badge>
-              )}
-            </div>
-          )}
-        </div>
-        <div className="flex shrink-0 flex-wrap justify-end gap-1.5 max-sm:basis-full max-sm:justify-start max-sm:pt-1">
-          {management?.updateAvailable && onUpdate && (
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busyAction === "update"}
-              disabled={busyAction !== null}
-              onClick={() => void runAction("update", onUpdate)}
-            >
-              <ArrowUpCircle size={13} /> 更新
-            </Button>
-          )}
-          {/* 不可绑定的历史安装给真出路（去市场重装），而不是一个灰掉且没有解释的按钮。 */}
-          {!canBind && orphanInstall && onOpenMarketplace ? (
-            <Button variant="secondary" size="sm" onClick={onOpenMarketplace}>
-              <Store size={13} /> 去市场安装
-            </Button>
-          ) : (
-            <Button variant="secondary" size="sm" onClick={onBind} disabled={!canBind}>
-              {canBind ? (connections.length > 0 ? "添加账号" : "绑定") : "不可绑定"}
-            </Button>
-          )}
-          {management?.installation === "marketplace" && onUninstallMarket && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-danger"
-              loading={busyAction === "uninstall"}
-              disabled={management.connectionCount > 0 || busyAction !== null}
-              onClick={() => void runAction("uninstall", onUninstallMarket)}
-            >
-              <Trash2 size={13} /> 卸载
-            </Button>
-          )}
-        </div>
-      </div>
+            {management?.updateAvailable && onUpdate && (
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={busyAction === "update"}
+                disabled={busyAction !== null}
+                onClick={() => void runAction("update", onUpdate)}
+              >
+                <ArrowUpCircle size={14} strokeWidth={1.75} /> 更新
+              </Button>
+            )}
+            {/* 不可绑定的历史安装给真出路（去市场重装），而不是一个灰掉且没有解释的按钮。 */}
+            {!canBind && orphanInstall && onOpenMarketplace ? (
+              <Button variant="secondary" size="sm" onClick={onOpenMarketplace}>
+                <Store size={14} strokeWidth={1.75} /> 去市场安装
+              </Button>
+            ) : (
+              <Button variant="secondary" size="sm" onClick={onBind} disabled={!canBind}>
+                {canBind ? (connections.length > 0 ? "添加账号" : "绑定") : "不可绑定"}
+              </Button>
+            )}
+            {management?.installation === "marketplace" && onUninstallMarket && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-muted hover:bg-danger-soft hover:text-danger"
+                loading={busyAction === "uninstall"}
+                disabled={management.connectionCount > 0 || busyAction !== null}
+                onClick={() => void runAction("uninstall", onUninstallMarket)}
+              >
+                卸载
+              </Button>
+            )}
+          </>
+        }
+      />
 
+      {orphanInstall && <ConnectorNote tone="warning">历史绑定 · 当前未安装</ConnectorNote>}
       {/* 禁用原因写成可见文字（title 在触屏/读屏上等于不存在）。 */}
       {management?.installation === "marketplace" && management.connectionCount > 0 && (
-        <p className="mt-2 text-caption text-warning">卸载前需先解绑下方全部账号。</p>
+        <ConnectorNote tone="warning">卸载前需先解绑下方全部账号。</ConnectorNote>
       )}
       {!canBind && !orphanInstall && (
-        <p className="mt-2 text-caption text-faint">
+        <ConnectorNote tone="neutral">
           该连接器当前不可绑定；等它在市场恢复可用后即可继续添加账号。
-        </p>
+        </ConnectorNote>
       )}
 
       {notice && (
-        <Alert tone={notice.tone} density="compact" className="mt-2" onDismiss={onDismissNotice}>
+        <Alert tone={notice.tone} density="compact" className="mt-3 sm:ml-7" onDismiss={onDismissNotice}>
           {notice.text}
         </Alert>
       )}
 
       {management && !management.available && (
-        <Alert tone="warning" density="compact" className="mt-2">
+        <ConnectorNote tone="warning">
           该 API 插件当前已下架、被撤销或签名契约不可用；保留在此供你解绑历史账号。
-        </Alert>
+        </ConnectorNote>
       )}
 
       {connections.length > 0 && (
-        <ul className="mt-3 flex flex-col divide-y divide-border border-t border-border pt-1">
+        <ListGroup aria-label={`${label}账号`} className="mt-4 sm:ml-7">
           {connections.map((c) => (
             <ConnectionRow
               key={c.id}
@@ -2092,9 +2151,9 @@ function ProviderCard({
               onRelink={() => onRelink(c)}
             />
           ))}
-        </ul>
+        </ListGroup>
       )}
-    </Card>
+    </section>
   );
 }
 
@@ -2135,8 +2194,8 @@ function ConnectionRow({
   };
 
   return (
-    <li className="flex flex-wrap items-center gap-2 py-2">
-      <div className="min-w-0 flex-1">
+    <ListRow className="flex flex-wrap items-center gap-x-3 gap-y-2">
+      <div className="min-w-0 flex-1 basis-40">
         {editing ? (
           <div className="flex items-center gap-1.5">
             <Input
@@ -2177,51 +2236,40 @@ function ConnectionRow({
           </div>
         ) : (
           <div className="flex min-w-0 items-center gap-1.5">
-            <span className="truncate text-body text-fg">
+            <span className="truncate text-[14px] font-medium leading-5 text-fg">
               {conn.displayName || conn.accountHint || "未命名连接"}
             </span>
             {canRename && (
-              <IconButton size="sm" aria-label="编辑备注名" onClick={() => setEditing(true)}>
-                <Pencil size={13} />
+              <IconButton
+                size="sm"
+                aria-label="编辑备注名"
+                className="text-faint"
+                onClick={() => setEditing(true)}
+              >
+                <Pencil size={13} strokeWidth={1.75} />
               </IconButton>
             )}
           </div>
         )}
-        {/* 状态升级为徽章（原来是三段同字号同粗细的裸文字，只靠颜色区分）；
-            账号提示与绑定时间降一层做元信息行，不再与状态争同一行。 */}
-        <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
-          {!hasError && (
-            <Badge tone="success" size="sm">
-              <CheckCircle2 size={11} aria-hidden="true" />
-              正常
-            </Badge>
-          )}
-          {needsRelink && (
-            <Badge tone="warning" size="sm">
-              <AlertTriangle size={11} aria-hidden="true" />
-              需要重新绑定
-            </Badge>
-          )}
-          {hasError && !needsRelink && (
-            <Badge tone="danger" size="sm">
-              <AlertTriangle size={11} aria-hidden="true" />
-              连接异常
-            </Badge>
-          )}
-          {/* 标题已在 displayName 为空时回落显示 accountHint；这里再渲染一遍会让同一串
-              账号提示上下各出一次（承接 manage 审计 M-18）。 */}
+        {/* 状态 = 圆点 + 词（与账号提示、绑定时间同一行元信息，· 分隔）。
+            标题已在 displayName 为空时回落显示 accountHint；这里不再重复（manage 审计 M-18）。 */}
+        <MetaLine className="mt-0.5">
+          <span className="inline-flex items-center gap-1.5 text-muted">
+            <StatusDot tone={!hasError ? "success" : needsRelink ? "warning" : "danger"} />
+            {!hasError ? "正常" : needsRelink ? "需要重新绑定" : "连接异常"}
+          </span>
           {conn.displayName && conn.accountHint && (
-            <span className="truncate text-caption text-faint">{conn.accountHint}</span>
+            <span className="truncate">{conn.accountHint}</span>
           )}
           {conn.createdAt && (
-            <span className="text-caption text-faint">
+            <span>
               绑定于 <TimeAgo value={conn.createdAt} format="short" tooltip={false} />
             </span>
           )}
-        </div>
+        </MetaLine>
         {/* 具体错误是一句话而不是标签：单独成行才能换行，塞进 nowrap 徽章会在窄屏顶破行。 */}
         {hasError && !needsRelink && (
-          <p className="mt-0.5 text-caption text-danger">
+          <p className="mt-1 text-meta text-danger">
             {connectorErrorText(conn.lastErrorCode)}
           </p>
         )}
@@ -2234,9 +2282,9 @@ function ConnectionRow({
         )}
         <IconButton
           size="sm"
-          variant="danger"
           aria-label="解绑"
           title="解绑"
+          className="text-faint hover:bg-danger-soft hover:text-danger"
           disabled={unbinding}
           onClick={() => {
             if (unbinding) return;
@@ -2244,10 +2292,10 @@ function ConnectionRow({
             void onUnbind(conn).finally(() => setUnbinding(false));
           }}
         >
-          {unbinding ? <Spinner size={14} /> : <Trash2 size={14} />}
+          {unbinding ? <Spinner size={14} /> : <Trash2 size={15} strokeWidth={1.75} />}
         </IconButton>
       </div>
-    </li>
+    </ListRow>
   );
 }
 

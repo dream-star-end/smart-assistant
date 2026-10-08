@@ -845,107 +845,120 @@ body {
   .tut-card:hover { transform: none; }
 }
 
-/* ── 管理中心(OCV5-344 第 2 轮视觉):与首页 / 教程中心同一套语言 ───────────────
-   只在 .oc-manage 作用域内生效。面板内部不逐个改写,而是:
-   ① 收紧圆角 token(卡片 22→14、控件 16→10):去掉「气泡卡 + 胖药丸下拉」的廉价感;
-   ② 分隔线降一档、卡片阴影改成一像素级的克制投影:层级靠留白和字号,不靠满屏描边;
-   ③ 面板标题(PanelHeader)提升为页面级标题。全部取语义 token,明暗主题自适应。 */
+/* ── 管理中心(OCV5-344 第 3 轮):安静的排版型工作面 ────────────────────────────
+   规则:层级靠字号 / 对齐 / 留白;一个分组 = 一个 10px 容器 + 发丝线;不画渐变、彩色药丸、
+   图标方块与浮起的卡片;强调色只给选中指示 / 焦点环 / 开关 / 文字链接 / 待办圆点。
+   原语在 QuietSurface 下自己换形态(ui/Quiet.tsx),这里只放外壳与几条跨原语的规则。 */
+.oc-manage,
+.oc-quiet {
+  --radius-xl: 10px;
+  --radius-lg: 8px;
+  --radius-md: 8px;
+}
 .oc-manage {
-  --radius-xl: 14px;
-  --radius-lg: 10px;
-  --color-border: color-mix(in srgb, var(--border) 72%, transparent);
-  background:
-    radial-gradient(70% 300px at 78% -170px, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
-    var(--surface);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--fg) 6%, transparent),
-    0 30px 80px -20px rgba(0, 0, 0, 0.35);
-}
-.oc-manage .shadow-soft {
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-}
-.dark .oc-manage .shadow-soft {
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
-}
-
-/* 导航栏:比内容区低半档的底色 + 顶部极淡的品牌光。窄屏是一条分段控件。 */
-.oc-manage-rail {
-  background:
-    radial-gradient(120% 220px at 0% -60px, color-mix(in srgb, var(--accent) 8%, transparent), transparent 70%),
-    color-mix(in srgb, var(--sidebar) 70%, var(--surface));
-}
-@media (max-width: 767px) {
-  .oc-manage-rail { background: transparent; }
-  .oc-manage-tablist { background: var(--hover); }
-}
-.oc-manage-tab[aria-selected="true"] {
   background: var(--surface);
   box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.06),
-    0 0 0 1px color-mix(in srgb, var(--fg) 7%, transparent);
+    0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent),
+    0 24px 64px -12px rgba(0, 0, 0, 0.28);
 }
-.dark .oc-manage-tab[aria-selected="true"] {
-  background: color-mix(in srgb, var(--fg) 7%, var(--surface));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent);
+.dark .oc-manage {
+  background: var(--bg);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--fg) 9%, transparent),
+    0 24px 64px -12px rgba(0, 0, 0, 0.6);
 }
+/* 手写 shadow-soft 的存量卡片在这里也是平的。 */
+.oc-manage .shadow-soft,
+.oc-quiet .shadow-soft { box-shadow: none; }
+/* 深色:分组容器取 surface,落在 bg 上形成克制的内嵌层次(Linear 同款)。 */
+.dark .oc-manage-rail { background: color-mix(in srgb, var(--sidebar) 60%, var(--bg)); }
+.oc-manage-rail { background: color-mix(in srgb, var(--sidebar) 55%, var(--surface)); }
+@media (max-width: 767px) {
+  .oc-manage-rail, .dark .oc-manage-rail { background: transparent; }
+}
+
+/* 导航项:32px 行,选中 = 中性填充 + 左侧 2px 强调短条。 */
+.oc-manage-tab { transition: background-color 120ms var(--ease-standard), color 120ms var(--ease-standard); }
 @media (min-width: 768px) {
-  /* 桌面选中项左侧 accent 指示条。 */
+  .oc-manage-tab[aria-selected="true"] { background: var(--active); }
   .oc-manage-tab[aria-selected="true"]::before {
     position: absolute;
-    left: -12px;
+    left: 0;
     top: 50%;
-    width: 3px;
-    height: 20px;
-    border-radius: 0 3px 3px 0;
+    width: 2px;
+    height: 14px;
+    border-radius: 2px;
     background: var(--accent);
     content: "";
     transform: translateY(-50%);
   }
 }
-.oc-manage-tab-icon {
-  background: var(--grad-cta, var(--accent));
-  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 30%, transparent);
-}
-.oc-manage-market {
-  border: 1px solid var(--color-border);
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--accent) 6%, transparent), transparent 60%),
-    var(--surface);
-}
-.oc-manage-market:hover {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-  box-shadow: 0 6px 20px -10px color-mix(in srgb, var(--accent) 45%, transparent);
+@media (max-width: 767px) {
+  /* 窄屏页签条:选中 = 前景色 + 2px 前景色下划线(与分区内的文字页签同一语法)。 */
+  .oc-manage-tab[aria-selected="true"]::after {
+    position: absolute;
+    left: 22%;
+    right: 22%;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--fg);
+    content: "";
+  }
 }
 
-/* 工具条:面包屑 + 紧凑的「作用范围」芯片。面板里的筛选 / 上下文下拉同款芯片;表单(<form>)里的字段保持原输入框样式,与同表单的文本框一致。触屏仍由原语保 44px。 */
-.oc-manage-toolbar {
-  border-bottom: 1px solid var(--color-border);
-}
+/* 作用范围 / 面板筛选下拉:安静的填充小控件(表单里的字段保持原输入框样式)。 */
 .oc-manage-scope select,
 .oc-manage-panel select:not(form select) {
-  height: 34px;
+  height: 32px;
   border-color: transparent;
   background-color: var(--hover);
   padding-left: 10px;
   font-size: 13px;
 }
 .oc-manage-scope select:hover,
-.oc-manage-panel select:not(form select):hover { border-color: var(--color-border); }
+.oc-manage-panel select:not(form select):hover { background-color: var(--active); }
 
-/* 面板标题 → 页面级标题。左右内距不动(分区契约 #1:标题左缘与列表行对齐)。 */
-.oc-manage-panel [data-panel-header] {
-  padding-top: 20px;
-  padding-bottom: 14px;
+/* 分组列表:行间发丝线(行自身无边框,展开内容共享同一条线);行悬停给极淡底。 */
+.oc-list > .oc-list-row + .oc-list-row { border-top: 1px solid var(--color-border); }
+.oc-list-row[data-interactive]:hover { background: var(--hover); }
+/* 元信息行:每一项前都带一个 14px 宽的「·」,整行左移 14px 再用 clip-path 裁掉左缘 14px ——
+   于是任何一行(含折行后的第二行)行首的分隔点都被裁掉,只剩项与项之间的点。 */
+.oc-meta {
+  column-gap: 0;
+  margin-left: -14px;
+  clip-path: inset(-4px -4px -4px 14px);
 }
-.oc-manage-panel [data-panel-header] h3 {
-  font-size: 19px;
-  line-height: 1.3;
-  letter-spacing: -0.02em;
+/* 分隔点绝对定位在每项左侧的 14px 内距里:不受子项自身 flex gap 影响,所有行左缘与标题对齐。 */
+.oc-meta > * {
+  position: relative;
+  padding-left: 14px;
 }
-.oc-manage-panel [data-panel-header] h3 + p {
-  margin-top: 4px;
-  font-size: 13px;
-  line-height: 1.55;
+.oc-meta > *::before {
+  position: absolute;
+  left: 0;
+  width: 14px;
+  color: var(--faint);
+  text-align: center;
+  content: "·";
+}
+/* 相邻的安静徽章(不在 MetaLine 里时)之间插「·」。徽章自身是 gap-1.5 的 flex,伪元素也吃这 6px,
+   所以分隔点右侧不再加外边距;左侧间距由外层容器的 gap 提供。 */
+.oc-qbadge + .oc-qbadge::before {
+  color: var(--faint);
+  content: "·";
+}
+.oc-qbadge-dot > svg { display: none; }
+/* 空态的预告骨架:淡化到 55%,只是形状提示。 */
+.oc-empty-ghost { opacity: 0.55; }
+
+/* 切换分区:内容 140ms 淡入 + 4px 上移;减少动效时不动。 */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes oc-manage-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+  .oc-manage-page { animation: oc-manage-in 140ms var(--ease-standard) both; }
 }
 
 /* ── 高成本 turn 完成后的一次性「评分引导」脉冲(方案 a)：极轻光环,**无布局位移**

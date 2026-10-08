@@ -5,12 +5,14 @@ import type { AuthSession, ResearchLibraryDoc } from '../../lib/types'
 import { cn } from '../../lib/utils'
 import {
   Alert,
-  Badge,
   Button,
   CopyChip,
   EmptyState,
   IconButton,
+  ListGroup,
+  ListRow,
   ListSkeleton,
+  MetaLine,
   PanelHeader,
   Spinner,
   TimeAgo,
@@ -193,7 +195,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
           </>
         ) : (
           <>
-            <Upload size={14} /> 上传入库
+            <Upload size={14} strokeWidth={1.75} /> 上传入库
           </>
         )}
       </label>
@@ -203,7 +205,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
   return (
     <div className="flex flex-col">
       <PanelHeader
-        title={total > 0 ? `文献库（${total}）` : '文献库'}
+        title="文献库"
         hint="已入库的权威文档（报告引用证据从这里回查）。支持 PDF / TXT / Markdown / HTML，单篇上限 25MB。"
         action={uploadControl}
       />
@@ -213,12 +215,19 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
           search={query}
           onSearchChange={setQuery}
           searchPlaceholder="按标题、文档 ID 或语言过滤…"
-          count={query.trim() ? filtered.length : null}
           debounceMs={120}
+          sticky={false}
+          // 安静表面:不画吸顶色带与底边线;计数是搜索框右侧的弱化等宽数字(原来写在标题括号里)。
+          className="border-b-0 bg-transparent px-4 pb-1 pt-0"
+          actions={
+            <span className="text-meta tabular-nums text-faint">
+              {query.trim() ? `${filtered.length} / ${total}` : `${total} 篇`}
+            </span>
+          }
         />
       )}
 
-      <div className="flex flex-col gap-3 px-4 py-3">
+      <div className="flex flex-col gap-3 px-4 pb-4 pt-3">
         {err && (
           <Alert
             tone="danger"
@@ -252,7 +261,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
               <label
                 htmlFor={UPLOAD_INPUT_ID}
                 className={cn(
-                  buttonVariants({ variant: 'accent', size: 'sm' }),
+                  buttonVariants({ variant: 'primary', size: 'sm' }),
                   'cursor-pointer',
                   uploading && 'pointer-events-none opacity-60',
                 )}
@@ -263,7 +272,7 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
                   </>
                 ) : (
                   <>
-                    <Upload size={14} /> 上传第一篇文献
+                    <Upload size={14} strokeWidth={1.75} /> 上传第一篇文献
                   </>
                 )}
               </label>
@@ -281,56 +290,67 @@ export function LibraryPanel({ auth }: { auth: AuthSession }) {
             }
           />
         ) : (
-          <ul className="divide-y divide-border rounded-lg border border-border">
+          // 一个分组容器 + 发丝线;不再每行重复同一个书本图标,语言 / 段数不再是灰色药丸。
+          <ListGroup>
             {/* 等待发生在内容所在的位置：25MB 的 PDF 要走上传 + 服务端解析切片，
                 只在按钮上转圈会让人以为卡死。 */}
             {uploading && uploadingName && (
-              <li className="flex items-center gap-3 px-3.5 py-2.5">
-                <BookOpen size={15} className="shrink-0 text-muted" />
+              <ListRow className="flex items-center gap-3">
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-section font-medium text-fg">{uploadingName}</div>
-                  <div className="mt-0.5 text-caption text-faint">正在解析并切片…</div>
+                  <div className="truncate text-[14px] font-medium leading-5 text-fg">{uploadingName}</div>
+                  <div className="mt-0.5 text-meta text-faint">正在解析并切片…</div>
                 </div>
-                <Badge tone="accent" size="sm">
-                  解析中
-                </Badge>
-              </li>
+                <span className="inline-flex shrink-0 items-center gap-1.5 text-meta text-muted">
+                  <Spinner size={13} /> 解析中
+                </span>
+              </ListRow>
             )}
             {filtered.map((d) => (
-              <li key={d.docId} className="flex items-center gap-3 px-3.5 py-2.5">
-                <BookOpen size={15} className="shrink-0 text-muted" />
+              <ListRow key={d.docId} className="flex items-center gap-3">
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-section font-medium text-fg">{d.title || UNTITLED}</div>
-                  <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <Badge tone="neutral" size="sm">
-                      {LANG_LABEL[d.lang] ?? d.lang}
-                    </Badge>
-                    <Badge tone="neutral" size="sm">
-                      {d.spanCount} 段
-                    </Badge>
-                    <span className="text-caption text-faint">
-                      <TimeAgo value={d.createdAt} format="short" tooltip={false} /> 入库
-                    </span>
+                  <div
+                    className={cn(
+                      'truncate text-[14px] font-medium leading-5',
+                      d.title ? 'text-fg' : 'text-muted',
+                    )}
+                  >
+                    {d.title || UNTITLED}
+                  </div>
+                  <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-1.5">
+                    <MetaLine>
+                      <span>{LANG_LABEL[d.lang] ?? d.lang}</span>
+                      <span>{d.spanCount} 段</span>
+                      <span>
+                        <TimeAgo value={d.createdAt} format="short" tooltip={false} /> 入库
+                      </span>
+                    </MetaLine>
                     {/* 文献行没有详情页（需后端单文档接口）：至少让用户把 docId 认出来、复制得走 ——
-                        对话里的证据卡与「引用核查」都是按 docId 回查的。 */}
-                    <span className="inline-flex items-center gap-1 text-caption text-faint">
-                      文档 ID
-                      <CopyChip value={d.docId} label={shortDocId(d.docId)} className="py-0.5 text-caption" />
+                        对话里的证据卡与「引用核查」都是按 docId 回查的。窄屏换行时不带行首「·」。 */}
+                    <span aria-hidden="true" className="hidden text-meta text-faint sm:inline">
+                      ·
                     </span>
+                    <CopyChip
+                      value={d.docId}
+                      label={shortDocId(d.docId)}
+                      className="-mx-1 gap-1 bg-transparent px-1 py-0 text-meta text-faint hover:bg-hover [@media(hover:none)]:-my-2.5 [@media(hover:none)]:px-1"
+                    />
                   </div>
                 </div>
                 <IconButton
-                  variant="danger"
+                  variant="muted"
                   size="sm"
+                  shape="square"
                   aria-label={`删除文献「${d.title || UNTITLED}」`}
                   title="删除文献"
                   onClick={() => void remove(d)}
+                  // 静止弱化;悬停 / 聚焦才转红 —— 红色留给确认框。
+                  className="-mr-1.5 hover:bg-danger-soft hover:text-danger focus-visible:text-danger"
                 >
-                  <Trash2 size={14} />
+                  <Trash2 size={15} strokeWidth={1.75} />
                 </IconButton>
-              </li>
+              </ListRow>
             ))}
-          </ul>
+          </ListGroup>
         )}
       </div>
       {confirmDialogEl}

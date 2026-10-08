@@ -47,6 +47,16 @@ export { Pagination } from "./Pagination";
 export { EmptyState, Panel, PanelHeader } from "./Panel";
 export { Popover, PopoverContent, PopoverTrigger } from "./Popover";
 export { Progress, type ProgressProps } from "./Progress";
+export {
+  GroupHeading,
+  ListGroup,
+  ListRow,
+  MetaLine,
+  QuietSurface,
+  StatusDot,
+  type StatusTone,
+  useQuiet,
+} from "./Quiet";
 export { Select, type SelectOption, type SelectProps } from "./Select";
 export { ProjectScopeSelect } from "./ProjectScopeSelect";
 export {

@@ -23,7 +23,7 @@ function renderShell(props: Partial<Parameters<typeof ManageCenter>[0]> = {}) {
   )
 }
 
-test('无障碍名仍是「管理中心」，可见标题在品牌块里，只有一个关闭按钮', () => {
+test('无障碍名仍是「管理中心」，可见标题在导航栏顶部，只有一个关闭按钮', () => {
   renderShell()
   expect(screen.getByRole('dialog', { name: '管理中心' })).toBeInTheDocument()
   expect(screen.getAllByRole('button', { name: '关闭' })).toHaveLength(1)
@@ -118,13 +118,26 @@ test('「怎么用」打开当前分区的教程；「优化」没有独立教�
   expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
 })
 
-test('分区说明只在导航栏出现一次；工具条是面包屑，窄屏无控件时整条隐藏', () => {
+test('分区说明只作读屏描述、不再挂在每个导航项下；窄屏无控件时工具条整条隐藏', () => {
   renderShell({ tab: 'connectors' })
+  // 第 3 轮：说明只出现一次，且是 sr-only 的 aria-describedby 目标（视觉由页面标题下的说明承担）。
+  const blurb = screen.getByText('已连接的应用和账号')
+  expect(blurb).toHaveClass('sr-only')
   expect(screen.getAllByText('已连接的应用和账号')).toHaveLength(1)
-  const crumb = screen.getByText('管理中心', { selector: '.oc-manage-toolbar span span' })
-  expect(crumb.parentElement).toHaveTextContent('管理中心插件')
+  // 不再有面包屑：页面标题本身就说明了位置。
+  expect(document.querySelector('.oc-manage-toolbar')).not.toHaveTextContent('管理中心')
   // 插件分区既无作用范围、也没传帮助回调：窄屏不渲染空工具条。
   expect(document.querySelector('.oc-manage-toolbar')).toHaveClass('max-md:hidden')
+})
+
+test('外壳是安静表面：没有渐变标识方块 / 渐变图标，原语拿到 QuietSurface', () => {
+  renderShell()
+  const dialog = screen.getByRole('dialog')
+  expect(dialog.querySelector('.bg-grad-cta, .tut-mark, .oc-manage-tab-icon')).toBeNull()
+  // 未登录空态由 EmptyState 原语渲染；安静形态带 data-empty-state 且不渲染图标方块。
+  const empty = dialog.querySelector('[data-empty-state]')
+  expect(empty).not.toBeNull()
+  expect(empty?.querySelector('svg')).toBeNull()
 })
 
 test('导航栏底部「去市场添加」直达市场', () => {

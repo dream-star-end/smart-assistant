@@ -97,8 +97,9 @@ describe("SkillsPanel 加载 / 空态 / 出口", () => {
 describe("SkillsPanel 来源可辨与只读语义", () => {
   test("自建 / 市场安装分组呈现,组头带计数", async () => {
     mountPanel();
-    expect(await screen.findByText("自建（3）")).toBeInTheDocument();
-    expect(screen.getByText("市场安装（1）")).toBeInTheDocument();
+    // 计数是组头里单独的等宽数字(不再写进全角括号)。
+    expect(await screen.findByRole("heading", { name: /^自建/ })).toHaveTextContent("自建3");
+    expect(screen.getByRole("heading", { name: /^市场安装/ })).toHaveTextContent("市场安装1");
   });
 
   test("只读技能行尾是「查看」而不是「编辑」(点了改不了 = 点了没有预期反应)", async () => {
