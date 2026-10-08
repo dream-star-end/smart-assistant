@@ -133,8 +133,7 @@ describe("saveMessageAsProjectSkill", () => {
 
   test("creates the user skill, then adds it to the project overlay", async () => {
     const g = guard();
-    vi.spyOn(api, "getSkill").mockRejectedValue(notFound());
-    const update = vi.spyOn(api, "updateSkill").mockResolvedValue({ ok: true });
+    const update = vi.spyOn(api, "createSkill").mockResolvedValue({ ok: true });
     vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 3, skillOverlay: ["existing"] });
     const put = vi.spyOn(taskboardApi, "putProjectContext").mockResolvedValue({
       ok: true,
@@ -147,8 +146,7 @@ describe("saveMessageAsProjectSkill", () => {
   });
 
   test("a 409 version conflict re-reads the context and retries once", async () => {
-    vi.spyOn(api, "getSkill").mockRejectedValue(notFound());
-    vi.spyOn(api, "updateSkill").mockResolvedValue({ ok: true });
+    vi.spyOn(api, "createSkill").mockResolvedValue({ ok: true });
     const getCtx = vi
       .spyOn(taskboardApi, "getProjectContext")
       .mockResolvedValueOnce({ version: 3, skillOverlay: [] })
@@ -166,8 +164,7 @@ describe("saveMessageAsProjectSkill", () => {
   });
 
   test("a second 409 gives up with overlay_conflict (the skill itself is saved)", async () => {
-    vi.spyOn(api, "getSkill").mockRejectedValue(notFound());
-    const update = vi.spyOn(api, "updateSkill").mockResolvedValue({ ok: true });
+    const update = vi.spyOn(api, "createSkill").mockResolvedValue({ ok: true });
     vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 1, skillOverlay: [] });
     const put = vi.spyOn(taskboardApi, "putProjectContext").mockRejectedValue(conflict());
     expect(await saveMessageAsProjectSkill(guard(), input)).toEqual({ kind: "overlay_conflict" });
@@ -175,16 +172,18 @@ describe("saveMessageAsProjectSkill", () => {
     expect(put).toHaveBeenCalledTimes(2);
   });
 
-  test("an existing skill with that name is never overwritten", async () => {
-    vi.spyOn(api, "getSkill").mockResolvedValue({ name: "weekly-report" } as never);
-    const update = vi.spyOn(api, "updateSkill");
+  test("an existing skill with that name is never overwritten: the server refuses the create (412)", async () => {
+    const create = vi
+      .spyOn(api, "createSkill")
+      .mockRejectedValue(new ApiError({ status: 412, message: "skill already exists" }));
+    const put = vi.spyOn(taskboardApi, "putProjectContext");
     expect(await saveMessageAsProjectSkill(guard(), input)).toEqual({ kind: "name_taken" });
-    expect(update).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(put).not.toHaveBeenCalled();
   });
 
   test("already in the overlay → done without a write", async () => {
-    vi.spyOn(api, "getSkill").mockRejectedValue(notFound());
-    vi.spyOn(api, "updateSkill").mockResolvedValue({ ok: true });
+    vi.spyOn(api, "createSkill").mockResolvedValue({ ok: true });
     vi.spyOn(taskboardApi, "getProjectContext").mockResolvedValue({ version: 2, skillOverlay: ["weekly-report"] });
     const put = vi.spyOn(taskboardApi, "putProjectContext");
     expect(await saveMessageAsProjectSkill(guard(), input)).toEqual({ kind: "saved" });
@@ -193,8 +192,7 @@ describe("saveMessageAsProjectSkill", () => {
 
   test("identity switch after the skill is created stops before touching the project", async () => {
     let changed = false;
-    vi.spyOn(api, "getSkill").mockRejectedValue(notFound());
-    vi.spyOn(api, "updateSkill").mockImplementation(async () => {
+    vi.spyOn(api, "createSkill").mockImplementation(async () => {
       changed = true;
       return { ok: true };
     });
@@ -209,7 +207,7 @@ describe("saveMessageAsProjectSkill", () => {
 
   test("identity switch before anything → nothing is read or written", async () => {
     const g = guard({ identityChanged: () => true });
-    const getSkill = vi.spyOn(api, "getSkill");
+    const getSkill = vi.spyOn(api, "createSkill");
     expect(await saveMessageAsProjectSkill(g, input)).toEqual({ kind: "aborted" });
     expect(g.prepareBoard).not.toHaveBeenCalled();
     expect(getSkill).not.toHaveBeenCalled();

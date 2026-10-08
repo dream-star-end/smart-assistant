@@ -1,4 +1,5 @@
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
+import { saveUserSkill } from './userSkillWrite.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
 import { readServerFeatures } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
@@ -9472,6 +9473,7 @@ export class Gateway {
         body?: string
         tags?: string[]
         agentIds?: unknown
+        createOnly?: unknown
       }>(req)
       const hasDescription = Object.prototype.hasOwnProperty.call(body, 'description')
       const hasBody = Object.prototype.hasOwnProperty.call(body, 'body')
@@ -9489,12 +9491,23 @@ export class Gateway {
         this.sendJson(res, 200, { ok: true })
         return
       }
-      const r = await store.save(
-        { name: skillName, description: body.description ?? '', tags: body.tags },
-        body.body ?? '',
-        agentIds ? { agentIds } : undefined,
+      // `createOnly: true` in the body: 412 when the skill already exists
+      // (checked and written under one per-name lock; see userSkillWrite.ts).
+      // A body field, not If-None-Match: the master's container proxy forwards
+      // only a fixed header set.
+      const outcome = await saveUserSkill(
+        store,
+        {
+          name: skillName,
+          description: body.description ?? '',
+          tags: body.tags,
+          body: body.body ?? '',
+          ...(agentIds ? { agentIds } : {}),
+        },
+        { createOnly: body.createOnly === true },
       )
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+      if (outcome.status === 'exists') return this.sendError(res, 412, 'skill already exists')
+      if (!outcome.ok) return this.sendError(res, 400, outcome.error ?? 'save failed')
       this.sendJson(res, 200, { ok: true })
       return
     }

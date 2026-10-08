@@ -105,7 +105,16 @@ export function projectSearchSnippet(
   return `${start > 0 ? '…' : ''}${text.slice(start, end)}${end < text.length ? '…' : ''}`
 }
 
+/**
+ * The path the agent should Read for a hit. A version with a stored copy (url
+ * into the sha256 store) is read from that copy: the source path may since
+ * have been overwritten, by a later version or by another project writing the
+ * same generated/ path. Only registrations without a copy fall back to the
+ * source path.
+ */
 export function projectSearchAssetPath(asset: Pick<ProjectAsset, 'source' | 'url' | 'containerPath'>): string | null {
+  const stored = asset.url ? resolveUploadExcerptPath(asset.url, null) : null
+  if (stored) return stored
   if (asset.source === 'upload') return resolveUploadExcerptPath(asset.url, asset.containerPath)
   return asset.containerPath ? oneLine(asset.containerPath) || null : null
 }

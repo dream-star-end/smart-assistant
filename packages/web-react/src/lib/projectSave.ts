@@ -143,18 +143,17 @@ export async function saveMessageAsProjectSkill(
   const early = await prepare(g);
   if (early) return early;
   try {
-    // PUT /api/skills/:name 会覆盖同名技能（旧版进 history）；这里只建新的，同名先拦下。
-    try {
-      await api.getSkill(g.auth, input.name);
-      return g.identityChanged() ? ABORTED : { kind: "name_taken" };
-    } catch (e) {
-      if (!(e instanceof ApiError && e.status === 404)) throw e;
-    }
+    // 只建新的：服务端在同一把锁里查重并写入，同名（包括另一个标签页刚建的）返回 412。
     if (g.identityChanged()) return ABORTED;
-    await api.updateSkill(g.auth, input.name, {
-      description: input.description.trim(),
-      body: input.body,
-    });
+    try {
+      await api.createSkill(g.auth, input.name, {
+        description: input.description.trim(),
+        body: input.body,
+      });
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 412) return g.identityChanged() ? ABORTED : { kind: "name_taken" };
+      throw e;
+    }
     for (let attempt = 0; attempt < 2; attempt += 1) {
       if (g.identityChanged()) return ABORTED;
       const ctx = await taskboardApi.getProjectContext(g.auth, g.boardProjectId);

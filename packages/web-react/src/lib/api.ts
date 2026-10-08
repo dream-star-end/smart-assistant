@@ -3249,6 +3249,19 @@ export const api = {
       ),
     ),
 
+  /** 新建技能，同名已存在时服务端拒绝（PUT body createOnly，412 → ApiError.status 412）。 */
+  createSkill: (a: AuthSession, name: string, body: { description?: string; body?: string; tags?: string[] }) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ ...body, createOnly: true }),
+        }),
+      ),
+    ),
+
   /** 读技能目录内单个文件（GET /api/skills/:name?file=<rel>）。 */
   getSkillFile: (a: AuthSession, name: string, path: string) =>
     jsonOrThrow<{ path: string; content: string }>(

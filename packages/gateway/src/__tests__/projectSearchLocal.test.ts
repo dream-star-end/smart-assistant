@@ -182,6 +182,15 @@ describe('hit shaping', () => {
     assert.equal(hit!.snippet, '付款 期限')
     assert.equal(hit!.path, `/home/agent/.openclaude/uploads/${'a'.repeat(64)}.pdf`)
   })
+
+  test('an output version with a stored copy is read from the copy, not the overwritable source path', () => {
+    const d = 'b'.repeat(64)
+    const [hit] = buildProjectSearchHits(
+      [asset({ source: 'output', url: `/api/media/${d}.md`, containerPath: '/home/agent/.openclaude/generated/report.md' })],
+      'x',
+    )
+    assert.equal(hit!.path, `/home/agent/.openclaude/uploads/${d}.md`)
+  })
 })
 
 describe('reachability', () => {
