@@ -336,16 +336,21 @@ function foldProvenImageCaption(message: Record<string, unknown>,
     // carry one caption after all results. It belongs to the single image
     // whose pixel size it names as "displayed"; no match or several matches
     // stay unfolded (and rejected).
-    const matching: Array<{ index: number; size: { width: number; height: number } }> = [];
+    // The caption is appended to its result, so the matched image must be that result's last block.
+    const matching: Array<{ index: number; size: { width: number; height: number }; last: boolean }> = [];
     for (let index = 0; index < results.length; index++) {
       const part = results[index];
       if (!object(part) || !Array.isArray(part.content)) continue;
-      for (const item of part.content.map(strictBoxImageBlock)) {
+      const content = part.content as unknown[];
+      content.forEach((block, position) => {
+        const item = strictBoxImageBlock(block);
         const size = item ? boxImageDimensions(item.data) : null;
-        if (size && captionMatchesImage(caption, size)) matching.push({ index, size });
-      }
+        if (size && captionMatchesImage(caption, size)) {
+          matching.push({ index, size, last: position === content.length - 1 });
+        }
+      });
     }
-    if (matching.length !== 1) return message;
+    if (matching.length !== 1 || !matching[0]!.last) return message;
     imageIndex = matching[0]!.index;
     matchedSize = matching[0]!.size;
   }
