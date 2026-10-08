@@ -154,7 +154,7 @@ test("目录 revision 变化会刷新跨客户端市场和发布状态", () => {
   // tab ↔ 面板的 aria 关联(读屏能从 tab 跳到对应面板)
   expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", "marketplace-tab-browse");
   expect(screen.getByRole("heading", { name: "AI 市场" }).parentElement).toHaveClass("min-w-0");
-  expect(screen.getByRole("dialog")).toHaveClass("oc-center-dialog", "h-[min(85vh,46rem)]", "h-[min(85dvh,46rem)]");
+  expect(screen.getByRole("dialog")).toHaveClass("oc-center-dialog", "marketplace-window");
   expect(screen.getByRole("dialog")).not.toHaveClass("top-1/2");
 });
 

@@ -1,5 +1,5 @@
 import * as Dialog from '@radix-ui/react-dialog'
-import { CheckCircle2, LogIn, TriangleAlert, X } from 'lucide-react'
+import { ArrowUpRight, CheckCircle2, Compass, LogIn, TriangleAlert, X } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
 import { marketplaceArtifactKind } from '../lib/marketplace'
@@ -143,17 +143,17 @@ export function MarketplaceCenter({
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm data-[state=open]:animate-fade" />
         <Dialog.Content
           aria-describedby={undefined}
-          className="oc-center-dialog fixed left-1/2 z-50 flex h-[min(85vh,46rem)] h-[min(85dvh,46rem)] w-[calc(100vw-2rem)] max-w-3xl -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
+          className="marketplace-window oc-center-dialog fixed left-1/2 z-50 flex -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-float focus:outline-none data-[state=open]:animate-in"
         >
-          {/* 标题区与下方内容同为 px-4:改造前 px-5 让标题比列表右缩 4px,是肉眼可见的错位缝。
-              副标题在窄屏隐藏 —— 它在 375px 下必然折行,吃掉 40px 而信息量为零。 */}
-          <div className="flex items-start justify-between gap-3 px-4 py-2.5 sm:py-3">
-            <div className="min-w-0">
-              <Dialog.Title className="text-title font-semibold text-fg">AI 市场</Dialog.Title>
-              <p className="mt-0.5 hidden text-meta text-faint sm:block">
-                发现并安装技能、智能体与插件，也可以把自己的作品分享给大家。
-              </p>
+          <div className="marketplace-masthead">
+            <div className="marketplace-brand">
+              <span className="marketplace-brand-mark" aria-hidden="true"><Compass size={22} strokeWidth={1.6} /></span>
+              <div className="min-w-0">
+                <Dialog.Title className="marketplace-brand-title">AI 市场</Dialog.Title>
+                <span className="marketplace-wordmark" aria-hidden="true">CLARVY / COLLECTIONS</span>
+              </div>
             </div>
+            <span className="marketplace-masthead-note">让好想法，有好工具。<ArrowUpRight size={14} aria-hidden="true" /></span>
             <Dialog.Close asChild>
               <IconButton aria-label="关闭" size="sm">
                 <X size={16} />
@@ -161,7 +161,7 @@ export function MarketplaceCenter({
             </Dialog.Close>
           </div>
 
-          <div className="border-b border-border px-4 pb-2.5">
+          <div className="marketplace-navigation">
             <Tabs
               aria-label="市场分区"
               idBase={TAB_ID_BASE}
@@ -220,7 +220,7 @@ export function MarketplaceCenter({
             role="tabpanel"
             id={`${TAB_ID_BASE}-panel-${safeTab}`}
             aria-labelledby={`${TAB_ID_BASE}-tab-${safeTab}`}
-            className="min-h-0 flex-1 overflow-y-auto"
+            className="marketplace-content min-h-0 flex-1 overflow-y-auto"
           >
             {!auth ? (
               <EmptyState

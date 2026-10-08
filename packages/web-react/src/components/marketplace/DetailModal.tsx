@@ -1,6 +1,7 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol'
 import {
   Activity,
+  Sparkles,
   ArrowUpCircle,
   Download,
   FileQuestion,
@@ -708,7 +709,8 @@ export function DetailModal({
       // 全站信息密度最高的弹层之一(富介绍 + 徽章行 + 双栏 manifest + 代码块),
       // 与同为「浏览并选择」的 AgentPicker 对齐到 lg(max-w-2xl)。
       size="lg"
-      title={detail?.name ?? '市场详情'}
+      className="marketplace-detail"
+      title={<span className="marketplace-detail-title"><span aria-hidden="true"><Sparkles size={24} strokeWidth={1.5} /></span>{detail?.name ?? '市场详情'}</span>}
       description={detail ? `${detail.slug} · v${detail.version}` : undefined}
       footer={
         // 单个 flex item 拿满宽后可在内部分两行:第一行是就近的失败提示,第二行才是动作组。
@@ -863,7 +865,7 @@ export function DetailModal({
 
           {/* ① 身份与信任 + 真实使用信号:驱动「装不装」的东西必须紧贴标题,不能压在长介绍之后。
               色彩预算按语义分配:身份/信任 success、分类 info、标签与统计一律 neutral。 */}
-          <div className="flex flex-col gap-1.5">
+          <div className="marketplace-detail-facts flex flex-col gap-1.5">
             <div className="flex flex-wrap items-center gap-1.5">
               {isPreset && (
                 <Badge tone="success">

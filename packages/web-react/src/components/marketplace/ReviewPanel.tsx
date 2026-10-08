@@ -384,7 +384,8 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
   };
 
   return (
-    <div className="flex flex-col gap-4 px-4 py-4">
+    <div className="marketplace-review marketplace-workbench flex flex-col gap-4 px-4 py-4">
+      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">CURATION DESK</span><h2>让好作品，被看见。</h2><p>审阅内容与风险，为每一次发现把好关。</p></header>
       {promptTextEl}
       {confirmEl}
 

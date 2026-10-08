@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "@fontsource-variable/inter";
+@import "./components/marketplace/marketplace.css";
 
 /* ── Design tokens exposed to Tailwind (utilities like bg-bg, text-fg…) ── */
 @theme {

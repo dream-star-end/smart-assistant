@@ -188,7 +188,7 @@ test("卡片:users30d>0 → 以「30天 N 人在用」替代安装数徽章位",
   expect(screen.queryByText("50 人在用")).not.toBeInTheDocument();
 });
 
-test("卡片:users30d=0/缺省 → 沿用安装数「N 人在用」", async () => {
+test("卡片:users30d=0/缺省 → 如实显示「N 次安装」，不冒充活跃使用", async () => {
   searchMarketplace.mockResolvedValue({
     results: [card("cold", { name: "冷门技能", category: "office-docs", installCount: 8 })],
     method: "all",
@@ -196,7 +196,7 @@ test("卡片:users30d=0/缺省 → 沿用安装数「N 人在用」", async () =
   listMarketplaceInstalled.mockResolvedValue([]);
 
   render(<BrowsePanel auth={auth} />);
-  expect(await screen.findByText("8 人在用")).toBeInTheDocument();
+  expect(await screen.findByText("8 次安装")).toBeInTheDocument();
   expect(screen.queryByText(/30天/)).not.toBeInTheDocument();
 });
 
@@ -482,4 +482,28 @@ test("审核通过 CTA 的 focusRequest 可直接打开新上架条目", async (
     />,
   );
   expect(screen.queryByTestId("detail-slug")).not.toBeInTheDocument();
+});
+
+
+test("首屏失败不会误报成空目录，保留可重试出口", async () => {
+  searchMarketplace.mockRejectedValue(new Error("offline"));
+  listMarketplaceInstalled.mockResolvedValue([]);
+  render(<BrowsePanel auth={auth} />);
+  expect(await screen.findByText("加载市场失败")).toBeInTheDocument();
+  expect(screen.queryByText("市场还没有上架的技能")).not.toBeInTheDocument();
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  fireEvent.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByRole("button", { name: /PPT 生成器/ })).toBeInTheDocument();
+});
+
+test("搜索时让出展厅标题空间，清空后恢复发现", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  render(<BrowsePanel auth={auth} />);
+  expect(screen.getByRole("region", { name: "探索市场" })).toBeInTheDocument();
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "PPT" } });
+  expect(screen.queryByRole("region", { name: "探索市场" })).not.toBeInTheDocument();
+  await waitFor(() => expect(searchMarketplace).toHaveBeenLastCalledWith(auth, "PPT", "skill", 50));
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "" } });
+  expect(screen.getByRole("region", { name: "探索市场" })).toBeInTheDocument();
 });

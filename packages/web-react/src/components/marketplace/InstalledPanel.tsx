@@ -320,6 +320,7 @@ export function InstalledPanel({
     return (
       <li key={r.slug}>
         <CardRow
+          className="marketplace-installed-row"
           icon={<KindChip kind={r.kind} revoked={revoked} />}
           title={r.name}
           meta={
@@ -401,7 +402,8 @@ export function InstalledPanel({
   }
 
   return (
-    <div className="flex flex-col">
+    <div className="marketplace-library flex flex-col">
+      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">YOUR COLLECTION</span><h2>我的能力库</h2><p>管理已安装的工具，让每一项能力各就其位。</p></header>
       <Modal
         open={pendingUninstall !== null}
         onOpenChange={(open) => {
@@ -554,6 +556,7 @@ export function InstalledPanel({
               {connectorRows.map((r) => (
                 <li key={r.slug}>
                   <CardRow
+          className="marketplace-installed-row"
                     icon={<KindChip kind="connector" revoked={r.listingState === 'revoked'} />}
                     title={r.name}
                     meta={

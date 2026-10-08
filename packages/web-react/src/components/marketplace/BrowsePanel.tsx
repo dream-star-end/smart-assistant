@@ -1,6 +1,7 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
 import {
   ArrowUpCircle,
+  ArrowUpRight,
   BarChart3,
   Bot,
   Boxes,
@@ -47,7 +48,6 @@ import {
   Alert,
   Badge,
   Button,
-  cardVariants,
   EmptyState,
   IconButton,
   Input,
@@ -133,7 +133,9 @@ function CardTile({
   card,
   installed,
   onOpen,
+  featured = false,
 }: {
+  featured?: boolean;
   card: MarketplaceCard;
   installed: Map<string, MarketplaceInstalled>;
   onOpen: (slug: string) => void;
@@ -142,13 +144,13 @@ function CardTile({
   const canUpdate = inst ? updateAvailable(inst) : false;
   const bench = benchmarkBadgeLabel(card.benchmark);
   // 使用信号(真实使用 > 安装):近30天有去重使用人数则以「30天 N 人在用」替代原
-  // 安装数徽章位;否则沿用安装数「N 人在用」。缺字段(旧后端)两者皆无 → 不占位。
+  // 安装数徽章位;否则如实展示「N 次安装」，不把安装量冒充活跃人数。缺字段(旧后端)两者皆无 → 不占位。
   const users30d = card.users30d ?? 0;
   const inUseLabel =
     users30d > 0
       ? `30天 ${formatInstallCount(users30d)} 人在用`
       : formatInstallCount(card.installCount)
-        ? `${formatInstallCount(card.installCount)} 人在用`
+        ? `${formatInstallCount(card.installCount)} 次安装`
         : null;
   // 评分:服务端已保证样本≥5 才非 null(前端不做二次阈值判断)。中性信号,诚实文案。
   const rating = card.rating ?? null;
@@ -186,43 +188,22 @@ function CardTile({
         onClick={() => onOpen(card.slug)}
         aria-label={ariaLabel}
         aria-describedby={descId}
-        className={cn(
-          cardVariants({ padding: "md", interactive: true }),
-          "flex h-full w-full flex-col gap-2 bg-elevated text-left",
-        )}
+        data-category={card.category ?? "general"}
+        data-featured={featured || undefined}
+        className="marketplace-card"
       >
-        <div className="flex items-start gap-2.5">
-          <span
-            className={cn(
-              "flex size-8 shrink-0 items-center justify-center rounded-lg",
-              trusted ? "bg-success-soft text-success" : "bg-accent-soft text-accent",
-            )}
-          >
-            <Icon size={15} aria-hidden="true" />
+        <span className="marketplace-card-top">
+          <span className="marketplace-card-icon"><Icon size={24} strokeWidth={1.6} aria-hidden="true" /></span>
+          <span className="marketplace-card-state">
+            {canUpdate ? <><ArrowUpCircle size={13} aria-hidden="true" /> 可更新</>
+              : inst ? <><ShieldCheck size={13} aria-hidden="true" /> 已安装</>
+                : <ArrowUpRight size={18} className="marketplace-card-arrow" aria-hidden="true" />}
           </span>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5">
-              <span className="truncate text-section font-semibold text-fg">{card.name}</span>
-              {canUpdate ? (
-                <ArrowUpCircle size={13} className="shrink-0 text-accent" aria-hidden="true" />
-              ) : inst ? (
-                <ShieldCheck size={13} className="shrink-0 text-success" aria-hidden="true" />
-              ) : null}
-            </div>
-            {/* button 内只允许 phrasing content —— 用 span 而非 <p>。
-                不能再叠 `block`:它的 display:block 会盖掉 line-clamp 的 -webkit-box,
-                两行截断随即失效,卡高跟着描述长度失控(K-02)。 */}
-            <span
-              id={descId}
-              className="mt-0.5 line-clamp-2 text-meta leading-snug text-muted"
-            >
-              {card.description}
-            </span>
-          </div>
-        </div>
-
+        </span>
+        <span className="marketplace-card-name">{card.name}</span>
+        <span id={descId} className="marketplace-card-description line-clamp-2">{card.description}</span>
         {(identity || catLabel || card.tags.length > 0) && (
-          <div className="flex flex-wrap items-center gap-1" aria-hidden="true">
+          <div className="marketplace-card-tags flex flex-wrap items-center gap-1" aria-hidden="true">
             {identity && (
               <Badge tone={trusted ? "success" : "accent"} size="sm">
                 {identity}
@@ -247,7 +228,7 @@ function CardTile({
         )}
 
         {hasSignals && (
-          <div className="mt-auto flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border/60 pt-2 text-caption text-faint">
+          <div className="marketplace-card-signals">
             {rating && (
               // role=img + aria-label:样本量说明从桌面端才触发的原生 title 挪进无障碍名,
               // 触屏用户不再完全够不到它。
@@ -307,11 +288,11 @@ function Section({
   onOpen: (slug: string) => void;
 }) {
   return (
-    <section className="flex flex-col gap-2.5">
-      <div>
-        <div className="flex flex-wrap items-center gap-1.5">
+    <section className="marketplace-section" data-featured={title === "平台精选" || undefined}>
+      <div className="marketplace-section-heading">
+        <div className="flex flex-wrap items-center gap-2">
           <Icon size={13} className={cn("shrink-0 text-faint", iconClassName)} aria-hidden="true" />
-          <h3 className="text-caption font-semibold uppercase tracking-[0.06em] text-muted">
+          <h3 className="marketplace-section-title">
             {title}
           </h3>
           <Badge tone="neutral" size="sm">
@@ -322,11 +303,11 @@ function Section({
         {/* 分区说明在窄屏隐藏:每个分区多一行就多吃 16px,而 390px 屏上光是必需控件
             (Tabs/类目/搜索/分类片)已经占掉近一半高度。 */}
         {blurb && <p className="mt-1 hidden line-clamp-1 text-caption text-faint sm:block">{blurb}</p>}
-        <div className="mt-1.5 h-px bg-border" />
+
       </div>
-      <ul className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+      <ul className="marketplace-grid">
         {cards.map((c) => (
-          <CardTile key={c.slug} card={c} installed={installed} onOpen={onOpen} />
+          <CardTile key={c.slug} card={c} installed={installed} onOpen={onOpen} featured={title === "平台精选"} />
         ))}
       </ul>
     </section>
@@ -587,17 +568,31 @@ export function BrowsePanel({
     );
 
   return (
-    <div className="flex flex-col">
+    <div className="marketplace-browse flex flex-col">
+      {!q && selectedCat === null && (
+        <section className="marketplace-hero" aria-label="探索市场">
+          <div className="marketplace-hero-copy">
+            <span className="marketplace-eyebrow"><span /> 为你的灵感，扩展可能</span>
+            <h2>好工具，<br />让想法<span className="marketplace-hero-emphasis">更进一步。</span></h2>
+            <p>{kind === "agent" ? "找到与你默契配合的智能体，把专业的事交给专业的伙伴。" : kind === "connector" ? "连接你熟悉的应用，让对话与工作自然衔接。" : "发现实用技能，把重复的事交给 AI，把时间留给创造。"}</p>
+          </div>
+          <div className="marketplace-hero-art" aria-hidden="true">
+            <span className="marketplace-art-caption">YOUR NEXT CAPABILITY</span>
+            <div className="marketplace-art-stack"><span><Code2 size={28} /></span><span><Bot size={32} strokeWidth={1.5} /></span><span><Sparkles size={42} strokeWidth={1.3} /></span></div>
+            <span className="marketplace-art-foot">灵感 × 能力 <ArrowUpRight size={16} /></span>
+          </div>
+        </section>
+      )}
       {/* 一条 sticky 头带承载「看哪一类 + 搜什么 + 让 AI 帮挑」:改造前 kind pill 在
           sticky 搜索框上方且不吸顶,一滚动就只剩一个孤零零的搜索框。 */}
-      <div className="sticky top-0 z-10 flex flex-col gap-1.5 bg-surface px-4 pb-2 pt-2.5 sm:flex-row sm:items-center sm:gap-2.5">
+      <div className="marketplace-toolbar">
         {onKindChange && (
           <Tabs
             aria-label="市场类型"
             value={kind}
             onValueChange={(v) => onKindChange(v as "skill" | "agent" | "connector")}
             items={KIND_TABS}
-            className="shrink-0 self-start sm:self-auto"
+            className="marketplace-kind-tabs shrink-0 self-start sm:self-auto"
           />
         )}
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
@@ -615,7 +610,7 @@ export function BrowsePanel({
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder={`搜索${noun}`}
-              className="pl-9"
+              className="marketplace-search pl-9"
             />
           </div>
           {stale && (
@@ -637,7 +632,7 @@ export function BrowsePanel({
       </div>
       {!q && (
         // 提示词做成可点的芯片:改造前是一行纯文字,三个带引号的词看着像能点,点了没反应(K-06)。
-        <div className="flex flex-wrap items-center gap-1.5 px-4 pb-1.5 text-caption text-faint">
+        <div className="marketplace-suggestions flex flex-wrap items-center gap-1.5 text-caption text-faint">
           <span>试试</span>
           {(kind === "agent"
             ? ["写作", "编程", "研究"]
@@ -663,7 +658,7 @@ export function BrowsePanel({
             // 只在窄屏(真的横滚时)可聚焦;桌面换行不滚,不留无意义的 Tab 停靠点(QA t-1028 §6 #1)。
             // biome-ignore lint/a11y/noNoninteractiveTabindex: 移动端横向滚动分类必须可由键盘聚焦和滚动。
             tabIndex={narrow ? 0 : undefined}
-            className="flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible"
+            className="marketplace-categories flex snap-x scroll-px-4 gap-1.5 overflow-x-auto px-4 pb-2 outline-none [scrollbar-width:none] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:snap-none sm:overflow-x-visible"
           >
             <Chip active={selectedCat === null} onClick={() => setSelectedCat(null)}>
               全部
@@ -681,7 +676,7 @@ export function BrowsePanel({
           </section>
           <div
             aria-hidden="true"
-            className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-surface to-transparent sm:hidden"
+            className="marketplace-category-fade pointer-events-none absolute inset-y-0 right-0 w-8 sm:hidden"
           />
         </div>
       )}
@@ -704,7 +699,7 @@ export function BrowsePanel({
 
       {firstLoad ? (
         <ListSkeleton variant="card" rows={4} className="px-4 pb-5" />
-      ) : empty ? (
+      ) : empty && !err ? (
         debouncedQ ? (
           <EmptyState
             icon={PackageSearch}
@@ -754,7 +749,7 @@ export function BrowsePanel({
               窄屏在不必要时(分区态且没有更多可加载)让出这 21px —— 分区计数已在各区头。 */}
           <div
             className={cn(
-              "flex items-center gap-2 px-4 pb-2",
+              "marketplace-results flex items-center gap-2",
               !flatMode && !truncated && "hidden sm:flex",
             )}
           >
@@ -793,7 +788,7 @@ export function BrowsePanel({
 
           {sections && selectedCat === null ? (
             // 分区视图:平台精选 → 各分类分区 → 未分类兜底
-            <div className="flex flex-col gap-5 px-4 pb-5">
+            <div className="marketplace-sections">
               {sections.featured.length > 0 && (
                 <Section
                   title="平台精选"
@@ -835,7 +830,7 @@ export function BrowsePanel({
             </div>
           ) : (
             // 平铺视图:搜索相关度列表,或选中某个分类筛选片
-            <ul className="grid grid-cols-1 gap-2.5 px-4 pb-5 sm:grid-cols-2">
+            <ul className="marketplace-grid marketplace-flat-grid">
               {flatCards.map((c) => (
                 <CardTile key={c.slug} card={c} installed={installed} onOpen={setActive} />
               ))}

@@ -754,7 +754,8 @@ export function PublishPanel({
   }, [refill]);
 
   return (
-    <div className="flex flex-col gap-4 px-4 py-4">
+    <div className="marketplace-publish marketplace-workbench flex flex-col gap-4 px-4 py-4">
+      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">MADE TO SHARE</span><h2>把你的得心应手，分享出去。</h2><p>将经验变成技能，让更多人从你的创造中受益。</p></header>
       {confirmEl}
       <div ref={publishesRef}>
         <MyPublishes

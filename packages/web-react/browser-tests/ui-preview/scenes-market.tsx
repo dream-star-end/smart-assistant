@@ -7,7 +7,7 @@
  *
  * 只读预览:所有写操作(安装/卸载/审核/发布)返回中性成功值,不改变场景数据。
  */
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { MarketplaceCenter } from '../../src/components/MarketplaceCenter'
 import { DetailModal } from '../../src/components/marketplace/DetailModal'
 import { FeaturedPanel } from '../../src/components/marketplace/FeaturedPanel'
@@ -1293,17 +1293,18 @@ function Market({
   kind?: 'skill' | 'agent' | 'connector'
   isAdmin?: boolean
 }) {
+  const [activeTab, setActiveTab] = useState(tab)
   return (
     <MarketplaceCenter
       open
-      tab={tab}
+      tab={activeTab}
       auth={auth}
       isAdmin={isAdmin}
       initialBrowseKind={kind}
       onCreateInChat={() => {}}
       onAskAiInChat={() => {}}
       onOpenConnectors={() => {}}
-      onTabChange={() => {}}
+      onTabChange={setActiveTab}
       onClose={() => {}}
     />
   )
