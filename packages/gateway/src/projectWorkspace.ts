@@ -15,7 +15,7 @@ import {
   type ProjectWorkspace,
 } from '@openclaude/storage'
 import type { EngineCwdSource } from './engineCwd.js'
-import { resolveTurnProjectContext } from './projectContextRuntime.js'
+import { type ProjectContextUnavailableReason, resolveTurnProjectContext } from './projectContextRuntime.js'
 
 export interface ChatRunWorkspace {
   projectId: string | null
@@ -25,6 +25,8 @@ export interface ChatRunWorkspace {
   bound: boolean
   contextFingerprint: string
   assetsRevision: number
+  /** The project context could not be read; the caller must not run the turn as unbound. */
+  unavailable?: ProjectContextUnavailableReason
 }
 
 export interface BoardProjectWorkspaceView {
@@ -67,6 +69,7 @@ export async function resolveChatRunWorkspace(opts: {
     boardProjectId: opts.boardProjectId,
     env: opts.env,
   })
+  if (resolved?.unavailable) return { ...UNBOUND, unavailable: resolved.unavailable }
   const projectId = resolved?.boardProjectId ?? null
   if (!projectId || !resolved?.bound) return UNBOUND
   const lookup = opts.getBoardProject ?? defaultGetBoardProject

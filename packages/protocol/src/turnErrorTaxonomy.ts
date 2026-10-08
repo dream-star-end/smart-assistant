@@ -88,6 +88,9 @@ export const TURN_ERROR_TAXONOMY = {
   /** Soft-deleted conversation. Same-peer retry cannot revive it; restore from
    * the recycle bin (or start a new session) is the only recovery. */
   session_deleted: { retryable: false, cta: 'new_session', expected: true, reportable: false },
+  /** gateway 在派发前读不到会话所属项目(主控超时/出错),本轮挂起未执行未计费;
+   *  只给手动重试:主控恢复前自动重试只会再挂一次。 */
+  project_context_unavailable: { retryable: true, cta: 'retry', allowPublicServerMessage: true },
   /** bridge bindAuthorityTurnDispatch 失败(含 cron-origin 未收养成功)。手动重试走新 dispatch。 */
   durable_dispatch_unavailable: { retryable: true, cta: 'retry' },
   stopped: { retryable: false, cta: 'none', expected: true, reportable: false },

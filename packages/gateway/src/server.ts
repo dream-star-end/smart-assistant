@@ -20685,6 +20685,28 @@ export class Gateway {
       sessionId: frame.peer.id,
       ...(cronBoardOverride ? { boardProjectId: cronBoardOverride } : {}),
     })
+    if (chatWorkspace.unavailable) {
+      // The master could not tell us this session's project. Running anyway
+      // would drop its instructions, files and cwd without anyone noticing,
+      // so the turn is held before anything is spawned or billed.
+      this.log.warn('project context unavailable; turn held', {
+        sessionKey,
+        reason: chatWorkspace.unavailable,
+        traceId: turnTraceId,
+      })
+      const heldFrames = _earlyRejectErrorFrames({
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        userId: activeUserId,
+        traceId: turnTraceId,
+        code: 'project_context_unavailable',
+        message: '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。',
+        legacyErrorText: '[error] PROJECT_CONTEXT_UNAVAILABLE',
+      })
+      for (const f of heldFrames) this.deliver(f, adapter)
+      return
+    }
     const webchatRunContext = createRunContextDescriptor({
       runId: `webchat:${frame.peer.id}`,
       boardProjectId: chatWorkspace.projectId,

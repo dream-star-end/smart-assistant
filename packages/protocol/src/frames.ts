@@ -1061,6 +1061,7 @@ export const OutboundError = Type.Object({
     Type.Literal('engine_error'),
     Type.Literal('auth_error'),
     Type.Literal('session_persist_unavailable'),
+    Type.Literal('project_context_unavailable'),
   ]),
   /** 简短人类文案,前端直接渲染。 */
   message: Type.String(),
