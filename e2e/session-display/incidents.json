@@ -6507,6 +6507,36 @@
           "assertion": "stop reaches a native-resumed keeper that runs in the transcript run directory"
         }
       ]
+    },
+    {
+      "id": "INC-20261008-BOX-FOREIGN-TOOL-HISTORY",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "商业 rel-ac3dbe616 用户 1870：同一会话先用 k3-256k 调用工具（tool id 为 tool_…），再切到 box-api-claude-opus-5-5，每次请求在发起前被拒 400 BOX_REQUEST_UNSUPPORTED（BOX_BLOCK_UNSUPPORTED，界面 upstream_failed，第三次重试还显示成认证失败）；Box 历史编译只认 toolu_ 形式的 tool id",
+      "rootFixCommit": "f9113f38",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "a k3 tool history compiles with paired toolu_ ids derived from the originals"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "other id shapes, unpaired history and a foreign current result stay rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "a foreign id whose renamed form is already used is refused"
+        }
+      ]
     }
   ]
 }
