@@ -6258,6 +6258,60 @@
           "assertion": "bounded list height"
         }
       ]
+    },
+    {
+      "id": "INC-20261008-PROJECT-MD-SEED-OVERWRITE",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "绑定看板的项目里，手改过的 PROJECT.md（哈希与记录不符）会被当成没有指令，随后被项目的 PG 旧指令整份覆盖；用户清空的指令下一轮又被 PG 旧文本填回。",
+      "rootFixCommit": "fe0f67e7",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "缺陷在存储层（项目卷上的 PROJECT.md 与 meta.json），回归在 unit 层，对旧实现红、新实现绿（五条）。个人版没有能覆盖容器卷文件的 browser/live-e2e/deploy-gate runner；发布后在 uid3 卷上只读核对 meta.json 的 instructionsState 与 PROJECT.md 未变，属一次性核对。",
+        "since": "2026-10-08"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/projectContext.test.ts",
+          "assertion": "a hand-edited PROJECT.md with a stale hash is preserved, not replaced by the seed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/projectContext.test.ts",
+          "assertion": "a deliberate clear is never refilled by a stale PG mirror"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/projectContext.test.ts",
+          "assertion": "a seed racing a human write cannot overwrite it (checked under the lock)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "容器向主控读会话所属项目失败（超时/5xx/网络/坏响应）时，本轮静默按无项目执行：没有项目指令和常用文件，工作目录回落默认，用户与日志都看不出。",
+      "rootFixCommit": "7c393322",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
+          "assertion": "a session in a project is held when the master stays unreachable"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
+          "assertion": "resolveChatRunWorkspace passes the hold to the caller instead of a default cwd"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/project-context-held.node-test.mjs",
+          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one retry runs it"
+        }
+      ]
     }
   ]
 }
