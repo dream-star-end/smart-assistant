@@ -111,6 +111,13 @@ test('「怎么用」打开当前分区的教程；「优化」没有独立教�
   expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
 })
 
+test('桌面上下文条只在有内容（作用范围 / 怎么用）时出现，不重复导航栏里的说明', () => {
+  renderShell({ tab: 'connectors' })
+  // 没有范围、没有帮助回调：桌面隐藏（窄屏仍保留一行分区说明）。
+  const blurbs = screen.getAllByText(/已连接的应用和账号/)
+  expect(blurbs.some((el) => el.closest('.md\\:hidden'))).toBe(true)
+})
+
 test('导航栏底部「去市场添加」直达市场', () => {
   const onOpenMarketplace = vi.fn()
   renderShell({ onOpenMarketplace })

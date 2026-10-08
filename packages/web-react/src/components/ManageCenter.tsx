@@ -259,7 +259,13 @@ export function ManageCenter({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         {/* 上下文条：当前分区是什么 + 作用范围（仅记忆/技能/定时）+ 怎么用。
             窄屏上分区说明只在这里出现一次，代替桌面导航栏里的副标题。 */}
-        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-2.5">
+        {/* 桌面上分区说明已在导航栏里：既无范围选择也无帮助入口时整条不渲染，不重复一行说明。 */}
+        <div
+          className={cn(
+            'flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-2.5',
+            !scoped && !showHelp && 'md:hidden',
+          )}
+        >
           {/* 有范围选择的分区在窄屏只留一行「作用范围」，分区说明让位（导航上已有图标与名字）。 */}
           <div
             className={cn(
@@ -280,7 +286,7 @@ export function ManageCenter({
               <ProjectScopeSelect className="min-w-0 flex-1 md:w-56 md:flex-none" />
             </div>
           ) : (
-            <span className="hidden flex-1 text-meta text-faint md:block">{current.blurb}</span>
+            <span aria-hidden="true" className="hidden flex-1 md:block" />
           )}
           {showHelp && (
             <Button
