@@ -460,6 +460,14 @@ SQL
 }
 
 # ---------- main ----------
+# 宿主侧 oc-task 评论队列(scripts/v5-task-host.sh):容器被 idle sweep 回收期间排队的评论,
+# 容器回来后按序送达。失败/容器不在只留在队列里,绝不影响 lease 调度本身。
+flush_task_spool() {
+  local host_task="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/v5-task-host.sh"
+  [[ -x "$host_task" ]] || return 0
+  timeout 120 "$host_task" flush --quiet </dev/null || true
+}
+
 main() {
   lease_need_tool sqlite3; lease_need_tool git; lease_need_tool jq; lease_need_tool flock
   acquire_singleton
@@ -469,5 +477,6 @@ main() {
   settle_rides
   dispatch_train
   deliver_outbox
+  flush_task_spool
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
