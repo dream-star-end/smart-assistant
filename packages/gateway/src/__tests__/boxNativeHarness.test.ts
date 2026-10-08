@@ -79,7 +79,7 @@ describe('box native harness', () => {
 })
 
 describe('box native harness: every listed model', () => {
-  for (const model of ['box-api-claude-sonnet-5-5', 'box-api-claude-haiku-4-5']) {
+  for (const model of ['box-api-claude-sonnet-5-5', 'box-api-claude-haiku-4-5', 'box-api-claude-haiku-5-5']) {
     test(`${model} carries the token and runs on ccb`, () => {
       const descriptor = projectCcbExecutionDescriptor({ ...base, canonicalModel: model })
       assert.equal(descriptor.contextOwner, 'box-native-v1')

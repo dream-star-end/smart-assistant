@@ -24,6 +24,7 @@ import {
   DEFAULT_CURSOR_CONTEXT_TIER,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
+  boxClaudeRunner,
   cursorFamilyDefaultEffort,
   cursorFamilyDefaultFast,
   cursorFamilyEfforts,
@@ -153,8 +154,8 @@ describe('Grok Build engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    // 72 + 8 grok-4.7 (2026-09-22) + 3 box Claude (2026-09-23)
-    assert.equal(CURSOR_ENGINE_MODELS.length, 83)
+    // 72 + 8 grok-4.7 (2026-09-22) + 3 box Claude (2026-09-23) + box Claude Haiku 5.5 (2026-10-08)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 84)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),
@@ -319,6 +320,13 @@ describe('Cursor engine model authority', () => {
     assert.equal(findCursorEngineModel('box-claude-opus', null, false)?.upstreamModel, 'claude-opus-5-5')
     assert.equal(findCursorEngineModel('box-claude-sonnet', null, false)?.upstreamModel, 'claude-sonnet-5')
     assert.equal(findCursorEngineModel('box-claude-haiku', null, false)?.upstreamModel, 'claude-haiku-4-5')
+    // Haiku 5.5 is a different model, not an effort row of Haiku 4.5: its own family.
+    assert.equal(cursorFamilyDefaultEffort('box-claude-haiku-5-5'), null)
+    assert.equal(cursorFamilyHasEffortAxis('box-claude-haiku-5-5'), false)
+    assert.equal(findCursorEngineModel('box-claude-haiku-5-5', null, false)?.upstreamModel, 'claude-haiku-5-5')
+    assert.equal(publicCursorModelId('box-claude-haiku-5-5'), 'box-claude-haiku-5-5')
+    assert.equal(cursorModelIdFromPublic('box-claude-haiku-5-5'), 'box-claude-haiku-5-5')
+    assert.equal(boxClaudeRunner('box-claude-haiku-5-5'), 'interactive')
     assert.equal(publicCursorModelId('box-claude-opus-5-5'), 'box-claude-opus-5-5')
     assert.equal(cursorModelIdFromPublic('box-claude-opus-5-5'), 'box-claude-opus-5-5')
 

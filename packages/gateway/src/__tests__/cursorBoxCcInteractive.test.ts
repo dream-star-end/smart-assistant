@@ -48,7 +48,7 @@ const FIXTURES = join(HERE, 'fixtures')
 
 test('runner: catalog row decides, OC_BOX_INTERACTIVE forces either side, the bridge reads the result', () => {
   const box = CURSOR_ENGINE_MODELS.filter((m: { id: string }) => m.id.startsWith('box-claude-'))
-  assert.equal(box.length, 3)
+  assert.equal(box.length, 4)
   for (const m of box) {
     const row = boxClaudeRunner(m.id)
     assert.ok(row === 'p' || row === 'interactive', m.id)
@@ -57,7 +57,7 @@ test('runner: catalog row decides, OC_BOX_INTERACTIVE forces either side, the br
     assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '1' }), 'interactive')
   }
   // Personal default: every box-claude row prefers the interactive runner.
-  assert.deepEqual(box.map((m: { id: string }) => boxClaudeRunner(m.id)), ['interactive', 'interactive', 'interactive'])
+  assert.deepEqual(box.map((m: { id: string }) => boxClaudeRunner(m.id)), ['interactive', 'interactive', 'interactive', 'interactive'])
   // Only box-claude rows carry a runner; anything else is -p.
   assert.equal(boxClaudeRunner('cursor-opus-5-high'), undefined)
   assert.equal(resolveBoxCcRunner('cursor-opus-5-high', {}), 'p')

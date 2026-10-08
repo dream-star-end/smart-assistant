@@ -904,6 +904,7 @@ describe('oc-cursor wrapper', () => {
     const f = fixture()
     for (const model of [
       'claude-haiku-4-5',
+      'claude-haiku-5-5',
       'claude-opus-5-5',
       'claude-sonnet-5',
       'gemini-3.1-pro',

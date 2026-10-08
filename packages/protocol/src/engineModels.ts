@@ -299,6 +299,7 @@ export type CursorEngineFamilyId =
   | 'box-claude-opus'
   | 'box-claude-sonnet'
   | 'box-claude-haiku'
+  | 'box-claude-haiku-5-5'
 
 export const CURSOR_ENGINE_MODELS = [
   {
@@ -1047,7 +1048,7 @@ export const CURSOR_ENGINE_MODELS = [
   // the bridge falls back to `claude -p` by itself when that cannot start,
   // and the OC_BOX_INTERACTIVE master knob (0/1) forces either side.
   // One family each: the picker collapses a family to a single effort row,
-  // and these three names are different models, not effort levels.
+  // and these names are different models, not effort levels.
   {
     id: 'box-claude-opus-5-5',
     displayName: 'Claude Opus 5.5',
@@ -1074,6 +1075,16 @@ export const CURSOR_ENGINE_MODELS = [
     upstreamModel: 'claude-haiku-4-5',
     family: 'box-claude-haiku',
     familyLabel: 'Claude Haiku 4.5',
+    effort: null,
+    fast: false,
+    runner: 'interactive',
+  },
+  {
+    id: 'box-claude-haiku-5-5',
+    displayName: 'Claude Haiku 5.5',
+    upstreamModel: 'claude-haiku-5-5',
+    family: 'box-claude-haiku-5-5',
+    familyLabel: 'Claude Haiku 5.5',
     effort: null,
     fast: false,
     runner: 'interactive',
@@ -1357,7 +1368,8 @@ export function cursorFamilyDefaultEffort(
     family === 'gemini-3.1-pro' ||
     family === 'box-claude-opus' ||
     family === 'box-claude-sonnet' ||
-    family === 'box-claude-haiku'
+    family === 'box-claude-haiku' ||
+    family === 'box-claude-haiku-5-5'
   ) {
     return null
   }

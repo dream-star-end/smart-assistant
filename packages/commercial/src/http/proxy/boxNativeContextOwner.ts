@@ -9,6 +9,7 @@ export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
   "box-api-claude-opus-5-5",
   "box-api-claude-sonnet-5-5",
   "box-api-claude-haiku-4-5",
+  "box-api-claude-haiku-5-5",
 ];
 /** One listed model, kept for fixtures. Checks read the list. */
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!;
