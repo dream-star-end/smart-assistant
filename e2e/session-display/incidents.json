@@ -6326,7 +6326,9 @@
       "severity": "P1",
       "symptom": "智能体生成的文件（会话产出）由容器网关登记进容器本地 SQLite，且无项目归属；界面读主控 PG，项目资产面板里看不到。uid3 自 2026-08-20 起积压 223 条。",
       "rootFixCommit": "92d53527",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "eb70ffe1"
+      ],
       "proofPending": {
         "reason": "缺陷在容器↔主控的登记链路，回归在 unit 层：容器侧收集器对假主控（重试/待登记队列/冻结项目）六条、主控路由对假身份与假存储（租户只取容器身份、冻结项目、已删项目落未分类、外人会话不登记）六条；把收集器强制回本地登记时六条全红。个人版没有覆盖真实容器→主控链路的 browser/live-e2e/deploy-gate runner；发布后用 uid3 真实一轮产出文件、在 PG project_assets 只读核对新行与项目归属，属一次性核对。",
         "since": "2026-10-08"
@@ -6351,6 +6353,16 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalProjectAssets.test.ts",
           "assertion": "the project frozen at turn start wins over the session's current project"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/turnChatProjectFreeze.test.ts",
+          "assertion": "a queued next message in another project does not change the running turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts",
+          "assertion": "a registration queued while a flush is sending is not lost"
         }
       ]
     }
