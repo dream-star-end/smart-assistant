@@ -4,7 +4,7 @@
  * tool_result is deliberately rejected: an in-flight tool call must be
  * delivered to the *same live CLI/MCP rendezvous*, not a resumed process.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
 import { BoxCacheAnnotationError, normalizeBoxSemanticBody,
   strictBoxImageBlock } from "./boxCacheAnnotations.js";
@@ -37,6 +37,48 @@ function systemText(content: unknown): string {
     }
     return (part as { text: string }).text;
   }).join("\n\n");
+}
+
+/** OCV5-337: completed history written by another model (e.g. k3 `tool_…`,
+ * OpenAI `call_…`) carries tool ids the Box CLI history never had, so a
+ * session switched to Box Claude failed with BOX_BLOCK_UNSUPPORTED. Such
+ * ids in history before the current user message are renamed, pair by pair,
+ * to a stable toolu_ id derived from the original. The current message is
+ * not touched: a live exchange always has the Box CLI's own ids. */
+const BOX_TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
+const FOREIGN_TOOL_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+function boxHistoryToolId(id: string): string {
+  return `toolu_oc${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
+}
+function remapForeignToolIds(messages: unknown[], currentIndex: number): unknown[] {
+  const used = new Set<string>();
+  const foreign = new Set<string>();
+  messages.forEach((message, index) => {
+    for (const block of blocks((message as { content?: unknown } | null)?.content)) {
+      const id = block.type === "tool_use" ? block.id : block.type === "tool_result" ? block.tool_use_id : undefined;
+      if (typeof id !== "string") continue;
+      if (BOX_TOOL_ID.test(id)) used.add(id);
+      else if (index < currentIndex && FOREIGN_TOOL_ID.test(id)) foreign.add(id);
+    }
+  });
+  if (foreign.size === 0) return messages;
+  const renamed = new Map([...foreign].map((id) => [id, boxHistoryToolId(id)]));
+  if ([...renamed.values()].some((id) => used.has(id))) throw new BoxMessagesShapeError("BOX_TOOL_HISTORY_INVALID");
+  return messages.map((message, index) => {
+    if (index >= currentIndex || !Array.isArray((message as { content?: unknown } | null)?.content)) return message;
+    const content = (message as { content: unknown[] }).content.map((part) => {
+      if (part === null || typeof part !== "object" || Array.isArray(part)) return part;
+      const block = part as Record<string, unknown>;
+      if (block.type === "tool_use" && typeof block.id === "string" && renamed.has(block.id)) {
+        return { ...block, id: renamed.get(block.id) };
+      }
+      if (block.type === "tool_result" && typeof block.tool_use_id === "string" && renamed.has(block.tool_use_id)) {
+        return { ...block, tool_use_id: renamed.get(block.tool_use_id) };
+      }
+      return part;
+    });
+    return { ...(message as Record<string, unknown>), content };
+  });
 }
 
 function validateContent(content: unknown, role: "user" | "assistant"): void {
@@ -173,7 +215,11 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     }
     throw error;
   }
-  const messages = semantic.messages.map(readMessage);
+  let lastUser = -1;
+  semantic.messages.forEach((message, index) => {
+    if ((message as { role?: unknown } | null)?.role === "user") lastUser = index;
+  });
+  const messages = remapForeignToolIds(semantic.messages, lastUser).map(readMessage);
   let currentIndex = -1;
   for (let index = messages.length - 1; index >= 0; index--) {
     if (messages[index]?.role === "user") { currentIndex = index; break; }
