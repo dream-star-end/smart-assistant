@@ -210,6 +210,9 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
+import { useServerFeatures } from "./hooks/useServerFeatures";
+import { projectChipsBoardId } from "./lib/projectChips";
+import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
@@ -271,6 +274,10 @@ const CommandPalette = lazy(() =>
 // 项目主页(/p/<id>)是并列工作区,点开项目才需要;带着 ProjectAssetsPanel,不能进入口闭包。
 const ProjectHome = lazy(() =>
   import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
+);
+// P5b「记住这条 / 存为项目技能」弹窗：点了才下载（带 lib/taskboard）。
+const SaveToProjectDialog = lazy(() =>
+  import("./components/project/SaveToProjectDialog").then((m) => ({ default: m.SaveToProjectDialog })),
 );
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
@@ -784,6 +791,14 @@ export function App() {
   const createProjectMounted = useMountedOnce(createProjectFrom !== null);
   const [projectArchiveOpen, setProjectArchiveOpen] = useState(false);
   const projectArchiveMounted = useMountedOnce(projectArchiveOpen);
+  // P5b：「记住这条 / 存为项目技能」弹窗请求（null = 关）。
+  const [saveToProject, setSaveToProject] = useState<SaveToProjectRequest | null>(null);
+  const saveToProjectMounted = useMountedOnce(saveToProject !== null);
+  // 换号 / 登出：发起时的身份已不在，弹窗直接收起（保存流程自己也会按身份停下）。
+  useEffect(() => {
+    void user?.id;
+    setSaveToProject(null);
+  }, [user?.id]);
 
   const {
     projects,
@@ -822,6 +837,35 @@ export function App() {
 
   projectsRef.current = projects;
   const homeProject = projectHome ? projects.find((p) => p.id === projectHome.projectId) : undefined;
+
+  // 服务端功能开关（GET /api/features；读不到 = 全关，demo 不读）。
+  const serverFeatures = useServerFeatures(demo ? null : auth, demo);
+  // 当前会话所属项目的看板：P5b 两个入口只在会话属于有看板的项目时出现。
+  const activeProjectId = activeId ? sessions.find((s) => s.id === activeId)?.projectId : undefined;
+  const activeChatProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) : undefined;
+  const chipsBoardProjectId = projectChipsBoardId({
+    demo,
+    taskboardEnabled: TASKBOARD_ENABLED,
+    chipsFlag: serverFeatures.chips,
+    project: activeChatProject,
+  });
+  const chipsProjectName = activeChatProject?.name ?? "";
+
+  // 确保项目的看板已在容器里建好（任何看板路由首次访问都会建出预留的看板）。
+  // 项目主页的入口和 P5b / P5c 的保存共用这一条路径。
+  const prepareProjectBoard = useCallback(
+    async (boardProjectId: string): Promise<boolean> => {
+      try {
+        const { taskboardApi } = await import("./lib/taskboard");
+        await taskboardApi.getProject(authRef.current, boardProjectId);
+        return true;
+      } catch (e) {
+        toast(apiErrorMessage(e, "项目看板暂时打不开，请稍后再试"), "error");
+        return false;
+      }
+    },
+    [toast],
+  );
   // 主页上的项目被删除(本页 ⋯ 删除或别处删除)：列表落定后不再存在 → 回对话。
   useEffect(() => {
     if (projectHome && projectsLoaded && !homeProject) setProjectHome(null);
@@ -2768,6 +2812,24 @@ export function App() {
         : (messageId, expected) =>
             peekUserMessagePayload(activeId, messageId, expected),
       resolveRetryTarget: demo ? undefined : resolveRetryTarget,
+      onSaveToProject:
+        chipsBoardProjectId && activeId
+          ? (message, kind) => {
+              const text = (message.text ?? "").trim();
+              if (!text) return;
+              const a = authRef.current;
+              setSaveToProject({
+                kind,
+                text,
+                sessionId: activeId,
+                boardProjectId: chipsBoardProjectId,
+                projectName: chipsProjectName,
+                auth: a,
+                epoch: a.snapshot().epoch,
+                nonce: Date.now(),
+              });
+            }
+          : undefined,
     }),
     [
       regenerate,
@@ -2785,6 +2847,8 @@ export function App() {
       fetchUserMessagePayload,
       peekUserMessagePayload,
       resolveRetryTarget,
+      chipsBoardProjectId,
+      chipsProjectName,
     ],
   );
 
@@ -3821,17 +3885,7 @@ export function App() {
               onPrepareBoard={
                 demo || !TASKBOARD_ENABLED || !homeProject.boardProjectId
                   ? undefined
-                  : async () => {
-                      // Any board route creates a reserved board on first use (container side).
-                      try {
-                        const { taskboardApi } = await import("./lib/taskboard");
-                        await taskboardApi.getProject(authRef.current, homeProject.boardProjectId as string);
-                        return true;
-                      } catch (e) {
-                        toast(apiErrorMessage(e, "项目看板暂时打不开，请稍后再试"), "error");
-                        return false;
-                      }
-                    }
+                  : () => prepareProjectBoard(homeProject.boardProjectId as string)
               }
               onShowSurface={(surface) => {
                 setProjectHome(null);
@@ -4431,6 +4485,21 @@ export function App() {
             onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
             onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
             onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
+          />
+        </LazyBoundary>
+      )}
+      {saveToProjectMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <SaveToProjectDialog
+            request={saveToProject}
+            onClose={() => setSaveToProject(null)}
+            currentAuth={() => authRef.current}
+            prepareBoard={prepareProjectBoard}
+            onShowSurface={(surface) => {
+              setProjectHome(null);
+              setBoardOpen(false);
+              openManage(surface);
+            }}
           />
         </LazyBoundary>
       )}

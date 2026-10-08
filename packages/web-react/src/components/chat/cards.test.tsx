@@ -1260,3 +1260,40 @@ describe("普通回答不再占头像列", () => {
     expect(screen.getByTestId("assistant-row").querySelector(".bg-grad-cta")).toBeNull();
   });
 });
+
+// P5b:「记住这条 / 存为项目技能」只在 App 给了入口、回答已完成、所在轮末条、非只读时出现。
+describe("AssistantCard 存到项目入口(P5b)", () => {
+  const done = { id: "a-p5", role: "assistant", text: "## 发版约定\n每周五发版", ts: 1 } as ChatMessage;
+  const DONE_CTX: RenderCtx = { isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true };
+
+  test("完成态末条回答:两个入口常显,点了按种类回调", () => {
+    const onSaveToProject = vi.fn();
+    render(<AssistantCard msg={done} ctx={DONE_CTX} cb={{ onSaveToProject }} />);
+    fireEvent.click(screen.getByRole("button", { name: "记住这条" }));
+    fireEvent.click(screen.getByRole("button", { name: "存为项目技能" }));
+    expect(onSaveToProject).toHaveBeenNthCalledWith(1, done, "memory");
+    expect(onSaveToProject).toHaveBeenNthCalledWith(2, done, "skill");
+  });
+
+  test("没有入口回调(开关关 / 不在项目 / demo)时不出", () => {
+    render(<AssistantCard msg={done} ctx={DONE_CTX} cb={{}} />);
+    expect(screen.queryByTestId("project-save-chips")).toBeNull();
+  });
+
+  test("流式中、本轮未收笔、只读、非末条、错误卡都不出", () => {
+    const onSaveToProject = vi.fn();
+    const cases: Array<{ msg: ChatMessage; ctx: RenderCtx; readOnly?: boolean }> = [
+      { msg: done, ctx: { ...DONE_CTX, sending: true } },
+      { msg: done, ctx: { isLast: false, sending: true, inActiveTurn: true, turnFinalAssistant: true } },
+      { msg: done, ctx: DONE_CTX, readOnly: true },
+      { msg: done, ctx: { ...DONE_CTX, turnFinalAssistant: false } },
+      { msg: { ...done, _errorCode: "upstream_failed" } as ChatMessage, ctx: DONE_CTX },
+      { msg: { ...done, text: "" } as ChatMessage, ctx: DONE_CTX },
+    ];
+    for (const c of cases) {
+      render(<AssistantCard msg={c.msg} ctx={c.ctx} cb={{ onSaveToProject }} readOnly={c.readOnly} />);
+      expect(screen.queryByTestId("project-save-chips")).toBeNull();
+      cleanup();
+    }
+  });
+});

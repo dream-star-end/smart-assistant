@@ -1542,7 +1542,7 @@ export const taskboardApi = {
   createProjectMemory: (
     a: AuthSession,
     projectId: string,
-    body: { slug: string; content: string; supersedes?: string },
+    body: { slug: string; content: string; supersedes?: string; sourceSession?: string },
   ) =>
     boardSend<{ ok: boolean; candidate: ProjectMemoryItem }>(
       a,

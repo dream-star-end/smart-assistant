@@ -5,6 +5,7 @@
  */
 import {
   AlertTriangle,
+  BookmarkPlus,
   Brain,
   ChevronRight,
   Check,
@@ -24,6 +25,7 @@ import {
   Type,
   Volume2,
   Wallet,
+  Wand2,
   X,
 } from "lucide-react";
 import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
@@ -53,7 +55,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Badge, Button, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
+import { Alert, Badge, Button, chipVariants, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
 import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
@@ -161,6 +163,9 @@ export type CardCallbacks = {
    *  user 行(存在且 status==='error',带完整 payload)。找不到返回 undefined → 红卡不显示「重试」,
    *  回退 onRegenerate「重新尝试」。App 侧读当前会话 messages 实现,不进 message sig。 */
   resolveRetryTarget?: (clientMessageId: string) => ChatMessage | undefined;
+  /** P5b:把一条已完成的回答存到所在项目（「记住这条」= 项目记忆，「存为项目技能」）。
+   *  App 只在 OC_P5_CHIPS 打开、会话属于有看板的项目、非 demo 时提供；缺省不出这两个入口。 */
+  onSaveToProject?: (msg: ChatMessage, kind: "memory" | "skill") => void;
 };
 
 function buildFeedbackCtx(m: ChatMessage): FeedbackContext {
@@ -471,6 +476,29 @@ function MessageActions({
           </IconButton>
         )}
       </TouchActionRow>
+    </div>
+  );
+}
+
+/** P5b 一键存到项目：常显的两个小药丸，只挂在一轮的末条回答上。 */
+function ProjectSaveChips({
+  msg,
+  onSave,
+}: {
+  msg: ChatMessage;
+  onSave: (msg: ChatMessage, kind: "memory" | "skill") => void;
+}) {
+  const cls = chipVariants({ size: "sm" });
+  return (
+    <div className="flex items-center gap-1.5" data-testid="project-save-chips">
+      <button type="button" className={cls} onClick={() => onSave(msg, "memory")}>
+        <BookmarkPlus size={12} aria-hidden />
+        记住这条
+      </button>
+      <button type="button" className={cls} onClick={() => onSave(msg, "skill")}>
+        <Wand2 size={12} aria-hidden />
+        存为项目技能
+      </button>
     </div>
   );
 }
@@ -1129,6 +1157,10 @@ export function AssistantCard({
           const showRating =
             !live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply &&
             !!ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn);
+          // P5b：完成态（非流式、本轮已收笔）、非只读、所在轮末条回答，且 App 给了入口才出。
+          const showProjectChips =
+            showActions && !readOnly && !!cb.onSaveToProject && !!ctx.turnFinalAssistant &&
+            !(ctx.sending && ctx.inActiveTurn);
           const hasActions = showActions || showMinimalActions;
           return (
             <div
@@ -1143,6 +1175,9 @@ export function AssistantCard({
                   readOnly={readOnly}
                   className="mt-0 -ml-1.5"
                 />
+              )}
+              {showProjectChips && cb.onSaveToProject && (
+                <ProjectSaveChips msg={msg} onSave={cb.onSaveToProject} />
               )}
               {/* 用户主动停止 / 失败但模型已产出合法部分回答:正文可见就必须可留存 —— 给精简动作行
                   (复制 / 复制纯文本 / 引用),不出朗读、重新生成、反馈(那些属于完整回答)。 */}
