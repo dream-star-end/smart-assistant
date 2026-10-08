@@ -6922,13 +6922,19 @@ async function _sqliteCreateProjectAsset(
       return { ok: false, error: 'limit_exceeded' }
     }
     // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+    // 带 capturedAt 的产出版本以「文件写成的时间」为 created_at(不晚于现在):重放判断
+    // 拿 capturedAt 和它比,比的是同一种时间;补发队列晚到的登记不会把之后的真实重写挤成「重放」。
     // 「常用」只挂在最新版本上:新版本(登记或恢复)继承上一版的 pinned,旧版本一律取消。
-    let createdAt = now
+    const versionBase =
+      parsed.value.source === 'output' && parsed.value.capturedAt !== null
+        ? Math.min(parsed.value.capturedAt, now)
+        : now
+    let createdAt = versionBase
     let pinned = parsed.value.pinned
     if (parsed.value.source === 'output' && parsed.value.containerPath) {
       const latest = _sqliteLatestOutputVersion(db, userId, projectId, parsed.value.containerPath)
       if (latest) {
-        createdAt = Math.max(now, latest.createdAt + 1)
+        createdAt = Math.max(versionBase, latest.createdAt + 1)
         pinned = pinned || latest.pinned
         db.prepare(
           `UPDATE project_assets SET pinned = 0, updated_at = MAX(updated_at + 1, ?)
@@ -6958,7 +6964,7 @@ async function _sqliteCreateProjectAsset(
       parsed.value.excerpt,
       pinned ? 1 : 0,
       createdAt,
-      createdAt,
+      Math.max(now, createdAt),
     )
     const asset = _sqliteReadProjectAsset(db, userId, id)
     if (!asset) throw new Error('project asset insert vanished')

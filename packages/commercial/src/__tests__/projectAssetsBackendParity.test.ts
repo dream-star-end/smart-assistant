@@ -76,9 +76,12 @@ describe('project_assets PG/SQLite 契约对齐', () => {
       assert.ok(src.includes('PROJECT_ASSET_VERSION_GROUP_SQL'), 'list 必须用共享的折叠键')
       assert.ok(src.includes('withVersionCount('), 'versionCount 形状两侧一致')
     }
-    assert.match(sqliteSrc, /Math\.max\(now, latest\.createdAt \+ 1\)/)
+    // Output versions are dated by capture time (never later than now), floored above the previous version.
+    assert.match(sqliteSrc, /Math\.min\(parsed\.value\.capturedAt, now\)/)
+    assert.match(sqliteSrc, /Math\.max\(versionBase, latest\.createdAt \+ 1\)/)
     assert.match(backendSrc, /createdAtFloor = latest\.createdAt \+ 1/)
-    assert.match(backendSrc, /GREATEST\(\$\{CLOCK_MS_SQL\}, \$14::bigint\)/)
+    assert.match(backendSrc, /GREATEST\(LEAST\(\$\{CLOCK_MS_SQL\}, \$15::bigint\), \$14::bigint\)/)
+    assert.match(backendSrc, /parsed\.value\.source === "output" \? parsed\.value\.capturedAt : null/)
   })
 
   test('重放识别:两侧都只在 capturedAt 不晚于最新版本时复用旧版本', () => {

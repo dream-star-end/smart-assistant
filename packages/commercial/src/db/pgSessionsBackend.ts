@@ -13184,7 +13184,7 @@ export function createPgSessionsBackend(
              mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
            ) VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-             GREATEST(${CLOCK_MS_SQL}, $14::bigint), GREATEST(${CLOCK_MS_SQL}, $14::bigint), NULL
+             GREATEST(LEAST(${CLOCK_MS_SQL}, $15::bigint), $14::bigint), GREATEST(${CLOCK_MS_SQL}, $14::bigint), NULL
            )`,
           [
             id,
@@ -13201,6 +13201,10 @@ export function createPgSessionsBackend(
             parsed.value.excerpt,
             pinned,
             createdAtFloor,
+            // Output versions are dated by when the file was written (never later
+            // than now), the same clock the replay rule compares capturedAt with.
+            // LEAST ignores NULL, so without capturedAt this is the clock as before.
+            parsed.value.source === "output" ? parsed.value.capturedAt : null,
           ],
         );
         const asset = await readPgProjectAsset(client, userId, id);

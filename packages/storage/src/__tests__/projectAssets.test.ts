@@ -607,6 +607,25 @@ describe('project_assets 产出物版本', () => {
     if (!bad.ok) assert.equal(bad.error, 'invalid_captured_at')
   })
 
+  it('补发队列晚到的登记不会把之后真实写回的旧内容判成重放(版本按文件写成的时间记)', async () => {
+    // A 写于 1000 并登记;B 写于 2000 但登记失败进了补发队列;3000 又真实写回 A。
+    // 下一次归集先补发 B,再登记当前的 A:A 必须是新的最新版本。
+    const a1 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    const b = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: 2_000 }))
+    assert.equal(a1.ok && b.ok && b.created, true)
+    if (!b.ok) return
+    assert.equal(b.asset.createdAt, 2_000, '版本时间是文件写成的时间,不是登记时间')
+    const a2 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 3_000 }))
+    assert.equal(a2.ok && a2.created, true)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed[0]?.digest, DIGEST_A)
+    assert.equal(listed[0]?.versionCount, 3)
+    // capturedAt 在未来的被压到现在,不会排到真正更新的版本之后去。
+    const future = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: Date.now() + 86_400_000 }))
+    assert.equal(future.ok && future.created, true)
+    if (future.ok) assert.ok(future.asset.createdAt <= Date.now())
+  })
+
   it('常用只挂在最新版本:新版本继承 pinned,旧版本取消;恢复同样继承', async () => {
     const proj = await createChatProject(USER, { name: 'Pins' })
     assert.equal(proj.ok, true)
