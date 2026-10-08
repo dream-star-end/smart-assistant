@@ -6462,7 +6462,8 @@
       "symptom": "商业 rel-ac3dbe616 用户 1870：box-api-claude-opus-5-5 并行 Read 5 张截图，Claude Code 只缩放了其中一张（2430x1131→2000x931），唯一的尺寸说明排在 5 个结果之后；折叠只认整条消息恰好 1 张图，续接被拒 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION（模型服务暂时中断）",
       "rootFixCommit": "f2315c66",
       "coverageCommits": [
-        "40946716"
+        "40946716",
+        "fa6ae519"
       ],
       "regressions": [
         {
@@ -6479,6 +6480,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
           "assertion": "the caption joins a result whose matching image is not its first image"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
+          "assertion": "a matching image followed by another image in the same result stays rejected"
         }
       ]
     },
