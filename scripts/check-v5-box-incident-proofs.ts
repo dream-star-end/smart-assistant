@@ -2815,6 +2815,32 @@ function proveParallelImageCaption(api: Api): string {
   return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
 }
 
+/** INC-20261008-BOX-FOREIGN-TOOL-HISTORY, commercial u1870 10:28 CST: the session had run k3-256k, whose tool calls
+ * carry ids like `tool_…`. Switched to box-api-claude-opus-5-5, every request was refused before launch with 400
+ * BOX_REQUEST_UNSUPPORTED (BOX_BLOCK_UNSUPPORTED). History from another model is admitted with its tool calls renamed
+ * pair by pair; a live tool exchange keeps the strict Box ids. */
+function proveForeignToolHistory(api: Api): string {
+  const history = (current: unknown): Body => ({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash"), tool("Read")],
+    messages: [{ role: "user", content: "list files" },
+      { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "k3-signature" },
+        { type: "tool_use", id: "tool_Ab12Cd34Ef56", name: "Bash", input: { command: "ls" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tool_Ab12Cd34Ef56", content: "a" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_9", name: "Read", input: { file_path: "/a" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "A" }] },
+      { role: "assistant", content: [text("done")] }, current] });
+  const admitted = api.gate(history({ role: "user", content: "now continue with Claude" }), true);
+  if (admitted !== null) fail(`FOREIGN_HISTORY_GATE_${admitted}`);
+  const classified = api.classify(history({ role: "user", content: "now continue with Claude" }));
+  if (classified.classification !== "fresh") fail(`FOREIGN_HISTORY_CLASS_${classified.classification}`);
+  // a current tool result under a foreign id is no live Box exchange and stays refused
+  const live: Body = { model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
+    { role: "user", content: "run" },
+    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }] };
+  if (api.gate(live, true) === null || api.classify(live).classification === "continuation_candidate") fail("FOREIGN_LIVE_ADMITTED");
+  return "[ocv5-337-foreign-tool-history] PASS — a session switched to Box Claude from another model runs with its tool history";
+}
+
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
@@ -2837,7 +2863,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), proveParallelImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),

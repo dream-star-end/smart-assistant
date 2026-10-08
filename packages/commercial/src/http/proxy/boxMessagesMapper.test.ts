@@ -192,3 +192,59 @@ describe("OCV5-299 historical tool names are staged callable-only", () => {
       message: { role: "user", content: "继续" } }));
   });
 });
+
+describe("OCV5-337 history written by another model", () => {
+  // commercial u1870 2026-10-08 10:28: k3-256k tool calls (ids tool_…) in the history of a session switched
+  // to box-api-claude-opus-5-5 made every request 400 BOX_REQUEST_UNSUPPORTED (BOX_BLOCK_UNSUPPORTED).
+  const k3History = (current: unknown = { role: "user", content: "now continue with Claude" }) => body([
+    { role: "user", content: "list files" },
+    { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "k3-sig" },
+      { type: "tool_use", id: "tool_Ab12Cd34Ef56", name: "Bash", input: { command: "ls" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "tool_Ab12Cd34Ef56", content: "a\nb" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "call_9", name: "Read", input: { file_path: "/a" } },
+      { type: "tool_use", id: "functions.Read:1", name: "Read", input: { file_path: "/b" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "A" },
+      { type: "tool_result", tool_use_id: "functions.Read:1", content: "B" }] },
+    { role: "assistant", content: [{ type: "text", text: "done" }] },
+    current,
+  ]);
+  it("a k3 tool history compiles with paired toolu_ ids derived from the originals", () => {
+    const first = compileBoxCliSyntheticTurn(k3History(), args);
+    const again = compileBoxCliSyntheticTurn(k3History(), args);
+    const records = first.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line));
+    const uses = records.flatMap((r) => r.message.content).filter((b: { type?: string }) => b?.type === "tool_use");
+    const results = records.flatMap((r) => Array.isArray(r.message.content) ? r.message.content : [])
+      .filter((b: { type?: string }) => b?.type === "tool_result");
+    assert.equal(uses.length, 3);
+    assert.ok(uses.every((u: { id: string }) => /^toolu_oc[0-9a-f]{32}$/.test(u.id)));
+    assert.deepEqual(results.map((r: { tool_use_id: string }) => r.tool_use_id), uses.map((u: { id: string }) => u.id));
+    assert.equal(first.snapshotJsonl.includes("tool_Ab12Cd34Ef56") || first.snapshotJsonl.includes("call_9"), false);
+    const ids = (snapshot: string) => snapshot.match(/toolu_oc[0-9a-f]{32}/g);
+    assert.deepEqual(ids(again.snapshotJsonl), ids(first.snapshotJsonl), "the same history maps to the same ids");
+  });
+  it("other id shapes, unpaired history and a foreign current result stay rejected", () => {
+    const withId = (id: string) => body([
+      { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "x" }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: "next" }]);
+    assert.equal(code(withId("tool 1")), "BOX_BLOCK_UNSUPPORTED");
+    assert.equal(code(withId("x".repeat(129))), "BOX_BLOCK_UNSUPPORTED");
+    assert.equal(code(body([
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_2", content: "x" }] },
+      { role: "user", content: "next" }])), "BOX_TOOL_HISTORY_INVALID");
+    assert.equal(code(body([{ role: "user", content: "run" },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }])), "BOX_BLOCK_UNSUPPORTED");
+  });
+  it("a Box history keeps its own ids byte for byte", () => {
+    const output = compileBoxCliSyntheticTurn(body([
+      { role: "assistant", content: [{ type: "tool_use", id: "toolu_keep", name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_keep", content: "x" }] },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: "next" }]), args);
+    assert.ok(output.snapshotJsonl.includes('"toolu_keep"'));
+    assert.equal(output.snapshotJsonl.includes("toolu_oc"), false);
+  });
+});
