@@ -19,6 +19,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 
 | Job | CI 命令 | 证明的用户可见事实 | timeout |
 | --- | --- | --- | --- |
+| same-tree | `bash .github/scripts/ci-same-tree-evidence.sh <sha>`(仅 push) | 合并后 push 去重:push commit 与某父提交 tree 逐字节相同且该父提交 pull_request 运行全绿 → 其余 job 全部跳过;tree 不同或查询失败 → 全量跑。PR 上为 skipped | 3 min |
 | ci-queue-sentinel | `(none; scheduling gate)` | 秒级调度闸:先让第一梯队(含 required 6 job)抢 runner,再放行 integ/browser | 2 min |
 | typecheck | `npm run typecheck && npm run check:ci-parity` | 全仓类型闭合;CI 门集合 ≡ `check:v5` 门集合(见下「CI parity 门」) | 20 min |
 | lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合;禁止静默 test retry | 10 min |
@@ -26,7 +27,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | channels | `npm run test:channels` | 企微 iLink 收发/媒体/配对链路契约 | 10 min |
 | gateway | `npm run test:gateway` | 网关侧会话/工具/路由行为 | 25 min |
 | storage | `npm run test:storage && npm run test:mcp-memory` | 持久化层与记忆子系统 | 15 min |
-| web-react | `npm run check:v5:incidents && npm run check:tutorials && npm run test:web-react` | 历史事故回归清单 + 教程 JSONL 只追加 + 前端组件单测(jsdom) | 30 min |
+| web-react | `bash .github/scripts/run-parallel.sh 'npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials' 'npm run test:web-react'`(两组并行,同一 required context) | 历史事故回归清单 + 教程 JSONL 只追加 + 前端组件单测(jsdom) | 30 min |
 | web-react-browser | `npm run test:browser` | 真 Chromium 受信点击:附件/选择器一类"jsdom 恒假阴性"的交互真的能点开 | 20 min |
 | node-agent-go | `npm run build:node-agent` | node-agent(Go)编译 + vet 闭合:容器资源限额/运维参数改动不能带着编译错误合入(2026-08 FormatFloat 事故) | 10 min |
 | v5-ops | `npm run test:v5:ops` | 发布/回滚脚本的安全契约(真 psql 持久化);迁移编号门规则 + **对真实仓库状态的断言**(不重号、缺口必须声明 `-- order-dependency:`、新迁移登记进 `requiredMigrations`,规则同 `npm run lint:migration-order`) | 20 min |
