@@ -114,7 +114,7 @@ test("the detached text lane runs each listed Box model under its own upstream i
       [requestId, JSON.stringify({ boxUpstreamModel: listed.upstreamModel })]);
       assert.equal(await journal.claimTextUnknownCandidate(unknown), true);
     }
-    assert.equal(n, 3);
+    assert.equal(n, 4);
   } finally {
     client.release();
     await pool.end();
