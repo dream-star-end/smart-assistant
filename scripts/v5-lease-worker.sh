@@ -475,8 +475,11 @@ flush_task_spool() {
   find "$TASK_SPOOL_DIR/q" "$TASK_SPOOL_DIR/inflight" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null \
     | grep -q . || return 0
   command -v systemd-run >/dev/null 2>&1 || return 0
+  # transient unit 不继承调用方环境:spool 目录与 PATH 显式传入。
   systemd-run --quiet --collect --unit=openclaude-v5-oc-task-spool-flush \
     --property=RuntimeMaxSec=300 \
+    --setenv=OC_V5_TASK_SPOOL_DIR="$TASK_SPOOL_DIR" \
+    --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     "$host_task" flush --quiet </dev/null >/dev/null 2>&1 || true
   return 0
 }

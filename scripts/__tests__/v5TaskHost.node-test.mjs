@@ -172,5 +172,30 @@ test('lease worker: launches the flush as a transient systemd unit (own cgroup, 
  r=spawnSync('bash',[join(scripts,'worker.sh')],{env,encoding:'utf8',timeout:30000});
  assert.equal(r.status,0,r.stderr);assert.match(r.stdout,/returned/);
  const args=readFileSync(join(f.dir,'systemd-run.args'),'utf8').trim().split('\n');
- for(const want of['--collect','--unit=openclaude-v5-oc-task-spool-flush','--property=RuntimeMaxSec=300','flush','--quiet'])assert.ok(args.includes(want),want+' in '+args.join(' '));
+ for(const want of['--collect','--unit=openclaude-v5-oc-task-spool-flush','--property=RuntimeMaxSec=300','--setenv=OC_V5_TASK_SPOOL_DIR='+join(f.dir,'spool'),'flush','--quiet'])assert.ok(args.includes(want),want+' in '+args.join(' '));
+ assert.ok(args.some(a=>a.startsWith('--setenv=PATH=')),'explicit PATH');
+});
+
+test('ordering under concurrency: a live comment issued while an older one is mid-delivery queues behind it',async t=>{
+ const f=fixture(t);f.run('ticket','comment','OCV5-10','--body','older SLOW_ME');f.setRunning(true);
+ // Make the older write slow (but successful) so the live comment arrives while it is in flight.
+ const dockerPath=join(f.dir,'bin/docker');const src=readFileSync(dockerPath,'utf8');
+ // Sleep BEFORE the call is recorded, so the calls log reflects completion order (an overtaking write would log first).
+ writeFileSync(dockerPath,src.replace('ctr="$1"; shift; shift\n','ctr="$1"; shift; shift\n  for a in "$@"; do [[ "$a" == *SLOW_ME* ]] && sleep 2; done\n'));
+ const flusher=spawn('bash',[script,'flush'],{env:f.env,stdio:'ignore'});
+ spawnSync('sleep',['0.8']);
+ const live=f.run('ticket','comment','OCV5-10','--body','newer');
+ await new Promise(r=>flusher.on('exit',r));
+ if(live.status===75)f.run('flush');
+ assert.deepEqual(f.writes().map(c=>c.at(-1)),['older SLOW_ME','newer']);
+});
+
+test('ordering under concurrency: entries published by concurrent enqueues are delivered in publish order (monotonic sequence)',t=>{
+ const f=fixture(t);
+ for(let i=0;i<6;i++)spawnSync('bash',['-c',`for j in 1 2 3 4; do bash ${JSON.stringify(script)} ticket comment OCV5-11 --body "c${i}-$j" & done; wait`],{env:f.env,encoding:'utf8',timeout:60000});
+ const names=f.ls('q');assert.equal(names.length,24);
+ const seqs=names.map(n=>Number(n.split('-')[0]));assert.deepEqual(seqs,[...seqs].sort((a,b)=>a-b));
+ assert.equal(new Set(seqs).size,24,'sequence numbers are unique');
+ f.setRunning(true);f.run('flush');
+ assert.deepEqual(f.writes().map(c=>c.at(-1)),names.map(n=>f.bodyOf('delivered',n)));
 });

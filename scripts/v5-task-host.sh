@@ -14,6 +14,8 @@
 #   q/ ──预探测确认工单不存在──▶ failed/(从未发送)
 # 每次写之前先做只读探测(ticket get <工单>):探测不通 → 一条都没发,原样留在 q/。
 # flush 开始时 inflight/ 里的残留(上次送达途中被杀)一律移入 uncertain/,不重发。
+# 顺序:所有「排序相关」的动作都在同一把队列锁(.lock)下做 —— 入队分配单调序号并发布、flush 处理
+# 一整条(选队首→探测→写→落终态)、在线评论判断「队列空就直接发,否则排队」。flush 在两条之间放锁。
 #
 # 用法:
 #   scripts/v5-task-host.sh [--uid N] <oc-task 参数…>     # 默认 uid 3(个人版 owner)
@@ -27,6 +29,7 @@ CONTAINER_FMT="${OC_V5_TASK_CONTAINER_FMT:-oc-v5-u%s}"
 UID_DEFAULT="${OC_V5_TASK_UID:-3}"
 EXEC_TIMEOUT="${OC_V5_TASK_EXEC_TIMEOUT:-60}"
 EXEC_KILL_AFTER="${OC_V5_TASK_EXEC_KILL_AFTER:-5}"
+LOCK_WAIT="${OC_V5_TASK_LOCK_WAIT:-300}"
 
 die() { echo "✗ $*" >&2; exit 2; }
 
@@ -50,14 +53,32 @@ spool_dirs() {
   done
 }
 
-queued_count() { find "$SPOOL_DIR/q" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l; }
+# q/ 与 inflight/ 都算「还没送完」:在线评论只有两者都空才可直接发。
+queued_count() { find "$SPOOL_DIR/q" "$SPOOL_DIR/inflight" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l; }
+
+queue_lock() { # 队列锁(fd 9),有界等待
+  spool_dirs
+  exec 9>>"$SPOOL_DIR/.lock"
+  flock -w "$LOCK_WAIT" 9 || die "等队列锁超过 ${LOCK_WAIT}s(另一个送达卡住?)"
+}
+# 注意:不能写 `exec 9>&- 2>/dev/null` —— 裸 exec 上的重定向会永久改掉本 shell 的 stderr。
+queue_unlock() { flock -u 9 2>/dev/null || true; { exec 9>&-; } 2>/dev/null || true; }
+
+next_seq() { # 持队列锁调用:单调序号,不依赖时钟
+  local n=0
+  [[ -s "$SPOOL_DIR/.seq" ]] && n="$(cat "$SPOOL_DIR/.seq")"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  n=$((n + 1))
+  ( umask 077; printf '%s\n' "$n" >"$SPOOL_DIR/.seq.tmp" ); mv -f "$SPOOL_DIR/.seq.tmp" "$SPOOL_DIR/.seq"
+  printf '%012d' "$n"
+}
 
 enqueue_comment() { # <uid> <args…>(已确认是 ticket comment)
   local uid="$1"; shift
-  local id name
-  spool_dirs
+  local id name held="${QUEUE_LOCK_HELD:-0}"
+  [[ "$held" == 1 ]] || queue_lock
   id="tq-$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
-  name="$(date +%s%N)-$id.json"   # 文件名即顺序
+  name="$(next_seq)-$id.json"   # 文件名即顺序:序号在队列锁内分配并在锁内发布
   # 参数经 NUL 分隔走 stdin(以 -- 开头的参数不能交给 jq 的 --args 解析)。先写临时名再 rename,读者看不到半个文件。
   ( umask 077
     printf '%s\0' "$@" | jq -cRs --arg id "$id" --arg uid "$uid" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -81,6 +102,7 @@ cmd_flush() {
   # 同时只允许一个 flush;另一个在跑就直接返回。
   exec 8>>"$SPOOL_DIR/.flush.lock"
   flock -n 8 || { [[ "$quiet" == 1 ]] || echo "另一个 flush 正在进行,跳过"; return 0; }
+  queue_lock
   for f in "$SPOOL_DIR"/inflight/*.json; do
     [[ -e "$f" ]] || continue
     mv -f "$f" "$SPOOL_DIR/uncertain/"
@@ -88,6 +110,8 @@ cmd_flush() {
     echo "⚠ oc-task 队列:$(basename "$f") 上次送达途中被打断,结果未知,已移入 uncertain/,不重发;请到工单核对。" >&2
   done
   while [[ -z "$stop" ]]; do
+    # 一整条(选队首→探测→写→落终态)在队列锁内完成;两条之间放锁,让入队/在线评论能插到队尾。
+    queue_unlock; queue_lock
     f="$(find "$SPOOL_DIR/q" -maxdepth 1 -type f -name '*.json' -printf '%f\n' | LC_ALL=C sort | head -n 1)"
     [[ -n "$f" ]] || break
     base="$f"; line="$(cat "$SPOOL_DIR/q/$base")"
@@ -121,6 +145,7 @@ cmd_flush() {
       stop="$id 写入返回 rc=$rc,结果未知,已移入 uncertain/,不重发"
     fi
   done
+  queue_unlock
   if [[ "$quiet" != 1 || "$sent" -gt 0 || ( -n "$stop" && "$stop" != 容器*未运行 ) ]]; then
     echo "oc-task 队列:已送达 $sent,剩余 $(queued_count)${stop:+;停在:$stop}" >&2
   fi
@@ -156,13 +181,17 @@ main() {
   local is_comment=0
   [[ "${1:-}" == ticket && "${2:-}" == comment ]] && is_comment=1
   if running "$ctr"; then
+    [[ "$is_comment" == 1 ]] || { exec_task "$ctr" "$@"; return; }   # 非评论命令不涉及评论顺序
     cmd_flush --quiet || true
-    # 前面还有没送完的评论时,新评论排到它们后面,不插队。
-    if [[ "$is_comment" == 1 && "$(queued_count)" -gt 0 ]]; then
-      enqueue_comment "$uid" "$@"
+    # 判断与发送都在队列锁内:前面还有没送完(含送达中)的评论时,新评论排到队尾,不插队。
+    queue_lock
+    if [[ "$(queued_count)" -gt 0 ]]; then
+      QUEUE_LOCK_HELD=1 enqueue_comment "$uid" "$@"
     fi
-    exec_task "$ctr" "$@"
-    return
+    local rc=0
+    exec_task "$ctr" "$@" || rc=$?
+    queue_unlock
+    return "$rc"
   fi
   if [[ "$is_comment" == 1 ]]; then
     echo "⏳ $ctr 未运行(idle sweep 回收后要等 owner 下次连接才重建)。" >&2
