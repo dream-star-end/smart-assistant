@@ -49,7 +49,10 @@ export interface ParityProblem {
 export function extractNpmScripts(command: string): { scripts: string[]; workspaceForms: string[] } {
   const scripts: string[] = [];
   const workspaceForms: string[] = [];
-  const re = /\bnpm\s+run\s+(\S+)/g;
+  // 脚本名不含引号:CI 里把整组命令作为引号参数传给 .github/scripts/run-parallel.sh 时,
+  // 收尾引号不能粘进脚本名(否则 `check:tutorials'` 会被当成另一个脚本)。
+  // 脚本名本身也可以带引号(`npm run 'x'`),一并剥掉,不能让它躲过核对。
+  const re = /\bnpm\s+run\s+['"]?([^\s'"]+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(command)) !== null) {
     const token = m[1]!;

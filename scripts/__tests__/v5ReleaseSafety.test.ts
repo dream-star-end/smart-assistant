@@ -7656,7 +7656,9 @@ wait $!
     // 就能卡死正常发布),并逐个比对 commit 的 check-run 结论。
     assert.match(fn, /protection\/required_status_checks/, '必须以分支保护的必需集为判定口径')
     assert.match(fn, /commits\/\$sha\/check-runs/, '必须查的是被构建的那个 commit 的 check-run')
-    assert.match(fn, /\^\(success\|skipped\|neutral\)\$/, 'conclusion 白名单必须显式')
+    assert.match(fn, /\^\(success\|neutral\)\$/, 'conclusion 白名单必须显式')
+    // skipped 不得算绿:合并后 push 的 same-tree 去重会让 required check 变 skipped,那只能经 same-tree 复用放行。
+    assert.doesNotMatch(fn, /\(success\|skipped\|neutral\)/, 'skipped 不能进 conclusion 白名单')
     assert.match(fn, /unverifiable=/, '证据取不到必须与「取到且是红的」一样进阻断分支')
     // 逃生口必须显式且记账。
     assert.match(fn, /ALLOW_UNVERIFIED_CI" != 1/, '缺显式逃生旗标判定')
