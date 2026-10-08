@@ -261,3 +261,92 @@ describe("useChatProjects createProject", () => {
     expect((got as ChatProject | null)?.name).toBe("演示项目");
   });
 });
+
+describe("useChatProjects archive / pin / fenced delete / restore", () => {
+  function setup(projects: ChatProject[]) {
+    vi.spyOn(api, "listChatProjects").mockResolvedValue(projects);
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    const restored: Array<[string, string[]]> = [];
+    const hook = renderHook(
+      () =>
+        useChatProjects({
+          demo: false,
+          auth,
+          authSession: auth,
+          userId: "u1",
+          promptText: async () => null,
+          confirmDialog: async () => true,
+          onUngroupProjectSessions: () => ["s1"],
+          onRestoreProjectSessions: (pid, ids) => void restored.push([pid, ids]),
+        }),
+      { wrapper: ToastProvider },
+    );
+    return { ...hook, restored };
+  }
+  const bound: ChatProject = { ...proj("p-bound"), boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
+
+  test("delete pauses the project's cron and archives its board before deleting, and offers undo", async () => {
+    const order: string[] = [];
+    vi.spyOn(api, "listCron").mockResolvedValue([{ id: "j1", enabled: true }, { id: "j2", enabled: false }] as never);
+    vi.spyOn(api, "updateCron").mockImplementation(async (_a, id, patch) => {
+      order.push(`cron ${id} ${(patch as { enabled: boolean }).enabled}`);
+      return { ok: true } as never;
+    });
+    const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "patchProject").mockImplementation(async (_a, _id, body) => {
+      order.push(`board ${body.archivedAt ? "archived" : "open"}`);
+      return { ok: true } as never;
+    });
+    const del = vi.spyOn(api, "deleteChatProject").mockImplementation(async (_a, _id, paused) => {
+      order.push(`delete ${(paused ?? []).join(",")}`);
+    });
+    const { result } = setup([bound]);
+    await waitFor(() => expect(result.current.projects).toHaveLength(1));
+    await act(async () => {
+      await result.current.deleteProjectConfirm(bound);
+    });
+    expect(order).toEqual(["cron j1 false", "board archived", "delete j1"]);
+    expect(del).toHaveBeenCalledTimes(1);
+    expect(result.current.projects).toEqual([]);
+    expect(await screen.findByRole("button", { name: "撤销" })).toBeTruthy();
+  });
+
+  test("restore brings the project back, re-files exactly the re-linked chats and resumes the paused cron", async () => {
+    vi.spyOn(api, "restoreChatProject").mockResolvedValue({
+      project: bound,
+      pausedCronJobIds: ["j1"],
+      relinkedSessionIds: ["s1"],
+    });
+    const cron = vi.spyOn(api, "updateCron").mockResolvedValue({ ok: true } as never);
+    const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "patchProject").mockResolvedValue({ ok: true } as never);
+    const { result, restored } = setup([]);
+    await waitFor(() => expect(api.listChatProjects).toHaveBeenCalled());
+    let ok = false;
+    await act(async () => {
+      ok = await result.current.restoreProject("p-bound");
+    });
+    expect(ok).toBe(true);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["p-bound"]);
+    expect(restored).toEqual([["p-bound", ["s1"]]]);
+    expect(cron).toHaveBeenCalledWith(expect.anything(), "j1", { enabled: true });
+  });
+
+  test("archive and pin update the list; a failed archive rolls back", async () => {
+    const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "patchProject").mockResolvedValue({ ok: true } as never);
+    vi.spyOn(api, "patchChatProject")
+      .mockResolvedValueOnce({ ...bound, pinnedAt: 5 })
+      .mockRejectedValueOnce(new Error("500"));
+    const { result } = setup([bound]);
+    await waitFor(() => expect(result.current.projects).toHaveLength(1));
+    await act(async () => {
+      await result.current.setProjectPinned(bound, true);
+    });
+    expect(result.current.projects[0]?.pinnedAt).toBe(5);
+    await act(async () => {
+      await result.current.setProjectArchived(bound, true);
+    });
+    expect(result.current.projects[0]?.archivedAt ?? null).toBe(null);
+  });
+});

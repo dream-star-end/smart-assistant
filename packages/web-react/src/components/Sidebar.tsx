@@ -133,6 +133,10 @@ export type SidebarProps = {
   onMoveToProject?: (s: Session, projectId: string | null) => void;
   /** 会话菜单「新建项目并移入…」:打开新建项目对话框,创建后该会话移进新项目。 */
   onCreateProjectFromSession?: (s: Session) => void;
+  onToggleProjectPin?: (p: ChatProject) => void;
+  onArchiveProject?: (p: ChatProject) => void;
+  /** 「已归档 / 最近删除的项目」入口(项目标题行)。 */
+  onOpenProjectArchive?: () => void;
   projects?: ChatProject[];
   collapsedProjectIds?: Set<string>;
   onToggleProjectCollapsed?: (id: string) => void;
@@ -220,6 +224,9 @@ export function Sidebar({
   onTogglePin,
   onMoveToProject,
   onCreateProjectFromSession,
+  onToggleProjectPin,
+  onArchiveProject,
+  onOpenProjectArchive,
   projects,
   collapsedProjectIds,
   onToggleProjectCollapsed,
@@ -336,7 +343,9 @@ export function Sidebar({
   }, []);
 
   const orderedProjects = useMemo(() => {
-    const list = projects ?? [];
+    // 归档的项目不在主列表;置顶的排在最前(各自保持原有顺序)。
+    const live = (projects ?? []).filter((p) => !p.archivedAt);
+    const list = [...live.filter((p) => p.pinnedAt), ...live.filter((p) => !p.pinnedAt)];
     if (!orderOverride) return list;
     const map = new Map(list.map((p) => [p.id, p]));
     const out: ChatProject[] = [];
@@ -639,6 +648,19 @@ export function Sidebar({
               <Plus size={14} />
             </IconButton>
           )}
+          {withAction && onOpenProjectArchive && (
+            <IconButton
+              aria-label="已归档和最近删除的项目"
+              title="已归档和最近删除的项目"
+              variant="muted"
+              size="xs"
+              shape="square"
+              className="rounded-xs"
+              onClick={onOpenProjectArchive}
+            >
+              <Archive size={14} />
+            </IconButton>
+          )}
         </h2>
       );
     }
@@ -789,6 +811,8 @@ export function Sidebar({
           onNewSession={!isDefault && onNewInProject ? () => onNewInProject(p.id) : undefined}
           onMoveUp={() => moveProject(p.id, -1)}
           onMoveDown={() => moveProject(p.id, 1)}
+          onTogglePin={isDefault ? undefined : onToggleProjectPin}
+          onArchive={isDefault ? undefined : onArchiveProject}
           onDragOverSession={() => setDragOverProjectId(p.id)}
           onDragLeave={() => setDragOverProjectId((cur) => (cur === p.id ? null : cur))}
           onDropSessionId={(id) => {

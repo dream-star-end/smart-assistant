@@ -33,6 +33,7 @@ import {
 } from "react";
 import type { ProjectTab } from "../../hooks/useAppRoute";
 import { useProjectAssets } from "../../hooks/useProjectAssets";
+import { useProjectScope } from "../../hooks/useProjectScope";
 import { PROJECT_COLORS } from "../../lib/projectColors";
 import type { AuthSession, ChatProject, ProjectAsset, Session } from "../../lib/types";
 import { cn } from "../../lib/utils";
@@ -96,7 +97,22 @@ export type ProjectHomeProps = {
   loadingArchived?: boolean;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
+  /**
+   * 项目的看板/记忆/技能/定时任务在各自的页面里,按本项目的范围打开。
+   * onPrepareBoard 确保本项目的看板已在容器里建好(首次用时创建);成功后本组件把
+   * 项目范围切到这块看板,再由 onShowSurface 打开对应页面。不传则不显示入口。
+   */
+  onPrepareBoard?: () => Promise<boolean>;
+  onShowSurface?: (surface: ProjectSurface) => void;
 };
+
+export type ProjectSurface = "board" | "memory" | "skills" | "cron";
+const SURFACES: Array<{ id: ProjectSurface; label: string }> = [
+  { id: "board", label: "看板" },
+  { id: "memory", label: "记忆" },
+  { id: "skills", label: "技能" },
+  { id: "cron", label: "定时任务" },
+];
 
 const OVERVIEW_SESSION_LIMIT = 5;
 const OVERVIEW_OUTPUT_LIMIT = 6;
@@ -133,6 +149,8 @@ export function ProjectHome(props: ProjectHomeProps) {
     onLoadArchived,
     loadingArchived = false,
     sidebarCollapsed,
+    onPrepareBoard,
+    onShowSurface,
     onExpandSidebar,
   } = props;
 
@@ -307,6 +325,14 @@ export function ProjectHome(props: ProjectHomeProps) {
               </Chip>
             )}
           </div>
+
+          {project.boardProjectId && onPrepareBoard && onShowSurface && (
+            <ProjectSurfaceLinks
+              boardProjectId={project.boardProjectId}
+              onPrepareBoard={onPrepareBoard}
+              onShowSurface={onShowSurface}
+            />
+          )}
 
           <div className="flex min-w-0 items-center gap-2 border-b border-border pb-2">
             <div className="min-w-0 flex-1">
@@ -875,5 +901,39 @@ function OutputsTab({
         </div>
       )}
     </div>
+  );
+}
+
+function ProjectSurfaceLinks({
+  boardProjectId,
+  onPrepareBoard,
+  onShowSurface,
+}: {
+  boardProjectId: string;
+  onPrepareBoard: () => Promise<boolean>;
+  onShowSurface: (surface: ProjectSurface) => void;
+}) {
+  const scope = useProjectScope();
+  const [opening, setOpening] = useState<ProjectSurface | null>(null);
+  const open = async (surface: ProjectSurface) => {
+    setOpening(surface);
+    try {
+      if (!(await onPrepareBoard())) return;
+      await scope.refreshWorkProjects();
+      scope.setToken(boardProjectId);
+      onShowSurface(surface);
+    } finally {
+      setOpening(null);
+    }
+  };
+  return (
+    <nav aria-label="项目里的更多" className="flex flex-wrap items-center gap-2" data-testid="project-surface-links">
+      <span className="text-caption text-faint">项目里的</span>
+      {SURFACES.map((s) => (
+        <Chip key={s.id} onClick={() => void open(s.id)} aria-busy={opening === s.id || undefined}>
+          {s.label}
+        </Chip>
+      ))}
+    </nav>
   );
 }

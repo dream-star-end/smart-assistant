@@ -111,7 +111,15 @@ export type ChatProject = {
   updatedAt: number;
   sessionCount: number;
   boardProjectId?: string | null;
+  /** Archived: hidden from the main list, cron fenced via its archived board. */
+  archivedAt?: number | null;
+  /** Pinned projects are listed first. */
+  pinnedAt?: number | null;
+  template?: "blank" | "repo" | "research" | "writing" | null;
 };
+
+/** GET /api/chat-projects?deleted=1 — restorable for 30 days. */
+export type DeletedChatProject = { id: string; name: string; deletedAt: number; sessionCount: number };
 
 /**
  * 聊天项目资产（用户上传的参考资料 + 会话产出物）。

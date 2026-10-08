@@ -1,4 +1,5 @@
 import {
+  Archive,
   ArrowDown,
   ArrowUp,
   ChevronRight,
@@ -8,6 +9,8 @@ import {
   MoreHorizontal,
   Paperclip,
   Pencil,
+  Pin,
+  PinOff,
   Plus,
   Settings2,
   Trash2,
@@ -49,6 +52,8 @@ export function ProjectRow({
   onNewSession,
   onMoveUp,
   onMoveDown,
+  onTogglePin,
+  onArchive,
   onDragOverSession,
   onDragLeave,
   onDropSessionId,
@@ -85,6 +90,10 @@ export function ProjectRow({
   onNewSession?: () => void;
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  /** 置顶/取消置顶(置顶项目排在最前)。 */
+  onTogglePin?: (p: ChatProject) => void;
+  /** 归档:从列表收起,定时任务随之停跑;在「已归档的项目」里可恢复。 */
+  onArchive?: (p: ChatProject) => void;
   onDragOverSession: (e: DragEvent) => void;
   onDragLeave: () => void;
   onDropSessionId: (sessionId: string) => void;
@@ -94,7 +103,7 @@ export function ProjectRow({
 }) {
   const canMutate = !immutable;
   const showMutateMenu =
-    canMutate && Boolean(onRename || onDelete || onOpenSettings || showMoveInMenu);
+    canMutate && Boolean(onRename || onDelete || onOpenSettings || showMoveInMenu || onTogglePin || onArchive);
   const showAssetsOnlyMenu = Boolean(immutable && onOpenAssets);
   const showMenu = showMutateMenu || showAssetsOnlyMenu;
   const swatch = !immutable && PROJECT_COLORS.find((c) => c.key === p.color);
@@ -315,7 +324,23 @@ export function ProjectRow({
                     </DropdownMenuItem>
                   </>
                 )}
-                {(onRename || onOpenSettings || showMoveInMenu) && onDelete && (
+                {onTogglePin && (
+                  <DropdownMenuItem onSelect={() => onTogglePin(p)}>
+                    {p.pinnedAt ? (
+                      <PinOff size={14} className="shrink-0 text-muted" />
+                    ) : (
+                      <Pin size={14} className="shrink-0 text-muted" />
+                    )}
+                    {p.pinnedAt ? "取消置顶" : "置顶"}
+                  </DropdownMenuItem>
+                )}
+                {onArchive && (
+                  <DropdownMenuItem onSelect={() => onArchive(p)}>
+                    <Archive size={14} className="shrink-0 text-muted" />
+                    归档
+                  </DropdownMenuItem>
+                )}
+                {(onRename || onOpenSettings || showMoveInMenu || onTogglePin || onArchive) && onDelete && (
                   <DropdownMenuSeparator />
                 )}
                 {onDelete && (

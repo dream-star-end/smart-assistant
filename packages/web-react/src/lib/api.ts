@@ -71,6 +71,7 @@ import type {
   PutSessionInput,
   PutSessionResult,
   ChatProject,
+  DeletedChatProject,
   CreateProjectAssetInput,
   PatchProjectAssetInput,
   ProjectAsset,
@@ -2405,6 +2406,8 @@ export const api = {
       color?: string | null;
       sortOrder?: number;
       boardProjectId?: string | null;
+      archived?: boolean;
+      pinned?: boolean;
     },
   ): Promise<ChatProject> =>
     jsonOrThrow<{ project: ChatProject }>(
@@ -2418,16 +2421,43 @@ export const api = {
       ),
     ).then((b) => b.project),
 
-  deleteChatProject: (a: AuthSession, id: string): Promise<void> =>
+  /** pausedCronJobIds: jobs the client paused before deleting; kept for a restore. */
+  deleteChatProject: (a: AuthSession, id: string, pausedCronJobIds?: string[]): Promise<void> =>
     jsonOrThrow<{ ok: true }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "include",
-          headers: bearerHeaders(t),
+          headers: bearerHeaders(t, pausedCronJobIds !== undefined),
+          ...(pausedCronJobIds !== undefined ? { body: JSON.stringify({ pausedCronJobIds }) } : {}),
         }),
       ),
     ).then(() => undefined),
+
+  listDeletedChatProjects: (a: AuthSession): Promise<DeletedChatProject[]> =>
+    jsonOrThrow<{ projects: DeletedChatProject[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/chat-projects?deleted=1", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.projects || []),
+
+  restoreChatProject: (
+    a: AuthSession,
+    id: string,
+  ): Promise<{ project: ChatProject; pausedCronJobIds: string[]; relinkedSessionIds: string[] }> =>
+    jsonOrThrow<{ project: ChatProject; pausedCronJobIds?: string[]; relinkedSessionIds?: string[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/chat-projects/${encodeURIComponent(id)}/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({
+      project: b.project,
+      pausedCronJobIds: b.pausedCronJobIds ?? [],
+      relinkedSessionIds: b.relinkedSessionIds ?? [],
+    })),
 
   // ── 项目资产（侧栏项目下聚合上传资料 + 会话产出）──
 

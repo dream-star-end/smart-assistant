@@ -345,3 +345,39 @@ describe("ProjectHome", () => {
     expect(h2.onLoadArchived).not.toHaveBeenCalled();
   });
 });
+
+describe("ProjectHome surfaces (P2)", () => {
+  it("a project with a board links to its board, memory, skills and cron; the board is prepared first", async () => {
+    const order: string[] = [];
+    const onPrepareBoard = vi.fn(async () => {
+      order.push("prepare");
+      return true;
+    });
+    const onShowSurface = vi.fn((s: string) => void order.push(`show ${s}`));
+    renderHome({
+      project: { ...project, boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      onPrepareBoard,
+      onShowSurface,
+    } as Overrides);
+    const links = await screen.findByTestId("project-surface-links");
+    expect(links).toHaveTextContent("看板");
+    fireEvent.click(screen.getByRole("button", { name: "记忆" }));
+    await waitFor(() => expect(onShowSurface).toHaveBeenCalledWith("memory"));
+    expect(order).toEqual(["prepare", "show memory"]);
+  });
+
+  it("no links when the board cannot be prepared, and none without a board", async () => {
+    const onShowSurface = vi.fn();
+    renderHome({
+      project: { ...project, boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      onPrepareBoard: async () => false,
+      onShowSurface,
+    } as Overrides);
+    fireEvent.click(await screen.findByRole("button", { name: "定时任务" }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(onShowSurface).not.toHaveBeenCalled();
+    cleanup();
+    renderHome({ onPrepareBoard: async () => true, onShowSurface } as Overrides);
+    expect(screen.queryByTestId("project-surface-links")).toBeNull();
+  });
+});

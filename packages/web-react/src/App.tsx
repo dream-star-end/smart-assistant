@@ -254,6 +254,9 @@ const InboxDialog = lazy(() => import("./components/InboxDialog").then((m) => ({
 const MessageFeedbackDialog = lazy(() =>
   import("./components/chat/MessageFeedbackDialog").then((m) => ({ default: m.MessageFeedbackDialog })),
 );
+const ProjectArchiveDialog = lazy(() =>
+  import("./components/ProjectArchiveDialog").then((m) => ({ default: m.ProjectArchiveDialog })),
+);
 const CreateProjectDialog = lazy(() =>
   import("./components/CreateProjectDialog").then((m) => ({ default: m.CreateProjectDialog })),
 );
@@ -772,6 +775,8 @@ export function App() {
   // 新建项目对话框:null=关;{}=普通新建;{sessionId,title}=从该会话创建并移入。
   const [createProjectFrom, setCreateProjectFrom] = useState<{ sessionId?: string; title?: string } | null>(null);
   const createProjectMounted = useMountedOnce(createProjectFrom !== null);
+  const [projectArchiveOpen, setProjectArchiveOpen] = useState(false);
+  const projectArchiveMounted = useMountedOnce(projectArchiveOpen);
 
   const {
     projects,
@@ -781,6 +786,10 @@ export function App() {
     createProject,
     renameProjectPrompt,
     deleteProjectConfirm,
+    restoreProject,
+    listDeletedProjects,
+    setProjectArchived,
+    setProjectPinned,
     updateProject,
     reorderProjects,
   } = useChatProjects({
@@ -3536,6 +3545,9 @@ export function App() {
     onCreateProjectFromSession: (sess: Session) => setCreateProjectFrom({ sessionId: sess.id, title: sess.title }),
     onRenameProject: renameProjectPrompt,
     onDeleteProject: deleteProjectConfirm,
+    onToggleProjectPin: demo ? undefined : (p: ChatProject) => void setProjectPinned(p, !p.pinnedAt),
+    onArchiveProject: demo ? undefined : (p: ChatProject) => void setProjectArchived(p, true),
+    onOpenProjectArchive: demo ? undefined : () => setProjectArchiveOpen(true),
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
     socketVersion: chat.version,
@@ -3774,6 +3786,26 @@ export function App() {
               onDelete={() => void deleteProjectConfirm(homeProject)}
               onOpenMobileNav={() => setMobileNavOpen(true)}
               onLoadArchived={() => void loadArchivedSessions()}
+              onPrepareBoard={
+                demo || !TASKBOARD_ENABLED || !homeProject.boardProjectId
+                  ? undefined
+                  : async () => {
+                      // Any board route creates a reserved board on first use (container side).
+                      try {
+                        const { taskboardApi } = await import("./lib/taskboard");
+                        await taskboardApi.getProject(authRef.current, homeProject.boardProjectId as string);
+                        return true;
+                      } catch (e) {
+                        toast(apiErrorMessage(e, "项目看板暂时打不开，请稍后再试"), "error");
+                        return false;
+                      }
+                    }
+              }
+              onShowSurface={(surface) => {
+                setProjectHome(null);
+                if (surface === "board") setBoardOpen(true);
+                else openManage(surface);
+              }}
               loadingArchived={loadingArchived}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
@@ -4310,6 +4342,18 @@ export function App() {
         </LazyBoundary>
       )}
 
+      {projectArchiveMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ProjectArchiveDialog
+            open={projectArchiveOpen}
+            onOpenChange={setProjectArchiveOpen}
+            archived={projects.filter((p) => p.archivedAt)}
+            loadDeleted={listDeletedProjects}
+            onUnarchive={(p) => setProjectArchived(p, false)}
+            onRestore={restoreProject}
+          />
+        </LazyBoundary>
+      )}
       {createProjectMounted && (
         <LazyBoundary fallback={<DialogFallback />}>
           <CreateProjectDialog

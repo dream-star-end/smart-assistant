@@ -354,6 +354,9 @@ export function ProjectSettingsDialog(props: {
             </div>
           </Field>
 
+          {/* 有看板的项目(开启项目层后所有新项目)绑定是自动且永久的,不再让用户选。 */}
+          {!project?.boardProjectId && (
+            <>
           <Field
             label="绑定任务面板项目"
             hint="绑定后，聊天与看板 stage 共用项目指令、资产、技能和正式记忆。未绑定 GitHub 仓库的会话使用项目工作区；仓库 clone 就绪时会话会切到仓库快照（允许覆盖）。"
@@ -388,6 +391,8 @@ export function ProjectSettingsDialog(props: {
               disabled={!!boardListErr}
             />
           </Field>
+            </>
+          )}
 
           <Field
             label={

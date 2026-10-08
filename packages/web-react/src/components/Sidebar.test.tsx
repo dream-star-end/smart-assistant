@@ -2054,3 +2054,34 @@ describe("Sidebar 搜索范围可见（QW6）", () => {
     expect(hints.map((h) => h.textContent)).toEqual(["工作"]);
   });
 });
+
+describe("Sidebar 项目归档/置顶（P2）", () => {
+  it("archived projects leave the list, pinned ones come first, and the menu offers 置顶 / 归档", async () => {
+    const onToggleProjectPin = vi.fn();
+    const onArchiveProject = vi.fn();
+    renderSidebar({
+      sessions: [],
+      projects: [
+        project({ id: "p-aaaa", name: "甲", sortOrder: 0 }),
+        project({ id: "p-bbbb", name: "乙", sortOrder: 1, pinnedAt: 5 }),
+        project({ id: "p-cccc", name: "丙", sortOrder: 2, archivedAt: 9 }),
+      ],
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onToggleProjectPin,
+      onArchiveProject,
+      onOpenProjectArchive: () => {},
+    });
+    const names = screen.getAllByRole("button", { name: /^项目 .+ 更多$/ }).map((b) => b.getAttribute("aria-label"));
+    expect(names).toEqual(["项目 乙 更多", "项目 甲 更多"]);
+    expect(screen.getByRole("button", { name: "已归档和最近删除的项目" })).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 甲 更多" }), { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "置顶" }));
+    expect(onToggleProjectPin).toHaveBeenCalledWith(expect.objectContaining({ id: "p-aaaa" }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "项目 乙 更多" }), { button: 0, ctrlKey: false, pointerType: "mouse" });
+    expect(await screen.findByRole("menuitem", { name: "取消置顶" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "归档" }));
+    expect(onArchiveProject).toHaveBeenCalledWith(expect.objectContaining({ id: "p-bbbb" }));
+  });
+});
