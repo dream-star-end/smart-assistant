@@ -447,12 +447,104 @@ write_master_version_json() { # <staging> <short-sha>
 
 # 构建一份可运行的 master release。不装 unit、不切 symlink、不迁库、不重启。
 # 成功后 BUILT_MASTER_RELEASE 指向 rel-* 绝对路径。
+# ── web-react dist 复用(2026-10-08 devflow-opt)──
+# 实测每次 selfhost --deploy 都重建前端 ~200s(其中 vite 14s,其余是 tsc -b),哪怕本次只改了后端。
+# 构建是确定性的(oc-build = index.html 内容哈希),所以「全部构建输入逐字节相同」时,上一份 release
+# 的 dist 就是本次会构建出的 dist,tsc -b 的结论也相同 —— 复用不削门。
+#
+# 输入口径(任何一项变 → key 变 → 照常构建):
+#   packages/web-react 整棵 tree(源码、配置、自身 lock、public、vite.config)
+#   packages/protocol 整棵 tree(@openclaude/protocol 依赖)
+#   packages/mcp-memory/src(web-react 唯一越包相对 import:mcp-memory/src/toolNames)
+#   根 package-lock.json / package.json(依赖版本)
+#   本文件自身(构建步骤一变就作废所有旧 key)
+#   node --version
+# 复用前对 donor 的 dist 重算摘要,与 donor 构建时记下的摘要比对;不信任裸存在。
+# OC_V5_FORCE_WEB_BUILD=1 强制重建。
+WEB_DIST_REUSE_RECORD=".web-dist-reuse.json"
+WEB_DIST_REUSE_SCHEMA="web-dist-reuse-v1"
+WEB_DIST_KEY_PATHS=(
+  packages/web-react
+  packages/protocol
+  packages/mcp-memory/src
+  package-lock.json
+  package.json
+  scripts/v5-selfhost-master-release-lib.sh
+)
+
+master_web_dist_key() { # <full-sha> → stdout 64-hex;任一输入取不到 → rc=1(调用方照常构建)
+  local sha="$1" p oid parts node_ver
+  parts="$WEB_DIST_REUSE_SCHEMA"
+  for p in "${WEB_DIST_KEY_PATHS[@]}"; do
+    oid="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${sha}:${p}" 2>/dev/null)" || return 1
+    [[ "$oid" =~ ^[0-9a-f]{40}$ ]] || return 1
+    parts+=$'\n'"$p $oid"
+  done
+  node_ver="$(node --version 2>/dev/null)" || return 1
+  parts+=$'\n'"node $node_ver"
+  printf '%s' "$parts" | sha256sum | cut -d' ' -f1
+}
+
+web_dist_digest() { # <dist-dir> → stdout 64-hex(相对路径 + 内容;拒绝符号链接)
+  local dist="$1"
+  [[ -d "$dist" && ! -L "$dist" ]] || return 1
+  [[ -z "$(find "$dist" -type l -print -quit)" ]] || return 1
+  ( cd "$dist" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum ) | sha256sum | cut -d' ' -f1
+}
+
+# stdout 只打印可复用 dist 的 release 绝对路径;找不到 rc=1。日志走 stderr。
+# 候选:live 优先,其次最近的已封存 rel-*(最多 8 份);拒绝 .poisoned / 缺 .complete / 记录不符 / 摘要不符。
+find_web_dist_donor() { # <key>
+  local key="$1" cand rec rkey rdigest got live=""
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -L "$MASTER_LIVE_LINK" ]]; then
+    live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  fi
+  while IFS= read -r cand; do
+    [[ -n "$cand" && -d "$cand" && ! -L "$cand" ]] || continue
+    release_dir_is_poisoned "$cand" && continue
+    [[ -f "$cand/.complete" && ! -L "$cand/.complete" ]] || continue
+    rec="$cand/$WEB_DIST_REUSE_RECORD"
+    [[ -f "$rec" && ! -L "$rec" ]] || continue
+    rkey="$(jq -er --arg s "$WEB_DIST_REUSE_SCHEMA" 'select(.schema == $s) | .key' "$rec" 2>/dev/null)" || continue
+    [[ "$rkey" == "$key" ]] || continue
+    rdigest="$(jq -er '.distDigest' "$rec" 2>/dev/null)" || continue
+    [[ "$rdigest" =~ ^[0-9a-f]{64}$ ]] || continue
+    grep -q 'name="oc-build"' "$cand/packages/web-react/dist/index.html" 2>/dev/null || continue
+    got="$(web_dist_digest "$cand/packages/web-react/dist")" || continue
+    if [[ "$got" != "$rdigest" ]]; then
+      mlog "  web dist donor 摘要不符,跳过 $cand(recorded=${rdigest:0:12} got=${got:0:12})"
+      continue
+    fi
+    printf '%s\n' "$cand"
+    return 0
+  done < <(
+    [[ -n "$live" ]] && printf '%s\n' "$live"
+    if [[ -d "$MASTER_RELEASES_ROOT" ]]; then
+      find "$MASTER_RELEASES_ROOT" -mindepth 1 -maxdepth 1 -type d -name 'rel-*' ! -name '*.poisoned' \
+        -printf '%T@\t%p\n' | sort -nr | cut -f2- | grep -vxF -- "${live:-/nonexistent}" | head -8
+    fi
+  )
+  return 1
+}
+
+write_web_dist_reuse_record() { # <staging> <key-or-empty> <mode> <full-sha> [donor]
+  local staging="$1" key="$2" mode="$3" sha="$4" donor="${5:-}" digest
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 0   # 取不到 key 的构建不登记,下次照常构建
+  digest="$(web_dist_digest "$staging/packages/web-react/dist")" || return 1
+  jq -n --arg schema "$WEB_DIST_REUSE_SCHEMA" --arg key "$key" --arg digest "$digest" \
+    --arg mode "$mode" --arg sha "$sha" --arg donor "$donor" \
+    '{schema: $schema, key: $key, distDigest: $digest, mode: $mode, sourceCommit: $sha, donor: $donor}' \
+    > "$staging/$WEB_DIST_REUSE_RECORD"
+}
+
 build_master_release() {
-  local full_sha short_sha ts staging reldir donor t0 t1 build_id
+  local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
   BUILT_MASTER_RELEASE=""
   MASTER_DEPS_MODE=""
   MASTER_DEPS_ELAPSED_S=""
   MASTER_FRONTEND_ELAPSED_S=""
+  MASTER_FRONTEND_MODE=""
 
   # Explicit invocation pin; build-master-only keeps the no-argument HEAD snapshot.
   full_sha="${1:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
@@ -582,14 +674,31 @@ build_master_release() {
   fi
 
   t0="$(date +%s)"
-  mlog "  web-react official build @ staging(不碰工作树 dist)"
-  if ! ( cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ); then
-    cleanup_master_staging
-    die "staging web-react 构建失败"
+  web_key="$(master_web_dist_key "$full_sha" || true)"
+  web_donor=""
+  if [[ -n "$web_key" && "${OC_V5_FORCE_WEB_BUILD:-0}" != 1 ]]; then
+    web_donor="$(find_web_dist_donor "$web_key" || true)"
+  fi
+  if [[ -n "$web_donor" ]]; then
+    mlog "  web-react 构建输入未变(key=${web_key:0:12})→ 复用 $web_donor 的 dist(摘要已复核)"
+    if [[ -e "$staging/packages/web-react/dist" ]] \
+      || ! cp -a -- "$web_donor/packages/web-react/dist" "$staging/packages/web-react/dist"; then
+      cleanup_master_staging
+      die "复用 web dist 失败(donor=$web_donor)"
+    fi
+    MASTER_FRONTEND_MODE="reused"
+  else
+    [[ -n "$web_key" ]] || mlog "  web dist key 取不到 → 照常构建"
+    mlog "  web-react official build @ staging(不碰工作树 dist)"
+    if ! ( cd "$staging" && NODE_OPTIONS='--max-old-space-size=4096' npm run build --workspace packages/web-react ); then
+      cleanup_master_staging
+      die "staging web-react 构建失败"
+    fi
+    MASTER_FRONTEND_MODE="built"
   fi
   t1="$(date +%s)"
   MASTER_FRONTEND_ELAPSED_S="$((t1 - t0))"
-  mlog "  frontend elapsed=${MASTER_FRONTEND_ELAPSED_S}s"
+  mlog "  frontend elapsed=${MASTER_FRONTEND_ELAPSED_S}s mode=$MASTER_FRONTEND_MODE"
   [[ -f "$staging/packages/web-react/dist/index.html" ]] || {
     cleanup_master_staging
     die "构建后缺 staging dist/index.html"
@@ -601,6 +710,10 @@ build_master_release() {
     die "staging dist/index.html 缺 oc-build meta"
   }
   mlog "  dist oc-build=$build_id"
+  if ! write_web_dist_reuse_record "$staging" "$web_key" "$MASTER_FRONTEND_MODE" "$full_sha" "$web_donor"; then
+    cleanup_master_staging
+    die "写 $WEB_DIST_REUSE_RECORD 失败"
+  fi
 
   # openclaude-memory MCP server 预编译 CJS(dist/ 被 gitignore,git archive 不带产物,
   # 必须在 staging 构建;缺产物则引擎回落 tsx ~7s 冷启动路径,故 fail-loud)。
@@ -646,7 +759,7 @@ build_master_release() {
   MASTER_STAGING_DEV=""
   MASTER_STAGING_INO=""
   BUILT_MASTER_RELEASE="$reldir"
-  mlog "  ✓ master release 就绪: $reldir deps=${MASTER_DEPS_MODE}/${MASTER_DEPS_ELAPSED_S}s frontend=${MASTER_FRONTEND_ELAPSED_S}s"
+  mlog "  ✓ master release 就绪: $reldir deps=${MASTER_DEPS_MODE}/${MASTER_DEPS_ELAPSED_S}s frontend=${MASTER_FRONTEND_ELAPSED_S}s/${MASTER_FRONTEND_MODE}"
 }
 
 cmd_build_master_only() {
