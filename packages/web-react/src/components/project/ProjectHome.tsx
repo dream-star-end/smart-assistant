@@ -2,6 +2,7 @@ import {
   ArrowRight,
   ArrowUp,
   CalendarDays,
+  Download,
   File as FileIcon,
   FileCode,
   FileImage,
@@ -33,12 +34,14 @@ import {
 } from "react";
 import type { ProjectTab } from "../../hooks/useAppRoute";
 import { api } from "../../lib/api";
+import { formatBytes } from "../../lib/chat/download";
 import { useProjectAssets } from "../../hooks/useProjectAssets";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { PROJECT_COLORS } from "../../lib/projectColors";
 import type { AuthSession, ChatProject, ProjectAsset, Session } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
+import { useSignedDownload } from "../chat/media";
 import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
 import {
   Alert,
@@ -54,6 +57,7 @@ import {
   EmptyState,
   IconButton,
   Input,
+  Modal,
   Skeleton,
   Spinner,
   Tabs,
@@ -418,6 +422,8 @@ export function ProjectHome(props: ProjectHomeProps) {
                 loading={assetsLoading}
                 error={assetsError}
                 onReload={reloadAssets}
+                demo={demo}
+                authSession={authSession}
                 titleById={titleById}
                 onOpenSession={onOpenSession}
               />
@@ -717,16 +723,20 @@ function OutputTile({
   asset,
   sourceTitle,
   onOpenSession,
+  onShowVersions,
   compact = false,
 }: {
   asset: ProjectAsset;
   sourceTitle?: string;
   onOpenSession: (id: string) => void;
+  /** 有多个版本时打开版本历史；不传（概览）只显示版本号。 */
+  onShowVersions?: (asset: ProjectAsset) => void;
   compact?: boolean;
 }) {
   const kind = outputKind(asset);
   const Icon = KIND_ICON[kind];
   const canOpen = Boolean(asset.sessionId && sourceTitle);
+  const versions = asset.versionCount ?? 1;
   const body = (
     <>
       <span
@@ -739,8 +749,15 @@ function OutputTile({
         <Icon size={compact ? 16 : 24} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-body font-medium text-fg" title={asset.name}>
-          {asset.name}
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-body font-medium text-fg" title={asset.name}>
+            {asset.name}
+          </span>
+          {versions > 1 && !onShowVersions && (
+            <Badge size="sm" data-testid="output-version-badge">
+              v{versions}
+            </Badge>
+          )}
         </span>
         <span className="truncate text-caption text-muted">
           {sourceTitle ? `来自「${sourceTitle}」` : OUTPUT_KIND_LABELS[kind]}
@@ -772,18 +789,175 @@ function OutputTile({
   return (
     <div className={cls} data-output-kind={kind}>
       {body}
-      {!compact && canOpen && (
-        <Button
-          size="sm"
-          variant="ghost"
-          className="self-start px-2"
-          onClick={() => onOpenSession(asset.sessionId!)}
-        >
-          在会话中打开
-          <ArrowRight size={13} aria-hidden />
-        </Button>
+      {!compact && (canOpen || (versions > 1 && onShowVersions)) && (
+        <div className="flex flex-wrap items-center gap-1">
+          {canOpen && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="px-2"
+              onClick={() => onOpenSession(asset.sessionId!)}
+            >
+              在会话中打开
+              <ArrowRight size={13} aria-hidden />
+            </Button>
+          )}
+          {versions > 1 && onShowVersions && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="px-2"
+              data-testid="output-version-badge"
+              aria-label={`${asset.name} 共 ${versions} 个版本，查看版本历史`}
+              onClick={() => onShowVersions(asset)}
+            >
+              v{versions}
+            </Button>
+          )}
+        </div>
       )}
     </div>
+  );
+}
+
+/**
+ * 一个产出的版本历史（新→旧）：每版的时间、大小、下载。每一版都是登记时复制下来的
+ * 不可变副本，源文件后来被覆盖或删除也能下载。「恢复」把旧版本的字节再登记成最新
+ * 版本，已有版本一个都不动。
+ */
+function OutputVersionsDialog({
+  asset,
+  demo,
+  authSession,
+  onClose,
+  onRestored,
+}: {
+  asset: ProjectAsset;
+  demo: boolean;
+  authSession: AuthSession;
+  onClose: () => void;
+  onRestored: () => void;
+}) {
+  const toast = useToast();
+  const [versions, setVersions] = useState<ProjectAsset[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (demo) {
+      setVersions([asset]);
+      return;
+    }
+    let alive = true;
+    setError(null);
+    api
+      .listProjectAssetVersions(authSession, asset.id)
+      .then((list) => alive && setVersions(list))
+      .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      alive = false;
+    };
+  }, [asset, demo, authSession, nonce]);
+
+  const restore = async (v: ProjectAsset) => {
+    setRestoring(v.id);
+    try {
+      await api.restoreProjectAssetVersion(authSession, v.id);
+      toast("已把这一版恢复为最新版本", "success");
+      setNonce((n) => n + 1);
+      onRestored();
+    } catch (e) {
+      toast(`恢复失败：${e instanceof Error ? e.message : String(e)}`, "error");
+    } finally {
+      setRestoring(null);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onOpenChange={(o) => !o && onClose()}
+      title={`${asset.name} 的版本`}
+      description="每一版都单独保存，源文件之后被覆盖或删除也能下载。恢复会把旧版本另存为最新一版。"
+      size="md"
+    >
+      <div data-testid="output-versions" className="flex flex-col">
+        {error ? (
+          <Alert tone="danger">版本加载失败：{error}</Alert>
+        ) : versions === null ? (
+          <div className="flex items-center justify-center gap-2 py-8 text-meta text-muted">
+            <Spinner size={14} />
+            正在加载版本…
+          </div>
+        ) : (
+          <ol className="-mx-2 flex flex-col">
+            {versions.map((v, i) => (
+              <OutputVersionRow
+                key={v.id}
+                version={v}
+                label={`v${versions.length - i}`}
+                latest={i === 0}
+                restoring={restoring === v.id}
+                restoreDisabled={restoring !== null || demo}
+                onRestore={() => void restore(v)}
+              />
+            ))}
+          </ol>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function OutputVersionRow({
+  version,
+  label,
+  latest,
+  restoring,
+  restoreDisabled,
+  onRestore,
+}: {
+  version: ProjectAsset;
+  label: string;
+  latest: boolean;
+  restoring: boolean;
+  restoreDisabled: boolean;
+  onRestore: () => void;
+}) {
+  // 版本优先用自己的不可变副本（url）；没有副本的旧登记只能取源路径上的当前文件。
+  const src = version.url || version.containerPath;
+  const { state, start, cancel } = useSignedDownload(src, version.name);
+  return (
+    <li
+      data-testid="output-version"
+      data-version-id={version.id}
+      className="flex min-h-11 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-hover"
+    >
+      <span className="w-9 shrink-0 tabular-nums text-meta font-medium text-fg">{label}</span>
+      <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 text-caption text-muted">
+        <TimeAgo value={version.createdAt} />
+        <span>{formatBytes(version.sizeBytes) || "大小未知"}</span>
+        {latest && <Badge size="sm" tone="accent">最新</Badge>}
+        {!version.url && <span className="text-faint">未单独保存</span>}
+      </span>
+      {!latest && version.url && (
+        <Button size="sm" variant="ghost" className="shrink-0 px-2" disabled={restoreDisabled} onClick={onRestore}>
+          {restoring ? <Spinner size={12} /> : <RotateCcw size={13} aria-hidden />}
+          恢复
+        </Button>
+      )}
+      <IconButton
+        aria-label={state.phase === "downloading" ? "取消下载" : `下载 ${label}`}
+        variant="muted"
+        size="sm"
+        shape="square"
+        disabled={!src}
+        onClick={() => (state.phase === "downloading" ? cancel() : void start())}
+      >
+        {state.phase === "downloading" ? <Spinner size={14} /> : <Download size={15} />}
+      </IconButton>
+    </li>
   );
 }
 
@@ -872,6 +1046,8 @@ function OutputsTab({
   loading,
   error,
   onReload,
+  demo,
+  authSession,
   titleById,
   onOpenSession,
 }: {
@@ -879,10 +1055,13 @@ function OutputsTab({
   loading: boolean;
   error: string | null;
   onReload: () => void;
+  demo: boolean;
+  authSession: AuthSession;
   titleById: Map<string, string>;
   onOpenSession: (id: string) => void;
 }) {
   const [kind, setKind] = useState<OutputKind | "all">("all");
+  const [historyFor, setHistoryFor] = useState<ProjectAsset | null>(null);
   const counts = useMemo(() => {
     const c: Record<OutputKind, number> = { doc: 0, image: 0, table: 0, code: 0, other: 0 };
     for (const a of outputs) c[outputKind(a)] += 1;
@@ -937,9 +1116,19 @@ function OutputsTab({
               asset={a}
               sourceTitle={a.sessionId ? titleById.get(a.sessionId) : undefined}
               onOpenSession={onOpenSession}
+              onShowVersions={setHistoryFor}
             />
           ))}
         </div>
+      )}
+      {historyFor && (
+        <OutputVersionsDialog
+          asset={historyFor}
+          demo={demo}
+          authSession={authSession}
+          onClose={() => setHistoryFor(null)}
+          onRestored={onReload}
+        />
       )}
     </div>
   );

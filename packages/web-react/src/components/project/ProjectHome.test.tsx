@@ -295,6 +295,61 @@ describe("ProjectHome", () => {
     expect(screen.queryByRole("button", { name: /在会话中打开/ })).toBeNull();
   });
 
+  it("产出页签：多版本的产出显示 v<N>，版本历史列出时间/大小/下载，恢复旧版本", async () => {
+    const path = "/home/agent/.openclaude/generated/report.md";
+    const v = (id: string, n: number, createdAt: number, sizeBytes: number, url: string | null) =>
+      asset({ id, name: "report.md", source: "output", containerPath: path, url, sizeBytes, createdAt });
+    const latest = { ...v("o-v3", 3, 9_000, 3_072, "/api/media/" + "c".repeat(64) + ".md"), versionCount: 3 };
+    const versions = [
+      latest,
+      v("o-v2", 2, 8_000, 2_048, "/api/media/" + "b".repeat(64) + ".md"),
+      v("o-v1", 1, 7_000, 1_024, null),
+    ];
+    const list = vi.spyOn(api, "listProjectAssetVersions").mockResolvedValue(versions);
+    const restore = vi
+      .spyOn(api, "restoreProjectAssetVersion")
+      .mockResolvedValue({ asset: { ...versions[1]!, id: "o-v4" }, created: true });
+    renderHome({ tab: "outputs", assets: [...ASSETS, latest] });
+    await waitFor(() => expect(screen.getByText("report.md")).toBeInTheDocument());
+    // 单版本产出没有版本号。
+    expect(screen.getAllByTestId("output-version-badge")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "report.md 共 3 个版本，查看版本历史" }));
+    const dialog = await screen.findByTestId("output-versions");
+    await waitFor(() => expect(within(dialog).getAllByTestId("output-version")).toHaveLength(3));
+    expect(list).toHaveBeenCalledWith(expect.anything(), "o-v3");
+    const rows = within(dialog).getAllByTestId("output-version");
+    expect(rows.map((r) => r.textContent?.slice(0, 2))).toEqual(["v3", "v2", "v1"]);
+    expect(within(rows[0]!).getByText("最新")).toBeInTheDocument();
+    expect(within(rows[0]!).getByText("3 KB")).toBeInTheDocument();
+    expect(within(rows[1]!).getByText("2 KB")).toBeInTheDocument();
+    for (const label of ["下载 v3", "下载 v2", "下载 v1"]) {
+      expect(within(dialog).getByRole("button", { name: label })).toBeEnabled();
+    }
+    // 最新版不给恢复；没有单独副本的旧登记也不给。
+    expect(within(rows[0]!).queryByRole("button", { name: /恢复/ })).toBeNull();
+    expect(within(rows[2]!).queryByRole("button", { name: /恢复/ })).toBeNull();
+    expect(within(rows[2]!).getByText("未单独保存")).toBeInTheDocument();
+
+    const reloadsBefore = vi.mocked(api.listProjectAssets).mock.calls.length;
+    fireEvent.click(within(rows[1]!).getByRole("button", { name: /恢复/ }));
+    await waitFor(() => expect(restore).toHaveBeenCalledWith(expect.anything(), "o-v2"));
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(vi.mocked(api.listProjectAssets).mock.calls.length).toBeGreaterThan(reloadsBefore));
+  });
+
+  it("概览：多版本产出也显示 v<N>（只读，不嵌套按钮）", async () => {
+    const latest = {
+      ...asset({ id: "o-many", name: "weekly.md", source: "output", createdAt: 9_999, containerPath: "/home/agent/.openclaude/generated/weekly.md" }),
+      versionCount: 2,
+    };
+    renderHome({ assets: [...ASSETS, latest] });
+    const card = await screen.findByTestId("project-home-outputs");
+    await waitFor(() => expect(within(card).getByText("weekly.md")).toBeInTheDocument());
+    expect(within(card).getByTestId("output-version-badge")).toHaveTextContent("v2");
+    expect(within(card).queryByRole("button", { name: /版本历史/ })).toBeNull();
+  });
+
   it("产出页签空态", async () => {
     renderHome({ tab: "outputs", assets: [] });
     await waitFor(() => expect(screen.getByText("还没有产出")).toBeInTheDocument());

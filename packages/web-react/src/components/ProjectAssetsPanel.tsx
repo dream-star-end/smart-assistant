@@ -233,7 +233,8 @@ function AssetRow({
   onRename: () => void;
   onDelete: () => void;
 }) {
-  const src = asset.containerPath || asset.url;
+  // 产出物优先下载这一版自己的不可变副本（url）；源路径上的文件可能已被覆盖或删除。
+  const src = asset.source === "output" ? asset.url || asset.containerPath : asset.containerPath || asset.url;
   const { state, start, cancel } = useSignedDownload(src, asset.name);
   const pinLabel = asset.pinned ? "取消常用" : "设为常用";
 

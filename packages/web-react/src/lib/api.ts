@@ -2528,6 +2528,35 @@ export const api = {
       ),
     ).then(unwrapProjectAsset),
 
+  /** 产出物同一源路径的全部版本，新→旧。上传或单版本产出只回它自己。 */
+  listProjectAssetVersions: (a: AuthSession, assetId: string): Promise<ProjectAsset[]> =>
+    jsonOrThrow<{ versions: ProjectAsset[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets/${encodeURIComponent(assetId)}/versions`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.versions || []),
+
+  /**
+   * 把某个旧版本恢复成最新版本：服务端用它的字节再登记一个新版本，已有版本不动。
+   * `created=false` 表示它本来就是最新版本。
+   */
+  restoreProjectAssetVersion: (
+    a: AuthSession,
+    assetId: string,
+  ): Promise<{ asset: ProjectAsset; created: boolean }> =>
+    jsonOrThrow<{ asset: ProjectAsset; created: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets/${encodeURIComponent(assetId)}/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
   /** DELETE 约定 204 / 空体；200+JSON 也收。 */
   deleteProjectAsset: (a: AuthSession, assetId: string): Promise<void> =>
     callWithRefresh(a, (t) =>

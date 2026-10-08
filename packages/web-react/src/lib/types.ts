@@ -136,10 +136,14 @@ export type ProjectAsset = {
   containerPath: string | null;
   mime: string | null;
   sizeBytes: number | null;
+  /** 内容 sha256。产出物的每个版本都带它和 url（指向那一版不可变的副本）。 */
+  digest?: string | null;
   excerpt: string | null;
   pinned: boolean;
   createdAt: number;
   updatedAt: number;
+  /** 只在列表里、且同一源路径有多个版本时出现：列表只给最新一版，这里是版本总数。 */
+  versionCount?: number;
 };
 
 /** POST /api/project-assets 请求体。`size` 对应资源字节数（响应字段是 `sizeBytes`）。 */
