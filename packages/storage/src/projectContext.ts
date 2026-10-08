@@ -8,6 +8,10 @@
  *
  * B2: PROJECT.md is the only write authority for bound instructions. PG
  * `chat_projects.instructions` is unbound-only (and a one-time seed source).
+ * B4: the seed runs only for a project whose instructions were never
+ * initialised (`instructionsState: 'never'`). A deliberate clear stays clear,
+ * and a PROJECT.md whose bytes no longer match the recorded hash is copied
+ * aside (PROJECT.conflict-<ts>.md) before anything overwrites or removes it.
  * B3: ~/.openclaude/projects is DATA. It is never an allowed cwd root.
  */
 
@@ -99,7 +103,23 @@ export interface ProjectContextMeta {
   /** Phase 2 placeholder: promotion manifest hash. Phase 1 always null. */
   promotion: { schemaVersion: 1; manifestSha256: string | null }
   instructionsSeed?: { from: 'chat_project'; at: number } | null
+  /** B4. Absent in pre-B4 meta; derived by parseMeta. */
+  instructionsState?: ProjectInstructionsState
+  /** Last PROJECT.md copied aside because its hash did not match the manifest. */
+  instructionsConflict?: ProjectInstructionsConflict | null
 }
+
+export type ProjectInstructionsState = 'never' | 'set' | 'cleared'
+
+export interface ProjectInstructionsConflict {
+  /** File name inside the project dir, e.g. PROJECT.conflict-1791460000000.md */
+  file: string
+  sha256: string
+  at: number
+}
+
+/** What is on disk at PROJECT.md relative to the gateway-owned hash. */
+export type ProjectInstructionsFileStatus = 'absent' | 'empty' | 'valid' | 'mismatch'
 
 export interface ProjectContextSnapshot {
   boardProjectId: string
@@ -107,11 +127,17 @@ export interface ProjectContextSnapshot {
   instructions: string | null
   skillOverlay: string[]
   meta: ProjectContextMeta
+  /** Omitted by writers that do not re-read the file; loadProjectContext always sets it. */
+  instructionsFileStatus?: ProjectInstructionsFileStatus
 }
 
 export type ProjectContextWriteResult =
   | { ok: true; snapshot: ProjectContextSnapshot }
-  | { ok: false; error: 'version_conflict' | 'invalid_instructions' | 'invalid_id' | 'source_missing'; current?: number }
+  | {
+      ok: false
+      error: 'version_conflict' | 'invalid_instructions' | 'invalid_id' | 'source_missing' | 'not_seedable'
+      current?: number
+    }
 
 export function emptyContentManifest(): ProjectContentManifest {
   return { schemaVersion: 1, projectMdSha256: null, skills: [] }
@@ -129,7 +155,31 @@ function emptyMeta(boardProjectId: string, key?: string): ProjectContextMeta {
     contentManifest: emptyContentManifest(),
     promotion: { schemaVersion: 1, manifestSha256: null },
     instructionsSeed: null,
+    instructionsState: 'never',
+    instructionsConflict: null,
   }
+}
+
+/**
+ * Pre-B4 meta has no instructionsState. A recorded hash means instructions
+ * were set; a recorded seed with no hash means they were seeded and later
+ * cleared. Anything else is treated as never initialised, which is exactly
+ * the case the pre-B4 seed already covered.
+ */
+function deriveInstructionsState(parsed: Partial<ProjectContextMeta>, sha: string | null): ProjectInstructionsState {
+  const raw = parsed.instructionsState
+  if (raw === 'never' || raw === 'set' || raw === 'cleared') return raw
+  if (sha) return 'set'
+  if (parsed.instructionsSeed?.from === 'chat_project') return 'cleared'
+  return 'never'
+}
+
+function parseConflict(raw: unknown): ProjectInstructionsConflict | null {
+  if (!raw || typeof raw !== 'object') return null
+  const obj = raw as Partial<ProjectInstructionsConflict>
+  if (typeof obj.file !== 'string' || typeof obj.sha256 !== 'string') return null
+  if (!/^PROJECT\.conflict-[0-9]+\.md$/.test(obj.file)) return null
+  return { file: obj.file, sha256: obj.sha256, at: Number(obj.at) || 0 }
 }
 
 function sha256Hex(s: string): string {
@@ -225,6 +275,12 @@ function parseMeta(raw: string, boardProjectId: string): ProjectContextMeta {
       instructionsSeed: parsed.instructionsSeed?.from === 'chat_project'
         ? { from: 'chat_project', at: Number(parsed.instructionsSeed.at) || Date.now() }
         : null,
+      instructionsState: deriveInstructionsState(
+        parsed,
+        (parsed.contentManifest as Partial<ProjectContentManifest> | undefined)?.projectMdSha256 ??
+          instructionsSha256,
+      ),
+      instructionsConflict: parseConflict(parsed.instructionsConflict),
     }
   } catch {
     return emptyMeta(boardProjectId)
@@ -268,28 +324,63 @@ export async function incrementProjectContextVersion(boardProjectId: string): Pr
   })
 }
 
+interface InstructionsFileRead {
+  status: ProjectInstructionsFileStatus
+  /** Clipped text, set only when status is 'valid'. */
+  instructions: string | null
+  /** Raw bytes as read, set for 'valid' and 'mismatch'. */
+  raw: string | null
+}
+
+async function readInstructionsFileUnlocked(
+  id: string,
+  meta: ProjectContextMeta,
+): Promise<InstructionsFileRead> {
+  let raw: string
+  try {
+    raw = await readFile(paths.projectInstructionsFile(id), 'utf8')
+  } catch {
+    return { status: 'absent', instructions: null, raw: null }
+  }
+  const trimmed = clipProjectInstructions(raw)
+  if (!trimmed) return { status: 'empty', instructions: null, raw: null }
+  const expected = meta.contentManifest.projectMdSha256 ?? meta.instructionsSha256 ?? null
+  if (expected && sha256Hex(trimmed) === expected) {
+    return { status: 'valid', instructions: trimmed, raw }
+  }
+  return { status: 'mismatch', instructions: null, raw }
+}
+
+/**
+ * Copy a hash-mismatched PROJECT.md aside before anything may replace it.
+ * Idempotent per content: the same bytes are preserved once. Returns the meta
+ * to persist (the caller holds the project lock).
+ */
+async function preserveInstructionsConflictUnlocked(
+  id: string,
+  meta: ProjectContextMeta,
+  raw: string,
+): Promise<ProjectContextMeta> {
+  const sha = sha256Hex(raw)
+  if (meta.instructionsConflict?.sha256 === sha) return meta
+  const at = Date.now()
+  const file = `PROJECT.conflict-${at}.md`
+  await writeFileAtomic(join(paths.projectDir(id), file), raw)
+  return { ...meta, instructionsConflict: { file, sha256: sha, at } }
+}
+
 export async function loadProjectContext(boardProjectId: string): Promise<ProjectContextSnapshot> {
   const id = assertBoardId(boardProjectId)
   return withProjectLock(id, async () => {
     const meta = await readMetaUnlocked(id)
-    let instructions: string | null = null
-    try {
-      const raw = await readFile(paths.projectInstructionsFile(id), 'utf8')
-      const trimmed = clipProjectInstructions(raw)
-      const expected =
-        meta.contentManifest.projectMdSha256 ?? meta.instructionsSha256 ?? null
-      if (trimmed && expected && sha256Hex(trimmed) === expected) {
-        instructions = trimmed
-      }
-    } catch {
-      instructions = null
-    }
+    const file = await readInstructionsFileUnlocked(id, meta)
     return {
       boardProjectId: id,
       version: meta.version,
-      instructions,
+      instructions: file.instructions,
       skillOverlay: meta.contentManifest.skills.filter((s) => s.active).map((s) => s.name),
       meta,
+      instructionsFileStatus: file.status,
     }
   })
 }
@@ -349,9 +440,25 @@ export async function writeProjectInstructions(
     return { ok: false, error: 'invalid_instructions' }
   }
   return withProjectLock(id, async () => {
-    const meta = await readMetaUnlocked(id)
+    let meta = await readMetaUnlocked(id)
     if (meta.version !== expectedVersion) {
       return { ok: false, error: 'version_conflict', current: meta.version }
+    }
+    const onDisk = await readInstructionsFileUnlocked(id, meta)
+    if (opts.seedFromChat) {
+      // B4: a seed only fills a never-initialised, empty PROJECT.md. Checked
+      // under the same lock as the write so a concurrent human edit or clear
+      // cannot be overwritten by a stale seed.
+      if (meta.instructionsState !== 'never' || (onDisk.status !== 'absent' && onDisk.status !== 'empty')) {
+        if (onDisk.status === 'mismatch' && onDisk.raw != null) {
+          const preserved = await preserveInstructionsConflictUnlocked(id, meta, onDisk.raw)
+          if (preserved !== meta) await persistMetaUnlocked(preserved)
+        }
+        return { ok: false, error: 'not_seedable', current: meta.version }
+      }
+    }
+    if (onDisk.status === 'mismatch' && onDisk.raw != null) {
+      meta = await preserveInstructionsConflictUnlocked(id, meta, onDisk.raw)
     }
     const file = paths.projectInstructionsFile(id)
     if (body) await writeFileAtomic(file, `${body}\n`)
@@ -377,6 +484,7 @@ export async function writeProjectInstructions(
       instructionsSeed: opts.seedFromChat
         ? { from: 'chat_project', at: Date.now() }
         : meta.instructionsSeed,
+      instructionsState: body ? 'set' : 'cleared',
     }
     await persistMetaUnlocked(next)
     return {
@@ -393,8 +501,11 @@ export async function writeProjectInstructions(
 }
 
 /**
- * One-time seed: copy unbound chat instructions into PROJECT.md iff the file
- * is still empty. Not a dual-write loop — later PG edits are ignored.
+ * One-time seed: copy unbound chat instructions into PROJECT.md iff the
+ * project's instructions were never initialised and the file is absent or
+ * empty (B4). Not a dual-write loop — later PG edits are ignored, a deliberate
+ * clear is never refilled, and a hash-mismatched file is preserved rather
+ * than overwritten.
  */
 export async function seedProjectInstructionsIfEmpty(
   boardProjectId: string,
@@ -404,6 +515,12 @@ export async function seedProjectInstructionsIfEmpty(
   const current = await loadProjectContext(boardProjectId)
   if (current.instructions) return current
   const body = sourceInstructions ? clipProjectInstructions(sourceInstructions) : ''
+  if (body && (current.meta.instructionsState !== 'never' || current.instructionsFileStatus === 'mismatch')) {
+    // Fall through to the locked writer only to preserve a mismatched file;
+    // it refuses the seed itself.
+    await writeProjectInstructions(boardProjectId, body, current.version, { seedFromChat: true, key })
+    return loadProjectContext(boardProjectId)
+  }
   if (!body) {
     if (key && !current.meta.key) {
       await withProjectLock(boardProjectId, async () => {
