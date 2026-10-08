@@ -8,7 +8,8 @@
 #   · 发布队列项不是 active ×1
 #
 # 不变量:
-#   · 只读。不取锁、不写队列、不碰远端状态;egress 判定只经 ssh 读 egress 进程 cwd 与 release 元数据。
+#   · 只读、不阻塞。不取任何锁(队列走 v5-release-queue.sh check)、不写队列、不碰远端状态;
+#     egress 判定只经 ssh 读 egress 进程 cwd 与 release 元数据。
 #   · 不另起口径:MODE / --egress / 队列 / egress 面全部复用 deploy-v5.sh 的真实变量与函数
 #     (V5_DEPLOY_SOURCE_ONLY=1 source),预检只会比 deploy-v5.sh **更早**拒绝,不会放行它会拒的东西。
 #   · deploy-v5.sh 自己的门一个不少照跑;本脚本不是门禁的替代。
@@ -34,19 +35,28 @@ if ! (
 
   fail=0
 
-  # 1) 发布队列:与 deploy-v5.sh 持锁后的 assert_development_release_queue 同一判据(active + 已 pin + pinned 是 HEAD 祖先)。
+  # 1) 发布队列:判据同 deploy-v5.sh 持锁后的 assert_development_release_queue(active + 已 pin +
+  #    pinned 是 HEAD 祖先),但走 v5-release-queue.sh check —— 只读、不取队列锁、不建库,
+  #    别人持有队列锁时也不会挂住。check 退出 3 = 读不到:预检不替 deploy-v5.sh 下结论,只告警放行。
   if release_queue_required_for_mode "$MODE"; then
-    if ! "$RELEASE_QUEUE_SCRIPT" assert --id "${OC_V5_RELEASE_QUEUE_ID:-}" >&2; then
-      echo "✗ 预检:发布队列未就绪(MODE=$MODE)。先 submit → acquire → pin,并在同一条命令里带 OC_V5_RELEASE_QUEUE_ID" >&2
-      fail=1
-    fi
+    "$RELEASE_QUEUE_SCRIPT" check --id "${OC_V5_RELEASE_QUEUE_ID:-}" >&2
+    case $? in
+      0) ;;
+      3) echo "  ⚠ 预检:发布队列状态读不到,交给 deploy-v5.sh 的 assert 判定" >&2 ;;
+      *)
+        echo "✗ 预检:发布队列未就绪(MODE=$MODE)。先 submit → acquire → pin,并在同一条命令里带 OC_V5_RELEASE_QUEUE_ID" >&2
+        fail=1
+        ;;
+    esac
   fi
 
   # 2) Box 证明门测试库:build_release 要求显式测试库。transient unit 只继承 OC_V5_PROOF_TEST_DATABASE_URL
   #    (见 v5-deploy-detached.sh add_optional_env),调用方 shell 里的 TEST_DATABASE_URL 带不进 unit,故只认前者。
   builds_release=0
+  # 与 deploy-v5.sh 里 build_release 的全部调用方一一对应(deploy / deploy_dist / canary 新建 /
+  # knowledge_planet_build_release_mutation);v5DeployDetached.test.ts 钉住调用方清单,新增调用方会让测试变红。
   case "$MODE" in
-    deploy|dist) builds_release=1 ;;
+    deploy|dist|knowledge-planet-verify) builds_release=1 ;;
     canary) [[ -z "${CANARY_RELEASE:-}" ]] && builds_release=1 ;;
   esac
   if [[ "$builds_release" == 1 && -z "${OC_V5_PROOF_TEST_DATABASE_URL:-}" ]]; then

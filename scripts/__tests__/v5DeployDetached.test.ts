@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -414,5 +415,113 @@ test('start runs the preflight and never creates a unit when it fails', () => {
     assert.throws(() => readFileSync(log, 'utf8'))
   } finally {
     fake.cleanup()
+  }
+})
+
+test('preflight neither blocks on a held release-queue lock nor writes the queue DB', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    const id = activePinnedQueue(fx, head)
+    const db = String(fx.env.OC_V5_RELEASE_QUEUE_DB)
+    const lock = String(fx.env.OC_V5_RELEASE_QUEUE_LOCK)
+    // 先让队列库落盘稳定,再取 hash。
+    spawnSync('sqlite3', [db, 'PRAGMA wal_checkpoint(TRUNCATE);'])
+    const before = createHash('sha256').update(readFileSync(db)).digest('hex')
+    // 另一个进程持有队列锁 60s:assert 路径会在 flock 上无限等;预检必须不受影响。
+    const holder = spawn('flock', [lock, 'sleep', '60'], { stdio: 'ignore', detached: true })
+    try {
+      spawnSync('sleep', ['0.3'])
+      const started = Date.now()
+      const result = spawnSync(preflight, ['--', '--with-dist', '--egress'], {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 20_000,
+        env: { ...fx.env, OC_V5_RELEASE_QUEUE_ID: id, OC_V5_PROOF_TEST_DATABASE_URL: 'postgres://t@127.0.0.1:55432/x_test' },
+      })
+      assert.equal(result.error, undefined, 'preflight hung on the queue lock')
+      assert.equal(result.status, 0, result.stderr)
+      assert.ok(Date.now() - started < 15_000)
+      assert.match(result.stderr, /只读检查/)
+    } finally {
+      if (holder.pid) process.kill(-holder.pid, 'SIGKILL')
+    }
+    const after = createHash('sha256').update(readFileSync(db)).digest('hex')
+    assert.equal(after, before)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('preflight requires the proof DSN for knowledge-planet-verify (it calls build_release)', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    const id = activePinnedQueue(fx, head)
+    const result = runPreflight({ ...fx.env, OC_V5_RELEASE_QUEUE_ID: id }, ['--verify-knowledge-planet-user=1'])
+    assert.equal(result.status, 2, result.stderr)
+    assert.match(result.stderr, /MODE=knowledge-planet-verify 会 build_release/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('preflight lane matrix: recovery lanes need neither queue nor DSN; queue lanes need the queue', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    for (const lane of ['--rollback', '--abort', '--recover', '--smoke', '--reclaim-mutation-lease', '--reclaim-mutation-inflight', '--hide-luna']) {
+      const r = runPreflight(fx.env, [lane])
+      assert.equal(r.status, 0, `${lane}: ${r.stderr}`)
+    }
+    for (const lane of ['--finalize', '--promote=50']) {
+      const refused = runPreflight(fx.env, [lane])
+      assert.equal(refused.status, 2, `${lane}: ${refused.stderr}`)
+      assert.match(refused.stderr, /发布队列未就绪/)
+      assert.doesNotMatch(refused.stderr, /OC_V5_PROOF_TEST_DATABASE_URL/)
+    }
+    const id = activePinnedQueue(fx, head)
+    for (const lane of ['--finalize', '--promote=50']) {
+      const ok = runPreflight({ ...fx.env, OC_V5_RELEASE_QUEUE_ID: id }, [lane])
+      assert.equal(ok.status, 0, `${lane}: ${ok.stderr}`)
+    }
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('preflight DSN lane list matches every build_release caller in deploy-v5.sh', () => {
+  // 新增 build_release 调用方时本用例变红:先在 v5-deploy-preflight.sh 的 builds_release 分支补上对应 MODE。
+  const lines = readFileSync(path.join(root, 'scripts/deploy-v5.sh'), 'utf8').split('\n')
+  const callers = new Set<string>()
+  let fn = ''
+  for (const line of lines) {
+    const def = /^([a-z_][a-z0-9_]*)\(\)\s*\{/.exec(line)
+    if (def) fn = def[1]!
+    if (/^\s*#/.test(line)) continue
+    // 只认命令位置的调用(行首缩进后 build_release,后接 || / ; / 行尾),不认字符串和注释里的提及。
+    if (/^\s+build_release(\s*\|\||\s*;|\s*$)/.test(line)) callers.add(fn)
+  }
+  assert.deepEqual([...callers].sort(), ['canary', 'deploy', 'deploy_dist', 'knowledge_planet_build_release_mutation'])
+})
+
+test('queue check is read-only and reports an unreadable queue as undecidable (exit 3), not as refusal', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'v5-rq-check-'))
+  try {
+    const r = spawnSync(path.join(root, 'scripts/v5-release-queue.sh'), ['check', '--id', 'rq-20261008T000000Z-abcdef123456'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        OC_V5_RELEASE_QUEUE_DB: path.join(dir, 'missing.db'),
+        OC_V5_RELEASE_QUEUE_LOCK: path.join(dir, 'queue.lock'),
+        OC_V5_RELEASE_QUEUE_RUN_DIR: path.join(dir, 'run'),
+      },
+    })
+    assert.equal(r.status, 3, r.stderr)
+    assert.throws(() => readFileSync(path.join(dir, 'missing.db')))
+    assert.throws(() => readFileSync(path.join(dir, 'queue.lock')))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
