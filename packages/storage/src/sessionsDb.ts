@@ -6342,33 +6342,31 @@ async function _sqliteDeleteChatProject(
       'SELECT 1 FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
     ).get(id, userId)
     if (!live) return { ok: false, error: 'not_found' }
+    // Mark deleted first: from here no new session/asset can be filed into it.
+    db.prepare(
+      `UPDATE chat_projects SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
+    ).run(now, now, id, userId)
+    // The manifest is exactly the set these UPDATEs unlinked.
     const sessionIds = (db.prepare(
-      'SELECT id FROM client_sessions WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL',
-    ).all(userId, id) as Array<{ id: string }>).map((r) => r.id)
+      `UPDATE client_sessions SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL RETURNING id`,
+    ).all(now, userId, id) as Array<{ id: string }>).map((r) => r.id)
     const assetIds = (db.prepare(
-      'SELECT id FROM project_assets WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL',
-    ).all(userId, id) as Array<{ id: string }>).map((r) => r.id)
+      `UPDATE project_assets SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL RETURNING id`,
+    ).all(now, userId, id) as Array<{ id: string }>).map((r) => r.id)
     const manifest: ChatProjectDeletedManifest = {
       sessionIds,
       assetIds,
       pausedCronJobIds: opts.pausedCronJobIds ?? [],
       at: now,
     }
-    db.prepare(
-      `UPDATE chat_projects
-          SET deleted_at = ?, deleted_manifest = ?, updated_at = MAX(updated_at + 1, ?)
-        WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
-    ).run(now, JSON.stringify(manifest), now, id, userId)
-    db.prepare(
-      `UPDATE client_sessions
-          SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
-        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
-    ).run(now, userId, id)
-    db.prepare(
-      `UPDATE project_assets
-          SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
-        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
-    ).run(now, userId, id)
+    db.prepare('UPDATE chat_projects SET deleted_manifest = ? WHERE id = ? AND user_id = ?').run(
+      JSON.stringify(manifest),
+      id,
+      userId,
+    )
     return { ok: true }
   })
   return txn()

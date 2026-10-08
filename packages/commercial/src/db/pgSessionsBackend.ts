@@ -12862,15 +12862,33 @@ export function createPgSessionsBackend(
           [id, userId],
         );
         if ((live.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        // Mark deleted first: asset/session filing checks the project is live, so
+        // nothing new can attach after this; the manifest is exactly what the
+        // UPDATEs below unlink (RETURNING), not a separate earlier read.
+        await client.query(
+          `UPDATE chat_projects
+              SET deleted_at = ${CLOCK_MS_SQL},
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          [id, userId],
+        );
         const sessionIds = (
           await client.query<{ id: string }>(
-            "SELECT id FROM client_sessions WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL",
+            `UPDATE client_sessions
+                SET project_id = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL
+              RETURNING id`,
             [userId, id],
           )
         ).rows.map((r) => r.id);
         const assetIds = (
           await client.query<{ id: string }>(
-            "SELECT id FROM project_assets WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL",
+            `UPDATE project_assets
+                SET project_id = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL
+              RETURNING id`,
             [userId, id],
           )
         ).rows.map((r) => r.id);
@@ -12881,26 +12899,8 @@ export function createPgSessionsBackend(
           at: Date.now(),
         };
         await client.query(
-          `UPDATE chat_projects
-              SET deleted_at = ${CLOCK_MS_SQL},
-                  deleted_manifest = $3,
-                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-            WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+          "UPDATE chat_projects SET deleted_manifest = $3 WHERE id = $1 AND user_id = $2",
           [id, userId, JSON.stringify(manifest)],
-        );
-        await client.query(
-          `UPDATE client_sessions
-              SET project_id = NULL,
-                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-            WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
-          [userId, id],
-        );
-        await client.query(
-          `UPDATE project_assets
-              SET project_id = NULL,
-                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-            WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
-          [userId, id],
         );
         return { ok: true };
       });
