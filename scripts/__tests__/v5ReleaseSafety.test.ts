@@ -7736,6 +7736,9 @@ wait $!
     assert.match(fn, /V5_E2E_REMOTE_PORT="\$port"/, '旅程必须打调用方指定的端口(candidate lane 切流前跑)')
     const preJ5Timeout = /const PRE_J5_TIMEOUT = ([\d_]+);/.exec(journeySource)
     const j5Timeout = /const TURN_WAIT_TIMEOUT = ([\d_]+);/.exec(journeySource)
+    const j5Grace = /const J5_BACKEND_GRACE = ([\d_]+);/.exec(journeySource)
+    assert.ok(j5Grace, 'J5 后端核对后的宽限必须是有限常量')
+    const j5GraceMs = Number(j5Grace[1].replaceAll('_', ''))
     const outerTimeout = /timeout (\d+) node "\$SCRIPT_DIR\/v5-e2e-journey-canary\.mjs"/.exec(fn)
     assert.ok(preJ5Timeout, 'J1-J4 必须保留有限总防挂预算')
     assert.ok(j5Timeout, 'J5 必须保留有限等待上限')
@@ -7753,11 +7756,11 @@ wait $!
       /clearTimeout\(preJ5Timer\);\s+await step\("J5 /,
       '只有进入 J5 时才可结束 J1-J4 总防挂计时',
     )
-    assert.match(
-      journeySource,
-      /const deadline = Date\.now\(\) \+ TURN_WAIT_TIMEOUT;/,
-      'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT',
-    )
+    // J5 判定已抽到 scripts/lib/journey-j5.mjs:deadline 由 turnWaitMs 驱动,旅程必须把 TURN_WAIT_TIMEOUT 传进去。
+    const j5Lib = await readFile(path.join(root, 'scripts/lib/journey-j5.mjs'), 'utf8')
+    assert.match(j5Lib, /const deadline = Date\.now\(\) \+ turnWaitMs;/, 'J5 deadline 必须实际使用传入的等待上限')
+    assert.match(journeySource, /turnWaitMs: TURN_WAIT_TIMEOUT,/, 'J5 deadline 必须实际使用 TURN_WAIT_TIMEOUT')
+    assert.match(journeySource, /graceMs: J5_BACKEND_GRACE,/, 'J5 宽限必须是计入总预算的常量')
     const modelPin = journeySource.indexOf('const JOURNEY_MODEL_ID = "grok-build";')
     // 选模逻辑已抽到共享 helper(selfhost 契约门共用);不变量不变:真实选择器 → 菜单项 → 触发器回显,
     // 且必须在附件上传/首次 UI 发送之前生效。canary 侧断言"调用 helper 并传固定模型",helper 侧断言顺序。
@@ -7807,7 +7810,7 @@ wait $!
     )
     assert.ok(j5TimeoutMs >= 180_000, '生产正常慢轮已超过 120s，J5 等待窗不得退回旧阈值')
     assert.ok(
-      outerTimeoutMs >= preJ5TimeoutMs + j5TimeoutMs + 30_000,
+      outerTimeoutMs >= preJ5TimeoutMs + j5TimeoutMs + j5GraceMs + 30_000,
       '外层总超时必须覆盖 J1-J4 总预算、完整 J5 等待窗和清理余量',
     )
     // 旧的「成功出口裸接 || exit 1」形态必须彻底消失 —— 它正是本次整改要消灭的无效门。
@@ -8031,19 +8034,29 @@ wait $!
 
   test('E2E journey completion requires a new finalized non-error assistant row', async () => {
     const source = await readFile(e2eJourney, 'utf8')
-    assert.match(source, /assistantRowsBefore = await page\.getByTestId\("assistant-row"\)\.count\(\)/)
-    assert.match(source, /await assistantRows\.count\(\)\) > assistantRowsBefore/)
-    assert.match(source, /newestAssistant\.locator\("\.caret-blink"\)/)
-    assert.match(source, /getByRole\("button", \{ name: "发送", exact: true \}\)/)
-    assert.match(source, /newestAssistant\.locator\('\[role="alert"\]'\)/)
+    const j5 = await readFile(path.join(root, 'scripts/lib/journey-j5.mjs'), 'utf8')
+    // 2026-10-08:不再用发送前的行数基线(OCV5-334 误报);锚定本次用户消息行之后的 assistant 行。
+    assert.doesNotMatch(source, /assistantRowsBefore/, '不得回到行数基线判据')
+    assert.match(source, /await waitJ5Delivered\(page, \{/)
+    assert.match(j5, /\[data-testid="user-row"\]/)
+    assert.match(j5, /compareDocumentPosition\(r\) & Node\.DOCUMENT_POSITION_FOLLOWING/)
+    assert.match(j5, /st\.rowsAfter > 0 && !st\.caret && \(await send\.count\(\)\) > 0/)
+    assert.match(j5, /querySelector\("\.caret-blink"\)/)
+    assert.match(j5, /getByRole\("button", \{ name: "发送", exact: true \}\)/)
+    assert.match(j5, /querySelector\('\[role="alert"\]'\)/)
+    assert.match(j5, /finalBody\.includes\(probeToken\)/)
+    assert.match(j5, /发送失败\|消息暂未安全送达/)
+    // 宽限只在后端已证实(含探针的 assistant 回复)时给,且只给一次。
+    assert.match(j5, /if \(!backend\.found\) \{\s+throw new Error/)
+    assert.match(source, /r\.role = 'assistant' AND position\(:'probe' in r\.semantic_text\) > 0/)
+    assert.match(source, /BEGIN READ ONLY;/)
     assert.match(source, /writeFileSync\(probePath, `\$\{probeToken\}\\n`\)/)
-    assert.match(source, /finalBody\.includes\(probeToken\)/)
     assert.match(source, /getByRole\("button", \{ name: "设置并开始", exact: true \}\)\.click\(\)/)
     assert.match(source, /getByRole\("button", \{ name: \/清除\/ \}\)\.click\(\)/)
     assert.match(source, /getByRole\("button", \{ name: "清除目标", exact: true \}\)\.click\(\)/)
     assert.match(source, /getByText\("已启用", \{ exact: true \}\)/)
     assert.doesNotMatch(source, /name: "开始目标"/)
-    assert.doesNotMatch(source, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
+    assert.doesNotMatch(source + j5, /name: "重新生成"/, '不得把可选的重新生成按钮当作回复完成信号')
   })
 
   test('E2E journey gives only the post-restart first paint a longer boot budget', async () => {

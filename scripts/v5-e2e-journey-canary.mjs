@@ -40,6 +40,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { launchJourneyBrowser, selectJourneyModel } from "./lib/journey-browser.mjs";
+import { waitJ5Delivered } from "./lib/journey-j5.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -81,6 +82,40 @@ const JOURNEY_MODEL_ID = "grok-build";
  * 探针等成功判据仍保持不变。
  */
 const TURN_WAIT_TIMEOUT = 180_000;
+/**
+ * J5 到 TURN_WAIT_TIMEOUT 仍未判定时的**一次**有界宽限(2026-10-08 冒烟健壮性)。只有后端权威
+ * 证据先成立才给:kl-mirror 上本 canary 的 assistant turn-tape 记录里已出现本次附件秘密探针
+ * (探针随机唯一,不会与并行的双引擎 smoke turn 混淆)。宽限期内 UI 判据一条不放松;收尾即通过但
+ * 打印 `warn slow_ui_settle` 供 v5-smoke-flake-report 统计,仍未收尾照样失败。查不到/查询失败 = 不宽限。
+ */
+const J5_BACKEND_GRACE = 60_000;
+const V5_ENV_PATH = process.env.V5_ENV ?? "/etc/openclaude/commercial-v5.env";
+
+/** 只读核对后端是否已落下含探针的 assistant 回复。返回 { checked, found, detail }。 */
+function backendReplyHasProbe(probeToken) {
+  if (DIRECT_BASE) return { checked: false, found: false, detail: "direct-base mode: no backend access" };
+  if (!/^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$/.test(EMAIL) || !/^OC_ATTACH_[a-z0-9_]+$/.test(probeToken) || !/^\/[A-Za-z0-9._\/-]+$/.test(V5_ENV_PATH)) {
+    return { checked: false, found: false, detail: "refused: unexpected email/probe/env path shape" };
+  }
+  const sql = [
+    "BEGIN READ ONLY;",
+    "SELECT 'n=' || count(*) FROM client_session_turn_tape_model_records r",
+    " WHERE r.user_id = 'c:' || (SELECT id::text FROM users WHERE email = :'email')",
+    "   AND r.role = 'assistant' AND position(:'probe' in r.semantic_text) > 0;",
+    "COMMIT;",
+  ].join("\n");
+  try {
+    const out = execFileSync("ssh", [SSH_HOST,
+      `set -a; . ${V5_ENV_PATH}; set +a; psql "$DATABASE_URL" -X -At -v ON_ERROR_STOP=1 -v email=${EMAIL} -v probe=${probeToken}`],
+      { input: sql, encoding: "utf8", timeout: 20_000, stdio: ["pipe", "pipe", "ignore"] });
+    const m = /^n=(\d+)$/m.exec(out);
+    if (!m) return { checked: false, found: false, detail: "unparseable backend answer" };
+    return { checked: true, found: Number(m[1]) > 0, detail: `assistant tape records with probe: ${m[1]}` };
+  } catch (err) {
+    return { checked: false, found: false, detail: `backend query failed: ${String(err?.message ?? err).split("\n")[0].slice(0, 120)}` };
+  }
+}
+let j5Evidence = null;
 
 function fatal(code, msg) {
   console.error(`e2e-journey: ${msg}`);
@@ -346,7 +381,6 @@ try {
   });
 
   const marker = `e2e journey canary ${Date.now().toString(36)}`;
-  let assistantRowsBefore = 0;
   await step("J4 带附件发送:消息上屏+附件区清空", async () => {
     const input = page.locator("textarea").first();
     await input.fill(`${marker}(自动冒烟)。请读取刚上传的附件「${probeName}」第一行，并只把第一行原样回复；不要猜测、不要描述文件名。`);
@@ -357,7 +391,6 @@ try {
       if (Date.now() > deadline) throw new Error("发送按钮在超时窗内未变为可用(上传未完成?)");
       await new Promise((r) => setTimeout(r, 200));
     }
-    assistantRowsBefore = await page.getByTestId("assistant-row").count();
     await send.click();
     // .first():模型回复若复读 marker 会出现第二个匹配,strict 单元素断言会误报。
     await page.getByText(marker, { exact: false }).first().waitFor({ state: "visible", timeout: STEP_TIMEOUT });
@@ -373,35 +406,15 @@ try {
     //   失败判据 = ErrorBanner 签名(发送失败 / 消息暂未安全送达),一出现立即 fail;
     //   成功判据 = 新 assistant 行出现 + 流式光标消失 + composer 从「停止」恢复「发送」；
     //   新行不得含 alert（终态错误/空轮/截断都必须 fail）。不依赖回复文案或可选操作按钮。
-    const failSig = page.getByText(/发送失败|消息暂未安全送达/).first();
-    const assistantRows = page.getByTestId("assistant-row");
-    const send = page.getByRole("button", { name: "发送", exact: true });
-    const deadline = Date.now() + TURN_WAIT_TIMEOUT;
-    for (;;) {
-      if ((await failSig.count()) > 0) {
-        throw new Error("发送失败签名出现(消息未送达,见截图)");
-      }
-      if ((await assistantRows.count()) > assistantRowsBefore) {
-        const newestAssistant = assistantRows.last();
-        const responseFinished =
-          (await newestAssistant.locator(".caret-blink").count()) === 0 &&
-          (await send.count()) > 0;
-        if (responseFinished) {
-          if ((await newestAssistant.locator('[role="alert"]').count()) > 0) {
-            throw new Error("assistant 以错误/空轮/截断提示结束(非正常回复)");
-          }
-          const finalBody = (await newestAssistant.locator(".prose").last().textContent())?.trim() ?? "";
-          if (!finalBody.includes(probeToken)) {
-            throw new Error("assistant 最终正文未包含附件秘密探针(附件未送达 Agent、未读取或回复不完整)");
-          }
-          break;
-        }
-      }
-      if (Date.now() > deadline) {
-        throw new Error(`assistant 回复在 ${TURN_WAIT_TIMEOUT / 1000}s 内未完成(无失败卡亦无完整回复 = turn 挂起)`);
-      }
-      await new Promise((r) => setTimeout(r, 500));
-    }
+    // 判定逻辑与判据见 scripts/lib/journey-j5.mjs(锚定本次用户消息行;超时先只读核对后端,再至多一次宽限)。
+    await waitJ5Delivered(page, {
+      marker,
+      probeToken,
+      turnWaitMs: TURN_WAIT_TIMEOUT,
+      graceMs: J5_BACKEND_GRACE,
+      backendCheck: () => backendReplyHasProbe(probeToken),
+      onEvidence: (e) => { j5Evidence = e; },
+    });
   });
 
   console.log("e2e-journey: 旅程全过(登录/附件读取/目标创建清除/发送/送达)");
@@ -413,6 +426,10 @@ try {
   try {
     await page.screenshot({ path: shot, fullPage: true });
     console.error(`e2e-journey: 失败截图 ${shot}`);
+    if (j5Evidence) {
+      writeFileSync(`${shot}.json`, JSON.stringify(j5Evidence, null, 2));
+      console.error(`e2e-journey: J5 证据 ${shot}.json`);
+    }
   } catch {}
   console.error(`e2e-journey: ✗ 步骤「${stepName}」失败: ${String(err?.message ?? err).slice(0, 500)}`);
   await browser.close().catch(() => {});
