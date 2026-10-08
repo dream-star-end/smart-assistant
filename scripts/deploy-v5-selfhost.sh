@@ -1526,8 +1526,8 @@ start_runtime_release_bg() { # <sha>
   if [[ "$DRY" == 1 || "${OC_V5_SERIAL_RUNTIME_BUILD:-0}" == 1 ]]; then
     return 0   # dry-run / 显式串行:由 collect_runtime_release_bg 就地构建
   fi
-  RUNTIME_BG_LOG="$(mktemp /tmp/ocv5-runtime-release-bg.XXXXXX.log)" || die "mktemp runtime bg log 失败"
-  RUNTIME_BG_RESULT="$(mktemp /tmp/ocv5-runtime-release-bg.XXXXXX.env)" || die "mktemp runtime bg result 失败"
+  RUNTIME_BG_LOG="$(mktemp "${TMPDIR:-/tmp}/ocv5-runtime-release-bg.XXXXXX.log")" || die "mktemp runtime bg log 失败"
+  RUNTIME_BG_RESULT="$(mktemp "${TMPDIR:-/tmp}/ocv5-runtime-release-bg.XXXXXX.env")" || die "mktemp runtime bg result 失败"
   log "  runtime release 后台并行构建 → $RUNTIME_BG_LOG"
   (
     trap - EXIT
@@ -1547,7 +1547,10 @@ collect_runtime_release_bg() { # <sha>
   RUNTIME_BG_PID=""
   log "── runtime release(后台段日志回放)──"
   cat "$RUNTIME_BG_LOG" 2>/dev/null || true
-  [[ "$rc" == 0 ]] || die "runtime release 后台构建失败 rc=$rc(live 未改;日志见上)"
+  if [[ "$rc" != 0 ]]; then
+    rm -f "$RUNTIME_BG_LOG" "$RUNTIME_BG_RESULT"   # 日志已回放进本次输出
+    die "runtime release 后台构建失败 rc=$rc(live 未改;日志见上)"
+  fi
   BUILT_RUNTIME_RELEASE=""
   RUNTIME_IMAGE_ID=""
   while IFS= read -r line; do
