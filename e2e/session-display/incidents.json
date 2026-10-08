@@ -6294,7 +6294,9 @@
       "severity": "P2",
       "symptom": "容器向主控读会话所属项目失败（超时/5xx/网络/坏响应）时，本轮静默按无项目执行：没有项目指令和常用文件，工作目录回落默认，用户与日志都看不出。",
       "rootFixCommit": "7c393322",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "c5c0c444"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -6305,6 +6307,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
           "assertion": "resolveChatRunWorkspace passes the hold to the caller instead of a default cwd"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
+          "assertion": "a spawn-time read that fails builds from the turn-start read, not without the project"
         },
         {
           "layer": "browser",
