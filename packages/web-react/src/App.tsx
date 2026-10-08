@@ -187,6 +187,7 @@ import {
 import { resolveTutorialAction } from "./lib/tutorialActions";
 import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage, ApiError } from "./lib/api";
+import { uploadFilesToProject } from "./lib/projectFileUpload";
 import { reportClientFriction } from "./lib/clientFriction";
 import {
   effectiveEffortModelId,
@@ -4020,7 +4021,8 @@ export function App() {
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
             projectSlot={
-              activeId ? undefined : (
+              // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
+              activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (
                 <ComposerProjectPill
                   projects={projects}
                   projectId={draftProjectId}
@@ -4178,32 +4180,29 @@ export function App() {
             fromSessionTitle={createProjectFrom?.sessionId ? (createProjectFrom.title ?? "") : null}
             onSubmit={async (input) => {
               const from = createProjectFrom;
+              // 上传与之后的落位都绑定发起创建时的身份:中途换号/登出则停,不把文件传进另一个账号。
+              const createAuth = authRef.current;
+              const createEpoch = createAuth.snapshot().epoch;
+              const identityChanged = () =>
+                authRef.current !== createAuth || createAuth.snapshot().epoch !== createEpoch;
               const created = await createProject({
                 name: input.name,
                 instructions: input.instructions,
                 ...(input.color ? { color: input.color } : {}),
               });
               if (!created) return false;
+              if (identityChanged()) return true;
               if (input.files.length > 0 && !demo && auth) {
-                let failed = 0;
-                for (const file of input.files) {
-                  try {
-                    const uploaded = await api.uploadFile(authRef.current, file);
-                    await api.createProjectAsset(authRef.current, {
-                      projectId: created.id,
-                      source: "upload",
-                      name: file.name,
-                      url: uploaded.url,
-                      mime: uploaded.mimeType,
-                      size: uploaded.size ?? file.size,
-                      digest: uploaded.digest,
-                    });
-                  } catch (e) {
-                    failed += 1;
-                    console.warn("create project: file upload failed", e);
-                  }
+                const result = await uploadFilesToProject({
+                  auth: createAuth,
+                  projectId: created.id,
+                  files: input.files,
+                  identityChanged,
+                });
+                if (result.aborted) return true;
+                if (result.failed > 0) {
+                  toast(`有 ${result.failed} 个文件没有上传成功，可以在项目设置的「文件」里重新上传`, "error");
                 }
-                if (failed > 0) toast(`有 ${failed} 个文件没有上传成功，可以在项目设置的「资产」里重新上传`, "error");
               }
               const moving = from?.sessionId ? sessions.find((x) => x.id === from.sessionId) : undefined;
               if (moving) moveSessionToProject(moving, created.id);
