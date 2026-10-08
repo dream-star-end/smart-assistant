@@ -330,28 +330,30 @@ function foldProvenImageCaption(message: Record<string, unknown>,
   const expected = new Set(useIds);
   if (resultIds.some((id) => !expected.has(id))) return message;
   const caption = captions[0]!;
+  let matchedSize: { width: number; height: number } | null = null;
   if (images > 1) {
     // OCV5-334: parallel Reads where Claude Code downscaled only one image
     // carry one caption after all results. It belongs to the single image
     // whose pixel size it names as "displayed"; no match or several matches
     // stay unfolded (and rejected).
-    const matching: number[] = [];
+    const matching: Array<{ index: number; size: { width: number; height: number } }> = [];
     for (let index = 0; index < results.length; index++) {
       const part = results[index];
       if (!object(part) || !Array.isArray(part.content)) continue;
       for (const item of part.content.map(strictBoxImageBlock)) {
         const size = item ? boxImageDimensions(item.data) : null;
-        if (size && captionMatchesImage(caption, size)) matching.push(index);
+        if (size && captionMatchesImage(caption, size)) matching.push({ index, size });
       }
     }
     if (matching.length !== 1) return message;
-    imageIndex = matching[0]!;
+    imageIndex = matching[0]!.index;
+    matchedSize = matching[0]!.size;
   }
   const imageResult = results[imageIndex];
   if (!object(imageResult) || !Array.isArray(imageResult.content)
     || !denseArray(imageResult.content)) return message;
   const imageBlock = imageResult.content.map(strictBoxImageBlock).find((item) => item !== null);
-  const dims = imageBlock ? boxImageDimensions(imageBlock.data) : null;
+  const dims = matchedSize ?? (imageBlock ? boxImageDimensions(imageBlock.data) : null);
   if ((images > 1 || !provenCaption(caption)) && !(dims && captionMatchesImage(caption, dims))) {
     return message;
   }

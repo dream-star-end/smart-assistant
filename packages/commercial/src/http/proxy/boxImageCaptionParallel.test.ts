@@ -50,3 +50,18 @@ test("a caption that matches no image, or more than one, stays rejected", async 
     "continuation_candidate");
   assert.notEqual(kind(turn(one, [text(caption(2430, 1131, 1999, 931))])), "continuation_candidate");
 });
+
+test("the caption joins a result whose matching image is not its first image", async () => {
+  const small = await jpeg(1215, 566);
+  const shown = await jpeg(2000, 931);
+  const body = turn([small, small, small, small, small], [text(caption(2430, 1131, 2000, 931))]) as unknown as
+    { messages: Array<{ content: Array<{ tool_use_id?: string; content?: unknown[] }> }> };
+  const owner = body.messages.at(-1)!.content.find((part) => part.tool_use_id === IDS[2])!;
+  owner.content = [...owner.content!, { type: "image", source: { type: "base64", media_type: "image/jpeg", data: shown } }];
+  const classified = classifyBoxContinuation(body as unknown as ProxyBody);
+  assert.equal(classified.classification, "continuation_candidate");
+  const current = (classified.effectiveBody as { messages: Array<{ content: unknown[] }> }).messages.at(-1)!;
+  const folded = current.content.find((part) => (part as { tool_use_id?: string }).tool_use_id === IDS[2]) as
+    { content: Array<{ type: string; text?: string }> };
+  assert.equal(folded.content.at(-1)?.text, caption(2430, 1131, 2000, 931));
+});
