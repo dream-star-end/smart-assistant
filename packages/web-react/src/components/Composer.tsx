@@ -173,6 +173,7 @@ export function Composer({
   lastUserText,
   draftKey,
   goalOpenRequest,
+  projectSlot,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -217,6 +218,8 @@ export function Composer({
   draftKey?: string;
   /** 外部请求打开目标对话框：nonce 变化即打开（与 prefill 同模式）。 */
   goalOpenRequest?: number;
+  /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
+  projectSlot?: ReactNode;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -795,6 +798,11 @@ export function Composer({
             {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
                 390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
                 (after 截图实测 pill 压在排队键上),窄屏仍放在外壳下方的底栏(见下)。 */}
+            {projectSlot && (
+              <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-project-slot">
+                {projectSlot}
+              </span>
+            )}
             {onOpenRepo && (
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
                 <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
@@ -914,9 +922,13 @@ export function Composer({
         </div>
       </div>
       {/* 窄屏底栏:GitHub 仓库入口(sm+ 已并入工具行,这里只在 <sm 渲染)。 */}
-      {onOpenRepo && (
-        <div className="flex min-h-[30px] items-center px-1.5 py-1.5 sm:hidden" data-testid="composer-repo-slot-mobile">
-          <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
+      {(onOpenRepo || projectSlot) && (
+        <div
+          className="flex min-h-[30px] min-w-0 items-center gap-2 px-1.5 py-1.5 sm:hidden"
+          data-testid="composer-repo-slot-mobile"
+        >
+          {projectSlot}
+          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
         </div>
       )}
       {/* 语音状态(录音/转写/错误)常驻 live region(C-19):容器随 voiceEnabled 常在、内容变化才被读屏播报;

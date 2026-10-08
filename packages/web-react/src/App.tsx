@@ -27,6 +27,7 @@ import { saveBlob } from "./lib/chat/download";
 import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
+import { ComposerProjectPill } from "./components/ComposerProjectPill";
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import type { ImageAnnotationSource } from "./components/ImageAnnotationEditor";
 import {
@@ -249,6 +250,9 @@ const GithubRepoModal = lazy(() =>
 const InboxDialog = lazy(() => import("./components/InboxDialog").then((m) => ({ default: m.InboxDialog })));
 const MessageFeedbackDialog = lazy(() =>
   import("./components/chat/MessageFeedbackDialog").then((m) => ({ default: m.MessageFeedbackDialog })),
+);
+const CreateProjectDialog = lazy(() =>
+  import("./components/CreateProjectDialog").then((m) => ({ default: m.CreateProjectDialog })),
 );
 const ProjectSettingsDialog = lazy(() =>
   import("./components/ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
@@ -712,29 +716,46 @@ export function App() {
   // 「项目下新建会话」草稿意图：项目行入口记下目标项目，空白草稿真正建会话（首次发送）时
   // 消费——本地立即归属该项目 + 服务端 PATCH 落库。无参新建 / 选中已有会话都会覆盖清除，
   // 意图只活在「一次草稿」生命周期内，不会泄漏到之后的新会话。
+  // 草稿归属既要被 send 同步读取(ref),也要在输入框里显示、可改(state):两者经 setDraftProject 同写。
   const draftProjectRef = useRef<string | null>(null);
+  const [draftProjectId, setDraftProjectIdState] = useState<string | null>(null);
+  const setDraftProject = useCallback((projectId: string | null) => {
+    draftProjectRef.current = projectId;
+    setDraftProjectIdState(projectId);
+  }, []);
   const handleNew = useCallback(() => {
-    draftProjectRef.current = null;
+    setDraftProject(null);
     newSession();
-  }, [newSession]);
+  }, [newSession, setDraftProject]);
   const newSessionInProject = useCallback(
     (projectId: string) => {
-      draftProjectRef.current = projectId;
+      setDraftProject(projectId);
       newSession();
     },
-    [newSession],
+    [newSession, setDraftProject],
   );
 
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
   const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
+  // 「打开项目」的唯一入口(顶栏项目、输入框项目标识)。项目主页上线前落到项目设置。
+  const projectsRef = useRef<ChatProject[]>([]);
+  const openProject = useCallback((projectId: string) => {
+    const p = projectsRef.current.find((x) => x.id === projectId);
+    if (!p) return;
+    setUngroupedAssetsOpen(false);
+    setProjectSettings(p);
+  }, []);
   const projectSettingsOpen = projectSettings !== null || ungroupedAssetsOpen;
   const projectSettingsMounted = useMountedOnce(projectSettingsOpen);
+  // 新建项目对话框:null=关;{}=普通新建;{sessionId,title}=从该会话创建并移入。
+  const [createProjectFrom, setCreateProjectFrom] = useState<{ sessionId?: string; title?: string } | null>(null);
+  const createProjectMounted = useMountedOnce(createProjectFrom !== null);
 
   const {
     projects,
     collapsedIds: collapsedProjectIds,
     toggleCollapsed: toggleProjectCollapsed,
-    createProjectPrompt,
+    createProject,
     renameProjectPrompt,
     deleteProjectConfirm,
     updateProject,
@@ -758,11 +779,9 @@ export function App() {
       const ids = new Set(sessionIds);
       setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
     },
-    onCreated: (p) => {
-      setUngroupedAssetsOpen(false);
-      setProjectSettings(p);
-    },
   });
+
+  projectsRef.current = projects;
 
   const unreadSessions = useUnreadSessions({
     sessions,
@@ -1327,7 +1346,7 @@ export function App() {
           if (
             draftProjectRef.current === draftPid &&
             (!target || selectedSessionIdRef.current === sessionId)
-          ) draftProjectRef.current = null;
+          ) setDraftProject(null);
           const applyProject = (retries: number) => {
             api.patchSessionMeta(authRef.current, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
               if (retries > 0) window.setTimeout(() => applyProject(retries - 1), 1500);
@@ -3410,7 +3429,8 @@ export function App() {
     projects,
     collapsedProjectIds,
     onToggleProjectCollapsed: toggleProjectCollapsed,
-    onCreateProject: createProjectPrompt,
+    onCreateProject: () => setCreateProjectFrom({}),
+    onCreateProjectFromSession: (sess: Session) => setCreateProjectFrom({ sessionId: sess.id, title: sess.title }),
     onRenameProject: renameProjectPrompt,
     onDeleteProject: deleteProjectConfirm,
     isSending: (id: string) => !demo && chat.isSending(id),
@@ -3499,7 +3519,7 @@ export function App() {
           <Sidebar
             {...sidebarProps}
             onSelect={(id) => {
-              draftProjectRef.current = null;
+              setDraftProject(null);
               setBoardOpen(false);
               selectSession(id);
             }}
@@ -3537,7 +3557,7 @@ export function App() {
         <Sidebar
           {...sidebarProps}
           onSelect={(id) => {
-            draftProjectRef.current = null;
+            setDraftProject(null);
             setBoardOpen(false);
             selectSession(id);
             setMobileNavOpen(false);
@@ -3629,9 +3649,12 @@ export function App() {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
             if (!pid) return null;
             const chat = projects.find((p) => p.id === pid);
-            return chat ? { chatName: chat.name, workName: chat.boardProjectId ? chat.name : null } : null;
+            return chat ? { chatName: chat.name } : null;
           })()}
-          onOpenProjectScope={() => openManage(DEFAULT_MANAGE_TAB)}
+          onOpenProjectScope={() => {
+            const pid = sessions.find((s) => s.id === activeId)?.projectId;
+            if (pid) openProject(pid);
+          }}
           models={models}
           lockedModels={lockedModels}
           selectedModelId={modelId}
@@ -3996,6 +4019,17 @@ export function App() {
             sendKey={composerPrefs.sendKey}
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
+            projectSlot={
+              activeId ? undefined : (
+                <ComposerProjectPill
+                  projects={projects}
+                  projectId={draftProjectId}
+                  editable
+                  onPick={setDraftProject}
+                  onOpen={openProject}
+                />
+              )
+            }
           />
         </div>
         </>
@@ -4134,6 +4168,54 @@ export function App() {
         </LazyBoundary>
       )}
 
+      {createProjectMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <CreateProjectDialog
+            open={createProjectFrom !== null}
+            onOpenChange={(o) => {
+              if (!o) setCreateProjectFrom(null);
+            }}
+            fromSessionTitle={createProjectFrom?.sessionId ? (createProjectFrom.title ?? "") : null}
+            onSubmit={async (input) => {
+              const from = createProjectFrom;
+              const created = await createProject({
+                name: input.name,
+                instructions: input.instructions,
+                ...(input.color ? { color: input.color } : {}),
+              });
+              if (!created) return false;
+              if (input.files.length > 0 && !demo && auth) {
+                let failed = 0;
+                for (const file of input.files) {
+                  try {
+                    const uploaded = await api.uploadFile(authRef.current, file);
+                    await api.createProjectAsset(authRef.current, {
+                      projectId: created.id,
+                      source: "upload",
+                      name: file.name,
+                      url: uploaded.url,
+                      mime: uploaded.mimeType,
+                      size: uploaded.size ?? file.size,
+                      digest: uploaded.digest,
+                    });
+                  } catch (e) {
+                    failed += 1;
+                    console.warn("create project: file upload failed", e);
+                  }
+                }
+                if (failed > 0) toast(`有 ${failed} 个文件没有上传成功，可以在项目设置的「资产」里重新上传`, "error");
+              }
+              const moving = from?.sessionId ? sessions.find((x) => x.id === from.sessionId) : undefined;
+              if (moving) moveSessionToProject(moving, created.id);
+              else {
+                setBoardOpen(false);
+                newSessionInProject(created.id);
+              }
+              return true;
+            }}
+          />
+        </LazyBoundary>
+      )}
       {projectSettingsMounted && (
         <LazyBoundary fallback={<DialogFallback />}>
           <ProjectSettingsDialog

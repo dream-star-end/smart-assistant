@@ -46,6 +46,7 @@ export function SessionRow({
   onDelete,
   onTogglePin,
   onMoveToProject,
+  onCreateProjectFromSession,
   onArchive,
   onMarkRead,
   unread,
@@ -70,6 +71,7 @@ export function SessionRow({
   onDelete: (s: Session) => void;
   onTogglePin?: (s: Session) => void;
   onMoveToProject?: (s: Session, projectId: string | null) => void;
+  onCreateProjectFromSession?: (s: Session) => void;
   onArchive?: (s: Session) => void;
   onMarkRead?: (id: string) => void;
   unread?: boolean;
@@ -299,7 +301,7 @@ export function SessionRow({
                     移动到项目
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent className="w-44">
-                    {projects.length === 0 && (
+                    {projects.length === 0 && !onCreateProjectFromSession && (
                       <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>
                     )}
                     {projects.map((p) => (
@@ -316,6 +318,14 @@ export function SessionRow({
                         <DropdownMenuSeparator />
                         <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>
                           移出项目
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                    {onCreateProjectFromSession && (
+                      <>
+                        {(projects.length > 0 || s.projectId) && <DropdownMenuSeparator />}
+                        <DropdownMenuItem onSelect={() => onCreateProjectFromSession(s)}>
+                          新建项目并移入…
                         </DropdownMenuItem>
                       </>
                     )}

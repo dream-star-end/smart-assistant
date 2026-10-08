@@ -182,19 +182,20 @@ describe("useChatProjects reorderProjects 串行写入", () => {
   });
 });
 
-describe("useChatProjects onCreated", () => {
-  test("创建成功后 onCreated 收到 created", async () => {
+describe("useChatProjects createProject", () => {
+  test("一步创建：名称、指令、颜色一起提交，返回服务端记录并替换乐观行", async () => {
     const created: ChatProject = {
       id: "p-real",
       name: "新项目",
+      instructions: "用学术中文",
+      color: "info",
       sortOrder: 0,
       createdAt: 1,
       updatedAt: 1,
       sessionCount: 0,
     };
     vi.spyOn(api, "listChatProjects").mockResolvedValue([]);
-    vi.spyOn(api, "createChatProject").mockResolvedValue(created);
-    const onCreated = vi.fn();
+    const createSpy = vi.spyOn(api, "createChatProject").mockResolvedValue(created);
     const auth = createMemoryAuthSession(() => {}, "tok");
     const { result } = renderHook(() =>
       useChatProjects({
@@ -202,21 +203,45 @@ describe("useChatProjects onCreated", () => {
         auth,
         authSession: auth,
         userId: "u1",
-        promptText: async () => "新项目",
+        promptText: async () => null,
         confirmDialog: async () => true,
-        onCreated,
       }),
     );
     await waitFor(() => expect(api.listChatProjects).toHaveBeenCalled());
+    let got: ChatProject | null = null;
     await act(async () => {
-      await result.current.createProjectPrompt();
+      got = await result.current.createProject({ name: " 新项目 ", instructions: " 用学术中文 ", color: "info" });
     });
-    expect(onCreated).toHaveBeenCalledTimes(1);
-    expect(onCreated).toHaveBeenCalledWith(created);
+    expect(createSpy).toHaveBeenCalledWith(auth, { name: "新项目", instructions: "用学术中文", color: "info" });
+    expect(got).toEqual(created);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["p-real"]);
   });
 
-  test("demo 分支创建不调用 onCreated", async () => {
-    const onCreated = vi.fn();
+  test("失败时撤回乐观行并返回 null", async () => {
+    vi.spyOn(api, "listChatProjects").mockResolvedValue([]);
+    vi.spyOn(api, "createChatProject").mockRejectedValue(new Error("boom"));
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    const { result } = renderHook(() =>
+      useChatProjects({
+        demo: false,
+        auth,
+        authSession: auth,
+        userId: "u1",
+        promptText: async () => null,
+        confirmDialog: async () => true,
+      }),
+    );
+    await waitFor(() => expect(api.listChatProjects).toHaveBeenCalled());
+    let got: ChatProject | null = { id: "x" } as ChatProject;
+    await act(async () => {
+      got = await result.current.createProject({ name: "坏项目" });
+    });
+    expect(got).toBeNull();
+    expect(result.current.projects).toEqual([]);
+  });
+
+  test("demo 分支只建本地记录，不调接口", async () => {
+    const createSpy = vi.spyOn(api, "createChatProject");
     const auth = createMemoryAuthSession(() => {}, "tok");
     const { result } = renderHook(() =>
       useChatProjects({
@@ -224,14 +249,15 @@ describe("useChatProjects onCreated", () => {
         auth,
         authSession: auth,
         userId: "u1",
-        promptText: async () => "演示项目",
+        promptText: async () => null,
         confirmDialog: async () => true,
-        onCreated,
       }),
     );
+    let got: ChatProject | null = null;
     await act(async () => {
-      await result.current.createProjectPrompt();
+      got = await result.current.createProject({ name: "演示项目" });
     });
-    expect(onCreated).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+    expect((got as ChatProject | null)?.name).toBe("演示项目");
   });
 });

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useToast } from "../components/ui";
-import { api } from "../lib/api";
+import { api, apiErrorMessage } from "../lib/api";
 import type { AuthSession, ChatProject } from "../lib/types";
 
 export function projectCollapsedStorageKey(userId: string): string {
@@ -50,9 +50,9 @@ export type UseChatProjectsOptions = {
   onUngroupProjectSessions?: (projectId: string) => string[];
   /** 删除项目失败：把 sessionIds 重新挂回该项目。 */
   onRestoreProjectSessions?: (projectId: string, sessionIds: string[]) => void;
-  /** 真实创建成功、乐观行被服务端记录替换后调用（demo 不调）。 */
-  onCreated?: (project: ChatProject) => void;
 };
+
+export type CreateProjectInput = { name: string; instructions?: string; color?: string };
 
 /** 项目列表拉取失败后的自动重试间隔（仅在失败态且标签可见时计时）。 */
 export const PROJECTS_RETRY_MS = 30_000;
@@ -65,7 +65,10 @@ export type UseChatProjects = {
   /** 手动重拉项目列表（失败态的重试入口；成功后清失败态）。 */
   reloadProjects: () => Promise<void>;
   toggleCollapsed: (projectId: string) => void;
-  createProjectPrompt: () => Promise<void>;
+  /**
+   * 一步创建(名称 + 可选指令/颜色)。返回服务端记录;demo 返回本地乐观记录;失败 toast 并返回 null。
+   */
+  createProject: (input: CreateProjectInput) => Promise<ChatProject | null>;
   renameProjectPrompt: (p: ChatProject) => Promise<void>;
   deleteProjectConfirm: (p: ChatProject) => Promise<void>;
   updateProject: (
@@ -176,32 +179,42 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     [userId],
   );
 
-  const createProjectPrompt = useCallback(async () => {
-    const name = (
-      await cbRef.current.promptText({ title: "新建项目", placeholder: "项目名称" })
-    )?.trim();
-    if (!name) return;
-    const tempId = `local-proj-${Date.now()}`;
-    const optimistic: ChatProject = {
-      id: tempId,
-      name,
-      sortOrder: projects.length,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sessionCount: 0,
-    };
-    setProjects((c) => [...c, optimistic]);
-    if (demo || !cbRef.current.auth) return;
-    try {
-      const created = await api.createChatProject(cbRef.current.authSession, { name });
-      setProjects((c) => c.map((p) => (p.id === tempId ? created : p)));
-      cbRef.current.onCreated?.(created);
-    } catch (e) {
-      setProjects((c) => c.filter((p) => p.id !== tempId));
-      console.warn("createChatProject failed", e);
-      toast("新建项目失败", "error");
-    }
-  }, [demo, projects.length, toast]);
+  const createProject = useCallback(
+    async (input: CreateProjectInput): Promise<ChatProject | null> => {
+      const name = input.name.trim();
+      if (!name) return null;
+      const instructions = input.instructions?.trim() || undefined;
+      const color = input.color || undefined;
+      const tempId = `local-proj-${Date.now()}`;
+      const optimistic: ChatProject = {
+        id: tempId,
+        name,
+        ...(instructions ? { instructions } : {}),
+        ...(color ? { color } : {}),
+        sortOrder: projects.length,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        sessionCount: 0,
+      };
+      setProjects((c) => [...c, optimistic]);
+      if (demo || !cbRef.current.auth) return optimistic;
+      try {
+        const created = await api.createChatProject(cbRef.current.authSession, {
+          name,
+          ...(instructions ? { instructions } : {}),
+          ...(color ? { color } : {}),
+        });
+        setProjects((c) => c.map((p) => (p.id === tempId ? created : p)));
+        return created;
+      } catch (e) {
+        setProjects((c) => c.filter((p) => p.id !== tempId));
+        console.warn("createChatProject failed", e);
+        toast(apiErrorMessage(e, "新建项目失败"), "error");
+        return null;
+      }
+    },
+    [demo, projects.length, toast],
+  );
 
   const renameProjectPrompt = useCallback(
     async (p: ChatProject) => {
@@ -334,7 +347,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     projectsLoadFailed,
     reloadProjects,
     toggleCollapsed,
-    createProjectPrompt,
+    createProject,
     renameProjectPrompt,
     deleteProjectConfirm,
     updateProject,

@@ -3,6 +3,7 @@ import {
   Bell,
   ChevronDown,
   Download,
+  FolderOpen,
   Menu,
   MoreHorizontal,
   PanelLeft,
@@ -205,16 +206,19 @@ export function ChatHeader({
         </span>
         <ChevronDown size={15} className="hidden shrink-0 text-faint sm:block" />
       </button>
-      {projectBreadcrumb && (projectBreadcrumb.chatName || projectBreadcrumb.workName) ? (
+      {projectBreadcrumb?.chatName ? (
+        // 所在项目:窄屏也显示(截断),点开项目本身,而不是管理中心。
         <button
           type="button"
           data-testid="chat-project-breadcrumb"
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
-          className="hidden min-w-0 max-w-[14rem] truncate rounded-lg px-2 py-1 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:inline-block"
-          title={[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
+          aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
+          className="inline-flex min-h-11 min-w-0 max-w-[7rem] shrink items-center gap-1 rounded-lg px-1.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[14rem] sm:px-2 sm:py-1"
+          title={`所在项目：${projectBreadcrumb.chatName}`}
         >
-          {[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
+          <FolderOpen size={13} aria-hidden className="shrink-0" />
+          <span className="truncate">{projectBreadcrumb.chatName}</span>
         </button>
       ) : null}
       {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (

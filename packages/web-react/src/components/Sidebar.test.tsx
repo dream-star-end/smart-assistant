@@ -492,6 +492,27 @@ describe("Sidebar 项目分组", () => {
     expect(onMoveToProject.mock.calls[0][1]).toBe("p-work");
   });
 
+  it("会话更多菜单可以从这条会话新建项目并移入", async () => {
+    const onCreateProjectFromSession = vi.fn();
+    renderSidebar({
+      sessions: projectSessions,
+      projects,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+      onMoveToProject: () => {},
+      onCreateProjectFromSession,
+    });
+    openSessionMenu("未分组会话");
+    const sub = screen.getByRole("menuitem", { name: "移动到项目" });
+    fireEvent.focus(sub);
+    fireEvent.keyDown(sub, { key: "ArrowRight" });
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "新建项目并移入…" })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("menuitem", { name: "新建项目并移入…" }));
+    expect(onCreateProjectFromSession).toHaveBeenCalledTimes(1);
+    expect(onCreateProjectFromSession.mock.calls[0][0].id).toBe("s-out");
+  });
+
   it("项目行提供在项目内新建会话入口，点击以项目 id 回调", () => {
     const onNewInProject = vi.fn();
     renderSidebar({

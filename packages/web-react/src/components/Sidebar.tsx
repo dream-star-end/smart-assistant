@@ -131,6 +131,8 @@ export type SidebarProps = {
   onDelete: (s: Session) => void;
   onTogglePin?: (s: Session) => void;
   onMoveToProject?: (s: Session, projectId: string | null) => void;
+  /** 会话菜单「新建项目并移入…」:打开新建项目对话框,创建后该会话移进新项目。 */
+  onCreateProjectFromSession?: (s: Session) => void;
   projects?: ChatProject[];
   collapsedProjectIds?: Set<string>;
   onToggleProjectCollapsed?: (id: string) => void;
@@ -213,6 +215,7 @@ export function Sidebar({
   onDelete,
   onTogglePin,
   onMoveToProject,
+  onCreateProjectFromSession,
   projects,
   collapsedProjectIds,
   onToggleProjectCollapsed,
@@ -716,6 +719,7 @@ export function Sidebar({
           onDelete={onDelete}
           onTogglePin={onTogglePin}
           onMoveToProject={onMoveToProject}
+          onCreateProjectFromSession={onCreateProjectFromSession}
           onArchive={onArchive}
           onMarkRead={onMarkRead}
           unread={unreadIds?.has(s.id)}
