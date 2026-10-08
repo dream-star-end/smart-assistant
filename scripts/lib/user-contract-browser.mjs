@@ -170,7 +170,9 @@ export async function waitTurnUiSettled(page, rowsBefore, { model, recheck, time
   try {
     await settle(graceMs);
   } catch {
-    const base = contractEvidenceBase();
+    // 证据 best effort:目录建不出来也绝不覆盖原失败。
+    let base = "unavailable";
+    try { base = contractEvidenceBase(); } catch { /* evidence is best effort */ }
     try { await page.screenshot({ path: `${base}.png`, fullPage: true, timeout: 5_000 }); } catch { /* evidence is best effort */ }
     const atFail = await uiState(page);
     try {

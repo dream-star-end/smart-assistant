@@ -16,8 +16,11 @@ async function fail(error) {
   console.log(tapResult(false, n, CASES[current], performance.now() - stepStart, error));
   for (let i = n + 1; i <= 3; i++) console.log(tapResult(false, i, CASES[i - 1], 0, "Prerequisite failed; not executed"));
   // 唯一命名:不再覆盖上一次失败的截图(2026-10-08 冒烟健壮性:证据要能事后对照)。
-  const shot = `${contractEvidenceBase()}-fail-${n}.png`;
-  try { await page?.screenshot({ path: shot, fullPage: true, timeout: 1_000 }); console.log(`# evidence screenshot=${shot}`); } catch { /* original failure remains fatal */ }
+  try {
+    const shot = `${contractEvidenceBase()}-fail-${n}.png`;
+    await page?.screenshot({ path: shot, fullPage: true, timeout: 1_000 });
+    console.log(`# evidence screenshot=${shot}`);
+  } catch { /* original failure remains fatal */ }
   await browser?.close().catch(() => {});
   process.exitCode = 1;
 }
