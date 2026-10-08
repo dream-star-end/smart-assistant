@@ -6238,6 +6238,26 @@
           "assertion": "a foreign id whose renamed form is already used is refused"
         }
       ]
+    },
+    {
+      "id": "INC-20261008-MARKET-SKILL-IMPORT-OVERFLOW",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "市场发布页将技能长说明当按钮标题并平铺数百项，导致横向溢出、基本信息表单被挤走。",
+      "rootFixCommit": "3dfd9ea7",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/marketplace/PublishPanel.test.tsx",
+          "assertion": "从大列表搜索导入后，名称、说明、正文和附属文件完整回填"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ui-preview/marketplace-design.mjs",
+          "assertion": "bounded list height"
+        }
+      ]
     }
   ]
 }
