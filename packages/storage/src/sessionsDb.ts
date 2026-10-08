@@ -445,6 +445,16 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!projCols.some(c => c.name === 'is_research_default')) {
       db.exec('ALTER TABLE chat_projects ADD COLUMN is_research_default INTEGER NOT NULL DEFAULT 0')
     }
+    // PG 0310_chat_project_workspace:归档/置顶/模板。
+    if (!projCols.some(c => c.name === 'archived_at')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN archived_at INTEGER DEFAULT NULL')
+    }
+    if (!projCols.some(c => c.name === 'pinned_at')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN pinned_at INTEGER DEFAULT NULL')
+    }
+    if (!projCols.some(c => c.name === 'template')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN template TEXT DEFAULT NULL')
+    }
   } catch { /* table missing in extremely old fixtures; CREATE above already ran */ }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_user_board
@@ -2103,9 +2113,22 @@ export type ChatProject = {
   updatedAt: number
   sessionCount: number
   boardProjectId: string | null
+  archivedAt: number | null
+  pinnedAt: number | null
+  template: ChatProjectTemplate | null
 }
 
-export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color'
+/** Decides the default workspace of a new project; null for projects created before templates. */
+export const CHAT_PROJECT_TEMPLATES = ['blank', 'repo', 'research', 'writing'] as const
+export type ChatProjectTemplate = (typeof CHAT_PROJECT_TEMPLATES)[number]
+export function parseChatProjectTemplate(value: unknown): ChatProjectTemplate | null | 'invalid' {
+  if (value === undefined || value === null || value === '') return null
+  return typeof value === 'string' && (CHAT_PROJECT_TEMPLATES as readonly string[]).includes(value)
+    ? (value as ChatProjectTemplate)
+    : 'invalid'
+}
+
+export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color' | 'invalid_template'
 export type ChatProjectUpdateError =
   | 'not_found'
   | 'invalid_name'
@@ -2114,6 +2137,7 @@ export type ChatProjectUpdateError =
   | 'invalid_sort_order'
   | 'invalid_board_project_id'
   | 'board_project_bound'
+  | 'invalid_flag'
 export type ChatProjectDeleteError = 'not_found'
 
 export type ChatProjectCreateResult =
@@ -6021,6 +6045,9 @@ type ChatProjectDbRow = {
   updated_at: number
   session_count: number
   board_project_id: string | null
+  archived_at: number | null
+  pinned_at: number | null
+  template: string | null
 }
 
 function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
@@ -6034,12 +6061,18 @@ function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
     updatedAt: r.updated_at,
     sessionCount: r.session_count,
     boardProjectId: r.board_project_id ?? null,
+    archivedAt: r.archived_at ?? null,
+    pinnedAt: r.pinned_at ?? null,
+    template: (() => {
+      const t = parseChatProjectTemplate(r.template)
+      return t === 'invalid' ? null : t
+    })(),
   }
 }
 
 const CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         p.board_project_id, COALESCE(c.cnt, 0) AS session_count
+         p.board_project_id, p.archived_at, p.pinned_at, p.template, COALESCE(c.cnt, 0) AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -6072,7 +6105,15 @@ async function _sqliteListChatProjects(userId: string): Promise<ChatProject[]> {
 
 async function _sqliteCreateChatProject(
   userId: string,
-  input: { name?: unknown; instructions?: unknown; color?: unknown; isResearchDefault?: unknown },
+  input: {
+    name?: unknown
+    instructions?: unknown
+    color?: unknown
+    isResearchDefault?: unknown
+    template?: unknown
+    /** Reserve the work-project id now (project layer on): the container creates that board on first use. */
+    reserveBoard?: boolean
+  },
 ): Promise<ChatProjectCreateResult> {
   const name = parseChatProjectName(input.name)
   if (!name) return { ok: false, error: 'invalid_name' }
@@ -6080,7 +6121,10 @@ async function _sqliteCreateChatProject(
   if ('invalid' in instructions) return { ok: false, error: 'invalid_instructions' }
   const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
   if ('invalid' in color) return { ok: false, error: 'invalid_color' }
+  const template = parseChatProjectTemplate(input.template)
+  if (template === 'invalid') return { ok: false, error: 'invalid_template' }
   const isDefault = input.isResearchDefault === true
+  const boardProjectId = input.reserveBoard === true && !isDefault ? randomUUID() : null
 
   const db = await getSessionsDb()
   const now = Date.now()
@@ -6093,10 +6137,11 @@ async function _sqliteCreateChatProject(
     try {
       db.prepare(`
         INSERT INTO chat_projects
-          (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at, is_research_default)
+          (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at,
+           is_research_default, template, board_project_id)
         VALUES (?, ?, ?, ?, ?, COALESCE((
           SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL
-        ), 0), ?, ?, NULL, ?)
+        ), 0), ?, ?, NULL, ?, ?, ?)
       `).run(
         id,
         userId,
@@ -6107,6 +6152,8 @@ async function _sqliteCreateChatProject(
         now,
         now,
         isDefault ? 1 : 0,
+        template,
+        boardProjectId,
       )
     } catch (err) {
       if (isDefault && isUniqueConstraintError(err, 'idx_chat_projects_user_research_default')) {
@@ -6130,10 +6177,28 @@ async function _sqliteCreateChatProject(
 async function _sqliteUpdateChatProject(
   userId: string,
   id: string,
-  input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown; boardProjectId?: unknown },
+  input: {
+    name?: unknown
+    instructions?: unknown
+    color?: unknown
+    sortOrder?: unknown
+    boardProjectId?: unknown
+    archived?: unknown
+    pinned?: unknown
+  },
 ): Promise<ChatProjectUpdateResult> {
   const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
   const params: unknown[] = [Date.now()]
+  if (input.archived !== undefined) {
+    if (typeof input.archived !== 'boolean') return { ok: false, error: 'invalid_flag' }
+    sets.push(input.archived ? 'archived_at = COALESCE(archived_at, ?)' : 'archived_at = NULL')
+    if (input.archived) params.push(Date.now())
+  }
+  if (input.pinned !== undefined) {
+    if (typeof input.pinned !== 'boolean') return { ok: false, error: 'invalid_flag' }
+    sets.push(input.pinned ? 'pinned_at = COALESCE(pinned_at, ?)' : 'pinned_at = NULL')
+    if (input.pinned) params.push(Date.now())
+  }
   if (input.name !== undefined) {
     const name = parseChatProjectName(input.name)
     if (!name) return { ok: false, error: 'invalid_name' }
@@ -6171,6 +6236,12 @@ async function _sqliteUpdateChatProject(
     const bound = parseBoardProjectId(input.boardProjectId)
     if ('invalid' in bound) return { ok: false, error: 'invalid_board_project_id' }
     if (bound.present) {
+      // A project keeps its work project for life: memory, skills, cron and
+      // billing history hang off that id. Only an unbound project may bind.
+      const existing = await _sqliteGetChatProjectForUser(userId, id)
+      if (existing?.boardProjectId && existing.boardProjectId !== bound.value) {
+        return { ok: false, error: 'board_project_bound' }
+      }
       sets.push('board_project_id = ?')
       params.push(bound.value)
     }
@@ -6296,13 +6367,19 @@ export type ChatProjectRuntimeBind = {
   boardProjectId: string | null
   name: string
   instructions: string | null
+  template?: ChatProjectTemplate | null
+}
+
+function _bindTemplate(raw: string | null | undefined): ChatProjectTemplate | null {
+  const t = parseChatProjectTemplate(raw)
+  return t === 'invalid' ? null : t
 }
 
 async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<ChatProjectRuntimeBind | null> {
   const db = await getSessionsDb()
   const row = db.prepare(`
     SELECT cs.user_id AS user_id, p.id AS chat_project_id, p.board_project_id AS board_project_id,
-           p.name AS name, p.instructions AS instructions
+           p.name AS name, p.instructions AS instructions, p.template AS template
       FROM client_sessions cs
       JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
      WHERE cs.id = ? AND cs.deleted_at IS NULL AND p.deleted_at IS NULL
@@ -6313,6 +6390,7 @@ async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<
         board_project_id: string | null
         name: string
         instructions: string | null
+        template: string | null
       }
     | undefined
   if (!row) return null
@@ -6322,6 +6400,7 @@ async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<
     boardProjectId: row.board_project_id ?? null,
     name: row.name,
     instructions: row.instructions,
+    template: _bindTemplate(row.template),
   }
 }
 
@@ -6333,7 +6412,7 @@ async function _sqliteGetChatProjectBindByBoardProjectId(
   if (!('present' in parsed) || !parsed.present || !parsed.value) return null
   const db = await getSessionsDb()
   const row = db.prepare(`
-    SELECT user_id, id, board_project_id, name, instructions
+    SELECT user_id, id, board_project_id, name, instructions, template
       FROM chat_projects
      WHERE user_id = ? AND board_project_id = ? AND deleted_at IS NULL
   `).get(userId, parsed.value) as
@@ -6343,6 +6422,7 @@ async function _sqliteGetChatProjectBindByBoardProjectId(
         board_project_id: string | null
         name: string
         instructions: string | null
+        template: string | null
       }
     | undefined
   if (!row) return null
@@ -6352,6 +6432,7 @@ async function _sqliteGetChatProjectBindByBoardProjectId(
     boardProjectId: row.board_project_id ?? null,
     name: row.name,
     instructions: row.instructions,
+    template: _bindTemplate(row.template),
   }
 }
 

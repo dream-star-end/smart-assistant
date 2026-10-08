@@ -330,6 +330,12 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    label: '/api/board/projects/:id/ensure',
+    re: /^\/api\/board\/projects\/[^/]+\/ensure$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/board/projects/:id/context/preview',
     re: /^\/api\/board\/projects\/[^/]+\/context\/preview$/,
     methods: M('GET'),

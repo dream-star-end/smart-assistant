@@ -42,6 +42,18 @@ describe('chat_projects PG/SQLite 契约对齐', () => {
     assert.match(backendSrc, /board_project_bound/)
   })
 
+  test('0302 archive/pin/template 列在 PG 与 SQLite 两侧都有,并登记 requiredMigrations', () => {
+    const sql = readFileSync(join(here, '../db/migrations/0302_chat_project_workspace.sql'), 'utf8')
+    for (const col of ['archived_at', 'pinned_at', 'template']) {
+      assert.match(sql, new RegExp(`ADD COLUMN IF NOT EXISTS ${col}`))
+      assert.match(sqliteSrc, new RegExp(`ADD COLUMN ${col}`))
+      assert.match(backendSrc, new RegExp(`p\\.${col}`))
+    }
+    assert.ok(metadata.requiredMigrations.includes('0302_chat_project_workspace'))
+    assert.match(backendSrc, /reserveBoard/)
+    assert.match(sqliteSrc, /reserveBoard/)
+  })
+
   test('pgSessionsBackend 覆盖 sqliteBackend 新增方法', () => {
     for (const method of [
       'listChatProjects',

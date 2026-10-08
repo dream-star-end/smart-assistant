@@ -13,6 +13,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   commitProjectSkillOverlay,
   loadProjectContext,
+  parseBoardProjectId,
   parseProjectWorkspace,
   paths,
   readProjectRunContextFile,
@@ -671,6 +672,20 @@ async function dispatch(
     if (method === 'GET')
       return handleProjectBoard(res, url, db, decodeURIComponent(projectBoard[1]))
     return sendError(res, 405, 'method not allowed')
+  }
+
+  // A chat project reserved this work-project id on the master; create the board
+  // here on first use. Name and template come from the master, never the client.
+  const projectEnsure = path.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/)
+  if (projectEnsure) {
+    if (method !== 'POST') return sendError(res, 405, 'method not allowed')
+    const id = parseBoardProjectId(decodeURIComponent(projectEnsure[1]))
+    if (!('present' in id) || !id.present || !id.value) return sendError(res, 400, 'invalid project id')
+    const { resolveTurnProjectContext } = await import('../projectContextRuntime.js')
+    await resolveTurnProjectContext({ boardProjectId: id.value })
+    const project = getProject(db, id.value)
+    if (!project) throw new TaskboardNotFound('project', id.value)
+    return sendJson(res, 200, { project })
   }
 
   const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)

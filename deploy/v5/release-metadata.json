@@ -173,7 +173,8 @@
     "0290_retire_cursor_sand_for_box_claude",
     "0291_box_claude_cursor_audit",
     "0292_gpt61_sol_retire_gpt6_sol",
-    "0300_box_claude_haiku_5_5"
+    "0300_box_claude_haiku_5_5",
+    "0302_chat_project_workspace"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

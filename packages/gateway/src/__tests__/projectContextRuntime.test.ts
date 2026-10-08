@@ -124,6 +124,23 @@ describe('project context read failure', () => {
     assert.equal(ws.projectId, null)
   })
 
+  it('a reserved board is created in this container before the turn uses it', async () => {
+    const boardId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    const body = { ...PROJECT_BODY, boardProjectId: boardId, name: '论文 写作', template: 'writing' }
+    const { fetcher } = fetcherFrom([{ status: 200, body }])
+    const got = await resolveTurnProjectContext({ sessionId: 's-reserved', env: ENV, fetcher })
+    assert.equal(got?.bound, true)
+    assert.equal(got?.boardProjectId, boardId)
+    const { getProject, getTaskboardDb } = await import('../taskboard/db/index.js')
+    const board = getProject(getTaskboardDb(), boardId)
+    assert.equal(board?.name, '论文 写作')
+    assert.deepEqual(board?.workspaceSpec, { kind: 'isolated' })
+    // second turn: same board, no duplicate
+    const again = fetcherFrom([{ status: 200, body: { ...body, name: 'renamed' } }])
+    await resolveTurnProjectContext({ sessionId: 's-reserved', env: ENV, fetcher: again.fetcher })
+    assert.equal(getProject(getTaskboardDb(), boardId)?.name, '论文 写作')
+  })
+
   it('flag off never consults the master', async () => {
     const { fetcher, calls } = fetcherFrom([])
     const got = await resolveTurnProjectContext({

@@ -37,7 +37,13 @@ const FETCH_ATTEMPTS = 2
 const LAST_RESOLVED_MAX = 2_000
 const lastResolved = new Map<string, ResolvedTurnProjectContext>()
 
-export type ProjectContextUnavailableReason = 'timeout' | 'http_error' | 'network' | 'bad_response'
+export type ProjectContextUnavailableReason =
+  | 'timeout'
+  | 'http_error'
+  | 'network'
+  | 'bad_response'
+  /** The project's work project could not be created/read in this container. */
+  | 'board_unavailable'
 
 export interface ResolvedTurnProjectContext {
   boardProjectId: string | null
@@ -67,8 +73,33 @@ interface MasterBody {
   boardProjectId?: string | null
   name?: string | null
   instructions?: string | null
+  template?: string | null
   pinnedAssets?: ProjectAsset[]
   assetsRevision?: number
+}
+
+/** New boards of these templates get their own folder; blank and pre-template projects use the default workspace. */
+const ISOLATED_TEMPLATES = new Set(['repo', 'research', 'writing'])
+
+/**
+ * The chat project reserved this work-project id in the master database; the
+ * board lives in this container and is created here on first use. Only when
+ * the master told us the project (name known) — a trusted cron override
+ * without a master answer must already point at an existing board.
+ */
+async function ensureBoardForProject(boardProjectId: string, remote: MasterBody | null): Promise<boolean> {
+  if (!remote?.name) return true
+  try {
+    const { ensureProjectById, getTaskboardDb } = await import('./taskboard/db/index.js')
+    ensureProjectById(getTaskboardDb(), {
+      id: boardProjectId,
+      name: remote.name,
+      workspaceSpec: remote.template && ISOLATED_TEMPLATES.has(remote.template) ? { kind: 'isolated' } : null,
+    })
+    return true
+  } catch {
+    return false
+  }
 }
 
 type MasterRead = { ok: true; body: MasterBody } | { ok: false; reason: ProjectContextUnavailableReason }
@@ -169,7 +200,10 @@ export async function resolveTurnProjectContext(
   if (boardId) {
     if (hasMaster) {
       const read = await fetchMaster(`boardProjectId=${encodeURIComponent(boardId)}`, opts)
-      return hydrateBound(boardId, read?.ok ? read.body : null)
+      const remote = read?.ok ? read.body : null
+      // Only a board the master knows as a chat project's is created here.
+      if (remote?.chatProjectId) await ensureBoardForProject(boardId, remote)
+      return hydrateBound(boardId, remote)
     }
     const userId = process.env.OC_USER_ID?.trim() || 'default'
     const bind =
@@ -208,7 +242,21 @@ export async function resolveTurnProjectContext(
       const remote = read?.ok ? read.body : null
       const boundId = remote?.boardProjectId ? parseBoardProjectId(remote.boardProjectId) : { present: false as const }
       const id = 'present' in boundId && boundId.present ? boundId.value : null
-      if (id) return rememberResolved(sessionId, await hydrateBound(id, remote))
+      if (id) {
+        if (!(await ensureBoardForProject(id, remote))) {
+          return {
+            boardProjectId: null,
+            chatProjectId: remote?.chatProjectId ?? null,
+            name: remote?.name ?? null,
+            instructions: null,
+            assets: [],
+            assetsRevision: 0,
+            bound: false,
+            unavailable: 'board_unavailable',
+          }
+        }
+        return rememberResolved(sessionId, await hydrateBound(id, remote))
+      }
       return rememberResolved(sessionId, {
         boardProjectId: null,
         chatProjectId: remote?.chatProjectId ?? null,

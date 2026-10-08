@@ -213,6 +213,7 @@ import {
   SESSION_LIST_LIMIT_MAX,
   listChatProjects,
   createChatProject,
+  isProjectContextEnabled,
   updateChatProject,
   deleteChatProject,
   parseChatProjectName,
@@ -4939,7 +4940,9 @@ export class Gateway {
             this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
             return
           }
-          const result = await createChatProject(userId, data)
+          // With the project layer on, every new project reserves its work-project id
+          // now (the container creates that board on first use). Never client-controlled.
+          const result = await createChatProject(userId, { ...data, reserveBoard: isProjectContextEnabled() })
           if (!result.ok) {
             if (result.error === 'limit_exceeded') {
               this.sendJson(res, 400, { error: 'project limit exceeded (max 100)' })
@@ -4967,6 +4970,8 @@ export class Gateway {
             color?: unknown
             sortOrder?: unknown
             boardProjectId?: unknown
+            archived?: unknown
+            pinned?: unknown
           }
           try {
             data = JSON.parse(await this.readBody(req, 16 * 1024))
@@ -4979,8 +4984,11 @@ export class Gateway {
           const hasColor = data.color !== undefined
           const hasSort = data.sortOrder !== undefined
           const hasBoard = data.boardProjectId !== undefined
-          if (!hasName && !hasInstructions && !hasColor && !hasSort && !hasBoard) {
-            this.sendJson(res, 400, { error: 'name, instructions, color, sortOrder or boardProjectId required' })
+          const hasFlags = data.archived !== undefined || data.pinned !== undefined
+          if (!hasName && !hasInstructions && !hasColor && !hasSort && !hasBoard && !hasFlags) {
+            this.sendJson(res, 400, {
+              error: 'name, instructions, color, sortOrder, boardProjectId, archived or pinned required',
+            })
             return
           }
           if (hasName && parseChatProjectName(data.name) === null) {
@@ -6375,6 +6383,7 @@ export class Gateway {
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/) ||
@@ -24086,6 +24095,7 @@ function normalizePath(p: string): string {
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
     .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
+    .replace(/\/api\/board\/projects\/[^/]+\/ensure/, '/api/board/projects/:id/ensure')
     .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
     .replace(
       /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,

@@ -119,6 +119,7 @@ import {
   type ChatProjectCreateResult,
   type ChatProjectDeleteResult,
   type ChatProjectRuntimeBind,
+  type ChatProjectTemplate,
   type ChatProjectUpdateResult,
   type PinnedAssetsPage,
   type ProjectAsset,
@@ -176,6 +177,7 @@ import {
   parseChatProjectName,
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
+  parseChatProjectTemplate,
   parseProjectAssetCreateInput,
   parseProjectAssetName,
   parseProjectAssetProjectId,
@@ -668,7 +670,8 @@ async function pgUnreadBySessionIds(
 
 const PG_CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         p.board_project_id, COALESCE(c.cnt, 0)::text AS session_count
+         p.board_project_id, p.archived_at, p.pinned_at, p.template,
+         COALESCE(c.cnt, 0)::text AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -688,7 +691,15 @@ type PgChatProjectRow = {
   updated_at: string;
   session_count: string;
   board_project_id: string | null;
+  archived_at: string | null;
+  pinned_at: string | null;
+  template: string | null;
 };
+
+function pgTemplate(raw: string | null | undefined): ChatProjectTemplate | null {
+  const t = parseChatProjectTemplate(raw);
+  return t === "invalid" ? null : t;
+}
 
 function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
   return {
@@ -701,6 +712,9 @@ function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
     updatedAt: bigIntNum(r.updated_at, "updated_at"),
     sessionCount: Number(r.session_count) || 0,
     boardProjectId: r.board_project_id ?? null,
+    archivedAt: r.archived_at == null ? null : bigIntNum(r.archived_at, "archived_at"),
+    pinnedAt: r.pinned_at == null ? null : bigIntNum(r.pinned_at, "pinned_at"),
+    template: pgTemplate(r.template),
   };
 }
 
@@ -12217,8 +12231,9 @@ export function createPgSessionsBackend(
           board_project_id: string | null;
           name: string;
           instructions: string | null;
+          template: string | null;
         }>(
-          `SELECT cs.user_id, p.id AS chat_project_id, p.board_project_id, p.name, p.instructions
+          `SELECT cs.user_id, p.id AS chat_project_id, p.board_project_id, p.name, p.instructions, p.template
              FROM client_sessions cs
              JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
             WHERE cs.id = $1 AND cs.deleted_at IS NULL AND p.deleted_at IS NULL`,
@@ -12232,6 +12247,7 @@ export function createPgSessionsBackend(
         boardProjectId: row.board_project_id ?? null,
         name: row.name,
         instructions: row.instructions,
+        template: pgTemplate(row.template),
       };
     },
 
@@ -12248,8 +12264,9 @@ export function createPgSessionsBackend(
           board_project_id: string | null;
           name: string;
           instructions: string | null;
+          template: string | null;
         }>(
-          `SELECT user_id, id, board_project_id, name, instructions
+          `SELECT user_id, id, board_project_id, name, instructions, template
              FROM chat_projects
             WHERE user_id = $1 AND board_project_id = $2 AND deleted_at IS NULL`,
           [userId, parsed.value],
@@ -12262,6 +12279,7 @@ export function createPgSessionsBackend(
         boardProjectId: row.board_project_id ?? null,
         name: row.name,
         instructions: row.instructions,
+        template: pgTemplate(row.template),
       };
     },
 
@@ -12642,7 +12660,14 @@ export function createPgSessionsBackend(
 
     async createChatProject(
       userId: string,
-      input: { name?: unknown; instructions?: unknown; color?: unknown; isResearchDefault?: unknown },
+      input: {
+        name?: unknown;
+        instructions?: unknown;
+        color?: unknown;
+        isResearchDefault?: unknown;
+        template?: unknown;
+        reserveBoard?: boolean;
+      },
     ): Promise<ChatProjectCreateResult> {
       const name = parseChatProjectName(input.name);
       if (!name) return { ok: false, error: "invalid_name" };
@@ -12650,7 +12675,11 @@ export function createPgSessionsBackend(
       if ("invalid" in instructions) return { ok: false, error: "invalid_instructions" };
       const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
       if ("invalid" in color) return { ok: false, error: "invalid_color" };
+      const template = parseChatProjectTemplate(input.template);
+      if (template === "invalid") return { ok: false, error: "invalid_template" };
       const isDefault = input.isResearchDefault === true;
+      // Project layer on: reserve the work-project id now; the container creates that board on first use.
+      const boardProjectId = input.reserveBoard === true && !isDefault ? randomUUID() : null;
       const id = randomUUID();
       return withTx(pool, async (client) => {
         const countRow = (
@@ -12665,10 +12694,11 @@ export function createPgSessionsBackend(
         try {
           await client.query(
             `INSERT INTO chat_projects
-               (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at, is_research_default)
+               (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at,
+                is_research_default, template, board_project_id)
              VALUES ($1, $2, $3, $4, $5, COALESCE((
                SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = $2 AND deleted_at IS NULL
-             ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL, $6)`,
+             ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL, $6, $7, $8)`,
             [
               id,
               userId,
@@ -12676,6 +12706,8 @@ export function createPgSessionsBackend(
               instructions.present ? instructions.value : null,
               color.present ? color.value : null,
               isDefault,
+              template,
+              boardProjectId,
             ],
           );
         } catch (err) {
@@ -12710,11 +12742,21 @@ export function createPgSessionsBackend(
         color?: unknown;
         sortOrder?: unknown;
         boardProjectId?: unknown;
+        archived?: unknown;
+        pinned?: unknown;
       },
     ): Promise<ChatProjectUpdateResult> {
       const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
       const params: unknown[] = [];
       let n = 1;
+      if (input.archived !== undefined) {
+        if (typeof input.archived !== "boolean") return { ok: false, error: "invalid_flag" };
+        sets.push(input.archived ? `archived_at = COALESCE(archived_at, ${CLOCK_MS_SQL})` : "archived_at = NULL");
+      }
+      if (input.pinned !== undefined) {
+        if (typeof input.pinned !== "boolean") return { ok: false, error: "invalid_flag" };
+        sets.push(input.pinned ? `pinned_at = COALESCE(pinned_at, ${CLOCK_MS_SQL})` : "pinned_at = NULL");
+      }
       if (input.name !== undefined) {
         const name = parseChatProjectName(input.name);
         if (!name) return { ok: false, error: "invalid_name" };
@@ -12755,6 +12797,11 @@ export function createPgSessionsBackend(
         const bound = parseBoardProjectId(input.boardProjectId);
         if ("invalid" in bound) return { ok: false, error: "invalid_board_project_id" };
         if (bound.present) {
+          // A project keeps its work project for life (memory, skills, cron, billing hang off it).
+          const existing = await readPgChatProject(pool, userId, id);
+          if (existing?.boardProjectId && existing.boardProjectId !== bound.value) {
+            return { ok: false, error: "board_project_bound" };
+          }
           sets.push(`board_project_id = $${n++}`);
           params.push(bound.value);
         }

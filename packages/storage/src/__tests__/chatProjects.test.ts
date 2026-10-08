@@ -78,7 +78,7 @@ describe('chat_projects CRUD', () => {
     assert.equal(ok.project.boardProjectId, null)
   })
 
-  it('1:1 board_project_id bind, unbind, cross-user isolation', async () => {
+  it('1:1 board_project_id bind is permanent; cross-user isolation', async () => {
     const a = await createChatProject(USER, { name: 'A' })
     const b = await createChatProject(USER, { name: 'B' })
     const other = await createChatProject(OTHER, { name: 'X' })
@@ -94,15 +94,20 @@ describe('chat_projects CRUD', () => {
     if (!conflict.ok) assert.equal(conflict.error, 'board_project_bound')
     const otherBind = await updateChatProject(OTHER, other.project.id, { boardProjectId: board })
     assert.equal(otherBind.ok, true)
+    // Memory, skills, cron and billing hang off the board id: no unbind, no rebind.
     const unbind = await updateChatProject(USER, a.project.id, { boardProjectId: null })
-    assert.equal(unbind.ok, true)
-    if (unbind.ok) assert.equal(unbind.project.boardProjectId, null)
+    assert.equal(unbind.ok, false)
+    if (!unbind.ok) assert.equal(unbind.error, 'board_project_bound')
+    const rebind = await updateChatProject(USER, a.project.id, { boardProjectId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' })
+    assert.equal(rebind.ok, false)
+    const same = await updateChatProject(USER, a.project.id, { boardProjectId: board })
+    assert.equal(same.ok, true)
     const invalid = await updateChatProject(USER, b.project.id, { boardProjectId: 'not-a-uuid' })
     assert.equal(invalid.ok, false)
     if (!invalid.ok) assert.equal(invalid.error, 'invalid_board_project_id')
   })
 
-  it('bound updates do not write instructions to PG; unbind restores PG authority', async () => {
+  it('bound updates do not write instructions to PG (PROJECT.md is the authority)', async () => {
     const created = await createChatProject(USER, { name: 'BoundIns', instructions: 'pg-seed' })
     assert.equal(created.ok, true)
     if (!created.ok) return
@@ -112,12 +117,41 @@ describe('chat_projects CRUD', () => {
     const skipped = await updateChatProject(USER, created.project.id, { instructions: 'should-not-land' })
     assert.equal(skipped.ok, true)
     if (skipped.ok) assert.equal(skipped.project.instructions, 'pg-seed')
-    const unbound = await updateChatProject(USER, created.project.id, { boardProjectId: null })
-    assert.equal(unbound.ok, true)
-    if (unbound.ok) assert.equal(unbound.project.instructions, 'pg-seed')
-    const after = await updateChatProject(USER, created.project.id, { instructions: 'pg-after-unbind' })
-    assert.equal(after.ok, true)
-    if (after.ok) assert.equal(after.project.instructions, 'pg-after-unbind')
+  })
+
+  it('project layer on: a new project reserves its board id; research default never does', async () => {
+    const reserved = await createChatProject(USER, { name: 'Reserved', reserveBoard: true, template: 'research' })
+    assert.equal(reserved.ok, true)
+    if (!reserved.ok) return
+    assert.match(reserved.project.boardProjectId ?? '', /^[0-9a-f-]{36}$/)
+    assert.equal(reserved.project.template, 'research')
+    const plain = await createChatProject(USER, { name: 'Plain' })
+    assert.equal(plain.ok && plain.project.boardProjectId, null)
+    const research = await createChatProject(USER, { name: 'Lib', isResearchDefault: true, reserveBoard: true })
+    assert.equal(research.ok && research.project.boardProjectId, null)
+    const bad = await createChatProject(USER, { name: 'Bad', template: 'novel' })
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.equal(bad.error, 'invalid_template')
+  })
+
+  it('archive and pin are reversible flags; a repeat keeps the first timestamp', async () => {
+    const created = await createChatProject(USER, { name: 'Flags' })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    const archived = await updateChatProject(USER, created.project.id, { archived: true, pinned: true })
+    assert.equal(archived.ok, true)
+    if (!archived.ok) return
+    assert.ok(archived.project.archivedAt && archived.project.pinnedAt)
+    const again = await updateChatProject(USER, created.project.id, { archived: true })
+    assert.equal(again.ok && again.project.archivedAt, archived.project.archivedAt)
+    const restored = await updateChatProject(USER, created.project.id, { archived: false, pinned: false })
+    assert.equal(restored.ok && restored.project.archivedAt, null)
+    assert.equal(restored.ok && restored.project.pinnedAt, null)
+    const bad = await updateChatProject(USER, created.project.id, { archived: 'yes' })
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.equal(bad.error, 'invalid_flag')
+    const listed = (await listChatProjects(USER)).find((p) => p.id === created.project.id)
+    assert.equal(listed?.archivedAt, null)
   })
 
   it('list 按 sort_order ASC, created_at ASC;sessionCount 只计未删会话', async () => {
