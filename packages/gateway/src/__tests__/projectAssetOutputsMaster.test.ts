@@ -6,7 +6,7 @@
  */
 import * as assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, it } from 'node:test'
@@ -73,6 +73,7 @@ describe('container output assets → master', () => {
         size: Buffer.byteLength(REPORT_BYTES),
         digest: REPORT_DIGEST,
         url: `/api/media/${REPORT_DIGEST}.md`,
+        capturedAt: Math.round((await stat(join(outputRoots.generated, 'report.md'))).mtimeMs),
       }],
     })
     // The version copy is in the store before the master hears about it.

@@ -195,6 +195,8 @@ export interface OutputAssetItem {
   digest?: string
   /** `/api/media/<digest>.<ext>` of the version copy; always sent together with digest. */
   url?: string
+  /** Source file mtime (ms) when these bytes were read; lets the master tell a replay from a rewrite. */
+  capturedAt?: number
 }
 
 /** Where outputs are read from and where version copies go (test seam). */
@@ -209,6 +211,7 @@ export interface CapturedOutputVersion {
   size: number
   digest?: string
   url?: string
+  capturedAt?: number
 }
 
 /** One registration request; also the shape of a pending spool line. */
@@ -316,7 +319,9 @@ export async function captureOutputVersion(
     log.warn('output path resolves outside generated/, not registered', { containerPath })
     return null
   }
-  const src = await open(real, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+  // O_NONBLOCK: opening a FIFO with no writer would otherwise wait forever and
+  // pin a libuv worker thread. Only a regular file is ever read.
+  const src = await open(real, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
   try {
     // A directory swapped for a symlink between realpath and open is caught
     // here: what we actually opened must still live under generated/.
@@ -329,7 +334,8 @@ export async function captureOutputVersion(
     if (!st.isFile()) return null
     if (st.size > OUTPUT_VERSION_COPY_MAX_BYTES) return { size: st.size }
     try {
-      return await copyIntoCas(src, basename(containerPath), roots.cas)
+      const copied = await copyIntoCas(src, basename(containerPath), roots.cas)
+      return { ...copied, capturedAt: Math.round(st.mtimeMs) }
     } catch (err) {
       log.warn('output version copy failed, registering the source path only', { containerPath }, err)
       return { size: st.size }
@@ -499,7 +505,9 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
         name,
         ...(mime ? { mime } : {}),
         size: captured.size,
-        ...(captured.digest && captured.url ? { digest: captured.digest, url: captured.url } : {}),
+        ...(captured.digest && captured.url
+          ? { digest: captured.digest, url: captured.url, capturedAt: captured.capturedAt }
+          : {}),
       })
     } catch (err) {
       log.warn('collectSessionOutputAssets skipped', { sessionId: opts.sessionId, containerPath }, err)
@@ -535,7 +543,7 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
         containerPath: item.containerPath,
         mime: item.mime,
         size: item.size,
-        ...(item.digest && item.url ? { digest: item.digest, url: item.url } : {}),
+        ...(item.digest && item.url ? { digest: item.digest, url: item.url, capturedAt: item.capturedAt } : {}),
       })
       if (!result.ok && result.error !== 'limit_exceeded') {
         log.warn('collectSessionOutputAssets create failed', {

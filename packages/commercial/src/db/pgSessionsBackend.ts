@@ -750,6 +750,19 @@ const PG_PROJECT_ASSET_SELECT = `
     FROM project_assets
 `;
 
+/**
+ * 「是该源路径的最新版本」(上传与无源路径的行恒为真),与 SQLite 侧
+ * SQLITE_ASSET_IS_LATEST_VERSION 同构:注入常用资产时只认最新版本。
+ */
+const PG_ASSET_IS_LATEST_VERSION = `NOT EXISTS (
+  SELECT 1 FROM project_assets newer
+   WHERE project_assets.source = 'output' AND project_assets.container_path IS NOT NULL
+     AND newer.user_id = project_assets.user_id AND newer.deleted_at IS NULL
+     AND newer.source = 'output' AND newer.project_id IS NOT DISTINCT FROM project_assets.project_id
+     AND newer.container_path = project_assets.container_path
+     AND (newer.created_at > project_assets.created_at
+          OR (newer.created_at = project_assets.created_at AND newer.id > project_assets.id)))`;
+
 type PgProjectAssetRow = {
   id: string;
   project_id: string | null;
@@ -851,8 +864,10 @@ async function pgLatestOutputVersion(
 
 /**
  * 去重规则与 SQLite 侧 _sqliteFindDuplicateAsset 同构:
- *   - 带字节副本的产出(output + containerPath + digest):只与该源路径的最新版本比,
+ *   - 带字节副本的产出(output + containerPath + digest):先与该源路径的最新版本比,
  *     digest 相同 = 同一版本,不同 = 新版本(返回 null)。
+ *     例外是重放:带 capturedAt(源文件 mtime)且不晚于最新版本的 created_at,而这个
+ *     digest 已是某个旧版本 → 返回那个旧版本,不出新版本。
  *   - 其它(上传、旧容器只报路径的产出):同 digest,digest 空则同 container_path。
  */
 async function pgFindDuplicateAsset(
@@ -862,10 +877,26 @@ async function pgFindDuplicateAsset(
   source: ParsedProjectAssetCreate["source"],
   digest: string | null,
   containerPath: string | null,
+  capturedAt: number | null,
 ): Promise<ProjectAsset | null> {
   if (source === "output" && containerPath && digest) {
     const latest = await pgLatestOutputVersion(queryable, userId, projectId, containerPath);
-    return latest && latest.digest === digest ? latest : null;
+    if (!latest) return null;
+    if (latest.digest === digest) return latest;
+    if (capturedAt !== null && capturedAt <= latest.createdAt) {
+      const row = (
+        await queryable.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+              AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3 AND digest = $4
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1`,
+          [userId, projectId, containerPath, digest],
+        )
+      ).rows[0];
+      if (row) return mapPgProjectAssetRow(row);
+    }
+    return null;
   }
   if (digest) {
     const row = (
@@ -12333,6 +12364,7 @@ export function createPgSessionsBackend(
           `${PG_PROJECT_ASSET_SELECT}
             WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
               AND project_id IS NOT DISTINCT FROM $2
+              AND ${PG_ASSET_IS_LATEST_VERSION}
             ORDER BY created_at DESC
             LIMIT $3`,
           [userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX],
@@ -13122,16 +13154,28 @@ export function createPgSessionsBackend(
           parsed.value.source,
           parsed.value.digest,
           parsed.value.containerPath,
+          parsed.value.capturedAt,
         );
         if (dup) return { ok: true, asset: dup, created: false };
         if ((await pgCountProjectAssets(client, userId, projectId)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
           return { ok: false, error: "limit_exceeded" };
         }
         // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+        // 「常用」只挂在最新版本上:新版本(登记或恢复)继承上一版的 pinned,旧版本一律取消。
         let createdAtFloor = 0;
+        let pinned = parsed.value.pinned;
         if (parsed.value.source === "output" && parsed.value.containerPath) {
           const latest = await pgLatestOutputVersion(client, userId, projectId, parsed.value.containerPath);
-          if (latest) createdAtFloor = latest.createdAt + 1;
+          if (latest) {
+            createdAtFloor = latest.createdAt + 1;
+            pinned = pinned || latest.pinned;
+            await client.query(
+              `UPDATE project_assets SET pinned = FALSE, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+                  AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3 AND pinned IS TRUE`,
+              [userId, projectId, parsed.value.containerPath],
+            );
+          }
         }
         // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
         await client.query(
@@ -13155,7 +13199,7 @@ export function createPgSessionsBackend(
             parsed.value.sizeBytes,
             parsed.value.digest,
             parsed.value.excerpt,
-            parsed.value.pinned,
+            pinned,
             createdAtFloor,
           ],
         );
@@ -13253,6 +13297,7 @@ export function createPgSessionsBackend(
           `${PG_PROJECT_ASSET_SELECT}
             WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
               AND project_id IS NOT DISTINCT FROM $2
+              AND ${PG_ASSET_IS_LATEST_VERSION}
             ORDER BY created_at DESC
             LIMIT $3`,
           [sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX],

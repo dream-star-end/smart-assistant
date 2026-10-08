@@ -5,8 +5,9 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/projectAssetOutputVersions.test.ts
  */
 import * as assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, truncate, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, it } from 'node:test'
@@ -131,5 +132,37 @@ describe('output version capture', () => {
     assert.equal(captured?.digest, sha('real'))
     assert.equal(await readFile(join(roots.cas, `${sha('real')}.txt`), 'utf8'), 'real')
     assert.deepEqual((await casFiles()).filter((f) => f.startsWith('.tmp-')), [])
+  })
+
+  it('a FIFO with no writer is skipped without blocking', async () => {
+    const fifo = join(roots.generated, 'pipe.md')
+    execFileSync('mkfifo', [fifo])
+    let timer: NodeJS.Timeout | undefined
+    const guard = new Promise<'timeout'>((done) => {
+      timer = setTimeout(() => done('timeout'), 3_000)
+    })
+    try {
+      const got = await Promise.race([captureOutputVersion(`${GEN}/pipe.md`, roots), guard])
+      assert.equal(got, null)
+      const collected = await Promise.race([
+        collectSessionOutputAssets({
+          userId: 'default', sessionId: 's-1', assistantText: `${GEN}/pipe.md`, env: LOCAL_ENV, outputRoots: roots,
+        }).then(() => 'done' as const),
+        guard,
+      ])
+      assert.equal(collected, 'done')
+    } finally {
+      clearTimeout(timer)
+    }
+    assert.deepEqual(await listProjectAssets('default', { projectId: null }), [])
+  })
+
+  it('sends the source mtime as capturedAt with each version copy', async () => {
+    const file = join(roots.generated, 'dated.md')
+    await writeFile(file, 'dated')
+    const when = new Date('2026-01-02T03:04:05.678Z')
+    await utimes(file, when, when)
+    const captured = await captureOutputVersion(`${GEN}/dated.md`, roots)
+    assert.equal(captured?.capturedAt, when.getTime())
   })
 })

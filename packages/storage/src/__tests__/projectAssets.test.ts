@@ -30,6 +30,7 @@ const {
   getSessionsDb,
   listPinnedProjectAssetsForChatProject,
   listPinnedProjectAssetsForSession,
+  patchClientSessionMeta,
   listProjectAssetVersions,
   listProjectAssets,
   parseProjectAssetContainerPath,
@@ -573,5 +574,81 @@ describe('project_assets 产出物版本', () => {
     assert.equal(listed.length, 1)
     assert.equal(listed[0]?.id, inProj.asset.id)
     assert.equal(listed[0]?.versionCount, undefined)
+  })
+
+  it('重放:旧登记(capturedAt 不晚于最新版本)返回已有旧版本,不出假版本', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: Date.now() }))
+    assert.equal(v1.ok && v2.ok && v2.created, true)
+    if (!v1.ok || !v2.ok) return
+    // A 的响应丢了,队列补发同一份登记。
+    const replay = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    assert.equal(replay.ok, true)
+    if (!replay.ok) return
+    assert.equal(replay.created, false)
+    assert.equal(replay.asset.id, v1.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed[0]?.id, v2.asset.id)
+    assert.equal(listed[0]?.versionCount, 2)
+  })
+
+  it('真的写回旧内容(capturedAt 晚于最新版本)仍出新版本;不带 capturedAt 只比最新版本', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: 2_000 }))
+    assert.equal(v1.ok && v2.ok, true)
+    if (!v1.ok || !v2.ok) return
+    const rewrite = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: v2.asset.createdAt + 5_000 }))
+    assert.equal(rewrite.ok && rewrite.created, true)
+    const v4 = await createProjectAsset(USER, output(DIGEST_B))
+    assert.equal(v4.ok && v4.created, true, '旧容器/恢复:没有 capturedAt,只比最新版本')
+    assert.equal((await listProjectAssets(USER, { projectId: null }))[0]?.versionCount, 4)
+    const bad = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: -1 }))
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.equal(bad.error, 'invalid_captured_at')
+  })
+
+  it('常用只挂在最新版本:新版本继承 pinned,旧版本取消;恢复同样继承', async () => {
+    const proj = await createChatProject(USER, { name: 'Pins' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const pid = proj.project.id
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { projectId: pid }))
+    assert.equal(v1.ok, true)
+    if (!v1.ok) return
+    await updateProjectAsset(USER, v1.asset.id, { pinned: true })
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { projectId: pid }))
+    assert.equal(v2.ok, true)
+    if (!v2.ok) return
+    assert.equal(v2.asset.pinned, true)
+    const versions = await listProjectAssetVersions(USER, v2.asset.id)
+    assert.deepEqual(versions?.map((v) => v.pinned), [true, false])
+    const pinned = await listPinnedProjectAssetsForChatProject(USER, pid)
+    assert.deepEqual(pinned.assets.map((a) => a.id), [v2.asset.id])
+    // 恢复 = 用旧 digest 再登记(不带 capturedAt):也继承常用。
+    const restored = await createProjectAsset(USER, output(DIGEST_A, { projectId: pid }))
+    assert.equal(restored.ok && restored.created && restored.asset.pinned, true)
+    if (!restored.ok) return
+    assert.deepEqual((await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id), [restored.asset.id])
+  })
+
+  it('旧数据里旧版本仍 pinned、最新版本未 pinned:注入查询不注入旧版本', async () => {
+    const proj = await createChatProject(USER, { name: 'Stale' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const pid = proj.project.id
+    await upsertClientSession(baseSession('sess-stale'))
+    await patchClientSessionMeta('sess-stale', USER, { projectId: pid })
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { projectId: pid }))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { projectId: pid }))
+    const up = await createProjectAsset(USER, { source: 'upload', name: 'u.md', url: MEDIA_URL(DIGEST_A, 'md'), projectId: pid })
+    assert.equal(v1.ok && v2.ok && up.ok, true)
+    if (!v1.ok || !v2.ok || !up.ok) return
+    const db = await getSessionsDb()
+    db.prepare('UPDATE project_assets SET pinned = 1 WHERE id IN (?, ?)').run(v1.asset.id, up.asset.id)
+    assert.deepEqual((await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id), [up.asset.id])
+    assert.deepEqual((await listPinnedProjectAssetsForSession('sess-stale')).map((a) => a.id), [up.asset.id])
+    await updateProjectAsset(USER, v2.asset.id, { pinned: true })
+    const ids = (await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id).sort()
+    assert.deepEqual(ids, [up.asset.id, v2.asset.id].sort())
   })
 })

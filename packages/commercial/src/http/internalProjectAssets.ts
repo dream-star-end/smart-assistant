@@ -20,7 +20,9 @@
  * digest must be 64 lowercase hex and the url must be the media URL of that
  * same digest, otherwise the whole batch is rejected (a row must never point
  * at bytes other than the ones it claims). Older containers send neither and
- * are registered by source path exactly as before.
+ * are registered by source path exactly as before. `capturedAt` (optional,
+ * finite ms) is the source mtime of the copied bytes; the backend uses it to
+ * recognise a resent old registration instead of minting a fake new version.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -107,6 +109,7 @@ interface ParsedItem {
   size?: number;
   digest?: string;
   url?: string;
+  capturedAt?: number;
 }
 
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -134,12 +137,16 @@ function parseItems(raw: unknown): ParsedItem[] | null {
     if (typeof e.name !== "string" || !e.name.trim()) return null;
     const copy = parseVersionCopy(e);
     if (copy === null) return null;
+    // Source mtime (ms) of the copied bytes; tells a spool replay from a real rewrite.
+    if (e.capturedAt !== undefined && e.capturedAt !== null
+      && (typeof e.capturedAt !== "number" || !Number.isFinite(e.capturedAt) || e.capturedAt < 0)) return null;
     out.push({
       containerPath,
       name: e.name,
       ...(typeof e.mime === "string" ? { mime: e.mime } : {}),
       ...(typeof e.size === "number" && Number.isFinite(e.size) ? { size: e.size } : {}),
       ...(copy ?? {}),
+      ...(typeof e.capturedAt === "number" ? { capturedAt: e.capturedAt } : {}),
     });
   }
   return out;
@@ -221,6 +228,7 @@ export function makeInternalProjectAssetsHandler(
         ...(item.mime ? { mime: item.mime } : {}),
         ...(item.size !== undefined ? { size: item.size } : {}),
         ...(item.digest && item.url ? { digest: item.digest, url: item.url } : {}),
+        ...(item.capturedAt !== undefined ? { capturedAt: item.capturedAt } : {}),
       };
       let result = await create(userId, projectIdPresent ? { ...input, projectId: frozenProjectId } : input);
       if (!result.ok && result.error === "project_not_found" && projectIdPresent && frozenProjectId) {

@@ -81,6 +81,28 @@ describe('project_assets PG/SQLite 契约对齐', () => {
     assert.match(backendSrc, /GREATEST\(\$\{CLOCK_MS_SQL\}, \$14::bigint\)/)
   })
 
+  test('重放识别:两侧都只在 capturedAt 不晚于最新版本时复用旧版本', () => {
+    assert.match(sqliteSrc, /capturedAt !== null && capturedAt <= latest\.createdAt/)
+    assert.match(backendSrc, /capturedAt !== null && capturedAt <= latest\.createdAt/)
+    assert.match(sqliteSrc, /parsed\.value\.capturedAt,\n    \)/)
+    assert.match(backendSrc, /parsed\.value\.capturedAt,\n        \)/)
+  })
+
+  test('常用只挂最新版本:两侧继承+取消旧版本,注入查询只认最新版本', () => {
+    assert.match(sqliteSrc, /pinned = pinned \|\| latest\.pinned/)
+    assert.match(backendSrc, /pinned = pinned \|\| latest\.pinned/)
+    assert.match(sqliteSrc, /UPDATE project_assets SET pinned = 0[\s\S]{0,200}container_path = \? AND pinned = 1/)
+    assert.match(backendSrc, /UPDATE project_assets SET pinned = FALSE[\s\S]{0,260}container_path = \$3 AND pinned IS TRUE/)
+    assert.equal(sqliteSrc.split('AND ${SQLITE_ASSET_IS_LATEST_VERSION}').length - 1, 2)
+    assert.equal(backendSrc.split('AND ${PG_ASSET_IS_LATEST_VERSION}').length - 1, 2)
+    for (const [name, src] of [
+      ['listPinnedProjectAssetsForChatProject', extractMethod(backendSrc, 'listPinnedProjectAssetsForChatProject', 'searchClientSessions')],
+      ['listPinnedProjectAssetsForSession', extractMethod(backendSrc, 'listPinnedProjectAssetsForSession', 'bumpClientSessionHistoryRevision')],
+    ] as const) {
+      assert.ok(src.includes('PG_ASSET_IS_LATEST_VERSION'), `${name} 必须只认最新版本`)
+    }
+  })
+
   test('PG create 在去重之前取锁(并发的两个新版本不会互相看不见)', () => {
     const createSrc = extractMethod(backendSrc, 'createProjectAsset', 'updateProjectAsset')
     const lockAt = createSrc.indexOf('pg_advisory_xact_lock')

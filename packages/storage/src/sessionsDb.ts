@@ -2253,6 +2253,7 @@ export type ProjectAssetCreateError =
   | 'invalid_mime'
   | 'invalid_size'
   | 'invalid_session'
+  | 'invalid_captured_at'
   | 'project_not_found'
 export type ProjectAssetUpdateError =
   | 'not_found'
@@ -2298,6 +2299,11 @@ export type ProjectAssetCreateInput = {
   digest?: unknown
   excerpt?: unknown
   pinned?: unknown
+  /**
+   * 产出物:容器读到这份字节时源文件的 mtime(ms)。只用来认出重放的旧登记,
+   * 不落库。缺省(旧容器 / 恢复 / 回填工具)= 只和最新版本比。
+   */
+  capturedAt?: unknown
 }
 
 export type ProjectAssetUpdateInput = {
@@ -2319,6 +2325,7 @@ export type ParsedProjectAssetCreate = {
   digest: string | null
   excerpt: string | null
   pinned: boolean
+  capturedAt: number | null
 }
 
 export type ClientSessionMetaPatch = {
@@ -2738,6 +2745,8 @@ export function parseProjectAssetCreateInput(
   if ('invalid' in size) return { ok: false, error: 'invalid_size' }
   const sessionId = parseProjectAssetSessionId(input.sessionId)
   if ('invalid' in sessionId) return { ok: false, error: 'invalid_session' }
+  const capturedAt = parseProjectAssetCapturedAt(input.capturedAt)
+  if ('invalid' in capturedAt) return { ok: false, error: 'invalid_captured_at' }
   let digestValue = digest.present ? digest.value : null
   if (!digestValue && urlValue) digestValue = digestFromProjectAssetUrl(urlValue)
   return {
@@ -2755,8 +2764,17 @@ export function parseProjectAssetCreateInput(
       digest: digestValue,
       excerpt: parseProjectAssetExcerpt(input.excerpt),
       pinned: input.pinned === true,
+      capturedAt: capturedAt.present ? capturedAt.value : null,
     },
   }
+}
+
+export function parseProjectAssetCapturedAt(
+  value: unknown,
+): { present: false } | { present: true; value: number } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return { invalid: true }
+  return { present: true, value }
 }
 
 export function mapClientSessionLastOutcome(raw: unknown): ClientSessionLastOutcome | null {
@@ -6613,6 +6631,7 @@ async function _sqliteListPinnedProjectAssetsForChatProject(
   const rows = db.prepare(
     `${PROJECT_ASSET_SELECT}
       WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+        AND ${SQLITE_ASSET_IS_LATEST_VERSION}
       ORDER BY created_at DESC
       LIMIT ?`,
   ).all(userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]
@@ -6642,6 +6661,19 @@ const PROJECT_ASSET_SELECT = `
          size_bytes, digest, excerpt, pinned, created_at, updated_at
     FROM project_assets
 `
+
+/**
+ * 「是该源路径的最新版本」(上传与无源路径的行恒为真)。注入常用资产时只认最新版本,
+ * 旧数据里残留的旧版本 pinned 不会被注入。顺序与 list 的 created_at DESC, id DESC 一致。
+ */
+const SQLITE_ASSET_IS_LATEST_VERSION = `NOT EXISTS (
+  SELECT 1 FROM project_assets newer
+   WHERE project_assets.source = 'output' AND project_assets.container_path IS NOT NULL
+     AND newer.user_id = project_assets.user_id AND newer.deleted_at IS NULL
+     AND newer.source = 'output' AND newer.project_id IS project_assets.project_id
+     AND newer.container_path = project_assets.container_path
+     AND (newer.created_at > project_assets.created_at
+          OR (newer.created_at = project_assets.created_at AND newer.id > project_assets.id)))`
 
 /** list 折叠版本用的分组键;SQLite / PG 同一表达式。 */
 export const PROJECT_ASSET_VERSION_GROUP_SQL =
@@ -6722,9 +6754,12 @@ function _sqliteLatestOutputVersion(
 
 /**
  * 去重规则(PG 侧 pgFindDuplicateAsset 同构):
- *   - 带字节副本的产出(output + containerPath + digest):只与该源路径的**最新**版本比。
+ *   - 带字节副本的产出(output + containerPath + digest):先与该源路径的**最新**版本比。
  *     digest 相同 = 同一版本(返回它);不同 = 新版本(返回 null,由调用方插入)。
  *     A→B→A 会得到第三个版本,「恢复旧版本」也是同一条路:用旧 digest 再登记一次。
+ *     例外是重放:登记带 capturedAt(源文件 mtime),且它不晚于最新版本的 created_at,
+ *     而这个 digest 已是某个旧版本 —— 那是早先那次登记的重发(响应丢了、队列补发),
+ *     返回那个旧版本,不出新版本。真的又写回 A 时 mtime 晚于最新版本,照常出新版本。
  *   - 其它(上传、旧容器只报路径的产出):同 (user, project, source, digest),
  *     digest 空则同 container_path,与以前一致。
  */
@@ -6735,10 +6770,23 @@ function _sqliteFindDuplicateAsset(
   source: ProjectAssetSource,
   digest: string | null,
   containerPath: string | null,
+  capturedAt: number | null,
 ): ProjectAsset | null {
   if (source === 'output' && containerPath && digest) {
     const latest = _sqliteLatestOutputVersion(db, userId, projectId, containerPath)
-    return latest && latest.digest === digest ? latest : null
+    if (!latest) return null
+    if (latest.digest === digest) return latest
+    if (capturedAt !== null && capturedAt <= latest.createdAt) {
+      const row = db.prepare(
+        `${PROJECT_ASSET_SELECT}
+          WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ?
+            AND container_path = ? AND digest = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1`,
+      ).get(userId, projectId, containerPath, digest) as ProjectAssetDbRow | undefined
+      if (row) return _mapProjectAssetRow(row)
+    }
+    return null
   }
   if (digest) {
     const row = db.prepare(
@@ -6867,16 +6915,27 @@ async function _sqliteCreateProjectAsset(
       parsed.value.source,
       parsed.value.digest,
       parsed.value.containerPath,
+      parsed.value.capturedAt,
     )
     if (dup) return { ok: true, asset: dup, created: false }
     if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
       return { ok: false, error: 'limit_exceeded' }
     }
     // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+    // 「常用」只挂在最新版本上:新版本(登记或恢复)继承上一版的 pinned,旧版本一律取消。
     let createdAt = now
+    let pinned = parsed.value.pinned
     if (parsed.value.source === 'output' && parsed.value.containerPath) {
       const latest = _sqliteLatestOutputVersion(db, userId, projectId, parsed.value.containerPath)
-      if (latest) createdAt = Math.max(now, latest.createdAt + 1)
+      if (latest) {
+        createdAt = Math.max(now, latest.createdAt + 1)
+        pinned = pinned || latest.pinned
+        db.prepare(
+          `UPDATE project_assets SET pinned = 0, updated_at = MAX(updated_at + 1, ?)
+            WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ?
+              AND container_path = ? AND pinned = 1`,
+        ).run(now, userId, projectId, parsed.value.containerPath)
+      }
     }
     // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
     db.prepare(`
@@ -6897,7 +6956,7 @@ async function _sqliteCreateProjectAsset(
       parsed.value.sizeBytes,
       parsed.value.digest,
       parsed.value.excerpt,
-      parsed.value.pinned ? 1 : 0,
+      pinned ? 1 : 0,
       createdAt,
       createdAt,
     )
@@ -6986,6 +7045,7 @@ async function _sqliteListPinnedProjectAssetsForSession(sessionId: string): Prom
   const rows = db.prepare(
     `${PROJECT_ASSET_SELECT}
       WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+        AND ${SQLITE_ASSET_IS_LATEST_VERSION}
       ORDER BY created_at DESC
       LIMIT ?`,
   ).all(sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]

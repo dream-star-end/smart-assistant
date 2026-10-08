@@ -245,4 +245,29 @@ describe("internal project-assets", () => {
     }
     assert.equal(h.calls.length, 0);
   });
+
+  test("capturedAt is passed through when valid and rejects the batch when not", async () => {
+    const h = harness();
+    const ok = res();
+    await h.handler(
+      req({
+        authorization: auth,
+        body: { sessionId: "s-1", items: [{ containerPath: OUT, name: "report.md", digest: D1, url: `/api/media/${D1}.md`, capturedAt: 1_700_000_000_123.5 }] },
+      }),
+      ok,
+      ctx,
+    );
+    assert.equal(ok.statusCode, 200);
+    assert.equal(h.calls[0]?.input.capturedAt, 1_700_000_000_123.5);
+    for (const capturedAt of ["123", -1, true, {}]) {
+      const r = res();
+      await h.handler(
+        req({ authorization: auth, body: { sessionId: "s-1", items: [{ containerPath: OUT, name: "report.md", capturedAt }] } }),
+        r,
+        ctx,
+      );
+      assert.equal(r.statusCode, 400, JSON.stringify(capturedAt));
+    }
+    assert.equal(h.calls.length, 1);
+  });
 });
