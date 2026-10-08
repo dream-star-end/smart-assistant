@@ -241,3 +241,22 @@ describe("ChatHeader compact navigation", () => {
     expect(row).not.toHaveClass("rounded-xl");
   });
 });
+
+describe("ChatHeader 未分类会话的项目建议", () => {
+  it("显示建议；移入与不用各自回调；已在项目里时显示所在项目而不是建议", () => {
+    const onAccept = vi.fn();
+    const onDismiss = vi.fn();
+    renderHeader({ projectSuggestion: { name: "论文综述", onAccept, onDismiss } });
+    fireEvent.click(screen.getByRole("button", { name: "移入项目「论文综述」" }));
+    fireEvent.click(screen.getByRole("button", { name: "不用移入" }));
+    expect(onAccept).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    cleanup();
+    renderHeader({
+      projectBreadcrumb: { chatName: "别的项目" },
+      projectSuggestion: { name: "论文综述", onAccept, onDismiss },
+    });
+    expect(screen.queryByTestId("chat-project-suggestion")).toBeNull();
+    expect(screen.getByTestId("chat-project-breadcrumb")).toHaveTextContent("别的项目");
+  });
+});

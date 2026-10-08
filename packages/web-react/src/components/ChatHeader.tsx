@@ -73,6 +73,7 @@ export function ChatHeader({
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
+  projectSuggestion,
   onOpenProjectScope,
 }: {
   agent: Agent;
@@ -128,6 +129,8 @@ export function ChatHeader({
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
   sessionUnreadCount?: number;
   projectBreadcrumb?: { chatName?: string | null; workName?: string | null } | null;
+  /** 未分类会话的项目建议（P5，开关控制）。只提示，移入由用户点。 */
+  projectSuggestion?: { name: string; onAccept: () => void; onDismiss: () => void } | null;
   onOpenProjectScope?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
@@ -220,6 +223,30 @@ export function ChatHeader({
           <FolderOpen size={13} aria-hidden className="shrink-0" />
           <span className="truncate">{projectBreadcrumb.chatName}</span>
         </button>
+      ) : projectSuggestion ? (
+        <span
+          data-testid="chat-project-suggestion"
+          className="inline-flex min-w-0 max-w-[11rem] shrink items-center gap-0.5 rounded-lg border border-dashed border-border text-caption text-muted sm:max-w-[18rem]"
+        >
+          <button
+            type="button"
+            onClick={projectSuggestion.onAccept}
+            aria-label={`移入项目「${projectSuggestion.name}」`}
+            title={`这个会话可能属于「${projectSuggestion.name}」，点一下移入`}
+            className="inline-flex min-h-11 min-w-0 items-center gap-1 rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:py-1"
+          >
+            <FolderOpen size={13} aria-hidden className="shrink-0" />
+            <span className="truncate">移入「{projectSuggestion.name}」?</span>
+          </button>
+          <button
+            type="button"
+            onClick={projectSuggestion.onDismiss}
+            aria-label="不用移入"
+            className="inline-flex min-h-11 shrink-0 items-center rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:py-1"
+          >
+            不用
+          </button>
+        </span>
       ) : null}
       {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (
         <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">

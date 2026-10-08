@@ -211,6 +211,7 @@ import {
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
 import { useServerFeatures } from "./hooks/useServerFeatures";
+import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
 import { projectChipsBoardId } from "./lib/projectChips";
 import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 
@@ -840,6 +841,10 @@ export function App() {
 
   // 服务端功能开关（GET /api/features；读不到 = 全关，demo 不读）。
   const serverFeatures = useServerFeatures(demo ? null : auth, demo);
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    setDismissedSuggestions(user?.id ? readDismissedSuggestions(user.id) : new Set());
+  }, [user?.id]);
   // 当前会话所属项目的看板：P5b 两个入口只在会话属于有看板的项目时出现。
   const activeProjectId = activeId ? sessions.find((s) => s.id === activeId)?.projectId : undefined;
   const activeChatProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) : undefined;
@@ -3910,6 +3915,23 @@ export function App() {
             if (!pid) return null;
             const chat = projects.find((p) => p.id === pid);
             return chat ? { chatName: chat.name } : null;
+          })()}
+          projectSuggestion={(() => {
+            if (!serverFeatures.unfiledSuggest || !user?.id || !activeId) return null;
+            const active = sessions.find((s) => s.id === activeId);
+            if (!active || active.projectId || active.archived || dismissedSuggestions.has(active.id)) return null;
+            const hit = suggestProjectForChat(active, sessions, projects);
+            const target = hit ? projects.find((p) => p.id === hit.projectId) : undefined;
+            if (!target) return null;
+            const uid = user.id;
+            return {
+              name: target.name,
+              onAccept: () => moveSessionToProject(active, target.id),
+              onDismiss: () => {
+                dismissSuggestion(uid, active.id);
+                setDismissedSuggestions((cur) => new Set(cur).add(active.id));
+              },
+            };
           })()}
           onOpenProjectScope={() => {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
