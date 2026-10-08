@@ -5,8 +5,15 @@
  *
  * A failed master read is never treated as "this chat has no project": that
  * used to drop the binding, the instructions and the project cwd silently.
- * The read is retried once; if it still fails and the session is (or may be)
- * in a project, the result carries `unavailable` and the turn is held.
+ * The read is retried once; if it still fails the result carries
+ * `unavailable` and server.ts holds the turn before dispatch. A failed read
+ * says nothing about membership, and a chat can be moved into a project at
+ * any time, so no earlier "not in a project" answer can stand in for it.
+ *
+ * The prompt builder reads again when a runner spawns. Every turn passes the
+ * server's read first and is held if that read fails, so a spawn always has
+ * a successful read from its own turn: `reuseLastOnFailure` falls back to it
+ * instead of building a prompt without the project.
  */
 import {
   getChatProjectBindByBoardProjectId,
@@ -26,9 +33,9 @@ const ENV_MASTER_URL = 'OPENCLAUDE_V3_MASTER_BASE_URL'
 const ENV_CONTAINER_TOKEN = 'OPENCLAUDE_V3_CONTAINER_TOKEN'
 const FETCH_TIMEOUT_MS = 5_000
 const FETCH_ATTEMPTS = 2
-/** Session → last known chat-project membership, from successful master reads. */
-const MEMBERSHIP_CACHE_MAX = 2_000
-const membershipCache = new Map<string, { inProject: boolean }>()
+/** Session → latest successful session-scoped resolution (for reuseLastOnFailure). */
+const LAST_RESOLVED_MAX = 2_000
+const lastResolved = new Map<string, ResolvedTurnProjectContext>()
 
 export type ProjectContextUnavailableReason = 'timeout' | 'http_error' | 'network' | 'bad_response'
 
@@ -50,6 +57,8 @@ export interface ResolveTurnProjectContextOpts {
   env?: NodeJS.ProcessEnv
   fetcher?: typeof undiciRequest
   timeoutMs?: number
+  /** Prompt building only: on a failed read, use this session's latest successful resolution. */
+  reuseLastOnFailure?: boolean
 }
 
 interface MasterBody {
@@ -106,18 +115,19 @@ async function fetchMaster(query: string, opts: ResolveTurnProjectContextOpts): 
   return last
 }
 
-function rememberMembership(sessionId: string, inProject: boolean): void {
-  membershipCache.delete(sessionId)
-  membershipCache.set(sessionId, { inProject })
-  if (membershipCache.size > MEMBERSHIP_CACHE_MAX) {
-    const oldest = membershipCache.keys().next().value
-    if (oldest !== undefined) membershipCache.delete(oldest)
+function rememberResolved(sessionId: string, value: ResolvedTurnProjectContext): ResolvedTurnProjectContext {
+  lastResolved.delete(sessionId)
+  lastResolved.set(sessionId, value)
+  if (lastResolved.size > LAST_RESOLVED_MAX) {
+    const oldest = lastResolved.keys().next().value
+    if (oldest !== undefined) lastResolved.delete(oldest)
   }
+  return value
 }
 
 /** Test seam. */
-export function _resetProjectMembershipCacheForTest(): void {
-  membershipCache.clear()
+export function _resetProjectContextCacheForTest(): void {
+  lastResolved.clear()
 }
 
 async function hydrateBound(
@@ -182,10 +192,9 @@ export async function resolveTurnProjectContext(
     if (sessionId) {
       const read = await fetchMaster(`sessionId=${encodeURIComponent(sessionId)}`, opts)
       if (read && !read.ok) {
-        // Only a session we have seen outside every project may run on: for
-        // it the old empty result was correct. A project session, or one we
-        // know nothing about yet, must not silently lose its project.
-        const empty: ResolvedTurnProjectContext = {
+        const last = opts.reuseLastOnFailure ? lastResolved.get(sessionId) : undefined
+        if (last) return last
+        return {
           boardProjectId: null,
           chatProjectId: null,
           name: null,
@@ -193,16 +202,14 @@ export async function resolveTurnProjectContext(
           assets: [],
           assetsRevision: 0,
           bound: false,
+          unavailable: read.reason,
         }
-        if (membershipCache.get(sessionId)?.inProject === false) return empty
-        return { ...empty, unavailable: read.reason }
       }
       const remote = read?.ok ? read.body : null
-      rememberMembership(sessionId, Boolean(remote?.chatProjectId || remote?.boardProjectId))
       const boundId = remote?.boardProjectId ? parseBoardProjectId(remote.boardProjectId) : { present: false as const }
       const id = 'present' in boundId && boundId.present ? boundId.value : null
-      if (id) return hydrateBound(id, remote)
-      return {
+      if (id) return rememberResolved(sessionId, await hydrateBound(id, remote))
+      return rememberResolved(sessionId, {
         boardProjectId: null,
         chatProjectId: remote?.chatProjectId ?? null,
         name: remote?.name ?? null,
@@ -210,7 +217,7 @@ export async function resolveTurnProjectContext(
         assets: remote?.pinnedAssets ?? [],
         assetsRevision: Number(remote?.assetsRevision) || 0,
         bound: false,
-      }
+      })
     }
     return null
   }

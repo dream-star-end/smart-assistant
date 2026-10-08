@@ -10,7 +10,7 @@ import { beforeEach, describe, it } from 'node:test'
 
 process.env.OPENCLAUDE_HOME = await mkdtemp(join(tmpdir(), 'oc-projctx-rt-'))
 
-const { _resetProjectMembershipCacheForTest, resolveTurnProjectContext } = await import(
+const { _resetProjectContextCacheForTest, resolveTurnProjectContext } = await import(
   '../projectContextRuntime.js'
 )
 const { resolveChatRunWorkspace } = await import('../projectWorkspace.js')
@@ -55,7 +55,7 @@ const UNBOUND_BODY = {
 const PROJECT_BODY = { ...UNBOUND_BODY, chatProjectId: 'proj-1', name: '论文综述', instructions: '用学术中文' }
 
 describe('project context read failure', () => {
-  beforeEach(() => _resetProjectMembershipCacheForTest())
+  beforeEach(() => _resetProjectContextCacheForTest())
 
   it('retries once and uses the second answer', async () => {
     const { fetcher, calls } = fetcherFrom([{ status: 502, body: 'bad gateway' }, { status: 200, body: PROJECT_BODY }])
@@ -81,14 +81,31 @@ describe('project context read failure', () => {
     assert.equal(got?.unavailable, 'timeout')
   })
 
-  it('a session known to be outside every project keeps running as before', async () => {
+  it('a session seen outside every project is still held: it may have been moved into one', async () => {
     const ok = fetcherFrom([{ status: 200, body: UNBOUND_BODY }])
     const before = await resolveTurnProjectContext({ sessionId: 's-plain', env: ENV, fetcher: ok.fetcher })
     assert.equal(before?.bound, false)
+    assert.equal(before?.unavailable, undefined)
+    // The user now moves the chat into a project; the next read fails.
     const down = fetcherFrom([{ status: 500, body: '' }, { status: 500, body: '' }])
     const after = await resolveTurnProjectContext({ sessionId: 's-plain', env: ENV, fetcher: down.fetcher })
-    assert.deepEqual(after, before)
-    assert.equal(after?.unavailable, undefined)
+    assert.equal(after?.unavailable, 'http_error')
+  })
+
+  it('a spawn-time read that fails builds from the turn-start read, not without the project', async () => {
+    const ok = fetcherFrom([{ status: 200, body: PROJECT_BODY }])
+    await resolveTurnProjectContext({ sessionId: 's-spawn', env: ENV, fetcher: ok.fetcher })
+    const down = fetcherFrom(['network', 'network'])
+    const spawn = await resolveTurnProjectContext({
+      sessionId: 's-spawn', env: ENV, fetcher: down.fetcher, reuseLastOnFailure: true,
+    })
+    assert.equal(spawn?.unavailable, undefined)
+    assert.equal(spawn?.instructions, '用学术中文')
+    assert.equal(spawn?.chatProjectId, 'proj-1')
+    // The turn-start read itself never reuses: it must see the failure.
+    const down2 = fetcherFrom(['network', 'network'])
+    const turnStart = await resolveTurnProjectContext({ sessionId: 's-spawn', env: ENV, fetcher: down2.fetcher })
+    assert.equal(turnStart?.unavailable, 'network')
   })
 
   it('a malformed body counts as a failure, not as "no project"', async () => {

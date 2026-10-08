@@ -1541,6 +1541,9 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     resolved = await resolveTurnProjectContext({
       sessionId: ctx.sessionId,
       boardProjectId: ctx.projectId,
+      // The turn already passed server.ts's read (or was held there); if this
+      // spawn-time read fails, build from that read rather than without the project.
+      reuseLastOnFailure: true,
     })
   }
   if (resolved !== undefined) {
