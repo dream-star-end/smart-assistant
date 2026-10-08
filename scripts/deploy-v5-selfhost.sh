@@ -880,6 +880,12 @@ OC_REDACT_TOOL_EVENT_PREVIEWS=1
 # Bound project context (PROJECT.md / skill overlay / run snapshots). Commercial
 # production does not set this; gateway keeps the old path when unset.
 OC_PROJECT_CONTEXT=1
+# Project smart assist (OCV5-354), one flag each; the master forwards them into
+# user containers. OC_P5_UNFILED_SUGGEST stays unset: its precision on the
+# operator's real unfiled chats was below the bar (evidence in OCV5-354).
+OC_P5_PROJECT_SEARCH=1
+OC_P5_CHIPS=1
+OC_P5_RECIPE_SCHEDULE=1
 # Claude Code external HTTPS transport:keep internal http://172.31.0.1:18892
 # on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
 OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
@@ -980,6 +986,9 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_LOCAL_USAGE_RETENTION_DAYS 365
   ensure_env_kv "$V5_ENV" OC_REDACT_TOOL_EVENT_PREVIEWS 1
   ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
+  ensure_env_kv "$V5_ENV" OC_P5_PROJECT_SEARCH 1
+  ensure_env_kv "$V5_ENV" OC_P5_CHIPS 1
+  ensure_env_kv "$V5_ENV" OC_P5_RECIPE_SCHEDULE 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
   ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
