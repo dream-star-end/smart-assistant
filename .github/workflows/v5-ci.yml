@@ -25,11 +25,11 @@ jobs:
   # 再抢 runner。sentinel 失败会 skip 二梯队——它们本就不挡合并。
   # 不给 required 6 job 互加 needs;不改既有 job 名与 npm 命令(保 parity /
   # branch protection 上下文名)。
-  # 合并后 push 去重(2026-10-08):push 的 commit 与某个父提交 tree 逐字节相同、且该父提交的
-  # pull_request 运行已全绿 → 下面所有 job 跳过(同一棵 tree 已完整跑过)。tree 不同(base 前进,
-  # 即 strict=false 下 push CI 要抓的语义冲突)一律全量跑;判定脚本任何查询失败也全量跑。
+  # 合并后 push 去重(2026-10-08):push 的 commit 的 tree 已被某次全绿 pull_request 运行原样测过
+  # (该运行 tested-tree 产物记录的被测 tree 与之逐字节相同)→ 下面所有 job 跳过。tree 不同(base
+  # 前进,即 strict=false 下 push CI 要抓的语义冲突)、产物缺失或任何查询失败 → 全量跑。
   # 只在 push 上跑;pull_request 上本 job 为 skipped,不占 runner、不加延迟。
-  # 发布门不依赖本结论:deploy-v5.sh 的 CI 绿门自己按 same-tree 规则核对父提交的 required check。
+  # 发布门不依赖本结论:deploy-v5.sh 的 CI 绿门不把 skipped 当绿,自己按 same-tree 规则核对父提交。
   same-tree:
     name: same-tree-evidence
     if: github.event_name == 'push'
@@ -52,6 +52,37 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: bash .github/scripts/ci-same-tree-evidence.sh '${{ github.sha }}'
+
+  # PR 运行记下自己真正测的那棵 tree(checkout 的是 refs/pull/N/merge,不是 PR head),合并后 push
+  # 的 same-tree 用它逐字节比对:只有「被测 tree == 合并结果 tree」才允许跳过 push CI。
+  # 不被任何 job needs,不加 PR 延迟;失败只会让本次 PR 运行变红(与其它 job 一样)。
+  tested-tree:
+    name: tested-tree
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Record tested tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ci-tested-tree
+          git rev-parse 'HEAD^{tree}' > /tmp/ci-tested-tree/tree
+          git rev-parse HEAD > /tmp/ci-tested-tree/commit
+          cat /tmp/ci-tested-tree/tree
+
+      - name: Upload tested tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-tested-tree
+          path: /tmp/ci-tested-tree
+          if-no-files-found: error
+          retention-days: 30
 
   ci-queue-sentinel:
     name: ci-queue-sentinel

@@ -19,7 +19,8 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 
 | Job | CI 命令 | 证明的用户可见事实 | timeout |
 | --- | --- | --- | --- |
-| same-tree | `bash .github/scripts/ci-same-tree-evidence.sh <sha>`(仅 push) | 合并后 push 去重:push commit 与某父提交 tree 逐字节相同且该父提交 pull_request 运行全绿 → 其余 job 全部跳过;tree 不同或查询失败 → 全量跑。PR 上为 skipped | 3 min |
+| tested-tree | `git rev-parse HEAD^{tree}` → 产物 `ci-tested-tree`(仅 pull_request) | 记下本次 PR 运行真正测的 tree(refs/pull/N/merge),供合并后 push 的 same-tree 逐字节比对;不被任何 job needs | 3 min |
+| same-tree | `bash .github/scripts/ci-same-tree-evidence.sh <sha>`(仅 push) | 合并后 push 去重:push commit 的 tree 已被某次全绿 pull_request 运行原样测过(其 ci-tested-tree 产物逐字节相同)→ 其余 job 全部跳过;tree 不同、产物缺失或查询失败 → 全量跑;deploy 绿门不把 skipped 当绿。PR 上为 skipped | 3 min |
 | ci-queue-sentinel | `(none; scheduling gate)` | 秒级调度闸:先让第一梯队(含 required 6 job)抢 runner,再放行 integ/browser | 2 min |
 | typecheck | `npm run typecheck && npm run check:ci-parity` | 全仓类型闭合;CI 门集合 ≡ `check:v5` 门集合(见下「CI parity 门」) | 20 min |
 | lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合;禁止静默 test retry | 10 min |

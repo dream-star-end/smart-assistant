@@ -3360,7 +3360,10 @@ assert_ci_green_for_source_commit() { # <full sha>
           in_progress|queued|waiting) pending="$pending $ctx(status=$status)" ;;
           *) bad="$bad $ctx(status=$status)" ;;
         esac
-      elif [[ ! "$conclusion" =~ ^(success|skipped|neutral)$ ]]; then
+      # skipped 不算绿:v5-ci.yml 在合并后 push 上会按 same-tree 证据跳过全部 job(2026-10-08),
+      # 被构建 commit 上的 required check 因此可能是 skipped。那不是这次 commit 自己的绿证据 ——
+      # 走下方 same-tree 复用,由本门自己核对父提交的 tree 与 required check。
+      elif [[ ! "$conclusion" =~ ^(success|neutral)$ ]]; then
         bad="$bad $ctx(conclusion=$conclusion)"
       fi
     done <<<"$required"

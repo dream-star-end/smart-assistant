@@ -13,16 +13,27 @@ const P2 = 'c'.repeat(40)
 const TREE = '1'.repeat(40)
 const OTHER = '2'.repeat(40)
 
-// 假 gh:按 URL 返回 fixture JSON;--jq 交给真 jq。FAKE_GH_FAIL=1 → 一律失败。
-function fixture(responses: Record<string, unknown>, extraEnv: Record<string, string> = {}) {
+// 假 gh:`gh api <url> [--jq expr]` 按 URL 返回 fixture JSON(--jq 交给真 jq);
+// `gh run download <id> -R r -n ci-tested-tree -D dir` 按 artifacts[id] 写 dir/tree。FAKE_GH_FAIL=1 → 一律失败。
+function fixture(responses: Record<string, unknown>, artifacts: Record<string, string> = {}, extraEnv: Record<string, string> = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'same-tree-'))
   const bin = path.join(dir, 'bin')
   spawnSync('mkdir', ['-p', bin])
   writeFileSync(path.join(dir, 'responses.json'), JSON.stringify(responses))
+  writeFileSync(path.join(dir, 'artifacts.json'), JSON.stringify(artifacts))
   writeFileSync(
     path.join(bin, 'gh'),
     `#!/usr/bin/env bash
 [[ "\${FAKE_GH_FAIL:-0}" == 1 ]] && exit 1
+if [[ "$1" == run && "$2" == download ]]; then
+  rid="$3"; dest=""; name=""
+  shift 3
+  while [[ $# -gt 0 ]]; do case "$1" in -D) dest="$2"; shift 2;; -n) name="$2"; shift 2;; *) shift;; esac; done
+  [[ "$name" == ci-tested-tree ]] || exit 1
+  tree="$(jq -r --arg r "$rid" '.[$r] // empty' "${dir}/artifacts.json")"
+  [[ -n "$tree" ]] || exit 1
+  mkdir -p "$dest"; printf '%s\\n' "$tree" > "$dest/tree"; exit 0
+fi
 url="$2"; jqexpr=""
 [[ "\${3:-}" == "--jq" ]] && jqexpr="$4"
 body="$(jq -c --arg u "$url" '.[$u] // empty' "${dir}/responses.json")"
@@ -44,32 +55,56 @@ if [[ -n "$jqexpr" ]]; then jq -r "$jqexpr" <<<"$body"; else printf '%s\\n' "$bo
 const runs = (head: string, list: Array<{ status: string; conclusion: string | null; created_at: string; id: number }>) => ({
   [`repos/o/r/actions/workflows/v5-ci.yml/runs?head_sha=${head}&event=pull_request&per_page=50`]: { workflow_runs: list },
 })
+const mergeOf = (parents: string[], trees: Record<string, string>) => ({
+  [`repos/o/r/git/commits/${SHA}`]: { tree: { sha: TREE }, parents: parents.map((sha) => ({ sha })) },
+  ...Object.fromEntries(Object.entries(trees).map(([sha, tree]) => [`repos/o/r/git/commits/${sha}`, { tree: { sha: tree } }])),
+})
 
-test('merge tree == PR head tree and the latest PR run is green → skip=true', () => {
-  const fx = fixture({
-    [`repos/o/r/git/commits/${SHA}`]: { tree: { sha: TREE }, parents: [{ sha: P1 }, { sha: P2 }] },
-    [`repos/o/r/git/commits/${P1}`]: { tree: { sha: OTHER } },
-    [`repos/o/r/git/commits/${P2}`]: { tree: { sha: TREE } },
-    ...runs(P2, [
-      { status: 'completed', conclusion: 'failure', created_at: '2026-10-08T01:00:00Z', id: 1 },
-      { status: 'completed', conclusion: 'success', created_at: '2026-10-08T02:00:00Z', id: 2 },
-    ]),
-  })
+test('PR head has the merge tree, its latest PR run is green, and that run tested exactly this tree → skip=true', () => {
+  const fx = fixture(
+    {
+      ...mergeOf([P1, P2], { [P1]: OTHER, [P2]: TREE }),
+      ...runs(P2, [
+        { status: 'completed', conclusion: 'failure', created_at: '2026-10-08T01:00:00Z', id: 1 },
+        { status: 'completed', conclusion: 'success', created_at: '2026-10-08T02:00:00Z', id: 2 },
+      ]),
+    },
+    { '2': TREE },
+  )
   try {
     const r = fx.run()
     assert.equal(r.status, 0, r.stderr)
-    assert.equal(fx.output(), 'skip=true\n')
+    assert.equal(fx.output(), 'skip=true\n', r.stdout)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('green PR run whose tested merge-preview tree differs (base moved after the run) → skip=false', () => {
+  const fx = fixture(
+    { ...mergeOf([P2], { [P2]: TREE }), ...runs(P2, [{ status: 'completed', conclusion: 'success', created_at: '2026-10-08T02:00:00Z', id: 7 }]) },
+    { '7': OTHER },
+  )
+  try {
+    fx.run()
+    assert.equal(fx.output(), 'skip=false\n')
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('green PR run without a ci-tested-tree artifact (runs from before this mechanism) → skip=false', () => {
+  const fx = fixture({ ...mergeOf([P2], { [P2]: TREE }), ...runs(P2, [{ status: 'completed', conclusion: 'success', created_at: '2026-10-08T02:00:00Z', id: 9 }]) })
+  try {
+    fx.run()
+    assert.equal(fx.output(), 'skip=false\n')
   } finally {
     fx.cleanup()
   }
 })
 
 test('different tree (base moved: the semantic-conflict case push CI exists for) → skip=false', () => {
-  const fx = fixture({
-    [`repos/o/r/git/commits/${SHA}`]: { tree: { sha: TREE }, parents: [{ sha: P1 }, { sha: P2 }] },
-    [`repos/o/r/git/commits/${P1}`]: { tree: { sha: OTHER } },
-    [`repos/o/r/git/commits/${P2}`]: { tree: { sha: OTHER } },
-  })
+  const fx = fixture({ ...mergeOf([P1, P2], { [P1]: OTHER, [P2]: OTHER }) })
   try {
     fx.run()
     assert.equal(fx.output(), 'skip=false\n')
@@ -84,14 +119,16 @@ test('same tree but the LATEST PR run is red, cancelled or still running → ski
     { status: 'completed', conclusion: 'cancelled' },
     { status: 'in_progress', conclusion: null },
   ]) {
-    const fx = fixture({
-      [`repos/o/r/git/commits/${SHA}`]: { tree: { sha: TREE }, parents: [{ sha: P2 }] },
-      [`repos/o/r/git/commits/${P2}`]: { tree: { sha: TREE } },
-      ...runs(P2, [
-        { status: 'completed', conclusion: 'success', created_at: '2026-10-08T01:00:00Z', id: 1 },
-        { ...latest, created_at: '2026-10-08T02:00:00Z', id: 2 },
-      ]),
-    })
+    const fx = fixture(
+      {
+        ...mergeOf([P2], { [P2]: TREE }),
+        ...runs(P2, [
+          { status: 'completed', conclusion: 'success', created_at: '2026-10-08T01:00:00Z', id: 1 },
+          { ...latest, created_at: '2026-10-08T02:00:00Z', id: 2 },
+        ]),
+      },
+      { '1': TREE, '2': TREE },
+    )
     try {
       fx.run()
       assert.equal(fx.output(), 'skip=false\n', JSON.stringify(latest))
@@ -102,11 +139,7 @@ test('same tree but the LATEST PR run is red, cancelled or still running → ski
 })
 
 test('same tree but no pull_request run at all (direct push) → skip=false', () => {
-  const fx = fixture({
-    [`repos/o/r/git/commits/${SHA}`]: { tree: { sha: TREE }, parents: [{ sha: P2 }] },
-    [`repos/o/r/git/commits/${P2}`]: { tree: { sha: TREE } },
-    ...runs(P2, []),
-  })
+  const fx = fixture({ ...mergeOf([P2], { [P2]: TREE }), ...runs(P2, []) })
   try {
     fx.run()
     assert.equal(fx.output(), 'skip=false\n')
@@ -116,7 +149,7 @@ test('same tree but no pull_request run at all (direct push) → skip=false', ()
 })
 
 test('any API failure or bad input fails open to a full run (skip=false), never errors the job', () => {
-  const failing = fixture({}, { FAKE_GH_FAIL: '1' })
+  const failing = fixture({}, {}, { FAKE_GH_FAIL: '1' })
   try {
     const r = failing.run()
     assert.equal(r.status, 0)
