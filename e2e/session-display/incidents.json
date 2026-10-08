@@ -6415,6 +6415,25 @@
           "assertion": "T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度"
         }
       ]
+    },
+    {
+      "id": "INC-20261009-UPLOAD-RETRY-ACCOUNT-SWITCH",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "上传遇到 503（容器冷启）退避重试期间若退出并登录另一账号，重试会用新账号的凭据把前一账号选中的文件上传进新账号的空间。代码审查发现，未见线上发生。",
+      "rootFixCommit": "10f10992",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "回归在 unit 层（真实 api.uploadFile + 内存 AuthSession，503 退避中切换身份后不再发出第二次请求；去掉修复即红）。换号时机需要在退避窗口内人工登出登录，个人版没有能编排这一时序的 browser/live-e2e/deploy-gate runner。",
+        "since": "2026-10-09"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "uploadFile never retries under another identity after a 503 backoff"
+        }
+      ]
     }
   ]
 }
