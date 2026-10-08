@@ -663,10 +663,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
     await screen.findAllByRole('menuitem')
-    // 2026-09-05 selfhost: Terra/Luna live in the collapsed "更多 GPT 模型" group.
-    const collapsed = document.querySelector('[data-collapsed-group]')
-    expect(collapsed).toBeTruthy()
-    if (collapsed) fireEvent.click(collapsed)
+    // 573b7c88b (2026-09-22) retired the GPT-5.6 families on selfhost; nothing is collapsed by
+    // default any more, so the fixture's Terra row is directly in the menu.
     const modelTarget = (await screen.findAllByRole('menuitem'))
       .find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     expect(modelTarget).toBeTruthy()
@@ -709,6 +707,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       model: 'gpt-5.6-terra',
       text: '先设目标再执行',
     }))
+    // fc1219307 (INC-20260923-QUEUE-ABOVE-COMPOSER): a prompt the socket has not started yet is
+    // listed above the composer, not in the transcript. jsdom has no live socket, so it waits there.
     if (!navigate) {
       await waitFor(() => expect(screen.getAllByTestId('queued-send-row')).toHaveLength(1))
       expect(screen.getByTestId('queued-send-row').querySelector('p')?.textContent).toBe('先设目标再执行')

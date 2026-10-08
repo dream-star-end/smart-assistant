@@ -19,8 +19,8 @@ describe('PreferencesTab · 对话行为', () => {
   test('默认模型切到 1M 前确认长上下文累计计费风险', async () => {
     vi.spyOn(api, 'getPublicModels').mockResolvedValue({
       models: [
-        { id: 'gpt-5.6-sol', display_name: 'GPT-5.6-Sol' },
-        { id: 'gpt-5.6-sol-1m', display_name: 'GPT-5.6-Sol' },
+        { id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol' },
+        { id: 'gpt-6.1-sol-1m', display_name: 'GPT-6.1-Sol' },
       ],
       lockedModels: [],
     })
@@ -28,7 +28,7 @@ describe('PreferencesTab · 对话行为', () => {
     render(
       <PreferencesTab
         auth={auth}
-        prefs={{ default_model: 'gpt-5.6-sol' }}
+        prefs={{ default_model: 'gpt-6.1-sol' }}
         autoDream={null}
         theme="system"
         onSetTheme={() => {}}
@@ -39,12 +39,12 @@ describe('PreferencesTab · 对话行为', () => {
     )
 
     const select = await screen.findByRole('combobox', { name: '默认模型' })
-    fireEvent.change(select, { target: { value: 'gpt-5.6-sol-1m' } })
+    fireEvent.change(select, { target: { value: 'gpt-6.1-sol-1m' } })
     const dialog = await screen.findByRole('dialog')
     expect(dialog).toHaveTextContent('实际总费用不一定只增加 50%')
     expect(onPatch).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '仍要切换' }))
-    await waitFor(() => expect(onPatch).toHaveBeenCalledWith({ default_model: 'gpt-5.6-sol-1m' }))
+    await waitFor(() => expect(onPatch).toHaveBeenCalledWith({ default_model: 'gpt-6.1-sol-1m' }))
   })
 
   test('不再提供自动继续执行设置', () => {
