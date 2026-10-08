@@ -58,6 +58,7 @@ import {
   TimeAgo,
   useConfirm,
   usePrompt,
+  useToast,
 } from "../ui";
 import {
   OUTPUT_KIND_LABELS,
@@ -914,12 +915,19 @@ function ProjectSurfaceLinks({
   onShowSurface: (surface: ProjectSurface) => void;
 }) {
   const scope = useProjectScope();
+  const toast = useToast();
   const [opening, setOpening] = useState<ProjectSurface | null>(null);
   const open = async (surface: ProjectSurface) => {
     setOpening(surface);
     try {
       if (!(await onPrepareBoard())) return;
-      await scope.refreshWorkProjects();
+      // Only switch scope once the refreshed list really has this board; otherwise the
+      // token would resolve to 全部项目 and the page would show other projects' data.
+      const boards = await scope.refreshWorkProjects();
+      if (!boards.some((b) => b.id === boardProjectId)) {
+        toast("项目看板暂时没有加载出来，请稍后再试", "error");
+        return;
+      }
       scope.setToken(boardProjectId);
       onShowSurface(surface);
     } finally {

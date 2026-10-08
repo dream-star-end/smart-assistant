@@ -16,9 +16,13 @@ export type LifecycleDeps = {
   listCron: (boardProjectId: string) => Promise<Array<{ id: string; enabled?: boolean }>>;
   setCronEnabled: (id: string, enabled: boolean) => Promise<void>;
   setBoardArchived: (boardProjectId: string, archived: boolean) => Promise<void>;
+  /** Whether the board is archived right now (so a rollback restores exactly that). */
+  isBoardArchived: (boardProjectId: string) => Promise<boolean>;
   setProjectArchived: (projectId: string, archived: boolean) => Promise<void>;
   deleteProject: (projectId: string, pausedCronJobIds: string[]) => Promise<void>;
-  restoreProject: (projectId: string) => Promise<{ boardProjectId: string | null; pausedCronJobIds: string[] }>;
+  restoreProject: (
+    projectId: string,
+  ) => Promise<{ boardProjectId: string | null; pausedCronJobIds: string[]; archived: boolean }>;
 };
 
 async function pauseProjectCron(deps: LifecycleDeps, boardProjectId: string): Promise<string[]> {
@@ -53,16 +57,19 @@ async function resumeCron(deps: LifecycleDeps, ids: string[]): Promise<string[]>
 export async function fenceAndDeleteProject(deps: LifecycleDeps, project: LifecycleProject): Promise<void> {
   const board = project.boardProjectId ?? null;
   let paused: string[] = [];
-  let boardArchived = false;
+  let boardArchivedHere = false;
   try {
     if (board) {
       paused = await pauseProjectCron(deps, board);
-      await deps.setBoardArchived(board, true);
-      boardArchived = true;
+      // Only archive (and on failure only reopen) a board this action archived.
+      if (!(await deps.isBoardArchived(board))) {
+        await deps.setBoardArchived(board, true);
+        boardArchivedHere = true;
+      }
     }
     await deps.deleteProject(project.id, paused);
   } catch (err) {
-    if (boardArchived && board) await deps.setBoardArchived(board, false).catch(() => {});
+    if (boardArchivedHere && board) await deps.setBoardArchived(board, false).catch(() => {});
     await resumeCron(deps, paused);
     throw err;
   }
@@ -74,7 +81,10 @@ export async function restoreDeletedProject(
   projectId: string,
 ): Promise<{ cronNotResumed: string[] }> {
   const restored = await deps.restoreProject(projectId);
-  if (restored.boardProjectId) await deps.setBoardArchived(restored.boardProjectId, false).catch(() => {});
+  // A project that was archived before it was deleted comes back archived; its board stays archived too.
+  if (restored.boardProjectId && !restored.archived) {
+    await deps.setBoardArchived(restored.boardProjectId, false).catch(() => {});
+  }
   const cronNotResumed = await resumeCron(deps, restored.pausedCronJobIds);
   return { cronNotResumed };
 }
@@ -91,11 +101,12 @@ export async function setProjectArchivedFenced(
 ): Promise<void> {
   const board = project.boardProjectId ?? null;
   if (archived) {
-    if (board) await deps.setBoardArchived(board, true);
+    const archivedHere = board ? !(await deps.isBoardArchived(board)) : false;
+    if (board && archivedHere) await deps.setBoardArchived(board, true);
     try {
       await deps.setProjectArchived(project.id, true);
     } catch (err) {
-      if (board) await deps.setBoardArchived(board, false).catch(() => {});
+      if (board && archivedHere) await deps.setBoardArchived(board, false).catch(() => {});
       throw err;
     }
     return;

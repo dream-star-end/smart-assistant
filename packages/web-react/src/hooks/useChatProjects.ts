@@ -270,12 +270,20 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         const { taskboardApi } = await import("../lib/taskboard");
         await taskboardApi.patchProject(a, board, { archivedAt: archived ? Date.now() : null });
       },
+      isBoardArchived: async (board) => {
+        const { taskboardApi } = await import("../lib/taskboard");
+        return Boolean((await taskboardApi.getProject(a, board)).archivedAt);
+      },
       setProjectArchived: (id, archived) => api.patchChatProject(a, id, { archived }).then(() => undefined),
       deleteProject: (id, paused) => api.deleteChatProject(a, id, paused),
       restoreProject: async (id) => {
         const r = await api.restoreChatProject(a, id);
         restoredRef.current = r;
-        return { boardProjectId: r.project.boardProjectId ?? null, pausedCronJobIds: r.pausedCronJobIds };
+        return {
+          boardProjectId: r.project.boardProjectId ?? null,
+          pausedCronJobIds: r.pausedCronJobIds,
+          archived: Boolean(r.project.archivedAt),
+        };
       },
     };
   }, []);

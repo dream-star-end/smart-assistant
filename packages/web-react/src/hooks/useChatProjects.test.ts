@@ -293,6 +293,7 @@ describe("useChatProjects archive / pin / fenced delete / restore", () => {
       return { ok: true } as never;
     });
     const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "getProject").mockResolvedValue({ archivedAt: null } as never);
     vi.spyOn(tb.taskboardApi, "patchProject").mockImplementation(async (_a, _id, body) => {
       order.push(`board ${body.archivedAt ? "archived" : "open"}`);
       return { ok: true } as never;
@@ -334,6 +335,7 @@ describe("useChatProjects archive / pin / fenced delete / restore", () => {
 
   test("archive and pin update the list; a failed archive rolls back", async () => {
     const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "getProject").mockResolvedValue({ archivedAt: null } as never);
     vi.spyOn(tb.taskboardApi, "patchProject").mockResolvedValue({ ok: true } as never);
     vi.spyOn(api, "patchChatProject")
       .mockResolvedValueOnce({ ...bound, pinnedAt: 5 })

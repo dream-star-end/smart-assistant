@@ -7,9 +7,10 @@ function deps(over: Partial<LifecycleDeps> = {}) {
     listCron: vi.fn(async () => [{ id: "j-on", enabled: true }, { id: "j-off", enabled: false }, { id: "j-on2" }]),
     setCronEnabled: vi.fn(async (id, on) => void log.push(`cron ${id} ${on ? "on" : "off"}`)),
     setBoardArchived: vi.fn(async (_b, a) => void log.push(`board ${a ? "archive" : "open"}`)),
+    isBoardArchived: vi.fn(async () => false),
     setProjectArchived: vi.fn(async (_p, a) => void log.push(`project ${a ? "archive" : "show"}`)),
     deleteProject: vi.fn(async (_p, paused) => void log.push(`delete ${paused.join(",")}`)),
-    restoreProject: vi.fn(async () => ({ boardProjectId: "b1", pausedCronJobIds: ["j-on", "j-on2"] })),
+    restoreProject: vi.fn(async () => ({ boardProjectId: "b1", pausedCronJobIds: ["j-on", "j-on2"], archived: false })),
     ...over,
   };
   return { d, log };
@@ -61,5 +62,22 @@ describe("project lifecycle", () => {
     const b = deps();
     await setProjectArchivedFenced(b.d, { id: "p1", boardProjectId: "b1" }, false);
     expect(b.log).toEqual(["project show", "board open"]);
+  });
+
+  it("a board that was already archived is not reopened by a failed delete", async () => {
+    const { d, log } = deps({
+      isBoardArchived: vi.fn(async () => true),
+      deleteProject: vi.fn(async () => { throw new Error("500"); }),
+    });
+    await expect(fenceAndDeleteProject(d, { id: "p1", boardProjectId: "b1" })).rejects.toThrow("500");
+    expect(log).toEqual(["cron j-on off", "cron j-on2 off", "cron j-on on", "cron j-on2 on"]);
+  });
+
+  it("a project archived before deletion is restored archived, board left archived", async () => {
+    const { d, log } = deps({
+      restoreProject: vi.fn(async () => ({ boardProjectId: "b1", pausedCronJobIds: [], archived: true })),
+    });
+    await restoreDeletedProject(d, "p1");
+    expect(log).toEqual([]);
   });
 });

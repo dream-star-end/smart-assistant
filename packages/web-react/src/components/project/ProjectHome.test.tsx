@@ -346,7 +346,17 @@ describe("ProjectHome", () => {
   });
 });
 
+const scopeBoards = { current: [] as Array<{ id: string }> };
+const setToken = vi.fn();
+vi.mock("../../hooks/useProjectScope", () => ({
+  useProjectScope: () => ({
+    refreshWorkProjects: async () => scopeBoards.current,
+    setToken,
+  }),
+}));
+
 describe("ProjectHome surfaces (P2)", () => {
+  afterEach(() => setToken.mockClear());
   it("a project with a board links to its board, memory, skills and cron; the board is prepared first", async () => {
     const order: string[] = [];
     const onPrepareBoard = vi.fn(async () => {
@@ -354,6 +364,7 @@ describe("ProjectHome surfaces (P2)", () => {
       return true;
     });
     const onShowSurface = vi.fn((s: string) => void order.push(`show ${s}`));
+    scopeBoards.current = [{ id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }];
     renderHome({
       project: { ...project, boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
       onPrepareBoard,
@@ -364,6 +375,21 @@ describe("ProjectHome surfaces (P2)", () => {
     fireEvent.click(screen.getByRole("button", { name: "记忆" }));
     await waitFor(() => expect(onShowSurface).toHaveBeenCalledWith("memory"));
     expect(order).toEqual(["prepare", "show memory"]);
+    expect(setToken).toHaveBeenCalledWith("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+  });
+
+  it("does not switch scope or open the page when the refreshed list lacks the board", async () => {
+    scopeBoards.current = [];
+    const onShowSurface = vi.fn();
+    renderHome({
+      project: { ...project, boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
+      onPrepareBoard: async () => true,
+      onShowSurface,
+    } as Overrides);
+    fireEvent.click(await screen.findByRole("button", { name: "定时任务" }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(onShowSurface).not.toHaveBeenCalled();
+    expect(setToken).not.toHaveBeenCalled();
   });
 
   it("no links when the board cannot be prepared, and none without a board", async () => {
