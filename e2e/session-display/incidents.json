@@ -6209,6 +6209,35 @@
           "assertion": "stop reaches a native-resumed keeper that runs in the transcript run directory"
         }
       ]
+    },
+    {
+      "id": "INC-20261008-BOX-FOREIGN-TOOL-HISTORY",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "商业 u1870：同一会话先用 k3-256k 调用工具（tool id 为 tool_…）再切到 Box Claude，每次请求被拒 400 BOX_REQUEST_UNSUPPORTED（BOX_BLOCK_UNSUPPORTED）。个人版同一份代码同样受影响",
+      "rootFixCommit": "635c99f3",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "商业 OCV5-337 的发布门证明（[ocv5-337-foreign-tool-history]，红绿各一次）在商业树；个人版没有这道 Box 证明门，这里由同一份代码的 unit 层锁住。",
+        "since": "2026-10-08"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "a k3 tool history compiles with paired toolu_ ids derived from the originals"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "other id shapes, unpaired history and a foreign current result stay rejected"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "a foreign id whose renamed form is already used is refused"
+        }
+      ]
     }
   ]
 }
