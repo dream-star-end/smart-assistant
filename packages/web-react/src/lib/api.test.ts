@@ -1286,6 +1286,21 @@ test('uploadFile retries 503 then succeeds', async () => {
   expect(String(fetchMock.mock.calls[0]?.[0])).toBe('/api/uploads')
 })
 
+test('uploadFile never retries under another identity after a 503 backoff', async () => {
+  vi.useFakeTimers()
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => uploadUnavailable(2))
+  vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+  const { session } = makeSession('tok-upload-switch')
+  const pending = api.uploadFile(session, uploadFileBlob())
+  const expectation = expect(pending).rejects.toBeInstanceOf(AuthEpochStaleError)
+  await vi.advanceTimersByTimeAsync(0)
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+  session.beginIdentity() // logout + login as someone else during the backoff
+  await vi.runAllTimersAsync()
+  await expectation
+  expect(fetchMock).toHaveBeenCalledTimes(1)
+})
+
 test('uploadFile throws after exhausting 503 retries', async () => {
   vi.useFakeTimers()
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => uploadUnavailable(1))

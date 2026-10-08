@@ -2509,8 +2509,13 @@ export const api = {
     opts?: { maxRetries?: number; signal?: AbortSignal },
   ): Promise<{ url: string; digest?: string; size?: number; mimeType?: string }> {
     const maxRetries = opts?.maxRetries ?? 5;
+    // The file belongs to the identity that started the upload. callWithRefresh
+    // snapshots the epoch per call, so without this pin a 503 retry after a
+    // logout/account switch would send the file with the next account's token.
+    const startEpoch = a.snapshot().epoch;
     for (let attempt = 0; ; attempt++) {
       if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      if (a.snapshot().epoch !== startEpoch) throw new AuthEpochStaleError();
       const res = await callWithRefresh(a, (t) =>
         fetch("/api/uploads", {
           method: "POST",
