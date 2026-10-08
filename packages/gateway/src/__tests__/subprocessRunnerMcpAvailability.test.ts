@@ -51,10 +51,18 @@ describe('subprocessRunner MCP availability wiring', () => {
       false,
     )
 
-    const withLaunch = projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: LAUNCH })
+    const withLaunch = projectCcbMcpAvailability({
+      configuredTools: [],
+      mcpLaunch: LAUNCH,
+      projectSearchEnabled: true,
+    })
     for (const name of PLATFORM_MCP_TOOL_NAMES) {
       assert.ok(withLaunch.includes(name), name)
     }
+    // P5a: project_search only with OC_P5_PROJECT_SEARCH; everything else unchanged.
+    const flagOff = projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: LAUNCH })
+    assert.equal(flagOff.includes('project_search'), false)
+    assert.deepEqual(flagOff, withLaunch.filter((n) => n !== 'project_search'))
 
     const evalNames = projectCcbMcpAvailability({
       configuredTools: [],

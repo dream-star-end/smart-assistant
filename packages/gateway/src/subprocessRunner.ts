@@ -1,5 +1,9 @@
 import { BOX_API_MODELS, isBoxApiModel } from '@openclaude/protocol'
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
+import {
+  identityCompatEnvironment,
+  isProjectSearchEnabled,
+  type IdentityCompatRuntimeContext,
+} from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -2673,6 +2677,7 @@ export class SubprocessRunner extends EventEmitter {
       mcpLaunch,
       skillEvalMode: this.opts.skillEvalMode,
       skillTrainRunId: this.opts.skillTrainRunId,
+      projectSearchEnabled: isProjectSearchEnabled(process.env),
     })
 
     // (Marketplace skills/agents are reconciled deterministically in
@@ -2796,6 +2801,11 @@ export class SubprocessRunner extends EventEmitter {
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
+            // P5a: project_search is listed only when both flags are on; pass them
+            // explicitly so the MCP list matches the prompt's tool projection.
+            ...(isProjectSearchEnabled(process.env)
+              ? { OC_PROJECT_CONTEXT: '1', OC_P5_PROJECT_SEARCH: '1' }
+              : {}),
             // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
             // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill
             // 路径退化为相对 cwd 的路径,跨容器串。v3 容器由 entrypoint.ts 显式注入

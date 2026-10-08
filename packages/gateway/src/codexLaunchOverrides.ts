@@ -1,4 +1,8 @@
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
+import {
+  identityCompatEnvironment,
+  isProjectSearchEnabled,
+  type IdentityCompatRuntimeContext,
+} from '@openclaude/storage'
 /**
  * codexLaunchOverrides — assemble per-spawn `-c` overrides for codex CLI.
  *
@@ -382,7 +386,10 @@ export async function buildCodexLaunchOverrides(
   const mcpLaunch = omitPlatformMcp
     ? null
     : resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
-  const availableMcpTools = mcpLaunch ? [...PLATFORM_MCP_TOOL_NAMES] : []
+  const projectSearchOn = isProjectSearchEnabled(process.env)
+  const availableMcpTools = mcpLaunch
+    ? PLATFORM_MCP_TOOL_NAMES.filter((name) => projectSearchOn || name !== 'project_search')
+    : []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
@@ -496,6 +503,7 @@ export async function buildCodexLaunchOverrides(
       OC_AGENT_ID: ctx.agentId,
       ...identityCompatEnvironment(ctx.identityCompat),
       ...(ctx.projectId ? { OPENCLAUDE_PROJECT_ID: ctx.projectId } : {}),
+      ...(isProjectSearchEnabled(process.env) ? { OC_PROJECT_CONTEXT: '1', OC_P5_PROJECT_SEARCH: '1' } : {}),
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),

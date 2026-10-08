@@ -41,6 +41,7 @@ describe('project_assets PG/SQLite 契约对齐', () => {
       'updateProjectAsset',
       'deleteProjectAsset',
       'listPinnedProjectAssetsForSession',
+      'searchChatProjectAssets',
     ]) {
       assert.ok(backendSrc.includes(`async ${method}(`), `PG 缺 ${method}`)
       assert.ok(sqliteSrc.includes(`${method}:`), `sqliteBackend 缺 ${method}`)
@@ -128,6 +129,24 @@ test('searchProjectAssets: both backends escape LIKE, scope by user_id, skip del
     assert.match(src, /deleted_at IS NULL/, `${name} must skip soft-deleted assets`)
     assert.match(src, /PROJECT_ASSET_SEARCH_LIMIT_MAX/, `${name} must cap the limit`)
     assert.match(src, /excerpt/, `${name} must search the excerpt too`)
+  }
+  assert.match(pg, /ILIKE/, 'PG search is case-insensitive')
+})
+test('searchChatProjectAssets: same normaliser, user + project scope, latest version only, escaped LIKE', () => {
+  const pg = extractMethod(backendSrc, 'searchChatProjectAssets', 'bumpClientSessionHistoryRevision')
+  const lite = sqliteSrc.slice(
+    sqliteSrc.indexOf('async function _sqliteSearchChatProjectAssets('),
+    sqliteSrc.indexOf('export function rankSessionSearchHits<'),
+  )
+  for (const [name, src] of [['pg', pg], ['sqlite', lite]] as const) {
+    assert.ok(src.length > 0, `${name} search missing`)
+    assert.match(src, /normalizeChatProjectAssetSearch\(opts\)/, `${name} must share the normaliser (escape + limit cap)`)
+    assert.match(src, /ESCAPE '\\\\'/, `${name} must use ESCAPE '\\'`)
+    assert.match(src, /user_id = (\?|\$1) AND deleted_at IS NULL AND project_id = (\?|\$2)/, `${name} must scope by user and project`)
+    assert.ok(src.includes('PROJECT_ASSET_VERSION_GROUP_SQL'), `${name} must fold output versions`)
+    assert.match(src, /version_rank = 1/, `${name} must search the latest version only`)
+    assert.match(src, /excerpt/, `${name} must search the excerpt too`)
+    assert.match(src, /ORDER BY created_at DESC, id DESC/, `${name} must order deterministically`)
   }
   assert.match(pg, /ILIKE/, 'PG search is case-insensitive')
 })

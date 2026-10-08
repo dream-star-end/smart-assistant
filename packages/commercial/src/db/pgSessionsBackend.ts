@@ -133,6 +133,7 @@ import {
   type ProjectAssetUpdateResult,
   type ListProjectAssetsOpts,
   type SearchProjectAssetsOpts,
+  type SearchChatProjectAssetsOpts,
   type ParsedProjectAssetCreate,
   type ClientSession,
   type ClientSessionLifecycle,
@@ -180,6 +181,7 @@ import {
   _warnSeqAnomaly,
   buildSearchSnippet,
   escapeLikePattern,
+  normalizeChatProjectAssetSearch,
   parseBoardProjectId,
   assetsRevision,
   parseChatProjectName,
@@ -13313,6 +13315,38 @@ export function createPgSessionsBackend(
             ORDER BY created_at DESC
             LIMIT $3`,
           [sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
+    },
+
+    async searchChatProjectAssets(
+      userId: string,
+      chatProjectId: string,
+      opts: SearchChatProjectAssetsOpts,
+    ): Promise<ProjectAsset[]> {
+      const norm = normalizeChatProjectAssetSearch(opts);
+      if (!norm || !chatProjectId) return [];
+      const params: unknown[] = [userId, chatProjectId, norm.like, norm.limit];
+      if (norm.source) params.push(norm.source);
+      // Same fold as listProjectAssets: only the latest version of an output is searched.
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+                  size_bytes::text AS size_bytes, digest, excerpt, pinned,
+                  created_at::text AS created_at, updated_at::text AS updated_at
+             FROM (
+               SELECT *,
+                      ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                         ORDER BY created_at DESC, id DESC) AS version_rank
+                 FROM project_assets
+                WHERE user_id = $1 AND deleted_at IS NULL AND project_id = $2
+             ) AS versioned
+            WHERE version_rank = 1
+              AND (name ILIKE $3 ESCAPE '\\' OR COALESCE(excerpt, '') ILIKE $3 ESCAPE '\\')${norm.source ? " AND source = $5" : ""}
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4`,
+          params,
         )
       ).rows;
       return rows.map(mapPgProjectAssetRow);

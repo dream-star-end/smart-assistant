@@ -36,6 +36,7 @@ const {
   parseProjectAssetContainerPath,
   parseProjectAssetUrl,
   searchProjectAssets,
+  searchChatProjectAssets,
   updateProjectAsset,
   upsertClientSession,
 } = await import('../sessionsDb.js')
@@ -684,5 +685,67 @@ describe('project_assets 产出物版本', () => {
     await updateProjectAsset(USER, v2.asset.id, { pinned: true })
     const ids = (await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id).sort()
     assert.deepEqual(ids, [up.asset.id, v2.asset.id].sort())
+  })
+})
+
+describe('searchChatProjectAssets(project_search)', () => {
+  beforeEach(clearTables)
+
+  const hex = (c: string) => c.repeat(64)
+
+  it('只搜指定项目、未删、本租户;名称与摘录都命中;source/limit/转义', async () => {
+    const a = await createChatProject(USER, { name: 'A' })
+    const b = await createChatProject(USER, { name: 'B' })
+    assert.equal(a.ok && b.ok, true)
+    if (!a.ok || !b.ok) return
+    const pa = a.project.id
+    const pb = b.project.id
+    await createProjectAsset(USER, { source: 'upload', name: '合同.pdf', url: MEDIA_URL(hex('1')), projectId: pa, excerpt: '付款期限三十日' })
+    await createProjectAsset(USER, { source: 'upload', name: '付款说明.md', url: MEDIA_URL(hex('2'), 'md'), projectId: pa })
+    await createProjectAsset(USER, {
+      source: 'output',
+      name: 'plan.md',
+      containerPath: '/home/agent/.openclaude/generated/plan.md',
+      projectId: pa,
+      excerpt: '付款节点',
+    })
+    await createProjectAsset(USER, { source: 'upload', name: '别的项目付款.pdf', url: MEDIA_URL(hex('3')), projectId: pb })
+    await createProjectAsset(USER, { source: 'upload', name: '未分组付款.pdf', url: MEDIA_URL(hex('4')) })
+    const gone = await createProjectAsset(USER, { source: 'upload', name: '已删付款.pdf', url: MEDIA_URL(hex('5')), projectId: pa })
+    if (gone.ok) await deleteProjectAsset(USER, gone.asset.id)
+    await createProjectAsset(USER, { source: 'upload', name: '100%_x.txt', url: MEDIA_URL(hex('6'), 'txt'), projectId: pa })
+
+    const hits = await searchChatProjectAssets(USER, pa, { q: '付款' })
+    assert.deepEqual(new Set(hits.map((h) => h.name)), new Set(['合同.pdf', '付款说明.md', 'plan.md']))
+    assert.ok(hits.every((h) => h.projectId === pa))
+
+    assert.deepEqual((await searchChatProjectAssets(USER, pa, { q: '付款', source: 'output' })).map((h) => h.name), ['plan.md'])
+    assert.equal((await searchChatProjectAssets(USER, pa, { q: '付款', limit: 1 })).length, 1)
+    assert.equal((await searchChatProjectAssets(USER, pa, { q: '付款', limit: 999 })).length, 3)
+    assert.deepEqual((await searchChatProjectAssets(USER, pa, { q: '%_' })).map((h) => h.name), ['100%_x.txt'])
+    assert.equal((await searchChatProjectAssets(USER, pa, { q: '%' })).length, 1, '% is literal')
+    assert.deepEqual(await searchChatProjectAssets(USER, pa, { q: '   ' }), [])
+    assert.deepEqual(await searchChatProjectAssets(OTHER, pa, { q: '付款' }), [], 'other tenant sees nothing')
+    assert.deepEqual(await searchChatProjectAssets(USER, '', { q: '付款' }), [])
+  })
+
+  it('产出物只搜最新版本:旧版本的摘录不再命中', async () => {
+    const p = await createChatProject(USER, { name: 'V' })
+    assert.equal(p.ok, true)
+    if (!p.ok) return
+    const REPORT = '/home/agent/.openclaude/generated/report.md'
+    const v1 = await createProjectAsset(USER, {
+      source: 'output', name: 'report.md', containerPath: REPORT, projectId: p.project.id,
+      digest: DIGEST_A, url: MEDIA_URL(DIGEST_A, 'md'), excerpt: '旧版独有词',
+    })
+    const v2 = await createProjectAsset(USER, {
+      source: 'output', name: 'report.md', containerPath: REPORT, projectId: p.project.id,
+      digest: DIGEST_B, url: MEDIA_URL(DIGEST_B, 'md'), excerpt: '新版内容',
+    })
+    assert.equal(v1.ok && v2.ok && v2.created, true)
+    assert.deepEqual(await searchChatProjectAssets(USER, p.project.id, { q: '旧版独有词' }), [])
+    const latest = await searchChatProjectAssets(USER, p.project.id, { q: 'report' })
+    assert.equal(latest.length, 1)
+    assert.equal(latest[0]?.digest, DIGEST_B)
   })
 })

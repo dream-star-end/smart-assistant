@@ -608,6 +608,7 @@ import {
   decideSkillLocalRelay,
   SKILL_LOCAL_RELAY_PREFIX,
 } from './ocSkillLocalRelay.js'
+import { handleProjectSearchLocal, PROJECT_SEARCH_LOCAL_PATH } from './projectSearchLocal.js'
 import {
   startToolFailureReporter,
   type ToolFailureReporter,
@@ -4125,6 +4126,21 @@ export class Gateway {
           guarded(this._handleSkillEvalGenStatus(req, res, p))
           return
       }
+      return
+    }
+
+    // project_search MCP tool (P5a): loopback-only + the raw gateway token (no JWT,
+    // no bridge bypass). Not an /api/* path, so the browser proxy never reaches it.
+    if (url.pathname === PROJECT_SEARCH_LOCAL_PATH) {
+      const authorized = checkToken(this.extractToken(req), this.deps.config.gateway.accessToken)
+      handleProjectSearchLocal({
+        method: req.method ?? 'GET',
+        url: req.url ?? '/',
+        remoteAddress: req.socket.remoteAddress,
+        authorized,
+      })
+        .then((r) => this.sendJson(res, r.status, r.body))
+        .catch((err) => this.sendInternalError(res, err))
       return
     }
 

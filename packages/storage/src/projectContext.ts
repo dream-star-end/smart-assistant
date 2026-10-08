@@ -41,6 +41,18 @@ export function isProjectContextEnabled(env: NodeJS.ProcessEnv = process.env): b
   return v === '1' || v === 'true' || v === 'yes' || v === 'on'
 }
 
+/**
+ * P5a: the project_search agent tool plus the adaptive pinned-files budget in
+ * the PROJECT slot. Only effective when project context itself is on.
+ */
+export const PROJECT_SEARCH_FLAG = 'OC_P5_PROJECT_SEARCH'
+
+export function isProjectSearchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!isProjectContextEnabled(env)) return false
+  const v = (env[PROJECT_SEARCH_FLAG] ?? '').trim().toLowerCase()
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on'
+}
+
 export function parseBoardProjectId(value: unknown):
   | { present: false }
   | { present: true; value: string | null }

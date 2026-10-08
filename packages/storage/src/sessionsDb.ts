@@ -7066,6 +7066,64 @@ async function _sqliteListPinnedProjectAssetsForSession(sessionId: string): Prom
   return rows.map(_mapProjectAssetRow)
 }
 
+/**
+ * project_search (agent tool): one chat project's non-deleted assets, matched by
+ * name or excerpt substring. Outputs fold to their latest version first, so an
+ * older version's text never surfaces. The caller resolves the chat project
+ * from a verified identity; this only adds the user_id scope on top.
+ */
+export type SearchChatProjectAssetsOpts = {
+  q: string
+  source?: ProjectAssetSource
+  limit?: number
+}
+export const PROJECT_ASSET_PROJECT_SEARCH_LIMIT_DEFAULT = 8
+export const PROJECT_ASSET_PROJECT_SEARCH_LIMIT_MAX = 20
+export const PROJECT_ASSET_PROJECT_SEARCH_QUERY_MAX = 200
+
+/** Shared by both backends: null = nothing to search (empty query). */
+export function normalizeChatProjectAssetSearch(
+  opts: SearchChatProjectAssetsOpts,
+): { like: string; limit: number; source: ProjectAssetSource | null } | null {
+  const q = typeof opts.q === 'string' ? opts.q.trim().slice(0, PROJECT_ASSET_PROJECT_SEARCH_QUERY_MAX) : ''
+  if (!q) return null
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(PROJECT_ASSET_PROJECT_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+    : PROJECT_ASSET_PROJECT_SEARCH_LIMIT_DEFAULT
+  const source = opts.source === 'upload' || opts.source === 'output' ? opts.source : null
+  return { like: `%${escapeLikePattern(q)}%`, limit, source }
+}
+
+async function _sqliteSearchChatProjectAssets(
+  userId: string,
+  chatProjectId: string,
+  opts: SearchChatProjectAssetsOpts,
+): Promise<ProjectAsset[]> {
+  const norm = normalizeChatProjectAssetSearch(opts)
+  if (!norm || !chatProjectId) return []
+  const params: unknown[] = [userId, chatProjectId, norm.like, norm.like]
+  if (norm.source) params.push(norm.source)
+  params.push(norm.limit)
+  const db = await getSessionsDb()
+  // SQLite LIKE is ASCII case-insensitive by default; CJK has no case.
+  const rows = db.prepare(
+    `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+            size_bytes, digest, excerpt, pinned, created_at, updated_at
+       FROM (
+         SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                   ORDER BY created_at DESC, id DESC) AS version_rank
+           FROM project_assets
+          WHERE user_id = ? AND deleted_at IS NULL AND project_id = ?
+       ) AS versioned
+      WHERE version_rank = 1
+        AND (name LIKE ? ESCAPE '\\' OR COALESCE(excerpt, '') LIKE ? ESCAPE '\\')${norm.source ? ' AND source = ?' : ''}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).all(...params) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
 export function rankSessionSearchHits<T extends { sessionId: string; matchedAt: number; kind: SessionSearchKind }>(
   hits: T[],
   limit: number,
@@ -7679,6 +7737,7 @@ const sqliteBackend = {
   updateProjectAsset: _sqliteUpdateProjectAsset,
   deleteProjectAsset: _sqliteDeleteProjectAsset,
   listPinnedProjectAssetsForSession: _sqliteListPinnedProjectAssetsForSession,
+  searchChatProjectAssets: _sqliteSearchChatProjectAssets,
   bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
@@ -7891,6 +7950,9 @@ export const deleteProjectAsset: ClientSessionsBackend['deleteProjectAsset'] =
 
 export const listPinnedProjectAssetsForSession: ClientSessionsBackend['listPinnedProjectAssetsForSession'] =
   (...args) => getActiveBackend().listPinnedProjectAssetsForSession(...args)
+
+export const searchChatProjectAssets: ClientSessionsBackend['searchChatProjectAssets'] =
+  (...args) => getActiveBackend().searchChatProjectAssets(...args)
 
 export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
   (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)

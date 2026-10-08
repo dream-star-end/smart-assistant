@@ -277,6 +277,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
   "openclaude-memory:task_approve": { icon: ListChecks, label: "批准任务单" },
   "openclaude-memory:present_task_approval": { icon: ShieldCheck, label: "任务审批卡" },
+  "openclaude-memory:project_search": { icon: Search, label: "搜索项目文件" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -712,7 +713,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return `${tgt}${title}`.trim();
     }
     if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
-    if (op === "skill_search") return asStr(input.query);
+    if (op === "skill_search" || op === "project_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
     if (op === "task_create") return asStr(input.title);
     if (op === "task_update" || op === "task_comment" || op === "task_get" || op === "task_approve" || op === "present_task_approval") {

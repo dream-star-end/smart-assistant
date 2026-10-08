@@ -16,7 +16,11 @@ delete process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR
 delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
 delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
 
+delete process.env.OC_P5_PROJECT_SEARCH
+
 const {
+  PROJECT_ASSETS_ADAPTIVE_MAX_CHARS,
+  PROJECT_ASSETS_SEARCH_HINT,
   PROJECT_ASSETS_END,
   PROJECT_ASSETS_INJECT_MAX_CHARS,
   PROJECT_ASSETS_START,
@@ -159,5 +163,78 @@ describe('buildPromptContext 经 projectAssets 注入', () => {
       projectAssets: [],
     })
     assert.doesNotMatch(miss.content, new RegExp(PROJECT_ASSETS_START))
+  })
+})
+
+describe('P5a 自适应预算(OC_P5_PROJECT_SEARCH)', () => {
+  const longExcerpt = (tag: string) => `${tag} 第一行\n第二行 ${'内'.repeat(1900)} 尾巴${tag}`
+  const many = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      asset({
+        id: `p${i}`,
+        name: `doc-${i}.md`,
+        excerpt: longExcerpt(`T${i}`),
+        containerPath: `/home/agent/.openclaude/uploads/doc-${i}.md`,
+      }),
+    )
+
+  it('关:与今天一致(2000 总预算、200 字摘要、无搜索提示)', async () => {
+    const assets = many(3)
+    const off = await buildProjectSlot({ agentId: 'main', projectInstructions: null, projectAssets: assets, projectSearch: false })
+    const legacy = buildProjectAssetsSection(assets)
+    assert.ok(off && legacy)
+    assert.ok(off.content.endsWith(legacy))
+    assert.ok(legacy.length <= PROJECT_ASSETS_INJECT_MAX_CHARS)
+    assert.doesNotMatch(off.content, /project_search/)
+    assert.doesNotMatch(off.content, /尾巴T0/)
+  })
+
+  it('关:不设 env 时默认关', async () => {
+    const assets = many(1)
+    const slot = await buildProjectSlot({ agentId: 'main', projectInstructions: null, projectAssets: assets })
+    assert.ok(slot)
+    assert.ok(slot.content.endsWith(buildProjectAssetsSection(assets)!))
+  })
+
+  it('开:前几条内联完整摘录(保留换行),超出 8000 后其余回落到 200 字索引', async () => {
+    const assets = many(6)
+    const slot = await buildProjectSlot({ agentId: 'main', projectInstructions: null, projectAssets: assets, projectSearch: true })
+    assert.ok(slot)
+    const section = slot.content.slice(slot.content.indexOf(PROJECT_ASSETS_START))
+    assert.ok(section.length <= PROJECT_ASSETS_ADAPTIVE_MAX_CHARS, `section ${section.length}`)
+    assert.ok(section.length > PROJECT_ASSETS_INJECT_MAX_CHARS)
+    // 第一、二条完整(含尾巴),且换行保留
+    assert.match(section, /尾巴T0/)
+    assert.match(section, /尾巴T1/)
+    assert.match(section, /T0 第一行\n\s+第二行/)
+    // 第一条放不下全文的及以后:索引形式
+    const firstIndexAt = section.indexOf('   摘要: ')
+    assert.ok(firstIndexAt > 0, 'later items fall back to the index form')
+    assert.doesNotMatch(section.slice(firstIndexAt), /内容摘录/)
+    for (let i = 0; i < 6; i++) assert.match(section, new RegExp(`\\d+\\. doc-${i}\\.md`))
+    assert.ok(section.includes(PROJECT_ASSETS_SEARCH_HINT))
+  })
+
+  it('开:确定性(同输入同字节),20 条以上计入省略', async () => {
+    const assets = many(24)
+    const a = buildProjectAssetsSection(assets, { adaptive: true, searchHint: true })
+    const b = buildProjectAssetsSection(assets, { adaptive: true, searchHint: true })
+    assert.ok(a)
+    assert.equal(a, b)
+    assert.ok(a.length <= PROJECT_ASSETS_ADAPTIVE_MAX_CHARS)
+    assert.match(a, /其余 \d+ 条已省略/)
+  })
+
+  it('开:工具未注册时不出搜索提示', async () => {
+    const slot = await buildProjectSlot({
+      agentId: 'main',
+      projectInstructions: null,
+      projectAssets: many(1),
+      projectSearch: true,
+      availableMcpTools: ['skill_search'],
+    })
+    assert.ok(slot)
+    assert.doesNotMatch(slot.content, /project_search/)
+    assert.match(slot.content, /尾巴T0/)
   })
 })

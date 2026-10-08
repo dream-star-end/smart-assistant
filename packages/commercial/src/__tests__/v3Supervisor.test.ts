@@ -1123,6 +1123,44 @@ describe("provisionV3Container", () => {
     }
   });
 
+  test("selfhost master OC_P5_PROJECT_SEARCH is forwarded into v5 container env; unset stays out", async () => {
+    const savedChannel = process.env.OC_RUNTIME_CHANNEL;
+    const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;
+    const savedFlag = process.env.OC_P5_PROJECT_SEARCH;
+    try {
+      process.env.OC_RUNTIME_CHANNEL = "v5";
+      process.env.OC_PROMPT_QUEUE_V1 = "1";
+      const provision = async (ip: string) => {
+        // FakePool rejects a second ensure for the same uid → fresh pool each time.
+        pool = new FakePool();
+        const { docker, captured } = makeDocker();
+        await provisionV3Container(
+          {
+            docker,
+            pool: pool as unknown as Pool,
+            image: TEST_IMAGE,
+            selfHostId: TEST_HOST,
+            randomIp: () => ip,
+            randomSecret: fixedSecret("d".repeat(64)),
+          },
+          779,
+        );
+        return captured.containersCreated[0]?.Env ?? [];
+      };
+      process.env.OC_P5_PROJECT_SEARCH = "true";
+      assert.ok((await provision("172.31.5.45")).includes("OC_P5_PROJECT_SEARCH=1"));
+      delete process.env.OC_P5_PROJECT_SEARCH;
+      assert.ok(!(await provision("172.31.5.46")).some((e: string) => e.startsWith("OC_P5_PROJECT_SEARCH=")));
+    } finally {
+      if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+      else process.env.OC_RUNTIME_CHANNEL = savedChannel;
+      if (savedPromptQueue === undefined) delete process.env.OC_PROMPT_QUEUE_V1;
+      else process.env.OC_PROMPT_QUEUE_V1 = savedPromptQueue;
+      if (savedFlag === undefined) delete process.env.OC_P5_PROJECT_SEARCH;
+      else process.env.OC_P5_PROJECT_SEARCH = savedFlag;
+    }
+  });
+
   test("selfhost master OC_RESEARCH_WORKSPACE=1 is forwarded into v5 container env; unset stays out", async () => {
     const savedChannel = process.env.OC_RUNTIME_CHANNEL;
     const savedPromptQueue = process.env.OC_PROMPT_QUEUE_V1;

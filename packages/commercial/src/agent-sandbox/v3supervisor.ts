@@ -2877,6 +2877,12 @@ export async function provisionV3Container(
     if (process.env.OC_PROJECT_CONTEXT === "1") {
       env.push("OC_PROJECT_CONTEXT=1");
     }
+    // P5a project_search tool + adaptive pinned-files budget. Same selective
+    // injection: unset → container keeps today's PROJECT slot and lists no tool.
+    // The container only honours it while OC_PROJECT_CONTEXT is on.
+    if (["1", "true", "yes", "on"].includes((process.env.OC_P5_PROJECT_SEARCH ?? "").trim().toLowerCase())) {
+      env.push("OC_P5_PROJECT_SEARCH=1");
+    }
     // R3.0 research workspace (课题): flag is judged on both sides — master
     // (workspaceFlag.ts) and the container CLIs (ocResearchClient.ts read
     // process.env). Without this line the container never sees the flag and

@@ -670,6 +670,30 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  // P5a: listed only when OC_P5_PROJECT_SEARCH (with OC_PROJECT_CONTEXT) is on.
+  {
+    name: 'project_search',
+    description: [
+      '按关键词搜索**当前项目**里的文件(用户上传)与产出物,只搜本项目,不跨项目。',
+      '系统提示里的常用文件清单之外还有文件时用它找;匹配文件名与已存档的内容摘录。',
+      '返回每条命中的名称、来源、可用 Read 读取的路径和匹配处片段;要完整内容就 Read 该路径。',
+      '当前对话不在项目里时会报错。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '关键词(文件名或内容里的词,1-200 字)' },
+        source: {
+          type: 'string',
+          enum: ['upload', 'output'],
+          description: '可选:upload=用户上传的文件,output=对话产出物;不填两者都搜',
+        },
+        limit: { type: 'number', minimum: 1, maximum: 20, description: '返回条数,1-20,默认 8' },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+  },
 ]
 
 /**
