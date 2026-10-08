@@ -32,6 +32,7 @@ import {
   useState,
 } from "react";
 import type { ProjectTab } from "../../hooks/useAppRoute";
+import { api } from "../../lib/api";
 import { useProjectAssets } from "../../hooks/useProjectAssets";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { PROJECT_COLORS } from "../../lib/projectColors";
@@ -70,6 +71,10 @@ import {
   pinnedOf,
   projectSessionsOf,
   projectSummary,
+  type ActivityCron,
+  type ActivityItem,
+  type ActivityTicket,
+  mergeActivity,
 } from "./projectHomeModel";
 
 export type ProjectHomeProps = {
@@ -199,6 +204,18 @@ export function ProjectHome(props: ProjectHomeProps) {
   useEffect(() => {
     if (needsArchived) loadArchivedRef.current?.();
   }, [needsArchived]);
+  const surfaces = useSurfaceOpener(project.boardProjectId, onPrepareBoard, onShowSurface);
+  const boardActivity = useProjectActivity(project.boardProjectId, authSession, !demo && tab === "overview");
+  const activity = useMemo(
+    () =>
+      mergeActivity({
+        sessions: projectSessions,
+        tickets: boardActivity.tickets,
+        cron: boardActivity.cron,
+        limit: OVERVIEW_SESSION_LIMIT,
+      }),
+    [projectSessions, boardActivity],
+  );
   const pinned = useMemo(() => pinnedOf(assets), [assets]);
   const lastSession = projectSessions[0];
   const swatch = PROJECT_COLORS.find((c) => c.key === project.color);
@@ -327,13 +344,7 @@ export function ProjectHome(props: ProjectHomeProps) {
             )}
           </div>
 
-          {project.boardProjectId && onPrepareBoard && onShowSurface && (
-            <ProjectSurfaceLinks
-              boardProjectId={project.boardProjectId}
-              onPrepareBoard={onPrepareBoard}
-              onShowSurface={onShowSurface}
-            />
-          )}
+          {surfaces.open && <ProjectSurfaceLinks open={surfaces.open} opening={surfaces.opening} />}
 
           <div className="flex min-w-0 items-center gap-2 border-b border-border pb-2">
             <div className="min-w-0 flex-1">
@@ -355,6 +366,8 @@ export function ProjectHome(props: ProjectHomeProps) {
             {tab === "overview" && (
               <OverviewTab
                 sessions={projectSessions}
+                activity={activity}
+                onOpenSurface={surfaces.open ? (surface) => void surfaces.open?.(surface) : undefined}
                 instructions={instructions}
                 pinned={pinned}
                 outputs={outputs}
@@ -524,6 +537,8 @@ function AssetsError({ error, onReload }: { error: string; onReload: () => void 
 
 function OverviewTab({
   sessions,
+  activity,
+  onOpenSurface,
   instructions,
   pinned,
   outputs,
@@ -536,6 +551,9 @@ function OverviewTab({
   onTabChange,
 }: {
   sessions: Session[];
+  /** 会话 + 看板任务 + 定时任务合并后的最近活动（无看板时只有会话）。 */
+  activity: ActivityItem[];
+  onOpenSurface?: (surface: ProjectSurface) => void;
   instructions: string;
   pinned: ProjectAsset[];
   outputs: ProjectAsset[];
@@ -547,12 +565,12 @@ function OverviewTab({
   onOpenSettings: () => void;
   onTabChange: (tab: ProjectTab) => void;
 }) {
-  const recent = sessions.slice(0, OVERVIEW_SESSION_LIMIT);
+  const recent = activity;
   const latestOutputs = outputs.slice(0, OVERVIEW_OUTPUT_LIMIT);
   return (
     <div className="grid min-w-0 gap-4 @2xl:grid-cols-2">
       <SectionCard
-        title="最近会话"
+        title="最近活动"
         testId="project-home-recent"
         action={
           sessions.length > OVERVIEW_SESSION_LIMIT ? (
@@ -569,9 +587,17 @@ function OverviewTab({
           </p>
         ) : (
           <div className="-mx-2 flex flex-col">
-            {recent.map((s) => (
-              <SessionLine key={s.id} session={s} onOpen={onOpenSession} />
-            ))}
+            {recent.map((item) =>
+              item.kind === "chat" ? (
+                <SessionLine key={`chat-${item.id}`} session={item.session} onOpen={onOpenSession} />
+              ) : (
+                <ActivityLine
+                  key={`${item.kind}-${item.id}`}
+                  item={item}
+                  onOpen={onOpenSurface ? () => onOpenSurface(item.kind === "ticket" ? "board" : "cron") : undefined}
+                />
+              ),
+            )}
           </div>
         )}
       </SectionCard>
@@ -905,18 +931,16 @@ function OutputsTab({
   );
 }
 
-function ProjectSurfaceLinks({
-  boardProjectId,
-  onPrepareBoard,
-  onShowSurface,
-}: {
-  boardProjectId: string;
-  onPrepareBoard: () => Promise<boolean>;
-  onShowSurface: (surface: ProjectSurface) => void;
-}) {
+/** 按本项目的看板范围打开看板/记忆/技能/定时任务。入口链接和「最近活动」共用。 */
+function useSurfaceOpener(
+  boardProjectId: string | null | undefined,
+  onPrepareBoard: (() => Promise<boolean>) | undefined,
+  onShowSurface: ((surface: ProjectSurface) => void) | undefined,
+): { open: ((surface: ProjectSurface) => Promise<void>) | null; opening: ProjectSurface | null } {
   const scope = useProjectScope();
   const toast = useToast();
   const [opening, setOpening] = useState<ProjectSurface | null>(null);
+  if (!boardProjectId || !onPrepareBoard || !onShowSurface) return { open: null, opening };
   const open = async (surface: ProjectSurface) => {
     setOpening(surface);
     try {
@@ -934,6 +958,16 @@ function ProjectSurfaceLinks({
       setOpening(null);
     }
   };
+  return { open, opening };
+}
+
+function ProjectSurfaceLinks({
+  open,
+  opening,
+}: {
+  open: (surface: ProjectSurface) => Promise<void>;
+  opening: ProjectSurface | null;
+}) {
   return (
     <nav aria-label="项目里的更多" className="flex flex-wrap items-center gap-2" data-testid="project-surface-links">
       <span className="text-caption text-faint">项目里的</span>
@@ -943,5 +977,58 @@ function ProjectSurfaceLinks({
         </Chip>
       ))}
     </nav>
+  );
+}
+
+/**
+ * 项目的看板任务与定时任务（主页「最近活动」用）。只读已有接口；失败不打扰，只显示会话。
+ * lib/taskboard 动态引入，不进首屏。
+ */
+function useProjectActivity(
+  boardProjectId: string | null | undefined,
+  authSession: AuthSession,
+  enabled: boolean,
+): { tickets: ActivityTicket[]; cron: ActivityCron[] } {
+  const [data, setData] = useState<{ tickets: ActivityTicket[]; cron: ActivityCron[] }>({ tickets: [], cron: [] });
+  useEffect(() => {
+    if (!enabled || !boardProjectId) {
+      setData({ tickets: [], cron: [] });
+      return;
+    }
+    let alive = true;
+    void (async () => {
+      const [tickets, cron] = await Promise.all([
+        import("../../lib/taskboard")
+          .then(({ taskboardApi }) => taskboardApi.listTickets(authSession, { projectId: boardProjectId }))
+          .then((page) => (page.items ?? []) as unknown as ActivityTicket[])
+          .catch(() => [] as ActivityTicket[]),
+        api.listCron(authSession, { boardProjectId }).then((jobs) => jobs as unknown as ActivityCron[]).catch(() => [] as ActivityCron[]),
+      ]);
+      if (alive) setData({ tickets, cron });
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [boardProjectId, authSession, enabled]);
+  return data;
+}
+
+function ActivityLine({ item, onOpen }: { item: Exclude<ActivityItem, { kind: "chat" }>; onOpen?: () => void }) {
+  const tag = item.kind === "ticket" ? "任务" : "定时";
+  const tone = item.kind === "ticket" ? "bg-[#fdf2f8] text-[#be185d]" : "bg-[#fff7ed] text-[#c2410c]";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      disabled={!onOpen}
+      data-testid={`activity-${item.kind}`}
+      className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-hover disabled:cursor-default disabled:hover:bg-transparent"
+    >
+      <span className={cn("shrink-0 rounded px-1.5 py-0.5 text-caption", tone)}>{tag}</span>
+      <span className="min-w-0 flex-1 truncate text-body">
+        {item.kind === "ticket" ? `${item.identifier} ${item.title}` : item.title}
+      </span>
+      <TimeAgo className="shrink-0 text-caption text-faint" value={item.at} />
+    </button>
   );
 }

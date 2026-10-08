@@ -186,3 +186,56 @@ export function projectSummary(input: {
   parts.push(input.sessionCount > 0 ? `${input.sessionCount} 个会话` : "还没有会话");
   return parts.join(" · ");
 }
+
+/** 「最近活动」里的一条：会话、看板任务或定时任务（只用已有接口的数据）。 */
+export type ActivityItem =
+  | { kind: "chat"; id: string; at: number; title: string; session: Session }
+  | { kind: "ticket"; id: string; at: number; title: string; identifier: string; status: string }
+  | { kind: "cron"; id: string; at: number; title: string; enabled: boolean };
+
+export type ActivityTicket = { id: string; identifier: string; title: string; status: string; updatedAt?: number | string };
+export type ActivityCron = {
+  id: string;
+  label?: string;
+  prompt?: string;
+  enabled?: boolean;
+  lastRunAt?: string | number | null;
+};
+
+function toMs(v: string | number | null | undefined): number {
+  if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+  if (typeof v === "string") {
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? t : 0;
+  }
+  return 0;
+}
+
+/**
+ * 会话 + 看板任务 + 定时任务（只算跑过的）按时间合并，最新在前。
+ * 没有时间的条目不进列表（不编造时间）。
+ */
+export function mergeActivity(input: {
+  sessions: readonly Session[];
+  tickets?: readonly ActivityTicket[];
+  cron?: readonly ActivityCron[];
+  limit: number;
+}): ActivityItem[] {
+  const items: ActivityItem[] = [];
+  for (const s of input.sessions) {
+    const at = sessionRecency(s);
+    if (at > 0) items.push({ kind: "chat", id: s.id, at, title: s.title || "新对话", session: s });
+  }
+  for (const t of input.tickets ?? []) {
+    const at = toMs(t.updatedAt);
+    if (at > 0) items.push({ kind: "ticket", id: t.id, at, title: t.title, identifier: t.identifier, status: t.status });
+  }
+  for (const j of input.cron ?? []) {
+    const at = toMs(j.lastRunAt);
+    if (at > 0) {
+      const title = (j.label || j.prompt || "定时任务").trim().slice(0, 60);
+      items.push({ kind: "cron", id: j.id, at, title, enabled: j.enabled !== false });
+    }
+  }
+  return items.sort((a, b) => b.at - a.at).slice(0, input.limit);
+}

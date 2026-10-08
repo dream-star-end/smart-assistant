@@ -407,3 +407,38 @@ describe("ProjectHome surfaces (P2)", () => {
     expect(screen.queryByTestId("project-surface-links")).toBeNull();
   });
 });
+
+const boardTickets = { current: [] as Array<Record<string, unknown>> };
+vi.mock("../../lib/taskboard", () => ({
+  taskboardApi: { listTickets: async () => ({ items: boardTickets.current }) },
+}));
+
+describe("ProjectHome activity (P3)", () => {
+  it("最近活动合并会话、看板任务与定时任务，按时间倒序；点任务打开看板", async () => {
+    const board = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    boardTickets.current = [{ id: "t1", identifier: "PRJ-3", title: "补齐验收截图", status: "doing", updatedAt: 7_000 }];
+    vi.spyOn(api, "listCron").mockResolvedValue([
+      { id: "c1", label: "每周汇总", enabled: true, lastRunAt: 3_000 },
+    ] as never);
+    scopeBoards.current = [{ id: board }];
+    const onShowSurface = vi.fn();
+    renderHome({ project: { ...project, boardProjectId: board }, onPrepareBoard: async () => true, onShowSurface } as Overrides);
+    const card = await screen.findByTestId("project-home-recent");
+    await waitFor(() => expect(within(card).getByTestId("activity-ticket")).toBeInTheDocument());
+    const text = card.textContent ?? "";
+    expect(text.indexOf("PRJ-3 补齐验收截图")).toBeLessThan(text.indexOf("侧栏搜索交互"));
+    expect(text.indexOf("侧栏搜索交互")).toBeLessThan(text.indexOf("每周汇总"));
+    expect(text.indexOf("每周汇总")).toBeLessThan(text.indexOf("项目功能重构调研"));
+    fireEvent.click(within(card).getByTestId("activity-ticket"));
+    await waitFor(() => expect(onShowSurface).toHaveBeenCalledWith("board"));
+  });
+
+  it("没有看板时只有会话，不请求任务与定时任务", async () => {
+    const spy = vi.spyOn(api, "listCron");
+    renderHome();
+    const card = await screen.findByTestId("project-home-recent");
+    expect(within(card).queryByTestId("activity-ticket")).toBeNull();
+    expect(card).toHaveTextContent("侧栏搜索交互");
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
