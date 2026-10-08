@@ -35,6 +35,7 @@ describe('project_assets PG/SQLite 契约对齐', () => {
   test('pgSessionsBackend 覆盖 sqliteBackend 新增方法', () => {
     for (const method of [
       'listProjectAssets',
+      'searchProjectAssets',
       'createProjectAsset',
       'updateProjectAsset',
       'deleteProjectAsset',
@@ -64,6 +65,24 @@ describe('project_assets PG/SQLite 契约对齐', () => {
       assert.ok(lockAt < countAt, `${name} 必须在计数之前取 xact lock`)
     }
   })
+})
+
+test('searchProjectAssets: both backends escape LIKE, scope by user_id, skip deleted, cap the limit', () => {
+  const pg = extractMethod(backendSrc, 'searchProjectAssets', 'createProjectAsset')
+  const lite = sqliteSrc.slice(
+    sqliteSrc.indexOf('async function _sqliteSearchProjectAssets('),
+    sqliteSrc.indexOf('async function _sqliteCreateProjectAsset('),
+  )
+  for (const [name, src] of [['pg', pg], ['sqlite', lite]] as const) {
+    assert.ok(src.length > 0, `${name} search missing`)
+    assert.match(src, /escapeLikePattern\(q\)/, `${name} must escape LIKE wildcards`)
+    assert.match(src, /ESCAPE '\\\\'/, `${name} must use ESCAPE '\\'`)
+    assert.match(src, /user_id = /, `${name} must scope by user_id`)
+    assert.match(src, /deleted_at IS NULL/, `${name} must skip soft-deleted assets`)
+    assert.match(src, /PROJECT_ASSET_SEARCH_LIMIT_MAX/, `${name} must cap the limit`)
+    assert.match(src, /excerpt/, `${name} must search the excerpt too`)
+  }
+  assert.match(pg, /ILIKE/, 'PG search is case-insensitive')
 })
 
 function extractMethod(src: string, name: string, nextName: string): string {

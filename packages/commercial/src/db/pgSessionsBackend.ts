@@ -132,6 +132,7 @@ import {
   type ProjectAssetUpdateInput,
   type ProjectAssetUpdateResult,
   type ListProjectAssetsOpts,
+  type SearchProjectAssetsOpts,
   type ParsedProjectAssetCreate,
   type ClientSession,
   type ClientSessionLifecycle,
@@ -157,6 +158,9 @@ import {
   CHAT_PROJECT_PER_USER_LIMIT,
   PROJECT_ASSET_LIST_LIMIT_DEFAULT,
   PROJECT_ASSET_LIST_LIMIT_MAX,
+  PROJECT_ASSET_SEARCH_LIMIT_DEFAULT,
+  PROJECT_ASSET_SEARCH_LIMIT_MAX,
+  PROJECT_ASSET_SEARCH_QUERY_MAX,
   PROJECT_ASSET_PER_PROJECT_LIMIT,
   PROJECT_ASSET_PINNED_INJECT_MAX,
   compareMessagesByOrder,
@@ -13000,6 +13004,29 @@ export function createPgSessionsBackend(
             ORDER BY created_at DESC
             LIMIT $3`,
           [userId, opts.projectId, limit],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
+    },
+
+    async searchProjectAssets(userId: string, opts: SearchProjectAssetsOpts): Promise<ProjectAsset[]> {
+      const q = typeof opts.q === "string" ? opts.q.trim().slice(0, PROJECT_ASSET_SEARCH_QUERY_MAX) : "";
+      if (!q) return [];
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(PROJECT_ASSET_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+        : PROJECT_ASSET_SEARCH_LIMIT_DEFAULT;
+      const like = `%${escapeLikePattern(q)}%`;
+      const hasSource = opts.source === "upload" || opts.source === "output";
+      const params: unknown[] = [userId, like, limit];
+      if (hasSource) params.push(opts.source);
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL
+              AND (name ILIKE $2 ESCAPE '\\' OR COALESCE(excerpt, '') ILIKE $2 ESCAPE '\\')${hasSource ? " AND source = $4" : ""}
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3`,
+          params,
         )
       ).rows;
       return rows.map(mapPgProjectAssetRow);

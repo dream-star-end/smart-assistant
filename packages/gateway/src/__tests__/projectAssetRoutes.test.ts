@@ -58,4 +58,13 @@ describe('project-assets 网关接线', () => {
     assert.match(block, /req\.method === 'DELETE'/)
     assert.match(block, /tryExtractProjectAssetExcerpt/)
   })
+
+  it('GET ?q= switches to cross-project search with a validated source and capped limit', () => {
+    const start = serverSrc.indexOf("url.pathname === '/api/project-assets'")
+    const block = serverSrc.slice(start, serverSrc.indexOf("req.method === 'POST'", start))
+    assert.match(block, /searchParams\.get\('q'\)/)
+    assert.match(block, /searchProjectAssets\(userId, /)
+    assert.match(block, /'invalid source'/)
+    assert.match(block, /PROJECT_ASSET_SEARCH_LIMIT_MAX/)
+  })
 })

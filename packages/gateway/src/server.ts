@@ -225,6 +225,10 @@ import {
   CHAT_PROJECT_COLOR_MAX,
   CHAT_PROJECT_INSTRUCTIONS_MAX,
   listProjectAssets,
+  searchProjectAssets,
+  PROJECT_ASSET_SEARCH_LIMIT_DEFAULT,
+  PROJECT_ASSET_SEARCH_LIMIT_MAX,
+  PROJECT_ASSET_SEARCH_QUERY_MAX,
   createProjectAsset,
   updateProjectAsset,
   deleteProjectAsset,
@@ -5097,6 +5101,26 @@ export class Gateway {
     if (url.pathname === '/api/project-assets') {
       const userId = this.getUserId(req)
       if (req.method === 'GET') {
+        // ?q= switches to a cross-project search (Cmd+K): every non-deleted
+        // asset of this user, in any project or ungrouped, by name/excerpt.
+        const rawQ = url.searchParams.get('q')
+        if (rawQ !== null && rawQ.trim() !== '') {
+          const rawSource = url.searchParams.get('source')
+          if (rawSource !== null && rawSource !== '' && rawSource !== 'upload' && rawSource !== 'output') {
+            this.sendJson(res, 400, { error: 'invalid source' })
+            return
+          }
+          const source = rawSource === 'upload' || rawSource === 'output' ? rawSource : undefined
+          const limit = parseOptionalPositiveInt(
+            url.searchParams.get('limit'),
+            PROJECT_ASSET_SEARCH_LIMIT_DEFAULT,
+            PROJECT_ASSET_SEARCH_LIMIT_MAX,
+          )
+          searchProjectAssets(userId, { q: rawQ.trim().slice(0, PROJECT_ASSET_SEARCH_QUERY_MAX), source, limit })
+            .then((assets) => this.sendJson(res, 200, { assets }))
+            .catch(() => this.sendJson(res, 500, { error: 'search failed' }))
+          return
+        }
         const rawProjectId = url.searchParams.get('projectId')
         const projectId = rawProjectId === null || rawProjectId === '' || rawProjectId === 'none'
           ? null

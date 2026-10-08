@@ -2271,6 +2271,16 @@ export type ListProjectAssetsOpts = {
   limit?: number
 }
 
+/** Cross-project search (Cmd+K): name/excerpt substring over the caller's non-deleted assets. */
+export type SearchProjectAssetsOpts = {
+  q: string
+  source?: ProjectAssetSource
+  limit?: number
+}
+export const PROJECT_ASSET_SEARCH_LIMIT_DEFAULT = 20
+export const PROJECT_ASSET_SEARCH_LIMIT_MAX = 50
+export const PROJECT_ASSET_SEARCH_QUERY_MAX = 200
+
 export type ProjectAssetCreateInput = {
   projectId?: unknown
   source?: unknown
@@ -6742,6 +6752,32 @@ async function _sqliteListProjectAssets(
   return rows.map(_mapProjectAssetRow)
 }
 
+async function _sqliteSearchProjectAssets(
+  userId: string,
+  opts: SearchProjectAssetsOpts,
+): Promise<ProjectAsset[]> {
+  const q = typeof opts.q === 'string' ? opts.q.trim().slice(0, PROJECT_ASSET_SEARCH_QUERY_MAX) : ''
+  if (!q) return []
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(PROJECT_ASSET_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+    : PROJECT_ASSET_SEARCH_LIMIT_DEFAULT
+  const like = `%${escapeLikePattern(q)}%`
+  const sourceSql = opts.source === 'upload' || opts.source === 'output' ? ' AND source = ?' : ''
+  const params: unknown[] = [userId, like, like]
+  if (sourceSql) params.push(opts.source)
+  params.push(limit)
+  const db = await getSessionsDb()
+  // SQLite LIKE is ASCII case-insensitive by default; CJK has no case.
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL
+        AND (name LIKE ? ESCAPE '\\' OR COALESCE(excerpt, '') LIKE ? ESCAPE '\\')${sourceSql}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).all(...params) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
 async function _sqliteCreateProjectAsset(
   userId: string,
   input: ProjectAssetCreateInput,
@@ -7488,6 +7524,7 @@ const sqliteBackend = {
   listDeletedChatProjects: _sqliteListDeletedChatProjects,
   restoreChatProject: _sqliteRestoreChatProject,
   listProjectAssets: _sqliteListProjectAssets,
+  searchProjectAssets: _sqliteSearchProjectAssets,
   createProjectAsset: _sqliteCreateProjectAsset,
   updateProjectAsset: _sqliteUpdateProjectAsset,
   deleteProjectAsset: _sqliteDeleteProjectAsset,
@@ -7687,6 +7724,9 @@ export const restoreChatProject: ClientSessionsBackend['restoreChatProject'] =
 
 export const listProjectAssets: ClientSessionsBackend['listProjectAssets'] =
   (...args) => getActiveBackend().listProjectAssets(...args)
+
+export const searchProjectAssets: ClientSessionsBackend['searchProjectAssets'] =
+  (...args) => getActiveBackend().searchProjectAssets(...args)
 
 export const createProjectAsset: ClientSessionsBackend['createProjectAsset'] =
   (...args) => getActiveBackend().createProjectAsset(...args)

@@ -6,7 +6,8 @@
  *   2. 软删只标 deleted_at,不删磁盘文件;
  *   3. 每项目(含未分组 NULL) 500 上限;
  *   4. 同 (user_id, project_id, source, digest) 未删行去重,digest 空则用 container_path;
- *   5. 恶意 url / containerPath 被拒。
+ *   5. 恶意 url / containerPath 被拒;
+ *   6. 跨项目搜索(Cmd+K):name/excerpt 子串,按用户隔离,LIKE 通配符转义。
  *
  * Run: npx tsx --test packages/storage/src/__tests__/projectAssets.test.ts
  */
@@ -30,6 +31,7 @@ const {
   listProjectAssets,
   parseProjectAssetContainerPath,
   parseProjectAssetUrl,
+  searchProjectAssets,
   updateProjectAsset,
   upsertClientSession,
 } = await import('../sessionsDb.js')
@@ -394,3 +396,70 @@ describe('project_assets CRUD', () => {
     assert.equal(renamed.asset.projectId, proj.project.id)
   })
 })
+
+describe('searchProjectAssets (Cmd+K cross-project search)', () => {
+  beforeEach(clearTables)
+
+  const digest = (c: string) => c.repeat(64)
+
+  it('searches name and excerpt across all projects and ungrouped, newest first', async () => {
+    const p1 = await createChatProject(USER, { name: 'P1' })
+    const p2 = await createChatProject(USER, { name: 'P2' })
+    assert.ok(p1.ok && p2.ok)
+    if (!p1.ok || !p2.ok) return
+    const db = await getSessionsDb()
+    const mk = async (name: string, d: string, projectId: string | null, extra: Record<string, unknown> = {}) => {
+      const r = await createProjectAsset(USER, { source: 'upload', name, url: MEDIA_URL(digest(d)), projectId, ...extra })
+      assert.equal(r.ok, true)
+      return r.ok ? r.asset : null
+    }
+    const a = await mk('Weekly-Report.md', 'a', p1.project.id)
+    const b = await mk('9月周报.xlsx', 'b', p2.project.id)
+    const c = await mk('notes.txt', 'c', null, { excerpt: '这是本周 WEEKLY 汇总' })
+    await mk('unrelated.pdf', 'd', null)
+    // Deterministic ordering: a oldest, c newest.
+    db.prepare('UPDATE project_assets SET created_at = ? WHERE id = ?').run(1000, a!.id)
+    db.prepare('UPDATE project_assets SET created_at = ? WHERE id = ?').run(2000, b!.id)
+    db.prepare('UPDATE project_assets SET created_at = ? WHERE id = ?').run(3000, c!.id)
+
+    const weekly = await searchProjectAssets(USER, { q: 'weekly' })
+    assert.deepEqual(weekly.map((x) => x.name), ['notes.txt', 'Weekly-Report.md'], 'case-insensitive, name or excerpt')
+    assert.deepEqual((await searchProjectAssets(USER, { q: '周报' })).map((x) => x.projectId), [p2.project.id])
+    assert.deepEqual(await searchProjectAssets(USER, { q: '   ' }), [])
+    assert.equal((await searchProjectAssets(USER, { q: '.', limit: 2 })).length, 2)
+    assert.equal((await searchProjectAssets(USER, { q: '.', limit: 999 })).length, 4)
+  })
+
+  it('is isolated per user and skips soft-deleted rows', async () => {
+    const mine = await createProjectAsset(USER, { source: 'upload', name: 'secret-plan.md', url: MEDIA_URL(DIGEST_A) })
+    const gone = await createProjectAsset(USER, { source: 'upload', name: 'secret-old.md', url: MEDIA_URL(DIGEST_B) })
+    assert.ok(mine.ok && gone.ok)
+    if (!gone.ok) return
+    await deleteProjectAsset(USER, gone.asset.id)
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'secret' })).map((x) => x.name), ['secret-plan.md'])
+    assert.deepEqual(await searchProjectAssets(OTHER, { q: 'secret' }), [])
+  })
+
+  it('escapes LIKE wildcards % _ and backslash', async () => {
+    await createProjectAsset(USER, { source: 'upload', name: '100%_done.md', url: MEDIA_URL(DIGEST_A) })
+    await createProjectAsset(USER, { source: 'upload', name: '100xxdone.md', url: MEDIA_URL(DIGEST_B) })
+    await createProjectAsset(USER, { source: 'upload', name: 'a\\b.txt', url: MEDIA_URL('c'.repeat(64)) })
+    assert.deepEqual((await searchProjectAssets(USER, { q: '%_' })).map((x) => x.name), ['100%_done.md'])
+    assert.deepEqual((await searchProjectAssets(USER, { q: '0_d' })).map((x) => x.name), [])
+    assert.deepEqual((await searchProjectAssets(USER, { q: '%' })).map((x) => x.name), ['100%_done.md'])
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'a\\b' })).map((x) => x.name), ['a\\b.txt'])
+  })
+
+  it('filters by source', async () => {
+    await createProjectAsset(USER, { source: 'upload', name: 'report-in.md', url: MEDIA_URL(DIGEST_A) })
+    await createProjectAsset(USER, {
+      source: 'output',
+      name: 'report-out.md',
+      containerPath: '/home/agent/.openclaude/generated/report-out.md',
+    })
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'report', source: 'output' })).map((x) => x.name), ['report-out.md'])
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'report', source: 'upload' })).map((x) => x.name), ['report-in.md'])
+    assert.equal((await searchProjectAssets(USER, { q: 'report' })).length, 2)
+  })
+})
+
