@@ -6880,14 +6880,22 @@ async function _sqliteSearchProjectAssets(
     : PROJECT_ASSET_SEARCH_LIMIT_DEFAULT
   const like = `%${escapeLikePattern(q)}%`
   const sourceSql = opts.source === 'upload' || opts.source === 'output' ? ' AND source = ?' : ''
-  const params: unknown[] = [userId, like, like]
+  const params: unknown[] = [userId, userId, like, like]
   if (sourceSql) params.push(opts.source)
   params.push(limit)
   const db = await getSessionsDb()
   // SQLite LIKE is ASCII case-insensitive by default; CJK has no case.
+  // Outputs fold to their latest version (per project and source path), as in listProjectAssets.
   const rows = db.prepare(
     `${PROJECT_ASSET_SELECT}
       WHERE user_id = ? AND deleted_at IS NULL
+        AND id IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id, ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                          ORDER BY created_at DESC, id DESC) AS version_rank
+              FROM project_assets WHERE user_id = ? AND deleted_at IS NULL
+          ) WHERE version_rank = 1
+        )
         AND (name LIKE ? ESCAPE '\\' OR COALESCE(excerpt, '') LIKE ? ESCAPE '\\')${sourceSql}
       ORDER BY created_at DESC, id DESC
       LIMIT ?`,

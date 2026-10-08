@@ -454,6 +454,21 @@ describe('searchProjectAssets (Cmd+K cross-project search)', () => {
     assert.deepEqual((await searchProjectAssets(USER, { q: 'a\\b' })).map((x) => x.name), ['a\\b.txt'])
   })
 
+  it('an output with several versions shows once, as its latest version', async () => {
+    const out = (digest: string) => ({
+      source: 'output',
+      name: 'weekly-report.md',
+      containerPath: '/home/agent/.openclaude/generated/weekly-report.md',
+      digest,
+      url: MEDIA_URL(digest, 'md'),
+    })
+    await createProjectAsset(USER, out(DIGEST_A))
+    const v2 = await createProjectAsset(USER, out(DIGEST_B))
+    assert.ok(v2.ok)
+    if (!v2.ok) return
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'weekly-report' })).map((x) => x.id), [v2.asset.id])
+  })
+
   it('filters by source', async () => {
     await createProjectAsset(USER, { source: 'upload', name: 'report-in.md', url: MEDIA_URL(DIGEST_A) })
     await createProjectAsset(USER, {

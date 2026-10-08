@@ -13114,8 +13114,16 @@ export function createPgSessionsBackend(
       if (hasSource) params.push(opts.source);
       const rows = (
         await pool.query<PgProjectAssetRow>(
+          // Outputs fold to their latest version (per project and source path), as in listProjectAssets.
           `${PG_PROJECT_ASSET_SELECT}
             WHERE user_id = $1 AND deleted_at IS NULL
+              AND id IN (
+                SELECT id FROM (
+                  SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id, ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                                ORDER BY created_at DESC, id DESC) AS version_rank
+                    FROM project_assets WHERE user_id = $1 AND deleted_at IS NULL
+                ) AS versioned WHERE version_rank = 1
+              )
               AND (name ILIKE $2 ESCAPE '\\' OR COALESCE(excerpt, '') ILIKE $2 ESCAPE '\\')${hasSource ? " AND source = $4" : ""}
             ORDER BY created_at DESC, id DESC
             LIMIT $3`,
