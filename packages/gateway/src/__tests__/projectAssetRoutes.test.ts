@@ -47,6 +47,20 @@ describe('project-assets 网关接线', () => {
     assert.doesNotMatch(allowlistSrc, /chat-projects/)
   })
 
+  it('产出物版本路由:versions(GET) 与 restore(POST) 用 match 字面量,normalizePath 收口', () => {
+    assert.ok(
+      serverSrc.includes('url.pathname.match(/^\\/api\\/project-assets\\/([a-zA-Z0-9_-]{8,64})\\/versions$/)'),
+      'versions 必须是 url.pathname.match 字面量',
+    )
+    assert.ok(
+      serverSrc.includes('url.pathname.match(/^\\/api\\/project-assets\\/([a-zA-Z0-9_-]{8,64})\\/restore$/)'),
+      'restore 必须是 url.pathname.match 字面量',
+    )
+    assert.match(serverSrc, /listProjectAssetVersions\(/)
+    assert.ok(serverSrc.includes("'/api/project-assets/:id/versions'"))
+    assert.ok(serverSrc.includes("'/api/project-assets/:id/restore'"))
+  })
+
   it('GET/POST/PATCH/DELETE 四个方法都接线', () => {
     const start = serverSrc.indexOf("url.pathname === '/api/project-assets'")
     assert.ok(start >= 0)

@@ -8,9 +8,27 @@
  * 后端是本地 SQLite,界面读的是 master 的 PG,登记在本地等于没登记。项目
  * 取回合开始时解析出的 chat project(冻结),不取登记那一刻会话所在项目。
  * master 暂时不可达时重试,仍失败就写进本地待登记队列,下次归集时补发。
+ *
+ * 版本:登记前先把产出当前的字节复制进与上传同一个内容寻址区(sha256),登记行
+ * 带 digest + url 指向这份不可变副本,containerPath 只作源路径。同一路径写两次
+ * 不同内容 = 两个版本,各自可下载;源文件之后被覆盖或删除不影响旧版本。
  */
-import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { constants as fsConstants } from 'node:fs'
+import {
+  appendFile,
+  link,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+  type FileHandle,
+} from 'node:fs/promises'
+import { basename, dirname, join, sep } from 'node:path'
 import {
   createProjectAsset,
   parseProjectAssetContainerPath,
@@ -28,6 +46,10 @@ const log = createLogger({ module: 'projectAssets' })
 
 export const GENERATED_OUTPUT_PATH_RE = /\/home\/agent\/\.openclaude\/generated\/[^\s<"'\`>]+/g
 export const PROJECT_ASSET_TURN_COLLECT_MAX = 5
+/** Outputs above this are registered by source path only, without a version copy. */
+export const OUTPUT_VERSION_COPY_MAX_BYTES = 50 * 1024 * 1024
+const GENERATED_PREFIX = '/home/agent/.openclaude/generated/'
+const COPY_CHUNK_BYTES = 1024 * 1024
 const EXCERPT_PARSE_TIMEOUT_MS = 8_000
 const EXCERPT_TEXT_BYTES_MAX = 16 * 1024
 
@@ -169,6 +191,24 @@ export interface OutputAssetItem {
   name: string
   mime?: string
   size?: number
+  /** sha256 of the version copy; absent when the output was not copied (too big / copy failed). */
+  digest?: string
+  /** `/api/media/<digest>.<ext>` of the version copy; always sent together with digest. */
+  url?: string
+}
+
+/** Where outputs are read from and where version copies go (test seam). */
+export interface OutputVersionRoots {
+  /** Real directory behind `/home/agent/.openclaude/generated/`. */
+  generated: string
+  /** Content-addressed store, the same directory uploads land in (served by /api/media). */
+  cas: string
+}
+
+export interface CapturedOutputVersion {
+  size: number
+  digest?: string
+  url?: string
 }
 
 /** One registration request; also the shape of a pending spool line. */
@@ -190,10 +230,114 @@ export interface CollectSessionOutputAssetsOpts {
   sleep?: (ms: number) => Promise<void>
   spoolFile?: string
   /** Test seam: outputs live under /home/agent, which tests cannot create. */
-  statFile?: (path: string) => Promise<{ isFile(): boolean; size: number }>
+  outputRoots?: OutputVersionRoots
 }
 
 type RegisterOutcome = 'registered' | 'rejected' | 'unreachable'
+
+function defaultOutputRoots(): OutputVersionRoots {
+  return { generated: GENERATED_PREFIX.slice(0, -1), cas: storagePaths.uploadsDir }
+}
+
+/** Storage suffix from the output's own name; same charset PROJECT_ASSET_URL_RE accepts. */
+export function outputVersionExt(name: string): string {
+  const m = name.match(/\.([A-Za-z0-9]{1,32})$/)
+  return m ? m[1]!.toLowerCase() : 'bin'
+}
+
+async function writeAll(fh: FileHandle, chunk: Buffer): Promise<void> {
+  let off = 0
+  while (off < chunk.length) {
+    const { bytesWritten } = await fh.write(chunk, off, chunk.length - off)
+    off += bytesWritten
+  }
+}
+
+/**
+ * Copy the already-opened source into the content-addressed store, hashing
+ * exactly the bytes copied (a file rewritten mid-copy still gets a digest
+ * that matches what is stored). Publish is tmp + link, like uploads: an
+ * existing `<digest>.<ext>` is the same bytes and is kept.
+ */
+async function copyIntoCas(src: FileHandle, name: string, casDir: string): Promise<CapturedOutputVersion> {
+  await mkdir(casDir, { recursive: true })
+  const tmp = join(casDir, `.tmp-output-${process.pid}-${randomUUID()}`)
+  const out = await open(tmp, 'wx', 0o644)
+  const hash = createHash('sha256')
+  let copied = 0
+  try {
+    try {
+      const buf = Buffer.allocUnsafe(COPY_CHUNK_BYTES)
+      for (;;) {
+        const { bytesRead } = await src.read(buf, 0, buf.length, copied)
+        if (bytesRead === 0) break
+        copied += bytesRead
+        if (copied > OUTPUT_VERSION_COPY_MAX_BYTES) throw new Error('output grew past the version copy cap')
+        const chunk = buf.subarray(0, bytesRead)
+        hash.update(chunk)
+        await writeAll(out, chunk)
+      }
+      await out.chmod(0o644)
+    } finally {
+      await out.close()
+    }
+    const digest = hash.digest('hex')
+    const finalName = `${digest}.${outputVersionExt(name)}`
+    const finalPath = join(casDir, finalName)
+    try {
+      await link(tmp, finalPath)
+    } catch (err) {
+      if ((err as { code?: string }).code !== 'EEXIST') throw err
+      // Same digest already stored. Anything that is not a regular file of
+      // the right size there is not those bytes: replace it.
+      const existing = await lstat(finalPath)
+      if (!existing.isFile() || existing.size !== copied) await rename(tmp, finalPath)
+    }
+    return { size: copied, digest, url: `/api/media/${finalName}` }
+  } finally {
+    await rm(tmp, { force: true })
+  }
+}
+
+/**
+ * Capture the current bytes of one output as an immutable version.
+ * null = do not register (missing, not a regular file, or resolving outside
+ * generated/ through a symlink). Over the cap, or if the copy fails, only
+ * the size comes back and the output is registered by source path as before.
+ */
+export async function captureOutputVersion(
+  containerPath: string,
+  roots: OutputVersionRoots = defaultOutputRoots(),
+): Promise<CapturedOutputVersion | null> {
+  if (!containerPath.startsWith(GENERATED_PREFIX)) return null
+  const rootReal = await realpath(roots.generated)
+  const real = await realpath(join(rootReal, containerPath.slice(GENERATED_PREFIX.length)))
+  if (!real.startsWith(rootReal + sep)) {
+    log.warn('output path resolves outside generated/, not registered', { containerPath })
+    return null
+  }
+  const src = await open(real, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+  try {
+    // A directory swapped for a symlink between realpath and open is caught
+    // here: what we actually opened must still live under generated/.
+    const opened = await realpath(`/proc/self/fd/${src.fd}`).catch(() => real)
+    if (!opened.startsWith(rootReal + sep)) {
+      log.warn('output path moved outside generated/ while opening, not registered', { containerPath })
+      return null
+    }
+    const st = await src.stat()
+    if (!st.isFile()) return null
+    if (st.size > OUTPUT_VERSION_COPY_MAX_BYTES) return { size: st.size }
+    try {
+      return await copyIntoCas(src, basename(containerPath), roots.cas)
+    } catch (err) {
+      log.warn('output version copy failed, registering the source path only', { containerPath }, err)
+      return { size: st.size }
+    }
+  } finally {
+    await src.close()
+  }
+}
 
 export function outputAssetSpoolFile(): string {
   return join(storagePaths.home, 'pending-output-assets.jsonl')
@@ -344,11 +488,19 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
   const items: OutputAssetItem[] = []
   for (const containerPath of paths) {
     try {
-      const st = await (opts.statFile ?? stat)(containerPath)
-      if (!st.isFile()) continue
+      // The copy happens before the registration exists, so a registered
+      // version always points at bytes that are already stored.
+      const captured = await captureOutputVersion(containerPath, opts.outputRoots)
+      if (!captured) continue
       const name = basename(containerPath)
       const mime = mimeFromAssetName(name)
-      items.push({ containerPath, name, ...(mime ? { mime } : {}), size: st.size })
+      items.push({
+        containerPath,
+        name,
+        ...(mime ? { mime } : {}),
+        size: captured.size,
+        ...(captured.digest && captured.url ? { digest: captured.digest, url: captured.url } : {}),
+      })
     } catch (err) {
       log.warn('collectSessionOutputAssets skipped', { sessionId: opts.sessionId, containerPath }, err)
     }
@@ -383,6 +535,7 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
         containerPath: item.containerPath,
         mime: item.mime,
         size: item.size,
+        ...(item.digest && item.url ? { digest: item.digest, url: item.url } : {}),
       })
       if (!result.ok && result.error !== 'limit_exceeded') {
         log.warn('collectSessionOutputAssets create failed', {

@@ -229,6 +229,7 @@ import {
   PROJECT_ASSET_SEARCH_LIMIT_DEFAULT,
   PROJECT_ASSET_SEARCH_LIMIT_MAX,
   PROJECT_ASSET_SEARCH_QUERY_MAX,
+  listProjectAssetVersions,
   createProjectAsset,
   updateProjectAsset,
   deleteProjectAsset,
@@ -5209,6 +5210,70 @@ export class Gateway {
         return
       }
       this.sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    // 产出物版本:同一源路径的全部版本(新→旧),以及把某个旧版本恢复成最新版本。
+    // 恢复 = 用旧版本的 digest/url 再登记一行(新 created_at),从不改写或删除已有版本。
+    const projectAssetVersionsMatch = url.pathname.match(/^\/api\/project-assets\/([a-zA-Z0-9_-]{8,64})\/versions$/)
+    if (projectAssetVersionsMatch) {
+      const userId = this.getUserId(req)
+      if (req.method !== 'GET') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      listProjectAssetVersions(userId, projectAssetVersionsMatch[1]!)
+        .then((versions) => versions
+          ? this.sendJson(res, 200, { versions })
+          : this.sendJson(res, 404, { error: 'not found' }))
+        .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
+      return
+    }
+    const projectAssetRestoreMatch = url.pathname.match(/^\/api\/project-assets\/([a-zA-Z0-9_-]{8,64})\/restore$/)
+    if (projectAssetRestoreMatch) {
+      const userId = this.getUserId(req)
+      if (req.method !== 'POST') {
+        this.sendJson(res, 405, { error: 'method not allowed' })
+        return
+      }
+      const assetId = projectAssetRestoreMatch[1]!
+      ;(async () => {
+        const versions = await listProjectAssetVersions(userId, assetId)
+        const target = versions?.find((v) => v.id === assetId)
+        if (!target) {
+          this.sendJson(res, 404, { error: 'not found' })
+          return
+        }
+        if (target.source !== 'output' || !target.containerPath || !target.url || !target.digest) {
+          this.sendJson(res, 400, { error: 'version has no stored copy' })
+          return
+        }
+        const result = await createProjectAsset(userId, {
+          source: 'output',
+          projectId: target.projectId,
+          sessionId: target.sessionId,
+          name: target.name,
+          url: target.url,
+          containerPath: target.containerPath,
+          mime: target.mime,
+          size: target.sizeBytes,
+          digest: target.digest,
+          excerpt: target.excerpt,
+        })
+        if (!result.ok) {
+          if (result.error === 'limit_exceeded') {
+            this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
+            return
+          }
+          if (result.error === 'project_not_found') {
+            this.sendJson(res, 404, { error: 'project not found' })
+            return
+          }
+          this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
+          return
+        }
+        // created=false: this version is already the newest one.
+        this.sendJson(res, 200, { asset: result.asset, created: result.created })
+      })().catch(() => this.sendJson(res, 500, { error: 'restore failed' }))
       return
     }
     const projectAssetMatch = url.pathname.match(/^\/api\/project-assets\/([a-zA-Z0-9_-]{8,64})$/)
@@ -24171,6 +24236,8 @@ function normalizePath(p: string): string {
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+\/restore/, '/api/chat-projects/:id/restore')
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
+    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+\/versions/, '/api/project-assets/:id/versions')
+    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+\/restore/, '/api/project-assets/:id/restore')
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
     .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')

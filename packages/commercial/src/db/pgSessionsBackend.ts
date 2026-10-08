@@ -163,6 +163,7 @@ import {
   PROJECT_ASSET_SEARCH_QUERY_MAX,
   PROJECT_ASSET_PER_PROJECT_LIMIT,
   PROJECT_ASSET_PINNED_INJECT_MAX,
+  PROJECT_ASSET_VERSION_GROUP_SQL,
   compareMessagesByOrder,
   deriveArchivedOrderSeqsForRead,
   deriveOrderSeqsForRead,
@@ -190,6 +191,7 @@ import {
   parseProjectAssetCreateInput,
   parseProjectAssetName,
   parseProjectAssetProjectId,
+  withVersionCount,
   parseSessionBatchInput,
   type PatchClientSessionMetaResult,
   rankSessionSearchHits,
@@ -827,6 +829,32 @@ async function pgCountProjectAssets(
   return Number(row?.n ?? 0);
 }
 
+/** 同一项目里某个产出源路径的最新未删版本(无则 null)。 */
+async function pgLatestOutputVersion(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string | null,
+  containerPath: string,
+): Promise<ProjectAsset | null> {
+  const row = (
+    await queryable.query<PgProjectAssetRow>(
+      `${PG_PROJECT_ASSET_SELECT}
+        WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+          AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1`,
+      [userId, projectId, containerPath],
+    )
+  ).rows[0];
+  return row ? mapPgProjectAssetRow(row) : null;
+}
+
+/**
+ * 去重规则与 SQLite 侧 _sqliteFindDuplicateAsset 同构:
+ *   - 带字节副本的产出(output + containerPath + digest):只与该源路径的最新版本比,
+ *     digest 相同 = 同一版本,不同 = 新版本(返回 null)。
+ *   - 其它(上传、旧容器只报路径的产出):同 digest,digest 空则同 container_path。
+ */
 async function pgFindDuplicateAsset(
   queryable: Pick<Pool | PoolClient, "query">,
   userId: string,
@@ -835,6 +863,10 @@ async function pgFindDuplicateAsset(
   digest: string | null,
   containerPath: string | null,
 ): Promise<ProjectAsset | null> {
+  if (source === "output" && containerPath && digest) {
+    const latest = await pgLatestOutputVersion(queryable, userId, projectId, containerPath);
+    return latest && latest.digest === digest ? latest : null;
+  }
   if (digest) {
     const row = (
       await queryable.query<PgProjectAssetRow>(
@@ -12997,13 +13029,42 @@ export function createPgSessionsBackend(
       const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
         ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
         : PROJECT_ASSET_LIST_LIMIT_DEFAULT;
+      // 产出物按源路径折叠成一条(最新版本)并带版本数;与 SQLite 同一分组键。
       const rows = (
-        await pool.query<PgProjectAssetRow>(
-          `${PG_PROJECT_ASSET_SELECT}
-            WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2
+        await pool.query<PgProjectAssetRow & { version_count: string }>(
+          `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+                  size_bytes::text AS size_bytes, digest, excerpt, pinned,
+                  created_at::text AS created_at, updated_at::text AS updated_at,
+                  version_count::text AS version_count
+             FROM (
+               SELECT *,
+                      ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                         ORDER BY created_at DESC, id DESC) AS version_rank,
+                      COUNT(*) OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}) AS version_count
+                 FROM project_assets
+                WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2
+             ) AS versioned
+            WHERE version_rank = 1
             ORDER BY created_at DESC
             LIMIT $3`,
           [userId, opts.projectId, limit],
+        )
+      ).rows;
+      return rows.map((r) => withVersionCount(mapPgProjectAssetRow(r), Number(r.version_count)));
+    },
+
+    async listProjectAssetVersions(userId: string, assetId: string): Promise<ProjectAsset[] | null> {
+      const asset = await readPgProjectAsset(pool, userId, assetId);
+      if (!asset) return null;
+      if (asset.source !== "output" || !asset.containerPath) return [asset];
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+              AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4`,
+          [userId, asset.projectId, asset.containerPath, PROJECT_ASSET_PER_PROJECT_LIMIT],
         )
       ).rows;
       return rows.map(mapPgProjectAssetRow);
@@ -13043,6 +13104,17 @@ export function createPgSessionsBackend(
         const resolved = await pgResolveAssetProjectId(client, userId, parsed.value);
         if (!resolved.ok) return resolved;
         const { projectId } = resolved;
+        // 同一 (user_id, project_id) 桶的 去重+count+INSERT 必须串行:默认 READ COMMITTED
+        // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破;同一产出的两个
+        // 新版本并发登记也会各自看不到对方。锁放在去重之前,与 SQLite 的单事务一致。
+        // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
+        // pg_advisory_lock(连接归还池后锁会泄漏)。
+        // NULL project_id(未分组)用 coalesce($2,'') 编码:真实 chat_projects.id 是 UUID
+        // (解析还拒绝 <8 字符),空串不会与真实 id 撞,故不会误锁其它项目。
+        await client.query(
+          "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
+          [`oc_proj_asset:${userId}`, projectId],
+        );
         const dup = await pgFindDuplicateAsset(
           client,
           userId,
@@ -13052,18 +13124,14 @@ export function createPgSessionsBackend(
           parsed.value.containerPath,
         );
         if (dup) return { ok: true, asset: dup, created: false };
-        // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
-        // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
-        // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
-        // pg_advisory_lock(连接归还池后锁会泄漏)。
-        // NULL project_id(未分组)用 coalesce($2,'') 编码:真实 chat_projects.id 是 UUID
-        // (解析还拒绝 <8 字符),空串不会与真实 id 撞,故不会误锁其它项目。
-        await client.query(
-          "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
-          [`oc_proj_asset:${userId}`, projectId],
-        );
         if ((await pgCountProjectAssets(client, userId, projectId)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
           return { ok: false, error: "limit_exceeded" };
+        }
+        // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+        let createdAtFloor = 0;
+        if (parsed.value.source === "output" && parsed.value.containerPath) {
+          const latest = await pgLatestOutputVersion(client, userId, projectId, parsed.value.containerPath);
+          if (latest) createdAtFloor = latest.createdAt + 1;
         }
         // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
         await client.query(
@@ -13072,7 +13140,7 @@ export function createPgSessionsBackend(
              mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
            ) VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-             ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL
+             GREATEST(${CLOCK_MS_SQL}, $14::bigint), GREATEST(${CLOCK_MS_SQL}, $14::bigint), NULL
            )`,
           [
             id,
@@ -13088,6 +13156,7 @@ export function createPgSessionsBackend(
             parsed.value.digest,
             parsed.value.excerpt,
             parsed.value.pinned,
+            createdAtFloor,
           ],
         );
         const asset = await readPgProjectAsset(client, userId, id);

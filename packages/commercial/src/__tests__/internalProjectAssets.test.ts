@@ -194,4 +194,55 @@ describe("internal project-assets", () => {
     await h.handler(req({ method: "GET", authorization: auth }), get, ctx);
     assert.equal(get.statusCode, 405);
   });
+
+  const D1 = "a1".repeat(32);
+  const D2 = "b2".repeat(32);
+
+  test("a version copy's digest and url are passed through to the backend", async () => {
+    const h = harness();
+    const r = res();
+    await h.handler(
+      req({
+        authorization: auth,
+        body: { sessionId: "s-1", items: [{ containerPath: OUT, name: "report.md", digest: D1, url: `/api/media/${D1}.md` }] },
+      }),
+      r,
+      ctx,
+    );
+    assert.equal(r.statusCode, 200);
+    assert.equal(h.calls[0]?.input.digest, D1);
+    assert.equal(h.calls[0]?.input.url, `/api/media/${D1}.md`);
+    assert.equal(h.calls[0]?.input.containerPath, OUT);
+  });
+
+  test("an old container's payload (no digest, no url) is registered by path as before", async () => {
+    const h = harness();
+    const r = res();
+    await h.handler(req({ authorization: auth, body: { sessionId: "s-1", items: [{ containerPath: OUT, name: "report.md", size: 10 }] } }), r, ctx);
+    assert.equal(r.statusCode, 200);
+    assert.deepEqual(h.calls[0]?.input, { source: "output", sessionId: "s-1", name: "report.md", containerPath: OUT, size: 10 });
+  });
+
+  test("rejects a digest/url mismatch, a half pair, and malformed values", async () => {
+    const h = harness();
+    for (const extra of [
+      { digest: D1, url: `/api/media/${D2}.md` },
+      { digest: D1 },
+      { url: `/api/media/${D1}.md` },
+      { digest: D1.toUpperCase(), url: `/api/media/${D1.toUpperCase()}.md` },
+      { digest: "abc", url: "/api/media/abc.md" },
+      { digest: D1, url: `/api/file?path=/etc/passwd&x=${D1}` },
+      { digest: D1, url: `https://evil.test/api/media/${D1}.md` },
+      { digest: 1, url: 2 },
+    ]) {
+      const r = res();
+      await h.handler(
+        req({ authorization: auth, body: { sessionId: "s-1", items: [{ containerPath: OUT, name: "report.md", ...extra }] } }),
+        r,
+        ctx,
+      );
+      assert.equal(r.statusCode, 400, JSON.stringify(extra));
+    }
+    assert.equal(h.calls.length, 0);
+  });
 });

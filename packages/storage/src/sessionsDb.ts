@@ -2235,6 +2235,11 @@ export type ProjectAsset = {
   pinned: boolean
   createdAt: number
   updatedAt: number
+  /**
+   * 产出物版本数:只出现在 list 结果里,且只在同一源路径(container_path)有 >1 个
+   * 未删版本时给出。list 对每个源路径只回最新版本那一行。
+   */
+  versionCount?: number
 }
 
 export type ProjectAssetCreateError =
@@ -6638,6 +6643,15 @@ const PROJECT_ASSET_SELECT = `
     FROM project_assets
 `
 
+/** list 折叠版本用的分组键;SQLite / PG 同一表达式。 */
+export const PROJECT_ASSET_VERSION_GROUP_SQL =
+  "CASE WHEN source = 'output' AND container_path IS NOT NULL THEN 'p:' || container_path ELSE 'i:' || id END"
+
+/** versionCount 只在有多个版本时出现,单版本的行形状与以前一致。 */
+export function withVersionCount(asset: ProjectAsset, count: number): ProjectAsset {
+  return Number.isFinite(count) && count > 1 ? { ...asset, versionCount: count } : asset
+}
+
 function _mapProjectAssetRow(r: ProjectAssetDbRow): ProjectAsset {
   return {
     id: r.id,
@@ -6690,6 +6704,30 @@ function _sqliteCountProjectAssets(
   return row.n
 }
 
+/** 同一项目里某个产出源路径的最新未删版本(无则 null)。 */
+function _sqliteLatestOutputVersion(
+  db: Database.Database,
+  userId: string,
+  projectId: string | null,
+  containerPath: string,
+): ProjectAsset | null {
+  const row = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ? AND container_path = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+  ).get(userId, projectId, containerPath) as ProjectAssetDbRow | undefined
+  return row ? _mapProjectAssetRow(row) : null
+}
+
+/**
+ * 去重规则(PG 侧 pgFindDuplicateAsset 同构):
+ *   - 带字节副本的产出(output + containerPath + digest):只与该源路径的**最新**版本比。
+ *     digest 相同 = 同一版本(返回它);不同 = 新版本(返回 null,由调用方插入)。
+ *     A→B→A 会得到第三个版本,「恢复旧版本」也是同一条路:用旧 digest 再登记一次。
+ *   - 其它(上传、旧容器只报路径的产出):同 (user, project, source, digest),
+ *     digest 空则同 container_path,与以前一致。
+ */
 function _sqliteFindDuplicateAsset(
   db: Database.Database,
   userId: string,
@@ -6698,6 +6736,10 @@ function _sqliteFindDuplicateAsset(
   digest: string | null,
   containerPath: string | null,
 ): ProjectAsset | null {
+  if (source === 'output' && containerPath && digest) {
+    const latest = _sqliteLatestOutputVersion(db, userId, projectId, containerPath)
+    return latest && latest.digest === digest ? latest : null
+  }
   if (digest) {
     const row = db.prepare(
       `${PROJECT_ASSET_SELECT}
@@ -6743,12 +6785,39 @@ async function _sqliteListProjectAssets(
     ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
     : PROJECT_ASSET_LIST_LIMIT_DEFAULT
   const db = await getSessionsDb()
+  // 产出物按源路径折叠成一条(最新版本)并带版本数;上传与无源路径的行各自成组。
   const rows = db.prepare(
-    `${PROJECT_ASSET_SELECT}
-      WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?
+    `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+            size_bytes, digest, excerpt, pinned, created_at, updated_at, version_count
+       FROM (
+         SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                   ORDER BY created_at DESC, id DESC) AS version_rank,
+                COUNT(*) OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}) AS version_count
+           FROM project_assets
+          WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?
+       ) AS versioned
+      WHERE version_rank = 1
       ORDER BY created_at DESC
       LIMIT ?`,
-  ).all(userId, opts.projectId, limit) as ProjectAssetDbRow[]
+  ).all(userId, opts.projectId, limit) as Array<ProjectAssetDbRow & { version_count: number }>
+  return rows.map((r) => withVersionCount(_mapProjectAssetRow(r), Number(r.version_count)))
+}
+
+async function _sqliteListProjectAssetVersions(
+  userId: string,
+  assetId: string,
+): Promise<ProjectAsset[] | null> {
+  const db = await getSessionsDb()
+  const asset = _sqliteReadProjectAsset(db, userId, assetId)
+  if (!asset) return null
+  if (asset.source !== 'output' || !asset.containerPath) return [asset]
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ? AND container_path = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).all(userId, asset.projectId, asset.containerPath, PROJECT_ASSET_PER_PROJECT_LIMIT) as ProjectAssetDbRow[]
   return rows.map(_mapProjectAssetRow)
 }
 
@@ -6803,6 +6872,12 @@ async function _sqliteCreateProjectAsset(
     if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
       return { ok: false, error: 'limit_exceeded' }
     }
+    // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+    let createdAt = now
+    if (parsed.value.source === 'output' && parsed.value.containerPath) {
+      const latest = _sqliteLatestOutputVersion(db, userId, projectId, parsed.value.containerPath)
+      if (latest) createdAt = Math.max(now, latest.createdAt + 1)
+    }
     // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
     db.prepare(`
       INSERT INTO project_assets (
@@ -6823,8 +6898,8 @@ async function _sqliteCreateProjectAsset(
       parsed.value.digest,
       parsed.value.excerpt,
       parsed.value.pinned ? 1 : 0,
-      now,
-      now,
+      createdAt,
+      createdAt,
     )
     const asset = _sqliteReadProjectAsset(db, userId, id)
     if (!asset) throw new Error('project asset insert vanished')
@@ -7525,6 +7600,7 @@ const sqliteBackend = {
   restoreChatProject: _sqliteRestoreChatProject,
   listProjectAssets: _sqliteListProjectAssets,
   searchProjectAssets: _sqliteSearchProjectAssets,
+  listProjectAssetVersions: _sqliteListProjectAssetVersions,
   createProjectAsset: _sqliteCreateProjectAsset,
   updateProjectAsset: _sqliteUpdateProjectAsset,
   deleteProjectAsset: _sqliteDeleteProjectAsset,
@@ -7727,6 +7803,8 @@ export const listProjectAssets: ClientSessionsBackend['listProjectAssets'] =
 
 export const searchProjectAssets: ClientSessionsBackend['searchProjectAssets'] =
   (...args) => getActiveBackend().searchProjectAssets(...args)
+export const listProjectAssetVersions: ClientSessionsBackend['listProjectAssetVersions'] =
+  (...args) => getActiveBackend().listProjectAssetVersions(...args)
 
 export const createProjectAsset: ClientSessionsBackend['createProjectAsset'] =
   (...args) => getActiveBackend().createProjectAsset(...args)

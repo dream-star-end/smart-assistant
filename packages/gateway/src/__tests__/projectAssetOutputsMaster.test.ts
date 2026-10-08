@@ -5,7 +5,8 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, describe, it } from 'node:test'
@@ -22,7 +23,15 @@ const ENV = {
 } as NodeJS.ProcessEnv
 const OUT = '/home/agent/.openclaude/generated/report.md'
 const TEXT = `Saved the report to ${OUT}.`
-const statFile = async () => ({ isFile: () => true, size: 42 })
+// Outputs live under /home/agent in the container; here generated/ is a temp dir.
+const outputRoots = {
+  generated: join(process.env.OPENCLAUDE_HOME as string, 'generated'),
+  cas: join(process.env.OPENCLAUDE_HOME as string, 'uploads'),
+}
+const REPORT_BYTES = '# report\n'.repeat(4) + 'end\n'
+await mkdir(outputRoots.generated, { recursive: true })
+await writeFile(join(outputRoots.generated, 'report.md'), REPORT_BYTES)
+const REPORT_DIGEST = createHash('sha256').update(REPORT_BYTES).digest('hex')
 
 type Reply = number | 'network'
 function fetcherFrom(replies: Reply[]) {
@@ -50,30 +59,39 @@ describe('container output assets → master', () => {
     const { fetcher, calls } = fetcherFrom([200])
     await collectSessionOutputAssets({
       userId: 'default', sessionId: 's-1', assistantText: TEXT, chatProjectId: 'proj-a',
-      env: ENV, fetcher, sleep: noSleep, statFile, spoolFile: spool(),
+      env: ENV, fetcher, sleep: noSleep, outputRoots, spoolFile: spool(),
     })
     assert.equal(calls.length, 1)
     assert.equal(calls[0]?.url, 'http://master.test/internal/v3/project-assets')
     assert.deepEqual(calls[0]?.body, {
       sessionId: 's-1',
       projectId: 'proj-a',
-      items: [{ containerPath: OUT, name: 'report.md', mime: 'text/markdown', size: 42 }],
+      items: [{
+        containerPath: OUT,
+        name: 'report.md',
+        mime: 'text/markdown',
+        size: Buffer.byteLength(REPORT_BYTES),
+        digest: REPORT_DIGEST,
+        url: `/api/media/${REPORT_DIGEST}.md`,
+      }],
     })
+    // The version copy is in the store before the master hears about it.
+    assert.equal(await readFile(join(outputRoots.cas, `${REPORT_DIGEST}.md`), 'utf8'), REPORT_BYTES)
   })
 
   it('an unresolved project is left for the master to infer; null is sent as ungrouped', async () => {
     const a = fetcherFrom([200])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, env: ENV, fetcher: a.fetcher, sleep: noSleep, statFile, spoolFile: spool() })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, env: ENV, fetcher: a.fetcher, sleep: noSleep, outputRoots, spoolFile: spool() })
     assert.equal(Object.hasOwn(a.calls[0]!.body, 'projectId'), false)
     const b = fetcherFrom([200])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, chatProjectId: null, env: ENV, fetcher: b.fetcher, sleep: noSleep, statFile, spoolFile: spool() })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, chatProjectId: null, env: ENV, fetcher: b.fetcher, sleep: noSleep, outputRoots, spoolFile: spool() })
     assert.equal(b.calls[0]!.body.projectId, null)
   })
 
   it('retries a 5xx and stops at the first success', async () => {
     const { fetcher, calls } = fetcherFrom([502, 200])
     const file = spool()
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, env: ENV, fetcher, sleep: noSleep, statFile, spoolFile: file })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, env: ENV, fetcher, sleep: noSleep, outputRoots, spoolFile: file })
     assert.equal(calls.length, 2)
     await assert.rejects(readFile(file, 'utf8'))
   })
@@ -81,14 +99,14 @@ describe('container output assets → master', () => {
   it('a master outage spools the registration and the next collection sends it once', async () => {
     const file = spool()
     const down = fetcherFrom(['network', 'network', 'network'])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, chatProjectId: 'proj-a', env: ENV, fetcher: down.fetcher, sleep: noSleep, statFile, spoolFile: file })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, chatProjectId: 'proj-a', env: ENV, fetcher: down.fetcher, sleep: noSleep, outputRoots, spoolFile: file })
     const queued = (await readFile(file, 'utf8')).trim().split('\n')
     assert.equal(queued.length, 1)
     assert.equal(JSON.parse(queued[0]!).projectId, 'proj-a')
 
     _resetOutputAssetSpoolThrottleForTest()
     const up = fetcherFrom([200, 200])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: 'no files this turn', env: ENV, fetcher: up.fetcher, sleep: noSleep, statFile, spoolFile: file })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: 'no files this turn', env: ENV, fetcher: up.fetcher, sleep: noSleep, outputRoots, spoolFile: file })
     assert.equal(up.calls.length, 1)
     assert.equal(up.calls[0]!.body.sessionId, 's-1')
     assert.equal(up.calls[0]!.body.projectId, 'proj-a')
@@ -98,7 +116,7 @@ describe('container output assets → master', () => {
   it('a 4xx is final: not retried, not spooled', async () => {
     const file = spool()
     const { fetcher, calls } = fetcherFrom([400, 200])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, env: ENV, fetcher, sleep: noSleep, statFile, spoolFile: file })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-1', assistantText: TEXT, env: ENV, fetcher, sleep: noSleep, outputRoots, spoolFile: file })
     assert.equal(calls.length, 1)
     await assert.rejects(readFile(file, 'utf8'))
   })
@@ -107,7 +125,7 @@ describe('container output assets → master', () => {
     const file = spool()
     await writeFile(file, `{"sessionId":"s-9","items":[{"containerPath":"${OUT}","name":"report.md"}]}\n{torn\n`)
     const up = fetcherFrom([200])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: '', env: ENV, fetcher: up.fetcher, sleep: noSleep, statFile, spoolFile: file })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: '', env: ENV, fetcher: up.fetcher, sleep: noSleep, outputRoots, spoolFile: file })
     assert.equal(up.calls.length, 1)
     assert.equal(up.calls[0]!.body.sessionId, 's-9')
   })
@@ -133,11 +151,11 @@ describe('output asset spool under concurrency', () => {
       throw new Error('ECONNREFUSED')
     }) as unknown as typeof import('undici').request
     const flush = collectSessionOutputAssets({
-      userId: 'default', sessionId: 's-x', assistantText: '', env: ENV, fetcher: slowFetcher, sleep: noSleep, statFile, spoolFile: file,
+      userId: 'default', sessionId: 's-x', assistantText: '', env: ENV, fetcher: slowFetcher, sleep: noSleep, outputRoots, spoolFile: file,
     })
     await new Promise((done) => setTimeout(done, 20))
     await collectSessionOutputAssets({
-      userId: 'default', sessionId: 's-new', assistantText: TEXT, env: ENV, fetcher: slowFetcher, sleep: noSleep, statFile, spoolFile: file,
+      userId: 'default', sessionId: 's-new', assistantText: TEXT, env: ENV, fetcher: slowFetcher, sleep: noSleep, outputRoots, spoolFile: file,
     })
     releaseSend()
     await flush
@@ -149,7 +167,7 @@ describe('output asset spool under concurrency', () => {
     const file = spool()
     await writeFile(`${file}.inflight`, `${JSON.stringify({ sessionId: 's-crash', items: [{ containerPath: OUT, name: 'report.md' }] })}\n`)
     const up = fetcherFrom([200])
-    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: '', env: ENV, fetcher: up.fetcher, sleep: noSleep, statFile, spoolFile: file })
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: '', env: ENV, fetcher: up.fetcher, sleep: noSleep, outputRoots, spoolFile: file })
     assert.equal(up.calls[0]?.body.sessionId, 's-crash')
     await assert.rejects(readFile(`${file}.inflight`, 'utf8'))
   })

@@ -36,6 +36,7 @@ describe('project_assets PG/SQLite 契约对齐', () => {
     for (const method of [
       'listProjectAssets',
       'searchProjectAssets',
+      'listProjectAssetVersions',
       'createProjectAsset',
       'updateProjectAsset',
       'deleteProjectAsset',
@@ -64,6 +65,27 @@ describe('project_assets PG/SQLite 契约对齐', () => {
       assert.ok(countAt >= 0, `${name} 缺 pgCountProjectAssets`)
       assert.ok(lockAt < countAt, `${name} 必须在计数之前取 xact lock`)
     }
+  })
+
+  test('产出物版本:两侧同一去重规则、同一折叠键、同样的版本时间下限', () => {
+    // 带字节副本的产出只与该源路径的最新版本比 digest;其它仍按 digest / container_path。
+    assert.match(sqliteSrc, /source === 'output' && containerPath && digest\)[\s\S]{0,200}_sqliteLatestOutputVersion[\s\S]{0,120}latest\.digest === digest/)
+    assert.match(backendSrc, /source === "output" && containerPath && digest\)[\s\S]{0,200}pgLatestOutputVersion[\s\S]{0,120}latest\.digest === digest/)
+    for (const src of [sqliteSrc, backendSrc]) {
+      assert.match(src, /ORDER BY created_at DESC, id DESC/)
+      assert.ok(src.includes('PROJECT_ASSET_VERSION_GROUP_SQL'), 'list 必须用共享的折叠键')
+      assert.ok(src.includes('withVersionCount('), 'versionCount 形状两侧一致')
+    }
+    assert.match(sqliteSrc, /Math\.max\(now, latest\.createdAt \+ 1\)/)
+    assert.match(backendSrc, /createdAtFloor = latest\.createdAt \+ 1/)
+    assert.match(backendSrc, /GREATEST\(\$\{CLOCK_MS_SQL\}, \$14::bigint\)/)
+  })
+
+  test('PG create 在去重之前取锁(并发的两个新版本不会互相看不见)', () => {
+    const createSrc = extractMethod(backendSrc, 'createProjectAsset', 'updateProjectAsset')
+    const lockAt = createSrc.indexOf('pg_advisory_xact_lock')
+    const dupAt = createSrc.indexOf('pgFindDuplicateAsset(')
+    assert.ok(lockAt >= 0 && dupAt > lockAt)
   })
 })
 

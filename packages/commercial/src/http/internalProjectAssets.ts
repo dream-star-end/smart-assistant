@@ -14,6 +14,13 @@
  * rule (the session's project at registration time).
  *
  * Repeats are harmless: createProjectAsset dedups by digest/container path.
+ *
+ * Versions: a current container copies each output into the content-addressed
+ * store first and sends `digest` + `url` of that copy. Both or neither; the
+ * digest must be 64 lowercase hex and the url must be the media URL of that
+ * same digest, otherwise the whole batch is rejected (a row must never point
+ * at bytes other than the ones it claims). Older containers send neither and
+ * are registered by source path exactly as before.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -21,7 +28,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   classifyClientSessions,
   createProjectAsset,
+  digestFromProjectAssetUrl,
   parseProjectAssetContainerPath,
+  PROJECT_ASSET_URL_RE,
 } from "@openclaude/storage";
 import {
   ContainerIdentityError,
@@ -96,6 +105,21 @@ interface ParsedItem {
   name: string;
   mime?: string;
   size?: number;
+  digest?: string;
+  url?: string;
+}
+
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+
+/** undefined = neither sent (old container); null = invalid; else the checked pair. */
+function parseVersionCopy(e: Record<string, unknown>): { digest: string; url: string } | undefined | null {
+  const hasDigest = e.digest !== undefined && e.digest !== null;
+  const hasUrl = e.url !== undefined && e.url !== null;
+  if (!hasDigest && !hasUrl) return undefined;
+  if (typeof e.digest !== "string" || typeof e.url !== "string") return null;
+  if (!DIGEST_RE.test(e.digest) || !PROJECT_ASSET_URL_RE.test(e.url)) return null;
+  if (digestFromProjectAssetUrl(e.url) !== e.digest) return null;
+  return { digest: e.digest, url: e.url };
 }
 
 function parseItems(raw: unknown): ParsedItem[] | null {
@@ -108,11 +132,14 @@ function parseItems(raw: unknown): ParsedItem[] | null {
     // Only agent outputs come through here; uploads have their own route.
     if (!containerPath || !containerPath.startsWith("/home/agent/.openclaude/generated/")) return null;
     if (typeof e.name !== "string" || !e.name.trim()) return null;
+    const copy = parseVersionCopy(e);
+    if (copy === null) return null;
     out.push({
       containerPath,
       name: e.name,
       ...(typeof e.mime === "string" ? { mime: e.mime } : {}),
       ...(typeof e.size === "number" && Number.isFinite(e.size) ? { size: e.size } : {}),
+      ...(copy ?? {}),
     });
   }
   return out;
@@ -193,6 +220,7 @@ export function makeInternalProjectAssetsHandler(
         containerPath: item.containerPath,
         ...(item.mime ? { mime: item.mime } : {}),
         ...(item.size !== undefined ? { size: item.size } : {}),
+        ...(item.digest && item.url ? { digest: item.digest, url: item.url } : {}),
       };
       let result = await create(userId, projectIdPresent ? { ...input, projectId: frozenProjectId } : input);
       if (!result.ok && result.error === "project_not_found" && projectIdPresent && frozenProjectId) {

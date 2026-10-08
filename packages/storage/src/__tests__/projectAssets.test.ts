@@ -8,6 +8,8 @@
  *   4. 同 (user_id, project_id, source, digest) 未删行去重,digest 空则用 container_path;
  *   5. 恶意 url / containerPath 被拒;
  *   6. 跨项目搜索(Cmd+K):name/excerpt 子串,按用户隔离,LIKE 通配符转义。
+ *   7. 带字节副本的产出按源路径出版本:同内容不出新版本,内容变了出新版本,
+ *      list 每个源路径只回最新版本并带 versionCount,listProjectAssetVersions 列全部版本。
  *
  * Run: npx tsx --test packages/storage/src/__tests__/projectAssets.test.ts
  */
@@ -28,6 +30,7 @@ const {
   getSessionsDb,
   listPinnedProjectAssetsForChatProject,
   listPinnedProjectAssetsForSession,
+  listProjectAssetVersions,
   listProjectAssets,
   parseProjectAssetContainerPath,
   parseProjectAssetUrl,
@@ -463,3 +466,112 @@ describe('searchProjectAssets (Cmd+K cross-project search)', () => {
   })
 })
 
+describe('project_assets 产出物版本', () => {
+  beforeEach(clearTables)
+
+  const REPORT = '/home/agent/.openclaude/generated/report.md'
+  const output = (digest: string | null, extra: Record<string, unknown> = {}) => ({
+    source: 'output',
+    name: 'report.md',
+    containerPath: REPORT,
+    ...(digest ? { digest, url: MEDIA_URL(digest, 'md') } : {}),
+    ...extra,
+  })
+
+  it('同源路径:同内容复用,内容变了出新版本,两版都可下载', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A))
+    const again = await createProjectAsset(USER, output(DIGEST_A))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B))
+    assert.equal(v1.ok && again.ok && v2.ok, true)
+    if (!v1.ok || !again.ok || !v2.ok) return
+    assert.equal(again.created, false)
+    assert.equal(again.asset.id, v1.asset.id)
+    assert.equal(v2.created, true)
+    assert.notEqual(v2.asset.id, v1.asset.id)
+    assert.ok(v2.asset.createdAt > v1.asset.createdAt, '新版本严格晚于旧版本')
+    assert.equal(v2.asset.containerPath, REPORT)
+    assert.equal(v2.asset.url, MEDIA_URL(DIGEST_B, 'md'))
+
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.id, v2.asset.id)
+    assert.equal(listed[0]?.versionCount, 2)
+
+    const versions = await listProjectAssetVersions(USER, v1.asset.id)
+    assert.deepEqual(versions?.map((a) => a.digest), [DIGEST_B, DIGEST_A])
+    assert.deepEqual(versions?.map((a) => a.url), [MEDIA_URL(DIGEST_B, 'md'), MEDIA_URL(DIGEST_A, 'md')])
+  })
+
+  it('A→B→A 出第三个版本;用旧版本再登记一次 = 恢复为最新', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B))
+    const v3 = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(v1.ok && v2.ok && v3.ok, true)
+    if (!v1.ok || !v2.ok || !v3.ok) return
+    assert.equal(v3.created, true)
+    assert.notEqual(v3.asset.id, v1.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed[0]?.id, v3.asset.id)
+    assert.equal(listed[0]?.versionCount, 3)
+    // 再登记一次最新的内容不再出版本。
+    const same = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(same.ok && same.created, false)
+  })
+
+  it('旧容器只报路径:与以前一样按 container_path 复用', async () => {
+    const legacy = await createProjectAsset(USER, output(null))
+    const legacyAgain = await createProjectAsset(USER, output(null))
+    assert.equal(legacy.ok && legacyAgain.ok, true)
+    if (!legacy.ok || !legacyAgain.ok) return
+    assert.equal(legacyAgain.asset.id, legacy.asset.id)
+    assert.equal(legacy.asset.digest, null)
+    // 之后的新容器带字节副本:无 digest 的旧行算 v1,新内容是 v2。
+    const v2 = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(v2.ok && v2.created, true)
+    // 旧容器再报一次同路径:仍复用,不出版本。
+    const legacyLater = await createProjectAsset(USER, output(null))
+    assert.equal(legacyLater.ok && legacyLater.created, false)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.versionCount, 2)
+  })
+
+  it('上传去重不变:同 digest 不同名仍复用;上传不按路径折叠', async () => {
+    const a = await createProjectAsset(USER, { source: 'upload', name: 'a.md', url: MEDIA_URL(DIGEST_A, 'md') })
+    const b = await createProjectAsset(USER, { source: 'upload', name: 'b.md', url: MEDIA_URL(DIGEST_A, 'md') })
+    const c = await createProjectAsset(USER, { source: 'upload', name: 'c.md', url: MEDIA_URL(DIGEST_B, 'md') })
+    assert.equal(a.ok && b.ok && c.ok, true)
+    if (!a.ok || !b.ok || !c.ok) return
+    assert.equal(b.asset.id, a.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed.length, 2)
+    assert.ok(listed.every((x) => x.versionCount === undefined))
+    // 产出与上传同 digest 互不复用。
+    const out = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(out.ok && out.created, true)
+  })
+
+  it('版本按项目与租户隔离;删掉最新版后上一版成为列表里的那一条', async () => {
+    const proj = await createChatProject(USER, { name: 'V' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const inProj = await createProjectAsset(USER, output(DIGEST_A, { projectId: proj.project.id }))
+    const ungrouped = await createProjectAsset(USER, output(DIGEST_B))
+    const other = await createProjectAsset(OTHER, output(DIGEST_B))
+    assert.equal(inProj.ok && ungrouped.ok && other.ok, true)
+    if (!inProj.ok || !ungrouped.ok || !other.ok) return
+    assert.equal(inProj.created && ungrouped.created && other.created, true)
+    assert.equal((await listProjectAssetVersions(USER, inProj.asset.id))?.length, 1)
+    assert.equal(await listProjectAssetVersions(USER, other.asset.id), null)
+    assert.equal(await listProjectAssetVersions(OTHER, inProj.asset.id), null)
+
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { projectId: proj.project.id }))
+    assert.equal(v2.ok && v2.created, true)
+    if (!v2.ok) return
+    await deleteProjectAsset(USER, v2.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: proj.project.id })
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.id, inProj.asset.id)
+    assert.equal(listed[0]?.versionCount, undefined)
+  })
+})
