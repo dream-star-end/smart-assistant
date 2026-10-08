@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { compileBoxCliSyntheticTurn, BoxMessagesShapeError } from "./boxMessagesMapper.js";
 import type { ProxyBody } from "./shared.js";
 
@@ -237,6 +238,15 @@ describe("OCV5-337 history written by another model", () => {
     assert.equal(code(body([{ role: "user", content: "run" },
       { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
       { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }])), "BOX_BLOCK_UNSUPPORTED");
+  });
+  it("a foreign id whose renamed form is already used is refused", () => {
+    const clash = `toolu_oc${createHash("sha256").update("call_1").digest("hex").slice(0, 32)}`;
+    assert.equal(code(body([
+      { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} },
+        { type: "tool_use", id: clash, name: "Bash", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" },
+        { type: "tool_result", tool_use_id: clash, content: "y" }] },
+      { role: "user", content: "next" }])), "BOX_TOOL_HISTORY_INVALID");
   });
   it("a Box history keeps its own ids byte for byte", () => {
     const output = compileBoxCliSyntheticTurn(body([
