@@ -130,7 +130,7 @@ describe('box native remote context: every listed model', () => {
     delete process.env[ENV]
   })
 
-  for (const model of ['box-api-claude-sonnet-5-5', 'box-api-claude-haiku-4-5']) {
+  for (const model of ['box-api-claude-sonnet-5-5', 'box-api-claude-haiku-4-5', 'box-api-claude-haiku-5-5']) {
     it(`${model} owns a live tool continuation under its own descriptor`, () => {
       process.env[ENV] = JSON.stringify({ ...descriptor, canonicalModel: model })
       assert.equal(boxNativeRemoteContextOwnsHistory({ model, querySource: 'sdk', messages: liveChain }), true)
