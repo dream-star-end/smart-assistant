@@ -12,7 +12,7 @@ const home = mkdtempSync(join(tmpdir(), 'oc-persist-rc-'))
 process.env.OPENCLAUDE_HOME = home
 process.env.OC_PROJECT_CONTEXT = '1'
 
-const { persistRunContextSnapshot, createRunContextDescriptor } = await import('../runContextPersist.js')
+const { persistRunContextSnapshot, createRunContextDescriptor, webchatRunId, readProjectRunContextFile } = await import('../runContextPersist.js')
 const { getTaskboardDb } = await import('../taskboard/db/index.js')
 const { createProject } = await import('../taskboard/db/projects.js')
 const { createTicket } = await import('../taskboard/db/tickets.js')
@@ -158,6 +158,36 @@ describe('persistRunContextSnapshot', () => {
       cwd: '/nope',
     })
     assert.equal(r.wrote, false)
+  })
+})
+
+describe('webchat run ids', () => {
+  it('two turns of one chat keep two snapshots instead of overwriting one', async () => {
+    const board = '22222222-2222-4222-8222-222222222222'
+    const ids = [webchatRunId('wsess-0123456789abcdef', 'trace-a'), webchatRunId('wsess-0123456789abcdef', 'trace-b')]
+    assert.notEqual(ids[0], ids[1])
+    const written: string[] = []
+    for (const [i, runId] of ids.entries()) {
+      const r = await persistRunContextSnapshot({
+        descriptor: createRunContextDescriptor({
+          runId,
+          boardProjectId: board,
+          channel: 'webchat',
+          agentId: 'main',
+          sessionKey: 'agent:main:webchat:dm:wsess-0123456789abcdef',
+          persistSnapshot: true,
+        }),
+        applied: [{ name: 'USER', bytes: 1, sha256: String(i) }],
+        cwd: home,
+      })
+      assert.equal(r.wrote, true)
+      written.push(r.snapshotId!)
+    }
+    assert.notEqual(written[0], written[1])
+    for (const [i, id] of written.entries()) {
+      const snap = await readProjectRunContextFile(board, id)
+      assert.equal(snap?.runId, ids[i])
+    }
   })
 })
 

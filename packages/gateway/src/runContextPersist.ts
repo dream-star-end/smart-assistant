@@ -60,6 +60,15 @@ export interface PersistRunContextResult {
   error?: string
 }
 
+/**
+ * Run id for a webchat turn. One id per turn (not per chat), so a chat whose
+ * context changes between turns keeps a snapshot for each, instead of every
+ * spawn overwriting `runs/webchat_<chat>`.
+ */
+export function webchatRunId(peerId: string, turnTraceId: string): string {
+  return `webchat:${peerId}:${turnTraceId}`
+}
+
 export async function persistRunContextSnapshot(
   input: PersistRunContextInput,
 ): Promise<PersistRunContextResult> {

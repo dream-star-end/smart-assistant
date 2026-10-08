@@ -135,7 +135,7 @@ import {
 } from './promptQueueCoordinator.js'
 import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
 import { resolveChatRunWorkspace } from './projectWorkspace.js'
-import { createRunContextDescriptor } from './runContextPersist.js'
+import { createRunContextDescriptor, webchatRunId } from './runContextPersist.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -20793,7 +20793,7 @@ export class Gateway {
       return
     }
     const webchatRunContext = createRunContextDescriptor({
-      runId: `webchat:${frame.peer.id}`,
+      runId: webchatRunId(frame.peer.id, turnTraceId),
       boardProjectId: chatWorkspace.projectId,
       channel: frame.channel,
       agentId: effectiveAgent.id,
