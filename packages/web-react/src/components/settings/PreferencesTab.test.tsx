@@ -192,7 +192,7 @@ describe('BuiltinHotkeysTable · 快捷键只读表', () => {
   test('独立渲染内置说明,不发任何请求,没有可编辑 input', () => {
     const models = vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     render(<BuiltinHotkeysTable />)
-    expect(screen.getByText('搜索会话')).toBeInTheDocument()
+    expect(screen.getByText('搜索与跳转（项目、会话、文件）')).toBeInTheDocument()
     expect(screen.getByText('新建会话')).toBeInTheDocument()
     expect(screen.getByText('停止生成（生成中）')).toBeInTheDocument()
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument()

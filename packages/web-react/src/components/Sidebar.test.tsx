@@ -331,6 +331,27 @@ describe("Sidebar 会话列表", () => {
   });
 });
 
+describe("Sidebar 搜索与跳转 (Ctrl/⌘K)", () => {
+  it("the search row carries a Ctrl K button that opens the palette; inline search keeps working", () => {
+    const onOpenPalette = vi.fn();
+    renderSidebar({ onOpenPalette });
+    const btn = screen.getByRole("button", { name: "搜索与跳转（项目、会话、文件）" });
+    expect(btn).toHaveTextContent("Ctrl K");
+    fireEvent.click(btn);
+    expect(onOpenPalette).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText("搜索标题或消息")).not.toHaveFocus();
+    // Typing inline hides the hint (the clear button takes its place).
+    fireEvent.change(screen.getByPlaceholderText("搜索标题或消息"), { target: { value: "x" } });
+    expect(screen.queryByRole("button", { name: "搜索与跳转（项目、会话、文件）" })).toBeNull();
+    expect(screen.getByRole("button", { name: "清除搜索" })).toBeInTheDocument();
+  });
+
+  it("no button without onOpenPalette", () => {
+    renderSidebar();
+    expect(screen.queryByRole("button", { name: "搜索与跳转（项目、会话、文件）" })).toBeNull();
+  });
+});
+
 describe("Sidebar 任务面板入口", () => {
   it("传入 onOpenBoard 时渲染入口，并用 data-product-feature=taskboard 标注", () => {
     const onOpenBoard = vi.fn();

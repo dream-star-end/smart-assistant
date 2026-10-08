@@ -24,11 +24,14 @@ export function CreateProjectDialog({
   open,
   onOpenChange,
   fromSessionTitle,
+  initialName,
   onSubmit,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   fromSessionTitle?: string | null;
+  /** Prefilled name for a plain new project (Ctrl/⌘K 「新建项目「…」」). */
+  initialName?: string | null;
   onSubmit: (input: CreateProjectSubmit) => Promise<boolean>;
 }) {
   const [name, setName] = useState("");
@@ -42,12 +45,12 @@ export function CreateProjectDialog({
 
   useEffect(() => {
     if (!open) return;
-    setName((fromSessionTitle ?? "").slice(0, NAME_MAX));
+    setName((fromSessionTitle ?? initialName ?? "").slice(0, NAME_MAX));
     setInstructions("");
     setColor(null);
     setFiles([]);
     setSaving(false);
-  }, [open, fromSessionTitle]);
+  }, [open, fromSessionTitle, initialName]);
 
   const nameTrim = name.trim();
   const nameInvalid = nameTrim.length < 1 || nameTrim.length > NAME_MAX;

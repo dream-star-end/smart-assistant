@@ -54,9 +54,10 @@ describe("resolveGlobalHotkey", () => {
     }
   });
 
-  test("输入框内忽略搜索/新建", () => {
+  test("输入框内忽略新建;⌘K 快速跳转在输入框内也生效", () => {
     const input = document.createElement("input");
-    expect(resolveGlobalHotkey(key({ key: "k", metaKey: true, target: input }))).toBeNull();
+    expect(resolveGlobalHotkey(key({ key: "k", metaKey: true, target: input }))).toBe("search");
+    expect(resolveGlobalHotkey(key({ key: "k", ctrlKey: true, target: document.createElement("textarea") }))).toBe("search");
     expect(
       resolveGlobalHotkey(key({ key: "o", metaKey: true, shiftKey: true, target: input })),
     ).toBeNull();

@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
@@ -1089,9 +1089,9 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     expect(noFetch).not.toHaveBeenCalled()
   })
 
-  // shell 审计 S-01:⌘K 原先无条件打开移动端抽屉(Sheet 带 md:hidden)。桌面断点下抽屉不可见,
-  // 但 Radix 模态照常把 <body> 设成 pointer-events:none —— 整页点死且看不见任何弹层。
-  test('⌘K 桌面视口:只展开内联侧栏并聚焦搜索框,不打开移动抽屉(S-01)', async () => {
+  // P4: ⌘K opens the quick-switch palette (lazy chunk) instead of focusing the sidebar search.
+  // Desktop: no mobile drawer may open (shell S-01: a hidden Radix modal would freeze the page).
+  test('⌘K 桌面视口:打开快速跳转面板,再按一次关闭,不打开移动抽屉', async () => {
     window.history.replaceState({}, '', '/?demo=1')
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
     const realMatchMedia = window.matchMedia
@@ -1100,12 +1100,30 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     try {
       render(<App />)
       fireEvent.keyDown(window, { key: 'k', metaKey: true })
-      await waitFor(() => expect(screen.getByLabelText('搜索标题或消息')).toHaveFocus())
+      const input = await screen.findByRole('combobox', { name: '搜索与跳转' })
+      await waitFor(() => expect(input).toHaveFocus())
       expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
-      expect(document.body.style.pointerEvents).not.toBe('none')
+      fireEvent.keyDown(input, { key: 'k', ctrlKey: true })
+      await waitFor(() => expect(screen.queryByTestId('command-palette')).toBeNull())
     } finally {
       window.matchMedia = realMatchMedia
     }
+  })
+
+  test('⌘K 键盘直达:输入会话标题,Enter 打开该会话', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    render(<App />)
+    const title = '锂金属负极枝晶抑制机理综述'
+    expect(screen.getAllByRole('button', { name: title }).some((b) => b.getAttribute('aria-current') === 'true')).toBe(false)
+    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    const input = await screen.findByRole('combobox', { name: '搜索与跳转' })
+    fireEvent.change(input, { target: { value: '锂金属' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByTestId('command-palette')).toBeNull())
+    await waitFor(() =>
+      expect(screen.getAllByRole('button', { name: title }).some((b) => b.getAttribute('aria-current') === 'true')).toBe(true),
+    )
   })
 
   // P1 项目主页:点侧栏项目名进主页;主页开始框在该项目开新会话并只发送一次首条消息。
@@ -1134,17 +1152,16 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     expect(screen.getAllByText(/收到，关于「整理文献清单」/)).toHaveLength(1)
   }, 20000)
 
-  test('⌘K 窄屏视口:仍打开会话导航抽屉(抽屉里有自己的搜索框)', async () => {
+  test('窄屏:抽屉里的搜索与跳转按钮关闭抽屉并打开全屏面板', async () => {
     window.history.replaceState({}, '', '/?demo=1')
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
     // setup.ts 的 matchMedia 桩恒 matches=false → 视为 <md
     render(<App />)
-    expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
-    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    fireEvent.click(screen.getAllByRole('button', { name: /^打开菜单/ })[0])
     const drawer = await screen.findByRole('dialog', { name: '会话导航' })
-    expect(drawer).toBeInTheDocument()
-    // jsdom 没有布局,两份侧栏(内联 + 抽屉)都在 DOM 里;抽屉里必须有搜索框可供聚焦逻辑挑选
-    expect(drawer.querySelector('[data-sidebar-search]')).not.toBeNull()
+    fireEvent.click(within(drawer).getByRole('button', { name: '搜索与跳转（项目、会话、文件）' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull())
+    expect(await screen.findByTestId('command-palette')).toBeInTheDocument()
   })
 })
 

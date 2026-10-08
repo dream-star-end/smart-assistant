@@ -51,6 +51,7 @@ import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecov
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
+import { pushPaletteRecent } from "./lib/paletteRecents";
 import { type BannerKind, collapsedBannersLabel, resolveBanners } from "./lib/bannerStack";
 import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
@@ -263,6 +264,10 @@ const CreateProjectDialog = lazy(() =>
 const ProjectSettingsDialog = lazy(() =>
   import("./components/ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
 );
+// Ctrl/⌘K palette: lazy, mounted on first open (first-screen budget).
+const CommandPalette = lazy(() =>
+  import("./components/CommandPalette").then((m) => ({ default: m.CommandPalette })),
+);
 // 项目主页(/p/<id>)是并列工作区,点开项目才需要;带着 ProjectAssetsPanel,不能进入口闭包。
 const ProjectHome = lazy(() =>
   import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
@@ -470,6 +475,8 @@ export function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
   const inboxMounted = useMountedOnce(inboxOpen);
   const [findOpen, setFindOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const paletteMounted = useMountedOnce(paletteOpen);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
   // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
   const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
@@ -819,6 +826,35 @@ export function App() {
   useEffect(() => {
     if (projectHome && projectsLoaded && !homeProject) setProjectHome(null);
   }, [projectHome, projectsLoaded, homeProject]);
+
+  // Ctrl/⌘K recents: whatever the user actually lands on (project home or a chat).
+  const paletteUserId = user?.id ?? (demo ? "demo" : null);
+  const homeProjectId = homeProject?.id ?? null;
+  const chatViewActiveId = !boardOpen && !projectHome ? activeId : undefined;
+  useEffect(() => {
+    if (homeProjectId) pushPaletteRecent(paletteUserId, { kind: "project", id: homeProjectId });
+  }, [paletteUserId, homeProjectId]);
+  useEffect(() => {
+    if (chatViewActiveId) pushPaletteRecent(paletteUserId, { kind: "session", id: chatViewActiveId });
+  }, [paletteUserId, chatViewActiveId]);
+  // Stable search callbacks for the palette (its debounce effect depends on them).
+  const searchSessionMessagesRef = useRef(searchSessionMessages);
+  searchSessionMessagesRef.current = searchSessionMessages;
+  const paletteSearchMessages = useMemo(
+    () =>
+      demo || !auth
+        ? undefined
+        : (q: string, signal: AbortSignal) => searchSessionMessagesRef.current(q, signal, undefined, true),
+    [demo, auth],
+  );
+  const paletteSearchAssets = useMemo(
+    () =>
+      demo || !auth
+        ? undefined
+        : (q: string, signal: AbortSignal, limit: number) =>
+            api.searchProjectAssets(authRef.current, q, { signal, limit }),
+    [demo, auth],
+  );
 
   const unreadSessions = useUnreadSessions({
     sessions,
@@ -2215,17 +2251,11 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       const action = resolveGlobalHotkey(e);
       if (action === "search") {
+        if (!inWorkspace) return;
         e.preventDefault();
-        // 按视口分流(shell 审计 S-01):移动抽屉的 Sheet 带 md:hidden,桌面断点下抽屉与遮罩都是
-        // display:none,但 Radix 模态照常把 <body> 设成 pointer-events:none、其余内容 aria-hidden
-        // —— 桌面按 ⌘K 会把整页点死且看不见任何弹层。桌面只展开内联侧栏,窄屏才开抽屉。
-        setCollapsed(false);
-        if (!isMdViewport) setMobileNavOpen(true);
-        window.setTimeout(() => {
-          const nodes = [...document.querySelectorAll<HTMLInputElement>("[data-sidebar-search]")];
-          const visible = nodes.find((el) => el.getClientRects().length > 0) ?? nodes[0];
-          visible?.focus();
-        }, 0);
+        // Toggle. Another dialog layer (settings, drawer, …) keeps Esc/focus; don't stack on it.
+        const otherLayer = isDialogLayerOpen();
+        setPaletteOpen((o) => (o ? false : !otherLayer));
         return;
       }
       if (action === "new") {
@@ -2241,7 +2271,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew, inWorkspace, demo, wsMessages.length, isMdViewport]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -3601,6 +3631,7 @@ export function App() {
     onLoadArchived: loadArchivedSessions,
     loadingArchived,
     onSearchMessages: searchSessionMessages,
+    onOpenPalette: () => setPaletteOpen(true),
   };
   const closeMobileThen = (fn?: () => void) =>
     fn
@@ -3718,6 +3749,7 @@ export function App() {
           onOpenMarketplace={closeMobileThen(sidebarProps.onOpenMarketplace)}
           onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
+          onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
           onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
           onOpenApiAccess={closeMobileThen(sidebarProps.onOpenApiAccess)}
@@ -4354,6 +4386,54 @@ export function App() {
           />
         </LazyBoundary>
       )}
+      {paletteMounted && (
+        <LazyBoundary fallback={null}>
+          <CommandPalette
+            open={paletteOpen}
+            onOpenChange={setPaletteOpen}
+            userId={paletteUserId}
+            projects={projects}
+            sessions={sessions}
+            currentProjectId={
+              homeProject?.id ??
+              (boardOpen
+                ? null
+                : ((chatViewActiveId ? sessions.find((x) => x.id === chatViewActiveId)?.projectId : null) ??
+                  draftProjectId))
+            }
+            onProjectHome={!!homeProject}
+            activeSession={chatViewActiveId ? (sessions.find((x) => x.id === chatViewActiveId) ?? null) : null}
+            searchMessages={paletteSearchMessages}
+            searchAssets={paletteSearchAssets}
+            onOpenProject={(projectId, tab) => {
+              if (!projects.some((x) => x.id === projectId)) return;
+              setPendingRouteProject(null);
+              setBoardOpenState(false);
+              setProjectHome({ projectId, tab: tab ?? "overview" });
+            }}
+            onOpenSession={(id) => {
+              setDraftProject(null);
+              setBoardOpen(false);
+              selectSession(id);
+            }}
+            onOpenUngroupedAssets={() => {
+              setProjectSettings(null);
+              setUngroupedAssetsOpen(true);
+            }}
+            onNewSession={() => {
+              setBoardOpen(false);
+              handleNew();
+            }}
+            onNewSessionInProject={(projectId) => {
+              setBoardOpen(false);
+              newSessionInProject(projectId);
+            }}
+            onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
+            onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
+            onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
+          />
+        </LazyBoundary>
+      )}
       {createProjectMounted && (
         <LazyBoundary fallback={<DialogFallback />}>
           <CreateProjectDialog
@@ -4362,6 +4442,7 @@ export function App() {
               if (!o) setCreateProjectFrom(null);
             }}
             fromSessionTitle={createProjectFrom?.sessionId ? (createProjectFrom.title ?? "") : null}
+            initialName={createProjectFrom && !createProjectFrom.sessionId ? (createProjectFrom.title ?? null) : null}
             onSubmit={async (input) => {
               const from = createProjectFrom;
               // 上传与之后的落位都绑定发起创建时的身份:中途换号/登出则停,不把文件传进另一个账号。

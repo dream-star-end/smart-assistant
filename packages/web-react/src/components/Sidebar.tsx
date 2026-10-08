@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
+  Command,
   Film,
   Globe,
   KeyRound,
@@ -209,6 +210,8 @@ export type SidebarProps = {
   ) => Promise<SessionSearchHit[]>;
   searchProjectId?: string | null;
   virtualizeThreshold?: number;
+  /** Ctrl/⌘K palette (projects, chats, files, actions). Omit to hide the hint button. */
+  onOpenPalette?: () => void;
 };
 
 export function Sidebar({
@@ -277,6 +280,7 @@ export function Sidebar({
   onSearchMessages,
   searchProjectId,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
+  onOpenPalette,
 }: SidebarProps) {
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -1045,6 +1049,23 @@ export function Sidebar({
               <X size={13} />
             </IconButton>
           )}
+          {onOpenPalette && !q && (
+            <button
+              type="button"
+              data-product-control
+              data-sidebar-palette
+              aria-label="搜索与跳转（项目、会话、文件）"
+              title={`搜索与跳转 (${paletteKeyLabel()})`}
+              onClick={(e) => {
+                e.preventDefault();
+                onOpenPalette();
+              }}
+              className="flex h-6 shrink-0 items-center justify-center rounded-xs px-1.5 text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
+            >
+              <kbd className="font-sans text-caption [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
+              <Command size={15} aria-hidden className="hidden [@media(hover:none)]:block" />
+            </button>
+          )}
           {onBatch && !multiSelect && (
             <IconButton
               data-product-control
@@ -1303,4 +1324,11 @@ export function Sidebar({
       </div>
     </aside>
   );
+}
+
+/** 「Ctrl K」/「⌘K」 hint for the palette button (Mac-family shows ⌘). */
+function paletteKeyLabel(): string {
+  const platform =
+    typeof navigator === "undefined" ? "" : `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`;
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘K" : "Ctrl K";
 }

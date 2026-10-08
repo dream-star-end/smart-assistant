@@ -2476,6 +2476,30 @@ export const api = {
     ).then((b) => b.assets || []);
   },
 
+  /**
+   * Ctrl/⌘K: search the caller's files and outputs across all projects (and
+   * ungrouped) by name/excerpt, newest first. Server caps `limit` at 50.
+   */
+  searchProjectAssets: (
+    a: AuthSession,
+    q: string,
+    opts?: { source?: "upload" | "output"; limit?: number; signal?: AbortSignal },
+  ): Promise<ProjectAsset[]> => {
+    const params = new URLSearchParams();
+    params.set("q", q);
+    if (opts?.source) params.set("source", opts.source);
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    return jsonOrThrow<{ assets: ProjectAsset[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: opts?.signal,
+        }),
+      ),
+    ).then((b) => b.assets || []);
+  },
+
   createProjectAsset: (a: AuthSession, input: CreateProjectAssetInput): Promise<ProjectAsset> =>
     jsonOrThrow<{ asset?: ProjectAsset } & Partial<ProjectAsset>>(
       callWithRefresh(a, (t) =>

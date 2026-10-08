@@ -27,6 +27,12 @@ describe("CreateProjectDialog", () => {
     await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
   });
 
+  it("a plain new project can start with a prefilled name (from the Ctrl/⌘K palette)", () => {
+    render(<CreateProjectDialog open onOpenChange={() => {}} initialName="周报" onSubmit={vi.fn()} />);
+    expect(screen.getByLabelText(/名称/)).toHaveValue("周报");
+    expect(screen.getByRole("button", { name: "创建并开始" })).toBeEnabled();
+  });
+
   it("an empty name cannot be submitted", () => {
     const onSubmit = vi.fn();
     render(<CreateProjectDialog open onOpenChange={() => {}} onSubmit={onSubmit} />);

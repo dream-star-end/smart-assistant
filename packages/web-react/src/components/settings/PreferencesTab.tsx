@@ -448,7 +448,7 @@ export function PreferencesTab({
 export function BuiltinHotkeysTable() {
   const mod = modifierKeyLabel()
   const rows: Array<{ keys: string; action: string }> = [
-    { keys: `${mod}+K`, action: '搜索会话' },
+    { keys: `${mod}+K`, action: '搜索与跳转（项目、会话、文件）' },
     { keys: `${mod}+Shift+O`, action: '新建会话' },
     { keys: 'Esc', action: '停止生成（生成中）' },
     { keys: 'Enter / Shift+Enter', action: '发送 / 换行（桌面）' },
