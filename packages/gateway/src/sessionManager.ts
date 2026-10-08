@@ -913,8 +913,10 @@ export interface AgentSession {
   /** projectId + contextVersion + assetsRevision + manifest hashes. */
   contextFingerprint?: string
   /**
-   * Chat project resolved at the start of the latest turn; its output assets
-   * are registered there. undefined = not resolved (flag off): master infers.
+   * Chat project the running turn resolved at its start (server.ts); its
+   * output assets are registered there. Set by submit() under the turn lock,
+   * so a queued next message cannot replace it mid-turn. undefined = not
+   * resolved (flag off): the master infers.
    */
   turnChatProjectId?: string | null
   runContext?: import('./runContextPersist.js').RunContextDescriptor
@@ -3042,6 +3044,8 @@ export class SessionManager {
       requestId: string
       traceId?: string
       model?: string
+      /** Chat project this external turn resolved at its start (not via submit, so passed here). */
+      chatProjectId?: string | null
     },
     reservation?: PromptQueueExternalTurnReservation,
   ): Promise<{ turnIndex: number; messageId: string }> {
@@ -3108,7 +3112,7 @@ export class SessionManager {
       this._trackPersistence(persistence)
       scheduleSessionOutputAssetCollection({
         userId: session.userId,
-        chatProjectId: session.turnChatProjectId,
+        ...(Object.prototype.hasOwnProperty.call(args, 'chatProjectId') ? { chatProjectId: args.chatProjectId } : {}),
         sessionId: session.peerId,
         assistantText: args.assistantText,
         sessionKey: session.sessionKey,
@@ -3973,8 +3977,6 @@ export class SessionManager {
     projectId?: string | null
     contextFingerprint?: string
     assetsRevision?: number
-    /** See AgentSession.turnChatProjectId. Applied on every call, including undefined. */
-    turnChatProjectId?: string | null
     runContext?: import('./runContextPersist.js').RunContextDescriptor
     frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
     /**
@@ -4232,7 +4234,6 @@ export class SessionManager {
                 canonical.parentSessionKey = opts.parentSessionKey
               if (opts.projectId !== undefined) canonical.projectId = opts.projectId
               if (nextFingerprint) canonical.contextFingerprint = nextFingerprint
-              canonical.turnChatProjectId = opts.turnChatProjectId
               if (opts.runContext) canonical.runContext = opts.runContext
               canonical._identityCreationOpts = identityCreationOpts
               return canonical
@@ -4317,7 +4318,6 @@ export class SessionManager {
           existing.parentSessionKey = opts.parentSessionKey
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
         if (nextFingerprint) existing.contextFingerprint = nextFingerprint
-        existing.turnChatProjectId = opts.turnChatProjectId
         if (opts.runContext) existing.runContext = opts.runContext
         existing._identityCreationOpts = identityCreationOpts
         return existing
@@ -4420,7 +4420,6 @@ export class SessionManager {
       contextFingerprint:
         opts.contextFingerprint ??
         (await computeSessionContextFingerprint(opts.projectId, opts.assetsRevision)),
-      turnChatProjectId: opts.turnChatProjectId,
       runContext: opts.runContext,
       frozenProjectContext: opts.frozenProjectContext,
       repoSessionId,
@@ -5190,6 +5189,8 @@ export class SessionManager {
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
+      /** Chat project this turn resolved at its start; see AgentSession.turnChatProjectId. */
+      turnChatProjectId?: string | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
       /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
@@ -5564,6 +5565,11 @@ export class SessionManager {
         session._platformGoal = goal
         await session.runner.setGoalState(goal)
       }
+      // Under the turn lock: this turn's outputs go to the project it resolved
+      // at start, even if a queued next message resolved another one.
+      session.turnChatProjectId = Object.prototype.hasOwnProperty.call(opts ?? {}, 'turnChatProjectId')
+        ? opts?.turnChatProjectId
+        : undefined
       session.lastUsedAt = Date.now()
       // Clear tool use mappings from previous turn to prevent unbounded growth
       session.toolUseIdToName.clear()

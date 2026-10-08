@@ -20735,7 +20735,6 @@ export class Gateway {
       projectId: chatWorkspace.projectId,
       contextFingerprint: chatWorkspace.contextFingerprint,
       assetsRevision: chatWorkspace.assetsRevision,
-      turnChatProjectId: chatWorkspace.chatProjectId,
       runContext: webchatRunContext,
       title: (frame.content.text ?? '').slice(0, 50).trim() || undefined,
       // 仅用于**新建** runner 时初始化 effort;既存 session 的切换由 submit() 处理
@@ -21369,6 +21368,7 @@ export class Gateway {
           : imageEditJobId,
         traceId: turnTraceId,
         model: 'gpt-image-2',
+        ...(chatWorkspace.chatProjectId !== undefined ? { chatProjectId: chatWorkspace.chatProjectId } : {}),
       }, externalQueueReservation)
       const delivered = {
         type: 'outbound.message' as const,
@@ -22210,6 +22210,7 @@ export class Gateway {
       ...(Object.prototype.hasOwnProperty.call(frame, '_goalState')
         ? { platformGoal: frame._goalState ?? null }
         : {}),
+      ...(chatWorkspace.chatProjectId !== undefined ? { turnChatProjectId: chatWorkspace.chatProjectId } : {}),
       // 模型权威批次 §4 —— bridge turn 的上游请求凭据。
       //
       // descriptor 是**验签产物**(_consumeAuthority → attachTurnAuthority),它原样保留了
@@ -22444,6 +22445,7 @@ export class Gateway {
               : imageEditJobId ?? externalQueueReservation.turnKey.slice(0, 32),
             traceId: turnTraceId,
             model: 'gpt-image-2',
+            ...(chatWorkspace.chatProjectId !== undefined ? { chatProjectId: chatWorkspace.chatProjectId } : {}),
           }, externalQueueReservation)
         } catch (err) {
           externalQueueError ??= err

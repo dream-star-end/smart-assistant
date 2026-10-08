@@ -9,7 +9,7 @@
  * 取回合开始时解析出的 chat project(冻结),不取登记那一刻会话所在项目。
  * master 暂时不可达时重试,仍失败就写进本地待登记队列,下次归集时补发。
  */
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import {
   createProjectAsset,
@@ -241,9 +241,52 @@ async function postRegistration(
   return 'unreachable'
 }
 
-async function appendSpool(file: string, reg: OutputAssetRegistration): Promise<void> {
-  await mkdir(dirname(file), { recursive: true })
-  await appendFile(file, `${JSON.stringify(reg)}\n`, { encoding: 'utf8', mode: 0o600 })
+// Every spool file operation runs through this one in-process lock. The
+// container gateway is the only writer (single process), so a promise chain
+// is enough. A flush moves the queue to <file>.inflight under the lock and
+// sends without holding it; appends during the send land in a fresh queue
+// file, and whatever still fails is appended back under the lock. An
+// .inflight left by a crash is picked up by the next flush, so a record is
+// never dropped (at worst sent twice, which the master dedups).
+let spoolChain: Promise<unknown> = Promise.resolve()
+function withSpoolLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = spoolChain.then(fn, fn)
+  spoolChain = run.catch(() => undefined)
+  return run
+}
+
+function serialize(regs: OutputAssetRegistration[]): string {
+  return regs.map((r) => `${JSON.stringify(r)}\n`).join('')
+}
+
+function parseSpool(raw: string): OutputAssetRegistration[] {
+  const out: OutputAssetRegistration[] = []
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const reg = JSON.parse(line) as OutputAssetRegistration
+      if (reg && typeof reg.sessionId === 'string' && Array.isArray(reg.items)) out.push(reg)
+    } catch {
+      /* drop a torn line */
+    }
+  }
+  return out
+}
+
+async function readIfExists(file: string): Promise<string> {
+  try {
+    return await readFile(file, 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+async function appendSpool(file: string, regs: OutputAssetRegistration[]): Promise<void> {
+  if (regs.length === 0) return
+  await withSpoolLock(async () => {
+    await mkdir(dirname(file), { recursive: true })
+    await appendFile(file, serialize(regs), { encoding: 'utf8', mode: 0o600 })
+  })
 }
 
 let lastFlushAt = 0
@@ -251,35 +294,37 @@ let flushing: Promise<void> | null = null
 
 /** Resend spooled registrations. Keeps whatever still fails; bounded. */
 export async function flushOutputAssetSpool(opts: CollectSessionOutputAssetsOpts, force = false): Promise<void> {
-  if (flushing) return flushing
+  // One flush at a time; a collection arriving meanwhile does not wait for it
+  // (its own failures are appended under the lock and picked up next time).
+  if (flushing) return
   if (!force && Date.now() - lastFlushAt < SPOOL_FLUSH_MIN_INTERVAL_MS) return
   lastFlushAt = Date.now()
   const file = opts.spoolFile ?? outputAssetSpoolFile()
+  const inflight = `${file}.inflight`
   flushing = (async () => {
-    let raw: string
-    try {
-      raw = await readFile(file, 'utf8')
-    } catch {
-      return
-    }
-    const pending: OutputAssetRegistration[] = []
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue
-      try {
-        const reg = JSON.parse(line) as OutputAssetRegistration
-        if (reg && typeof reg.sessionId === 'string' && Array.isArray(reg.items)) pending.push(reg)
-      } catch {
-        /* drop a torn line */
-      }
-    }
-    const keep: OutputAssetRegistration[] = []
-    for (const reg of pending.slice(-SPOOL_MAX_ENTRIES)) {
+    const pending = await withSpoolLock(async () => {
+      const carried = await readIfExists(inflight)
+      const queued = await readIfExists(file)
+      if (!carried.trim() && !queued.trim()) return [] as OutputAssetRegistration[]
+      await mkdir(dirname(file), { recursive: true })
+      const tmp = `${inflight}.tmp-${process.pid}`
+      await writeFile(tmp, carried + queued, { encoding: 'utf8', mode: 0o600 })
+      await rename(tmp, inflight)
+      await writeFile(file, '', { encoding: 'utf8', mode: 0o600 })
+      return parseSpool(carried + queued)
+    })
+    if (pending.length === 0) return
+    // At most SPOOL_MAX_ENTRIES per flush; the rest stays queued, nothing is dropped.
+    const keep: OutputAssetRegistration[] = pending.slice(SPOOL_MAX_ENTRIES)
+    const sendable = pending.slice(0, SPOOL_MAX_ENTRIES)
+    for (const reg of sendable) {
       const outcome = await postRegistration(reg, { ...opts, sleep: async () => {} })
       if (outcome === 'unreachable') keep.push(reg)
     }
-    const tmp = `${file}.tmp-${process.pid}`
-    await writeFile(tmp, keep.map((r) => `${JSON.stringify(r)}\n`).join(''), { encoding: 'utf8', mode: 0o600 })
-    await rename(tmp, file)
+    await withSpoolLock(async () => {
+      if (keep.length > 0) await appendFile(file, serialize(keep), { encoding: 'utf8', mode: 0o600 })
+      await rm(inflight, { force: true })
+    })
   })()
   try {
     await flushing
@@ -318,7 +363,7 @@ export async function collectSessionOutputAssets(opts: CollectSessionOutputAsset
     }
     const outcome = await postRegistration(reg, opts)
     if (outcome === 'unreachable') {
-      await appendSpool(opts.spoolFile ?? outputAssetSpoolFile(), reg)
+      await appendSpool(opts.spoolFile ?? outputAssetSpoolFile(), [reg])
       log.warn('output assets queued for later registration', {
         sessionId: opts.sessionId,
         count: items.length,

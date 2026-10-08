@@ -112,3 +112,45 @@ describe('container output assets → master', () => {
     assert.equal(up.calls[0]!.body.sessionId, 's-9')
   })
 })
+
+describe('output asset spool under concurrency', () => {
+  beforeEach(() => _resetOutputAssetSpoolThrottleForTest())
+
+  it('a registration queued while a flush is sending is not lost', async () => {
+    const file = spool()
+    await writeFile(file, `${JSON.stringify({ sessionId: 's-old', items: [{ containerPath: OUT, name: 'report.md' }] })}\n`)
+    // The flush's send is held until we let it go; meanwhile another turn fails and queues.
+    let releaseSend!: () => void
+    const held = new Promise<void>((done) => (releaseSend = done))
+    const calls: string[] = []
+    const slowFetcher = (async (_url: string, init: { body: string }) => {
+      const body = JSON.parse(init.body)
+      calls.push(body.sessionId)
+      if (body.sessionId === 's-old') {
+        await held
+        return { statusCode: 200, body: { text: async () => '{}' } }
+      }
+      throw new Error('ECONNREFUSED')
+    }) as unknown as typeof import('undici').request
+    const flush = collectSessionOutputAssets({
+      userId: 'default', sessionId: 's-x', assistantText: '', env: ENV, fetcher: slowFetcher, sleep: noSleep, statFile, spoolFile: file,
+    })
+    await new Promise((done) => setTimeout(done, 20))
+    await collectSessionOutputAssets({
+      userId: 'default', sessionId: 's-new', assistantText: TEXT, env: ENV, fetcher: slowFetcher, sleep: noSleep, statFile, spoolFile: file,
+    })
+    releaseSend()
+    await flush
+    const left = (await readFile(file, 'utf8')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l).sessionId)
+    assert.deepEqual(left, ['s-new'])
+  })
+
+  it('an inflight file left by a crash is sent by the next flush', async () => {
+    const file = spool()
+    await writeFile(`${file}.inflight`, `${JSON.stringify({ sessionId: 's-crash', items: [{ containerPath: OUT, name: 'report.md' }] })}\n`)
+    const up = fetcherFrom([200])
+    await collectSessionOutputAssets({ userId: 'default', sessionId: 's-2', assistantText: '', env: ENV, fetcher: up.fetcher, sleep: noSleep, statFile, spoolFile: file })
+    assert.equal(up.calls[0]?.body.sessionId, 's-crash')
+    await assert.rejects(readFile(`${file}.inflight`, 'utf8'))
+  })
+})
