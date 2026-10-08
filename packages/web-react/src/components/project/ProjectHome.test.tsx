@@ -95,6 +95,7 @@ function renderHome(over: Overrides = {}) {
     onDelete: vi.fn(),
     onOpenMobileNav: vi.fn(),
     onTabChange: vi.fn(),
+    onLoadArchived: vi.fn(),
   };
   function Harness() {
     const [tab, setTab] = useState<ProjectTab>(rest.tab ?? "overview");
@@ -317,5 +318,30 @@ describe("ProjectHome", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "删除" }));
     expect(h.onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("会话页签触发已归档会话加载；加载中且暂无会话时显示加载态而不是空态", () => {
+    const h = renderHome({ sessions: [], tab: "chats", loadingArchived: true, assets: [] });
+    expect(h.onLoadArchived).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("project-chats-loading")).toHaveTextContent("正在加载会话…");
+    expect(screen.queryByText("这个项目还没有会话")).toBeNull();
+  });
+
+  it("加载中但已有会话：列表照常显示并提示正在加载已归档会话", () => {
+    renderHome({ tab: "chats", loadingArchived: true });
+    expect(screen.getByText("侧栏搜索交互")).toBeInTheDocument();
+    expect(screen.getByText("正在加载已归档会话…")).toBeInTheDocument();
+  });
+
+  it("概览：产出的来源会话不在已加载列表里时才触发已归档加载", async () => {
+    const h = renderHome({
+      assets: [asset({ id: "o-x", name: "old.md", source: "output", sessionId: "s-gone" })],
+    });
+    await waitFor(() => expect(h.onLoadArchived).toHaveBeenCalledTimes(1));
+    cleanup();
+    vi.restoreAllMocks();
+    const h2 = renderHome();
+    await waitFor(() => expect(screen.getByText("PROPOSAL.md")).toBeInTheDocument());
+    expect(h2.onLoadArchived).not.toHaveBeenCalled();
   });
 });

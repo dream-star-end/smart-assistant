@@ -1959,3 +1959,77 @@ describe('Aurora v5 — desktop enroll 特判', () => {
     expect(screen.queryByRole('heading', { name: '确认这台电脑' })).not.toBeInTheDocument()
   })
 })
+
+describe('Aurora v5 — 项目主页(P1 review)', () => {
+  const PROJECTS = { projects: [{ id: 'p1', name: '论文综述', sortOrder: 0, createdAt: 1, updatedAt: 1, sessionCount: 0 }] }
+  function withProjects(list: Promise<ReturnType<typeof okJson>> | ReturnType<typeof okJson> = okJson(PROJECTS)) {
+    const base = routedFetchTwoSessions()
+    return vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/chat-projects')) return list
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+  }
+
+  test('开始框的首条消息用新会话的默认模型，不沿用刚才会话的模型', async () => {
+    const sendSpy = vi.spyOn(ChatSocket.prototype, 'sendMessage')
+    fetchMock = withProjects()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
+    await act(async () => {
+      fireEvent.click(screen.getByText('历史会话甲'))
+    })
+    await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
+
+    // 当前会话换到 Terra(B)；全局默认仍是首个模型 Sol(A)。
+    const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
+    await act(async () => {
+      fireEvent.click(terra!)
+    })
+    const direct = screen.queryByRole('button', { name: '直接切换' })
+    if (direct) await act(async () => { fireEvent.click(direct) })
+    await waitFor(() => expect(trigger.textContent).toContain('GPT-5.6-Terra'))
+
+    fireEvent.click(await screen.findByRole('button', { name: '论文综述' }))
+    const box = await screen.findByRole('textbox', { name: '在「论文综述」里开始' })
+    fireEvent.change(box, { target: { value: '整理文献清单' } })
+    await act(async () => {
+      fireEvent.keyDown(box, { key: 'Enter' })
+    })
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1))
+    expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.6-sol', text: '整理文献清单' }))
+    expect(sendSpy.mock.calls[0]![0]).not.toHaveProperty('sessId', 'webhist01')
+    await act(async () => { await new Promise((r) => setTimeout(r, 100)) })
+    expect(sendSpy).toHaveBeenCalledTimes(1)
+  }, 30000)
+
+  test('boot /p/<id> 列表迟到前点新建：保持空白草稿，不被项目主页抢回', async () => {
+    window.history.replaceState({}, '', '/p/p1')
+    let resolveList!: (value: ReturnType<typeof okJson>) => void
+    const list = new Promise<ReturnType<typeof okJson>>((resolve) => { resolveList = resolve })
+    fetchMock = withProjects(list)
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    fireEvent.click((await screen.findAllByRole('button', { name: /新建会话/ }))[0])
+    await waitFor(() => expect(window.location.pathname).toBe('/'))
+    await act(async () => {
+      resolveList(okJson(PROJECTS))
+      await list
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '论文综述' })).toBeInTheDocument())
+    expect(screen.queryByTestId('project-home')).toBeNull()
+    expect(window.location.pathname).toBe('/')
+  }, 30000)
+
+  test('boot /p/<id>：列表到达后打开项目主页并保留 URL', async () => {
+    window.history.replaceState({}, '', '/p/p1/chats')
+    fetchMock = withProjects()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    expect(await screen.findByTestId('project-home')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /会话/ })).toHaveAttribute('aria-selected', 'true')
+    expect(window.location.pathname).toBe('/p/p1/chats')
+  }, 30000)
+})

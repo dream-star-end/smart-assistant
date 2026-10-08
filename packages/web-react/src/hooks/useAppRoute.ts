@@ -360,7 +360,10 @@ export type UseAppRouteOptions = {
   onPopWorkspace?: (workspace: WorkspaceView) => void
   /** project 工作区当前位置（workspace = project 时必传）。 */
   projectRoute?: ProjectRoute | null
-  /** 启动深链 `/p/<id>` 的未决恢复目标（App 持有；未决期间不回写 URL）。 */
+  /**
+   * 启动深链 `/p/<id>` 的未决恢复目标（App 持有；未决期间不回写 URL）。
+   * 任何用户导航都要作废它：popstate 由本 hook 清；选会话 / 新建 / 开任务面板或项目由 App 清。
+   */
   pendingProject?: ProjectRoute | null
   clearPendingProject?: () => void
   /** 已知项目 id（判断深链 / popstate 的项目是否存在）。 */
@@ -391,6 +394,8 @@ export function useAppRoute(opts: UseAppRouteOptions): void {
     if (!enabled) return
     const onPop = () => {
       if (!cbRef.current.inWorkspace) return
+      // 用户前进/后退即放弃未决的 /p/<id> 启动恢复：列表迟到后不能再把人拽回项目主页。
+      if (cbRef.current.pendingProject) cbRef.current.clearPendingProject?.()
       const query = new URLSearchParams(location.search)
       cbRef.current.onPopPanel?.(
         parsePanelParam(query),

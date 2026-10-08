@@ -425,4 +425,35 @@ describe('项目主页 /p/<id> 深链', () => {
     expect(onOpenProject).toHaveBeenCalledTimes(1)
     expect(location.pathname).toBe('/')
   })
+
+  it('popstate 作废未决的 /p/<id> 启动恢复：列表迟到后不再打开项目主页', () => {
+    history.replaceState({}, '', '/p/p1')
+    let pending: { projectId: string; tab: 'overview' } | null = { projectId: 'p1', tab: 'overview' }
+    const clearPendingProject = vi.fn(() => {
+      pending = null
+    })
+    const onOpenProject = vi.fn()
+    const opts = (): UseAppRouteOptions =>
+      base({
+        pendingProject: pending,
+        clearPendingProject,
+        onOpenProject,
+        projectIds: [],
+        projectListSettled: false,
+        onPopWorkspace: () => {},
+      })
+    const { rerender } = renderHook((o: UseAppRouteOptions) => useAppRoute(o), {
+      initialProps: opts(),
+    })
+    act(() => {
+      history.pushState({}, '', '/')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+    })
+    expect(clearPendingProject).toHaveBeenCalledTimes(1)
+    // 列表到达：pending 已清，不能再打开项目。
+    rerender({ ...opts(), projectIds: ['p1'], projectListSettled: true })
+    expect(onOpenProject).not.toHaveBeenCalled()
+    expect(location.pathname).toBe('/')
+  })
 })
+

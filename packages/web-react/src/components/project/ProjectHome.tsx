@@ -52,6 +52,7 @@ import {
   IconButton,
   Input,
   Skeleton,
+  Spinner,
   Tabs,
   TimeAgo,
   useConfirm,
@@ -87,6 +88,12 @@ export type ProjectHomeProps = {
   onRename: () => void;
   onDelete: () => void;
   onOpenMobileNav: () => void;
+  /**
+   * 拉取已归档会话（与侧栏「已归档」展开同一个加载，幂等）。默认列表不含归档，
+   * 「会话」页签与产出的来源会话要用到它们。
+   */
+  onLoadArchived?: () => void;
+  loadingArchived?: boolean;
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
 };
@@ -123,6 +130,8 @@ export function ProjectHome(props: ProjectHomeProps) {
     onRename,
     onDelete,
     onOpenMobileNav,
+    onLoadArchived,
+    loadingArchived = false,
     sidebarCollapsed,
     onExpandSidebar,
   } = props;
@@ -162,6 +171,15 @@ export function ProjectHome(props: ProjectHomeProps) {
     [sessions],
   );
   const outputs = useMemo(() => outputsOf(assets), [assets]);
+
+  // 「会话」页签要列全（含归档），产出要能找到来源会话：需要时触发已归档会话加载。
+  const outputsMissSource = outputs.some((a) => a.sessionId && !titleById.has(a.sessionId));
+  const needsArchived = tab === "chats" || outputsMissSource;
+  const loadArchivedRef = useRef(onLoadArchived);
+  loadArchivedRef.current = onLoadArchived;
+  useEffect(() => {
+    if (needsArchived) loadArchivedRef.current?.();
+  }, [needsArchived]);
   const pinned = useMemo(() => pinnedOf(assets), [assets]);
   const lastSession = projectSessions[0];
   const swatch = PROJECT_COLORS.find((c) => c.key === project.color);
@@ -325,6 +343,7 @@ export function ProjectHome(props: ProjectHomeProps) {
             {tab === "chats" && (
               <ChatsTab
                 sessions={allProjectSessions}
+                loadingArchived={loadingArchived}
                 onOpenSession={onOpenSession}
                 onNewSession={onNewSession}
               />
@@ -703,15 +722,25 @@ function OutputTile({
 
 function ChatsTab({
   sessions,
+  loadingArchived,
   onOpenSession,
   onNewSession,
 }: {
   sessions: Session[];
+  loadingArchived: boolean;
   onOpenSession: (id: string) => void;
   onNewSession: () => void;
 }) {
   const [query, setQuery] = useState("");
   const shown = useMemo(() => filterSessionsByTitle(sessions, query), [sessions, query]);
+  if (sessions.length === 0 && loadingArchived) {
+    return (
+      <div data-testid="project-chats-loading" className="flex items-center justify-center gap-2 py-12 text-meta text-muted">
+        <Spinner size={14} />
+        正在加载会话…
+      </div>
+    );
+  }
   if (sessions.length === 0) {
     return (
       <EmptyState
@@ -750,6 +779,12 @@ function ChatsTab({
           新建会话
         </Button>
       </div>
+      {loadingArchived && (
+        <p className="flex items-center gap-2 px-2 text-caption text-muted">
+          <Spinner size={12} />
+          正在加载已归档会话…
+        </p>
+      )}
       {shown.length === 0 ? (
         <p className="px-2 py-6 text-center text-meta text-muted">没有标题匹配「{query.trim()}」的会话</p>
       ) : (

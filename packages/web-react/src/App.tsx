@@ -390,9 +390,11 @@ export function App() {
     routingEnabled ? parseProjectPath(location.pathname) : null,
   );
   // 所有「去对话 / 去任务面板」的入口都经这里：切工作区即离开项目主页。
+  // 用户主动导航也作废未决的 /p/<id> 深链恢复(否则列表迟到后会把人拽回项目主页)。
   const setBoardOpen = useCallback((open: boolean) => {
     setBoardOpenState(open);
     setProjectHome(null);
+    setPendingRouteProject(null);
   }, []);
   const [boardView, setBoardView] = useState<BoardViewParam>(() =>
     routingEnabled ? parseBoardView(params, preferredBoardView()) : preferredBoardView(),
@@ -716,6 +718,7 @@ export function App() {
       setMessages([]);
       setChatError(null);
       setPendingRouteSession(null);
+      setPendingRouteProject(null);
     },
     onDeleteSession: (id) => {
       localStore.current.delete(id);
@@ -760,6 +763,7 @@ export function App() {
   const projectsRef = useRef<ChatProject[]>([]);
   const openProject = useCallback((projectId: string) => {
     if (!projectsRef.current.some((x) => x.id === projectId)) return;
+    setPendingRouteProject(null);
     setBoardOpenState(false);
     setProjectHome({ projectId, tab: "overview" });
   }, []);
@@ -816,6 +820,7 @@ export function App() {
     // 在项目主页时点系统通知：落到对应会话即离开主页(任务面板保持原行为)。
     onNotificationOpen: (id: string) => {
       setProjectHome(null);
+      setPendingRouteProject(null);
       selectSession(id);
     },
   });
@@ -1410,11 +1415,15 @@ export function App() {
   );
 
   // 项目主页「在 X 里开始…」/ 快捷开始：先进入该项目的空白草稿，再在草稿就位后发送首条消息。
-  // 不能与 newSessionInProject 同一拍调用 send：send 同步读 draftProjectRef，但 activeId 取自
-  // 闭包，同拍会把消息发进旧会话。effect 等「对话工作区 + 无选中 + 草稿归属该项目」成立才发，
-  // nonce 保证只发一次(重渲染 / 依赖抖动都不会重发)。
+  // 不能与 newSessionInProject 同一拍调用 send：send 同步读 draftProjectRef，但 activeId、模型、
+  // 思考档位、上下文档位、团队模式都取自闭包；它们由「activeId 变化」触发的 effect 重置为新会话
+  // 的默认值，同一轮 effect 里拿到的 send 仍是旧会话的配置(会把旧会话的模型定格进新会话)。
+  // 所以分两拍：①草稿就位(对话工作区 + 无选中 + 草稿归属该项目)时只「上膛」——此时各重置 effect
+  // 的 setState 与上膛同批提交；②下一次渲染后的 effect 用新的 send 发送，与手动新建会话后再发一致。
+  // nonce 保证只发一次；任一拍发现草稿不在(用户已走开 / 未登录 newSession 直接返回)即丢弃，
+  // 不把消息发进别的会话。
   const [pendingProjectStart, setPendingProjectStart] = useState<
-    { projectId: string; text: string; nonce: number } | null
+    { projectId: string; text: string; nonce: number; armed: boolean } | null
   >(null);
   const consumedProjectStartRef = useRef(0);
   const startInProject = useCallback(
@@ -1423,30 +1432,39 @@ export function App() {
       if (!t) return;
       setBoardOpen(false);
       newSessionInProject(projectId);
-      setPendingProjectStart({ projectId, text: t, nonce: Date.now() + Math.random() });
+      setPendingProjectStart({ projectId, text: t, nonce: Date.now() + Math.random(), armed: false });
     },
     [setBoardOpen, newSessionInProject],
   );
   useEffect(() => {
     const p = pendingProjectStart;
     if (!p || consumedProjectStartRef.current === p.nonce) return;
-    consumedProjectStartRef.current = p.nonce;
-    setPendingProjectStart(null);
-    // 草稿没就位(例如未登录时 newSession 直接返回)：丢弃，不把消息发进别的会话。
     // demo 的 newSession 会立即建一条本地会话并选中，所以 demo 不要求 activeId 为空。
     const draftReady =
       (demo || activeId === undefined) &&
       !boardOpen &&
       !projectHome &&
       draftProjectId === p.projectId;
-    if (!draftReady) return;
-    if (demo && activeId) {
-      // demo 的 send 不建会话也不落项目：把刚建的本地会话直接归入项目，侧栏与主页才看得到。
-      const title = p.text.slice(0, 40);
-      setSessions((c) =>
-        c.map((x) => (x.id === activeId ? { ...x, projectId: p.projectId, title, messageCount: 1 } : x)),
-      );
+    if (!draftReady) {
+      consumedProjectStartRef.current = p.nonce;
+      setPendingProjectStart(null);
+      return;
     }
+    if (!p.armed) {
+      if (demo && activeId) {
+        // demo 的 send 不建会话也不落项目：把刚建的本地会话直接归入项目，侧栏与主页才看得到。
+        const title = p.text.slice(0, 40);
+        setSessions((c) =>
+          c.map((x) =>
+            x.id === activeId ? { ...x, projectId: p.projectId, title, messageCount: 1 } : x,
+          ),
+        );
+      }
+      setPendingProjectStart({ ...p, armed: true });
+      return;
+    }
+    consumedProjectStartRef.current = p.nonce;
+    setPendingProjectStart(null);
     void send(p.text);
   }, [pendingProjectStart, activeId, boardOpen, projectHome, draftProjectId, send, demo, setSessions]);
 
@@ -3755,6 +3773,8 @@ export function App() {
               onRename={() => void renameProjectPrompt(homeProject)}
               onDelete={() => void deleteProjectConfirm(homeProject)}
               onOpenMobileNav={() => setMobileNavOpen(true)}
+              onLoadArchived={() => void loadArchivedSessions()}
+              loadingArchived={loadingArchived}
               sidebarCollapsed={collapsed}
               onExpandSidebar={() => setCollapsed(false)}
             />
