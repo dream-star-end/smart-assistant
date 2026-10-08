@@ -3,27 +3,27 @@ import {
   Brain,
   CircleHelp,
   Clock3,
-  type LucideIcon,
   LogIn,
+  type LucideIcon,
   Plug,
   Sparkles,
   Store,
   WandSparkles,
-} from "lucide-react";
-import { type KeyboardEvent, useRef } from "react";
-import { MANAGE_TABS, type ManageTab, SCOPED_MANAGE_TABS } from "../lib/manageTabs";
-import { PRODUCT_CAPABILITIES, type ProductFeatureId } from "../lib/productCapabilities";
-import { cn } from "../lib/utils";
-import type { AuthSession } from "../lib/types";
-import { CronPanel } from "./manage/CronPanel";
-import { LibraryPanel } from "./manage/LibraryPanel";
-import { MemoryPanel } from "./manage/MemoryPanel";
-import { OptimizationPanel } from "./manage/OptimizationPanel";
-import { SkillsPanel } from "./manage/SkillsPanel";
-import { ConnectorsTab } from "./settings/ConnectorsTab";
-import { Button, EmptyState, Modal, ProjectScopeSelect } from "./ui";
+} from 'lucide-react'
+import { type KeyboardEvent, useRef } from 'react'
+import { MANAGE_TABS, type ManageTab, SCOPED_MANAGE_TABS } from '../lib/manageTabs'
+import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
+import type { AuthSession } from '../lib/types'
+import { cn } from '../lib/utils'
+import { CronPanel } from './manage/CronPanel'
+import { LibraryPanel } from './manage/LibraryPanel'
+import { MemoryPanel } from './manage/MemoryPanel'
+import { OptimizationPanel } from './manage/OptimizationPanel'
+import { SkillsPanel } from './manage/SkillsPanel'
+import { ConnectorsTab } from './settings/ConnectorsTab'
+import { Button, EmptyState, Modal, ProjectScopeSelect } from './ui'
 
-export type { ManageTab };
+export type { ManageTab }
 
 /** 分区图标：导航栏与上下文条共用，同一分区处处同一个图形。 */
 const TAB_ICONS: Record<ManageTab, LucideIcon> = {
@@ -33,10 +33,16 @@ const TAB_ICONS: Record<ManageTab, LucideIcon> = {
   connectors: Plug,
   library: BookOpen,
   optimization: WandSparkles,
-};
+}
 
 /** 「优化」没有独立教程(它的 featureId 借的是记忆),不挂帮助入口,免得点进去讲的是别的。 */
-const HELP_TABS: ReadonlySet<ManageTab> = new Set(["memory", "skills", "cron", "connectors", "library"]);
+const HELP_TABS: ReadonlySet<ManageTab> = new Set([
+  'memory',
+  'skills',
+  'cron',
+  'connectors',
+  'library',
+])
 
 /**
  * 管理中心：记忆 / 技能 / 定时 / 插件 / 文献 / 优化。均经 commercial router 容器代理
@@ -82,57 +88,59 @@ export function ManageCenter({
   onOpenHelp,
   onRequireLogin,
 }: {
-  open: boolean;
-  tab: ManageTab;
-  auth: AuthSession | null;
+  open: boolean
+  tab: ManageTab
+  auth: AuthSession | null
   /** 记忆按 agent 维度；默认选中当前对话 agent。 */
-  agentId: string;
+  agentId: string
   /** 可切换的智能体（全能助手 + 已安装市场智能体），记忆面板内切换。 */
-  agents: { id: string; name: string }[];
+  agents: { id: string; name: string }[]
   /** 市场安装后一次性自动打开对应 Plugin 的授权弹层。 */
-  autoAuthorizePluginSlug?: string | null;
+  autoAuthorizePluginSlug?: string | null
   /** Auto‑Dream 待确认建议数（与侧栏入口信号同源，见 hooks/useOptimizerPending）。 */
-  optimizerPendingCount?: number;
-  onAutoAuthorizeConsumed?: () => void;
-  onTabChange: (t: ManageTab) => void;
-  onClose: () => void;
-  onOpenMarketplace?: () => void;
+  optimizerPendingCount?: number
+  onAutoAuthorizeConsumed?: () => void
+  onTabChange: (t: ManageTab) => void
+  onClose: () => void
+  onOpenMarketplace?: () => void
   /** 「怎么用」：打开对应功能的教程。省略则不渲染帮助入口。 */
-  onOpenHelp?: (featureId: ProductFeatureId) => void;
+  onOpenHelp?: (featureId: ProductFeatureId) => void
   /** 未登录态 CTA：关闭本壳并把用户送到登录页。省略则空态只剩说明。 */
-  onRequireLogin?: () => void;
+  onRequireLogin?: () => void
 }) {
-  const tabRefs = useRef<Partial<Record<ManageTab, HTMLButtonElement | null>>>({});
-  const current = MANAGE_TABS.find((t) => t.id === tab) ?? MANAGE_TABS[0];
-  const pendingLabel = optimizerPendingCount > 99 ? "99+" : String(optimizerPendingCount);
+  const tabRefs = useRef<Partial<Record<ManageTab, HTMLButtonElement | null>>>({})
+  const current = MANAGE_TABS.find((t) => t.id === tab) ?? MANAGE_TABS[0]
+  const pendingLabel = optimizerPendingCount > 99 ? '99+' : String(optimizerPendingCount)
 
   const focusTab = (id: ManageTab) => {
-    onTabChange(id);
-    tabRefs.current[id]?.focus();
-  };
+    onTabChange(id)
+    tabRefs.current[id]?.focus()
+  }
   // 竖排(桌面)与横排(窄屏)共用一份 tablist：两组方向键都响应，Home/End 跳首尾。
   const onTabKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
-    const index = MANAGE_TABS.findIndex((t) => t.id === tab);
-    const last = MANAGE_TABS.length - 1;
-    let next: number | null = null;
-    if (event.key === "ArrowDown" || event.key === "ArrowRight") next = index >= last ? 0 : index + 1;
-    else if (event.key === "ArrowUp" || event.key === "ArrowLeft") next = index <= 0 ? last : index - 1;
-    else if (event.key === "Home") next = 0;
-    else if (event.key === "End") next = last;
-    if (next === null) return;
-    event.preventDefault();
-    focusTab(MANAGE_TABS[next].id);
-  };
+    const index = MANAGE_TABS.findIndex((t) => t.id === tab)
+    const last = MANAGE_TABS.length - 1
+    let next: number | null = null
+    if (event.key === 'ArrowDown' || event.key === 'ArrowRight')
+      next = index >= last ? 0 : index + 1
+    else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft')
+      next = index <= 0 ? last : index - 1
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = last
+    if (next === null) return
+    event.preventDefault()
+    focusTab(MANAGE_TABS[next].id)
+  }
 
-  const CurrentIcon = TAB_ICONS[current.id];
-  const scoped = SCOPED_MANAGE_TABS.has(current.id);
-  const showHelp = Boolean(onOpenHelp) && HELP_TABS.has(current.id);
+  const CurrentIcon = TAB_ICONS[current.id]
+  const scoped = SCOPED_MANAGE_TABS.has(current.id)
+  const showHelp = Boolean(onOpenHelp) && HELP_TABS.has(current.id)
 
   return (
     <Modal
       open={open}
       onOpenChange={(next) => {
-        if (!next) onClose();
+        if (!next) onClose()
       }}
       title="管理中心"
       description="记忆、技能、定时任务与插件都在这里"
@@ -157,15 +165,15 @@ export function ManageCenter({
           className="grid grid-cols-6 gap-0.5 p-1.5 md:flex md:flex-1 md:flex-col md:gap-1 md:overflow-y-auto md:p-3"
         >
           {MANAGE_TABS.map((t) => {
-            const Icon = TAB_ICONS[t.id];
-            const featureId = t.featureId;
-            const selected = t.id === tab;
-            const pending = t.id === "optimization" && optimizerPendingCount > 0;
+            const Icon = TAB_ICONS[t.id]
+            const featureId = t.featureId
+            const selected = t.id === tab
+            const pending = t.id === 'optimization' && optimizerPendingCount > 0
             return (
               <button
                 key={t.id}
                 ref={(el) => {
-                  tabRefs.current[t.id] = el;
+                  tabRefs.current[t.id] = el
                 }}
                 type="button"
                 role="tab"
@@ -181,17 +189,19 @@ export function ManageCenter({
                 onClick={() => onTabChange(t.id)}
                 onKeyDown={onTabKeyDown}
                 className={cn(
-                  "group relative flex min-w-0 flex-col items-center gap-0.5 rounded-lg px-1 py-1.5 text-center outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring md:flex-row md:items-start md:gap-3 md:rounded-xl md:px-3 md:py-2.5 md:text-left [@media(hover:none)]:min-h-11",
+                  'group relative flex min-w-0 flex-col items-center gap-0.5 rounded-lg px-1 py-1.5 text-center outline-none transition-colors duration-150 ease-standard focus-visible:ring-2 focus-visible:ring-ring md:flex-row md:items-start md:gap-3 md:rounded-xl md:px-3 md:py-2.5 md:text-left [@media(hover:none)]:min-h-11',
                   selected
-                    ? "bg-surface text-fg shadow-sm ring-1 ring-border"
-                    : "text-muted hover:bg-hover hover:text-fg",
+                    ? 'bg-surface text-fg shadow-sm ring-1 ring-border'
+                    : 'text-muted hover:bg-hover hover:text-fg',
                 )}
               >
                 <span
                   aria-hidden="true"
                   className={cn(
-                    "relative flex size-7 shrink-0 items-center justify-center rounded-lg transition-colors md:mt-0.5 md:size-8",
-                    selected ? "bg-accent-soft text-accent" : "text-faint group-hover:text-fg md:bg-hover",
+                    'relative flex size-7 shrink-0 items-center justify-center rounded-lg transition-colors md:mt-0.5 md:size-8',
+                    selected
+                      ? 'bg-accent-soft text-accent'
+                      : 'text-faint group-hover:text-fg md:bg-hover',
                   )}
                 >
                   <Icon size={16} />
@@ -202,7 +212,10 @@ export function ManageCenter({
                 </span>
                 <span className="min-w-0 md:flex-1">
                   <span className="flex items-center gap-1.5">
-                    <span id={`manage-tab-${t.id}-label`} className="truncate text-caption font-medium md:text-body md:font-semibold">
+                    <span
+                      id={`manage-tab-${t.id}-label`}
+                      className="truncate text-caption font-medium md:text-body md:font-semibold"
+                    >
                       {t.label}
                       {pending && <span className="sr-only"> {pendingLabel} 项待确认</span>}
                     </span>
@@ -223,7 +236,7 @@ export function ManageCenter({
                   </span>
                 </span>
               </button>
-            );
+            )
           })}
         </div>
         {onOpenMarketplace && (
@@ -248,7 +261,12 @@ export function ManageCenter({
             窄屏上分区说明只在这里出现一次，代替桌面导航栏里的副标题。 */}
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-2.5">
           {/* 有范围选择的分区在窄屏只留一行「作用范围」，分区说明让位（导航上已有图标与名字）。 */}
-          <div className={cn("min-w-0 flex-1 items-center gap-2 md:hidden", scoped ? "hidden" : "flex")}>
+          <div
+            className={cn(
+              'min-w-0 flex-1 items-center gap-2 md:hidden',
+              scoped ? 'hidden' : 'flex',
+            )}
+          >
             <CurrentIcon size={14} aria-hidden="true" className="shrink-0 text-accent" />
             <span className="truncate text-meta text-muted">
               <span className="font-medium text-fg">{current.label}</span> · {current.blurb}
@@ -256,7 +274,9 @@ export function ManageCenter({
           </div>
           {scoped ? (
             <div className="flex min-w-0 items-center gap-2 text-meta text-muted max-md:w-full md:flex-1">
-              <span aria-hidden="true" className="shrink-0">作用范围</span>
+              <span aria-hidden="true" className="shrink-0">
+                作用范围
+              </span>
               <ProjectScopeSelect className="min-w-0 flex-1 md:w-56 md:flex-none" />
             </div>
           ) : (
@@ -277,10 +297,10 @@ export function ManageCenter({
         </div>
 
         {/* 窄屏「优化」待办：导航上只有小圆点，这里把数量和出口说全；选中「优化」或计数为 0 时不渲染。 */}
-        {optimizerPendingCount > 0 && tab !== "optimization" && (
+        {optimizerPendingCount > 0 && tab !== 'optimization' && (
           <button
             type="button"
-            onClick={() => onTabChange("optimization")}
+            onClick={() => onTabChange('optimization')}
             className="mx-3 mt-2.5 flex shrink-0 items-center justify-between gap-2 rounded-lg bg-accent-soft px-3 py-2 text-left text-meta text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring md:hidden [@media(hover:none)]:min-h-11"
           >
             <span>有 {pendingLabel} 项优化建议待确认</span>
@@ -297,64 +317,64 @@ export function ManageCenter({
           tabIndex={0}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
-        {!auth ? (
-          <div className="flex flex-1 items-center justify-center">
-            <EmptyState
-              icon={LogIn}
-              title="登录后即可管理"
-              hint="记忆、技能、定时任务与插件都需要登录后才能读写。"
-              action={
-                onRequireLogin ? (
-                  <Button variant="primary" onClick={onRequireLogin}>
-                    去登录
-                  </Button>
-                ) : undefined
-              }
-            />
-          </div>
-        ) : (
-          <>
-            {tab === "memory" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
-                {/* 工作项目作用域下的「项目资产」「智能体项目上下文预览」由 MemoryPanel 在
+          {!auth ? (
+            <div className="flex flex-1 items-center justify-center">
+              <EmptyState
+                icon={LogIn}
+                title="登录后即可管理"
+                hint="记忆、技能、定时任务与插件都需要登录后才能读写。"
+                action={
+                  onRequireLogin ? (
+                    <Button variant="primary" onClick={onRequireLogin}>
+                      去登录
+                    </Button>
+                  ) : undefined
+                }
+              />
+            </div>
+          ) : (
+            <>
+              {tab === 'memory' && (
+                <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
+                  {/* 工作项目作用域下的「项目资产」「智能体项目上下文预览」由 MemoryPanel 在
                     「项目记忆」页签内渲染（改造前追加在整个面板之后、不随页签切换）。 */}
-                <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
-              </div>
-            )}
-            {tab === "skills" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.skills.id}>
-                <SkillsPanel auth={auth} />
-              </div>
-            )}
-            {tab === "cron" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.schedules.id}>
-                <CronPanel auth={auth} />
-              </div>
-            )}
-            {tab === "connectors" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
-                <ConnectorsTab
-                  auth={auth}
-                  onOpenMarketplace={onOpenMarketplace}
-                  autoAuthorizePluginSlug={autoAuthorizePluginSlug}
-                  onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
-                />
-              </div>
-            )}
-            {tab === "library" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.research.id}>
-                <LibraryPanel auth={auth} />
-              </div>
-            )}
-            {tab === "optimization" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
-                <OptimizationPanel auth={auth} agentId={agentId} agents={agents} />
-              </div>
-            )}
-          </>
-        )}
+                  <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
+                </div>
+              )}
+              {tab === 'skills' && (
+                <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.skills.id}>
+                  <SkillsPanel auth={auth} />
+                </div>
+              )}
+              {tab === 'cron' && (
+                <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.schedules.id}>
+                  <CronPanel auth={auth} />
+                </div>
+              )}
+              {tab === 'connectors' && (
+                <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
+                  <ConnectorsTab
+                    auth={auth}
+                    onOpenMarketplace={onOpenMarketplace}
+                    autoAuthorizePluginSlug={autoAuthorizePluginSlug}
+                    onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
+                  />
+                </div>
+              )}
+              {tab === 'library' && (
+                <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.research.id}>
+                  <LibraryPanel auth={auth} />
+                </div>
+              )}
+              {tab === 'optimization' && (
+                <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
+                  <OptimizationPanel auth={auth} agentId={agentId} agents={agents} />
+                </div>
+              )}
+            </>
+          )}
         </div>
       </div>
     </Modal>
-  );
+  )
 }
