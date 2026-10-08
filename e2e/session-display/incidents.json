@@ -6158,6 +6158,57 @@
         "reason": "回归在 unit 层（真实 installer.py 对 f95dbfb 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌，含无自身鉴权的 relay 替身）；线上证据要账号 25 真实 Box：发布后 Sand host 换 PID、生命周期 ready、能力探针命中、账号池写入 ≥1，属一次性运维核对，接不进 browser/live-e2e/deploy-gate runner。",
         "since": "2026-10-08"
       }
+    },
+    {
+      "id": "INC-20261008-BOX-PARALLEL-IMAGE-CAPTION",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "商业 u1870：并行 Read 5 张截图只有一张被缩放，唯一说明在全部结果之后；折叠只认整条消息恰 1 张图，续接 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION。个人版同一份代码同样受影响",
+      "rootFixCommit": "b6447e9d",
+      "coverageCommits": [
+        "1b7e7623",
+        "77af10a8"
+      ],
+      "proofPending": {
+        "reason": "商业 OCV5-334 的发布门证明（scripts/check-v5-box-incident-proofs.ts，红绿各一次）在商业树；个人版没有这道 Box 证明门，这里由同一份代码的 unit 层锁住。商业 rel-8db5c2ee8 已用 canary 真实验证（停止原生续接的运行、STOP_CANARY_OK）。",
+        "since": "2026-10-08"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
+          "assertion": "OCV5-334 one caption among parallel image results continues the turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
+          "assertion": "the caption joins a result whose matching image is not its first image"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxImageCaptionParallel.test.ts",
+          "assertion": "a matching image followed by another image in the same result stays rejected"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261008-BOX-NATIVE-RESUME-UNSTOPPABLE",
+      "occurredAt": "2026-10-08",
+      "severity": "P1",
+      "symptom": "商业 u1870：原生续接把 keeper 启动在写 transcript 那次运行的目录，keeper 停止脚本只认自己运行目录，停止一律退出 125；续接被拒后运行停不掉，之后每条消息 IDLE_HISTORY_PENDING 直到 4 小时期限。个人版同一份代码同样受影响",
+      "rootFixCommit": "176b01cd",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "商业 OCV5-334 的发布门证明（scripts/check-v5-box-incident-proofs.ts，红绿各一次）在商业树；个人版没有这道 Box 证明门，这里由同一份代码的 unit 层锁住。商业 rel-8db5c2ee8 已用 canary 真实验证（停止原生续接的运行、STOP_CANARY_OK）。",
+        "since": "2026-10-08"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxKeeperStop.test.ts",
+          "assertion": "stop reaches a native-resumed keeper that runs in the transcript run directory"
+        }
+      ]
     }
   ]
 }
