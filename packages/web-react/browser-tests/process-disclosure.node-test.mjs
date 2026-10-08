@@ -346,10 +346,22 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       const attentionGroup = attentionProcess.getByTestId("process-detail-toggle");
       assert.equal(await attentionGroup.count(), 1);
       assert.equal(await attentionGroup.getAttribute("aria-expanded"), "false");
-      await attentionProcess.getByTestId("process-group-missed").waitFor();
-      assert.equal(await attentionProcess.getByTestId("process-group-missed").textContent(), "1 步未成功");
-      await attention.page.getByText("未成功").waitFor();
+      assert.equal(await attentionProcess.getByTestId("process-group-missed").count(), 0);
+      assert.equal(await attentionProcess.getByText(/步未成功/).count(), 0);
       assert.equal(await attention.page.getByText("hidden-probe-cmd").count(), 0);
+      await attentionGroup.click();
+      const failed = attentionProcess.getByTestId("tool-step").filter({ hasText: "未成功" });
+      assert.equal(await failed.count(), 1);
+      const quiet = failed.getByText("未成功", { exact: true });
+      await quiet.waitFor();
+      assert.equal(await quiet.evaluate((node) => node.classList.contains("text-faint")), true);
+      assert.equal(await failed.locator(".text-danger, [class*=text-danger]").count(), 0);
+      const failedToggle = failed.getByRole("button").first();
+      if (await failedToggle.getAttribute("aria-expanded") !== "true") await failedToggle.click();
+      const failedOutput = failed.locator("pre");
+      assert.equal(await failedOutput.count(), 1);
+      await failedOutput.waitFor({ state: "visible" });
+      assert.ok((await failedOutput.textContent()).split("\n").includes("probe-error-detail"));
       await attention.page.getByRole("button", { name: "拒绝" }).click();
       await attention.page.waitForFunction(() => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-respond-count") === "1");
       await attention.page.waitForTimeout(200);
@@ -533,22 +545,14 @@ test("live status is single and readable in both themes and accessibility media"
           await page.getByTestId("process-step-live").waitFor();
           assert.equal(await shell.count(), 1);
           const toggle = shell.getByTestId("process-toggle");
-          if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.tap();
-          const group = shell.getByTestId("process-detail-toggle");
-          assert.equal(await group.count(), 1);
-          if (await group.getAttribute("aria-expanded") !== "true") await group.tap();
-          assert.equal(await shell.locator(".oc-live-status-shine").count(), 1, "only current outer status shines");
-          assert.equal(await toggle.locator(".oc-live-status-shine").count(), 1);
-          assert.equal(await shell.getByTestId("process-details").locator(".oc-live-status-shine").count(), 0, "tool and internal summaries do not shine again");
-          const tool = shell.getByTestId("tool-step").filter({ hasText: "STILL_RUNNING_FILE" });
-          assert.equal(await tool.count(), 1);
-          const header = tool.getByRole("button");
-          assert.equal(await header.count(), 1);
-          const box = await header.boundingBox();
-          assert.ok(box && box.height >= 44, `commercial mobile tool target: ${JSON.stringify(box)}`);
-          const text = toggle.locator(".oc-live-status-shine");
-          assert.ok((await text.innerText()).trim().length > 0);
-          const report = await text.evaluate((el) => {
+          if (await toggle.getAttribute("aria-expanded") === "true") await toggle.tap();
+          assert.equal(await toggle.getAttribute("aria-expanded"), "false");
+          assert.equal(await shell.getByTestId("process-group-summary").count(), 0);
+          const phases = [];
+          const checkStatus = async (phase, text) => {
+            assert.equal(await text.count(), 1, `${phase}: unique live status`);
+            assert.ok((await text.innerText()).trim().length > 0);
+            const report = await text.evaluate((el) => {
             const s = getComputedStyle(el);
             let parent = el;
             while (parent && getComputedStyle(parent).backgroundColor === "rgba(0, 0, 0, 0)") parent = parent.parentElement;
@@ -564,18 +568,51 @@ test("live status is single and readable in both themes and accessibility media"
             return { text: el.textContent, animation: s.animationName, background: s.backgroundImage, color: s.color, fill: s.webkitTextFillColor,
               faint, bg, contrast: (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), rect: { width: el.getBoundingClientRect().width, height: el.getBoundingClientRect().height } };
           });
-          assert.ok(report.rect.width > 0 && report.rect.height > 0);
-          if (mode === "normal") {
-            assert.equal(report.animation, "oc-live-status-sweep");
-            assert.match(report.background, /linear-gradient/);
-            assert.equal(report.fill, "rgba(0, 0, 0, 0)");
-            assert.ok(report.contrast >= 4.5, `actual faint/background contrast: ${JSON.stringify(report)}`);
-          } else {
-            assert.equal(report.animation, "none");
-            assert.equal(report.background, "none");
-            assert.notEqual(report.color, "rgba(0, 0, 0, 0)");
-            assert.notEqual(report.fill, "rgba(0, 0, 0, 0)");
-          }
+            assert.ok(report.rect.width > 0 && report.rect.height > 0);
+            if (mode === "normal") {
+              assert.equal(report.animation, "oc-live-status-sweep");
+              assert.match(report.background, /linear-gradient/);
+              assert.equal(report.fill, "rgba(0, 0, 0, 0)");
+              assert.ok(report.contrast >= 4.5, `actual faint/background contrast: ${JSON.stringify(report)}`);
+            } else {
+              assert.equal(report.animation, "none");
+              assert.equal(report.background, "none");
+              assert.notEqual(report.color, "rgba(0, 0, 0, 0)");
+              assert.notEqual(report.fill, "rgba(0, 0, 0, 0)");
+            }
+
+            mkdirSync(shots, { recursive: true });
+            await page.screenshot({ path: join(shots, `ocv5-308-status-${theme}-${mode}-${phase}.png`) });
+            phases.push({ phase, ...report });
+          };
+          // Collapsed phase keeps the exact oc-swap-in CSS negative control meaningful.
+          assert.equal(await shell.locator(".oc-live-status-shine").count(), 1);
+          await checkStatus("collapsed", toggle.locator(".oc-live-status-shine"));
+          await toggle.tap();
+          assert.equal(await toggle.getAttribute("aria-expanded"), "true");
+          const summary = shell.getByTestId("process-group-summary");
+          assert.equal(await summary.count(), 1);
+          assert.equal(await summary.getAttribute("data-live-working"), "true");
+          assert.equal(await toggle.locator(".oc-live-status-shine").count(), 0, "expanded shell title is quiet");
+          assert.equal(await shell.locator(".oc-live-status-shine").count(), 1, "only the working group shines");
+          await checkStatus("expanded", summary);
+          const group = shell.getByTestId("process-detail-toggle");
+          assert.equal(await group.count(), 1);
+          if (await group.getAttribute("aria-expanded") !== "true") await group.tap();
+          assert.equal(await shell.getByTestId("process-details").locator(".oc-live-status-shine").count(), 0, "tool/internal rows never duplicate shimmer");
+          const tool = shell.getByTestId("tool-step").filter({ hasText: "STILL_RUNNING_FILE" });
+          assert.equal(await tool.count(), 1);
+          const header = tool.getByRole("button");
+          assert.equal(await header.count(), 1);
+          const box = await header.boundingBox();
+          assert.ok(box && box.height >= 44, `commercial mobile tool target: ${JSON.stringify(box)}`);
+          await page.evaluate(() => window.__processPage.setScene("stream"));
+          await page.getByText(/STREAM_TAIL_MARKER/).waitFor();
+          assert.equal(await page.locator(".oc-live-status-shine").count(), 0, "writing prose is not working-step shimmer");
+          await page.evaluate(() => window.__processPage.setSending(false));
+          await page.waitForFunction(() => document.querySelector("[data-testid=process-disclosure]")?.getAttribute("data-process-active") === "false");
+          assert.equal(await page.locator(".oc-live-status-shine").count(), 0, "terminal turn has no shimmer");
+          const report = { phases };
           assert.deepEqual(errors, []);
           mkdirSync(shots, { recursive: true });
           await page.screenshot({ path: join(shots, `ocv5-308-status-${theme}-${mode}.png`) });
