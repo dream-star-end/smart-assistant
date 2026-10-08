@@ -294,6 +294,28 @@ assert_locked() {
   printf '✓ V5 release queue active=%s canonical_sha=%s\n' "$id" "$pinned"
 }
 
+# 只读、不取队列锁、不建库:给发车预检(scripts/v5-deploy-preflight.sh)用,判据与 assert_locked 相同。
+# 预检不能被别人持有的队列锁挂住,也不能 init/改写队列库;SQLite WAL 读者只会建/复用 -wal/-shm
+# 旁文件(权限随主库 0600),不写库内容。
+# 退出码:0 = 就绪;2 = 确定未就绪(与 assert 同一拒绝);3 = 读不到(无法判定,由调用方决定)。
+check_readonly() {
+  local id="$1" row status pinned current
+  [[ -f "$QUEUE_DB" ]] || { echo "? 发布队列库不存在:$QUEUE_DB" >&2; exit 3; }
+  row="$(sqlite3 -readonly -noheader -separator '|' "$QUEUE_DB" \
+    "SELECT status, IFNULL(canonical_sha,'') FROM release_queue_jobs WHERE id='$(sql_quote "$id")' LIMIT 1;" 2>/dev/null)" \
+    || { echo "? 发布队列库只读查询失败:$QUEUE_DB" >&2; exit 3; }
+  status="${row%%|*}"
+  pinned="${row#*|}"
+  [[ "$status" == active ]] || die "发布队列项不是 active:$id status=${status:-missing}"
+  valid_sha "$pinned" || die "发布队列项尚未 pin canonical SHA:$id"
+  current="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  if [[ "$current" != "$pinned" ]]; then
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$pinned" "$current" 2>/dev/null \
+      || die "pinned SHA 不在 canonical 历史里:queue=$pinned current=$current(pin 错了,或该 commit 尚未合入/已被改写)"
+  fi
+  printf '✓ V5 release queue active=%s canonical_sha=%s(只读检查)\n' "$id" "$pinned"
+}
+
 finish_locked() {
   local id="$1" result="$2" reason="$3" actor="$4" status created
   status="$(job_field_locked "$id" status)"
@@ -570,6 +592,7 @@ Usage:
   v5-release-queue.sh wait --id ID --owner O [--timeout SECONDS]
   v5-release-queue.sh pin --id ID --sha CANONICAL_SHA --actor A
   v5-release-queue.sh assert [--id ID]
+  v5-release-queue.sh check [--id ID]        # 只读、不取锁的 assert(发车预检用)
   v5-release-queue.sh finish --id ID --result deployed|not-deployed --reason R --actor A
   v5-release-queue.sh cancel --id ID --reason R --actor A
   v5-release-queue.sh abandon-active --id ID --result deployed|not-deployed --reason R --operator O
@@ -698,6 +721,17 @@ case "$command_name" in
     done
     valid_id "$id" || die "缺少/非法 OC_V5_RELEASE_QUEUE_ID:$id"
     with_queue_lock assert_locked "$id"
+    ;;
+  check)
+    id="${OC_V5_RELEASE_QUEUE_ID:-}"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id) id="${2:-}"; shift 2 ;;
+        *) die "check 未知参数:$1" ;;
+      esac
+    done
+    valid_id "$id" || die "缺少/非法 OC_V5_RELEASE_QUEUE_ID:$id"
+    check_readonly "$id"
     ;;
   pinned-sha)
     # 只读:回显该 job 的 pinned canonical SHA(deploy 用它决定"发哪个 commit")。

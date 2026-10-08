@@ -434,7 +434,8 @@ printf '%s\\n' "$@" >"${log}"
     const result = spawnSync(detached, ['start', '--', '--canary'], {
       cwd: root,
       encoding: 'utf8',
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+      // 本用例只钉 unit 的 KillMode/ExecStopPost;发车预检由 v5DeployDetached.test.ts 覆盖。
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, OC_V5_DETACHED_SKIP_PREFLIGHT: '1' },
     })
     assert.equal(result.status, 0, result.stdout + result.stderr)
     const args = readFileSync(log, 'utf8').trim().split('\n')
