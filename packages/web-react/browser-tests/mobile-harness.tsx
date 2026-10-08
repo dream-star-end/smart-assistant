@@ -36,6 +36,8 @@ declare global {
     /** T25 移动整页:上层真实收到的交互结果(run.mjs 读回)。 */
     __mobilePage: {
       navOpens: number;
+      /** Independent input/expected-output fixtures for real clipboard proof (T68). */
+      copyFixture: { raw: string; plain: string };
       sends: Array<{ text: string; mediaCount: number }>;
       following: boolean;
       directManipulation: boolean;
@@ -57,6 +59,10 @@ declare global {
 
 window.__mobilePage = {
   navOpens: 0,
+  copyFixture: {
+    raw: "**MOBILE-ASSISTANT-COPY-FIXTURE**\n\n复制必须保留 **原文** 和 `工具结果`。",
+    plain: "MOBILE-ASSISTANT-COPY-FIXTURE\n\n复制必须保留 原文 和 工具结果。",
+  },
   sends: [],
   following: true,
   directManipulation: false,
@@ -121,6 +127,12 @@ const MOBILE_MESSAGES: ChatMessage[] = [
       "MOBILE_ASSISTANT_TAIL_MARKER",
     ].join("\n"),
     ts: 3,
+  },
+  {
+    id: "mobile-assistant-copy-fixture",
+    role: "assistant",
+    text: window.__mobilePage.copyFixture.raw,
+    ts: 4,
   },
 ];
 

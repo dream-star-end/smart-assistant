@@ -1,3 +1,4 @@
+import { ToolCardPolishProbe } from "./tool-card-polish-probe";
 // browser-tests 挂载壳:在真浏览器里 mount **真实 Composer**(非复刻结构),
 // 由 run.mjs 用受信点击驱动断言。背景(2026-07-18 附件事故):jsdom 的 label
 // 激活查找走 ownerDocument 而非 tree scope、fireEvent 非受信不触发同步 flush,
@@ -981,26 +982,7 @@ createRoot(document.getElementById("team-agent-card-root")!).render(
   </StrictMode>,
 );
 
-const marketItems = Array.from({ length: 10 }, (_, index) => ({
-  slug: `browser-skill-${index + 1}`,
-  name: `浏览器能力 ${index + 1}`,
-  kind: "skill",
-  description: `适合场景 ${index + 1}`,
-}));
-createRoot(document.getElementById("tool-card-polish-root")!).render(
-  <StrictMode>
-    <div style={{ width: 360, maxWidth: "100%" }}>
-      <ToolCard
-        message={{
-          toolName: "Bash",
-          inputJson: { command: "oc-market search browser" },
-          output: JSON.stringify(marketItems),
-          _completed: true,
-        }}
-      />
-    </div>
-  </StrictMode>,
-);
+createRoot(document.getElementById("tool-card-polish-root")!).render(<ToolCardPolishProbe />);
 
 createRoot(document.getElementById("interrupted-tool-status-root")!).render(
   <StrictMode>
