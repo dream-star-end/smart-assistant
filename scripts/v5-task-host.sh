@@ -7,11 +7,14 @@
 # 经常漏。本脚本不改产品行为、不碰数据库、不借用户凭据、不唤醒容器:
 #   · 读(get/list…)与 create(编号必须由服务端返回)在容器不在时直接失败并说明;
 #   · comment 入队(root 0600,JSONL),送达用的仍是容器内官方 oc-task,保证与直接评论同一路径。
+#   · 至多一次:送达前先把队首条目原子地挪进 inflight.json;成功后记 delivered.jsonl。flush 发现残留的
+#     inflight.json(上次送达途中被杀,结果未知)时**不重发**,挪进 uncertain.jsonl 并告警,由人核对工单。
+#   · 每次 docker exec 硬上限(TERM 后再 KILL);同一时刻只有一个 flush(拿不到锁就跳过,下个 tick 再来)。
 #
 # 用法:
 #   scripts/v5-task-host.sh [--uid N] <oc-task 参数…>     # 默认 uid 3(个人版 owner)
 #   scripts/v5-task-host.sh flush [--quiet]               # 容器在时按序送达队列(lease worker 每 tick 调用)
-#   scripts/v5-task-host.sh pending                       # 只读:列出未送达条目
+#   scripts/v5-task-host.sh pending                       # 只读:列出未送达 / 结果未知的条目
 # 退出码:oc-task 原样;75 = 已入队待送达;3 = 容器不在且该命令不能排队;2 = 用法错误。
 set -euo pipefail
 
@@ -27,17 +30,28 @@ running() { # <container>
   [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" == true ]]
 }
 
+EXEC_TIMEOUT="${OC_V5_TASK_EXEC_TIMEOUT:-60}"
+EXEC_KILL_AFTER="${OC_V5_TASK_EXEC_KILL_AFTER:-5}"
+
 exec_task() { # <container> <args…>
   local ctr="$1"; shift
-  docker exec -u agent -e HOME=/home/agent "$ctr" /home/agent/.local/bin/oc-task "$@"
+  timeout --kill-after="$EXEC_KILL_AFTER" "$EXEC_TIMEOUT" \
+    docker exec -u agent -e HOME=/home/agent "$ctr" /home/agent/.local/bin/oc-task "$@"
 }
 
-spool_lock() {
+spool_dir() {
   mkdir -p "$SPOOL_DIR"
   chmod 0700 "$SPOOL_DIR"
+}
+
+# 入队:短临界区,阻塞等锁。flush 的长 I/O(docker exec)不在这把锁里做,不会让入队久等。
+spool_lock() {
+  spool_dir
   exec 9>>"$SPOOL_DIR/.lock"
   flock 9
 }
+
+spool_unlock() { flock -u 9; exec 9>&-; }
 
 enqueue_comment() { # <uid> <args…>(已确认是 ticket comment)
   local uid="$1"; shift
@@ -53,43 +67,84 @@ enqueue_comment() { # <uid> <args…>(已确认是 ticket comment)
   exit 75
 }
 
-cmd_flush() {
-  local quiet=0 line uid ctr id rest kept=0 sent=0 failed=""
-  [[ "${1:-}" == --quiet ]] && quiet=1
-  [[ -s "$SPOOL_DIR/pending.jsonl" ]] || { [[ "$quiet" == 1 ]] || echo "队列为空"; return 0; }
+# 原子取出队首一条到 inflight.json(持队列锁的短临界区);队列空返回 1。
+take_head_locked() {
+  local head
   spool_lock
-  rest="$(mktemp "$SPOOL_DIR/.pending.XXXXXX")"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    if [[ -n "$failed" ]]; then printf '%s\n' "$line" >>"$rest"; kept=$((kept + 1)); continue; fi
-    uid="$(jq -r '.uid' <<<"$line")"; id="$(jq -r '.id' <<<"$line")"
+  if [[ ! -s "$SPOOL_DIR/pending.jsonl" ]]; then spool_unlock; return 1; fi
+  head="$(head -n 1 "$SPOOL_DIR/pending.jsonl")"
+  ( umask 077; printf '%s\n' "$head" >"$SPOOL_DIR/.inflight.tmp" )
+  mv -f "$SPOOL_DIR/.inflight.tmp" "$SPOOL_DIR/inflight.json"
+  ( umask 077; tail -n +2 "$SPOOL_DIR/pending.jsonl" >"$SPOOL_DIR/.pending.tmp" )
+  mv -f "$SPOOL_DIR/.pending.tmp" "$SPOOL_DIR/pending.jsonl"
+  spool_unlock
+}
+
+# 送达失败:把 inflight 条目放回队首,保持顺序(持队列锁)。
+requeue_inflight_locked() {
+  spool_lock
+  ( umask 077; { cat "$SPOOL_DIR/inflight.json"; cat "$SPOOL_DIR/pending.jsonl" 2>/dev/null || true; } >"$SPOOL_DIR/.pending.tmp" )
+  mv -f "$SPOOL_DIR/.pending.tmp" "$SPOOL_DIR/pending.jsonl"
+  rm -f "$SPOOL_DIR/inflight.json"
+  spool_unlock
+}
+
+cmd_flush() {
+  local quiet=0 line uid ctr id rc sent=0 stop=""
+  [[ "${1:-}" == --quiet ]] && quiet=1
+  [[ -d "$SPOOL_DIR" ]] || { [[ "$quiet" == 1 ]] || echo "队列为空"; return 0; }
+  # 同时只允许一个 flush;另一个在跑就直接返回(lease worker 每 30s 都会再来)。
+  exec 8>>"$SPOOL_DIR/.flush.lock"
+  flock -n 8 || { [[ "$quiet" == 1 ]] || echo "另一个 flush 正在进行,跳过"; return 0; }
+  if [[ -s "$SPOOL_DIR/inflight.json" ]]; then
+    # 上次送达途中被打断,无法判断评论是否已写入:至多一次 → 不重发,交给人核对。
+    ( umask 077; cat "$SPOOL_DIR/inflight.json" >>"$SPOOL_DIR/uncertain.jsonl" )
+    rm -f "$SPOOL_DIR/inflight.json"
+    echo "⚠ oc-task 队列:发现上次中断的送达($(jq -r '.id' "$SPOOL_DIR/uncertain.jsonl" | tail -n 1)),结果未知,已移入 uncertain.jsonl,不重发;请到工单核对。" >&2
+  fi
+  while [[ -z "$stop" ]]; do
+    [[ -s "$SPOOL_DIR/pending.jsonl" ]] || break
+    line="$(head -n 1 "$SPOOL_DIR/pending.jsonl")"
+    uid="$(jq -r '.uid' <<<"$line" 2>/dev/null)" || { stop="队首条目不是合法 JSON"; break; }
     ctr="$(container_of "$uid")"
-    if ! running "$ctr"; then
-      failed="容器 $ctr 未运行"; printf '%s\n' "$line" >>"$rest"; kept=$((kept + 1)); continue
-    fi
+    running "$ctr" || { stop="容器 $ctr 未运行"; break; }
+    take_head_locked || break
+    line="$(cat "$SPOOL_DIR/inflight.json")"
+    id="$(jq -r '.id' <<<"$line")"
     # 评论正文多行:参数按 NUL 分隔还原,不能按换行切。
     mapfile -d '' -t args < <(jq -j '.args[] | . + "\u0000"' <<<"$line")
-    if exec_task "$ctr" "${args[@]}" </dev/null >/dev/null 2>"$SPOOL_DIR/.last-error"; then
-      jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {deliveredAt: $at}' <<<"$line" >>"$SPOOL_DIR/delivered.jsonl"
+    rc=0
+    exec_task "$ctr" "${args[@]}" </dev/null >/dev/null 2>"$SPOOL_DIR/.last-error" || rc=$?
+    if [[ "$rc" == 0 ]]; then
+      ( umask 077; jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {deliveredAt: $at}' <<<"$line" >>"$SPOOL_DIR/delivered.jsonl" )
+      rm -f "$SPOOL_DIR/inflight.json"
       sent=$((sent + 1))
+    elif [[ "$rc" == 124 || "$rc" == 137 ]]; then
+      # 超时被杀:评论可能已写入,至多一次 → 不重发,交给人核对。
+      ( umask 077; cat "$SPOOL_DIR/inflight.json" >>"$SPOOL_DIR/uncertain.jsonl" )
+      rm -f "$SPOOL_DIR/inflight.json"
+      stop="$id 送达超时(rc=$rc),结果未知,已移入 uncertain.jsonl,不重发"
     else
-      # 按序送达:一条失败就停,后面的保持原顺序留在队列里,下一次 tick 再试。
-      failed="$id 送达失败: $(head -c 300 "$SPOOL_DIR/.last-error" | tr '\n' ' ')"
-      printf '%s\n' "$line" >>"$rest"; kept=$((kept + 1))
+      # oc-task 明确报错(没写入):放回队首,按序停下,下个 tick 再试。
+      requeue_inflight_locked
+      stop="$id 送达失败(rc=$rc): $(head -c 300 "$SPOOL_DIR/.last-error" | tr '\n' ' ')"
     fi
-  done <"$SPOOL_DIR/pending.jsonl"
-  chmod 0600 "$rest"
-  mv -f "$rest" "$SPOOL_DIR/pending.jsonl"
-  if [[ "$quiet" != 1 || "$sent" -gt 0 || -n "$failed" ]]; then
-    echo "oc-task 队列:已送达 $sent,剩余 $kept${failed:+;停在:$failed}" >&2
+  done
+  if [[ "$quiet" != 1 || "$sent" -gt 0 || ( -n "$stop" && "$stop" != 容器*未运行 ) ]]; then
+    echo "oc-task 队列:已送达 $sent,剩余 $(grep -c . "$SPOOL_DIR/pending.jsonl" 2>/dev/null || echo 0)${stop:+;停在:$stop}" >&2
   fi
-  [[ "$sent" -gt 0 && "$kept" == 0 ]] && rm -f "$SPOOL_DIR/.last-error"
   return 0
 }
 
 cmd_pending() {
-  [[ -s "$SPOOL_DIR/pending.jsonl" ]] || { echo "队列为空"; return 0; }
-  jq -r '"\(.id)  uid=\(.uid)  \(.queuedAt)  \(.args | join(" ") | .[0:120])"' "$SPOOL_DIR/pending.jsonl"
+  local f any=0
+  for f in pending inflight uncertain; do
+    local path="$SPOOL_DIR/$f.json"; [[ "$f" == inflight ]] || path="$SPOOL_DIR/$f.jsonl"
+    [[ -s "$path" ]] || continue
+    any=1
+    jq -r --arg f "$f" '"[\($f)] \(.id)  uid=\(.uid)  \(.queuedAt)  \(.args | join(" ") | .[0:120])"' "$path"
+  done
+  [[ "$any" == 1 ]] || echo "队列为空"
 }
 
 main() {

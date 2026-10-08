@@ -461,11 +461,16 @@ SQL
 
 # ---------- main ----------
 # 宿主侧 oc-task 评论队列(scripts/v5-task-host.sh):容器被 idle sweep 回收期间排队的评论,
-# 容器回来后按序送达。失败/容器不在只留在队列里,绝不影响 lease 调度本身。
+# 容器回来后按序送达。脱离运行(setsid + &):worker 本 tick 不等它,也不受它失败/挂住影响;
+# 同一时刻只有一个 flush(脚本内 flock -n),整体再加硬上限(TERM 后 KILL)。
 flush_task_spool() {
-  local host_task="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/v5-task-host.sh"
+  local host_task
+  host_task="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/v5-task-host.sh"
   [[ -x "$host_task" ]] || return 0
-  timeout 120 "$host_task" flush --quiet </dev/null || true
+  mkdir -p "$WORKER_LOG_DIR" 2>/dev/null || true
+  setsid timeout --kill-after=10 300 "$host_task" flush --quiet \
+    </dev/null >>"$WORKER_LOG_DIR/oc-task-spool.log" 2>&1 &
+  return 0
 }
 
 main() {
