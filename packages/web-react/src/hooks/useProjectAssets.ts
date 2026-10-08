@@ -176,7 +176,7 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
       } catch (e) {
         setAssets(snapshot);
         console.warn("patchProjectAsset failed", e);
-        toast("更新项目知识失败，已恢复", "error");
+        toast("更新常用文件失败，已恢复", "error");
         throw e;
       }
     },
@@ -186,7 +186,7 @@ export function useProjectAssets(opts: UseProjectAssetsOptions): UseProjectAsset
   const renameAsset = useCallback(
     async (asset: ProjectAsset) => {
       const name = (
-        await cbRef.current.promptText({ title: "重命名资产", initial: asset.name })
+        await cbRef.current.promptText({ title: "重命名文件", initial: asset.name })
       )?.trim();
       if (!name || name === asset.name) return;
       let snapshot: ProjectAsset[] = [];

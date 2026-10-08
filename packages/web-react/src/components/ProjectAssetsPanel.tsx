@@ -80,12 +80,12 @@ export function ProjectAssetsPanel(props: {
 
       {/* 「注入」是实现术语，用户语境是「项目知识 / 已启用」（PA-01）。 */}
       <p className="text-meta text-muted">
-        设为项目知识的资料，会作为该项目下所有会话的共享背景知识。
+        设为常用的文件，会作为这个项目里所有会话的共享背景。
       </p>
 
       <div className="flex flex-wrap items-center gap-2 text-meta">
         <span className="tabular-nums text-fg">
-          项目知识 {injected}/{PINNED_INJECT_LIMIT}
+          常用文件 {injected}/{PINNED_INJECT_LIMIT}
         </span>
         {pinnedCount > PINNED_INJECT_LIMIT ? (
           <span className="text-warning">超过 {PINNED_INJECT_LIMIT} 条时只启用前 {PINNED_INJECT_LIMIT} 条</span>
@@ -117,7 +117,7 @@ export function ProjectAssetsPanel(props: {
       ) : assets.length === 0 && !error ? (
         <EmptyState
           icon={File}
-          title="还没有资产"
+          title="还没有文件"
           hint="上传参考资料，或在会话里生成文件后会出现在这里。"
         />
       ) : (
@@ -235,7 +235,7 @@ function AssetRow({
 }) {
   const src = asset.containerPath || asset.url;
   const { state, start, cancel } = useSignedDownload(src, asset.name);
-  const pinLabel = asset.pinned ? "取消项目知识" : "设为项目知识";
+  const pinLabel = asset.pinned ? "取消常用" : "设为常用";
 
   return (
     <li
@@ -260,7 +260,7 @@ function AssetRow({
             </Badge>
             {asset.pinned ? (
               <Badge size="sm" tone="accent">
-                <Pin size={10} /> 项目知识
+                <Pin size={10} /> 常用
               </Badge>
             ) : null}
           </div>

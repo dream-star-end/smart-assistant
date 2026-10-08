@@ -2,6 +2,7 @@ import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within }
 import { afterEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import type { ChatProject, Session, User } from "../lib/types";
+import { ProjectScopeProvider } from "../hooks/useProjectScope";
 import { Sidebar } from "./Sidebar";
 import { SESSION_ROW_HEIGHT, DEFAULT_PROJECT_ID, PROJECT_ROW_HEIGHT } from "./sidebar/constants";
 import { flattenSidebarItems } from "./sidebar/flattenItems";
@@ -603,7 +604,7 @@ describe("Sidebar 项目分组", () => {
     expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
   });
 
-  it("default 组菜单只有「项目资产」一项", async () => {
+  it("default 组菜单只有「未分类的文件」一项", async () => {
     const onOpenProjectAssets = vi.fn();
     renderSidebar({
       sessions: [session({ id: "s-loose", title: "未分组会话" })],
@@ -620,13 +621,13 @@ describe("Sidebar 项目分组", () => {
       ctrlKey: false,
       pointerType: "mouse",
     });
-    await waitFor(() => expect(screen.getByRole("menuitem", { name: "项目资产" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "未分类的文件" })).toBeInTheDocument());
     expect(screen.queryByRole("menuitem", { name: "项目设置" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "重命名" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "删除" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "上移" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "下移" })).toBeNull();
-    fireEvent.click(screen.getByRole("menuitem", { name: "项目资产" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "未分类的文件" }));
     expect(onOpenProjectAssets).toHaveBeenCalledWith(null);
   });
 
@@ -1937,5 +1938,69 @@ describe("Sidebar SIDEBAR-R1 行菜单：右键 / 触屏长按", () => {
       screen.getByRole("button", { name: t }).closest("[data-session-row]")!;
     expect(rowOf("项目里").querySelector("[data-session-guide]")).not.toBeNull();
     expect(rowOf("置顶的").querySelector("[data-session-guide]")).toBeNull();
+  });
+});
+
+describe("Sidebar 搜索范围可见（QW6）", () => {
+  const scoped = [project({ id: "p-work-0001", name: "工作", sessionCount: 1 })];
+  const scopedSessions: Session[] = [
+    session({ id: "s-in", title: "复盘 项目内", projectId: "p-work-0001" }),
+    session({ id: "s-out", title: "复盘 项目外" }),
+  ];
+
+  function renderScoped(onSearchMessages = vi.fn(async (..._args: unknown[]) => [] as never[])) {
+    window.history.replaceState({}, "", "/?project=p-work-0001");
+    const utils = render(
+      <ProjectScopeProvider auth={null} chatProjects={scoped} userId="u1">
+        <Sidebar
+          sessions={scopedSessions}
+          user={user}
+          projects={scoped}
+          collapsedProjectIds={new Set()}
+          onToggleProjectCollapsed={() => {}}
+          onCreateProject={() => {}}
+          onSearchMessages={onSearchMessages}
+          onSelect={() => {}}
+          onNew={() => {}}
+          onRename={() => {}}
+          onDelete={() => {}}
+        />
+      </ProjectScopeProvider>,
+    );
+    return { ...utils, onSearchMessages };
+  }
+
+  afterEach(() => window.history.replaceState({}, "", "/"));
+
+  it("a scope chosen elsewhere is shown as a chip, and title matches follow it", async () => {
+    const { onSearchMessages } = renderScoped();
+    fireEvent.change(screen.getByLabelText("搜索标题或消息"), { target: { value: "复盘" } });
+    expect(await screen.findByTestId("sidebar-search-scope")).toHaveTextContent("仅在「工作」中搜索");
+    expect(screen.getByRole("button", { name: "复盘 项目内" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "复盘 项目外" })).toBeNull();
+    await waitFor(() => expect(onSearchMessages).toHaveBeenCalled());
+    expect(onSearchMessages.mock.calls.at(-1)![2]).toBe("p-work-0001");
+  });
+
+  it("the chip clears the filter for this search", async () => {
+    const { onSearchMessages } = renderScoped();
+    fireEvent.change(screen.getByLabelText("搜索标题或消息"), { target: { value: "复盘" } });
+    fireEvent.click(await screen.findByRole("button", { name: "搜索全部项目" }));
+    expect(screen.queryByTestId("sidebar-search-scope")).toBeNull();
+    expect(screen.getByRole("button", { name: "复盘 项目外" })).toBeInTheDocument();
+    await waitFor(() => expect(onSearchMessages.mock.calls.at(-1)![2]).toBeUndefined());
+  });
+
+  it("title hits show which project they are in", async () => {
+    renderSidebar({
+      sessions: scopedSessions,
+      projects: scoped,
+      collapsedProjectIds: new Set(),
+      onToggleProjectCollapsed: () => {},
+      onCreateProject: () => {},
+    });
+    fireEvent.change(screen.getByLabelText("搜索标题或消息"), { target: { value: "复盘" } });
+    const hints = await screen.findAllByTestId("session-row-project");
+    expect(hints.map((h) => h.textContent)).toEqual(["工作"]);
   });
 });

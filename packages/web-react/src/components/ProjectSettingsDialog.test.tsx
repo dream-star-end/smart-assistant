@@ -60,7 +60,7 @@ describe("ProjectSettingsDialog", () => {
 
   test("字数超限禁用保存", () => {
     renderDialog();
-    const textarea = screen.getByLabelText("自定义指令");
+    const textarea = screen.getByLabelText("项目指令");
     fireEvent.change(textarea, { target: { value: "x".repeat(4001) } });
     expect(screen.getByText("4001 / 4000")).toBeTruthy();
     expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
@@ -126,7 +126,7 @@ describe("ProjectSettingsDialog", () => {
       },
     });
     await waitFor(() => expect(taskboardApi.getProjectContext).toHaveBeenCalled());
-    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md"));
+    await waitFor(() => expect(screen.getByLabelText("项目指令")).toHaveValue("from-project-md"));
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() => expect(put).toHaveBeenCalled());
     expect(put).toHaveBeenCalledWith(
@@ -143,17 +143,17 @@ describe("ProjectSettingsDialog", () => {
     vi.spyOn(api, "listProjectAssets").mockResolvedValue([]);
     const { onSave, auth } = renderDialog();
     expect(screen.getByRole("tab", { name: "设置" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByLabelText("自定义指令")).toBeTruthy();
+    expect(screen.getByLabelText("项目指令")).toBeTruthy();
     expect(screen.getByRole("button", { name: "保存" })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("tab", { name: "资产" }));
-    await waitFor(() => expect(screen.getByRole("tab", { name: "资产" })).toHaveAttribute("aria-selected", "true"));
+    fireEvent.click(screen.getByRole("tab", { name: "文件" }));
+    await waitFor(() => expect(screen.getByRole("tab", { name: "文件" })).toHaveAttribute("aria-selected", "true"));
     expect(screen.getByRole("button", { name: "上传参考资料" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "保存" })).toBeNull();
     expect(api.listProjectAssets).toHaveBeenCalledWith(auth, "p1");
 
     fireEvent.click(screen.getByRole("tab", { name: "设置" }));
-    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toBeTruthy());
+    await waitFor(() => expect(screen.getByLabelText("项目指令")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() =>
       expect(onSave).toHaveBeenCalledWith(
@@ -179,10 +179,10 @@ describe("ProjectSettingsDialog", () => {
       fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
       const ask = await screen.findByText(/所选看板项目自带的指令与当前内容不同/);
       expect(ask).toBeTruthy();
-      expect(screen.getByLabelText("自定义指令")).toHaveValue("用中文回答");
+      expect(screen.getByLabelText("项目指令")).toHaveValue("用中文回答");
       fireEvent.click(screen.getByRole("button", { name: "保留当前内容" }));
       expect(screen.queryByText(/所选看板项目自带的指令与当前内容不同/)).toBeNull();
-      expect(screen.getByLabelText("自定义指令")).toHaveValue("用中文回答");
+      expect(screen.getByLabelText("项目指令")).toHaveValue("用中文回答");
     });
 
     test("「用看板指令覆盖」才替换文本域", async () => {
@@ -191,7 +191,7 @@ describe("ProjectSettingsDialog", () => {
       await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
       fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
       fireEvent.click(await screen.findByRole("button", { name: "用看板指令覆盖" }));
-      expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md");
+      expect(screen.getByLabelText("项目指令")).toHaveValue("from-project-md");
       expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
     });
 
@@ -200,7 +200,7 @@ describe("ProjectSettingsDialog", () => {
       renderDialog({ project: { ...project, instructions: "" } });
       await waitFor(() => expect(screen.getByRole("option", { name: "B · Board" })).toBeTruthy());
       fireEvent.change(screen.getByLabelText("绑定任务面板项目"), { target: { value: boardId } });
-      await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-project-md"));
+      await waitFor(() => expect(screen.getByLabelText("项目指令")).toHaveValue("from-project-md"));
       expect(screen.queryByRole("button", { name: "用看板指令覆盖" })).toBeNull();
     });
   });
@@ -216,7 +216,7 @@ describe("ProjectSettingsDialog", () => {
       new ApiError({ status: 409, message: "version conflict", code: "version_conflict" }),
     );
     const { onSave, onClose } = renderDialog({ project: { ...project, boardProjectId: boardId } });
-    await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("x"));
+    await waitFor(() => expect(screen.getByLabelText("项目指令")).toHaveValue("x"));
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     expect((await screen.findByRole("alert")).textContent).toContain("重新打开");
     expect(onSave).not.toHaveBeenCalled();
@@ -265,14 +265,14 @@ describe("ProjectSettingsDialog", () => {
   describe("关闭前脏检查（PS-03）", () => {
     test("有未保存改动时按 Esc：先弹确认，「继续编辑」留在弹窗，「放弃修改」才关闭", async () => {
       const { onClose } = renderDialog();
-      fireEvent.change(screen.getByLabelText("自定义指令"), { target: { value: "改了一段" } });
+      fireEvent.change(screen.getByLabelText("项目指令"), { target: { value: "改了一段" } });
       fireEvent.keyDown(document, { key: "Escape" });
       expect(await screen.findByText("放弃未保存的修改？")).toBeTruthy();
       expect(onClose).not.toHaveBeenCalled();
       fireEvent.click(screen.getByRole("button", { name: "继续编辑" }));
       await waitFor(() => expect(screen.queryByText("放弃未保存的修改？")).toBeNull());
       expect(onClose).not.toHaveBeenCalled();
-      expect(screen.getByLabelText("自定义指令")).toHaveValue("改了一段");
+      expect(screen.getByLabelText("项目指令")).toHaveValue("改了一段");
 
       fireEvent.click(screen.getByRole("button", { name: "取消" }));
       fireEvent.click(await screen.findByRole("button", { name: "放弃修改" }));
@@ -296,7 +296,7 @@ describe("ProjectSettingsDialog", () => {
         instructions: "from-board",
       });
       const { onClose } = renderDialog({ project: { ...project, boardProjectId: boardId } });
-      await waitFor(() => expect(screen.getByLabelText("自定义指令")).toHaveValue("from-board"));
+      await waitFor(() => expect(screen.getByLabelText("项目指令")).toHaveValue("from-board"));
       fireEvent.keyDown(document, { key: "Escape" });
       await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
       expect(screen.queryByText("放弃未保存的修改？")).toBeNull();

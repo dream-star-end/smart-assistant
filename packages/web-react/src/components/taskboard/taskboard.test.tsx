@@ -1451,7 +1451,7 @@ describe('TaskboardView 窄屏配置入口', () => {
     await waitFor(() => expect(screen.getByLabelText('项目范围')).toHaveValue('p1'))
     await openConfigMenu()
     expect(await screen.findByTestId('project-edit-open')).toHaveTextContent('管理项目')
-    expect(screen.getByTestId('project-create-open')).toHaveTextContent('新建项目')
+    expect(screen.getByTestId('project-create-open')).toHaveTextContent('新建工作项目')
     expect(screen.getByTestId('stage-settings-open')).toHaveTextContent('流水线配置')
     expect(screen.getByTestId('template-library-open')).toHaveTextContent('流水线模板')
     expect(screen.getByTestId('board-settings-open')).toHaveTextContent('护栏设置')

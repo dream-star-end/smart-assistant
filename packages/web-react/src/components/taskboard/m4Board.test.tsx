@@ -37,9 +37,9 @@ vi.mock('../../hooks/useProjectScope', () => ({
     chatProjects: [{ id: 'chat-unbound', name: 'test', boardProjectId: null }],
     selectOptions: [
       { value: 'all', label: '全部项目' },
-      { value: 'none', label: '未归类' },
+      { value: 'none', label: '未分类' },
       { value: 'p1', label: 'OCV5 自用' },
-      { value: 'chat-unbound', label: '会话组 · test' },
+      { value: 'chat-unbound', label: '项目 · test' },
     ],
     loading: false,
     refreshWorkProjects: async () => {},

@@ -294,8 +294,18 @@ export function Sidebar({
   }, [archivedExpanded]);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
+  // 全局项目范围(在看板/管理中心选的)也会收窄侧栏搜索:必须看得见,也能一键放开。
+  // 放开只对本侧栏搜索生效,范围本身一变就恢复跟随。
+  const [ignoreScopeForSearch, setIgnoreScopeForSearch] = useState(false);
+  const scopeToken = projectScope.scope.token;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 范围 token 变化即恢复跟随
+  useEffect(() => setIgnoreScopeForSearch(false), [scopeToken]);
+  const scopeFilterForSearch =
+    searchProjectId === undefined && !ignoreScopeForSearch
+      ? projectScope.scope.chatProjectIdForFilter
+      : undefined;
   const activeSearchProjectId =
-    searchProjectId !== undefined ? searchProjectId : projectScope.scope.chatProjectIdForFilter;
+    searchProjectId !== undefined ? searchProjectId : scopeFilterForSearch;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
   // 只有出现在项目列表里的 projectId 才算「有归属」。projectId 指向未知项目的会话
   // （项目列表请求失败 / 项目在他端被删）一律落回「未分类」，绝不从侧栏消失（S-12）。
@@ -344,8 +354,13 @@ export function Sidebar({
       ? sessions.filter((s) => !s.archived || archivedExpanded)
       : activeSessions;
     if (!needle) return pool;
-    return pool.filter((s) => (s.title || "新对话").toLowerCase().includes(needle));
-  }, [activeSessions, sessions, q, searching, archivedExpanded]);
+    // 标题命中与消息命中同一个项目范围,不再一边过滤一边不过滤。
+    return pool.filter(
+      (s) =>
+        (s.title || "新对话").toLowerCase().includes(needle) &&
+        (activeSearchProjectId === undefined || (s.projectId ?? null) === activeSearchProjectId),
+    );
+  }, [activeSessions, sessions, q, searching, archivedExpanded, activeSearchProjectId]);
 
   const pinned = useMemo(
     () =>
@@ -732,6 +747,11 @@ export function Sidebar({
           }}
           allowDrag={!coarse}
           highlightQuery={searching ? q : undefined}
+          projectHint={
+            searching && s.projectId
+              ? (projects ?? []).find((p) => p.id === s.projectId)?.name
+              : undefined
+          }
         />
       );
     }
@@ -1009,6 +1029,31 @@ export function Sidebar({
             </IconButton>
           )}
         </label>
+        {searching && scopeFilterForSearch !== undefined && (
+          <div
+            data-testid="sidebar-search-scope"
+            className="mt-1 flex min-w-0 items-center gap-1 rounded-sm bg-accent-soft py-0.5 pl-2.5 pr-1 text-caption text-accent"
+          >
+            <span className="min-w-0 flex-1 truncate">
+              仅在「
+              {scopeFilterForSearch === null
+                ? "未分类"
+                : ((projects ?? []).find((p) => p.id === scopeFilterForSearch)?.name ?? "当前项目")}
+              」中搜索
+            </span>
+            <IconButton
+              data-product-control
+              aria-label="搜索全部项目"
+              title="搜索全部项目"
+              variant="muted"
+              size="xs"
+              shape="round"
+              onClick={() => setIgnoreScopeForSearch(true)}
+            >
+              <X size={12} />
+            </IconButton>
+          </div>
+        )}
 
         {onOpenBoard && (
           <button

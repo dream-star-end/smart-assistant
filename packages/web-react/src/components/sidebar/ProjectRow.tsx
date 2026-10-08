@@ -70,7 +70,7 @@ export function ProjectRow({
   onRename?: (p: ChatProject) => void;
   onDelete?: (p: ChatProject) => void;
   onOpenSettings?: (p: ChatProject) => void;
-  /** 虚拟 default 组专用：菜单只含「项目资产」。 */
+  /** 虚拟 default 组专用：菜单只含「未分类的文件」。 */
   onOpenAssets?: (p: ChatProject) => void;
   /** 在该项目下直接新建会话；default 组不传（顶部「新建会话」已覆盖未分类）。 */
   onNewSession?: () => void;
@@ -235,7 +235,7 @@ export function ProjectRow({
                     onSelect={() => onOpenAssets?.(p)}
                   >
                     <Paperclip size={14} className="shrink-0 text-muted" />
-                    项目资产
+                    未分类的文件
                   </DropdownMenuItem>
                 )}
                 {onOpenSettings && (

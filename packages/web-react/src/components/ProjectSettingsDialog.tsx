@@ -16,7 +16,7 @@ const INSTRUCTIONS_MAX = 4000;
 
 const SETTINGS_TABS = [
   { value: "settings", label: "设置" },
-  { value: "assets", label: "资产" },
+  { value: "assets", label: "文件" },
 ] as const;
 
 type DialogTab = (typeof SETTINGS_TABS)[number]["value"];
@@ -256,12 +256,12 @@ export function ProjectSettingsDialog(props: {
     <Modal
       open={open}
       onOpenChange={handleOpenChange}
-      title={<span id={titleId}>{assetsOnly ? "项目资产" : "项目设置"}</span>}
+      title={<span id={titleId}>{assetsOnly ? "未分类的文件" : "项目设置"}</span>}
       description={
         assetsOnly
-          ? "未分组会话的上传资料与产出物。"
+          ? "没放进项目的会话里上传的文件和智能体产出。"
           : activeTab === "assets"
-            ? "聚合本项目下的上传资料与会话产出。"
+            ? "这个项目的上传文件和智能体产出。"
             : "项目指令会在该项目下的会话里作为额外偏好生效，不会覆盖平台规则。"
       }
       size="lg"
@@ -393,7 +393,7 @@ export function ProjectSettingsDialog(props: {
             label={
               // 字数计数并入标签行：原来落在文本域下方，默认高度下被 footer 遮住要滚动才见（PS-06）。
               <span className="flex items-center justify-between gap-2">
-                <span>自定义指令</span>
+                <span>项目指令</span>
                 <span
                   aria-live="polite"
                   className={cn(
@@ -412,7 +412,7 @@ export function ProjectSettingsDialog(props: {
               value={instructions}
               rows={6}
               onChange={(e) => setInstructions(e.target.value)}
-              aria-label="自定义指令"
+              aria-label="项目指令"
             />
           </Field>
           {pendingBoardInstructions !== null ? (
@@ -461,7 +461,7 @@ export function ProjectSettingsDialog(props: {
         </div>
       ) : (
         <Alert tone="warning" density="compact">
-          登录后才能管理项目资产。
+          登录后才能管理项目文件。
         </Alert>
       )}
       {/* 放在分区条件之外：切到「资产」Tab 再按 Esc，脏检查确认框也得挂着（PS-03）。 */}

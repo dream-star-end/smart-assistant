@@ -619,7 +619,7 @@ export const sidebarScenes: Scene[] = [
   },
   {
     id: 'sidebar-project-settings',
-    label: '项目设置 · 名称/颜色/看板绑定/自定义指令',
+    label: '项目设置 · 名称/颜色/看板绑定/项目指令',
     group: '工作区',
     viewports: ['desktop', 'mobile'],
     api: {},
