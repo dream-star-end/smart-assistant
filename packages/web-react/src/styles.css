@@ -803,6 +803,48 @@ body {
   .oc-home-title { background: none; color: CanvasText; }
 }
 
+/* ── 教程中心重构(OCV5-342 跟进):全部取语义 token,明暗主题自适应;无图片、无新字体 ── */
+.tut-shell {
+  background:
+    radial-gradient(90% 320px at 50% -120px, color-mix(in srgb, var(--accent) 9%, transparent), transparent 70%),
+    var(--bg);
+}
+.tut-mark {
+  box-shadow:
+    0 6px 18px color-mix(in srgb, var(--accent) 28%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+.tut-hero {
+  position: relative;
+  background:
+    radial-gradient(70% 120% at 100% 0%, color-mix(in srgb, var(--info, var(--accent)) 12%, transparent), transparent 60%),
+    radial-gradient(60% 120% at 0% 100%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 60%),
+    var(--surface);
+}
+.tut-rail {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 45%, transparent), var(--border) 60%, transparent);
+}
+.tut-card {
+  transition: border-color 0.25s var(--ease-standard), box-shadow 0.25s var(--ease-standard), transform 0.25s var(--ease-standard);
+}
+.tut-card:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  box-shadow: var(--shadow-soft);
+  transform: translateY(-1px);
+}
+.tut-frame {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 24px 60px -24px color-mix(in srgb, var(--accent) 30%, rgba(0, 0, 0, 0.25));
+}
+.tut-cta {
+  background:
+    radial-gradient(60% 140% at 100% 0%, rgba(255, 255, 255, 0.16), transparent 60%),
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 72%, #0b0a14) 0%, color-mix(in srgb, var(--accent) 34%, #0b0a14) 100%);
+  box-shadow: 0 24px 60px -28px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+@media (prefers-reduced-motion: reduce) {
+  .tut-card:hover { transform: none; }
+}
+
 /* ── 高成本 turn 完成后的一次性「评分引导」脉冲(方案 a)：极轻光环,**无布局位移**
    (只动 box-shadow / border-radius),仅在用户未表达减少动效偏好时播放,播 2 次即止。
    --accent 随明暗主题自适应(见 :root / .dark 的 accent token);color-mix 保证光环柔和不刺眼。
