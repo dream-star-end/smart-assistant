@@ -4980,6 +4980,7 @@ export class Gateway {
               project: result.project,
               pausedCronJobIds: result.pausedCronJobIds,
               relinkedSessions: result.relinkedSessions,
+              relinkedSessionIds: result.relinkedSessionIds,
               relinkedAssets: result.relinkedAssets,
             })
             return

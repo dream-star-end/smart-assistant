@@ -204,6 +204,7 @@ describe('chat_projects CRUD', () => {
     if (!restored.ok) return
     assert.deepEqual(restored.pausedCronJobIds, ['job-1'])
     assert.equal(restored.relinkedSessions, 1)
+    assert.deepEqual(restored.relinkedSessionIds, ['sess-r1'])
     assert.equal(restored.relinkedAssets, 1)
     const { sessions } = await listClientSessions(USER)
     assert.equal(sessions.find((x) => x.id === 'sess-r1')?.projectId, pid)

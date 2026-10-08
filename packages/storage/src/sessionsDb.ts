@@ -2160,7 +2160,14 @@ export type ChatProjectDeletedManifest = {
 }
 
 export type ChatProjectRestoreResult =
-  | { ok: true; project: ChatProject; pausedCronJobIds: string[]; relinkedSessions: number; relinkedAssets: number }
+  | {
+      ok: true
+      project: ChatProject
+      pausedCronJobIds: string[]
+      relinkedSessions: number
+      relinkedSessionIds: string[]
+      relinkedAssets: number
+    }
   | { ok: false; error: ChatProjectRestoreError }
 
 export type DeletedChatProject = { id: string; name: string; deletedAt: number; sessionCount: number }
@@ -6414,12 +6421,14 @@ async function _sqliteRestoreChatProject(userId: string, id: string): Promise<Ch
         WHERE id = ? AND user_id = ?`,
     ).run(now, id, userId)
     // Only items still ungrouped come back; anything the user moved since stays where it is.
-    let relinkedSessions = 0
+    const relinkedSessionIds: string[] = []
     const relinkSession = db.prepare(
       `UPDATE client_sessions SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
         WHERE id = ? AND user_id = ? AND project_id IS NULL AND deleted_at IS NULL`,
     )
-    for (const sid of manifest.sessionIds) relinkedSessions += relinkSession.run(id, now, sid, userId).changes
+    for (const sid of manifest.sessionIds) {
+      if (relinkSession.run(id, now, sid, userId).changes > 0) relinkedSessionIds.push(sid)
+    }
     let relinkedAssets = 0
     const relinkAsset = db.prepare(
       `UPDATE project_assets SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
@@ -6428,7 +6437,14 @@ async function _sqliteRestoreChatProject(userId: string, id: string): Promise<Ch
     for (const aid of manifest.assetIds) relinkedAssets += relinkAsset.run(id, now, aid, userId).changes
     const project = _sqliteReadChatProject(db, userId, id)
     if (!project) throw new Error('restored chat project vanished')
-    return { ok: true, project, pausedCronJobIds: manifest.pausedCronJobIds, relinkedSessions, relinkedAssets }
+    return {
+      ok: true,
+      project,
+      pausedCronJobIds: manifest.pausedCronJobIds,
+      relinkedSessions: relinkedSessionIds.length,
+      relinkedSessionIds,
+      relinkedAssets,
+    }
   })
   return txn()
 }

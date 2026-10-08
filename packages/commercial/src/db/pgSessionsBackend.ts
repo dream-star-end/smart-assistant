@@ -12959,13 +12959,16 @@ export function createPgSessionsBackend(
           [id, userId],
         );
         // Only items still ungrouped come back; anything the user moved since stays where it is.
-        const rs = manifest.sessionIds.length
-          ? await client.query(
-              `UPDATE client_sessions SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-                WHERE user_id = $2 AND id = ANY($3::text[]) AND project_id IS NULL AND deleted_at IS NULL`,
-              [id, userId, manifest.sessionIds],
-            )
-          : { rowCount: 0 };
+        const relinkedSessionIds = manifest.sessionIds.length
+          ? (
+              await client.query<{ id: string }>(
+                `UPDATE client_sessions SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                  WHERE user_id = $2 AND id = ANY($3::text[]) AND project_id IS NULL AND deleted_at IS NULL
+                  RETURNING id`,
+                [id, userId, manifest.sessionIds],
+              )
+            ).rows.map((r) => r.id)
+          : [];
         const ra = manifest.assetIds.length
           ? await client.query(
               `UPDATE project_assets SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
@@ -12979,7 +12982,8 @@ export function createPgSessionsBackend(
           ok: true,
           project,
           pausedCronJobIds: manifest.pausedCronJobIds,
-          relinkedSessions: rs.rowCount ?? 0,
+          relinkedSessions: relinkedSessionIds.length,
+          relinkedSessionIds,
           relinkedAssets: ra.rowCount ?? 0,
         };
       });
