@@ -282,8 +282,9 @@ function toolUseIds(assistant: Record<string, unknown>): string[] | null {
   if (ids.length < 1 || new Set(ids).size !== ids.length) return null;
   return ids;
 }
-/** Move one proven coordinate sentence into the single image's tool_result.
- * Unknown shapes, conflicts, and non-unique images are left untouched. */
+/** Move one proven coordinate sentence into the image's tool_result: the
+ * single image, or among several the only one whose size the caption names.
+ * Unknown shapes, conflicts, and ambiguous images are left untouched. */
 function foldProvenImageCaption(message: Record<string, unknown>,
   assistant: Record<string, unknown>): Record<string, unknown> {
   if (!Array.isArray(message.content) || !denseArray(message.content)) return message;
@@ -324,17 +325,43 @@ function foldProvenImageCaption(message: Record<string, unknown>,
     insideCaptions += inspected.captions;
     if (inspected.images > 0) { images += inspected.images; imageIndex = index; }
   }
-  if (images !== 1 || imageIndex < 0 || insideCaptions !== 0) return message;
+  if (images < 1 || imageIndex < 0 || insideCaptions !== 0) return message;
   if (resultIds.length !== useIds.length || new Set(resultIds).size !== resultIds.length) return message;
   const expected = new Set(useIds);
   if (resultIds.some((id) => !expected.has(id))) return message;
+  const caption = captions[0]!;
+  let matchedSize: { width: number; height: number } | null = null;
+  if (images > 1) {
+    // OCV5-334: parallel Reads where Claude Code downscaled only one image
+    // carry one caption after all results. It belongs to the single image
+    // whose pixel size it names as "displayed"; no match or several matches
+    // stay unfolded (and rejected).
+    // The caption is appended to its result, so the matched image must be that result's last block.
+    const matching: Array<{ index: number; size: { width: number; height: number }; last: boolean }> = [];
+    for (let index = 0; index < results.length; index++) {
+      const part = results[index];
+      if (!object(part) || !Array.isArray(part.content)) continue;
+      const content = part.content as unknown[];
+      content.forEach((block, position) => {
+        const item = strictBoxImageBlock(block);
+        const size = item ? boxImageDimensions(item.data) : null;
+        if (size && captionMatchesImage(caption, size)) {
+          matching.push({ index, size, last: position === content.length - 1 });
+        }
+      });
+    }
+    if (matching.length !== 1 || !matching[0]!.last) return message;
+    imageIndex = matching[0]!.index;
+    matchedSize = matching[0]!.size;
+  }
   const imageResult = results[imageIndex];
   if (!object(imageResult) || !Array.isArray(imageResult.content)
     || !denseArray(imageResult.content)) return message;
-  const caption = captions[0]!;
   const imageBlock = imageResult.content.map(strictBoxImageBlock).find((item) => item !== null);
-  const dims = imageBlock ? boxImageDimensions(imageBlock.data) : null;
-  if (!provenCaption(caption) && !(dims && captionMatchesImage(caption, dims))) return message;
+  const dims = matchedSize ?? (imageBlock ? boxImageDimensions(imageBlock.data) : null);
+  if ((images > 1 || !provenCaption(caption)) && !(dims && captionMatchesImage(caption, dims))) {
+    return message;
+  }
   const nextResults = results.slice();
   nextResults[imageIndex] = { ...imageResult, content: [...imageResult.content,
     { type: "text", text: caption }] };

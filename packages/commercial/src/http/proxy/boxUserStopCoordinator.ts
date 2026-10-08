@@ -108,7 +108,8 @@ export class BoxUserStopCoordinator {
     try {
       target = await this.resolvePinned(leaf);
       if (target.accountId !== leaf.accountId) return "pending";
-      const stop = target.exec.run(makeBoxKeeperStop(leaf.runNonce, leaf.leaseEpoch), {
+      const stop = target.exec.run(makeBoxKeeperStop(leaf.runNonce, leaf.leaseEpoch,
+        leaf.cliCwd), {
         timeoutMs: 10_000, maxResponseBytes: 1024 });
       let stopTimer: ReturnType<typeof setTimeout> | undefined;
       try {

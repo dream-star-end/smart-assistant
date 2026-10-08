@@ -196,6 +196,10 @@ export interface BoxStoppedFailureProbeCandidate {
   readonly runNonce: string;
   readonly leaseEpoch: string;
   readonly linked: boolean;
+  /** OCV5-334: the CLI cwd of a native-resumed run (journal boxNativeCliCwd)
+   * when it is not the run's own directory. The keeper runs there, so its
+   * stop must expect this cwd. */
+  readonly cliCwd?: string;
   /** OCV5-323: an inflight unknown resume leaf without a handoff. Its CLI
    * waits for tool results that no request will publish again.
    * OCV5-313: every launched detached-tool unknown leaf, whatever its phase. */
@@ -203,6 +207,13 @@ export interface BoxStoppedFailureProbeCandidate {
   /** OCV5-313: the row is older than BOX_RUN_EXPIRED_AFTER_MS, so its run
    * cannot be alive any more (same rule as admission capacity). */
   readonly expired?: boolean;
+}
+/** OCV5-334: boxNativeCliCwd of a native-resumed run, only when it is a
+ * well-formed run directory other than the run's own. */
+function nativeKeeperCwd(ctx: Record<string, unknown>, runNonce: string): string | undefined {
+  const cwd = ctx.boxNativeCliCwd;
+  return typeof cwd === "string" && /^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(cwd)
+    && cwd !== `/tmp/ocv5-289-run-${runNonce}` ? cwd : undefined;
 }
 /** Any value isBoxUnknownPhase accepts. */
 export type BoxStaleResumePhase = string;
@@ -2683,9 +2694,11 @@ export class BoxDurableJournal implements BoxJournalPort {
         && isBoxUnknownPhase(ctx.boxUnknownPhase)
         && Number.isSafeInteger(unknownForMs)
         ? { phase: ctx.boxUnknownPhase, unknownForMs } : undefined;
+      const cliCwd = nativeKeeperCwd(ctx, ctx.boxRunNonce);
       candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
         accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
         leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined,
+        ...(cliCwd ? { cliCwd } : {}),
         ...(staleResume ? { staleResume } : {}),
         ...(row.expired === true ? { expired: true } : {}) });
     }
@@ -2953,9 +2966,11 @@ export class BoxDurableJournal implements BoxJournalPort {
           || !/^[A-Za-z0-9_-]{1,64}$/.test(ctx.boxOwnerRequestId)))) {
       throw new BoxDurableJournalError("BOX_CANCEL_LEAF_UNKNOWN");
     }
+    const cliCwd = nativeKeeperCwd(ctx, input.runNonce);
     return { requestId: row.request_id, uid: input.uid,
       accountId: input.accountId, runNonce: input.runNonce,
-      leaseEpoch: input.leaseEpoch, linked: ctx.boxOwnerRequestId !== undefined };
+      leaseEpoch: input.leaseEpoch, linked: ctx.boxOwnerRequestId !== undefined,
+      ...(cliCwd ? { cliCwd } : {}) };
   }
 
   /** Resolve a stop only from the currently authenticated user container's

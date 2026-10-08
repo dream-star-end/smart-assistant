@@ -2726,6 +2726,95 @@ async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
+/** INC-20261008-BOX-NATIVE-RESUME-UNSTOPPABLE, commercial u1870 run 7d17585d: a native resume launches the keeper in
+ * the CLI cwd of the run that wrote the transcript, and the keeper stop accepted only a keeper in the run's own
+ * directory. Every stop exited 125 (BOX_EXEC_REMOTE_EXIT), the parked run stayed in handoff and the session's
+ * next messages were refused as IDLE_HISTORY_PENDING until the four-hour deadline. Here a real keeper process
+ * runs in another run's directory and is stopped by the real coordinator, journal leaf and stop script. */
+async function proveNativeResumedStop(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_334n, containerId: 334n, sessionId: "session-native-stop" };
+  const turnKey = "7".repeat(64);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'native-stop@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-nstop", turnKey);
+  await turn.first();
+  const nonce = turn.host.runNonce, epoch = turn.host.leaseEpoch;
+  const run = `/tmp/ocv5-289-run-${nonce}`, proofDir = `/tmp/ocv5-289-proof-${nonce}`;
+  const native = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
+  const keeperPath = `/tmp/ocv5-289-v2-keeper-${randomBytes(8).toString("hex")}.py`;
+  const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${randomBytes(8).toString("hex")}.py`;
+  for (const dir of [run, proofDir, native]) {
+    mkdirSync(dir, { mode: 0o700 });
+    cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
+  }
+  writeFileSync(keeperPath, "import signal,time,sys\nsignal.signal(signal.SIGTERM,lambda *_:sys.exit(0))\n" +
+    "open('ready','w').close()\nwhile True:time.sleep(.1)\n", { mode: 0o600 });
+  cleanups.add(() => rmSync(keeperPath, { force: true }));
+  const keeper = spawn("/usr/bin/python3", ["-I", keeperPath, supervisorPath, "--proof-dir", proofDir,
+    "--lease-epoch", epoch], { cwd: native, stdio: "ignore" });
+  cleanups.add(() => { if (keeper.exitCode === null) keeper.kill("SIGKILL"); });
+  for (let i = 0; i < 200 && !existsSync(`${native}/ready`); i++) await tick(10);
+  writeFileSync(`${proofDir}/stop.ready`, JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
+    keeperPid: keeper.pid, cliPid: keeper.pid, revision: 1 }) + "\n", { mode: 0o600 });
+  // the journal records the resumed transcript's cwd, as claimToolResume writes it for a native resume
+  await db.query(`UPDATE request_finalize_journal SET ctx=ctx || jsonb_build_object('boxNativeCliCwd',$2::text,
+    'boxNativeSessionId',$3::text) WHERE request_id=$1`, ["box-nstop-1", native, randomUUID()]);
+  // the cleanup worker's listing carries the same cwd for its stale-resume stop
+  await aged(db, "box-nstop-1", "3 hours");
+  const listed = (await journal.listStoppedFailureProbeCandidates(20))
+    .find((candidate: { requestId: string }) => candidate.requestId === "box-nstop-1") as { cliCwd?: string } | undefined;
+  if (listed?.cliCwd !== native) fail(`NATIVE_STOP_WORKER_CWD_${String(listed?.cliCwd)}`);
+  const sent: string[][] = [];
+  const local = { accountId: turn.host.target.accountId, exec: { run: async (request: ExecRequest & { command: string }) => {
+    if (request.args[3] !== nonce || request.args[4] !== epoch) throw api.transportError("BOX_EXEC_REMOTE_EXIT");
+    sent.push(request.args.slice(3));
+    const out = spawnSync(request.command, request.args, { cwd: "/tmp", encoding: "utf8", timeout: 5000 });
+    if (out.status !== 0) throw api.transportError("BOX_EXEC_REMOTE_EXIT");
+    return reply(out.stdout);
+  } } };
+  await api.stopCoordinator(journal, local).requestStop({ requestId: "box-nstop-1", uid: who.uid,
+    accountId: turn.host.target.accountId, runNonce: nonce, leaseEpoch: epoch });
+  const exited = keeper.exitCode !== null || await Promise.race([
+    new Promise<boolean>((resolve) => { keeper.once("exit", () => resolve(true)); }), tick(3000).then(() => false)]);
+  if (sent.length !== 1 || sent[0]![2] !== native || !exited) {
+    fail(`NATIVE_STOP_NOT_STOPPED_${sent.length}_${String(sent[0]?.[2])}_${exited}`);
+  }
+  return "[ocv5-334-native-resume-stop] PASS — a native-resumed run whose keeper runs in the transcript run directory is stopped";
+}
+
+/** INC-20261008-BOX-PARALLEL-IMAGE-CAPTION, commercial u1870 request 0e9b5222: five parallel Reads returned five
+ * JPEG screenshots and Claude Code downscaled only one (2430x1131 -> 2000x931), so a single caption followed all
+ * five results. The fold accepted only a message with exactly one image and the turn ended with 409. */
+function proveParallelImageCaption(api: Api): string {
+  const ids = ["toolu_par_1", "toolu_par_2", "toolu_par_3", "toolu_par_4", "toolu_par_5"];
+  const sizes: Array<[number, number]> = [[1215, 566], [1215, 566], [1215, 566], [1822, 848], [2000, 931]];
+  const shots = sizes.map(([w, h]) => png(w, h));
+  const caption = (dw: number, dh: number) =>
+    `[Image: original 2430x1131, displayed at ${dw}x${dh}. Multiply coordinates by ${(2430 / dw).toFixed(2)} to map to original image.]`;
+  const request = (images: string[], tail: unknown[]): Body => ({ model: MODEL, stream: true, max_tokens: 64,
+    tools: [tool("Read")],
+    messages: [{ role: "user", content: "看这些截图" },
+      { role: "assistant", content: ids.map((id, n) => ({ type: "tool_use", id, name: "Read", input: { file_path: `/s${n}.jpg` } })) },
+      { role: "user", content: [...[4, 3, 0, 2, 1].map((n) => ({ type: "tool_result", tool_use_id: ids[n], content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: images[n] } }] })), ...tail] }] });
+  const cached = (value: string) => ({ ...text(value), cache_control: { type: "ephemeral" } });
+  const body = request(shots, [cached(caption(2000, 931))]);
+  const rejected = api.gate(body, true);
+  if (rejected !== null) fail(`PARALLEL_IMAGE_GATE_${rejected}`);
+  const classified = api.classify(body);
+  if (classified.classification !== "continuation_candidate") fail(`PARALLEL_IMAGE_CLASS_${classified.rejectCode}`);
+  const rows = api.match(body, ids.map((id, n) => ({ id, boxName: "mcp__ocbridge__Read", clientName: "Read",
+    input: { file_path: `/s${n}.jpg` } })));
+  const owner = rows.find((row) => row.modelToolUseId === ids[4]);
+  if (!owner || !isDeepStrictEqual(owner.content,
+    [{ type: "image", data: shots[4], mimeType: "image/png" }, text(caption(2000, 931))])) fail("PARALLEL_IMAGE_RESULT");
+  // a caption no image or two images match is not attributed
+  staysRejected(api, "PARALLEL_IMAGE_NO_MATCH", request(shots.map((shot, n) => n === 4 ? shots[0]! : shot), [cached(caption(2000, 931))]));
+  staysRejected(api, "PARALLEL_IMAGE_TWO_MATCH", request(shots.map((shot, n) => n === 0 ? shots[4]! : shot), [cached(caption(2000, 931))]));
+  return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
+}
+
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
@@ -2748,7 +2837,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    proveImageCaption(api), proveParallelImageCaption(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
@@ -2756,7 +2845,7 @@ async function main(): Promise<void> {
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
-      await proveUpstreamRefusal(api, db)]),
+      await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);
