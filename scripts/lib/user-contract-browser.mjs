@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { selectJourneyModel } from "./journey-browser.mjs";
 import { assertOutbound, parseFrame, turnEvidence, turnPolicy } from "./user-contract.mjs";
 
@@ -83,7 +85,7 @@ export async function installTurnProbe(context, base, cost) {
       }
       server.send(raw);
     });
-    server.onMessage((raw) => { const f = parseFrame(raw); if (f) received.push(f); ws.send(raw); });
+    server.onMessage((raw) => { const f = parseFrame(raw); if (f) received.push(Object.assign(f, { __at: Date.now() })); ws.send(raw); });
   });
   return probe;
 }
@@ -107,19 +109,78 @@ export async function sendContractTurn(page, probe, { model, engine, catalog, co
     if (evidence.error) throw new Error("Exact turn returned an error");
     return evidence.complete;
   }, 180_000, "Exact turn did not complete");
-  await page.waitForFunction((before) => {
-    const rows = document.querySelectorAll('[data-testid="assistant-row"]');
-    const last = rows[rows.length - 1];
-    return rows.length > before && last && !last.querySelector('.caret-blink') && document.querySelector('button[aria-label="发送"]') && last.querySelector('.prose')?.textContent?.trim();
-  }, rowsBefore, { timeout: 20_000, polling: 50 }).catch(async () => {
-    const state = await page.evaluate(() => {
-      const rows = document.querySelectorAll('[data-testid="assistant-row"]');
-      const last = rows[rows.length - 1];
-      return { rows: rows.length, hasText: Boolean(last?.querySelector('.prose')?.textContent?.trim()), caret: Boolean(last?.querySelector('.caret-blink')), send: Boolean(document.querySelector('button[aria-label="发送"]')) };
-    });
-    throw new Error(`Completed turn UI did not settle: model=${model}, before=${rowsBefore}, state=${JSON.stringify(state)}`);
+  await waitTurnUiSettled(page, rowsBefore, {
+    model,
+    recheck: () => turnEvidence(probe.received, sent),
+    timeline: () => turnTimeline(probe.received, sent),
   });
   if (await page.getByTestId("assistant-row").last().locator('[role="alert"]').count() || await page.getByText(/发送失败|消息暂未安全送达/).count()) throw new Error("Turn finished with a failure card");
+}
+// ── UI 收尾等待(2026-10-08 冒烟健壮性)──
+// 进入这里时,后端已经给出本轮权威完成证据:服务器对这条消息(同 peer + clientMessageId)发出
+// isFinal 的 outbound.message,且没有任何 error 帧。UI 判据一条不放松:新 assistant 行、无流式
+// 光标、composer 回到「发送」、正文非空;之后仍查失败卡。
+// 只把「后端已完成、UI 还在收尾」与真失败分开:
+//   · strictMs 内收尾 → 通过;
+//   · 超时 → 复核后端证据(仍完成、仍无 error,否则立即按真失败处理)→ 再给一次 graceMs;
+//     期间收尾 → 通过,但打印 `# warn slow_ui_settle …`,进日志供 v5-smoke-flake-report 统计;
+//   · grace 仍未收尾 → 硬失败,并落证据(唯一命名的截图 + DOM 状态 + 本轮帧时间线,不含正文)。
+export const UI_SETTLE_STRICT_MS = 20_000;
+export const UI_SETTLE_GRACE_MS = 40_000;
+
+function uiSettledPredicate(before) {
+  const rows = document.querySelectorAll('[data-testid="assistant-row"]');
+  const last = rows[rows.length - 1];
+  return rows.length > before && last && !last.querySelector('.caret-blink') && document.querySelector('button[aria-label="发送"]') && last.querySelector('.prose')?.textContent?.trim();
+}
+
+async function uiState(page) {
+  return page.evaluate(() => {
+    const rows = document.querySelectorAll('[data-testid="assistant-row"]');
+    const last = rows[rows.length - 1];
+    return { rows: rows.length, hasText: Boolean(last?.querySelector('.prose')?.textContent?.trim()), caret: Boolean(last?.querySelector('.caret-blink')), send: Boolean(document.querySelector('button[aria-label="发送"]')), stop: Boolean(document.querySelector('button[aria-label="停止"]')) };
+  }).catch(() => ({ unavailable: true }));
+}
+
+// 本轮帧的时间线:只记类型 / isFinal / 相对发送的毫秒数,不记正文与凭据。
+export function turnTimeline(frames, sent) {
+  const own = frames.filter((f) => f?.peer?.id === sent.peer.id && f.clientMessageId === sent.clientMessageId);
+  const t0 = own[0]?.__at ?? 0;
+  return own.map((f) => ({ type: f.type, final: f.isFinal === true, error: Boolean(f.error), ms: (f.__at ?? 0) - t0 }));
+}
+
+export function contractEvidenceBase(env = process.env) {
+  const dir = env.OC_CONTRACT_ARTIFACTS || "/tmp";
+  mkdirSync(dir, { recursive: true });
+  return join(dir, `v5-contract-${new Date().toISOString().replace(/[:.]/g, "")}-${Math.random().toString(36).slice(2, 8)}`);
+}
+
+export async function waitTurnUiSettled(page, rowsBefore, { model, recheck, timeline = () => [], strictMs = UI_SETTLE_STRICT_MS, graceMs = UI_SETTLE_GRACE_MS, log = console.log } = {}) {
+  const started = Date.now();
+  const settle = (timeout) => page.waitForFunction(uiSettledPredicate, rowsBefore, { timeout, polling: 50 });
+  try {
+    await settle(strictMs);
+    return { slow: false, settledMs: Date.now() - started };
+  } catch { /* strict window missed: re-check backend, then one bounded grace window */ }
+  const atStrict = await uiState(page);
+  const evidence = recheck?.();
+  if (!evidence?.complete || evidence.error) {
+    throw new Error(`Exact turn backend evidence lost on re-check (complete=${Boolean(evidence?.complete)}, error=${Boolean(evidence?.error)}): model=${model}`);
+  }
+  try {
+    await settle(graceMs);
+  } catch {
+    const base = contractEvidenceBase();
+    try { await page.screenshot({ path: `${base}.png`, fullPage: true, timeout: 5_000 }); } catch { /* evidence is best effort */ }
+    const atFail = await uiState(page);
+    try {
+      writeFileSync(`${base}.json`, JSON.stringify({ model, rowsBefore, strictMs, graceMs, waitedMs: Date.now() - started, atStrict, atFail, url: page.url(), timeline: timeline() }, null, 2));
+    } catch { /* evidence is best effort */ }
+    throw new Error(`Completed turn UI did not settle within ${strictMs + graceMs}ms after backend completion: model=${model}, before=${rowsBefore}, state=${JSON.stringify(atFail)}, evidence=${base}.{png,json}`);
+  }
+  const settledMs = Date.now() - started;
+  log(`# warn slow_ui_settle model=${model} settled_ms=${settledMs} strict_ms=${strictMs} state_at_strict=${JSON.stringify(atStrict)}`);
+  return { slow: true, settledMs };
 }
 export async function waitUntil(check, timeout, message) {
   const deadline = Date.now() + timeout;
