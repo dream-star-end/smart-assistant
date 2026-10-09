@@ -320,7 +320,6 @@ export function TabsBlock({
   const baseId = useId();
   const n = spec.tabs.length;
   const cur = Math.min(active, Math.max(0, n - 1));
-  const tab = spec.tabs[cur];
   return (
     <Frame kind="tabs" title={spec.title} subtitle={spec.subtitle} notes={notes} streaming={streaming} copyText={() => specToMarkdown(spec)}>
       <div className="oc-iui-tabbar">
@@ -330,15 +329,23 @@ export function TabsBlock({
           onChange={setActive}
           label={spec.title ?? "分段内容"}
           idBase={baseId}
-          panelId={`${baseId}-p`}
+          panelIdFor={(i) => `${baseId}-p${i}`}
         />
       </div>
-      {tab && (
-        <div role="tabpanel" id={`${baseId}-p`} aria-labelledby={`${baseId}-t${cur}`} className="oc-iui-tabpanel" key={cur}>
+      {/* 所有面板都保持挂载、只隐藏非当前的:嵌套的表单草稿、计算器输入、测验进度、「已发送」锁切走再回来都还在。 */}
+      {spec.tabs.map((tab, i) => (
+        <div
+          key={`${i}:${tab.label}`}
+          role="tabpanel"
+          id={`${baseId}-p${i}`}
+          aria-labelledby={`${baseId}-t${i}`}
+          className="oc-iui-tabpanel"
+          hidden={i !== cur}
+        >
           {tab.body && <BodyMarkdown text={tab.body} />}
           {tab.block && renderNested?.(tab.block)}
         </div>
-      )}
+      ))}
     </Frame>
   );
 }

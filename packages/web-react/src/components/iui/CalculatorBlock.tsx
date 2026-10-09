@@ -188,10 +188,16 @@ function SweepChart({ sweep }: { sweep: NonNullable<ReturnType<typeof useSweep>>
   );
 }
 
-function Breakdown({ outs, results }: { outs: CalcOutput[]; results: ReturnType<typeof computeOutputs> }) {
-  const vals = outs.map((o) => Math.max(0, results[o.id]?.value ?? 0));
+/** 占比条只在每一段都是有效的非负数、且合计 > 0 时成立;否则这些输出回到普通结果列表,显示真实值。 */
+function breakdownValues(outs: CalcOutput[], results: ReturnType<typeof computeOutputs>): number[] | null {
+  const vals = outs.map((o) => results[o.id]?.value);
+  if (vals.some((v) => v === null || v === undefined || !Number.isFinite(v) || v < 0)) return null;
+  const nums = vals as number[];
+  return nums.reduce((a, b) => a + b, 0) > 0 ? nums : null;
+}
+
+function Breakdown({ outs, vals }: { outs: CalcOutput[]; vals: number[] }) {
   const total = vals.reduce((a, b) => a + b, 0);
-  if (!(total > 0)) return null;
   return (
     <div className="oc-iui-breakdown">
       <div className="oc-iui-breakdown-bar" aria-hidden>
@@ -238,8 +244,10 @@ export function CalculatorBlock({ spec, notes, streaming, nested }: { spec: Calc
   const primary = spec.outputs.find((o) => o.primary) ?? (spec.outputs.length === 1 ? spec.outputs[0] : undefined);
   // 带 tone 的输出显示在主结果下面(如「+170,851 收益」),同时可以出现在占比条里。
   const toned = spec.outputs.filter((o) => o !== primary && o.tone);
-  const others = spec.outputs.filter((o) => o !== primary && !toned.includes(o) && !spec.breakdown.includes(o.id));
   const breakdownOuts = spec.breakdown.map((id) => spec.outputs.find((o) => o.id === id)!).filter(Boolean);
+  const breakdownVals = breakdownOuts.length >= 2 ? breakdownValues(breakdownOuts, results) : null;
+  const inBreakdown = (o: CalcOutput) => breakdownVals !== null && spec.breakdown.includes(o.id);
+  const others = spec.outputs.filter((o) => o !== primary && !toned.includes(o) && !inBreakdown(o));
   const set = (id: string, v: number) => setValues((s) => ({ ...s, [id]: v }));
   const touched = Object.keys(values).length > 0;
 
@@ -288,7 +296,7 @@ export function CalculatorBlock({ spec, notes, streaming, nested }: { spec: Calc
             {results[primary.id]?.error && <div className="oc-iui-error">无法计算:{results[primary.id]!.error}</div>}
           </div>
         )}
-        {breakdownOuts.length >= 2 && <Breakdown outs={breakdownOuts} results={results} />}
+        {breakdownVals && <Breakdown outs={breakdownOuts} vals={breakdownVals} />}
         {sweep && <SweepChart sweep={sweep} />}
         {(others.length > 0 || (!primary && toned.length > 0)) && (
           <dl className="oc-iui-calc-list">

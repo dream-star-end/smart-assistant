@@ -219,6 +219,90 @@ describe("schema · new components", () => {
   });
 });
 
+describe("review r1 regressions", () => {
+  it("form ids stay unique when a generated id collides with a later explicit one", () => {
+    const f = ok({ type: "form", fields: [{ id: "f2", label: "姓名", value: "Alice" }, { label: "城市", value: "Paris" }, { id: "f2", label: "再撞一次" }] });
+    if (f.type !== "form") throw new Error("form");
+    expect(new Set(f.fields.map((x) => x.id)).size).toBe(3);
+    expect(composeFormMessage(f, Object.fromEntries(f.fields.map((x) => [x.id, x.value ?? ""])))).toBe("我的情况:\n- 姓名:Alice\n- 城市:Paris");
+  });
+
+  it("switching tabs keeps a nested form's draft and its sent lock", () => {
+    const sendUserText = vi.fn();
+    render(
+      <ChatInteractionContext.Provider value={{ sendUserText }}>
+        <IuiBlock
+          code={j({
+            type: "tabs",
+            tabs: [
+              { label: "填表", block: { type: "form", fields: [{ id: "who", label: "几个人" }], submit: "发送" } },
+              { label: "说明", body: "看完再填" },
+            ],
+          })}
+        />
+      </ChatInteractionContext.Provider>,
+    );
+    fireEvent.change(screen.getByLabelText("几个人"), { target: { value: "6" } });
+    fireEvent.click(screen.getByRole("tab", { name: "说明" }));
+    fireEvent.click(screen.getByRole("tab", { name: "填表" }));
+    expect(screen.getByLabelText("几个人")).toHaveValue("6");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    fireEvent.click(screen.getByRole("tab", { name: "说明" }));
+    fireEvent.click(screen.getByRole("tab", { name: "填表" }));
+    expect(screen.getByText("已发送")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "发送" })).toBeNull();
+    expect(sendUserText).toHaveBeenCalledTimes(1);
+  });
+
+  it("a breakdown with a negative or failed part shows the real values instead of a bar", () => {
+    const { container } = render(
+      <IuiBlock
+        code={j({
+          type: "calculator",
+          inputs: [{ id: "a", label: "本金", value: 100 }],
+          outputs: [
+            { id: "total", label: "合计", formula: "a - 20", primary: true },
+            { id: "principal", label: "本金部分", formula: "a" },
+            { id: "loss", label: "亏损", formula: "-20" },
+          ],
+          breakdown: ["principal", "loss"],
+        })}
+      />,
+    );
+    expect(container.querySelector(".oc-iui-breakdown")).toBeNull();
+    const list = container.querySelector(".oc-iui-calc-list")!;
+    expect(list).toHaveTextContent("亏损-20");
+    expect(list).toHaveTextContent("本金部分100");
+  });
+
+  it("copied curve summary uses the current inputs, not the defaults", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(
+      <IuiBlock
+        code={j({
+          type: "calculator",
+          title: "曲线",
+          inputs: [
+            { id: "x", label: "年数", value: 10, step: 10 },
+            { id: "p", label: "单价", value: 100, step: 100 },
+          ],
+          outputs: [{ id: "v", label: "金额", formula: "p*x", primary: true }],
+          chart: { x: "x", from: 0, to: "x", series: ["v"] },
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "增加年数" }));
+    fireEvent.click(screen.getByRole("button", { name: "增加单价" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "复制(Markdown)" }));
+    });
+    const md = writeText.mock.calls[0]![0] as string;
+    expect(md).toContain("曲线(年数 从 0 到 20)");
+    expect(md).toContain("金额:0 → 4,000");
+  });
+});
+
 describe("render · new components", () => {
   it("cards render images without referrer, fall back to an icon tile, open links in a new tab", () => {
     const { container } = render(

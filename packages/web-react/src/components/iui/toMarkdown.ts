@@ -169,7 +169,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
         const shown = r?.value == null ? `无法计算(${r?.error ?? "未知错误"})` : withUnit(formatNumber(r.value, o.format, o.decimals), o.unit);
         return `- **${o.label}** = \`${o.formula}\` = ${shown}`;
       });
-      const sweep = spec.chart ? calcSweepNote(spec) : [];
+      const sweep = spec.chart ? calcSweepNote(spec, env) : [];
       return [
         ...heading(spec.title, spec.subtitle),
         "输入:",
@@ -281,11 +281,9 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
   }
 }
 
-/** 计算器曲线在 Markdown 里的样子:首尾两个点的数值(完整曲线只在界面里看)。 */
-function calcSweepNote(spec: CalculatorSpec): string[] {
+/** 计算器曲线在 Markdown 里的样子:按当前输入算首尾两个点的数值(完整曲线只在界面里看)。 */
+function calcSweepNote(spec: CalculatorSpec, env: Record<string, number>): string[] {
   const c = spec.chart!;
-  const env: Record<string, number> = {};
-  for (const i of spec.inputs) env[i.id] = i.value;
   const to = typeof c.to === "string" ? env[c.to] : c.to;
   if (to === undefined) return [];
   const at = (x: number) => computeOutputs({ ...env, [c.x]: x }, spec.outputs);

@@ -529,7 +529,7 @@ export function Segmented({
   label,
   role = "tablist",
   idBase,
-  panelId,
+  panelIdFor,
   className,
 }: {
   items: string[];
@@ -538,7 +538,8 @@ export function Segmented({
   label: string;
   role?: "tablist" | "radiogroup";
   idBase?: string;
-  panelId?: string;
+  /** 每个标签控制的面板 id(tablist 用)。 */
+  panelIdFor?: (i: number) => string;
   className?: string;
 }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -593,7 +594,7 @@ export function Segmented({
           id={`${base}-t${i}`}
           aria-selected={isTabs ? i === value : undefined}
           aria-checked={isTabs ? undefined : i === value}
-          aria-controls={isTabs ? panelId : undefined}
+          aria-controls={isTabs ? panelIdFor?.(i) : undefined}
           tabIndex={i === value ? 0 : -1}
           className="oc-iui-seg-btn"
           data-active={i === value || undefined}

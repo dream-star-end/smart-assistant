@@ -922,8 +922,13 @@ function form(raw: Record<string, unknown>, ctx: Ctx): FormSpec | null {
     const o = it as Record<string, unknown>;
     const label = str(o.label ?? o.name, 60);
     if (!label) continue;
-    let id = typeof o.id === "string" && ID_RE.test(o.id.trim()) ? o.id.trim() : `f${fields.length + 1}`;
-    if (seen.has(id)) id = `f${fields.length + 1}`;
+    let id = typeof o.id === "string" && ID_RE.test(o.id.trim()) ? o.id.trim() : "";
+    // 缺 id / 重复 id:生成一个没被占用的(自动生成的也可能撞上后面字段写明的 id)。
+    if (!id || seen.has(id)) {
+      let n = fields.length + 1;
+      while (seen.has(`f${n}`)) n += 1;
+      id = `f${n}`;
+    }
     seen.add(id);
     const options = strList(o.options, 12, ctx, "选项", 60);
     let kind = pickOne<FormField["kind"]>(o.kind ?? o.type, ["text", "number", "select", "chips", "date"], options.length ? "chips" : "text");
