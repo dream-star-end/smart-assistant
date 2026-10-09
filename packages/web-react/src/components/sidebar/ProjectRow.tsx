@@ -134,10 +134,11 @@ export function ProjectRow({
   const trailing = (
     <span
       className={cn(
-        "flex shrink-0 items-center gap-1.5 transition-opacity duration-150",
-        // 桌面悬停 / 聚焦时让位给右侧操作钮（叠放，不再常年占宽）。
+        "flex shrink-0 items-center gap-1.5",
+        // 桌面悬停 / 聚焦 / 菜单打开时把位置让给右侧操作钮：两者在同一条 flex 流里互换，
+        // 名字按剩余宽度截断。以前操作钮绝对定位叠在行上，只淡出计数，长项目名会钻到「+」「⋯」底下（OCV5-364）。
         (onNewSession || showMenu) &&
-          "[@media(hover:hover)]:group-hover:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-0",
+          "[@media(hover:hover)]:group-hover:hidden [@media(hover:hover)]:group-focus-within:hidden [@media(hover:hover)]:group-has-[[data-state=open]]:hidden",
       )}
     >
       {collapsed && runningCount > 0 && (
@@ -244,10 +245,10 @@ export function ProjectRow({
         )}
         <div
           className={cn(
-            "absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity duration-150",
-            "[@media(hover:hover)]:group-hover:opacity-100 [@media(hover:hover)]:group-focus-within:opacity-100 has-[[data-state=open]]:opacity-100",
-            // 触屏没有悬停：「…」常显并回到文档流（「+」在触屏隐藏，菜单第一项就是新建会话）。
-            "[@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:opacity-100",
+            "flex h-full shrink-0 items-center gap-0.5 pr-1",
+            // 桌面：平时不占宽，悬停 / 聚焦 / 菜单打开时进入 flex 流（与上面 trailing 互换）。
+            // 触屏没有悬停：「…」常显（「+」在触屏隐藏，菜单第一项就是新建会话）。
+            "[@media(hover:hover)]:hidden [@media(hover:hover)]:group-hover:flex [@media(hover:hover)]:group-focus-within:flex [@media(hover:hover)]:has-[[data-state=open]]:flex",
           )}
         >
           {onNewSession && (
