@@ -28,6 +28,9 @@ import { cn } from "../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } from "./chat/media";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
+import { IuiBlock } from "./iui/IuiBlock";
+import { uiFencesToMarkdown } from "./iui/toMarkdown";
+import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
 import { normalizeMathDelimiters } from "./mathDelimiters";
 
@@ -308,6 +311,8 @@ export default function MarkdownImpl({
   // 重建 components 就把所有富块(OptionsBlock 的点选、HtmlPreview 的 iframe)整个重挂载。
   const liveRef = useRef(live);
   liveRef.current = live;
+  // Intelligent UI 开关:关闭(或服务端总开关关闭)时把 ```ui 围栏整段换成等价 Markdown 再渲染。
+  const iuiEnabled = useIntelligentUiEnabled();
   // components 里的渲染器是「组件类型」:每次渲染都造新函数 = React 视为新类型 → 富块子树
   // 逐次卸载重挂(t-839 OG-02 实证:流式结束 caret 翻转,options 点选凭空消失)。按真正影响
   // 渲染分支的 props 记忆化;`caret` 只影响 rehype 插件,不进这里。
@@ -355,6 +360,9 @@ export default function MarkdownImpl({
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
               if (lang === "chart") return <ChartBlock code={nodeText(children).replace(/\n$/, "")} />;
+              // Intelligent UI(OCV5-361):```ui 块 → 原生组件。开关关闭时上游已把 ui 围栏转成 Markdown,不会走到这里。
+              if (lang === "ui")
+                return <IuiBlock code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} readOnly={readOnly} />;
               if (lang === "options")
                 return <OptionsBlock code={nodeText(children).replace(/\n$/, "")} readOnly={readOnly} />;
               if (!readOnly && (lang === "html" || lang === "htmlpreview"))
@@ -441,7 +449,9 @@ export default function MarkdownImpl({
         ]}
         components={components}
       >
-        {typeof children === "string" ? normalizeMathDelimiters(children) : children}
+        {typeof children === "string"
+          ? normalizeMathDelimiters(iuiEnabled ? children : uiFencesToMarkdown(children, !!live))
+          : children}
       </ReactMarkdown>
     </div>
   );

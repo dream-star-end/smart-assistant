@@ -54,6 +54,7 @@ import { lastKnownSubscriptionPaid, requestSubscribeIntent } from "../../lib/sub
 import { thinkingSegments, thinkingSummaryTitle } from "../../lib/thinkingText";
 import { reportClientFriction, reportClientFrictionOnce } from "../../lib/clientFriction";
 import { cn, groupDigits } from "../../lib/utils";
+import { uiFencesToMarkdown } from "../iui/toMarkdown";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import {
@@ -512,7 +513,8 @@ function MessageActions({
   meta?: boolean;
   className?: string;
 }) {
-  const body = text ?? msg.text ?? "";
+  // Intelligent UI(OCV5-361):复制/朗读拿到的是 ```ui 组件的 Markdown 版本,不是原始 JSON。
+  const body = uiFencesToMarkdown(text ?? msg.text ?? "");
   const toast = useToast();
   const speech = useSpeech(() => stripMarkdown(body));
   const [menuOpen, setMenuOpen] = useState(false);

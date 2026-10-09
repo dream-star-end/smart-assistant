@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
+import { setIntelligentUiPref, useIntelligentUiState } from '../../lib/intelligentUi'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
 import {
   type PreferenceEffort,
@@ -82,6 +83,7 @@ export function PreferencesTab({
   const [optimizerClosing, setOptimizerClosing] = useState(false)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
   const composerPrefs = useLocalComposerPrefs()
+  const iui = useIntelligentUiState()
 
   useEffect(() => {
     let alive = true
@@ -104,6 +106,19 @@ export function PreferencesTab({
     try {
       await onPatch(p)
     } catch (e) {
+      setErr(apiErrorMessage(e, '保存失败'))
+    }
+  }
+
+  /** Intelligent UI 开关:先本地生效(新回合与已有消息的渲染立即切换),写失败再回滚。 */
+  async function changeIntelligentUi(checked: boolean) {
+    const prev = iui.pref
+    setIntelligentUiPref(checked)
+    setErr(null)
+    try {
+      await onPatch({ intelligent_ui: checked })
+    } catch (e) {
+      setIntelligentUiPref(prev)
       setErr(apiErrorMessage(e, '保存失败'))
     }
   }
@@ -216,6 +231,32 @@ export function PreferencesTab({
             options={effortSelectOptions}
           />
         </label>
+      </div>
+
+      {/* 回答样式：Intelligent UI(OCV5-361)。偏好存服务端,跨设备生效;服务端总开关关闭时不可切换。 */}
+      <div className="border-t border-border px-5 py-4">
+        <div className="pb-2 text-caption font-medium uppercase tracking-wide text-faint">
+          回答样式
+        </div>
+        <div className="flex items-start justify-between gap-4 py-1.5">
+          <div className="min-w-0">
+            <div className="text-section text-fg">交互式回答</div>
+            <p className="mt-0.5 text-meta leading-relaxed text-muted">
+              回答里直接给出表格、图表、清单、对比卡和可调的计算器,可以点选、排序、改数。关闭后只用文字回答,已有的组件也按文字显示。
+            </p>
+            {!iui.available && (
+              <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
+            )}
+          </div>
+          <Switch
+            aria-label="交互式回答"
+            checked={iui.available && iui.pref}
+            disabled={!iui.available}
+            onCheckedChange={(checked) => {
+              void changeIntelligentUi(checked)
+            }}
+          />
+        </div>
       </div>
 
       {/* 输入：仅本设备 */}

@@ -24,6 +24,7 @@ import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { saveBlob } from "./lib/chat/download";
+import { applyIntelligentUiSnapshot } from "./lib/intelligentUi";
 import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
@@ -2137,7 +2138,14 @@ export function App() {
     setModelsLoading(true);
     Promise.all([
       api.getPublicModels(auth),
-      api.getPreferences(auth).then(extractPrefs).catch(() => ({} as PrefsView)),
+      api
+        .getPreferences(auth)
+        .then((snap) => {
+          // Intelligent UI 开关(OCV5-361)与模型偏好同批水合。
+          applyIntelligentUiSnapshot(snap);
+          return extractPrefs(snap);
+        })
+        .catch(() => ({} as PrefsView)),
     ])
       .then(([catalog, prefs]) => {
         if (cancelled) return;

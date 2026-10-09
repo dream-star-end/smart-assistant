@@ -11,6 +11,7 @@ import {
   type ProductFeatureId,
   type SettingsDestinationSection,
 } from "../lib/productCapabilities";
+import { applyIntelligentUiSnapshot } from "../lib/intelligentUi";
 import { type PrefsView, extractPrefs } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
 import { cn } from "../lib/utils";
@@ -147,6 +148,7 @@ export function SettingsCenter({
         if (!alive) return;
         const next = extractPrefs(snap);
         setPrefs(next);
+        applyIntelligentUiSnapshot(snap);
         onPreferencesChange?.(next);
       })
       .catch((e) => {
@@ -166,6 +168,7 @@ export function SettingsCenter({
       const snap = await api.patchPreferences(auth, patch);
       const next = extractPrefs(snap);
       setPrefs(next);
+      applyIntelligentUiSnapshot(snap);
       onPreferencesChange?.(next, patch);
     },
     [auth, onPreferencesChange],

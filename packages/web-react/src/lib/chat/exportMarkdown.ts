@@ -1,3 +1,4 @@
+import { uiFencesToMarkdown } from "../../components/iui/toMarkdown";
 import type { ChatMessage } from "./model";
 
 const EXPORT_ROLES = new Set<ChatMessage["role"]>(["user", "assistant", "tool"]);
@@ -36,7 +37,8 @@ export function exportSessionMarkdown(messages: readonly ChatMessage[]): string 
     const lines = [`## ${headingFor(m.role)}`];
     const when = formatExportTime(m.ts);
     if (when) lines.push(when);
-    lines.push(m.role === "tool" ? toolSummary(m) : m.text ?? "");
+    // Intelligent UI(OCV5-361):助手正文里的 ```ui 组件导出为等价 Markdown。
+    lines.push(m.role === "tool" ? toolSummary(m) : m.role === "assistant" ? uiFencesToMarkdown(m.text ?? "") : m.text ?? "");
     blocks.push(lines.join("\n"));
   }
   return blocks.length ? `${blocks.join("\n\n")}\n` : "";
