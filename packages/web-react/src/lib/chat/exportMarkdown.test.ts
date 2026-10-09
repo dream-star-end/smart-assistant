@@ -15,8 +15,8 @@ function msg(partial: Partial<ChatMessage> & Pick<ChatMessage, "id" | "role">): 
 }
 
 describe("exportSessionMarkdown", () => {
-  test("只收 user/assistant/tool，按 ## 用户/助手 + 本地时间 + 正文", () => {
-    const md = exportSessionMarkdown([
+  test("只收 user/assistant/tool，按 ## 用户/助手 + 本地时间 + 正文", async () => {
+    const md = await exportSessionMarkdown([
       msg({ id: "u1", role: "user", text: "你好" }),
       msg({ id: "t1", role: "thinking", text: "内部思考" }),
       msg({ id: "a1", role: "assistant", text: "世界" }),
@@ -43,13 +43,13 @@ describe("exportSessionMarkdown", () => {
     expect(md).toContain(when);
   });
 
-  test("tool 缺 toolName/preview 时回落 tool", () => {
-    const md = exportSessionMarkdown([msg({ id: "t", role: "tool" })]);
+  test("tool 缺 toolName/preview 时回落 tool", async () => {
+    const md = await exportSessionMarkdown([msg({ id: "t", role: "tool" })]);
     expect(md).toContain("tool");
   });
 
-  test("空列表得到空串", () => {
-    expect(exportSessionMarkdown([])).toBe("");
+  test("空列表得到空串", async () => {
+    expect(await exportSessionMarkdown([])).toBe("");
   });
 });
 

@@ -1,9 +1,10 @@
 /**
  * Intelligent UI 信息类组件:进度/占比条、键值规格表、行程路线。
  */
-import { Bike, Car, Footprints, Plane, Ship, Sparkles, TrainFront } from "lucide-react";
+import { Icon } from "lucide-react";
 import { cn } from "../../lib/utils";
 import type { KvSpec, ProgressSpec, RouteSpec } from "./schema";
+import { iconFor } from "./icons";
 import { Frame, Inline } from "./shell";
 import { formatNumber, specToMarkdown, withUnit } from "./toMarkdown";
 
@@ -92,19 +93,22 @@ export function KvBlock({ spec, notes, streaming, nested }: BlockProps<KvSpec>) 
 
 function ModeIcon({ mode }: { mode?: string }) {
   const m = (mode ?? "").toLowerCase();
-  const Icon = /飞|plane|flight/.test(m)
-    ? Plane
+  const name = /飞|plane|flight/.test(m)
+    ? "plane"
     : /火车|高铁|地铁|train|rail/.test(m)
-      ? TrainFront
+      ? "train"
       : /步行|走|walk|hike/.test(m)
-        ? Footprints
+        ? "walk"
         : /骑|bike|cycl/.test(m)
-          ? Bike
+          ? "bike"
           : /船|轮渡|ferry|boat/.test(m)
-            ? Ship
-            : Car;
-  return <Icon size={13} aria-hidden />;
+            ? "ship"
+            : "car";
+  const node = iconFor(name);
+  return node ? <Icon iconNode={node} size={13} aria-hidden /> : null;
 }
+
+const sparkles = iconFor("sparkles");
 
 export function RouteBlock({ spec, notes, streaming, nested }: BlockProps<RouteSpec>) {
   return (
@@ -125,7 +129,7 @@ export function RouteBlock({ spec, notes, streaming, nested }: BlockProps<RouteS
                   </span>
                   {s.note && (
                     <span className="oc-iui-stop-note">
-                      {s.highlight && <Sparkles size={12} aria-hidden />}
+                      {s.highlight && sparkles && <Icon iconNode={sparkles} size={12} aria-hidden />}
                       {s.note}
                     </span>
                   )}

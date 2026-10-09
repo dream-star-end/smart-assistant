@@ -3974,9 +3974,10 @@ export function App() {
           onExport={
             demo
               ? undefined
-              : () => {
+              : async () => {
+                  const md = await exportSessionMarkdown(wsMessages);
                   saveBlob(
-                    new Blob([exportSessionMarkdown(wsMessages)], {
+                    new Blob([md], {
                       type: "text/markdown;charset=utf-8",
                     }),
                     sessionExportFilename(activeSess?.title),

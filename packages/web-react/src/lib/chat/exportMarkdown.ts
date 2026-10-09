@@ -1,4 +1,4 @@
-import { uiFencesToMarkdown } from "../../components/iui/toMarkdown";
+import { uiPlainText } from "../../components/iui/plainText";
 import type { ChatMessage } from "./model";
 
 const EXPORT_ROLES = new Set<ChatMessage["role"]>(["user", "assistant", "tool"]);
@@ -29,8 +29,9 @@ function toolSummary(m: ChatMessage): string {
 /**
  * 把当前内存窗消息编成会话导出 Markdown。
  * 只收 user / assistant / tool；thinking、过程卡等跳过。
+ * 异步:助手正文含 ```ui 组件时要等组件转换器的懒块加载。
  */
-export function exportSessionMarkdown(messages: readonly ChatMessage[]): string {
+export async function exportSessionMarkdown(messages: readonly ChatMessage[]): Promise<string> {
   const blocks: string[] = [];
   for (const m of messages) {
     if (!EXPORT_ROLES.has(m.role)) continue;
@@ -38,7 +39,7 @@ export function exportSessionMarkdown(messages: readonly ChatMessage[]): string 
     const when = formatExportTime(m.ts);
     if (when) lines.push(when);
     // Intelligent UI(OCV5-361):助手正文里的 ```ui 组件导出为等价 Markdown。
-    lines.push(m.role === "tool" ? toolSummary(m) : m.role === "assistant" ? uiFencesToMarkdown(m.text ?? "") : m.text ?? "");
+    lines.push(m.role === "tool" ? toolSummary(m) : m.role === "assistant" ? await uiPlainText(m.text ?? "") : m.text ?? "");
     blocks.push(lines.join("\n"));
   }
   return blocks.length ? `${blocks.join("\n\n")}\n` : "";

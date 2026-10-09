@@ -103,8 +103,8 @@ describe("协议文案", () => {
 
   test("提示词里列的图标名前端都认识", () => {
     const here = dirname(fileURLToPath(import.meta.url));
-    const shell = readFileSync(resolve(here, "../../../web-react/src/components/iui/shell.tsx"), "utf8");
-    const icons = /const ICONS[^=]*=\s*\{([\s\S]*?)\};/.exec(shell)?.[1] ?? "";
+    const source = readFileSync(resolve(here, "../../../web-react/src/components/iui/icons.ts"), "utf8");
+    const icons = /const ICON_SOURCES = \{([\s\S]*?)\} as const/.exec(source)?.[1] ?? "";
     const known = new Set([...icons.matchAll(/^\s*"?([a-z-]+)"?:/gm)].map((x) => x[1]!));
     assert.ok(known.size >= 40, `parsed icons: ${known.size}`);
     const line = /icon 可选:([^\n。]+)/.exec(INTELLIGENT_UI_PROMPT)?.[1] ?? "";

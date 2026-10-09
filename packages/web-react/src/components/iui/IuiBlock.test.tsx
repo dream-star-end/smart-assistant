@@ -340,9 +340,9 @@ describe("switch on/off through the Markdown renderer", () => {
     expect(container.querySelector('figure[data-iui="table"]')).toBeTruthy();
   });
 
-  it("export writes the Markdown version of components", () => {
+  it("export writes the Markdown version of components", async () => {
     const msgs = [{ role: "assistant", text: doc, ts: Number.NaN } as unknown as ChatMessage];
-    const md = exportSessionMarkdown(msgs);
+    const md = await exportSessionMarkdown(msgs);
     expect(md).toContain("| 型号 | 价格 |");
     expect(md).not.toContain("```ui");
   });

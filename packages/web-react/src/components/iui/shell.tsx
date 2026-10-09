@@ -5,109 +5,7 @@
  * 第二轮视觉:无灰框的浮起卡片(极淡描边 + 柔和阴影 + 圆角 16),标题区带类型徽章,关键数字大号并有过渡,
  * 分段控件是带滑块的轨道。所有颜色走主题 token(明暗自动),动效在「减弱动效」下关闭。
  */
-import {
-  Apple,
-  Baby,
-  Bath,
-  Bed,
-  Beef,
-  Bike,
-  BookOpen,
-  Brain,
-  Briefcase,
-  Building2,
-  CakeSlice,
-  Calculator,
-  Calendar,
-  CalendarClock,
-  Camera,
-  Car,
-  Carrot,
-  Cat,
-  ChartBarBig,
-  ChartColumn,
-  Check,
-  ChefHat,
-  ClipboardList,
-  Clock,
-  Cloud,
-  Coffee,
-  Columns3,
-  Copy,
-  Dog,
-  Droplet,
-  Dumbbell,
-  Fish,
-  Flame,
-  Flower2,
-  Footprints,
-  Gamepad2,
-  Gauge,
-  Gem,
-  Gift,
-  Globe,
-  GraduationCap,
-  Hammer,
-  Heart,
-  Hotel,
-  House,
-  ImageOff,
-  Images,
-  Landmark,
-  Laptop,
-  LayoutGrid,
-  LayoutList,
-  Leaf,
-  Lightbulb,
-  ListChecks,
-  ListTree,
-  type LucideIcon,
-  MapPin,
-  Mountain,
-  Moon,
-  Music,
-  Package,
-  Paintbrush,
-  Palette,
-  PanelsTopLeft,
-  PiggyBank,
-  Pill,
-  Pizza,
-  Plane,
-  Rocket,
-  Route,
-  Salad,
-  Scissors,
-  Shield,
-  Shirt,
-  Ship,
-  ShoppingBag,
-  Smartphone,
-  Snowflake,
-  Sofa,
-  Soup,
-  Sparkles,
-  Sprout,
-  Star,
-  Stethoscope,
-  Store,
-  Sun,
-  Table2,
-  Target,
-  Tent,
-  TrainFront,
-  TreePine,
-  Trophy,
-  Truck,
-  User,
-  Users,
-  Utensils,
-  Wallet,
-  Wind,
-  Wine,
-  Wrench,
-  Zap,
-} from "lucide-react";
+import { Check, Copy, Icon, ImageOff } from "lucide-react";
 import {
   Fragment,
   type KeyboardEvent,
@@ -122,6 +20,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "../../lib/utils";
 import { useSignedSrc } from "../chat/media";
+import { iconFor, kindIcon } from "./icons";
 
 const INLINE_RE = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
 
@@ -174,102 +73,10 @@ export function BodyMarkdown({ text }: { text: string }) {
 
 // ── 图标 ──────────────────────────────────────────────────────────────
 
-/** 模型可用的图标名(写进提示词)。未知名字返回 null,调用方用首字代替。 */
-const ICONS: Record<string, LucideIcon> = {
-  leaf: Leaf,
-  sprout: Sprout,
-  flower: Flower2,
-  tree: TreePine,
-  carrot: Carrot,
-  apple: Apple,
-  salad: Salad,
-  soup: Soup,
-  beef: Beef,
-  fish: Fish,
-  pizza: Pizza,
-  cake: CakeSlice,
-  coffee: Coffee,
-  wine: Wine,
-  utensils: Utensils,
-  chef: ChefHat,
-  home: House,
-  bed: Bed,
-  sofa: Sofa,
-  bath: Bath,
-  building: Building2,
-  store: Store,
-  hotel: Hotel,
-  landmark: Landmark,
-  plane: Plane,
-  car: Car,
-  train: TrainFront,
-  bike: Bike,
-  ship: Ship,
-  pin: MapPin,
-  mountain: Mountain,
-  tent: Tent,
-  walk: Footprints,
-  globe: Globe,
-  sun: Sun,
-  moon: Moon,
-  cloud: Cloud,
-  snow: Snowflake,
-  water: Droplet,
-  fire: Flame,
-  energy: Zap,
-  wind: Wind,
-  heart: Heart,
-  star: Star,
-  gift: Gift,
-  book: BookOpen,
-  study: GraduationCap,
-  brain: Brain,
-  work: Briefcase,
-  fitness: Dumbbell,
-  health: Stethoscope,
-  pill: Pill,
-  music: Music,
-  camera: Camera,
-  game: Gamepad2,
-  shirt: Shirt,
-  gem: Gem,
-  paint: Paintbrush,
-  scissors: Scissors,
-  tool: Wrench,
-  hammer: Hammer,
-  money: Wallet,
-  savings: PiggyBank,
-  shopping: ShoppingBag,
-  package: Package,
-  truck: Truck,
-  calendar: Calendar,
-  clock: Clock,
-  shield: Shield,
-  idea: Lightbulb,
-  target: Target,
-  trophy: Trophy,
-  rocket: Rocket,
-  sparkles: Sparkles,
-  user: User,
-  people: Users,
-  baby: Baby,
-  dog: Dog,
-  cat: Cat,
-  phone: Smartphone,
-  laptop: Laptop,
-};
-
-export const ICON_NAMES = Object.keys(ICONS);
-
-export function iconFor(name: string | undefined): LucideIcon | null {
-  if (!name) return null;
-  return ICONS[name.trim().toLowerCase().replace(/[\s_]+/g, "-")] ?? ICONS[name.trim().toLowerCase().split(/[-\s_]/)[0]!] ?? null;
-}
-
 /** 图标或首字(模型写了未知图标名 / 没写图标时)。 */
 export function Glyph({ icon, fallback, size = 18 }: { icon?: string; fallback: string; size?: number }) {
-  const Icon = iconFor(icon);
-  if (Icon) return <Icon size={size} strokeWidth={1.75} aria-hidden />;
+  const node = iconFor(icon);
+  if (node) return <Icon iconNode={node} size={size} strokeWidth={1.75} aria-hidden />;
   const ch = Array.from(fallback.trim())[0] ?? "·";
   return (
     <span className="oc-iui-glyph-char" aria-hidden>
@@ -277,27 +84,6 @@ export function Glyph({ icon, fallback, size = 18 }: { icon?: string; fallback: 
     </span>
   );
 }
-
-const KIND_ICON: Record<string, LucideIcon> = {
-  table: Table2,
-  chart: ChartColumn,
-  stats: Gauge,
-  steps: ListChecks,
-  compare: Columns3,
-  calculator: Calculator,
-  tabs: PanelsTopLeft,
-  timeline: CalendarClock,
-  cards: LayoutList,
-  gallery: Images,
-  swatches: Palette,
-  tiles: LayoutGrid,
-  recipe: ChefHat,
-  quiz: GraduationCap,
-  progress: ChartBarBig,
-  kv: ListTree,
-  form: ClipboardList,
-  route: Route,
-};
 
 // ── 图片 ──────────────────────────────────────────────────────────────
 
@@ -418,7 +204,7 @@ export function Frame({ kind, title, subtitle, actions, source, note, notes, cop
   ) : (
     actions
   );
-  const KindIcon = KIND_ICON[kind];
+  const kindNode = kindIcon(kind);
   const showHead = !!(title || subtitle || headActions);
   return (
     <figure
@@ -431,9 +217,9 @@ export function Frame({ kind, title, subtitle, actions, source, note, notes, cop
         <div className={cn("oc-iui-head", !title && !subtitle && "is-actions-only")}>
           {title || subtitle ? (
             <div className="oc-iui-head-main">
-              {KindIcon && title && !bare && !nested && (
+              {kindNode && title && !bare && !nested && (
                 <span className="oc-iui-kind" aria-hidden>
-                  <KindIcon size={14} strokeWidth={2} />
+                  <Icon iconNode={kindNode} size={14} strokeWidth={2} />
                 </span>
               )}
               <div className="min-w-0">
