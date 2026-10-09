@@ -138,7 +138,16 @@ test("Composer session-owned drafts (real Chromium, no backend)", { timeout: 90_
       assert.equal(await input.inputValue(), "");
     });
     await scenario("explicit prefill owns target draft, unchanged nonce is not replayed", { A: "A draft", B: "B draft" }, async ({ page, input, select, stored }) => {
-      await page.getByRole("button", { name: "prefill B" }).click();
+      // Read right after React's microtask commit, before any later task or paint: the prefill
+      // must own the first committed frame of B, never a frame of B's stored draft (hosted runners
+      // caught that frame, OCV5-355).
+      const firstFrame = await page.evaluate(async () => {
+        const button = [...document.querySelectorAll("button")].find((el) => el.textContent === "prefill B");
+        button.click();
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        return document.querySelector('textarea[aria-label="消息输入框"]').value;
+      });
+      assert.equal(firstFrame, "explicit B prefill");
       assert.equal(await input.inputValue(), "explicit B prefill");
       assert.equal(await stored("A"), "A draft");
       await input.fill("B manual edit");
