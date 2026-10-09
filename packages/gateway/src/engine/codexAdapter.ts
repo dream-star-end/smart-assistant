@@ -686,6 +686,11 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     return this.kernel.effortLevel
   }
 
+  /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  get promptIntelligentUi(): boolean | undefined {
+    return (this.kernel as { promptIntelligentUi?: boolean }).promptIntelligentUi
+  }
+
   setTraceId(traceId: string | undefined): void {
     this.kernel.setTraceId(traceId)
   }

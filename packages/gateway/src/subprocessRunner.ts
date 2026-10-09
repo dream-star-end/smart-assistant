@@ -35,7 +35,7 @@ import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
 import { relocateCcbJsonlToCwd } from './engine/ccbTranscriptRelocate.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
-import { buildPromptContext } from './promptSlots.js'
+import { buildPromptContext, INTELLIGENT_UI_SLOT } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -1464,6 +1464,9 @@ export class SubprocessRunner extends EventEmitter {
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
   private delegateContextFile: string | null = null
   private platformGoal: GoalStateSnapshot | null = null
+  /** Intelligent UI(OCV5-361):本次 spawn 的 extra-prompt 是否含 INTELLIGENT_UI slot。
+   *  undefined = 还没组装过 / 组装失败;sessionManager 用它判断开关切换后是否需要重启。 */
+  private _promptIntelligentUi: boolean | undefined = undefined
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
@@ -1523,6 +1526,10 @@ export class SubprocessRunner extends EventEmitter {
    *  before deciding whether to recycle the subprocess). */
   get effortLevel(): string | undefined {
     return this.opts.effortLevel
+  }
+
+  get promptIntelligentUi(): boolean | undefined {
+    return this._promptIntelligentUi
   }
 
   /** Update effort level. Caller is responsible for restarting the subprocess
@@ -2686,6 +2693,7 @@ export class SubprocessRunner extends EventEmitter {
     //  a background sync on startup. All call the same idempotent reconcile.)
 
     // Build merged extra system prompt via structured prompt slots
+    this._promptIntelligentUi = undefined
     try {
       const promptResult = await buildPromptContext({
         agentId: this.opts.agentId,
@@ -2723,6 +2731,7 @@ export class SubprocessRunner extends EventEmitter {
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
+      this._promptIntelligentUi = promptResult.applied.some((a) => a.name === INTELLIGENT_UI_SLOT)
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
       if (mergedPrompt) {

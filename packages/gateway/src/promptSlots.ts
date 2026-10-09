@@ -1422,7 +1422,21 @@ const PLATFORM_SLOTS_TIMEOUT_MS = 5_000
 
 /** 允许容器接受的 slot name 白名单。master 加新 slot 时,旧容器看到不识别的 name
  *  应静默忽略而不是错误地落到 SOUL/USER 之间。 */
-const PLATFORM_SLOT_WHITELIST = new Set(['SKILLS_LITERATURE', 'MODEL_HINT'])
+/** Intelligent UI(OCV5-361)组件协议 slot 名;master 按总开关 + 用户偏好决定是否下发。 */
+export const INTELLIGENT_UI_SLOT = 'INTELLIGENT_UI'
+
+const PLATFORM_SLOT_WHITELIST = new Set(['SKILLS_LITERATURE', 'MODEL_HINT', INTELLIGENT_UI_SLOT])
+
+/**
+ * 只有 Web 对话会话(`agent:<aid>:webchat:...`)注入 Intelligent UI 协议:
+ * 微信 / QQ / cron / 委派 / 子 agent / webhook / openai 兼容通道的输出不经 web 渲染器,
+ * 注入后用户会在那些通道里收到原始 JSON。
+ */
+export function isWebchatSessionKey(sessionKey: string | undefined): boolean {
+  if (!sessionKey) return false
+  const parts = sessionKey.split(':')
+  return parts[0] === 'agent' && parts[2] === 'webchat'
+}
 
 /**
  * 容器从 master fetch 回来的单个 slot。`canonicalModelId` 仅 MODEL_HINT 出现,
@@ -1459,6 +1473,18 @@ export async function fetchPlatformSlotsFromMaster(
   ctx: PromptSlotContext,
   deps: FetchPlatformSlotsDeps = {},
 ): Promise<RemotePlatformSlot[] | null> {
+  const r = await fetchPlatformSlotsFromMasterDetailed(ctx, deps)
+  return r === null ? null : r.slots
+}
+
+/**
+ * 同 {@link fetchPlatformSlotsFromMaster},但区分「master 正常返回(可能为空)」与「拉取失败」:
+ * Intelligent UI 开关比对(intelligentUiDesired.ts)要知道失败,失败时不能当成「已关闭」。
+ */
+export async function fetchPlatformSlotsFromMasterDetailed(
+  ctx: PromptSlotContext,
+  deps: FetchPlatformSlotsDeps = {},
+): Promise<{ ok: boolean; slots: RemotePlatformSlot[] } | null> {
   const env = deps.env ?? process.env
   const baseUrl = env[ENV_MASTER_URL]
   const bearer = env[ENV_CONTAINER_TOKEN]
@@ -1493,7 +1519,7 @@ export async function fetchPlatformSlotsFromMaster(
       '[promptSlots] platform slot fetch failed, returning empty',
       err instanceof Error ? err.message : String(err),
     )
-    return []
+    return { ok: false, slots: [] }
   } finally {
     clearTimeout(timer)
   }
@@ -1503,7 +1529,7 @@ export async function fetchPlatformSlotsFromMaster(
     // 5xx = master 本身出问题。两种都不在 spawn 路径上做花式重试。
     // eslint-disable-next-line no-console
     console.warn('[promptSlots] platform slot fetch non-200', { status })
-    return []
+    return { ok: false, slots: [] }
   }
 
   let parsed: unknown
@@ -1512,7 +1538,7 @@ export async function fetchPlatformSlotsFromMaster(
   } catch {
     // eslint-disable-next-line no-console
     console.warn('[promptSlots] platform slot response JSON parse failed')
-    return []
+    return { ok: false, slots: [] }
   }
 
   // 防御性 shape 校验:必须是 `{ slots: [...] }`。
@@ -1521,7 +1547,7 @@ export async function fetchPlatformSlotsFromMaster(
     typeof parsed !== 'object' ||
     !Array.isArray((parsed as { slots: unknown }).slots)
   ) {
-    return []
+    return { ok: false, slots: [] }
   }
 
   const out: RemotePlatformSlot[] = []
@@ -1544,7 +1570,7 @@ export async function fetchPlatformSlotsFromMaster(
       out.push({ name, content: trimmed })
     }
   }
-  return out
+  return { ok: true, slots: out }
 }
 
 async function readBoundedText(
@@ -1747,6 +1773,14 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
 
   const tools = buildToolsSlot(ctx)
   slots.push(tools)
+
+  // Layer 3c: Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),
+  // 只对 webchat 会话注入。静态文案,放在 TOOLS 之后、MODEL_HINT 之前:利于缓存,且模型补丁
+  // 仍可覆盖其中的行为。开关关闭时 master 不下发 → 本段不存在(零 token)。
+  if (remotePlatformSlots !== null && isWebchatSessionKey(ctx.sessionKey)) {
+    const iui = remotePlatformSlots.find((s) => s.name === INTELLIGENT_UI_SLOT)
+    if (iui) slots.push({ name: INTELLIGENT_UI_SLOT, content: iui.content })
+  }
 
   // Layer 4: per-model 行为补丁。位于 TOOLS 之后、RESEARCH 之前 —
   // 比工具说明更靠后(更"贴近"user message,不被工具说明稀释),
