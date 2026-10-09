@@ -27,8 +27,11 @@ export function niceTicks(min: number, max: number, count = 5): number[] {
   const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => span / s <= count) ?? 10 * mag;
   const lo = Math.floor(min / step) * step;
   const hi = Math.ceil(max / step) * step;
+  // 按序号生成而不是累加:数值极大时 v + step === v(浮点吸收),累加循环永不结束。
+  const n = Math.round((hi - lo) / step);
+  if (!Number.isFinite(n) || n < 1 || n > 50 || lo + step === lo) return [min, max];
   const out: number[] = [];
-  for (let v = lo; v <= hi + step / 2; v += step) out.push(Math.round(v / step) * step);
+  for (let i = 0; i <= n; i++) out.push(lo + i * step);
   return out;
 }
 

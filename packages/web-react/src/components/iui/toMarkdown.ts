@@ -13,14 +13,32 @@ const CURRENCY_PREFIX = new Set(["¥", "￥", "$", "€", "£", "HK$", "US$"]);
 
 export function formatNumber(v: number, format: CalcFormat = "number", decimals?: number): string {
   if (!Number.isFinite(v)) return "—";
-  if (format === "percent") {
-    return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: decimals ?? 2, minimumFractionDigits: decimals ?? 0 }).format(v * 100)}%`;
+  const clampD = (d: number) => Math.max(0, Math.min(10, Math.trunc(d)));
+  const want = decimals === undefined ? undefined : clampD(decimals);
+  let maxD: number;
+  let minD: number;
+  if (format === "integer") {
+    // integer 永远 0 位小数(忽略 decimals);否则 min > max 会让 Intl 抛 RangeError。
+    maxD = 0;
+    minD = 0;
+  } else if (format === "currency") {
+    maxD = want ?? 2;
+    minD = maxD;
+  } else if (format === "percent") {
+    maxD = want ?? 2;
+    minD = want ?? 0;
+  } else {
+    maxD = want ?? (Math.abs(v) >= 100 ? 2 : 4);
+    minD = want ?? 0;
   }
-  const d = format === "integer" ? 0 : format === "currency" ? (decimals ?? 2) : decimals;
-  return new Intl.NumberFormat("zh-CN", {
-    maximumFractionDigits: d ?? (Math.abs(v) >= 100 ? 2 : 4),
-    minimumFractionDigits: format === "currency" ? (d ?? 2) : (decimals ?? 0),
-  }).format(v);
+  const n = format === "percent" ? v * 100 : v;
+  let text: string;
+  try {
+    text = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: maxD, minimumFractionDigits: Math.min(minD, maxD) }).format(n);
+  } catch {
+    text = String(Number(n.toFixed(maxD)));
+  }
+  return format === "percent" ? `${text}%` : text;
 }
 
 /** 数值 + 单位:货币符号放前面,其它单位放后面(中文习惯不留空格的单位如 %、元)。 */
@@ -177,11 +195,16 @@ function rawFence(code: string): string {
 
 /** 单个 ui 块源码 → Markdown;`partial` = 未闭合的流式块。 */
 export function uiCodeToMarkdown(code: string, partial = false): string {
-  const parsed = parseUiBlock(code, partial);
-  if (!parsed.ok) return partial ? "" : rawFence(code);
-  const v = validateSpec(parsed.value, !parsed.complete);
-  if (!v.ok) return partial ? "" : rawFence(code);
-  return specToMarkdown(v.spec);
+  // 复制 / 导出 / 关闭开关都走这里:任何意外都退回原文,绝不让整条消息渲染失败。
+  try {
+    const parsed = parseUiBlock(code, partial);
+    if (!parsed.ok) return partial ? "" : rawFence(code);
+    const v = validateSpec(parsed.value, !parsed.complete);
+    if (!v.ok) return partial ? "" : rawFence(code);
+    return specToMarkdown(v.spec);
+  } catch {
+    return partial ? "" : rawFence(code);
+  }
 }
 
 const FENCE_OPEN = /^( {0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n`]*$/;

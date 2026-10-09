@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { computeOutputs, evaluate, FormulaError, parseFormula, substitute } from "./formula";
 import { completePartialJson, IUI_MAX_BLOCK_BYTES, parseUiBlock, sliceFirstObject } from "./parse";
 import { LIMITS, resolveType, validateSpec } from "./schema";
+import { niceTicks } from "./ChartBlock";
 import { formatNumber, specToMarkdown, uiCodeToMarkdown, uiFencesToMarkdown, withUnit } from "./toMarkdown";
 
 describe("parseUiBlock", () => {
@@ -211,6 +212,27 @@ describe("formula", () => {
 
   it("substitutes current values for display", () => {
     expect(substitute("price * qty", { price: 100, qty: 3 }, String)).toBe("100 * 3");
+  });
+});
+
+describe("review r1 regressions", () => {
+  it("integer format with decimals never throws (was RangeError)", () => {
+    expect(formatNumber(4.567, "integer", 2)).toBe("5");
+    const md = uiFencesToMarkdown(
+      '```ui\n{"type":"calculator","inputs":[{"id":"x","value":2}],"outputs":[{"id":"y","formula":"x*2","format":"integer","decimals":2}]}\n```',
+    );
+    expect(md).toContain("= 4");
+  });
+
+  it("absurd decimals are clamped instead of throwing", () => {
+    expect(formatNumber(1.5, "number", 99)).toBe("1.5000000000");
+    expect(formatNumber(1.5, "currency", -3)).toBe("2");
+  });
+
+  it("niceTicks terminates for huge nearly-equal values (was an infinite loop)", () => {
+    const t = niceTicks(10000000000000000, 10000000000000002);
+    expect(t.length).toBeLessThanOrEqual(51);
+    expect(niceTicks(0, 100)).toEqual([0, 20, 40, 60, 80, 100]);
   });
 });
 

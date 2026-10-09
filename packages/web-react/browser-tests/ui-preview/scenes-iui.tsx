@@ -2,6 +2,7 @@
  * Intelligent UI(OCV5-361)视觉预览场景:三段典型对话,真实 MessageList 渲染。
  * 本文件只依赖 MessageList,改造前的树上也能跑(用于前后对照);开关关闭的场景在 scenes-iui-off.tsx。
  */
+import { useLayoutEffect } from 'react'
 import { MessageList } from '../../src/components/MessageRenderer'
 import type { CardCallbacks } from '../../src/components/chat/cards'
 import type { ChatMessage } from '../../src/lib/chat/model'
@@ -135,6 +136,26 @@ export function conversation(question: string, answer: string): ChatMessage[] {
 }
 
 export function Timeline({ messages }: { messages: ChatMessage[] }) {
+  // 生产 #root 是 position:fixed + 100dvh + overflow:hidden;放开它,移动端才能截到整段对话(同 scenes-messages 的 Page)。
+  useLayoutEffect(() => {
+    const html = document.documentElement
+    const body = document.body
+    const root = document.getElementById('root')
+    const prev = [html.style.height, body.style.height, body.style.overflow]
+    const prevRoot = root ? [root.style.position, root.style.height, root.style.overflow] : null
+    html.style.height = 'auto'
+    body.style.height = 'auto'
+    body.style.overflow = 'visible'
+    if (root) {
+      root.style.position = 'static'
+      root.style.height = 'auto'
+      root.style.overflow = 'visible'
+    }
+    return () => {
+      ;[html.style.height, body.style.height, body.style.overflow] = prev
+      if (root && prevRoot) [root.style.position, root.style.height, root.style.overflow] = prevRoot
+    }
+  }, [])
   return (
     <div className="min-h-screen bg-bg">
       <div className="mx-auto max-w-[760px] px-4 py-6">
