@@ -486,6 +486,31 @@ describe("persist — 历史合并纯函数", () => {
     expect(serverWins._automaticRecovery).toBe(true);
   });
 
+  test("server echo keeps the automatic retry lineage so the 1..10 cap still holds", () => {
+    // OCV5-355: dropping root/attempt/max on a server echo restarted every automatic retry at
+    // attempt 2 under a new root; a turn that kept failing before dispatch was resent forever.
+    const local = [
+      {
+        id: "m-recover-a3",
+        role: "user",
+        text: "retry",
+        ts: 1,
+        _recoveryOfClientMessageId: "m-recover-a2",
+        _recoveryMode: "replay",
+        _automaticRecovery: true,
+        _automaticRecoveryRootClientMessageId: "u-root",
+        _automaticRecoveryAttempt: 3,
+        _automaticRecoveryMax: 10,
+      } satisfies ChatMessage,
+    ];
+    const [merged] = applyServerIncremental(local, [
+      { id: "m-recover-a3", role: "user", text: "retry", ts: 1, _source: "server" } satisfies ChatMessage,
+    ]);
+    expect(merged._automaticRecoveryRootClientMessageId).toBe("u-root");
+    expect(merged._automaticRecoveryAttempt).toBe(3);
+    expect(merged._automaticRecoveryMax).toBe(10);
+  });
+
   test("applyServerIncremental: 空增量返回原数组引用", () => {
     const local = [msg("a")];
     expect(applyServerIncremental(local, [])).toBe(local);

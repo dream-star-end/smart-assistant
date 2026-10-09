@@ -16,7 +16,7 @@ import {
   Target,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode, type SetStateAction } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
@@ -313,7 +313,9 @@ export function Composer({
 
   // 预填:nonce 变化 → 覆盖当前输入并聚焦(仅在用户显式点了「在对话中创建」时触发,
   // 不会与正常输入竞争;文本可改可删,发送权始终在用户)。
-  useEffect(() => {
+  // 用 layout effect:切会话与预填同一次点击时，预填必须在首个提交帧就盖住目标会话的旧草稿；
+  // passive effect 在 React 19 下会晚于绘制，先闪一帧旧草稿(OCV5-355,composer-draft #9)。
+  useLayoutEffect(() => {
     if (!prefill) return;
     setValue(prefill.text);
     requestAnimationFrame(() => ref.current?.focus());
