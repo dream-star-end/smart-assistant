@@ -23,7 +23,8 @@ import { Check, ChevronRight, PanelRight } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { cn } from "../lib/utils";
 import { ProcessStepContext, useProcessStep } from "./chat/processStep";
-import { TokenUsageBadge, type DisplayTokenUsage } from "./chat/tokenUsage";
+import { StepMetaBadge } from "./chat/stepDuration";
+import type { DisplayTokenUsage } from "./chat/tokenUsage";
 import { ToolBody } from "./tool/lazyToolBody";
 import {
   ToolHeaderLabelContext,
@@ -50,6 +51,7 @@ export function ToolCard({
   tokenUsage?: DisplayTokenUsage;
 }) {
   const step = useProcessStep();
+  const stepId = (message as { id?: string }).id;
   const display = normalizeToolForDisplay(message);
   const name = display.name;
   const input = display.input;
@@ -166,7 +168,7 @@ export function ToolCard({
               </span>
             )}
             <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
-              <TokenUsageBadge usage={tokenUsage} />
+              <StepMetaBadge ids={[stepId]} tokenUsage={tokenUsage} />
               <span id={statusId} aria-live="polite" className="flex items-center text-meta">
                 {/* 过程行里的未成功/受阻/取消是中途常态:如实标注,但与其他过程文字同为安静灰字。 */}
                 {hasError || isBlocked || isCancelled ? (
@@ -286,7 +288,7 @@ export function ToolCard({
           </span>
         )}
         <span className="ml-auto flex shrink-0 items-center gap-2">
-          <TokenUsageBadge usage={tokenUsage} />
+          <StepMetaBadge ids={[stepId]} tokenUsage={tokenUsage} />
           {/* 状态区 aria-live:运行中→完成/未成功的迁移会被读屏播报(T-22)。
               运行态 spinner 是 aria-hidden，需 sr-only 播报；其余状态均有可见 Badge 文案。 */}
           <span id={statusId} aria-live="polite" className="flex items-center">

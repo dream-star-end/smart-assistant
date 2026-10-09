@@ -77,6 +77,7 @@ import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
 import { Media } from "./media";
 import { useProcessStep } from "./processStep";
+import { StepMetaBadge } from "./stepDuration";
 import { ResponseRatingCard } from "./ResponseRating";
 import { TurnActivity, type TurnActivityInfo } from "./TurnActivity";
 import {
@@ -1409,7 +1410,7 @@ export const ThinkingCard = memo(
               </span>
             ) : null}
             <span className="ml-auto flex shrink-0 items-center gap-2 pl-1">
-              <TokenUsageBadge usage={tokenUsage} />
+              <StepMetaBadge ids={msgs.map((m) => m.id)} tokenUsage={tokenUsage} />
               {hasBody ? (
                 <ChevronRight
                   size={14}
@@ -1458,7 +1459,7 @@ export const ThinkingCard = memo(
           <span className={cn("min-w-0 truncate font-medium", live && "oc-live-status-shine")} title={headline}>
             {headline}
           </span>
-          <TokenUsageBadge usage={tokenUsage} />
+          <StepMetaBadge ids={msgs.map((m) => m.id)} tokenUsage={tokenUsage} />
           <ChevronRight
             size={14}
             className={cn("ml-auto shrink-0 text-faint transition-transform duration-200", !collapsed && "rotate-90")}
@@ -1523,7 +1524,7 @@ export function PlanCard({
         >
           {msg.text || "执行计划"}
         </span>
-        <TokenUsageBadge usage={tokenUsage} />
+        <StepMetaBadge ids={[msg.id]} tokenUsage={tokenUsage} />
         {msg._partial && <Badge tone="accent">编制中</Badge>}
       </div>
       <div className="px-3.5 py-2.5">

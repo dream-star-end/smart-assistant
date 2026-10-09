@@ -18,13 +18,15 @@ import {
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ProgressiveMarkdown, RecoveredStepContext } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { ProcessStepContext } from "./processStep";
+import { StepTimingContext } from "./stepDuration";
+import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
 import { timelineMessageKey } from "./findInSession";
 
@@ -1099,6 +1101,8 @@ export function ProcessDisclosure<T>({
   olderSteps,
   startedAt,
   lastFrameAt,
+  turnStartedAt,
+  turnEndedAt,
 }: {
   sections: ProcessSection<T>[];
   active: boolean;
@@ -1121,8 +1125,19 @@ export function ProcessDisclosure<T>({
    * 摘要行旁显示已运行时长。缺省(历史轮、单测)则两者都不出现。
    */
   lastFrameAt?: number | null;
+  /** OCV5-367: 本轮起点(进行中 = 本轮活动起点;历史 = 本轮用户消息时刻),首步耗时从这里算。 */
+  turnStartedAt?: number | null;
+  /** OCV5-367: 过程之后第一行(本轮回答)的到达时刻,末步没有自身终点时以它收尾。 */
+  turnEndedAt?: number | null;
 }) {
   const messages = sections.flatMap((section) => section.messages);
+  // OCV5-367: 每一步的耗时(自上一步结束到本步结束)。按值签名缓存,数值不变时 Map 引用不变,
+  // 步骤行(在 memo 边界之下读 context)不会被每一帧无谓重渲。
+  const computedTimings = computeStepTimings(messages, { turnStartedAt, turnEndedAt, active });
+  const timingsSig = stepTimingsSignature(computedTimings);
+  const timingsRef = useRef<{ sig: string; map: typeof computedTimings } | null>(null);
+  if (timingsRef.current?.sig !== timingsSig) timingsRef.current = { sig: timingsSig, map: computedTimings };
+  const stepTimings = timingsRef.current.map;
   const summary = operationSummary(messages);
   // Cleared/completed goals are diagnostics, not a new step. They must not
   // take the current-stage identity from the work still in progress.
@@ -1210,6 +1225,7 @@ export function ProcessDisclosure<T>({
   };
 
   return (
+    <StepTimingContext.Provider value={stepTimings}>
     <section
       data-testid="process-disclosure"
       data-process-active={active ? "true" : "false"}
@@ -1327,6 +1343,7 @@ export function ProcessDisclosure<T>({
               // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
               // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
               const working = active && index === currentIndex;
+              const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
                   <RailRow node={<StepNode Icon={group.Icon} tone={group.tone} />} enter={false}>
@@ -1353,6 +1370,15 @@ export function ProcessDisclosure<T>({
                           className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
                         >
                           {`已运行 ${runningFor}`}
+                        </span>
+                      ) : groupTiming?.ms !== undefined ? (
+                        // OCV5-367: 折叠的步骤组给出这一组合计用时(组内每一步都有可信时间才给)。
+                        <span
+                          data-testid="process-group-duration"
+                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
+                          title={`这一组步骤共用时 ${formatStepDuration(groupTiming.ms)}`}
+                        >
+                          {formatStepDuration(groupTiming.ms)}
                         </span>
                       ) : null}
                       <span className="sr-only">{operationSummary(section.messages)}</span>
@@ -1390,5 +1416,6 @@ export function ProcessDisclosure<T>({
           </div>
         ) : null}
     </section>
+    </StepTimingContext.Provider>
   );
 }
