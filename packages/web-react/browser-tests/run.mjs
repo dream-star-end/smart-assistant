@@ -1507,7 +1507,15 @@ async function runAskQuestionMobileCase() {
 
 await check("T18 点助手“引用”→预览可取消→再次引用后随正文发送", async () => {
   const root = page.locator("#message-quote-root");
-  const quote = root.getByRole("button", { name: "引用" });
+  // OCV5-359:「引用」在助手动作条的「更多操作」菜单里(Portal,按页面级 menuitem 定位)。
+  const more = root.getByTestId("assistant-actions").getByRole("button", { name: "更多操作" });
+  const quote = {
+    click: async () => {
+      await more.click();
+      await page.getByRole("menu").getByRole("menuitem", { name: "引用" }).click();
+      await page.getByRole("menu").waitFor({ state: "hidden", timeout: 3000 });
+    },
+  };
   await quote.click();
   await root.getByText("正在引用 从简").waitFor({ state: "visible", timeout: 3000 });
   await root.getByText("这是需要被引用的完整回答").last().waitFor({ state: "visible", timeout: 3000 });
@@ -2079,8 +2087,9 @@ await check("T25 390×844 整页:顶栏入口不被挤出、宽正文不被裁�
 // ── T68 触屏动作行折叠(messages 审计 M-03)──────────────────────────────────────
 // 触屏没有 hover:此前每条消息下方常显整排 44px 动作图标(助手 5 个、用户 3 个)+ 状态标签,
 // 长会话里 1 行正文配 3 行 chrome。OCV5-295:助手复制常显，其余动作默认收进「更多操作」。
+// OCV5-359:助手「更多操作」是真下拉菜单(Radix Portal,role=menu/menuitem),不再是行内展开开关。
 // jsdom 无 CSS 量不出"看得见/看不见",这里在 (hover:none) 真生效的 390×844 上下文里量。
-await check("T68 390px 触屏:助手一击复制原文，更多默认收起且纯文本复制完整，用户动作可展开", async () => {
+await check("T68 390px 触屏:助手一击复制原文，更多菜单默认关闭且纯文本复制完整，用户动作可展开", async () => {
   screenshotPage = mobilePage;
   const hoverNone = await mobilePage.evaluate(() => matchMedia("(hover: none)").matches);
   if (!hoverNone) throw new Error("移动上下文未仿真 (hover: none),本用例前提不成立(hasTouch 丢了?)");
@@ -2136,8 +2145,12 @@ await check("T68 390px 触屏:助手一击复制原文，更多默认收起且�
   }
   const assistantRow = mobilePage.getByTestId("assistant-row").filter({ hasText: "MOBILE-ASSISTANT-COPY-FIXTURE" });
   const assistantCopy = assistantRow.getByRole("button", { name: "复制", exact: true });
-  const assistantToggle = assistantRow.getByRole("button", { name: "更多操作" });
-  const plainCopy = assistantRow.getByRole("button", { name: "复制纯文本" });
+  // 不用 getByRole:模态菜单打开时 Radix 给菜单外节点挂 aria-hidden,按 role 找不到触发按钮,
+  // 而这里正要读它打开态的 aria-expanded。
+  const assistantToggle = assistantRow.locator('button[aria-label="更多操作"]');
+  // 菜单渲染在 Portal 里(不在 assistantRow 之下),按页面级 role=menu 定位。
+  const assistantMenu = mobilePage.getByRole("menu");
+  const plainCopy = assistantMenu.getByRole("menuitem", { name: "复制纯文本" });
   await assistantCopy.waitFor({ state: "visible", timeout: 5000 });
   for (const button of [assistantCopy, assistantToggle]) {
     const box = await button.boundingBox();
@@ -2146,7 +2159,7 @@ await check("T68 390px 触屏:助手一击复制原文，更多默认收起且�
     }
   }
   if ((await assistantToggle.getAttribute("aria-expanded")) !== "false" || await plainCopy.isVisible()) {
-    throw new Error("末条助手更多操作应默认收起，复制纯文本不得常显");
+    throw new Error("末条助手更多菜单应默认关闭，复制纯文本不得常显");
   }
   const expectedCopy = await mobilePage.evaluate(() => window.__mobilePage.copyFixture);
   async function copyAndRead(button, expected, label) {
@@ -2164,11 +2177,22 @@ await check("T68 390px 触屏:助手一击复制原文，更多默认收起且�
   if (!plainBox || plainBox.height < TOUCH_MIN || plainBox.width < TOUCH_MIN) {
     throw new Error(`纯文本复制触控靶不足44px: ${JSON.stringify(plainBox)}`);
   }
+  if ((await assistantToggle.getAttribute("aria-expanded")) !== "true") {
+    throw new Error("助手更多菜单打开后 aria-expanded 应为 true");
+  }
+  // 选中菜单项即执行并关闭菜单,焦点回到触发按钮。
   await copyAndRead(plainCopy, expectedCopy.plain, "助手纯文本复制");
-  await assistantRow.getByRole("button", { name: "收起操作" }).click();
-  await plainCopy.waitFor({ state: "hidden", timeout: 3000 });
-  if ((await assistantRow.getByRole("button", { name: "更多操作" }).getAttribute("aria-expanded")) !== "false") {
-    throw new Error("助手收起后 aria-expanded 没有恢复 false");
+  await assistantMenu.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await assistantToggle.getAttribute("aria-expanded")) !== "false") {
+    throw new Error("助手菜单关闭后 aria-expanded 没有恢复 false");
+  }
+  // Esc 也能关:再开一次,按 Esc,菜单消失。
+  await assistantToggle.click();
+  await plainCopy.waitFor({ state: "visible", timeout: 3000 });
+  await mobilePage.keyboard.press("Escape");
+  await assistantMenu.waitFor({ state: "hidden", timeout: 3000 });
+  if ((await assistantToggle.getAttribute("aria-expanded")) !== "false") {
+    throw new Error("Esc 关闭助手菜单后 aria-expanded 没有恢复 false");
   }
   // T25 corroboration: wrapping must not hide or truncate the user's long token.
   const expectedUser = "MOBILE_LONG_TOKEN_MARKER_aG9yaXpvbnRhbC1vdmVyZmxvdy1yZWdyZXNzaW9uLWNhbmFyeS12ZXJ5LWxvbmctdW5icm9rZW4tdG9rZW4";
@@ -3544,11 +3568,27 @@ await check("T45 中断 turn 刷新后仍显示 requestId/积分，空窗给出�
     state: "visible",
     timeout: 3000,
   });
-  await root.getByRole("button", { name: "复制请求ID req-stopped-turn-display" }).waitFor({
+  // OCV5-359:有动作条的回答,requestId/积分默认不常显 —— 桌面 hover 时在行尾淡显,
+  // 且常驻「更多操作」菜单底部明细。两条路径都要真能拿到。
+  const stoppedRow = root.getByTestId("assistant-row").filter({ hasText: "已经写出的部分回答" });
+  const stoppedReq = stoppedRow.getByRole("button", { name: "复制请求ID req-stopped-turn-display" });
+  await stoppedRow.hover();
+  await stoppedReq.waitFor({ state: "visible", timeout: 3000 });
+  await page.waitForFunction(
+    (el) => el instanceof HTMLElement && getComputedStyle(el.closest("[data-testid=assistant-meta]").parentElement).opacity === "1",
+    await stoppedReq.elementHandle(),
+    { timeout: 3000 },
+  );
+  await root.getByLabel("消耗 4096 积分").first().waitFor({ state: "visible", timeout: 3000 });
+  await stoppedRow.getByRole("button", { name: "更多操作" }).click();
+  const stoppedMenu = page.getByRole("menu");
+  await stoppedMenu.getByRole("menuitem", { name: "复制请求ID req-stopped-turn-display" }).waitFor({
     state: "visible",
     timeout: 3000,
   });
-  await root.getByLabel("消耗 4096 积分").waitFor({ state: "visible", timeout: 3000 });
+  await stoppedMenu.getByLabel("消耗 4096 积分").waitFor({ state: "visible", timeout: 3000 });
+  await page.keyboard.press("Escape");
+  await stoppedMenu.waitFor({ state: "hidden", timeout: 3000 });
   await root.getByRole("button", { name: /思考|已思考/ }).first().waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("status", { name: "过程记录整理中" }).waitFor({ state: "visible", timeout: 3000 });
   await root.getByRole("button", { name: "复制请求ID req-unpublished-window" }).waitFor({

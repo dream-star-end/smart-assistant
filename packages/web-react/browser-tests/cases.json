@@ -180,7 +180,7 @@
     },
     {
       "id": "T45",
-      "proves": "中断 turn 只用服务端回显字段仍显示 requestId/积分与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试"
+      "proves": "中断 turn 只用服务端回显字段仍可取到 requestId/积分（OCV5-359:桌面 hover 行尾淡显且在「更多操作」菜单明细里）与已产生正文；records_unpublished 空窗给出非正文占位且 fallback 有 usage 时仍显示 requestId/积分，不渲染红卡或重试"
     },
     {
       "id": "T46",
@@ -272,7 +272,7 @@
     },
     {
       "id": "T68",
-      "proves": "真 Chromium 390×844 触屏上下文及production CSS：用户动作默认折叠、44px开关可展开/收起；完成态助手（含末条与宽内容历史行）复制常显一击可达、更多默认关闭；受信点击真实Clipboard API精确写入完整Markdown原文、手工期望纯文本和用户长串全文；复制及更多触控靶均≥44px。OCV5-295合同，不恢复末条整排默认展开。"
+      "proves": "真 Chromium 390×844 触屏上下文及production CSS：用户动作默认折叠、44px开关可展开/收起；完成态助手（含末条与宽内容历史行）复制常显一击可达、更多菜单默认关闭（OCV5-359:Radix 菜单,选中项/Esc 关闭并复位 aria-expanded）；受信点击真实Clipboard API精确写入完整Markdown原文、菜单项手工期望纯文本和用户长串全文；复制、更多及菜单项触控靶均≥44px。OCV5-295合同，不恢复末条整排默认展开。"
     },
     {
       "id": "T69",
