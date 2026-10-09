@@ -199,6 +199,9 @@ describe("auth.register (integ)", () => {
     assert.match(mailer.sent[0].text, /不要把验证码转发/, "须提示勿转发验证码");
     assert.match(mailer.sent[0].text, /账号不会被激活/);
     assert.match(mailer.sent[0].text, /—— OpenClaude 团队\nclaudeai\.chat/);
+    // OCV5-363:同时带 HTML 卡片版,验证码与文本版一致。
+    const textCode = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
+    assert.ok(mailer.sent[0].html?.includes(`>${textCode}<`), "html 必须含同一个验证码");
     // 邮件正文中的 raw code 不能等于 DB 里的 token_hash(存的是 sha256 hex)
     const code = mailer.sent[0].text.match(/\n {4}(\d{6})\n/)?.[1] ?? "";
     assert.ok(code.length === 6);

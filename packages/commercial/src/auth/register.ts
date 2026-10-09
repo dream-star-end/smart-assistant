@@ -30,6 +30,7 @@ import { tx } from "../db/queries.js";
 import { hashPassword } from "./passwords.js";
 import { verifyTurnstile, TurnstileError, resolveTurnstileBypass } from "./turnstile.js";
 import type { Mailer } from "./mail.js";
+import { renderVerifyEmail } from "./verifyEmailTemplate.js";
 
 /** RFC 5322 简化邮箱正则,长度 ≤ 254(05-SEC §7) */
 const emailSchema = z
@@ -311,23 +312,16 @@ export async function register(
   //      163/QQ 把注册确认邮件扔垃圾箱概率较高;主动提示能省掉大量
   //      "没收到邮件"工单。boss 2026-04-23 明确要求加此提示。
   //   3) 告知 30min 过期 + 如何重发
+  // 2026-10-09 OCV5-363:正文移到 verifyEmailTemplate.ts,另带 HTML 卡片版。
   let sent = true;
   try {
     await deps.mailer.send({
       to: input.email,
-      subject: "[OpenClaude] 邮箱验证码 · 完成注册",
-      text:
-        `你好,欢迎使用 OpenClaude。\n\n` +
-        `这是一封由 OpenClaude（claudeai.chat）发出的邮箱验证邮件。你的验证码是:\n\n` +
-        `    ${verify.raw}\n\n` +
-        `请在有效期内回到注册页输入此验证码完成验证。\n` +
-        `验证码 30 分钟内有效,一次性使用。若验证码过期,可在注册页点「重新发送」。\n\n` +
-        `请不要把验证码转发给任何人(包括自称客服的联系人)。\n\n` +
-        `📬 若未在收件箱看到此邮件,请检查「垃圾邮件 / Spam」文件夹,\n` +
-        `   并把 OpenClaude 寄件地址加入联系人 / 白名单,以免后续被误判。\n\n` +
-        `如果这不是你本人操作,忽略此邮件即可,账号不会被激活。\n\n` +
-        `—— OpenClaude 团队\n` +
-        `claudeai.chat`,
+      ...renderVerifyEmail({
+        kind: "register",
+        code: verify.raw,
+        ttlMinutes: VERIFY_EMAIL_TTL_SECONDS / 60,
+      }),
     });
   } catch {
     sent = false;
