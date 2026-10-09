@@ -145,6 +145,32 @@ function channelSubscribes(channel: AlertChannelRow, event: AlertEventInput): bo
  */
 const SYSTEM_INBOX_UID = "1";
 
+/**
+ * OCV5-365:实际收件人。uid=1 是 active admin(商业版 boss)时照旧取 1,与 shell 侧
+ * BOSS_UID 一致;否则(个人版 uid=1 是种子普通用户,admin 是 2 号系统种子 + 运营本人)
+ * 取最小的非系统种子 active admin。查不到 admin 时退回 1,保持原行为。
+ */
+async function resolveAlertInboxUid(): Promise<string> {
+  try {
+    const r = await query<{ id: string }>(
+      `SELECT id::text AS id FROM users
+        WHERE role = 'admin' AND status = 'active'
+        ORDER BY (id = 1) DESC, (email LIKE '%@system.openclaude') ASC, id ASC
+        LIMIT 1`,
+    );
+    return r.rows[0]?.id ?? SYSTEM_INBOX_UID;
+  } catch {
+    return SYSTEM_INBOX_UID;
+  }
+}
+
+/**
+ * OCV5-365:零通道兜底按 dedupe_key 去重的时间窗。outbox 路径靠 ON CONFLICT 去重,
+ * 兜底路径原先每次都写,个人版因此每天约 300 条(磁盘告警按小时分桶却每 5 分钟写一条)。
+ * 同 key 24h 内只写一次;key 本身带时间桶的事件(按小时/按天)不受影响。
+ */
+const INBOX_FALLBACK_DEDUPE_WINDOW_HOURS = 24;
+
 /** admin_alert 的 severity → inbox_messages.level(0046 CHECK: info|notice|promo|warning)。 */
 function severityToInboxLevel(sev: Severity): "info" | "warning" {
   // inbox level 枚举无 'critical' → critical 落 'warning'(最高等级),与站内信 UI 一致。
@@ -152,7 +178,8 @@ function severityToInboxLevel(sev: Severity): "info" | "warning" {
 }
 
 /**
- * 送达不变量兜底:直接往 inbox_messages 写一条系统站内信(uid=1)。
+ * 送达不变量兜底:直接往 inbox_messages 写一条系统站内信(收件人见 resolveAlertInboxUid)。
+ * opts.dedupe=true(零通道兜底)时同 dedupe_key 24h 内只写一次,命中去重返回 false。
  *
  * **刻意用最小参数化 INSERT,而非复用 inbox/inbox.ts 的 createInboxMessage()**:
  *   1. createInboxMessage 带 zod 校验 + 收件人 status='active' 门 + 可选邮件快照;
@@ -167,6 +194,7 @@ function severityToInboxLevel(sev: Severity): "info" | "warning" {
 async function writeSystemInbox(
   event: AlertEventInput,
   note: string,
+  opts: { dedupe?: boolean } = {},
 ): Promise<boolean> {
   try {
     // char_length(CJK)按字符计,slice 按 UTF-16 code unit;对常见告警文案足够安全,
@@ -174,12 +202,35 @@ async function writeSystemInbox(
     const title = `${event.title}`.replace(/[\r\n]+/g, " ").slice(0, 190) || event.event_type;
     const body = `${event.body}\n\n${note}`.slice(0, 16000) || note;
     const level = severityToInboxLevel(event.severity);
-    await query(
-      `INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by)
-       VALUES ('user', $1::bigint, $2, $3, $4, $1::bigint)`,
-      [SYSTEM_INBOX_UID, title, body, level],
-    );
-    return true;
+    const uid = await resolveAlertInboxUid();
+    const dedupeKey = opts.dedupe ? event.dedupe_key ?? null : null;
+    if (!dedupeKey) {
+      await query(
+        `INSERT INTO inbox_messages (audience, user_id, title, body_md, level, created_by)
+         VALUES ('user', $1::bigint, $2, $3, $4, $1::bigint)`,
+        [uid, title, body, level],
+      );
+      return true;
+    }
+    // source_id 留 NULL:ux_inbox_source 对 NULL 不判重,去重只靠这里的窗口检查;
+    // advisory 锁把同 key 的并发兜底串行化,避免两条一起落库。
+    return await tx(async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+        `admin-alert-inbox:${dedupeKey}`,
+      ]);
+      const r = await client.query(
+        `INSERT INTO inbox_messages
+           (audience, user_id, title, body_md, level, created_by, source_type, source_phase)
+         SELECT 'user', $1::bigint, $2, $3, $4, $1::bigint, 'admin_alert', $5
+          WHERE NOT EXISTS (
+            SELECT 1 FROM inbox_messages
+             WHERE source_type = 'admin_alert' AND source_phase = $5
+               AND created_at > NOW() - make_interval(hours => $6::int)
+          )`,
+        [uid, title, body, level, dedupeKey, INBOX_FALLBACK_DEDUPE_WINDOW_HOURS],
+      );
+      return (r.rowCount ?? 0) > 0;
+    });
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -200,7 +251,8 @@ export interface EnqueueResult {
   silenceReason: string | null;
   /**
    * 送达不变量兜底(方案 §2.3-1):零订阅通道时告警会"蒸发",此时写一条
-   * inbox_messages(uid=1)保证有落点。true = 本次触发了兜底 inbox 写入。
+   * inbox_messages 保证有落点。true = 本次触发了兜底 inbox 写入;同 dedupe_key
+   * 24h 内已兜底过(OCV5-365)或写库失败为 false。
    */
   inbox_fallback: boolean;
   /**
@@ -227,7 +279,7 @@ export async function enqueueAlert(
     // 送达不变量(方案 §2.3-1):零订阅通道 → 告警本会"蒸发"。写 inbox 兜底保证有
     // 落点。**无条件写**(不看 silence):silence 抑的是"主动投递通道",inbox 是被动
     // 留痕的最后一道 durability,与之正交(shell 侧 send_inbox 也不受 silence 影响)。
-    const wrote = await writeSystemInbox(event, "(未配置告警通道,站内信兜底)");
+    const wrote = await writeSystemInbox(event, "(未配置告警通道,站内信兜底)", { dedupe: true });
     return {
       enqueued: 0,
       suppressed: 0,

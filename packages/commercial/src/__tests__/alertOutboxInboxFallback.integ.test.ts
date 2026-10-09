@@ -277,6 +277,90 @@ describe("enqueueAlertToChannel — 测试送达路径不写 inbox", () => {
   });
 });
 
+describe("enqueueAlert — 零通道兜底去重与收件人(OCV5-365)", () => {
+  function warnEvent(dedupe: string | null, title = "磁盘告警 87%"): AlertEventInput {
+    return { event_type: "health.compute_host_disk_high", severity: "warning", title, body: "disk", dedupe_key: dedupe };
+  }
+
+  test("同 dedupe_key 重复兜底 → 只写 1 条,第二次 inbox_fallback=false", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const first = await enqueueAlert(warnEvent("health.compute_host_disk_high:1:warning:2026-10-09T14"));
+    const second = await enqueueAlert(
+      warnEvent("health.compute_host_disk_high:1:warning:2026-10-09T14", "磁盘告警 88%"),
+    );
+    assert.equal(first.inbox_fallback, true);
+    assert.equal(second.inbox_fallback, false);
+    assert.equal(second.skipped_no_channels, true);
+    assert.equal(await inboxCount(), 1);
+    const row = (await query<{ source_type: string; source_phase: string }>(
+      `SELECT source_type, source_phase FROM inbox_messages`,
+    )).rows[0];
+    assert.equal(row.source_type, "admin_alert");
+    assert.equal(row.source_phase, "health.compute_host_disk_high:1:warning:2026-10-09T14");
+  });
+
+  test("不同 dedupe_key 各写一条;无 dedupe_key 不去重", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await enqueueAlert(warnEvent("k:2026-10-09T14"));
+    await enqueueAlert(warnEvent("k:2026-10-09T15"));
+    await enqueueAlert(warnEvent(null));
+    await enqueueAlert(warnEvent(null));
+    assert.equal(await inboxCount(), 4);
+  });
+
+  test("同 key 超过 24h 窗口后可再次兜底", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await enqueueAlert(warnEvent("account_pool.low_capacity:global"));
+    await query(`UPDATE inbox_messages SET created_at = NOW() - INTERVAL '25 hours'`);
+    const again = await enqueueAlert(warnEvent("account_pool.low_capacity:global"));
+    assert.equal(again.inbox_fallback, true);
+    assert.equal(await inboxCount(), 2);
+  });
+
+  test("uid=1 不是 admin(个人版)→ 发给最小的非系统种子 active admin", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await query(`UPDATE users SET role='user' WHERE id = 1`);
+    await query(
+      `INSERT INTO users(id, email, password_hash, credits, role, status) VALUES
+         (2, 'seed-reviewer@system.openclaude', 'stub', 0, 'admin', 'active'),
+         (3, 'operator@test.local', 'stub', 0, 'admin', 'active')
+       ON CONFLICT (id) DO UPDATE SET role='admin', status='active', email=EXCLUDED.email`,
+    );
+    try {
+      const r = await enqueueAlert(warnEvent(null));
+      assert.equal(r.inbox_fallback, true);
+      const row = (await query<{ user_id: string; created_by: string }>(
+        `SELECT user_id::text AS user_id, created_by::text AS created_by FROM inbox_messages`,
+      )).rows[0];
+      assert.equal(row.user_id, "3");
+      assert.equal(row.created_by, "3");
+    } finally {
+      await query(`DELETE FROM inbox_messages`);
+      await query(`DELETE FROM users WHERE id IN (2, 3)`);
+      await ensureBoss();
+    }
+  });
+
+  test("uid=1 是 active admin(商业版)→ 仍发给 uid=1", async (t) => {
+    if (skipIfNoPg(t)) return;
+    await query(
+      `INSERT INTO users(id, email, password_hash, credits, role, status)
+       VALUES (3, 'operator@test.local', 'stub', 0, 'admin', 'active')
+       ON CONFLICT (id) DO UPDATE SET role='admin', status='active'`,
+    );
+    try {
+      await enqueueAlert(warnEvent(null));
+      const row = (await query<{ user_id: string }>(
+        `SELECT user_id::text AS user_id FROM inbox_messages`,
+      )).rows[0];
+      assert.equal(row.user_id, "1");
+    } finally {
+      await query(`DELETE FROM inbox_messages`);
+      await query(`DELETE FROM users WHERE id = 3`);
+    }
+  });
+});
+
 describe("enqueueAlert — inbox 写失败不抛", () => {
   test("uid=1 缺失时兜底写库失败 → 不抛,inbox_fallback=false", async (t) => {
     if (skipIfNoPg(t)) return;
