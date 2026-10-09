@@ -388,7 +388,7 @@ export async function buildCodexLaunchOverrides(
     : resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
   const projectSearchOn = isProjectSearchEnabled(process.env)
   const availableMcpTools = mcpLaunch
-    ? PLATFORM_MCP_TOOL_NAMES.filter((name) => projectSearchOn || name !== 'project_search')
+    ? [...PLATFORM_MCP_TOOL_NAMES].filter((name) => projectSearchOn || name !== 'project_search')
     : []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
