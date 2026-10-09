@@ -6,7 +6,7 @@ import { ApiError, api } from "../../lib/api";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import type { AuthSession, AutoDreamReportResponse, MemoryFileMeta } from "../../lib/types";
 import { ToastProvider, TooltipProvider } from "../ui";
-import { MemoryPanel } from "./MemoryPanel";
+import { LeftoverBody, MemoryPanel } from "./MemoryPanel";
 
 const auth: AuthSession = createMemoryAuthSession(() => {}, "tok");
 
@@ -1017,5 +1017,24 @@ describe("MemoryPanel · 用户画像字数口径", () => {
     const save = screen.getByRole("button", { name: "保存" });
     expect(save).toBeDisabled();
     expect(save).toHaveAttribute("title", expect.stringContaining("（7/5）"));
+  });
+});
+
+describe("MemoryPanel · 待确认条目正文", () => {
+  test("长正文默认 3 行，可展开读全再决定（采纳提升的是完整条目）", () => {
+    const text = "第一行\n第二行\n第三行\n第四行：只有展开后才能完整读到的约束";
+    render(<LeftoverBody text={text} />);
+    const body = screen.getByText(/第一行/);
+    expect(body).toHaveClass("line-clamp-3");
+    const toggle = screen.getByRole("button", { name: "展开全文" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(body).not.toHaveClass("line-clamp-3");
+    expect(screen.getByRole("button", { name: "收起" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  test("短正文不渲染展开按钮", () => {
+    render(<LeftoverBody text="一句话" />);
+    expect(screen.queryByRole("button", { name: "展开全文" })).not.toBeInTheDocument();
   });
 });

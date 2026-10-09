@@ -210,3 +210,10 @@ test('切换分区回调透出的是分区 id', () => {
   fireEvent.click(screen.getByRole('tab', { name: '插件' }))
   expect(onTabChange).toHaveBeenCalledWith('connectors')
 })
+
+test('窄屏分段是定位容器（styles.css 的 ::after 把命中区外扩到 44px）', () => {
+  renderShell()
+  for (const tab of screen.getAllByRole('tab')) {
+    expect(tab).toHaveClass('oc-manage-tab', 'relative', 'max-md:h-8')
+  }
+})

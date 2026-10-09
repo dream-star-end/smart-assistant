@@ -113,6 +113,9 @@ export function SkillEditor({
 }) {
   const [tab, setTab] = useState<WorkbenchTab>(initialTab);
   const [deleting, setDeleting] = useState(false);
+  // 保存与删除互斥(Codex r1):按钮态之外再用 ref 守住处理函数 —— 状态落地前的连点也挡得住。
+  const deletingRef = useRef(false);
+  const savingRef = useRef(false);
   // 已访问过的页签保持挂载(hidden),这样切走再切回时评测用例的编辑草稿与
   // 进行中的轮询都不会丢 —— 这两条流程都是分钟级且会扣费,重来一次代价真实。
   const [visited, setVisited] = useState<ReadonlySet<WorkbenchTab>>(() => new Set([initialTab]));
@@ -362,6 +365,9 @@ export function SkillEditor({
     const paths = [...dirtyRef.current];
     const scopeWasDirty = scopeDirtyRef.current;
     if (paths.length === 0 && !scopeWasDirty) return;
+    // 删除进行中不再保存:后端保存会重建缺失的技能目录,保存晚于删除落地 = 技能「复活」。
+    if (deletingRef.current) return;
+    savingRef.current = true;
     setSaving(true);
     setSaveErr(null);
 
@@ -425,6 +431,7 @@ export function SkillEditor({
     if (scopeSaved && scopeUnchanged()) setScopeDirty(false);
 
     clearDirty(cleanPaths);
+    savingRef.current = false;
     setSaving(false);
     if (firstErr) {
       setSaveErr(
@@ -569,7 +576,7 @@ export function SkillEditor({
             关闭
           </Button>
           {writable && (
-            <Button variant="primary" loading={saving} disabled={pendingCount === 0} onClick={save}>
+            <Button variant="primary" loading={saving} disabled={pendingCount === 0 || deleting} onClick={save}>
               {saved && pendingCount === 0 ? "已保存" : pendingCount > 0 ? `保存（${pendingCount}）` : "保存"}
             </Button>
           )}
@@ -698,11 +705,15 @@ export function SkillEditor({
                   variant="ghost"
                   size="sm"
                   loading={deleting}
+                  disabled={saving}
                   onClick={async () => {
+                    if (savingRef.current || deletingRef.current) return;
+                    deletingRef.current = true;
                     setDeleting(true);
                     try {
                       if (await onDelete()) onClose();
                     } finally {
+                      deletingRef.current = false;
                       setDeleting(false);
                     }
                   }}
@@ -969,7 +980,7 @@ export function SkillEditor({
             density="compact"
             onDismiss={() => setSaveErr(null)}
             action={
-              <Button size="sm" variant="secondary" loading={saving} onClick={save}>
+              <Button size="sm" variant="secondary" loading={saving} disabled={deleting} onClick={save}>
                 重试保存
               </Button>
             }

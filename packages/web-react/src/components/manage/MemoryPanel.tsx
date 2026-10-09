@@ -378,10 +378,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
               {leftover.map((c) => (
                 <ListRow key={c.id ?? c.file}>
                   <div className="text-[14px] font-medium leading-5 text-fg">{memoryTitle(c.slug)}</div>
-                  {/* 正文压到 3 行:决策只需看个大概,整段 1200 字的 <pre> 会把一行撑成半屏。 */}
-                  <p className="mt-0.5 line-clamp-3 whitespace-pre-line break-words text-body text-muted">
-                    {(c.content ?? "").slice(0, 1200)}
-                  </p>
+                  <LeftoverBody text={(c.content ?? "").slice(0, 1200)} />
                   <div className="mt-2.5 flex gap-2">
                     <Button
                       size="sm"
@@ -409,6 +406,37 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
       )}
       {confirmEl}
     </div>
+  );
+}
+
+/**
+ * 待确认条目的正文:默认压到 3 行(整段 1200 字会把一行撑成半屏),但「采纳」提升的是
+ * 完整条目 —— 所以超过 3 行时给「展开全文」,决定之前能读全(Codex r1)。
+ */
+export function LeftoverBody({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const long = text.length > 90 || text.split("\n").length > 3;
+  return (
+    <>
+      <p
+        className={cn(
+          "mt-0.5 whitespace-pre-line break-words text-body text-muted",
+          open ? "max-h-60 overflow-y-auto" : "line-clamp-3",
+        )}
+      >
+        {text}
+      </p>
+      {long && (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+          className="mt-1 rounded-[6px] text-meta font-medium text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+        >
+          {open ? "收起" : "展开全文"}
+        </button>
+      )}
+    </>
   );
 }
 
@@ -935,7 +963,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索记忆"
                 aria-label="搜索核心记忆"
-                className="h-9 rounded-[10px] border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10 [@media(hover:none)]:min-h-10"
+                className="h-9 rounded-[10px] border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10"
                 autoComplete="off"
               />
             </div>

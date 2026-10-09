@@ -386,6 +386,33 @@ describe("技能工作台 删除入口(OCV5-360:删除从列表行挪进工作�
     expect(onDelete).toHaveBeenCalledTimes(1);
   });
 
+  test("保存与删除互斥(Codex r1):保存在途时删除不可点;删除在途时保存不可点", async () => {
+    // 保存晚于删除落地会让后端重建技能目录 —— 技能「复活」。
+    let releaseSave: (v?: unknown) => void = () => {};
+    vi.spyOn(api, "updateSkill").mockImplementation(
+      () => new Promise((ok) => { releaseSave = ok; }) as never,
+    );
+    let releaseDelete: (v: boolean) => void = () => {};
+    const onDelete = vi.fn(() => new Promise<boolean>((ok) => { releaseDelete = ok; }));
+    mountWithDelete(DETAIL, onDelete);
+    const editor = await screen.findByDisplayValue(DETAIL.body);
+    fireEvent.change(editor, { target: { value: "改过" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    const del = screen.getByRole("button", { name: "删除技能" });
+    await waitFor(() => expect(del).toBeDisabled());
+    fireEvent.click(del);
+    expect(onDelete).not.toHaveBeenCalled();
+    releaseSave({});
+    await waitFor(() => expect(del).toBeEnabled());
+
+    fireEvent.change(editor, { target: { value: "再改" } });
+    fireEvent.click(del);
+    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: /保存/ })).toBeDisabled();
+    releaseDelete(false);
+    await waitFor(() => expect(screen.getByRole("button", { name: /保存/ })).toBeEnabled());
+  });
+
   test("删除被取消 / 失败(onDelete 返回 false):工作台保持打开", async () => {
     const onDelete = vi.fn().mockResolvedValue(false);
     const { onClose } = mountWithDelete(DETAIL, onDelete);

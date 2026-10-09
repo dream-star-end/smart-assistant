@@ -161,6 +161,7 @@ export function ManageCenter({
         data-product-feature={featureId}
         onClick={() => onTabChange(t.id)}
         onKeyDown={onTabKeyDown}
+        // 窄屏分段是 32px 高的视觉块;styles.css 里透明 ::after 上下各外扩 6px,命中区 = 44px(Codex r1)。
         className={cn(
           'oc-manage-tab group relative flex min-w-0 items-center justify-center rounded-[7px] text-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring max-md:h-8 md:h-8 md:justify-start md:gap-2.5 md:rounded-[8px] md:px-2.5 md:text-left',
           selected ? 'text-fg' : 'text-muted hover:text-fg md:hover:bg-hover',

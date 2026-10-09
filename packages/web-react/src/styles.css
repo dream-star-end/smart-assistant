@@ -897,6 +897,8 @@ body {
   /* 窄屏分区切换(OCV5-360):iOS 分段控件 —— 一条浅灰轨道,选中项是抬起的表面色滑块。
      不再是图标 + 两字标签的六等分条(改造前 390px 下拥挤,且「文献」「优化」两个分区已下线)。 */
   .oc-manage-tablist { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+  /* 分段视觉高 32px;透明 ::after 上下各外扩 6px,命中区 44px(触控标准)。 */
+  .oc-manage-tab::after { position: absolute; inset: -6px 0; content: ""; }
   .dark .oc-manage-tablist { background: color-mix(in srgb, var(--fg) 9%, transparent); }
   .oc-manage-tab { transition: background-color 180ms var(--ease-standard), color 120ms var(--ease-standard), box-shadow 180ms var(--ease-standard); }
   .oc-manage-tab[aria-selected="true"] {
