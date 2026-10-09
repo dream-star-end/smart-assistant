@@ -6491,6 +6491,21 @@
           "assertion": "automatic retry lineage climbs 1..10 and stops"
         }
       ]
+    },
+    {
+      "id": "INC-20261009-PROJECT-NAME-ACTION-OVERLAP",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "个人版运营 2026-10-09 21:52 报障（附截图）：侧栏项目名过长（「V5个人版和商业版项目开发」，268px 默认宽度）时，悬停出现的「+」「⋯」叠在项目名和折叠箭头上。操作钮绝对定位叠在行上，悬停只淡出比两枚按钮窄的计数；改为桌面悬停/聚焦/菜单打开时操作钮进入 flex 流、与计数互换，名字截断。真 Chromium 量测：修前 chevron 右缘 228.3 > 首个操作钮左缘 206，修后各状态无重叠。",
+      "rootFixCommit": "8d99a504",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/project-row-long-name.node-test.mjs",
+          "assertion": "OCV5-364: long project names never run under the sidebar row actions"
+        }
+      ]
     }
   ]
 }
