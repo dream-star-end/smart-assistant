@@ -7,19 +7,26 @@
  * 这里的上限是渲染护栏(防止超大块拖垮页面),不约束模型使用组件的意愿。
  */
 
+import { needsSignedSrc } from "../../lib/chat/media";
+
 export type Cell = string | number | null;
 
-export type TableSpec = {
+/** 标题下的一行说明;所有带标题的组件都可写。 */
+type Sub = { subtitle?: string };
+
+export type TableSpec = Sub & {
   type: "table";
   title?: string;
-  columns: { label: string; unit?: string; align: "left" | "right" }[];
+  columns: { label: string; unit?: string; align: "left" | "right"; bar: boolean }[];
   rows: Cell[][];
+  /** 强调行(0 起,按原始顺序)。 */
+  highlight?: number;
   source?: string;
   note?: string;
 };
 
 export type ChartKind = "bar" | "line" | "area" | "pie";
-export type ChartSpec = {
+export type ChartSpec = Sub & {
   type: "chart";
   kind: ChartKind;
   title?: string;
@@ -34,26 +41,28 @@ export type ChartSpec = {
 };
 
 export type StatTone = "up" | "down" | "neutral";
-export type StatsSpec = {
+export type StatsSpec = Sub & {
   type: "stats";
   title?: string;
-  items: { label: string; value: string | number; unit?: string; delta?: string; tone?: StatTone; basis?: string }[];
+  items: { label: string; value: string | number; unit?: string; delta?: string; tone?: StatTone; basis?: string; trend?: number[] }[];
   source?: string;
 };
 
-export type StepsSpec = {
+export type StepsSpec = Sub & {
   type: "steps";
   title?: string;
   checkable: boolean;
   items: { title: string; detail?: string; done: boolean }[];
 };
 
-export type CompareSpec = {
+export type CompareSpec = Sub & {
   type: "compare";
   title?: string;
   items: {
     name: string;
     tag?: string;
+    price?: string;
+    image?: string;
     summary?: string;
     points: string[];
     pros: string[];
@@ -90,12 +99,18 @@ export type CalcOutput = {
   format: CalcFormat;
   decimals?: number;
   primary: boolean;
+  tone?: "up" | "down";
 };
-export type CalculatorSpec = {
+/** 按某个输入扫描画曲线:x 从 from 到 to(数字或输入 id),每个点重算 series 里的输出。 */
+export type CalcChart = { kind: "area" | "line" | "bar"; x: string; from: number; to: number | string; points: number; series: string[]; xLabel?: string };
+export type CalculatorSpec = Sub & {
   type: "calculator";
   title?: string;
   inputs: CalcInput[];
   outputs: CalcOutput[];
+  /** 占比条:这些输出按数值比例并排。 */
+  breakdown: string[];
+  chart?: CalcChart;
   assumptions: string[];
   note?: string;
 };
@@ -103,15 +118,79 @@ export type CalculatorSpec = {
 export type CalloutTone = "info" | "tip" | "warning" | "danger" | "success";
 export type CalloutSpec = { type: "callout"; tone: CalloutTone; title?: string; body: string };
 
-export type TabsSpec = { type: "tabs"; title?: string; tabs: { label: string; body: string }[] };
+/** 分段里可以放一个完整组件(不能再嵌 tabs)。 */
+export type TabsSpec = Sub & { type: "tabs"; title?: string; tabs: { label: string; body: string; block?: Exclude<IuiSpec, TabsSpec> }[] };
 
-export type TimelineSpec = {
+export type TimelineSpec = Sub & {
   type: "timeline";
   title?: string;
   items: { time: string; title: string; detail?: string }[];
 };
 
 export type SuggestionsSpec = { type: "suggestions"; items: string[] };
+
+export type CardItem = { title: string; subtitle?: string; body?: string; image?: string; icon?: string; tags: string[]; meta?: string; url?: string };
+export type CardsSpec = Sub & { type: "cards"; title?: string; layout: "list" | "grid"; items: CardItem[] };
+
+export type GallerySpec = Sub & { type: "gallery"; title?: string; images: { src: string; caption?: string }[]; caption?: string };
+
+export type SwatchesSpec = Sub & { type: "swatches"; title?: string; colors: { hex: string; name?: string }[] };
+
+export const TILE_TONES = ["green", "amber", "sky", "rose", "violet", "slate"] as const;
+export type TileTone = (typeof TILE_TONES)[number];
+export type TilesSpec = Sub & {
+  type: "tiles";
+  title?: string;
+  columns: number;
+  items: { title: string; subtitle?: string; icon?: string; tone: TileTone; span: number }[];
+  caption?: string;
+};
+
+export type RecipeSpec = Sub & {
+  type: "recipe";
+  title?: string;
+  servings: number;
+  unit: string;
+  ingredients: { name: string; amount?: number; unit?: string; note?: string }[];
+  steps: string[];
+  meta: { label: string; value: string }[];
+};
+
+export type QuizSpec = Sub & {
+  type: "quiz";
+  title?: string;
+  questions: { question: string; options: string[]; answer: number; explain?: string }[];
+};
+
+export type ProgressTone = "default" | "good" | "warn" | "bad";
+export type ProgressSpec = Sub & {
+  type: "progress";
+  title?: string;
+  items: { label: string; value: number; max: number; unit?: string; tone: ProgressTone; note?: string }[];
+  source?: string;
+};
+
+export type KvSpec = Sub & { type: "kv"; title?: string; items: { label: string; value: string }[]; source?: string };
+
+export type FormField = {
+  id: string;
+  label: string;
+  kind: "text" | "number" | "select" | "chips" | "date";
+  options: string[];
+  multi: boolean;
+  placeholder?: string;
+  unit?: string;
+  required: boolean;
+  value?: string;
+};
+export type FormSpec = Sub & { type: "form"; title?: string; fields: FormField[]; submit: string };
+
+export type RouteSpec = Sub & {
+  type: "route";
+  title?: string;
+  stops: { name: string; detail?: string; note?: string; highlight: boolean }[];
+  legs: { distance?: string; duration?: string; mode?: string }[];
+};
 
 export type IuiSpec =
   | TableSpec
@@ -124,7 +203,17 @@ export type IuiSpec =
   | CalloutSpec
   | TabsSpec
   | TimelineSpec
-  | SuggestionsSpec;
+  | SuggestionsSpec
+  | CardsSpec
+  | GallerySpec
+  | SwatchesSpec
+  | TilesSpec
+  | RecipeSpec
+  | QuizSpec
+  | ProgressSpec
+  | KvSpec
+  | FormSpec
+  | RouteSpec;
 
 export type IuiType = IuiSpec["type"];
 
@@ -140,6 +229,16 @@ export const IUI_TYPES: readonly IuiType[] = [
   "tabs",
   "timeline",
   "suggestions",
+  "cards",
+  "gallery",
+  "swatches",
+  "tiles",
+  "recipe",
+  "quiz",
+  "progress",
+  "kv",
+  "form",
+  "route",
 ];
 
 export type ValidateResult =
@@ -162,6 +261,18 @@ export const LIMITS = {
   calcOutputs: 12,
   tabs: 8,
   suggestions: 6,
+  cards: 12,
+  images: 12,
+  swatches: 12,
+  tiles: 16,
+  ingredients: 40,
+  quiz: 10,
+  quizOptions: 6,
+  progress: 12,
+  kv: 30,
+  formFields: 10,
+  stops: 12,
+  trend: 60,
 } as const;
 
 type Ctx = { notes: string[]; partial: boolean };
@@ -213,6 +324,50 @@ function optional<K extends string, V>(key: K, value: V | undefined): { [P in K]
   return (value === undefined ? {} : { [key]: value }) as { [P in K]?: V };
 }
 
+function numList(v: unknown, max: number): number[] | undefined {
+  const out = arr(v)
+    .map((x) => num(x))
+    .filter((x): x is number => x !== undefined)
+    .slice(0, max);
+  return out.length >= 2 ? out : undefined;
+}
+
+/** 图片只认 https 外链与容器内文件路径(走现有签名管线);http / data / 其它一律不加载。 */
+export function imageSrc(v: unknown): string | undefined {
+  const s = str(v, 2000);
+  if (!s) return undefined;
+  if (/^https:\/\/[^\s"'<>]+$/i.test(s)) return s;
+  if (!s.includes("..") && needsSignedSrc(s)) return s;
+  return undefined;
+}
+
+const HEX_RE = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+function calcChart(v: unknown, inputs: CalcInput[], outIds: Set<string>): CalcChart | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  const x = typeof o.x === "string" ? o.x : "";
+  if (!inputs.some((i) => i.id === x)) return undefined;
+  const series = arr(o.series)
+    .filter((id): id is string => typeof id === "string" && outIds.has(id))
+    .slice(0, 4);
+  if (series.length === 0) return undefined;
+  const from = num(o.from) ?? 0;
+  const toRaw = o.to;
+  const to = typeof toRaw === "string" && inputs.some((i) => i.id === toRaw) ? toRaw : num(toRaw);
+  if (to === undefined) return undefined;
+  const points = Math.round(num(o.points) ?? 0);
+  return {
+    kind: pickOne<CalcChart["kind"]>(o.kind, ["area", "line", "bar"], "area"),
+    x,
+    from,
+    to,
+    points: points >= 2 && points <= 120 ? points : 0,
+    series,
+    ...optional("xLabel", str(o.x_label ?? o.xLabel, 40)),
+  };
+}
+
 // ── 各类型 ─────────────────────────────────────────────────────────────
 
 function table(raw: Record<string, unknown>, ctx: Ctx): TableSpec | null {
@@ -220,12 +375,12 @@ function table(raw: Record<string, unknown>, ctx: Ctx): TableSpec | null {
   for (const c of arr(raw.columns)) {
     if (typeof c === "string" || typeof c === "number") {
       const label = str(c);
-      if (label) columns.push({ label, align: "left" });
+      if (label) columns.push({ label, align: "left", bar: false });
     } else if (c && typeof c === "object") {
       const o = c as Record<string, unknown>;
       const label = str(o.label ?? o.name ?? o.title);
       if (!label) continue;
-      columns.push({ label, ...optional("unit", str(o.unit, 24)), align: o.align === "right" ? "right" : "left" });
+      columns.push({ label, ...optional("unit", str(o.unit, 24)), align: o.align === "right" ? "right" : "left", bar: o.bar === true });
     }
   }
   const cols = cap(columns, LIMITS.tableCols, ctx, "列");
@@ -249,7 +404,7 @@ function table(raw: Record<string, unknown>, ctx: Ctx): TableSpec | null {
   // 没给列名但有行:用「列 1、列 2…」补齐。
   if (cols.length === 0 && rows.length > 0) {
     const width = Math.min(Math.max(...rows.map((r) => r.length)), LIMITS.tableCols);
-    for (let i = 0; i < width; i++) cols.push({ label: `列 ${i + 1}`, align: "left" });
+    for (let i = 0; i < width; i++) cols.push({ label: `列 ${i + 1}`, align: "left", bar: false });
   }
   if (cols.length === 0 && !ctx.partial) return null;
   // 全数字列自动右对齐(未显式指定时)。
@@ -258,11 +413,18 @@ function table(raw: Record<string, unknown>, ctx: Ctx): TableSpec | null {
       if (rows.some((r) => typeof r[i] === "number")) c.align = "right";
     }
   });
+  // 数据条只对数字列有意义。
+  cols.forEach((c, i) => {
+    if (c.bar && !rows.some((r) => typeof r[i] === "number")) c.bar = false;
+  });
+  const hl = num(raw.highlight);
+  const capped = cap(rows, LIMITS.tableRows, ctx, "行");
   return {
     type: "table",
     ...optional("title", str(raw.title)),
     columns: cols,
-    rows: cap(rows, LIMITS.tableRows, ctx, "行"),
+    rows: capped,
+    ...optional("highlight", hl !== undefined && Number.isInteger(hl) && hl >= 0 && hl < capped.length ? hl : undefined),
     ...optional("source", str(raw.source, 600)),
     ...optional("note", str(raw.note, 600)),
   };
@@ -336,6 +498,7 @@ function stats(raw: Record<string, unknown>, ctx: Ctx): StatsSpec | null {
       ...optional("delta", str(o.delta ?? o.change, 40)),
       ...optional("tone", typeof o.tone === "string" ? pickOne<StatTone>(o.tone, ["up", "down", "neutral"], "neutral") : undefined),
       ...optional("basis", str(o.basis ?? o.note, 300)),
+      ...optional("trend", numList(o.trend ?? o.sparkline, LIMITS.trend)),
     });
   }
   if (items.length === 0 && !ctx.partial) return null;
@@ -380,6 +543,8 @@ function compare(raw: Record<string, unknown>, ctx: Ctx): CompareSpec | null {
     items.push({
       name,
       ...optional("tag", str(o.tag ?? o.badge, 40)),
+      ...optional("price", str(o.price, 40)),
+      ...optional("image", imageSrc(o.image)),
       ...optional("summary", str(o.summary ?? o.description, 1000)),
       points: strList(o.points ?? o.features, LIMITS.compareList, ctx, "要点"),
       pros: strList(o.pros, LIMITS.compareList, ctx, "优点"),
@@ -474,14 +639,23 @@ function calculator(raw: Record<string, unknown>, ctx: Ctx): CalculatorSpec | nu
       format: pickOne<CalcFormat>(o.format, ["number", "integer", "currency", "percent"], "number"),
       ...optional("decimals", decimals !== undefined ? Math.max(0, Math.min(8, Math.round(decimals))) : undefined),
       primary: o.primary === true,
+      ...optional<"tone", "up" | "down">("tone", o.tone === "up" || o.tone === "down" ? (o.tone as "up" | "down") : undefined),
     });
   }
   if ((inputs.length === 0 || outputs.length === 0) && !ctx.partial) return null;
+  const ins = cap(inputs, LIMITS.calcInputs, ctx, "输入");
+  const outs = cap(outputs, LIMITS.calcOutputs, ctx, "结果");
+  const outIds = new Set(outs.map((o) => o.id));
+  const breakdown = arr(raw.breakdown)
+    .filter((x): x is string => typeof x === "string" && outIds.has(x))
+    .slice(0, 6);
   return {
     type: "calculator",
     ...optional("title", str(raw.title)),
-    inputs: cap(inputs, LIMITS.calcInputs, ctx, "输入"),
-    outputs: cap(outputs, LIMITS.calcOutputs, ctx, "结果"),
+    inputs: ins,
+    outputs: outs,
+    breakdown: breakdown.length >= 2 ? breakdown : [],
+    ...optional("chart", calcChart(raw.chart, ins, outIds)),
     assumptions: strList(raw.assumptions, 12, ctx, "假设", 600),
     ...optional("note", str(raw.note, 600)),
   };
@@ -506,7 +680,19 @@ function tabs(raw: Record<string, unknown>, ctx: Ctx): TabsSpec | null {
     const o = it as Record<string, unknown>;
     const label = str(o.label ?? o.title, 40);
     if (!label) continue;
-    out.push({ label, body: str(o.body ?? o.content, LIMITS.text) ?? "" });
+    let block: TabsSpec["tabs"][number]["block"];
+    const b = o.block ?? o.ui;
+    if (b && typeof b === "object" && !Array.isArray(b)) {
+      const t = resolveType((b as Record<string, unknown>).type);
+      if (t && t !== "tabs") {
+        const sub: Ctx = { notes: ctx.notes, partial: ctx.partial };
+        const spec = VALIDATORS[t](b as Record<string, unknown>, sub);
+        if (spec && spec.type !== "tabs") block = withSubtitle(spec, b as Record<string, unknown>) as typeof block;
+      }
+    }
+    const body = str(o.body ?? o.content, LIMITS.text) ?? "";
+    if (!body && !block && !ctx.partial) continue;
+    out.push({ label, body, ...optional("block", block) });
   }
   if (out.length === 0 && !ctx.partial) return null;
   return { type: "tabs", ...optional("title", str(raw.title)), tabs: cap(out, LIMITS.tabs, ctx, "标签") };
@@ -531,6 +717,276 @@ function suggestions(raw: Record<string, unknown>, ctx: Ctx): SuggestionsSpec | 
   return { type: "suggestions", items };
 }
 
+function cards(raw: Record<string, unknown>, ctx: Ctx): CardsSpec | null {
+  const items: CardItem[] = [];
+  for (const it of arr(raw.items ?? raw.cards)) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const title = str(o.title ?? o.name ?? o.label);
+    if (!title) continue;
+    const url = str(o.url ?? o.link, 2000);
+    items.push({
+      title,
+      ...optional("subtitle", str(o.subtitle, 200)),
+      ...optional("body", str(o.body ?? o.description ?? o.desc, 1000)),
+      ...optional("image", imageSrc(o.image ?? o.img)),
+      ...optional("icon", str(o.icon, 40)),
+      tags: strList(o.tags, 4, ctx, "标签", 24),
+      ...optional("meta", str(o.meta ?? o.price, 60)),
+      ...optional("url", url && /^https?:\/\//i.test(url) ? url : undefined),
+    });
+  }
+  if (items.length === 0 && !ctx.partial) return null;
+  return {
+    type: "cards",
+    ...optional("title", str(raw.title)),
+    layout: raw.layout === "grid" ? "grid" : "list",
+    items: cap(items, LIMITS.cards, ctx, "卡片"),
+  };
+}
+
+function gallery(raw: Record<string, unknown>, ctx: Ctx): GallerySpec | null {
+  const images: GallerySpec["images"] = [];
+  for (const it of arr(raw.images ?? raw.items)) {
+    const o = typeof it === "string" ? { src: it } : it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+    if (!o) continue;
+    const src = imageSrc(o.src ?? o.url ?? o.image);
+    if (src) images.push({ src, ...optional("caption", str(o.caption ?? o.alt, 200)) });
+  }
+  if (images.length === 0 && !ctx.partial) return null;
+  return {
+    type: "gallery",
+    ...optional("title", str(raw.title)),
+    images: cap(images, LIMITS.images, ctx, "图片"),
+    ...optional("caption", str(raw.caption, 600)),
+  };
+}
+
+function swatches(raw: Record<string, unknown>, ctx: Ctx): SwatchesSpec | null {
+  const colors: SwatchesSpec["colors"] = [];
+  for (const it of arr(raw.colors ?? raw.items)) {
+    const o = typeof it === "string" ? { hex: it } : it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+    if (!o) continue;
+    const hex = typeof o.hex === "string" ? o.hex.trim() : typeof o.color === "string" ? o.color.trim() : "";
+    if (!HEX_RE.test(hex)) continue;
+    colors.push({ hex: hex.toLowerCase(), ...optional("name", str(o.name ?? o.label, 40)) });
+  }
+  if (colors.length === 0 && !ctx.partial) return null;
+  return { type: "swatches", ...optional("title", str(raw.title)), colors: cap(colors, LIMITS.swatches, ctx, "颜色") };
+}
+
+function tiles(raw: Record<string, unknown>, ctx: Ctx): TilesSpec | null {
+  const items: TilesSpec["items"] = [];
+  const columns = Math.max(2, Math.min(4, Math.round(num(raw.columns) ?? 2)));
+  for (const it of arr(raw.items ?? raw.tiles)) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const title = str(o.title ?? o.label ?? o.name, 80);
+    if (!title) continue;
+    const span = Math.round(num(o.span) ?? 1);
+    items.push({
+      title,
+      ...optional("subtitle", str(o.subtitle ?? o.detail, 120)),
+      ...optional("icon", str(o.icon, 40)),
+      tone: pickOne<TileTone>(o.tone ?? o.color, TILE_TONES, TILE_TONES[items.length % TILE_TONES.length]!),
+      span: span >= 1 && span <= columns ? span : 1,
+    });
+  }
+  if (items.length === 0 && !ctx.partial) return null;
+  return {
+    type: "tiles",
+    ...optional("title", str(raw.title)),
+    columns,
+    items: cap(items, LIMITS.tiles, ctx, "方块"),
+    ...optional("caption", str(raw.caption ?? raw.note, 300)),
+  };
+}
+
+function recipe(raw: Record<string, unknown>, ctx: Ctx): RecipeSpec | null {
+  const ingredients: RecipeSpec["ingredients"] = [];
+  for (const it of arr(raw.ingredients ?? raw.items)) {
+    if (typeof it === "string") {
+      const name = str(it, 120);
+      if (name) ingredients.push({ name });
+      continue;
+    }
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const name = str(o.name ?? o.label, 120);
+    if (!name) continue;
+    const amount = num(o.amount ?? o.qty);
+    ingredients.push({
+      name,
+      ...optional("amount", amount !== undefined && amount >= 0 ? amount : undefined),
+      ...optional("unit", str(o.unit, 16)),
+      ...optional("note", str(o.note, 120)),
+    });
+  }
+  const servings = num(raw.servings ?? raw.serves);
+  if ((ingredients.length === 0 || servings === undefined) && !ctx.partial) return null;
+  const meta: RecipeSpec["meta"] = [];
+  for (const it of arr(raw.meta)) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const label = str(o.label, 20);
+    const value = str(o.value, 40);
+    if (label && value) meta.push({ label, value });
+  }
+  return {
+    type: "recipe",
+    ...optional("title", str(raw.title)),
+    servings: servings !== undefined && servings > 0 && servings <= 1000 ? servings : 1,
+    unit: str(raw.unit, 8) ?? "人",
+    ingredients: cap(ingredients, LIMITS.ingredients, ctx, "用料"),
+    steps: strList(raw.steps, LIMITS.listItems, ctx, "步骤", 600),
+    meta: meta.slice(0, 4),
+  };
+}
+
+function quiz(raw: Record<string, unknown>, ctx: Ctx): QuizSpec | null {
+  const questions: QuizSpec["questions"] = [];
+  const list = Array.isArray(raw.questions) ? raw.questions : raw.question ? [raw] : [];
+  for (const it of list) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const question = str(o.question ?? o.q, 600);
+    const options = strList(o.options ?? o.choices, LIMITS.quizOptions, ctx, "选项", 200);
+    let answer = num(o.answer);
+    if (answer === undefined && typeof o.answer === "string") answer = options.indexOf(o.answer.trim());
+    if (!question || options.length < 2 || answer === undefined || !Number.isInteger(answer) || answer < 0 || answer >= options.length) continue;
+    questions.push({ question, options, answer, ...optional("explain", str(o.explain ?? o.explanation, 1000)) });
+  }
+  if (questions.length === 0 && !ctx.partial) return null;
+  return { type: "quiz", ...optional("title", str(raw.title)), questions: cap(questions, LIMITS.quiz, ctx, "题目") };
+}
+
+function progress(raw: Record<string, unknown>, ctx: Ctx): ProgressSpec | null {
+  const items: ProgressSpec["items"] = [];
+  for (const it of arr(raw.items ?? raw.bars)) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const label = str(o.label ?? o.name, 80);
+    const value = num(o.value);
+    if (!label || value === undefined) continue;
+    const max = num(o.max ?? o.target ?? o.total);
+    items.push({
+      label,
+      value,
+      max: max !== undefined && max > 0 ? max : 100,
+      ...optional("unit", str(o.unit, 16)),
+      tone: pickOne<ProgressTone>(o.tone, ["default", "good", "warn", "bad"], "default"),
+      ...optional("note", str(o.note ?? o.detail, 200)),
+    });
+  }
+  if (items.length === 0 && !ctx.partial) return null;
+  return {
+    type: "progress",
+    ...optional("title", str(raw.title)),
+    items: cap(items, LIMITS.progress, ctx, "条目"),
+    ...optional("source", str(raw.source, 600)),
+  };
+}
+
+function kv(raw: Record<string, unknown>, ctx: Ctx): KvSpec | null {
+  const items: KvSpec["items"] = [];
+  const src = raw.items ?? raw.pairs;
+  if (Array.isArray(src)) {
+    for (const it of src) {
+      if (!it || typeof it !== "object") continue;
+      const o = it as Record<string, unknown>;
+      const label = str(o.label ?? o.key ?? o.name, 80);
+      const value = str(o.value, 600);
+      if (label && value) items.push({ label, value });
+    }
+  } else if (src && typeof src === "object") {
+    for (const [k, v] of Object.entries(src as Record<string, unknown>)) {
+      const label = str(k, 80);
+      const value = str(v, 600);
+      if (label && value) items.push({ label, value });
+    }
+  }
+  if (items.length === 0 && !ctx.partial) return null;
+  return {
+    type: "kv",
+    ...optional("title", str(raw.title)),
+    items: cap(items, LIMITS.kv, ctx, "条目"),
+    ...optional("source", str(raw.source, 600)),
+  };
+}
+
+function form(raw: Record<string, unknown>, ctx: Ctx): FormSpec | null {
+  const fields: FormField[] = [];
+  const seen = new Set<string>();
+  for (const it of arr(raw.fields)) {
+    if (!it || typeof it !== "object") continue;
+    const o = it as Record<string, unknown>;
+    const label = str(o.label ?? o.name, 60);
+    if (!label) continue;
+    let id = typeof o.id === "string" && ID_RE.test(o.id.trim()) ? o.id.trim() : `f${fields.length + 1}`;
+    if (seen.has(id)) id = `f${fields.length + 1}`;
+    seen.add(id);
+    const options = strList(o.options, 12, ctx, "选项", 60);
+    let kind = pickOne<FormField["kind"]>(o.kind ?? o.type, ["text", "number", "select", "chips", "date"], options.length ? "chips" : "text");
+    if ((kind === "select" || kind === "chips") && options.length === 0) kind = "text";
+    const value = str(o.value ?? o.default, 200);
+    fields.push({
+      id,
+      label,
+      kind,
+      options,
+      multi: o.multi === true,
+      ...optional("placeholder", str(o.placeholder, 80)),
+      ...optional("unit", str(o.unit, 16)),
+      required: o.required === true,
+      ...optional("value", value),
+    });
+  }
+  if (fields.length === 0 && !ctx.partial) return null;
+  return {
+    type: "form",
+    ...optional("title", str(raw.title)),
+    fields: cap(fields, LIMITS.formFields, ctx, "字段"),
+    submit: str(raw.submit ?? raw.button, 20) ?? "发送",
+  };
+}
+
+function route(raw: Record<string, unknown>, ctx: Ctx): RouteSpec | null {
+  const stops: RouteSpec["stops"] = [];
+  for (const it of arr(raw.stops ?? raw.items)) {
+    const o = typeof it === "string" ? { name: it } : it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+    if (!o) continue;
+    const name = str(o.name ?? o.title, 80);
+    if (!name) continue;
+    stops.push({
+      name,
+      ...optional("detail", str(o.detail ?? o.description, 600)),
+      ...optional("note", str(o.note, 60)),
+      highlight: o.highlight === true,
+    });
+  }
+  const capped = cap(stops, LIMITS.stops, ctx, "站点");
+  const legs: RouteSpec["legs"] = [];
+  for (const it of arr(raw.legs).slice(0, Math.max(0, capped.length - 1))) {
+    const o = it && typeof it === "object" ? (it as Record<string, unknown>) : {};
+    legs.push({
+      ...optional("distance", str(o.distance, 24)),
+      ...optional("duration", str(o.duration ?? o.time, 24)),
+      ...optional("mode", str(o.mode, 16)),
+    });
+  }
+  if (capped.length < (ctx.partial ? 1 : 2)) return null;
+  return { type: "route", ...optional("title", str(raw.title)), stops: capped, legs };
+}
+
+const NO_SUBTITLE = new Set<IuiType>(["callout", "choice", "suggestions"]);
+
+/** 通用的 `subtitle`(标题下一行说明)。cards 的 description 是卡片自己的字段,这里只认 subtitle。 */
+function withSubtitle<S extends IuiSpec>(spec: S, raw: Record<string, unknown>): S {
+  if (NO_SUBTITLE.has(spec.type)) return spec;
+  const sub = str(raw.subtitle, 300);
+  return sub ? { ...spec, subtitle: sub } : spec;
+}
+
 const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => IuiSpec | null> = {
   table,
   chart,
@@ -543,6 +999,16 @@ const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => Iu
   tabs,
   timeline,
   suggestions,
+  cards,
+  gallery,
+  swatches,
+  tiles,
+  recipe,
+  quiz,
+  progress,
+  kv,
+  form,
+  route,
 };
 
 /** 常见别名(模型偶尔写成其它名字)。 */
@@ -553,8 +1019,25 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   cards: "compare",
   comparison: "compare",
   options: "choice",
-  form: "calculator",
   calc: "calculator",
+  menu: "cards",
+  list: "cards",
+  images: "gallery",
+  photos: "gallery",
+  collage: "gallery",
+  palette: "swatches",
+  colors: "swatches",
+  grid: "tiles",
+  ingredients: "recipe",
+  test: "quiz",
+  bars: "progress",
+  meter: "progress",
+  specs: "kv",
+  keyvalue: "kv",
+  facts: "kv",
+  details: "kv",
+  itinerary: "route",
+  trip: "route",
   alert: "callout",
   note: "callout",
   segmented: "tabs",
@@ -574,8 +1057,9 @@ export function validateSpec(raw: Record<string, unknown>, partial: boolean): Va
   if (!type) return { ok: false, reason: typeof raw.type === "string" ? `unknown_type:${raw.type.slice(0, 40)}` : "missing_type" };
   const ctx: Ctx = { notes: [], partial };
   try {
-    const spec = VALIDATORS[type](raw, ctx);
-    if (!spec) return { ok: false, reason: `invalid_${type}` };
+    const validated = VALIDATORS[type](raw, ctx);
+    if (!validated) return { ok: false, reason: `invalid_${type}` };
+    const spec = withSubtitle(validated, raw);
     if (type === "steps" && raw.type === "checklist") (spec as StepsSpec).checkable = raw.checkable !== false;
     return { ok: true, spec, notes: ctx.notes };
   } catch {

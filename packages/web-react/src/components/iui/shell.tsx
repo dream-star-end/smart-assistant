@@ -1,12 +1,127 @@
 /**
- * Intelligent UI(OCV5-361)—— 组件公共外壳:行内文字、正文 Markdown、外框、页脚(来源 / 说明 /
- * 复制)与骨架。外观克制:1px 边框、圆角、正文字号,只用主题 token(明暗自动)。
+ * Intelligent UI(OCV5-361)—— 组件公共外壳:行内文字、正文 Markdown、外框(类型徽章 + 标题 + 副标题 +
+ * 操作 + 页脚)、图片、图标、数字过渡、分段控件与骨架。
+ *
+ * 第二轮视觉:无灰框的浮起卡片(极淡描边 + 柔和阴影 + 圆角 16),标题区带类型徽章,关键数字大号并有过渡,
+ * 分段控件是带滑块的轨道。所有颜色走主题 token(明暗自动),动效在「减弱动效」下关闭。
  */
-import { Check, Copy } from "lucide-react";
-import { Fragment, type ReactNode, useState } from "react";
+import {
+  Apple,
+  Baby,
+  Bath,
+  Bed,
+  Beef,
+  Bike,
+  BookOpen,
+  Brain,
+  Briefcase,
+  Building2,
+  CakeSlice,
+  Calculator,
+  Calendar,
+  CalendarClock,
+  Camera,
+  Car,
+  Carrot,
+  Cat,
+  ChartBarBig,
+  ChartColumn,
+  Check,
+  ChefHat,
+  ClipboardList,
+  Clock,
+  Cloud,
+  Coffee,
+  Columns3,
+  Copy,
+  Dog,
+  Droplet,
+  Dumbbell,
+  Fish,
+  Flame,
+  Flower2,
+  Footprints,
+  Gamepad2,
+  Gauge,
+  Gem,
+  Gift,
+  Globe,
+  GraduationCap,
+  Hammer,
+  Heart,
+  Hotel,
+  House,
+  ImageOff,
+  Images,
+  Landmark,
+  Laptop,
+  LayoutGrid,
+  LayoutList,
+  Leaf,
+  Lightbulb,
+  ListChecks,
+  ListTree,
+  type LucideIcon,
+  MapPin,
+  Mountain,
+  Moon,
+  Music,
+  Package,
+  Paintbrush,
+  Palette,
+  PanelsTopLeft,
+  PiggyBank,
+  Pill,
+  Pizza,
+  Plane,
+  Rocket,
+  Route,
+  Salad,
+  Scissors,
+  Shield,
+  Shirt,
+  Ship,
+  ShoppingBag,
+  Smartphone,
+  Snowflake,
+  Sofa,
+  Soup,
+  Sparkles,
+  Sprout,
+  Star,
+  Stethoscope,
+  Store,
+  Sun,
+  Table2,
+  Target,
+  Tent,
+  TrainFront,
+  TreePine,
+  Trophy,
+  Truck,
+  User,
+  Users,
+  Utensils,
+  Wallet,
+  Wind,
+  Wine,
+  Wrench,
+  Zap,
+} from "lucide-react";
+import {
+  Fragment,
+  type KeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "../../lib/utils";
+import { useSignedSrc } from "../chat/media";
 
 const INLINE_RE = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/g;
 
@@ -42,7 +157,7 @@ const BODY_COMPONENTS = {
     ) : (
       <span>{children}</span>
     ),
-  // 正文里不加载图片:组件内容来自模型,远程图片可能是追踪像素。
+  // 正文 Markdown 里不加载图片;要放图用 cards / gallery(只认 https 与容器文件,且不带来源页信息)。
   img: ({ alt }: { alt?: string }) => <span className="text-faint">[{alt || "图片"}]</span>,
 };
 
@@ -56,6 +171,192 @@ export function BodyMarkdown({ text }: { text: string }) {
     </div>
   );
 }
+
+// ── 图标 ──────────────────────────────────────────────────────────────
+
+/** 模型可用的图标名(写进提示词)。未知名字返回 null,调用方用首字代替。 */
+const ICONS: Record<string, LucideIcon> = {
+  leaf: Leaf,
+  sprout: Sprout,
+  flower: Flower2,
+  tree: TreePine,
+  carrot: Carrot,
+  apple: Apple,
+  salad: Salad,
+  soup: Soup,
+  beef: Beef,
+  fish: Fish,
+  pizza: Pizza,
+  cake: CakeSlice,
+  coffee: Coffee,
+  wine: Wine,
+  utensils: Utensils,
+  chef: ChefHat,
+  home: House,
+  bed: Bed,
+  sofa: Sofa,
+  bath: Bath,
+  building: Building2,
+  store: Store,
+  hotel: Hotel,
+  landmark: Landmark,
+  plane: Plane,
+  car: Car,
+  train: TrainFront,
+  bike: Bike,
+  ship: Ship,
+  pin: MapPin,
+  mountain: Mountain,
+  tent: Tent,
+  walk: Footprints,
+  globe: Globe,
+  sun: Sun,
+  moon: Moon,
+  cloud: Cloud,
+  snow: Snowflake,
+  water: Droplet,
+  fire: Flame,
+  energy: Zap,
+  wind: Wind,
+  heart: Heart,
+  star: Star,
+  gift: Gift,
+  book: BookOpen,
+  study: GraduationCap,
+  brain: Brain,
+  work: Briefcase,
+  fitness: Dumbbell,
+  health: Stethoscope,
+  pill: Pill,
+  music: Music,
+  camera: Camera,
+  game: Gamepad2,
+  shirt: Shirt,
+  gem: Gem,
+  paint: Paintbrush,
+  scissors: Scissors,
+  tool: Wrench,
+  hammer: Hammer,
+  money: Wallet,
+  savings: PiggyBank,
+  shopping: ShoppingBag,
+  package: Package,
+  truck: Truck,
+  calendar: Calendar,
+  clock: Clock,
+  shield: Shield,
+  idea: Lightbulb,
+  target: Target,
+  trophy: Trophy,
+  rocket: Rocket,
+  sparkles: Sparkles,
+  user: User,
+  people: Users,
+  baby: Baby,
+  dog: Dog,
+  cat: Cat,
+  phone: Smartphone,
+  laptop: Laptop,
+};
+
+export const ICON_NAMES = Object.keys(ICONS);
+
+export function iconFor(name: string | undefined): LucideIcon | null {
+  if (!name) return null;
+  return ICONS[name.trim().toLowerCase().replace(/[\s_]+/g, "-")] ?? ICONS[name.trim().toLowerCase().split(/[-\s_]/)[0]!] ?? null;
+}
+
+/** 图标或首字(模型写了未知图标名 / 没写图标时)。 */
+export function Glyph({ icon, fallback, size = 18 }: { icon?: string; fallback: string; size?: number }) {
+  const Icon = iconFor(icon);
+  if (Icon) return <Icon size={size} strokeWidth={1.75} aria-hidden />;
+  const ch = Array.from(fallback.trim())[0] ?? "·";
+  return (
+    <span className="oc-iui-glyph-char" aria-hidden>
+      {ch}
+    </span>
+  );
+}
+
+const KIND_ICON: Record<string, LucideIcon> = {
+  table: Table2,
+  chart: ChartColumn,
+  stats: Gauge,
+  steps: ListChecks,
+  compare: Columns3,
+  calculator: Calculator,
+  tabs: PanelsTopLeft,
+  timeline: CalendarClock,
+  cards: LayoutList,
+  gallery: Images,
+  swatches: Palette,
+  tiles: LayoutGrid,
+  recipe: ChefHat,
+  quiz: GraduationCap,
+  progress: ChartBarBig,
+  kv: ListTree,
+  form: ClipboardList,
+  route: Route,
+};
+
+// ── 图片 ──────────────────────────────────────────────────────────────
+
+/**
+ * 组件里的图片:https 外链或容器文件(走与正文图片相同的签名管线)。外链不带来源页信息、懒加载;
+ * 签不到 / 加载失败显示带图标的色块,不留破图。
+ */
+export function Media({
+  src,
+  alt,
+  className,
+  icon,
+  fallbackText,
+}: {
+  src?: string;
+  alt: string;
+  className?: string;
+  icon?: string;
+  fallbackText?: string;
+}) {
+  const { url, onError } = useSignedSrc(src ?? null);
+  const [failed, setFailed] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const errorsRef = useRef(0);
+  useEffect(() => {
+    setFailed(false);
+    setLoaded(false);
+    errorsRef.current = 0;
+  }, [src]);
+  if (!src || failed) {
+    return (
+      <span className={cn("oc-iui-media oc-iui-media-fallback", className)} role={src ? "img" : undefined} aria-label={src ? `${alt}(图片无法加载)` : undefined}>
+        {src && !icon ? <ImageOff size={18} aria-hidden /> : <Glyph icon={icon} fallback={fallbackText ?? alt} size={22} />}
+      </span>
+    );
+  }
+  return (
+    <span className={cn("oc-iui-media", !loaded && "is-loading", className)}>
+      {url && (
+        <img
+          src={url}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          referrerPolicy="no-referrer"
+          onLoad={() => setLoaded(true)}
+          onError={() => {
+            // 容器文件的签名过期:先重签一次;再失败(或外链失败)就换成色块。
+            errorsRef.current += 1;
+            if (src.startsWith("/") && errorsRef.current === 1) onError();
+            else setFailed(true);
+          }}
+        />
+      )}
+    </span>
+  );
+}
+
+// ── 复制 ──────────────────────────────────────────────────────────────
 
 export function CopyButton({ getText, label = "复制" }: { getText: () => string; label?: string }) {
   const [done, setDone] = useState(false);
@@ -80,9 +381,12 @@ export function CopyButton({ getText, label = "复制" }: { getText: () => strin
   );
 }
 
+// ── 外框 ──────────────────────────────────────────────────────────────
+
 export type FrameProps = {
   kind: string;
   title?: string;
+  subtitle?: string;
   /** 标题行右侧的额外控件(如图表的「数据」切换)。 */
   actions?: ReactNode;
   source?: string;
@@ -92,15 +396,18 @@ export type FrameProps = {
   streaming?: boolean;
   className?: string;
   children: ReactNode;
-  /** 无边框外观(提示框、建议按钮自带外观)。 */
+  /** 无卡片外观(提示框、建议按钮、对比卡自带外观)。 */
   bare?: boolean;
+  /** 嵌在分段标签里:不再画外层卡片和类型徽章。 */
+  nested?: boolean;
 };
 
-/** 组件外框:可选标题行 + 内容 + 页脚(来源/说明/省略提示 + 复制)。 */
-export function Frame({ kind, title, actions, source, note, notes, copyText, streaming, className, children, bare }: FrameProps) {
+/** 组件外框:可选标题区(类型徽章 + 标题 + 副标题 + 操作)+ 内容 + 页脚(来源/说明/省略提示 + 复制)。 */
+export function Frame({ kind, title, subtitle, actions, source, note, notes, copyText, streaming, className, children, bare, nested }: FrameProps) {
   const footText = source || note || (notes && notes.length > 0);
   // 有来源/说明时复制放在页脚;否则放到标题行,不为一个图标单独占一条空页脚。
-  const copy = copyText && !streaming ? <CopyButton getText={copyText} /> : null;
+  // 没有标题也没有页脚时不单独放复制按钮(不为一个图标占一行;整条消息的复制仍会带上它的 Markdown)。
+  const copy = copyText && !streaming && !nested && (title || footText) ? <CopyButton getText={copyText} /> : null;
   const copyInHead = !footText && !!copy;
   const headActions = copyInHead ? (
     <>
@@ -110,19 +417,37 @@ export function Frame({ kind, title, actions, source, note, notes, copyText, str
   ) : (
     actions
   );
+  const KindIcon = KIND_ICON[kind];
+  const showHead = !!(title || subtitle || headActions);
   return (
     <figure
-      className={cn("oc-iui", bare ? "oc-iui-bare" : "oc-iui-card", className)}
+      className={cn("oc-iui", nested ? "oc-iui-nested" : bare ? "oc-iui-bare" : "oc-iui-card", className)}
       data-iui={kind}
       data-streaming={streaming ? "true" : undefined}
       aria-busy={streaming || undefined}
     >
-      {(title || headActions) && (
-        <div className="oc-iui-head">
-          {title ? (
-            <figcaption className="oc-iui-title">
-              <Inline text={title} />
-            </figcaption>
+      {showHead && (
+        <div className={cn("oc-iui-head", !title && !subtitle && "is-actions-only")}>
+          {title || subtitle ? (
+            <div className="oc-iui-head-main">
+              {KindIcon && title && !bare && !nested && (
+                <span className="oc-iui-kind" aria-hidden>
+                  <KindIcon size={14} strokeWidth={2} />
+                </span>
+              )}
+              <div className="min-w-0">
+                {title && (
+                  <figcaption className="oc-iui-title">
+                    <Inline text={title} />
+                  </figcaption>
+                )}
+                {subtitle && (
+                  <p className="oc-iui-subtitle">
+                    <Inline text={subtitle} />
+                  </p>
+                )}
+              </div>
+            </div>
           ) : (
             <span />
           )}
@@ -152,27 +477,169 @@ export function Frame({ kind, title, actions, source, note, notes, copyText, str
   );
 }
 
+// ── 数字过渡 ──────────────────────────────────────────────────────────
+
+function reducedMotion(): boolean {
+  try {
+    return globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/** 数值变化时 240ms 缓动到新值(减弱动效 / 非数字时直接跳)。首帧就是目标值,不从 0 滚上来。 */
+export function useTweenedNumber(target: number | null): number | null {
+  const [shown, setShown] = useState(target);
+  const fromRef = useRef(target);
+  useEffect(() => {
+    const from = fromRef.current;
+    if (target === null || from === null || from === target || reducedMotion() || typeof requestAnimationFrame === "undefined") {
+      fromRef.current = target;
+      setShown(target);
+      return;
+    }
+    // 起点取第一帧的时间戳(rAF 时间戳与 performance.now 不保证同一时钟),进度夹在 0–1。
+    let t0: number | null = null;
+    let raf = 0;
+    const tick = (now: number) => {
+      if (t0 === null) t0 = now;
+      const k = Math.max(0, Math.min(1, (now - t0) / 240));
+      const e = 1 - (1 - k) ** 3;
+      const v = from + (target - from) * e;
+      fromRef.current = v;
+      setShown(k >= 1 ? target : v);
+      if (k < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target]);
+  return shown;
+}
+
+// ── 分段控件(滑块轨道) ──────────────────────────────────────────────
+
+/**
+ * 灰色轨道 + 滑动白色滑块。`role` 为 tablist 时按 WAI-ARIA tabs 键盘约定;radiogroup 时按单选组。
+ * 滑块位置由按钮实测宽度决定,字长不同也对得齐。
+ */
+export function Segmented({
+  items,
+  value,
+  onChange,
+  label,
+  role = "tablist",
+  idBase,
+  panelId,
+  className,
+}: {
+  items: string[];
+  value: number;
+  onChange: (i: number) => void;
+  label: string;
+  role?: "tablist" | "radiogroup";
+  idBase?: string;
+  panelId?: string;
+  className?: string;
+}) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  const trackRef = useRef<HTMLDivElement>(null);
+  const [thumb, setThumb] = useState<{ x: number; w: number } | null>(null);
+  const fallbackId = useId();
+  const base = idBase ?? fallbackId;
+  const n = items.length;
+
+  useLayoutEffect(() => {
+    const measure = () => {
+      const el = refs.current[value];
+      if (!el) return;
+      setThumb({ x: el.offsetLeft, w: el.offsetWidth });
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined" || !trackRef.current) return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(trackRef.current);
+    return () => ro.disconnect();
+  }, [value, items]);
+
+  useEffect(() => {
+    // 选中项滚到可见(窄屏横向滚动时)。
+    refs.current[value]?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, [value]);
+
+  const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    let next: number | null = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (value + 1) % n;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (value - 1 + n) % n;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = n - 1;
+    if (next === null) return;
+    e.preventDefault();
+    onChange(next);
+    refs.current[next]?.focus();
+  };
+
+  const isTabs = role === "tablist";
+  return (
+    <div ref={trackRef} role={role} aria-label={label} className={cn("oc-iui-seg", className)} onKeyDown={onKey}>
+      {thumb && <span className="oc-iui-seg-thumb" style={{ transform: `translateX(${thumb.x}px)`, width: thumb.w }} aria-hidden />}
+      {items.map((t, i) => (
+        <button
+          key={`${i}:${t}`}
+          ref={(el) => {
+            refs.current[i] = el;
+          }}
+          type="button"
+          role={isTabs ? "tab" : "radio"}
+          id={`${base}-t${i}`}
+          aria-selected={isTabs ? i === value : undefined}
+          aria-checked={isTabs ? undefined : i === value}
+          aria-controls={isTabs ? panelId : undefined}
+          tabIndex={i === value ? 0 : -1}
+          className="oc-iui-seg-btn"
+          data-active={i === value || undefined}
+          onClick={() => onChange(i)}
+        >
+          {t}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── 骨架 ──────────────────────────────────────────────────────────────
+
 /** 每种组件骨架的最小高度(与最终外形接近,减少出现时的跳动)。 */
 const SKELETON_HEIGHT: Record<string, number> = {
-  table: 168,
-  chart: 280,
-  stats: 104,
-  steps: 156,
-  compare: 220,
+  table: 180,
+  chart: 300,
+  stats: 120,
+  steps: 170,
+  compare: 240,
   choice: 132,
-  calculator: 280,
-  callout: 72,
-  tabs: 168,
-  timeline: 156,
+  calculator: 320,
+  callout: 76,
+  tabs: 200,
+  timeline: 170,
   suggestions: 44,
+  cards: 220,
+  gallery: 240,
+  swatches: 120,
+  tiles: 220,
+  recipe: 300,
+  quiz: 220,
+  progress: 160,
+  kv: 160,
+  form: 240,
+  route: 240,
 };
 
 export function Skeleton({ kind }: { kind?: string }) {
   const h = (kind && SKELETON_HEIGHT[kind]) || 96;
-  const rows = Math.max(1, Math.round((h - 40) / 28));
+  const rows = Math.max(1, Math.round((h - 56) / 30));
+  const bare = kind === "suggestions";
   return (
     <div
-      className={cn("oc-iui", kind === "suggestions" ? "oc-iui-bare" : "oc-iui-card", "oc-iui-skeleton")}
+      className={cn("oc-iui", bare ? "oc-iui-bare" : "oc-iui-card", "oc-iui-skeleton")}
       style={{ minHeight: h }}
       // biome-ignore lint/a11y/useSemanticElements: 骨架是块级占位,<output> 的行内语义不合适
       role="status"
@@ -180,9 +647,15 @@ export function Skeleton({ kind }: { kind?: string }) {
       aria-label="内容生成中"
       data-iui-skeleton={kind ?? "unknown"}
     >
-      {Array.from({ length: rows }, (_, i) => (
+      {!bare && (
+        <span className="oc-iui-skeleton-head" aria-hidden>
+          <span className="oc-iui-skeleton-dot" />
+          <span className="oc-iui-skeleton-bar" style={{ width: "38%" }} />
+        </span>
+      )}
+      {Array.from({ length: bare ? 3 : rows }, (_, i) => (
         // biome-ignore lint/suspicious/noArrayIndexKey: 静态占位条
-        <span key={i} className="oc-iui-skeleton-bar" style={{ width: `${88 - ((i * 17) % 40)}%` }} />
+        <span key={i} className="oc-iui-skeleton-bar" style={{ width: bare ? undefined : `${92 - ((i * 17) % 40)}%` }} />
       ))}
     </div>
   );

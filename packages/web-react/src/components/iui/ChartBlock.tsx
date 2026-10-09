@@ -3,7 +3,7 @@
  * 宽度随容器测量,文字不随缩放变形;图例行兼作读数行(悬停/触摸/方向键时显示该点各系列数值),
  * 高度固定,不产生跳动。「数据」切换成原始数据表,方便核对与读屏。
  */
-import { type KeyboardEvent, type PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type KeyboardEvent, type PointerEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { cn } from "../../lib/utils";
 import type { ChartSpec } from "./schema";
 import { Frame } from "./shell";
@@ -35,6 +35,57 @@ export function niceTicks(min: number, max: number, count = 5): number[] {
   return out;
 }
 
+/** 单调三次插值(Fritsch–Carlson):曲线平滑且不越过相邻点,不会凭空造出波峰。 */
+export function smoothPath(pts: readonly (readonly [number, number])[]): string {
+  const n = pts.length;
+  if (n === 0) return "";
+  if (n < 3) return pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
+  const dx: number[] = [];
+  const m: number[] = [];
+  for (let i = 0; i < n - 1; i++) {
+    const d = pts[i + 1]![0] - pts[i]![0];
+    dx.push(d);
+    m.push(d === 0 ? 0 : (pts[i + 1]![1] - pts[i]![1]) / d);
+  }
+  const t: number[] = [m[0]!];
+  for (let i = 1; i < n - 1; i++) t.push(m[i - 1]! * m[i]! <= 0 ? 0 : (m[i - 1]! + m[i]!) / 2);
+  t.push(m[n - 2]!);
+  for (let i = 0; i < n - 1; i++) {
+    if (m[i] === 0) {
+      t[i] = 0;
+      t[i + 1] = 0;
+      continue;
+    }
+    const a = t[i]! / m[i]!;
+    const b = t[i + 1]! / m[i]!;
+    const h = a * a + b * b;
+    if (h > 9) {
+      const k = 3 / Math.sqrt(h);
+      t[i] = k * a * m[i]!;
+      t[i + 1] = k * b * m[i]!;
+    }
+  }
+  let d = `M${pts[0]![0].toFixed(1)},${pts[0]![1].toFixed(1)}`;
+  for (let i = 0; i < n - 1; i++) {
+    const [x0, y0] = pts[i]!;
+    const [x1, y1] = pts[i + 1]!;
+    const h = dx[i]! / 3;
+    d += `C${(x0 + h).toFixed(1)},${(y0 + t[i]! * h).toFixed(1)} ${(x1 - h).toFixed(1)},${(y1 - t[i + 1]! * h).toFixed(1)} ${x1.toFixed(1)},${y1.toFixed(1)}`;
+  }
+  return d;
+}
+
+/** 只圆顶部两角的柱子(贴着基线的一端保持直角)。 */
+function barPath(x: number, yTop: number, w: number, h: number, up: boolean): string {
+  const r = Math.max(0, Math.min(5, w / 2, h));
+  if (up) {
+    const y1 = yTop + h;
+    return `M${x},${y1}V${yTop + r}Q${x},${yTop} ${x + r},${yTop}H${x + w - r}Q${x + w},${yTop} ${x + w},${yTop + r}V${y1}Z`;
+  }
+  const y1 = yTop + h;
+  return `M${x},${yTop}V${y1 - r}Q${x},${y1} ${x + r},${y1}H${x + w - r}Q${x + w},${y1} ${x + w},${y1 - r}V${yTop}Z`;
+}
+
 function compact(v: number): string {
   const a = Math.abs(v);
   if (a >= 1e8) return `${formatNumber(v / 1e8, "number", 1)}亿`;
@@ -42,7 +93,7 @@ function compact(v: number): string {
   return formatNumber(v, "number", a < 10 && a % 1 !== 0 ? 2 : 0);
 }
 
-function useWidth(fallback = 560) {
+export function useWidth(fallback = 560) {
   const ref = useRef<HTMLDivElement>(null);
   const [w, setW] = useState(fallback);
   useEffect(() => {
@@ -135,18 +186,21 @@ function Readout({ spec, active }: { spec: ChartSpec; active: number | null }) {
   );
 }
 
-function CartesianChart({
+export function CartesianChart({
   spec,
   width,
   active,
   setActive,
+  height,
 }: {
   spec: ChartSpec;
   width: number;
   active: number | null;
   setActive: (i: number | null) => void;
+  height?: number;
 }) {
-  const H = width < 420 ? 220 : 260;
+  const gid = useId().replace(/:/g, "");
+  const H = height ?? (width < 420 ? 220 : 260);
   const n = spec.labels.length;
   const stacked = spec.stacked && spec.kind !== "line";
   const values = spec.series.flatMap((s) => s.values.filter((v): v is number => v !== null));
@@ -164,17 +218,19 @@ function CartesianChart({
     const vmax = Math.max(...values);
     if (vmin > 0 && vmin > (vmax - vmin) * 2) lo = vmin;
   }
-  const ticks = niceTicks(lo, hi, width < 420 ? 4 : 5);
+  const ticks = niceTicks(lo, hi, H < 200 ? 3 : width < 420 ? 4 : 5);
   const tMin = ticks[0]!;
   const tMax = ticks[ticks.length - 1]!;
   const labelW = Math.max(...ticks.map((t) => compact(t).length)) * 7 + 10;
-  const pad = { l: labelW, r: 8, t: 10, b: 26 };
+  const pad = { l: labelW, r: 10, t: 16, b: 26 };
   const pw = Math.max(40, width - pad.l - pad.r);
   const ph = H - pad.t - pad.b;
   const y = (v: number) => pad.t + ph - ((v - tMin) / (tMax - tMin || 1)) * ph;
   const band = n > 0 ? pw / n : pw;
   const cx = (i: number) => pad.l + band * i + band / 2;
   const every = Math.max(1, Math.ceil((n * 44) / pw));
+  // 类目标签按可用宽度截断(按每字约 9px 保守估计)。
+  const maxChars = Math.max(4, Math.floor((band * every) / 9));
 
   const onPointer = (e: PointerEvent<SVGSVGElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -184,9 +240,12 @@ function CartesianChart({
   };
 
   const bars = () => {
-    const inner = band * 0.72;
+    const inner = band * (spec.series.length > 1 && !stacked ? 0.78 : 0.56);
     const groups = stacked ? 1 : spec.series.length;
-    const bw = Math.max(2, inner / Math.max(1, groups));
+    const bw = Math.max(2, Math.min(56, inner / Math.max(1, groups)));
+    const used = stacked ? bw : bw * groups;
+    // 柱子少时在柱顶标数值(多了会挤,改由悬停读数)。
+    const labelBars = !stacked && n * groups <= 12 && bw >= 18;
     return spec.labels.map((_, i) => {
       let posAcc = 0;
       let negAcc = 0;
@@ -205,18 +264,21 @@ function CartesianChart({
           y0 = y(Math.max(tMin, 0));
           y1 = y(v);
         }
-        const x = pad.l + band * i + (band - inner) / 2 + (stacked ? 0 : si * bw);
+        const x = pad.l + band * i + (band - used) / 2 + (stacked ? 0 : si * bw);
+        const w = Math.max(1, bw - (groups > 1 ? 3 : 0));
+        const top = Math.min(y0, y1);
+        const h = Math.max(0.5, Math.abs(y1 - y0));
+        // 堆叠时只给最外一段圆角。
+        const outer = !stacked || spec.series.slice(si + 1).every((t) => (t.values[i] ?? 0) === 0 || Math.sign(t.values[i] ?? 0) !== Math.sign(v));
         return (
-          <rect
-            key={`${i}-${s.name}`}
-            x={x}
-            y={Math.min(y0, y1)}
-            width={Math.max(1, (stacked ? inner : bw) - (groups > 1 ? 1.5 : 0))}
-            height={Math.max(0.5, Math.abs(y1 - y0))}
-            rx={2}
-            fill={color(si)}
-            opacity={active === null || active === i ? 1 : 0.45}
-          />
+          <g key={`${i}-${s.name}`} opacity={active === null || active === i ? 1 : 0.4} className="oc-iui-bar">
+            {outer ? <path d={barPath(x, top, w, h, v >= 0)} fill={`url(#${gid}-b${si})`} /> : <rect x={x} y={top} width={w} height={h} fill={`url(#${gid}-b${si})`} />}
+            {labelBars && (
+              <text x={x + w / 2} y={v >= 0 ? top - 5 : top + h + 12} textAnchor="middle" className="oc-iui-bar-label">
+                {compact(v)}
+              </text>
+            )}
+          </g>
         );
       });
     });
@@ -236,26 +298,38 @@ function CartesianChart({
         }
       }
       if (cur.length) segs.push(cur);
-      const path = (seg: (readonly [number, number])[]) => seg.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
       const base = y(tMin > 0 ? tMin : tMax < 0 ? tMax : 0);
+      const lastIdx = pts.reduce((acc, p, i) => (p ? i : acc), -1);
+      const showDots = n <= 12 && spec.kind === "line";
       return (
         <g key={s.name}>
           {spec.kind === "area" &&
             segs.map((seg) => (
               <path
                 key={`a${seg[0]![0]}`}
-                d={`${path(seg)}L${seg[seg.length - 1]![0].toFixed(1)},${base.toFixed(1)}L${seg[0]![0].toFixed(1)},${base.toFixed(1)}Z`}
-                fill={color(si)}
-                opacity={0.14}
+                d={`${smoothPath(seg)}L${seg[seg.length - 1]![0].toFixed(1)},${base.toFixed(1)}L${seg[0]![0].toFixed(1)},${base.toFixed(1)}Z`}
+                fill={`url(#${gid}-a${si})`}
               />
             ))}
           {segs.map((seg) => (
-            <path key={`l${seg[0]![0]}`} d={path(seg)} fill="none" stroke={color(si)} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+            <path
+              key={`l${seg[0]![0]}`}
+              d={smoothPath(seg)}
+              fill="none"
+              stroke={color(si)}
+              strokeWidth={2.25}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              strokeDasharray={si > 0 && spec.kind === "area" ? "5 4" : undefined}
+            />
           ))}
           {pts.map((p, i) =>
-            p && (n <= 24 || active === i) ? (
+            p && (showDots || active === i || i === lastIdx) ? (
               // biome-ignore lint/suspicious/noArrayIndexKey: 点位与类目一一对应
-              <circle key={i} cx={p[0]} cy={p[1]} r={active === i ? 4 : 2.5} fill={color(si)} stroke="var(--surface)" strokeWidth={1.5} />
+              <g key={i}>
+                {(i === lastIdx || active === i) && <circle cx={p[0]} cy={p[1]} r={7} fill={color(si)} opacity={0.18} />}
+                <circle cx={p[0]} cy={p[1]} r={active === i || i === lastIdx ? 3.75 : 2.75} fill={color(si)} stroke="var(--surface)" strokeWidth={1.75} />
+              </g>
             ) : null,
           )}
         </g>
@@ -274,6 +348,20 @@ function CartesianChart({
       onPointerLeave={() => setActive(null)}
       aria-hidden
     >
+      <defs>
+        {spec.series.map((s, si) => (
+          <linearGradient key={`a${s.name}`} id={`${gid}-a${si}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color(si)} stopOpacity={si === 0 ? 0.32 : 0.16} />
+            <stop offset="100%" stopColor={color(si)} stopOpacity={0} />
+          </linearGradient>
+        ))}
+        {spec.series.map((s, si) => (
+          <linearGradient key={`b${s.name}`} id={`${gid}-b${si}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color(si)} stopOpacity={1} />
+            <stop offset="100%" stopColor={color(si)} stopOpacity={0.78} />
+          </linearGradient>
+        ))}
+      </defs>
       {ticks.map((t) => (
         <g key={t}>
           <line x1={pad.l} x2={width - pad.r} y1={y(t)} y2={y(t)} className={t === 0 ? "oc-iui-axis" : "oc-iui-grid"} />
@@ -282,12 +370,17 @@ function CartesianChart({
           </text>
         </g>
       ))}
-      {active !== null && <rect x={pad.l + band * active} y={pad.t} width={band} height={ph} className="oc-iui-hover-band" />}
+      {active !== null &&
+        (spec.kind === "bar" ? (
+          <rect x={pad.l + band * active} y={pad.t} width={band} height={ph} rx={6} className="oc-iui-hover-band" />
+        ) : (
+          <line x1={cx(active)} x2={cx(active)} y1={pad.t} y2={pad.t + ph} className="oc-iui-hover-line" />
+        ))}
       {spec.kind === "bar" ? bars() : lines()}
       {spec.labels.map((l, i) =>
         i % every === 0 ? (
           <text key={`${i}:${l}`} x={cx(i)} y={H - 8} textAnchor="middle" className="oc-iui-tick">
-            {l.length > 8 ? `${l.slice(0, 7)}…` : l}
+            {l.length > maxChars ? `${l.slice(0, maxChars - 1)}…` : l}
           </text>
         ) : null,
       )}
@@ -321,6 +414,9 @@ function PieChart({ spec, active, setActive }: { spec: ChartSpec; active: number
         d={d}
         fill={color(i)}
         fillRule="evenodd"
+        stroke="var(--iui-surface)"
+        strokeWidth={2}
+        strokeLinejoin="round"
         opacity={active === null || active === i ? 1 : 0.4}
         onPointerEnter={() => setActive(i)}
         onPointerDown={() => setActive(i)}
@@ -356,7 +452,7 @@ function PieChart({ spec, active, setActive }: { spec: ChartSpec; active: number
   );
 }
 
-export function ChartBlock({ spec, notes, streaming }: { spec: ChartSpec; notes: string[]; streaming: boolean }) {
+export function ChartBlock({ spec, notes, streaming, nested }: { spec: ChartSpec; notes: string[]; streaming: boolean; nested?: boolean }) {
   const [ref, width] = useWidth();
   const [showData, setShowData] = useState(false);
   const [active, setActive] = useState<number | null>(null);
@@ -375,7 +471,9 @@ export function ChartBlock({ spec, notes, streaming }: { spec: ChartSpec; notes:
   return (
     <Frame
       kind="chart"
+      nested={nested}
       title={spec.title}
+      subtitle={spec.subtitle}
       source={spec.source}
       note={spec.note}
       notes={notes}

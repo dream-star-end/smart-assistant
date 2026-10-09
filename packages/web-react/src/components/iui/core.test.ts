@@ -81,7 +81,7 @@ describe("validateSpec", () => {
       ["A", 1.2],
       ["B", 1.4],
     ]);
-    expect(v.spec.columns[1]).toEqual({ label: "重量", unit: "kg", align: "right" });
+    expect(v.spec.columns[1]).toEqual({ label: "重量", unit: "kg", align: "right", bar: false });
   });
 
   it("caps oversized content and records a note instead of failing", () => {

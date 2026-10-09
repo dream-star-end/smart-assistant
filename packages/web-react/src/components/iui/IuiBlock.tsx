@@ -9,6 +9,9 @@
 import { Component, type ReactNode, useMemo } from "react";
 import { CalculatorBlock } from "./CalculatorBlock";
 import { ChartBlock } from "./ChartBlock";
+import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
+import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
+import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
 import { TableBlock } from "./TableBlock";
 import {
   CalloutBlock,
@@ -26,7 +29,7 @@ import { BodyMarkdown, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
-const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout"]);
+const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe"]);
 
 export class BlockBoundary extends Component<{ fallback: ReactNode; children: ReactNode; resetKey: string }, { failed: boolean; key: string }> {
   state = { failed: false, key: this.props.resetKey };
@@ -51,30 +54,52 @@ function RawFallback({ code, message }: { code: string; message: string }) {
   );
 }
 
-function render(spec: IuiSpec, notes: string[], streaming: boolean, readOnly?: boolean): ReactNode {
+/** spec → 组件。`nested` = 画在分段标签里(不再套卡片外框)。 */
+export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, readOnly?: boolean, nested?: boolean): ReactNode {
+  const p = { notes, streaming, nested };
   switch (spec.type) {
     case "table":
-      return <TableBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <TableBlock spec={spec} {...p} />;
     case "chart":
-      return <ChartBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <ChartBlock spec={spec} {...p} />;
     case "calculator":
-      return <CalculatorBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <CalculatorBlock spec={spec} {...p} />;
     case "stats":
-      return <StatsBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <StatsBlock spec={spec} {...p} />;
     case "steps":
-      return <StepsBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <StepsBlock spec={spec} {...p} />;
     case "compare":
-      return <CompareBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <CompareBlock spec={spec} {...p} />;
     case "callout":
-      return <CalloutBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <CalloutBlock spec={spec} {...p} />;
     case "tabs":
-      return <TabsBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <TabsBlock spec={spec} {...p} renderNested={(b) => renderSpec(b, [], streaming, readOnly, true)} />;
     case "timeline":
-      return <TimelineBlock spec={spec} notes={notes} streaming={streaming} />;
+      return <TimelineBlock spec={spec} {...p} />;
     case "suggestions":
-      return <SuggestionsBlock spec={spec} notes={notes} streaming={streaming} readOnly={readOnly} />;
+      return <SuggestionsBlock spec={spec} {...p} readOnly={readOnly} />;
     case "choice":
-      return <ChoiceBlock spec={spec} notes={notes} streaming={streaming} readOnly={readOnly} />;
+      return <ChoiceBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "cards":
+      return <CardsBlock spec={spec} {...p} />;
+    case "gallery":
+      return <GalleryBlock spec={spec} {...p} />;
+    case "swatches":
+      return <SwatchesBlock spec={spec} {...p} />;
+    case "tiles":
+      return <TilesBlock spec={spec} {...p} />;
+    case "recipe":
+      return <RecipeBlock spec={spec} {...p} />;
+    case "quiz":
+      return <QuizBlock spec={spec} {...p} />;
+    case "progress":
+      return <ProgressBlock spec={spec} {...p} />;
+    case "kv":
+      return <KvBlock spec={spec} {...p} />;
+    case "form":
+      return <FormBlock spec={spec} {...p} readOnly={readOnly} />;
+    case "route":
+      return <RouteBlock spec={spec} {...p} />;
   }
 }
 
@@ -92,7 +117,26 @@ function hasContent(spec: IuiSpec): boolean {
     case "suggestions":
       return spec.items.length > 0;
     case "tabs":
-      return spec.tabs.length > 0;
+      // 分段里嵌了组件:等整块写完再画(嵌套的计算器/表单需要完整数据)。
+      return spec.tabs.length > 0 && !spec.tabs.some((t) => t.block);
+    case "cards":
+    case "progress":
+    case "kv":
+      return spec.items.length > 0;
+    case "gallery":
+      return spec.images.length > 0;
+    case "swatches":
+      return spec.colors.length > 0;
+    case "tiles":
+      return spec.items.length > 0;
+    case "route":
+      return spec.stops.length > 1;
+    case "recipe":
+      return spec.ingredients.length > 0;
+    case "quiz":
+      return spec.questions.length > 0;
+    case "form":
+      return spec.fields.length > 0;
     case "choice":
       return spec.options.length > 0;
     case "calculator":
@@ -140,7 +184,7 @@ export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
     case "ok":
       return (
         <BlockBoundary resetKey={code} fallback={<BodyMarkdown text={safeMarkdown(outcome.spec)} />}>
-          {render(outcome.spec, outcome.notes, outcome.streaming, readOnly)}
+          {renderSpec(outcome.spec, outcome.notes, outcome.streaming, readOnly)}
         </BlockBoundary>
       );
   }

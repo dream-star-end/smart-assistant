@@ -10,7 +10,16 @@ import { BlockBoundary, IuiBlock } from "./IuiBlock";
 
 const j = (v: unknown) => JSON.stringify(v);
 
+// 数字过渡在「减弱动效」下直接跳到结果;断言读数的用例都按减弱动效跑(过渡本身在 round2 里单测)。
+const reduceMotion = () =>
+  Object.defineProperty(window, "matchMedia", {
+    configurable: true,
+    writable: true,
+    value: (q: string) => ({ matches: q.includes("reduce"), media: q, addEventListener() {}, removeEventListener() {} }),
+  });
+
 beforeEach(() => {
+  reduceMotion();
   __resetIntelligentUiForTests();
   try {
     localStorage.clear();
@@ -72,7 +81,7 @@ describe("chart", () => {
     );
     const img = screen.getByRole("img");
     expect(img.getAttribute("aria-label")).toMatch(/季度收入:柱状图,2 个数据点/);
-    expect(img.querySelectorAll("rect[rx]").length).toBe(2);
+    expect(img.querySelectorAll(".oc-iui-bar").length).toBe(2);
     fireEvent.keyDown(img, { key: "ArrowRight" });
     // 读数行显示当前点(与 x 轴刻度的 Q1 区分开)
     expect(document.querySelector(".oc-iui-readout")).toHaveTextContent("Q110万元");
@@ -106,9 +115,9 @@ describe("other components", () => {
   it("checkable steps update progress and remember ticks locally", () => {
     const code = j({ type: "steps", checkable: true, items: ["买菜", { title: "腌肉", detail: "提前一晚" }, "烤"] });
     render(<IuiBlock code={code} />);
-    expect(screen.getByText("已完成 0 / 3")).toBeInTheDocument();
+    expect(screen.getByText("0 / 3")).toHaveTextContent("已完成 0 / 3");
     fireEvent.click(screen.getByRole("checkbox", { name: /腌肉/ }));
-    expect(screen.getByText("已完成 1 / 3")).toBeInTheDocument();
+    expect(screen.getByText("1 / 3")).toHaveTextContent("已完成 1 / 3");
     cleanup();
     render(<IuiBlock code={code} />);
     expect(screen.getByRole("checkbox", { name: /腌肉/ })).toBeChecked();

@@ -1,4 +1,4 @@
-import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Check, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { Cell, TableSpec } from "./schema";
 import { Frame, Inline } from "./shell";
@@ -18,6 +18,28 @@ export function sortKey(c: Cell): { n: number | null; s: string } {
 
 const isEmpty = (c: Cell) => c === null || c === "";
 
+const YES = new Set(["✓", "✔", "✅", "☑"]);
+const NO = new Set(["✗", "✘", "✕", "×", "❌"]);
+
+function CellContent({ c }: { c: Cell }) {
+  if (c === null) return <span className="text-faint">—</span>;
+  if (typeof c === "number") return <>{formatNumber(c)}</>;
+  const t = c.trim();
+  if (YES.has(t))
+    return (
+      <span className="oc-iui-mark is-yes" role="img" aria-label="是">
+        <Check size={13} strokeWidth={2.75} aria-hidden />
+      </span>
+    );
+  if (NO.has(t))
+    return (
+      <span className="oc-iui-mark is-no" role="img" aria-label="否">
+        <X size={13} strokeWidth={2.75} aria-hidden />
+      </span>
+    );
+  return <Inline text={c} />;
+}
+
 export function compareCells(a: Cell, b: Cell): number {
   const ka = sortKey(a);
   const kb = sortKey(b);
@@ -28,23 +50,30 @@ export function compareCells(a: Cell, b: Cell): number {
   return ka.s.localeCompare(kb.s, "zh-CN", { numeric: true });
 }
 
-export function TableBlock({ spec, notes, streaming }: { spec: TableSpec; notes: string[]; streaming: boolean }) {
+export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec; notes: string[]; streaming: boolean; nested?: boolean }) {
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
   const width = spec.columns.length;
   const rows = useMemo(() => {
-    const padded = spec.rows.map((r) => Array.from({ length: width }, (_, i) => r[i] ?? null));
+    const padded = spec.rows.map((r, i) => ({ r: Array.from({ length: width }, (_, j) => r[j] ?? null), i }));
     if (!sort || streaming) return padded;
     return padded
-      .map((r, i) => ({ r, i }))
       .sort((x, y) => {
         // 空值不随升降序翻转,永远排最后。
         const ex = isEmpty(x.r[sort.col]!);
         const ey = isEmpty(y.r[sort.col]!);
         if (ex !== ey) return ex ? 1 : -1;
         return compareCells(x.r[sort.col]!, y.r[sort.col]!) * sort.dir || x.i - y.i;
-      })
-      .map((x) => x.r);
+      });
   }, [spec.rows, width, sort, streaming]);
+
+  // 数据条:按列内最大绝对值归一。
+  const barMax = useMemo(
+    () =>
+      spec.columns.map((c, i) =>
+        c.bar ? Math.max(0, ...spec.rows.map((r) => (typeof r[i] === "number" ? Math.abs(r[i] as number) : 0))) : 0,
+      ),
+    [spec.columns, spec.rows],
+  );
 
   const toggle = (col: number) =>
     setSort((s) => (s?.col !== col ? { col, dir: 1 } : s.dir === 1 ? { col, dir: -1 } : null));
@@ -52,7 +81,9 @@ export function TableBlock({ spec, notes, streaming }: { spec: TableSpec; notes:
   return (
     <Frame
       kind="table"
+      nested={nested}
       title={spec.title}
+      subtitle={spec.subtitle}
       source={spec.source}
       note={spec.note}
       notes={notes}
@@ -97,21 +128,25 @@ export function TableBlock({ spec, notes, streaming }: { spec: TableSpec; notes:
             </tr>
           </thead>
           <tbody>
-            {rows.map((r, ri) => (
-              // biome-ignore lint/suspicious/noArrayIndexKey: 行没有稳定 id;排序后按位置重排即可
-              <tr key={`r${ri}`}>
+            {rows.map(({ r, i: orig }) => (
+              <tr key={`r${orig}`} className={spec.highlight === orig ? "is-highlight" : undefined}>
                 {r.map((c, ci) => {
-                  const right = spec.columns[ci]?.align === "right";
+                  const col = spec.columns[ci];
+                  const right = col?.align === "right";
                   const Tag = ci === 0 ? "th" : "td";
+                  const bar = col?.bar && typeof c === "number" && barMax[ci]! > 0 ? Math.abs(c) / barMax[ci]! : null;
                   return (
                     // biome-ignore lint/suspicious/noArrayIndexKey: 单元格位置即身份
                     <Tag key={ci} scope={ci === 0 ? "row" : undefined} className={right ? "is-num" : undefined}>
-                      {c === null ? (
-                        <span className="text-faint">—</span>
-                      ) : typeof c === "number" ? (
-                        formatNumber(c)
+                      {bar !== null ? (
+                        <span className="oc-iui-cellbar">
+                          <span className="oc-iui-cellbar-track" aria-hidden>
+                            <span style={{ width: `${Math.max(2, bar * 100)}%` }} />
+                          </span>
+                          <span>{formatNumber(c as number)}</span>
+                        </span>
                       ) : (
-                        <Inline text={c} />
+                        <CellContent c={c} />
                       )}
                     </Tag>
                   );

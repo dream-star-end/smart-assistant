@@ -64,8 +64,9 @@ function mdTable(header: string[], rows: string[][], align?: ("left" | "right")[
   return [h, sep, ...body].join("\n");
 }
 
-function heading(title?: string): string[] {
-  return title ? [`**${title}**`, ""] : [];
+function heading(title?: string, subtitle?: string): string[] {
+  if (!title) return subtitle ? [subtitle, ""] : [];
+  return subtitle ? [`**${title}**`, subtitle, ""] : [`**${title}**`, ""];
 }
 
 function sourceLines(source?: string, note?: string): string[] {
@@ -73,6 +74,13 @@ function sourceLines(source?: string, note?: string): string[] {
   if (note) out.push("", `> ${note}`);
   if (source) out.push("", `来源:${source}`);
   return out;
+}
+
+/** 食谱换算后的用量取整到厨房里好量的精度:≥100 取 5 的倍数,≥10 取整,其余一位小数。 */
+export function kitchenRound(v: number): number {
+  if (v >= 100) return Math.round(v / 5) * 5;
+  if (v >= 10) return Math.round(v);
+  return Math.round(v * 10) / 10;
 }
 
 export function calculatorSnapshot(spec: CalculatorSpec, values?: Record<string, number>) {
@@ -87,7 +95,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "table": {
       const header = spec.columns.map((c) => (c.unit ? `${c.label}(${c.unit})` : c.label));
       return [
-        ...heading(spec.title),
+        ...heading(spec.title, spec.subtitle),
         mdTable(header, spec.rows.map((r) => r.map(cellText)), spec.columns.map((c) => c.align)),
         ...sourceLines(spec.source, spec.note),
       ].join("\n");
@@ -104,7 +112,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     }
     case "stats":
       return [
-        ...heading(spec.title),
+        ...heading(spec.title, spec.subtitle),
         ...spec.items.map((it) => {
           const v = withUnit(typeof it.value === "number" ? formatNumber(it.value) : it.value, it.unit);
           const delta = it.delta ? `(${it.delta})` : "";
@@ -115,7 +123,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
       ].join("\n");
     case "steps":
       return [
-        ...heading(spec.title),
+        ...heading(spec.title, spec.subtitle),
         ...spec.items.map((it, i) => {
           const mark = spec.checkable ? `- [${it.done ? "x" : " "}] ` : `${i + 1}. `;
           return `${mark}${it.title}${it.detail ? `\n   ${it.detail.replace(/\n/g, "\n   ")}` : ""}`;
@@ -123,9 +131,10 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
       ].join("\n");
     case "compare":
       return [
-        ...heading(spec.title),
+        ...heading(spec.title, spec.subtitle),
         ...spec.items.flatMap((it) => [
           `### ${it.name}${it.tag ? `(${it.tag})` : ""}${it.recommended ? " · 推荐" : ""}`,
+          ...(it.price ? [`**${it.price}**`] : []),
           ...(it.summary ? [it.summary] : []),
           ...it.points.map((p) => `- ${p}`),
           ...it.pros.map((p) => `- 优点:${p}`),
@@ -160,13 +169,15 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
         const shown = r?.value == null ? `无法计算(${r?.error ?? "未知错误"})` : withUnit(formatNumber(r.value, o.format, o.decimals), o.unit);
         return `- **${o.label}** = \`${o.formula}\` = ${shown}`;
       });
+      const sweep = spec.chart ? calcSweepNote(spec) : [];
       return [
-        ...heading(spec.title),
+        ...heading(spec.title, spec.subtitle),
         "输入:",
         ...inputs,
         "",
         "结果:",
         ...outputs,
+        ...sweep,
         ...(spec.assumptions.length ? ["", "假设:", ...spec.assumptions.map((a) => `- ${a}`)] : []),
         ...(spec.note ? ["", `> ${spec.note}`] : []),
       ].join("\n");
@@ -177,15 +188,119 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
       return [`> ${head}`, ...spec.body.split("\n").map((l) => `> ${l}`)].join("\n");
     }
     case "tabs":
-      return [...heading(spec.title), ...spec.tabs.flatMap((t) => [`### ${t.label}`, t.body, ""])].join("\n").trim();
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.tabs.flatMap((t) => [`### ${t.label}`, ...(t.body ? [t.body] : []), ...(t.block ? ["", specToMarkdown(t.block)] : []), ""]),
+      ]
+        .join("\n")
+        .trim();
     case "timeline":
       return [
-        ...heading(spec.title),
+        ...heading(spec.title, spec.subtitle),
         ...spec.items.map((it) => `- ${it.time ? `**${it.time}** ` : ""}${it.title}${it.detail ? ` —— ${it.detail}` : ""}`),
       ].join("\n");
     case "suggestions":
       return ["你可以接着问:", ...spec.items.map((s) => `- ${s}`)].join("\n");
+    case "cards":
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.items.map((it) => {
+          const name = it.url ? `[${it.title}](${it.url})` : it.title;
+          const extra = [it.subtitle, it.meta, it.tags.length ? it.tags.join(" · ") : undefined].filter(Boolean).join(" · ");
+          return `- **${name}**${extra ? `(${extra})` : ""}${it.body ? `:${it.body}` : ""}`;
+        }),
+      ].join("\n");
+    case "gallery":
+      // 图片不在 Markdown 里内联(与正文规则一致),列出地址和说明。
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.images.map((im, i) => `- 图片 ${i + 1}${im.caption ? `:${im.caption}` : ""}(${im.src})`),
+        ...(spec.caption ? ["", spec.caption] : []),
+      ].join("\n");
+    case "swatches":
+      return [...heading(spec.title, spec.subtitle), ...spec.colors.map((c) => `- ${c.name ? `${c.name} ` : ""}\`${c.hex}\``)].join("\n");
+    case "tiles":
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.items.map((t) => `- **${t.title}**${t.subtitle ? `:${t.subtitle}` : ""}`),
+        ...(spec.caption ? ["", `> ${spec.caption}`] : []),
+      ].join("\n");
+    case "recipe": {
+      const servings = values?.servings ?? spec.servings;
+      const scale = servings / (spec.servings || 1);
+      return [
+        ...heading(spec.title, spec.subtitle),
+        `份量:${formatNumber(servings)} ${spec.unit}`,
+        ...(spec.meta.length ? [spec.meta.map((m) => `${m.label} ${m.value}`).join(" · ")] : []),
+        "",
+        "用料:",
+        ...spec.ingredients.map(
+          (g) =>
+            `- ${g.name}:${g.amount === undefined ? "适量" : `${formatNumber(kitchenRound(g.amount * scale))}${g.unit ? ` ${g.unit}` : ""}`}${g.note ? `(${g.note})` : ""}`,
+        ),
+        ...(spec.steps.length ? ["", "做法:", ...spec.steps.map((st, i) => `${i + 1}. ${st}`)] : []),
+      ].join("\n");
+    }
+    case "quiz":
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.questions.flatMap((q, i) => [
+          `${i + 1}. ${q.question}`,
+          ...q.options.map((o, j) => `   ${String.fromCharCode(65 + j)}. ${o}`),
+          `   答案:${String.fromCharCode(65 + q.answer)}${q.explain ? `。${q.explain}` : ""}`,
+          "",
+        ]),
+      ]
+        .join("\n")
+        .trim();
+    case "progress":
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.items.map((it) => {
+          const pct = it.max > 0 ? ` (${formatNumber((it.value / it.max) * 100, "number", 0)}%)` : "";
+          return `- **${it.label}**:${withUnit(formatNumber(it.value), it.unit)} / ${withUnit(formatNumber(it.max), it.unit)}${pct}${it.note ? ` —— ${it.note}` : ""}`;
+        }),
+        ...sourceLines(spec.source),
+      ].join("\n");
+    case "kv":
+      return [...heading(spec.title, spec.subtitle), mdTable(["项目", "内容"], spec.items.map((it) => [it.label, it.value])), ...sourceLines(spec.source)].join("\n");
+    case "form":
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.fields.map((f) => `- ${f.label}${f.required ? "(必填)" : ""}:${f.options.length ? f.options.join(" / ") : (f.placeholder ?? "____")}`),
+      ].join("\n");
+    case "route":
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.stops.flatMap((st, i) => {
+          const leg = spec.legs[i];
+          const legText = i < spec.stops.length - 1 && leg && (leg.distance || leg.duration) ? [`   ↓ ${[leg.mode, leg.distance, leg.duration].filter(Boolean).join(" · ")}`] : [];
+          return [`${i + 1}. **${st.name}**${st.note ? `(${st.note})` : ""}${st.detail ? ` —— ${st.detail}` : ""}`, ...legText];
+        }),
+      ].join("\n");
   }
+}
+
+/** 计算器曲线在 Markdown 里的样子:首尾两个点的数值(完整曲线只在界面里看)。 */
+function calcSweepNote(spec: CalculatorSpec): string[] {
+  const c = spec.chart!;
+  const env: Record<string, number> = {};
+  for (const i of spec.inputs) env[i.id] = i.value;
+  const to = typeof c.to === "string" ? env[c.to] : c.to;
+  if (to === undefined) return [];
+  const at = (x: number) => computeOutputs({ ...env, [c.x]: x }, spec.outputs);
+  const a = at(c.from);
+  const b = at(to);
+  const label = spec.inputs.find((i) => i.id === c.x)?.label ?? c.x;
+  return [
+    "",
+    `曲线(${label} 从 ${formatNumber(c.from)} 到 ${formatNumber(to)}):`,
+    ...c.series.map((id) => {
+      const o = spec.outputs.find((x) => x.id === id);
+      const f = (v: number | null | undefined) => (v == null ? "—" : withUnit(formatNumber(v, o?.format, o?.decimals), o?.unit));
+      return `- ${o?.label ?? id}:${f(a[id]?.value)} → ${f(b[id]?.value)}`;
+    }),
+  ];
 }
 
 /** 解析不了的块:原样作为 JSON 代码块保留(复制/导出不丢信息)。 */
