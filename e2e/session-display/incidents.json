@@ -6434,6 +6434,63 @@
           "assertion": "uploadFile never retries under another identity after a 503 backoff"
         }
       ]
+    },
+    {
+      "id": "INC-20261009-CC-SWITCH-LIGHT-SLOT-ORDER",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "个人版 OCV5-355 托管真 Chromium 复现（非用户报障）：CC Switch 导入的轻量位 ANTHROPIC_DEFAULT_HAIKU_MODEL 在目录里 sonnet 排在 gemini flash 之前时被填成 sonnet（更贵）。0bf1a90d7 把 haiku/flash/sonnet 三档合成一个正则，按目录顺序取首个命中；改为按档优先级逐档匹配。",
+      "rootFixCommit": "e9f933aa",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/ApiAccessTab.test.tsx",
+          "assertion": "轻量位按档取：sonnet 排在 gemini flash 前也先取 flash"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
+          "assertion": "existing key: real paste exports exact Clarvy ASCII name and intact import contract"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-PREFILL-DRAFT-FLASH",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "个人版 OCV5-355 托管真 Chromium 复现（非用户报障）：同一次点击切会话并预填输入框时，预填在 passive effect 里写入，React 19 下晚于绘制，目标会话的旧草稿先显示一帧；改为 layout effect，首个提交帧即为预填。微任务后读取：修前 3/3 红，修后 10/10 绿。",
+      "rootFixCommit": "53a7141d",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/composer-draft.node-test.mjs",
+          "assertion": "explicit prefill owns target draft, unchanged nonce is not replayed"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-AUTO-RETRY-LINEAGE-RESET",
+      "occurredAt": "2026-10-09",
+      "severity": "P1",
+      "symptom": "个人版 OCV5-355 真 Chromium 复现（非用户报障，托管 double-failure-card 偶发红引出）：服务端回显用户行合并时丢掉客户端自有的自动重试谱系（root/attempt/max），每次 REST 同步后下一次自动重放都从 attempt 2、以上一条重试为 root 重新起算，共享 1..10 上限永不触发；派发前持续失败的轮被无限重发（fixture 10 秒 80 次）。修后 attempt 1..10 后停止，共 11 次发送。",
+      "rootFixCommit": "c8288390",
+      "coverageCommits": [
+        "42e4a01f"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "server echo keeps the automatic retry lineage so the 1..10 cap still holds"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/double-failure-card.node-test.mjs",
+          "assertion": "automatic retry lineage climbs 1..10 and stops"
+        }
+      ]
     }
   ]
 }
