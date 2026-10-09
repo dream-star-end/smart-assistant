@@ -61,7 +61,7 @@ export function useUiPlainText(text: string): string {
         if (alive) setReady((n) => n + 1);
       },
       () => {
-        /* 留在原文;下次渲染会重试 */
+        /* 留在原文;组件重新挂载或导出调用 uiPlainText 时再试(loading 已清空) */
       },
     );
     return () => {
