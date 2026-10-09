@@ -181,7 +181,8 @@ export function AdminShell({ user, onLogout }: { user: User | null; onLogout: ()
 
         <main className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-[1440px] px-4 py-6 md:px-8">
-            <LazyBoundary fallback={<PageSkeleton />}>
+            {/* key=tab 同时给边界：某页渲染崩溃只拦住该页，切到别的 tab 时边界随之重置。 */}
+            <LazyBoundary key={tab} fallback={<PageSkeleton />}>
               {/* key=tab：切页强制重挂载，页面各自的 useAdminPoll/图表得到干净生命周期。 */}
               <PageComponent key={tab} />
             </LazyBoundary>
