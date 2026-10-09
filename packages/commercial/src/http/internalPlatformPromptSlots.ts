@@ -53,6 +53,7 @@ import { getLiteratureSkillConfig } from "../admin/literatureConfig.js";
 import { renderLiteratureSkillContent } from "../literatureSkill.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { CatalogSource } from "./internalModelCatalog.js";
+import { INTELLIGENT_UI_SLOT_NAME, resolveIntelligentUiSlot } from "../intelligentUi/index.js";
 
 /** Container → master GET 这个 path 拿平台级 slot。挂在 plain 18791 self-host
  *  和 mTLS 18443 remote-host 同一个 listener,与 anthropicProxy / serverAuthored /
@@ -65,7 +66,7 @@ const MAX_MODEL_QUERY_BYTES = 128;
 
 /** Slot 名白名单 —— 任何不在表里的 name 不会被 master 返回,容器侧也会按白名单
  *  二次过滤(防止 master 加新 slot 但容器旧镜像不识别时静默接受)。 */
-const ALLOWED_SLOT_NAMES = new Set(["SKILLS_LITERATURE", "MODEL_HINT"]);
+const ALLOWED_SLOT_NAMES = new Set(["SKILLS_LITERATURE", "MODEL_HINT", INTELLIGENT_UI_SLOT_NAME]);
 
 /** 单个 slot 响应 shape。MODEL_HINT 必带 canonicalModelId;其它 slot 不带。 */
 export interface PlatformSlotResponse {
@@ -110,6 +111,11 @@ export interface PlatformPromptSlotsHandlerDeps {
    * {@link getLiteratureSkillConfig}。单测注入 stub 控制 enabled / token_set。
    */
   readLiteratureSkillConfig?: typeof getLiteratureSkillConfig;
+  /**
+   * 测试 hook:Intelligent UI slot(OCV5-361)。默认按总开关 + 该容器所属用户的偏好决定。
+   * uid 只从容器身份推导,绝不从 query 取。
+   */
+  resolveIntelligentUi?: (userId: number) => Promise<{ name: string; content: string } | null>;
 }
 
 /** Listener 路由层透传的容器请求 ctx(host + bound peer ip),与
@@ -153,12 +159,14 @@ export function makePlatformPromptSlotsHandler(
     }
 
     // 1) 容器身份双因子校验(同 anthropicProxy / serverAuthored)
+    let containerUserId: number;
     try {
-      await verifyContainerIdentity(
+      const identity = await verifyContainerIdentity(
         deps.identityRepo,
         ctx,
         req.headers.authorization,
       );
+      containerUserId = identity.userId;
     } catch (err) {
       if (err instanceof ContainerIdentityError) {
         // 不暴露 errcode 详情(同 sendJsonError pattern in serverAuthored)
@@ -250,6 +258,15 @@ export function makePlatformPromptSlotsHandler(
     //
     //    日志只打 name 列表 + 总数 + 总字节,**不打 content**(prompt 文本可能
     //    被 admin 改成含敏感细节,日志后端可能持久化或外发监控)。
+    // Intelligent UI(OCV5-361):总开关开 且 用户没关 → 下发组件协议。放在最后:
+    // 容器侧按自己的 slot 顺序落位,这里的数组顺序不影响最终位置。
+    try {
+      const iui = await (deps.resolveIntelligentUi ?? resolveIntelligentUiSlot)(containerUserId);
+      if (iui && ALLOWED_SLOT_NAMES.has(iui.name)) slots.push(iui);
+    } catch (err) {
+      reqLog.warn("intelligent_ui_slot_failed", { err: errString(err) });
+    }
+
     const totalBytes = slots.reduce(
       (acc, s) => acc + Buffer.byteLength(s.content, "utf-8"),
       0,

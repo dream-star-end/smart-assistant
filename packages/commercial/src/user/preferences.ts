@@ -22,6 +22,7 @@
  *   auto_dream_enabled     : boolean —— Max+ 用户显式开启的 V5 原生后台记忆整理
  *   auto_optimizer_enabled : boolean —— 已接受 V2 全面审计与匿名平台发现上报同意
  *   hotkeys         : Record<string, string>(最多 32 条,key/value <= 64 chars)
+ *   intelligent_ui  : boolean —— 个人版交互式回答(OCV5-361);缺省视为开,false = 关
  *
  * 不做的:
  *   - 不做 etag / If-Match 乐观锁(MVP 只返当前快照,前端"最后写入赢"够用)
@@ -59,6 +60,7 @@ export const PreferencesSchema = z
     auto_dream_enabled: z.boolean().optional(),
     auto_optimizer_enabled: z.boolean().optional(),
     hotkeys: hotkeysSchema.optional(),
+    intelligent_ui: z.boolean().optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -80,6 +82,7 @@ export const PreferencesPatchSchema = z
     auto_dream_enabled: z.boolean().nullable().optional(),
     auto_optimizer_enabled: z.boolean().nullable().optional(),
     hotkeys: hotkeysSchema.nullable().optional(),
+    intelligent_ui: z.boolean().nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;
