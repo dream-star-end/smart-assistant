@@ -2,8 +2,7 @@ name: V5 selfhost web-react
 
 # 个人版(feat/v5-selfhost)此前没有任何托管 CI:v5-ci.yml 只触发 feat/v5-aurora-rewrite,
 # deploy-v5-selfhost.sh 也不跑前端单测,于是过期用例在个人版攒到 18 条(OCV5-343)。
-# 这里跑与商业 required `web-react` job 相同的前端全量单测,让红在 push/PR 时就可见。
-# test:browser 暂不进本 workflow:个人版首次托管跑出 8 例 node-test 红 + run.mjs 顺序依赖级联,见 OCV5-355。
+# 这里跑与商业 `web-react` / `web-react-browser` job 相同的两条前端命令,让红在 push/PR 时就可见。
 # 不进 check:ci-parity(它只核对 v5-ci.yml ≡ check:v5),也不改任何发布脚本的门。
 
 on:
@@ -40,3 +39,37 @@ jobs:
 
       - name: Run web-react unit tests
         run: npm run test:web-react
+
+  web-react-browser:
+    # 与 v5-ci 的 web-react-browser 同一命令与同样的 runner 准备(CJK 字体 + 产物目录)。OCV5-355 清绿后加入:
+    # 首次托管失败里 OCV5-265 正文高度断言就是缺 CJK 字体按回退字形排版造成的。
+    name: selfhost-web-react-browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 界面是中文。托管 runner 没有 CJK 字体时汉字按回退字形排版,行数和高度都和用户看到的不一样。
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+
+      # 浏览器门把截图和预览地址写到 /home/agent/.openclaude/generated;托管 runner 默认无权创建。
+      - name: Prepare browser artifact directory
+        run: sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /home/agent/.openclaude/generated
+
+      - name: Run web-react-browser
+        run: npm run test:browser
