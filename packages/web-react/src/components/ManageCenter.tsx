@@ -307,17 +307,25 @@ export function ManageCenter({
               窄屏只在有控件时出现。 */}
           <div
             className={cn(
-              'oc-manage-toolbar flex shrink-0 items-center gap-2 px-4 py-2 md:h-14 md:justify-end md:gap-1 md:py-0 md:pl-10 md:pr-14',
+              'oc-manage-toolbar flex shrink-0 items-center gap-2 px-4 py-1 md:h-14 md:justify-end md:gap-1 md:py-0 md:pl-10 md:pr-14',
               !scoped && !showHelp && 'max-md:hidden',
             )}
           >
             {scoped && (
-              <div className="oc-manage-scope flex min-w-0 items-center gap-2 md:w-56">
-                <span aria-hidden="true" className="shrink-0 text-meta text-faint">
+              <div className="oc-manage-scope flex min-w-0 items-center gap-1 md:w-56 md:gap-2">
+                {/* 可见标签是真 <label>：窄屏点「作用范围」也能拉起选择器（触控靶 = 标签 + 值）。 */}
+                <label
+                  htmlFor="manage-scope-select"
+                  className="shrink-0 cursor-pointer text-body text-muted md:text-meta md:text-faint"
+                >
                   作用范围
-                </span>
-                {/* 窄屏按内容取宽（不是一条 340px 的大框），桌面填满 224px 的槽位。 */}
-                <ProjectScopeSelect className="w-40 min-w-0 md:w-auto md:flex-1" />
+                </label>
+                {/* 窄屏是行内值「全部项目 ⌄」（无填充框，按内容取宽，44px 触控高），
+                    桌面是 224px 槽位里的安静填充小控件。 */}
+                <ProjectScopeSelect
+                  id="manage-scope-select"
+                  className="w-auto min-w-0 max-w-full md:flex-1"
+                />
               </div>
             )}
             {showHelp && (

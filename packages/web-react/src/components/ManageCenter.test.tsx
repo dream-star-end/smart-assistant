@@ -100,6 +100,13 @@ test('方向键 / Home / End 在分区间移动并切换（roving tabindex）', 
 test('作用范围只在记忆/技能/定时出现，并带可见说明；切到其他分区不显示', () => {
   renderShell({ tab: 'memory' })
   expect(screen.getByText('作用范围')).toBeInTheDocument()
+  // 可见标签就是选择器的 <label>：窄屏点标签也能拉起选择器（行内值没有框，触控靶靠标签 + 值）。
+  const label = screen.getByText('作用范围')
+  expect(label.tagName).toBe('LABEL')
+  const select = screen.getByRole('combobox', { name: '项目范围' })
+  expect(label).toHaveAttribute('for', select.id)
+  // 窄屏按内容取宽，不再给固定宽度的框。
+  expect(select.parentElement).not.toHaveClass('w-40')
   cleanup()
   renderShell({ tab: 'connectors' })
   expect(screen.queryByText('作用范围')).not.toBeInTheDocument()

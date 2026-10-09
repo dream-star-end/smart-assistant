@@ -918,6 +918,26 @@ body {
 }
 .oc-manage-scope select:hover,
 .oc-manage-panel select:not(form select):hover { background-color: var(--active); }
+/* 窄屏作用范围:不是框,是一行「作用范围 全部项目 ⌄」—— 值用正文色 16px/500(<16px 会让
+   iOS 聚焦时整页放大),按内容取宽,透明底,只在按下/悬停给极淡底;高度 44px 保触控靶。 */
+@media (max-width: 767.98px) {
+  .oc-manage-scope select {
+    field-sizing: content;
+    height: 44px;
+    max-width: 100%;
+    border-color: transparent;
+    background-color: transparent;
+    padding-left: 6px;
+    padding-right: 24px;
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--fg);
+    text-overflow: ellipsis;
+  }
+  .oc-manage-scope select:hover { background-color: var(--hover); }
+  .oc-manage-scope select:active { background-color: var(--active); }
+  .oc-manage-scope select + svg { right: 6px; width: 14px; height: 14px; }
+}
 
 /* 分组列表:行间发丝线(行自身无边框,展开内容共享同一条线);行悬停给极淡底。 */
 .oc-list > .oc-list-row + .oc-list-row { border-top: 1px solid var(--color-border); }
