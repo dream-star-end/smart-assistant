@@ -2015,6 +2015,23 @@ function mergeLocalClientFields(
       typeof localMsg._automaticRecovery === "boolean"
         ? { _automaticRecovery: localMsg._automaticRecovery }
         : {}),
+      // Automatic-retry lineage is client-only too. Dropping it on a server echo restarted every
+      // retry at attempt 2 under a new root, so the shared 1..10 cap never fired and a turn that
+      // kept failing before dispatch was resent forever (OCV5-355, double-failure-card probe:
+      // 80 sends in 10s).
+      ...(serverMsg._automaticRecoveryRootClientMessageId === undefined &&
+      typeof localMsg._automaticRecoveryRootClientMessageId === "string" &&
+      localMsg._automaticRecoveryRootClientMessageId.length > 0
+        ? { _automaticRecoveryRootClientMessageId: localMsg._automaticRecoveryRootClientMessageId }
+        : {}),
+      ...(serverMsg._automaticRecoveryAttempt === undefined &&
+      Number.isSafeInteger(localMsg._automaticRecoveryAttempt)
+        ? { _automaticRecoveryAttempt: localMsg._automaticRecoveryAttempt }
+        : {}),
+      ...(serverMsg._automaticRecoveryMax === undefined &&
+      Number.isSafeInteger(localMsg._automaticRecoveryMax)
+        ? { _automaticRecoveryMax: localMsg._automaticRecoveryMax }
+        : {}),
     };
     return Object.keys(localFields).length > 0 ? { ...serverMsg, ...localFields } : serverMsg;
   }
@@ -2396,6 +2413,14 @@ export class SessionStore {
                 _recoveryOfClientMessageId: recovery.sourceClientMessageId,
                 _recoveryMode: recovery.mode,
                 _automaticRecovery: recovery.automatic,
+                // Keep the shared retry lineage across a reload too (OCV5-355).
+                ...("attempt" in recovery
+                  ? {
+                      _automaticRecoveryRootClientMessageId: recovery.rootClientMessageId,
+                      _automaticRecoveryAttempt: recovery.attempt,
+                      _automaticRecoveryMax: recovery.max,
+                    }
+                  : {}),
               }
             : {}),
           _routing: {
