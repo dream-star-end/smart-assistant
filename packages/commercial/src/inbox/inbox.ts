@@ -373,6 +373,19 @@ export interface CronDeliveryInboxInput {
   deliveryKey: string;
 }
 
+/**
+ * 同一 deliveryKey 已落库、但本次内容不同。该 occurrence 已送达过一次,原文保留;
+ * 调用方应按"已送达"收口而不是重试(OCV5-365:容器重建后按新统计重拼当天简报,
+ * 原先这里落 500 → 网关每分钟重试到午夜,每天约 1.4k 条 error 日志)。
+ */
+export class CronDeliveryAlreadyDeliveredError extends Error {
+  readonly code = "DELIVERY_KEY_ALREADY_DELIVERED";
+  constructor() {
+    super("inbox-post: delivery key content collision");
+    this.name = "CronDeliveryAlreadyDeliveredError";
+  }
+}
+
 /** Persist one cron delivery with its stable occurrence key. */
 export async function createCronDeliveryInboxMessage(
   input: CronDeliveryInboxInput,
@@ -385,7 +398,7 @@ export async function createCronDeliveryInboxMessage(
   );
   if (existing.rows[0]) {
     if (existing.rows[0].title !== input.title || existing.rows[0].body_md !== input.bodyMd) {
-      throw new Error("inbox-post: delivery key content collision");
+      throw new CronDeliveryAlreadyDeliveredError();
     }
     return;
   }

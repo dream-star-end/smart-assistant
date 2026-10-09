@@ -273,6 +273,28 @@ describe("inbox-post handler", () => {
     assert.equal(posts.length, 1);
   });
 
+  test("delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)", async () => {
+    const h = makeInboxPostHandler({
+      identityRepo: repoFor(99),
+      postMessage: async () => {
+        throw Object.assign(new Error("inbox-post: delivery key content collision"), {
+          code: "DELIVERY_KEY_ALREADY_DELIVERED",
+        });
+      },
+    });
+    const res = makeRes();
+    await h(
+      makeReq({
+        auth: `Bearer ${TOKEN}`,
+        body: { title: "看板日报", bodyMd: "新统计", deliveryKey: "taskboard-digest:2026-10-09" },
+      }),
+      res,
+      CTX,
+    );
+    assert.equal(res.statusCode, 200);
+    assert.deepEqual(res.body, { ok: false, reason: "duplicate" });
+  });
+
   test("postMessage throws → 500", async () => {
     const h = makeInboxPostHandler({
       identityRepo: repoFor(),

@@ -252,6 +252,12 @@ export function makeInboxPostHandler(deps: InboxPostHandlerDeps): InboxPostHandl
         ...(body.deliveryKey ? { deliveryKey: body.deliveryKey } : {}),
       });
     } catch (err) {
+      // 同 deliveryKey 已送达过(内容不同):幂等收口为 duplicate,网关据此标记已送达、停止重试。
+      if ((err as { code?: unknown } | null)?.code === "DELIVERY_KEY_ALREADY_DELIVERED") {
+        log.warn("delivery_key_already_delivered", { uid, deliveryKey: body.deliveryKey });
+        sendJson(res, 200, { ok: false, reason: "duplicate" }, { [REQUEST_ID_HEADER]: requestId });
+        return;
+      }
       log.error("post_failed", {
         uid,
         err: err instanceof Error ? err.message : String(err),
