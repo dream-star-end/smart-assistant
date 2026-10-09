@@ -37,6 +37,7 @@ export function RecipeBlock({ spec, notes, streaming, nested }: BlockProps<Recip
       copyText={() => specToMarkdown(spec, { servings })}
     >
       <div className="oc-iui-recipe-bar">
+        {/* biome-ignore lint/a11y/useSemanticElements: 胶囊步进器是一行按钮,fieldset 的默认边框和 legend 布局不适用 */}
         <div className="oc-iui-pill-stepper" role="group" aria-labelledby={`${id}-l`}>
           <span id={`${id}-l`} className="oc-iui-pill-stepper-label">
             份量

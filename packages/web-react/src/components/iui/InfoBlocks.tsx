@@ -38,6 +38,7 @@ export function ProgressBlock({ spec, notes, streaming, nested }: BlockProps<Pro
                   {it.max !== 100 || it.unit ? <span className="oc-iui-progress-max"> / {withUnit(formatNumber(it.max), it.unit)}</span> : null}
                 </span>
               </div>
+              {/* biome-ignore lint/a11y/useFocusableInteractive: progressbar 是只读指示,不该进 Tab 序列 */}
               <div
                 className="oc-iui-progress-track"
                 role="progressbar"

@@ -46,7 +46,7 @@ export function Sparkline({ values, tone }: { values: number[]; tone?: "up" | "d
   const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
   const stroke = tone === "down" ? "var(--danger)" : tone === "up" ? "var(--success)" : "var(--iui-c1)";
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="oc-iui-spark" aria-hidden>
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="oc-iui-spark" aria-hidden="true">
       <defs>
         <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={stroke} stopOpacity={0.22} />
@@ -215,7 +215,7 @@ function ProgressRing({ value }: { value: number }) {
   const r = 7;
   const c = 2 * Math.PI * r;
   return (
-    <svg viewBox="0 0 18 18" width={18} height={18} className="oc-iui-ring" aria-hidden>
+    <svg viewBox="0 0 18 18" width={18} height={18} className="oc-iui-ring" aria-hidden="true">
       <circle cx={9} cy={9} r={r} className="oc-iui-ring-track" />
       <circle cx={9} cy={9} r={r} className="oc-iui-ring-fill" strokeDasharray={`${c * value} ${c}`} transform="rotate(-90 9 9)" />
     </svg>

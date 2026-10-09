@@ -322,6 +322,7 @@ export function Media({
   const [failed, setFailed] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const errorsRef = useRef(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: src 变了就重置加载状态,src 只作触发条件
   useEffect(() => {
     setFailed(false);
     setLoaded(false);
@@ -549,6 +550,7 @@ export function Segmented({
   const base = idBase ?? fallbackId;
   const n = items.length;
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: items 变化(标签文字变长)要重新量滑块位置
   useLayoutEffect(() => {
     const measure = () => {
       const el = refs.current[value];
