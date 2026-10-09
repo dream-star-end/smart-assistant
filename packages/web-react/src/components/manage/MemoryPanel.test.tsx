@@ -194,6 +194,9 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     expect(within(report).getByText(/新增 1 条、更新 1 条、清理 1 条/)).toBeInTheDocument();
     expect(within(report).getByText(/已参考 5 个近期会话/)).toBeInTheDocument();
     expect(within(report).getByText(/已积累 2 个新会话/)).toBeInTheDocument();
+    // jsdom 无 matchMedia = 窄屏:变化清单默认收起,摘要句仍在;点开才出清单。
+    expect(within(report).queryByText("当前偏好")).not.toBeInTheDocument();
+    fireEvent.click(within(report).getByRole("button", { name: "查看 3 项变化" }));
     // 变更行按记忆**名称**呈现（存量记忆解析得到 name），不再打印 .md 文件名
     expect(within(report).getByText("当前偏好")).toBeInTheDocument();
     expect(within(report).getByText("deleted")).toBeInTheDocument();
@@ -202,6 +205,73 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     fireEvent.click(within(report).getByRole("button", { name: /当前偏好/ }));
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
     expect(api.getMemoryFile).toHaveBeenCalledWith(auth, "main", "updated.md");
+  });
+
+  test("桌面:变化清单默认展开、没有展开按钮", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(min-width: 768px)",
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }));
+    mockDream({
+      status: "success",
+      pendingSessions: 0,
+      lastReport: {
+        status: "success",
+        finishedAt: new Date().toISOString(),
+        sessionsReviewed: 3,
+        summary: "整理了一条偏好",
+        created: [],
+        updated: [{ file: "updated.md", action: "updated", type: "user" }],
+        deleted: [],
+      },
+    });
+    mockIndex([{ file: "updated.md", name: "当前偏好", type: "user" }]);
+    renderPanel();
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    expect(within(report).getByText("当前偏好")).toBeInTheDocument();
+    expect(within(report).queryByRole("button", { name: /项变化/ })).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  test("窄屏收起后拉宽到桌面:清单恢复展开(桌面没有开关,不能把它藏住)", async () => {
+    let wide = false;
+    const listeners = new Set<() => void>();
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      get matches() {
+        return query === "(min-width: 768px)" ? wide : !wide;
+      },
+      media: query,
+      addEventListener: (_: string, cb: () => void) => listeners.add(cb),
+      removeEventListener: (_: string, cb: () => void) => listeners.delete(cb),
+    }));
+    mockDream({
+      status: "success",
+      pendingSessions: 0,
+      lastReport: {
+        status: "success",
+        finishedAt: new Date().toISOString(),
+        sessionsReviewed: 3,
+        summary: "整理了一条偏好",
+        created: [],
+        updated: [{ file: "updated.md", action: "updated", type: "user" }],
+        deleted: [],
+      },
+    });
+    mockIndex([{ file: "updated.md", name: "当前偏好", type: "user" }]);
+    renderPanel();
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    fireEvent.click(within(report).getByRole("button", { name: "查看 1 项变化" }));
+    fireEvent.click(within(report).getByRole("button", { name: "收起变化" }));
+    expect(within(report).queryByText("当前偏好")).not.toBeInTheDocument();
+    act(() => {
+      wide = true;
+      for (const cb of listeners) cb();
+    });
+    expect(within(report).getByText("当前偏好")).toBeInTheDocument();
+    expect(within(report).queryByRole("button", { name: /项变化|收起变化/ })).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
   });
 
   test("无变化的成功报告也明确说明未扣出一堆不可见结果", async () => {

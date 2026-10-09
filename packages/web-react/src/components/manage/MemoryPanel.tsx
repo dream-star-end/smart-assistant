@@ -1,6 +1,7 @@
 import { BarChart3, Bot, Brain, Check, ChevronRight, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
+import { useMdViewport } from "../../hooks/useMdViewport";
 import { useProjectScope } from "../../hooks/useProjectScope";
 import { isWorkScope } from "../../lib/projectScope";
 import { taskboardApi, type ProjectMemoryItem } from "../../lib/taskboard";
@@ -1125,6 +1126,12 @@ function AutoDreamReportCard({
   const running = value.status === "running";
   const changes = report ? [...report.created, ...report.updated, ...report.deleted] : [];
   const total = changes.length;
+  // 窄屏(OCV5-360):变化清单默认收起 —— 展开时整张回执占掉首屏三分之二,记忆本身被挤到折叠线以下。
+  // 摘要句已经说清「新增/更新/清理各几条」,清单按需展开;桌面默认展开。
+  const md = useMdViewport();
+  const [showChanges, setShowChanges] = useState<boolean | null>(null);
+  // 桌面恒展开(没有开关可点回来):窄屏收起后再拉宽也不能把清单藏住(Codex r3)。
+  const changesOpen = md || (showChanges ?? false);
 
   return (
     // 渐变 hero 样式只保留在「全面优化」Tab —— 这里是整理**回执**,与那张待确认建议卡
@@ -1172,7 +1179,23 @@ function AutoDreamReportCard({
         ) : null}
       </div>
 
-      {!running && changes.length > 0 && (
+      {!running && changes.length > 0 && !md && (
+        <button
+          type="button"
+          aria-expanded={changesOpen}
+          onClick={() => setShowChanges(!changesOpen)}
+          className="flex min-h-11 w-full items-center justify-between gap-3 border-t border-border px-4 py-2.5 text-left text-body text-muted outline-none transition-colors duration-100 hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          <span>{changesOpen ? "收起变化" : `查看 ${total} 项变化`}</span>
+          <ChevronRight
+            size={15}
+            strokeWidth={1.75}
+            aria-hidden="true"
+            className={cn("shrink-0 text-faint transition-transform duration-150", changesOpen && "rotate-90")}
+          />
+        </button>
+      )}
+      {!running && changes.length > 0 && changesOpen && (
         <ul className="oc-list border-t border-border">
           {changes.map((change, index) => {
             const meta =
