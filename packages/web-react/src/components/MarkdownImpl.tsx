@@ -302,6 +302,7 @@ export default function MarkdownImpl({
   caret,
   readOnly,
   blockImages,
+  autoDetectCode = true,
 }: MarkdownProps) {
   // `live` 只被 HtmlPreview 读:走 ref 而不进 useMemo 依赖,否则流式结束(live→false)那一次
   // 重建 components 就把所有富块(OptionsBlock 的点选、HtmlPreview 的 iframe)整个重挂载。
@@ -429,7 +430,8 @@ export default function MarkdownImpl({
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[
-          [rehypeHighlight, { detect: true, ignoreMissing: true }],
+          // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
+          [rehypeHighlight, { detect: autoDetectCode, ignoreMissing: true }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
           [rehypeKatex, { strict: false, throwOnError: false }],
           // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。

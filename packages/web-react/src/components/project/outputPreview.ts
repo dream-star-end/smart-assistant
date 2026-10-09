@@ -15,6 +15,16 @@ export type PreviewKind = "image" | "pdf" | "markdown" | "code" | "text" | "file
 export const TEXT_PREVIEW_MAX_BYTES = 1024 * 1024;
 /** 代码高亮上限：highlight.js 在几百 KB 的单块上会卡住主线程，超过就纯文本显示。 */
 export const CODE_HIGHLIGHT_MAX_CHARS = 200_000;
+/**
+ * Markdown 按富文本渲染的上限。超过就按纯文本显示：解析 + 高亮是同步的，几百 KB 的文档
+ * （尤其是大代码块）会卡死主线程。无语言代码块另外关掉了自动探测（autoDetectCode=false）。
+ */
+export const MARKDOWN_RENDER_MAX_CHARS = 200_000;
+/**
+ * 图片自动加载上限（列表缩略图与查看器）。服务端只给 ≤32 MiB 的原图出缩略档，再大会回落原图、
+ * 整块进内存 —— 所以大小未知或超过它的图片不自动拉：列表只显示类型标记，查看器先问一句。
+ */
+export const IMAGE_AUTOLOAD_MAX_BYTES = 16 * 1024 * 1024;
 /** PDF 预览上限（整块进内存做 object URL）。 */
 export const PDF_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
 /** 卡片首几行：只对已知不大的文本文件取头部，且只读这么多字节。 */
@@ -200,6 +210,11 @@ export async function fetchSignedCapped(
     offset += take;
   }
   return { kind: "ok", bytes: merged, type, truncated: loaded > cap };
+}
+
+/** 图片大小已知且不超过自动加载上限才自动拉（大小未知 = 不自动拉）。 */
+export function imageAutoLoadable(sizeBytes: number | null | undefined): boolean {
+  return typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes >= 0 && sizeBytes <= IMAGE_AUTOLOAD_MAX_BYTES;
 }
 
 /** 文件大小已知且超过上限 → 不必发请求，直接给下载。 */

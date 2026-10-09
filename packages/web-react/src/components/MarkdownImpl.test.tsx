@@ -272,3 +272,30 @@ test('容器 loopback 链接显示预览标识且不交给浏览器新标签页'
   expect(anchor).not.toHaveAttribute('target')
   expect(anchor).toHaveTextContent('容器预览')
 })
+
+describe('MarkdownImpl autoDetectCode', () => {
+  test('autoDetectCode=false：无语言代码块不做语言探测（大围栏不触发同步高亮）', () => {
+    const big = '```\n' + 'a'.repeat(50_000) + '\n```'
+    const started = performance.now()
+    const { container } = render(<MarkdownImpl readOnly autoDetectCode={false}>{big}</MarkdownImpl>)
+    expect(container.querySelector('.hljs')).toBeNull()
+    expect(container.textContent).toContain('a'.repeat(1000))
+    expect(performance.now() - started).toBeLessThan(5000)
+    cleanup()
+    // 缩进代码块同理。
+    const { container: c2 } = render(
+      <MarkdownImpl readOnly autoDetectCode={false}>{'说明\n\n    const x = 1;\n    let y = 2;'}</MarkdownImpl>,
+    )
+    expect(c2.querySelector('.hljs')).toBeNull()
+  })
+
+  test('缺省仍自动探测（聊天正文行为不变）；标了语言的块照常高亮', () => {
+    const { container } = render(<MarkdownImpl>{'```\nconst x = 1;\nlet y = 2;\n```'}</MarkdownImpl>)
+    expect(container.querySelector('.hljs')).not.toBeNull()
+    cleanup()
+    const { container: c2 } = render(
+      <MarkdownImpl readOnly autoDetectCode={false}>{'```ts\nconst x: number = 1;\n```'}</MarkdownImpl>,
+    )
+    expect(c2.querySelector('.hljs')).not.toBeNull()
+  })
+})

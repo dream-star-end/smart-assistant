@@ -10,6 +10,8 @@ import { useFreshSignedUrl, useSignedDownload, useSignedSrc } from "../chat/medi
 import { Button, DescriptionList, DescriptionRow, MetaLine, Modal, Spinner, TimeAgo, useToast } from "../ui";
 import {
   CODE_HIGHLIGHT_MAX_CHARS,
+  IMAGE_AUTOLOAD_MAX_BYTES,
+  MARKDOWN_RENDER_MAX_CHARS,
   type PreviewKind,
   PDF_PREVIEW_MAX_BYTES,
   SNIPPET_FETCH_MAX_FILE_BYTES,
@@ -20,6 +22,7 @@ import {
   extBadgeOf,
   fenceCode,
   fetchSignedCapped,
+  imageAutoLoadable,
   isTextual,
   knownTooLarge,
   looksLikePdf,
@@ -172,7 +175,8 @@ function ImageThumb({ src }: { src: string }) {
 
 function OutputThumb({ asset, visible, compact }: { asset: ProjectAsset; visible: boolean; compact: boolean }) {
   const src = outputSrc(asset);
-  const isImage = previewKindOf(asset) === "image";
+  // 只给大小已知且不大的图片自动拉缩略：超大图服务端会回落原图，滚过去就会整块下载进内存。
+  const isImage = previewKindOf(asset) === "image" && imageAutoLoadable(asset.sizeBytes);
   return (
     <span
       aria-hidden
@@ -322,11 +326,14 @@ function PreviewFallback({
   hint,
   onDownload,
   onRetry,
+  onPreviewAnyway,
 }: {
   title: string;
   hint?: string;
   onDownload: () => void;
   onRetry?: () => void;
+  /** 大文件：用户明确要求时才加载预览。 */
+  onPreviewAnyway?: () => void;
 }) {
   return (
     <div data-testid="output-preview-fallback" className="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-16 text-center">
@@ -341,6 +348,11 @@ function PreviewFallback({
           <Button size="sm" variant="ghost" onClick={onRetry}>
             <RotateCcw size={13} aria-hidden />
             重试
+          </Button>
+        )}
+        {onPreviewAnyway && (
+          <Button size="sm" variant="ghost" onClick={onPreviewAnyway}>
+            仍要预览
           </Button>
         )}
       </div>
@@ -381,10 +393,12 @@ function TextPreview({
     return <PreviewFallback title="这不是纯文本文件" hint="内容无法按文字显示，请下载后用合适的应用打开。" onDownload={onDownload} />;
   }
   // Markdown 走站内的渲染器（react-markdown，不开原始 HTML；readOnly 不执行 HTML 围栏、图片只走签名/外链只读）。
-  if (kind === "markdown") {
+  // 无语言代码块不做同步语言探测（autoDetectCode=false）；整篇过长直接按纯文本显示 —— 外来文件
+  // 里一个几百 KB 的代码块就能让解析 + 高亮把主线程卡死、连关闭都点不动。
+  if (kind === "markdown" && text.length <= MARKDOWN_RENDER_MAX_CHARS) {
     return (
       <div data-testid="output-preview-markdown" className="min-w-0">
-        <Markdown readOnly signMedia>
+        <Markdown readOnly signMedia autoDetectCode={false}>
           {text}
         </Markdown>
       </div>
@@ -393,17 +407,26 @@ function TextPreview({
   if (kind === "code" && text.length <= CODE_HIGHLIGHT_MAX_CHARS) {
     return (
       <div data-testid="output-preview-code" className="min-w-0 [&_.prose]:max-w-none">
-        <Markdown readOnly>{fenceCode(text, codeLanguageOf(asset.name))}</Markdown>
+        <Markdown readOnly autoDetectCode={false}>
+          {fenceCode(text, codeLanguageOf(asset.name))}
+        </Markdown>
       </div>
     );
   }
   return (
-    <pre
-      data-testid="output-preview-text"
-      className="min-w-0 whitespace-pre-wrap break-words font-mono text-caption leading-relaxed text-fg"
-    >
-      {text}
-    </pre>
+    <>
+      {kind !== "text" && (
+        <p data-testid="output-preview-plain-note" className="mb-3 text-meta text-faint">
+          内容较长，按纯文本显示。
+        </p>
+      )}
+      <pre
+        data-testid="output-preview-text"
+        className="min-w-0 whitespace-pre-wrap break-words font-mono text-caption leading-relaxed text-fg"
+      >
+        {text}
+      </pre>
+    </>
   );
 }
 
@@ -454,7 +477,27 @@ function PdfPreview({
   );
 }
 
+/**
+ * 图片预览的闸：大小已知且 ≤16 MiB 才自动加载；更大或大小未知先问 —— 下载，或「仍要预览」。
+ * 否则点开一个几百 MB 的图片产出就会整块拉进内存（手机直接 OOM）。
+ */
 function ImagePreview({ asset, onDownload }: { asset: ProjectAsset; onDownload: () => void }) {
+  const [force, setForce] = useState(false);
+  if (!force && !imageAutoLoadable(asset.sizeBytes)) {
+    const size = formatBytes(asset.sizeBytes);
+    return (
+      <PreviewFallback
+        title={size ? "图片较大" : "图片大小未知"}
+        hint={`${size ? `图片 ${size}，` : ""}超过 ${formatBytes(IMAGE_AUTOLOAD_MAX_BYTES)} 时不自动加载预览，以免占满内存。可以下载，或仍要预览。`}
+        onDownload={onDownload}
+        onPreviewAnyway={() => setForce(true)}
+      />
+    );
+  }
+  return <LoadedImagePreview asset={asset} onDownload={onDownload} />;
+}
+
+function LoadedImagePreview({ asset, onDownload }: { asset: ProjectAsset; onDownload: () => void }) {
   const src = outputSrc(asset);
   const { url } = useSignedSrc(src);
   const { get, peek, cacheIdentity } = useFreshSignedUrl(src);

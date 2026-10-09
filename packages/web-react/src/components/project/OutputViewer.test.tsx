@@ -153,6 +153,42 @@ describe("OutputViewer", () => {
     expect(dialog.querySelector("iframe")).toBeNull();
   });
 
+  it("超大 Markdown（90 万字符的无语言围栏）不走富文本解析与高亮，按纯文本显示", async () => {
+    const body = `\`\`\`\n${"a".repeat(900_000)}\n\`\`\`\n`;
+    fetchMock.mockResolvedValue(new Response(body));
+    renderViewer(out({ id: "huge", name: "huge.md", sizeBytes: body.length }));
+    const dialog = await screen.findByRole("dialog");
+    const pre = await within(dialog).findByTestId("output-preview-text");
+    expect(pre.textContent).toHaveLength(body.length);
+    expect(within(dialog).getByTestId("output-preview-plain-note")).toHaveTextContent("按纯文本显示");
+    expect(within(dialog).queryByTestId("output-preview-markdown")).toBeNull();
+    expect(dialog.querySelector(".hljs")).toBeNull();
+  });
+
+  it("超大或大小未知的图片不自动加载：先给下载 /「仍要预览」，点了才取", async () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:img-big");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    renderViewer(out({ id: "big-img", name: "huge.png", url: "/api/media/big-img", sizeBytes: 512 * 1024 * 1024 }));
+    let dialog = await screen.findByRole("dialog");
+    const fb = within(dialog).getByTestId("output-preview-fallback");
+    expect(fb).toHaveTextContent("图片较大");
+    expect(fb).toHaveTextContent("512.0 MB");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValue(new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { headers: { "content-type": "image/png" } }));
+    fireEvent.click(within(fb).getByRole("button", { name: "仍要预览" }));
+    expect(await within(dialog).findByTestId("output-preview-image")).toHaveAttribute("src", "blob:img-big");
+    expect(String(fetchMock.mock.calls[0]![0])).toMatch(/&w=1280$/);
+
+    cleanup();
+    fetchMock.mockClear();
+    renderViewer(out({ id: "unk-img", name: "unknown.png", url: "/api/media/unk-img", sizeBytes: null }));
+    dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByTestId("output-preview-fallback")).toHaveTextContent("图片大小未知");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("压缩包：详情 + 下载，不取字节；版本历史与「在会话中打开」是次要操作", async () => {
     const h = renderViewer(out({ id: "zip", name: "v5-offline-all-amd64.zip", sizeBytes: 3 * 1024 * 1024, versionCount: 3 }));
     const dialog = await screen.findByRole("dialog");
@@ -224,6 +260,31 @@ describe("OutputRow", () => {
     render(wrap(<OutputRow asset={a} onOpen={onOpen} />));
     expect(await screen.findByTestId("output-snippet")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("列表缩略图只给大小已知且不大的图片自动加载（640 档）；超大或大小未知只显示类型标记", async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), { headers: { "content-type": "image/png" } }),
+    );
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:thumb");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    render(
+      wrap(
+        <>
+          <OutputRow asset={out({ id: "huge", name: "huge.png", url: "/api/media/huge", sizeBytes: 512 * 1024 * 1024 })} onOpen={vi.fn()} />
+          <OutputRow asset={out({ id: "unk", name: "unknown.png", url: "/api/media/unk", sizeBytes: null })} onOpen={vi.fn()} />
+          <OutputRow asset={out({ id: "ok", name: "chart.png", url: "/api/media/ok", sizeBytes: 48_000 })} onOpen={vi.fn()} />
+        </>,
+      ),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(String(fetchMock.mock.calls[0]![0])).toMatch(/media%2Fok.*&w=640$/);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const thumbs = screen.getAllByTestId("output-thumb");
+    expect(thumbs[0]!.querySelector("img")).toBeNull();
+    expect(thumbs[1]!.querySelector("img")).toBeNull();
+    await waitFor(() => expect(thumbs[2]!.querySelector("img")).toHaveAttribute("src", "blob:thumb"));
   });
 
   it("有服务端摘要直接用；大文件、压缩包不取字节，只显示扩展名标记", async () => {

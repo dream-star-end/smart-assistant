@@ -30,6 +30,12 @@ export type MarkdownProps = {
   readOnly?: boolean;
   /** 完全禁用正文图片加载；用于公开投稿等不可信内容，避免远程像素追踪。 */
   blockImages?: boolean;
+  /**
+   * 没标语言的代码块是否自动探测语言再高亮（缺省 true，聊天正文行为不变）。
+   * 探测是同步跑全部语法的，对几百 KB 的无语言围栏 / 缩进代码块会卡死主线程；
+   * 渲染外来文件（项目产出预览）时传 false：无语言的块只按纯文本显示。
+   */
+  autoDetectCode?: boolean;
 };
 
 let markdownImplLoader: Promise<typeof import("./MarkdownImpl")> | null = null;
@@ -140,6 +146,7 @@ export const Markdown = memo(function Markdown({
   caret,
   readOnly,
   blockImages,
+  autoDetectCode,
 }: MarkdownProps) {
   const fallback = <MarkdownFallback live={live} readOnly={readOnly}>{children}</MarkdownFallback>;
   return (
@@ -151,6 +158,7 @@ export const Markdown = memo(function Markdown({
           caret={caret}
           readOnly={readOnly}
           blockImages={blockImages}
+          autoDetectCode={autoDetectCode}
         >
           {children}
         </MarkdownImpl>
