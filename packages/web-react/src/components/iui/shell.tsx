@@ -98,7 +98,18 @@ export type FrameProps = {
 
 /** 组件外框:可选标题行 + 内容 + 页脚(来源/说明/省略提示 + 复制)。 */
 export function Frame({ kind, title, actions, source, note, notes, copyText, streaming, className, children, bare }: FrameProps) {
-  const footer = source || note || (notes && notes.length > 0) || copyText;
+  const footText = source || note || (notes && notes.length > 0);
+  // 有来源/说明时复制放在页脚;否则放到标题行,不为一个图标单独占一条空页脚。
+  const copy = copyText && !streaming ? <CopyButton getText={copyText} /> : null;
+  const copyInHead = !footText && !!copy;
+  const headActions = copyInHead ? (
+    <>
+      {actions}
+      {copy}
+    </>
+  ) : (
+    actions
+  );
   return (
     <figure
       className={cn("oc-iui", bare ? "oc-iui-bare" : "oc-iui-card", className)}
@@ -106,7 +117,7 @@ export function Frame({ kind, title, actions, source, note, notes, copyText, str
       data-streaming={streaming ? "true" : undefined}
       aria-busy={streaming || undefined}
     >
-      {(title || actions) && (
+      {(title || headActions) && (
         <div className="oc-iui-head">
           {title ? (
             <figcaption className="oc-iui-title">
@@ -115,11 +126,11 @@ export function Frame({ kind, title, actions, source, note, notes, copyText, str
           ) : (
             <span />
           )}
-          {actions && <div className="oc-iui-actions">{actions}</div>}
+          {headActions && <div className="oc-iui-actions">{headActions}</div>}
         </div>
       )}
       {children}
-      {footer && (
+      {footText && (
         <div className="oc-iui-foot">
           <div className="oc-iui-foot-text">
             {note && (
@@ -134,7 +145,7 @@ export function Frame({ kind, title, actions, source, note, notes, copyText, str
             )}
             {notes && notes.length > 0 && <p>部分内容已省略({notes.join(";")})</p>}
           </div>
-          {copyText && !streaming && <CopyButton getText={copyText} />}
+          {copy}
         </div>
       )}
     </figure>
