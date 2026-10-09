@@ -917,6 +917,13 @@ export function materializeLosslessTurn(
       output,
       error: Boolean(tool.isError),
       durationMs: typeof tool.durationMs === "number" ? tool.durationMs : 0,
+      // OCV5-367: the entry's own `ts` is the tool_result arrival (every engine
+      // adapter restamps it on completion); the row `ts` above is the card's
+      // appearance. Keep the result time so a reloaded timeline can show how
+      // long the step took (arrivedAt + durationMs misses the input streaming).
+      ...(completed && typeof tool.ts === "number" && Number.isSafeInteger(tool.ts) && tool.ts >= toolTs
+        ? { completedAt: tool.ts }
+        : {}),
       ...(completed ? {} : { partial: true }),
       _completed: completed,
     }, toolEventOrdinal));

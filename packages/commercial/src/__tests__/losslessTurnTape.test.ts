@@ -43,6 +43,52 @@ describe("materializeLosslessTurn", () => {
     }
   });
 
+  test("OCV5-367: tool rows keep the result arrival as completedAt next to the appearance ts", () => {
+    const base = {
+      sessionId: "web-lossless-step-time",
+      agentId: "main",
+      turnIndex: 8,
+      clientMessageId: "m-step-time",
+      status: "completed" as const,
+      turnKey: TURN_KEY,
+      text: "answer",
+      createdAt: 1_783_944_100_000,
+    };
+    const tool = {
+      toolName: "Write",
+      inputJson: { file_path: "x" },
+      inputPreview: "x",
+      output: "done",
+      isError: false,
+      // Input streamed for 60s after the card appeared; the tool then ran 1s.
+      arrivedAt: 1_783_944_002_000,
+      durationMs: 1_000,
+      ts: 1_783_944_063_000,
+    };
+    const turn = materializeLosslessTurn({
+      ...base,
+      tools: [
+        { ...tool, toolUseId: "t-done", blockId: "t-done", completed: true },
+        { ...tool, toolUseId: "t-stale", blockId: "t-stale", completed: true, ts: 1_783_944_001_000 },
+      ],
+    });
+    const done = turn.records.find((record) => record.id.endsWith("-tool-t-done"))!;
+    assert.equal(done.ts, 1_783_944_002_000);
+    assert.equal(done.payload.ts, 1_783_944_002_000);
+    assert.equal(done.payload.completedAt, 1_783_944_063_000);
+    // A result time before the card appeared is not a result time.
+    const stale = turn.records.find((record) => record.id.endsWith("-tool-t-stale"))!;
+    assert.equal("completedAt" in stale.payload, false);
+
+    const interrupted = materializeLosslessTurn({
+      ...base,
+      status: "crashed",
+      tools: [{ ...tool, toolUseId: "t-open", blockId: "t-open", completed: false, output: "partial" }],
+    });
+    const open = interrupted.records.find((record) => record.id.endsWith("-tool-t-open"))!;
+    assert.equal("completedAt" in open.payload, false);
+  });
+
   test("stamps the highest shared retry counter on the terminal assistant despite runtime batching", () => {
     const turn = materializeLosslessTurn({
       sessionId: "web-lossless-retry",

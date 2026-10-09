@@ -46,6 +46,18 @@ describe('OCV5-367 步骤耗时', () => {
     expect(timings.get('t2')).toEqual({ runningSince: 4_000 })
   })
 
+  test('新 tape 带 completedAt:参数流式生成的时间算在这一步里,与实时一致(Codex r1)', () => {
+    // 卡片 2000ms 出现,参数写到 62000ms,63000ms 出结果;durationMs 只含执行的 1000ms。
+    const rows = [
+      row('prev', 'tool', 500, { _completed: true, completedAt: 1_000 }),
+      row('write', 'tool', 2_000, { _completed: true, durationMs: 1_000, completedAt: 63_000 }),
+    ]
+    expect(computeStepTimings(rows, { active: false }).get('write')).toEqual({ ms: 62_000 })
+    // 旧 tape 没有 completedAt:只剩下界 ts+durationMs,长参数的时间落到下一步。
+    const legacy = [rows[0]!, row('write', 'tool', 2_000, { _completed: true, durationMs: 1_000 })]
+    expect(computeStepTimings(legacy, { active: false }).get('write')).toEqual({ ms: 2_000 })
+  })
+
   test('并行工具:被上一步完全覆盖的一步显示自身时长,不出现 0 或负数', () => {
     const rows = [
       row('slow', 'tool', 1_000, { _completed: true, completedAt: 10_000 }),

@@ -10,9 +10,9 @@ import type { ChatMessage } from './model'
  * calls) falls back to its own span.
  *
  * Ends come only from recorded times: a tool's result arrival (`completedAt`,
- * live) or its durable `ts + durationMs` (turn tape); any other row ends where
- * the next row starts. Nothing is invented — a row without a trustworthy time
- * gets no entry and the UI shows nothing for it.
+ * live and in turn tapes), or `ts + durationMs` on tapes written before that
+ * was kept; any other row ends where the next row starts. Nothing is invented
+ * — a row without a trustworthy time gets no entry and the UI shows nothing.
  */
 export type StepTiming =
   | { ms: number; runningSince?: undefined }
@@ -36,13 +36,18 @@ function toolRunning(message: ChatMessage): boolean {
 }
 
 function ownEnd(message: ChatMessage, start: number): number | undefined {
-  const completedAt = validTime(message.completedAt)
-  if (completedAt !== undefined && completedAt >= start) return completedAt
-  if (message.role === 'tool') {
-    const durationMs = validTime(message.durationMs)
-    if (durationMs !== undefined) return start + durationMs
+  const completedAt = validTime(message.completedAt);
+  if (completedAt !== undefined && completedAt >= start) return completedAt;
+  if (message.role === "tool") {
+    // Tapes written before completedAt was kept (OCV5-367): ts is when the card
+    // appeared and durationMs starts once the input is complete, so this is a
+    // lower bound — long input streaming lands on the next step. Taking the
+    // next row's start instead would charge the next model call's wait to this
+    // tool, which live timing never does.
+    const durationMs = validTime(message.durationMs);
+    if (durationMs !== undefined) return start + durationMs;
   }
-  return undefined
+  return undefined;
 }
 
 export function computeStepTimings(
