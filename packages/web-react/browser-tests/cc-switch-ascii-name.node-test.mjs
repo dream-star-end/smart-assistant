@@ -152,7 +152,8 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
       });
       await page.goto(origin);
       await page.addScriptTag({ content: bundled.text });
-      if (source === "new") await page.getByText("还没有 API Key", { exact: true }).waitFor();
+      // d3201a8a8 / 0bf1a90d7 turned the empty state into one guiding sentence; anchor on its start.
+      if (source === "new") await page.getByText(/^还没有 API Key。/).waitFor();
       else await page.getByTestId("api-keys-list").waitFor();
       // A nondefault model proves the real fetch response, filtering and public-id conversion settled.
       await page.waitForFunction(() =>
@@ -164,7 +165,7 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
         await page.getByRole("textbox", { name: "新密钥名称", exact: true }).fill(LABEL);
         await assertNotImportable(page); // A label alone must not manufacture a key.
         await page.getByRole("button", { name: "创建", exact: true }).click();
-        await page.getByText("已包含刚创建的密钥,可直接导入。", { exact: true }).waitFor();
+        await page.getByText("已包含刚创建的密钥，可直接导入。", { exact: true }).waitFor();
       } else {
         await page.getByRole("tab", { name: "使用已有密钥", exact: true }).click();
         const input = page.getByLabel("完整 API Key", { exact: true });

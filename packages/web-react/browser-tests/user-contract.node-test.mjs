@@ -5,7 +5,9 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { launchJourneyBrowser, selectJourneyModel } from '../../../scripts/lib/journey-browser.mjs'
 const { build } = createRequire(import.meta.url)('esbuild')
-test('R2 real collapsed picker selects exact model (shared deployment helper)', async () => {
+// 93696701d moved the selfhost contract smoke to a visible gpt-6-luna (requireCollapsed: false); after
+// 573b7c88b no selfhost family is collapsed, so the old GPT-5.6 collapsed-group proof had no members (OCV5-355).
+test('R2 real picker selects exact visible model (shared deployment helper)', async () => {
   const bundle = await build({
     entryPoints: [fileURLToPath(new URL('./user-contract-harness.tsx', import.meta.url))],
     bundle: true,
@@ -26,12 +28,14 @@ test('R2 real collapsed picker selects exact model (shared deployment helper)', 
     const page = await browser.newPage()
     await page.setContent('<html><body><div id="root"></div></body></html>')
     await page.addScriptTag({ content: bundle.outputFiles[0].text })
-    await selectJourneyModel(page, 'gpt-5.6-luna', { requireCollapsed: true })
-    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-5.6-luna')
-    // A new component mount must start collapsed (selected Luna correctly auto-opens on reopen).
+    await selectJourneyModel(page, 'gpt-6-luna', { requireCollapsed: false })
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-6-luna')
+    assert.equal(await page.locator('[data-collapsed-group]').count(), 0, 'selfhost has no default-collapsed family')
+    // A fresh mount still reaches the same exact row through the shared helper.
     await page.setContent('<html><body><div id="root"></div></body></html>')
     await page.addScriptTag({ content: bundle.outputFiles[0].text })
-    await selectJourneyModel(page, 'gpt-5.6-luna', { requireCollapsed: true })
+    await selectJourneyModel(page, 'gpt-6-luna', { requireCollapsed: false })
+    assert.equal(await page.getByTestId('selected-model').textContent(), 'gpt-6-luna')
   } finally {
     await browser.close()
   }
@@ -46,9 +50,9 @@ import { join } from 'node:path'
 const { WebSocketServer } = createRequire(import.meta.url)('ws')
 const fixtureHtml = `<!doctype html><body><div id="app"><button id="login">登录</button></div>
 <script>
-const app=document.querySelector('#app');let model='gpt-5.6-sol',peer=0,ws;
+const app=document.querySelector('#app');let model='glm-5.3',peer=0,ws;
 document.querySelector('#login').onclick=()=>{app.innerHTML='<form><input type="email"><input type="password"><button>登录</button></form>';document.querySelector('form').onsubmit=async(e)=>{e.preventDefault();if(localStorage.getItem('oc_auth_hint'))throw Error('unexpected hint');await fetch('/api/auth/login',{method:'POST',body:'{}'});localStorage.setItem('oc_auth_hint','1');await fetch('/api/public/models');ws=new WebSocket('ws://'+location.host+'/ws/user-chat-bridge');ws.onmessage=(e)=>{const f=JSON.parse(e.data);if(f.type==='outbound.message'){document.querySelector('#answer').innerHTML='<div data-testid="assistant-row"><div class="prose">2</div></div>'}};app.innerHTML='<button id="new">新建会话</button><div id="chat"></div>';document.querySelector('#new').onclick=newSession;};};
-function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-5.6-sol">gpt-5.6-sol</button><button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button><button data-collapsed-group="closed">更多 GPT 模型</button></div>';document.querySelector('[data-collapsed-group]').onclick=(e)=>{e.target.dataset.collapsedGroup='open';e.target.insertAdjacentHTML('afterend','<button data-model-id="gpt-5.6-luna">gpt-5.6-luna</button>');bindModels();};bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
+function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna">gpt-6-luna</button><button data-model-id="grok-build">grok-build</button><button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
 function bindModels(){for(const b of document.querySelectorAll('[data-model-id]'))b.onclick=()=>{model=b.dataset.modelId;document.querySelector('#model').textContent=model;document.querySelector('#menu').innerHTML='';};}
 </script>`
 for (const cost of ['dry', 'live'])
@@ -65,7 +69,9 @@ for (const cost of ['dry', 'live'])
         res.end(
           JSON.stringify({
             models: [
-              { id: 'gpt-5.6-sol', engine: 'codex' },
+              // Mirrors the smoke defaults the selfhost deploy gate uses: C2 gpt-6-luna, C3 grok-build + deepseek-v4-flash.
+              { id: 'gpt-6-luna', engine: 'codex' },
+              { id: 'grok-build', engine: 'grok' },
               { id: 'deepseek-v4-flash', engine: 'ccb' },
             ],
           }),
@@ -115,7 +121,7 @@ for (const cost of ['dry', 'live'])
       assert.match(output, /# timings_ms \[\d+,\d+,\d+\]/)
       assert.deepEqual(
         calls.map((f) => f.model),
-        cost === 'dry' ? [] : ['gpt-5.6-sol', 'deepseek-v4-flash'],
+        cost === 'dry' ? [] : ['grok-build', 'deepseek-v4-flash'],
       )
       console.log(`# synthetic-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
     } finally {
