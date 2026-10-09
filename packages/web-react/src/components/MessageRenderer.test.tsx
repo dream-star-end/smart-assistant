@@ -40,6 +40,17 @@ function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMe
   // 不再自动弹），所以待审批用例必须显式给一个新鲜 ts,否则测的就不是真实场景。
 }
 
+/** 打开(最后一条)助手回复动作条的「更多」菜单 —— OCV5-359 起次要动作都在里面。 */
+function openAssistantMenu(): HTMLElement {
+  const bars = screen.getAllByTestId("assistant-actions");
+  fireEvent.pointerDown(within(bars[bars.length - 1]!).getByRole("button", { name: "更多操作" }), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  return screen.getByRole("menu");
+}
+
 function renderMsg(
   message: ChatMessage,
   opts: {
@@ -229,10 +240,16 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     const onRegenerate = vi.fn();
     renderMsg(mk("assistant", { text: "可复制的回答" }), { cb: { onRegenerate } });
     const copy = screen.getByRole("button", { name: "复制" });
-    const plain = screen.getByRole("button", { name: "复制纯文本" });
-    const regenerate = screen.getByRole("button", { name: "重新生成" });
-    for (const button of [copy, plain, regenerate]) {
+    const more = screen.getByRole("button", { name: "更多操作" });
+    for (const button of [copy, more]) {
       expect(button).toHaveClass("[@media(hover:none)]:size-11");
+    }
+    // OCV5-359:纯文本 / 重新生成收进「更多」菜单,菜单项触屏同样 44px。
+    const menu = openAssistantMenu();
+    const plain = within(menu).getByRole("menuitem", { name: "复制纯文本" });
+    const regenerate = within(menu).getByRole("menuitem", { name: "重新生成" });
+    for (const item of [plain, regenerate]) {
+      expect(item).toHaveClass("[@media(hover:none)]:min-h-11");
     }
     fireEvent.click(regenerate);
     expect(onRegenerate).toHaveBeenCalledTimes(1);
@@ -270,6 +287,10 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
     }
     // 复制仍可用(只读面不禁止留存内容)。
     expect(screen.getAllByRole("button", { name: "复制" })).toHaveLength(2);
+    const menu = openAssistantMenu();
+    for (const name of ["引用", "重新生成", "反馈"]) {
+      expect(within(menu).queryByRole("menuitem", { name })).toBeNull();
+    }
   });
 
   test("非只读列表:同一组回调下用户行有「编辑」、助手行有「重新生成」(对照)", () => {
@@ -285,7 +306,7 @@ describe("MessageRenderer 角色分派 + 非工具卡", () => {
       />,
     );
     expect(screen.getByRole("button", { name: "编辑" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
+    expect(within(openAssistantMenu()).getByRole("menuitem", { name: "重新生成" })).toBeInTheDocument();
   });
 
   // M-05:footer(本轮活动指示 / 软提示 / 尾部骨架)嵌在 px-5 的列表根内又自带 px-5,比时间线多缩进 20px。
@@ -2152,7 +2173,7 @@ describe("MessageList 归档显式分页(§4/§5)", () => {
     expect(screen.getByText("可见提问")).toBeInTheDocument();
     expect(screen.getByText("可见最终答复")).toBeInTheDocument();
     expect(screen.getByText(/已思考/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重新生成" })).toBeInTheDocument();
+    expect(within(openAssistantMenu()).getByRole("menuitem", { name: "重新生成" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /progress · tool_delta/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /bash_output_tail/ })).toBeNull();
     expect(onFetchTapeRecordPayload).not.toHaveBeenCalled();
@@ -3368,7 +3389,8 @@ describe("生成占位卡渲染", () => {
 
 // ═══════════════ 评价反馈行只挂每轮末条 assistant 正文（boss 07-11） ═══════════════
 describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", () => {
-  const RATING_PROMPT = "这条回复怎么样?";
+  // OCV5-359 去掉了「这条回复怎么样?」引导语,评价行以 thumb 所在的 response-rating 节点计数。
+  const RATING = "response-rating";
   // 经 ResponseRatingProvider(非 null value)才会真正挂 ResponseRatingCard;App 侧同款包裹。
   function renderRatable(messages: ChatMessage[], sending = false) {
     return render(
@@ -3386,10 +3408,11 @@ describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", 
       mk("assistant", { id: "aB", text: "第二段回复内容", _completed: true }),
     ]);
     // 全轮只出 1 行评价(轮末条 B),中间段 A 不出。
-    expect(screen.getAllByText(RATING_PROMPT)).toHaveLength(1);
+    expect(screen.getAllByTestId(RATING)).toHaveLength(1);
+    expect(screen.queryByText("这条回复怎么样?")).toBeNull();
     // 且这唯一的评价行位于末条 B 之后(DOM 顺序诚实:非误挂在中间段 A 上)。
     const html = container.innerHTML;
-    expect(html.indexOf(RATING_PROMPT)).toBeGreaterThan(html.indexOf("第二段回复内容"));
+    expect(html.indexOf(`data-testid="${RATING}"`)).toBeGreaterThan(html.indexOf("第二段回复内容"));
   });
 
   test("两个历史轮 → 各自末条都有评价(不是仅全会话末条)", () => {
@@ -3402,7 +3425,7 @@ describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", 
       mk("assistant", { id: "a2e", text: "轮2末尾段" }),
     ]);
     // 轮1末尾 + 轮2末尾 各一行 = 2;轮1中间段不出。
-    expect(screen.getAllByText(RATING_PROMPT)).toHaveLength(2);
+    expect(screen.getAllByTestId(RATING)).toHaveLength(2);
   });
 
   test("流式中(sending)末条不出评价行(终态门控保留)", () => {
@@ -3411,7 +3434,7 @@ describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", 
       [mk("user", { id: "u1", text: "问" }), mk("assistant", { id: "a1", text: "流式回复中" })],
       true,
     );
-    expect(screen.queryByText(RATING_PROMPT)).toBeNull();
+    expect(screen.queryByTestId(RATING)).toBeNull();
   });
 
   test("流式中:已完成的轮末条 assistant 亦不出(活跃段 sending 门控优先于 flag)", () => {
@@ -3424,7 +3447,7 @@ describe("ResponseRating 只挂轮末条 assistant 正文(中间回复不出)", 
       ],
       true,
     );
-    expect(screen.queryByText(RATING_PROMPT)).toBeNull();
+    expect(screen.queryByTestId(RATING)).toBeNull();
   });
 });
 

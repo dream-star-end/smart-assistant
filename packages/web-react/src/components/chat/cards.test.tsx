@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ChatInteractionContext } from "../tool/context";
@@ -52,6 +52,16 @@ const retryableUser: ChatMessage = {
 
 function renderErr(msg: ChatMessage, cb: CardCallbacks, tokenUsage?: { totalTokens: number }) {
   render(<AssistantCard msg={msg} ctx={ERR_CTX} cb={cb} tokenUsage={tokenUsage} />);
+}
+
+/** 打开助手动作条的「更多」菜单(Radix:pointerdown 左键打开),返回菜单节点。 */
+function openMoreMenu(): HTMLElement {
+  fireEvent.pointerDown(screen.getByRole("button", { name: "更多操作" }), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: "mouse",
+  });
+  return screen.getByRole("menu");
 }
 
 describe("F3 UserCard 发送失败重试命中区", () => {
@@ -134,9 +144,12 @@ describe("消息引用动作与已发送引用块", () => {
         cb={{ onQuote }}
       />,
     );
-    const button = screen.getByRole("button", { name: "引用" });
-    expect(button).toHaveClass("[@media(hover:none)]:size-11");
-    fireEvent.click(button);
+    // OCV5-359:引用收进「更多」菜单;触发按钮本身是 44px 触控靶,菜单项触屏也是 44px。
+    expect(screen.getByRole("button", { name: "更多操作" })).toHaveClass("[@media(hover:none)]:size-11");
+    openMoreMenu();
+    const item = screen.getByRole("menuitem", { name: "引用" });
+    expect(item).toHaveClass("[@media(hover:none)]:min-h-11");
+    fireEvent.click(item);
     expect(onQuote).toHaveBeenCalledWith(message);
   });
 
@@ -190,130 +203,165 @@ describe("UserCard 编辑重发", () => {
 });
 
 describe("AssistantCard readOnly(M-01)", () => {
-  test("只读面动作行只留复制/纯文本/朗读,不出引用、重新生成、反馈", () => {
+  test("只读面动作行只留复制/纯文本/朗读,不出引用、重新生成、反馈、存到项目", () => {
     render(
       <AssistantCard
         msg={{ id: "a-ro", role: "assistant", text: "回答正文", ts: 1 } as ChatMessage}
         ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
-        cb={{ onQuote: vi.fn(), onRegenerate: vi.fn(), onFeedback: vi.fn() }}
+        cb={{ onQuote: vi.fn(), onRegenerate: vi.fn(), onFeedback: vi.fn(), onSaveToProject: vi.fn() }}
         readOnly
       />,
     );
     expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "复制纯文本" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "引用" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "重新生成" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "反馈" })).toBeNull();
+    const menu = openMoreMenu();
+    expect(within(menu).getByRole("menuitem", { name: "复制纯文本" })).toBeInTheDocument();
+    for (const name of ["引用", "重新生成", "反馈", "记住这条", "存为项目技能"]) {
+      expect(within(menu).queryByRole("menuitem", { name })).toBeNull();
+    }
   });
 });
 
-// M-03:触屏下每条消息常显整排 44px 动作图标 → 默认只露一个「更多操作」开关,点开才展开整排。
-// jsdom 无 CSS:开关与整排同时在 DOM 里,这里断言的是开关的存在、展开态与决定显隐的 class。
-describe("触屏动作行折叠(TouchActionRow)", () => {
-  test("历史助手行默认折叠:开关 aria-expanded=false,整排带 hover:none 隐藏 class;点开后展开", () => {
+// OCV5-359:助手回复底下只剩一条安静的图标行(复制 · 👍 · 👎 · 更多);其余动作、存到项目、
+// 时间 · 积分 · 请求ID 全收进「更多」菜单。jsdom 无 CSS:显隐断言落在决定显隐的 class 上。
+describe("助手动作条(OCV5-359)", () => {
+  const LATEST: RenderCtx = { isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true };
+  const OLDER: RenderCtx = { isLast: false, sending: false, inActiveTurn: false, turnFinalAssistant: true };
+  const costly = {
+    id: "a-cost",
+    role: "assistant",
+    text: "带费用的回答",
+    ts: Date.now() - 5_000,
+    usage: { traceId: "trace-cost-1234", costCredits: "109" },
+  } as ChatMessage;
+
+  function renderBar(ctx: RenderCtx, cb: CardCallbacks = {}, submit = vi.fn()) {
     render(
-      <AssistantCard
-        msg={{ id: "a-hist", role: "assistant", text: "历史回答", ts: 1 } as ChatMessage}
-        ctx={{ isLast: false, sending: false, inActiveTurn: false, turnFinalAssistant: true }}
-        cb={{ onRegenerate: vi.fn() }}
-      />,
-    );
-    const toggle = screen.getByRole("button", { name: "更多操作" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(toggle).toHaveClass("[@media(hover:none)]:inline-flex");
-    // OCV5-295:完成态「复制」在折叠区外常显;折叠区以「复制纯文本」定位,开合语义不变。
-    const row = screen.getByRole("button", { name: "复制纯文本" }).parentElement!;
-    const copy = screen.getByRole("button", { name: "复制" });
-    expect(row).not.toContainElement(copy);
-    expect(copy.closest(".\\[\\@media\\(hover\\:none\\)\\]\\:hidden")).toBeNull();
-    expect(row).toHaveClass("[@media(hover:none)]:hidden");
-    expect(row).not.toHaveClass("[@media(hover:none)]:opacity-100");
-
-    fireEvent.click(toggle);
-    const collapse = screen.getByRole("button", { name: "收起操作" });
-    expect(collapse).toHaveAttribute("aria-expanded", "true");
-    expect(row).toHaveClass("[@media(hover:none)]:opacity-100");
-    expect(row).not.toHaveClass("[@media(hover:none)]:hidden");
-    // 桌面 hover 露出的 class 保持不变。
-    expect(row).toHaveClass("group-hover:opacity-100");
-
-    fireEvent.click(collapse);
-    expect(screen.getByRole("button", { name: "更多操作" })).toHaveAttribute("aria-expanded", "false");
-    expect(row).toHaveClass("[@media(hover:none)]:hidden");
-  });
-
-  // OCV5-295:末条不再默认整排展开。复制在折叠区外常显(一击),其余五个动作在「更多操作」里(两击内)。
-  test("末轮末条助手回复:复制常显在折叠区外,其余动作默认收在「更多操作」里", () => {
-    render(
-      <AssistantCard
-        msg={{ id: "a-final", role: "assistant", text: "最新回答", ts: 1 } as ChatMessage}
-        ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
-        cb={{ onRegenerate: vi.fn(), onQuote: vi.fn(), onFeedback: vi.fn() }}
-      />,
-    );
-    const toggle = screen.getByRole("button", { name: "更多操作" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    const fold = screen.getByRole("button", { name: "重新生成" }).parentElement!;
-    expect(fold).toHaveClass("[@media(hover:none)]:hidden");
-    const copy = screen.getByRole("button", { name: "复制" });
-    expect(copy).toHaveClass("[@media(hover:none)]:size-11");
-    expect(fold).not.toContainElement(copy);
-    expect(copy.closest(".\\[\\@media\\(hover\\:none\\)\\]\\:hidden")).toBeNull();
-    for (const name of ["复制纯文本", "引用", "重新生成", "反馈"]) {
-      expect(fold).toContainElement(screen.getByRole("button", { name }));
-    }
-
-    fireEvent.click(toggle);
-    expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
-    expect(fold).toHaveClass("[@media(hover:none)]:opacity-100");
-    expect(fold).not.toHaveClass("[@media(hover:none)]:hidden");
-  });
-
-  test("正向积分与请求号留在 assistant-meta,不进「更多操作」折叠区;评价行与 meta 同一父节点", () => {
-    render(
-      <ResponseRatingProvider value={{ ratings: new Map(), submit: vi.fn() }}>
-        <AssistantCard
-          msg={{
-            id: "a-cost",
-            role: "assistant",
-            text: "带费用的回答",
-            ts: Date.now() - 5_000,
-            usage: { traceId: "trace-cost-1234", costCredits: "109" },
-          } as ChatMessage}
-          ctx={{ isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true }}
-          cb={{ onRegenerate: vi.fn() }}
-        />
+      <ResponseRatingProvider value={{ ratings: new Map(), submit }}>
+        <AssistantCard msg={costly} ctx={ctx} cb={cb} />
       </ResponseRatingProvider>,
     );
-    const meta = screen.getByTestId("assistant-meta");
-    const credits = screen.getByLabelText("消耗 109 积分");
-    const req = screen.getByRole("button", { name: "复制请求ID trace-cost-1234" });
-    expect(meta).toContainElement(credits);
-    expect(meta).toContainElement(req);
-    const fold = screen.getByRole("button", { name: "重新生成" }).parentElement!;
-    expect(fold).not.toContainElement(credits);
-    expect(fold).not.toContainElement(req);
-    const footer = screen.getByTestId("assistant-footer");
-    expect(footer).toContainElement(meta);
-    expect(footer).toContainElement(screen.getByRole("button", { name: "点赞" }));
-    expect(footer).toContainElement(screen.getByText("这条回复怎么样?"));
+    return screen.getByTestId("assistant-actions");
+  }
+
+  test("单行只有 复制 · 点赞 · 点踩 · 更多;没有引导语、没有常显药丸", () => {
+    const bar = renderBar(LATEST, { onRegenerate: vi.fn(), onSaveToProject: vi.fn() });
+    const names = within(bar)
+      .getAllByRole("button")
+      .map((b) => b.getAttribute("aria-label"))
+      .filter((n) => !n?.startsWith("复制请求ID"));
+    expect(names).toEqual(["复制", "点赞", "点踩", "更多操作"]);
+    expect(screen.queryByText("这条回复怎么样?")).toBeNull();
+    expect(screen.queryByRole("button", { name: "记住这条" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "存为项目技能" })).toBeNull();
+    expect(screen.queryByTestId("project-save-chips")).toBeNull();
+    // 每个图标的触屏命中区都是 44px。
+    for (const name of ["复制", "点赞", "点踩", "更多操作"]) {
+      expect(screen.getByRole("button", { name })).toHaveClass("[@media(hover:none)]:size-11");
+    }
   });
 
-  test("停止/失败精简行:复制 / 纯文本 / 引用直接可见,不收进折叠", () => {
+  test("时间 · 积分 · 请求ID 默认不显:触屏 display:none,桌面 opacity-0 待 hover / 焦点", () => {
+    renderBar(LATEST);
+    const meta = screen.getByTestId("assistant-meta");
+    const holder = meta.parentElement!;
+    expect(holder).toHaveClass("hidden", "[@media(hover:hover)]:flex", "opacity-0");
+    expect(holder).toHaveClass("group-hover:opacity-100", "focus-within:opacity-100");
+    expect(meta).toContainElement(screen.getByLabelText("消耗 109 积分"));
+  });
+
+  test("最新回答常显;更早的回答桌面透明待 hover / 焦点,触屏恒显,不改 display(不跳)", () => {
+    const latest = renderBar(LATEST);
+    expect(latest).toHaveAttribute("data-latest", "true");
+    expect(latest).not.toHaveClass("opacity-0");
+    cleanup();
+
+    const older = renderBar(OLDER);
+    expect(older).toHaveAttribute("data-latest", "false");
+    expect(older).toHaveClass(
+      "opacity-0",
+      "group-hover:opacity-100",
+      "focus-within:opacity-100",
+      "[@media(hover:none)]:opacity-100",
+      "has-[[data-rating-panel]]:opacity-100",
+    );
+    expect(older).not.toHaveClass("hidden");
+    // 菜单打开时强制可见(焦点进了 portal,鼠标移开也不淡出)。
+    openMoreMenu();
+    expect(older).not.toHaveClass("opacity-0");
+  });
+
+  test("「更多」菜单承接全部次要动作、存到项目与本条明细", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const onRegenerate = vi.fn();
+    const onFeedback = vi.fn();
+    renderBar(LATEST, { onRegenerate, onQuote: vi.fn(), onFeedback, onSaveToProject: vi.fn() });
+    const menu = openMoreMenu();
+    const items = within(menu).getAllByRole("menuitem").map((i) => i.textContent);
+    expect(items.slice(0, 2)).toEqual(["复制纯文本", expect.stringMatching(/朗读|引用/)]);
+    for (const name of ["复制纯文本", "引用", "重新生成", "反馈", "记住这条", "存为项目技能"]) {
+      expect(within(menu).getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+    const details = within(menu).getByTestId("assistant-meta-menu");
+    expect(details.querySelector("time")).not.toBeNull();
+    expect(within(details).getByLabelText("消耗 109 积分")).toHaveTextContent("109 积分");
+    const copyId = within(menu).getByRole("menuitem", { name: "复制请求ID trace-cost-1234" });
+    expect(copyId).toHaveTextContent("trace-co");
+    fireEvent.click(copyId);
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("trace-cost-1234"));
+
+    openMoreMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "重新生成" }));
+    expect(onRegenerate).toHaveBeenCalledTimes(1);
+    openMoreMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "反馈" }));
+    expect(onFeedback).toHaveBeenCalledWith(expect.objectContaining({ messageId: "a-cost", traceId: "trace-cost-1234" }));
+  });
+
+  test("菜单可键盘打开,Esc 关闭并把焦点还给触发按钮", async () => {
+    renderBar(LATEST, { onQuote: vi.fn() });
+    const trigger = screen.getByRole("button", { name: "更多操作" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).getAllByRole("menuitem").length).toBeGreaterThan(0);
+    fireEvent.keyDown(menu, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("复制一击可用;点赞点踩照常提交", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const submit = vi.fn();
+    renderBar(OLDER, {}, submit);
+    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("带费用的回答"));
+    fireEvent.click(screen.getByRole("button", { name: "点赞" }));
+    expect(submit).toHaveBeenCalledWith({ messageId: "a-cost", rating: "up", traceId: "trace-cost-1234" });
+    fireEvent.click(screen.getByRole("button", { name: "点踩" }));
+    expect(submit).toHaveBeenLastCalledWith({ messageId: "a-cost", rating: "down", traceId: "trace-cost-1234" });
+  });
+
+  test("停止/失败精简行:复制常显,纯文本 / 引用 / 明细在菜单里,不出完整回答的动作", () => {
     renderErr(
       errMsg({ _errorCode: "stopped", text: "停止前写出的半截答案", usage: { traceId: "trace-stop", costCredits: "12" } }),
-      { onRegenerate: vi.fn(), onQuote: vi.fn() },
+      { onRegenerate: vi.fn(), onQuote: vi.fn(), onFeedback: vi.fn(), onSaveToProject: vi.fn() },
     );
-    expect(screen.getByRole("button", { name: "收起操作" })).toHaveAttribute("aria-expanded", "true");
-    for (const name of ["复制", "复制纯文本", "引用"]) {
-      const row = screen.getByRole("button", { name }).parentElement!;
-      expect(row).toHaveClass("[@media(hover:none)]:opacity-100");
-      expect(row).not.toHaveClass("[@media(hover:none)]:hidden");
+    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
+    expect(screen.getByTestId("assistant-actions")).toHaveAttribute("data-latest", "true");
+    const menu = openMoreMenu();
+    expect(within(menu).getByRole("menuitem", { name: "复制纯文本" })).toBeInTheDocument();
+    expect(within(menu).getByRole("menuitem", { name: "引用" })).toBeInTheDocument();
+    for (const name of ["朗读", "重新生成", "反馈", "记住这条", "存为项目技能"]) {
+      expect(within(menu).queryByRole("menuitem", { name })).toBeNull();
     }
-    expect(screen.getByTestId("assistant-meta")).toContainElement(screen.getByLabelText("消耗 12 积分"));
-    expect(screen.getByRole("button", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
+    expect(within(menu).getByLabelText("消耗 12 积分")).toBeInTheDocument();
+    expect(within(menu).getByRole("menuitem", { name: "复制请求ID trace-stop" })).toBeInTheDocument();
   });
+});
 
+describe("用户行触屏动作折叠(TouchActionRow)", () => {
   test("用户行同样默认折叠,开关为 44px 触控靶", () => {
     render(<UserCard msg={userMsg({ status: "replied" })} cb={{ onEditResend: vi.fn() }} />);
     const toggle = screen.getByRole("button", { name: "更多操作" });
@@ -367,11 +415,12 @@ describe("AssistantCard 部分回答的精简动作行(M-18)", () => {
     );
     expect(screen.getByText("这是模型已经写出的前半段回答")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "复制纯文本" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "引用" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "朗读" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "重新生成" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "反馈" })).toBeNull();
+    const menu = openMoreMenu();
+    expect(within(menu).getByRole("menuitem", { name: "复制纯文本" })).toBeInTheDocument();
+    expect(within(menu).getByRole("menuitem", { name: "引用" })).toBeInTheDocument();
+    expect(within(menu).queryByRole("menuitem", { name: "朗读" })).toBeNull();
+    expect(within(menu).queryByRole("menuitem", { name: "重新生成" })).toBeNull();
+    expect(within(menu).queryByRole("menuitem", { name: "反馈" })).toBeNull();
   });
 
   test("用户主动停止且有部分回答:同样可复制", async () => {
@@ -1261,23 +1310,30 @@ describe("普通回答不再占头像列", () => {
   });
 });
 
-// P5b:「记住这条 / 存为项目技能」只在 App 给了入口、回答已完成、所在轮末条、非只读时出现。
+// P5b:「记住这条 / 存为项目技能」只在 App 给了入口(OC_P5_CHIPS 开)、回答已完成、所在轮末条、
+// 非只读时出现 —— OCV5-359 起只在「更多」菜单里,不再是每条回答底下常显的药丸。
 describe("AssistantCard 存到项目入口(P5b)", () => {
   const done = { id: "a-p5", role: "assistant", text: "## 发版约定\n每周五发版", ts: 1 } as ChatMessage;
   const DONE_CTX: RenderCtx = { isLast: true, sending: false, inActiveTurn: true, turnFinalAssistant: true };
 
-  test("完成态末条回答:两个入口常显,点了按种类回调", () => {
+  test("完成态末条回答:两个入口在「更多」菜单里(不常显),点了按种类回调", () => {
     const onSaveToProject = vi.fn();
     render(<AssistantCard msg={done} ctx={DONE_CTX} cb={{ onSaveToProject }} />);
-    fireEvent.click(screen.getByRole("button", { name: "记住这条" }));
-    fireEvent.click(screen.getByRole("button", { name: "存为项目技能" }));
+    expect(screen.queryByText("记住这条")).toBeNull();
+    expect(screen.queryByText("存为项目技能")).toBeNull();
+    openMoreMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "记住这条" }));
+    openMoreMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "存为项目技能" }));
     expect(onSaveToProject).toHaveBeenNthCalledWith(1, done, "memory");
     expect(onSaveToProject).toHaveBeenNthCalledWith(2, done, "skill");
   });
 
-  test("没有入口回调(开关关 / 不在项目 / demo)时不出", () => {
+  test("没有入口回调(开关关 / 不在项目 / demo)时菜单里也不出", () => {
     render(<AssistantCard msg={done} ctx={DONE_CTX} cb={{}} />);
-    expect(screen.queryByTestId("project-save-chips")).toBeNull();
+    const menu = openMoreMenu();
+    expect(within(menu).queryByRole("menuitem", { name: "记住这条" })).toBeNull();
+    expect(within(menu).queryByRole("menuitem", { name: "存为项目技能" })).toBeNull();
   });
 
   test("流式中、本轮未收笔、只读、非末条、错误卡都不出", () => {
@@ -1292,7 +1348,12 @@ describe("AssistantCard 存到项目入口(P5b)", () => {
     ];
     for (const c of cases) {
       render(<AssistantCard msg={c.msg} ctx={c.ctx} cb={{ onSaveToProject }} readOnly={c.readOnly} />);
-      expect(screen.queryByTestId("project-save-chips")).toBeNull();
+      expect(screen.queryByText("记住这条")).toBeNull();
+      if (screen.queryByRole("button", { name: "更多操作" })) {
+        const menu = openMoreMenu();
+        expect(within(menu).queryByRole("menuitem", { name: "记住这条" })).toBeNull();
+        expect(within(menu).queryByRole("menuitem", { name: "存为项目技能" })).toBeNull();
+      }
       cleanup();
     }
   });

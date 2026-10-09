@@ -10,6 +10,7 @@ import {
   ChevronRight,
   Check,
   Copy,
+  Hash,
   Info,
   ListTodo,
   RotateCcw,
@@ -55,7 +56,21 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { Markdown } from "../Markdown";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
-import { Alert, Badge, Button, chipVariants, IconButton, TimeAgo, TooltipProvider, useToast } from "../ui";
+import {
+  Alert,
+  Badge,
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  IconButton,
+  TimeAgo,
+  TooltipProvider,
+  useToast,
+} from "../ui";
+import { formatDate } from "../ui/TimeAgo";
 import { agentDisplayName } from "./agentNames";
 import { ProgressivePlainText } from "./AgentGroupCard";
 import { DelegateProcessList } from "./delegateProcessList";
@@ -186,10 +201,13 @@ function CopyIconButton({
   getText,
   label,
   icon,
+  variant,
 }: {
   getText: () => string;
   label: string;
   icon: React.ReactNode;
+  /** 助手动作条用 muted,与 👍👎 / 更多同一灰度。 */
+  variant?: "ghost" | "muted";
 }) {
   const [done, setDone] = useState(false);
   const toast = useToast();
@@ -199,6 +217,7 @@ function CopyIconButton({
       title={label}
       size="sm"
       shape="square"
+      variant={variant}
       className="[@media(hover:none)]:size-11"
       onClick={async () => {
         try {
@@ -243,14 +262,11 @@ function ReqIdChip({ traceId }: { traceId: string }) {
 }
 
 /** 时间 · 积分 · 请求ID 同一行。时间用 caption:超过 30 天的绝对日期不能继承正文 16px。
- *  token 计数留在消息上给定价和上下文，最终回答底部不再打印。 */
-function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) {
-  const traceId = msg.usage?.traceId;
-  const credits = msg.usage?.costCredits;
-  const waived = msg.usage?.waived === true;
-  // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
-  const showCredits = !waived && credits && /^\d+$/.test(credits) && credits !== "0";
-  const showTime = Boolean(msg.ts);
+ *  token 计数留在消息上给定价和上下文，最终回答底部不再打印。
+ *  OCV5-359:有动作条时它只在桌面 hover 时于行尾淡显(明细常驻「更多」菜单);
+ *  没有动作条的行(空正文错误 / 静默卡)仍常显。 */
+function MetaRow({ msg }: { msg: ChatMessage }) {
+  const { traceId, credits, showCredits, waived, showTime } = metaFacts(msg);
   if (!traceId && !showCredits && !waived && !showTime) return null;
   return (
     <div data-testid="assistant-meta" className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-caption text-faint">
@@ -276,8 +292,10 @@ function MetaRow({ msg }: { msg: ChatMessage; tokenUsage?: DisplayTokenUsage }) 
   );
 }
 
-// ─── 朗读（浏览器原生 SpeechSynthesis，无后端 TTS 依赖；不支持的浏览器整按钮隐藏） ───
-function SpeakButton({ getText }: { getText: () => string }) {
+// ─── 朗读（浏览器原生 SpeechSynthesis，无后端 TTS 依赖；不支持的浏览器不出这一项） ───
+// 状态挂在动作条上(不在菜单项里):菜单关闭后菜单内容会卸载,朗读却要继续,
+// 正在念时动作条另露一个「停止朗读」图标,用户不必再打开菜单去找。
+function useSpeech(getText: () => string) {
   const [speaking, setSpeaking] = useState(false);
   const speechRun = useRef(0);
   const supported = typeof window !== "undefined" && "speechSynthesis" in window;
@@ -288,8 +306,8 @@ function SpeakButton({ getText }: { getText: () => string }) {
       if (supported) window.speechSynthesis.cancel();
     };
   }, [supported]);
-  if (!supported) return null;
   const toggle = () => {
+    if (!supported) return;
     const synth = window.speechSynthesis;
     if (speaking) {
       speechRun.current += 1;
@@ -323,37 +341,22 @@ function SpeakButton({ getText }: { getText: () => string }) {
     };
     speakFrom(0);
   };
-  return (
-    <IconButton
-      aria-label={speaking ? "停止朗读" : "朗读"}
-      title={speaking ? "停止朗读" : "朗读"}
-      size="sm"
-      shape="square"
-      className="[@media(hover:none)]:size-11"
-      onClick={toggle}
-    >
-      {speaking ? <Square size={14} className="fill-current" /> : <Volume2 size={15} />}
-    </IconButton>
-  );
+  return { supported, speaking, toggle };
 }
 
 // ─── 触屏动作行折叠 ───────────────────────────────────────────────────────
 // 桌面:hover 露出整排动作(无预留高度以外的视觉噪音)。触屏没有 hover,原先整排 44px 图标
 // 对**每条**消息常显,长会话里 1 行正文配 3 行 chrome。现在触屏默认只露一个 44px「更多」开关,
-// 点开才展开整排。完成态助手回复的「复制」放在本行外常显(OCV5-295),其余一律默认收起;
-// `defaultOpen` 只给停止/失败精简行(复制/纯文本/引用三个)用,让它们直接可见。
+// 点开才展开整排。现在只剩用户气泡在用;助手回复改走下方 MessageActions 的「更多」菜单(OCV5-359)。
 // jsdom 无 CSS,开关与整排同时存在于 DOM,既有按钮断言不受影响。
 function TouchActionRow({
   children,
-  defaultOpen = false,
   className,
 }: {
   children: React.ReactNode;
-  defaultOpen?: boolean;
   className?: string;
 }) {
-  const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = userOpen ?? defaultOpen;
+  const [open, setUserOpen] = useState(false);
   return (
     <div className={cn("mt-1.5 flex items-center gap-0.5", className)}>
       <IconButton
@@ -379,7 +382,104 @@ function TouchActionRow({
   );
 }
 
-// ─── 动作条（copy 富/纯 + 朗读 + 重新生成 + 反馈） ─────────────────────────────
+// ─── 助手回复动作条（OCV5-359） ─────────────────────────────────────────────
+// 一条安静的图标行:复制 · 👍 · 👎 · 更多(⋯)。其余一律收进「更多」菜单:
+//   复制纯文本 / 朗读 / 引用 / 重新生成 / 反馈 → 存到项目(记住这条 / 存为项目技能,P5 开关门控)
+//   → 本条明细(时间 · 积分 · 请求ID,可复制)。
+// 原先两行(动作 + 两个常显药丸 / 时间 · 积分 · #id · 「这条回复怎么样?」 + 👍👎)对每条回答都铺开,
+// 运营反馈「太多了，不太友好」。
+//
+// 显隐:最新一条回答(末轮末条)常显;更早的回答在桌面(能 hover 的设备)默认透明,
+// hover / 键盘焦点进入 / 菜单打开 / 点踩补充区展开时显出。只改 opacity、不改 display,
+// 行高始终预留,出现时不跳。触屏没有 hover:整行常显 —— 现在只剩 4 个淡色图标,
+// 「点一下消息才露出」既难发现、又会和选字/点链接抢手势,收益不抵代价。
+// 时间 · 积分 · 请求ID 在桌面 hover 时于行尾淡显,触屏只在菜单里。
+type MetaFacts = {
+  traceId?: string;
+  credits?: string;
+  showCredits: boolean;
+  waived: boolean;
+  showTime: boolean;
+  any: boolean;
+};
+
+function metaFacts(msg: ChatMessage): MetaFacts {
+  const traceId = msg.usage?.traceId || undefined;
+  const credits = msg.usage?.costCredits;
+  const waived = msg.usage?.waived === true;
+  // 计费仅在有正向扣费时展示（"0"/负数/缺省不展示）；免单轮改展示「已免单」。
+  const showCredits = !waived && !!credits && /^\d+$/.test(credits) && credits !== "0";
+  const showTime = Boolean(msg.ts);
+  return {
+    traceId,
+    credits,
+    showCredits,
+    waived,
+    showTime,
+    any: Boolean(traceId) || showCredits || waived || showTime,
+  };
+}
+
+/** 「更多」菜单底部的本条明细:一行 caption(时间 · 积分),下面一项「复制请求 ID」。 */
+function MetaMenuSection({ msg }: { msg: ChatMessage }) {
+  const f = metaFacts(msg);
+  const toast = useToast();
+  const facts: React.ReactNode[] = [];
+  if (f.showTime) {
+    facts.push(
+      <time key="t" dateTime={new Date(msg.ts).toISOString()} title={formatDate(msg.ts, "full")}>
+        {formatDate(msg.ts, "relative")}
+      </time>,
+    );
+  }
+  if (f.waived) facts.push(<span key="w">已免单</span>);
+  if (f.showCredits) {
+    facts.push(
+      <span key="c" aria-label={`消耗 ${f.credits} 积分`}>
+        {groupDigits(f.credits!)} 积分
+      </span>,
+    );
+  }
+  return (
+    <>
+      {facts.length > 0 && (
+        <div
+          data-testid="assistant-meta-menu"
+          className="flex flex-wrap items-center gap-x-1.5 px-2.5 pb-1 pt-1.5 text-caption tabular-nums text-faint"
+        >
+          {facts.map((node, i) => (
+            <span key={i} className="inline-flex items-center gap-x-1.5">
+              {i > 0 && <span aria-hidden="true">·</span>}
+              {node}
+            </span>
+          ))}
+        </div>
+      )}
+      {f.traceId && (
+        <DropdownMenuItem
+          aria-label={`复制请求ID ${f.traceId}`}
+          title={`请求ID ${f.traceId}（用于反馈/排查）`}
+          className="text-meta text-muted"
+          onSelect={async () => {
+            try {
+              await navigator.clipboard.writeText(f.traceId!);
+              toast("已复制请求ID", "success");
+            } catch {
+              toast(COPY_FAILED_TOAST, "error");
+            }
+          }}
+        >
+          <Hash size={13} className="shrink-0 text-faint" aria-hidden="true" />
+          复制请求 ID
+          <span className="ml-auto font-mono text-caption text-faint">{f.traceId.slice(0, 8)}</span>
+        </DropdownMenuItem>
+      )}
+    </>
+  );
+}
+
+const MENU_ICON = "shrink-0 text-muted";
+
 function MessageActions({
   msg,
   cb,
@@ -387,6 +487,10 @@ function MessageActions({
   text,
   minimal = false,
   readOnly = false,
+  latest = false,
+  rating,
+  onSaveToProject,
+  meta = false,
   className,
 }: {
   msg: ChatMessage;
@@ -394,111 +498,142 @@ function MessageActions({
   showRegen: boolean;
   /** 复制/朗读用的正文(缺省 msg.text;失败轮的合法部分回答传 errorPresentation.bodyText)。 */
   text?: string;
-  /** 只留复制/纯文本/引用(已停止 / 失败但有部分回答的行),不出朗读/重新生成/反馈。 */
+  /** 只留复制/纯文本/引用(已停止 / 失败但有部分回答的行),不出朗读/重新生成/反馈/存到项目。 */
   minimal?: boolean;
-  /** 只读面(教程回放 / 后台会话查看器):不出引用/重新生成/反馈这类会写回会话的动作。 */
+  /** 只读面(教程回放 / 后台会话查看器):不出引用/重新生成/反馈/存到项目这类会写回的动作。 */
   readOnly?: boolean;
+  /** 最新一条回答:动作条常显;否则桌面端 hover / 焦点时才显出(见上方注释)。 */
+  latest?: boolean;
+  /** 👍👎(ResponseRatingCard),只有所在轮末条回答才有。 */
+  rating?: React.ReactNode;
+  /** P5b「记住这条 / 存为项目技能」—— 只放在「更多」菜单里,不再常显药丸。 */
+  onSaveToProject?: (msg: ChatMessage, kind: "memory" | "skill") => void;
+  /** 是否带出时间 · 积分 · 请求ID(终态帧到达后才有,见 RenderCtx.inActiveTurn)。 */
+  meta?: boolean;
   className?: string;
 }) {
   const body = text ?? msg.text ?? "";
-  const copy = <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} />;
-  // 停止 / 失败但有部分回答:只有复制 / 纯文本 / 引用三个,整排直接可见(不折叠)。
-  if (minimal) {
-    return (
-      <TouchActionRow defaultOpen className={className}>
-        {copy}
-        <CopyIconButton
-          getText={() => stripMarkdown(body)}
-          label="复制纯文本"
-          icon={<Type size={15} />}
-        />
-        {!readOnly && cb.onQuote && (
-          <IconButton
-            aria-label="引用"
-            title="引用"
-            size="sm"
-            shape="square"
-            className="[@media(hover:none)]:size-11"
-            onClick={() => cb.onQuote?.(msg)}
-          >
-            <Quote size={15} />
-          </IconButton>
-        )}
-      </TouchActionRow>
-    );
-  }
-  // OCV5-295:完成态「复制」常显(触屏/桌面都一击可达);其余动作收进同一个「更多操作」,
-  // 末条也默认收起 —— 触屏不再为最新回复铺一整排 7 个 44px 图标。showRegen 只决定有无「重新生成」。
+  const toast = useToast();
+  const speech = useSpeech(() => stripMarkdown(body));
+  const [menuOpen, setMenuOpen] = useState(false);
+  const facts = metaFacts(msg);
+  const showMeta = meta && facts.any;
+  const canSpeak = !minimal && speech.supported;
+  const canQuote = !readOnly && !!cb.onQuote;
+  const canRegen = !minimal && !readOnly && showRegen && !!cb.onRegenerate;
+  const canFeedback = !minimal && !readOnly && !!cb.onFeedback;
+  const canSave = !minimal && !readOnly && !!onSaveToProject;
+  const copyPlain = async () => {
+    try {
+      await navigator.clipboard.writeText(stripMarkdown(body));
+      toast("已复制纯文本", "success");
+    } catch {
+      toast(COPY_FAILED_TOAST, "error");
+    }
+  };
   return (
-    <div className={cn("mt-1.5 flex items-center gap-0.5", className)}>
-      {copy}
-      <TouchActionRow className="mt-0">
-        <CopyIconButton
-          getText={() => stripMarkdown(body)}
-          label="复制纯文本"
-          icon={<Type size={15} />}
-        />
-        <SpeakButton getText={() => stripMarkdown(body)} />
-        {!readOnly && cb.onQuote && (
-          <IconButton
-            aria-label="引用"
-            title="引用"
-            size="sm"
-            shape="square"
-            className="[@media(hover:none)]:size-11"
-            onClick={() => cb.onQuote?.(msg)}
-          >
-            <Quote size={15} />
+    <div
+      data-testid="assistant-actions"
+      data-latest={latest ? "true" : "false"}
+      className={cn(
+        "flex min-w-0 flex-1 flex-wrap items-center gap-0.5 transition-opacity duration-150",
+        // 非最新回答:桌面透明待 hover / 焦点;触屏(hover:none)恒显。菜单开着时强制可见,
+        // 否则焦点进了 portal 里的菜单、鼠标一移开,触发按钮就跟着淡出。
+        !latest &&
+          !menuOpen &&
+          !speech.speaking &&
+          "opacity-0 group-hover:opacity-100 focus-within:opacity-100 has-[[data-rating-panel]]:opacity-100 [@media(hover:none)]:opacity-100",
+        className,
+      )}
+    >
+      <CopyIconButton getText={() => body} label="复制" icon={<Copy size={15} />} variant="muted" />
+      {rating}
+      {speech.speaking && (
+        <IconButton
+          aria-label="停止朗读"
+          title="停止朗读"
+          size="sm"
+          shape="square"
+          variant="muted"
+          className="text-accent hover:text-accent"
+          onClick={speech.toggle}
+        >
+          <Square size={13} className="fill-current" />
+        </IconButton>
+      )}
+      <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+        <DropdownMenuTrigger asChild>
+          <IconButton aria-label="更多操作" title="更多操作" size="sm" shape="square" variant="muted">
+            <MoreHorizontal size={15} />
           </IconButton>
-        )}
-        {!readOnly && showRegen && cb.onRegenerate && (
-          <IconButton
-            aria-label="重新生成"
-            title="重新生成"
-            size="sm"
-            shape="square"
-            className="[@media(hover:none)]:size-11"
-            onClick={cb.onRegenerate}
-          >
-            <RotateCcw size={15} />
-          </IconButton>
-        )}
-        {!readOnly && cb.onFeedback && (
-          <IconButton
-            aria-label="反馈"
-            title="反馈"
-            size="sm"
-            shape="square"
-            className="[@media(hover:none)]:size-11"
-            onClick={() => cb.onFeedback?.(buildFeedbackCtx(msg))}
-          >
-            <MessageSquare size={15} />
-          </IconButton>
-        )}
-      </TouchActionRow>
-    </div>
-  );
-}
-
-/** P5b 一键存到项目：常显的两个小药丸，只挂在一轮的末条回答上。 */
-function ProjectSaveChips({
-  msg,
-  onSave,
-}: {
-  msg: ChatMessage;
-  onSave: (msg: ChatMessage, kind: "memory" | "skill") => void;
-}) {
-  const cls = chipVariants({ size: "sm" });
-  return (
-    <div className="flex items-center gap-1.5" data-testid="project-save-chips">
-      <button type="button" className={cls} onClick={() => onSave(msg, "memory")}>
-        <BookmarkPlus size={12} aria-hidden />
-        记住这条
-      </button>
-      <button type="button" className={cls} onClick={() => onSave(msg, "skill")}>
-        <Wand2 size={12} aria-hidden />
-        存为项目技能
-      </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" className="w-56" aria-label="消息操作">
+          <DropdownMenuItem onSelect={copyPlain}>
+            <Type size={14} className={MENU_ICON} aria-hidden="true" />
+            复制纯文本
+          </DropdownMenuItem>
+          {canSpeak && (
+            <DropdownMenuItem onSelect={speech.toggle}>
+              {speech.speaking ? (
+                <Square size={13} className={cn(MENU_ICON, "fill-current")} aria-hidden="true" />
+              ) : (
+                <Volume2 size={14} className={MENU_ICON} aria-hidden="true" />
+              )}
+              {speech.speaking ? "停止朗读" : "朗读"}
+            </DropdownMenuItem>
+          )}
+          {canQuote && (
+            <DropdownMenuItem onSelect={() => cb.onQuote?.(msg)}>
+              <Quote size={14} className={MENU_ICON} aria-hidden="true" />
+              引用
+            </DropdownMenuItem>
+          )}
+          {canRegen && (
+            <DropdownMenuItem onSelect={() => cb.onRegenerate?.()}>
+              <RotateCcw size={14} className={MENU_ICON} aria-hidden="true" />
+              重新生成
+            </DropdownMenuItem>
+          )}
+          {canFeedback && (
+            <DropdownMenuItem onSelect={() => cb.onFeedback?.(buildFeedbackCtx(msg))}>
+              <MessageSquare size={14} className={MENU_ICON} aria-hidden="true" />
+              反馈
+            </DropdownMenuItem>
+          )}
+          {canSave && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                data-testid="project-save-memory"
+                onSelect={() => onSaveToProject?.(msg, "memory")}
+              >
+                <BookmarkPlus size={14} className={MENU_ICON} aria-hidden="true" />
+                记住这条
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                data-testid="project-save-skill"
+                onSelect={() => onSaveToProject?.(msg, "skill")}
+              >
+                <Wand2 size={14} className={MENU_ICON} aria-hidden="true" />
+                存为项目技能
+              </DropdownMenuItem>
+            </>
+          )}
+          {showMeta && (
+            <>
+              <DropdownMenuSeparator />
+              <MetaMenuSection msg={msg} />
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {/* 桌面:时间 · 积分 · #id 在行尾淡显,只在 hover / 键盘焦点时出现(opacity,不占新行);
+          触屏没有 hover,整块 display:none,明细只在「更多」菜单里。 */}
+      {showMeta && (
+        <div className="ml-auto hidden min-w-0 pl-3 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100 [@media(hover:hover)]:flex">
+          <MetaRow msg={msg} />
+        </div>
+      )}
     </div>
   );
 }
@@ -1138,27 +1273,24 @@ export function AssistantCard({
           </output>
         )}
 
-        {/* 动作条 + meta（流式中不显示动作条，避免抖动）。流式阶段不单挂 token。
-            OCV5-307:动作、meta、评价合成**一条**底栏 —— 原先「复制」独占一行、meta+评价再占一行,
-            每条回答底下两行附属 chrome。现在左侧是动作(复制常显,其余 hover / 「更多操作」),
-            右侧是 meta + 评价;宽度不够时 flex-wrap 自然换行。桌面 hover 动作虽 opacity-0
-            仍占宽度,所以 meta 组走 ml-auto 靠右,不会被隐形按钮推出一段空白。 */}
+        {/* 动作条（流式中不显示，避免抖动）。OCV5-359:一条安静的图标行 —— 复制 · 👍 · 👎 · 更多;
+            存到项目、时间 · 积分 · 请求ID 都收进「更多」菜单(桌面 hover 时 meta 另在行尾淡显)。
+            没有动作条可挂的行(空正文的错误 / 静默卡)仍把 meta 常显在这里,否则积分无处可看。 */}
         {(() => {
           const showActions = !live && !hasError && !!msg.text && !isSyntheticEmptyNotice;
           const showMinimalActions = !live && hasError && !!presentedError?.bodyText;
           // 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
           // 刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。
           const showMeta = metaVisible && !hideOrphanSilentMeta;
-          // 逐条评价反馈行(极轻,常驻):仅对有正文、非 error 的 assistant 回复出现,且**只挂在
-          // 所在轮的末条 assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)——
-          // 一轮里穿插工具卡/思考卡/委派的多段中间文本回复不再各自带"这条回复怎么样?"(boss 07-11)。
-          // 其余门控与 MetaRow 一致(流式中 / 团队编排未终态时不出);历史各轮末条各自可评。
+          // 逐条评价(👍👎):仅对有正文、非 error 的 assistant 回复出现,且**只挂在所在轮的末条
+          // assistant 正文上**(turnFinalAssistant,轮边界判定在 turnSegment.ts)—— 一轮里穿插的
+          // 中间文本回复不各自带评价(boss 07-11)。流式中 / 团队编排未终态时不出;历史各轮末条各自可评。
           // 未登录/demo 由卡内 Context 兜底隐藏。
           const showRating =
             !live && !hasError && !!msg.text && !isSyntheticEmptyNotice && !isEmptyNoReply &&
             !!ctx.turnFinalAssistant && !(ctx.sending && ctx.inActiveTurn);
-          // P5b：完成态（非流式、本轮已收笔）、非只读、所在轮末条回答，且 App 给了入口才出。
-          const showProjectChips =
+          // P5b：完成态（非流式、本轮已收笔）、非只读、所在轮末条回答，且 App 给了入口才进菜单。
+          const showProjectSave =
             showActions && !readOnly && !!cb.onSaveToProject && !!ctx.turnFinalAssistant &&
             !(ctx.sending && ctx.inActiveTurn);
           const hasActions = showActions || showMinimalActions;
@@ -1173,14 +1305,19 @@ export function AssistantCard({
                   cb={cb}
                   showRegen={showRegenerate && !hasError}
                   readOnly={readOnly}
-                  className="mt-0 -ml-1.5"
+                  latest={showRegenerate}
+                  meta={showMeta}
+                  onSaveToProject={showProjectSave ? cb.onSaveToProject : undefined}
+                  rating={
+                    showRating ? (
+                      <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
+                    ) : null
+                  }
+                  className="-ml-1.5"
                 />
               )}
-              {showProjectChips && cb.onSaveToProject && (
-                <ProjectSaveChips msg={msg} onSave={cb.onSaveToProject} />
-              )}
-              {/* 用户主动停止 / 失败但模型已产出合法部分回答:正文可见就必须可留存 —— 给精简动作行
-                  (复制 / 复制纯文本 / 引用),不出朗读、重新生成、反馈(那些属于完整回答)。 */}
+              {/* 用户主动停止 / 失败但模型已产出合法部分回答:正文可见就必须可留存 —— 精简动作行
+                  (复制;菜单里纯文本 / 引用),不出朗读、重新生成、反馈、存到项目(那些属于完整回答)。 */}
               {showMinimalActions && (
                 <MessageActions
                   msg={msg}
@@ -1189,23 +1326,12 @@ export function AssistantCard({
                   text={presentedError!.bodyText}
                   minimal
                   readOnly={readOnly}
-                  className="mt-0 -ml-1.5"
+                  latest={isLastTurn}
+                  meta={showMeta}
+                  className="-ml-1.5"
                 />
               )}
-              {(showMeta || showRating) && (
-                <div
-                  className={cn(
-                    "flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 empty:hidden",
-                    // 窄屏不靠右:一靠右就和左侧动作拆成阶梯状的三行;贴着动作顺排更紧凑。
-                    hasActions && "sm:ml-auto sm:justify-end",
-                  )}
-                >
-                  {showMeta && <MetaRow msg={msg} tokenUsage={tokenUsage} />}
-                  {showRating && (
-                    <ResponseRatingCard messageId={msg.id} traceId={msg.usage?.traceId ?? null} />
-                  )}
-                </div>
-              )}
+              {!hasActions && showMeta && <MetaRow msg={msg} />}
             </div>
           );
         })()}

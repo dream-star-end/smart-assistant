@@ -1,10 +1,14 @@
 /**
  * 每条 assistant 回复底部的**极轻**评价反馈行（boss 选定形态）。
  *
- * 三态（默认收起 → 只一行小字 + 两个 thumb 图标按钮，不遮挡、不撑大布局）：
- *  1. 未评：muted「这条回复怎么样?」+ 👍 👎。
- *  2. 已评：选中 thumb 高亮，文案「谢谢反馈」；再点任一 thumb 可改评/补充（不做取消）。
- *  3. 展开（点 thumb 后就地展开，非弹窗）：问题/正向标签 Chip 多选 + 一句话可选输入 + 提交。
+ * 三态（默认只两个 thumb 图标按钮，嵌在 AssistantCard 的单行动作条里，不带任何可见文案 ——
+ * OCV5-359 去掉了「这条回复怎么样?」引导语，可访问名留在 aria-label 上）：
+ *  1. 未评：👍 👎。
+ *  2. 已评：选中 thumb 高亮(aria-pressed)，读屏播报「谢谢反馈」；再点任一 thumb 可改评/补充（不做取消）。
+ *  3. 展开（点 👎 后就地展开，非弹窗）：问题标签 Chip 多选 + 一句话可选输入 + 提交。
+ *
+ * 布局：根节点 `display:contents`，两个 thumb 直接成为动作条的 flex 子项（与复制 / 更多并排），
+ * 展开的补充区 `basis-full order-last` 自动换到动作条下方另起一行。
  *
  * 数据流（单一权威 = App 持有的 ratings Map，经 Context 下发）：
  *  - 点 thumb → 立即静默 `submit`（乐观：App 同步更新 Map，随后 POST；thumb 本身即最有价值信号）。
@@ -202,33 +206,25 @@ export function ResponseRatingCard({
   };
 
   return (
-    // oc-rating-nudge:纯 box-shadow/border-radius 脉冲(见 styles.css),无布局位移、
-    // respect prefers-reduced-motion、暗色自适应；未命中/已评时不加,布局与常态完全一致。
-    // OCV5-295:根节点不再强制独占一行(与 MetaRow 同一 flex-wrap 父节点里并排);
-    // 点踩展开补充区时整卡 basis-full 另起一行,补充区自身也 basis-full。
-    <div
-      className={cn(
-        "flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-2",
-        expanded && rating && "basis-full",
-        nudged && "oc-rating-nudge",
-      )}
-    >
-      <div className="flex items-center gap-1.5 text-meta text-faint">
-        <span>
-          {expanded && rating === "down"
-            ? "已记录，可选补充原因"
-            : rating
-              ? "谢谢反馈"
-              : "这条回复怎么样?"}
-        </span>
-        <div className="flex items-center gap-0.5">
-          <ThumbButton kind="up" selected={rating === "up"} onClick={() => clickThumb("up")} />
-          <ThumbButton kind="down" selected={rating === "down"} onClick={() => clickThumb("down")} />
-        </div>
+    // display:contents —— thumb 与补充区直接参与外层动作条的 flex 排布(见文件头注释)。
+    <div className="contents" data-testid="response-rating">
+      {/* oc-rating-nudge:纯 box-shadow/border-radius 脉冲(见 styles.css),无布局位移、
+          respect prefers-reduced-motion、暗色自适应；未命中/已评时不加,布局与常态完全一致。 */}
+      <div className={cn("flex items-center gap-0.5 rounded-md", nudged && "oc-rating-nudge")}>
+        <ThumbButton kind="up" selected={rating === "up"} onClick={() => clickThumb("up")} />
+        <ThumbButton kind="down" selected={rating === "down"} onClick={() => clickThumb("down")} />
       </div>
+      {/* 已评状态只给读屏一句确认;视觉上选中 thumb 的高亮已经够了,不再常驻一行小字。 */}
+      <span className="sr-only" aria-live="polite">
+        {rating && !expanded ? "谢谢反馈" : ""}
+      </span>
 
       {expanded && rating && (
-        <div className="flex basis-full flex-col gap-2.5 rounded-lg border border-border bg-surface/60 px-3 py-2.5 animate-in">
+        <div
+          data-rating-panel
+          className="order-last mt-1 flex basis-full flex-col gap-2.5 rounded-lg border border-border bg-surface/60 px-3 py-2.5 animate-in"
+        >
+          <p className="text-meta text-muted">已记录，可选补充原因</p>
           <div className="flex flex-wrap gap-1.5">
             {DOWN_TAGS.map((t) => (
               <TagChip key={t} label={t} active={tags.includes(t)} onClick={() => toggleTag(t)} />

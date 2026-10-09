@@ -203,7 +203,8 @@ describe("deferred oversized immutable record", () => {
     );
     expect(await screen.findByText("真实完整最终回答")).toBeInTheDocument();
     expect(screen.getByLabelText("消耗 1234 积分")).toBeInTheDocument();
-    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "点赞" })).toBeInTheDocument();
+    expect(screen.queryByText("这条回复怎么样?")).toBeNull();
 
     const waived = { ...locator, usage: { costCredits: "1234", waived: true } };
     view.rerender(
