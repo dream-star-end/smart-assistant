@@ -92,14 +92,28 @@ describe("协议文案", () => {
     for (const t of advertised) assert.ok(types.includes(t), `prompt advertises unknown type ${t}`);
   });
 
-  test("示例块本身是合法 JSON", () => {
+  test("示例块本身是合法 JSON:分段里放计算器(带曲线与占比)", () => {
     const m = /```ui\n(.+)\n```/.exec(INTELLIGENT_UI_PROMPT);
     assert.ok(m);
-    const v = JSON.parse(m![1]!) as { type: string };
-    assert.equal(v.type, "calculator");
+    const v = JSON.parse(m![1]!) as { type: string; tabs: { block: { type: string; chart?: unknown; breakdown?: unknown } }[] };
+    assert.equal(v.type, "tabs");
+    assert.equal(v.tabs[0]!.block.type, "calculator");
+    assert.ok(v.tabs[0]!.block.chart && v.tabs[0]!.block.breakdown);
   });
 
-  test("体积受控(系统提示每轮都带)", () => {
-    assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8") < 6_000, String(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8")));
+  test("提示词里列的图标名前端都认识", () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const shell = readFileSync(resolve(here, "../../../web-react/src/components/iui/shell.tsx"), "utf8");
+    const icons = /const ICONS[^=]*=\s*\{([\s\S]*?)\};/.exec(shell)?.[1] ?? "";
+    const known = new Set([...icons.matchAll(/^\s*"?([a-z-]+)"?:/gm)].map((x) => x[1]!));
+    assert.ok(known.size >= 40, `parsed icons: ${known.size}`);
+    const line = /icon 可选:([^\n。]+)/.exec(INTELLIGENT_UI_PROMPT)?.[1] ?? "";
+    const advertised = line.trim().split(/\s+/);
+    assert.ok(advertised.length >= 40);
+    for (const name of advertised) assert.ok(known.has(name), `prompt advertises unknown icon ${name}`);
+  });
+
+  test("体积受控(系统提示每轮都带;第二轮组件补齐后上限 9KB)", () => {
+    assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8") < 9_000, String(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8")));
   });
 });
