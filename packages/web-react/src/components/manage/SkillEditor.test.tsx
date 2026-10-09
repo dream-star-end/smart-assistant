@@ -395,7 +395,7 @@ describe("技能工作台 删除入口(OCV5-360:删除从列表行挪进工作�
     let releaseDelete: (v: boolean) => void = () => {};
     const onDelete = vi.fn(() => new Promise<boolean>((ok) => { releaseDelete = ok; }));
     mountWithDelete(DETAIL, onDelete);
-    const editor = await screen.findByDisplayValue(DETAIL.body);
+    const editor = await screen.findByDisplayValue("原始正文");
     fireEvent.change(editor, { target: { value: "改过" } });
     fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
     const del = screen.getByRole("button", { name: "删除技能" });

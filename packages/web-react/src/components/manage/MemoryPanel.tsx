@@ -378,7 +378,7 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
               {leftover.map((c) => (
                 <ListRow key={c.id ?? c.file}>
                   <div className="text-[14px] font-medium leading-5 text-fg">{memoryTitle(c.slug)}</div>
-                  <LeftoverBody text={(c.content ?? "").slice(0, 1200)} />
+                  <LeftoverBody text={c.content ?? ""} />
                   <div className="mt-2.5 flex gap-2">
                     <Button
                       size="sm"
@@ -415,7 +415,8 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
  */
 export function LeftoverBody({ text }: { text: string }) {
   const [open, setOpen] = useState(false);
-  const long = text.length > 90 || text.split("\n").length > 3;
+  // 窄屏 3 行约 60 个汉字;宁可多给一个「展开」也不让超出部分无从看到(Codex r2)。
+  const long = text.length > 40 || text.split("\n").length > 3;
   return (
     <>
       <p
@@ -464,7 +465,14 @@ function SectionHeading({
   as?: "h3" | "h4";
 }) {
   return (
-    <div className={cn("flex flex-wrap items-end justify-between gap-x-4 gap-y-2 pb-1", className)}>
+    // 说明在窄屏隐藏时标题只剩一行:与 44px 触控高的操作按钮居中对齐,而不是底对齐(否则按钮文字比标题高半行)。
+    <div
+      className={cn(
+        "flex flex-wrap items-end justify-between gap-x-4 gap-y-2 pb-1",
+        hideHintOnMobile && "max-md:items-center",
+        className,
+      )}
+    >
       <div className="min-w-0 flex-1 basis-40">
         <Tag className="flex items-baseline gap-2 text-[14px] font-semibold leading-5 tabular-nums text-fg">
           {title}
