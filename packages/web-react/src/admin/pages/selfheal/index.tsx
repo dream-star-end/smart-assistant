@@ -41,7 +41,8 @@ type BadgeTone = "neutral" | "accent" | "success" | "warning" | "danger" | "info
 
 const POLL_MS = 15_000;
 const PAGE = 50;
-const MAX_LIMIT = 300;
+// 与后端 INCIDENTS_MAX_LIMIT(admin/selfhealOps.ts)一致；超过 200 后端回 400,「加载更多」会让整页报错(OCV5-365)。
+const MAX_LIMIT = 200;
 
 function compareDecimalIds(a: string, b: string): number {
   const left = BigInt(a);

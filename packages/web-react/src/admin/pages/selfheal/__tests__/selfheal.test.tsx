@@ -179,6 +179,28 @@ describe("已压制 conditions 区块", () => {
     expect(screen.getByText("未触发")).toBeTruthy();
   });
 
+  test("加载更多不超过后端上限 200(OCV5-365)", async () => {
+    adminGet.mockImplementation((path: string, params?: { limit?: number }) => {
+      if (path === "/selfheal/incidents") {
+        return Promise.resolve({ rows: [INC], next_before: "1", total: 999, open_total: 1, limit: params?.limit });
+      }
+      return routeGet(path);
+    });
+    renderPage(<SelfhealPage />);
+    await screen.findByText("服务不可用");
+    for (let i = 0; i < 6; i += 1) {
+      const more = screen.queryByRole("button", { name: "加载更多" });
+      if (!more) break;
+      fireEvent.click(more);
+      await waitFor(() => expect(adminGet).toHaveBeenCalled());
+    }
+    const limits = adminGet.mock.calls
+      .filter((call) => call[0] === "/selfheal/incidents")
+      .map((call) => Number((call[1] as { limit?: number } | undefined)?.limit ?? 0));
+    expect(Math.max(...limits)).toBe(200);
+    expect(screen.queryByRole("button", { name: "加载更多" })).toBeNull();
+  });
+
   test("incident_id 深链在列表命中后自动打开真实事故详情", async () => {
     window.location.hash = "#tab=selfheal&incident_id=9";
     renderPage(<SelfhealPage />);
