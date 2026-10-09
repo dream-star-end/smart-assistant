@@ -1,13 +1,11 @@
 import {
   ArrowRight,
   ArrowUp,
+  Brain,
   CalendarDays,
+  ChevronRight,
+  Clock3,
   Download,
-  File as FileIcon,
-  FileCode,
-  FileImage,
-  FileSpreadsheet,
-  FileText,
   FolderOpen,
   Menu,
   MessageSquare,
@@ -20,6 +18,7 @@ import {
   Search,
   Settings2,
   Sparkles,
+  SquareKanban,
   Trash2,
   Upload,
   type LucideIcon,
@@ -28,6 +27,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -43,6 +43,7 @@ import { cn } from "../../lib/utils";
 import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
 import { useSignedDownload } from "../chat/media";
 import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
+import { OutputRow, OutputViewer } from "./OutputViewer";
 import { ScheduledRecipeChips } from "./ScheduledRecipes";
 import {
   Alert,
@@ -58,6 +59,7 @@ import {
   EmptyState,
   IconButton,
   Input,
+  ListGroup,
   Modal,
   Skeleton,
   Spinner,
@@ -121,23 +123,16 @@ export type ProjectHomeProps = {
 };
 
 export type ProjectSurface = "board" | "memory" | "skills" | "cron";
-const SURFACES: Array<{ id: ProjectSurface; label: string }> = [
-  { id: "board", label: "看板" },
-  { id: "memory", label: "记忆" },
-  { id: "skills", label: "技能" },
-  { id: "cron", label: "定时任务" },
+/** 图标与管理中心 / 侧栏同一套（同一分区处处同一个图形）。hint 只在宽容器里显示。 */
+const SURFACES: Array<{ id: ProjectSurface; label: string; hint: string; icon: LucideIcon }> = [
+  { id: "board", label: "看板", hint: "任务与进度", icon: SquareKanban },
+  { id: "memory", label: "记忆", hint: "项目记住的事", icon: Brain },
+  { id: "skills", label: "技能", hint: "项目专用技能", icon: Sparkles },
+  { id: "cron", label: "定时任务", hint: "按时自动运行", icon: Clock3 },
 ];
 
 const OVERVIEW_SESSION_LIMIT = 5;
 const OVERVIEW_OUTPUT_LIMIT = 6;
-
-const KIND_ICON: Record<OutputKind, LucideIcon> = {
-  doc: FileText,
-  image: FileImage,
-  table: FileSpreadsheet,
-  code: FileCode,
-  other: FileIcon,
-};
 
 /**
  * 项目主页（`/p/<id>[/<tab>]`）：一个项目的所有东西在一处 —— 开始新会话、最近会话、
@@ -206,6 +201,9 @@ export function ProjectHome(props: ProjectHomeProps) {
     [sessions],
   );
   const outputs = useMemo(() => outputsOf(assets), [assets]);
+  // 产出查看器与版本历史挂在主页这一层：概览和产出页签共用，查看器里也能跳到版本历史。
+  const [viewing, setViewing] = useState<ProjectAsset | null>(null);
+  const [historyFor, setHistoryFor] = useState<ProjectAsset | null>(null);
 
   // 「会话」页签要列全（含归档），产出要能找到来源会话：需要时触发已归档会话加载。
   const outputsMissSource = outputs.some((a) => a.sessionId && !titleById.has(a.sessionId));
@@ -395,6 +393,7 @@ export function ProjectHome(props: ProjectHomeProps) {
                 onReloadAssets={reloadAssets}
                 titleById={titleById}
                 onOpenSession={onOpenSession}
+                onOpenOutput={setViewing}
                 onOpenSettings={onOpenSettings}
                 onTabChange={onTabChange}
               />
@@ -434,13 +433,30 @@ export function ProjectHome(props: ProjectHomeProps) {
                 loading={assetsLoading}
                 error={assetsError}
                 onReload={reloadAssets}
-                demo={demo}
-                authSession={authSession}
                 titleById={titleById}
-                onOpenSession={onOpenSession}
+                onOpenOutput={setViewing}
               />
             )}
           </div>
+          {viewing && (
+            <OutputViewer
+              key={viewing.id}
+              asset={viewing}
+              sourceTitle={viewing.sessionId ? titleById.get(viewing.sessionId) : undefined}
+              onClose={() => setViewing(null)}
+              onOpenSession={onOpenSession}
+              onShowVersions={setHistoryFor}
+            />
+          )}
+          {historyFor && (
+            <OutputVersionsDialog
+              asset={historyFor}
+              demo={demo}
+              authSession={authSession}
+              onClose={() => setHistoryFor(null)}
+              onRestored={reloadAssets}
+            />
+          )}
         </div>
       </div>
     </div>
@@ -579,6 +595,7 @@ function OverviewTab({
   onReloadAssets,
   titleById,
   onOpenSession,
+  onOpenOutput,
   onOpenSettings,
   onTabChange,
 }: {
@@ -594,6 +611,7 @@ function OverviewTab({
   onReloadAssets: () => void;
   titleById: Map<string, string>;
   onOpenSession: (id: string) => void;
+  onOpenOutput: (asset: ProjectAsset) => void;
   onOpenSettings: () => void;
   onTabChange: (tab: ProjectTab) => void;
 }) {
@@ -714,120 +732,19 @@ function OverviewTab({
             还没有产出。智能体在这个项目的会话里生成的文件会出现在这里。
           </p>
         ) : (
-          <div className="grid grid-cols-2 gap-2">
+          <div className="-mx-2 flex flex-col">
             {latestOutputs.map((a) => (
-              <OutputTile
+              <OutputRow
                 key={a.id}
                 asset={a}
                 sourceTitle={a.sessionId ? titleById.get(a.sessionId) : undefined}
-                onOpenSession={onOpenSession}
+                onOpen={onOpenOutput}
                 compact
               />
             ))}
           </div>
         )}
       </SectionCard>
-    </div>
-  );
-}
-
-function OutputTile({
-  asset,
-  sourceTitle,
-  onOpenSession,
-  onShowVersions,
-  compact = false,
-}: {
-  asset: ProjectAsset;
-  sourceTitle?: string;
-  onOpenSession: (id: string) => void;
-  /** 有多个版本时打开版本历史；不传（概览）只显示版本号。 */
-  onShowVersions?: (asset: ProjectAsset) => void;
-  compact?: boolean;
-}) {
-  const kind = outputKind(asset);
-  const Icon = KIND_ICON[kind];
-  const canOpen = Boolean(asset.sessionId && sourceTitle);
-  const versions = asset.versionCount ?? 1;
-  const body = (
-    <>
-      <span
-        aria-hidden
-        className={cn(
-          "flex shrink-0 items-center justify-center rounded-lg bg-accent-soft text-accent",
-          compact ? "size-9" : "h-20 w-full",
-        )}
-      >
-        <Icon size={compact ? 16 : 24} />
-      </span>
-      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span className="truncate text-body font-medium text-fg" title={asset.name}>
-            {asset.name}
-          </span>
-          {versions > 1 && !onShowVersions && (
-            <Badge size="sm" data-testid="output-version-badge">
-              v{versions}
-            </Badge>
-          )}
-        </span>
-        <span className="truncate text-caption text-muted">
-          {sourceTitle ? `来自「${sourceTitle}」` : OUTPUT_KIND_LABELS[kind]}
-          {" · "}
-          <TimeAgo value={asset.createdAt} tooltip={false} />
-        </span>
-      </span>
-    </>
-  );
-  const cls = cn(
-    "flex min-w-0 rounded-lg border border-border bg-surface p-2 text-left",
-    compact ? "items-center gap-2" : "flex-col gap-2",
-  );
-  if (compact && canOpen) {
-    return (
-      <button
-        type="button"
-        onClick={() => onOpenSession(asset.sessionId!)}
-        title="在会话中打开"
-        className={cn(
-          cls,
-          "outline-none transition-colors hover:border-border-strong hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11",
-        )}
-      >
-        {body}
-      </button>
-    );
-  }
-  return (
-    <div className={cls} data-output-kind={kind}>
-      {body}
-      {!compact && (canOpen || (versions > 1 && onShowVersions)) && (
-        <div className="flex flex-wrap items-center gap-1">
-          {canOpen && (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="px-2"
-              onClick={() => onOpenSession(asset.sessionId!)}
-            >
-              在会话中打开
-              <ArrowRight size={13} aria-hidden />
-            </Button>
-          )}
-          {versions > 1 && onShowVersions && (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="px-2"
-              data-testid="output-version-badge"
-              aria-label={`${asset.name} 共 ${versions} 个版本，查看版本历史`}
-              onClick={() => onShowVersions(asset)}
-            >
-              v{versions}
-            </Button>
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -1058,22 +975,17 @@ function OutputsTab({
   loading,
   error,
   onReload,
-  demo,
-  authSession,
   titleById,
-  onOpenSession,
+  onOpenOutput,
 }: {
   outputs: ProjectAsset[];
   loading: boolean;
   error: string | null;
   onReload: () => void;
-  demo: boolean;
-  authSession: AuthSession;
   titleById: Map<string, string>;
-  onOpenSession: (id: string) => void;
+  onOpenOutput: (asset: ProjectAsset) => void;
 }) {
   const [kind, setKind] = useState<OutputKind | "all">("all");
-  const [historyFor, setHistoryFor] = useState<ProjectAsset | null>(null);
   const counts = useMemo(() => {
     const c: Record<OutputKind, number> = { doc: 0, image: 0, table: 0, code: 0, other: 0 };
     for (const a of outputs) c[outputKind(a)] += 1;
@@ -1086,9 +998,9 @@ function OutputsTab({
   if (error) return <AssetsError error={error} onReload={onReload} />;
   if (loading) {
     return (
-      <div className="grid grid-cols-2 gap-3 @2xl:grid-cols-3">
+      <div className="flex flex-col gap-2">
         {[0, 1, 2].map((i) => (
-          <Skeleton key={i} className="h-36 w-full" />
+          <Skeleton key={i} className="h-16 w-full" />
         ))}
       </div>
     );
@@ -1121,26 +1033,18 @@ function OutputsTab({
       {shown.length === 0 ? (
         <p className="px-2 py-6 text-center text-meta text-muted">没有这类产出</p>
       ) : (
-        <div className="grid grid-cols-2 gap-3 @2xl:grid-cols-3">
+        // 安静表面的分组列表：一个容器 + 行间发丝线，整行可点开查看器（不是一格一张大卡）。
+        <ListGroup data-testid="project-outputs-list">
           {shown.map((a) => (
-            <OutputTile
-              key={a.id}
-              asset={a}
-              sourceTitle={a.sessionId ? titleById.get(a.sessionId) : undefined}
-              onOpenSession={onOpenSession}
-              onShowVersions={setHistoryFor}
-            />
+            <li key={a.id} className="oc-list-row" data-interactive>
+              <OutputRow
+                asset={a}
+                sourceTitle={a.sessionId ? titleById.get(a.sessionId) : undefined}
+                onOpen={onOpenOutput}
+              />
+            </li>
           ))}
-        </div>
-      )}
-      {historyFor && (
-        <OutputVersionsDialog
-          asset={historyFor}
-          demo={demo}
-          authSession={authSession}
-          onClose={() => setHistoryFor(null)}
-          onRestored={onReload}
-        />
+        </ListGroup>
       )}
     </div>
   );
@@ -1176,6 +1080,12 @@ function useSurfaceOpener(
   return { open, opening };
 }
 
+/**
+ * 项目里的看板 / 记忆 / 技能 / 定时任务入口。安静表面（管理中心第 3 轮）的写法：
+ * 一个小号分组标题 + 一个 10px 圆角容器，格与格之间是发丝线（gap-px 透出底色），
+ * 每格 = 图标 + 名称（宽容器再带一行说明）+ ›。窄屏两列两行、宽容器一行四格；
+ * 每格最小 48px 高（≥44px 触控靶）。和上面的快捷开始药丸拉开一段距离，层级靠标题与留白。
+ */
 function ProjectSurfaceLinks({
   open,
   opening,
@@ -1183,14 +1093,49 @@ function ProjectSurfaceLinks({
   open: (surface: ProjectSurface) => Promise<void>;
   opening: ProjectSurface | null;
 }) {
+  const id = useId();
   return (
-    <nav aria-label="项目里的更多" className="flex flex-wrap items-center gap-2" data-testid="project-surface-links">
-      <span className="text-caption text-faint">项目里的</span>
-      {SURFACES.map((s) => (
-        <Chip key={s.id} onClick={() => void open(s.id)} aria-busy={opening === s.id || undefined}>
-          {s.label}
-        </Chip>
-      ))}
+    <nav aria-labelledby={`${id}-title`} className="mt-2 flex flex-col gap-2" data-testid="project-surface-links">
+      <h2 id={`${id}-title`} className="text-meta font-medium text-faint">
+        项目空间
+      </h2>
+      <ul className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-border bg-border @2xl:grid-cols-4">
+        {SURFACES.map((s) => {
+          const Icon = s.icon;
+          const busy = opening === s.id;
+          return (
+            <li key={s.id} className="flex bg-surface">
+              <button
+                type="button"
+                onClick={() => void open(s.id)}
+                aria-label={s.label}
+                aria-describedby={`${id}-${s.id}`}
+                aria-busy={busy || undefined}
+                data-surface={s.id}
+                className="group flex min-h-12 w-full min-w-0 items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              >
+                <Icon size={16} strokeWidth={1.75} aria-hidden className="shrink-0 text-muted" />
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate text-body font-medium text-fg">{s.label}</span>
+                  <span id={`${id}-${s.id}`} className="hidden truncate text-meta text-faint @md:block">
+                    {s.hint}
+                  </span>
+                </span>
+                {busy ? (
+                  <Spinner size={13} />
+                ) : (
+                  <ChevronRight
+                    size={15}
+                    strokeWidth={1.75}
+                    aria-hidden
+                    className="shrink-0 text-faint transition-colors group-hover:text-muted"
+                  />
+                )}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
     </nav>
   );
 }

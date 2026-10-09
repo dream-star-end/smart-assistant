@@ -234,7 +234,7 @@ export function useSignedSrc(src: string | null | undefined): {
  *   Safari 弹窗拦截风险,能同步就同步)。
  * - 非容器路径(http/data:)原样返回,无过期概念。
  */
-function useFreshSignedUrl(src: string | null | undefined): {
+export function useFreshSignedUrl(src: string | null | undefined): {
   get: (opts?: { forceResign?: boolean }) => Promise<string | null>;
   peek: () => string | null;
   cacheIdentity: string | null;

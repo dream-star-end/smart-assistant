@@ -147,7 +147,7 @@ const CODE_EXT = new Set([
   "scala",
 ]);
 
-function extOf(name: string): string {
+export function extOf(name: string): string {
   const base = name.split("/").pop() ?? name;
   const i = base.lastIndexOf(".");
   return i > 0 ? base.slice(i + 1).toLowerCase() : "";

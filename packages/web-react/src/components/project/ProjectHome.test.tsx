@@ -185,9 +185,14 @@ describe("ProjectHome", () => {
     const outputs = screen.getByTestId("project-home-outputs");
     expect(within(outputs).getByText("PROPOSAL.md")).toBeInTheDocument();
     expect(within(outputs).getByText("usage-sept.xlsx")).toBeInTheDocument();
-    // 有来源会话的产出可点开会话。
-    fireEvent.click(within(outputs).getByText("sidebar-mock.png"));
+    // 点产出就地打开查看器；「在会话中打开」是查看器里的次要操作。
+    fireEvent.click(within(outputs).getByRole("button", { name: "查看 sidebar-mock.png" }));
+    const viewer = await screen.findByRole("dialog");
+    expect(within(viewer).getByTestId("output-viewer")).toHaveAttribute("data-preview-kind", "image");
+    expect(h.onOpenSession).toHaveBeenCalledTimes(1); // 只有上面点会话那一次：点产出不跳会话
+    fireEvent.click(within(viewer).getByRole("button", { name: /在会话中打开/ }));
     expect(h.onOpenSession).toHaveBeenLastCalledWith("s-new");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
     expect(screen.getByTestId("project-home-summary")).toHaveTextContent(
       "已设项目指令 · 1 份常用文件 · 2 个会话",
@@ -279,20 +284,32 @@ describe("ProjectHome", () => {
     expect(screen.getByText(/设为常用的文件/)).toBeInTheDocument();
   });
 
-  it("产出页签：类型筛选与「在会话中打开」", async () => {
+  it("产出页签：类型筛选，点一行就地打开查看器，「在会话中打开」留作次要操作", async () => {
     const h = renderHome({ tab: "outputs" });
     await waitFor(() => expect(screen.getByText("PROPOSAL.md")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "全部 3" })).toHaveAttribute("aria-pressed", "true");
+    // 一个分组列表，每个产出一行（不再是一格一张大卡）。
+    expect(within(screen.getByTestId("project-outputs-list")).getAllByTestId("output-row")).toHaveLength(3);
+    // 卡片上不再直接挂「在会话中打开」。
+    expect(screen.queryByRole("button", { name: /在会话中打开/ })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "图片 1" }));
     expect(screen.getByText("sidebar-mock.png")).toBeInTheDocument();
     expect(screen.queryByText("PROPOSAL.md")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: /在会话中打开/ }));
+    fireEvent.click(screen.getByRole("button", { name: "查看 sidebar-mock.png" }));
+    let viewer = await screen.findByRole("dialog");
+    fireEvent.click(within(viewer).getByRole("button", { name: /在会话中打开/ }));
     expect(h.onOpenSession).toHaveBeenCalledWith("s-new");
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 
     fireEvent.click(screen.getByRole("button", { name: "表格 1" }));
-    expect(screen.getByText("usage-sept.xlsx")).toBeInTheDocument();
-    // 没有来源会话的产出不给「在会话中打开」。
-    expect(screen.queryByRole("button", { name: /在会话中打开/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看 usage-sept.xlsx" }));
+    viewer = await screen.findByRole("dialog");
+    // xlsx 不能在线预览：详情 + 下载；没有来源会话就不给「在会话中打开」。
+    expect(within(viewer).getByTestId("output-details")).toHaveTextContent("usage-sept.xlsx");
+    expect(within(viewer).getByRole("button", { name: "下载 usage-sept.xlsx" })).toBeInTheDocument();
+    expect(within(viewer).queryByRole("button", { name: /在会话中打开/ })).toBeNull();
+    fireEvent.keyDown(viewer, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
   it("产出页签：多版本的产出显示 v<N>，版本历史列出时间/大小/下载，恢复旧版本", async () => {
@@ -314,7 +331,10 @@ describe("ProjectHome", () => {
     // 单版本产出没有版本号。
     expect(screen.getAllByTestId("output-version-badge")).toHaveLength(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "report.md 共 3 个版本，查看版本历史" }));
+    // 版本历史从查看器里进入。
+    fireEvent.click(screen.getByRole("button", { name: "查看 report.md" }));
+    const viewer = await screen.findByRole("dialog");
+    fireEvent.click(within(viewer).getByRole("button", { name: "report.md 共 3 个版本，查看版本历史" }));
     const dialog = await screen.findByTestId("output-versions");
     await waitFor(() => expect(within(dialog).getAllByTestId("output-version")).toHaveLength(3));
     expect(list).toHaveBeenCalledWith(expect.anything(), "o-v3");
@@ -426,7 +446,12 @@ describe("ProjectHome surfaces (P2)", () => {
       onShowSurface,
     } as Overrides);
     const links = await screen.findByTestId("project-surface-links");
-    expect(links).toHaveTextContent("看板");
+    // 一个有标题的分组：四个入口，每个都是 ≥44px（min-h-12 = 48px）的整格按钮。
+    expect(links).toHaveAccessibleName("项目空间");
+    const buttons = within(links).getAllByRole("button");
+    expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual(["看板", "记忆", "技能", "定时任务"]);
+    for (const b of buttons) expect(b.className).toMatch(/\bmin-h-12\b/);
+    expect(within(links).getByRole("button", { name: "看板" })).toHaveAccessibleDescription("任务与进度");
     fireEvent.click(screen.getByRole("button", { name: "记忆" }));
     await waitFor(() => expect(onShowSurface).toHaveBeenCalledWith("memory"));
     expect(order).toEqual(["prepare", "show memory"]);
