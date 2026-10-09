@@ -211,3 +211,62 @@ slot 是系统提示的一部分，走正常的模型请求，由 egress/proxy �
 - cc3-admin-v4 改管理中心，cc3-selfhost-workspace 改消息操作行（OCV5-359）和产出预览（OCV5-358）。
 - 本任务新增文件为主。改动的现有文件：`MarkdownImpl.tsx`（一处分派加预处理）、消息复制（一行包装）、`App.tsx`（提供 context、导出包装）、`settings/PreferencesTab.tsx`（一行开关）。
 - 合入前对 canonical 最新 HEAD 做 rebase，冲突按对方的意图保留，测试重跑。
+
+---
+
+# 第二轮(2026-10-09 晚):组件补齐 + 视觉升级
+
+运营原话(21:56–22:00):「预置了哪些组件，是否齐全，ui、ux样式是否高级有设计感、美观」「组件继续补齐，我自己验证了下感觉样式不够高级，太素了」。
+
+## R2.0 诊断
+
+- 第一版 11 种组件覆盖了「表格 / 图表 / 数字 / 清单 / 对比 / 选项 / 计算器 / 提示 / 分段 / 时间线 / 追问」,但参考里最有辨识度的几类没有:**图片卡片列表**(烤羊腿菜单)、**图片拼贴 + 色板**(胶囊衣橱)、**彩色网格方块**(菜园规划)、**随人数换算的食谱**、**分段标签里放计算器**(Investing / Mortgage / Bill split)、**大数字 + 增长额 + 进度条 + 面积曲线**的计算器、学习类的**小测验**、追问参数的**表单**、行程**路线**。
+- 「太素」的具体来源:每个组件都是 1px 灰框白底盒子;标题 14.5px 灰,和正文同级;数字不够大;图表是平涂色块、直线折线、无渐变;分段/开关/滑块是浏览器默认或近似默认;没有任何动效;所有组件长一个样,读不出层次。
+
+## R2.1 新增组件(9 种)与增强
+
+| type | 用途 | 关键字段 |
+|---|---|---|
+| `cards` | 图片卡片列表(菜单、景点、书单、商品) | `layout: list\|grid`,`items[{title, subtitle?, body?, image?, icon?, tags?, meta?, url?}]` |
+| `gallery` | 图片拼贴(1 大 + 2 小,超过显示 +N) | `images[{src, caption?}]`,`caption?` |
+| `swatches` | 色板(配色、穿搭、装修) | `colors[{hex, name?}]`,点一下复制色值 |
+| `tiles` | 彩色方块网格(菜园、户型分区、日程格) | `columns 2–4`,`items[{title, subtitle?, icon?, tone?, span?}]`,`caption?` |
+| `recipe` | 随份数换算的食谱 | `servings, unit?, ingredients[{name, amount?, unit?, note?}]`,`steps?`,`meta?[{label,value}]` |
+| `quiz` | 小测验,本地判分 | `questions[{question, options[], answer(序号), explain?}]` |
+| `progress` | 水平进度/占比条(预算、营养、评分) | `items[{label, value, max?, unit?, tone?, note?}]` |
+| `kv` | 规格/要点键值表 | `items[{label, value}]` |
+| `form` | 收集参数后作为一条用户消息发出 | `fields[{id, label, kind: text\|number\|select\|chips\|date, options?, placeholder?, unit?, required?}]`,`submit?` |
+| `route` | 行程路线(站点 + 段间距离/时长 + 值得绕路) | `stops[{name, detail?, note?, highlight?}]`,`legs?[{distance?, duration?, mode?}]` |
+
+增强:
+- 所有组件可写 `subtitle`(标题下一行说明)。
+- `tabs[].block`:分段里放一个完整组件(不能再嵌 tabs),实现参考里的「理财计算器三连」。
+- `calculator`:`chart{kind, x(输入 id), from, to(数字或输入 id), points?, series[输出 id], x_label?}` 按输入扫描画曲线;`breakdown[输出 id]` 画占比条;输出 `tone: up|down` 绿色/红色;主结果大号居中,数值变化有过渡。
+- `stats`:每项可带 `trend[数字]` 画迷你走势线。
+- `table`:列可 `bar: true`(行内数据条),`highlight` 指定强调行;单元格写 ✓ / ✗ 渲染成图标。
+- `compare`:每项可带 `price`、`image`。
+- 图片(`cards` / `gallery` / `compare.image`):`https://` 地址或容器内文件路径;容器路径走现有签名(与正文图片同一条路),外链 `referrerPolicy=no-referrer`、懒加载;加载失败显示带图标的色块,不留破图。其它字段仍不加载图片。
+
+`form` 原来是 `calculator` 的别名,现在成为独立组件;模型过去没被告知过 `form`,不影响历史消息语义(历史里若有 `"type":"form"` 且带 inputs/outputs,校验失败会按列表/原文降级,不会崩)。
+
+## R2.2 视觉系统(浅 / 深两套)
+
+- **表面**:去掉 1px 灰框。卡片 = 白(深色为抬升表面)+ 极淡描边(前景 6%)+ 两层柔和阴影,圆角 16;卡内分区用浅灰填充面而不是分割线。
+- **标题区**:左侧 26px 圆角图标徽章(按组件类型给图标,强调色淡底),标题 15.5px/600,副标题 13px 灰;复制/数据等操作是 28px 圆形图标按钮。
+- **数字**:关键数字 30–36px、字重 650、等宽数字、负字距;变化时 240ms 过渡(尊重减弱动效)。增减用带底色的小药丸。
+- **色板**:图表 6 色(紫 / 青绿 / 琥珀 / 玫红 / 天蓝 / 橄榄),浅深各一组;面积图渐变填充、折线平滑(单调三次插值)、柱子顶部圆角、终点光点;方块网格 6 种柔和色调。
+- **控件**:分段控件 = 灰色轨道 + 滑动白色滑块;滑块自绘轨道(已选部分强调色)+ 带阴影圆钮;步进器胶囊形;开关强调色;选项与建议是胶囊按钮。
+- **动效**:组件完成时淡入上移 6px(220ms);骨架换内容交叉淡入;勾选、切换有短过渡。全部在 `prefers-reduced-motion` 下关闭。
+- **不做**:不放大正文字号、不用 emoji 当标题、不用花哨渐变背景;手机 390px 宽下所有组件单列可读,触屏命中 ≥44px。
+
+## R2.3 协议与提示词
+
+提示词加入新组件的一行 schema 与一个分段+计算器示例;体积从约 3.7KB 增到约 6.5KB(仍是开关开时才发)。前后端字段一致性测试同步更新。
+
+## R2.4 测试与发布
+
+- 单测:新 schema 的校验/修复/截断、Markdown 转换(关闭开关、复制、导出)、计算器扫描曲线与占比、quiz 判分、form 组装消息、recipe 换算、图片地址白名单。
+- 渲染测试:每种新组件的渲染、键盘可达、流式骨架。
+- 预览截图:新增「全部组件」场景,手机/桌面 × 浅/深;同一份内容在改动前的树上渲染作为「改动前」。
+- 线上真实对话:多模型多轮,检查新组件被选用且 JSON 有效;扣费对账。
+- 发布:同一工单 OCV5-361 的后续,新分支,正常门禁与 Lease ride。
