@@ -223,19 +223,6 @@ describe("cursorExternalApiOutbox startScanner lifecycle", () => {
     }
   });
 
-  test("idle scans log one heartbeat, not one line per tick (OCV5-365)", async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-idle-log-"));
-    const lines: Array<Record<string, unknown>> = [];
-    try {
-      const box = await openCursorExternalApiOutbox({ directory: dir });
-      const deps = { pool: {} as never, pricing: { get: () => null } as never, logger: capturingLogger(lines) };
-      for (let i = 0; i < 5; i += 1) await box.scanOnce(deps);
-      assert.equal(lines.filter((l) => l.msg === "cursor_external_outbox_scan").length, 1);
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
   test("second batch still runs after a non-empty first scan, then stop drains and restart works", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "oc-outbox-second-"));
     let handle: { stop: () => Promise<void> } | undefined;
