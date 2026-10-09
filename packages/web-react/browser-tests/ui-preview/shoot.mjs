@@ -20,7 +20,7 @@
 //   OC_E2E_BROWSER    指定 Chrome/Chromium 可执行文件(见 scripts/lib/resolve-browser.mjs)
 // 退出码:0 全部成功 / 1 有场景失败或零场景(fail-loud,不静默出空目录)。
 import { createRequire } from 'node:module'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -117,6 +117,8 @@ const plugins = [
 
 // ── 构建 ────────────────────────────────────────────────────────────────────
 const workDir = mkdtempSync(join(tmpdir(), 'oc-ui-preview-'))
+// Build output only (shots go elsewhere); remove it on every exit path (OCV5-357).
+process.on('exit', () => { rmSync(workDir, { recursive: true, force: true }) })
 const bundlePath = join(workDir, 'harness.js')
 await esbuild.build({
   entryPoints: [join(HERE, 'harness.tsx')],

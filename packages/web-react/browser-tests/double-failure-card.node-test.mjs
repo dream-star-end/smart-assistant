@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -31,6 +31,7 @@ async function until(label, fn, timeout = 15000) {
 
 test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one retry button", { timeout: 180000 }, async (t) => {
   const assetDir = mkdtempSync(join(tmpdir(), "oc-double-card-browser-"));
+  t.after(() => rmSync(assetDir, { recursive: true, force: true }));
   await build({
     entryPoints: [join(here, "process-disclosure-app-harness.tsx")], bundle: true,
     splitting: true, format: "esm", outdir: assetDir, entryNames: "app", chunkNames: "chunks/[name]-[hash]", jsx: "automatic",

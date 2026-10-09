@@ -39,7 +39,7 @@
 // (默认 /tmp)。退出码:0 全过 / 1 断言失败 / 2 环境错误(浏览器缺失等,同样视为门失败)。
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -68,6 +68,9 @@ const TOUCH_MIN = 43.5;
 
 // ── bundle ──────────────────────────────────────────────────────────────────
 const outDir = mkdtempSync(join(tmpdir(), "oc-browser-tests-"));
+// Each run bundles ~50MB here; nothing removed it, and hundreds piled up in /tmp (OCV5-357).
+// The exit hook also covers process.exit and uncaught failures.
+process.on("exit", () => { rmSync(outDir, { recursive: true, force: true }); });
 const bundlePath = join(outDir, "harness.js");
 await esbuild.build({
   entryPoints: [join(HERE, "harness.tsx")],
