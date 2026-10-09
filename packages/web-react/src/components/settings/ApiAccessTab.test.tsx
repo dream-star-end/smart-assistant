@@ -322,6 +322,14 @@ describe("limitPercent", () => {
 });
 
 describe("pickDefaultModel / buildCcSwitchDeepLink", () => {
+  // OCV5-355:三档合成一个正则时按目录顺序取第一个命中，sonnet 排在 flash 前就会占掉轻量位。
+  test("轻量位按档取：sonnet 排在 gemini flash 前也先取 flash", () => {
+    const light = [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/];
+    expect(pickDefaultModel(["sonnet-5", "gemini-3.8-flash"], "haiku-4.5", light)).toBe("gemini-3.8-flash");
+    expect(pickDefaultModel(["sonnet-5", "gemini-3.8-flash", "haiku-4"], "haiku-4.5", light)).toBe("haiku-4");
+    expect(pickDefaultModel(["opus-5", "sonnet-5"], "haiku-4.5", light)).toBe("sonnet-5");
+  });
+
   test("首选在列表里就用首选;列表缺失/为空用首选兜底;否则按家族正则退到列表项", () => {
     expect(pickDefaultModel(null, "fable-5.1")).toBe("fable-5.1");
     expect(pickDefaultModel([], "fable-5.1")).toBe("fable-5.1");
