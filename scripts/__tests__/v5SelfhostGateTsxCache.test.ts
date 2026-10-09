@@ -55,6 +55,18 @@ describe("selfhost release gates use a per-build tsx cache (OCV5-357)", () => {
     assert.ok(before.lastIndexOf("create_master_gate_tmpdir") > before.lastIndexOf("build_master_release() {"));
   });
 
+  test("gate workers that rebuild their env keep the private TMPDIR (otherwise tsx falls back to /tmp/tsx-<uid>)", () => {
+    const box = readFileSync(path.join(root, "scripts/check-v5-box-success-recovery.ts"), "utf8");
+    assert.match(box, /if \(process\.env\.TMPDIR\) allowed\.add\("TMPDIR"\);/);
+    assert.match(box, /\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\),\n {6}\.\.\.extra,/);
+    const cb = readFileSync(path.join(root, "scripts/check-v5-callback-payload-hash.mjs"), "utf8");
+    assert.match(cb, /OC_TEST_MUTEX_TIMEOUT: '90',\n\s+\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\) \},/);
+    // The others already give their workers a TMPDIR under os.tmpdir(), which is the private dir.
+    for (const f of ["check-v5-cursor-sand-inference.ts", "check-v5-delegate-billing-requestid.ts", "check-v5-cron-submit-boundary.ts", "check-v5-session-unavailable-rootfix.ts"]) {
+      assert.match(readFileSync(path.join(root, "scripts", f), "utf8"), /TMPDIR/, f);
+    }
+  });
+
   test("every failure path cleans the gate dir: cleanup_master_staging calls it first", () => {
     const body = fn("cleanup_master_staging");
     const call = body.indexOf("cleanup_master_gate_tmpdir");

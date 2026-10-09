@@ -245,6 +245,8 @@ function assertWorkerEnv(home: string): void {
   if (process.env[HOLD_KEY]) allowed.add(HOLD_KEY);
   if (process.env[HOLD_SIGNALS_KEY]) allowed.add(HOLD_SIGNALS_KEY);
   if (process.env[FAULT_KEY]) allowed.add(FAULT_KEY);
+  // The release passes a per-build TMPDIR so tsx's compile cache lives and dies with the build (OCV5-357).
+  if (process.env.TMPDIR) allowed.add("TMPDIR");
   const keys = Object.keys(process.env).sort();
   for (const key of keys) {
     if (!allowed.has(key)) throw new Error(`BOX_SUCCESS_GATE_ENV_LEAK ${key}`);
@@ -335,6 +337,7 @@ export async function supervise(opts: SuperviseOptions): Promise<{ stdout: strin
       OPENCLAUDE_HOME: home,
       TEST_DATABASE_URL: db.raw,
       NODE_ENV: "test",
+      ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
       ...extra,
     },
   });
