@@ -67,6 +67,7 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
       const peer = { id: BOARD_SESSION, kind: "dm" };
       const sessionKey = `agent:main:webchat:dm:${BOARD_SESSION}`;
       scenario.sent.push(id);
+      if (frame.content?.recovery?.automatic === true) scenario.attempts.push(frame.content.recovery.attempt);
       send({ type: "outbound.ack", admitted: true, peer, clientMessageId: id });
       const ts = Date.now();
       // The same failed turn as the server stores it: the verified status record
@@ -84,7 +85,7 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
     for (const width of [1280, 390]) await t.test(`${width} one failure card, one retry`, async () => {
-      scenario = { sent: [], seq: 0 };
+      scenario = { sent: [], seq: 0, attempts: [] };
       preview.store.board = []; preview.store.older = []; preview.store.revision += 1;
       const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
       const page = await context.newPage(); const errors = [];
@@ -94,7 +95,14 @@ test("INC-20261006-DOUBLE-FAILURE-CARD: real App shows one failure card and one 
         await page.getByPlaceholder(/对话/).fill("DOUBLE_CARD_REQUEST");
         await page.getByRole("button", { name: "发送", exact: true }).click();
         await page.getByText("消息未开始处理", { exact: true }).waitFor();
+        // Every replay fails again, so the shared automatic lineage must run 1..10 and stop. Judge
+        // the cards only after it has settled; a fixed 1.5s sample landed mid-retry (OCV5-355).
+        // Before the fix the lineage restarted at attempt 2 after each server echo: 80 sends in 10s.
+        const deadline = Date.now() + 20_000;
+        while (scenario.attempts.length < 10 && Date.now() < deadline) await new Promise((done) => setTimeout(done, 100));
         await new Promise((done) => setTimeout(done, 1500));
+        assert.deepEqual(scenario.attempts, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "automatic retry lineage climbs 1..10 and stops");
+        assert.equal(scenario.sent.length, 11, "the original send plus exactly ten automatic retries");
         const body = await page.locator("body").innerText();
         assert.equal(await page.getByText("消息未开始处理", { exact: true }).count(), 1, "the unbilled status card is shown once");
         assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0, "the second red card of the same failure is not shown");
