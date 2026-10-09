@@ -524,6 +524,7 @@ describe("auth.verify.resendVerification (integ)", () => {
     assert.doesNotMatch(mailer.sent[0].text, /https?:\/\//, "重发验证码邮件不应含 URL");
     assert.match(mailer.sent[0].text, /旧验证码已作废/);
     assert.match(mailer.sent[0].text, /不要把验证码转发/);
+    assert.match(mailer.sent[0].html ?? "", /旧验证码已作废/, "重发也带 HTML 卡片版");
     const newCodeMatch = mailer.sent[0].text.match(/\n {4}(\d{6})\n/);
     assert.ok(newCodeMatch, "新邮件必须含 6 位码");
     const newCode = newCodeMatch![1];

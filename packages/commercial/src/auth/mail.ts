@@ -13,6 +13,8 @@ export interface MailMessage {
   subject: string;
   /** 纯文本正文 */
   text: string;
+  /** 可选 HTML 正文;有则与 text 一起发(multipart/alternative),客户端自选 */
+  html?: string;
 }
 
 export interface Mailer {
@@ -75,6 +77,7 @@ export function createResendMailer(opts: ResendMailerOptions): Mailer {
             to: [msg.to],
             subject: msg.subject,
             text: msg.text,
+            ...(msg.html ? { html: msg.html } : {}),
           }),
           signal: ctrl.signal,
         });
