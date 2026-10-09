@@ -508,7 +508,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       <ListRow
         key={job.id}
         data-interactive=""
-        className={cn("p-0 first:rounded-t-[9px] last:rounded-b-[9px]", job.id === highlightId && "animate-in")}
+        className={cn("p-0", job.id === highlightId && "animate-in")}
       >
         <div className="flex items-start">
           <button
@@ -517,7 +517,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
             aria-expanded={editing}
             aria-label={`编辑「${name}」`}
             aria-describedby={descId}
-            className="min-w-0 flex-1 rounded-[9px] py-3 pl-4 pr-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+            className="min-w-0 flex-1 py-3 pl-4 pr-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           >
             <span id={descId} className="flex min-w-0 flex-col gap-0.5">
               {/* 一级:标题 + 状态(圆点 + 文字)。停用 / 已完成的标题降为弱化色。 */}
@@ -590,7 +590,7 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
           </div>
         </div>
         {editing && (
-          <div className="rounded-b-[9px] border-t border-border bg-bg/60">
+          <div className="border-t border-border bg-bg/60">
             <CronForm
               key={`edit-${job.id}-${formNonce}`}
               auth={auth}

@@ -117,7 +117,7 @@ export function MemoryPanel({
           ) : undefined
         }
       />
-      {/* 二级页签:安静表面下是一条带发丝底线的文字页签,底线只在内容列内(不再通栏)。 */}
+      {/* 二级页签:app 统一的药丸页签(与设置「7 天 / 30 天」同款,OCV5-362)。 */}
       <div className="min-w-0 px-4">
         <Tabs
           aria-label="记忆分区"
@@ -586,7 +586,7 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
           )}
 
           {/* 四个指标是一条分格的统计带(一个容器 + 发丝分隔),不是四张下沉小卡。 */}
-          <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-border bg-border lg:grid-cols-4">
+          <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4">
             {[
               ["使用会话", totals.sessions],
               ["记忆操作", totals.events],
@@ -972,7 +972,7 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索记忆"
                 aria-label="搜索核心记忆"
-                className="h-9 rounded-[10px] border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10"
+                className="h-9 border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10"
                 autoComplete="off"
               />
             </div>
@@ -1140,7 +1140,7 @@ function AutoDreamReportCard({
     <section
       aria-label="Auto-Dream 梦境报告"
       aria-busy={running || undefined}
-      className="overflow-hidden rounded-[10px] border border-border bg-surface"
+      className="overflow-hidden rounded-xl border border-border bg-surface shadow-soft"
     >
       <div className="px-4 py-3.5">
         <div className="flex items-baseline justify-between gap-3">

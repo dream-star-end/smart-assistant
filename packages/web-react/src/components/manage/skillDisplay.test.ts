@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { isSecretSkill, skillDisplayTitle } from "./skillDisplay";
+import { isSecretSkill, skillDisplayTitle, skillHeading } from "./skillDisplay";
 
 describe("isSecretSkill", () => {
   test("改造前写死的三个 slug 都按规则命中", () => {
@@ -44,5 +44,32 @@ describe("skillDisplayTitle", () => {
     expect(
       skillDisplayTitle({ name: "write-helper", description: "写作助手\r\n第二行说明" }),
     ).toEqual({ title: "写作助手", caption: "write-helper" });
+  });
+});
+
+describe("skillHeading", () => {
+  test("取正文第一个一级标题,去掉首尾空白与收尾 #", () => {
+    expect(skillHeading("# 顾问模式：参考核验与设计检查\n\n## 何时使用")).toBe("顾问模式：参考核验与设计检查");
+    expect(skillHeading("引言\n\n#  部署清单  ##\n# 第二个")).toBe("部署清单");
+  });
+  test("没有一级标题(只有二级 / 空正文)返回 null", () => {
+    expect(skillHeading("## 只有二级标题\n正文")).toBeNull();
+    expect(skillHeading("")).toBeNull();
+    expect(skillHeading(undefined)).toBeNull();
+    expect(skillHeading("#没有空格不算标题")).toBeNull();
+  });
+  test("收尾 # 要隔空格才去掉;围栏代码块里的 # 注释不算标题(Codex r1)", () => {
+    expect(skillHeading("# C#")).toBe("C#");
+    expect(skillHeading("# 发布 #")).toBe("发布");
+    expect(skillHeading("```bash\n# Install dependencies\nnpm i\n```\n# 真正的标题")).toBe("真正的标题");
+    expect(skillHeading("~~~\n# 注释\n~~~")).toBeNull();
+  });
+  test("围栏按 CommonMark 收栏(同字符、不短于开栏、无尾随内容);空标题返回 null(Codex r2)", () => {
+    expect(skillHeading("~~~~\n~~~\n# 假的\n~~~~\n# 真的")).toBe("真的");
+    expect(skillHeading("~~~\n~~~oops\n# 假的\n~~~\n# 真的")).toBe("真的");
+    expect(skillHeading("\t~~~\n# 真的")).toBe("真的");
+    expect(skillHeading("``` a`b\n# 真的")).toBe("真的");
+    expect(skillHeading("# ###")).toBeNull();
+    expect(skillHeading("#")).toBeNull();
   });
 });

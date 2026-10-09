@@ -260,7 +260,8 @@ describe("技能工作台保存竞态(请求在途继续编辑)", () => {
     await settleSave();
     expect(screen.getByDisplayValue("服务端 v5")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("服务端 v4")).not.toBeInTheDocument();
-    expect(screen.getByText(/正文（v5；/)).toBeInTheDocument();
+    // 版本号在工作台头部的 slug 行里(OCV5-362:不再塞进「正文」字段标签)。
+    expect(screen.getByText("v5")).toBeInTheDocument();
   });
 
   test("保存期间没再动过的路径照常清干净(不因为加了快照校验就永远脏)", async () => {
@@ -329,7 +330,7 @@ describe("技能工作台只读态与触屏可达性", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  test("标题用列表同款展示名,历史页签计数在打开时就带上", async () => {
+  test("标题:正文没有 H1 时用列表同款展示名,历史页签计数在打开时就带上", async () => {
     vi.spyOn(api, "getSkillHistory").mockResolvedValue({
       history: [{ version: "2", timestamp: new Date().toISOString() }],
       writable: true,
@@ -342,8 +343,38 @@ describe("技能工作台只读态与触屏可达性", () => {
         <SkillEditor auth={auth} skillName="写作助手" displayTitle="帮你把草稿改成成稿" open onClose={() => {}} onChanged={() => {}} />
       </TooltipProvider>,
     );
-    expect(await screen.findByText("技能工作台 · 帮你把草稿改成成稿")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "帮你把草稿改成成稿" })).toBeInTheDocument();
+    expect(screen.queryByText(/技能工作台 ·/)).not.toBeInTheDocument();
     expect(await screen.findByRole("tab", { name: "历史（1）" })).toBeInTheDocument();
+  });
+
+  test("标题优先用正文的一级标题(人话名字),slug 与版本号在下面一行;触发描述不进头部", async () => {
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: true });
+    vi.spyOn(api, "getSkill").mockResolvedValue({
+      ...DETAIL,
+      version: "1.0.16",
+      body: "# 顾问模式：参考核验与设计检查\n\n## 何时使用\n",
+    });
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    render(
+      <TooltipProvider>
+        <SkillEditor
+          auth={auth}
+          skillName="advisor-mode-reference-design"
+          displayTitle="设计或核验 Claude Code 风格的顾问模式时使用。先核验官方机制，再检查与团队、审计的边界"
+          open
+          onClose={() => {}}
+          onChanged={() => {}}
+        />
+      </TooltipProvider>,
+    );
+    const heading = await screen.findByRole("heading", { name: "顾问模式：参考核验与设计检查" });
+    expect(heading.querySelector(".line-clamp-1")).not.toBeNull();
+    expect(screen.getByText("advisor-mode-reference-design")).toBeInTheDocument();
+    expect(screen.getByText("v1.0.16")).toBeInTheDocument();
+    expect(screen.queryByText(/正文 \/ 文件 \/ 评测/)).not.toBeInTheDocument();
+    // 「技能标识 …」不再作为正文区里的一行(曾在窄屏压到正文标签上)。
+    expect(screen.queryByText(/^技能标识/)).not.toBeInTheDocument();
   });
 
   test("辅助文件删除按钮常驻 DOM(不再靠 hover 才出现 → 触屏可达)", async () => {

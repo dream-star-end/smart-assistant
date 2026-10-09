@@ -60,6 +60,7 @@ export {
   useHeaderSlot,
   useQuiet,
 } from "./Quiet";
+export { SectionNav, type SectionNavItem } from "./SectionNav";
 export { Select, type SelectOption, type SelectProps } from "./Select";
 export { ProjectScopeSelect } from "./ProjectScopeSelect";
 export {

@@ -3,7 +3,6 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { X } from "lucide-react";
 import { type ReactNode, useRef } from "react";
 import { cn } from "../../lib/utils";
-import { useQuiet } from "./Quiet";
 import { revealFocusedElement, useScrollBodyTabbable } from "./a11y";
 import { IconButton } from "./IconButton";
 
@@ -108,6 +107,8 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   /** 内容区附加类;大尺寸对话查看器可用来接管 padding/滚动容器。 */
   bodyClassName?: string;
   hideClose?: boolean;
+  /** 标题行右侧、关闭按钮之前的附加操作(如管理中心「怎么用」)。仅在有 title 时渲染。 */
+  headerActions?: ReactNode;
   /** Optional layered-Escape handler. Omit to keep Radix's default close behavior. */
   onEscapeKeyDown?: RD.DialogContentProps["onEscapeKeyDown"];
   /** Let immersive dialogs place initial focus on their primary interaction surface. */
@@ -138,6 +139,7 @@ export function Modal({
   className,
   bodyClassName,
   hideClose,
+  headerActions,
   onEscapeKeyDown,
   onOpenAutoFocus,
   onCloseAutoFocus,
@@ -145,7 +147,6 @@ export function Modal({
 }: ModalProps) {
   // Description 仅在 title 存在时渲染;否则显式断开 Radix 默认 aria-describedby,避免悬空引用。
   const hasDescription = Boolean(title && description);
-  const quiet = useQuiet();
   // 正文滚动区:只在「溢出且没有可聚焦子孙」时进入 Tab 序(a11y shell#7),让纯文本长内容也能键盘滚动。
   const bodyRef = useRef<HTMLDivElement>(null);
   const bodyTabbable = useScrollBodyTabbable(bodyRef, open);
@@ -163,9 +164,7 @@ export function Modal({
           onCloseAutoFocus={onCloseAutoFocus}
           // Tab 回绕时 Radix 用 preventScroll 聚焦,目标若滚出了弹层可视区要自己滚回来(a11y shell#8)。
           onFocusCapture={revealFocusedElement}
-          // 安静表面里打开的子弹窗(工作台 / 确认框)走 portal,不在 .oc-manage 节点之下:
-          // 挂 oc-quiet 让它拿到同一套圆角 / 阴影 token。
-          className={cn(modalContentVariants({ size, fixedHeight, mobile }), quiet && "oc-quiet", className)}
+          className={cn(modalContentVariants({ size, fixedHeight, mobile }), className)}
         >
           {title ? (
             <div
@@ -181,12 +180,17 @@ export function Modal({
                   <RD.Description className="mt-1 text-sm text-muted">{description}</RD.Description>
                 )}
               </div>
-              {!hideClose && (
-                <RD.Close asChild>
-                  <IconButton aria-label="关闭" size="sm">
-                    <X size={16} />
-                  </IconButton>
-                </RD.Close>
+              {(headerActions || !hideClose) && (
+                <div className="flex shrink-0 items-center gap-1">
+                  {headerActions}
+                  {!hideClose && (
+                    <RD.Close asChild>
+                      <IconButton aria-label="关闭" size="sm">
+                        <X size={16} />
+                      </IconButton>
+                    </RD.Close>
+                  )}
+                </div>
               )}
             </div>
           ) : (

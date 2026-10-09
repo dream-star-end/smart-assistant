@@ -121,7 +121,7 @@ describe("SkillsPanel 行(OCV5-360:整行一个点按目标)", () => {
       skills: [{ name: "writer-pro", description: "帮你把草稿改成成稿\n第二行不进标题", writable: true, layer: "shared", agentIds: [] }],
     });
     fireEvent.click(await screen.findByRole("button", { name: "打开 帮你把草稿改成成稿" }));
-    expect(await screen.findByText("技能工作台 · 帮你把草稿改成成稿")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "帮你把草稿改成成稿" })).toBeInTheDocument();
   });
 
   test("标题两行截断、其余描述两行截断(不叠 block)、slug 不上行面", async () => {
@@ -166,7 +166,7 @@ describe("SkillsPanel 行(OCV5-360:整行一个点按目标)", () => {
   test("只读 / 市场技能的工作台没有删除入口", async () => {
     mountPanel();
     fireEvent.click(await screen.findByRole("button", { name: "查看 市场技能" }));
-    await screen.findByText(/技能工作台 · 市场技能/);
+    await screen.findByRole("heading", { name: /市场技能/ });
     expect(screen.queryByRole("button", { name: "删除技能" })).not.toBeInTheDocument();
   });
 

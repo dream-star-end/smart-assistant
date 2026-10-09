@@ -99,7 +99,7 @@ export function Alert({
         hasTrailing && "flex-wrap items-start",
         // 安静表面(管理中心):不画彩色描边框。中性下沉底 + 状态圆点;无标题的警告 / 错误
         // 正文取语义色,其余用前景色 —— 颜色只承载「这是问题」这一件事。
-        quiet && "items-start gap-2.5 rounded-[10px] border-transparent bg-hover",
+        quiet && "items-start gap-2.5 border-transparent bg-hover",
         className,
       )}
       {...props}

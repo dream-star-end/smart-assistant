@@ -45,16 +45,15 @@ test('窄屏 + 插槽：页面标题只留给读屏，操作搬进上下文行�
   expect(screen.getByTestId('panel')).not.toContainElement(screen.getByRole('button', { name: '市场' }))
 })
 
-test('桌面：页面标题照常显示，操作留在标题右侧', () => {
+test('桌面 + 插槽：与窄屏一致，标题只留给读屏、操作进上下文行（OCV5-362：与设置中心一样不放页面大标题）', () => {
   stubViewport(true)
   render(
     <Shell>
       <PanelHeader title="技能" action={<button type="button">市场</button>} />
     </Shell>,
   )
-  expect(document.querySelector('[data-panel-header]')).not.toHaveClass('sr-only')
-  expect(screen.getByTestId('slot')).toBeEmptyDOMElement()
-  expect(screen.getByTestId('panel')).toContainElement(screen.getByRole('button', { name: '市场' }))
+  expect(document.querySelector('[data-panel-header]')).toHaveClass('sr-only')
+  expect(screen.getByTestId('slot')).toContainElement(screen.getByRole('button', { name: '市场' }))
 })
 
 test('没有插槽（管理中心之外）时窄屏也不收起标题', () => {

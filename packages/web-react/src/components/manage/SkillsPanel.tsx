@@ -296,7 +296,7 @@ function SkillRow({
     scope.length === 0 ? "暂未启用" : scope.length <= 2 ? scope.join("、") : `${scope.slice(0, 2).join("、")} 等 ${scope.length} 个`;
 
   return (
-    <ListRow data-interactive="" className="p-0 first:rounded-t-[9px] last:rounded-b-[9px]">
+    <ListRow data-interactive="" className="p-0">
       <button
         type="button"
         onClick={() => setEditorOpen(true)}

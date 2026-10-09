@@ -110,7 +110,8 @@ test('md 以上用 168px 竖导航，窄屏不并排', () => {
   const { rerender } = render(<SettingsCenter {...base} />)
   const desktopNav = screen.getByRole('tablist', { name: '设置分区' })
   expect(desktopNav).toHaveAttribute('aria-orientation', 'vertical')
-  expect(desktopNav).toHaveClass('w-[168px]')
+  // 168px 在 SectionNav 外层(导航与底部附加入口共用一列);与管理中心共用同一原语(OCV5-362)。
+  expect(desktopNav.closest('.w-\\[168px\\]')).not.toBeNull()
   expect(screen.getByRole('tab', { name: '账户与计费' })).toHaveAttribute(
     'aria-controls',
     'settings-panel-account',

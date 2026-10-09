@@ -845,79 +845,14 @@ body {
   .tut-card:hover { transform: none; }
 }
 
-/* ── 管理中心(OCV5-344 第 3 轮):安静的排版型工作面 ────────────────────────────
-   规则:层级靠字号 / 对齐 / 留白;一个分组 = 一个 10px 容器 + 发丝线;不画渐变、彩色药丸、
-   图标方块与浮起的卡片;强调色只给选中指示 / 焦点环 / 开关 / 文字链接 / 待办圆点。
-   原语在 QuietSurface 下自己换形态(ui/Quiet.tsx),这里只放外壳与几条跨原语的规则。 */
-.oc-manage,
-.oc-quiet {
-  --radius-xl: 10px;
-  --radius-lg: 8px;
-  --radius-md: 8px;
-}
-.oc-manage {
-  background: var(--surface);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--fg) 8%, transparent),
-    0 24px 64px -12px rgba(0, 0, 0, 0.28);
-}
-.dark .oc-manage {
-  background: var(--bg);
-  box-shadow:
-    0 0 0 1px color-mix(in srgb, var(--fg) 9%, transparent),
-    0 24px 64px -12px rgba(0, 0, 0, 0.6);
-}
-/* 手写 shadow-soft 的存量卡片在这里也是平的。 */
-.oc-manage .shadow-soft,
-.oc-quiet .shadow-soft { box-shadow: none; }
-/* 深色:分组容器取 surface,落在 bg 上形成克制的内嵌层次(Linear 同款)。 */
-.dark .oc-manage-rail { background: color-mix(in srgb, var(--sidebar) 60%, var(--bg)); }
-.oc-manage-rail { background: color-mix(in srgb, var(--sidebar) 55%, var(--surface)); }
-@media (max-width: 767px) {
-  .oc-manage-rail, .dark .oc-manage-rail { background: transparent; }
-}
-
-/* 导航项:32px 行,选中 = 中性填充 + 左侧 2px 强调短条。 */
-.oc-manage-tab { transition: background-color 120ms var(--ease-standard), color 120ms var(--ease-standard); }
-@media (min-width: 768px) {
-  .oc-manage-tab[aria-selected="true"] { background: var(--active); }
-  .oc-manage-tab[aria-selected="true"]::before {
-    position: absolute;
-    left: 0;
-    top: 50%;
-    width: 2px;
-    height: 14px;
-    border-radius: 2px;
-    background: var(--accent);
-    content: "";
-    transform: translateY(-50%);
-  }
-}
-@media (max-width: 767px) {
-  /* 窄屏分区切换(OCV5-360):iOS 分段控件 —— 一条浅灰轨道,选中项是抬起的表面色滑块。
-     不再是图标 + 两字标签的六等分条(改造前 390px 下拥挤,且「文献」「优化」两个分区已下线)。 */
-  .oc-manage-tablist { background: color-mix(in srgb, var(--fg) 6%, transparent); }
-  /* 分段视觉高 32px;透明 ::after 上下各外扩 6px,命中区 44px(触控标准)。 */
-  .oc-manage-tab::after { position: absolute; inset: -6px 0; content: ""; }
-  .dark .oc-manage-tablist { background: color-mix(in srgb, var(--fg) 9%, transparent); }
-  .oc-manage-tab { transition: background-color 180ms var(--ease-standard), color 120ms var(--ease-standard), box-shadow 180ms var(--ease-standard); }
-  .oc-manage-tab[aria-selected="true"] {
-    background: var(--surface);
-    box-shadow:
-      0 0 0 0.5px color-mix(in srgb, var(--fg) 10%, transparent),
-      0 1px 2px rgba(0, 0, 0, 0.08);
-  }
-  .dark .oc-manage-tab[aria-selected="true"] {
-    background: color-mix(in srgb, var(--fg) 16%, var(--bg));
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
-  }
-  /* 固定区下沿:内容滚离顶部才出现发丝线(Notion 式)。改造前没有边界,滚上去的搜索框
-     看起来像被「作用范围」行切掉了上半(运营 11:54 截图的「遮挡」)。 */
-  /* 用工具条自身的下边框而不是外投影:不需要定位/层级(定位会让壳体的绝对定位关闭按钮
-     以工具条为包含块、掉到上下文行里)。 */
-  .oc-manage-toolbar { border-bottom: 1px solid transparent; transition: border-color 120ms var(--ease-standard); }
-  .oc-manage-toolbar[data-scrolled] { border-bottom-color: var(--color-border); }
-}
+/* ── 管理中心(OCV5-344 第 3 轮 → OCV5-362 第 5 轮) ─────────────────────────────
+   第 5 轮删掉了这里的独立外壳语言(把 --radius-* 压到 10/8px、自定义投影与暗色底、染色侧栏、
+   iOS 方角分段、强制去掉 shadow-soft):运营「和 v5 个人版的整体样式很割裂」。外壳与圆角 / 阴影
+   全部回到 app 的 token;这里只剩上下文行的滚动发丝线、行内取值选择器与分组列表的几条规则。 */
+/* 上下文行下沿:内容滚离顶部才出现发丝线(Notion 式)—— 否则滚上去的搜索框看起来像被
+   「作用范围」行切掉了上半(运营 10-09 11:54 截图)。 */
+.oc-manage-toolbar { border-bottom: 1px solid transparent; transition: border-color 120ms var(--ease-standard); }
+.oc-manage-toolbar[data-scrolled] { border-bottom-color: var(--color-border); }
 
 /* 作用范围 / 面板筛选下拉:安静的填充小控件(表单里的字段保持原输入框样式)。 */
 .oc-manage-panel select:not(form select):not(.oc-inline-select select) {

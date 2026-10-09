@@ -1,7 +1,6 @@
 import type { LucideIcon } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { useMdViewport } from '../../hooks/useMdViewport'
 import { cn } from '../../lib/utils'
 import { Card } from './Card'
 import { useHeaderSlot, useQuiet } from './Quiet'
@@ -26,31 +25,26 @@ export function PanelHeader({
 }) {
   const quiet = useQuiet()
   const slot = useHeaderSlot()
-  const md = useMdViewport()
   if (quiet) {
-    // 安静表面:分区标题就是页面标题 —— 22/30 半粗 + 一行 13px 说明,下方 24px 后接内容。
-    // 标题里的「（8）」这类计数由调用方写在 title 里时原样保留;新代码请用 GroupHeading 的 count。
-    // 窄屏且壳体提供了上下文行插槽(OCV5-360):分段控件已写明当前分区,页面标题 + 说明只是
-    // 在重复它、把内容挤到半屏以下 —— 标题与说明只留给读屏,右侧操作 portal 进上下文行。
-    const compact = Boolean(slot) && !md
-    return (
-      <div
-        data-panel-header=""
-        className={cn(
-          'flex flex-wrap items-start justify-between gap-x-4 gap-y-3 px-4',
-          compact ? 'sr-only' : 'pb-5 pt-2 md:pt-1',
-        )}
-      >
-        <div className="min-w-0 flex-1 basis-64">
-          <h3 className="text-[22px] font-semibold leading-[30px] tracking-[-0.01em] text-fg">
-            {title}
-          </h3>
-          {hint && <p className="mt-1 max-w-[60ch] text-body text-muted">{hint}</p>}
+    // 安静表面(管理中心):壳体提供了上下文行插槽时(OCV5-362 起两个断点都提供),导航已写明
+    // 当前分区 —— 与设置中心一样不再放页面大标题,标题 + 说明只留给读屏,右侧操作 portal 进上下文行。
+    // 没有插槽(单独渲染的面板)时退回可见的标题行。
+    if (slot) {
+      return (
+        <div data-panel-header="" className="sr-only">
+          <h3>{title}</h3>
+          {hint && <p>{hint}</p>}
+          {action && createPortal(<div className="flex min-w-0 items-center gap-1">{action}</div>, slot)}
         </div>
-        {action &&
-          (compact && slot
-            ? createPortal(<div className="flex min-w-0 items-center gap-1">{action}</div>, slot)
-            : <div className="flex shrink-0 items-center gap-2">{action}</div>)}
+      )
+    }
+    return (
+      <div data-panel-header="" className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 px-4 pb-4 pt-2">
+        <div className="min-w-0 flex-1 basis-64">
+          <h3 className="text-title font-semibold text-fg">{title}</h3>
+          {hint && <p className="mt-0.5 max-w-[60ch] text-caption text-muted">{hint}</p>}
+        </div>
+        {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
       </div>
     )
   }

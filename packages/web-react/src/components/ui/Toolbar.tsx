@@ -101,7 +101,7 @@ export function Toolbar({
             className={cn(
               "w-full pl-9",
               quiet &&
-                "h-9 rounded-[10px] border-transparent bg-hover transition-colors hover:bg-active focus:bg-surface max-md:h-10",
+                "h-9 border-transparent bg-hover transition-colors hover:bg-active focus:bg-surface max-md:h-10",
             )}
           />
         </div>

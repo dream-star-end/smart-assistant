@@ -1,7 +1,6 @@
 import { cva, type VariantProps } from "class-variance-authority";
 import type { HTMLAttributes, ReactNode } from "react";
 import { cn } from "../../lib/utils";
-import { useQuiet } from "./Quiet";
 
 /**
  * 卡片容器 —— 全仓「圆角 + 描边 + 表面」的唯一权威。
@@ -54,14 +53,10 @@ export interface CardProps
     VariantProps<typeof cardVariants> {}
 
 export function Card({ className, padding, tone, interactive, ...props }: CardProps) {
-  const quiet = useQuiet();
   return (
     <div
       className={cn(
         cardVariants({ padding, tone, interactive }),
-        // 安静表面:平的(无阴影、hover 不抬升),10px 圆角;accent 选中态退成中性下沉底。
-        quiet && "rounded-[10px] shadow-none hover:translate-y-0 hover:shadow-none",
-        quiet && tone === "accent" && "border-border-strong bg-hover",
         className,
       )}
       {...props}

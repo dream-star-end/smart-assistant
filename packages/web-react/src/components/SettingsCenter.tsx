@@ -1,5 +1,5 @@
 import { Sparkles } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Theme } from "../hooks/useTheme";
 import { useMdViewport } from "../hooks/useMdViewport";
 import { api, apiErrorMessage } from "../lib/api";
@@ -21,7 +21,7 @@ import { FeedbackTab } from "./settings/FeedbackTab";
 import { BuiltinHotkeysTable, PreferencesTab } from "./settings/PreferencesTab";
 import { SubscriptionDialog } from "./settings/SubscriptionDialog";
 import { UsageTab } from "./settings/UsageTab";
-import { Avatar, Button, Modal, Spinner, Tabs } from "./ui";
+import { Avatar, Button, Modal, SectionNav, Spinner, Tabs } from "./ui";
 
 export type SettingsSection = SettingsDestinationSection;
 
@@ -203,7 +203,14 @@ export function SettingsCenter({
       >
         <div className={cn("flex min-h-0 min-w-0 flex-1", desktop ? "flex-row" : "flex-col")}>
           {desktop ? (
-            <VerticalNav value={section} onChange={setSection} groups={groups} />
+            <SectionNav
+              aria-label="设置分区"
+              idBase="settings-nav"
+              panelIdBase="settings-panel"
+              value={section}
+              onChange={setSection}
+              groups={groups}
+            />
           ) : (
             <div className="shrink-0 border-b border-border px-4 py-3">
               <Tabs
@@ -263,82 +270,6 @@ export function SettingsCenter({
         />
       )}
     </>
-  );
-}
-
-function VerticalNav({
-  value,
-  onChange,
-  groups,
-}: {
-  value: SettingsSection;
-  onChange: (section: SettingsSection) => void;
-  groups: { label: string; items: SectionDef[] }[];
-}) {
-  const ids = groups.flatMap((g) => g.items.map((s) => s.id));
-  const refs = useRef<(HTMLButtonElement | null)[]>([]);
-
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    const index = ids.indexOf(value);
-    if (index < 0) return;
-    let next = -1;
-    if (event.key === "ArrowDown") next = (index + 1) % ids.length;
-    else if (event.key === "ArrowUp") next = (index - 1 + ids.length) % ids.length;
-    else if (event.key === "Home") next = 0;
-    else if (event.key === "End") next = ids.length - 1;
-    if (next < 0) return;
-    event.preventDefault();
-    onChange(ids[next]!);
-    refs.current[next]?.focus();
-  };
-
-  return (
-    <nav
-      role="tablist"
-      aria-label="设置分区"
-      aria-orientation="vertical"
-      onKeyDown={onKeyDown}
-      className="flex w-[168px] shrink-0 flex-col overflow-y-auto border-r border-border p-2"
-    >
-      {groups.map((group) => (
-        <div key={group.label}>
-          {/* 只有一个分组时分组标题是多余层级(审计 SET-41);多组才需要区分。 */}
-          {groups.length > 1 ? (
-            <div className="px-2.5 pb-1 pt-3 text-meta font-medium uppercase tracking-wide text-faint">
-              {group.label}
-            </div>
-          ) : (
-            <div className="pt-1" aria-hidden />
-          )}
-          {group.items.map((it) => {
-            const selected = it.id === value;
-            const index = ids.indexOf(it.id);
-            return (
-              <button
-                key={it.id}
-                ref={(el) => {
-                  refs.current[index] = el;
-                }}
-                type="button"
-                role="tab"
-                id={`settings-nav-${it.id}`}
-                aria-controls={selected ? `settings-panel-${it.id}` : undefined}
-                aria-selected={selected}
-                tabIndex={selected ? 0 : -1}
-                data-product-feature={it.featureId}
-                onClick={() => onChange(it.id)}
-                className={cn(
-                  "flex w-full rounded-md px-2.5 py-1.5 text-left text-body outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                  selected ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
-                )}
-              >
-                {it.label}
-              </button>
-            );
-          })}
-        </div>
-      ))}
-    </nav>
   );
 }
 

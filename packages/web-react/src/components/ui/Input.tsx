@@ -22,8 +22,11 @@ import { cn } from "../../lib/utils";
  *    在卡片上会画出一圈错色边;无 offset 时环紧贴自身边框,两种底色下都正确。
  *    `focus:border-accent` 保持 `focus:`(非环样式,鼠标点击时也应变色)。
  */
-export const controlSurfaceClass =
-  "w-full rounded-lg border border-border-control bg-surface text-base md:text-sm text-fg outline-none transition-[border-color,box-shadow] duration-150 ease-standard placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50 [@media(hover:none)]:min-h-11";
+export const controlSurfaceBaseClass =
+  "w-full rounded-lg border border-border-control bg-surface text-base md:text-sm text-fg outline-none transition-[border-color,box-shadow] duration-150 ease-standard placeholder:text-faint focus:border-accent focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50";
+
+/** 单行控件(Input / Select):外观 + 粗指针下的 44px 触控靶。多行框用 controlSurfaceBaseClass。 */
+export const controlSurfaceClass = `${controlSurfaceBaseClass} [@media(hover:none)]:min-h-11`;
 
 /**
  * 控件高度档位。触控靶由 controlSurfaceClass 的 `[@media(hover:none)]:min-h-11` 统一兜底

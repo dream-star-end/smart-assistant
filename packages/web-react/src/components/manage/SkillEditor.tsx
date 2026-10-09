@@ -60,6 +60,7 @@ import {
   useToast,
 } from "../ui";
 import { SkillEvalSection, SkillTrainSection } from "./SkillOptPanel";
+import { skillHeading } from "./skillDisplay";
 
 const AUX_PREFIXES = ["references/", "assets/", "evals/", "scripts/"];
 const SKILL_MD = "SKILL.md";
@@ -218,6 +219,8 @@ export function SkillEditor({
   }, []);
 
   const writable = detail?.writable === true;
+  // 同一个技能在列表 / 工作台 / 确认框里尽量只叫一个名字:正文有 H1 就用它(随编辑实时更新)。
+  const heading = skillHeading(body) ?? (displayTitle?.trim() || skillName);
   const scopeEditable = writable && detail?.layer === "shared";
 
   // load 的代际号:refresh 可能被保存/删文件/训练合并/重试同时触发,响应乱序回来时
@@ -550,11 +553,17 @@ export function SkillEditor({
       onOpenChange={(o) => {
         if (!o) void requestClose();
       }}
-      title={`技能工作台 · ${displayTitle?.trim() || skillName}`}
+      // 头部只放人话名字(正文 H1 > 描述首行 > slug),一行截断;slug 与版本号是下面那一行灰字。
+      // 原先「技能工作台 · <整句触发描述>」在手机上占四行粗体(运营 10-09 19:53 截图)。
+      title={<span className="line-clamp-1 break-all text-title font-semibold text-fg">{heading}</span>}
       description={
-        writable
-          ? "正文 / 文件 / 评测 / 训练优化都在这里完成。"
-          : "只读技能（市场安装 / 平台内置）：内容不可编辑，但可以跑评测。"
+        <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 text-meta text-faint">
+          <span className="select-all break-all">{skillName}</span>
+          {detail?.version && <span aria-hidden="true">·</span>}
+          {detail?.version && <span className="tabular-nums">v{detail.version}</span>}
+          {detail && !writable && <span aria-hidden="true">·</span>}
+          {detail && !writable && <span>只读</span>}
+        </span>
       }
       size="xl"
       mobile="fullscreen"
@@ -672,31 +681,20 @@ export function SkillEditor({
                 </Card>
               ))}
             {writable ? (
-              <Field
-                label={detail?.version ? `正文（v${detail.version}；保存后旧版自动入历史）` : "正文"}
-                className="min-h-0 flex-1"
-              >
+              // 窄屏整列自然滚动:Field 不参与 flex 收缩(收缩会把文本框压成一行、让下一行压到标签上,
+              // 运营 10-09 19:53 截图);桌面才撑满剩余高度。
+              <Field label="正文（保存后旧版自动入历史）" className="shrink-0 md:min-h-0 md:flex-1 md:shrink">
                 <Textarea
                   value={body}
                   onChange={(e) => {
                     setBody(e.target.value);
                     markDirty(SKILL_MD);
                   }}
-                  className="min-h-[16rem] flex-1 font-mono"
+                  className="min-h-[18rem] flex-1 font-mono"
                 />
               </Field>
             ) : (
-              <ReadOnlyText
-                label={detail?.version ? `正文（v${detail.version}）` : "正文"}
-                text={body}
-                className="min-h-0 flex-1"
-              />
-            )}
-            {/* 技能标识(slug)不再出现在列表行上,只在这里给一次 —— 排查 / 对话里点名时用得到。 */}
-            {displayTitle?.trim() && displayTitle.trim() !== skillName && (
-              <p className="shrink-0 text-meta text-faint">
-                技能标识 <span className="select-all text-muted">{skillName}</span>
-              </p>
+              <ReadOnlyText label="正文" text={body} className="shrink-0 md:min-h-0 md:flex-1 md:shrink" />
             )}
             {writable && onDelete && (
               <div data-danger-zone="" className="mt-2 flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border pt-4">
