@@ -2913,10 +2913,15 @@ await check("T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用
 
 await check("T30 视频任务中心持久排队、实时进度与跨 worker 取消终态", async () => {
   await page.evaluate(() => window.__openMediaTask(true));
-  await page.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
+  // 一切断言都限定在任务中心这个面板里:同页其它 root(被中断工具卡等)也有完全相同的「已取消」,
+  // 不限定时「已取消」可能立刻命中别处，取消请求和刷新还没落地就去查「取消」按钮(托管慢机上必现,OCV5-355)。
+  const center = page.getByRole("dialog", { name: "视频任务中心" });
+  await center.waitFor({ state: "visible", timeout: 5000 });
+  try {
+  await center.getByText("BROWSER_MEDIA_TASK", { exact: true }).waitFor({ state: "visible", timeout: 5000 });
   // 审计 M-05：与 status 同义的 phase（queued/canceled）不再重复拼在状态后面，原始 phase 只留在 title 里排障。
-  await page.getByText("排队中", { exact: true }).first().waitFor({ state: "visible" });
-  if (await page.getByText(/· queued/).count()) {
+  await center.getByText("排队中", { exact: true }).first().waitFor({ state: "visible" });
+  if (await center.getByText(/· queued/).count()) {
     throw new Error("任务状态行仍把协议 phase 枚举原样拼给用户");
   }
   await page.evaluate(() => window.__pushMediaJob({
@@ -2941,8 +2946,8 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     createdAt: "2026-08-05T00:00:00.000Z",
     updatedAt: "2026-08-05T00:00:01.000Z",
   }));
-  await page.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
-  await page.getByText("生成中 · 正在生成画面", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+  await center.getByText("7/20", { exact: true }).waitFor({ state: "visible" });
+  await center.getByText("生成中 · 正在生成画面", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
   const cancelRequests = [];
   const onCancelRequest = (request) => {
     if (
@@ -2957,7 +2962,7 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     // 审计 M-06：取消是不可逆操作，先弹确认层；「再想想」不发请求，「取消任务」才发且只发一次。
     // exact:true:同页 #interrupted-tool-status-root 的工具卡表头可及名含「已取消」(tools T-22 起
     // 表头可及名 = 标签 + 摘要 + 状态),子串匹配会撞成 strict mode violation。
-    await page.getByRole("button", { name: "取消", exact: true }).click();
+    await center.getByRole("button", { name: "取消", exact: true }).click();
     const confirmDialog = page.getByRole("dialog", { name: "取消这个视频任务？" });
     await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
     await confirmDialog.getByRole("button", { name: "再想想" }).click();
@@ -2965,7 +2970,7 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     await page.waitForTimeout(300);
     if (cancelRequests.length !== 0) throw new Error("「再想想」不该发出取消请求");
 
-    await page.getByRole("button", { name: "取消", exact: true }).click();
+    await center.getByRole("button", { name: "取消", exact: true }).click();
     await confirmDialog.waitFor({ state: "visible", timeout: 3000 });
     const canceled = page.waitForRequest(
       (request) =>
@@ -2980,12 +2985,15 @@ await check("T30 视频任务中心持久排队、实时进度与跨 worker 取�
     page.off("request", onCancelRequest);
   }
   // M-05 起状态行不再拼协议 phase(原「已取消 · canceled」),只剩「已取消」。
-  await page.getByText("已取消", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
+  await center.getByText("已取消", { exact: true }).first().waitFor({ state: "visible", timeout: 3000 });
   if (cancelRequests.length !== 1) throw new Error(`取消请求应只发一次，实际 ${cancelRequests.length} 次`);
-  if (await page.getByRole("button", { name: "取消", exact: true }).count()) {
+  if (await center.getByRole("button", { name: "取消", exact: true }).count()) {
     throw new Error("跨 worker 取消已终态后仍显示可重复取消入口");
   }
-  await page.evaluate(() => window.__openMediaTask(false));
+  } finally {
+    // 失败也要关掉任务中心：它的遮罩会盖住后面所有用例的点击(曾从 T30 一路级联到 T49)。
+    await page.evaluate(() => window.__openMediaTask(false));
+  }
 });
 
 await check("T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次", async () => {
