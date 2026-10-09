@@ -6506,6 +6506,71 @@
           "assertion": "OCV5-364: long project names never run under the sidebar row actions"
         }
       ]
+    },
+    {
+      "id": "INC-20261009-ADMIN-BOUNDARY-STICKY",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "管理后台任一页面渲染崩溃后，错误边界不随切页重置，所有 tab 都停在「此页面加载出错」直到整页刷新。",
+      "rootFixCommit": "596687a5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/admin/AdminShellBoundary.test.tsx",
+          "assertion": "页面崩溃只影响当前 tab，切页后错误边界重置"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-ALERT-INBOX-FALLBACK",
+      "occurredAt": "2026-10-09",
+      "severity": "P1",
+      "symptom": "个人版未配置告警通道时，运维告警兜底站内信写给非管理员 uid=1 且不去重，每天约 300 条无人阅读，运营看不到任何告警。",
+      "rootFixCommit": "dae6883b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts",
+          "assertion": "同 dedupe_key 重复兜底 → 只写 1 条,第二次 inbox_fallback=false"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts",
+          "assertion": "uid=1 不是 admin(个人版)→ 发给最小的非系统种子 active admin"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-INBOX-DELIVERY-KEY-500",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "容器重建后看板日报按新统计重发同一 deliveryKey，主控回 500，网关每分钟重试到午夜，每天约 1.4k 条 error 日志。",
+      "rootFixCommit": "1560945a",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalInboxPost.test.ts",
+          "assertion": "delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-SELFHEAL-LOAD-MORE-400",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "自愈修复页「加载更多」把 limit 加到 300，后端上限 200 回 400，列表报错。",
+      "rootFixCommit": "1f55ee33",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/admin/pages/selfheal/__tests__/selfheal.test.tsx",
+          "assertion": "加载更多不超过后端上限 200(OCV5-365)"
+        }
+      ]
     }
   ]
 }
