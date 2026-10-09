@@ -6537,6 +6537,43 @@
           "assertion": "a foreign id whose renamed form is already used is refused"
         }
       ]
+    },
+    {
+      "id": "INC-20261009-PREFILL-DRAFT-FLASH",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "个人版 OCV5-355 托管真 Chromium 复现（非用户报障）：同一次点击切会话并预填输入框时，预填在 passive effect 里写入，React 19 下晚于绘制，目标会话的旧草稿先显示一帧；改为 layout effect，首个提交帧即为预填。微任务后读取：修前 3/3 红，修后 10/10 绿。（商业版 OCV5-355 挑自个人版；商业版同样缺此修复，开发机红绿复现一致。）",
+      "rootFixCommit": "6981c360",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/composer-draft.node-test.mjs",
+          "assertion": "explicit prefill owns target draft, unchanged nonce is not replayed"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-AUTO-RETRY-LINEAGE-RESET",
+      "occurredAt": "2026-10-09",
+      "severity": "P1",
+      "symptom": "个人版 OCV5-355 真 Chromium 复现（非用户报障，托管 double-failure-card 偶发红引出）：服务端回显用户行合并时丢掉客户端自有的自动重试谱系（root/attempt/max），每次 REST 同步后下一次自动重放都从 attempt 2、以上一条重试为 root 重新起算，共享 1..10 上限永不触发；派发前持续失败的轮被无限重发（fixture 10 秒 80 次）。修后 attempt 1..10 后停止，共 11 次发送。（商业版 OCV5-355 挑自个人版；商业版同样缺此修复，开发机红绿复现一致。）",
+      "rootFixCommit": "af04fd7e",
+      "coverageCommits": [
+        "6ac17b78"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/persist.test.ts",
+          "assertion": "server echo keeps the automatic retry lineage so the 1..10 cap still holds"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/double-failure-card.node-test.mjs",
+          "assertion": "automatic retry lineage climbs 1..10 and stops"
+        }
+      ]
     }
   ]
 }
