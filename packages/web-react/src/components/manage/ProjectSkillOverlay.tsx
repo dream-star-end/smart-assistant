@@ -112,8 +112,10 @@ export function ProjectSkillOverlay({
   const summaryCount = loading ? null : enabledCount;
 
   return (
+    // 与下方技能列表同一种分组容器(OCV5-362):改前是一条通栏发丝线 + 悬在线下的折叠按钮,
+    // 夹在上下文行与搜索框之间像一道多余的分隔。
     <section
-      className="border-t border-border px-4 py-2.5"
+      className="mx-4 mb-3 rounded-xl border border-border bg-surface px-4 py-1.5"
       data-testid="project-skill-overlay"
       aria-label="项目专属技能"
     >

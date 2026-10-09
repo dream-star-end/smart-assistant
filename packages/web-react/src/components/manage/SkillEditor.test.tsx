@@ -417,6 +417,52 @@ describe("技能工作台 删除入口(OCV5-360:删除从列表行挪进工作�
     expect(onDelete).toHaveBeenCalledTimes(1);
   });
 
+  test("正文页签两栏:正文编辑器 + 信息栏(多行描述 / 来源 / 删除),删除不再压在正文框上(OCV5-362)", async () => {
+    mountWithDelete(DETAIL, vi.fn().mockResolvedValue(true));
+    const body = await screen.findByRole("textbox", { name: "正文" });
+    const aside = screen.getByRole("complementary", { name: "技能信息" });
+    // 描述是多行文本框(改前单行 Input,长触发句被截成一行)。
+    const desc = screen.getByLabelText("描述");
+    expect(desc.tagName).toBe("TEXTAREA");
+    expect(aside).toContainElement(desc);
+    expect(aside).toContainElement(screen.getByRole("button", { name: "删除技能" }));
+    expect(aside).not.toContainElement(body);
+    expect(aside.querySelector("[data-skill-facts]")).toHaveTextContent("自建");
+    // 切走后正文面板只剩 hidden —— 不能同时带 md:grid(桌面上会盖过 hidden,叠在别的页签上面)。
+    fireEvent.click(screen.getByRole("tab", { name: "评测" }));
+    const bodyPanel = document.getElementById(body.closest("[role=tabpanel]")?.id ?? "");
+    expect(bodyPanel).toHaveClass("hidden");
+    expect(bodyPanel?.className).not.toMatch(/md:grid/);
+  });
+
+  test("历史页签:版本是一个分组列表,且不会在定高面板里被压缩裁掉(Codex r1)", async () => {
+    vi.spyOn(api, "getSkill").mockResolvedValue(DETAIL);
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({
+      history: Array.from({ length: 20 }, (_, i) => ({ version: `1.0.${i}`, timestamp: new Date().toISOString() })),
+      writable: true,
+    });
+    render(
+      <TooltipProvider>
+        <SkillEditor auth={auth} skillName="写作助手" open onClose={() => {}} onChanged={() => {}} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: "历史（20）" }));
+    const list = document.querySelector("[data-skill-history]") as HTMLElement;
+    expect(list.querySelectorAll("li")).toHaveLength(20);
+    expect(list).toHaveClass("shrink-0");
+    expect(screen.getAllByRole("button", { name: "恢复此版本" })).toHaveLength(20);
+  });
+
+  test("没有辅助文件:文件页签是一个空态 + 就地新建,不再左右两个空栏(OCV5-362)", async () => {
+    mountWithDelete({ ...DETAIL, files: ["SKILL.md"] }, vi.fn());
+    fireEvent.click(await screen.findByRole("tab", { name: "文件" }));
+    expect(await screen.findByText("还没有辅助文件")).toBeInTheDocument();
+    expect(screen.getAllByText("还没有辅助文件")).toHaveLength(1);
+    expect(document.querySelector("[data-new-file-form]")).toContainElement(screen.getByLabelText("新建文件"));
+    expect(screen.queryByRole("button", { name: /展开文件列表|收起文件列表/ })).not.toBeInTheDocument();
+  });
+
   test("保存与删除互斥(Codex r1):保存在途时删除不可点;删除在途时保存不可点", async () => {
     // 保存晚于删除落地会让后端重建技能目录 —— 技能「复活」。
     let releaseSave: (v?: unknown) => void = () => {};

@@ -78,13 +78,15 @@ export function GroupHeading({
 /**
  * 分组列表容器:一个容器装一组行,行与行之间是发丝线 —— 不是「每条一张卡」。
  * 外形与 Card 默认一致(app 的 rounded-xl + 描边 + soft 阴影,OCV5-362),不再另起 10px 平板。
+ * shrink-0:放进定高的 flex 列(工作台历史页签)时不许被压缩 —— overflow-hidden 会把后面的行
+ * 裁掉,外层滚动也够不着(Codex r1)。
  * 渲染成 <ul>;行用 ListRow(<li>)。
  */
 export function ListGroup({ className, ...props }: HTMLAttributes<HTMLUListElement>) {
   return (
     <ul
       className={cn(
-        "oc-list overflow-hidden rounded-xl border border-border bg-surface shadow-soft",
+        "oc-list shrink-0 overflow-hidden rounded-xl border border-border bg-surface shadow-soft",
         className,
       )}
       {...props}

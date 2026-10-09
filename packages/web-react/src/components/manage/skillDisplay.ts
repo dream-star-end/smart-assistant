@@ -1,11 +1,31 @@
-/** 技能列表主标题 / 副标题：描述第一行作标题，slug 作 caption；无描述则回退 name。 */
+/**
+ * 技能列表主标题 / 其余描述 / 副标题(slug)。
+ *
+ * 技能描述是写给模型看的触发句(「设计或核验 Claude Code 风格的顾问模式时使用。先核验官方机制，再……」),
+ * 整句当标题时每行都是两行同色同字重的长句,282 条叠在一起就是运营说的「很拥挤」(10-09 22:18 截图)。
+ * 这里取第一句(到第一个 。；！？ 或英文句点+空格)作短标题,并去掉句尾的「时使用 / 时调用」这类触发套话;
+ * 其余部分作为灰色补充行。描述首行没有断句符时整行作标题、rest 为空(调用方单行截断)。
+ * 无描述则回退 name。
+ */
 export function skillDisplayTitle(skill: {
   name: string;
   description?: string | null;
-}): { title: string; caption?: string } {
-  const firstLine = (skill.description ?? "").split(/\r?\n/)[0].trim();
+}): { title: string; caption?: string; rest?: string } {
+  const lines = (skill.description ?? "").split(/\r?\n/);
+  const firstLine = lines[0].trim();
   if (!firstLine) return { title: skill.name };
-  return { title: firstLine, caption: skill.name };
+  const after = lines.slice(1).join(" ").trim();
+  const m = /^(.+?)(?:[。；;！!？?]|\.(?=\s|$))\s*(.*)$/.exec(firstLine);
+  let title = firstLine;
+  let rest = after;
+  if (m) {
+    // 只去「时使用 / 的时候调用」这类触发套话;「检测工具调用」里的「调用」是正文,不能删(Codex r1)。
+    const clause = m[1].replace(/(?:时|的时候)(?:使用|调用)$/, "").trim();
+    // 去掉套话后太短(「使用时。」之类)就保留原句,不造出一个两字标题。
+    title = clause.length >= 4 ? clause : m[1].trim();
+    rest = [m[2].trim(), after].filter(Boolean).join(" ");
+  }
+  return { title, caption: skill.name, ...(rest ? { rest } : {}) };
 }
 
 /**

@@ -50,6 +50,8 @@ import {
   Field,
   IconButton,
   Input,
+  ListGroup,
+  ListRow,
   ListSkeleton,
   Modal,
   Skeleton,
@@ -545,6 +547,45 @@ export function SkillEditor({
 
   const panelClass = "min-h-0 flex-1 overflow-y-auto px-5 py-4";
 
+  // 新建辅助文件的小表单:有文件时放在左侧目录底部,没有文件时直接放在空态里(OCV5-362)。
+  const newFileForm = (
+    <>
+      <Field
+        label="新建文件"
+        hint="路径需以 references/ · assets/ · evals/ · scripts/ 开头"
+        error={newPathErr}
+      >
+        <Input
+          value={newPath}
+          inputSize="sm"
+          onChange={(e) => {
+            setNewPath(e.target.value);
+            if (newPathErr) setNewPathErr(null);
+          }}
+          placeholder="scripts/gen.sh"
+          className="font-mono"
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              void createFile();
+            }
+          }}
+        />
+      </Field>
+      <Button
+        variant="secondary"
+        size="sm"
+        loading={creating}
+        disabled={!newPath.trim()}
+        onClick={createFile}
+        className="mt-1.5 w-full"
+      >
+        {creating ? null : <FilePlus size={13} />} 创建
+      </Button>
+    </>
+  );
+
+
   return (
     <Modal
       open={open}
@@ -567,7 +608,7 @@ export function SkillEditor({
       }
       size="xl"
       mobile="fullscreen"
-      className="md:h-[min(88vh,50rem)] md:max-w-4xl"
+      className="md:h-[min(88vh,52rem)] md:max-w-5xl"
       bodyClassName="flex min-h-0 flex-col overflow-y-hidden p-0"
       toolbar={
         <Tabs
@@ -633,95 +674,135 @@ export function SkillEditor({
       ) : (
         <>
           {/* ── 正文 ─────────────────────────────────────────────────────── */}
+          {/* OCV5-362 第 6 轮(运营「技能点进去显示 ui/ux 还是很烂」):桌面两栏 —— 左边是撑满高度的
+              正文编辑器,右边 18rem 的信息栏放描述 / 适用智能体 / 标识与版本 / 删除。改前五块竖排在
+              一列里:描述被截成一行、删除行压在正文框底边上。窄屏单列:正文在前,信息栏接在下面。 */}
           <div
             id={`${ID_BASE}-panel-body`}
             role="tabpanel"
             aria-labelledby={`${ID_BASE}-tab-body`}
-            className={cn("flex flex-col gap-3", panelClass, tab !== "body" && "hidden")}
+            // 两栏只在当前页签挂:`md:grid` 在层叠上排在 `hidden` 之后,一起写会让桌面上其它页签
+            // 底下仍铺着正文两栏。
+            className={
+              tab === "body"
+                ? "min-h-0 flex-1 overflow-y-auto md:grid md:grid-cols-[minmax(0,1fr)_18rem] md:overflow-hidden"
+                : "hidden"
+            }
           >
-            {!writable && (
-              <Alert tone="info" density="compact">
-                这是市场安装 / 平台内置的技能，内容由作者维护，不可编辑。需要按自己的用法改动，
-                可在市场详情页「另存为自建技能」后再来这里编辑。
-              </Alert>
-            )}
-            {/* 只读技能不用 disabled 控件呈现内容:disabled 是 50% 透明、不可聚焦、不可选中复制、
-                触屏内不可滚动 —— "只读但可读"变成"基本读不了"。改为可聚焦的只读文本块。 */}
-            {writable ? (
-              <Field label="描述（触发的唯一依据：做什么 + 何时用）">
-                <Input
-                  value={desc}
-                  onChange={(e) => {
-                    setDesc(e.target.value);
-                    markDirty(SKILL_MD);
-                  }}
-                />
-              </Field>
-            ) : (
-              <div className="flex flex-col gap-1">
-                <span className="text-meta font-medium text-muted">描述</span>
-                <p className="text-body leading-relaxed text-fg">{desc || "（无描述）"}</p>
-              </div>
-            )}
-            {agents.length > 0 &&
-              (scopeEditable ? (
-                <AgentScopePicker
-                  agents={agents}
-                  selectedIds={scopeIds}
-                  onChange={(ids) => {
-                    setScopeIds(ids);
-                    setScopeDirty(true);
-                  }}
-                  title="适用智能体"
-                  hint="自建共享技能可改归属。"
-                />
+            <div className="flex flex-col gap-2 px-5 py-4 md:min-h-0">
+              {!writable && (
+                <Alert tone="info" density="compact">
+                  这是市场安装 / 平台内置的技能，内容由作者维护，不可编辑。需要按自己的用法改动，
+                  可在市场详情页「另存为自建技能」后再来这里编辑。
+                </Alert>
+              )}
+              {/* 只读技能不用 disabled 控件呈现内容:disabled 是 50% 透明、不可聚焦、不可选中复制、
+                  触屏内不可滚动 —— "只读但可读"变成"基本读不了"。改为可聚焦的只读文本块。 */}
+              {writable ? (
+                <>
+                  <div className="flex items-baseline justify-between gap-3">
+                    <label htmlFor={`${ID_BASE}-body`} className="text-meta font-medium text-muted">
+                      正文
+                    </label>
+                    <span className="truncate text-caption text-faint">保存后旧版自动进入历史</span>
+                  </div>
+                  <Textarea
+                    id={`${ID_BASE}-body`}
+                    value={body}
+                    onChange={(e) => {
+                      setBody(e.target.value);
+                      markDirty(SKILL_MD);
+                    }}
+                    spellCheck={false}
+                    className="min-h-[18rem] font-mono md:min-h-0 md:flex-1"
+                  />
+                </>
               ) : (
-                <Card padding="sm" className="text-meta text-muted">
-                  适用：<AgentScopeSummary agentIds={detail?.agentIds} agents={agents} />
-                </Card>
-              ))}
-            {writable ? (
-              // 窄屏整列自然滚动:Field 不参与 flex 收缩(收缩会把文本框压成一行、让下一行压到标签上,
-              // 运营 10-09 19:53 截图);桌面才撑满剩余高度。
-              <Field label="正文（保存后旧版自动入历史）" className="shrink-0 md:min-h-0 md:flex-1 md:shrink">
-                <Textarea
-                  value={body}
-                  onChange={(e) => {
-                    setBody(e.target.value);
-                    markDirty(SKILL_MD);
-                  }}
-                  className="min-h-[18rem] flex-1 font-mono"
-                />
-              </Field>
-            ) : (
-              <ReadOnlyText label="正文" text={body} className="shrink-0 md:min-h-0 md:flex-1 md:shrink" />
-            )}
-            {writable && onDelete && (
-              <div data-danger-zone="" className="mt-2 flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border pt-4">
-                <p className="min-w-0 flex-1 basis-48 text-meta text-muted">删除后智能体将不再使用它，且无法恢复。</p>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  loading={deleting}
-                  disabled={saving}
-                  onClick={async () => {
-                    if (savingRef.current || deletingRef.current) return;
-                    deletingRef.current = true;
-                    setDeleting(true);
-                    try {
-                      if (await onDelete()) onClose();
-                    } finally {
-                      deletingRef.current = false;
-                      setDeleting(false);
-                    }
-                  }}
-                  className="text-danger hover:bg-danger-soft"
-                >
-                  <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
-                  删除技能
-                </Button>
-              </div>
-            )}
+                <ReadOnlyText label="正文" text={body} className="min-h-[18rem] md:min-h-0 md:flex-1" />
+              )}
+            </div>
+
+            <aside
+              aria-label="技能信息"
+              className="flex flex-col gap-6 border-border px-5 py-4 max-md:border-t md:min-h-0 md:overflow-y-auto md:border-l"
+            >
+              {writable ? (
+                <Field label="描述" hint="触发的唯一依据：做什么 + 什么时候用。">
+                  <Textarea
+                    value={desc}
+                    onChange={(e) => {
+                      setDesc(e.target.value);
+                      markDirty(SKILL_MD);
+                    }}
+                    rows={5}
+                  />
+                </Field>
+              ) : (
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-meta font-medium text-muted">描述</span>
+                  <p className="text-body leading-relaxed text-fg">{desc || "（无描述）"}</p>
+                </div>
+              )}
+
+              {agents.length > 0 &&
+                (scopeEditable ? (
+                  <AgentScopePicker
+                    bare
+                    agents={agents}
+                    selectedIds={scopeIds}
+                    onChange={(ids) => {
+                      setScopeIds(ids);
+                      setScopeDirty(true);
+                    }}
+                    title="适用智能体"
+                    hint="哪些智能体会用到这个技能。"
+                  />
+                ) : (
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-meta font-medium text-muted">适用智能体</span>
+                    <p className="text-body text-fg">
+                      <AgentScopeSummary agentIds={detail?.agentIds} agents={agents} />
+                    </p>
+                  </div>
+                ))}
+
+              {/* 标识与版本已在头部那一行灰字里,这里只补头部没有的事实。 */}
+              <dl data-skill-facts="" className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-meta">
+                <dt className="text-faint">来源</dt>
+                <dd className="text-muted">{detail?.layer === "hub" ? "市场安装" : "自建"}</dd>
+                <dt className="text-faint">辅助文件</dt>
+                <dd className="tabular-nums text-muted">{auxCount > 0 ? `${auxCount} 个` : "无"}</dd>
+                <dt className="text-faint">历史版本</dt>
+                <dd className="tabular-nums text-muted">{history.length > 0 ? `${history.length} 个` : "无"}</dd>
+              </dl>
+
+              {writable && onDelete && (
+                <div data-danger-zone="" className="mt-auto flex flex-col items-start gap-1 border-t border-border pt-4">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    loading={deleting}
+                    disabled={saving}
+                    onClick={async () => {
+                      if (savingRef.current || deletingRef.current) return;
+                      deletingRef.current = true;
+                      setDeleting(true);
+                      try {
+                        if (await onDelete()) onClose();
+                      } finally {
+                        deletingRef.current = false;
+                        setDeleting(false);
+                      }
+                    }}
+                    className="-ml-3 text-danger hover:bg-danger-soft"
+                  >
+                    <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
+                    删除技能
+                  </Button>
+                  <p className="text-caption text-faint">删除后智能体将不再使用它，且无法恢复。</p>
+                </div>
+              )}
+            </aside>
           </div>
 
           {/* ── 文件 ─────────────────────────────────────────────────────── */}
@@ -736,6 +817,24 @@ export function SkillEditor({
               tab !== "files" && "hidden",
             )}
           >
+            {auxCount === 0 && !selected ? (
+              // 没有任何辅助文件:不再一左一右两个空栏(左边「还没有辅助文件」+ 表单,右边又一个空态),
+              // 合成一个空态 + 就地新建(OCV5-362)。
+              <div className="flex flex-col gap-2 overflow-y-auto">
+                {fileErr && (
+                  <Alert tone="danger" density="compact" onDismiss={() => setFileErr(null)}>
+                    {fileErr}
+                  </Alert>
+                )}
+                <EmptyState
+                  icon={FolderOpen}
+                  title="还没有辅助文件"
+                  hint="辅助文件放参考资料、脚本与素材，技能运行时按需读取；技能正文在「正文」页签。"
+                />
+                {writable && <div data-new-file-form="" className="w-full max-w-sm px-4">{newFileForm}</div>}
+              </div>
+            ) : (
+            <>
             <div className="flex items-center gap-2">
               <IconButton
                 variant="muted"
@@ -798,38 +897,7 @@ export function SkillEditor({
                   )}
                   {writable && (
                     <div className="mt-2 border-t border-border pt-2">
-                      <Field
-                        label="新建文件"
-                        hint="路径需以 references/ · assets/ · evals/ · scripts/ 开头"
-                        error={newPathErr}
-                      >
-                        <Input
-                          value={newPath}
-                          inputSize="sm"
-                          onChange={(e) => {
-                            setNewPath(e.target.value);
-                            if (newPathErr) setNewPathErr(null);
-                          }}
-                          placeholder="scripts/gen.sh"
-                          className="font-mono"
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
-                              e.preventDefault();
-                              void createFile();
-                            }
-                          }}
-                        />
-                      </Field>
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        loading={creating}
-                        disabled={!newPath.trim()}
-                        onClick={createFile}
-                        className="mt-1.5 w-full"
-                      >
-                        {creating ? null : <FilePlus size={13} />} 创建
-                      </Button>
+                      {newFileForm}
                     </div>
                   )}
                 </Card>
@@ -890,6 +958,8 @@ export function SkillEditor({
                 )}
               </div>
             </div>
+            </>
+            )}
           </div>
 
           {/* ── 评测 ─────────────────────────────────────────────────────── */}
@@ -942,7 +1012,7 @@ export function SkillEditor({
               <EmptyState
                 icon={Clock}
                 title="还没有历史版本"
-                hint="每次保存 SKILL.md 正文都会自动把旧版快照到这里，可一键回滚。"
+                hint="每次保存正文，旧版都会自动留在这里，可以一键恢复。辅助文件不进历史。"
                 action={
                   writable ? (
                     <Button size="sm" variant="secondary" onClick={() => setTab("body")}>
@@ -952,20 +1022,24 @@ export function SkillEditor({
                 }
               />
             ) : (
-              history.map((h) => (
-                <Card key={h.version} tone="sunken" padding="sm" className="flex items-center gap-2.5">
-                  <Clock size={14} className="shrink-0 text-accent" />
-                  <Badge tone="neutral">v{h.version}</Badge>
-                  <TimeAgo value={h.timestamp} className="text-meta text-muted" />
-                  {writable && (
-                    <Button variant="secondary" size="sm" className="ms-auto" onClick={() => restore(h.version)}>
-                      恢复此版本
-                    </Button>
-                  )}
-                </Card>
-              ))
+              // 与管理中心其它列表同一种分组容器(OCV5-362):改前每个版本一张下沉卡片 + 强调色时钟图标。
+              <>
+                <ListGroup data-skill-history="">
+                  {history.map((h) => (
+                    <ListRow key={h.version} className="flex items-center gap-3">
+                      <span className="text-body font-medium tabular-nums text-fg">v{h.version}</span>
+                      <TimeAgo value={h.timestamp} className="text-meta text-faint" />
+                      {writable && (
+                        <Button variant="ghost" size="sm" className="ms-auto" onClick={() => restore(h.version)}>
+                          恢复此版本
+                        </Button>
+                      )}
+                    </ListRow>
+                  ))}
+                </ListGroup>
+                <p className="mt-1 text-caption text-faint">历史覆盖正文（SKILL.md）；辅助文件不进历史。</p>
+              </>
             )}
-            <p className="mt-1 text-meta text-muted">历史快照覆盖 SKILL.md 正文；辅助文件不入快照。</p>
           </div>
         </>
       )}

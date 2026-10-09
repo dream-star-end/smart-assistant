@@ -124,17 +124,42 @@ describe("SkillsPanel 行(OCV5-360:整行一个点按目标)", () => {
     expect(await screen.findByRole("heading", { name: "帮你把草稿改成成稿" })).toBeInTheDocument();
   });
 
-  test("标题两行截断、其余描述两行截断(不叠 block)、slug 不上行面", async () => {
+  test("短标题单行截断、其余描述窄屏两行 / 桌面一行(不叠 block)、slug 不上行面", async () => {
     mountPanel({
       skills: [{ name: "writer-pro", description: "帮你把草稿改成成稿\n第二行是补充说明", writable: true, layer: "shared", agentIds: [] }],
     });
     const title = await screen.findByText("帮你把草稿改成成稿");
-    expect(title).toHaveClass("line-clamp-2");
+    expect(title).toHaveClass("truncate", "font-medium");
     const desc = screen.getByText("第二行是补充说明");
-    expect(desc).toHaveClass("line-clamp-2");
+    expect(desc).toHaveClass("line-clamp-2", "md:line-clamp-1", "text-muted");
     expect(desc).not.toHaveClass("block");
     expect(screen.queryByText("writer-pro")).not.toBeInTheDocument();
     expect(document.querySelector(".font-mono")).toBeNull();
+  });
+
+  test("触发句描述:第一句去掉「时使用」作短标题,其余进灰色补充行(OCV5-362 列表拥挤)", async () => {
+    mountPanel({
+      skills: [
+        {
+          name: "advisor",
+          description: "设计或核验 Claude Code 风格的顾问模式时使用。先核验官方机制，再检查边界。",
+          writable: true,
+          layer: "shared",
+          agentIds: [],
+        },
+      ],
+    });
+    expect(await screen.findByText("设计或核验 Claude Code 风格的顾问模式")).toHaveAttribute("data-skill-title");
+    expect(screen.getByText("先核验官方机制，再检查边界。")).toHaveAttribute("data-skill-desc");
+    expect(screen.getByRole("button", { name: "打开 设计或核验 Claude Code 风格的顾问模式" })).toBeInTheDocument();
+  });
+
+  test("搜索框写总数、不再另挂计数;筛选时才在右侧给「命中 / 总数」", async () => {
+    mountPanel();
+    const search = await screen.findByPlaceholderText(/^搜索 \d+ 个技能$/);
+    expect(screen.queryByText(/^\d+ 个技能$/)).not.toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "市场" } });
+    expect(await screen.findByText(/^\d+ \/ \d+$/)).toBeInTheDocument();
   });
 
   test("元信息一行:来源 · 适用 · 前两个标签 +N", async () => {

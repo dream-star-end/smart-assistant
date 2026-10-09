@@ -145,8 +145,9 @@ export function SkillsPanel({
   const grouped = mine.length > 0 && hub.length > 0;
 
   const total = skills?.length ?? 0;
-  // 计数不再塞进页面标题的全角括号里:放在搜索框右侧,等宽数字、弱化色。
-  const countLabel = q ? `${visible.length} / ${total}` : `${total} 个技能`;
+  // 总数写进搜索框占位(「搜索 282 个技能」),不再在搜索框右侧另起一个悬空的计数;
+  // 只有筛选中才在右侧给「12 / 282」—— 那时它才是新信息。
+  const countLabel = q ? `${visible.length} / ${total}` : null;
 
   const renderRow = (sk: SkillSummary) => (
     <SkillRow
@@ -217,12 +218,16 @@ export function SkillsPanel({
           <Toolbar
             search={filter}
             onSearchChange={setFilter}
-            searchPlaceholder="搜索技能"
+            searchPlaceholder={`搜索 ${total} 个技能`}
             debounceMs={120}
             sticky={false}
-            // 安静表面:不画吸顶色带与底边线,搜索框与列表同一左缘。
-            className="flex-nowrap border-b-0 bg-transparent px-4 pb-3 pt-0 md:pb-4"
-            actions={<span className="whitespace-nowrap text-meta tabular-nums text-faint">{countLabel}</span>}
+            // 安静表面:不画吸顶色带与底边线,搜索框与列表同一左缘;搜索框占满整行。
+            className="flex-nowrap border-b-0 bg-transparent px-4 pb-4 pt-1"
+            actions={
+              countLabel ? (
+                <span className="whitespace-nowrap text-meta tabular-nums text-faint">{countLabel}</span>
+              ) : undefined
+            }
           />
           {visible.length === 0 ? (
             <EmptyState
@@ -236,7 +241,7 @@ export function SkillsPanel({
               }
             />
           ) : grouped ? (
-            <div className="flex flex-col gap-8 px-4 pb-4">
+            <div className="flex flex-col gap-7 px-4 pb-4">
               <section>
                 <GroupHeading title="自建" count={mine.length} />
                 <ListGroup>{mine.map(renderRow)}</ListGroup>
@@ -288,13 +293,14 @@ function SkillRow({
   const descId = `${useId()}-desc`;
   const isHub = skill.layer === "hub";
   const display = skillDisplayTitle(skill);
-  // 标题取描述首行;描述的其余行才作为行面的「描述」—— 不把同一句话印两遍。
-  const rest = (skill.description ?? "").split(/\r?\n/).slice(1).join(" ").trim();
   const tags = skill.tags ?? [];
   const scope = agentScopeLabels(skill.agentIds, agents);
   const scopeLabel =
     scope.length === 0 ? "暂未启用" : scope.length <= 2 ? scope.join("、") : `${scope.slice(0, 2).join("、")} 等 ${scope.length} 个`;
 
+  // 行面三层、三种分量(OCV5-362 第 6 轮,运营「技能页显示感觉很拥挤」):
+  // 短标题(第一句,14/500,单行)/ 其余描述(13 灰,桌面单行、窄屏两行)/ 12 号元信息。
+  // 改前是两行同色同字重的整句触发描述,282 条连成一面字墙。
   return (
     <ListRow data-interactive="" className="p-0">
       <button
@@ -303,19 +309,19 @@ function SkillRow({
         aria-haspopup="dialog"
         aria-label={`${skill.writable ? "打开" : "查看"} ${display.title}`}
         aria-describedby={descId}
-        className="flex min-h-12 w-full min-w-0 items-center gap-3 px-4 py-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        className="flex min-h-14 w-full min-w-0 items-center gap-3 px-4 py-3.5 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         <span className="min-w-0 flex-1">
-          <span data-skill-title="" className="line-clamp-2 text-[14px] font-medium leading-5 text-fg">
+          <span data-skill-title="" className="block truncate text-[14px] font-medium leading-5 text-fg">
             {display.title}
           </span>
           <span id={descId} className="contents">
-          {rest && (
-            <span data-skill-desc="" className="mt-0.5 line-clamp-2 text-body leading-[18px] text-muted">
-              {rest}
+          {display.rest && (
+            <span data-skill-desc="" className="mt-0.5 line-clamp-2 text-body leading-[19px] text-muted md:line-clamp-1">
+              {display.rest}
             </span>
           )}
-          <span data-skill-meta="" className={cn(META_CLASS, "mt-1 flex-nowrap overflow-hidden whitespace-nowrap")}>
+          <span data-skill-meta="" className={cn(META_CLASS, "mt-1.5 flex-nowrap overflow-hidden whitespace-nowrap")}>
             <span className="shrink-0">{isHub ? "市场" : "自建"}</span>
             {skill.writable === false && <span className="shrink-0">只读</span>}
             <span className="min-w-0 truncate">{scopeLabel}</span>

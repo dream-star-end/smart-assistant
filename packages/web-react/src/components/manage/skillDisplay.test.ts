@@ -40,10 +40,42 @@ describe("skillDisplayTitle", () => {
     });
     expect(
       skillDisplayTitle({ name: "write-helper", description: "写作助手\n第二行说明" }),
-    ).toEqual({ title: "写作助手", caption: "write-helper" });
+    ).toEqual({ title: "写作助手", caption: "write-helper", rest: "第二行说明" });
     expect(
       skillDisplayTitle({ name: "write-helper", description: "写作助手\r\n第二行说明" }),
-    ).toEqual({ title: "写作助手", caption: "write-helper" });
+    ).toEqual({ title: "写作助手", caption: "write-helper", rest: "第二行说明" });
+  });
+
+  test("触发句:第一句作短标题并去掉「时使用」,其余作灰色补充行(OCV5-362 列表拥挤)", () => {
+    expect(
+      skillDisplayTitle({
+        name: "advisor",
+        description: "设计或核验 Claude Code 风格的顾问模式时使用。先核验官方机制，再检查边界；不代表方案已经批准。",
+      }),
+    ).toEqual({
+      title: "设计或核验 Claude Code 风格的顾问模式",
+      caption: "advisor",
+      rest: "先核验官方机制，再检查边界；不代表方案已经批准。",
+    });
+    expect(skillDisplayTitle({ name: "a", description: "评价审查员近期委派审计的实际效果。用户说「评一下」时使用。" }).title).toBe(
+      "评价审查员近期委派审计的实际效果",
+    );
+    // 英文句点只有后跟空白/行尾才断句:版本号、文件名里的点不断。
+    expect(skillDisplayTitle({ name: "a", description: "Deploy v5.3 via deploy-v5.sh. Then verify." })).toEqual({
+      title: "Deploy v5.3 via deploy-v5.sh",
+      caption: "a",
+      rest: "Then verify.",
+    });
+    // 没有断句符:整行作标题,无 rest。
+    expect(skillDisplayTitle({ name: "a", description: "Bash 租约超时排查，且不能放宽 TTL 时使用" })).toEqual({
+      title: "Bash 租约超时排查，且不能放宽 TTL 时使用",
+      caption: "a",
+    });
+    // 只有「时 / 的时候」+ 使用/调用 才是套话;句尾普通的「调用」「使用」保留。
+    expect(skillDisplayTitle({ name: "a", description: "检测工具调用。其余" }).title).toBe("检测工具调用");
+    expect(skillDisplayTitle({ name: "a", description: "需要翻译的时候调用。其余" }).title).toBe("需要翻译");
+    // 去掉套话后太短 → 保留原句。
+    expect(skillDisplayTitle({ name: "a", description: "写作时使用。其余" }).title).toBe("写作时使用");
   });
 });
 

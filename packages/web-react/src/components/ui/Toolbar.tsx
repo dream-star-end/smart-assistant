@@ -81,7 +81,8 @@ export function Toolbar({
       )}
 
       {onSearchChange && (
-        <div className="relative min-w-0 flex-1 sm:max-w-64">
+        // 安静表面(管理中心)里搜索框占满内容列 —— 64 宽的半截框右侧留一大片空白(OCV5-362)。
+        <div className={cn("relative min-w-0 flex-1", !quiet && "sm:max-w-64")}>
           <Search
             size={15}
             aria-hidden="true"
