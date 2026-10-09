@@ -23,6 +23,7 @@ import {
   mapCodexRelayUrlMulti,
   parseAnnotatedImageRequest,
   promoteBailianCodexVisionToolOutputs,
+  relayErrorShape,
   resolveCodexRelayUpstreamBases,
   type CodexRelayDb,
 } from '../http/internalCodexRelay.js'
@@ -778,5 +779,19 @@ describe('internalCodexRelay 遥测辅助路径 fail-closed(nit2)', () => {
         await close(server)
       }
     }
+  })
+})
+
+describe('relayErrorShape (OCV5-365)', () => {
+  test('keeps error name and system codes, never the message', () => {
+    const err = Object.assign(new TypeError('fetch failed: secret-ish detail'), {
+      cause: Object.assign(new Error('connect ETIMEDOUT 1.2.3.4:443'), { code: 'UND_ERR_CONNECT_TIMEOUT' }),
+    })
+    const shape = relayErrorShape(err)
+    assert.deepEqual(shape, { errorName: 'TypeError', causeCode: 'UND_ERR_CONNECT_TIMEOUT' })
+    assert.equal(JSON.stringify(shape).includes('secret'), false)
+    assert.deepEqual(relayErrorShape(Object.assign(new Error('x'), { code: 'ECONNRESET' })), { errorName: 'Error', errorCode: 'ECONNRESET' })
+    assert.deepEqual(relayErrorShape('nope'), {})
+    assert.deepEqual(relayErrorShape(Object.assign(new Error('x'), { code: 'has spaces and a message' })), { errorName: 'Error' })
   })
 })

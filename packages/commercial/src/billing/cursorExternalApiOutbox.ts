@@ -36,6 +36,8 @@ export const CURSOR_EXTERNAL_OUTBOX_SCHEMA = 1 as const;
 export const MAX_OUTBOX_FILES_PER_BATCH = 32;
 export const MAX_OUTBOX_FILE_BYTES = 64 * 1024;
 export const MAX_OUTBOX_BATCH_MS = 5_000;
+/** 空扫描(什么都没看到)的 scan 日志最多每 10 分钟打一条心跳(OCV5-365:原先每 5s 一条,占主日志 ~70%)。 */
+export const IDLE_OUTBOX_SCAN_LOG_INTERVAL_MS = 10 * 60_000;
 export const MAX_OUTBOX_SCAN_DIR_MS = 2_000;
 
 const BILLING_ID_RE = /^[0-9a-f]{32}$/;
@@ -207,6 +209,7 @@ export async function openCursorExternalApiOutbox(args: {
 
   let scanCursor = "";
   let pendingTail: OutboxScanObservation[] = [];
+  let lastIdleScanLogAt = Number.NEGATIVE_INFINITY;
   let stopped = false;
   let inFlight: Promise<void> | null = null;
 
@@ -417,7 +420,12 @@ export async function openCursorExternalApiOutbox(args: {
         consumed.push(result);
       }
       const summary = summarizeScan(batch.observations, consumed, batch.scanned, batch.truncated);
-      deps.logger?.info("cursor_external_outbox_scan", summary);
+      const idle = batch.scanned === 0 && batch.observations.length === 0 && consumed.length === 0;
+      const now = Date.now();
+      if (!idle || now - lastIdleScanLogAt >= IDLE_OUTBOX_SCAN_LOG_INTERVAL_MS) {
+        deps.logger?.info("cursor_external_outbox_scan", summary);
+        if (idle) lastIdleScanLogAt = now;
+      }
       return { consumed, observations: batch.observations, scanned: batch.scanned };
     },
     startScanner(deps) {

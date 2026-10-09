@@ -157,6 +157,8 @@ export interface CursorAuthSyncDeps {
   lifecycleState?: SandLifecycleState;
 }
 
+let lastMaterializeLogKey: string | null = null;
+
 function requireSyncOwner(canPublish: (() => boolean) | undefined): void {
   if (canPublish && !canPublish()) throw new Error("CURSOR_AUTH_SYNC_OWNER_STOPPED");
 }
@@ -487,7 +489,11 @@ export async function syncCursorAuthDir(deps?: Partial<CursorAuthSyncDeps>): Pro
       return boxBinding ? [{ ...s, boxBinding }] : [];
     }) : slots;
     const writtenFp = writeAtomicSlots(resolved.authDir, publishSlots, managed, resolved.canPublish);
-    log.info("materialized cursor account pool onto host auth dir", {
+    // 同步每 ~20s 跑一次,结果不变时降到 debug(OCV5-365:原先 72h 1.1 万条 info,全是 written:0)。
+    const materializeLogKey = `${publishSlots.length}|${imported}|${writtenFp.join(",")}`;
+    const materializeLogLevel = materializeLogKey === lastMaterializeLogKey ? "debug" : "info";
+    lastMaterializeLogKey = materializeLogKey;
+    log[materializeLogLevel]("materialized cursor account pool onto host auth dir", {
       written: publishSlots.length,
       imported,
       fingerprints: writtenFp,
