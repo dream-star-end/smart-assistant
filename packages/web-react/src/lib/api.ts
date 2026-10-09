@@ -2993,6 +2993,8 @@ export const api = {
       ),
     ),
 
+  // Auto‑Dream 全面优化:前端调用方(管理中心「优化」分区 / 侧栏待确认计数)已下线(OCV5-360);
+  // 方法保留以便回滚恢复,后端路由与状态文件未动。
   getAutoDreamOptimizer: (a: AuthSession, agentId: string) =>
     jsonOrThrow<AutoDreamOptimizerState>(
       callWithRefresh(a, (t) =>
@@ -3165,7 +3167,8 @@ export const api = {
       ),
     ),
 
-  /** 文献库列表(GET /api/me/research/library,master 直存,非容器代理)。 */
+  /** 文献库列表(GET /api/me/research/library,master 直存,非容器代理)。
+   *  前端调用方(管理中心「文献」分区)已下线(OCV5-360);方法保留以便回滚恢复。 */
   listResearchLibrary: (a: AuthSession) =>
     jsonOrThrow<{ documents: ResearchLibraryDoc[] }>(
       callWithRefresh(a, (t) =>

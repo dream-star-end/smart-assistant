@@ -69,7 +69,6 @@ import {
 } from "./sidebar/runningOrder";
 import {
   Avatar,
-  Badge,
   Button,
   DropdownMenu,
   DropdownMenuContent,
@@ -125,7 +124,6 @@ export type SidebarProps = {
   activeId?: string;
   user: User | null;
   credits?: string | null;
-  optimizerPending?: number;
   onSelect: (id: string) => void;
   onNew: () => void;
   onRename: (s: Session) => void;
@@ -219,7 +217,6 @@ export function Sidebar({
   activeId,
   user,
   credits,
-  optimizerPending = 0,
   onSelect,
   onNew,
   onRename,
@@ -1211,13 +1208,7 @@ export function Sidebar({
                 >
                   <LayoutGrid size={16} className="shrink-0 text-muted" />
                   <span className="flex-1">管理中心</span>
-                  {optimizerPending > 0 ? (
-                    <Badge tone="accent" size="sm">
-                      {optimizerPending > 99 ? "99+" : optimizerPending} 项待确认
-                    </Badge>
-                  ) : (
-                    <span className="text-caption text-faint">记忆 · 技能</span>
-                  )}
+                  <span className="text-caption text-faint">记忆 · 技能</span>
                 </DropdownMenuItem>
               )}
               {onOpenMarketplace && (

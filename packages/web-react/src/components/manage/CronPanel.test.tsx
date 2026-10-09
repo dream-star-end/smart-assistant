@@ -138,7 +138,9 @@ describe("CronPanel 状态与信息层次", () => {
     const del = vi.spyOn(api, "deleteCron").mockResolvedValue({ ok: true });
     mountPanel();
 
-    fireEvent.click(await screen.findByRole("button", { name: "删除「每日早报」" }));
+    // 行上不再有垃圾桶:删除在编辑表单底部(点行展开)。
+    fireEvent.click(await screen.findByRole("button", { name: "编辑「每日早报」" }));
+    fireEvent.click(await screen.findByRole("button", { name: "删除任务" }));
     expect(await screen.findByText("删除定时任务「每日早报」？")).toBeInTheDocument();
     expect(screen.getByText("删除后该任务不再执行，且无法恢复。")).toBeInTheDocument();
 
@@ -240,7 +242,8 @@ describe("CronPanel 后台对账的顺序栅栏", () => {
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
 
     // ② 用户随即删除该任务，行正确移除
-    fireEvent.click(screen.getByRole("button", { name: "删除「每日早报」" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑「每日早报」" }));
+    fireEvent.click(await screen.findByRole("button", { name: "删除任务" }));
     fireEvent.click(await screen.findByRole("button", { name: "删除" }));
     await waitFor(() => expect(del).toHaveBeenCalledWith(auth, "j1"));
     await waitFor(() => expect(screen.queryByText("每日早报")).not.toBeInTheDocument());
@@ -337,14 +340,14 @@ describe("CronPanel 未绑定聊天项目作用域", () => {
 });
 
 describe("CronPanel 行内信息可达性", () => {
-  test("已翻译排程的触发器可聚焦且可访问名含 cron 原串；下次执行的精确时刻直接可见；心跳任务有标识", async () => {
+  test("排程只显示中文、不甩裸 cron；下次执行的精确时刻直接可见；心跳任务有标识", async () => {
     vi.spyOn(api, "listCron").mockResolvedValue([{ ...ACTIVE, heartbeat: true }]);
     mountPanel();
 
-    const trigger = await screen.findByLabelText("每天 08:00，Cron 表达式 0 8 * * *");
-    expect(trigger).toHaveAttribute("tabindex", "0");
-    // 原串仍不作为可见文本铺在行上（保持列表可扫读），只进可访问名。
+    // 排程只显示中文;裸 cron 是实现细节,不上行面,行内也不再有可聚焦的提示触发器(整行已是按钮,不能嵌套可聚焦元素)。
+    expect(await screen.findByText("每天 08:00")).toBeInTheDocument();
     expect(screen.queryByText("0 8 * * *")).not.toBeInTheDocument();
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
     // 精确时刻从 title 升为可见文本：MM-DD HH:mm。
     expect(screen.getByText(/（\d{2}-\d{2} \d{2}:\d{2}）/)).toBeInTheDocument();
     expect(screen.getByText("心跳探针")).toBeInTheDocument();
@@ -431,5 +434,71 @@ describe("CronPanel 送达通道由后端下发", () => {
     ]);
     mountPanel();
     expect(await screen.findByText("discord")).toBeInTheDocument();
+  });
+});
+
+describe("CronPanel 行(OCV5-360:整行一个点按目标,开关是唯一行内控件)", () => {
+  test("行上没有铅笔 / 垃圾桶;点行展开编辑表单,再点收起", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([ACTIVE]);
+    mountPanel();
+    const row = await screen.findByRole("button", { name: "编辑「每日早报」" });
+    expect(screen.queryByRole("button", { name: "删除「每日早报」" })).not.toBeInTheDocument();
+    expect(row).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(row);
+    expect(await screen.findByRole("button", { name: "保存修改" })).toBeInTheDocument();
+    expect(row).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(row);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "保存修改" })).not.toBeInTheDocument());
+  });
+
+  test("开关在行按钮之外(点开关只启停,不展开表单)", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([ACTIVE]);
+    const update = vi.spyOn(api, "updateCron").mockResolvedValue({ ok: true });
+    mountPanel();
+    const sw = await screen.findByRole("switch", { name: "启用「每日早报」" });
+    const row = screen.getByRole("button", { name: "编辑「每日早报」" });
+    expect(row.contains(sw)).toBe(false);
+    fireEvent.click(sw);
+    await waitFor(() => expect(update).toHaveBeenCalledWith(auth, "j1", { enabled: false }));
+    expect(screen.queryByRole("button", { name: "保存修改" })).not.toBeInTheDocument();
+  });
+
+  test("状态 = 圆点 + 文字(不是徽章);指令两行截断;已过点只给圆点着色", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([
+      { ...ACTIVE, nextRunAt: new Date(Date.now() - 6 * 3_600_000).toISOString() },
+    ]);
+    mountPanel();
+    const status = await screen.findByText("启用中");
+    expect(status).toHaveAttribute("data-cron-status");
+    expect(status.querySelector(".bg-success")).not.toBeNull();
+    const desc = screen.getByText("汇总昨天进展");
+    expect(desc).toHaveClass("line-clamp-2");
+    expect(desc).not.toHaveClass("block");
+    const overdue = document.querySelector("[data-cron-overdue]") as HTMLElement;
+    expect(overdue).toHaveTextContent(/已过点 · 原定/);
+    expect(overdue).not.toHaveClass("text-warning");
+    expect(overdue.querySelector(".bg-warning")).not.toBeNull();
+  });
+
+  test("编辑表单底部可删除;新建表单没有删除入口", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([ACTIVE]);
+    mountPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "新建" }));
+    await screen.findByRole("button", { name: "创建任务" });
+    expect(screen.queryByRole("button", { name: "删除任务" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "编辑「每日早报」" }));
+    const del = await screen.findByRole("button", { name: "删除任务" });
+    expect(del.closest("[data-cron-form-actions]")).not.toBeNull();
+  });
+
+  test("表单移动端:排程控件两列网格不溢出,操作条窄屏吸底", async () => {
+    vi.spyOn(api, "listCron").mockResolvedValue([]);
+    mountPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "创建第一个定时任务" }));
+    await screen.findByRole("button", { name: "创建任务" });
+    const grid = document.querySelector("[data-cron-schedule-fields]") as HTMLElement;
+    expect(grid).toHaveClass("grid", "grid-cols-2", "sm:flex");
+    const bar = document.querySelector("[data-cron-form-actions]") as HTMLElement;
+    expect(bar).toHaveClass("max-md:sticky", "max-md:bottom-0");
   });
 });

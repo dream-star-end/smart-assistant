@@ -49,12 +49,15 @@ export { Popover, PopoverContent, PopoverTrigger } from "./Popover";
 export { Progress, type ProgressProps } from "./Progress";
 export {
   GroupHeading,
+  HeaderSlotProvider,
+  InlineSelect,
   ListGroup,
   ListRow,
   MetaLine,
   QuietSurface,
   StatusDot,
   type StatusTone,
+  useHeaderSlot,
   useQuiet,
 } from "./Quiet";
 export { Select, type SelectOption, type SelectProps } from "./Select";

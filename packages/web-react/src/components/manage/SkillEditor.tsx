@@ -90,6 +90,7 @@ export function SkillEditor({
   onChanged,
   rates = null,
   initialTab = "body",
+  onDelete,
 }: {
   auth: AuthSession;
   skillName: string;
@@ -103,8 +104,15 @@ export function SkillEditor({
   rates?: ModelRates | null;
   /** 打开时落在哪个页签(列表行的「未配评测」入口直接落在评测)。 */
   initialTab?: WorkbenchTab;
+  /**
+   * 删除这个技能(OCV5-360:删除从列表行挪进工作台,危险操作放在「正文」页签最底部)。
+   * 由外层负责确认 + 请求;返回 true = 已删除,工作台随即关闭(不再拦截未保存改动 —— 技能已经没了)。
+   * 缺省或只读技能不渲染删除入口。
+   */
+  onDelete?: () => Promise<boolean>;
 }) {
   const [tab, setTab] = useState<WorkbenchTab>(initialTab);
+  const [deleting, setDeleting] = useState(false);
   // 已访问过的页签保持挂载(hidden),这样切走再切回时评测用例的编辑草稿与
   // 进行中的轮询都不会丢 —— 这两条流程都是分钟级且会扣费,重来一次代价真实。
   const [visited, setVisited] = useState<ReadonlySet<WorkbenchTab>>(() => new Set([initialTab]));
@@ -676,6 +684,34 @@ export function SkillEditor({
                 text={body}
                 className="min-h-0 flex-1"
               />
+            )}
+            {/* 技能标识(slug)不再出现在列表行上,只在这里给一次 —— 排查 / 对话里点名时用得到。 */}
+            {displayTitle?.trim() && displayTitle.trim() !== skillName && (
+              <p className="shrink-0 text-meta text-faint">
+                技能标识 <span className="select-all text-muted">{skillName}</span>
+              </p>
+            )}
+            {writable && onDelete && (
+              <div data-danger-zone="" className="mt-2 flex shrink-0 flex-wrap items-center justify-between gap-x-4 gap-y-2 border-t border-border pt-4">
+                <p className="min-w-0 flex-1 basis-48 text-meta text-muted">删除后智能体将不再使用它，且无法恢复。</p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  loading={deleting}
+                  onClick={async () => {
+                    setDeleting(true);
+                    try {
+                      if (await onDelete()) onClose();
+                    } finally {
+                      setDeleting(false);
+                    }
+                  }}
+                  className="text-danger hover:bg-danger-soft"
+                >
+                  <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
+                  删除技能
+                </Button>
+              </div>
             )}
           </div>
 

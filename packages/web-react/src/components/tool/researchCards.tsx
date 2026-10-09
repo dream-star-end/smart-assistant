@@ -41,6 +41,7 @@ import {
 import { type ReactNode, useEffect, useState } from "react";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
 import { shouldShowDelegateRunning } from "../../lib/chat/ocMemoryCli";
+import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
@@ -271,54 +272,57 @@ function LiteratureCard({ data, partial }: { data: Record<string, unknown>; part
   const sources = recArr<LitSource>(data.sources);
   const warnings = asArr(data.warnings).map((w) => asStr(w)).filter(Boolean);
   if (sources.length === 0 && warnings.length === 0) return null;
+  // 「联网调研」能力的真实 UI 落点：对话里的文献检索结果卡（管理中心「文献」分区已下线，OCV5-360）。
   return (
-    <CardShell
-      icon={<BookOpen className="size-4" />}
-      title="文献检索"
-      subtitle={partial ? `已加载 ${sources.length} 篇` : `${sources.length} 篇`}
-    >
-      {sources.length > 0 && (
-        <ul className="flex flex-col divide-y divide-border">
-          {sources.slice(0, 50).map((s, i) => {
-            const meta = [authorsLine(s.authors), s.year ? String(s.year) : "", asStr(s.venue)]
-              .filter(Boolean)
-              .join(" · ");
-            const doi = asStr(s.doi);
-            const arxiv = asStr(s.arxivId);
-            const oaUrl = asStr(s.oa?.url);
-            return (
-              <li key={s.id || `${i}`} className="py-2 first:pt-0 last:pb-0">
-                <div className="text-[13px] leading-snug text-fg">{asStr(s.title) || "(无标题)"}</div>
-                {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
-                <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                  {s.retracted === true && (
-                    <Chip tone="danger">
-                      <AlertTriangle className="size-2.5" />
-                      已撤稿
-                    </Chip>
-                  )}
-                  {s.oa?.isOA && oaUrl && (
-                    <Chip href={oaUrl} tone="ok">
-                      开放获取
-                    </Chip>
-                  )}
-                  {doi && <Chip href={`https://doi.org/${encodeURIComponent(doi)}`}>DOI</Chip>}
-                  {arxiv && <Chip href={`https://arxiv.org/abs/${encodeURIComponent(arxiv)}`}>arXiv</Chip>}
-                  {typeof s.citationCount === "number" && <Chip>被引 {s.citationCount}</Chip>}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      {warnings.length > 0 && (
-        <div className="mt-2 flex items-start gap-1.5 text-xs text-warning">
-          <AlertTriangle className="mt-0.5 size-3 shrink-0" />
-          <span>部分来源暂不可用:{warnings.join(";")}</span>
-        </div>
-      )}
-      {partial && <PartialNote shown={sources.length} />}
-    </CardShell>
+    <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.research.id}>
+      <CardShell
+        icon={<BookOpen className="size-4" />}
+        title="文献检索"
+        subtitle={partial ? `已加载 ${sources.length} 篇` : `${sources.length} 篇`}
+      >
+        {sources.length > 0 && (
+          <ul className="flex flex-col divide-y divide-border">
+            {sources.slice(0, 50).map((s, i) => {
+              const meta = [authorsLine(s.authors), s.year ? String(s.year) : "", asStr(s.venue)]
+                .filter(Boolean)
+                .join(" · ");
+              const doi = asStr(s.doi);
+              const arxiv = asStr(s.arxivId);
+              const oaUrl = asStr(s.oa?.url);
+              return (
+                <li key={s.id || `${i}`} className="py-2 first:pt-0 last:pb-0">
+                  <div className="text-[13px] leading-snug text-fg">{asStr(s.title) || "(无标题)"}</div>
+                  {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                    {s.retracted === true && (
+                      <Chip tone="danger">
+                        <AlertTriangle className="size-2.5" />
+                        已撤稿
+                      </Chip>
+                    )}
+                    {s.oa?.isOA && oaUrl && (
+                      <Chip href={oaUrl} tone="ok">
+                        开放获取
+                      </Chip>
+                    )}
+                    {doi && <Chip href={`https://doi.org/${encodeURIComponent(doi)}`}>DOI</Chip>}
+                    {arxiv && <Chip href={`https://arxiv.org/abs/${encodeURIComponent(arxiv)}`}>arXiv</Chip>}
+                    {typeof s.citationCount === "number" && <Chip>被引 {s.citationCount}</Chip>}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {warnings.length > 0 && (
+          <div className="mt-2 flex items-start gap-1.5 text-xs text-warning">
+            <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+            <span>部分来源暂不可用:{warnings.join(";")}</span>
+          </div>
+        )}
+        {partial && <PartialNote shown={sources.length} />}
+      </CardShell>
+    </div>
   );
 }
 

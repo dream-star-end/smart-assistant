@@ -937,7 +937,8 @@ export type MediaSignResult = {
   expMs: number;
 };
 
-// ─── 用户文献库(research_documents,master 直存;ManageCenter「文献库」tab) ──
+// ─── 用户文献库(research_documents,master 直存)。管理中心「文献」分区已下线(OCV5-360),
+//     类型与 api.listResearchLibrary 等方法保留以便回滚恢复,后端路由与数据未动。 ──
 
 /** 文献库单篇(GET /api/me/research/library 的 documents 项)。 */
 export type ResearchLibraryDoc = {

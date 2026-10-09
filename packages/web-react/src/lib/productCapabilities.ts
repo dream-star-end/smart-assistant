@@ -8,7 +8,8 @@
 
 export type ProductFeatureCategory = "start" | "create" | "automate" | "extend" | "account";
 
-export type ManageDestinationTab = "memory" | "cron" | "skills" | "connectors" | "library";
+/** 管理中心教程落点。须是 lib/manageTabs 里 ManageTab 的子集（文献 / 优化分区已下线，OCV5-360）。 */
+export type ManageDestinationTab = "memory" | "cron" | "skills" | "connectors";
 export type SettingsDestinationSection =
   | "account"
   | "usage"
@@ -123,12 +124,13 @@ export const PRODUCT_CAPABILITIES = {
   },
   research: {
     id: "web-research",
-    title: "联网调研、引用与文献库",
+    title: "联网调研、论文检索与引用",
     shortTitle: "联网与研究",
     category: "create",
     icon: "search",
     aliases: ["搜索", "网页", "文献", "论文", "引用", "研究", "联网"],
-    destination: { kind: "manage", tab: "library" },
+    // 没有专属管理页：调研在对话里发生，落点是新对话（真实 UI 标记在对话里的文献检索卡）。
+    destination: { kind: "new-chat" },
     requirements: ["authenticated"],
   },
   artifacts: {
@@ -277,7 +279,7 @@ export const PRODUCT_CAPABILITIES = {
     shortTitle: "偏好设置",
     category: "account",
     icon: "settings",
-    aliases: ["主题", "深色", "默认模型", "通知", "Auto-Dream"],
+    aliases: ["主题", "深色", "默认模型", "通知"],
     destination: { kind: "settings", section: "preferences" },
     requirements: ["authenticated"],
   },

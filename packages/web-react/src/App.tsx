@@ -56,7 +56,7 @@ import { type BannerKind, collapsedBannersLabel, resolveBanners } from "./lib/ba
 import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
-import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
+import { DEFAULT_MANAGE_TAB, type ManageTab, normalizeManageTab } from "./lib/manageTabs";
 import type { SettingsSection } from "./components/SettingsCenter";
 import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
@@ -123,7 +123,6 @@ import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
-import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
@@ -1812,8 +1811,9 @@ export function App() {
   );
 
   // 打开管理中心到指定分区（侧栏入口 + 工具卡「打开记忆/技能/定时」按钮统一走此）。
+  // 归一化：已下线分区（文献 / 优化）或未知值从旧入口进来时回落默认分区，不开空白页。
   const openManage = useCallback((tab: ManageTab) => {
-    setManageTab(tab);
+    setManageTab(normalizeManageTab(tab));
     setManageOpen(true);
   }, []);
 
@@ -2188,10 +2188,6 @@ export function App() {
   // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
   // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
   const gate = useAgentGate(auth, inWorkspace && !demo);
-
-  // Auto‑Dream 待确认建议数：同一份计数同时驱动侧栏入口信号与管理中心「优化」Tab 徽标。
-  // 挂 gate.ready 是硬要求 —— 该 GET 经容器代理，容器没起时恒 503。
-  const optimizer = useOptimizerPending(auth, agent.id, inWorkspace && !demo && gate.ready);
 
   // P4 真实 WS 对话引擎。gate.ready（容器 running）是连接硬前置；refreshMe 供
   // cost_charged / 余额不足时刷新顶栏余额。demo 不连真实 WS。
@@ -3652,8 +3648,6 @@ export function App() {
     socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
-    // 账号菜单「管理中心」右侧的待办信号（Auto‑Dream 有待确认建议时替换静态副标题）。
-    optimizerPending: demo ? 0 : optimizer.pendingCount,
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
     onOpenMediaTasks:
@@ -4419,7 +4413,6 @@ export function App() {
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
             feedbackContext={settingsFeedbackContext}
-            onOpenMemory={() => openManage("optimization")}
             onOpenManage={() => openManage("connectors")}
             onOpenRepo={demo ? undefined : openRepo}
             onOpenProjectSettings={() => {
@@ -4659,9 +4652,8 @@ export function App() {
             agentId={agent.id}
             agents={myAgents}
             autoAuthorizePluginSlug={manageAutoAuthorizePluginSlug}
-            optimizerPendingCount={optimizer.pendingCount}
             onAutoAuthorizeConsumed={() => setManageAutoAuthorizePluginSlug(null)}
-            onTabChange={setManageTab}
+            onTabChange={(next) => setManageTab(normalizeManageTab(next))}
             onOpenMarketplace={() => {
               setManageOpen(false);
               openMarketplace("browse", "connector");
@@ -4683,8 +4675,6 @@ export function App() {
               setManageAutoAuthorizePluginSlug(null);
               // Plugin 绑定/解绑会改变 Agent readiness；关闭管理中心时立即刷新目录。
               void refreshMyAgents().catch(() => {});
-              // 面板里应用/忽略过建议 → 回拉待办真值，侧栏信号不留 stale。
-              void optimizer.refresh().catch(() => {});
             }}
           />
         </LazyBoundary>

@@ -424,6 +424,25 @@ function providerCard(label: string): HTMLElement {
   return el as HTMLElement;
 }
 
+/** 账号行「⋯」（改名 / 重新登录 / 解绑都在这里）的触发器名。 */
+const ACCOUNT_MENU = /^账号「.*」的更多操作$/;
+
+/** radix DropdownMenu 在 pointerdown 开启（click 不够），jsdom 里直接发。 */
+function openMenu(trigger: HTMLElement) {
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
+}
+
+/** 打开「⋯」并返回其中的菜单项。 */
+async function menuItem(trigger: HTMLElement, name: string | RegExp): Promise<HTMLElement> {
+  openMenu(trigger);
+  return screen.findByRole("menuitem", { name });
+}
+
+/** 打开「⋯」并选中菜单项。 */
+async function chooseMenuItem(trigger: HTMLElement, name: string | RegExp) {
+  fireEvent.click(await menuItem(trigger, name));
+}
+
 describe("ConnectorsTab 目录渲染", () => {
   test("渲染 5 个 provider 卡:中文名/描述/读写能力标注(github 只读)", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
@@ -592,7 +611,7 @@ describe("ConnectorsTab 已绑管理", () => {
     render(<ConnectorsTab auth={auth} />);
     await screen.findByText("工作邮箱");
 
-    fireEvent.click(screen.getByRole("button", { name: "解绑" }));
+    await chooseMenuItem(screen.getByRole("button", { name: ACCOUNT_MENU }), "解绑");
     // 二次确认弹层
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/解绑「工作邮箱」/)).toBeInTheDocument();
@@ -609,7 +628,7 @@ describe("ConnectorsTab 已绑管理", () => {
     render(<ConnectorsTab auth={auth} />);
     await screen.findByText("工作邮箱");
 
-    fireEvent.click(screen.getByRole("button", { name: "编辑备注名" }));
+    await chooseMenuItem(screen.getByRole("button", { name: ACCOUNT_MENU }), "编辑备注名");
     const input = screen.getByLabelText("备注名") as HTMLInputElement;
     expect(input.value).toBe("工作邮箱");
     fireEvent.change(input, { target: { value: "私人邮箱" } });
@@ -650,8 +669,13 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
 
     await screen.findByText("Linear");
     const card = providerCard("Linear");
-    expect(within(card).getByText("可更新 v2.0.0")).toBeInTheDocument();
-    fireEvent.click(within(card).getByRole("button", { name: "更新" }));
+    // 「可更新」是一行元信息里的安静词；动作本身在「⋯」里，带上目标版本。
+    expect(within(card).getByText("可更新")).toBeInTheDocument();
+    expect(within(card).queryByRole("button", { name: /更新/ })).not.toBeInTheDocument();
+    await chooseMenuItem(
+      within(card).getByRole("button", { name: "Linear的更多操作" }),
+      "更新到 v2.0.0",
+    );
 
     await waitFor(() => expect(mockedInstallMarketplace).toHaveBeenCalledWith(auth, "84"));
     await waitFor(() => expect(mockedGetConnectors).toHaveBeenCalledTimes(2));
@@ -667,7 +691,11 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     render(<ConnectorsTab auth={auth} />);
 
     await screen.findByText("Linear");
-    fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "卸载" }));
+    expect(within(providerCard("Linear")).queryByRole("button", { name: "卸载" })).not.toBeInTheDocument();
+    await chooseMenuItem(
+      within(providerCard("Linear")).getByRole("button", { name: "Linear的更多操作" }),
+      "卸载",
+    );
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/卸载 API 插件「Linear」/)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "卸载" }));
@@ -746,7 +774,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     const card = providerCard("Notion（声明式）");
     expect(within(card).getByText("旧版 Notion")).toBeInTheDocument();
     expect(within(card).getByText("已绑定 1 个账号")).toBeInTheDocument();
-    fireEvent.click(within(card).getByRole("button", { name: "解绑" }));
+    await chooseMenuItem(within(card).getByRole("button", { name: ACCOUNT_MENU }), "解绑");
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "解绑" }));
     await waitFor(() => expect(mockedDelete).toHaveBeenCalledWith(auth, "88"));
@@ -957,10 +985,14 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     await screen.findByText("我的 Linear");
 
     const card = providerCard("Linear");
-    // 声明式连接行不显示改名铅笔（后端无 rename）
-    expect(within(card).queryByRole("button", { name: "编辑备注名" })).not.toBeInTheDocument();
+    // 声明式连接行的「⋯」里没有改名（后端无 rename），只有解绑
+    openMenu(within(card).getByRole("button", { name: ACCOUNT_MENU }));
+    expect(await screen.findByRole("menuitem", { name: "解绑" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "编辑备注名" })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
 
-    fireEvent.click(within(card).getByRole("button", { name: "解绑" }));
+    await chooseMenuItem(within(card).getByRole("button", { name: ACCOUNT_MENU }), "解绑");
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/解绑「我的 Linear」/)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "解绑" }));
@@ -1031,8 +1063,11 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     await screen.findByText('知识星球')
     const card = providerCard('知识星球')
-    expect(within(card).getByText('可更新 v1.2.0')).toBeInTheDocument()
-    fireEvent.click(within(card).getByRole('button', { name: '更新' }))
+    expect(within(card).getByText('可更新')).toBeInTheDocument()
+    await chooseMenuItem(
+      within(card).getByRole('button', { name: '知识星球的更多操作' }),
+      '更新到 v1.2.0',
+    )
 
     await waitFor(() => expect(mockedInstallMarketplace).toHaveBeenCalledWith(auth, '202'))
   })
@@ -1069,8 +1104,21 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     await screen.findByText('旧版知识星球')
     const card = providerCard('知识星球')
     expect(within(card).getByText('需先更新')).toBeInTheDocument()
-    expect(within(card).getByRole('button', { name: '更新' })).toBeDisabled()
-    expect(within(card).getByRole('button', { name: '解绑' })).toBeEnabled()
+    // 不再常驻橙色段落；拦截原因出现在尝试更新 / 卸载的「⋯」菜单里，菜单项禁用。
+    expect(within(card).queryByText(/需先解绑/)).not.toBeInTheDocument()
+    const update = await menuItem(
+      within(card).getByRole('button', { name: '知识星球的更多操作' }),
+      '更新到 v1.2.0',
+    )
+    expect(update).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('menuitem', { name: '卸载' })).toHaveAttribute('aria-disabled', 'true')
+    expect(screen.getByRole('menu')).toHaveTextContent('更新或卸载前需先解绑全部账号')
+    fireEvent.click(update)
+    expect(mockedInstallMarketplace).not.toHaveBeenCalled()
+    fireEvent.keyDown(screen.getByRole('menu'), { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
+    const unbind = await menuItem(within(card).getByRole('button', { name: ACCOUNT_MENU }), '解绑')
+    expect(unbind).not.toHaveAttribute('aria-disabled')
   })
 
   test('受管 Plugin 登录过期后明确提示重新授权并保留解绑入口', async () => {
@@ -1097,7 +1145,10 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     await screen.findByText('过期的知识星球账号')
     const card = providerCard('知识星球')
     expect(within(card).getByText('需重新授权')).toBeInTheDocument()
-    expect(within(card).getByRole('button', { name: '解绑' })).toBeEnabled()
+    // 需要修复时，修复动作直接出现在账号行上（安静文字按钮）；解绑仍在「⋯」里。
+    expect(within(card).getByRole('button', { name: '重新扫码授权' })).toBeEnabled()
+    const unbind = await menuItem(within(card).getByRole('button', { name: ACCOUNT_MENU }), '解绑')
+    expect(unbind).not.toHaveAttribute('aria-disabled')
   })
 
   test('无账号的运行时 Plugin 可二次确认卸载', async () => {
@@ -1107,7 +1158,10 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     render(<ConnectorsTab auth={auth} />)
 
     await screen.findByText('知识星球')
-    fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '卸载' }))
+    await chooseMenuItem(
+      within(providerCard('知识星球')).getByRole('button', { name: '知识星球的更多操作' }),
+      '卸载',
+    )
     const dialog = await screen.findByRole('dialog')
     expect(within(dialog).getByText(/卸载 Plugin「知识星球」/)).toBeInTheDocument()
     fireEvent.click(within(dialog).getByRole('button', { name: '卸载' }))
@@ -1245,8 +1299,13 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('我的微博')
-    fireEvent.click(
-      within(providerCard('微博')).getByRole('button', { name: '重新扫码登录' }),
+    // 健康账号的「重新扫码登录」不占行面，收在账号「⋯」里。
+    expect(
+      within(providerCard('微博')).queryByRole('button', { name: '重新扫码登录' }),
+    ).not.toBeInTheDocument()
+    await chooseMenuItem(
+      within(providerCard('微博')).getByRole('button', { name: ACCOUNT_MENU }),
+      '重新扫码登录',
     )
 
     const confirmDialog = await screen.findByRole('dialog')
@@ -1294,6 +1353,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('我的微博')
+    // 登录失效时修复动作直接在账号行上（不必进「⋯」）。
     fireEvent.click(
       within(providerCard('微博')).getByRole('button', { name: '重新扫码登录' }),
     )
@@ -1436,8 +1496,9 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('我的知乎')
-    fireEvent.click(
-      within(providerCard('知乎')).getByRole('button', { name: '重新扫码登录' }),
+    await chooseMenuItem(
+      within(providerCard('知乎')).getByRole('button', { name: ACCOUNT_MENU }),
+      '重新扫码登录',
     )
 
     const confirmDialog = await screen.findByRole('dialog')
@@ -1718,7 +1779,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     const card = providerCard('知识星球')
     expect(within(card).getByText('已授权')).toBeInTheDocument()
     expect(within(card).queryByRole('button', { name: '微信扫码授权' })).not.toBeInTheDocument()
-    fireEvent.click(within(card).getByRole('button', { name: '解绑' }))
+    await chooseMenuItem(within(card).getByRole('button', { name: ACCOUNT_MENU }), '解绑')
     const dialog = await screen.findByRole('dialog')
     expect(within(dialog).getByText(/加密保存的登录状态会被销毁/)).toBeInTheDocument()
     fireEvent.click(within(dialog).getByRole('button', { name: '解绑' }))
@@ -1759,7 +1820,8 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       name: '我的知识星球写入能力',
     })
     expect(writeSwitch).not.toBeChecked()
-    expect(screen.getByText('写入已关闭')).toBeInTheDocument()
+    // 开关旁只留短标签「写入」，开/关由开关本身表达。
+    expect(screen.getByText('写入')).toBeInTheDocument()
 
     fireEvent.click(writeSwitch)
     const dialog = await screen.findByRole('dialog')
@@ -1951,7 +2013,6 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     expect(await screen.findByText('写入条款已更新，需重新同意')).toBeInTheDocument()
     expect(screen.getByText('免确认条款已更新，需重新同意后才会生效。')).toBeInTheDocument()
-    expect(screen.getByText('需重新同意')).toBeInTheDocument()
     expect(screen.queryByText('已生效：Agent 直接执行写入，不展示确认卡。')).not.toBeInTheDocument()
   })
 
@@ -2396,7 +2457,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     const boundCard = providerCard('知识星球')
-    fireEvent.click(within(boundCard).getByRole('button', { name: '解绑' }))
+    await chooseMenuItem(within(boundCard).getByRole('button', { name: ACCOUNT_MENU }), '解绑')
     fireEvent.click(
       within(await screen.findByRole('dialog')).getByRole('button', { name: '解绑' }),
     )
@@ -2485,7 +2546,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
     )
     await screen.findByText('工作邮箱')
 
-    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
     const input = screen.getByLabelText('备注名') as HTMLInputElement
     fireEvent.change(input, { target: { value: '私人邮箱' } })
     fireEvent.blur(input)
@@ -2500,7 +2561,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('工作邮箱')
 
-    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
     fireEvent.blur(screen.getByLabelText('备注名'))
 
     await waitFor(() => expect(screen.queryByLabelText('备注名')).not.toBeInTheDocument())
@@ -2512,7 +2573,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('工作邮箱')
 
-    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
     const input = screen.getByLabelText('备注名') as HTMLInputElement
     fireEvent.change(input, { target: { value: '改了又不想要' } })
     // 浏览器时序:mousedown → 输入框 blur → click
@@ -2532,7 +2593,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
     render(<ConnectorsTab auth={auth} />)
     await screen.findByText('工作邮箱')
 
-    fireEvent.click(screen.getByRole('button', { name: '编辑备注名' }))
+    await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
     const input = screen.getByLabelText('备注名') as HTMLInputElement
     fireEvent.change(input, { target: { value: '私人邮箱' } })
     fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
@@ -2541,5 +2602,82 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
 
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(mockedRename).toHaveBeenCalledWith(auth, '11', '私人邮箱'))
+  })
+})
+
+describe('ConnectorsTab 第 4 轮行语法（OCV5-360）', () => {
+  test('页面名与分区名一致为「插件」，唯一头部动作「添加」直达市场', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    const onOpenMarketplace = vi.fn()
+    render(<ConnectorsTab auth={auth} onOpenMarketplace={onOpenMarketplace} />)
+    await screen.findByText('邮箱')
+
+    expect(screen.getByRole('heading', { name: '插件' })).toBeInTheDocument()
+    expect(screen.queryByText('插件账号')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '添加插件' }))
+    expect(onOpenMarketplace).toHaveBeenCalledTimes(1)
+  })
+
+  test('说明最多两行（line-clamp-2，且不叠 block 取消截断），元信息只有一行', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+
+    const card = providerCard('知识星球')
+    const description = card.querySelector('[data-connector-description]')
+    expect(description).toHaveClass('line-clamp-2')
+    expect(description).not.toHaveClass('block')
+    expect(card.querySelectorAll('.oc-meta')).toHaveLength(1)
+    // 旧的第二行补充说明（读取/写入项数）不再出现在行面上
+    expect(within(card).queryByText(/项读取/)).not.toBeInTheDocument()
+  })
+
+  test('插件级更新 / 卸载不再是行内按钮，只在「⋯」里', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [{ ...knowledgePlanetPlugin(), latestVersionId: '202', latestVersion: '1.2.0', updateAvailable: true }],
+      accounts: [],
+    })
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('知识星球')
+    const card = providerCard('知识星球')
+
+    expect(within(card).queryByRole('button', { name: /^更新|^卸载/ })).not.toBeInTheDocument()
+    openMenu(within(card).getByRole('button', { name: '知识星球的更多操作' }))
+    expect(await screen.findByRole('menuitem', { name: '更新到 v1.2.0' })).not.toHaveAttribute(
+      'aria-disabled',
+    )
+    expect(screen.getByRole('menuitem', { name: '卸载' })).not.toHaveAttribute('aria-disabled')
+  })
+
+  test('账号行面只有写入开关与「⋯」，健康账号不显示修复按钮', async () => {
+    mockedGetConnectors.mockResolvedValue(catalog())
+    mockedPluginManagement.mockResolvedValue({
+      catalog: [knowledgePlanetPlugin()],
+      accounts: [
+        {
+          id: '901',
+          provider: 'knowledge-planet',
+          pluginType: 'managed-browser',
+          displayName: '我的知识星球',
+          accountHint: '微信扫码账号',
+          status: 'active',
+          actions: [{ id: 'list_groups', description: '列出星球', readOnly: true }],
+          versionId: '101',
+          executable: true,
+          writeControl: knowledgePlanetWriteControl(),
+        },
+      ],
+    })
+    render(<ConnectorsTab auth={auth} />)
+    await screen.findByText('我的知识星球')
+    const row = document.querySelector('[data-plugin-account="901"]') as HTMLElement
+
+    expect(within(row).getAllByRole('switch')).toHaveLength(1)
+    expect(within(row).getAllByRole('button').map((b) => b.getAttribute('aria-label'))).toEqual([
+      '账号「我的知识星球」的更多操作',
+    ])
+    expect(within(row).queryByRole('button', { name: /重新扫码/ })).not.toBeInTheDocument()
   })
 })

@@ -31,7 +31,6 @@ const base = {
   theme: 'light' as const,
   onClose: () => {},
   onSetTheme: () => {},
-  onOpenMemory: () => {},
 }
 
 afterEach(() => {

@@ -13,7 +13,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-// 四类技能覆盖徽章可见性矩阵:自建无 evals(显示)/自建有 evals(不显示)/只读/市场 hub。
+// 四类技能:两条自建可写 / 自建只读 / 市场 hub。
 const SKILLS: SkillSummary[] = [
   { name: "写作助手", writable: true, layer: "shared", agentIds: [] },
   { name: "翻译助手", writable: true, layer: "shared", agentIds: [] },
@@ -37,12 +37,13 @@ function mountPanel(opts: { skills?: SkillSummary[]; onOpenMarketplace?: () => v
   vi.spyOn(api, "listSkills").mockResolvedValue(opts.skills ?? SKILLS);
   vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
   vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: true });
+  const list = opts.skills ?? SKILLS;
   vi.spyOn(api, "getSkill").mockImplementation(
     async (_a, name) =>
       ({
         name,
-        writable: SKILLS.find((s) => s.name === name)?.writable,
-        layer: "shared",
+        writable: list.find((s) => s.name === name)?.writable,
+        layer: list.find((s) => s.name === name)?.layer ?? "shared",
         body: "技能正文",
         files: [],
       }) as SkillDetail,
@@ -50,11 +51,6 @@ function mountPanel(opts: { skills?: SkillSummary[]; onOpenMarketplace?: () => v
   const evals = vi.spyOn(api, "getSkillEvals").mockImplementation(async (_a, name) => evalsFor(name));
   render(<SkillsPanel auth={auth} onOpenMarketplace={opts.onOpenMarketplace} />);
   return { evals };
-}
-
-/** 展开某技能行(点技能名触发行内 toggle 按钮)。 */
-async function expandRow(name: string) {
-  fireEvent.click(await screen.findByText(name));
 }
 
 describe("SkillsPanel 加载 / 空态 / 出口", () => {
@@ -102,150 +98,84 @@ describe("SkillsPanel 来源可辨与只读语义", () => {
     expect(screen.getByRole("heading", { name: /^市场安装/ })).toHaveTextContent("市场安装1");
   });
 
-  test("只读技能行尾是「查看」而不是「编辑」(点了改不了 = 点了没有预期反应)", async () => {
+  test("只读技能的行可访问名是「查看」,可写的是「打开」", async () => {
     mountPanel();
     expect(await screen.findByRole("button", { name: "查看 只读技能" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "编辑 写作助手" })).toBeInTheDocument();
-    // 只读技能不给删除入口。
-    expect(screen.queryByRole("button", { name: "删除 只读技能" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开 写作助手" })).toBeInTheDocument();
   });
 });
 
-describe("SkillsPanel 行头布局与命名一致", () => {
-  test("编辑 / 删除动作簇在窄屏整行换到行头下方并与标题对齐,标题不再被压成两行截断", async () => {
+describe("SkillsPanel 行(OCV5-360:整行一个点按目标)", () => {
+  test("行面没有 编辑 / 删除 / 查看 按钮簇,也没有手风琴预览", async () => {
     mountPanel();
-    const edit = await screen.findByRole("button", { name: "编辑 写作助手" });
-    const actions = edit.parentElement as HTMLElement;
-    expect(actions.className).toContain("max-sm:basis-full");
-    // OCV5-344:窄屏与标题左缘对齐(不再贴右留空),按钮带可见文字。
-    expect(actions.className).toContain("max-sm:justify-start");
-    expect(edit).toHaveTextContent("编辑");
-    // 行头容器允许换行,标题按钮有最小宽度基准。
-    expect(actions.parentElement?.className).toContain("flex-wrap");
+    await screen.findByText("写作助手");
+    expect(screen.queryByRole("button", { name: /^编辑 / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^删除 / })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /在工作台中打开/ })).not.toBeInTheDocument();
+    // 每个技能恰好一个行按钮(4 个技能 → 4 个行按钮 + 页头无市场入口)。
+    expect(screen.getAllByRole("button", { name: /^(打开|查看) / })).toHaveLength(4);
   });
 
-  test("删除确认与工作台标题都用列表同款展示名(描述首行),slug 只作补充", async () => {
-    vi.spyOn(api, "deleteSkill").mockResolvedValue({ ok: true });
+  test("点行 → 打开技能工作台(标题用列表同款展示名)", async () => {
     mountPanel({
       skills: [{ name: "writer-pro", description: "帮你把草稿改成成稿\n第二行不进标题", writable: true, layer: "shared", agentIds: [] }],
     });
-    fireEvent.click(await screen.findByRole("button", { name: "删除 writer-pro" }));
-    expect(await screen.findByText("删除技能「帮你把草稿改成成稿」？")).toBeInTheDocument();
-    expect(screen.getByText(/技能标识 writer-pro/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "取消" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "编辑 writer-pro" }));
+    fireEvent.click(await screen.findByRole("button", { name: "打开 帮你把草稿改成成稿" }));
     expect(await screen.findByText("技能工作台 · 帮你把草稿改成成稿")).toBeInTheDocument();
   });
 
-  test("标签以 # 弱化文字呈现,与「适用」智能体芯片不同形;超过 3 个可点开而不是塞进 title", async () => {
+  test("标题两行截断、其余描述两行截断(不叠 block)、slug 不上行面", async () => {
+    mountPanel({
+      skills: [{ name: "writer-pro", description: "帮你把草稿改成成稿\n第二行是补充说明", writable: true, layer: "shared", agentIds: [] }],
+    });
+    const title = await screen.findByText("帮你把草稿改成成稿");
+    expect(title).toHaveClass("line-clamp-2");
+    const desc = screen.getByText("第二行是补充说明");
+    expect(desc).toHaveClass("line-clamp-2");
+    expect(desc).not.toHaveClass("block");
+    expect(screen.queryByText("writer-pro")).not.toBeInTheDocument();
+    expect(document.querySelector(".font-mono")).toBeNull();
+  });
+
+  test("元信息一行:来源 · 适用 · 前两个标签 +N", async () => {
     mountPanel({
       skills: [{ name: "tagged", description: "带很多标签", writable: true, layer: "shared", agentIds: [], tags: ["部署", "运维", "v5", "runbook", "灰度"] }],
     });
-    await screen.findByText("#部署");
-    expect(screen.queryByText("#runbook")).not.toBeInTheDocument();
-    const more = screen.getByRole("button", { name: "+2" });
-    expect(more).not.toHaveAttribute("title");
-    // 「+2」两个字符桌面只有 12px 宽,触屏点不中(t-762 manage#1):触控档由按钮自己撑到 44×44。
-    expect(more).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
-    fireEvent.click(more);
-    expect(screen.getByText("#runbook")).toBeInTheDocument();
-    expect(screen.getByText("#灰度")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "收起" })).toBeInTheDocument();
+    await screen.findByText("带很多标签");
+    const meta = document.querySelector("[data-skill-meta]") as HTMLElement;
+    expect(meta).toHaveTextContent("自建");
+    expect(meta).toHaveTextContent("#部署 #运维 +3");
+    expect(meta).not.toHaveTextContent("#v5");
+    expect(meta).toHaveClass("flex-nowrap");
   });
-});
 
-describe("SkillsPanel 未配评测提示", () => {
-  test("自建可写技能且无评测用例:展开后出现「未配评测」入口", async () => {
+  test("删除从工作台底部发起:确认框用展示名 + slug,确认后删除并刷新列表", async () => {
+    const del = vi.spyOn(api, "deleteSkill").mockResolvedValue({ ok: true });
+    mountPanel({
+      skills: [{ name: "writer-pro", description: "帮你把草稿改成成稿", writable: true, layer: "shared", agentIds: [] }],
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "打开 帮你把草稿改成成稿" }));
+    fireEvent.click(await screen.findByRole("button", { name: "删除技能" }));
+    expect(await screen.findByText("删除技能「帮你把草稿改成成稿」？")).toBeInTheDocument();
+    expect(screen.getByText(/技能标识 writer-pro。/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    await waitFor(() => expect(del).toHaveBeenCalledWith(auth, "writer-pro"));
+    await waitFor(() => expect(api.listSkills).toHaveBeenCalledTimes(2));
+  });
+
+  test("只读 / 市场技能的工作台没有删除入口", async () => {
     mountPanel();
-    await expandRow("写作助手");
-    expect(await screen.findByRole("button", { name: /未配评测/ })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "查看 市场技能" }));
+    await screen.findByText(/技能工作台 · 市场技能/);
+    expect(screen.queryByRole("button", { name: "删除技能" })).not.toBeInTheDocument();
   });
 
-  test("自建技能已有评测用例:不显示提示", async () => {
-    const { evals } = mountPanel();
-    await expandRow("翻译助手");
-    // 展开完成(工作台入口出现)且已探测过 → hasEvals=true → 无提示。
-    await screen.findAllByRole("button", { name: /在工作台中打开/ });
-    await waitFor(() => expect(evals).toHaveBeenCalledWith(auth, "翻译助手"));
-    expect(screen.queryByRole("button", { name: /未配评测/ })).not.toBeInTheDocument();
-  });
-
-  test("只读技能:展开后不显示提示,也不探测评测", async () => {
-    const { evals } = mountPanel();
-    await expandRow("只读技能");
-    await screen.findAllByRole("button", { name: /在工作台中打开/ });
-    expect(screen.queryByRole("button", { name: /未配评测/ })).not.toBeInTheDocument();
-    expect(evals).not.toHaveBeenCalledWith(auth, "只读技能");
-  });
-
-  test("市场(hub)技能:展开后不显示提示,也不探测评测", async () => {
-    const { evals } = mountPanel();
-    await expandRow("市场技能");
-    await screen.findAllByRole("button", { name: /在工作台中打开/ });
-    expect(screen.queryByRole("button", { name: /未配评测/ })).not.toBeInTheDocument();
-    expect(evals).not.toHaveBeenCalledWith(auth, "市场技能");
-  });
-
-  test("点「未配评测」→ 直接打开技能工作台并落在「评测」页签", async () => {
-    mountPanel();
-    await expandRow("写作助手");
-    fireEvent.click(await screen.findByRole("button", { name: /未配评测/ }));
-
-    expect(await screen.findByText("技能工作台 · 写作助手")).toBeInTheDocument();
-    expect(await screen.findByRole("tab", { name: "评测" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-  });
-});
-
-describe("SkillsPanel 行内预览只做轻量摘要", () => {
-  test("正文只给前 20 行 + 「在工作台中打开」,不再把评测/训练塞进行手风琴", async () => {
-    vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
-    vi.spyOn(api, "listSkills").mockResolvedValue([SKILLS[0]]);
-    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
-    vi.spyOn(api, "getSkillEvals").mockImplementation(async (_a, name) => evalsFor(name));
-    vi.spyOn(api, "getSkill").mockResolvedValue({
-      name: "写作助手",
-      writable: true,
-      layer: "shared",
-      body: Array.from({ length: 30 }, (_, i) => `第 ${i + 1} 行`).join("\n"),
-      files: [],
-    } as SkillDetail);
-
-    render(<SkillsPanel auth={auth} />);
-    await expandRow("写作助手");
-
-    expect(await screen.findByText(/仅显示前 20 行，共 30 行/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /在工作台中打开/ })).toBeInTheDocument();
-    // 评测 / 训练优化不再是行内二级页签。
-    expect(screen.queryByRole("button", { name: "评测" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "训练优化" })).not.toBeInTheDocument();
-  });
-
-  test("正文加载失败:行内 Alert 带「重试」,不再是一行裸红字", async () => {
-    vi.spyOn(api, "getPublicModels").mockResolvedValue({ models: [], lockedModels: [] });
-    vi.spyOn(api, "listSkills").mockResolvedValue([SKILLS[0]]);
-    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
-    vi.spyOn(api, "getSkillEvals").mockImplementation(async (_a, name) => evalsFor(name));
-    const getSkill = vi
-      .spyOn(api, "getSkill")
-      .mockRejectedValueOnce(new Error("nope"))
-      .mockResolvedValueOnce({
-        name: "写作助手",
-        writable: true,
-        layer: "shared",
-        body: "技能正文",
-        files: [],
-      } as SkillDetail);
-
-    render(<SkillsPanel auth={auth} />);
-    await expandRow("写作助手");
-
-    expect(await screen.findByText("加载技能正文失败")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
-    await waitFor(() => expect(getSkill).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText("技能正文")).toBeInTheDocument();
+  test("页头只有一颗紧凑的「市场」按钮", async () => {
+    const onOpenMarketplace = vi.fn();
+    mountPanel({ onOpenMarketplace });
+    await screen.findByText("写作助手");
+    const btn = screen.getByRole("button", { name: "市场" });
+    fireEvent.click(btn);
+    expect(onOpenMarketplace).toHaveBeenCalledTimes(1);
   });
 });

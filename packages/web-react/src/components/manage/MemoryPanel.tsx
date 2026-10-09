@@ -1,4 +1,4 @@
-import { BarChart3, Brain, Check, ChevronRight, Plus, Search, Trash2 } from "lucide-react";
+import { BarChart3, Bot, Brain, Check, ChevronRight, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";
 import { useProjectScope } from "../../hooks/useProjectScope";
@@ -21,8 +21,14 @@ import {
   Alert,
   Badge,
   Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
   EmptyState,
   Field,
+  IconButton,
+  InlineSelect,
   Input,
   ListGroup,
   ListRow,
@@ -30,7 +36,6 @@ import {
   MetaLine,
   Modal,
   PanelHeader,
-  Select,
   Skeleton,
   Spinner,
   Switch,
@@ -98,14 +103,15 @@ export function MemoryPanel({
         title="记忆"
         hint="这些内容会作为智能体的长期记忆，在每次对话中生效。"
         action={
+          // 智能体选择器是「作用范围」同一语法的行内值(图标 + 名称 + ⌄),不是灰色下拉框;
+          // 窄屏时 PanelHeader 把它 portal 进壳体的上下文行右侧。
           showPicker ? (
-            <Select
+            <InlineSelect
+              icon={Bot}
               aria-label="选择智能体"
               value={effective}
               onValueChange={setSelected}
               options={resources.map((a) => ({ value: a.id, label: a.name }))}
-              inputSize="sm"
-              className="w-32 sm:w-44"
             />
           ) : undefined
         }
@@ -325,25 +331,36 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
           ) : (
             <ListGroup aria-label="生效中的项目记忆">
               {official.map((o) => (
-                <ListRow key={o.slug} className="flex items-center justify-between gap-3 py-2">
-                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-0.5">
-                    <span className="min-w-0 truncate text-[14px] font-medium leading-5 text-fg">
+                // 行面只有标题(+ 状态);「废弃」收进行尾唯一一枚安静的 ⋯ 菜单,不再是行内按钮。
+                <ListRow key={o.slug} className="flex items-center justify-between gap-3 py-2 pr-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[14px] font-medium leading-5 text-fg">
                       {memoryTitle(o.slug)}
-                    </span>
+                    </div>
                     {o.tampered && (
-                      <Badge tone="warning" size="sm">
-                        文件被改动，未注入
-                      </Badge>
+                      <MetaLine className="mt-0.5">
+                        <Badge tone="warning" size="sm">
+                          文件被改动，未注入
+                        </Badge>
+                      </MetaLine>
                     )}
                   </div>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => void discard(o)}
-                    className="shrink-0 text-muted hover:bg-danger-soft hover:text-danger"
-                  >
-                    废弃
-                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <IconButton
+                        size="sm"
+                        aria-label={`${memoryTitle(o.slug)} 更多操作`}
+                        className="shrink-0 text-faint hover:text-fg"
+                      >
+                        <MoreHorizontal size={16} aria-hidden="true" />
+                      </IconButton>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem destructive onSelect={() => void discard(o)}>
+                        废弃
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </ListRow>
               ))}
             </ListGroup>
@@ -361,10 +378,11 @@ function ProjectMemorySection({ auth }: { auth: AuthSession }) {
               {leftover.map((c) => (
                 <ListRow key={c.id ?? c.file}>
                   <div className="text-[14px] font-medium leading-5 text-fg">{memoryTitle(c.slug)}</div>
-                  <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words font-sans text-body text-muted">
+                  {/* 正文压到 3 行:决策只需看个大概,整段 1200 字的 <pre> 会把一行撑成半屏。 */}
+                  <p className="mt-0.5 line-clamp-3 whitespace-pre-line break-words text-body text-muted">
                     {(c.content ?? "").slice(0, 1200)}
-                  </pre>
-                  <div className="mt-3 flex gap-2">
+                  </p>
+                  <div className="mt-2.5 flex gap-2">
                     <Button
                       size="sm"
                       loading={busyId === (c.id ?? "")}
@@ -405,23 +423,28 @@ function SectionHeading({
   hint,
   action,
   className,
+  hideHintOnMobile,
   as: Tag = "h4",
 }: {
   title: string;
   count?: number;
   hint?: string;
   action?: ReactNode;
+  /** 窄屏隐藏说明行(说明只是补充语境时用;上下文已由页签与分组说清)。 */
+  hideHintOnMobile?: boolean;
   className?: string;
   as?: "h3" | "h4";
 }) {
   return (
     <div className={cn("flex flex-wrap items-end justify-between gap-x-4 gap-y-2 pb-1", className)}>
-      <div className="min-w-0 flex-1 basis-56">
+      <div className="min-w-0 flex-1 basis-40">
         <Tag className="flex items-baseline gap-2 text-[14px] font-semibold leading-5 tabular-nums text-fg">
           {title}
           {count !== undefined && <span className="text-meta font-normal text-faint">{count}</span>}
         </Tag>
-        {hint && <p className="mt-0.5 text-meta text-muted">{hint}</p>}
+        {hint && (
+          <p className={cn("mt-0.5 text-meta text-muted", hideHintOnMobile && "max-md:hidden")}>{hint}</p>
+        )}
       </div>
       {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
     </div>
@@ -471,13 +494,15 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
 
   return (
     <div className="flex flex-col gap-6 px-4 pb-6 pt-5">
-      <div className="flex flex-wrap items-end justify-between gap-3">
+      <div className="flex items-start justify-between gap-3">
         <SectionHeading
-          className="pb-0"
+          className="min-w-0 flex-1 pb-0"
           title="记忆在会话里如何被使用"
           hint="按记忆被检索、写入和注入的真实记录统计。"
+          hideHintOnMobile
         />
-        <Select
+        {/* 时间范围是视图内的行内值,不是一只灰色下拉框。 */}
+        <InlineSelect
           aria-label="统计时间范围"
           value={String(days)}
           onValueChange={(next) => setDays(Number(next) || 30)}
@@ -486,8 +511,6 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
             { value: "30", label: "近 30 天" },
             { value: "90", label: "近 90 天" },
           ]}
-          inputSize="sm"
-          className="w-28"
         />
       </div>
 
@@ -844,10 +867,15 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
         </Alert>
       )}
 
-      {/* 梦境卡与列表是两条独立的异步链。给它预留等高占位,晚到时不会把整个列表往下顶。 */}
+      {/* 梦境卡只在「有报告」或「正在整理」时出现 —— 没有报告时不渲染一张"还没有整理过"的卡,
+          空记忆因此只剩一个空态(第 4 轮 §7)。占位只在列表已经出来、梦境还在路上时给:
+          列表还在加载时它自己的骨架已经说明"在加载",再叠一块骨架只会多一次跳动;
+          空记忆时占位会落在空态上方,读起来像第二个空态。 */}
       {dreamLoading ? (
-        <Skeleton className="h-[132px] rounded-[10px]" />
-      ) : dream && dream.mode !== "optimizer_v2" ? (
+        !loading && files.length > 0 ? (
+          <Skeleton data-testid="dream-placeholder" className="h-[88px] rounded-[10px]" />
+        ) : null
+      ) : hasDreamCard(dream) ? (
         <AutoDreamReportCard value={dream} files={files} onOpenMemory={setEditing} />
       ) : null}
 
@@ -880,9 +908,14 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
             className="pb-0"
             title={q ? `${filtered.length} / ${files.length} 条记忆` : `${files.length} 条记忆`}
             hint="该智能体自己的观察与经验，按智能体分别保存。"
+            hideHintOnMobile
             action={
-              <Button variant="secondary" size="sm" onClick={() => setCreating(true)}>
-                <Plus size={14} aria-hidden="true" /> 新建记忆
+              // 窄屏只写「新建」(+ 图标已说明动作),可访问名仍是「新建记忆」。
+              <Button variant="ghost" size="sm" className="gap-1 px-2.5" onClick={() => setCreating(true)}>
+                <Plus size={15} aria-hidden="true" />
+                <span>
+                  新建<span className="max-md:sr-only">记忆</span>
+                </span>
               </Button>
             }
           />
@@ -894,12 +927,15 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
                 aria-hidden="true"
                 className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
               />
+              {/* 安静的搜索框:无边框的淡填充圆角条,悬停加深一档,聚焦才出描边。
+                  字号沿用 Input 的 text-base(16px,iOS 不放大);触屏高度 40px。 */}
               <Input
+                type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="按名称或描述搜索…"
+                placeholder="搜索记忆"
                 aria-label="搜索核心记忆"
-                className="pl-9"
+                className="h-9 rounded-[10px] border-transparent bg-hover pl-9 transition-colors hover:bg-active focus:bg-surface max-md:h-10 [@media(hover:none)]:min-h-10"
                 autoComplete="off"
               />
             </div>
@@ -929,7 +965,13 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
                 )}
                 <ListGroup>
                   {g.items.map((f) => (
-                    <MemoryFileCard key={f.file} file={f} onOpen={() => setEditing(f)} />
+                    <MemoryFileCard
+                      key={f.file}
+                      file={f}
+                      // 已按类型分组时,组标题就是类型 —— 行面的元信息不再重复它。
+                      showType={!g.label}
+                      onOpen={() => setEditing(f)}
+                    />
                   ))}
                 </ListGroup>
               </div>
@@ -1029,6 +1071,11 @@ const DREAM_ACTION_META: Record<AutoDreamMemoryChange["action"], { label: string
   deleted: { label: "清理" },
 };
 
+/** 梦境卡的唯一出现条件:非「全面优化」模式,且有一份报告或正在整理。 */
+function hasDreamCard(dream: AutoDreamReportResponse | null): dream is AutoDreamReportResponse {
+  return Boolean(dream && dream.mode !== "optimizer_v2" && (dream.lastReport || dream.status === "running"));
+}
+
 function AutoDreamReportCard({
   value,
   files,
@@ -1070,11 +1117,7 @@ function AutoDreamReportCard({
           </p>
         ) : report ? (
           <DreamReportResult report={report} total={total} />
-        ) : (
-          <p className="mt-1 text-body text-muted">
-            还没有整理过。智能体会在对话积累到一定量后自动整理，结果显示在这里。
-          </p>
-        )}
+        ) : null}
         {(report && !running) || (!running && value.pendingSessions > 0) ? (
           // 两条元信息在窄屏会折行:分隔点自己画、窄屏隐藏,避免第二行以「·」开头。
           <p className="mt-2 flex flex-wrap gap-x-1.5 gap-y-0.5 text-meta tabular-nums text-faint max-sm:flex-col">
@@ -1157,7 +1200,15 @@ function DreamReportResult({ report, total }: { report: AutoDreamLastReport; tot
   );
 }
 
-function MemoryFileCard({ file, onOpen }: { file: MemoryFileMeta; onOpen: () => void }) {
+function MemoryFileCard({
+  file,
+  showType = true,
+  onOpen,
+}: {
+  file: MemoryFileMeta;
+  showType?: boolean;
+  onOpen: () => void;
+}) {
   const typeMeta = TYPE_META[file.type] ?? { label: file.type || "记忆", tone: "neutral" as const };
   const title = file.name?.trim() || file.file.replace(/\.md$/i, "");
   return (
@@ -1171,13 +1222,19 @@ function MemoryFileCard({ file, onOpen }: { file: MemoryFileMeta; onOpen: () => 
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[14px] font-medium leading-5 text-fg">{title}</span>
           {file.description?.trim() && (
-            <span className="mt-0.5 line-clamp-2 block text-body text-muted">{file.description}</span>
+            // 不能再加 `block`:它排在 line-clamp 的 display:-webkit-box 之后,会把截断整个取消
+            // (线上一条记忆占半屏的根因)。line-clamp 自带 display,span 也能截断。
+            <span data-testid="memory-row-description" className="mt-0.5 line-clamp-2 break-words text-body text-muted">
+              {file.description}
+            </span>
           )}
           {/* 文件名不再上卡面:它是存储实现,对用户没有含义(要看走编辑器的「编辑源码」)。 */}
           <MetaLine className="mt-1">
-            <Badge tone={typeMeta.tone} size="sm" className="text-meta text-faint">
-              {typeMeta.label}
-            </Badge>
+            {showType && (
+              <Badge tone={typeMeta.tone} size="sm" className="text-meta text-faint">
+                {typeMeta.label}
+              </Badge>
+            )}
             <span>
               更新于 <TimeAgo value={file.mtimeMs} className="text-meta text-faint" />
             </span>
@@ -1216,7 +1273,7 @@ function TypeChips({ value, onChange }: { value: string; onChange: (v: string) =
               key={o.value}
               size="sm"
               shape="pill"
-              variant={active ? "accent" : "secondary"}
+              variant={active ? "primary" : "secondary"}
               aria-pressed={active}
               onClick={() => onChange(o.value)}
             >

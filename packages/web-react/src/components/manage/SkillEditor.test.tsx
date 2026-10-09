@@ -354,3 +354,49 @@ describe("技能工作台只读态与触屏可达性", () => {
     expect(del.className).not.toContain("hidden");
   });
 });
+
+describe("技能工作台 删除入口(OCV5-360:删除从列表行挪进工作台底部)", () => {
+  function mountWithDelete(detail: SkillDetail, onDelete: () => Promise<boolean>) {
+    const onClose = vi.fn();
+    vi.spyOn(api, "getSkill").mockResolvedValue(detail);
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: detail.writable === true });
+    render(
+      <SkillEditor
+        auth={auth}
+        skillName={detail.name}
+        displayTitle="帮你写作"
+        open
+        onClose={onClose}
+        onChanged={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    return { onClose };
+  }
+
+  test("可写技能:正文页签底部有「删除技能」,删除成功后工作台关闭;slug 在这里出现", async () => {
+    const onDelete = vi.fn().mockResolvedValue(true);
+    const { onClose } = mountWithDelete(DETAIL, onDelete);
+    const del = await screen.findByRole("button", { name: "删除技能" });
+    expect(del.closest("[data-danger-zone]")).not.toBeNull();
+    expect(screen.getByText("写作助手", { selector: "span" })).toBeInTheDocument();
+    fireEvent.click(del);
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  test("删除被取消 / 失败(onDelete 返回 false):工作台保持打开", async () => {
+    const onDelete = vi.fn().mockResolvedValue(false);
+    const { onClose } = mountWithDelete(DETAIL, onDelete);
+    fireEvent.click(await screen.findByRole("button", { name: "删除技能" }));
+    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test("只读技能:即使传了 onDelete 也不渲染删除入口", async () => {
+    mountWithDelete({ ...DETAIL, writable: false, layer: "hub" }, vi.fn().mockResolvedValue(true));
+    await screen.findByText(/内容由作者维护/);
+    expect(screen.queryByRole("button", { name: "删除技能" })).not.toBeInTheDocument();
+  });
+});

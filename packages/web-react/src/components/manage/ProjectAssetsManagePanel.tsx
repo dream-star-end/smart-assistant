@@ -3,7 +3,7 @@ import { useProjectScope } from '../../hooks/useProjectScope'
 import { isWorkScope } from '../../lib/projectScope'
 import type { AuthSession } from '../../lib/types'
 import { ProjectAssetsPanel } from '../ProjectAssetsPanel'
-import { EmptyState, PanelHeader } from '../ui'
+import { EmptyState } from '../ui'
 
 /**
  * 工作项目作用域下的「项目资产」入口（复用侧栏的 ProjectAssetsPanel）。
@@ -17,10 +17,14 @@ export function ProjectAssetsManagePanel({ auth }: { auth: AuthSession }) {
 
   return (
     <div data-testid="project-assets-manage" className="border-t border-border">
-      <PanelHeader
-        title="项目资产"
-        hint="上传给这个项目的参考文件；重复文件只保留一份，含密钥或二维码的文件会标记为敏感。"
-      />
+      {/* 这是「项目记忆」页签里的一个小节,不是页面:不用 PanelHeader(它在手机管理中心里只留给
+          读屏、操作 portal 进上下文行),标题必须一直可见。 */}
+      <div className="px-4 pb-1 pt-5">
+        <h4 className="text-[14px] font-semibold leading-5 text-fg">项目资产</h4>
+        <p className="mt-0.5 text-meta text-muted">
+          上传给这个项目的参考文件；含密钥或二维码的文件会标记为敏感。
+        </p>
+      </div>
       {!chatId ? (
         <EmptyState
           icon={Folder}

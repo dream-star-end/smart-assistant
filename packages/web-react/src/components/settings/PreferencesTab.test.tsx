@@ -1,8 +1,10 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useState } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
+import type { PrefsView } from '../../lib/modelPreferences'
 import type { AuthSession } from '../../lib/types'
 import { BuiltinHotkeysTable, PreferencesTab } from './PreferencesTab'
 
@@ -29,12 +31,9 @@ describe('PreferencesTab · 对话行为', () => {
       <PreferencesTab
         auth={auth}
         prefs={{ default_model: 'gpt-6.1-sol' }}
-        autoDream={null}
         theme="system"
         onSetTheme={() => {}}
         onPatch={onPatch}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
 
@@ -53,12 +52,9 @@ describe('PreferencesTab · 对话行为', () => {
       <PreferencesTab
         auth={auth}
         prefs={{}}
-        autoDream={null}
         theme="system"
         onSetTheme={() => {}}
         onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
 
@@ -67,124 +63,87 @@ describe('PreferencesTab · 对话行为', () => {
   })
 })
 
-describe('PreferencesTab · Auto-Dream', () => {
+describe('PreferencesTab · 已下线入口', () => {
   test('API Key 管理已迁到「API 接入」分区,偏好页不再挂载', () => {
     vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     render(
       <PreferencesTab
         auth={auth}
         prefs={{}}
-        autoDream={null}
         theme="system"
         onSetTheme={() => {}}
         onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
     expect(screen.queryByText('API Key')).not.toBeInTheDocument()
     expect(screen.queryByPlaceholderText(/新密钥名称/)).not.toBeInTheDocument()
   })
 
-  test('显示 MiniMax 全面审计范围，并提供优化建议入口', async () => {
-    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
-    const openMemory = vi.fn()
-
-    render(
-      <PreferencesTab
-        auth={auth}
-        prefs={{ auto_optimizer_enabled: true }}
-        autoDream={
-          {
-            eligible: true,
-            available: true,
-            enabled: true,
-            optimizer_enabled: true,
-            legacy_enabled: false,
-            effective: true,
-            minimum_plan_code: 'max',
-            min_interval_hours: 168,
-            min_new_sessions: 5,
-            // 模拟滚动发布期间旧响应仍带字段；UI 也不能显示。
-            model_id: 'MiniMax-M3',
-            model_name: 'MiniMax M3',
-          } as never
-        }
-        theme="system"
-        onSetTheme={() => {}}
-        onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={openMemory}
-      />,
-    )
-
-    expect(screen.getByText(/MiniMax M3 结合平台功能与技能/)).toBeInTheDocument()
-    expect(screen.queryByText(/MiniMax-M3/)).not.toBeInTheDocument()
-    expect(screen.getByText(/所有用户内容和功能设置修改都先展示差异/)).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('button', { name: '查看优化建议' }))
-    expect(openMemory).toHaveBeenCalledTimes(1)
-  })
-
-  test('开启全面优化前必须确认审计、计费和匿名上报', async () => {
+  test('「全面优化」开关、同意弹窗与「查看优化建议」入口随管理中心「优化」分区下线', () => {
     vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     const onPatch = vi.fn(async () => {})
     render(
       <PreferencesTab
         auth={auth}
-        prefs={{}}
-        autoDream={{
-          eligible: true,
-          available: true,
-          enabled: false,
-          optimizer_enabled: false,
-          legacy_enabled: false,
-          effective: false,
-          minimum_plan_code: 'max',
-          min_interval_hours: 168,
-          min_new_sessions: 5,
-        }}
+        prefs={{ auto_optimizer_enabled: true }}
         theme="system"
         onSetTheme={() => {}}
         onPatch={onPatch}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
-
-    fireEvent.click(screen.getByRole('switch', { name: 'Auto-Dream' }))
-    expect(screen.getByText('开启 Auto‑Dream 全面优化？')).toBeInTheDocument()
-    expect(screen.getByText(/匿名平台优化发现/)).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Auto-Dream' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '查看优化建议' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/开启 Auto‑Dream 全面优化/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/全面审计/)).not.toBeInTheDocument()
     expect(onPatch).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByRole('button', { name: '同意并开启' }))
-    await vi.waitFor(() => expect(onPatch).toHaveBeenCalledWith({ auto_optimizer_enabled: true }))
+  })
+})
+
+describe('PreferencesTab · 全面优化关闭出口', () => {
+  function Harness({ onPatch }: { onPatch: (p: Record<string, unknown>) => void }) {
+    const [prefs, setPrefs] = useState<PrefsView>({ auto_optimizer_enabled: true })
+    return (
+      <PreferencesTab
+        auth={auth}
+        prefs={prefs}
+        theme="system"
+        onSetTheme={() => {}}
+        onPatch={async (p) => {
+          onPatch(p)
+          setPrefs((prev) => ({ ...prev, ...(p as PrefsView) }))
+        }}
+      />
+    )
+  }
+
+  test('仍开启时只给一个「关闭」，点击写 auto_optimizer_enabled=false 后整行消失', async () => {
+    vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
+    const onPatch = vi.fn()
+    render(<Harness onPatch={onPatch} />)
+    expect(screen.getByText('全面优化已下线')).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Auto-Dream' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }))
+    await waitFor(() => expect(onPatch).toHaveBeenCalledWith({ auto_optimizer_enabled: false }))
+    expect(onPatch).toHaveBeenCalledTimes(1)
+    // 关闭不弹同意框
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByText('全面优化已下线')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '关闭' })).not.toBeInTheDocument()
   })
 
-  test('不可用提示也不解释后台模型身份', () => {
+  test.each([[{}], [{ auto_optimizer_enabled: false }]])('未开启（%o）时不渲染', (prefs) => {
     vi.spyOn(api, 'getPublicModels').mockResolvedValue({ models: [], lockedModels: [] })
     render(
       <PreferencesTab
         auth={auth}
-        prefs={{}}
-        autoDream={{
-          eligible: true,
-          available: false,
-          enabled: false,
-          effective: false,
-          minimum_plan_code: 'max',
-          min_interval_hours: 24,
-          min_new_sessions: 5,
-        }}
+        prefs={prefs}
         theme="system"
         onSetTheme={() => {}}
         onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
-
-    expect(screen.getByText('Auto‑Dream 当前暂不可用，功能已安全暂停。')).toBeInTheDocument()
-    expect(screen.queryByText(/模型当前不可用/)).not.toBeInTheDocument()
+    expect(screen.queryByText('全面优化已下线')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '关闭' })).not.toBeInTheDocument()
   })
 })
 
@@ -215,12 +174,9 @@ describe('PreferencesTab · 通知分区', () => {
       <PreferencesTab
         auth={auth}
         prefs={{ notify_email: true, notify_telegram: true }}
-        autoDream={null}
         theme="system"
         onSetTheme={() => {}}
         onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
     expect(await screen.findByText('邮件通知')).toBeInTheDocument()
@@ -234,12 +190,9 @@ describe('PreferencesTab · 通知分区', () => {
       <PreferencesTab
         auth={auth}
         prefs={{ default_model: 'cursor-x' }}
-        autoDream={null}
         theme="system"
         onSetTheme={() => {}}
         onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
     const select = await screen.findByRole('combobox', { name: '默认模型' })
@@ -254,12 +207,9 @@ describe('PreferencesTab · 输入分区', () => {
       <PreferencesTab
         auth={auth}
         prefs={{}}
-        autoDream={null}
         theme="system"
         onSetTheme={() => {}}
         onPatch={async () => {}}
-        onUpgrade={() => {}}
-        onOpenMemory={() => {}}
       />,
     )
     expect(await screen.findByText('输入')).toBeInTheDocument()

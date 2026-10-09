@@ -42,6 +42,14 @@ describe("researchToolCard 分派", () => {
     expect(screen.getByText(/crossref 暂不可用/)).toBeInTheDocument();
   });
 
+  test("文献检索卡是「联网调研」能力的教程落点(data-product-feature=web-research)", () => {
+    const node = researchToolCard('oc-lit search "transformer"', tool({ output: LIT_JSON }));
+    const { container } = render(<div>{node}</div>);
+    const marker = container.querySelector('[data-product-feature="web-research"]');
+    expect(marker).not.toBeNull();
+    expect(marker).toHaveTextContent("Attention Is All You Need");
+  });
+
   test("env 前缀 / 绝对路径命令仍命中", () => {
     expect(
       researchToolCard("FOO=1 oc-lit snowball 10.x", tool({ output: LIT_JSON })),

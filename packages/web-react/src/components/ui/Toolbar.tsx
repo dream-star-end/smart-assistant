@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { cn, groupDigits } from "../../lib/utils";
 import { Badge } from "./Badge";
 import { Input } from "./Input";
+import { useQuiet } from "./Quiet";
 
 export interface ToolbarProps {
   /** 分区标题。 */
@@ -49,6 +50,7 @@ export function Toolbar({
   className,
 }: ToolbarProps) {
   const value = search ?? "";
+  const quiet = useQuiet();
   const [draft, setDraft] = useState(value);
   // 外部权威值变化(重置/深链)→ 同步草稿,避免草稿盖过外部。
   useEffect(() => {
@@ -95,7 +97,12 @@ export function Toolbar({
             aria-label={typeof title === "string" ? `搜索${title}` : searchPlaceholder}
             // 触控靶不在这里补:Input 的 controlSurfaceClass 自带
             // `[@media(hover:none)]:min-h-11`,调用方再补一遍就是本批要消灭的那种补丁。
-            className="w-full pl-9"
+            // 安静表面(管理中心):无边框的浅填充搜索框,与记忆分区的搜索同一形态。
+            className={cn(
+              "w-full pl-9",
+              quiet &&
+                "h-9 rounded-[10px] border-transparent bg-hover transition-colors hover:bg-active focus:bg-surface max-md:h-10",
+            )}
           />
         </div>
       )}

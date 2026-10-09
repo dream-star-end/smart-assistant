@@ -894,30 +894,66 @@ body {
   }
 }
 @media (max-width: 767px) {
-  /* 窄屏页签条:选中 = 前景色 + 2px 前景色下划线(与分区内的文字页签同一语法)。 */
-  .oc-manage-tab[aria-selected="true"]::after {
-    position: absolute;
-    left: 22%;
-    right: 22%;
-    bottom: -1px;
-    height: 2px;
-    border-radius: 2px;
-    background: var(--fg);
-    content: "";
+  /* 窄屏分区切换(OCV5-360):iOS 分段控件 —— 一条浅灰轨道,选中项是抬起的表面色滑块。
+     不再是图标 + 两字标签的六等分条(改造前 390px 下拥挤,且「文献」「优化」两个分区已下线)。 */
+  .oc-manage-tablist { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+  .dark .oc-manage-tablist { background: color-mix(in srgb, var(--fg) 9%, transparent); }
+  .oc-manage-tab { transition: background-color 180ms var(--ease-standard), color 120ms var(--ease-standard), box-shadow 180ms var(--ease-standard); }
+  .oc-manage-tab[aria-selected="true"] {
+    background: var(--surface);
+    box-shadow:
+      0 0 0 0.5px color-mix(in srgb, var(--fg) 10%, transparent),
+      0 1px 2px rgba(0, 0, 0, 0.08);
   }
+  .dark .oc-manage-tab[aria-selected="true"] {
+    background: color-mix(in srgb, var(--fg) 16%, var(--bg));
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+  /* 固定区下沿:内容滚离顶部才出现发丝线(Notion 式)。改造前没有边界,滚上去的搜索框
+     看起来像被「作用范围」行切掉了上半(运营 11:54 截图的「遮挡」)。 */
+  /* 用工具条自身的下边框而不是外投影:不需要定位/层级(定位会让壳体的绝对定位关闭按钮
+     以工具条为包含块、掉到上下文行里)。 */
+  .oc-manage-toolbar { border-bottom: 1px solid transparent; transition: border-color 120ms var(--ease-standard); }
+  .oc-manage-toolbar[data-scrolled] { border-bottom-color: var(--color-border); }
 }
 
 /* 作用范围 / 面板筛选下拉:安静的填充小控件(表单里的字段保持原输入框样式)。 */
-.oc-manage-scope select,
-.oc-manage-panel select:not(form select) {
+.oc-manage-panel select:not(form select):not(.oc-inline-select select) {
   height: 32px;
   border-color: transparent;
   background-color: var(--hover);
   padding-left: 10px;
   font-size: 13px;
 }
+.oc-manage-panel select:not(form select):not(.oc-inline-select select):hover { background-color: var(--active); }
+/* 行内取值选择器(InlineSelect):「值 ⌄」,透明底、按内容取宽,悬停/按下才给极淡底。
+   与窄屏作用范围同一语法;桌面 32px / 13px,窄屏 44px / 16px(<16px 会让 iOS 聚焦放大)。 */
+/* 作用范围(第 4 轮)桌面也是同一种行内值,不再是 224px 的灰色填充小框 —— 与分区内的
+   「全能助手 ⌄」同一语法;窄屏的 44px / 16px 规则见下方媒体查询。 */
+.oc-manage-scope select,
+.oc-inline-select select {
+  field-sizing: content;
+  height: 32px;
+  max-width: 100%;
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+  padding-left: 6px;
+  padding-right: 22px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+  text-overflow: ellipsis;
+}
 .oc-manage-scope select:hover,
-.oc-manage-panel select:not(form select):hover { background-color: var(--active); }
+.oc-inline-select select:hover { background-color: var(--hover); }
+.oc-manage-scope select:active,
+.oc-inline-select select:active { background-color: var(--active); }
+.oc-manage-scope select + svg,
+.oc-inline-select select + svg { right: 4px; width: 14px; height: 14px; }
+@media (max-width: 767.98px) {
+  .oc-inline-select select { height: 44px; font-size: 16px; }
+}
 /* 窄屏作用范围:不是框,是一行「作用范围 全部项目 ⌄」—— 值用正文色 16px/500(<16px 会让
    iOS 聚焦时整页放大),按内容取宽,透明底,只在按下/悬停给极淡底;高度 44px 保触控靶。 */
 @media (max-width: 767.98px) {
@@ -969,8 +1005,6 @@ body {
   content: "·";
 }
 .oc-qbadge-dot > svg { display: none; }
-/* 空态的预告骨架:淡化到 55%,只是形状提示。 */
-.oc-empty-ghost { opacity: 0.55; }
 
 /* 切换分区:内容 140ms 淡入 + 4px 上移;减少动效时不动。 */
 @media (prefers-reduced-motion: no-preference) {

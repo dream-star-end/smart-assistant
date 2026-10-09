@@ -11,12 +11,7 @@ import {
   type ProductFeatureId,
   type SettingsDestinationSection,
 } from "../lib/productCapabilities";
-import {
-  type AutoDreamFeatureView,
-  type PrefsView,
-  extractAutoDreamFeature,
-  extractPrefs,
-} from "../lib/modelPreferences";
+import { type PrefsView, extractPrefs } from "../lib/modelPreferences";
 import type { AuthSession, User } from "../lib/types";
 import { cn } from "../lib/utils";
 import { AccountTab } from "./settings/AccountTab";
@@ -85,7 +80,6 @@ export function SettingsCenter({
   onSetTheme,
   onRefreshMe,
   onPreferencesChange,
-  onOpenMemory,
   onOpenProjectSettings,
   feedbackContext,
   initialSection = "account",
@@ -100,7 +94,6 @@ export function SettingsCenter({
   onSetTheme: (t: Theme) => void;
   onRefreshMe?: () => void;
   onPreferencesChange?: (prefs: PrefsView, patch?: Record<string, unknown>) => void;
-  onOpenMemory: () => void;
   /** 保留给 App 装配；GitHub/插件已从设置分区移除，教程深链走 openRepo/openManage。 */
   onOpenManage?: () => void;
   onOpenRepo?: () => void;
@@ -119,7 +112,6 @@ export function SettingsCenter({
   const [ledgerReload, setLedgerReload] = useState(0);
 
   const [prefs, setPrefs] = useState<PrefsView | null>(null);
-  const [autoDream, setAutoDream] = useState<AutoDreamFeatureView | null>(null);
   const [prefsLoading, setPrefsLoading] = useState(false);
   const [prefsErr, setPrefsErr] = useState<string | null>(null);
   const [prefsReloadTick, setPrefsReloadTick] = useState(0);
@@ -155,7 +147,6 @@ export function SettingsCenter({
         if (!alive) return;
         const next = extractPrefs(snap);
         setPrefs(next);
-        setAutoDream(extractAutoDreamFeature(snap));
         onPreferencesChange?.(next);
       })
       .catch((e) => {
@@ -175,7 +166,6 @@ export function SettingsCenter({
       const snap = await api.patchPreferences(auth, patch);
       const next = extractPrefs(snap);
       setPrefs(next);
-      setAutoDream(extractAutoDreamFeature(snap));
       onPreferencesChange?.(next, patch);
     },
     [auth, onPreferencesChange],
@@ -244,14 +234,11 @@ export function SettingsCenter({
               user={user}
               theme={theme}
               prefs={prefs}
-              autoDream={autoDream}
               prefsLoading={prefsLoading}
               prefsErr={prefsErr}
               onRetryPrefs={() => setPrefsReloadTick((tick) => tick + 1)}
               onSetTheme={onSetTheme}
               onPatch={patchPref}
-              onUpgrade={() => setSubOpen(true)}
-              onOpenMemory={() => leaveTo(onOpenMemory)}
               onManageSub={() => setSubOpen(true)}
               ledgerReload={ledgerReload}
               onRefreshMe={onRefreshMe}
@@ -358,14 +345,11 @@ function SettingsPanel({
   user,
   theme,
   prefs,
-  autoDream,
   prefsLoading,
   prefsErr,
   onRetryPrefs,
   onSetTheme,
   onPatch,
-  onUpgrade,
-  onOpenMemory,
   onManageSub,
   ledgerReload,
   onRefreshMe,
@@ -377,14 +361,11 @@ function SettingsPanel({
   user: User | null;
   theme: Theme;
   prefs: PrefsView | null;
-  autoDream: AutoDreamFeatureView | null;
   prefsLoading: boolean;
   prefsErr: string | null;
   onRetryPrefs: () => void;
   onSetTheme: (t: Theme) => void;
   onPatch: (patch: Record<string, unknown>) => Promise<void>;
-  onUpgrade: () => void;
-  onOpenMemory: () => void;
   onManageSub: () => void;
   ledgerReload: number;
   onRefreshMe?: () => void;
@@ -450,12 +431,9 @@ function SettingsPanel({
           <PreferencesTab
             auth={auth}
             prefs={prefs}
-            autoDream={autoDream}
             theme={theme}
             onSetTheme={onSetTheme}
             onPatch={onPatch}
-            onUpgrade={onUpgrade}
-            onOpenMemory={onOpenMemory}
           />
         )}
       </div>

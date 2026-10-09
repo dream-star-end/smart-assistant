@@ -1,9 +1,10 @@
 import type { LucideIcon } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { createPortal } from 'react-dom'
+import { useMdViewport } from '../../hooks/useMdViewport'
 import { cn } from '../../lib/utils'
 import { Card } from './Card'
-import { useQuiet } from './Quiet'
-import { Skeleton } from './Skeleton'
+import { useHeaderSlot, useQuiet } from './Quiet'
 
 /**
  * 面板统一头部：标题 + 可选说明 + 可选右侧操作。管理中心/市场各分区共用，
@@ -24,13 +25,21 @@ export function PanelHeader({
   action?: ReactNode
 }) {
   const quiet = useQuiet()
+  const slot = useHeaderSlot()
+  const md = useMdViewport()
   if (quiet) {
     // 安静表面:分区标题就是页面标题 —— 22/30 半粗 + 一行 13px 说明,下方 24px 后接内容。
     // 标题里的「（8）」这类计数由调用方写在 title 里时原样保留;新代码请用 GroupHeading 的 count。
+    // 窄屏且壳体提供了上下文行插槽(OCV5-360):分段控件已写明当前分区,页面标题 + 说明只是
+    // 在重复它、把内容挤到半屏以下 —— 标题与说明只留给读屏,右侧操作 portal 进上下文行。
+    const compact = Boolean(slot) && !md
     return (
       <div
         data-panel-header=""
-        className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 px-4 pb-5 pt-2 md:pt-1"
+        className={cn(
+          'flex flex-wrap items-start justify-between gap-x-4 gap-y-3 px-4',
+          compact ? 'sr-only' : 'pb-5 pt-2 md:pt-1',
+        )}
       >
         <div className="min-w-0 flex-1 basis-64">
           <h3 className="text-[22px] font-semibold leading-[30px] tracking-[-0.01em] text-fg">
@@ -38,7 +47,10 @@ export function PanelHeader({
           </h3>
           {hint && <p className="mt-1 max-w-[60ch] text-body text-muted">{hint}</p>}
         </div>
-        {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
+        {action &&
+          (compact && slot
+            ? createPortal(<div className="flex min-w-0 items-center gap-1">{action}</div>, slot)
+            : <div className="flex shrink-0 items-center gap-2">{action}</div>)}
       </div>
     )
   }
@@ -119,26 +131,12 @@ export function EmptyState({
 }) {
   const quiet = useQuiet()
   if (quiet) {
-    // 安静表面的空态:不放「图标方块 + 一句话」的模板。上面两条淡化的骨架行预告
-    // 「这里将出现什么」,下面左对齐的标题 + 说明 + 行动按钮,与列表行同一条左缘。
+    // 安静表面的空态:不放「图标方块 + 一句话」的模板,也不放虚线骨架(第 4 轮:手机上它读起来
+    // 像「还在加载」)。左对齐的标题 + 说明 + 行动按钮,与列表行同一条左缘。
     // icon 参数保留(调用方契约不变),此形态下不渲染。
     return (
       <div data-empty-state="" className="px-4 py-2">
-        <div
-          aria-hidden="true"
-          className="oc-empty-ghost overflow-hidden rounded-[10px] border border-dashed border-border"
-        >
-          {[
-            ['w-2/5', 'w-3/5'],
-            ['w-1/3', 'w-1/2'],
-          ].map(([a, b]) => (
-            <div key={a} className="flex flex-col gap-2 px-4 py-3.5">
-              <Skeleton className={`h-2.5 ${a} rounded-full`} />
-              <Skeleton className={`h-2 ${b} rounded-full opacity-70`} />
-            </div>
-          ))}
-        </div>
-        <div className="pt-5">
+        <div className="pt-2 md:pt-4">
           <p className="text-[14px] font-semibold leading-5 text-fg">{title}</p>
           {hint && <p className="mt-1 max-w-[46ch] text-body text-muted">{hint}</p>}
           {action && <div className="mt-4 flex flex-wrap items-center gap-2">{action}</div>}

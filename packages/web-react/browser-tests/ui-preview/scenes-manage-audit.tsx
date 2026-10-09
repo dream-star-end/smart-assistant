@@ -1,12 +1,12 @@
 /**
  * 「管理中心」审计补充场景（2026-09 A·manage 审计 · 只增不改既有 scenes-manage.tsx）。
  *
- * 既有 scenes-manage.tsx 只覆盖六个 Tab 的首屏三态（有数据 / 空 / 错），且仅「记忆」「定时」
+ * 既有 scenes-manage.tsx 只覆盖各 Tab 的首屏三态（有数据 / 空 / 错），且仅「记忆」「定时」
  * 给了移动端视口。本文件补三类缺口：
- *  1. **其余四个 Tab 的移动端视口**：直接复用既有场景对象派生（不复制 mock 数据）；
+ *  1. **其余两个 Tab 的移动端视口**：直接复用既有场景对象派生（不复制 mock 数据）；
  *  2. **要点一下才能到达的二级状态**：技能工作台五个页签（含只读技能 / 训练草稿 diff）、
- *     记忆编辑器 / 新建 / 用户画像 / 用量 / 冷启动、定时新建 / 高级 cron 编辑、优化建议 Diff
- *     弹层、插件扫码授权中间态 / 过期态 / 写入免责确认；
+ *     记忆编辑器 / 新建 / 用户画像 / 用量 / 冷启动、定时新建 / 高级 cron 编辑、
+ *     插件扫码授权中间态 / 过期态 / 写入免责确认；
  *  3. **工作项目作用域**下才出现的三块面板：项目专属技能、项目记忆、Agent 项目上下文预览，
  *     以及「未绑定聊天项目」下定时任务的 cronBlocked 分支。
  *
@@ -34,7 +34,6 @@ import type {
   RuntimePluginAccount,
 } from '../../src/lib/connectors'
 import type {
-  AutoDreamOptimizerState,
   AutoDreamReportResponse,
   CronJob,
   MarketplaceMyAgent,
@@ -741,62 +740,6 @@ function workbench(tab: WorkbenchTab, extra: Partial<Record<string, unknown>> = 
   )
 }
 
-// ── 全面优化 ────────────────────────────────────────────────────────────────
-
-const OPTIMIZER_STATE: AutoDreamOptimizerState = {
-  schemaVersion: 2,
-  status: 'success',
-  runId: 'run_0f1d5851c9',
-  startedAt: agoIso(2 * DAY + 40 * MIN),
-  finishedAt: agoIso(2 * DAY),
-  lastSuccessAt: agoIso(2 * DAY),
-  sessionsReviewed: 137,
-  pagesReviewed: 42,
-  summary:
-    '本周共审计 137 个会话。你在「小红书母婴号」相关任务上重复交代了三次「医疗内容必须带权威源与免责声明」，建议固化为长期记忆。',
-  proposals: [
-    {
-      id: 'prop_mem_muying_disclaimer',
-      fingerprint: 'fp_a91c',
-      category: 'memory',
-      action: 'memory.upsert',
-      title: '把「母婴医疗内容必须附权威源 + 免责声明」固化为长期记忆',
-      reason: '近 30 天内你在 6 个不同会话里重复交代了同一条约束（3 次是在产出被退回后补充的）。',
-      targetId: 'memory/xhs-muying-account.md',
-      before:
-        '---\nname: 小红书母婴号运营手册\ndescription: momo 号的选题、排版与发布节奏\ntype: project\n---\n\n每日 20:00（北京时间）自动发布，队列低于 3 条时补货。',
-      after:
-        '---\nname: 小红书母婴号运营手册\ndescription: momo 号的选题、排版、发布节奏与医疗内容合规红线\ntype: project\n---\n\n每日 20:00（北京时间）自动发布，队列低于 3 条时补货。\n\n## 医疗内容红线\n- 涉及用药、喂养量、发育指标的结论必须给出权威源（WHO / 中华医学会 / 国家卫健委）。\n- 每篇结尾附「本文不构成医疗建议，具体请遵医嘱」。',
-      beforeFingerprint: 'fp_before_a91c',
-      state: 'pending',
-      createdAt: agoIso(2 * DAY),
-    },
-    {
-      id: 'prop_profile_tone',
-      fingerprint: 'fp_c73d',
-      category: 'profile',
-      action: 'profile.update',
-      title: '更新用户画像中的沟通偏好：默认中文、先给结论',
-      reason: '你在 21 次会话里显式要求「先给结论再展开」，当前画像里没有这条。',
-      targetId: 'user.md',
-      before: '## 沟通偏好\n- 默认中文回复。',
-      after: '## 沟通偏好\n- 默认中文回复。\n- 先给结论 / 建议，再展开论证；长回答需要带小标题。',
-      beforeFingerprint: 'fp_before_c73d',
-      state: 'conflict',
-      createdAt: agoIso(2 * DAY),
-      error: '用户画像在生成建议后被改动过，应用前请确认最新内容。',
-    },
-  ],
-}
-
-const optimizationBase: ApiMockTable = {
-  ...BASE,
-  getAutoDreamOptimizer: ok(OPTIMIZER_STATE),
-  runAutoDreamOptimizer: ok(OPTIMIZER_STATE),
-  cancelAutoDreamOptimizer: ok(OPTIMIZER_STATE),
-  mutateAutoDreamProposal: ok(OPTIMIZER_STATE),
-}
-
 // ── 插件账号（知识星球扫码授权） ────────────────────────────────────────────
 
 const KP_CATALOG: PluginManagementResponse['catalog'][number] = {
@@ -1062,8 +1005,6 @@ export const manageAuditScenes: Scene[] = [
   // ── 移动端视口补齐（复用既有 mock） ──
   mobileOnly('manage-skills'),
   mobileOnly('manage-connectors'),
-  mobileOnly('manage-library'),
-  mobileOnly('manage-optimization'),
   mobileOnly('manage-skills-empty'),
 
   // ── 记忆二级状态 ──
@@ -1234,29 +1175,6 @@ export const manageAuditScenes: Scene[] = [
     group: '管理中心',
     api: skillBase,
     render: () => workbench('history'),
-  },
-
-  // ── 全面优化二级状态 ──
-  {
-    id: 'manage-optimization-diff',
-    label: '全面优化 · 建议 Diff 弹层',
-    group: '管理中心',
-    viewports: ['desktop', 'mobile'],
-    api: optimizationBase,
-    render: () => (
-      <AutoClick steps={[{ text: '把「母婴医疗内容必须附权威源' }]}>
-        {shell('optimization')}
-      </AutoClick>
-    ),
-  },
-  {
-    id: 'manage-optimization-conflict',
-    label: '全面优化 · 有冲突的建议弹层',
-    group: '管理中心',
-    api: optimizationBase,
-    render: () => (
-      <AutoClick steps={[{ text: '更新用户画像中的沟通偏好' }]}>{shell('optimization')}</AutoClick>
-    ),
   },
 
   // ── 插件账号：扫码授权中间态 / 失败态 / 写入免责确认 ──

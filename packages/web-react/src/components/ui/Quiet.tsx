@@ -1,5 +1,7 @@
+import type { LucideIcon } from "lucide-react";
 import { createContext, type HTMLAttributes, type ReactNode, useContext } from "react";
 import { cn } from "../../lib/utils";
+import { Select, type SelectOption } from "./Select";
 
 /**
  * 「安静表面」:管理中心(OCV5-344 第 3 轮)的工作面语言 —— 层级靠字号、对齐与留白,
@@ -110,5 +112,64 @@ export function MetaLine({ className, ...props }: HTMLAttributes<HTMLDivElement>
       )}
       {...props}
     />
+  );
+}
+
+/**
+ * 窄屏「上下文行」插槽(OCV5-360 第 4 轮)。管理中心在窄屏把分区的页面标题藏起来
+ * (分段控件已经说明你在哪),PanelHeader 的右侧操作改为 portal 进这一行 —— 作用范围在左、
+ * 分区操作在右,同一行,不再为一颗按钮单独占一行。值是行内的 DOM 节点;null = 不搬运。
+ */
+const HeaderSlotContext = createContext<HTMLElement | null>(null);
+export const HeaderSlotProvider = HeaderSlotContext.Provider;
+export function useHeaderSlot() {
+  return useContext(HeaderSlotContext);
+}
+
+/**
+ * 行内取值选择器:「图标/标签 + 值 ⌄」,无填充框、按内容取宽(field-sizing)、44px 触控高(窄屏)。
+ * 与「作用范围」同一语法 —— 管理中心里所有"在当前视图里换一个对象"的选择都长这样。
+ * 原生 <select>:移动端直接调起系统选择器;值字号 ≥16px(窄屏)避免 iOS 聚焦放大。
+ */
+export function InlineSelect({
+  id,
+  icon: Icon,
+  label,
+  value,
+  onValueChange,
+  options,
+  className,
+  "aria-label": ariaLabel,
+}: {
+  id?: string;
+  icon?: LucideIcon;
+  /** 可见标签(真 <label>)。省略时必须给 aria-label。 */
+  label?: string;
+  value: string;
+  onValueChange: (value: string) => void;
+  options: SelectOption[];
+  className?: string;
+  "aria-label"?: string;
+}) {
+  const selected = options.find((o) => o.value === value)?.label;
+  return (
+    <span className={cn("oc-inline-select flex min-w-0 items-center gap-1", className)}>
+      {Icon && <Icon size={14} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />}
+      {label && id && (
+        <label htmlFor={id} className="shrink-0 cursor-pointer text-meta text-faint max-md:text-body max-md:text-muted">
+          {label}
+        </label>
+      )}
+      <Select
+        id={id}
+        aria-label={label ? undefined : ariaLabel}
+        title={selected}
+        value={value}
+        onValueChange={onValueChange}
+        options={options}
+        inputSize="sm"
+        className="w-auto min-w-0 max-w-full"
+      />
+    </span>
   );
 }

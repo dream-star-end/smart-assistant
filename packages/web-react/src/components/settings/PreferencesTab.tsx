@@ -1,11 +1,10 @@
-import { LockKeyhole, Monitor, Moon, MoonStar, Sparkles, Sun } from 'lucide-react'
+import { Monitor, Moon, Sun } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
 import {
-  type AutoDreamFeatureView,
   type PreferenceEffort,
   type PrefsView,
   initialModelFromPreferences,
@@ -18,7 +17,7 @@ import {
   LONG_CONTEXT_CONFIRM_TITLE,
   LongContextCostWarning,
 } from '../LongContextCostWarning'
-import { Alert, Button, Modal, Select, Switch, useConfirm } from '../ui'
+import { Alert, Button, Select, Switch, useConfirm } from '../ui'
 import { QqBindingCard } from './QqBindingCard'
 import { EFFORT_OPTIONS } from './labels'
 
@@ -55,7 +54,8 @@ export function modifierKeyLabel(): string {
 
 /**
  * 偏好 Tab：外观主题（接 useTheme，写穿到 preferences）+ 默认模型 + 思考深度 +
- * 通知开关。快捷键是独立导航，由 SettingsCenter 直接渲染 `BuiltinHotkeysTable`
+ * 通知开关。（Auto‑Dream「全面优化」开关随管理中心「优化」分区一起下线，OCV5-360；
+ * 仍处于开启态的账号只剩一个"只能关"的出口，见 OptimizerOffRow。）快捷键是独立导航，由 SettingsCenter 直接渲染 `BuiltinHotkeysTable`
  * （不经过本组件，也不依赖 prefs）。prefs 状态由 SettingsCenter 集中持有，本组件只负责 patch。
  * 本组件受控（onPatch 返回后由父刷新快照）。
  *
@@ -66,27 +66,20 @@ export function modifierKeyLabel(): string {
 export function PreferencesTab({
   auth,
   prefs,
-  autoDream,
   theme,
   onSetTheme,
   onPatch,
-  onUpgrade,
-  onOpenMemory,
 }: {
   auth: AuthSession
   prefs: PrefsView
-  autoDream: AutoDreamFeatureView | null
   theme: Theme
   onSetTheme: (t: Theme) => void
   /** 透传 patch 到后端（null 删除该字段）；父组件用返回快照刷新 prefs。 */
   onPatch: (patch: Record<string, unknown>) => Promise<void>
-  onUpgrade: () => void
-  onOpenMemory: () => void
 }) {
   const [models, setModels] = useState<PublicModel[]>([])
   const [err, setErr] = useState<string | null>(null)
-  const [optimizerConsentOpen, setOptimizerConsentOpen] = useState(false)
-  const [optimizerConsentSaving, setOptimizerConsentSaving] = useState(false)
+  const [optimizerClosing, setOptimizerClosing] = useState(false)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
   const composerPrefs = useLocalComposerPrefs()
 
@@ -282,142 +275,31 @@ export function PreferencesTab({
         </div>
       </div>
 
-      {/* Max+ 特色功能：V5 原生后台记忆整理（默认关闭，真实调用按实际积分计费）。 */}
-      <div className="border-t border-border px-5 py-4">
-        <div className="overflow-hidden rounded-2xl border border-accent/25 bg-gradient-to-br from-accent-soft via-surface to-surface shadow-sm">
-          <div className="flex items-start gap-3 px-4 pb-3 pt-4">
-            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-accent text-accent-fg shadow-sm">
-              <MoonStar size={20} />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-title font-semibold text-fg">Auto‑Dream</span>
-                <span className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent-soft px-2 py-0.5 text-micro font-semibold text-accent">
-                  <Sparkles size={10} /> Max+
-                </span>
-              </div>
-              <p className="mt-1 text-[12.5px] leading-relaxed text-muted">
-                MiniMax M3
-                结合平台功能与技能，全面审计会话、操作和日志，给出记忆、设置、技能、规则、Agent、插件与定时任务优化建议。
-              </p>
-            </div>
-            {autoDream?.enabled || (autoDream?.eligible && autoDream.available) ? (
-              <Switch
-                aria-label="Auto-Dream"
-                checked={autoDream?.optimizer_enabled === true}
-                onCheckedChange={(checked) => {
-                  if (checked && (!autoDream?.eligible || !autoDream.available)) return
-                  if (checked) setOptimizerConsentOpen(true)
-                  else void patch({ auto_optimizer_enabled: false })
-                }}
-              />
-            ) : (
-              <LockKeyhole size={17} className="mt-1 shrink-0 text-faint" />
-            )}
-          </div>
-
-          <div className="border-t border-accent/15 bg-surface/60 px-4 py-3">
-            <div className="flex items-start gap-2 text-[11.5px] leading-relaxed text-faint">
-              <span className="mt-0.5 size-1.5 shrink-0 rounded-full bg-accent/70" />
-              <span>
-                至多每 {autoDream?.min_interval_hours ?? 168} 小时运行一次；累计至少{' '}
-                {autoDream?.min_new_sessions ?? 5} 个新会话才会触发。审计按实际用量扣除积分。
-              </span>
-            </div>
-            <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-border bg-surface px-3 py-2.5">
-              <p className="min-w-0 flex-1 text-[11.5px] leading-relaxed text-muted">
-                所有用户内容和功能设置修改都先展示差异并由你确认；功能设置支持一键应用。
-              </p>
-              <button
-                type="button"
-                onClick={onOpenMemory}
-                className="shrink-0 rounded-lg border border-border bg-elevated px-3 py-1.5 text-meta font-medium text-fg outline-none transition-colors hover:border-accent hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                查看优化建议
-              </button>
-            </div>
-            {autoDream && !autoDream.eligible && (
-              <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-surface px-3 py-2.5">
-                <span className="text-meta text-muted">升级到 Max 即可解锁后台记忆整理。</span>
-                <button
-                  type="button"
-                  onClick={onUpgrade}
-                  className="shrink-0 rounded-lg bg-accent px-3 py-1.5 text-meta font-medium text-accent-fg outline-none transition-opacity hover:opacity-90 focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  升级到 Max
-                </button>
-              </div>
-            )}
-            {autoDream?.eligible && !autoDream.available && (
-              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-meta text-warning">
-                Auto‑Dream 当前暂不可用，功能已安全暂停。
-              </p>
-            )}
-            {autoDream?.legacy_enabled && !autoDream.optimizer_enabled && (
-              <p className="mt-3 rounded-xl border border-warning/25 bg-warning-soft px-3 py-2 text-meta text-warning">
-                你当前仍在使用旧版记忆整理。打开上方开关并确认后，将安全升级到全面优化；旧版自动改记忆会同时关闭。
-              </p>
-            )}
-          </div>
+      {/* 全面优化已下线：仍开着的账号只给一个关闭出口（关 = 收回授权，无需同意弹窗）；
+          未开启时什么都不渲染。后端会把 auto_dream_enabled 一并置 false（normalizeAutoDreamPreferencePatch）。 */}
+      {prefs.auto_optimizer_enabled === true && (
+        <div className="flex items-center justify-between gap-3 border-t border-border px-5 py-4">
+          <span className="min-w-0">
+            <span className="block text-section text-fg">全面优化已下线</span>
+            <span className="block text-caption text-faint">关闭后不再在后台审计你的会话</span>
+          </span>
+          <Button
+            size="sm"
+            variant="secondary"
+            loading={optimizerClosing}
+            onClick={async () => {
+              setOptimizerClosing(true)
+              try {
+                await patch({ auto_optimizer_enabled: false })
+              } finally {
+                setOptimizerClosing(false)
+              }
+            }}
+          >
+            关闭
+          </Button>
         </div>
-      </div>
-
-      <Modal
-        open={optimizerConsentOpen}
-        onOpenChange={(open) => !optimizerConsentSaving && setOptimizerConsentOpen(open)}
-        title="开启 Auto‑Dream 全面优化？"
-        description="请确认审计范围、计费和平台发现上报方式"
-        footer={
-          <>
-            <Button
-              variant="ghost"
-              disabled={optimizerConsentSaving}
-              onClick={() => setOptimizerConsentOpen(false)}
-            >
-              取消
-            </Button>
-            <Button
-              variant="primary"
-              disabled={optimizerConsentSaving}
-              onClick={async () => {
-                setOptimizerConsentSaving(true)
-                try {
-                  await patch({ auto_optimizer_enabled: true })
-                  setOptimizerConsentOpen(false)
-                } finally {
-                  setOptimizerConsentSaving(false)
-                }
-              }}
-            >
-              {optimizerConsentSaving && (
-                <span className="size-3.5 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-              )}
-              同意并开启
-            </Button>
-          </>
-        }
-      >
-        <div className="space-y-3 text-[13px] leading-relaxed text-muted">
-          <p>
-            开启后，MiniMax M3 会在独立、无工具、无网络的隔离环境中读取你在 V5
-            内保留的相关会话、操作日志、用量，以及当前记忆、技能、规则、Agent、插件和定时任务配置。
-          </p>
-          <div className="rounded-xl border border-border bg-surface p-3">
-            <p className="font-medium text-fg">你始终拥有最终决定权</p>
-            <ul className="mt-1.5 list-disc space-y-1 pl-4">
-              <li>不会根据模型输出直接修改任何用户内容或设置。</li>
-              <li>内容调整会打开前后差异弹窗；设置调整提供明确的一键确认。</li>
-              <li>每次模型审计按实际用量扣除积分，可随时关闭。</li>
-            </ul>
-          </div>
-          <div className="rounded-xl border border-accent/20 bg-accent-soft p-3">
-            <p className="font-medium text-fg">匿名平台优化发现</p>
-            <p className="mt-1">
-              如果发现需要平台方改进的问题，会自动向管理员后台上报闭集分类、影响和建议的匿名聚合信息；不会上报原始会话、日志正文、工具参数、凭证或可识别个人内容，也不会自动替平台执行修改或向其他用户发通知。
-            </p>
-          </div>
-        </div>
-      </Modal>
+      )}
 
       {/* 通知 */}
       <div className="border-t border-border px-5 py-4">

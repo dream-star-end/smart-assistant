@@ -312,9 +312,75 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     expect(index).toHaveBeenCalledTimes(3);
     expect(dream).toHaveBeenCalledTimes(3);
     expect(screen.getByText("冷启动后恢复的记忆")).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Auto-Dream 梦境报告" })).toHaveTextContent(
-      "还没有整理过",
-    );
+    // 梦境请求也恢复了,但没有报告也没在整理 → 不渲染「还没有整理过」卡,也不留占位。
+    expect(screen.queryByRole("region", { name: "Auto-Dream 梦境报告" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("dream-placeholder")).not.toBeInTheDocument();
+  });
+
+  test("记忆描述真的截到 2 行：line-clamp-2 不与 block 同用（block 会取消截断）", async () => {
+    mockIndex([{ file: "long.md", name: "长记忆", description: "很长的描述".repeat(40), type: "user" }]);
+    renderPanel();
+    await screen.findByText("长记忆");
+    const desc = screen.getByTestId("memory-row-description");
+    expect(desc).toHaveClass("line-clamp-2");
+    expect(desc).not.toHaveClass("block");
+    // 标题一行截断
+    expect(screen.getByText("长记忆")).toHaveClass("truncate");
+  });
+
+  test("空记忆且没有梦境报告时只有一个空态：没有梦境卡、没有占位", async () => {
+    mockDream({ status: "idle", pendingSessions: 3 });
+    mockIndex([]);
+    renderPanel();
+    expect(await screen.findByText("还没有核心记忆")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Auto-Dream 梦境报告" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/还没有整理过/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("dream-placeholder")).not.toBeInTheDocument();
+    // 一个空态 = 页面上只有一句「还没有…」
+    expect(screen.getAllByText(/^还没有/)).toHaveLength(1);
+  });
+
+  test("正在整理时即使还没有报告也显示梦境卡", async () => {
+    mockDream({ status: "running", pendingSessions: 0 });
+    mockIndex([]);
+    renderPanel();
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    expect(report).toHaveAttribute("aria-busy", "true");
+    expect(within(report).getByText(/正在整理近期对话/)).toBeInTheDocument();
+  });
+
+  test("梦境报告在路上时：列表已出来才给占位，空记忆不给", async () => {
+    vi.spyOn(api, "getAutoDreamReport").mockReturnValue(new Promise(() => {}));
+    mockIndex([{ file: "a.md", name: "A" }]);
+    renderPanel();
+    await screen.findByText("A");
+    expect(screen.getByTestId("dream-placeholder")).toBeInTheDocument();
+    cleanup();
+
+    mockIndex([]);
+    renderPanel();
+    await screen.findByText("还没有核心记忆");
+    expect(screen.queryByTestId("dream-placeholder")).not.toBeInTheDocument();
+  });
+
+  test("按类型分组后行面不再重复类型名；搜索框是 search 类型的安静输入框", async () => {
+    mockIndex([
+      { file: "a.md", name: "偏好一", type: "user" },
+      { file: "b.md", name: "偏好二", type: "user" },
+      { file: "c.md", name: "项目一", type: "project" },
+      { file: "d.md", name: "项目二", type: "project" },
+      { file: "e.md", name: "参考一", type: "reference" },
+      { file: "f.md", name: "参考二", type: "reference" },
+      { file: "g.md", name: "反馈一", type: "feedback" },
+    ]);
+    renderPanel();
+    await screen.findByText("7 条记忆");
+    // 「用户偏好」只作为组标题出现一次
+    expect(screen.getAllByText("用户偏好")).toHaveLength(1);
+    const box = screen.getByRole("searchbox", { name: "搜索核心记忆" });
+    expect(box).toHaveClass("border-transparent", "bg-hover");
+    // 新建按钮窄屏只露「新建」，可访问名仍完整
+    expect(screen.getByRole("button", { name: "新建记忆" })).toBeInTheDocument();
   });
 });
 
@@ -635,7 +701,10 @@ describe("MemoryPanel · 用户画像（单文本编辑）", () => {
       </TooltipProvider>,
     );
 
-    expect(await screen.findByLabelText("选择智能体")).toBeInTheDocument();
+    const picker = await screen.findByLabelText("选择智能体");
+    // 行内值(与「作用范围」同一语法),不是带可见标签的灰色下拉框
+    expect(picker.closest(".oc-inline-select")).not.toBeNull();
+    expect(screen.queryByText("选择智能体")).not.toBeInTheDocument();
     openProfileTab();
     expect(await screen.findByDisplayValue("称呼：dx")).toBeInTheDocument();
     expect(screen.queryByLabelText("选择智能体")).not.toBeInTheDocument();
@@ -884,6 +953,51 @@ describe("MemoryPanel · 读失败不再与空态并排", () => {
     });
     expect(await screen.findByText("已采纳")).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByText("早前留下的待确认条目")).not.toBeInTheDocument());
+  });
+});
+
+describe("MemoryPanel · 项目记忆行", () => {
+  test("生效中的行没有行内按钮：废弃收在 ⋯ 菜单里，确认后带 version 调用", async () => {
+    mockIndex([]);
+    const work = { id: "wp_muying_2026", key: "MY", name: "小红书母婴号运营", description: null, workspace: null, labels: [], archivedAt: null, createdAt: 1, updatedAt: 1 };
+    const chat = { id: "chat_muying_0001", name: "momo 号运营", boardProjectId: work.id };
+    const official = { projectId: work.id, slug: "muying-disclaimer", contentSha256: "sha", status: "official", version: 3 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input).split("?")[0];
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+        if (path === "/api/board/projects") return json({ items: [work] });
+        if (path === `/api/board/projects/${work.id}/memories`) {
+          return json({ projectId: work.id, official: [official], candidates: [] });
+        }
+        return json({});
+      }),
+    );
+    const { taskboardApi } = await import("../../lib/taskboard");
+    const deprecate = vi
+      .spyOn(taskboardApi, "deprecateProjectMemory")
+      .mockResolvedValue({ ok: true, official: official as never });
+    vi.spyOn(api, "listProjectAssets").mockResolvedValue([]);
+    localStorage.setItem("oc_v5_project_scope:u1", chat.id);
+    const { ProjectScopeProvider } = await import("../../hooks/useProjectScope");
+    renderPanel(
+      <ProjectScopeProvider auth={auth} chatProjects={[chat]} userId="u1">
+        <MemoryPanel auth={auth} agentId="main" agents={agents} />
+      </ProjectScopeProvider>,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "项目记忆" }));
+
+    const list = await screen.findByRole("list", { name: "生效中的项目记忆" });
+    expect(within(list).queryByRole("button", { name: "废弃" })).not.toBeInTheDocument();
+    const more = within(list).getByRole("button", { name: "muying-disclaimer 更多操作" });
+    fireEvent.pointerDown(more, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "废弃" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认废弃" }));
+    await waitFor(() => expect(deprecate).toHaveBeenCalledWith(auth, work.id, "muying-disclaimer", 3));
+    // 小节标题在任何宽度都可见（不再借用页面级 PanelHeader）
+    expect(screen.getByRole("heading", { name: "项目资产" })).toBeInTheDocument();
   });
 });
 

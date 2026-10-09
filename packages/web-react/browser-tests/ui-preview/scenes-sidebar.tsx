@@ -181,7 +181,6 @@ const baseSidebarProps: SidebarProps = {
   activeId: 's-web-2',
   user,
   credits: user.credits,
-  optimizerPending: 2,
   onSelect: noop,
   onNew: noop,
   onNewWithAgent: noop,

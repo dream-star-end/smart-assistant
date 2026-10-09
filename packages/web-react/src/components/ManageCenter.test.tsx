@@ -50,7 +50,7 @@ test('中心壳走 Modal 原语：定高 + 桌面放宽容纳导航栏 + 保留 
   )
 })
 
-test('首位 Tab 即默认落地页，且顺序/文案为已定案的六个分区', () => {
+test('首位 Tab 即默认落地页，且顺序/文案为已定案的四个分区（文献/优化已下线）', () => {
   // 契约：DEFAULT_MANAGE_TAB 由注册表首位派生。改造前 TABS[0]='optimization' 而 App
   // 默认 'memory'，首屏永远是"选中的不是第一个"。
   expect(DEFAULT_MANAGE_TAB).toBe(MANAGE_TABS[0].id)
@@ -59,13 +59,11 @@ test('首位 Tab 即默认落地页，且顺序/文案为已定案的六个分�
     'skills',
     'cron',
     'connectors',
-    'library',
-    'optimization',
   ])
   renderShell()
   const tabs = screen.getAllByRole('tab')
   // 名字只是分区名；一句话说明挂在 aria-describedby 上，不拼进名字（OCV5-344）。
-  expect(MANAGE_TABS.map((t) => t.label)).toEqual(['记忆', '技能', '定时', '插件', '文献', '优化'])
+  expect(MANAGE_TABS.map((t) => t.label)).toEqual(['记忆', '技能', '定时', '插件'])
   for (const [i, def] of MANAGE_TABS.entries()) {
     expect(tabs[i]).toHaveAccessibleName(def.label)
     expect(tabs[i]).toHaveAccessibleDescription(def.blurb)
@@ -73,12 +71,15 @@ test('首位 Tab 即默认落地页，且顺序/文案为已定案的六个分�
   expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
 })
 
-test('主导航：窄屏六等分一屏全见（不再横滚把「优化」藏到视口外），桌面竖排导航栏', () => {
+test('主导航：窄屏是四等分的分段控件（只有文字），桌面竖排导航栏（图标 + 名称）', () => {
   renderShell()
   const tablist = screen.getByRole('tablist', { name: '管理分区' })
-  expect(tablist).toHaveClass('grid', 'grid-cols-6', 'md:flex', 'md:flex-col')
+  expect(tablist).toHaveClass('oc-manage-tablist', 'grid', 'grid-cols-4', 'md:flex', 'md:flex-col')
   expect(tablist).not.toHaveClass('overflow-x-auto')
-  expect(screen.getAllByRole('tab')).toHaveLength(6)
+  const tabs = screen.getAllByRole('tab')
+  expect(tabs).toHaveLength(4)
+  // 图标只在桌面导航栏出现：窄屏分段里是纯文字。
+  for (const tab of tabs) expect(tab.querySelector('svg')).toHaveClass('hidden', 'md:block')
 })
 
 test('方向键 / Home / End 在分区间移动并切换（roving tabindex）', () => {
@@ -92,7 +93,7 @@ test('方向键 / Home / End 在分区间移动并切换（roving tabindex）', 
   fireEvent.keyDown(skills, { key: 'ArrowLeft' })
   expect(onTabChange).toHaveBeenLastCalledWith('memory')
   fireEvent.keyDown(skills, { key: 'End' })
-  expect(onTabChange).toHaveBeenLastCalledWith('optimization')
+  expect(onTabChange).toHaveBeenLastCalledWith('connectors')
   fireEvent.keyDown(skills, { key: 'Home' })
   expect(onTabChange).toHaveBeenLastCalledWith('memory')
 })
@@ -112,20 +113,25 @@ test('作用范围只在记忆/技能/定时出现，并带可见说明；切到
   expect(screen.queryByText('作用范围')).not.toBeInTheDocument()
 })
 
-test('「怎么用」打开当前分区的教程；「优化」没有独立教程不挂入口；未传回调不渲染', () => {
+test('「怎么用」打开当前分区的教程（四个分区都有），DOM 里只有一个入口；未传回调不渲染', () => {
   const onOpenHelp = vi.fn()
   const { unmount } = renderShell({ tab: 'cron', onOpenHelp })
+  // 窄屏它被绝对定位到标题行左侧、文字 sr-only；仍是同一个按钮，读屏不会读到两次。
+  expect(screen.getAllByRole('button', { name: '怎么用' })).toHaveLength(1)
   fireEvent.click(screen.getByRole('button', { name: '怎么用' }))
   expect(onOpenHelp).toHaveBeenCalledWith(MANAGE_TABS.find((t) => t.id === 'cron')?.featureId)
   unmount()
-  renderShell({ tab: 'optimization', onOpenHelp })
-  expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
+  renderShell({ tab: 'connectors', onOpenHelp })
+  fireEvent.click(screen.getByRole('button', { name: '怎么用' }))
+  expect(onOpenHelp).toHaveBeenLastCalledWith(
+    MANAGE_TABS.find((t) => t.id === 'connectors')?.featureId,
+  )
   cleanup()
   renderShell({ tab: 'cron' })
   expect(screen.queryByRole('button', { name: '怎么用' })).not.toBeInTheDocument()
 })
 
-test('分区说明只作读屏描述、不再挂在每个导航项下；窄屏无控件时工具条整条隐藏', () => {
+test('分区说明只作读屏描述、不再挂在每个导航项下；工具条不再有面包屑', () => {
   renderShell({ tab: 'connectors' })
   // 第 3 轮：说明只出现一次，且是 sr-only 的 aria-describedby 目标（视觉由页面标题下的说明承担）。
   const blurb = screen.getByText('已连接的应用和账号')
@@ -133,8 +139,22 @@ test('分区说明只作读屏描述、不再挂在每个导航项下；窄屏�
   expect(screen.getAllByText('已连接的应用和账号')).toHaveLength(1)
   // 不再有面包屑：页面标题本身就说明了位置。
   expect(document.querySelector('.oc-manage-toolbar')).not.toHaveTextContent('管理中心')
-  // 插件分区既无作用范围、也没传帮助回调：窄屏不渲染空工具条。
-  expect(document.querySelector('.oc-manage-toolbar')).toHaveClass('max-md:hidden')
+})
+
+test('窄屏上下文行：分区的 PanelHeader 操作经插槽搬进来；内容滚离顶部才出现下沿发丝线', () => {
+  renderShell({ tab: 'memory' })
+  const toolbar = document.querySelector('.oc-manage-toolbar') as HTMLElement
+  // 插槽在作用范围之后、只在窄屏出现；空时 empty:hidden 不占位。
+  const slot = toolbar.querySelector('[data-manage-slot]')
+  expect(slot).toHaveClass('md:hidden', 'empty:hidden', 'ml-auto')
+  expect(toolbar).not.toHaveAttribute('data-scrolled')
+  const panel = screen.getByRole('tabpanel')
+  Object.defineProperty(panel, 'scrollTop', { configurable: true, value: 120 })
+  fireEvent.scroll(panel)
+  expect(toolbar).toHaveAttribute('data-scrolled', 'true')
+  Object.defineProperty(panel, 'scrollTop', { configurable: true, value: 0 })
+  fireEvent.scroll(panel)
+  expect(toolbar).not.toHaveAttribute('data-scrolled')
 })
 
 test('外壳是安静表面：没有渐变标识方块 / 渐变图标，原语拿到 QuietSurface', () => {
@@ -165,41 +185,15 @@ test('tablist 与面板建立 aria 关联，键盘可聚焦内容区', () => {
   expect(skillsTab).toHaveAttribute('aria-controls', 'manage-panel-skills')
 })
 
-test('六个分区只挂一个面板，其余 tab 不得留悬空 aria-controls', () => {
-  // 壳体是「只渲染当前面板」的典型:6 个 tab 共用一个 tabpanel 容器。
-  // 若每个 tab 都落 aria-controls,另外 5 个就都指向不存在的节点 —— DOM 上看不出异常,
+test('四个分区只挂一个面板，其余 tab 不得留悬空 aria-controls', () => {
+  // 壳体是「只渲染当前面板」的典型:4 个 tab 共用一个 tabpanel 容器。
+  // 若每个 tab 都落 aria-controls,另外 3 个就都指向不存在的节点 —— DOM 上看不出异常,
   // 读屏的「跳到被控元素」却会静默失败。
   renderShell({ tab: 'skills' })
   expect(screen.getAllByRole('tabpanel')).toHaveLength(1)
   expect(screen.getByRole('tab', { name: '定时' })).not.toHaveAttribute('aria-controls')
   expect(screen.getByRole('tab', { name: '记忆' })).not.toHaveAttribute('aria-controls')
   expectAriaControlsResolvable()
-})
-
-test('有待确认建议时「优化」Tab 挂计数徽标，为 0 则不渲染噪声', () => {
-  const { unmount } = renderShell({ optimizerPendingCount: 3 })
-  expect(screen.getByRole('tab', { name: /优化\s*3\s*项待确认/ })).toBeInTheDocument()
-  unmount()
-  renderShell({ optimizerPendingCount: 0 })
-  expect(screen.getByRole('tab', { name: '优化' })).toBeInTheDocument()
-})
-
-test('窄屏下有待确认建议时补一行可点的待办提示，选中「优化」或计数为 0 时不渲染', () => {
-  const onTabChange = vi.fn<(t: ManageTab) => void>()
-  const { unmount } = renderShell({ optimizerPendingCount: 3, onTabChange })
-  // 窄屏导航上「优化」只放得下一个小圆点 —— 这一行把数量和出口说全。
-  const hint = screen.getByRole('button', { name: /有 3 项优化建议待确认/ })
-  expect(hint).toHaveClass('md:hidden')
-  fireEvent.click(hint)
-  expect(onTabChange).toHaveBeenCalledWith('optimization')
-  unmount()
-
-  renderShell({ optimizerPendingCount: 3, tab: 'optimization' })
-  expect(screen.queryByRole('button', { name: /项优化建议待确认/ })).not.toBeInTheDocument()
-  cleanup()
-
-  renderShell({ optimizerPendingCount: 0 })
-  expect(screen.queryByRole('button', { name: /项优化建议待确认/ })).not.toBeInTheDocument()
 })
 
 test('未登录态是带出口的空态，而不是一行灰字', () => {

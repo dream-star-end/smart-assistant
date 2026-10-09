@@ -92,19 +92,12 @@ describe("Sidebar 账号菜单（平台超管 / 反馈）", () => {
 });
 
 describe("Sidebar 管理中心入口副标题", () => {
-  it("无待办时展示与实际分区对齐的速览文案", () => {
+  it("展示与实际分区对齐的速览文案，不再有「优化」待确认徽章", () => {
     renderSidebar({ onOpenManage: () => {} });
     openAccountMenu();
     const entry = screen.getByRole("menuitem", { name: /管理中心/ });
     expect(entry).toHaveTextContent("记忆 · 技能");
-  });
-
-  it("有待确认建议时改用数量徽章（Auto‑Dream 在账号菜单的唯一曝光）", () => {
-    renderSidebar({ onOpenManage: () => {}, optimizerPending: 3 });
-    openAccountMenu();
-    const entry = screen.getByRole("menuitem", { name: /管理中心/ });
-    expect(entry).toHaveTextContent("3 项待确认");
-    expect(entry).not.toHaveTextContent("记忆 · 技能");
+    expect(entry).not.toHaveTextContent(/待确认/);
   });
 });
 
