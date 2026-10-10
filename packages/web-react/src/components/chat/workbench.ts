@@ -315,11 +315,25 @@ export function fileSnapshot(messages: readonly ChatMessage[], path: string, upT
   return known ? content : null;
 }
 
-/** 文件改动的指纹:改动条数、最后一条的 id 与状态。用来让「读容器文件」的回落在文件又被改过后重新读。 */
-export function changeFingerprint(change: FileChange | undefined): string {
-  if (!change) return "";
-  const last = change.entries.at(-1);
-  return `${change.entries.length}:${last?.message.id ?? ""}:${change.running ? "r" : ""}${change.hasError ? "e" : ""}:${last?.message._completed ? "c" : ""}`;
+/**
+ * 「读容器文件」回落的重读信号:会话里所有可能动过这个文件的工具行 —— 对它的写入、输入里提到它
+ * 的任何命令(脚本可能在命令返回时才写)、看不到输入的大记录定位桩 —— 各自的 id 与完成 / 出错
+ * 状态拼在一起。任何一行出现或跑完,指纹就变,卡片重读当前文件。
+ */
+export function fileTouchFingerprint(messages: readonly ChatMessage[], path: string): string {
+  const name0 = baseName(path);
+  const parts: string[] = [];
+  for (const m of messages) {
+    if (m.role !== "tool") continue;
+    let touches = m._payloadDeferred === true;
+    if (!touches) {
+      const { input } = normalizeToolForDisplay(m);
+      const text = typeof m.inputJson === "string" ? m.inputJson : JSON.stringify(input ?? m.inputJson ?? {});
+      touches = text.includes(path) || text.includes(name0);
+    }
+    if (touches) parts.push(`${m.id}:${m._completed ? 1 : 0}${m.error ? 1 : 0}`);
+  }
+  return parts.join("|");
 }
 
 // ── 摘要 ────────────────────────────────────────────────────────────────

@@ -148,6 +148,21 @@ describe("产出页", () => {
     expect(fetchSignedCapped).toHaveBeenCalledTimes(2);
   });
 
+  test("读容器文件的回落:提到这个文件的脚本命令跑完后重读(命令返回时才写)", async () => {
+    fetchSignedCapped.mockResolvedValueOnce(bytes("OLD-CONTENT")).mockResolvedValueOnce(bytes("NEW-CONTENT"));
+    const write = tool("w1", "Write", { file_path: "/tmp/a.md", content: "old\n" });
+    const script = { command: "sleep 2; python3 -c \"open('/tmp/a.md','w').write('new')\"" };
+    const running = [user("u1", "改"), write, tool("b1", "Bash", script, { _completed: false, output: "" })];
+    const { rerender } = render(<InspectorPanelContent messages={running} running onClose={() => {}} />);
+    await outputsReady();
+    fireEvent.click(screen.getByRole("radio", { name: "源码" }));
+    expect(await screen.findByText(/OLD-CONTENT/)).toBeInTheDocument();
+    const done = [user("u1", "改"), write, tool("b1", "Bash", script, { _completed: true, output: "" })];
+    rerender(<InspectorPanelContent messages={done} running onClose={() => {}} />);
+    expect(await screen.findByText(/NEW-CONTENT/)).toBeInTheDocument();
+    expect(screen.getByTestId("outputs-hero-origin")).toHaveTextContent("容器里的当前文件");
+  });
+
   test("运行中:新一轮开始自动跟过去;翻到旧轮后停在旧轮", async () => {
     const first = session().slice(0, 6);
     const { rerender } = render(<InspectorPanelContent messages={first} running onClose={() => {}} />);

@@ -6,6 +6,7 @@ import {
   collectWorkTurns,
   displayDir,
   fileSnapshot,
+  fileTouchFingerprint,
   formatDuration,
   outputKindOf,
   pickHero,
@@ -201,5 +202,17 @@ describe("来源与目录显示", () => {
     expect(displayDir("/home/agent/.openclaude/workspace/sessions/webabc/cc3wb/index.html")).toBe("工作区/cc3wb");
     expect(displayDir("/home/agent/.openclaude/workspace/a.md")).toBe("工作区");
     expect(displayDir("/etc/nginx/nginx.conf")).toBe("/etc/nginx");
+  });
+});
+
+describe("fileTouchFingerprint", () => {
+  test("提到这个文件的命令跑完、出现新写入或定位桩时变化;无关命令不变", () => {
+    const write = tool("w1", "Write", { file_path: "/tmp/a.md", content: "old\n" });
+    const cmd = { command: "sleep 2; python3 -c \"open('/tmp/a.md','w').write('new')\"" };
+    const base = fileTouchFingerprint([write, tool("b1", "Bash", cmd, { _completed: false, output: "" })], "/tmp/a.md");
+    expect(fileTouchFingerprint([write, tool("b1", "Bash", cmd)], "/tmp/a.md")).not.toBe(base);
+    expect(fileTouchFingerprint([write, tool("b1", "Bash", cmd, { _completed: false, output: "" }), tool("x", "Bash", { command: "ls /etc" })], "/tmp/a.md")).toBe(base);
+    const locator: ChatMessage = { id: "big", role: "tool", text: "", ts: TS, toolName: "Bash", _payloadDeferred: true, _completed: true };
+    expect(fileTouchFingerprint([write, locator], "/tmp/a.md")).toContain("big:");
   });
 });

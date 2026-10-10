@@ -38,7 +38,7 @@ function useFileText(path: string, replayed: string | null, refreshKey: string):
   const [state, setState] = useState<TextState>(() =>
     replayed !== null ? { phase: "ready", text: replayed, origin: "session" } : { phase: "loading" },
   );
-  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt 是「重试」、refreshKey 是「文件又被改过」的重读信号
+  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt 是「重试」、refreshKey 是「又有工具动过这个文件」的重读信号
   useEffect(() => {
     if (replayed !== null) {
       setState({ phase: "ready", text: replayed, origin: "session" });
@@ -123,7 +123,7 @@ export function FilePreview({
   kind: OutputKind;
   /** 会话回放出的全文;null = 回放不出来,读容器文件。 */
   replayed: string | null;
-  /** 文件改动指纹;变了就重读容器文件(只在回放不出来、走读文件时有意义)。 */
+  /** 动过这个文件的工具行的指纹;变了就重读容器文件(只在回放不出来、走读文件时有意义)。 */
   refreshKey?: string;
   view: PreviewView;
 }) {
