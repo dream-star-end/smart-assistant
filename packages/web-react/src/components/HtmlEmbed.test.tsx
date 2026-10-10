@@ -11,15 +11,8 @@ vi.mock("./chat/media", () => ({
 }));
 
 import { HtmlFileEmbed, HtmlPreview, isSelfContainedHtml } from "./HtmlEmbed";
-import {
-  embedCsp,
-  embedFileName,
-  injectHead,
-  isBridgeablePath,
-  isHeavyEmbed,
-  usesFileBridge,
-  wrapEmbedHtml,
-} from "./embedDoc";
+import { embedCsp, injectHead, wrapWithCspOnly } from "./embedCsp";
+import { embedFileName, isBridgeablePath, isHeavyEmbed, usesFileBridge, wrapEmbedHtml } from "./embedDoc";
 
 const PAGE = "<!DOCTYPE html><html><head><title>户型</title></head><body><div id=a>hi</div></body></html>";
 
@@ -51,24 +44,37 @@ afterEach(() => {
 });
 
 describe("embedDoc 注入", () => {
-  it("CSP、套件和引导脚本放在模型代码之前;有 <head> 就放进 head,doctype 保持在最前", () => {
-    const out = wrapEmbedHtml(PAGE, { token: "ab", dark: false, vars: { "--oc-fg": "#111" } });
-    expect(out.startsWith("<!DOCTYPE html>")).toBe(true);
-    const csp = out.indexOf("Content-Security-Policy");
-    expect(csp).toBeGreaterThan(out.indexOf("<head>"));
-    expect(csp).toBeLessThan(out.indexOf("<title>"));
+  it("注入放在文档最前(doctype 之后),解析后在真正的 head 里、早于模型的任何内容", () => {
+    const out = wrapEmbedHtml(PAGE, { token: "ab", dark: true, vars: { "--oc-fg": "#111" } });
+    expect(out.startsWith('<!DOCTYPE html><meta http-equiv="Content-Security-Policy"')).toBe(true);
     expect(out).toContain('id="oc-kit"');
     expect(out).toContain(":root{--oc-fg:#111}");
-    expect(out).toContain('<html data-theme="light">');
+    expect(out).toContain('setAttribute("data-theme","dark")');
+    const doc = new DOMParser().parseFromString(out, "text/html");
+    expect(doc.head.firstElementChild?.getAttribute("http-equiv")).toBe("Content-Security-Policy");
+    expect(doc.title).toBe("户型");
   });
 
-  it("片段 / 只有 doctype / 只有 html 三种写法都能放对位置", () => {
-    const frag = injectHead("<div>x</div>", "<meta x>", true);
-    expect(frag).toBe('<!DOCTYPE html><html data-theme="dark"><head><meta x></head><body><div>x</div></body></html>');
-    expect(injectHead("<!doctype html><div>x</div>", "<meta x>", false)).toBe("<!doctype html><head><meta x></head><div>x</div>");
-    expect(injectHead('<html lang="zh"><body>x</body></html>', "<meta x>", false)).toBe(
-      '<html data-theme="light" lang="zh"><head><meta x></head><body>x</body></html>',
-    );
+  it("注释里的 <head> 骗不走注入位置(Codex r1):CSP 仍是 head 第一个元素,早于模型脚本", () => {
+    const trap = '<!doctype html><!-- <head> --><html><head></head><body><script src="https://evil.test/x.js"></script></body></html>';
+    const out = injectHead(trap, "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\">");
+    expect(out.startsWith('<!doctype html><meta http-equiv="Content-Security-Policy"')).toBe(true);
+    const doc = new DOMParser().parseFromString(out, "text/html");
+    const csp = doc.head.querySelector('meta[http-equiv="Content-Security-Policy"]');
+    expect(csp).toBeTruthy();
+    const script = doc.querySelector("script");
+    expect(csp && script && csp.compareDocumentPosition(script) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // 模型脚本写在 head 里也一样排在注入后面。
+    const early = injectHead("<html><head><script>x()</script></head></html>", "<meta id=first>");
+    const d2 = new DOMParser().parseFromString(early, "text/html");
+    expect(d2.head.firstElementChild?.id).toBe("first");
+  });
+
+  it("片段补 doctype;开头的注释和 doctype 原样保留在最前(不触发怪异模式)", () => {
+    expect(injectHead("<div>x</div>", "<meta x>")).toBe("<!DOCTYPE html><meta x><div>x</div>");
+    expect(injectHead("<!-- hi -->\n<!DOCTYPE html><p>x</p>", "<meta x>")).toBe("<!-- hi -->\n<!DOCTYPE html><meta x><p>x</p>");
+    expect(injectHead("<!-- <!doctype html> --><p>x</p>", "<meta x>")).toBe("<!DOCTYPE html><meta x><!-- <!doctype html> --><p>x</p>");
+    expect(wrapWithCspOnly("<p>x</p>")).toContain("form-action 'none'");
   });
 
   it("CSP:脚本 / 网络只认固定 CDN,禁止提交表单和改 base", () => {
@@ -200,7 +206,8 @@ describe("HtmlPreview 无缝嵌入", () => {
     const post = vi.spyOn(f.contentWindow as Window, "postMessage");
     const doc = f.getAttribute("srcdoc");
     fromFrame(f, { oc: "embed", token, type: "ready" });
-    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ oc: "host", token, type: "theme", dark: false }), "*");
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ oc: "host", type: "theme", dark: false }), "*");
+    expect(JSON.stringify(post.mock.calls)).not.toContain(token);
     act(() => document.documentElement.classList.add("dark"));
     return waitFor(() => {
       expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ type: "theme", dark: true }), "*");
@@ -216,6 +223,44 @@ describe("HtmlPreview 无缝嵌入", () => {
     expect(container.textContent).toContain("尝试打开其它页面,已停止运行");
     fireEvent.click(screen.getAllByRole("button", { name: /重新运行/ })[0]!);
     expect(container.querySelector("iframe")).toBeTruthy();
+  });
+
+  it("第一次 load 后等不到本页 ready(首次 load 前就跳走了)也停止运行", () => {
+    vi.useFakeTimers();
+    const { container } = render(<HtmlPreview code={PAGE} />);
+    fireEvent.load(frame(container));
+    act(() => vi.advanceTimersByTime(1600));
+    expect(container.querySelector("iframe")).toBeNull();
+    expect(container.textContent).toContain("已停止运行");
+  });
+
+  it("收到 ready 的正常页面不会被误停", () => {
+    vi.useFakeTimers();
+    const { container } = render(<HtmlPreview code={PAGE} />);
+    const f = frame(container);
+    fromFrame(f, { oc: "embed", token: tokenOf(f), type: "ready" });
+    fireEvent.load(f);
+    act(() => vi.advanceTimersByTime(1600));
+    expect(container.querySelector("iframe")).toBeTruthy();
+  });
+
+  it("全屏打开时内容更新(流式结束)换新 iframe,不会被当成导航停止(Codex r1)", () => {
+    vi.useFakeTimers();
+    const { container, rerender } = render(<HtmlPreview code="<div>A</div>" live />);
+    act(() => vi.advanceTimersByTime(1500));
+    fireEvent.click(screen.getByRole("button", { name: "全屏放大预览" }));
+    const fullFrame = () => document.querySelector('iframe[title="交互内容(全屏)"]') as HTMLIFrameElement;
+    const f1 = fullFrame();
+    fromFrame(f1, { oc: "embed", token: tokenOf(f1), type: "ready" });
+    fireEvent.load(f1);
+    rerender(<HtmlPreview code="<div>AB</div>" />);
+    const f2 = fullFrame();
+    expect(f2).not.toBe(f1);
+    fromFrame(f2, { oc: "embed", token: tokenOf(f2), type: "ready" });
+    fireEvent.load(f2);
+    act(() => vi.advanceTimersByTime(1600));
+    expect(fullFrame()).toBeTruthy();
+    expect(container.textContent).not.toContain("已停止运行");
   });
 
   it("看源码 / 下载 HTML", () => {
@@ -247,10 +292,11 @@ describe("HtmlPreview 文件桥", () => {
     expect(f.getAttribute("srcdoc")).toContain("window.ocFile");
     const token = tokenOf(f);
     const post = vi.spyOn(f.contentWindow as Window, "postMessage");
+    fromFrame(f, { oc: "embed", token, type: "ready" });
     fromFrame(f, { oc: "embed", token, type: "file", id: 7, path: "/home/agent/.openclaude/generated/plan.png" });
     await waitFor(() =>
       expect(post).toHaveBeenCalledWith(
-        expect.objectContaining({ oc: "host", token, type: "file", id: 7, ok: true, mime: "image/png" }),
+        expect.objectContaining({ oc: "host", type: "file", id: 7, ok: true, mime: "image/png" }),
         "*",
         expect.any(Array),
       ),
@@ -258,6 +304,7 @@ describe("HtmlPreview 文件桥", () => {
     expect(resolve).toHaveBeenCalledWith("/home/agent/.openclaude/generated/plan.png");
     const sent = post.mock.calls.find((c) => (c[0] as { id?: number }).id === 7)?.[0] as Record<string, unknown>;
     expect(JSON.stringify(Object.keys(sent))).not.toContain("url");
+    expect(Object.keys(sent)).not.toContain("token");
   });
 
   it("生成目录以外的路径拒绝,不去签名", async () => {
@@ -265,8 +312,18 @@ describe("HtmlPreview 文件桥", () => {
     const f = frame(container);
     const token = tokenOf(f);
     const post = vi.spyOn(f.contentWindow as Window, "postMessage");
+    fromFrame(f, { oc: "embed", token, type: "ready" });
     fromFrame(f, { oc: "embed", token, type: "file", id: 1, path: "/home/agent/.openclaude/uploads/id.png" });
     await waitFor(() => expect(post).toHaveBeenCalledWith(expect.objectContaining({ id: 1, ok: false }), "*", []));
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("没收到本页 ready 之前的文件请求不理(首次 load 前就被导航走的页面拿不到文件)", async () => {
+    const { container } = render(<HtmlPreview code={BRIDGE} />);
+    const f = frame(container);
+    const token = tokenOf(f);
+    fromFrame(f, { oc: "embed", token, type: "file", id: 9, path: "/home/agent/.openclaude/generated/plan.png" });
+    await new Promise((r) => setTimeout(r, 20));
     expect(resolve).not.toHaveBeenCalled();
   });
 
@@ -289,6 +346,7 @@ describe("HtmlPreview 文件桥", () => {
     const f = frame(container);
     const token = tokenOf(f);
     const post = vi.spyOn(f.contentWindow as Window, "postMessage");
+    fromFrame(f, { oc: "embed", token, type: "ready" });
     fromFrame(f, { oc: "embed", token, type: "file", id: 3, path: "/home/agent/.openclaude/generated/big.glb" });
     await waitFor(() => expect(post).toHaveBeenCalledWith(expect.objectContaining({ id: 3, ok: false }), "*", []));
   });

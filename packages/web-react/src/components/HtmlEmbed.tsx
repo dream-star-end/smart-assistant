@@ -24,6 +24,8 @@ const MIN_H = 120;
 const DEFAULT_H = 360;
 /** 流式中片段停止变化多久后当作写完(没有 </html> 收尾的片段)。 */
 const SETTLE_MS = 1500;
+/** 第一次 load 后多久还没收到本页引导脚本的 ready,就当作已被导航到别处。 */
+const READY_GRACE_MS = 1500;
 /** 生成目录里的 .html 文件:超过这个大小只给下载卡。 */
 export const HTML_FILE_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -105,8 +107,15 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
   darkRef.current = dark;
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const fullRef = useRef<HTMLIFrameElement | null>(null);
-  const loads = useRef(0);
-  const fullLoads = useRef(0);
+  // 每个 iframe 元素各记一份:load 次数、本页引导脚本是否报过 ready(带 token)。
+  const states = useRef(new WeakMap<HTMLIFrameElement, { loads: number; ready: boolean }>());
+  const timers = useRef(new Set<number>());
+  useEffect(() => {
+    const pendingTimers = timers.current;
+    return () => {
+      for (const t of pendingTimers) window.clearTimeout(t);
+    };
+  }, []);
   const { resolve, invalidate } = useMediaSigner();
 
   // 写完才挂载,之后不随流式逐段重载(旧实现每 800ms 整帧重载,白屏闪)。
@@ -135,9 +144,10 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
 
   const postTheme = useCallback(
     (win: Window | null | undefined, isDark: boolean) => {
-      win?.postMessage({ oc: "host", token, type: "theme", dark: isDark, vars: readThemeVars() }, "*");
+      // 不带 token:iframe 只认 event.source === parent;token 只活在我们自己的 srcdoc 里。
+      win?.postMessage({ oc: "host", type: "theme", dark: isDark, vars: readThemeVars() }, "*");
     },
-    [token],
+    [],
   );
   useEffect(() => {
     postTheme(frameRef.current?.contentWindow, dark);
@@ -151,12 +161,18 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
       const m = e.data as { oc?: string; token?: string; type?: string; h?: number; id?: number; path?: unknown; name?: unknown };
       if (!m || m.oc !== "embed" || m.token !== token) return;
       const from = e.source as Window;
-      if (m.type === "ready") postTheme(from, darkRef.current);
+      const el = from === frameRef.current?.contentWindow ? frameRef.current : fullRef.current;
+      const st = el ? states.current.get(el) : undefined;
+      if (!st || st.loads > 1) return;
+      if (m.type === "ready") {
+        st.ready = true;
+        postTheme(from, darkRef.current);
+      }
       else if (m.type === "size" && from === frameRef.current?.contentWindow && typeof m.h === "number" && Number.isFinite(m.h)) {
         setHeight(Math.max(MIN_H, Math.min(Math.ceil(m.h), maxHeight())));
-      } else if (m.type === "file" && bridge && typeof m.id === "number") {
+      } else if (m.type === "file" && bridge && st.ready && typeof m.id === "number") {
         const reply = (msg: Record<string, unknown>, transfer?: Transferable[]) =>
-          from.postMessage({ oc: "host", token, type: "file", id: m.id, ...msg }, "*", transfer ?? []);
+          from.postMessage({ oc: "host", type: "file", id: m.id, ...msg }, "*", transfer ?? []);
         if (!isBridgeablePath(m.path)) return reply({ ok: false, error: "只能读取生成目录里的文件" });
         try {
           let url = await resolve(m.path);
@@ -175,7 +191,7 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
         } catch {
           reply({ ok: false, error: "文件不可用" });
         }
-      } else if (m.type === "download" && bridge && isBridgeablePath(m.path)) {
+      } else if (m.type === "download" && bridge && st.ready && isBridgeablePath(m.path)) {
         const url = await resolve(m.path);
         const name = (typeof m.name === "string" && m.name.trim()) || m.path.split("/").pop() || "file";
         if (url) triggerDownload(url, name);
@@ -185,24 +201,31 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
     return () => window.removeEventListener("message", onMessage);
   }, [token, bridge, resolve, invalidate, postTheme]);
 
-  // 同一个 iframe 元素第二次 load = 被导航到了别处(换内容时 key 变,是新元素)。
+  // 换内容 / 重新运行时 key 变,是新元素,计数从零开始。同一个元素:第二次 load = 被导航到了别处;
+  // 第一次 load 后迟迟等不到本页引导脚本的 ready = 首次 load 之前就已经跳走了。两种都停止运行。
   const setFrame = useCallback((el: HTMLIFrameElement | null) => {
     frameRef.current = el;
-    loads.current = 0;
+    if (el && !states.current.has(el)) states.current.set(el, { loads: 0, ready: false });
   }, []);
-  const onLoad = () => {
-    loads.current += 1;
-    if (loads.current > 1) setBlocked(true);
-  };
-  useEffect(() => {
-    if (full) fullLoads.current = 0;
-  }, [full]);
-  const onFullLoad = () => {
-    fullLoads.current += 1;
-    if (fullLoads.current > 1) {
-      setFull(false);
-      setBlocked(true);
-    }
+  const setFullFrame = useCallback((el: HTMLIFrameElement | null) => {
+    fullRef.current = el;
+    if (el && !states.current.has(el)) states.current.set(el, { loads: 0, ready: false });
+  }, []);
+  const stop = useCallback((el: HTMLIFrameElement) => {
+    if (el === fullRef.current) setFull(false);
+    setBlocked(true);
+  }, []);
+  const onFrameLoad = (e: React.SyntheticEvent<HTMLIFrameElement>) => {
+    const el = e.currentTarget;
+    const st = states.current.get(el);
+    if (!st) return;
+    st.loads += 1;
+    if (st.loads > 1) return stop(el);
+    const t = window.setTimeout(() => {
+      timers.current.delete(t);
+      if (!st.ready && el.isConnected) stop(el);
+    }, READY_GRACE_MS);
+    timers.current.add(t);
   };
 
   const downloadHtml = () => {
@@ -246,7 +269,7 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
               referrerPolicy="no-referrer"
               srcDoc={srcDoc}
               title="交互内容"
-              onLoad={onLoad}
+              onLoad={onFrameLoad}
               className="block h-full w-full border-0 bg-transparent"
             />
           ) : null}
@@ -295,12 +318,13 @@ export function HtmlPreview({ code, live, fileSrc }: { code: string; live?: bool
           >
             <Dialog.Title className="sr-only">交互内容全屏</Dialog.Title>
             <iframe
-              ref={fullRef}
+              key={frameKey}
+              ref={setFullFrame}
               sandbox="allow-scripts"
               referrerPolicy="no-referrer"
               srcDoc={srcDoc}
               title="交互内容(全屏)"
-              onLoad={onFullLoad}
+              onLoad={onFrameLoad}
               className="min-h-0 w-full flex-1 border-0 bg-transparent"
             />
             <Dialog.Close asChild>

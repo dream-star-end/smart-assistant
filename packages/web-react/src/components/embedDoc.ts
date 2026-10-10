@@ -8,28 +8,12 @@
  *   3. 引导脚本:上报内容高度(父页据此自适应,不再固定 288px)、接收主题、把密码输入框停用,
  *      以及(仅当模型代码用到时)生成目录文件桥:`data-oc-src` / `ocFile()` / `data-oc-download`。
  *
+ * 注入位置和 CSP 在 ./embedCsp(首屏兜底也用)。
  * iframe 仍只有 `sandbox="allow-scripts"`(不同源:拿不到父页 cookie / storage / DOM)。
  * 文件桥只给 `.openclaude/generated/` 下的文件,字节经 postMessage 交给 iframe,iframe 拿不到签名 URL。
  */
 
-/** 允许加载脚本 / 样式 / 网络请求的 CDN(固定版本由提示词要求)。 */
-export const EMBED_CDN_HOSTS = ["https://cdn.jsdelivr.net", "https://unpkg.com", "https://cdnjs.cloudflare.com"];
-
-export function embedCsp(): string {
-  const cdn = EMBED_CDN_HOSTS.join(" ");
-  return [
-    "default-src 'none'",
-    `script-src 'unsafe-inline' 'unsafe-eval' blob: ${cdn}`,
-    `style-src 'unsafe-inline' ${cdn} https://fonts.googleapis.com`,
-    `font-src data: ${cdn} https://fonts.gstatic.com`,
-    "img-src data: blob: https:",
-    `media-src data: blob: ${cdn}`,
-    `connect-src data: blob: ${cdn}`,
-    "worker-src blob:",
-    "form-action 'none'",
-    "base-uri 'none'",
-  ].join("; ");
-}
+import { embedCsp, injectHead } from "./embedCsp";
 
 /** 父页推给 iframe 的主题变量:站点 token → --oc-*。 */
 export const EMBED_THEME_TOKENS: Record<string, string> = {
@@ -103,15 +87,19 @@ export function looksComplete(code: string): boolean {
   return /<\/html>\s*$/i.test(code.trim());
 }
 
-/** 引导脚本(在 iframe 里跑)。token 只写在这份 srcdoc 里:iframe 被导航到别的页面后,新页面拿不到它。 */
-function bootstrap(token: string, bridge: boolean): string {
+/**
+ * 引导脚本(在 iframe 里跑)。token 只写在这份 srcdoc 里,父页发给 iframe 的消息从不带它(iframe 只认
+ * event.source === parent):iframe 被导航到别的页面后,新页面拿不到 token,也就用不了文件桥。
+ */
+function bootstrap(token: string, bridge: boolean, dark: boolean): string {
   return `(function(){
 var P=parent,T=${JSON.stringify(token)},last=-1,raf=0,seq=0,wait={};
+document.documentElement.setAttribute("data-theme",${JSON.stringify(dark ? "dark" : "light")});
 function post(m){m.oc="embed";m.token=T;try{P.postMessage(m,"*")}catch(e){}}
 function size(){raf=0;var d=document.documentElement,b=document.body;var h=Math.ceil(Math.max(d.scrollHeight,b?b.scrollHeight:0,d.getBoundingClientRect().height));if(h!==last){last=h;post({type:"size",h:h})}}
 function q(){if(!raf)raf=requestAnimationFrame(size)}
 function pw(root){var l=(root||document).querySelectorAll?(root||document).querySelectorAll("input[type=password]"):[];for(var i=0;i<l.length;i++){l[i].disabled=true;l[i].value="";l[i].placeholder="预览中不接受密码"}}
-addEventListener("message",function(e){if(e.source!==P)return;var m=e.data;if(!m||m.oc!=="host"||m.token!==T)return;
+addEventListener("message",function(e){if(e.source!==P)return;var m=e.data;if(!m||m.oc!=="host")return;
 if(m.type==="theme"){var r=document.documentElement;r.setAttribute("data-theme",m.dark?"dark":"light");for(var k in m.vars)r.style.setProperty(k,m.vars[k]);q()}
 if(m.type==="file"&&wait[m.id]){var f=wait[m.id];delete wait[m.id];f(m)}});
 ${
@@ -129,7 +117,7 @@ addEventListener("load",q);
 })();`;
 }
 
-/** 注入物放进 <head> 开头(没有 head 就放在 <html> 后 / doctype 后 / 最前),保证在模型脚本之前生效、又不触发怪异模式。 */
+/** 注入物放在文档最前(见 ./embedCsp injectHead),保证在模型脚本之前生效、又不触发怪异模式。 */
 export function wrapEmbedHtml(code: string, opts: { token: string; dark: boolean; vars: Record<string, string> }): string {
   const bridge = usesFileBridge(code);
   const vars = Object.entries(opts.vars)
@@ -139,32 +127,8 @@ export function wrapEmbedHtml(code: string, opts: { token: string; dark: boolean
     `<meta http-equiv="Content-Security-Policy" content="${embedCsp()}">` +
     `<meta name="color-scheme" content="${opts.dark ? "dark" : "light"}">` +
     `<style id="oc-kit">${EMBED_KIT_CSS}${vars ? `\n:root{${vars}}` : ""}</style>` +
-    `<script>${bootstrap(opts.token, bridge)}</script>`;
-  return injectHead(code, inject, opts.dark);
-}
-
-/** 把一段 head 内容放进文档开头:有 <head> 放它里面,没有就放在 <html> 后 / doctype 后 / 最前(不触发怪异模式)。 */
-export function injectHead(code: string, inject: string, dark: boolean): string {
-  const theme = dark ? "dark" : "light";
-  const themed = (s: string) => s.replace(/<html(?=[\s>])/i, `<html data-theme="${theme}"`);
-  const head = /<head(?:\s[^>]*)?>/i.exec(code);
-  if (head) {
-    const at = head.index + head[0].length;
-    return themed(`${code.slice(0, at)}${inject}${code.slice(at)}`);
-  }
-  const html = /<html(?:\s[^>]*)?>/i.exec(code);
-  if (html) {
-    const at = html.index + html[0].length;
-    return themed(`${code.slice(0, at)}<head>${inject}</head>${code.slice(at)}`);
-  }
-  const doctype = /^\s*<!doctype[^>]*>/i.exec(code);
-  if (doctype) return `${code.slice(0, doctype[0].length)}<head>${inject}</head>${code.slice(doctype[0].length)}`;
-  return `<!DOCTYPE html><html data-theme="${theme}"><head>${inject}</head><body>${code}</body></html>`;
-}
-
-/** 只加 CSP(懒加载 chunk 未到 / 加载失败时的兜底预览用,不带样式套件和引导脚本)。 */
-export function wrapWithCspOnly(code: string): string {
-  return injectHead(code, `<meta http-equiv="Content-Security-Policy" content="${embedCsp()}">`, false);
+    `<script>${bootstrap(opts.token, bridge, opts.dark)}</script>`;
+  return injectHead(code, inject);
 }
 
 /** 从 <title> 取下载文件名。 */

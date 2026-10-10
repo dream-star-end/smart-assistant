@@ -8,7 +8,7 @@
  * 所有调用方（Message / chat/cards / chat/AgentGroupCard）无需改动。
  */
 import { Component, lazy, memo, Suspense, type ReactNode } from "react";
-import { wrapWithCspOnly } from "./embedDoc";
+import { wrapWithCspOnly } from "./embedCsp";
 
 export type MarkdownProps = {
   children: string;
