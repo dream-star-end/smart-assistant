@@ -55,6 +55,30 @@ export function isBoxCliSyntheticUser(record: unknown): boolean {
     && (record as { isSynthetic?: unknown }).isSynthetic === true;
 }
 
+/** OCV5-368: the shape of Claude Code's own resume turn after a message ended
+ * at `max_tokens` ("Output token limit hit. Resume directly …"): a synthetic
+ * top-level user record with exactly one short text block. The wording changes
+ * between CLI releases, so only the shape is checked here; the decoder accepts
+ * it solely right after a `max_tokens` message_stop. A compact summary has the
+ * same shape but always follows a compact_boundary, which stays rejected. */
+export const MAX_OUTPUT_LIMIT_RESUME_UTF8_BYTES = 4096;
+export function isBoxCliOutputLimitResume(record: unknown): boolean {
+  if (!isBoxCliSyntheticUser(record)) return false;
+  const row = record as { parent_tool_use_id?: unknown; message?: unknown };
+  if (row.parent_tool_use_id !== null) return false;
+  const message = row.message;
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  const { role, content } = message as { role?: unknown; content?: unknown };
+  if (role !== "user" || !Array.isArray(content) || content.length !== 1) return false;
+  const block = content[0];
+  if (!block || typeof block !== "object" || Array.isArray(block)) return false;
+  const { type, text } = block as { type?: unknown; text?: unknown };
+  return type === "text" && typeof text === "string"
+    && Object.keys(block).every((key) => key === "type" || key === "text")
+    && Buffer.byteLength(text, "utf8") >= 1
+    && Buffer.byteLength(text, "utf8") <= MAX_OUTPUT_LIMIT_RESUME_UTF8_BYTES;
+}
+
 /** Returns true when this record is consumed and must not reach echo, SSE, or billing. */
 export class BoxCliCompaction {
   private pendingAnchor: string | null = null;

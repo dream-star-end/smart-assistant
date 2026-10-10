@@ -1,11 +1,12 @@
 /** First-message Box CLI tool-use decoder (one client-visible message; since
- * OCV5-301 it may span model retries after calls the CLI itself rejected). It progressively forwards blocks
+ * OCV5-301 it may span model retries after calls the CLI itself rejected, and
+ * since OCV5-368 the CLI's own resumes after `max_tokens`). It progressively forwards blocks
  * but withholds the Anthropic tool_use terminal until the complete snapshot,
  * sidecar pending IDs and durable cross-HTTP journal are verified by caller.
  * This is a protocol primitive, not the production bridge by itself.
  */
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
-  isBoxCliSyntheticUser } from "./boxCliCompaction.js";
+  isBoxCliOutputLimitResume, isBoxCliSyntheticUser } from "./boxCliCompaction.js";
 import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
@@ -35,6 +36,9 @@ const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 /** OCV5-301: how many consecutive model messages may consist only of calls
  * to tools this invocation does not expose before the run fails closed. */
 const BOX_CLI_REJECTED_SEGMENTS_MAX = 3;
+/** OCV5-368: Claude Code resumes a message cut at `max_tokens` at most this
+ * many times in one turn (its own recovery limit). */
+const BOX_CLI_OUTPUT_LIMIT_RESUMES_MAX = 3;
 /** Exactly Claude Code's unknown-tool answer (services/tools/toolExecution);
  * any other tool error (cancel, permission, validation) is not merged. */
 function cliNoSuchToolText(content: unknown, name: string): boolean {
@@ -159,6 +163,8 @@ export class BoxCliToolHandoffDecoder {
    * order, and usage is the sum of every segment (each was a paid call). A
    * segment with any exposed (valid) call is never merged. */
   private segments = 0;
+  /** OCV5-368: output-limit resumes merged into this visible message. */
+  private resumes = 0;
   private segmentStart = 0;
   private readonly messageIds = new Set<string>();
   /** Rejected call id -> its tool name, until the CLI's own answer arrives. */
@@ -309,6 +315,17 @@ export class BoxCliToolHandoffDecoder {
     return this.awaitingCliErrors !== null;
   }
 
+  /** OCV5-368: true for Claude Code's own resume turn right after a message
+   * that ended at `max_tokens`. The CLI then continues in a new model message
+   * of the same run, which joins this visible message like an OCV5-301 retry.
+   * Feed loops pass such a record to the decoder, not to compaction or echo. */
+  outputLimitResumeDue(record: unknown): boolean {
+    return !this.failed && !this.committed && !this.candidate && !this.finalCandidate
+      && this.sawStop && this.stopReason === "max_tokens" && !this.awaitingNextMessage
+      && this.options.allowFinal === true && this.resumes < BOX_CLI_OUTPUT_LIMIT_RESUMES_MAX
+      && isBoxCliOutputLimitResume(record);
+  }
+
   private totals(): { inputTokens: number; outputTokens: number;
     cacheReadTokens: number; cacheWriteTokens: number } {
     return { inputTokens: this.baseInput + this.inputTokens,
@@ -356,6 +373,14 @@ export class BoxCliToolHandoffDecoder {
     }
     const refusal = boxCliUpstreamRefusal(record);
     if (refusal) throw new BoxCliToolHandoffError(refusal);
+    if (this.outputLimitResumeDue(record)) {
+      // OCV5-368: the held max_tokens terminal is never sent; the next model
+      // message continues this one and its usage is added to the bill.
+      this.resumes++;
+      this.awaitingNextMessage = true;
+      this.heldTerminal = [];
+      return "";
+    }
     if (this.compaction) {
       try {
         if (this.compaction.take(record, this.started ? "in-model" : "pre-model")) return "";
@@ -418,6 +443,7 @@ export class BoxCliToolHandoffDecoder {
     }
     if (record.type === "result") {
       if (!this.options.allowFinal || !this.sawStop || this.stopReason === "tool_use"
+        || this.awaitingNextMessage
         || record.subtype !== "success" || record.is_error !== false) {
         throw new BoxCliToolHandoffError("BOX_TOOL_FINAL_RESULT_INVALID");
       }
@@ -662,7 +688,7 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_STOP_REASON_INVALID");
       }
       this.stopSequence = typeof sequence === "string" ? sequence : null;
-      if (this.segments > 0) {
+      if (this.segments > 0 || this.resumes > 0) {
         const total = this.totals();
         forwarded = { ...event, usage: { ...usage,
           ...(usage.input_tokens !== undefined ? { input_tokens: total.inputTokens } : {}),

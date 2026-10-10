@@ -64,7 +64,9 @@ const echoHash = createHash("sha256").update(JSON.stringify({
 
 function fixture(kind: "tool" | "final", failComplete = false,
   trailing = false, omitEcho = false, largeEcho = false, native = false,
-  cliVersion: string | null = "2.1.280", claimVersion: string | null = "2.1.280") {
+  cliVersion: string | null = "2.1.280", claimVersion: string | null = "2.1.280",
+  // OCV5-368: replaces the round's model records and its expected billed output
+  override?: { records: unknown[]; outputTokens: number }) {
   const sequence: string[] = [], emitted: string[] = [];
   const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
   const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
@@ -85,7 +87,7 @@ function fixture(kind: "tool" | "final", failComplete = false,
       nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
       ...(claimVersion === null ? {} : { nativeCliVersion: claimVersion }) } : {}) };
   const bytes = Buffer.concat([raw([...(omitEcho ? [] : [currentEcho]),
-    ...(kind === "tool" ? toolRecords : finalRecords)]),
+    ...(override?.records ?? (kind === "tool" ? toolRecords : finalRecords))]),
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
   const proof = { runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch,
     keeperPid: 101, cliPid: 102, reason: "worker_complete", revision: 1 };
@@ -123,7 +125,7 @@ function fixture(kind: "tool" | "final", failComplete = false,
       verifiedPendingToolUseIds: [id] };
   }, completeToolChain: async (evidence: { usage: { outputTokens: number } }) => {
     sequence.push("terminal-journal");
-    assert.equal(evidence.usage.outputTokens, 4);
+    assert.equal(evidence.usage.outputTokens, override?.outputTokens ?? 4);
     if (failComplete) throw new Error("synthetic journal failure");
   }, attachNativePointer: async () => { sequence.push("native-attach"); return true; },
   markUnknown: async () => { sequence.push("unknown"); } };
@@ -567,4 +569,41 @@ test("OCV5-313 a rejected result echo is journaled as continuation_echo_rejected
   /synthetic journal failure/);
   assert.deepEqual(phases, ["continuation_echo_rejected", "continuation_echo_rejected",
     "continuation_unknown"]);
+});
+
+// OCV5-368, live 2026-10-10 (commercial #8bbb12ed): the final message of a
+// continued round hit max_tokens on thinking; Claude Code resumed it itself and
+// wrote the answer, but the resume turn was rejected as an in-model compaction.
+const resumeTurn = { type: "user", parent_tool_use_id: null, isSynthetic: true,
+  session_id: "12345678-1234-4123-8123-123456789abc", uuid: "87654321-4321-4321-8321-cba987654321",
+  message: { role: "user", content: [{ type: "text", text: "Output token limit hit. Resume directly "
+    + "\u2014 no apology, no recap of what you were doing." }] } };
+const cutRecords = [
+  event({ type: "message_start", message: { id: "msg_cut", model, role: "assistant", content: [], usage } }),
+  event({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+  event({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "plan" } }),
+  event({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig" } }),
+  { type: "assistant", message: { id: "msg_cut", model, role: "assistant",
+    content: [{ type: "thinking", thinking: "plan", signature: "sig" }] } },
+  event({ type: "content_block_stop", index: 0 }),
+  event({ type: "message_delta", delta: { stop_reason: "max_tokens" },
+    usage: { input_tokens: 2, output_tokens: 3 } }),
+  event({ type: "message_stop" }),
+  resumeTurn,
+  { type: "system", subtype: "status", status: "requesting" },
+];
+
+test("OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and billed once", async () => {
+  for (const native of [false, true]) {
+    const f = fixture("final", false, false, false, false, native, "2.1.280", "2.1.280",
+      { records: [...cutRecords, ...finalRecords], outputTokens: 7 });
+    const result = await runBoxToolContinuation(f.input, f.deps);
+    assert.equal(result.kind, "final");
+    const sse = f.emitted.join("");
+    assert.equal(sse.match(/event: message_start/g)?.length, 1);
+    assert.ok(sse.includes("plan") && sse.includes("done"), "the cut thinking and the answer both arrive");
+    assert.ok(!sse.includes("max_tokens") && !sse.includes("Output token limit"));
+    assert.match(f.emitted.at(-1)!, /"stop_reason":"end_turn"/);
+    assert.equal(f.sequence.includes("unknown"), false);
+  }
 });
