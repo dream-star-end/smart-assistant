@@ -144,7 +144,6 @@ function TreeList({
         const label = (
           <span className="oc-iui-tree-text">
             <span className="oc-iui-tree-title">
-              {depth === 0 && <span className="oc-iui-tree-num">{i + 1}</span>}
               <Inline text={n.title} />
               {kids && !open && <span className="oc-iui-tree-count">{countNodes(n.children)}</span>}
             </span>
@@ -160,11 +159,13 @@ function TreeList({
             {kids ? (
               <button type="button" className="oc-iui-tree-row" aria-expanded={open} onClick={() => toggle(p)}>
                 <ChevronRight size={14} aria-hidden className="oc-iui-tree-chevron" />
+                {depth === 0 && <span className="oc-iui-tree-num">{i + 1}</span>}
                 {label}
               </button>
             ) : (
               <div className="oc-iui-tree-row">
                 <span className="oc-iui-tree-dot" aria-hidden />
+                {depth === 0 && <span className="oc-iui-tree-num">{i + 1}</span>}
                 {label}
               </div>
             )}

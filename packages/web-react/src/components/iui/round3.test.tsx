@@ -134,6 +134,7 @@ describe("diff", () => {
   it("tokenizes Chinese by character and English by word", () => {
     expect(tokenize("我们 meet at 3pm。")).toEqual(["我", "们", " ", "meet", " ", "at", " ", "3pm", "。"]);
     expect(countWords("我们 meet at 3pm。")).toBe(5);
+    expect(tokenize("SaaS增长")).toEqual(["SaaS", "增", "长"]);
   });
 
   it("marks only what changed and reassembles both texts", () => {
@@ -148,6 +149,13 @@ describe("diff", () => {
     expect(segs.filter((s) => s.op === "add").map((s) => s.text)).toEqual(["四上", "提前五分钟到", "early"]);
     expect(segs.find((s) => s.op === "eq" && s.text.includes("开会,请大家"))).toBeTruthy();
     expect(diffText("一样", "一样")).toEqual([{ op: "eq", text: "一样" }]);
+    // 两处改动之间只剩一两个相同的字:并成一块,不碎成单字交错
+    expect(diffText("开头甲A乙结尾", "开头丙A丁结尾")).toEqual([
+      { op: "eq", text: "开头" },
+      { op: "del", text: "甲A乙" },
+      { op: "add", text: "丙A丁" },
+      { op: "eq", text: "结尾" },
+    ]);
   });
 
   it("falls back to lines when there are too many edits, then gives up", () => {

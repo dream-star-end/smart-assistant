@@ -9,7 +9,8 @@ export type DiffSegment = { op: "eq" | "add" | "del"; text: string };
 
 /** 中文按字,英文/数字按词,空白和标点各自成一段(这样改一个词只标这个词)。 */
 export function tokenize(text: string): string[] {
-  return text.match(/\p{Script=Han}|[\p{L}\p{N}_'’]+|\s+|[^\s\p{L}\p{N}_]/gu) ?? [];
+  // 词只由非汉字的字母数字组成(\p{L} 也包含汉字,不排除的话「SaaS增长」会粘成一个词)。
+  return text.match(/\p{Script=Han}|(?:(?!\p{Script=Han})[\p{L}\p{N}_'’])+|\s+|[^\s\p{L}\p{N}_]/gu) ?? [];
 }
 
 function lines(text: string): string[] {
@@ -81,6 +82,35 @@ function merge(segs: DiffSegment[]): DiffSegment[] {
   return out;
 }
 
+/**
+ * 读起来更顺的分组:夹在两处改动之间、不超过 2 个字符的相同片段并进改动(否则中文按字比较会碎成
+ * 「删一个字、留一个字、增一个字」);每一段连续改动整理成「先删后增」各一块。两侧拼回仍是原文 / 改后。
+ */
+function tidy(segs: DiffSegment[]): DiffSegment[] {
+  const out: DiffSegment[] = [];
+  let del = "";
+  let add = "";
+  const flush = () => {
+    if (del) out.push({ op: "del", text: del });
+    if (add) out.push({ op: "add", text: add });
+    del = "";
+    add = "";
+  };
+  segs.forEach((s, i) => {
+    if (s.op === "del") del += s.text;
+    else if (s.op === "add") add += s.text;
+    else if ((del || add) && i < segs.length - 1 && Array.from(s.text).length <= 2 && !s.text.includes("\n")) {
+      del += s.text;
+      add += s.text;
+    } else {
+      flush();
+      out.push(s);
+    }
+  });
+  flush();
+  return out;
+}
+
 function diffTokens(a: string[], b: string[], maxD: number): DiffSegment[] | null {
   let pre = 0;
   while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre += 1;
@@ -88,11 +118,13 @@ function diffTokens(a: string[], b: string[], maxD: number): DiffSegment[] | nul
   while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf += 1;
   const mid = myers(a.slice(pre, a.length - suf), b.slice(pre, b.length - suf), maxD);
   if (!mid) return null;
-  return merge([
-    { op: "eq", text: a.slice(0, pre).join("") },
-    ...mid,
-    { op: "eq", text: a.slice(a.length - suf).join("") },
-  ]);
+  return tidy(
+    merge([
+      { op: "eq", text: a.slice(0, pre).join("") },
+      ...mid,
+      { op: "eq", text: a.slice(a.length - suf).join("") },
+    ]),
+  );
 }
 
 /** 原文 → 改后。改动太多时退到按行;仍然太多返回 null。 */
