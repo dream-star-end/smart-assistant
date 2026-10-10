@@ -93,7 +93,9 @@ export async function observeBoxToolTerminalOnly(input: {
       catch {
         return { status: "pending", reason: "BOX_RECOVERY_RECORD_INVALID", undeliverable: true };
       }
-      if (compaction) {
+      // OCV5-368: the CLI's resume after max_tokens goes to the decoder.
+      const resume = decoder.outputLimitResumeDue(record);
+      if (compaction && !resume) {
         try {
           if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
         } catch (error) {
@@ -105,7 +107,7 @@ export async function observeBoxToolTerminalOnly(input: {
       }
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "user"
-        && !(modelStarted && decoder.awaitingCliToolError())
+        && !resume && !(modelStarted && decoder.awaitingCliToolError())
         && !decoder.priorCliToolErrorDue(record)) {
         if (!echo || modelStarted) {
           return { status: "pending", reason: "BOX_RECOVERY_ECHO_UNEXPECTED", undeliverable: true };
