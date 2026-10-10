@@ -91,13 +91,16 @@ describe('master slot fetch accepts INTELLIGENT_UI', () => {
 })
 
 describe('buildPromptContext places INTELLIGENT_UI for webchat only', () => {
-  it('webchat + master sends it → present after TOOLS and before MODEL_HINT', async () => {
+  it('webchat + master sends it → present after SOUL, before AGENTS (htmlpreview guidance) and before MODEL_HINT', async () => {
     mock = { status: 200, body: withIui([{ name: 'MODEL_HINT', content: 'HINT_BODY', canonicalModelId: 'm1' }]) }
     const r = await buildPromptContext({ agentId: 'iui-web', sessionKey: WEB, model: 'm1' })
     const names = r.applied.map((a) => a.name)
     assert.ok(names.includes(INTELLIGENT_UI_SLOT), `applied: ${names.join(',')}`)
-    assert.ok(names.indexOf('TOOLS') < names.indexOf(INTELLIGENT_UI_SLOT))
+    assert.ok(names.indexOf('SOUL') < names.indexOf(INTELLIGENT_UI_SLOT), `applied: ${names.join(',')}`)
+    assert.ok(names.indexOf(INTELLIGENT_UI_SLOT) < names.indexOf('AGENTS'), `applied: ${names.join(',')}`)
     assert.ok(names.indexOf(INTELLIGENT_UI_SLOT) < names.indexOf('MODEL_HINT'))
+    // 正文里协议也在 htmlpreview 段之前(CLI 截断外置时模型常只读开头)
+    assert.ok(r.content.indexOf('IUI_PROTOCOL_MARKER') < r.content.indexOf('htmlpreview'))
     assert.match(r.content, /IUI_PROTOCOL_MARKER/)
   })
 

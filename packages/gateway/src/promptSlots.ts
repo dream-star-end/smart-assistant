@@ -1718,6 +1718,11 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const project = await buildProjectSlot(ctx)
   if (project) slots.push(project)
 
+  // INTELLIGENT_UI 的插入点(OCV5-361):身份 / 项目之后、AGENTS(平台能力,含 htmlpreview 段)之前。
+  // 靠后放时,超长提示被 CLI 截断外置(grok-build 约 20KB 起转存文件,模型常只读前 200 行)
+  // 会让模型只看到 htmlpreview 段而看不到本协议。remote fetch 仍并行,拿到结果后再插回这里。
+  const iuiInsertAt = slots.length
+
   // Layer 2: Semi-static capabilities
   const agents = await buildAgentsSlot(ctx)
   slots.push(agents)
@@ -1727,6 +1732,14 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
 
   // 等 remote 决策。null = personal 路径,数组 = v3 路径(可空)。
   const remotePlatformSlots = await remotePlatformSlotsPromise
+
+  // Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),只对 webchat
+  // 会话注入,插在上面记下的 iuiInsertAt(AGENTS 之前)。静态文案,位置固定利于缓存;
+  // MODEL_HINT 仍在其后,模型补丁可覆盖其中的行为。开关关闭时 master 不下发 → 本段不存在(零 token)。
+  if (remotePlatformSlots !== null && isWebchatSessionKey(ctx.sessionKey)) {
+    const iui = remotePlatformSlots.find((s) => s.name === INTELLIGENT_UI_SLOT)
+    if (iui) slots.splice(iuiInsertAt, 0, { name: INTELLIGENT_UI_SLOT, content: iui.content })
+  }
 
   // 平台级技能(SKILLS_LITERATURE):SKILLS 之后、MEMORY 之前。
   //   - remote 路径:在 master 返回的数组里找 name === 'SKILLS_LITERATURE'
@@ -1773,14 +1786,6 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
 
   const tools = buildToolsSlot(ctx)
   slots.push(tools)
-
-  // Layer 3c: Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),
-  // 只对 webchat 会话注入。静态文案,放在 TOOLS 之后、MODEL_HINT 之前:利于缓存,且模型补丁
-  // 仍可覆盖其中的行为。开关关闭时 master 不下发 → 本段不存在(零 token)。
-  if (remotePlatformSlots !== null && isWebchatSessionKey(ctx.sessionKey)) {
-    const iui = remotePlatformSlots.find((s) => s.name === INTELLIGENT_UI_SLOT)
-    if (iui) slots.push({ name: INTELLIGENT_UI_SLOT, content: iui.content })
-  }
 
   // Layer 4: per-model 行为补丁。位于 TOOLS 之后、RESEARCH 之前 —
   // 比工具说明更靠后(更"贴近"user message,不被工具说明稀释),
