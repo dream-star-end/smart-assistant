@@ -307,7 +307,13 @@ function CopyTextButton({ getText, label, disabled, primary }: { getText: () => 
 
 function DiffView({ before, after }: { before: string; after: string }) {
   const segs = useMemo(() => diffText(before, after), [before, after]);
-  if (!segs) return <p className="oc-iui-hint">改动太多,无法逐字对比;下面是改后的全文。</p>;
+  if (!segs)
+    return (
+      <>
+        <p className="oc-iui-hint">改动太多,无法逐字对比;下面是改后的全文。</p>
+        <div className="oc-iui-draft-text">{after}</div>
+      </>
+    );
   const added = segs.filter((s) => s.op === "add").reduce((n, s) => n + countWords(s.text), 0);
   const removed = segs.filter((s) => s.op === "del").reduce((n, s) => n + countWords(s.text), 0);
   return (

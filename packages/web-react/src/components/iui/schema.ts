@@ -304,7 +304,6 @@ export const LIMITS = {
   outlineNodes: 80,
   outlineChildren: 20,
   draftVariants: 3,
-  draftText: 6000,
 } as const;
 
 type Ctx = { notes: string[]; partial: boolean };
@@ -1100,11 +1099,11 @@ const DRAFT_KIND_ALIASES: Record<string, DraftKind> = {
   document: "doc",
 };
 
+/** 成稿是要原样拿走的交付物:不截断(整块已受 IUI_MAX_BLOCK_BYTES 限制),只统一换行、去掉首尾空行。 */
 function draftText(v: unknown): string | undefined {
   if (typeof v !== "string") return undefined;
   const t = v.replace(/\r\n?/g, "\n").replace(/^\n+|\s+$/g, "");
-  if (!t) return undefined;
-  return t.length > LIMITS.draftText ? `${t.slice(0, LIMITS.draftText)}…` : t;
+  return t || undefined;
 }
 
 function draft(raw: Record<string, unknown>, ctx: Ctx): DraftSpec | null {

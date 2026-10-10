@@ -266,6 +266,29 @@ describe("render · round 3", () => {
     expect(screen.getByText(/^删 \d+ 字$/)).toBeInTheDocument();
   });
 
+  it("long drafts are never truncated, and a diff that gives up still shows the full text (review r1)", async () => {
+    const writeText = mockClipboard();
+    const text = `${"a".repeat(6000)}新条款`;
+    const v = ok({ type: "draft", variants: [{ text }], original: `${"a".repeat(6000)}旧条款` });
+    if (v.spec.type !== "draft") throw new Error("draft");
+    expect(v.spec.variants[0]!.text).toBe(text);
+    expect(specToMarkdown(v.spec)).toContain("新条款");
+    expect(diffText(v.spec.original!, text)!.filter((s) => s.op !== "eq").map((s) => s.text)).toEqual(["旧", "新"]);
+    const { container } = render(<IuiBlock code={j({ type: "draft", variants: [{ text }] })} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "复制全文" }));
+    });
+    expect(writeText).toHaveBeenLastCalledWith(text);
+    cleanup();
+
+    const lines = (ch: string) => Array.from({ length: 601 }, () => ch).join("\n");
+    const r = render(<IuiBlock code={j({ type: "draft", variants: [{ text: lines("乙") }], original: lines("甲") })} />);
+    fireEvent.click(screen.getByRole("button", { name: "对比原文" }));
+    expect(screen.getByText(/改动太多/)).toBeInTheDocument();
+    expect(r.container.querySelector(".oc-iui-draft-text")!.textContent).toBe(lines("乙"));
+    expect(container).toBeTruthy();
+  });
+
   it("a streaming draft shows its text as it arrives but cannot be copied yet", () => {
     render(<IuiBlock live code={'{"type":"draft","variants":[{"text":"各位家长好,本周五'} />);
     expect(screen.getByText("各位家长好,本周五")).toBeInTheDocument();
