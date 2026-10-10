@@ -73,5 +73,15 @@ not use markdown image syntax (`![]()`). Inline rich-content code blocks
 For UI previews, interactive demos, HTML Canvas, animations, small games, or
 design mockups, prefer a fenced `htmlpreview` block directly in the reply
 unless the user explicitly asks for a saved/downloadable file.
+htmlpreview renders seamlessly inside the reply (no frame, auto height, follows
+light/dark): keep the page background transparent and use `var(--oc-fg)`,
+`--oc-muted`, `--oc-surface`, `--oc-line`, `--oc-accent`; ready-made classes
+`.oc-pills` (toggle buttons, active one `aria-pressed="true"`), `.oc-stage`,
+`.oc-caption`, `.oc-links`. Load libraries (e.g. three.js) only from
+cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com with a pinned version; no
+other network requests or form posts. To show or download a file from the
+generated directory use `<img data-oc-src="/abs/path">`,
+`await ocFile("/abs/path")` (returns a blob URL, e.g. for GLTFLoader) or
+`<a data-oc-download="/abs/path">`.
 
 ---

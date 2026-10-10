@@ -8,6 +8,7 @@
  * 所有调用方（Message / chat/cards / chat/AgentGroupCard）无需改动。
  */
 import { Component, lazy, memo, Suspense, type ReactNode } from "react";
+import { wrapWithCspOnly } from "./embedDoc";
 
 export type MarkdownProps = {
   children: string;
@@ -77,26 +78,23 @@ function PlainFallbackText({ children }: { children: string }) {
 }
 
 function HtmlPreviewFallback({ code, live }: { code: string; live?: boolean }) {
-  // 只用本仓 @theme 里存在的 token(bg-surface / bg-hover / text-muted);此前的 bg-background /
-  // bg-muted/40 / text-muted-foreground 不在 styles.css 里,chunk 未到达时头部无底色、文字色继承。
+  // 与 HtmlEmbed 同一外观(无标题栏);只用本仓 @theme 里存在的 token。兜底也带 CSP(chunk 加载失败时它就是唯一的预览)。
   return (
-    <div className="not-prose my-3 overflow-hidden rounded-lg border border-border bg-surface shadow-sm">
-      <div className="border-b border-border bg-hover px-3 py-2 text-xs font-medium text-muted">
-        HTML {live ? "预览(生成中)" : "预览"}
-      </div>
+    <div className="oc-embed not-prose my-3">
       {live ? (
-        <div className="flex h-28 items-center justify-center bg-surface px-3 text-xs text-muted">
-          生成完成后显示 HTML 预览
-        </div>
+        <output className="oc-embed-skeleton">
+          <span className="oc-embed-skeleton-label">正在生成交互内容…</span>
+        </output>
       ) : (
         <iframe
-          title="HTML 沙盒预览"
-          className="h-72 w-full bg-white"
+          title="交互内容"
+          className="block h-72 w-full rounded-xl border-0 bg-transparent"
           sandbox="allow-scripts"
           referrerPolicy="no-referrer"
-          srcDoc={code}
+          srcDoc={wrapWithCspOnly(code)}
         />
       )}
+      <div className="oc-embed-bar text-meta text-faint">交互内容 · 沙盒运行</div>
     </div>
   );
 }

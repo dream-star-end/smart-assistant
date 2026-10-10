@@ -179,6 +179,12 @@ export function MediaSignProvider({
  * onError:接到媒体元素的 onError —— 签名 URL 过期(403)时失效缓存并重签**一次**
  * (retriedRef 防 403 循环;真 ACL 拒绝重签一次后停在占位)。
  */
+/** 命令式签名(htmlpreview 文件桥):要取哪个文件由嵌入内容在运行时提出,用不了按 src 挂载的 hook。 */
+export function useMediaSigner(): Pick<MediaSignCtx, "resolve" | "invalidate"> {
+  const { resolve, invalidate } = useContext(Ctx);
+  return useMemo(() => ({ resolve, invalidate }), [resolve, invalidate]);
+}
+
 export function useSignedSrc(src: string | null | undefined): {
   url: string | null;
   onError: () => void;

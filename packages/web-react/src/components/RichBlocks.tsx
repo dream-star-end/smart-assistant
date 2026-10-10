@@ -1,10 +1,8 @@
 /**
- * Markdown 富块（对齐设计稿 ⑧）：mermaid 流程图 + HTML 沙盒预览。
+ * Markdown 富块（对齐设计稿 ⑧）：mermaid 流程图 + HTML 无缝嵌入(实现在 ./HtmlEmbed)。
  * 二者都在 MarkdownImpl(懒加载 chunk)内按需用：mermaid 库再经 dynamic import 拆成
  * 独立 chunk(只有真出现 ```mermaid 才下载,不拖累首屏与普通对话)。
  */
-import * as Dialog from "@radix-ui/react-dialog";
-import { Maximize2, X } from "lucide-react";
 import { chatInteractionUnavailableText, useChatInteraction } from "./tool/context";
 import { useOptionsGroup, useOptionsGroupSnapshot } from "./optionsGroup";
 import { useMemo, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
@@ -362,92 +360,5 @@ export function ChartBlock({ code }: { code: string }) {
   );
 }
 
-/** 流式期 HTML 预览的最小重载间隔(ms):压住 iframe 整帧重载频率,轻微闪≠狂闪。 */
-const RENDER_THROTTLE_MS = 800;
-
-/** ```html 代码块 → **默认沙盒预览**(allow-scripts,无 same-origin),可切源码 + 全屏放大。 */
-export function HtmlPreview({ code, live }: { code: string; live?: boolean }) {
-  const [show, setShow] = useState(true); // 默认预览(boss:html 应默认渲染,而非看源码)
-  const [full, setFull] = useState(false);
-  // 全屏层走 Radix Dialog:免费获得焦点陷阱 / role=dialog / Esc 关闭与焦点归还,
-  // 替代原先手写的 window keydown 监听(无障碍审计:自研覆盖层缺焦点管理)。
-  // 流式渲染节流:iframe 每次换 srcDoc 都会整帧重载(白屏一闪),逐 token 更新会狂闪。
-  // committed=喂给 iframe 的代码,只在它变化时才触发重载。两条 effect 各司其职:
-  const [committed, setCommitted] = useState(code);
-  const codeRef = useRef(code);
-  codeRef.current = code;
-  // ① 非流式(含不传 live 的静态/子 agent 调用方):committed 始终跟最新 code,立即渲染、
-  //    不节流(保持"缺省 live=false 行为不变"契约);也承接 live→false 收尾,最终完整帧即时落地。
-  useEffect(() => {
-    if (!live) setCommitted(code);
-  }, [code, live]);
-  // ② 流式期:仅随 live 变化建/拆一个节流 interval(不随每个 delta 重建),每 RENDER_THROTTLE_MS
-  //    把最新代码(codeRef,避免 stale 闭包)提交一次 → 实时可见但重载频率压到 ~1/0.8s(轻微闪)。
-  //    代码未变时 setCommitted 同值被 React bail,不重载(如 HTML 已写完、仍在写尾注阶段)。
-  useEffect(() => {
-    if (!live) return;
-    const id = window.setInterval(() => setCommitted(codeRef.current), RENDER_THROTTLE_MS);
-    return () => window.clearInterval(id);
-  }, [live]);
-  // sandbox 不含 allow-same-origin → 取不到父页 cookie/storage;仅 allow-scripts 跑演示。
-  // 预览用节流后的 committed;看源码(下方 pre)直接用最新 code(纯文本不闪,无需节流)。
-  const frame = (cls: string) => (
-    <iframe sandbox="allow-scripts" srcDoc={committed} title="HTML 沙盒预览" className={cls} />
-  );
-  return (
-    <div className="my-3 overflow-hidden rounded-lg border border-border">
-      <div className="flex items-center justify-between border-b border-border bg-hover px-3 py-1.5 text-meta text-muted">
-        <span>HTML {show ? (live ? "预览(生成中)" : "预览(沙盒)") : "源码"}</span>
-        <div className="flex items-center gap-1">
-          {show && (
-            <button
-              type="button"
-              onClick={() => setFull(true)}
-              title="全屏放大"
-              aria-label="全屏放大预览"
-              className="flex items-center justify-center rounded-md p-1 text-muted outline-none hover:bg-accent-soft hover:text-accent focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11"
-            >
-              <Maximize2 size={13} />
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={() => setShow((s) => !s)}
-            className="rounded-md px-2 py-0.5 text-accent outline-none hover:bg-accent-soft focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11 [@media(hover:none)]:px-3"
-          >
-            {show ? "看源码" : "预览"}
-          </button>
-        </div>
-      </div>
-      {show ? (
-        frame("h-72 w-full bg-white")
-      ) : (
-        <pre className="max-h-72 overflow-auto bg-code px-3 py-2 font-mono text-xs text-fg">{code}</pre>
-      )}
-      <Dialog.Root open={full} onOpenChange={setFull}>
-        <Dialog.Portal>
-          {/* 全屏内容自身铺满视口(黑底),无需单独 Overlay;样式保持改造前的全屏黑底。 */}
-          <Dialog.Content
-            aria-describedby={undefined}
-            className="fixed inset-0 z-[60] flex flex-col bg-black/80 p-3 animate-in outline-none sm:p-6"
-          >
-            <Dialog.Title className="sr-only">HTML 全屏预览</Dialog.Title>
-            <div className="mb-2 flex items-center justify-between text-white">
-              <span className="text-sm opacity-80">HTML 预览(沙盒) · 按 Esc 退出</span>
-              <Dialog.Close asChild>
-                <button
-                  type="button"
-                  aria-label="关闭全屏"
-                  className="flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm outline-none hover:bg-white/25 focus-visible:ring-2 focus-visible:ring-white/50"
-                >
-                  <X size={16} /> 关闭
-                </button>
-              </Dialog.Close>
-            </div>
-            {frame("min-h-0 flex-1 w-full rounded-lg bg-white")}
-          </Dialog.Content>
-        </Dialog.Portal>
-      </Dialog.Root>
-    </div>
-  );
-}
+/** ```html / ```htmlpreview 代码块 → 无缝嵌入(见 ./HtmlEmbed)。保留原导出名,调用方不变。 */
+export { HtmlPreview } from "./HtmlEmbed";

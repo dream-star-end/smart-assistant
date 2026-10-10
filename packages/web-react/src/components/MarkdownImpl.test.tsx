@@ -254,6 +254,12 @@ describe('MarkdownImpl signMedia 路径卡片', () => {
     expect(screen.queryByRole('button', { name: '复制' })).toBeNull()
   })
 
+  test('生成目录里的 .html 路径 → 无缝嵌入外壳 + 仍保留下载卡(取到内容前只有下载卡)', () => {
+    render(<MarkdownImpl signMedia>{'户型模型:`/home/agent/.openclaude/generated/house.html`'}</MarkdownImpl>)
+    expect(screen.getByText('house.html')).toBeInTheDocument()
+    expect(document.querySelector('iframe')).toBeNull()
+  })
+
   test('fenced 含路径以外正文 → 仍是代码块', () => {
     const source = ['```', '/home/agent/.openclaude/generated/report.docx', 'echo hi', '```'].join('\n')
     const { container } = render(<MarkdownImpl signMedia>{source}</MarkdownImpl>)

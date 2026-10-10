@@ -26,6 +26,7 @@ import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { cn } from "../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } from "./chat/media";
+import { HtmlFileEmbed } from "./HtmlEmbed";
 import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import { IuiBlock } from "./iui/IuiBlock";
@@ -348,9 +349,13 @@ export default function MarkdownImpl({
                 video: ({ node: _node, ...props }) => <SignedVideo {...props} />,
                 audio: ({ node: _node, ...props }) => <SignedAudio {...props} />,
                 // 自定义 filecard 元素(rehypeEmbedMedia 产出)→ 可下载文件卡。
-                filecard: ({ src, filename }: { src?: string; filename?: string }) => (
-                  <SignedFileCard src={src} filename={filename} />
-                ),
+                // 生成目录里的 .html:自包含的直接无缝嵌入(下面仍有下载卡);只读场景只给下载卡。
+                filecard: ({ src, filename }: { src?: string; filename?: string }) =>
+                  !readOnly && typeof src === "string" && /\/\.openclaude\/generated\/[^?#]+\.html?$/i.test(src) ? (
+                    <HtmlFileEmbed src={src} filename={filename} />
+                  ) : (
+                    <SignedFileCard src={src} filename={filename} />
+                  ),
               }
             : {}),
           code({ className, children, ...props }) {

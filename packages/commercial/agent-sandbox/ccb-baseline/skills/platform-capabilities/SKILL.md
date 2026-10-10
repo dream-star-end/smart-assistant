@@ -82,6 +82,8 @@ priority: 9
 
 `htmlpreview` 会在 claudeai.chat 对话里渲染为 sandbox iframe。代码块里放完整 HTML,可以包含 `<style>`、`<script>`、`<canvas>`。
 
+htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟随明暗主题):页面背景留透明,颜色用 `var(--oc-fg)`,另有 `--oc-muted` `--oc-surface` `--oc-line` `--oc-accent`;可直接用 `.oc-pills`(切换按钮组,当前项 `aria-pressed="true"`)、`.oc-stage`(画布区)、`.oc-caption`(说明行)、`.oc-links`(下载行)。库只能按固定版本从 cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com 加载(如 three.js),不能请求其它网址或提交表单。要显示或下载生成目录里的文件:`<img data-oc-src="绝对路径">`、`await ocFile("绝对路径")`(返回 blob URL,可交给 GLTFLoader)、`<a data-oc-download="绝对路径">`。
+
 最小模板:
 
 ```htmlpreview
@@ -91,18 +93,16 @@ priority: 9
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: white; }
-    canvas { display: block; width: 100%; max-width: 720px; margin: 24px auto; background: #111827; border-radius: 16px; }
+    canvas { display: block; width: 100%; max-width: 720px; margin: 12px auto; }
   </style>
 </head>
 <body>
-  <canvas id="demo" width="720" height="420"></canvas>
+  <div class="oc-stage"><canvas id="demo" width="720" height="420"></canvas></div>
   <script>
     const canvas = document.getElementById('demo')
     const ctx = canvas.getContext('2d')
-    ctx.fillStyle = '#1e293b'
-    ctx.fillRect(0, 0, canvas.width, canvas.height)
-    ctx.fillStyle = '#facc15'
+    const css = getComputedStyle(document.documentElement)
+    ctx.fillStyle = css.getPropertyValue('--oc-accent')
     ctx.font = 'bold 36px system-ui'
     ctx.fillText('HTML Canvas 内联预览', 160, 210)
   </script>

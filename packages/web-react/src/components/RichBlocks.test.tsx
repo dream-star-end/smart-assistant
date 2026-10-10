@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
 import { HtmlPreview, OptionsBlock } from "./RichBlocks";
@@ -188,10 +188,11 @@ describe("OptionsBlock", () => {
 });
 
 describe("HtmlPreview 触控尺寸(M-12)", () => {
-  it("头部「全屏放大」「看源码」在触屏下满足 44px", () => {
+  it("操作行「全屏放大」「看源码」在触屏下满足 44px", () => {
     render(<HtmlPreview code="<div>hi</div>" />);
-    expect(screen.getByRole("button", { name: "全屏放大预览" })).toHaveClass("[@media(hover:none)]:size-11");
-    expect(screen.getByRole("button", { name: "看源码" })).toHaveClass("[@media(hover:none)]:min-h-11");
+    for (const name of ["全屏放大预览", "看源码", "下载 HTML 文件", "重新运行"]) {
+      expect(screen.getByRole("button", { name })).toHaveClass("[@media(hover:none)]:min-h-11", "[@media(hover:none)]:min-w-11");
+    }
   });
 });
 
@@ -392,59 +393,11 @@ describe("OptionsBlock in a multi-question message (group mode)", () => {
   });
 });
 
-describe("HtmlPreview streaming throttle (anti-flicker)", () => {
-  const html = "<h1>hi</h1>";
-
-  it("renders the iframe immediately (first frame) even while streaming", () => {
-    const { container } = render(<HtmlPreview code={html} live />);
-    const frame = container.querySelector("iframe");
-    expect(frame).toBeTruthy();
-    expect(frame?.getAttribute("srcdoc")).toBe(html);
-    expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
-    expect(screen.getByText(/预览\(生成中\)/)).toBeTruthy();
-  });
-
-  it("mounts the iframe with final srcDoc when not live", () => {
-    const { container } = render(<HtmlPreview code={html} />);
-    const frame = container.querySelector("iframe");
-    expect(frame?.getAttribute("srcdoc")).toBe(html);
-    expect(screen.getByText(/预览\(沙盒\)/)).toBeTruthy();
-  });
-
-  it("throttles srcDoc updates while streaming (delta within window not reflected until interval fires)", () => {
-    vi.useFakeTimers();
-    try {
-      const { container, rerender } = render(<HtmlPreview code="<p>A</p>" live />);
-      const srcdoc = () => container.querySelector("iframe")?.getAttribute("srcdoc");
-      expect(srcdoc()).toBe("<p>A</p>"); // 首帧立即显示
-      // 流式来了新 delta,但未到节流窗口 → iframe 仍是旧帧(不逐 token 重载)
-      rerender(<HtmlPreview code="<p>AB</p>" live />);
-      expect(srcdoc()).toBe("<p>A</p>");
-      // 越过节流窗口后,提交最新代码
-      act(() => vi.advanceTimersByTime(800));
-      expect(srcdoc()).toBe("<p>AB</p>");
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("non-live callers (no live signal) sync every code update immediately — no throttle, no freeze", () => {
-    // 回归:子 agent / 静态调用方不传 live,code prop 变化必须立即反映,不能卡在首帧。
-    const { container, rerender } = render(<HtmlPreview code="<p>A</p>" />);
-    rerender(<HtmlPreview code="<p>AB</p>" />);
-    expect(container.querySelector("iframe")?.getAttribute("srcdoc")).toBe("<p>AB</p>");
-  });
-
-  it("commits the final code immediately when streaming ends (live → false)", () => {
-    const { container, rerender } = render(<HtmlPreview code="<p>partial</p>" live />);
-    rerender(<HtmlPreview code="<p>final</p>" />); // live 撤销:立即提交最终帧
-    expect(container.querySelector("iframe")?.getAttribute("srcdoc")).toBe("<p>final</p>");
-  });
-
-  it("source view shows the latest (un-throttled) code while streaming", () => {
-    const { container } = render(<HtmlPreview code={html} live />);
-    fireEvent.click(screen.getByText("看源码"));
-    expect(container.querySelector("pre")?.textContent).toContain(html);
+describe("HtmlPreview 导出", () => {
+  it("RichBlocks 仍导出 HtmlPreview(实现已移到 HtmlEmbed,调用方不变)", async () => {
+    const embed = await import("./HtmlEmbed");
+    expect(HtmlPreview).toBe(embed.HtmlPreview);
   });
 });
+
 
