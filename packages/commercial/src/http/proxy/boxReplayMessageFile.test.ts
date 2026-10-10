@@ -1,4 +1,5 @@
 import test from "node:test";
+import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES } from "./boxToolCapacity.js";
 import assert from "node:assert/strict";
 import { link, mkdtemp, readdir, readFile, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -59,7 +60,7 @@ test("invalid identities and oversized Message fail before disk mutation", async
     await assert.rejects(() => writeBoxReplayMessage(dir,
       { ...identity, requestId: "../bad" }, message));
     await assert.rejects(() => writeBoxReplayMessage(dir, identity,
-      { ...message, content: [{ type: "text", text: "x".repeat(2_100_000) }] }));
+      { ...message, content: [{ type: "text", text: "x".repeat(BOX_TOOL_MESSAGE_STREAM_MAX_BYTES + 1) }] }));
     const oversizedIdentity = { ...identity, authorization: "raw-secret-token", version: 9 };
     const proof = await writeBoxReplayMessage(dir, oversizedIdentity, message);
     assert.equal(JSON.stringify(proof).includes("raw-secret-token"), false);
