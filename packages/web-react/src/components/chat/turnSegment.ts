@@ -15,7 +15,7 @@ import type { ChatMessage } from "../../lib/chat/model";
 import { isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";
 
 /** 当前活跃段的起始下标(最后一条 user 消息的下一条;无 user 消息 → 0)。 */
-export function currentTurnStartIndex(messages: ChatMessage[]): number {
+export function currentTurnStartIndex(messages: readonly ChatMessage[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i]?.role === "user") return i + 1;
   }

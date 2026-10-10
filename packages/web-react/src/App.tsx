@@ -88,7 +88,16 @@ import {
   type ArtifactInspectTarget,
   type ChatInteraction,
 } from "./components/tool/context";
-import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
+import {
+  DETAIL_PANE_WIDTH,
+  InspectorPanel,
+  InspectorPanelContent,
+  type PaneRequest,
+  type PaneTab,
+  readDetailPaneOpen,
+  writeDetailPaneOpen,
+} from "./components/InspectorPanel";
+import type { ToolLike } from "./components/tool/format";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
@@ -119,7 +128,8 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
-import { useMdViewport } from "./hooks/useMdViewport";
+import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
+import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { useInbox } from "./hooks/useInbox";
@@ -470,10 +480,31 @@ export function App() {
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
-  // 产物详情列(Codex 式第三列):选中产物是纯 UI 态(切会话/关面板即清),不进 ChatSocket。
-  // 桌面 md+ 内联第三列;窄屏用右侧 Sheet 抽屉,不硬挤三列。
-  const [inspectTarget, setInspectTarget] = useState<ArtifactInspectTarget | null>(null);
+  // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
+  // 更窄的视口用贴底 Sheet,不硬挤三列。面板里看哪一步是纯 UI 态,不进 ChatSocket。
   const isMdViewport = useMdViewport();
+  const isWideViewport = useWideViewport();
+  const [paneOpen, setPaneOpenState] = useState(readDetailPaneOpen);
+  const [paneSheetOpen, setPaneSheetOpen] = useState(false);
+  const [paneRequest, setPaneRequest] = useState<PaneRequest | null>(null);
+  const [paneActive, setPaneActive] = useState<ToolLike | null>(null);
+  const paneWidth = useResizableWidth(DETAIL_PANE_WIDTH);
+  const setPaneOpen = useCallback((open: boolean) => {
+    setPaneOpenState(open);
+    writeDetailPaneOpen(open);
+  }, []);
+  const paneToggleRef = useRef<(() => void) | null>(null);
+  const isWideRef = useRef(isWideViewport);
+  isWideRef.current = isWideViewport;
+  /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
+  const openPane = useCallback(
+    (tab?: PaneTab, message?: ToolLike | null) => {
+      setPaneRequest({ tab, message, nonce: Date.now() });
+      if (isWideRef.current) setPaneOpen(true);
+      else setPaneSheetOpen(true);
+    },
+    [setPaneOpen],
+  );
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
@@ -922,10 +953,12 @@ export function App() {
   });
   const sidebarWidth = useSidebarWidth();
 
-  // 切会话/进出任务看板时清掉产物详情列:消息对象引用属于旧会话上下文,跨会话保留只会
-  // 展示与当前消息流无关的陈旧内容。
+  // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
+  // 展示与当前消息流无关的陈旧内容。宽屏面板的开合是用户偏好,保留;窄屏抽屉收起。
   useEffect(() => {
-    setInspectTarget(null);
+    setPaneRequest(null);
+    setPaneActive(null);
+    setPaneSheetOpen(false);
   }, [activeId, boardOpen, projectHome]);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
@@ -2273,6 +2306,20 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+  // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
+  const paneAvailable =
+    !boardOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
+  const paneInline = paneAvailable && isWideViewport && paneOpen;
+  const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
+  const togglePane = () => {
+    if (paneShown) {
+      if (isWideViewport) setPaneOpen(false);
+      else setPaneSheetOpen(false);
+      return;
+    }
+    openPane();
+  };
+  paneToggleRef.current = paneAvailable && !demo ? togglePane : null;
   const inflightDelegates = useInflightDelegates({
     sessionId: !demo && activeId ? activeId : null,
     messages: wsMessages,
@@ -2327,6 +2374,11 @@ export function App() {
         if (!inWorkspace || demo || wsMessages.length <= 0) return;
         e.preventDefault();
         setFindOpen(true);
+      }
+      if (action === "pane") {
+        if (!inWorkspace || !paneToggleRef.current) return;
+        e.preventDefault();
+        paneToggleRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -2648,8 +2700,11 @@ export function App() {
 
   // 产物详情列 open 回调:引用稳定,不随面板开合变化,避免打穿 MessageList 的 sig-memo。
   const artifactInspect = useMemo(
-    () => ({ open: (t: ArtifactInspectTarget) => setInspectTarget(t) }),
-    [],
+    () => ({
+      open: (t: ArtifactInspectTarget) => openPane("steps", t.message),
+      openPane: (tab: PaneTab) => openPane(tab),
+    }),
+    [openPane],
   );
 
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
@@ -3728,7 +3783,7 @@ export function App() {
     <ArtifactInspectContext.Provider value={artifactInspect}>
     {/* tools T-18:详情面板当前查看的那条 tool 消息 → 源卡片选中态。与 open 回调分开成独立 context,
         面板开合只重渲消费它的 ToolCard,不打穿 MessageList 的 sig-memo(tool/context.ts 注释)。 */}
-    <ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>
+    <ArtifactInspectActiveContext.Provider value={paneShown ? paneActive : null}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <ProjectScopeProvider
@@ -3979,6 +4034,8 @@ export function App() {
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
           onShare={demo ? undefined : () => setShareOpen(true)}
+          onTogglePane={paneAvailable && !demo ? togglePane : undefined}
+          paneOpen={paneShown}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
@@ -4317,23 +4374,46 @@ export function App() {
         )}
       </main>
 
-      {/* 产物详情列(Codex 式第三列)。桌面:与 Sidebar|main 并列的内联 aside;
-          窄屏:右侧 Sheet 抽屉(共用 InspectorPanelContent)。任务看板占据 main 时不渲染。 */}
-      {!boardOpen && inspectTarget && isMdViewport && (
-        <InspectorPanel target={inspectTarget} onClose={() => setInspectTarget(null)} />
+      {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
+          更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
+      {paneInline && (
+        <InspectorPanel
+          key={activeId ?? "demo"}
+          messages={wsMessages}
+          version={chat.version}
+          running={wsSending}
+          request={paneRequest}
+          focusNonce={paneRequest?.nonce}
+          onClose={() => setPaneOpen(false)}
+          onActiveChange={setPaneActive}
+          width={paneWidth.width}
+          resizing={paneWidth.resizing}
+          widthMin={DETAIL_PANE_WIDTH.min}
+          widthMax={DETAIL_PANE_WIDTH.max}
+          onResizeStart={paneWidth.onResizeStart}
+          onResizeKeyDown={paneWidth.onResizeKeyDown}
+        />
       )}
       <Sheet
-        open={!boardOpen && !!inspectTarget && !isMdViewport}
+        open={paneAvailable && paneSheetOpen && !isWideViewport}
         onOpenChange={(o) => {
-          if (!o) setInspectTarget(null);
+          if (!o) setPaneSheetOpen(false);
         }}
         side="bottom"
-        srTitle="产物详情"
-        className="md:hidden"
-        overlayClassName="md:hidden"
+        srTitle="详情面板"
       >
-        {inspectTarget && (
-          <InspectorPanelContent target={inspectTarget} onClose={() => setInspectTarget(null)} />
+        {paneSheetOpen && (
+          <div className="flex h-[80dvh] min-h-0 flex-col">
+            <InspectorPanelContent
+              key={activeId ?? "demo"}
+              messages={wsMessages}
+              version={chat.version}
+              running={wsSending}
+              request={paneRequest}
+              onClose={() => setPaneSheetOpen(false)}
+              onActiveChange={setPaneActive}
+            />
+          </div>
         )}
       </Sheet>
 

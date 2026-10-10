@@ -3,9 +3,10 @@ import { isDialogLayerOpen, resolveGlobalHotkey } from "./hotkeys";
 
 function key(
   over: Partial<KeyboardEvent> & Pick<KeyboardEvent, "key">,
-): Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> {
+): Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> & { code?: string } {
   return {
     key: over.key,
+    code: over.code,
     metaKey: over.metaKey ?? false,
     ctrlKey: over.ctrlKey ?? false,
     shiftKey: over.shiftKey ?? false,
@@ -69,5 +70,13 @@ describe("resolveGlobalHotkey", () => {
     expect(resolveGlobalHotkey(key({ key: "f", metaKey: true, shiftKey: true }))).toBeNull();
     const input = document.createElement("input");
     expect(resolveGlobalHotkey(key({ key: "f", metaKey: true, target: input }))).toBeNull();
+  });
+
+  test("⌘/Ctrl+\\ 开合详情面板:输入框内也生效;中文标点模式按物理键认;Shift 不触发", () => {
+    expect(resolveGlobalHotkey(key({ key: "\\", metaKey: true }))).toBe("pane");
+    expect(resolveGlobalHotkey(key({ key: "、", code: "Backslash", ctrlKey: true }))).toBe("pane");
+    expect(resolveGlobalHotkey(key({ key: "\\", ctrlKey: true, target: document.createElement("textarea") }))).toBe("pane");
+    expect(resolveGlobalHotkey(key({ key: "|", code: "Backslash", metaKey: true, shiftKey: true }))).toBeNull();
+    expect(resolveGlobalHotkey(key({ key: "\\" }))).toBeNull();
   });
 });

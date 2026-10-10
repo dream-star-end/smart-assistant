@@ -6,6 +6,8 @@ import {
   Menu,
   MoreHorizontal,
   PanelLeft,
+  PanelRight,
+  PanelRightClose,
   PenSquare,
   Search,
   Share2,
@@ -70,6 +72,8 @@ export function ChatHeader({
   onOpenInbox,
   onOpenFind,
   onShare,
+  onTogglePane,
+  paneOpen = false,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
@@ -124,6 +128,9 @@ export function ChatHeader({
   onOpenFind?: () => void;
   /** 打开「分享会话」(长图 + 文字,OCV5-369;省略则不渲染,如 demo)。窄屏收进「更多操作」菜单。 */
   onShare?: () => void;
+  /** 开合详情面板(右侧第三栏)。省略则不渲染(demo / 空会话 / 任务看板)。手机上入口在过程摘要行。 */
+  onTogglePane?: () => void;
+  paneOpen?: boolean;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
@@ -423,6 +430,20 @@ export function ChatHeader({
             {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
             <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
+        )}
+        {onTogglePane && (
+          <IconButton
+            data-product-control
+            data-testid="detail-pane-toggle"
+            onClick={onTogglePane}
+            aria-label="详情面板"
+            aria-pressed={paneOpen}
+            title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
+            shape="square"
+            className="hidden sm:flex"
+          >
+            {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
+          </IconButton>
         )}
       </div>
     </header>

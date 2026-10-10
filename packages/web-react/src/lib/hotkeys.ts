@@ -1,4 +1,4 @@
-export type GlobalHotkeyAction = "search" | "new" | "stop" | "find" | null;
+export type GlobalHotkeyAction = "search" | "new" | "stop" | "find" | "pane" | null;
 
 function isEditableTarget(el: EventTarget | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
@@ -17,14 +17,15 @@ export function isDialogLayerOpen(
 }
 
 /**
- * 全局快捷键分派：⌘K 快速跳转(输入框内也生效)、⌘⇧O 新建、Esc(生成中)停止。
+ * 全局快捷键分派：⌘K 快速跳转(输入框内也生效)、⌘⇧O 新建、⌘\ 开合详情面板(输入框内也生效)、
+ * Esc(生成中)停止。
  *
  * Esc 有两个持有方:Radix 弹层的「关闭」与这里的「停止生成」。弹层打开时 Esc 只该关弹层 ——
  * 否则用户在生成中打开任意对话框再按 Esc 关掉,会连带掐掉正在生成的这一轮。
  * `dialogOpen` 由调用方在事件发生时刻算出(见 isDialogLayerOpen),这里只做纯判断。
  */
 export function resolveGlobalHotkey(
-  e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target">,
+  e: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "shiftKey" | "target"> & { code?: string },
   opts: { sending?: boolean; dialogOpen?: boolean } = {},
 ): GlobalHotkeyAction {
   if (e.key === "Escape") return opts.sending && !opts.dialogOpen ? "stop" : null;
@@ -32,6 +33,8 @@ export function resolveGlobalHotkey(
   if (!mod) return null;
   // ⌘K opens the palette from anywhere, the composer included (focus usually sits there).
   if ((e.key === "k" || e.key === "K") && !e.shiftKey) return "search";
+  // 按物理键认 `\`:中文输入法标点模式下 key 会变成「、」,code 仍是 Backslash。
+  if ((e.code === "Backslash" || e.key === "\\") && !e.shiftKey) return "pane";
   if ((e.key === "o" || e.key === "O") && e.shiftKey) {
     if (isEditableTarget(e.target)) return null;
     return "new";

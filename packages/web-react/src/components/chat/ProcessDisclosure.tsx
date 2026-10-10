@@ -10,6 +10,7 @@ import {
   ListTodo,
   type LucideIcon,
   MessageCircleQuestion,
+  PanelRight,
   Pencil,
   Search,
   ShieldCheck,
@@ -28,6 +29,9 @@ import { ProcessStepContext } from "./processStep";
 import { StepTimingContext } from "./stepDuration";
 import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
+import { useArtifactInspect } from "../tool/context";
+import { cn } from "../../lib/utils";
+import { toolChangedFileCount } from "./workPane";
 import { timelineMessageKey } from "./findInSession";
 
 /**
@@ -1150,6 +1154,12 @@ export function ProcessDisclosure<T>({
   }
   const steps = stepItemCount(sections, messagesOf);
   const tally = kindTally(sections, messagesOf);
+  // 详情面板入口(OCV5-370):本轮改过文件 → 常显「改动 N 个文件」,点开面板的改动页;
+  // 只有其它步骤 → 一个安静的面板图标(桌面悬停 / 触屏常显),点开步骤页。
+  const openPane = useArtifactInspect().openPane;
+  const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
+  const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
+  const hasToolRows = processRows.some((message) => message.role === "tool");
   const elapsed = useElapsed(startedAt, active);
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
@@ -1231,9 +1241,10 @@ export function ProcessDisclosure<T>({
       data-process-active={active ? "true" : "false"}
       className="min-w-0"
     >
+      <div className="group/shellrow -mx-1.5 flex w-[calc(100%+0.75rem)] min-w-0 items-center gap-1">
       <button
         type="button"
-        className={shellToggleClass}
+        className={cn(shellToggleClass, "mx-0 w-auto min-w-0 flex-1")}
         aria-expanded={open}
         data-testid="process-toggle"
         onClick={() => setOpen(!open)}
@@ -1283,6 +1294,32 @@ export function ProcessDisclosure<T>({
           className={`shrink-0 text-faint transition-transform duration-300 ease-[var(--ease-spring)] group-hover/shell:text-muted ${open ? "rotate-180" : ""}`}
         />
       </button>
+      {openPane && changedFiles > 0 ? (
+        <button
+          type="button"
+          data-testid="process-pane-changes"
+          className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border border-border px-2.5 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          title="在详情面板查看改动"
+          onClick={() => openPane("changes")}
+        >
+          <Pencil size={12} aria-hidden className="text-faint" />
+          {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
+          <span className="sr-only sm:not-sr-only">改动 </span>
+          {changedFiles} 个文件
+        </button>
+      ) : openPane && hasToolRows ? (
+        <button
+          type="button"
+          data-testid="process-pane-steps"
+          aria-label="在详情面板查看步骤"
+          title="在详情面板查看步骤"
+          className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint opacity-0 outline-none transition-opacity hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
+          onClick={() => openPane("steps")}
+        >
+          <PanelRight size={15} />
+        </button>
+      ) : null}
+      </div>
       {!open
         ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
         : null}

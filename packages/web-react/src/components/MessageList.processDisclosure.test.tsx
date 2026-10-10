@@ -6,6 +6,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkeleton";
 import { operationSummary } from "./chat/ProcessDisclosure";
 import { MessageList } from "./MessageRenderer";
+import { ArtifactInspectContext } from "./tool/context";
 
 afterEach(() => {
   cleanup();
@@ -2337,5 +2338,49 @@ describe("MessageList Manus 过程披露", () => {
     expect(shell.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(answer.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(error.closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+});
+
+describe("OCV5-370 过程摘要上的详情面板入口", () => {
+  test("本轮改过文件 → 常显「改动 N 个文件」,点开面板改动页;不展开过程本身", () => {
+    const openPane = vi.fn();
+    const messages = settledTurn();
+    messages.splice(
+      messages.length - 1,
+      0,
+      row("w-1", "tool", "写入", {
+        _clientMessageId: "u1",
+        toolName: "Write",
+        inputJson: { file_path: "/w/board.html", content: "<h1>库存</h1>" },
+        _completed: true,
+        output: "ok",
+      }),
+    );
+    render(
+      <ArtifactInspectContext.Provider value={{ open: () => {}, openPane }}>
+        <MessageList processDisclosure messages={messages} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />
+      </ArtifactInspectContext.Provider>,
+    );
+    const chip = screen.getByTestId("process-pane-changes");
+    expect(chip).toHaveTextContent("改动 1 个文件");
+    fireEvent.click(chip);
+    expect(openPane).toHaveBeenCalledWith("changes");
+    expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("只有其它步骤 → 「在详情面板查看步骤」;没有面板(无 provider)→ 都不出现", () => {
+    const openPane = vi.fn();
+    render(
+      <ArtifactInspectContext.Provider value={{ open: () => {}, openPane }}>
+        <MessageList processDisclosure messages={settledTurn()} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />
+      </ArtifactInspectContext.Provider>,
+    );
+    expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "在详情面板查看步骤" }));
+    expect(openPane).toHaveBeenCalledWith("steps");
+    cleanup();
+    renderList(settledTurn());
+    expect(screen.queryByTestId("process-pane-steps")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
   });
 });

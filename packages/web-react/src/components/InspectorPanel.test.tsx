@@ -4,6 +4,9 @@
  *      点击回传 {kind:'tool', message} 且不连带触发表头折叠切换;
  *   2. 卡内 diff 截断行在有 inspect 回调时可点、去详情列;
  *   3. InspectorPanelContent 全文模式渲染:超过卡内 60 行上限的 diff 不再截断。
+ *
+ * OCV5-370 改版后面板吃整段会话消息 + 一个定位请求(PaneRequest);这里的单步用例按「从卡片点开
+ * 某一步」的形态渲染(request.tab=steps + message)。分区 / 翻步 / 跟随 / 改动见 InspectorPanel.pane.test.tsx。
  */
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -15,9 +18,15 @@ import {
   ArtifactInspectContext,
   type ArtifactInspectTarget,
 } from "./tool/context";
+import type { ToolLike } from "./tool/format";
 import { ToastProvider } from "./ui";
 
 afterEach(cleanup);
+
+/** 从卡片点开某一步:面板直接进这一步的全文详情。 */
+function Detail({ message, onClose = () => {} }: { message: ToolLike; onClose?: () => void }) {
+  return <InspectorPanelContent messages={[]} request={{ tab: "steps", message, nonce: 1 }} onClose={onClose} />;
+}
 
 /** 120 行新增内容:超过卡内 MAX_DIFF_LINES=60,必然触发截断行。 */
 const LONG_NEW_STRING = Array.from({ length: 120 }, (_, i) => `line-${i + 1}`).join("\n");
@@ -104,7 +113,7 @@ describe("产物详情列(inspector)", () => {
   test("详情面板全文模式渲染完整 diff,并可关闭", () => {
     const onClose = vi.fn();
     const target: ArtifactInspectTarget = { kind: "tool", message: longEditMessage };
-    render(<InspectorPanelContent target={target} onClose={onClose} />);
+    render(<Detail message={target.message} onClose={onClose} />);
     // 全文:超过卡内 60 行上限的行也在
     expect(screen.getByText(/line-120/)).toBeInTheDocument();
     expect(screen.queryByText(/已截断|查看全文/)).not.toBeInTheDocument();
@@ -121,7 +130,7 @@ describe("产物详情列(inspector)", () => {
     };
     render(
       <ToastProvider>
-        <InspectorPanelContent target={target} onClose={() => {}} />
+        <Detail message={target.message} />
       </ToastProvider>,
     );
     fireEvent.click(screen.getByLabelText("复制全文"));
@@ -139,7 +148,7 @@ describe("产物详情列(inspector)", () => {
     const target: ArtifactInspectTarget = { kind: "tool", message: longEditMessage };
     render(
       <ToastProvider>
-        <InspectorPanelContent target={target} onClose={() => {}} />
+        <Detail message={target.message} />
       </ToastProvider>,
     );
     fireEvent.click(screen.getByLabelText("复制全文"));
@@ -161,7 +170,7 @@ describe("产物详情列(inspector)", () => {
         _completed: true,
       },
     };
-    render(<InspectorPanelContent target={target} onClose={() => {}} />);
+    render(<Detail message={target.message} />);
     fireEvent.click(screen.getByLabelText("复制全文"));
     const copied = String(writeText.mock.calls[0]?.[0] ?? "");
     expect(copied).toBe("$ npm test\n1 passed\n1 failed: x");
@@ -177,7 +186,7 @@ describe("产物详情列(inspector)", () => {
         _completed: true,
       },
     };
-    render(<InspectorPanelContent target={failed} onClose={() => {}} />);
+    render(<Detail message={failed.message} />);
     expect(screen.getByText("未成功")).toBeInTheDocument();
     expect(screen.queryByText("已结束")).not.toBeInTheDocument();
     expect(screen.queryByText("完成")).not.toBeInTheDocument();
@@ -191,14 +200,14 @@ describe("产物详情列(inspector)", () => {
         _completed: true,
       },
     };
-    render(<InspectorPanelContent target={blocked} onClose={() => {}} />);
+    render(<Detail message={blocked.message} />);
     expect(screen.getByText("受阻")).toBeInTheDocument();
     cleanup();
     const errored: ArtifactInspectTarget = {
       kind: "tool",
       message: { toolName: "Write", inputJson: { file_path: "/a" }, error: true, output: "denied", _completed: true },
     };
-    render(<InspectorPanelContent target={errored} onClose={() => {}} />);
+    render(<Detail message={errored.message} />);
     expect(screen.getByText("未成功")).toBeInTheDocument();
     expect(screen.queryByText("已结束")).not.toBeInTheDocument();
   });
@@ -215,18 +224,27 @@ describe("产物详情列(inspector)", () => {
       cb(0);
       return 1;
     });
-    const { unmount } = render(<InspectorPanel target={target} onClose={onClose} />);
+    const { unmount } = render(
+      <InspectorPanel
+        messages={[]}
+        request={{ tab: "steps", message: target.message, nonce: 7 }}
+        focusNonce={7}
+        onClose={onClose}
+      />,
+    );
     const aside = screen.getByRole("complementary");
-    const heading = screen.getByRole("heading", { level: 2, name: "编辑文件" });
+    const heading = screen.getByRole("heading", { level: 2, name: "详情面板" });
     expect(aside).toHaveAttribute("aria-labelledby", heading.id);
+    expect(screen.getByRole("heading", { level: 3, name: "编辑文件" })).toBeInTheDocument();
     expect(document.activeElement).toBe(screen.getByLabelText("关闭详情面板"));
-    // Escape:焦点在输入框里时不关面板;在面板/其它地方关
+    // Escape 只在焦点在面板里时关面板(OCV5-370:面板可常开,别处的 Esc 属于输入法 / 弹层 / 停止生成)
     const input = document.createElement("textarea");
     document.body.appendChild(input);
     input.focus();
     fireEvent.keyDown(input, { key: "Escape" });
-    expect(onClose).not.toHaveBeenCalled();
     fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByLabelText("关闭详情面板"), { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
     unmount();
     expect(document.activeElement).toBe(trigger);
