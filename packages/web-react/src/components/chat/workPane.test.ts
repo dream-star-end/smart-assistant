@@ -90,6 +90,20 @@ describe("collectFileChanges", () => {
   });
 });
 
+describe("解析缓存", () => {
+  test("同一消息对象复用结果;输入就地变化(partialJson 增长 / inputJson 替换)后重算", () => {
+    const m = tool("w", "Write", { file_path: "/a", content: "1" }, { _completed: false, inputJson: undefined, partialJson: '{"file_path":"/a","content":"1' });
+    expect(collectFileChanges([m])[0]?.added).toBe(1);
+    m.partialJson = '{"file_path":"/a","content":"1\\n2\\n3';
+    expect(collectFileChanges([m])[0]?.added).toBe(3);
+    m.partialJson = undefined;
+    m.inputJson = { file_path: "/b", content: "x" };
+    m._inputRevision = 1;
+    m._completed = true;
+    expect(collectFileChanges([m]).map((f) => f.path)).toEqual(["/b"]);
+  });
+});
+
 describe("toolChangedFileCount", () => {
   test("数不同文件;失败的写入与非写文件工具不算", () => {
     expect(

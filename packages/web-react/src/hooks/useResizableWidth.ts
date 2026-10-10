@@ -58,8 +58,7 @@ function writeStoredWidth(opts: ResizableWidthOptions, width: number): void {
 export function useResizableWidth(options: ResizableWidthOptions): ResizableWidth {
   // 选项按挂载时的值使用(调用方传常量);存进 ref,回调保持稳定引用。
   const optsRef = useRef(options);
-  const opts = optsRef.current;
-  const [width, setWidth] = useState(() => readStoredWidth(opts));
+  const [width, setWidth] = useState(() => readStoredWidth(optsRef.current));
   const [resizing, setResizing] = useState(false);
   const widthRef = useRef(width);
   widthRef.current = width;
@@ -119,25 +118,25 @@ export function useResizableWidth(options: ResizableWidthOptions): ResizableWidt
     setResizing(false);
     if (persist) {
       clearPersistTimer();
-      writeStoredWidth(opts, widthRef.current);
+      writeStoredWidth(optsRef.current, widthRef.current);
     } else {
       clearPersistTimer();
     }
   };
 
   const applyWidth = (next: number, persist: "throttle" | "flush") => {
-    const clamped = clampWidth(opts, next);
+    const clamped = clampWidth(optsRef.current, next);
     widthRef.current = clamped;
     setWidth(clamped);
     if (persist === "flush") {
       clearPersistTimer();
-      writeStoredWidth(opts, clamped);
+      writeStoredWidth(optsRef.current, clamped);
       return;
     }
     clearPersistTimer();
     persistTimerRef.current = setTimeout(() => {
       persistTimerRef.current = null;
-      writeStoredWidth(opts, widthRef.current);
+      writeStoredWidth(optsRef.current, widthRef.current);
     }, PERSIST_THROTTLE_MS);
   };
 
@@ -147,7 +146,7 @@ export function useResizableWidth(options: ResizableWidthOptions): ResizableWidt
 
     if (e.detail >= 2) {
       endDrag(false);
-      applyWidth(opts.defaultWidth, "flush");
+      applyWidth(optsRef.current.defaultWidth, "flush");
       return;
     }
 
@@ -179,7 +178,7 @@ export function useResizableWidth(options: ResizableWidthOptions): ResizableWidt
       const drag = dragRef.current;
       if (!drag || ev.pointerId !== drag.pointerId) return;
       const delta = ev.clientX - drag.startX;
-      applyWidth(drag.startWidth + (opts.edge === "right" ? delta : -delta), "throttle");
+      applyWidth(drag.startWidth + (optsRef.current.edge === "right" ? delta : -delta), "throttle");
     };
     const up = (ev: PointerEvent) => {
       const drag = dragRef.current;
@@ -200,10 +199,10 @@ export function useResizableWidth(options: ResizableWidthOptions): ResizableWidt
   }, []);
 
   const onResizeKeyDown = useCallback((e: ReactKeyboardEvent) => {
-    const step = e.shiftKey ? (opts.keyStepLarge ?? 64) : (opts.keyStep ?? 16);
+    const step = e.shiftKey ? (optsRef.current.keyStepLarge ?? 64) : (optsRef.current.keyStep ?? 16);
     // 往把手外侧方向按 = 变宽(左侧栏 →,右侧面板 ←)。
-    const grow = opts.edge === "right" ? "ArrowRight" : "ArrowLeft";
-    const shrink = opts.edge === "right" ? "ArrowLeft" : "ArrowRight";
+    const grow = optsRef.current.edge === "right" ? "ArrowRight" : "ArrowLeft";
+    const shrink = optsRef.current.edge === "right" ? "ArrowLeft" : "ArrowRight";
     let next: number;
     switch (e.key) {
       case shrink:
@@ -213,10 +212,10 @@ export function useResizableWidth(options: ResizableWidthOptions): ResizableWidt
         next = widthRef.current + step;
         break;
       case "Home":
-        next = opts.min;
+        next = optsRef.current.min;
         break;
       case "End":
-        next = opts.max;
+        next = optsRef.current.max;
         break;
       default:
         return;

@@ -170,7 +170,119 @@ export type PaneTab = "steps" | "changes" | "plan";
  * nonce 每次请求都换:同一条消息连点两次也会重新定位并把焦点移进面板。
  * tab 缺省 = 只开面板(停在上次的分区)。
  */
-export type PaneRequest = { tab?: PaneTab; message?: ToolLike | null; nonce: number };
+export type PaneRequest = {
+  tab?: PaneTab;
+  message?: ToolLike | null;
+  nonce: number;
+  /** 发起请求时的会话;App 只把属于当前会话的请求交给面板(切会话后旧请求作废)。 */
+  sessionId?: string | null;
+};
+
+/**
+ * 大记录(>1 MiB)在历史里只是定位桩(`_payloadDeferred`),正文按需取。面板复用聊天区同一套
+ * 取数(App 的 cardCallbacks:页面内缓存 + 校验),不另起请求通道。
+ */
+export type DeferredPayloadLoader = {
+  peek?: (
+    tapeId: string,
+    recordOrdinal: number,
+    expected: { recordId: string; role: string; contentSha256?: string },
+  ) => ChatMessage[] | null;
+  fetch?: (
+    tapeId: string,
+    recordOrdinal: number,
+    expected: { recordId: string; role: string; contentSha256?: string },
+    signal?: AbortSignal,
+  ) => Promise<ChatMessage[] | null>;
+};
+
+/** 只把属于当前会话的请求交给面板:请求在切会话前发出、面板在切会话后挂载时,旧请求作废。 */
+export function paneRequestForSession(request: PaneRequest | null, sessionId: string | null | undefined): PaneRequest | null {
+  return request && (request.sessionId ?? null) === (sessionId ?? null) ? request : null;
+}
+
+function idOf(message: ToolLike | null | undefined): string | undefined {
+  const id = (message as { id?: unknown } | null | undefined)?.id;
+  return typeof id === "string" && id ? id : undefined;
+}
+
+function sameMessage(a: ToolLike | null | undefined, b: ToolLike | null | undefined): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const ia = idOf(a);
+  return ia !== undefined && ia === idOf(b);
+}
+
+type Hydrated = { message: ToolLike; state: "ready" | "loading" | "failed"; retry: () => void };
+
+function pickRecord(records: ChatMessage[] | null, locator: ChatMessage): ChatMessage | null {
+  if (!records || records.length === 0) return null;
+  return records.find((r) => r.id === locator.id) ?? records.find((r) => r.role === "tool") ?? null;
+}
+
+/** 定位桩 → 完整工具消息(先 peek 页面缓存,没有再取);不是定位桩原样返回。 */
+function useHydratedTool(message: ToolLike, loader?: DeferredPayloadLoader): Hydrated {
+  const m = message as ChatMessage;
+  const deferred = m._payloadDeferred === true;
+  const tapeId = m._turnTapeId;
+  const ordinal = m._recordOrdinal;
+  const expected =
+    deferred && m.id
+      ? { recordId: m.id, role: m.role, ...(m._payloadSha256 ? { contentSha256: m._payloadSha256 } : {}) }
+      : null;
+  const canLoad = !!expected && typeof tapeId === "string" && typeof ordinal === "number";
+  const [loaded, setLoaded] = useState<{ key: string; record: ChatMessage | null } | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const key = canLoad ? `${tapeId}:${ordinal}:${m.id}` : "";
+  const peeked = canLoad && loader?.peek && expected ? pickRecord(loader.peek(tapeId, ordinal, expected), m) : null;
+  const hasPeek = !!peeked;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: key 已覆盖 tapeId / ordinal / id;attempt 是「重试」信号
+  useEffect(() => {
+    if (!canLoad || hasPeek || !loader?.fetch || !expected) return;
+    const controller = new AbortController();
+    loader
+      .fetch(tapeId, ordinal, expected, controller.signal)
+      .then((records) => {
+        if (!controller.signal.aborted) setLoaded({ key, record: pickRecord(records, m) });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setLoaded({ key, record: null });
+      });
+    return () => controller.abort();
+  }, [key, attempt, hasPeek]);
+  const retry = () => {
+    setLoaded(null);
+    setAttempt((n) => n + 1);
+  };
+  if (!deferred) return { message, state: "ready", retry };
+  const record = peeked ?? (loaded?.key === key ? loaded.record : undefined);
+  if (record) return { message: record, state: "ready", retry };
+  if (!canLoad || !loader?.fetch || record === null) return { message, state: "failed", retry };
+  return { message, state: "loading", retry };
+}
+
+function DeferredNotice({ hydrated }: { hydrated: Hydrated }) {
+  if (hydrated.state === "loading") {
+    return (
+      <div className="flex items-center gap-2 py-2 text-meta text-muted" data-testid="pane-deferred-loading">
+        <Spinner size={13} className="text-accent" />
+        正在加载这一步的完整内容…
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-2 py-2 text-meta text-muted" data-testid="pane-deferred-failed">
+      这一步的内容较大，没能加载出来。
+      <button
+        type="button"
+        className="rounded text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={hydrated.retry}
+      >
+        重试
+      </button>
+    </div>
+  );
+}
 
 export const PANE_TAB_STORAGE_KEY = "oc_v5_detail_pane_tab";
 export const PANE_OPEN_STORAGE_KEY = "oc_v5_detail_pane_open";
@@ -284,7 +396,8 @@ function FullToolBody({ display }: { display: DisplayTool }) {
 }
 
 function StepDetail({
-  message,
+  message: rawMessage,
+  loader,
   index,
   total,
   following,
@@ -295,6 +408,7 @@ function StepDetail({
   onLatest,
 }: {
   message: ToolLike;
+  loader?: DeferredPayloadLoader;
   index: number;
   total: number;
   following: boolean;
@@ -305,6 +419,8 @@ function StepDetail({
   onLatest: () => void;
 }) {
   const inList = index >= 0;
+  const hydrated = useHydratedTool(rawMessage, loader);
+  const message = hydrated.message;
   return (
     <>
       <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1" data-testid="pane-stepper">
@@ -360,7 +476,11 @@ function StepDetail({
         className="min-h-0 flex-1 overflow-y-auto px-4 py-3 [overflow-wrap:anywhere] [&>*:first-child]:mt-0"
         data-testid="pane-step-body"
       >
-        <FullToolBody display={normalizeToolForDisplay(message)} />
+        {hydrated.state === "ready" ? (
+          <FullToolBody display={normalizeToolForDisplay(message)} />
+        ) : (
+          <DeferredNotice hydrated={hydrated} />
+        )}
       </div>
     </>
   );
@@ -471,7 +591,7 @@ function StepList({
                   <li key={step.message.id}>
                     <StepRow
                       message={step.message}
-                      active={active === step.message}
+                      active={sameMessage(active, step.message)}
                       durationMs={timings?.get(step.message.id)?.ms}
                       onPick={() => onPick(step.message)}
                     />
@@ -687,6 +807,7 @@ export function InspectorPanelContent({
   version,
   running = false,
   request,
+  deferredLoader,
   onClose,
   onActiveChange,
   titleId,
@@ -697,14 +818,15 @@ export function InspectorPanelContent({
   /** 本会话这一轮是否仍在进行(决定「跟随中」)。 */
   running?: boolean;
   request?: PaneRequest | null;
+  /** 大记录定位桩的正文取数(聊天区同一套缓存);不传则定位桩显示「没能加载」。 */
+  deferredLoader?: DeferredPayloadLoader;
   onClose: () => void;
   /** 当前在详情里查看的那一步 → 源卡片选中态(T-18)。 */
   onActiveChange?: (message: ToolLike | null) => void;
   titleId?: string;
 }) {
   const [tab, setTabState] = useState<PaneTab>(() => request?.tab ?? readStoredTab());
-  const [selected, setSelected] = useState<ToolLike | null>(() => request?.message ?? null);
-  const [follow, setFollow] = useState(false);
+  const [selected, setSelected] = useState<ToolLike | null>(() => (request?.tab === "steps" ? (request.message ?? null) : null));
   const [filePath, setFilePath] = useState<string | null>(null);
   const fallbackTitleId = useId();
   const headingId = titleId ?? fallbackTitleId;
@@ -716,7 +838,31 @@ export function InspectorPanelContent({
     writeStoredTab(next);
   };
 
+  const { turns, steps } = collectPaneSteps(messages);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
+  const changes = useMemo(() => collectFileChanges(messages), [messages, version]);
+  const todos = extractLatestTodos(messages, 0);
+
+  const view: PaneTab = tab === "plan" && todos.length === 0 ? "steps" : tab;
+  const latest = steps.at(-1)?.message ?? null;
+  // 首次挂载带着请求(面板 / 底部抽屉刚打开)时和后续请求一样:运行中点开最新那张卡就跟随。
+  const [follow, setFollow] = useState(
+    () => request?.tab === "steps" && !!request.message && running && sameMessage(request.message, latest),
+  );
+  // 选中按消息 id 记:历史重载 / 同步会用同 id 的新对象替换旧行,按引用记会停在旧正文上。
+  // 不在顶层步骤里的消息(团队子任务 / demo)按原对象显示。
+  const resolveSelected = (m: ToolLike | null): ToolLike | null => {
+    if (!m) return null;
+    const id = idOf(m);
+    return (id ? steps.find((s) => s.message.id === id)?.message : undefined) ?? m;
+  };
+  const shown: ToolLike | null = view === "steps" ? (follow ? latest : resolveSelected(selected)) : null;
+  const index = shown ? steps.findIndex((s) => sameMessage(s.message, shown)) : -1;
+  const following = follow && running && !!latest;
+  const file = view === "changes" && filePath ? (changes.find((f) => f.path === filePath) ?? null) : null;
+
   const handledNonce = useRef(request?.nonce);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 只响应新请求(nonce);latest / running 取请求到来那一刻
   useEffect(() => {
     if (!request || request.nonce === handledNonce.current) return;
     handledNonce.current = request.nonce;
@@ -725,21 +871,10 @@ export function InspectorPanelContent({
     setFilePath(null);
     if (request.tab === "steps") {
       setSelected(request.message ?? null);
-      setFollow(false);
+      // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
+      setFollow(!!request.message && running && sameMessage(request.message, latest));
     }
   }, [request]);
-
-  const { turns, steps } = collectPaneSteps(messages);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
-  const changes = useMemo(() => collectFileChanges(messages), [messages, version]);
-  const todos = extractLatestTodos(messages, 0);
-
-  const view: PaneTab = tab === "plan" && todos.length === 0 ? "steps" : tab;
-  const latest = steps.at(-1)?.message ?? null;
-  const shown: ToolLike | null = view === "steps" ? (follow ? latest : selected) : null;
-  const index = shown ? steps.findIndex((s) => s.message === shown) : -1;
-  const following = follow && running && !!latest;
-  const file = view === "changes" && filePath ? (changes.find((f) => f.path === filePath) ?? null) : null;
 
   useEffect(() => {
     onActiveChange?.(shown);
@@ -748,7 +883,7 @@ export function InspectorPanelContent({
 
   const pick = (message: ToolLike) => {
     setSelected(message);
-    setFollow(message === latest && running);
+    setFollow(running && sameMessage(message, latest));
   };
   const goTo = (i: number) => {
     const target = steps[i]?.message;
@@ -784,7 +919,6 @@ export function InspectorPanelContent({
   ];
 
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: 面板内 K/J、←/→ 翻步骤;按键来自内部可聚焦控件冒泡
     <div className="flex min-h-0 flex-1 flex-col bg-surface" onKeyDown={onKeyDown} data-testid="detail-pane">
       <header className="flex shrink-0 items-center gap-2 border-b border-border px-3 py-2 header-safe-t">
         <h2 id={headingId} className="sr-only">
@@ -813,10 +947,11 @@ export function InspectorPanelContent({
           shown ? (
             <StepDetail
               message={shown}
+              loader={deferredLoader}
               index={index}
               total={steps.length}
               following={following}
-              showLatest={!!latest && shown !== latest}
+              showLatest={!!latest && !sameMessage(shown, latest)}
               onBack={() => {
                 setSelected(null);
                 setFollow(false);

@@ -90,10 +90,12 @@ import {
 } from "./components/tool/context";
 import {
   DETAIL_PANE_WIDTH,
+  type DeferredPayloadLoader,
   InspectorPanel,
   InspectorPanelContent,
   type PaneRequest,
   type PaneTab,
+  paneRequestForSession,
   readDetailPaneOpen,
   writeDetailPaneOpen,
 } from "./components/InspectorPanel";
@@ -494,12 +496,14 @@ export function App() {
     writeDetailPaneOpen(open);
   }, []);
   const paneToggleRef = useRef<(() => void) | null>(null);
+  // 请求记下发起时的会话(openPane 引用稳定,不随会话变):切会话后旧请求不再交给新面板。
+  const activeIdRef = useRef<string | null>(null);
   const isWideRef = useRef(isWideViewport);
   isWideRef.current = isWideViewport;
   /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
   const openPane = useCallback(
     (tab?: PaneTab, message?: ToolLike | null) => {
-      setPaneRequest({ tab, message, nonce: Date.now() });
+      setPaneRequest({ tab, message, nonce: Date.now(), sessionId: activeIdRef.current });
       if (isWideRef.current) setPaneOpen(true);
       else setPaneSheetOpen(true);
     },
@@ -955,6 +959,7 @@ export function App() {
 
   // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
   // 展示与当前消息流无关的陈旧内容。宽屏面板的开合是用户偏好,保留;窄屏抽屉收起。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId / boardOpen / projectHome 是「换了上下文」的触发信号
   useEffect(() => {
     setPaneRequest(null);
     setPaneActive(null);
@@ -2306,9 +2311,11 @@ export function App() {
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+  activeIdRef.current = activeId ?? null;
   // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
   const paneAvailable =
     !boardOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
+  const paneRequestHere = paneRequestForSession(paneRequest, activeId);
   const paneInline = paneAvailable && isWideViewport && paneOpen;
   const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
   const togglePane = () => {
@@ -2921,6 +2928,11 @@ export function App() {
       chipsBoardProjectId,
       chipsProjectName,
     ],
+  );
+  // 详情面板里点开大记录(>1 MiB 定位桩)时,与聊天区共用同一套正文取数与页面缓存。
+  const paneDeferredLoader = useMemo<DeferredPayloadLoader>(
+    () => ({ peek: cardCallbacks.onPeekTapeRecordPayload, fetch: cardCallbacks.onFetchTapeRecordPayload }),
+    [cardCallbacks],
   );
 
   const composerReplyTo =
@@ -4382,8 +4394,9 @@ export function App() {
           messages={wsMessages}
           version={chat.version}
           running={wsSending}
-          request={paneRequest}
-          focusNonce={paneRequest?.nonce}
+          request={paneRequestHere}
+          deferredLoader={paneDeferredLoader}
+          focusNonce={paneRequestHere?.nonce}
           onClose={() => setPaneOpen(false)}
           onActiveChange={setPaneActive}
           width={paneWidth.width}
@@ -4409,7 +4422,8 @@ export function App() {
               messages={wsMessages}
               version={chat.version}
               running={wsSending}
-              request={paneRequest}
+              request={paneRequestHere}
+              deferredLoader={paneDeferredLoader}
               onClose={() => setPaneSheetOpen(false)}
               onActiveChange={setPaneActive}
             />

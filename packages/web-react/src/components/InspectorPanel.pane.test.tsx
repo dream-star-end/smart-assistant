@@ -3,10 +3,15 @@
  * 单步全文 / 复制 / 状态同源见 InspectorPanel.test.tsx。
  */
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
-import { InspectorPanel, InspectorPanelContent, PANE_TAB_STORAGE_KEY } from "./InspectorPanel";
+import {
+  InspectorPanel,
+  InspectorPanelContent,
+  PANE_TAB_STORAGE_KEY,
+  paneRequestForSession,
+} from "./InspectorPanel";
 
 afterEach(cleanup);
 beforeEach(() => {
@@ -236,5 +241,106 @@ describe("计划页与记忆", () => {
     expect(screen.getByRole("complementary")).toHaveStyle({ width: "440px" });
     rafSpy.mockRestore();
     composer.remove();
+  });
+});
+
+describe("Codex r1 回归", () => {
+  test("切会话:上一个会话发出的请求不交给新会话的面板", () => {
+    const req = { tab: "steps" as const, message: tool("t", "Bash", { command: "a" }), nonce: 3, sessionId: "A" };
+    expect(paneRequestForSession(req, "A")).toBe(req);
+    expect(paneRequestForSession(req, "B")).toBeNull();
+    expect(paneRequestForSession(null, "B")).toBeNull();
+    expect(paneRequestForSession({ nonce: 1 }, undefined)).not.toBeNull();
+  });
+
+  test("选中按 id:历史重载用同 id 的新对象替换后,详情显示新正文,计数与翻步还在", () => {
+    const first = session();
+    const { rerender } = render(<InspectorPanelContent messages={first} onClose={() => {}} />);
+    fireEvent.click(screen.getAllByTestId("pane-step")[1]);
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 4");
+    const reloaded = first.map((m) => (m.id === "t3" ? { ...m, output: "RELOADED-OUTPUT" } : { ...m }));
+    rerender(<InspectorPanelContent messages={reloaded} onClose={() => {}} />);
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 4");
+    expect(screen.getByTestId("pane-step-body")).toHaveTextContent("RELOADED-OUTPUT");
+    expect(screen.getByLabelText("下一步")).not.toBeDisabled();
+  });
+
+  test("大记录定位桩:用聊天区同一套取数加载正文;失败给重试", async () => {
+    const locator: ChatMessage = {
+      id: "big",
+      role: "tool",
+      text: "",
+      ts: TS,
+      _payloadDeferred: true,
+      _turnTapeId: "tape-1",
+      _recordOrdinal: 4,
+    };
+    const full = tool("big", "Bash", { command: "cat huge.log" }, { output: "HUGE-BODY-LOADED" });
+    const fetch = vi.fn().mockResolvedValue([full]);
+    render(
+      <InspectorPanelContent
+        messages={[user("u", "看日志"), locator]}
+        request={{ tab: "steps", message: locator, nonce: 1 }}
+        deferredLoader={{ fetch }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByTestId("pane-deferred-loading")).toBeInTheDocument();
+    expect(await screen.findByText(/HUGE-BODY-LOADED/)).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith("tape-1", 4, { recordId: "big", role: "tool" }, expect.any(AbortSignal));
+    cleanup();
+
+    const failing = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce([full]);
+    render(
+      <InspectorPanelContent
+        messages={[user("u", "看日志"), locator]}
+        request={{ tab: "steps", message: locator, nonce: 1 }}
+        deferredLoader={{ fetch: failing }}
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "重试" }));
+    expect(await screen.findByText(/HUGE-BODY-LOADED/)).toBeInTheDocument();
+    await waitFor(() => expect(failing).toHaveBeenCalledTimes(2));
+  });
+
+  test("页面缓存里已有正文(peek)时直接显示,不再取", () => {
+    const locator: ChatMessage = { id: "big", role: "tool", text: "", ts: TS, _payloadDeferred: true, _turnTapeId: "t", _recordOrdinal: 1 };
+    const fetch = vi.fn();
+    render(
+      <InspectorPanelContent
+        messages={[locator]}
+        request={{ tab: "steps", message: locator, nonce: 1 }}
+        deferredLoader={{ peek: () => [tool("big", "Bash", { command: "x" }, { output: "PEEKED" })], fetch }}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByText(/PEEKED/)).toBeInTheDocument();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("生成中从最新那张卡点开 → 直接跟随;点开旧卡不跟随", () => {
+    const messages = session();
+    const { rerender } = render(<InspectorPanelContent messages={messages} running onClose={() => {}} />);
+    rerender(<InspectorPanelContent messages={messages} running request={{ tab: "steps", message: messages[6], nonce: 5 }} onClose={() => {}} />);
+    expect(screen.getByTestId("pane-following")).toBeInTheDocument();
+    rerender(<InspectorPanelContent messages={messages} running request={{ tab: "steps", message: messages[4], nonce: 6 }} onClose={() => {}} />);
+    expect(screen.queryByTestId("pane-following")).not.toBeInTheDocument();
+    expect(screen.getByTestId("pane-latest")).toBeInTheDocument();
+  });
+
+  test("面板关着时生成中点最新卡:首次挂载就跟随,后续步骤到来自动切过去", () => {
+    const messages = session();
+    const { rerender } = render(
+      <InspectorPanelContent messages={messages} running request={{ tab: "steps", message: messages[6], nonce: 1 }} onClose={() => {}} />,
+    );
+    expect(screen.getByTestId("pane-following")).toBeInTheDocument();
+    const next = [...messages, tool("t5", "Bash", { command: "ls" })];
+    rerender(<InspectorPanelContent messages={next} running request={{ tab: "steps", message: messages[6], nonce: 1 }} onClose={() => {}} />);
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("5 / 5");
+    // 首次挂载点开的是旧卡:不跟随
+    cleanup();
+    render(<InspectorPanelContent messages={messages} running request={{ tab: "steps", message: messages[4], nonce: 1 }} onClose={() => {}} />);
+    expect(screen.queryByTestId("pane-following")).not.toBeInTheDocument();
   });
 });

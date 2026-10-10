@@ -95,6 +95,17 @@ function diffCounts(oldStr: string, newStr: string): { added: number; removed: n
   return { added, removed };
 }
 
+const rewriteCache = new WeakMap<ChatMessage, { prev: string; next: string; counts: { added: number; removed: number } }>();
+
+/** 再次 Write 相对上次写入的行数统计,按消息缓存(同上:避免每帧重跑 LCS)。 */
+function rewriteCounts(message: ChatMessage, prev: string, next: string): { added: number; removed: number } {
+  const hit = rewriteCache.get(message);
+  if (hit && hit.prev === prev && hit.next === next) return hit.counts;
+  const counts = diffCounts(prev, next);
+  rewriteCache.set(message, { prev, next, counts });
+  return counts;
+}
+
 function unifiedCounts(diff: string): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
@@ -106,9 +117,41 @@ function unifiedCounts(diff: string): { added: number; removed: number } {
   return { added, removed };
 }
 
+/**
+ * 按消息对象缓存解析结果:流式期间 App 每帧重渲,改动页与每轮过程摘要都会重算;Edit 的行级
+ * diff 是 LCS(最多 1M 格),不缓存会在长会话里每帧把全部 Edit 重新 diff 一遍。
+ * 输入就地变化(partialJson 增长 / inputJson 替换并递增 _inputRevision / toolName 改写)时失效。
+ */
+type ChangeCacheEntry = {
+  toolName: string | undefined;
+  inputJson: unknown;
+  inputRevision: number;
+  partialLength: number;
+  value: RawChange[];
+};
+const changeCache = new WeakMap<ChatMessage, ChangeCacheEntry>();
+
 /** 一条工具消息改到的文件(零到多条)。不是改文件的工具 → []。 */
 export function toolFileChanges(message: ChatMessage): RawChange[] {
   if (message.role !== "tool") return [];
+  const cached = changeCache.get(message);
+  const partialLength = message.partialJson?.length ?? -1;
+  const inputRevision = message._inputRevision ?? 0;
+  if (
+    cached &&
+    cached.toolName === message.toolName &&
+    cached.inputJson === message.inputJson &&
+    cached.inputRevision === inputRevision &&
+    cached.partialLength === partialLength
+  ) {
+    return cached.value;
+  }
+  const value = parseToolFileChanges(message);
+  changeCache.set(message, { toolName: message.toolName, inputJson: message.inputJson, inputRevision, partialLength, value });
+  return value;
+}
+
+function parseToolFileChanges(message: ChatMessage): RawChange[] {
   const { name, input } = normalizeToolForDisplay(message);
   if (name === "Edit" || name === "Write") {
     const patch = asArr(input?.changes).filter(
@@ -188,7 +231,7 @@ export function collectFileChanges(messages: readonly ChatMessage[]): FileChange
       if (raw.kind === "write" && raw.content !== undefined) {
         const prev = lastContent.get(raw.path);
         if (prev !== undefined && !failed) {
-          const counts = diffCounts(prev, raw.content);
+          const counts = rewriteCounts(m, prev, raw.content);
           entry.added = counts.added;
           entry.removed = counts.removed;
           entry.previousContent = prev;
