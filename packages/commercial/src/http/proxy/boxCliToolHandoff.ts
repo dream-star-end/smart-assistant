@@ -8,6 +8,7 @@
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliOutputLimitResume, isBoxCliSyntheticUser } from "./boxCliCompaction.js";
 import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
+import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES } from "./boxToolCapacity.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
   hashBoxAssistantNoCallerContent } from "./boxCallFingerprint.js";
@@ -36,6 +37,8 @@ const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 /** OCV5-301: how many consecutive model messages may consist only of calls
  * to tools this invocation does not expose before the run fails closed. */
 const BOX_CLI_REJECTED_SEGMENTS_MAX = 3;
+/** OCV5-368: also bounds held tool frames (see boxToolCapacity). */
+export { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES };
 /** OCV5-368: Claude Code resumes a message cut at `max_tokens` at most this
  * many times in one turn (its own recovery limit). */
 const BOX_CLI_OUTPUT_LIMIT_RESUMES_MAX = 3;
@@ -232,7 +235,9 @@ export class BoxCliToolHandoffDecoder {
         }
       }
       this.bytes += Buffer.byteLength(measured);
-      if (this.bytes > 1_048_576) throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_TOO_LARGE");
+      if (this.bytes > BOX_TOOL_MESSAGE_STREAM_MAX_BYTES) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_TOO_LARGE");
+      }
       this.pending += chunk;
       let emitted = "";
       while (this.candidate === null && this.finalCandidate === null) {
@@ -798,7 +803,7 @@ export class BoxCliToolHandoffDecoder {
     }
     if (this.holdToolFrames) {
       this.heldToolBytes += Buffer.byteLength(frame);
-      if (this.heldToolBytes > 16 * 1024 * 1024) {
+      if (this.heldToolBytes > BOX_TOOL_MESSAGE_STREAM_MAX_BYTES) {
         throw new BoxCliToolHandoffError("BOX_TOOL_HELD_FRAMES_TOO_LARGE");
       }
       this.heldToolFrames.push(frame);

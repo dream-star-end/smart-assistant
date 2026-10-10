@@ -10,6 +10,7 @@ import {
 } from './model/chatgptModels.js'
 import { getModelCapability } from './model/modelCapabilities.js'
 import { getStaticModelContextWindow } from './model/staticKeyModels.js'
+import { BOX_API_OUTPUT_TOKENS } from './model/boxNativeRemoteContext.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -199,6 +200,12 @@ export function getModelMaxOutputTokens(model: string): {
       return { default: defaultTokens, upperLimit }
     }
   }
+
+  // OCV5-368: a Box API model runs on the Box CLI, whose own catalog uses the
+  // model's official cap as default and upper limit. The egress passes this
+  // max_tokens to that CLI as CLAUDE_CODE_MAX_OUTPUT_TOKENS.
+  const boxCap = Object.hasOwn(BOX_API_OUTPUT_TOKENS, model) ? BOX_API_OUTPUT_TOKENS[model] : undefined
+  if (boxCap !== undefined) return { default: boxCap, upperLimit: boxCap }
 
   const m = getCanonicalName(model)
 
