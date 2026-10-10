@@ -238,72 +238,88 @@ export function pickHero(o: TurnOutputs): HeroRef | null {
 // ── 文件全文回放 ────────────────────────────────────────────────────────
 
 /**
- * 按会话消息回放某个文件在 `upTo`(含)这条消息之后的全文。
- * 只认得出确定结果的形状:Write 全文、apply_patch add 全文、能精确对上的 Edit / MultiEdit。
- * 中途出现 shell 写入、apply_patch update / delete、对不上的 Edit,或从头就没有全文 → null。
+ * 按会话消息回放某个文件在 `upTo`(含)这条消息之后的全文。宁缺毋错:回放不出**确定**结果就返回
+ * null,界面改读容器里的当前文件。
+ *  - 只认成功完成(status done)的 Write 全文、apply_patch add 全文、能精确对上的 Edit / MultiEdit;
+ *    失败 / 受阻 / 取消的写入没有落盘,跳过;还在运行的写入结果未定 → 不可知。
+ *  - 其它工具(Bash、脚本、子任务…)只要输入里提到这个文件(全路径或文件名),不论成败都可能
+ *    改过它 → 不可知。命令不提文件名却改了它(脚本内部写)识别不了,这是剩余盲区。
+ *  - 大记录定位桩(_payloadDeferred)看不到输入 → 不可知。
  */
 export function fileSnapshot(messages: readonly ChatMessage[], path: string, upTo?: ChatMessage): string | null {
   let content: string | null = null;
   let known = false;
+  const forget = () => {
+    content = null;
+    known = false;
+  };
+  const name0 = baseName(path);
   for (const m of messages) {
-    if (m.role === "tool" && !failed(m)) {
-      const { name, input } = normalizeToolForDisplay(m);
-      if (name === "Write" || name === "Edit" || name === "MultiEdit") {
-        const patch = asArr(input?.changes).filter(
-          (c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c),
-        );
-        if (patch.length > 0) {
-          for (const c of patch) {
-            if ((asStr(c.path) || asStr(input?.file_path)) !== path) continue;
-            const kind =
-              c.kind && typeof c.kind === "object" && !Array.isArray(c.kind)
-                ? asStr((c.kind as Record<string, unknown>).type)
-                : asStr(c.kind) || asStr(input?.kind);
-            if (kind.toLowerCase() === "add") {
-              content = asStr(c.diff);
+    if (m.role === "tool") {
+      if (m._payloadDeferred === true) forget();
+      else {
+        const display = normalizeToolForDisplay(m);
+        const { name, input } = display;
+        const status = resolveToolStatus(display).kind;
+        if (name === "Write" || name === "Edit" || name === "MultiEdit") {
+          const patch = asArr(input?.changes).filter(
+            (c): c is Record<string, unknown> => !!c && typeof c === "object" && !Array.isArray(c),
+          );
+          const touches =
+            patch.length > 0
+              ? patch.some((c) => (asStr(c.path) || asStr(input?.file_path)) === path)
+              : (asStr(input?.file_path) || asStr(input?.path)) === path;
+          if (touches && status === "running") forget();
+          else if (touches && status === "done") {
+            if (patch.length > 0) {
+              for (const c of patch) {
+                if ((asStr(c.path) || asStr(input?.file_path)) !== path) continue;
+                const kind =
+                  c.kind && typeof c.kind === "object" && !Array.isArray(c.kind)
+                    ? asStr((c.kind as Record<string, unknown>).type)
+                    : asStr(c.kind) || asStr(input?.kind);
+                if (kind.toLowerCase() === "add") {
+                  content = asStr(c.diff);
+                  known = true;
+                } else forget();
+              }
+            } else if (name === "Write") {
+              content = asStr(input?.content);
               known = true;
             } else {
-              content = null;
-              known = false;
-            }
-          }
-        } else if ((asStr(input?.file_path) || asStr(input?.path)) === path) {
-          if (name === "Write") {
-            content = asStr(input?.content);
-            known = true;
-          } else {
-            const edits =
-              name === "MultiEdit"
-                ? asArr(input?.edits).filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
-                : [input ?? {}];
-            for (const e of edits) {
-              if (!known || content === null) break;
-              const oldStr = asStr(e.old_string);
-              const newStr = asStr(e.new_string);
-              if (!oldStr || !content.includes(oldStr)) {
-                content = null;
-                known = false;
-                break;
+              const edits =
+                name === "MultiEdit"
+                  ? asArr(input?.edits).filter((e): e is Record<string, unknown> => !!e && typeof e === "object")
+                  : [input ?? {}];
+              for (const e of edits) {
+                if (!known || content === null) break;
+                const oldStr = asStr(e.old_string);
+                const newStr = asStr(e.new_string);
+                if (!oldStr || !content.includes(oldStr)) {
+                  forget();
+                  break;
+                }
+                content = e.replace_all === true ? content.split(oldStr).join(newStr) : content.replace(oldStr, () => newStr);
               }
-              content = e.replace_all === true ? content.split(oldStr).join(newStr) : content.replace(oldStr, () => newStr);
             }
           }
-        }
-      } else if (name === "Bash") {
-        const command = asStr(input?.command);
-        if (command.includes(path) || command.includes(baseName(path))) {
-          // 命令可能改写了它(sed -i / 重定向 / 生成脚本):回放不再可信。
-          const writes = /(>|\btee\b|\bsed\s+-i|\bmv\b|\bcp\b|\brm\b|\bperl\s+-[a-z]*i)/.test(command);
-          if (writes) {
-            content = null;
-            known = false;
-          }
+          // 失败 / 受阻 / 取消:没有落盘,不影响回放。
+        } else if (known) {
+          const text = typeof m.inputJson === "string" ? m.inputJson : JSON.stringify(input ?? m.inputJson ?? {});
+          if (text.includes(path) || text.includes(name0)) forget();
         }
       }
     }
     if (upTo && (m === upTo || (!!upTo.id && m.id === upTo.id))) break;
   }
   return known ? content : null;
+}
+
+/** 文件改动的指纹:改动条数、最后一条的 id 与状态。用来让「读容器文件」的回落在文件又被改过后重新读。 */
+export function changeFingerprint(change: FileChange | undefined): string {
+  if (!change) return "";
+  const last = change.entries.at(-1);
+  return `${change.entries.length}:${last?.message.id ?? ""}:${change.running ? "r" : ""}${change.hasError ? "e" : ""}:${last?.message._completed ? "c" : ""}`;
 }
 
 // ── 摘要 ────────────────────────────────────────────────────────────────

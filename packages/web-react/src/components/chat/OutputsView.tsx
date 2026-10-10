@@ -29,6 +29,7 @@ import {
   type OutputMedia,
   type TurnOutputs,
   collectTurnOutputs,
+  changeFingerprint,
   displayDir,
   extOf,
   fileSnapshot,
@@ -254,6 +255,7 @@ function FileHero({
               name={file.name}
               kind={file.kind}
               replayed={replayed}
+              refreshKey={changeFingerprint(change)}
               view={view === "preview" ? "preview" : "source"}
             />
           </Suspense>

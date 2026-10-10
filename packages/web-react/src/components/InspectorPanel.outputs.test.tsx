@@ -4,12 +4,22 @@
  */
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { InspectorPanelContent } from "./InspectorPanel";
 
+// 读容器文件的那条回落:测试里没有签名通道,直接替换受限读取(其余导出照旧)。
+const fetchSignedCapped = vi.hoisted(() => vi.fn());
+vi.mock("./project/outputPreview", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./project/outputPreview")>()),
+  fetchSignedCapped,
+}));
+const bytes = (text: string) => ({ kind: "ok" as const, bytes: new TextEncoder().encode(text), type: "text/plain", truncated: false });
+
 afterEach(cleanup);
 beforeEach(() => {
+  fetchSignedCapped.mockReset();
+  fetchSignedCapped.mockRejectedValue(new Error("签名失败"));
   try {
     localStorage.clear();
   } catch {
@@ -124,6 +134,18 @@ describe("产出页", () => {
     // 测试环境没有签名通道 → 读取失败,给重试
     expect(await screen.findByText("没能读取这个文件（可能已被移动或删除）。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
+  });
+
+  test("读容器文件的回落:文件又被改过(新的一次 Edit 完成)就重读", async () => {
+    fetchSignedCapped.mockResolvedValueOnce(bytes("VERSION-B")).mockResolvedValueOnce(bytes("VERSION-C"));
+    const first = [user("u1", "改一下"), tool("e1", "Edit", { file_path: `${W}/app.py`, old_string: "a", new_string: "b" })];
+    const { rerender } = render(<InspectorPanelContent messages={first} onClose={() => {}} />);
+    await outputsReady();
+    expect(await screen.findByText(/VERSION-B/)).toBeInTheDocument();
+    const second = [...first, tool("e2", "Edit", { file_path: `${W}/app.py`, old_string: "b", new_string: "c" })];
+    rerender(<InspectorPanelContent messages={second} onClose={() => {}} />);
+    expect(await screen.findByText(/VERSION-C/)).toBeInTheDocument();
+    expect(fetchSignedCapped).toHaveBeenCalledTimes(2);
   });
 
   test("运行中:新一轮开始自动跟过去;翻到旧轮后停在旧轮", async () => {

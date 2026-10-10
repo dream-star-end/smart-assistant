@@ -135,10 +135,26 @@ describe("fileSnapshot", () => {
     ).toBe("a\n");
   });
 
-  test("只读文件的命令不影响回放", () => {
+  test("其它工具提到这个文件(不论成败、不论像不像写)→ 回放不可知;没提到的不影响", () => {
+    const write = tool("w1", "Write", { file_path: "/w/a.md", content: "old\n" });
+    expect(fileSnapshot([write, tool("b1", "Bash", { command: "python3 -c \"open('/w/a.md','w').write('new')\"" })], "/w/a.md")).toBeNull();
     expect(
-      fileSnapshot([tool("w1", "Write", { file_path: "/w/a.py", content: "a\n" }), tool("b1", "Bash", { command: "python3 /w/a.py" })], "/w/a.py"),
-    ).toBe("a\n");
+      fileSnapshot([write, tool("b2", "Bash", { command: "printf new > /w/a.md; exit 1" }, { error: true, output: "exit 1" })], "/w/a.md"),
+    ).toBeNull();
+    expect(fileSnapshot([write, tool("b3", "Bash", { command: "python3 a.md" })], "/w/a.md")).toBeNull();
+    expect(fileSnapshot([write, tool("b4", "Bash", { command: "ls /w/other" })], "/w/a.md")).toBe("old\n");
+  });
+
+  test("取消(历史里回合中断的未完成写入)/ 受阻的写入没有落盘;运行中的写入结果未定;大记录定位桩看不到输入", () => {
+    const write = tool("w1", "Write", { file_path: "/w/a.md", content: "old\n" });
+    expect(
+      fileSnapshot([write, tool("w2", "Write", { file_path: "/w/a.md", content: "new\n" }, { _completed: false, _timelineRecord: true, _dispatchOutcome: "interrupted", output: "" })], "/w/a.md"),
+    ).toBe("old\n");
+    expect(
+      fileSnapshot([write, tool("w3", "Write", { file_path: "/w/a.md", content: "ne" }, { _completed: false, output: "" })], "/w/a.md"),
+    ).toBeNull();
+    const locator: ChatMessage = { id: "big", role: "tool", text: "", ts: TS, toolName: "Write", _payloadDeferred: true, _completed: true };
+    expect(fileSnapshot([write, locator], "/w/a.md")).toBeNull();
   });
 });
 

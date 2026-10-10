@@ -32,13 +32,13 @@ type TextState =
   | { phase: "failed"; message: string };
 
 /** 文件正文:会话回放优先,否则读容器里的当前文件。 */
-function useFileText(path: string, replayed: string | null): { state: TextState; retry: () => void } {
+function useFileText(path: string, replayed: string | null, refreshKey: string): { state: TextState; retry: () => void } {
   const { get } = useFreshSignedUrl(replayed === null ? path : null);
   const [attempt, setAttempt] = useState(0);
   const [state, setState] = useState<TextState>(() =>
     replayed !== null ? { phase: "ready", text: replayed, origin: "session" } : { phase: "loading" },
   );
-  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt 是「重试」的触发信号
+  // biome-ignore lint/correctness/useExhaustiveDependencies: attempt 是「重试」、refreshKey 是「文件又被改过」的重读信号
   useEffect(() => {
     if (replayed !== null) {
       setState({ phase: "ready", text: replayed, origin: "session" });
@@ -58,7 +58,7 @@ function useFileText(path: string, replayed: string | null): { state: TextState;
         setState({ phase: "failed", message: e instanceof Error ? e.message : String(e) });
       });
     return () => controller.abort();
-  }, [replayed, get, attempt]);
+  }, [replayed, get, attempt, refreshKey]);
   return { state, retry: () => setAttempt((n) => n + 1) };
 }
 
@@ -115,6 +115,7 @@ export function FilePreview({
   name,
   kind,
   replayed,
+  refreshKey = "",
   view,
 }: {
   path: string;
@@ -122,9 +123,11 @@ export function FilePreview({
   kind: OutputKind;
   /** 会话回放出的全文;null = 回放不出来,读容器文件。 */
   replayed: string | null;
+  /** 文件改动指纹;变了就重读容器文件(只在回放不出来、走读文件时有意义)。 */
+  refreshKey?: string;
   view: PreviewView;
 }) {
-  const { state, retry } = useFileText(path, replayed);
+  const { state, retry } = useFileText(path, replayed, refreshKey);
   if (state.phase === "loading") {
     return (
       <div className="space-y-2 px-5 py-5" data-testid="output-preview-loading">
