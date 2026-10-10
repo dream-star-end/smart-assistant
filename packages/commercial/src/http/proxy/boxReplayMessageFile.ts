@@ -6,9 +6,10 @@ import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
-import { BOX_TOOL_MAX_ROUNDS } from "./boxToolCapacity.js";
+import { BOX_TOOL_MAX_ROUNDS, BOX_TOOL_MESSAGE_STREAM_MAX_BYTES } from "./boxToolCapacity.js";
 
-const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+/** OCV5-368: whatever the decoder accepted as one message must persist (was 2 MiB). */
+const MAX_MESSAGE_BYTES = BOX_TOOL_MESSAGE_STREAM_MAX_BYTES;
 const ID = /^[A-Za-z0-9_-]{1,64}$/;
 const HEX24 = /^[a-f0-9]{24}$/;
 const HEX32 = /^[a-f0-9]{32}$/;

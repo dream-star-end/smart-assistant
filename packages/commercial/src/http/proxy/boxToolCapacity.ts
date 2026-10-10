@@ -33,3 +33,9 @@ export function reserveBoxToolEcho(spoolOffset: number, lastUserMessage: unknown
   }
   return echoUpperBound;
 }
+/** OCV5-368: bytes of CLI stream JSONL one visible message may span, and the
+ * bound on that message's private replay file (a completed message is always
+ * smaller than the stream it was decoded from). Box Opus and Sonnet answer up
+ * to 128000 output tokens; the live spool runs about 10 bytes per thinking
+ * token and 50 per text token, so a full text answer is about 6.4 MB. */
+export const BOX_TOOL_MESSAGE_STREAM_MAX_BYTES = 16 * 1024 * 1024;
