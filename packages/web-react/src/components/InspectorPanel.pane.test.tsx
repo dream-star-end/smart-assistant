@@ -44,9 +44,11 @@ function session(): ChatMessage[] {
   ];
 }
 
+const STEPS = { tab: "steps" as const, nonce: 1 };
+
 describe("详情面板分区与步骤", () => {
   test("步骤页按轮分组、最近一轮在上并默认展开;点一步进入详情,计数与上一步 / 下一步 / 返回", () => {
-    render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
+    render(<InspectorPanelContent messages={session()} request={STEPS} onClose={() => {}} />);
     expect(screen.getByRole("tab", { name: /步骤\s*4/ })).toHaveAttribute("aria-selected", "true");
     const turns = screen.getAllByTestId("pane-turn");
     expect(turns).toHaveLength(2);
@@ -100,6 +102,7 @@ describe("详情面板分区与步骤", () => {
           tool("b1", "Bash", { command: "a" }, { ts: t0 + 1200, completedAt: t0 + 2500, durationMs: 300 }),
           tool("b2", "Bash", { command: "b" }, { ts: t0 + 2600, completedAt: t0 + 4100, durationMs: 1200 }),
         ]}
+        request={STEPS}
         onClose={() => {}}
       />,
     );
@@ -110,7 +113,7 @@ describe("详情面板分区与步骤", () => {
   });
 
   test("没有步骤时给空态", () => {
-    render(<InspectorPanelContent messages={[user("u1", "你好")]} onClose={() => {}} />);
+    render(<InspectorPanelContent messages={[user("u1", "你好")]} request={STEPS} onClose={() => {}} />);
     expect(screen.getByText("还没有执行步骤")).toBeInTheDocument();
   });
 
@@ -118,7 +121,7 @@ describe("详情面板分区与步骤", () => {
     const messages = session();
     const onActive = vi.fn();
     const { rerender } = render(
-      <InspectorPanelContent messages={messages} running onClose={() => {}} onActiveChange={onActive} />,
+      <InspectorPanelContent messages={messages} running request={STEPS} onClose={() => {}} onActiveChange={onActive} />,
     );
     const latestRow = screen.getAllByTestId("pane-step")[2];
     fireEvent.click(latestRow);
@@ -150,18 +153,18 @@ describe("详情面板分区与步骤", () => {
   });
 });
 
-describe("改动页", () => {
-  test("按文件汇总:同会话再次 Write 按与上次写入的 diff 计数并展示;「查看这一步」跳回步骤", () => {
-    render(<InspectorPanelContent messages={session()} request={{ tab: "changes", nonce: 1 }} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /改动\s*1/ })).toHaveAttribute("aria-selected", "true");
-    const row = screen.getByTestId("pane-file");
+describe("产出页里的改动", () => {
+  test("文件的改动视图:同会话再次 Write 按与上次写入的 diff 计数并展示;「查看这一步」跳回步骤", async () => {
+    render(<InspectorPanelContent messages={session()} request={{ tab: "outputs", nonce: 1 }} onClose={() => {}} />);
+    await screen.findByTestId("outputs-view");
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
+    const row = screen.getByTestId("outputs-file");
     expect(row).toHaveTextContent("fib.py");
-    expect(row).toHaveTextContent("/w/demo");
-    expect(row).toHaveTextContent("2 次");
-    // 首次写入 +2;再次写入 a,b → a,B,c:+2 −1
+    expect(row).toHaveTextContent("2 次改动");
+    // 第二轮里:首次写入 +2;再次写入 a,b → a,B,c:+2 −1
     expect(row).toHaveTextContent("+4");
     expect(row).toHaveTextContent("−1");
-    fireEvent.click(row);
+    fireEvent.click(screen.getByRole("radio", { name: "改动 2" }));
     const changes = screen.getAllByTestId("pane-file-change");
     expect(changes).toHaveLength(2);
     expect(changes[1]).toHaveTextContent("覆盖写入（与上次写入对比）");
@@ -170,18 +173,15 @@ describe("改动页", () => {
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("4 / 4");
   });
 
-  test("失败的写入标「有失败」且不计行数;没有改动给空态", () => {
+  test("失败的写入标「有失败」且不计行数", async () => {
     const messages = [
       user("u1", "改"),
       tool("e1", "Edit", { file_path: "/w/a.ts", old_string: "x", new_string: "y" }, { error: true, output: "denied" }),
     ];
-    render(<InspectorPanelContent messages={messages} request={{ tab: "changes", nonce: 1 }} onClose={() => {}} />);
-    const row = screen.getByTestId("pane-file");
+    render(<InspectorPanelContent messages={messages} onClose={() => {}} />);
+    const row = await screen.findByTestId("outputs-file");
     expect(row).toHaveTextContent("有失败");
     expect(row).toHaveTextContent("+0");
-    cleanup();
-    render(<InspectorPanelContent messages={[user("u1", "看看")]} request={{ tab: "changes", nonce: 1 }} onClose={() => {}} />);
-    expect(screen.getByText("还没有改动文件")).toBeInTheDocument();
   });
 });
 
@@ -207,13 +207,19 @@ describe("计划页与记忆", () => {
     expect(plan).toHaveTextContent("正在写代码");
   });
 
-  test("分区选择记在本机,下次打开停在同一分区", () => {
+  test("分区选择记在本机,下次打开停在同一分区;没记过 / r1 记的「改动」→ 产出", () => {
     render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
-    fireEvent.click(screen.getByRole("tab", { name: /改动/ }));
-    expect(localStorage.getItem(PANE_TAB_STORAGE_KEY)).toBe("changes");
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("tab", { name: /步骤/ }));
+    expect(localStorage.getItem(PANE_TAB_STORAGE_KEY)).toBe("steps");
     cleanup();
     render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
-    expect(screen.getByRole("tab", { name: /改动/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    cleanup();
+    localStorage.setItem(PANE_TAB_STORAGE_KEY, "changes");
+    render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
+    expect(screen.getByRole("tab", { name: "产出" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.queryByRole("tab", { name: /改动/ })).not.toBeInTheDocument();
   });
 
   test("按记忆直接展开的宽屏面板不抢焦点;有拖宽把手(separator)", () => {
@@ -255,7 +261,7 @@ describe("Codex r1 回归", () => {
 
   test("选中按 id:历史重载用同 id 的新对象替换后,详情显示新正文,计数与翻步还在", () => {
     const first = session();
-    const { rerender } = render(<InspectorPanelContent messages={first} onClose={() => {}} />);
+    const { rerender } = render(<InspectorPanelContent messages={first} request={STEPS} onClose={() => {}} />);
     fireEvent.click(screen.getAllByTestId("pane-step")[1]);
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 4");
     const reloaded = first.map((m) => (m.id === "t3" ? { ...m, output: "RELOADED-OUTPUT" } : { ...m }));

@@ -1299,8 +1299,8 @@ export function ProcessDisclosure<T>({
           type="button"
           data-testid="process-pane-changes"
           className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border border-border px-2.5 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-          title="在详情面板查看改动"
-          onClick={() => openPane("changes")}
+          title="在详情面板查看这一轮的产出"
+          onClick={() => openPane("outputs", processRows[0])}
         >
           <Pencil size={12} aria-hidden className="text-faint" />
           {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}

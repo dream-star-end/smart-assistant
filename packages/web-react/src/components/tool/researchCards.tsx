@@ -61,6 +61,9 @@ import {
   stripExternalEnvelope,
   unwrapCursorShellEnvelope,
 } from "./shellEnvelope";
+import { type WebSearchHit, parseWebSearchResults } from "./webSearchHits";
+
+export { type WebSearchHit, parseWebSearchResults };
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
 
@@ -923,30 +926,6 @@ function domainOf(url: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-export interface WebSearchHit {
-  title: string;
-  url: string;
-  snippet?: string;
-}
-
-// 后端 WebSearchTool 把结果拼成 `  - [title](url): snippet` 行(见 minimaxAdapter/
-// WebSearchTool.mapToolResultToToolResultBlockParam)。逐行解析,非结果行(标题/REMINDER)
-// 自然不匹配。纯函数:解析失败/空/畸形 → [](卡片据此回落通用文本块,UX 铁律)。
-const WEB_SEARCH_LINE = /^\s*-\s+\[(.+?)\]\(([^)]+)\)(?::\s*(.*))?$/;
-
-export function parseWebSearchResults(text: string | null | undefined): WebSearchHit[] {
-  if (!text) return [];
-  const hits: WebSearchHit[] = [];
-  for (const line of text.split("\n")) {
-    const m = WEB_SEARCH_LINE.exec(line);
-    if (!m) continue;
-    const url = (m[2] ?? "").trim();
-    if (!url) continue;
-    hits.push({ title: (m[1] ?? "").trim(), url, snippet: m[3]?.trim() || undefined });
-  }
-  return hits;
 }
 
 /** WebSearch 结果 → 来源列表富卡;解析不出结果 → null(调用方回落通用 OutputBlock)。 */

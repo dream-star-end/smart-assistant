@@ -2709,7 +2709,7 @@ export function App() {
   const artifactInspect = useMemo(
     () => ({
       open: (t: ArtifactInspectTarget) => openPane("steps", t.message),
-      openPane: (tab: PaneTab) => openPane(tab),
+      openPane: (tab: PaneTab, message?: ToolLike | null) => openPane(tab, message),
     }),
     [openPane],
   );

@@ -35,6 +35,8 @@ import {
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  Suspense,
+  lazy,
   useEffect,
   useId,
   useMemo,
@@ -45,15 +47,9 @@ import type { ChatMessage } from "../lib/chat/model";
 import { computeStepTimings, formatStepDuration } from "../lib/chat/stepTiming";
 import { cn } from "../lib/utils";
 import { extractLatestTodos, type TodoItem } from "./chat/PinnedTaskTracker";
-import {
-  collectFileChanges,
-  collectPaneSteps,
-  type FileChange,
-  type FileChangeEntry,
-  type PaneTurn,
-} from "./chat/workPane";
-import { ToolBody } from "./tool/lazyToolBody";
-import { ToolBodyFullContext, ToolHeaderLabelContext } from "./tool/context";
+import { CopyIconButton, FullToolBody } from "./chat/paneParts";
+import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
+import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
 import {
   type DisplayTool,
   type ToolLike,
@@ -67,7 +63,10 @@ import { resolveToolMeta, toolSummary } from "./tool/meta";
 import { parseShellEnvelope } from "./tool/shellEnvelope";
 import { resolveToolStatus } from "./tool/status";
 import { toneTileClass } from "./tool/tone";
-import { Badge, EmptyState, IconButton, Spinner, Tabs, useToast } from "./ui";
+import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs, useToast } from "./ui";
+
+// 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
+const OutputsView = lazy(() => import("./chat/OutputsView").then((m) => ({ default: m.OutputsView })));
 
 function codexChangesText(input: Record<string, unknown> | null): string {
   return asArr(input?.changes)
@@ -123,47 +122,13 @@ export function inspectorCopyText(display: DisplayTool): string {
   }
 }
 
-function CopyIconButton({
-  getText,
-  label = "复制全文",
-  doneText = "已复制全文",
-}: {
-  getText: () => string;
-  label?: string;
-  doneText?: string;
-}) {
-  const toast = useToast();
-  const [done, setDone] = useState(false);
-  return (
-    <IconButton
-      aria-label={label}
-      title={label}
-      size="sm"
-      shape="square"
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(getText());
-          setDone(true);
-          toast(doneText, "success");
-          setTimeout(() => setDone(false), 1500);
-        } catch {
-          // 剪贴板不可用(非安全上下文 / 权限拒绝):不能再静默,给用户一个出口(T-19)。
-          toast("复制失败，请手动选中文本复制", "error");
-        }
-      }}
-    >
-      {done ? <Check size={15} /> : <Copy size={15} />}
-    </IconButton>
-  );
-}
-
 function isEditableTarget(node: EventTarget | null): boolean {
   if (!(node instanceof HTMLElement)) return false;
   const tag = node.tagName;
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || node.isContentEditable;
 }
 
-export type PaneTab = "steps" | "changes" | "plan";
+export type PaneTab = "outputs" | "steps" | "plan";
 
 /**
  * 从面板外打开 / 定位面板的请求(工具卡入口、过程摘要上的「改动 N 个文件」、顶栏开关)。
@@ -171,7 +136,9 @@ export type PaneTab = "steps" | "changes" | "plan";
  * tab 缺省 = 只开面板(停在上次的分区)。
  */
 export type PaneRequest = {
-  tab?: PaneTab;
+  /** "changes" 是 r1 的改动页:改动并进了产出页,旧入口 / 旧记忆按产出处理。 */
+  tab?: PaneTab | "changes";
+  /** steps:要打开的那一步;outputs:这一轮里的任意一行(定位到它所在的那一轮)。 */
   message?: ToolLike | null;
   nonce: number;
   /** 发起请求时的会话;App 只把属于当前会话的请求交给面板(切会话后旧请求作废)。 */
@@ -313,14 +280,19 @@ export function writeDetailPaneOpen(open: boolean): void {
   }
 }
 
+function requestTab(tab: PaneTab | "changes"): PaneTab {
+  return tab === "changes" ? "outputs" : tab;
+}
+
 function readStoredTab(): PaneTab {
   try {
     const v = localStorage.getItem(PANE_TAB_STORAGE_KEY);
-    if (v === "steps" || v === "changes" || v === "plan") return v;
+    if (v === "steps" || v === "plan" || v === "outputs") return v;
   } catch {
     /* private mode */
   }
-  return "steps";
+  // 没记过 / r1 记的「改动」:产出页(改动已并进去)。
+  return "outputs";
 }
 
 function writeStoredTab(tab: PaneTab): void {
@@ -381,17 +353,6 @@ function StepHeader({ message }: { message: ToolLike }) {
       </div>
       <CopyIconButton getText={() => inspectorCopyText(normalizeToolForDisplay(message))} />
     </div>
-  );
-}
-
-function FullToolBody({ display }: { display: DisplayTool }) {
-  const meta = resolveToolMeta(display.name, display.input);
-  return (
-    <ToolBodyFullContext.Provider value={true}>
-      <ToolHeaderLabelContext.Provider value={meta.label}>
-        <ToolBody name={display.name} input={display.input} tool={display.tool} />
-      </ToolHeaderLabelContext.Provider>
-    </ToolBodyFullContext.Provider>
   );
 }
 
@@ -606,163 +567,13 @@ function StepList({
   );
 }
 
-function LineCounts({ added, removed }: { added: number; removed: number }) {
+function OutputsFallback() {
   return (
-    <span className="tabular-nums">
-      <span className="text-success">+{added}</span> <span className="text-danger">−{removed}</span>
-    </span>
-  );
-}
-
-function ChangesList({ changes, onPick }: { changes: FileChange[]; onPick: (path: string) => void }) {
-  if (changes.length === 0) {
-    return (
-      <EmptyState
-        icon={FileDiff}
-        title="还没有改动文件"
-        hint="助手编辑或写入文件后，这里按文件汇总每一次改动和增删行数。"
-      />
-    );
-  }
-  const added = changes.reduce((n, f) => n + f.added, 0);
-  const removed = changes.reduce((n, f) => n + f.removed, 0);
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto pb-2" data-testid="pane-change-list">
-      <p className="px-3 py-2 text-meta text-muted">
-        {changes.length} 个文件 · <LineCounts added={added} removed={removed} />
-      </p>
-      <ul>
-        {changes.map((file) => {
-          const dir = dirName(file.path);
-          return (
-            <li key={file.path}>
-              <button type="button" data-testid="pane-file" className={rowButtonClass} onClick={() => onPick(file.path)}>
-                <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-success-soft text-success">
-                  <FilePen size={13} />
-                </span>
-                <span className="min-w-0 flex-1" title={file.path}>
-                  <span className="block truncate text-body text-fg">{baseName(file.path)}</span>
-                  {dir && <span className="block truncate font-mono text-[12px] text-faint">{dir}</span>}
-                </span>
-                <span className="flex shrink-0 items-center gap-2 text-meta">
-                  {file.running && <Spinner size={13} className="text-accent" />}
-                  {file.hasError && (
-                    <Badge tone="danger" size="sm">
-                      有失败
-                    </Badge>
-                  )}
-                  <LineCounts added={file.added} removed={file.removed} />
-                  <span className="tabular-nums text-faint">{file.entries.length} 次</span>
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
+    <div className="space-y-3 px-4 py-4" data-testid="outputs-loading">
+      <Skeleton className="h-3 w-24" />
+      <Skeleton className="h-4 w-2/3" />
+      <Skeleton className="h-48 w-full rounded-xl" />
     </div>
-  );
-}
-
-const CHANGE_KIND_LABEL: Record<FileChangeEntry["kind"], string> = {
-  edit: "编辑",
-  write: "写入",
-  patch: "补丁",
-  shell: "命令写入",
-};
-
-/** 再次 Write 同一文件:按与上次写入全文的 diff 展示(合成一条 Edit 交给同一套 diff 渲染)。 */
-function entryDisplay(entry: FileChangeEntry): DisplayTool {
-  const display = normalizeToolForDisplay(entry.message);
-  if (entry.previousContent === undefined) return display;
-  const input = {
-    file_path: asStr(display.input?.file_path),
-    old_string: entry.previousContent,
-    new_string: asStr(display.input?.content),
-  };
-  return { name: "Edit", input, tool: { ...display.tool, toolName: "Edit", inputJson: input } };
-}
-
-function FileChangeEntryView({
-  entry,
-  n,
-  onOpenStep,
-}: {
-  entry: FileChangeEntry;
-  n: number;
-  onOpenStep: (message: ToolLike) => void;
-}) {
-  const status = resolveToolStatus(normalizeToolForDisplay(entry.message));
-  const kind =
-    entry.previousContent !== undefined ? "覆盖写入（与上次写入对比）" : CHANGE_KIND_LABEL[entry.kind];
-  return (
-    <section data-testid="pane-file-change" className="min-w-0">
-      <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-meta text-muted">
-        <span className="font-medium text-fg">第 {n} 次</span>
-        <span>{kind}</span>
-        {entry.added !== null && entry.removed !== null && status.kind !== "error" && (
-          <LineCounts added={entry.added} removed={entry.removed} />
-        )}
-        {status.isRunning ? (
-          <Spinner size={12} className="text-accent" />
-        ) : status.kind !== "done" ? (
-          <Badge tone={status.tone} size="sm">
-            {status.label}
-          </Badge>
-        ) : null}
-        <button
-          type="button"
-          className="ml-auto rounded text-accent outline-none hover:underline focus-visible:ring-2 focus-visible:ring-ring"
-          onClick={() => onOpenStep(entry.message)}
-        >
-          查看这一步
-        </button>
-      </div>
-      <FullToolBody display={entryDisplay(entry)} />
-    </section>
-  );
-}
-
-function FileDetail({
-  file,
-  onBack,
-  onOpenStep,
-}: {
-  file: FileChange;
-  onBack: () => void;
-  onOpenStep: (message: ToolLike) => void;
-}) {
-  return (
-    <>
-      <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1">
-        <button type="button" className={navButtonClass} onClick={onBack}>
-          <ChevronLeft size={14} aria-hidden />
-          全部改动
-        </button>
-        <span className="flex-1" />
-        <CopyIconButton getText={() => file.path} label="复制路径" doneText="已复制路径" />
-      </div>
-      <div className="shrink-0 border-b border-border px-4 py-3">
-        <h3 className="truncate font-mono text-body font-semibold text-fg" title={file.path}>
-          {baseName(file.path)}
-        </h3>
-        <div className="mt-0.5 truncate font-mono text-xs text-muted" title={file.path}>
-          {file.path}
-        </div>
-        <div className="mt-1 text-meta text-muted">
-          {file.entries.length} 次改动 · <LineCounts added={file.added} removed={file.removed} />
-        </div>
-      </div>
-      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-3 [overflow-wrap:anywhere]" data-testid="pane-file-body">
-        {file.entries.map((entry, i) => (
-          <FileChangeEntryView
-            key={`${entry.message.id}:${i}`}
-            entry={entry}
-            n={i + 1}
-            onOpenStep={onOpenStep}
-          />
-        ))}
-      </div>
-    </>
   );
 }
 
@@ -825,25 +636,34 @@ export function InspectorPanelContent({
   onActiveChange?: (message: ToolLike | null) => void;
   titleId?: string;
 }) {
-  const [tab, setTabState] = useState<PaneTab>(() => request?.tab ?? readStoredTab());
+  const [tab, setTabState] = useState<PaneTab>(() => (request?.tab ? requestTab(request.tab) : readStoredTab()));
   const [selected, setSelected] = useState<ToolLike | null>(() => (request?.tab === "steps" ? (request.message ?? null) : null));
-  const [filePath, setFilePath] = useState<string | null>(null);
   const fallbackTitleId = useId();
   const headingId = titleId ?? fallbackTitleId;
   const idBase = useId();
 
   const setTab = (next: PaneTab) => {
     setTabState(next);
-    setFilePath(null);
     writeStoredTab(next);
   };
 
   const { turns, steps } = collectPaneSteps(messages);
   // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
-  const changes = useMemo(() => collectFileChanges(messages), [messages, version]);
+  const workTurns = useMemo(() => collectWorkTurns(messages), [messages, version]);
   const todos = extractLatestTodos(messages, 0);
+  const lastTurn = workTurns.length - 1;
+  // 产出页看的那一轮:null = 最新一轮(新一轮开始时自动跟过去);翻到旧轮时记它的 key。
+  const turnKeyFor = (message: ToolLike | null | undefined): string | null => {
+    const i = turnIndexOf(workTurns, message as { id?: string } | null | undefined);
+    return i < 0 || i === lastTurn ? null : (workTurns[i]?.key ?? null);
+  };
+  const [turnKey, setTurnKey] = useState<string | null>(() =>
+    request && request.tab !== undefined && requestTab(request.tab) === "outputs" ? turnKeyFor(request.message) : null,
+  );
+  const keyedTurn = turnKey === null ? -1 : workTurns.findIndex((t) => t.key === turnKey);
+  const outputsIndex = keyedTurn >= 0 ? keyedTurn : lastTurn;
 
-  const view: PaneTab = tab === "plan" && todos.length === 0 ? "steps" : tab;
+  const view: PaneTab = tab === "plan" && todos.length === 0 ? "outputs" : tab;
   const latest = steps.at(-1)?.message ?? null;
   // 首次挂载带着请求(面板 / 底部抽屉刚打开)时和后续请求一样:运行中点开最新那张卡就跟随。
   const [follow, setFollow] = useState(
@@ -859,7 +679,6 @@ export function InspectorPanelContent({
   const shown: ToolLike | null = view === "steps" ? (follow ? latest : resolveSelected(selected)) : null;
   const index = shown ? steps.findIndex((s) => sameMessage(s.message, shown)) : -1;
   const following = follow && running && !!latest;
-  const file = view === "changes" && filePath ? (changes.find((f) => f.path === filePath) ?? null) : null;
 
   const handledNonce = useRef(request?.nonce);
   // biome-ignore lint/correctness/useExhaustiveDependencies: 只响应新请求(nonce);latest / running 取请求到来那一刻
@@ -867,9 +686,10 @@ export function InspectorPanelContent({
     if (!request || request.nonce === handledNonce.current) return;
     handledNonce.current = request.nonce;
     if (!request.tab) return;
-    setTabState(request.tab);
-    setFilePath(null);
-    if (request.tab === "steps") {
+    const next = requestTab(request.tab);
+    setTabState(next);
+    if (next === "outputs") setTurnKey(turnKeyFor(request.message));
+    if (next === "steps") {
       setSelected(request.message ?? null);
       // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
       setFollow(!!request.message && running && sameMessage(request.message, latest));
@@ -913,8 +733,8 @@ export function InspectorPanelContent({
 
   const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
   const tabItems = [
+    { value: "outputs", label: <span>产出</span> },
     { value: "steps", label: <span>步骤{count(steps.length)}</span> },
-    { value: "changes", label: <span>改动{count(changes.length)}</span> },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
 
@@ -963,12 +783,25 @@ export function InspectorPanelContent({
           ) : (
             <StepList turns={turns} total={steps.length} active={selected} onPick={pick} />
           )
-        ) : view === "changes" ? (
-          file ? (
-            <FileDetail file={file} onBack={() => setFilePath(null)} onOpenStep={openStep} />
-          ) : (
-            <ChangesList changes={changes} onPick={setFilePath} />
-          )
+        ) : view === "outputs" ? (
+          <Suspense fallback={<OutputsFallback />}>
+          <OutputsView
+            messages={messages}
+            turns={workTurns}
+            index={outputsIndex}
+            running={running && outputsIndex === lastTurn}
+            onSelectTurn={(i) => {
+              const t = workTurns[i];
+              if (t) setTurnKey(i === lastTurn ? null : t.key);
+            }}
+            onOpenSteps={() => {
+              setTab("steps");
+              setSelected(null);
+              setFollow(false);
+            }}
+            onOpenStep={openStep}
+          />
+          </Suspense>
         ) : (
           <PlanView todos={todos} />
         )}

@@ -2342,7 +2342,7 @@ describe("MessageList Manus 过程披露", () => {
 });
 
 describe("OCV5-370 过程摘要上的详情面板入口", () => {
-  test("本轮改过文件 → 常显「改动 N 个文件」,点开面板改动页;不展开过程本身", () => {
+  test("本轮改过文件 → 常显「改动 N 个文件」,点开面板里这一轮的产出;不展开过程本身", () => {
     const openPane = vi.fn();
     const messages = settledTurn();
     messages.splice(
@@ -2364,7 +2364,8 @@ describe("OCV5-370 过程摘要上的详情面板入口", () => {
     const chip = screen.getByTestId("process-pane-changes");
     expect(chip).toHaveTextContent("改动 1 个文件");
     fireEvent.click(chip);
-    expect(openPane).toHaveBeenCalledWith("changes");
+    // 带上这一轮的一行,面板据此定位到这一轮
+    expect(openPane).toHaveBeenCalledWith("outputs", expect.objectContaining({ _clientMessageId: "u1" }));
     expect(screen.getByTestId("process-toggle")).toHaveAttribute("aria-expanded", "false");
   });
 

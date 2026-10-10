@@ -91,8 +91,11 @@ export type ArtifactInspectTarget = { kind: "tool"; message: ToolLike };
 
 export type ArtifactInspect = {
   open?: (target: ArtifactInspectTarget) => void;
-  /** 打开详情面板的某个分区(过程摘要上的「改动 N 个文件」/「在详情面板查看步骤」)。 */
-  openPane?: (tab: "steps" | "changes") => void;
+  /**
+   * 打开详情面板的某个分区(过程摘要上的「改动 N 个文件」/「在详情面板查看步骤」)。
+   * outputs 带上这一轮里的任意一行,面板定位到那一轮的产出。
+   */
+  openPane?: (tab: "steps" | "outputs", message?: ToolLike | null) => void;
 };
 
 export const ArtifactInspectContext = createContext<ArtifactInspect>({});
