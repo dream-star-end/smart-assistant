@@ -175,34 +175,36 @@ describe("ChatHeader 会话内查找", () => {
   });
 });
 
-describe("ChatHeader 导出会话", () => {
-  it("无 onExport 时不渲染导出按钮", () => {
+// OCV5-369:右上角「导出会话」改为「分享会话」(行为有意改变,原导出用例随之更新)。
+describe("ChatHeader 分享会话", () => {
+  it("无 onShare 时不渲染分享按钮", () => {
     renderHeader();
+    expect(screen.queryByRole("button", { name: "分享会话" })).toBeNull();
     expect(screen.queryByRole("button", { name: "导出会话" })).toBeNull();
   });
 
-  it("有 onExport 时渲染导出按钮且点击回调", () => {
-    const onExport = vi.fn();
-    renderHeader({ onExport });
-    fireEvent.click(screen.getByRole("button", { name: "导出会话" }));
-    expect(onExport).toHaveBeenCalledTimes(1);
+  it("有 onShare 时渲染分享按钮且点击回调", () => {
+    const onShare = vi.fn();
+    renderHeader({ onShare });
+    fireEvent.click(screen.getByRole("button", { name: "分享会话" }));
+    expect(onShare).toHaveBeenCalledTimes(1);
   });
 
-  // C-12:窄屏导出键 hidden sm:flex 直接消失且无溢出菜单承接。
-  it("窄屏「更多操作」菜单承接导出(桌面键 hidden sm:flex,菜单 sm:hidden),菜单项调用 onExport", async () => {
-    const onExport = vi.fn();
-    renderHeader({ onExport });
-    expect(screen.getByRole("button", { name: "导出会话" })).toHaveClass("hidden", "sm:flex");
+  // C-12:窄屏独立按钮 hidden sm:flex,由「更多操作」菜单承接。
+  it("窄屏「更多操作」菜单承接分享(桌面键 hidden sm:flex,菜单 sm:hidden),菜单项调用 onShare", async () => {
+    const onShare = vi.fn();
+    renderHeader({ onShare });
+    expect(screen.getByRole("button", { name: "分享会话" })).toHaveClass("hidden", "sm:flex");
     const more = screen.getByRole("button", { name: "更多操作" });
     expect(more.parentElement).toHaveClass("sm:hidden");
     fireEvent.pointerDown(more, { button: 0, pointerType: "mouse" });
     fireEvent.click(more);
-    const item = await screen.findByRole("menuitem", { name: /导出会话/ });
+    const item = await screen.findByRole("menuitem", { name: /分享/ });
     fireEvent.click(item);
-    expect(onExport).toHaveBeenCalledTimes(1);
+    expect(onShare).toHaveBeenCalledTimes(1);
   });
 
-  it("无 onExport 时也不渲染「更多操作」", () => {
+  it("无 onShare 时也不渲染「更多操作」", () => {
     renderHeader();
     expect(screen.queryByRole("button", { name: "更多操作" })).toBeNull();
   });

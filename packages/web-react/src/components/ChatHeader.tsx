@@ -2,13 +2,13 @@ import type { CursorContextTier } from "@openclaude/protocol";
 import {
   Bell,
   ChevronDown,
-  Download,
   FolderOpen,
   Menu,
   MoreHorizontal,
   PanelLeft,
   PenSquare,
   Search,
+  Share2,
   ShieldCheck,
   Users,
   Wallet,
@@ -69,7 +69,7 @@ export function ChatHeader({
   onOpenMobileNav,
   onOpenInbox,
   onOpenFind,
-  onExport,
+  onShare,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
@@ -122,8 +122,8 @@ export function ChatHeader({
   onOpenInbox?: () => void;
   /** 打开会话内查找条（省略则不渲染查找键，如 demo）。按钮常驻，不随查找条开关挂卸载。 */
   onOpenFind?: () => void;
-  /** 导出会话为 Markdown（省略则不渲染，如 demo）。窄屏隐藏以免挤顶栏。 */
-  onExport?: () => void;
+  /** 打开「分享会话」(长图 + 文字,OCV5-369;省略则不渲染,如 demo)。窄屏收进「更多操作」菜单。 */
+  onShare?: () => void;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
@@ -368,20 +368,20 @@ export function ChatHeader({
             <Search size={18} />
           </IconButton>
         )}
-        {onExport && (
+        {onShare && (
           <IconButton
             data-product-control
-            onClick={onExport}
-            aria-label="导出会话"
-            title="导出会话"
+            onClick={onShare}
+            aria-label="分享会话"
+            title="分享会话"
             shape="square"
             className="hidden sm:flex"
           >
-            <Download size={18} />
+            <Share2 size={18} />
           </IconButton>
         )}
-        {/* 窄屏没有位置放独立导出键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
-        {onExport && (
+        {/* 窄屏没有位置放独立分享键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
+        {onShare && (
           <div className="sm:hidden">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -390,9 +390,9 @@ export function ChatHeader({
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem data-product-control onSelect={onExport}>
-                  <Download size={16} className="shrink-0 text-muted" />
-                  <span className="flex-1">导出会话</span>
+                <DropdownMenuItem data-product-control onSelect={onShare}>
+                  <Share2 size={16} className="shrink-0 text-muted" />
+                  <span className="flex-1">分享</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

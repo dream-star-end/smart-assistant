@@ -242,6 +242,7 @@ const MediaTaskCenter = lazy(() =>
 const ChatGptProxyDialog = lazy(() =>
   import("./components/ChatGptProxyDialog").then((m) => ({ default: m.ChatGptProxyDialog })),
 );
+const ShareDialog = lazy(() => import("./components/ShareDialog").then((m) => ({ default: m.ShareDialog })));
 const TaskboardView = lazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
@@ -483,6 +484,7 @@ export function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
   const inboxMounted = useMountedOnce(inboxOpen);
   const [findOpen, setFindOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const paletteMounted = useMountedOnce(paletteOpen);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
@@ -2263,6 +2265,11 @@ export function App() {
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  // 分享对话框只针对打开时的会话;切会话(返回键/深链)就关掉,不拿旧快照配新标题。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是触发条件
+  useEffect(() => {
+    setShareOpen(false);
+  }, [activeId]);
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
@@ -3971,19 +3978,7 @@ export function App() {
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
-          onExport={
-            demo
-              ? undefined
-              : async () => {
-                  const md = await exportSessionMarkdown(wsMessages);
-                  saveBlob(
-                    new Blob([md], {
-                      type: "text/markdown;charset=utf-8",
-                    }),
-                    sessionExportFilename(activeSess?.title),
-                  );
-                }
-          }
+          onShare={demo ? undefined : () => setShareOpen(true)}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
@@ -4625,6 +4620,29 @@ export function App() {
               //(与教程 starterPrompt / 编辑重发同一条 prefill 路),用户改一改就能再发。
               setMediaTasksOpen(false);
               setComposerPrefill({ text: prompt, nonce: Date.now() });
+            }}
+          />
+        </LazyBoundary>
+      )}
+
+      {/* OCV5-369:右上角「分享会话」。原 Markdown 导出收进对话框的次要入口。 */}
+      {!demo && shareOpen && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ShareDialog
+            open={shareOpen}
+            onOpenChange={setShareOpen}
+            messages={wsMessages}
+            sending={sending}
+            title={activeSess?.title}
+            agentName={agent.name || "助手"}
+            onExportMarkdown={async () => {
+              const md = await exportSessionMarkdown(wsMessages);
+              saveBlob(
+                new Blob([md], {
+                  type: "text/markdown;charset=utf-8",
+                }),
+                sessionExportFilename(activeSess?.title),
+              );
             }}
           />
         </LazyBoundary>
