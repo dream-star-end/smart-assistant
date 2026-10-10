@@ -45,6 +45,15 @@
     "expect": "pass"
   },
   {
+    "name": "commercial-cj-volc-gz-pass",
+    "manifest": "valid-commercial.json",
+    "hostname": "cj-volc-gz",
+    "installRoot": "/opt/openclaude/openclaude-v5",
+    "dbName": "openclaude",
+    "env": {},
+    "expect": "pass"
+  },
+  {
     "name": "commercial-selfhost-env-fail",
     "manifest": "valid-commercial.json",
     "hostname": "kl-mirror",
@@ -74,6 +83,16 @@
     "sidecar18992": true,
     "expect": "fail",
     "errorContains": "cannot be upgraded"
+  },
+  {
+    "name": "selfhost-cj-volc-gz-host-fail",
+    "manifest": "valid-selfhost.json",
+    "hostname": "cj-volc-gz",
+    "installRoot": "/opt/openclaude/openclaude-v5-selfhost",
+    "dbName": "openclaude_v5_selfhost",
+    "env": {},
+    "expect": "fail",
+    "errorContains": "hostname"
   },
   {
     "name": "selfhost-wrong-host-fail",

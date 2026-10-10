@@ -290,7 +290,7 @@ export function resolveFlavorIdentity(signals: FlavorSignals = {}): FlavorIdenti
     /* host positive proof */
   } else if (dockerenv) {
     const otherHosts = manifest.flavor === "selfhost"
-      ? ["kl-mirror", "ser135234097086"]
+      ? ["kl-mirror", "ser135234097086", "cj-volc-gz"]
       : ["v3-dev-sg"];
     if (otherHosts.includes(hostname)) {
       throw new FlavorIdentityError(

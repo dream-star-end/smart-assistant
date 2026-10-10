@@ -83,6 +83,34 @@ describe("assertFlavorIdentity fixtures", () => {
   }
 });
 
+describe("commercial mainland host cj-volc-gz", () => {
+  test("commercial manifest on cj-volc-gz passes identity", () => {
+    const got = assertFlavorIdentity({
+      manifestPath: writeFixture("valid-commercial.json"),
+      hostname: "cj-volc-gz",
+      installRoot: "/opt/openclaude/openclaude-v5",
+      dbName: "openclaude",
+      env: { OC_FLAVOR_DOCKERENV: "0" },
+      dockerenv: false,
+    });
+    assert.equal(got.status, "ok");
+  });
+
+  test("selfhost manifest in a container on cj-volc-gz fails as other-flavor host", () => {
+    assert.throws(
+      () => assertFlavorIdentity({
+        manifestPath: writeFixture("valid-selfhost.json"),
+        hostname: "cj-volc-gz",
+        installRoot: "/opt/openclaude/openclaude-v5-selfhost",
+        dbName: "openclaude_v5_selfhost",
+        dockerenv: true,
+        env: {},
+      }),
+      /belongs to the other flavor/,
+    );
+  });
+});
+
 describe("missing manifest", () => {
   test("skips when no manifest is present", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "flavor-none-"));
