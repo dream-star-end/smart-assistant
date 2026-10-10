@@ -51,6 +51,13 @@ describe("parseUiBlock", () => {
     expect(escapeStrayQuotes('{"a":"他说"你好"","b":""}')).toBe('{"a":"他说\\"你好\\"","b":""}');
     // 修不出完整对象(引号后紧跟英文逗号)时仍按原文降级,不会截掉后半段文字。
     expect(parseUiBlock('{"type":"callout","body":"a"b", c"}', false)).toEqual({ ok: false, reason: "invalid" });
+    // 正文里的 `"}` 不能被当成对象结尾而截掉后半段(Codex 第 3 轮):修不出整块就按原文降级。
+    expect(parseUiBlock('{"type":"callout","body":"请保留"字段"}后的全部文字"}', false)).toEqual({ ok: false, reason: "invalid" });
+    expect(parseUiBlock('{"type":"callout","body":"请保留"字段"后的全部文字"}', false)).toEqual({
+      ok: true,
+      value: { type: "callout", body: '请保留"字段"后的全部文字' },
+      complete: true,
+    });
     // 流式中途不做这项修复(半截补全照旧),写完后才修。
     expect(parseUiBlock('{"type":"callout","body":"对"社会', true)).toMatchObject({ ok: true, complete: false });
   });

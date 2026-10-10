@@ -228,9 +228,10 @@ export function parseUiBlock(code: string, allowPartial: boolean): ParseResult {
 
   const result = parseSource(code, allowPartial);
   if (result.ok) return result;
-  // 宽容修复:正文里没转义的双引号。修完必须是一个完整的对象才采用(不和半截补全叠加,免得悄悄丢字)。
-  const escaped = sliceFirstObject(escapeStrayQuotes(code));
-  const v = escaped ? tryParseObject(escaped) ?? tryParseObject(stripTrailingCommas(escaped)) : null;
+  // 宽容修复:正文里没转义的双引号。修完后整块(对象后不许再有文字)必须能解析才采用;
+  // 不截取首个对象、不和半截补全叠加 —— 正文里的 `"}` 会被当成结尾,截取会悄悄丢掉后半段。
+  const escaped = escapeStrayQuotes(code).trim();
+  const v = tryParseObject(escaped) ?? tryParseObject(stripTrailingCommas(escaped));
   return v ? { ok: true, value: v, complete: true } : result;
 }
 
