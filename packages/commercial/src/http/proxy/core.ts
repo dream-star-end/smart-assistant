@@ -41,6 +41,7 @@ import {
   isProviderBoundHistoryError,
   isClientAbort,
   pipeStreamWithUsageCapture,
+  streamInterruptedSseFrame,
   sendJsonError,
   stripProviderBoundAssistantBlocks,
   errSummary,
@@ -490,6 +491,16 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         outcome: result.error === null ? "success" : "error",
       },
     );
+    // OCV5-328: an upstream that broke off mid-message must not read as a
+    // finished response. Not after a client abort (nobody is listening) and
+    // not once the terminal frames went out (the message is complete).
+    if (result.error !== null && !isClientAbort(result.error) && observed.kind !== "final") {
+      try {
+        res.write(streamInterruptedSseFrame(requestId));
+      } catch {
+        /* downstream already gone */
+      }
+    }
     try {
       res.end();
     } catch {
