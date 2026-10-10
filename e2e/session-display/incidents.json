@@ -6574,6 +6574,41 @@
           "assertion": "automatic retry lineage climbs 1..10 and stops"
         }
       ]
+    },
+    {
+      "id": "INC-20261010-BOX-OUTPUT-LIMIT-RESUME",
+      "occurredAt": "2026-10-10",
+      "severity": "P1",
+      "symptom": "商业版 #8bbb12ed（box-api-claude-opus-5-5，已执行 18 步，09:21–09:35 CST）：最后一次模型调用把 32000 的输出上限全部用在 thinking 上、以 max_tokens 结束；Box 上的 Claude Code 照例写了自己的 synthetic 续写 user 记录（“Output token limit hit. Resume directly …”）并在新消息里把回答写完（7040 tokens，end_turn，result success）。压缩守卫把“模型开始后的任何 synthetic user 记录”都当成压缩，续轮以 BOX_CLI_COMPACT_PHASE 失败；代理结束响应，回合显示「这轮没有回复」，前 9 次调研步骤扣了 361 积分，回答被丢弃。修复：decoder 在 stop_reason=max_tokens 的 message_stop 之后，把只有一个短文本块的顶层 synthetic user 记录当作 CLI 的续写，丢掉被扣住的 max_tokens 结尾，把下一条模型消息并入同一条可见消息（同 OCV5-301），两次调用的用量都计费；最多 3 次（Claude Code 自身的上限）；只校验形态不校验措辞；其它位置的 synthetic 记录仍按原规则拒绝。在线续轮、terminal recovery、unknown observer 三处都把这条记录交给 decoder。",
+      "rootFixCommit": "3b67d26f",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261010-output-limit-resume] PASS — a message the CLI resumed after max_tokens reaches the client as one answer and both calls are journaled for billing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.outputLimit.test.ts",
+          "assertion": "a max_tokens cut resumed by the CLI settles as one answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.outputLimit.test.ts",
+          "assertion": "a resumed message may end in a tool call and hand off with summed usage"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.outputLimit.test.ts",
+          "assertion": "a synthetic user turn anywhere else still fails closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and billed once"
+        }
+      ]
     }
   ]
 }

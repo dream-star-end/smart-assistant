@@ -1422,6 +1422,52 @@ async function proveUpstreamRefusal(api: Api, db: Db): Promise<string> {
   return "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once, its retries are not seen as still resolving, and the next message runs";
 }
 
+// INC-20261010-BOX-OUTPUT-LIMIT-RESUME, live 2026-10-10 01:35Z (commercial
+// #8bbb12ed, uid 4): the final message spent its whole output cap and stopped
+// at max_tokens. Claude Code wrote its own resume turn ("Output token limit
+// hit. Resume directly ...") and finished the answer in a new message, but the
+// resume turn was rejected as an in-model compaction: the turn showed no reply
+// and the answer was dropped. The resumed message joins the visible one, the
+// answer reaches the client and both upstream calls are journaled for billing.
+async function proveOutputLimitResume(api: Api, db: Db): Promise<string> {
+  const who = { uid: 900_000_368n, containerId: 368n, sessionId: "session-output-limit-resume" };
+  const journal = api.journal(db);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'output-limit-resume@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turnKey = "9".repeat(64);
+  await prechecked(api, db, { ...who, requestId: "box-output-limit-resume", turnKey });
+  // shape of Claude Code 2.1.296's record in the live spool
+  const resume = { type: "user", isSynthetic: true, parent_tool_use_id: null,
+    session_id: "12345678-1234-4123-8123-123456789abc", uuid: "87654321-4321-4321-8321-cba987654321",
+    message: { role: "user", content: [{ type: "text", text: "Output token limit hit. Resume directly — no apology, "
+      + "no recap of what you were doing. Pick up mid-thought if that is where the cut happened. "
+      + "Break remaining work into smaller pieces." }] } };
+  const spool = [cliInit, start("msg_cut"), ...say("msg_cut", 0, "Weighing the two techniques."),
+    ...stop("max_tokens", 32000), resume, { type: "system", subtype: "status", status: "requesting" },
+    start("msg_resumed"), ...say("msg_resumed", 0, "VLBI is needed for the frame."), ...stop("end_turn", 7040),
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 20, output_tokens: 39040 } }];
+  let stops = 0;
+  const host = boxHost(api, spoolOf(spool), { real: { journal, ...who, requestId: "box-output-limit-resume", turnKey,
+    stopRejectedRun: async (identity) => { stops++; return api.stopCoordinator(journal, host.target).requestStop(identity); } } });
+  const answered = await must("OUTPUT_LIMIT_RESUME_ROUND", host.round());
+  const sse = host.sse();
+  if (answered.kind !== "final") fail(`OUTPUT_LIMIT_RESUME_KIND_${answered.kind}`);
+  if (!sse.includes("Weighing the two techniques.") || !sse.includes("VLBI is needed for the frame.")) {
+    fail("OUTPUT_LIMIT_RESUME_ANSWER_DROPPED");
+  }
+  if ((sse.match(/event: message_start/g) ?? []).length !== 1) fail("OUTPUT_LIMIT_RESUME_NOT_ONE_MESSAGE");
+  if (sse.includes("max_tokens") || sse.includes("Output token limit")) fail("OUTPUT_LIMIT_RESUME_CUT_VISIBLE");
+  if (!/"stop_reason":"end_turn"/.test(sse)) fail("OUTPUT_LIMIT_RESUME_NO_END_TURN");
+  if (stops !== 0 || host.count.launch !== 1) fail("OUTPUT_LIMIT_RESUME_STOP_OR_LAUNCH_COUNT");
+  const row = await journalRow(db, "box-output-limit-resume");
+  const usage = row?.ctx.boxUsage as { inputTokens?: number; outputTokens?: number } | undefined;
+  if (row?.ctx.boxState !== "terminal") fail(`OUTPUT_LIMIT_RESUME_ROW_${row?.state}_${String(row?.ctx.boxState)}`);
+  if (usage?.inputTokens !== 20 || usage.outputTokens !== 39040) {
+    fail(`OUTPUT_LIMIT_RESUME_USAGE_${usage?.inputTokens}_${usage?.outputTokens}`);
+  }
+  return "[inc-20261010-output-limit-resume] PASS — a message the CLI resumed after max_tokens reaches the client as one answer and both calls are journaled for billing";
+}
+
 /** A Box tool turn as egress serves it: the product's BoxToolFetch on the real
  * journal, with one Box account behind it. `first` is the round that hands the
  * tool call to the client; `next` sends the client's tool result back. */
@@ -2886,7 +2932,8 @@ async function main(): Promise<void> {
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
-      await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db)]),
+      await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
+      await proveOutputLimitResume(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);
