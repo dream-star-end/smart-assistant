@@ -401,42 +401,100 @@ type Line = {
   lh: number;
   /** 连续同 bg 的行合成一块底(代码灰底 / 引用竖线 / 表格框)。 */
   bg?: "code" | "quote" | "table";
-  /** 表格行:各单元格文字与相对 x。 */
-  cells?: { text: string; x: number }[];
+  /** 表格行:各单元格(格内已换行)与相对 x;lh 是整行高度。 */
+  cells?: { lines: string[]; x: number }[];
+  /** 表格行:列分隔线的相对 x。 */
+  dividers?: number[];
   header?: boolean;
 };
 
 const CELL_PAD = 10;
+const CELL_VPAD = 6;
+/** 列宽下限:约三个汉字,再窄就读不成句。 */
+const MIN_COL = 15 * 3 + CELL_PAD * 2;
 
-/** 表格能横向放下(每格单行)时画成网格,否则退回「列1 · 列2」逐行文字。 */
+/**
+ * 列宽:先按单行自然宽度;放不下时短列保留自然宽度,剩下的宽度按自然宽度比例分给长列,
+ * 长列格内换行(OCV5-371)。列多到连下限都放不下时返回 null,退回「列1 · 列2」逐行文字。
+ */
+export function tableColumnWidths(natural: readonly number[], width: number): number[] | null {
+  const cols = natural.length;
+  if (cols === 0 || cols * MIN_COL > width) return null;
+  const total = natural.reduce((a, b) => a + b, 0);
+  // 放得下:富余宽度平均分给各列,表格铺满卡片内宽。
+  if (total <= width) return natural.map((w) => w + (width - total) / cols);
+  const out = new Array<number>(cols).fill(0);
+  let open = natural.map((_, i) => i);
+  let left = width;
+  // 注水:自然宽度不超过平均份额的列按自然宽度定下,其余列继续分剩下的宽度。
+  for (;;) {
+    const share = left / open.length;
+    const fixed = open.filter((i) => Math.max(natural[i], MIN_COL) <= share);
+    if (fixed.length === 0) break;
+    for (const i of fixed) {
+      out[i] = Math.max(natural[i], MIN_COL);
+      left -= out[i];
+    }
+    open = open.filter((i) => !fixed.includes(i));
+    if (open.length === 0) break;
+  }
+  if (open.length) {
+    const rest = open.reduce((a, i) => a + natural[i], 0);
+    // 按比例分,但每列不少于下限;下限挤占的部分从最宽的列里扣。
+    const shares = open.map((i) => Math.max(MIN_COL, (left * natural[i]) / rest));
+    let over = shares.reduce((a, b) => a + b, 0) - left;
+    const order = open.map((_, k) => k).sort((a, b) => shares[b] - shares[a]);
+    for (const k of order) {
+      if (over <= 0) break;
+      const take = Math.min(over, shares[k] - MIN_COL);
+      shares[k] -= take;
+      over -= take;
+    }
+    open.forEach((i, k) => {
+      out[i] = shares[k];
+    });
+  } else if (left > 0) {
+    // 全部按自然宽度定下后仍有富余,平均分掉。
+    for (let i = 0; i < cols; i++) out[i] += left / cols;
+  }
+  return out;
+}
+
+/** 表格画成网格,长单元格在格内换行;列太多时返回 null。 */
 function tableLines(rows: Extract<ShareBlock, { kind: "row" }>[], width: number, measure: Measure, fg: string): Line[] | null {
   const cols = Math.max(...rows.map((r) => r.cells.length));
-  const widths = new Array<number>(cols).fill(0);
+  const natural = new Array<number>(cols).fill(MIN_COL);
   for (const r of rows) {
     r.cells.forEach((c, i) => {
-      widths[i] = Math.max(widths[i], measure(c, r.header ? F.bold : F.body) + CELL_PAD * 2);
+      natural[i] = Math.max(natural[i], measure(c, r.header ? F.bold : F.body) + CELL_PAD * 2);
     });
   }
-  const total = widths.reduce((a, b) => a + b, 0);
-  if (total > width) return null;
-  // 富余宽度平均分给各列,表格铺满卡片内宽。
-  const extra = (width - total) / cols;
+  const widths = tableColumnWidths(natural, width);
+  if (!widths) return null;
   const xs: number[] = [];
+  const dividers: number[] = [];
   let x = 0;
-  for (const w of widths) {
+  widths.forEach((w, i) => {
     xs.push(x + CELL_PAD);
-    x += w + extra;
-  }
-  return rows.map((r) => ({
-    text: "",
-    font: r.header ? F.bold : F.body,
-    color: fg,
-    indent: 0,
-    lh: LH.body + 12,
-    bg: "table" as const,
-    header: r.header,
-    cells: r.cells.map((c, i) => ({ text: c, x: xs[i] })),
-  }));
+    x += w;
+    if (i < cols - 1) dividers.push(Math.round(x));
+  });
+  return rows.map((r) => {
+    const font = r.header ? F.bold : F.body;
+    const cells = widths.map((w, i) => ({ lines: wrapText(r.cells[i] ?? "", w - CELL_PAD * 2, font, measure), x: xs[i] }));
+    const rowLines = Math.max(1, ...cells.map((c) => c.lines.length));
+    return {
+      text: "",
+      font,
+      color: fg,
+      indent: 0,
+      lh: rowLines * LH.body + CELL_VPAD * 2,
+      bg: "table" as const,
+      header: r.header,
+      cells,
+      dividers,
+    };
+  });
 }
 
 /** 一条消息的正文行(含截断)。 */
@@ -469,7 +527,8 @@ function messageLines(
     } else if (b.kind === "rule") lines.push({ text: "────────", font: F.body, color: C.border, indent: 0, lh: LH.body });
     else if (b.kind === "row") {
       const rows: Extract<ShareBlock, { kind: "row" }>[] = [b];
-      while (blocks[bi + 1]?.kind === "row") rows.push(blocks[++bi] as Extract<ShareBlock, { kind: "row" }>);
+      // 表头行开启一张新表:两张表中间只隔空行时也各算各的列宽(OCV5-371)。
+      for (let nb = blocks[bi + 1]; nb?.kind === "row" && !nb.header; nb = blocks[bi + 1]) rows.push(blocks[++bi] as Extract<ShareBlock, { kind: "row" }>);
       const grid = tableLines(rows, width, measure, fg);
       if (grid) lines.push(...grid);
       else for (const r of rows) push(r.cells.filter(Boolean).join("  ·  "), r.header ? F.bold : F.body, fg, 0, LH.body);
@@ -484,7 +543,9 @@ function messageLines(
   let truncated = false;
   let textLines = 0;
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].lh >= LH.code) textLines++;
+    const cellLines = lines[i].cells ? Math.max(...(lines[i].cells ?? []).map((c) => c.lines.length), 1) : 0;
+    if (cellLines) textLines += cellLines;
+    else if (lines[i].lh >= LH.code) textLines++;
     if (textLines > SHARE_MAX_LINES_PER_MESSAGE) {
       lines.length = i;
       truncated = true;
@@ -517,8 +578,11 @@ function drawLines(lines: readonly Line[], x: number, y: number, width: number, 
         if (line.cells) {
           if (line.header) ops.push({ t: "rect", x: x + 1, y: cy + 1, w: width - 2, h: line.lh - 1, r: 7, fill: C.codeBg });
           else if (k > i) ops.push({ t: "rect", x, y: cy, w: width, h: 1, r: 0, fill: C.border });
+          for (const d of line.dividers ?? []) ops.push({ t: "rect", x: x + d, y: cy, w: 1, h: line.lh, r: 0, fill: C.border });
           for (const c of line.cells) {
-            ops.push({ t: "text", x: x + c.x, y: cy + 9, text: c.text, font: line.font, color: line.color });
+            c.lines.forEach((text, n) => {
+              if (text) ops.push({ t: "text", x: x + c.x, y: cy + CELL_VPAD + 3 + n * LH.body, text, font: line.font, color: line.color });
+            });
           }
         } else if (line.text) {
           ops.push({ t: "text", x: x + (l.bg === "code" ? 10 : 12), y: cy + 3, text: line.text, font: line.font, color: line.color });

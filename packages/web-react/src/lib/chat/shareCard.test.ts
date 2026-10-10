@@ -9,6 +9,7 @@ import {
   shareImageFilename,
   shareText,
   stripInline,
+  tableColumnWidths,
   wrapText,
 } from "./shareCard";
 
@@ -231,6 +232,34 @@ describe("wrapText", () => {
   });
 });
 
+describe("tableColumnWidths", () => {
+  const sum = (a: readonly number[] | null) => (a ?? []).reduce((x, y) => x + y, 0);
+
+  test("放得下时富余平均分,铺满宽度", () => {
+    expect(tableColumnWidths([100, 200], 400)).toEqual([150, 250]);
+  });
+
+  test("放不下时短列保留自然宽度,长列分剩下的,总宽不超", () => {
+    const w = tableColumnWidths([90, 1500], 468);
+    expect(w?.[0]).toBe(90);
+    expect(w?.[1]).toBeCloseTo(378);
+    expect(sum(w)).toBeCloseTo(468);
+  });
+
+  test("多个长列按自然宽度比例分,每列不低于下限", () => {
+    const w = tableColumnWidths([70, 2000, 1000, 100], 468);
+    expect(w).not.toBeNull();
+    expect(sum(w)).toBeCloseTo(468);
+    for (const x of w ?? []) expect(x).toBeGreaterThanOrEqual(65);
+    expect((w?.[1] ?? 0) > (w?.[2] ?? 0)).toBe(true);
+  });
+
+  test("列数乘下限超过宽度时返回 null", () => {
+    expect(tableColumnWidths(new Array(8).fill(100), 468)).toBeNull();
+    expect(tableColumnWidths([], 468)).toBeNull();
+  });
+});
+
 describe("layoutShareCard", () => {
   const base = { title: "周末安排", agentName: "全能助手", now: new Date(2026, 9, 10) };
 
@@ -251,15 +280,56 @@ describe("layoutShareCard", () => {
     expect(layout.ops[0]).toMatchObject({ t: "rect", h: layout.height });
   });
 
-  test("表格放得下时画成网格(每格单独一段文字),放不下退回逐行文字", () => {
+  test("表格放得下时画成网格(每格单独一段文字)", () => {
     const table = "| 人数 | 牛肉 |\n| --- | --- |\n| 4 人 | 400g |";
     const grid = layoutShareCard({ ...base, messages: [{ role: "assistant", text: table }] }, measure);
     const gridTexts = grid.ops.flatMap((o) => (o.t === "text" ? [o.text] : []));
     expect(gridTexts).toEqual(expect.arrayContaining(["人数", "牛肉", "4 人", "400g"]));
-    const wide = `| ${"很长的列".repeat(20)} | b |\n| --- | --- |\n| x | y |`;
-    const flat = layoutShareCard({ ...base, messages: [{ role: "assistant", text: wide }] }, measure);
-    const flatTexts = flat.ops.flatMap((o) => (o.t === "text" ? [o.text] : []));
-    expect(flatTexts).toContain("x  ·  y");
+  });
+
+  // OCV5-371:宽表格以前整张退回「a · b」逐行文字,现在保持网格、长单元格在格内换行。
+  test("宽表格仍画成网格:短列保留宽度,长单元格在本列内换行,有列分隔线", () => {
+    const long = "成都到青城前山再到都江堰一日游回成都约八点半出门晚上六点半到家".repeat(2);
+    const wide = `| 哪天 | 做什么 |\n| --- | --- |\n| 周日 | ${long} |`;
+    const layout = layoutShareCard({ ...base, messages: [{ role: "assistant", text: wide }] }, measure);
+    const texts = layout.ops.filter((o): o is Extract<typeof o, { t: "text" }> => o.t === "text");
+    // 不再是「周日  ·  …」那种逐行退回文字。
+    expect(texts.some((o) => o.text.includes("  ·  "))).toBe(false);
+    const day = texts.find((o) => o.text === "周日");
+    const pieces = texts.filter((o) => long.includes(o.text) && o.text.length > 1 && o.text !== "周日");
+    expect(day).toBeTruthy();
+    expect(pieces.length).toBeGreaterThan(1);
+    expect(pieces.map((p) => p.text).join("")).toBe(long);
+    // 同一列同一 x,逐行往下;首行与「周日」同一行。
+    expect(new Set(pieces.map((p) => p.x)).size).toBe(1);
+    expect(pieces[0].y).toBe(day?.y);
+    expect(pieces[1].y).toBeGreaterThan(pieces[0].y);
+    // 每段都在卡片内宽里(卡片右缘 = 540 - 20 - 16)。
+    for (const p of pieces) expect(p.x + measure(p.text, p.font)).toBeLessThanOrEqual(540 - 20 - 16);
+    // 「做什么」列起点在「周日」右边,中间有一条竖分隔线。
+    expect(pieces[0].x).toBeGreaterThan((day?.x ?? 0) + measure("周日", ""));
+    const rects = layout.ops.filter((o): o is Extract<typeof o, { t: "rect" }> => o.t === "rect");
+    expect(rects.some((r) => r.w === 1 && r.x > (day?.x ?? 0) && r.x < pieces[0].x)).toBe(true);
+  });
+
+  test("相邻两张表各自成表,列宽互不影响", () => {
+    const two = "| 哪天 | 做什么 |\n| --- | --- |\n| 周六 | 吃火锅 |\n\n| 项目 | 单价 | 数量 | 备注 |\n| --- | --- | --- | --- |\n| 门票 | 80 | 4 | 实名预约 |";
+    const layout = layoutShareCard({ ...base, messages: [{ role: "assistant", text: two }] }, measure);
+    const texts = layout.ops.filter((o): o is Extract<typeof o, { t: "text" }> => o.t === "text");
+    const at = (t: string) => texts.find((o) => o.text === t);
+    // 第一张表两列、第二张表四列:第二列起点不同,说明没有合成一张 4 列表。
+    expect(at("做什么")?.x).not.toBe(at("单价")?.x);
+    // 两张表是两个带边框的底块。
+    const boxes = layout.ops.filter((o) => o.t === "rect" && o.stroke && o.r === 8);
+    expect(boxes).toHaveLength(2);
+  });
+
+  test("列多到每列不足三个字宽时退回逐行文字", () => {
+    const cols = Array.from({ length: 8 }, (_, i) => `列${i}`);
+    const many = `| ${cols.join(" | ")} |\n| ${cols.map(() => "---").join(" | ")} |\n| ${cols.map((_, i) => `值${i}`).join(" | ")} |`;
+    const layout = layoutShareCard({ ...base, messages: [{ role: "assistant", text: many }] }, measure);
+    const texts = layout.ops.flatMap((o) => (o.t === "text" ? [o.text] : []));
+    expect(texts.some((t) => t.startsWith("值0  ·  值1  ·  值2"))).toBe(true);
   });
 
   test("代码块的底色块完整落在助手卡片内(留白计入高度)", () => {
