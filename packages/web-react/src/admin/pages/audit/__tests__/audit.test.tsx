@@ -277,8 +277,8 @@ describe("AuditPage", () => {
     expect(screen.getByText("NO_OUTPUT")).toBeTruthy();
     expect(screen.getAllByText("IMAGE_UPSTREAM_RATE_LIMITED").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("workspace_timeout")).toBeTruthy();
-    expect(screen.getByText("问题卡")).toBeTruthy();
-    expect(screen.getByText("近窗没有问题卡事件。")).toBeTruthy();
+    expect(await screen.findByText("问题卡")).toBeTruthy();
+    expect(await screen.findByText("近窗没有问题卡事件。")).toBeTruthy();
   });
 
   test("问题卡区块有数据时渲染漏斗与裁决", async () => {
@@ -331,7 +331,8 @@ describe("AuditPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
 
     expect(await screen.findByText("问题卡")).toBeTruthy();
-    expect(screen.getAllByText("upstream_failed").length).toBeGreaterThanOrEqual(1);
+    // 区块标题先于数据渲染；等数据行出现再做同步断言（单 worker 跑全量时偶发先断言）。
+    expect((await screen.findAllByText("upstream_failed")).length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("immediate")).toBeTruthy();
     // 双窗对象被展平：24h 与 7d 各一行，window 标由前端补齐。
     expect(screen.getByText("24h")).toBeTruthy();
@@ -360,7 +361,7 @@ describe("AuditPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
 
     expect(await screen.findByText("问题卡")).toBeTruthy();
-    expect(screen.getByText("近窗没有问题卡事件。")).toBeTruthy();
+    expect(await screen.findByText("近窗没有问题卡事件。")).toBeTruthy();
     expect(screen.getByText("暂无裁决")).toBeTruthy();
     expect(screen.getByText("暂无任务")).toBeTruthy();
     expect(screen.getByText("暂无占位")).toBeTruthy();
