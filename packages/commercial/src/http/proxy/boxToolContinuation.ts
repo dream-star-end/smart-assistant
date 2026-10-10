@@ -111,7 +111,9 @@ export async function runBoxToolContinuation(input: {
       let record: unknown;
       try { record = JSON.parse(line.text); }
       catch { throw new BoxToolContinuationError("BOX_TOOL_CONTINUATION_RECORD_INVALID"); }
-      if (compaction) {
+      // OCV5-368: the CLI's resume after max_tokens goes to the decoder.
+      const resume = decoder.outputLimitResumeDue(record);
+      if (compaction && !resume) {
         try {
           if (compaction.take(record, modelStarted ? "in-model" : "pre-model")) continue;
         } catch (error) {
@@ -123,7 +125,7 @@ export async function runBoxToolContinuation(input: {
       }
       if (record && typeof record === "object" && !Array.isArray(record)
         && (record as { type?: unknown }).type === "user"
-        && !(modelStarted && decoder.awaitingCliToolError())
+        && !resume && !(modelStarted && decoder.awaitingCliToolError())
         && !decoder.priorCliToolErrorDue(record)) {
         // OCV5-301: after the model starts, only Claude Code's own error for a
         // rejected call may appear; the decoder validates and merges it.
