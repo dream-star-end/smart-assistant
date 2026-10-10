@@ -8,7 +8,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
+import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES, BoxCliToolHandoffDecoder,
+  BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { isBoxCliOutputLimitResume } from "./boxCliCompaction.js";
 import { hashBoxAssistantContent } from "./boxCallFingerprint.js";
 
@@ -168,4 +169,20 @@ test("the resume shape check is independent of the CLI's wording", () => {
   const extraKey = resume();
   (extraKey.message.content[0] as { cache_control?: unknown }).cache_control = { type: "ephemeral" };
   assert.equal(isBoxCliOutputLimitResume(extraKey), false);
+});
+
+test("OCV5-368 a 128k-token answer far above 1 MiB of stream still settles", () => {
+  // ~3 MB of text deltas in 60000 small chunks, the way the CLI streams a long answer
+  const chunk = "x".repeat(50);
+  const deltas = Array.from({ length: 60_000 }, () => event({ type: "content_block_delta", index: 0,
+    delta: { type: "text_delta", text: chunk } }));
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog, { allowFinal: true });
+  const { last } = feed(decoder, [init, start("msg_long"),
+    event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }), ...deltas,
+    { type: "assistant", message: { id: "msg_long", model, role: "assistant",
+      content: [{ type: "text", text: chunk.repeat(60_000) }] } },
+    event({ type: "content_block_stop", index: 0 }), ...stop("end_turn", 120_000),
+    result(10, 120_000)]);
+  assert.equal(last.finalCandidate!.outputTokens, 120_000);
+  assert.ok(BOX_TOOL_MESSAGE_STREAM_MAX_BYTES >= 6_400_000, "room for a full 128k-token text answer");
 });

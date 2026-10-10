@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
+import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES, BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import { _UsageObserver } from "./shared.js";
 
@@ -324,7 +324,7 @@ test("thinking, signature and redacted data bind streamed content, not a diverge
 
 test("UTF-8 byte cap does not depend on a split surrogate pair", () => {
   const decoder = new BoxCliToolHandoffDecoder(model, catalog);
-  decoder.push("x".repeat(1_048_572));
+  decoder.push("x".repeat(BOX_TOOL_MESSAGE_STREAM_MAX_BYTES - 4));
   const emoji = "😀";
   decoder.push(emoji[0]!);
   decoder.push(emoji[1]!);
