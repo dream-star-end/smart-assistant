@@ -3,7 +3,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { computeOutputs, evaluate, FormulaError, parseFormula, substitute } from "./formula";
-import { completePartialJson, IUI_MAX_BLOCK_BYTES, parseUiBlock, sliceFirstObject } from "./parse";
+import { completePartialJson, escapeStrayQuotes, IUI_MAX_BLOCK_BYTES, parseUiBlock, sliceFirstObject } from "./parse";
 import { LIMITS, resolveType, validateSpec } from "./schema";
 import { niceTicks } from "./ChartBlock";
 import { formatNumber, specToMarkdown, uiCodeToMarkdown, uiFencesToMarkdown, withUnit } from "./toMarkdown";
@@ -37,6 +37,22 @@ describe("parseUiBlock", () => {
   it("rejects blocks over the size limit", () => {
     const big = `{"type":"callout","body":"${"x".repeat(IUI_MAX_BLOCK_BYTES)}"}`;
     expect(parseUiBlock(big, false)).toEqual({ ok: false, reason: "too_large" });
+  });
+
+  it("repairs unescaped ASCII quotes inside Chinese text (seen from deepseek in the round-3 canary)", () => {
+    const src = '{"type":"outline","items":[{"title":"16. 资本主义教条","detail":"信贷与"相信未来"，驱动增长"}]}';
+    expect(JSON.parse.bind(null, src)).toThrow();
+    const r = parseUiBlock(src, false);
+    expect(r).toEqual({
+      ok: true,
+      value: { type: "outline", items: [{ title: "16. 资本主义教条", detail: '信贷与"相信未来"，驱动增长' }] },
+      complete: true,
+    });
+    expect(escapeStrayQuotes('{"a":"他说"你好"","b":""}')).toBe('{"a":"他说\\"你好\\"","b":""}');
+    // 修不出完整对象(引号后紧跟英文逗号)时仍按原文降级,不会截掉后半段文字。
+    expect(parseUiBlock('{"type":"callout","body":"a"b", c"}', false)).toEqual({ ok: false, reason: "invalid" });
+    // 流式中途不做这项修复(半截补全照旧),写完后才修。
+    expect(parseUiBlock('{"type":"callout","body":"对"社会', true)).toMatchObject({ ok: true, complete: false });
   });
 
   it("returns partial objects while streaming", () => {

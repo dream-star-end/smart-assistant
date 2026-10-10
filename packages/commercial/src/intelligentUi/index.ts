@@ -43,7 +43,7 @@ export const INTELLIGENT_UI_PROMPT = [
   "用户的界面会把语言标记为 `ui` 的代码块渲染成原生交互组件。只要组件能让回答更清楚、更好比较、更好操作、更好看,就放心用,一条回答里用几个都可以,和文字自由穿插。",
   "",
   "## 写法",
-  `- 代码块写成 ${F}ui,块内是**一个**合法 JSON 对象(双引号、无注释、无尾逗号),\`type\` 决定组件;闭围栏 ${F} 独占一行。一个块一个组件。`,
+  `- 代码块写成 ${F}ui,块内是**一个**合法 JSON 对象(双引号、无注释、无尾逗号;文字里要加引号用「」或“”,不要用英文双引号),\`type\` 决定组件;闭围栏 ${F} 独占一行。一个块一个组件。`,
   "- 组件外照常用文字讲清结论和理由,不要只丢一个组件。多数组件可写 `title` 和 `subtitle`(标题下一行说明)。",
   "- 数字要有依据:table / chart / stats / progress / kv 写 `source`;stats 的数字用 `basis` 说明来历;估算写明是估算。",
   "- calculator 的公式必须算对,假设写进 `assumptions`。公式只能用:数字、输入或输出的 id、`+ - * / % ^`、比较、`&& || !`、`a ? b : c`,函数 `min max round(x,d) floor ceil abs sqrt pow log ln exp if(c,a,b) clamp(x,lo,hi) pmt(每期利率,期数,本金)`。",

@@ -3,7 +3,7 @@
  *
  * 三条路径:
  *   - 严格:整块是一个合法 JSON 对象(允许首尾空白、对象后的多余文字被忽略)。
- *   - 宽容修复:去尾逗号后再试一次(模型最常见的手误)。
+ *   - 宽容修复:去尾逗号后再试一次(模型最常见的手误);仍失败时给正文里没转义的双引号补转义再试。
  *   - 半截补全(流式):把尚未写完的 JSON 截到最后一个「安全点」再补齐括号,
  *     让表格行、图表点能随生成逐步出现。正在写的字符串值会被临时闭合。
  * 任何失败都返回 ok:false,调用方降级为原文,绝不抛错。
@@ -77,6 +77,37 @@ function stripTrailingCommas(text: string): string {
       const rest = text.slice(i + 1);
       const next = rest.search(/\S/);
       if (next >= 0 && (rest[next] === "}" || rest[next] === "]")) continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * 字符串里没转义的英文双引号(模型写中文时常把「"相信未来"」原样写进 JSON)→ 补上转义。
+ * 判定:字符串内的 `"` 后面(跳过空白)紧跟 `,` `}` `]` `:` 或已到结尾,才算字符串结束,否则当作正文里的引号。
+ * 只在严格解析失败后使用,合法 JSON 不经过这里。
+ */
+export function escapeStrayQuotes(text: string): string {
+  let out = "";
+  let inString = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (!inString) {
+      if (ch === '"') inString = true;
+      out += ch;
+      continue;
+    }
+    if (esc) esc = false;
+    else if (ch === "\\") esc = true;
+    else if (ch === '"') {
+      const next = text.slice(i + 1).match(/\S/)?.[0];
+      if (next !== undefined && !",}]:".includes(next)) {
+        out += '\\"';
+        continue;
+      }
+      inString = false;
     }
     out += ch;
   }
@@ -195,6 +226,15 @@ export function parseUiBlock(code: string, allowPartial: boolean): ParseResult {
   const first = code.search(/\S/);
   if (code[first] !== "{") return { ok: false, reason: "not_object" };
 
+  const result = parseSource(code, allowPartial);
+  if (result.ok) return result;
+  // 宽容修复:正文里没转义的双引号。修完必须是一个完整的对象才采用(不和半截补全叠加,免得悄悄丢字)。
+  const escaped = sliceFirstObject(escapeStrayQuotes(code));
+  const v = escaped ? tryParseObject(escaped) ?? tryParseObject(stripTrailingCommas(escaped)) : null;
+  return v ? { ok: true, value: v, complete: true } : result;
+}
+
+function parseSource(code: string, allowPartial: boolean): ParseResult {
   const whole = sliceFirstObject(code);
   if (whole) {
     const strict = tryParseObject(whole) ?? tryParseObject(stripTrailingCommas(whole));

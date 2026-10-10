@@ -125,6 +125,9 @@ describe("协议文案", () => {
     assert.match(INTELLIGENT_UI_PROMPT, /层级结构\(大纲、思维导图、组织架构\)用 outline/);
     assert.match(INTELLIGENT_UI_PROMPT, /- table:[^\n]*可下载 CSV,行多时可筛选/);
   });
+  test("文字里的引号写成「」或“”(canary 里 deepseek 把英文双引号直接写进 JSON 字符串)", () => {
+    assert.match(INTELLIGENT_UI_PROMPT, /合法 JSON 对象\([^)\n]*引号用「」或“”,不要用英文双引号\)/);
+  });
 
   test("体积受控(系统提示每轮都带;第二轮组件补齐后上限 9KB)", () => {
     assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8") < 9_000, String(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8")));
