@@ -272,7 +272,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.getByText("看板已经做好").waitFor();
       await waitUntil("hello", () => preview.stats.hellos > 0);
       await desktop.page.waitForFunction(() => !document.body.innerText.includes("未连接"));
-      await desktop.page.getByTitle("HTML 沙盒预览").waitFor();
+      await desktop.page.getByTitle("交互内容", { exact: true }).waitFor();
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "tool log stays folded in the App");
       assert.equal(await desktop.page.getByText("paper.pdf").count(), 0);
       assert.equal(await desktop.page.getByText("还在，可售合计 128。").count(), 1);
@@ -306,7 +306,7 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.doesNotMatch(meta.text, /2023-11-15|1970/);
       assert.ok(contrastRatio(meta.color, meta.bg) >= 4.5, `light contrast ${contrastRatio(meta.color, meta.bg)}`);
       await desktop.page.getByText("刚刚").first().waitFor();
-      const iframeSrc = await desktop.page.getByTitle("HTML 沙盒预览").getAttribute("srcdoc");
+      const iframeSrc = await desktop.page.getByTitle("交互内容", { exact: true }).getAttribute("srcdoc");
       assert.match(iframeSrc ?? "", /库存看板/);
       assert.match(iframeSrc ?? "", /可售合计 128/);
 
@@ -675,12 +675,12 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await desktop.page.getByRole("button", { name: "库存看板" }).click();
       await desktop.page.getByText("看板已经做好").waitFor();
       await desktop.page.getByText("南仓预警已补进看板").waitFor();
-      await desktop.page.getByTitle("HTML 沙盒预览").first().waitFor();
+      await desktop.page.getByTitle("交互内容", { exact: true }).first().waitFor();
 
       await desktop.page.goto(preview.url, { waitUntil: "domcontentloaded" });
       await desktop.page.getByText("看板已经做好").waitFor();
       await desktop.page.getByText("南仓预警已补进看板").waitFor();
-      await desktop.page.getByTitle("HTML 沙盒预览").first().waitFor();
+      await desktop.page.getByTitle("交互内容", { exact: true }).first().waitFor();
       await desktop.page.getByRole("link", { name: new RegExp(CSV_NAME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")) }).first().waitFor();
       await waitUntil("reload hello", () => preview.stats.hellos > 1);
       await desktop.page.waitForFunction(() => !document.body.innerText.includes("未连接"));

@@ -737,7 +737,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.getByText("最终总结在这里")).toBeInTheDocument();
     expect(screen.queryByText(/普通阶段见/)).not.toBeInTheDocument();
     expect(screen.queryByText("echo complicated-catalog")).not.toBeInTheDocument();
-    const preview = await screen.findByTitle("HTML 沙盒预览");
+    const preview = await screen.findByTitle("交互内容");
     expect(preview.closest("[data-testid=process-disclosure]")).toBeNull();
     const image = await screen.findByText("仓库");
     expect(image.closest("[data-testid=process-disclosure]")).toBeNull();
@@ -962,7 +962,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(document.querySelector("[data-chat-virtual-key=same-id]")).toBeNull();
     expect(screen.queryByText(/PREVIEW_BETA/)).not.toBeInTheDocument();
 
-    const previews = await screen.findAllByTitle("HTML 沙盒预览");
+    const previews = await screen.findAllByTitle("交互内容");
     expect(previews).toHaveLength(2);
     expect(previews.every((node) => node.tagName === "IFRAME")).toBe(true);
     expect(previews.every((node) => node.closest("[data-testid=process-disclosure]") == null)).toBe(true);
