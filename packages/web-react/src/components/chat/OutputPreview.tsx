@@ -3,12 +3,13 @@
  *
  *  - 正文来源:优先用会话里回放出的全文(fileSnapshot,零请求、容器回收后也在);回放不出来时
  *    经现有的媒体签名通道读容器里的当前文件(≤1 MB,与项目产出预览同一套上限与重签)。
- *  - HTML:沙盒 iframe(allow-scripts、无 same-origin,与聊天里的 HTML 预览同一策略)。
+ *  - HTML:沙盒 iframe(allow-scripts、无 same-origin)+ 与聊天里的 HTML 嵌入同一份 CSP(网络只认固定 CDN、禁表单)。
  *  - Markdown:渲染;代码 / 文本:高亮。都走只读 Markdown,不执行内嵌 HTML、不自动探测语言。
  */
 import { AlertCircle, RotateCw } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Markdown } from "../Markdown";
+import { wrapWithCspOnly } from "../embedCsp";
 import {
   CODE_HIGHLIGHT_MAX_CHARS,
   MARKDOWN_RENDER_MAX_CHARS,
@@ -85,8 +86,8 @@ const FRAME_CLASS = "block h-[min(68vh,640px)] w-full border-0 bg-white";
 
 function TextBody({ text, kind, name, view }: { text: string; kind: OutputKind; name: string; view: PreviewView }) {
   if (view === "preview" && kind === "html") {
-    // sandbox 不含 allow-same-origin:取不到父页 cookie / storage;只允许脚本跑演示。
-    return <iframe sandbox="allow-scripts" srcDoc={text} title={`${name} 预览`} className={FRAME_CLASS} data-testid="output-preview-frame" />;
+    // sandbox 不含 allow-same-origin:取不到父页 cookie / storage;CSP 放在第 0 个字节,模型的代码改不掉。
+    return <iframe sandbox="allow-scripts" srcDoc={wrapWithCspOnly(text)} title={`${name} 预览`} className={FRAME_CLASS} data-testid="output-preview-frame" />;
   }
   if (view === "preview" && kind === "markdown" && text.length <= MARKDOWN_RENDER_MAX_CHARS) {
     return (

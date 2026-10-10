@@ -7,6 +7,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { InspectorPanelContent } from "./InspectorPanel";
+import { wrapWithCspOnly } from "./embedCsp";
 
 // 读容器文件的那条回落:测试里没有签名通道,直接替换受限读取(其余导出照旧)。
 const fetchSignedCapped = vi.hoisted(() => vi.fn());
@@ -87,7 +88,9 @@ describe("产出页", () => {
     expect(screen.getByTestId("outputs-hero-name")).toHaveTextContent("index.html");
     const frame = await screen.findByTestId("output-preview-frame");
     expect(frame).toHaveAttribute("sandbox", "allow-scripts");
-    expect(frame.getAttribute("srcdoc")).toBe("<h1>Hello world</h1>\n");
+    expect(frame.getAttribute("srcdoc")).toBe(wrapWithCspOnly("<h1>Hello world</h1>\n"));
+    // 与聊天里的 HTML 嵌入同一份 CSP,且排在模型代码之前
+    expect(frame.getAttribute("srcdoc")).toMatch(/^<!DOCTYPE html><meta http-equiv="Content-Security-Policy" content="default-src 'none'/);
     expect(screen.getByTestId("outputs-hero-origin")).toHaveTextContent("内容来自会话记录");
 
     fireEvent.click(screen.getByRole("radio", { name: "源码" }));
