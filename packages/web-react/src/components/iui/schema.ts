@@ -192,7 +192,30 @@ export type RouteSpec = Sub & {
   legs: { distance?: string; duration?: string; mode?: string }[];
 };
 
+/** 回答里用到的来源。正文用 [1] [2] 引用;链接只认 http(s)。 */
+export type SourceItem = { title: string; url?: string; site?: string; date?: string; note?: string };
+export type SourcesSpec = Sub & { type: "sources"; title?: string; items: SourceItem[] };
+
+/** 大纲 / 思维导图:最多 4 层的树。 */
+export type OutlineNode = { title: string; detail?: string; children: OutlineNode[] };
+export type OutlineSpec = Sub & { type: "outline"; title?: string; view: "tree" | "map"; items: OutlineNode[] };
+
+/** 成稿:可直接发出去的文字,1–3 个版本;original = 改写前的原文(显示修改对比)。 */
+export const DRAFT_KINDS = ["email", "message", "post", "doc"] as const;
+export type DraftKind = (typeof DRAFT_KINDS)[number];
+export type DraftSpec = Sub & {
+  type: "draft";
+  title?: string;
+  kind?: DraftKind;
+  variants: { label: string; subject?: string; text: string }[];
+  original?: string;
+  note?: string;
+};
+
 export type IuiSpec =
+  | SourcesSpec
+  | OutlineSpec
+  | DraftSpec
   | TableSpec
   | ChartSpec
   | StatsSpec
@@ -239,6 +262,9 @@ export const IUI_TYPES: readonly IuiType[] = [
   "kv",
   "form",
   "route",
+  "sources",
+  "outline",
+  "draft",
 ];
 
 export type ValidateResult =
@@ -273,6 +299,12 @@ export const LIMITS = {
   formFields: 10,
   stops: 12,
   trend: 60,
+  sources: 12,
+  outlineDepth: 4,
+  outlineNodes: 80,
+  outlineChildren: 20,
+  draftVariants: 3,
+  draftText: 6000,
 } as const;
 
 type Ctx = { notes: string[]; partial: boolean };
@@ -983,6 +1015,130 @@ function route(raw: Record<string, unknown>, ctx: Ctx): RouteSpec | null {
   return { type: "route", ...optional("title", str(raw.title)), stops: capped, legs };
 }
 
+/** 只认 http(s) 链接(来源是给人点开的链接,不加载任何资源)。 */
+function httpUrl(v: unknown): string | undefined {
+  const s = str(v, 2000);
+  return s && /^https?:\/\/[^\s"'<>]+$/i.test(s) ? s : undefined;
+}
+
+/** 链接的站点名:去掉 www.;解析不了就不写。 */
+export function siteOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "") || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sources(raw: Record<string, unknown>, ctx: Ctx): SourcesSpec | null {
+  const items: SourceItem[] = [];
+  for (const it of arr(raw.items ?? raw.sources ?? raw.links)) {
+    const o = typeof it === "string" ? { url: it } : it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+    if (!o) continue;
+    const url = httpUrl(o.url ?? o.link ?? o.href);
+    const site = str(o.site ?? o.source ?? o.publisher, 60) ?? (url ? siteOf(url) : undefined);
+    const title = str(o.title ?? o.name ?? o.label, 200) ?? site;
+    if (!title) continue;
+    items.push({
+      title,
+      ...optional("url", url),
+      ...optional("site", site),
+      ...optional("date", str(o.date ?? o.published ?? o.time, 30)),
+      ...optional("note", str(o.note ?? o.summary ?? o.snippet ?? o.description, 300)),
+    });
+  }
+  if (items.length === 0 && !ctx.partial) return null;
+  return { type: "sources", ...optional("title", str(raw.title)), items: cap(items, LIMITS.sources, ctx, "来源") };
+}
+
+function outline(raw: Record<string, unknown>, ctx: Ctx): OutlineSpec | null {
+  let count = 0;
+  let trimmed = false;
+  const walk = (list: unknown, depth: number): OutlineNode[] => {
+    const out: OutlineNode[] = [];
+    for (const it of arr(list)) {
+      if (count >= LIMITS.outlineNodes || out.length >= LIMITS.outlineChildren) {
+        trimmed = true;
+        break;
+      }
+      const o = typeof it === "string" ? { title: it } : it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+      if (!o) continue;
+      const title = str(o.title ?? o.label ?? o.name ?? o.text, 200);
+      if (!title) continue;
+      count += 1;
+      const kids = o.children ?? o.items ?? o.nodes;
+      let children: OutlineNode[] = [];
+      if (arr(kids).length > 0) {
+        if (depth < LIMITS.outlineDepth) children = walk(kids, depth + 1);
+        else trimmed = true;
+      }
+      out.push({ title, ...optional("detail", str(o.detail ?? o.description ?? o.note, 600)), children });
+    }
+    return out;
+  };
+  const items = walk(raw.items ?? raw.children ?? raw.nodes, 1);
+  if (trimmed) ctx.notes.push(`大纲最多 ${LIMITS.outlineDepth} 层、${LIMITS.outlineNodes} 个节点,已省略其余`);
+  if (items.length === 0 && !ctx.partial) return null;
+  const viewRaw = typeof raw.view === "string" ? raw.view.toLowerCase().replace(/[\s_-]/g, "") : "";
+  return {
+    type: "outline",
+    ...optional("title", str(raw.title)),
+    view: viewRaw === "map" || viewRaw === "mindmap" ? "map" : "tree",
+    items,
+  };
+}
+
+const DRAFT_KIND_ALIASES: Record<string, DraftKind> = {
+  mail: "email",
+  letter: "email",
+  wechat: "message",
+  im: "message",
+  sms: "message",
+  chat: "message",
+  social: "post",
+  article: "doc",
+  document: "doc",
+};
+
+function draftText(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const t = v.replace(/\r\n?/g, "\n").replace(/^\n+|\s+$/g, "");
+  if (!t) return undefined;
+  return t.length > LIMITS.draftText ? `${t.slice(0, LIMITS.draftText)}…` : t;
+}
+
+function draft(raw: Record<string, unknown>, ctx: Ctx): DraftSpec | null {
+  const variants: DraftSpec["variants"] = [];
+  const list = Array.isArray(raw.variants) ? raw.variants : Array.isArray(raw.versions) ? raw.versions : null;
+  if (list) {
+    for (const it of list) {
+      const o = typeof it === "string" ? { text: it } : it && typeof it === "object" ? (it as Record<string, unknown>) : null;
+      if (!o) continue;
+      const text = draftText(o.text ?? o.body ?? o.content);
+      if (!text) continue;
+      variants.push({
+        label: str(o.label ?? o.name ?? o.title, 20) ?? `版本 ${variants.length + 1}`,
+        ...optional("subject", str(o.subject, 200) ?? str(raw.subject, 200)),
+        text,
+      });
+    }
+  } else {
+    const text = draftText(raw.text ?? raw.body ?? raw.content);
+    if (text) variants.push({ label: "版本 1", ...optional("subject", str(raw.subject, 200)), text });
+  }
+  if (variants.length === 0 && !ctx.partial) return null;
+  const kindRaw = typeof raw.kind === "string" ? raw.kind.trim().toLowerCase() : "";
+  const kind = (DRAFT_KINDS as readonly string[]).includes(kindRaw) ? (kindRaw as DraftKind) : DRAFT_KIND_ALIASES[kindRaw];
+  return {
+    type: "draft",
+    ...optional("title", str(raw.title)),
+    ...optional("kind", kind),
+    variants: cap(variants, LIMITS.draftVariants, ctx, "版本"),
+    ...optional("original", draftText(raw.original ?? raw.before)),
+    ...optional("note", str(raw.note, 600)),
+  };
+}
+
 const NO_SUBTITLE = new Set<IuiType>(["callout", "choice", "suggestions"]);
 
 /** 通用的 `subtitle`(标题下一行说明)。cards 的 description 是卡片自己的字段,这里只认 subtitle。 */
@@ -1014,6 +1170,9 @@ const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => Iu
   kv,
   form,
   route,
+  sources,
+  outline,
+  draft,
 };
 
 /** 常见别名(模型偶尔写成其它名字)。 */
@@ -1048,6 +1207,15 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   segmented: "tabs",
   followups: "suggestions",
   follow_up: "suggestions",
+  references: "sources",
+  citations: "sources",
+  refs: "sources",
+  links: "sources",
+  tree: "outline",
+  mindmap: "outline",
+  mind_map: "outline",
+  email: "draft",
+  copy: "draft",
 };
 
 export function resolveType(raw: unknown): IuiType | null {

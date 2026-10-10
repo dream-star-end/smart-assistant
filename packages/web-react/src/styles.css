@@ -1929,6 +1929,106 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-iui-stop-detail { font-size: 13.5px; color: var(--muted); }
 .oc-iui-leg { display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; margin-top: 8px; border-radius: 999px; padding: 2px 10px; background: var(--iui-sunken); box-shadow: inset 0 0 0 1px var(--iui-line); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
+/* 长表格:筛选 + 限高滚动 + 表头吸顶 */
+.oc-iui-table-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 2px 16px 10px; }
+.oc-iui-search { display: flex; flex: 1 1 220px; max-width: 360px; align-items: center; gap: 8px; height: 36px; padding: 0 12px; border-radius: 999px; background: var(--iui-sunken); box-shadow: inset 0 0 0 1px var(--iui-line); color: var(--faint); transition: box-shadow 0.15s; }
+@media (hover: none) { .oc-iui-search { height: 44px; } }
+.oc-iui-search:focus-within { box-shadow: inset 0 0 0 1px transparent, 0 0 0 2px var(--ring); }
+.oc-iui-search-input { flex: 1; min-width: 0; height: 100%; border: 0; background: transparent; font-size: 14px; color: var(--fg); outline: none; }
+.oc-iui-search-input::placeholder { color: var(--faint); }
+.oc-iui-search-input::-webkit-search-cancel-button { cursor: pointer; }
+.oc-iui-table-count { font-size: 12.5px; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; }
+.oc-iui-table-region.is-long { max-height: min(68vh, 520px); overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--iui-line); }
+.oc-iui .oc-iui-table-region.is-long thead th { position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--iui-surface) 92%, transparent); backdrop-filter: blur(8px); }
+.oc-iui .oc-iui-table-region.is-long thead th:first-child { left: 0; z-index: 3; }
+.oc-iui .oc-iui-table td.oc-iui-table-empty { padding: 22px 16px; text-align: center; color: var(--faint); }
+
+/* 来源 */
+.oc-iui .oc-iui-sources { display: flex; flex-direction: column; padding: 2px 8px 8px; counter-reset: none; }
+.oc-iui .oc-iui-source { display: flex; gap: 12px; padding: 10px 8px; border-radius: 12px; color: inherit; text-decoration: none; border-bottom: 0; transition: background-color 0.15s; }
+.oc-iui .oc-iui-source.is-link:hover { background: var(--iui-sunken); }
+.oc-iui .oc-iui-source.is-link:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--ring); }
+.oc-iui-source-num { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; min-width: 22px; height: 22px; margin-top: 1px; padding: 0 6px; border-radius: 7px; background: var(--accent-soft); font-size: 12px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+.oc-iui-source-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.oc-iui-source-title { display: flex; align-items: flex-start; gap: 6px; font-size: 14.5px; font-weight: 600; line-height: 1.45; color: var(--fg); }
+.oc-iui-source-title > span { min-width: 0; overflow-wrap: anywhere; }
+.oc-iui-source-ext { flex-shrink: 0; margin-top: 4px; color: var(--faint); opacity: 0; transition: opacity 0.15s; }
+.oc-iui-source.is-link:hover .oc-iui-source-ext, .oc-iui-source.is-link:focus-visible .oc-iui-source-ext { opacity: 1; }
+@media (hover: none) { .oc-iui-source-ext { opacity: 0.6; } }
+.oc-iui-source-meta { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--faint); min-width: 0; overflow-wrap: anywhere; }
+.oc-iui-source-avatar { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 16px; height: 16px; border-radius: 5px; font-size: 10px; font-weight: 700; line-height: 1; }
+.oc-iui-source-avatar.is-tone-0, .oc-iui-mind-branch.is-tone-0 { --tone-bg: var(--iui-t-violet-bg); --tone-fg: var(--iui-t-violet-fg); }
+.oc-iui-source-avatar.is-tone-1, .oc-iui-mind-branch.is-tone-1 { --tone-bg: var(--iui-t-green-bg); --tone-fg: var(--iui-t-green-fg); }
+.oc-iui-source-avatar.is-tone-2, .oc-iui-mind-branch.is-tone-2 { --tone-bg: var(--iui-t-amber-bg); --tone-fg: var(--iui-t-amber-fg); }
+.oc-iui-source-avatar.is-tone-3, .oc-iui-mind-branch.is-tone-3 { --tone-bg: var(--iui-t-sky-bg); --tone-fg: var(--iui-t-sky-fg); }
+.oc-iui-source-avatar.is-tone-4, .oc-iui-mind-branch.is-tone-4 { --tone-bg: var(--iui-t-rose-bg); --tone-fg: var(--iui-t-rose-fg); }
+.oc-iui-source-avatar.is-tone-5, .oc-iui-mind-branch.is-tone-5 { --tone-bg: var(--iui-t-slate-bg); --tone-fg: var(--iui-t-slate-fg); }
+.oc-iui-source-avatar { background: var(--tone-bg); color: var(--tone-fg); }
+.oc-iui-source-note { font-size: 13.5px; line-height: 1.55; color: var(--muted); }
+.oc-iui-more { padding: 0 12px 10px; }
+
+/* 大纲 */
+.oc-iui-tree-wrap { padding: 2px 8px 10px; }
+.oc-iui .oc-iui-tree { display: flex; flex-direction: column; }
+.oc-iui .oc-iui-tree:not(.is-root) { position: relative; margin-left: 17px; padding-left: 10px; }
+.oc-iui .oc-iui-tree:not(.is-root)::before { content: ""; position: absolute; left: 0; top: 2px; bottom: 8px; width: 1.5px; border-radius: 2px; background: var(--iui-line); }
+.oc-iui .oc-iui-tree-row { display: flex; width: 100%; align-items: flex-start; gap: 6px; min-height: 34px; padding: 6px 8px; border-radius: 10px; font: inherit; color: inherit; text-align: left; outline: none; transition: background-color 0.15s; }
+@media (hover: none) { .oc-iui .oc-iui-tree-row { min-height: 44px; } }
+.oc-iui button.oc-iui-tree-row:hover { background: var(--iui-sunken); }
+.oc-iui button.oc-iui-tree-row:focus-visible { box-shadow: inset 0 0 0 2px var(--ring); }
+.oc-iui-tree-chevron { flex-shrink: 0; margin-top: 4px; color: var(--faint); transition: transform 0.2s cubic-bezier(0.3, 0.8, 0.3, 1); }
+.oc-iui-tree > li.is-open > .oc-iui-tree-row > .oc-iui-tree-chevron { transform: rotate(90deg); color: var(--muted); }
+.oc-iui-tree-dot { flex-shrink: 0; width: 14px; height: 14px; margin-top: 4px; position: relative; }
+.oc-iui-tree-dot::after { content: ""; position: absolute; left: 5px; top: 5px; width: 5px; height: 5px; border-radius: 999px; background: color-mix(in srgb, var(--fg) 25%, transparent); }
+.oc-iui-tree-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.oc-iui-tree-title { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 6px; color: var(--fg); }
+.oc-iui-tree > li.is-depth-0 > .oc-iui-tree-row .oc-iui-tree-title { font-size: 15px; font-weight: 650; }
+.oc-iui-tree > li.is-depth-1 > .oc-iui-tree-row .oc-iui-tree-title { font-weight: 550; }
+.oc-iui-tree > li.is-depth-2 > .oc-iui-tree-row .oc-iui-tree-title, .oc-iui-tree > li.is-depth-3 > .oc-iui-tree-row .oc-iui-tree-title { font-size: 14px; color: color-mix(in srgb, var(--fg) 88%, var(--muted)); }
+.oc-iui-tree-num { display: inline-flex; align-items: center; justify-content: center; align-self: center; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 6px; background: var(--accent-soft); font-size: 11.5px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+.oc-iui-tree-count { align-self: center; border-radius: 999px; padding: 0 7px; background: var(--iui-sunken); box-shadow: inset 0 0 0 1px var(--iui-line); font-size: 11px; font-weight: 600; line-height: 18px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.oc-iui-tree-detail { font-size: 13px; line-height: 1.5; color: var(--muted); }
+.oc-iui-seg.is-compact { padding: 2px; }
+.oc-iui-seg.is-compact .oc-iui-seg-btn { padding: 3px 11px; font-size: 12.5px; }
+.oc-iui-seg.is-compact .oc-iui-seg-thumb { top: 2px; bottom: 2px; }
+
+/* 思维导图(两层半:中心 → 分支卡 → 要点,第三层并成一行) */
+.oc-iui-mind { display: flex; flex-direction: column; align-items: center; padding: 6px 16px 16px; }
+.oc-iui-mind-root { position: relative; display: inline-flex; max-width: 100%; padding: 8px 18px; border-radius: 999px; background: var(--accent); color: var(--accent-fg); font-size: 15px; font-weight: 650; text-align: center; box-shadow: 0 8px 20px -10px color-mix(in srgb, var(--accent) 80%, transparent); }
+.oc-iui-mind-root::after { content: ""; position: absolute; left: 50%; top: 100%; width: 2px; height: 14px; margin-left: -1px; background: color-mix(in srgb, var(--accent) 45%, transparent); }
+.oc-iui-mind-branches { position: relative; display: grid; width: 100%; gap: 12px; margin-top: 14px; padding-top: 14px; grid-template-columns: 1fr; }
+.oc-iui-mind-branches::before { content: ""; position: absolute; left: 10%; right: 10%; top: 0; height: 2px; border-radius: 2px; background: color-mix(in srgb, var(--accent) 30%, transparent); }
+@media (min-width: 640px) {
+  .oc-iui-mind-branches { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .oc-iui-mind-branches[data-count="3"], .oc-iui-mind-branches[data-count="5"], .oc-iui-mind-branches[data-count="6"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 639px) { .oc-iui-mind-branches::before { display: none; } .oc-iui-mind-branches { margin-top: 14px; padding-top: 0; } }
+.oc-iui-mind-branch { position: relative; display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 12px 14px 14px; border-radius: 14px; background: var(--tone-bg); color: var(--tone-fg); }
+.oc-iui .oc-iui-mind-head { margin: 0; font-size: 14.5px; font-weight: 700; line-height: 1.4; color: var(--tone-fg); }
+.oc-iui-mind-detail { font-size: 12.5px; line-height: 1.5; opacity: 0.85; }
+.oc-iui .oc-iui-mind-list { display: flex; flex-direction: column; gap: 6px; }
+.oc-iui-mind-list > li { display: flex; flex-direction: column; padding: 7px 10px; border-radius: 10px; background: color-mix(in srgb, var(--iui-surface) 72%, transparent); }
+.dark .oc-iui-mind-list > li { background: rgb(255 255 255 / 0.05); }
+.oc-iui-mind-item { font-size: 13.5px; font-weight: 550; line-height: 1.45; color: var(--fg); }
+.oc-iui-mind-sub { margin-top: 2px; font-size: 12px; line-height: 1.5; color: var(--muted); }
+
+/* 成稿 */
+.oc-iui-draft-paper { margin: 4px 16px 0; border-radius: 14px; background: var(--iui-sunken); box-shadow: inset 0 0 0 1px var(--iui-line); overflow: hidden; }
+.oc-iui-tabbar + .oc-iui-draft-paper { margin-top: 8px; }
+.oc-iui-draft-subject { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 4px 6px 4px 16px; border-bottom: 1px solid var(--iui-line); background: color-mix(in srgb, var(--iui-surface) 55%, transparent); }
+.oc-iui-draft-subject-label { flex-shrink: 0; font-size: 12px; font-weight: 600; letter-spacing: 0.04em; color: var(--faint); }
+.oc-iui-draft-subject-text { flex: 1; min-width: 0; font-size: 14.5px; font-weight: 650; color: var(--fg); overflow-wrap: anywhere; }
+.oc-iui-draft-text { padding: 14px 18px 16px; font-size: 15px; line-height: 1.8; color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+.oc-iui-diff ins { text-decoration: none; border-radius: 4px; padding: 1px 1px; background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--fg); box-shadow: inset 0 -1.5px 0 color-mix(in srgb, var(--success) 55%, transparent); }
+.oc-iui-diff del { border-radius: 4px; padding: 1px 1px; background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--muted); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--danger) 70%, transparent); }
+.oc-iui-diff-legend { display: flex; gap: 14px; padding: 10px 18px 0; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.oc-iui-diff-legend .is-del { color: var(--danger); }
+.oc-iui-diff-legend .is-add { color: var(--success); }
+.oc-iui-draft-paper > .oc-iui-hint { padding: 10px 18px 0; margin: 0; }
+.oc-iui-draft-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; padding: 12px 16px 16px; }
+.oc-iui-draft-count { font-size: 12.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.oc-iui-draft-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+
 /* 骨架 */
 .oc-iui-skeleton { display: flex; flex-direction: column; gap: 12px; padding: 16px; animation: none; }
 .oc-iui-skeleton-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }

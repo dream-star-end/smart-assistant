@@ -119,6 +119,13 @@ describe("协议文案", () => {
     assert.match(INTELLIGENT_UI_PROMPT, /- quiz:[^\n]*出题考考大家/);
     assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /小工具或小游戏用/);
   });
+  test("第三轮:来源只用真实链接、成稿与大纲的用法写明、表格说明筛选与下载", () => {
+    assert.match(INTELLIGENT_UI_PROMPT, /- sources:[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
+    assert.match(INTELLIGENT_UI_PROMPT, /- draft:[^\n]*original[^\n]*修改对比/);
+    assert.match(INTELLIGENT_UI_PROMPT, /层级结构\(大纲、思维导图、组织架构\)用 outline/);
+    assert.match(INTELLIGENT_UI_PROMPT, /- table:[^\n]*可下载 CSV,行多时可筛选/);
+  });
+
   test("体积受控(系统提示每轮都带;第二轮组件补齐后上限 9KB)", () => {
     assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8") < 9_000, String(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8")));
   });

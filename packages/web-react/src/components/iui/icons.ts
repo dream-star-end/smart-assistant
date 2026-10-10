@@ -118,6 +118,14 @@ export const KIND_ICON_SOURCES = {
   kv: "list-tree",
   form: "clipboard-list",
   route: "route",
+  sources: "book-marked",
+  outline: "network",
+  draft: "pen-line",
+} as const satisfies Record<string, LucideName>;
+
+/** 组件内部控件用、别处没有引过的图标(同样走生成的形状数据,不进首屏)。 */
+export const UI_ICON_SOURCES = {
+  diff: "git-compare-arrows",
 } as const satisfies Record<string, LucideName>;
 
 export const ICON_NAMES = Object.keys(ICON_SOURCES);
@@ -136,4 +144,8 @@ export function iconFor(name: string | undefined): IconNode | null {
 
 export function kindIcon(kind: string): IconNode | null {
   return lookup(KIND_ICON_SOURCES, kind);
+}
+
+export function uiIcon(name: keyof typeof UI_ICON_SOURCES): IconNode {
+  return ICON_NODES[UI_ICON_SOURCES[name]];
 }

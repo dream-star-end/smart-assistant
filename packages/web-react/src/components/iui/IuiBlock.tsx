@@ -13,6 +13,7 @@ import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
 import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
 import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
 import { TableBlock } from "./TableBlock";
+import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
 import {
   CalloutBlock,
   ChoiceBlock,
@@ -100,6 +101,12 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <FormBlock spec={spec} {...p} readOnly={readOnly} />;
     case "route":
       return <RouteBlock spec={spec} {...p} />;
+    case "sources":
+      return <SourcesBlock spec={spec} {...p} />;
+    case "outline":
+      return <OutlineBlock spec={spec} {...p} />;
+    case "draft":
+      return <DraftBlock spec={spec} {...p} />;
   }
 }
 
@@ -143,6 +150,11 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.inputs.length > 0 && spec.outputs.length > 0;
     case "callout":
       return spec.body.length > 0;
+    case "sources":
+    case "outline":
+      return spec.items.length > 0;
+    case "draft":
+      return spec.variants.length > 0;
   }
 }
 

@@ -1,8 +1,8 @@
-import { ArrowDown, ArrowUp, ArrowUpDown, Check, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Check, Download, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { Cell, TableSpec } from "./schema";
 import { Frame, Inline } from "./shell";
-import { formatNumber, specToMarkdown } from "./toMarkdown";
+import { formatNumber, specToMarkdown, tableToCsv } from "./toMarkdown";
 
 /** 单元格的排序键:数字直接比;「1,200」「35%」「¥80」这类数字字符串按数值比;其余按文字。 */
 export function sortKey(c: Cell): { n: number | null; s: string } {
@@ -17,6 +17,34 @@ export function sortKey(c: Cell): { n: number | null; s: string } {
 }
 
 const isEmpty = (c: Cell) => c === null || c === "";
+
+/** 超过这么多行:出现筛选框,表体限高滚动、表头吸顶。 */
+export const LONG_TABLE_ROWS = 12;
+
+/** 筛选:任一单元格(按显示出来的文字)包含关键词即保留,不区分大小写。 */
+export function rowMatches(r: Cell[], q: string): boolean {
+  const needle = q.trim().toLowerCase();
+  if (!needle) return true;
+  return r.some((c) => c !== null && (typeof c === "number" ? `${c} ${formatNumber(c)}` : c).toLowerCase().includes(needle));
+}
+
+function csvFileName(title?: string): string {
+  const base = (title ?? "表格").replace(/[\\/:*?"<>|\r\n]+/g, " ").trim().slice(0, 60) || "表格";
+  return `${base}.csv`;
+}
+
+function downloadCsv(spec: TableSpec, rows: Cell[][]) {
+  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") return;
+  const url = URL.createObjectURL(new Blob([tableToCsv(spec, rows)], { type: "text/csv;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = csvFileName(spec.title);
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 const YES = new Set(["✓", "✔", "✅", "☑"]);
 const NO = new Set(["✗", "✘", "✕", "×", "❌"]);
@@ -52,9 +80,13 @@ export function compareCells(a: Cell, b: Cell): number {
 
 export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec; notes: string[]; streaming: boolean; nested?: boolean }) {
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 } | null>(null);
+  const [query, setQuery] = useState("");
   const width = spec.columns.length;
+  const long = spec.rows.length > LONG_TABLE_ROWS;
+  const filtering = long && !streaming && query.trim() !== "";
   const rows = useMemo(() => {
-    const padded = spec.rows.map((r, i) => ({ r: Array.from({ length: width }, (_, j) => r[j] ?? null), i }));
+    const all = spec.rows.map((r, i) => ({ r: Array.from({ length: width }, (_, j) => r[j] ?? null), i }));
+    const padded = filtering ? all.filter((x) => rowMatches(x.r, query)) : all;
     if (!sort || streaming) return padded;
     return padded
       .sort((x, y) => {
@@ -64,7 +96,7 @@ export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec
         if (ex !== ey) return ex ? 1 : -1;
         return compareCells(x.r[sort.col]!, y.r[sort.col]!) * sort.dir || x.i - y.i;
       });
-  }, [spec.rows, width, sort, streaming]);
+  }, [spec.rows, width, sort, streaming, filtering, query]);
 
   // 数据条:按列内最大绝对值归一。
   const barMax = useMemo(
@@ -89,9 +121,42 @@ export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec
       notes={notes}
       streaming={streaming}
       copyText={() => specToMarkdown(spec)}
+      actions={
+        !streaming && (spec.title || spec.rows.length >= 5) ? (
+          <button
+            type="button"
+            className="oc-iui-icon-btn"
+            aria-label={filtering ? `下载筛选后的 ${rows.length} 行为 CSV` : "下载为 CSV"}
+            title={filtering ? `下载筛选后的 ${rows.length} 行(CSV)` : "下载 CSV"}
+            onClick={() => downloadCsv(spec, rows.map((x) => x.r))}
+          >
+            <Download size={14} aria-hidden />
+          </button>
+        ) : undefined
+      }
     >
+      {long && !streaming && (
+        <div className="oc-iui-table-tools">
+          <label className="oc-iui-search">
+            <Search size={14} aria-hidden />
+            <input
+              type="search"
+              className="oc-iui-search-input"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={`在 ${spec.rows.length} 行里筛选`}
+              aria-label="筛选表格行"
+            />
+          </label>
+          {filtering && (
+            <span className="oc-iui-table-count" aria-live="polite">
+              {rows.length} / {spec.rows.length} 行
+            </span>
+          )}
+        </div>
+      )}
       <section
-        className="oc-iui-table-region"
+        className={long ? "oc-iui-table-region is-long" : "oc-iui-table-region"}
         aria-label={spec.title ? `${spec.title}(可横向滚动)` : "表格(可横向滚动)"}
         // biome-ignore lint/a11y/noNoninteractiveTabindex: 横向滚动区必须可由键盘聚焦和滚动。
         tabIndex={0}
@@ -128,6 +193,13 @@ export function TableBlock({ spec, notes, streaming, nested }: { spec: TableSpec
             </tr>
           </thead>
           <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={width} className="oc-iui-table-empty">
+                  没有包含「{query.trim()}」的行
+                </td>
+              </tr>
+            )}
             {rows.map(({ r, i: orig }) => (
               <tr key={`r${orig}`} className={spec.highlight === orig ? "is-highlight" : undefined}>
                 {r.map((c, ci) => {

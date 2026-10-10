@@ -420,6 +420,9 @@ const SKELETON_HEIGHT: Record<string, number> = {
   kv: 160,
   form: 240,
   route: 240,
+  sources: 200,
+  outline: 240,
+  draft: 240,
 };
 
 export function Skeleton({ kind }: { kind?: string }) {

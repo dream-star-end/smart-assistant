@@ -6,7 +6,7 @@
  */
 import { computeOutputs } from "./formula";
 import { parseUiBlock } from "./parse";
-import type { CalcFormat, CalculatorSpec, Cell, IuiSpec } from "./schema";
+import type { CalcFormat, CalculatorSpec, Cell, IuiSpec, OutlineNode, TableSpec } from "./schema";
 import { validateSpec } from "./schema";
 
 const CURRENCY_PREFIX = new Set(["¥", "￥", "$", "€", "£", "HK$", "US$"]);
@@ -62,6 +62,22 @@ function mdTable(header: string[], rows: string[][], align?: ("left" | "right")[
   const sep = `| ${header.map((_, i) => (align?.[i] === "right" ? "---:" : "---")).join(" | ")} |`;
   const body = rows.map((r) => `| ${header.map((_, i) => esc(r[i] ?? "")).join(" | ")} |`);
   return [h, sep, ...body].join("\n");
+}
+
+function csvField(v: string): string {
+  // 以 = + - @ 开头的文字前面加 ',避免表格软件把它当公式执行;数字原样。
+  const safe = /^[=+\-@\t\r]/.test(v) ? `'${v}` : v;
+  return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+}
+
+/** 表格 → CSV:表头带单位,数字不做千分位格式化;开头带 BOM,Excel 打开中文不乱码。 */
+export function tableToCsv(spec: TableSpec, rows: Cell[][] = spec.rows): string {
+  const header = spec.columns.map((c) => csvField(c.unit ? `${c.label}(${c.unit})` : c.label));
+  const body = rows.map((r) => spec.columns.map((_, i) => {
+    const c = r[i] ?? null;
+    return c === null ? "" : typeof c === "number" ? String(c) : csvField(c);
+  }).join(","));
+  return `﻿${[header.join(","), ...body].join("\r\n")}\r\n`;
 }
 
 function heading(title?: string, subtitle?: string): string[] {
@@ -278,7 +294,33 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
           return [`${i + 1}. **${st.name}**${st.note ? `(${st.note})` : ""}${st.detail ? ` —— ${st.detail}` : ""}`, ...legText];
         }),
       ].join("\n");
+    case "sources":
+      return [
+        ...heading(spec.title ?? "来源", spec.subtitle),
+        ...spec.items.map((s, i) => {
+          const name = s.url ? `[${s.title}](${s.url})` : s.title;
+          const meta = [s.site !== s.title ? s.site : undefined, s.date].filter(Boolean).join(" · ");
+          return `${i + 1}. ${name}${meta ? `(${meta})` : ""}${s.note ? ` —— ${s.note}` : ""}`;
+        }),
+      ].join("\n");
+    case "outline":
+      return [...heading(spec.title, spec.subtitle), ...outlineLines(spec.items, 0)].join("\n");
+    case "draft": {
+      const many = spec.variants.length > 1;
+      return [
+        ...heading(spec.title, spec.subtitle),
+        ...spec.variants.flatMap((v) => [...(many ? [`### ${v.label}`] : []), ...(v.subject ? [`**主题**:${v.subject}`, ""] : []), v.text, ""]),
+        ...(spec.original ? ["原文:", "", ...spec.original.split("\n").map((l) => `> ${l}`), ""] : []),
+        ...(spec.note ? [`> ${spec.note}`] : []),
+      ]
+        .join("\n")
+        .trim();
+    }
   }
+}
+
+function outlineLines(nodes: OutlineNode[], depth: number): string[] {
+  return nodes.flatMap((n) => [`${"  ".repeat(depth)}- ${depth === 0 ? `**${n.title}**` : n.title}${n.detail ? ` —— ${n.detail}` : ""}`, ...outlineLines(n.children, depth + 1)]);
 }
 
 /** 计算器曲线在 Markdown 里的样子:按当前输入算首尾两个点的数值(完整曲线只在界面里看)。 */
