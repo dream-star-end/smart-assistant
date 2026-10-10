@@ -89,6 +89,24 @@ describe("selectShareMessages", () => {
     expect(ids(selectShareMessages(list, "all"))).toEqual(["u1"]);
   });
 
+  test("同步过的过程正文带 _orderSeq、后追加的错误卡没有,错误卡仍是末行(code r2)", () => {
+    const list = [
+      msg({ id: "u1", role: "user", text: "整理客户名单", ts: 100, _orderSeq: 1 }),
+      msg({ id: "a1", role: "assistant", text: "正在读取 /私有目录/客户名单", _clientMessageId: "u1", ts: 101, _orderSeq: 2 }),
+      msg({ id: "e1", role: "assistant", text: "连接中断", _errorCode: "stream_cut", _clientMessageId: "u1", ts: 200 }),
+    ];
+    expect(ids(selectShareMessages(list, "all"))).toEqual(["u1"]);
+  });
+
+  test("顺序信号互相矛盾时只分享问题", () => {
+    const list = [
+      msg({ id: "u1", role: "user", text: "问", ts: 1 }),
+      msg({ id: "t1", role: "tool", text: "Read", _clientMessageId: "u1", ts: 9 }),
+      msg({ id: "a1", role: "assistant", text: "答", _clientMessageId: "u1", ts: 5 }),
+    ];
+    expect(ids(selectShareMessages(list, "all"))).toEqual(["u1"]);
+  });
+
   test("降级合并行不当答案(code r1 #2)", () => {
     const list = [
       msg({ id: "u1", role: "user", text: "整理客户名单" }),
