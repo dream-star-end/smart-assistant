@@ -1234,6 +1234,20 @@ export async function pipeStreamWithUsageCapture(
   }
 }
 
+/**
+ * OCV5-328 (#27da48a8): the SSE frame that ends a response whose upstream
+ * broke off before message_delta / message_stop. Without it the client sees a
+ * clean EOF after completed content blocks, and clients on the raw Anthropic
+ * stream (CCB) take that for the end of the turn. The leading blank line
+ * closes any frame the upstream left half written.
+ */
+export function streamInterruptedSseFrame(requestId: string): string {
+  return `\n\nevent: error\ndata: ${JSON.stringify({ type: "error",
+    error: { type: "api_error",
+      message: "upstream stream ended before the response was complete" },
+    request_id: requestId })}\n\n`;
+}
+
 class ProxyAbortError extends Error {
   readonly code = "PROXY_ABORT" as const;
   constructor(reason: string) {

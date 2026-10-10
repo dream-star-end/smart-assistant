@@ -842,6 +842,68 @@ describe("runUpstreamRoundTrip — stream / fetch error 分支", () => {
     assert.equal(res.ended, true);
   });
 
+  // OCV5-328 (#27da48a8): 上游在 message_delta / message_stop 之前断开时,客户端
+  // 收到的是"几个完整 content block 之后干净 EOF",CCB 会把它当作回合正常结束。
+  // ctrl.error() 会丢掉还没被读走的 chunk,所以先让 chunk 被读走,下一次 pull 再出错。
+  const thenFail = (sse: string, error: Error) => {
+    let sent = false;
+    return new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        if (sent) { ctrl.error(error); return; }
+        sent = true;
+        ctrl.enqueue(new TextEncoder().encode(sse));
+      },
+    });
+  };
+
+  test("中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成", async () => {
+    const cut = thenFail(
+          'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":8}}}\n\n'
+          + 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+          + 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      new Error("BOX_TOOL_ID_OR_NAME_INVALID"));
+    const { ctx, res, finalize } = buildCtx({
+      fetchImpl: async () =>
+        new Response(cut, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    });
+    await runUpstreamRoundTrip(ctx);
+
+    assert.equal(finalize.failCalls.length, 1);
+    const frames = res.bodyText().split("\n\n").filter((frame) => frame.trim() !== "");
+    assert.equal(frames.length, 4, "已转发的三帧原样保留,之后只多一帧");
+    assert.match(frames[2]!, /^event: content_block_stop/);
+    const last = frames.at(-1)!;
+    assert.match(last, /^event: error\ndata: /);
+    const data = JSON.parse(last.slice(last.indexOf("data: ") + 6)) as {
+      type: string; error: { type: string; message: string }; request_id: string };
+    assert.equal(data.type, "error");
+    assert.equal(data.error.type, "api_error");
+    assert.equal(typeof data.request_id, "string");
+    assert.ok(!res.bodyText().includes("BOX_TOOL_ID_OR_NAME_INVALID"), "内部错误码不外泄");
+    assert.equal(res.ended, true);
+  });
+
+  test("完整消息之后才出的错、客户端自己断开:都不补 error 帧", async () => {
+    const complete = 'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+      + 'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n'
+      + 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+    const afterStop = buildCtx({ fetchImpl: async () => new Response(
+      thenFail(complete, new Error("late release failure")),
+      { status: 200, headers: { "content-type": "text/event-stream" } }) });
+    await runUpstreamRoundTrip(afterStop.ctx);
+    assert.ok(afterStop.res.bodyText().includes("event: message_stop"));
+    assert.ok(!afterStop.res.bodyText().includes("event: error"));
+
+    const abortErr = new Error("aborted");
+    abortErr.name = "AbortError";
+    const clientGone = buildCtx({ fetchImpl: async () => new Response(
+      thenFail("event: message_start\ndata: {}\n\n", abortErr),
+      { status: 200, headers: { "content-type": "text/event-stream" } }) });
+    await runUpstreamRoundTrip(clientGone.ctx);
+    assert.equal(clientGone.finalize.failClientCalls.length, 1);
+    assert.ok(!clientGone.res.bodyText().includes("event: error"));
+  });
+
   test("fetch 直接抛 AbortError(headersSent=false)→ failClient + sendJsonError 500", async () => {
     const abortErr = new Error("aborted");
     abortErr.name = "AbortError";
