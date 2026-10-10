@@ -23,14 +23,13 @@ export function embedCsp(): string {
 }
 
 /**
- * 把注入内容放到文档最前面,不去解析模型的 HTML 找 <head>(注释里的 "<head>" 之类会把注入骗进注释)。
- * 只跳过开头的空白 / 注释 / doctype(放在 doctype 前面会进怪异模式)。HTML 解析器会把 <html>/<head>
- * 之前出现的 meta / style / script 放进真正的 head,之后再出现的 <html>/<head> 标签只合并属性、不另起 head,
- * 所以注入物一定在 head 里、一定早于模型的任何脚本执行。没有 doctype 的补一个标准模式 doctype。
+ * 我们自己的 doctype + 注入内容永远放在第 0 个字节,模型写的任何东西(注释、doctype、脚本)都排在后面。
+ * 不去「跳过开头的注释 / doctype」:HTML 解析器对注释的切分(例如 `<!-->` 本身就是一个完整注释)和正则不同,
+ * 跳错一次,模型的脚本就会先于 CSP 执行(Codex r2 用 `<!--><script src=…>` 复现过)。
+ * 模型后面再写的 doctype 只是一个被忽略的解析错误,不影响标准模式;出现在 <html>/<head> 之前的
+ * meta / style / script 会被解析器放进真正的 head。
  */
 export function injectHead(code: string, inject: string): string {
-  const lead = /^(?:\s|<!--[\s\S]*?-->)*<!doctype[^>]*>/i.exec(code);
-  if (lead) return `${lead[0]}${inject}${code.slice(lead[0].length)}`;
   return `<!DOCTYPE html>${inject}${code}`;
 }
 

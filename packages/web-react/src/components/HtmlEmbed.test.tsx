@@ -44,7 +44,7 @@ afterEach(() => {
 });
 
 describe("embedDoc 注入", () => {
-  it("注入放在文档最前(doctype 之后),解析后在真正的 head 里、早于模型的任何内容", () => {
+  it("注入放在文档最前(我们自己的 doctype 之后),解析后在真正的 head 里", () => {
     const out = wrapEmbedHtml(PAGE, { token: "ab", dark: true, vars: { "--oc-fg": "#111" } });
     expect(out.startsWith('<!DOCTYPE html><meta http-equiv="Content-Security-Policy"')).toBe(true);
     expect(out).toContain('id="oc-kit"');
@@ -55,25 +55,29 @@ describe("embedDoc 注入", () => {
     expect(doc.title).toBe("户型");
   });
 
-  it("注释里的 <head> 骗不走注入位置(Codex r1):CSP 仍是 head 第一个元素,早于模型脚本", () => {
-    const trap = '<!doctype html><!-- <head> --><html><head></head><body><script src="https://evil.test/x.js"></script></body></html>';
-    const out = injectHead(trap, "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\">");
-    expect(out.startsWith('<!doctype html><meta http-equiv="Content-Security-Policy"')).toBe(true);
+  // Codex r1 / r2 的输入:注释里的 <head>、`<!-->` 空注释、doctype 里带引号的 ">"。
+  // 不管模型怎么写开头,解析后 CSP 都是 head 的第一个元素,文档里每个 <script> 都排在它后面。
+  it.each([
+    ["注释里的 <head>", '<!doctype html><!-- <head> --><html><head></head><body><script src="https://evil.test/x.js"></script></body></html>'],
+    ["<!--> 空注释", '<!--><script src="https://evil.test/x.js"></script><!-- --><!doctype html><p>x</p>'],
+    ["doctype 里带引号的 >", '<!doctype html SYSTEM ">"><script src="https://evil.test/x.js"></script>'],
+    ["head 里的脚本", "<html><head><script>x()</script></head></html>"],
+    ["片段", '<script src="https://evil.test/x.js"></script><div>x</div>'],
+  ])("CSP 先于模型的任何内容:%s", (_name, code) => {
+    const out = wrapEmbedHtml(code, { token: "ab", dark: false, vars: {} });
+    expect(out.startsWith('<!DOCTYPE html><meta http-equiv="Content-Security-Policy"')).toBe(true);
     const doc = new DOMParser().parseFromString(out, "text/html");
-    const csp = doc.head.querySelector('meta[http-equiv="Content-Security-Policy"]');
-    expect(csp).toBeTruthy();
-    const script = doc.querySelector("script");
-    expect(csp && script && csp.compareDocumentPosition(script) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // 模型脚本写在 head 里也一样排在注入后面。
-    const early = injectHead("<html><head><script>x()</script></head></html>", "<meta id=first>");
-    const d2 = new DOMParser().parseFromString(early, "text/html");
-    expect(d2.head.firstElementChild?.id).toBe("first");
+    const csp = doc.head.firstElementChild;
+    expect(csp?.getAttribute("http-equiv")).toBe("Content-Security-Policy");
+    for (const script of Array.from(doc.querySelectorAll("script"))) {
+      expect(csp!.compareDocumentPosition(script) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    expect(doc.compatMode).toBe("CSS1Compat");
   });
 
-  it("片段补 doctype;开头的注释和 doctype 原样保留在最前(不触发怪异模式)", () => {
+  it("兜底预览同样把 CSP 放在最前", () => {
     expect(injectHead("<div>x</div>", "<meta x>")).toBe("<!DOCTYPE html><meta x><div>x</div>");
-    expect(injectHead("<!-- hi -->\n<!DOCTYPE html><p>x</p>", "<meta x>")).toBe("<!-- hi -->\n<!DOCTYPE html><meta x><p>x</p>");
-    expect(injectHead("<!-- <!doctype html> --><p>x</p>", "<meta x>")).toBe("<!DOCTYPE html><meta x><!-- <!doctype html> --><p>x</p>");
+    expect(wrapWithCspOnly("<!--><script>x()</script>").startsWith('<!DOCTYPE html><meta http-equiv="Content-Security-Policy"')).toBe(true);
     expect(wrapWithCspOnly("<p>x</p>")).toContain("form-action 'none'");
   });
 
