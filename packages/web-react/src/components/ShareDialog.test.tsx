@@ -102,6 +102,27 @@ describe("ShareDialog", () => {
     expect(input.messages.map((m) => m.text)).toEqual(["整理客户名单"]);
   });
 
+  it("打开后消息数组被就地追加、sending 变化,切换范围仍用打开时的快照(code r1 #4)", async () => {
+    renderShareCard.mockResolvedValue({ blob: new Blob(["png"]), layout: {} });
+    const live = [...MESSAGES];
+    const view = open({ messages: live });
+    await screen.findByRole("img", { name: "分享长图预览" });
+    live.push(
+      msg({ id: "u2", role: "user", text: "再查一下" }),
+      msg({ id: "a3", role: "assistant", text: "正在读取 /私有目录/另一份", _clientMessageId: "u2" }),
+    );
+    live[3].text = "被就地改写";
+    view.rerender(
+      <ToastProvider>
+        <ShareDialog open onOpenChange={() => {}} messages={live} sending title="客户名单" agentName="全能助手" />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "全部" }));
+    await waitFor(() => expect(renderShareCard.mock.calls.length).toBeGreaterThan(1));
+    const last = renderShareCard.mock.calls.at(-1)?.[0] as { messages: { text: string }[] };
+    expect(last.messages.map((m) => m.text)).toEqual(["整理客户名单", "整理好了，共 12 位。"]);
+  });
+
   it("「导出 Markdown」保留原导出功能", async () => {
     renderShareCard.mockResolvedValue({ blob: new Blob(["png"]), layout: {} });
     const onExportMarkdown = vi.fn();

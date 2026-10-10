@@ -66,9 +66,10 @@ export function ShareDialog({
   const toast = useToast();
   const [range, setRange] = useState<ShareRange>("last");
   const [card, setCard] = useState<Card>({ state: "rendering" });
-  // 打开时的快照;关闭再打开才取新内容。
+  // 打开时的快照:逐行浅拷贝(消息数组和行对象会被就地更新),与同一时刻的 sending 一起冻结;
+  // 关闭再打开才取新内容。
   // biome-ignore lint/correctness/useExhaustiveDependencies: 有意只在 open 翻转时取快照
-  const snapshot = useMemo(() => ({ messages, sending }), [open]);
+  const snapshot = useMemo(() => ({ messages: messages.map((m) => ({ ...m })), sending }), [open]);
   const picked = useMemo(
     () => selectShareMessages(snapshot.messages, range, snapshot.sending),
     [snapshot, range],

@@ -70,6 +70,50 @@ describe("selectShareMessages", () => {
     expect(picked.map((m) => m.text).join("\n")).not.toContain("/私有目录");
   });
 
+  test("以错误卡收尾的一轮没有可分享的回答,过程叙述不顶替(code r1 #1)", () => {
+    const list = [
+      msg({ id: "u1", role: "user", text: "整理客户名单" }),
+      msg({ id: "a1", role: "assistant", text: "正在读取 /私有目录/客户名单", _clientMessageId: "u1" }),
+      msg({ id: "t1", role: "tool", text: "Read", _clientMessageId: "u1" }),
+      msg({ id: "e1", role: "assistant", text: "模型暂不可用", _errorCode: "upstream", _clientMessageId: "u1" }),
+    ];
+    expect(ids(selectShareMessages(list, "all"))).toEqual(["u1"]);
+  });
+
+  test("以工具收尾(没有最终正文)的一轮不收叙述", () => {
+    const list = [
+      msg({ id: "u1", role: "user", text: "跑一下" }),
+      msg({ id: "a1", role: "assistant", text: "正在执行 /私有目录/run.sh" }),
+      msg({ id: "t1", role: "tool", text: "Bash" }),
+    ];
+    expect(ids(selectShareMessages(list, "all"))).toEqual(["u1"]);
+  });
+
+  test("降级合并行不当答案(code r1 #2)", () => {
+    const list = [
+      msg({ id: "u1", role: "user", text: "整理客户名单" }),
+      msg({
+        id: "a1",
+        role: "assistant",
+        text: "正在读取 /私有目录/客户名单\n整理好了",
+        _displayDegradeReason: "records_unpublished",
+        _clientMessageId: "u1",
+      }),
+    ];
+    expect(ids(selectShareMessages(list, "all"))).toEqual(["u1"]);
+  });
+
+  test("按 _clientMessageId 归轮,不按数组位置(code r1 #3)", () => {
+    const list = [
+      msg({ id: "u1", role: "user", text: "第一问", ts: 1 }),
+      msg({ id: "a1p", role: "assistant", text: "正在读取 /私有目录", _clientMessageId: "u1", ts: 2 }),
+      msg({ id: "u2", role: "user", text: "第二问", ts: 4 }),
+      msg({ id: "a2", role: "assistant", text: "第二答", _clientMessageId: "u2", ts: 5 }),
+      msg({ id: "a1f", role: "assistant", text: "第一答", _clientMessageId: "u1", ts: 3 }),
+    ];
+    expect(ids(selectShareMessages(list, "all"))).toEqual(["u1", "a1f", "u2", "a2"]);
+  });
+
   test("生成中:进行中那一轮的回答不收", () => {
     const list = [
       msg({ id: "u1", role: "user", text: "第一问" }),

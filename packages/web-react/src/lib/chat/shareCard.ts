@@ -1,3 +1,4 @@
+import { isFoldableWorkRole } from "../../components/chat/ProcessDisclosure";
 import { uiPlainText } from "../../components/iui/plainText";
 import { BRAND } from "../brand";
 import { sessionExportFilename } from "./exportMarkdown";
@@ -37,6 +38,7 @@ function hiddenInChat(m: ChatMessage): boolean {
   );
 }
 
+/** 干净的最终正文:非错误、非状态记录、非降级合并行(降级行可能把过程段和答案拼在一起)。 */
 function isAnswerBody(m: ChatMessage): boolean {
   return (
     m.role === "assistant" &&
@@ -45,8 +47,18 @@ function isAnswerBody(m: ChatMessage): boolean {
     !m.error &&
     !m._turnStatusRecord &&
     !m._genPlaceholder &&
+    !m._displayDegraded &&
+    m._displayDegradeReason === undefined &&
     (m.text ?? "").trim().length > 0
   );
+}
+
+/** 参与「本轮最后一行是谁」判定的行:助手行(含错误/状态记录)和工作行。空正文的助手占位不算。 */
+function isTurnTail(m: ChatMessage): boolean {
+  if (m.role === "assistant") {
+    return (m.text ?? "").trim().length > 0 || !!m._errorCode || !!m._isError || !!m.error || !!m._turnStatusRecord;
+  }
+  return isFoldableWorkRole(m);
 }
 
 /** 与 turnSegment 的末条判定同序:_orderSeq → ts → 数组下标。 */
@@ -64,35 +76,60 @@ function after(a: [number, number, number], b: [number, number, number]): boolea
 
 /**
  * 按范围挑消息。用户消息 = 真实提问(恢复控制行、自动续接、排队中的不算)。
- * 轮次只按真实提问切:恢复子轮(不同 _clientMessageId)归并回它所属的提问,
- * 每轮只收**一条**助手正文 = 该轮最后一条非错误正文。中间叙述、错误卡、工具、thinking 都不进分享物。
- * `sending` 时进行中那一轮的回答还不是最终答案,不收。
+ * 归轮:行的 _clientMessageId 指向哪条提问就归哪轮(恢复子轮沿 _recoveryOfClientMessageId 归并回原提问);
+ * 没有归属的旧行按数组位置归到前一条真实提问。
+ * 每轮最多收**一条**助手正文,而且必须是该轮(按 _orderSeq → ts → 下标)的最后一行:
+ * 最后一行是错误卡、状态记录、降级合并行或工具/思考等工作行时,这一轮没有可分享的回答 ——
+ * 宁可只分享问题,也不把「正在读取 …」这类过程文本当答案。`sending` 时进行中那一轮不收回答。
  */
 export function selectShareMessages(
   messages: readonly ChatMessage[],
   range: ShareRange,
   sending = false,
 ): ChatMessage[] {
-  const rows = messages.filter((m) => !hiddenInChat(m));
-  const turns: { user: ChatMessage | null; answer: { m: ChatMessage; tuple: [number, number, number] } | null }[] = [
-    { user: null, answer: null },
-  ];
-  rows.forEach((m, i) => {
-    if (m.role === "user") {
-      if (m.status === "queued" || !(m.text ?? "").trim()) return;
-      turns.push({ user: m, answer: null });
-      return;
+  // 恢复控制行 → 它所恢复的那条消息。
+  const parent = new Map<string, string>();
+  for (const m of messages) {
+    if (!isRecoveryControlUserTurn(m) || !m._recoveryOfClientMessageId) continue;
+    parent.set(m.id, m._recoveryOfClientMessageId);
+    if (m._clientMessageId) parent.set(m._clientMessageId, m._recoveryOfClientMessageId);
+  }
+  const root = (id: string): string => {
+    let cur = id;
+    const seen = new Set<string>();
+    while (parent.has(cur) && !seen.has(cur)) {
+      seen.add(cur);
+      cur = parent.get(cur) as string;
     }
-    if (!isAnswerBody(m)) return;
-    const turn = turns[turns.length - 1];
+    return cur;
+  };
+
+  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; tuple: [number, number, number] } | null };
+  const turns: Turn[] = [{ user: null, tail: null }];
+  const byKey = new Map<string, Turn>();
+  const rows = messages.filter((m) => !hiddenInChat(m));
+  const positional: Turn[] = [];
+  for (const m of rows) {
+    if (m.role === "user" && m.status !== "queued" && (m.text ?? "").trim()) {
+      const turn: Turn = { user: m, tail: null };
+      turns.push(turn);
+      byKey.set(m.id, turn);
+      if (m._clientMessageId) byKey.set(m._clientMessageId, turn);
+    }
+    positional.push(turns[turns.length - 1]);
+  }
+  rows.forEach((m, i) => {
+    if (m.role === "user" || !isTurnTail(m)) return;
+    const owned = m._clientMessageId ? byKey.get(root(m._clientMessageId)) : undefined;
+    const turn = owned ?? positional[i];
     const tuple = orderTuple(m, i);
-    if (!turn.answer || after(tuple, turn.answer.tuple)) turn.answer = { m, tuple };
+    if (!turn.tail || after(tuple, turn.tail.tuple)) turn.tail = { m, tuple };
   });
-  if (sending && turns.length > 1) turns[turns.length - 1].answer = null;
+  const live = sending ? turns[turns.length - 1] : null;
   const body: ChatMessage[] = [];
   for (const t of turns) {
     if (t.user) body.push(t.user);
-    if (t.answer) body.push(t.answer.m);
+    if (t !== live && t.tail && isAnswerBody(t.tail.m)) body.push(t.tail.m);
   }
   if (range === "all") return body;
   const userIdx: number[] = [];
