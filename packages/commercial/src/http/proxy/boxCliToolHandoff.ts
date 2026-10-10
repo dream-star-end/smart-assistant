@@ -36,6 +36,11 @@ const TOOL_ID = /^toolu_[A-Za-z0-9_-]{1,120}$/;
 /** OCV5-301: how many consecutive model messages may consist only of calls
  * to tools this invocation does not expose before the run fails closed. */
 const BOX_CLI_REJECTED_SEGMENTS_MAX = 3;
+/** OCV5-368: bytes of CLI stream JSONL one visible message may span. Box Opus
+ * and Sonnet answer up to 128000 output tokens; the live spool runs about
+ * 10 bytes per thinking token and 50 per text token (partial-message deltas),
+ * so a full text answer is about 6.4 MB. Same bound as the held tool frames. */
+export const BOX_TOOL_MESSAGE_STREAM_MAX_BYTES = 16 * 1024 * 1024;
 /** OCV5-368: Claude Code resumes a message cut at `max_tokens` at most this
  * many times in one turn (its own recovery limit). */
 const BOX_CLI_OUTPUT_LIMIT_RESUMES_MAX = 3;
@@ -204,7 +209,9 @@ export class BoxCliToolHandoffDecoder {
         }
       }
       this.bytes += Buffer.byteLength(measured);
-      if (this.bytes > 1_048_576) throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_TOO_LARGE");
+      if (this.bytes > BOX_TOOL_MESSAGE_STREAM_MAX_BYTES) {
+        throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_TOO_LARGE");
+      }
       this.pending += chunk;
       let emitted = "";
       while (this.candidate === null && this.finalCandidate === null) {
@@ -739,7 +746,7 @@ export class BoxCliToolHandoffDecoder {
     }
     if (this.holdToolFrames) {
       this.heldToolBytes += Buffer.byteLength(frame);
-      if (this.heldToolBytes > 16 * 1024 * 1024) {
+      if (this.heldToolBytes > BOX_TOOL_MESSAGE_STREAM_MAX_BYTES) {
         throw new BoxCliToolHandoffError("BOX_TOOL_HELD_FRAMES_TOO_LARGE");
       }
       this.heldToolFrames.push(frame);

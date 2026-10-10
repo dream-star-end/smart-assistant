@@ -80,4 +80,16 @@ describe('boxApiModels', () => {
       if (mirrorPath.includes('commercial')) assert.doesNotMatch(mirror, /^import /m)
     })
   }
+
+  // OCV5-368: CCB sends max_tokens = the model's official cap for these models.
+  it('the CCB output-cap mirror equals maxOutputTokens for every model it lists', () => {
+    const mirror = readFileSync(fileURLToPath(new URL(
+      '../../../../claude-code-best/src/utils/model/boxNativeRemoteContext.ts', import.meta.url)), 'utf8')
+    const block = /export const BOX_API_OUTPUT_TOKENS: Readonly<Record<string, number>> = \{([^}]*)\}/.exec(mirror)
+    assert.ok(block, 'output cap mirror not found')
+    const entries = [...block[1]!.matchAll(/['"]([^'"]+)['"]:\s*([0-9_]+)/g)]
+      .map((hit) => [hit[1], Number(hit[2]!.replaceAll('_', ''))] as const)
+    assert.deepEqual(entries.map(([id]) => id), ['box-api-claude-opus-5-5', 'box-api-claude-sonnet-5-5'])
+    for (const [id, cap] of entries) assert.equal(cap, boxApiModelById(id)?.maxOutputTokens, id)
+  })
 })
