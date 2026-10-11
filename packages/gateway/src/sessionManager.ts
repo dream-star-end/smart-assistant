@@ -66,6 +66,7 @@ import {
   writeIdleOp,
 } from './boxIdleCompact.js'
 import { fetchBoxIdleProof, type IdleProofResponse } from './engine/boxIdleProofClient.js'
+import { notifyBoxUserStop } from './engine/boxUserStopClient.js'
 import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
 
 /** Background idle drain re-arms while proof stays pending (egress settling). */
@@ -86,6 +87,27 @@ async function settleStrandedIdleOp(session: AgentSession, op: IdleOp, recoveryD
   if (!reason) return
   log.warn('box idle op abandoned', { sessionKey: session.sessionKey, revision: op.revision, reason })
   writeSettledIdleOp(recoveryDir, { ...evidenced, disposition: 'abandoned', abandonReason: reason })
+}
+
+/** OCV5-377 (commercial uid 4, 10-11): the Box model answered an idle summary
+ * turn with a tool call. Its CLI stayed parked on that handoff after the CCB
+ * runner was killed; nothing can ever answer it, the open handoff kept the
+ * source and summary proofs pending, and every next message of the session
+ * was refused (IDLE_HISTORY_PENDING). Once the runner is proven dead, ask
+ * egress to stop that run, as a browser Stop does (container-scoped, this
+ * session and idle turn key only); its proof then reads failed and the op
+ * settles as idle_turn_failed. Nothing is sent to a model. */
+const IDLE_TURN_STOP_WAIT_MS = 30_000
+async function stopParkedIdleTurn(op: IdleOp): Promise<void> {
+  if (idleOpSettled(op) || op.summaryText || typeof op.runnerKilledAt !== 'number') return
+  // Bounded: this runs under session.lock on the submit path. A stop that is
+  // still running on egress past the budget completes there; the op then
+  // settles on a later pass (Codex r1).
+  const outcome = await notifyBoxUserStop({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey },
+    { timeoutMs: IDLE_TURN_STOP_WAIT_MS }).catch(() => 'pending' as const)
+  if (outcome !== 'skipped') {
+    log.info('box idle turn stop requested', { sessionKey: op.sessionKey, revision: op.revision, outcome })
+  }
 }
 
 /** Persist an op; once settled, rotate old settled files for the session. */
@@ -4748,6 +4770,9 @@ export class SessionManager {
     if (session._idleRunning) return
     const pending = readPendingIdle(recoveryDir, session.sessionKey)
     if (!pending && !readIdleCandidate(recoveryDir, session.sessionKey)) return
+    // OCV5-377: stop an idle summary turn parked on a tool call before reading
+    // proofs; its open handoff keeps both proofs pending (see stopParkedIdleTurn).
+    if (pending) await stopParkedIdleTurn(withIncarnationShutdown(recoveryDir, pending))
     const proof = await waitBoxIdleProof({ sessionId: source.sessionId, turnKey: source.turnKey })
     if (proof.status === 'skipped') {
       // Not configured / invalid identity. Safe to drop only a bare candidate:
@@ -4915,6 +4940,7 @@ export class SessionManager {
           const killed = typeof session.runner.shutdown === 'function'
             && await session.runner.shutdown().then(() => true, () => false)
           if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
+          if (killed) await stopParkedIdleTurn(step.op)
           log.warn('box idle turn ended without result', {
             sessionKey: session.sessionKey, revision: step.op.revision,
             timeout: false, noSummary: true, runnerKilled: killed,
@@ -4932,6 +4958,7 @@ export class SessionManager {
           killed = await session.runner.shutdown().then(() => true, () => false)
         }
         if (killed) step = { ...step, op: { ...step.op, runnerKilledAt: Date.now() } }
+        if (killed) await stopParkedIdleTurn(step.op)
         log.warn('box idle turn ended without result', {
           sessionKey: session.sessionKey, revision: step.op.revision,
           timeout: idleErr instanceof IdleTurnTimeoutError, runnerKilled: killed,
