@@ -248,6 +248,10 @@ export function makeBoxTextPlan(input: {
     cwd: cliCwd,
     environment: { HOME: "/home/box", PATH: "/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin",
       LANG: "C.UTF-8", CLAUDE_CODE_MAX_RETRIES: "0",
+      // OCV5-377: on a safety stop the CLI would retry once on its own with a
+      // nudge; that hidden answer reaches no client and holds the run. The
+      // client's own Claude Code decides what to do with the refusal.
+      CLAUDE_CODE_DISABLE_REFUSAL_RETRY: "1",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(input.body.max_tokens),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       // Explicit 0 or 1. Omitting the key would inherit an outer "1".
