@@ -216,7 +216,7 @@ test("unknown, contradictory or incomplete failure shapes stay pending", () => {
   // ancestor must be failed_stopped (not terminal) with a matching resume link
   assert.equal(pendingOf([{ ...failedParent, ctx: { ...failedParent.ctx, boxState: "terminal" } }, failedLeaf]), "pending");
   assert.equal(pendingOf([{ ...failedParent, ctx: { ...failedParent.ctx, boxResumeRevision: "x" } }, failedLeaf]), "pending");
-  // missing boxState, another open chain, or a second leaf
+  // missing boxState, another open chain, or a second leaf of the same run
   assert.equal(pendingOf([row("x", { boxState: undefined }, "aborted")]), "pending");
   assert.equal(pendingOf([failedText], ["elsewhere"]), "pending");
   assert.equal(pendingOf([failedText, { ...failedText, requestId: "f-text-2" }]), "pending");
@@ -385,4 +385,49 @@ test("OCV5-313 only a complete valid expired chain stops counting as another ope
     { boxTurnKey: "ef".repeat(32) });
   assert.deepEqual(ids([expiredLeaf, otherTurn]), ["y-first"]);
   assert.deepEqual(ids([row("live", { boxState: "unknown" }, "inflight")]), []);
+});
+
+// OCV5-377 (commercial uid 4, 10-11, turn c6b37a18): a 22-round tool chain
+// stopped when the Box login was rate-limited (its last round aborted,
+// worker_failed) plus the client's retry, a separate run also refused. Every
+// row was closed, yet the turn stayed pending because it had two leaves, and
+// the container refused every next message of the session.
+const N2 = "d".repeat(24);
+const refusedRound = row("u4-leaf", {
+  boxState: "failed_stopped", boxStopOutcome: "failed", boxTerminalProof: failedProof, boxAccountId: "20",
+  boxRunNonce: NONCE, boxLeaseEpoch: EPOCH, boxOwnerRequestId: "f-parent", boxParentResumeRevision: REV,
+}, "aborted");
+const chainParent = { ...failedParent, ctx: { ...failedParent.ctx, boxResumeRequestId: "u4-leaf" } };
+const refusedRetry = row("u4-retry", {
+  boxState: "failed_stopped", boxStopOutcome: "failed", boxAccountId: "20",
+  boxTerminalProof: { ...failedProof, runNonce: N2 }, boxRunNonce: N2, boxLeaseEpoch: EPOCH,
+}, "aborted");
+
+test("OCV5-377 a turn whose every component is a proven failure projects failed", () => {
+  for (const rows of [[chainParent, refusedRound, refusedRetry], [refusedRetry, refusedRound, chainParent]]) {
+    assert.deepEqual(projectBoxIdleChain({ sessionId, turnKey, rows }),
+      { status: "failed", sessionId, turnKey, requestIds: ["f-parent", "u4-leaf", "u4-retry"] });
+  }
+  // still pending: another open chain, a same-run duplicate, or a component that is neither
+  const pendingOf = (rows: IdleChainRow[], other: string[] = []) =>
+    projectBoxIdleChain({ sessionId, turnKey, rows, otherOpenRequestIds: other }).status;
+  assert.equal(pendingOf([chainParent, refusedRound, refusedRetry], ["elsewhere"]), "pending");
+  assert.equal(pendingOf([chainParent, refusedRound, { ...refusedRetry, ctx: { ...refusedRetry.ctx,
+    boxTerminalProof: failedProof, boxRunNonce: NONCE } }]), "pending");
+  assert.equal(pendingOf([chainParent, refusedRound, { ...refusedRetry, ctx: { ...refusedRetry.ctx,
+    boxState: "unknown" } }]), "pending");
+  assert.equal(pendingOf([chainParent, refusedRound, { ...refusedRetry, state: "inflight" }]), "pending");
+});
+
+test("OCV5-377 a proven failed retry beside a finished chain leaves the chain's terminal proof", () => {
+  const retry = { ...refusedRetry, ctx: { ...refusedRetry.ctx,
+    boxTerminalProof: { ...failedProof, runNonce: "e".repeat(24) }, boxRunNonce: "e".repeat(24) } };
+  const alone = projectBoxIdleChain({ sessionId, turnKey, rows: [leaf, parent] });
+  const beside = projectBoxIdleChain({ sessionId, turnKey, rows: [retry, leaf, parent] });
+  assert.equal(beside.status, "terminal");
+  if (beside.status === "terminal" && alone.status === "terminal") {
+    assert.equal(beside.requestId, "leaf");
+    assert.equal(beside.revision, alone.revision);
+    assert.equal(beside.capsuleSha256, alone.capsuleSha256);
+  }
 });
