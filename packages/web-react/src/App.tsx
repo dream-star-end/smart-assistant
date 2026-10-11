@@ -84,7 +84,7 @@ import {
   type ArtifactInspectTarget,
   type ChatInteraction,
 } from "./components/tool/context";
-import { browserStepOf } from "./components/tool/browserSteps";
+import { isBrowserStepMessage } from "./components/tool/browserDetect";
 import {
   DETAIL_PANE_WIDTH,
   type DeferredPayloadLoader,
@@ -2588,7 +2588,7 @@ export function App() {
   const artifactInspect = useMemo(
     () => ({
       // 浏览器操作(OCV5-374)进「浏览器」页看截图和整轮操作记录;其余工具进步骤详情。
-      open: (t: ArtifactInspectTarget) => openPane(browserStepOf(t.message) ? "browser" : "steps", t.message),
+      open: (t: ArtifactInspectTarget) => openPane(isBrowserStepMessage(t.message) ? "browser" : "steps", t.message),
       openPane: (tab: PaneTab, message?: ToolLike | null) => openPane(tab, message),
     }),
     [openPane],

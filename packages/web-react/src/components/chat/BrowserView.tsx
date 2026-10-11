@@ -68,8 +68,8 @@ function Window({ item, steps, index }: { item: BrowserTurnStep; steps: readonly
         </p>
       )}
       {shot ? (
-        <div className="bg-hover/30" data-testid="browser-window-shot">
-          <SignedImg src={shot} alt={title ? `${title} 截图` : "页面截图"} className="block max-h-[62vh] w-full object-contain object-top" />
+        <div className="flex justify-center bg-hover/40" data-testid="browser-window-shot">
+          <SignedImg src={shot} alt={title ? `${title} 截图` : "页面截图"} className="block max-h-[62vh] w-auto max-w-full object-contain" />
         </div>
       ) : (
         <div className="flex flex-col items-center gap-2 px-6 py-10 text-center text-meta text-faint" data-testid="browser-window-noshot">
@@ -135,7 +135,7 @@ function LogRow({
           {n}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-meta text-fg">{step.actions.map((a) => a.label).join(" → ")}</span>
+          <span className="block truncate text-meta text-fg">{step.actions.map((a) => a.label).join(" → ") || "浏览器操作"}</span>
           {where && (
             <span className="block truncate font-mono text-caption text-faint">
               {where.host}

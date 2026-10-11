@@ -1463,7 +1463,8 @@ function MinimaxCliCard({ command, tool }: { command: string; tool: ToolLike }):
 
 function OcBrowserCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
   const step = browserStepOf(tool, command);
-  return step ? <BrowserStepCard step={step} tool={tool} /> : null;
+  // 没登记的动词:交给 GenericOcCard 兜底(不泄漏命令),不画一张空的浏览器卡。
+  return step && step.actions.length > 0 ? <BrowserStepCard step={step} tool={tool} /> : null;
 }
 
 // ── 注册表 + 分派入口(单一权威:键 = OcCli,与 meta.OC_TOOLS 对齐)──────────────

@@ -49,7 +49,7 @@ import { cn } from "../lib/utils";
 import { extractLatestTodos, type TodoItem } from "./chat/PinnedTaskTracker";
 import { CopyIconButton, FullToolBody } from "./chat/paneParts";
 import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
-import { collectBrowserSteps } from "./tool/browserSteps";
+import { isBrowserStepMessage } from "./tool/browserDetect";
 import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
 import {
   type DisplayTool,
@@ -681,7 +681,10 @@ export function InspectorPanelContent({
   );
   const viewedTurn = workTurns[outputsIndex];
   // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
-  const browserCount = useMemo(() => (viewedTurn ? collectBrowserSteps(viewedTurn.steps).length : 0), [viewedTurn, version]);
+  const browserCount = useMemo(
+    () => (viewedTurn ? viewedTurn.steps.filter((m) => isBrowserStepMessage(m)).length : 0),
+    [viewedTurn, version],
+  );
 
   const view: PaneTab =
     (tab === "plan" && todos.length === 0) || (tab === "browser" && browserCount === 0) ? "outputs" : tab;

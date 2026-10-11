@@ -160,9 +160,9 @@ export function BrowserStepCard({ step, tool }: { step: BrowserStep; tool: ToolL
       </div>
       {shot && (
         <div className="border-t border-border/70 bg-hover/40 p-2.5">
-          <div className="relative overflow-hidden rounded-lg border border-border/70 bg-surface [&_img]:max-h-80 [&_img]:w-full [&_img]:object-contain [&_img]:object-top" data-testid="browser-shot">
+          <div className="relative flex justify-center overflow-hidden rounded-lg border border-border/70 bg-hover/60" data-testid="browser-shot">
             {/* 点图放大(全局看图器);右上角进侧栏看这一轮的浏览器记录。 */}
-            <SignedImg src={shot} alt="页面截图" className="block max-h-80 w-full object-contain object-top" />
+            <SignedImg src={shot} alt="页面截图" className="block max-h-80 w-auto max-w-full object-contain" />
             {openPane && (
               <button
                 type="button"

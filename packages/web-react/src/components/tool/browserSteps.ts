@@ -1,16 +1,17 @@
 /**
- * 浏览器操作的唯一解析(OCV5-374):oc-browser(Bash 调 playwright-cli)和 MCP browser_* 两条路,
- * 归一成「动作序列 + 页面 + 截图」。工具卡、过程折叠规则、详情面板的浏览器视图都只读这里,
- * 不各自写正则。
+ * 浏览器操作的完整解析(OCV5-374,只在懒加载块里用):oc-browser(Bash 调 playwright-cli)和
+ * MCP browser_* 两条路,归一成「动作序列 + 页面 + 截图」。工具卡正文、详情面板的浏览器页、产出页都只读
+ * 这里;首屏只需要的「是不是浏览器操作」在 browserDetect.ts,动作表与命令识别和这里同源。
  *
  * 截图路径:playwright-cli 的输出写相对路径 `.playwright-cli/page-….png`,相对的是
  * oc-browser.sh 先 `cd` 进去的 OPENCLAUDE_HOME(容器里固定 /home/agent/.openclaude)。
  * 旧代码用 `/\/…\.png/` 从相对路径里抠出 `/page-….png` 当容器文件:缩略图是坏图,折叠规则还把这一步
  * 当成「交付的图片」留在处理过程外面。
  */
+import { OC_BROWSER_CALL_RE, browserToolShape, isBrowserStepMessage } from "./browserDetect";
 import type { ToolLike } from "./format";
-import { asStr, normalizeToolForDisplay } from "./format";
-import { detectOcCli, parseMcpName } from "./meta";
+import { asStr } from "./format";
+import { parseMcpName } from "./meta";
 import { resolveToolStatus } from "./status";
 
 /** oc-browser.sh 里 playwright-cli 的工作目录(OPENCLAUDE_HOME 的容器默认值)。 */
@@ -39,7 +40,8 @@ export type BrowserStep = {
   output: string;
 };
 
-const VERB_LABELS: Record<string, string> = {
+/** 已登记的 oc-browser 动作(browser 技能文档 + 实际出现过的 resize / type 等)。 */
+const VERB_LABELS = {
   open: "打开网页",
   goto: "打开网页",
   "tab-new": "新标签页",
@@ -68,9 +70,11 @@ const VERB_LABELS: Record<string, string> = {
   reload: "刷新网页",
   "state-save": "保存登录状态",
   close: "关闭浏览器",
-};
+} as const satisfies Record<string, string>;
+type OcBrowserVerb = keyof typeof VERB_LABELS;
+const isVerb = (v: string): v is OcBrowserVerb => Object.prototype.hasOwnProperty.call(VERB_LABELS, v);
 
-const MCP_OPS: Record<string, string> = {
+const MCP_OPS: Record<string, OcBrowserVerb> = {
   browser_navigate: "goto",
   browser_navigate_back: "go-back",
   browser_take_screenshot: "screenshot",
@@ -136,7 +140,19 @@ function cliArgs(command: string, start: number): string[] {
   const tail = command.slice(start);
   const end = tail.search(/[\n;&|]/);
   const segment = end < 0 ? tail : tail.slice(0, end);
-  return [...segment.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((t) => t[1] ?? t[2] ?? t[3] ?? "");
+  const tokens = [...segment.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map((t) => ({ text: t[1] ?? t[2] ?? t[3] ?? "", bare: !!t[3] }));
+  // 去掉 shell 重定向(`2>&1`、`>/dev/null`、`> out.txt`):它们不是动作参数,`2>` 曾被当成元素显示。
+  const args: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (!t) continue;
+    if (t.bare && /^\d*[<>]/.test(t.text)) {
+      if (/^\d*[<>]+$/.test(t.text)) i++;
+      continue;
+    }
+    args.push(t.text);
+  }
+  return args;
 }
 
 function actionDetail(verb: string, args: string[]): string {
@@ -148,15 +164,14 @@ function actionDetail(verb: string, args: string[]): string {
   return plain[0] ?? "";
 }
 
-/** 命令位置的每个 `oc-browser <verb>`(复合命令按出现顺序)。只收已登记动作。 */
+/** 命令位置的每个已登记 `oc-browser <verb>`,带上它的参数详情。 */
 function cliActions(command: string): BrowserAction[] {
   const actions: BrowserAction[] = [];
-  for (const m of command.matchAll(/(?:^|[\n;&|(]\s*)(?:\S*\/)?oc-browser\s+([a-z-]+)/gi)) {
+  for (const m of command.matchAll(OC_BROWSER_CALL_RE)) {
     const verb = (m[1] ?? "").toLowerCase();
-    const label = VERB_LABELS[verb];
-    if (!label) continue;
-    const start = (m.index ?? 0) + m[0].length;
-    actions.push({ verb, label, detail: actionDetail(verb, cliArgs(command, start)) });
+    if (!isVerb(verb)) continue;
+    const end = (m.index ?? 0) + m[0].length;
+    actions.push({ verb, label: VERB_LABELS[verb], detail: actionDetail(verb, cliArgs(command, end)) });
   }
   return actions;
 }
@@ -195,18 +210,8 @@ function textOf(value: unknown): string {
  * `command`:调用方已拿到的 Bash 命令(工具卡分派处),行里没有输入时用它。
  */
 export function browserStepOf(message: ToolLike, command?: string): BrowserStep | null {
-  let name = message.toolName ?? "";
-  let input: Record<string, unknown> | null = null;
-  let tool: ToolLike = message;
-  try {
-    const display = normalizeToolForDisplay(message);
-    name = display.name || name;
-    input = display.input && typeof display.input === "object" ? (display.input as Record<string, unknown>) : null;
-    tool = display.tool;
-  } catch {
-    /* 原始行兜底 */
-  }
-  const shell = asStr(input?.command) || command || "";
+  if (!isBrowserStepMessage(message, command)) return null;
+  const { name, input, tool, shell } = browserToolShape(message, command);
   const output = [textOf(tool.output), message.bashTail?.tail ?? ""].filter(Boolean).join("\n");
   const status = resolveToolStatus({ name, tool });
   const failed = status.kind === "error" || /^(?:#{1,6}\s*)?Error\b/im.test(output);
@@ -214,16 +219,13 @@ export function browserStepOf(message: ToolLike, command?: string): BrowserStep 
   let actions: BrowserAction[];
   let requested: string[] = [];
   if (mcp) {
-    if (mcp.server !== "browser") return null;
     const verb = MCP_OPS[mcp.op];
-    actions = verb ? [{ verb, label: VERB_LABELS[verb] ?? verb, detail: mcpDetail(verb, input) }] : [];
+    actions = verb ? [{ verb, label: VERB_LABELS[verb], detail: mcpDetail(verb, input) }] : [];
     const filename = asStr(input?.filename) || asStr(input?.path);
     const resolved = filename ? resolveBrowserPath(filename) : null;
     if (resolved) requested = [resolved];
   } else {
-    if (detectOcCli(shell) !== "oc-browser") return null;
     actions = cliActions(shell);
-    if (actions.length === 0) return null;
     requested = cliFilenames(shell);
   }
   const nav = actions.find((a) => NAV_VERBS.has(a.verb));

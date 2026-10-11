@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { isBrowserStepMessage } from "./browserDetect";
 import {
   BROWSER_HOME,
   browserShotPaths,
@@ -108,6 +109,16 @@ describe("browserStepOf", () => {
     expect(step?.actions).toEqual([{ verb: "click", label: "点击", detail: "e12" }]);
   });
 
+  test("shell 重定向不是动作参数", () => {
+    const step = browserStepOf(
+      bash("oc-browser click e23 2>&1 && oc-browser screenshot --filename=/home/agent/.openclaude/generated/a.png 2>&1 > /tmp/log", "ok"),
+    );
+    expect(step?.actions.map((a) => [a.verb, a.detail])).toEqual([
+      ["click", "e23"],
+      ["screenshot", ""],
+    ]);
+  });
+
   test("fill 显示目标与输入", () => {
     const step = browserStepOf(bash('oc-browser fill e5 "hello world"', "ok"));
     expect(step?.actions[0]?.detail).toBe("e5 ← hello world");
@@ -116,7 +127,8 @@ describe("browserStepOf", () => {
   test("不是浏览器操作:普通命令、oc-browser 只出现在参数里", () => {
     expect(browserStepOf(bash("ls -la", "x"))).toBeNull();
     expect(browserStepOf(bash("echo oc-browser open https://a.example", "x"))).toBeNull();
-    expect(browserStepOf(bash("oc-browser frobnicate", "x"))).toBeNull();
+    // 没登记的动词仍是浏览器操作(面板计数),只是没有可展示的动作:工具卡回落通用卡。
+    expect(browserStepOf(bash("oc-browser frobnicate", "x"))?.actions).toEqual([]);
   });
 
   test("MCP browser_navigate / browser_take_screenshot", () => {
@@ -153,4 +165,20 @@ test("displayAddress", () => {
   expect(displayAddress("https://www.example.com/")).toEqual({ host: "example.com", path: "" });
   expect(displayAddress("http://127.0.0.1:8765/demo.html?x=1")).toEqual({ host: "127.0.0.1:8765", path: "/demo.html?x=1" });
   expect(displayAddress("not a url")).toEqual({ host: "not a url", path: "" });
+});
+
+test("isBrowserStepMessage(首屏判定)与完整解析同口径", () => {
+  const cases = [
+    bash("oc-browser open https://a.example", "x"),
+    bash("cd /w && oc-browser screenshot", "x"),
+    bash("echo oc-browser open https://a.example", "x"),
+    bash("oc-browser frobnicate", "x"),
+    bash("ls", "x"),
+    { toolName: "mcp__browser__browser_tabs", inputJson: {}, _completed: true },
+    { toolName: "mcp__web-context__fetch", inputJson: {}, _completed: true },
+  ];
+  expect(cases.map((m) => isBrowserStepMessage(m))).toEqual([true, true, false, true, false, true, false]);
+  expect(cases.map((m) => browserStepOf(m) !== null)).toEqual([true, true, false, true, false, true, false]);
+  // 工具卡分派处已拿到命令、行里没有输入时用调用方给的命令。
+  expect(isBrowserStepMessage({ output: "x" }, "oc-browser click e1")).toBe(true);
 });
