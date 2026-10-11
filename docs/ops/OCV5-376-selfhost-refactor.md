@@ -64,9 +64,11 @@ selfhost release retention 6 → 3 (4.5 GB at the next deploy). Root fs was 97% 
 - `npm run lint` was `biome check packages` (3.4k lint + 4.3k formatting errors; nothing ran it).
   It is now `scripts/check-biome-changed.sh`: changed files only, fails on any added error.
 - `check-v5-incident-regressions.ts` stopped at its first entry on selfhost. Now:
-  lineage accepts an exact `cherry-pick -x` (same `git patch-id`); `--edition=selfhost` replaces
-  the "≤ 11 pending" count with a shrink-only list of 63 incidents whose proof only runs in the
-  commercial release; two ledger rows that had rotted were fixed; 42 expired waivers removed;
+  lineage accepts an exact `cherry-pick -x` (same `git patch-id`); `--edition=selfhost` lists the
+  63 existing unproven incidents by id with reasons (shrink-only against the base branch), and new
+  unproven incidents follow the commercial rule (`proofPending{reason,since}`, counted against
+  `SELFHOST_PROOF_PENDING_BASELINE`, now 1 for OCV5-377's Box incident, raised only in review);
+  two ledger rows that had rotted were fixed; 42 expired waivers removed;
   trailer closure went from >7 min to seconds (one `rev-list` instead of commit × tip
   `merge-base`). It passes on this tree. Commercial (no `--edition`) behaves as before.
 - These now run in `.github/workflows/v5-selfhost-gates.yml`.

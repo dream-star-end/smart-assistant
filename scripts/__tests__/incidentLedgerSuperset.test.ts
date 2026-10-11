@@ -495,14 +495,37 @@ describe("incident selfhost edition", () => {
       reason: /selfhost proof debt 1\//,
     },
     {
-      name: "an unlisted unit-only incident fails",
+      name: "an unlisted unit-only incident without proofPending fails",
       arrange: (f) => {
         f.manifest.incidents[0].regressions.pop();
         debt(f, {});
         return ["--edition=selfhost"];
       },
       pass: false,
-      reason: /不在 selfhost-proof-debt\.json 里/,
+      reason: /必须写 proofPending/,
+    },
+    {
+      name: "a new unit-only incident with proofPending passes within the selfhost baseline",
+      arrange: (f) => {
+        f.manifest.incidents[0].regressions.pop();
+        f.manifest.incidents[0].proofPending = { reason: "selfhost cannot run its proof", since: "2026-10-11" };
+        debt(f, {});
+        return ["--edition=selfhost"];
+      },
+      pass: true,
+      reason: /proofPending 1\/1/,
+    },
+    {
+      name: "a second new proofPending incident exceeds the selfhost baseline",
+      arrange: (f) => {
+        f.manifest.incidents[0].regressions.pop();
+        f.manifest.incidents[0].proofPending = { reason: "selfhost cannot run its proof", since: "2026-10-11" };
+        f.manifest.incidents.push({ ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-SECOND" });
+        debt(f, {});
+        return ["--edition=selfhost"];
+      },
+      pass: false,
+      reason: /个人版 proofPending 事故 2 条 > 基线 1/,
     },
     {
       name: "a listed incident that has proof must leave the list",

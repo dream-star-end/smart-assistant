@@ -43,15 +43,24 @@ const PROOF_PENDING_BASELINE = 11;
 // 个人版的发布(deploy-v5-selfhost.sh)不跑商业的 deploy-gate / live-e2e proof,所以同一条事故在
 // 个人版账本里常常只有 unit/integration 证据,上面 11 条的计数门在个人版上结构性过不去,
 // 这道门因此在个人版上从来不跑,账本跟着烂(OCV5-376 跑出一条早已改名的 assertion 锚点)。
-// 个人版改用**按 id 的清单**:没有 proof 层证据的事故必须逐条列在 SELFHOST_PROOF_DEBT 里并写明
-// 原因;清单里的 id 一旦有了 proof 或已不在账本就必须删掉;条数只许降不许升。新事故不在清单里,
-// 所以必须直接带 proof 层证据。其余校验(锚点、路径形态、血缘、trailer 闭环)两版完全相同。
-// 商业版不传 --edition,行为不变。
+// 个人版的规则:
+//   · 存量:2026-10-11 盘点出的 63 条无 proof 事故逐条列在 SELFHOST_PROOF_DEBT(带原因)。按 id
+//     只许删不许加(与基线引用上的清单比),已有 proof 或已不在账本的必须删掉。
+//   · 新事故:与商业版同一条规则 —— 有 proof 层证据,或写 proofPending{reason,since} 并计入
+//     SELFHOST_PROOF_PENDING_BASELINE。基线只在评审里显式调高(商业版 11→17 也是这样走的)。
+//     个人版跑不了 Box 活体 proof(canary 没有 Box 模型),所以这条路必须存在,否则门又会永远红。
+// 其余校验(锚点、路径形态、runner、血缘、trailer 闭环)两版完全相同。商业版不传 --edition,行为不变。
 const EDITION_ARG = process.argv.find((arg) => arg.startsWith("--edition="));
 const EDITION = EDITION_ARG ? EDITION_ARG.slice("--edition=".length) : "commercial";
 const SELFHOST_PROOF_DEBT = join(ROOT, "e2e/session-display/selfhost-proof-debt.json");
-/** 个人版无 proof 层证据的事故条数上界(2026-10-11 OCV5-376 盘点所得);只许降不许升。 */
+/** 个人版存量无 proof 事故清单的条数上界(2026-10-11 OCV5-376 盘点所得);只许降不许升。 */
 const SELFHOST_PROOF_DEBT_CEILING = 63;
+/**
+ * 个人版新登记、带 proofPending 的无 proof 事故条数上界(同商业版 PROOF_PENDING_BASELINE 的用法)。
+ * 1 = INC-20261011-BOX-TOOL-409-STUCK-RECOVERY(OCV5-377:个人版 canary 用不了 Box 模型,
+ *     商业版由 deploy-gate proof 覆盖)。补上 proof 后同步调低。
+ */
+const SELFHOST_PROOF_PENDING_BASELINE = 1;
 const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
 /** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
 function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {
@@ -362,11 +371,9 @@ for (const incident of manifest.incidents) {
   }
 
   const hasProof = incident.regressions.some((item) => PROOF_LAYERS.has(item.layer));
-  if (!hasProof && EDITION === "selfhost") {
+  if (!hasProof && EDITION === "selfhost" && selfhostProofDebt.has(incident.id)) {
+    // 个人版存量清单里的事故:原因写在清单里,不计入 proofPending。
     selfhostDebtSeen.add(incident.id);
-    if (!selfhostProofDebt.has(incident.id)) {
-      fail(`${incident.id}: 个人版没有 browser/live-e2e/deploy-gate 证据,也不在 selfhost-proof-debt.json 里;新事故必须直接带 proof 层证据`);
-    }
   } else if (!hasProof) {
     if (!incident.proofPending?.reason?.trim() || !/^2026-[0-9]{2}-[0-9]{2}$/.test(incident.proofPending.since ?? "")) {
       fail(`${incident.id}: 没有 browser/live-e2e/deploy-gate 证据时必须写 proofPending{reason,since}`);
@@ -395,12 +402,15 @@ if (EDITION === "selfhost") {
   } else {
     for (const id of selfhostProofDebt.keys()) {
       if (!previous.ids.has(id)) {
-        fail(`selfhost-proof-debt.json: ${id} 不在 ${previous.ref} 的清单里;清单只许删不许加,新事故必须直接带 proof 层证据`);
+        fail(`selfhost-proof-debt.json: ${id} 不在 ${previous.ref} 的清单里;清单只许删不许加(新事故走 proofPending,见 SELFHOST_PROOF_PENDING_BASELINE)`);
       }
     }
   }
   if (selfhostProofDebt.size > SELFHOST_PROOF_DEBT_CEILING) {
-    fail(`selfhost-proof-debt.json 有 ${selfhostProofDebt.size} 条 > 上界 ${SELFHOST_PROOF_DEBT_CEILING};新事故必须带真 proof 证据`);
+    fail(`selfhost-proof-debt.json 有 ${selfhostProofDebt.size} 条 > 上界 ${SELFHOST_PROOF_DEBT_CEILING};清单只许减`);
+  }
+  if (proofPending > SELFHOST_PROOF_PENDING_BASELINE) {
+    fail(`个人版 proofPending 事故 ${proofPending} 条 > 基线 ${SELFHOST_PROOF_PENDING_BASELINE};新事故必须带真 proof 证据,或在评审里显式调高 SELFHOST_PROOF_PENDING_BASELINE 并写明为什么个人版跑不了它的 proof`);
   }
 } else if (proofPending > PROOF_PENDING_BASELINE) {
   fail(`proofPending 事故 ${proofPending} 条 > 基线 ${PROOF_PENDING_BASELINE};新事故必须带真 proof 证据`);
@@ -653,7 +663,7 @@ function checkTrailerClosure(): number {
 
 const trailerChecked = checkTrailerClosure();
 const proofDebtSummary = EDITION === "selfhost"
-  ? `selfhost proof debt ${selfhostProofDebt.size}/${SELFHOST_PROOF_DEBT_CEILING}`
+  ? `selfhost proof debt ${selfhostProofDebt.size}/${SELFHOST_PROOF_DEBT_CEILING}, proofPending ${proofPending}/${SELFHOST_PROOF_PENDING_BASELINE}`
   : `proofPending ${proofPending}/${PROOF_PENDING_BASELINE}`;
 
 for (const note of pendingRunners) {
