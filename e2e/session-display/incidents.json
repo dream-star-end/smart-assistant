@@ -6580,7 +6580,8 @@
       "rootFixCommit": "01831646",
       "coverageCommits": [
         "17093508",
-        "b7325db0"
+        "b7325db0",
+        "131211fb"
       ],
       "proofPending": {
         "reason": "回归在 unit 层：decoder 用 Box 上 Claude Code 2.1.296 真实写出的续写记录形态走完“max_tokens 截断→续写→回答”，续轮测试在 native 与非 native 下都走到 final 并按两次调用计费。个人版 canary 用不了仅管理员可见的 box-api-claude-opus-5-5，触发需要一次真实打满输出上限的回答，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
@@ -6590,7 +6591,7 @@
         {
           "layer": "unit",
           "path": "packages/protocol/src/__tests__/boxApiModels.test.ts",
-          "assertion": "the CCB output-cap mirror equals maxOutputTokens for every model it lists"
+          "assertion": "the CCB output-cap mirror lists every model with its maxOutputTokens"
         },
         {
           "layer": "unit",
