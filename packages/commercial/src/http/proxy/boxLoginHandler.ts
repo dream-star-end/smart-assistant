@@ -1,6 +1,11 @@
 /** Internal, container-authenticated Box login endpoints for the interactive session route:
  *   POST /internal/box/login          {account_id, session?, prefer?}    -> {profile, alternatives}
  *   POST /internal/box/login-signals  {account_id, profile, lines, unsafe?} -> {recorded}
+ *   POST /internal/box/exec-target    {}  -> {account_id, exec_url, exec_token, network_token}
+ *     The Box exec endpoint for an interactive session (box-claude-*), resolved by the master from the
+ *     account's own credential and egress, for a uid entitled to the owner's Cursor accounts. It replaces
+ *     the container's own Cursor credential pool for this route, which only ever published accounts whose
+ *     Sand relay was installed (a relay the interactive route never uses).
  * The uid always comes from the container identity, never from the body. Not part of the public
  * Anthropic Messages API. */
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -9,6 +14,13 @@ import type { BoxInteractiveLogins } from "./boxInteractiveLogins.js";
 
 export const BOX_LOGIN_PATH = "/internal/box/login";
 export const BOX_LOGIN_SIGNALS_PATH = "/internal/box/login-signals";
+export const BOX_EXEC_TARGET_PATH = "/internal/box/exec-target";
+const MAX_EXEC_TARGETS_IN_FLIGHT_PER_UID = 2;
+
+export type BoxExecTargetAnswer =
+  | { kind: "target"; accountId: bigint; execUrl: string; execToken: string; networkToken: string }
+  | { kind: "not_entitled" }
+  | { kind: "unavailable" };
 const ACCOUNT = /^[1-9][0-9]{0,18}$/;
 const PROFILE = /^(default|[a-z0-9][a-z0-9-]{0,31})$/;
 const SESSION = /^[a-f0-9]{16}$/;
@@ -58,11 +70,15 @@ function validSignals(body: Record<string, unknown>): { lines: string[]; unsafe:
 }
 
 export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
-  logins: Pick<BoxInteractiveLogins, "choose" | "observe"> }) {
+  logins: Pick<BoxInteractiveLogins, "choose" | "observe">;
+  execTargets?: (uid: bigint) => Promise<BoxExecTargetAnswer> }) {
+  const inFlight = new Map<string, number>();
   return async (req: IncomingMessage, res: ServerResponse,
     ctx: { hostUuid: string; boundIp: string }): Promise<void> => {
     const path = (req.url ?? "").split("?")[0];
-    if (req.method !== "POST" || (path !== BOX_LOGIN_PATH && path !== BOX_LOGIN_SIGNALS_PATH)) {
+    if (req.method !== "POST"
+      || (path !== BOX_LOGIN_PATH && path !== BOX_LOGIN_SIGNALS_PATH && path !== BOX_EXEC_TARGET_PATH)
+      || (path === BOX_EXEC_TARGET_PATH && !deps.execTargets)) {
       reply(res, 404, { error: "NOT_FOUND" }); return;
     }
     let identity: Awaited<ReturnType<IdentityStrategy["resolve"]>>;
@@ -75,7 +91,7 @@ export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
       reply(res, 403, { error: "CONTAINER_REQUIRED" }); return;
     }
     let parsed: unknown;
-    try { parsed = await bounded(readBody(req, path === BOX_LOGIN_PATH ? 1024 : MAX_BODY_BYTES), 5_000); }
+    try { parsed = await bounded(readBody(req, path === BOX_LOGIN_SIGNALS_PATH ? MAX_BODY_BYTES : 1024), 5_000); }
     catch (error) {
       if (error instanceof BodyTimeout) { reply(res, 408, { error: "REQUEST_TIMEOUT" }); req.destroy(); return; }
       reply(res, error instanceof Error && error.message === "BOX_LOGIN_BODY_TOO_LARGE" ? 413 : 400,
@@ -86,6 +102,25 @@ export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
       reply(res, 400, { error: "INVALID_REQUEST" }); return;
     }
     const body = parsed as Record<string, unknown>;
+    if (path === BOX_EXEC_TARGET_PATH) {
+      if (Object.keys(body).length !== 0) { reply(res, 400, { error: "INVALID_REQUEST" }); return; }
+      const key = identity.uid.toString();
+      const busy = inFlight.get(key) ?? 0;
+      if (busy >= MAX_EXEC_TARGETS_IN_FLIGHT_PER_UID) { reply(res, 429, { error: "BOX_EXEC_TARGET_BUSY" }); return; }
+      inFlight.set(key, busy + 1);
+      let answer: BoxExecTargetAnswer;
+      try { answer = await deps.execTargets!(identity.uid); }
+      catch { answer = { kind: "unavailable" }; }
+      finally {
+        const left = (inFlight.get(key) ?? 1) - 1;
+        if (left > 0) inFlight.set(key, left); else inFlight.delete(key);
+      }
+      if (answer.kind === "not_entitled") { reply(res, 403, { error: "BOX_EXEC_NOT_ENTITLED" }); return; }
+      if (answer.kind === "unavailable") { reply(res, 503, { error: "BOX_EXEC_TARGET_UNAVAILABLE" }); return; }
+      reply(res, 200, { account_id: answer.accountId.toString(), exec_url: answer.execUrl,
+        exec_token: answer.execToken, network_token: answer.networkToken });
+      return;
+    }
     if (typeof body.account_id !== "string" || !ACCOUNT.test(body.account_id)) {
       reply(res, 400, { error: "INVALID_REQUEST" }); return;
     }

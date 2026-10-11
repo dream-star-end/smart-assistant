@@ -229,3 +229,40 @@ test("POST /internal/box/login-signals: bounded lines for one login; the service
   ]) assert.equal((await call(handler, "/internal/box/login-signals", body)).status, 400, JSON.stringify(body).slice(0, 80));
   assert.equal(seen.length, 2);
 });
+
+test("POST /internal/box/exec-target: the endpoint for an entitled uid; refusal, failure and overload are plain", async () => {
+  const asked: bigint[] = [];
+  const answer = { kind: "target" as const, accountId: 25n, execUrl: "https://box.example.cursorvm.com/agent.v1.ControlService/Exec",
+    execToken: "T0K", networkToken: "N3T" };
+  const make = (execTargets: (uid: bigint) => Promise<unknown>) => makeBoxLoginHandler({ identity: container,
+    logins: { choose: async () => ({ kind: "unavailable" }), observe: () => false }, execTargets: execTargets as never });
+  assert.deepEqual(await call(make(async (uid) => { asked.push(uid); return answer; }), "/internal/box/exec-target", {}),
+    { status: 200, result: { account_id: "25", exec_url: answer.execUrl, exec_token: "T0K", network_token: "N3T" } });
+  assert.deepEqual(asked, [3n], "the uid comes from the container identity");
+  assert.deepEqual(await call(make(async () => ({ kind: "not_entitled" })), "/internal/box/exec-target", {}),
+    { status: 403, result: { error: "BOX_EXEC_NOT_ENTITLED" } });
+  assert.deepEqual(await call(make(async () => ({ kind: "unavailable" })), "/internal/box/exec-target", {}),
+    { status: 503, result: { error: "BOX_EXEC_TARGET_UNAVAILABLE" } });
+  assert.deepEqual(await call(make(async () => { throw new Error("cursor down"); }), "/internal/box/exec-target", {}),
+    { status: 503, result: { error: "BOX_EXEC_TARGET_UNAVAILABLE" } });
+  assert.equal((await call(make(async () => answer), "/internal/box/exec-target", { account_id: "25" })).status, 400);
+  // Not wired (an older egress build): not found, never a fallback.
+  const bare = makeBoxLoginHandler({ identity: container, logins: { choose: async () => ({ kind: "unavailable" }), observe: () => false } });
+  assert.equal((await call(bare, "/internal/box/exec-target", {})).status, 404);
+  // Two in flight per uid at most.
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const slow = make(async () => { await gate; return answer; });
+  const server = createServer((req, res) => { void slow(req, res, { hostUuid: "h", boundIp: "127.0.0.1" }); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/internal/box/exec-target`;
+    const post = () => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    const first = post(); const second = post();
+    await new Promise((r) => setTimeout(r, 100));
+    const third = await post();
+    assert.equal(third.status, 429); await third.text();
+    release();
+    assert.deepEqual([(await first).status, (await second).status], [200, 200]);
+  } finally { server.closeAllConnections(); await new Promise<void>((r) => server.close(() => r())); }
+});

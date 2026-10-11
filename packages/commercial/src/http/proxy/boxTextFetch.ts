@@ -34,6 +34,9 @@ export interface BoxResolvedTarget {
   cliVersion?: string;
   /** Claude Code login (boxClaudeProfile) this target launches under; absent = default. */
   profile?: string;
+  /** Only with `interactiveExecTarget`: the Box exec endpoint itself, handed to the user's container for
+   * an interactive session (the container runs the session; the master never execs on it). Secret. */
+  execTarget?: { execUrl: string; execToken: string; networkToken: string };
 }
 const MIN_RUN_BUDGET_MS = 160_000; // 120s Exec + 10s proof + 20s cleanup + margin
 export class BoxTextFetchError extends Error {

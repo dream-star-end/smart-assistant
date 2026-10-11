@@ -33,6 +33,17 @@ export interface CursorCredentialSelection {
   credentialKind: CursorCredentialKind
   /** Persisted Cursor machine id for `session` slots; null for `api_key`. */
   machineId: string | null
+  /** Interactive Box sessions (box-claude-*) only: no pool slot was selected; the master hands this
+   * container the Box exec endpoint for its entitled uid (boxLoginClient.requestBoxExecTarget). The
+   * pool only publishes accounts whose Sand relay is installed, which this route never uses. */
+  masterBox?: true
+}
+
+/** The selection an interactive Box session runs under when the master provides its Box. Not a
+ * credential: it names no key, slot or account; the account comes with the master's exec target. */
+export function masterBoxCredentialSelection(): CursorCredentialSelection {
+  return { slot: 0, keyName: 'master-box', sandEnabled: true, poolGeneration: 'master-box', accountId: '',
+    keyFingerprint: 'master-box', credentialKind: 'session', machineId: null, masterBox: true }
 }
 
 function wrapperBin(): string {

@@ -128,3 +128,62 @@ export async function reportBoxLoginSignals(
     return response.ok
   } catch { return false }
 }
+
+export const BOX_EXEC_TARGET_PATH = '/internal/box/exec-target'
+
+export interface BoxExecTargetFromMaster {
+  accountId: string
+  execUrl: string
+  execToken: string
+  networkToken: string
+}
+
+/** Thrown when this user is not entitled to the owner's Cursor accounts (the same rule that mounts the
+ * credential pool), or the master could not resolve the Box. Neither ever falls back to another route. */
+export class BoxExecTargetError extends Error {
+  constructor(readonly code: 'BOX_EXEC_NOT_ENTITLED' | 'BOX_EXEC_TARGET_UNAVAILABLE') { super(code) }
+}
+
+/** Same rule as the Box exec descriptor parsers on both sides (bearer() / secret()). */
+const SECRET = /^[\x21-\x7e]{1,16384}$/
+
+/** The Box exec endpoint for an interactive session, from the master (the account's own credential and
+ * egress, the model route's resolver). Needs the container's master route; secrets stay in memory and the
+ * private control file. */
+export async function requestBoxExecTarget(deps: Deps = {}): Promise<BoxExecTargetFromMaster> {
+  const env = deps.env ?? process.env
+  const origin = boxLoginUrlFromEnv(env)
+  const token = containerToken(env, deps.readFile ?? ((p) => readFileSync(p, 'utf8')))
+  if (!origin || !token) throw new BoxExecTargetError('BOX_EXEC_TARGET_UNAVAILABLE')
+  let response: Response
+  try {
+    response = await (deps.fetchImpl ?? fetch)(`${origin}${BOX_EXEC_TARGET_PATH}`, {
+      method: 'POST',
+      redirect: 'error',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: '{}',
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 75_000),
+    })
+  } catch { throw new BoxExecTargetError('BOX_EXEC_TARGET_UNAVAILABLE') }
+  let body: unknown
+  try { body = await response.json() } catch { body = null }
+  if (response.status === 403) throw new BoxExecTargetError('BOX_EXEC_NOT_ENTITLED')
+  const r = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
+  if (!response.ok || typeof r.account_id !== 'string' || !ACCOUNT.test(r.account_id)
+    || typeof r.exec_token !== 'string' || !SECRET.test(r.exec_token)
+    || typeof r.network_token !== 'string' || !SECRET.test(r.network_token)
+    || typeof r.exec_url !== 'string' || !boxExecUrlAcceptable(r.exec_url)) {
+    throw new BoxExecTargetError('BOX_EXEC_TARGET_UNAVAILABLE')
+  }
+  return { accountId: r.account_id, execUrl: r.exec_url, execToken: r.exec_token, networkToken: r.network_token }
+}
+
+/** The same shape the container's own Cursor resolver accepts (parseCursorSandBoxExecTarget). */
+function boxExecUrlAcceptable(raw: string): boolean {
+  if (raw.length > 2048) return false
+  try {
+    const url = new URL(raw)
+    return url.protocol === 'https:' && url.hostname.endsWith('.cursorvm.com') && !url.username && !url.password
+      && !url.search && !url.hash && url.pathname.replace(/\/+$/, '').endsWith('/agent.v1.ControlService/Exec')
+  } catch { return false }
+}

@@ -28,7 +28,8 @@ export class CursorBoxCcAdapter extends CcbAdapter {
 
   constructor(opts: EngineCreateOpts) {
     const selection = opts.cursorCredentialSelection
-    if (!selection?.sandEnabled || selection.credentialKind !== 'session' || !selection.machineId) {
+    if (!selection || (selection.masterBox !== true
+      && (!selection.sandEnabled || selection.credentialKind !== 'session' || !selection.machineId))) {
       throw new Error('BOX_CC_SESSION_REQUIRED')
     }
     const holder = { path: null as string | null }

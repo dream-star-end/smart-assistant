@@ -249,7 +249,11 @@ export class BoxAccountResolver {
     requiredAccountId?: bigint;
     /** Admin discovery/maintenance on a Box: no login scheduling, so a Box whose
      * every login is benched can still be inspected. Never set on model traffic. */
-    adminProbe?: boolean }): Promise<BoxResolvedTarget> {
+    adminProbe?: boolean;
+    /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
+     * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
+     * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
+    interactiveExecTarget?: boolean }): Promise<BoxResolvedTarget> {
     const refused = new Set<string>();
     for (let attempt = 0; ; attempt++) {
       try { return await this.resolveOnce(args, refused); }
@@ -272,7 +276,11 @@ export class BoxAccountResolver {
     requiredAccountId?: bigint;
     /** Admin discovery/maintenance on a Box: no login scheduling, so a Box whose
      * every login is benched can still be inspected. Never set on model traffic. */
-    adminProbe?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
+    adminProbe?: boolean;
+    /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
+     * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
+     * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
+    interactiveExecTarget?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
     const rows = (await this.deps.list()).filter((row) => eligible(row, now())
@@ -281,7 +289,7 @@ export class BoxAccountResolver {
     let profile = BOX_DEFAULT_PROFILE;
     // Cleanup, stop and observer paths pin an account and do not launch (they never wake a Box): a benched
     // or refused login must not stop them from reaching the Box to clean up.
-    const inspectOnly = args.adminProbe === true
+    const inspectOnly = args.adminProbe === true || args.interactiveExecTarget === true
       || (args.requiredAccountId !== undefined && args.allowWakeIfHibernated !== true);
     const choice = this.deps.profiles && !inspectOnly
       ? await this.chooseLogin(rows, args, now(), refused) : "legacy";
@@ -394,7 +402,9 @@ export class BoxAccountResolver {
           health: this.deps.profiles.health }) : transport;
       const owned = owner;
       handedOff = true;
-      return { accountId, exec, profile, ...(owned ? { dispose: () => owned.close() } : {}) };
+      return { accountId, exec, profile, ...(owned ? { dispose: () => owned.close() } : {}),
+        ...(args.interactiveExecTarget === true ? { execTarget: { execUrl: descriptor.execUrl,
+          execToken: descriptor.execToken, networkToken: descriptor.networkToken } } : {}) };
     } catch (error) {
       if (error instanceof BoxAccountResolverError) throw error;
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");

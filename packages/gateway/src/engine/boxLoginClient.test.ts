@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  BOX_EXEC_TARGET_PATH,
   BOX_LOGIN_PATH,
+  BoxExecTargetError,
+  requestBoxExecTarget,
   BOX_LOGIN_SIGNALS_PATH,
   BoxLoginUnavailableError,
   boxLoginUrlFromEnv,
@@ -89,4 +92,32 @@ test('reportBoxLoginSignals sends bounded lines for the login, or the Box refusa
   assert.equal(await reportBoxLoginSignals({ accountId: '25', profile: 'Bad', lines: [line] }, { env: ENV, fetchImpl }), false)
   assert.equal(await reportBoxLoginSignals({ accountId: undefined, profile: 'default', lines: [line] }, { env: ENV, fetchImpl }), false)
   assert.equal(calls.length, 3)
+})
+
+test('requestBoxExecTarget asks the master route with the container token and checks every field', async () => {
+  const env = { ANTHROPIC_BASE_URL: ORIGIN, OPENCLAUDE_V3_MASTER_BASE_URL: ORIGIN, OPENCLAUDE_V3_CONTAINER_TOKEN: 'oc-v3.c1.secret' }
+  const good = { account_id: '25', exec_url: 'https://box.example.cursorvm.com/agent.v1.ControlService/Exec', exec_token: 'T0K', network_token: 'N3T' }
+  const { calls, fetchImpl } = recorder(200, good)
+  assert.deepEqual(await requestBoxExecTarget({ env, fetchImpl }),
+    { accountId: '25', execUrl: good.exec_url, execToken: 'T0K', networkToken: 'N3T' })
+  assert.equal(calls[0]!.url, `${ORIGIN}${BOX_EXEC_TARGET_PATH}`)
+  assert.equal(calls[0]!.init.body, '{}')
+  assert.equal((calls[0]!.init.headers as Record<string, string>).authorization, 'Bearer oc-v3.c1.secret')
+  const code = async (status: number, body: unknown, e: Record<string, string> = env): Promise<string> => {
+    try { await requestBoxExecTarget({ env: e, fetchImpl: recorder(status, body).fetchImpl }); return 'ok' }
+    catch (err) { return err instanceof BoxExecTargetError ? err.code : String(err) }
+  }
+  assert.equal(await code(403, { error: 'BOX_EXEC_NOT_ENTITLED' }), 'BOX_EXEC_NOT_ENTITLED')
+  assert.equal(await code(503, { error: 'BOX_EXEC_TARGET_UNAVAILABLE' }), 'BOX_EXEC_TARGET_UNAVAILABLE')
+  for (const bad of [
+    { ...good, exec_url: 'https://evil.example.com/agent.v1.ControlService/Exec' },
+    { ...good, exec_url: 'http://box.example.cursorvm.com/agent.v1.ControlService/Exec' },
+    { ...good, exec_url: 'https://box.example.cursorvm.com/other' },
+    { ...good, exec_token: 'has space' },
+    { ...good, account_id: '025' },
+    { exec_url: good.exec_url },
+  ]) assert.equal(await code(200, bad), 'BOX_EXEC_TARGET_UNAVAILABLE', JSON.stringify(bad))
+  assert.equal(await code(200, good, { OPENCLAUDE_V3_CONTAINER_TOKEN: 'oc-v3.c1.secret' }), 'BOX_EXEC_TARGET_UNAVAILABLE', 'no master route')
+  const down = (async () => { throw new TypeError('fetch failed') }) as typeof fetch
+  await assert.rejects(requestBoxExecTarget({ env, fetchImpl: down }), (e: unknown) => e instanceof BoxExecTargetError && e.code === 'BOX_EXEC_TARGET_UNAVAILABLE')
 })

@@ -30,9 +30,10 @@ import {
 } from './cursorAdapter.js'
 import { CursorSandAdapter } from './cursorSandAdapter.js'
 import { CursorBoxCcAdapter } from './cursorBoxCcAdapter.js'
-import { cursorBoxCcEnabled, cursorBoxCcSelectionEligible, isBoxClaudeCatalogModel } from './cursorBoxCc.js'
+import { cursorBoxCcEnabled, cursorBoxCcFromMaster, cursorBoxCcSelectionEligible, isBoxClaudeCatalogModel } from './cursorBoxCc.js'
 import {
   cursorSandEnabledForSelection,
+  masterBoxCredentialSelection,
   selectCursorCredential,
   type CursorCredentialSelection,
 } from './cursorCredentialSelection.js'
@@ -133,16 +134,30 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   ) {
     super()
     this.selectCredential = selector
-    this.credentialSelection = opts.cursorCredentialSelection ?? selector({
+    this.credentialSelection = this.selectionFor(opts, opts.executionTarget, opts.cursorCredentialSelection)
+    this.opts = { ...opts, cursorCredentialSelection: this.credentialSelection }
+    this.variant = cursorVariantFor(opts.model, this.credentialSelection, opts.executionTarget)
+    this.inner = this.createInner(this.variant)
+    this.bindInner()
+  }
+
+  /** An interactive Box session (box-claude-*, local) gets its Box from the master and selects no pool
+   * slot; everything else selects from the pool. A selection handed in is kept while it is of the
+   * kind this model and target need. */
+  private selectionFor(
+    opts: EngineCreateOpts,
+    target: ExecutionTarget | undefined,
+    given?: CursorCredentialSelection,
+  ): CursorCredentialSelection {
+    const fromMaster = cursorBoxCcFromMaster(opts.model, target?.kind === 'remote')
+    if (given && (given.masterBox === true) === fromMaster) return given
+    if (fromMaster) return masterBoxCredentialSelection()
+    return this.selectCredential({
       agentId: opts.agentId,
       sessionKey: opts.sessionKey,
       agentBaseDir: opts.agentBaseDir,
       model: opts.model,
     })
-    this.opts = { ...opts, cursorCredentialSelection: this.credentialSelection }
-    this.variant = cursorVariantFor(opts.model, this.credentialSelection, opts.executionTarget)
-    this.inner = this.createInner(this.variant)
-    this.bindInner()
   }
 
   get currentVariant(): CursorVariant { return this.variant }
@@ -218,82 +233,87 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
 
   private async ensureVariant(generation = this.lifecycleGeneration): Promise<void> {
     this.assertLifecycle(generation)
-    let observedSelection: CursorCredentialSelection | null = null
-    if (this.credentialSelection.poolGeneration !== 'legacy') {
-      observedSelection = this.selectCredential({
-        agentId: this.opts.agentId,
-        sessionKey: this.opts.sessionKey,
-        agentBaseDir: this.opts.agentBaseDir,
-        model: this.opts.model,
-      })
-      if (
-        observedSelection.poolGeneration !== this.credentialSelection.poolGeneration
-        || observedSelection.keyName !== this.credentialSelection.keyName
-        || observedSelection.slot !== this.credentialSelection.slot
-        || observedSelection.accountId !== this.credentialSelection.accountId
-        || observedSelection.keyFingerprint !== this.credentialSelection.keyFingerprint
-        || observedSelection.sandEnabled !== this.credentialSelection.sandEnabled
-      ) {
-        this.credentialNeedsRefresh = true
-      }
-    }
-    if (this.credentialNeedsRefresh) {
-      const next = observedSelection ?? this.selectCredential({
-        agentId: this.opts.agentId,
-        sessionKey: this.opts.sessionKey,
-        agentBaseDir: this.opts.agentBaseDir,
-        model: this.opts.model,
-      })
-      const nextVariant = cursorVariantFor(this.opts.model, next, this.opts.executionTarget)
-      if (nextVariant !== this.variant) {
-        throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
-      }
+    if (this.credentialSelection.masterBox === true) {
+      // No pool slot to re-observe or rotate: the master provides this session's Box when its control is prepared.
       this.credentialNeedsRefresh = false
-      const sameCredential = next.accountId === this.credentialSelection.accountId
-        && next.keyFingerprint === this.credentialSelection.keyFingerprint
-        && next.credentialKind === this.credentialSelection.credentialKind
-        && next.machineId === this.credentialSelection.machineId
-      if (sameCredential) {
-        // Same account, same secret bytes: only the pool projection moved
-        // (a new immutable generation after an unrelated row update, a slot
-        // renumbering after another account was removed). Pool generations
-        // are never pruned, so the inner adapter can keep reading its bound
-        // generation; adopt the new metadata without tearing down a live
-        // CCB/Sand process mid-turn.
+    } else {
+      let observedSelection: CursorCredentialSelection | null = null
+      if (this.credentialSelection.poolGeneration !== 'legacy') {
+        observedSelection = this.selectCredential({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          agentBaseDir: this.opts.agentBaseDir,
+          model: this.opts.model,
+        })
         if (
-          next.poolGeneration !== this.credentialSelection.poolGeneration
-          || next.slot !== this.credentialSelection.slot
-          || next.keyName !== this.credentialSelection.keyName
+          observedSelection.poolGeneration !== this.credentialSelection.poolGeneration
+          || observedSelection.keyName !== this.credentialSelection.keyName
+          || observedSelection.slot !== this.credentialSelection.slot
+          || observedSelection.accountId !== this.credentialSelection.accountId
+          || observedSelection.keyFingerprint !== this.credentialSelection.keyFingerprint
+          || observedSelection.sandEnabled !== this.credentialSelection.sandEnabled
         ) {
-          log.info('cursor credential projection moved: adopting without recycle', {
+          this.credentialNeedsRefresh = true
+        }
+      }
+      if (this.credentialNeedsRefresh) {
+        const next = observedSelection ?? this.selectCredential({
+          agentId: this.opts.agentId,
+          sessionKey: this.opts.sessionKey,
+          agentBaseDir: this.opts.agentBaseDir,
+          model: this.opts.model,
+        })
+        const nextVariant = cursorVariantFor(this.opts.model, next, this.opts.executionTarget)
+        if (nextVariant !== this.variant) {
+          throw new Error('CURSOR_ROUTE_VARIANT_CHANGED_REOPEN_SESSION')
+        }
+        this.credentialNeedsRefresh = false
+        const sameCredential = next.accountId === this.credentialSelection.accountId
+          && next.keyFingerprint === this.credentialSelection.keyFingerprint
+          && next.credentialKind === this.credentialSelection.credentialKind
+          && next.machineId === this.credentialSelection.machineId
+        if (sameCredential) {
+          // Same account, same secret bytes: only the pool projection moved
+          // (a new immutable generation after an unrelated row update, a slot
+          // renumbering after another account was removed). Pool generations
+          // are never pruned, so the inner adapter can keep reading its bound
+          // generation; adopt the new metadata without tearing down a live
+          // CCB/Sand process mid-turn.
+          if (
+            next.poolGeneration !== this.credentialSelection.poolGeneration
+            || next.slot !== this.credentialSelection.slot
+            || next.keyName !== this.credentialSelection.keyName
+          ) {
+            log.info('cursor credential projection moved: adopting without recycle', {
+              sessionKey: this.opts.sessionKey,
+              accountId: next.accountId,
+              from: { keyName: this.credentialSelection.keyName, poolGeneration: this.credentialSelection.poolGeneration },
+              to: { keyName: next.keyName, poolGeneration: next.poolGeneration },
+            })
+            this.credentialSelection = next
+            this.opts.cursorCredentialSelection = next
+          }
+        } else {
+          const nativeId = this.inner.nativeSessionId
+          log.info('cursor credential switch: recycling inner adapter', {
             sessionKey: this.opts.sessionKey,
-            accountId: next.accountId,
-            from: { keyName: this.credentialSelection.keyName, poolGeneration: this.credentialSelection.poolGeneration },
-            to: { keyName: next.keyName, poolGeneration: next.poolGeneration },
+            variant: this.variant,
+            from: { keyName: this.credentialSelection.keyName, accountId: this.credentialSelection.accountId },
+            to: { keyName: next.keyName, accountId: next.accountId },
+            innerRunning: this.inner.isRunning,
           })
+          await this.inner.shutdown()
+          await this.inner.waitForOutputDrain()
+          this.assertLifecycle(generation)
+          this.unbindInner()
           this.credentialSelection = next
           this.opts.cursorCredentialSelection = next
+          this.opts.resumeSessionId = nativeId ? prefixResumeId(nativeId, this.variant) : undefined
+          this.inner = this.createInner(this.variant)
+          this.bindInner()
+          if (this.goal) await this.inner.setGoalState(this.goal)
+          this.assertLifecycle(generation)
         }
-      } else {
-        const nativeId = this.inner.nativeSessionId
-        log.info('cursor credential switch: recycling inner adapter', {
-          sessionKey: this.opts.sessionKey,
-          variant: this.variant,
-          from: { keyName: this.credentialSelection.keyName, accountId: this.credentialSelection.accountId },
-          to: { keyName: next.keyName, accountId: next.accountId },
-          innerRunning: this.inner.isRunning,
-        })
-        await this.inner.shutdown()
-        await this.inner.waitForOutputDrain()
-        this.assertLifecycle(generation)
-        this.unbindInner()
-        this.credentialSelection = next
-        this.opts.cursorCredentialSelection = next
-        this.opts.resumeSessionId = nativeId ? prefixResumeId(nativeId, this.variant) : undefined
-        this.inner = this.createInner(this.variant)
-        this.bindInner()
-        if (this.goal) await this.inner.setGoalState(this.goal)
-        this.assertLifecycle(generation)
       }
     }
     const desired = cursorVariantFor(this.opts.model, this.credentialSelection, this.opts.executionTarget)
@@ -478,8 +498,12 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   }
   get toolsets(): string[] | undefined { return this.opts.agentToolsets }
   async setExecutionTarget(target: ExecutionTarget): Promise<void> {
-    const desired = cursorVariantFor(this.opts.model, this.credentialSelection, target)
-    if (desired === this.variant) {
+    // Moving a box-claude-* session between local and remote changes where its Box comes from
+    // (master vs pool). Select first: a failed pool selection throws before anything is torn down.
+    const selection = this.selectionFor(this.opts, target, this.credentialSelection)
+    const selectionChanged = selection !== this.credentialSelection
+    const desired = cursorVariantFor(this.opts.model, selection, target)
+    if (desired === this.variant && !selectionChanged) {
       this.opts.executionTarget = target
       await this.inner.setExecutionTarget(target)
       return
@@ -494,6 +518,9 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     this.unbindInner()
     this.opts.executionTarget = target
     this.opts.resumeSessionId = undefined
+    this.credentialSelection = selection
+    this.opts.cursorCredentialSelection = selection
+    this.credentialNeedsRefresh = false
     this.variant = desired
     this.inner = this.createInner(desired)
     this.bindInner()
