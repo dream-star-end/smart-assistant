@@ -584,6 +584,9 @@ export const DELEGATE_KNOB_CONTAINER_ENV_KEYS = [
   "OC_DELEGATE_CURSOR_MCP_WAIT",
   "OC_CURSOR_SAND_OFFICIAL_CC",
   "OC_CURSOR_SAND_BOX_CC",
+  // OCV5-380: box-claude-* needs the master's interactive route too (cursorBoxCcEnabled). Forwarded
+  // only when set; commercial never sets it, so commercial containers keep their env unchanged.
+  "OC_BOX_INTERACTIVE_MASTER",
   "OC_CCB_OFFICIAL_CC",
 ] as const;
 

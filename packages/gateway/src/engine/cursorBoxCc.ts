@@ -43,8 +43,12 @@ export {
   type ExecFrame,
 } from './cursorBoxCcExec.js'
 
+/** Box Claude (box-claude-*) runs only where the master serves the interactive route: its master sets
+ * OC_BOX_INTERACTIVE_MASTER=1 and forwards it (selfhost). Commercial forwards OC_CURSOR_SAND_BOX_CC but
+ * never the master switch, so an accidentally re-enabled box-claude-* row still cannot reach the Box
+ * from a commercial container (OCV5-380: no commercial interactive migration without the operator). */
 export function cursorBoxCcEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.OC_CURSOR_SAND_BOX_CC === '1'
+  return env.OC_CURSOR_SAND_BOX_CC === '1' && env.OC_BOX_INTERACTIVE_MASTER === '1'
 }
 
 /** Session slots are the logged-in Cursor accounts that own a Grok Bot box.
