@@ -267,7 +267,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
           // 「批准」换成「展开审查」,这里再守一道 —— 安全前提不该只由渲染分支保证。
           if (!connectorVerified.has(versionId)) {
             setOpen(versionId);
-            setRowError(versionId, "批准 API 插件前，必须先确认已使用隔离账号完成真实功能验收。");
+            setRowError(versionId, "批准插件前，必须先确认已使用隔离账号完成真实功能验收。");
             return;
           }
           const suggested = (row.manifest as { proposedSecurityDecision?: unknown } | null)
@@ -478,7 +478,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
               {selectedHasConnector && (
                 // 禁用原因不能只写在 native title:disabled 元素多数浏览器不触发它,触屏则完全无从呈现。
                 <span className="text-caption text-warning">
-                  API 插件需逐个填写实际安全决策并确认功能验收，不能批量批准
+                  插件需逐个填写实际安全决策并确认功能验收，不能批量批准
                 </span>
               )}
               <div className="ms-auto flex gap-2">
@@ -562,7 +562,7 @@ export function ReviewPanel({ auth }: { auth: AuthSession }) {
                             <span className="shrink-0 text-caption text-faint">v{r.version}</span>
                             {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
                             {r.kind === "connector" && (
-                              <Badge tone="info">API 插件 · 人工安全审</Badge>
+                              <Badge tone="info">插件 · 人工安全审</Badge>
                             )}
                             {waited >= 1 && <Badge tone="warning">等待 {waited} 天</Badge>}
                             {/* 存量/平台 seed 行缺人向元数据 → 缺陷提示(非阻断,仅提示补齐)。 */}
@@ -1012,7 +1012,7 @@ function RevokeBox({ auth }: { auth: AuthSession }) {
             {catalog.map((c) => (
               <option key={c.slug} value={c.slug}>
                 {c.name}（
-                {c.kind === "agent" ? "智能体" : c.kind === "connector" ? "API 插件" : "技能"}）
+                {c.kind === "agent" ? "智能体" : c.kind === "connector" ? "插件" : "技能"}）
               </option>
             ))}
           </datalist>

@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
@@ -13,11 +13,17 @@ loadBeforeAll(prefetchMarkdownImpl);
 // api 网络层全 mock —— 只验证 BrowsePanel 的分区/筛选片行为,不打真实网络。
 const searchMarketplace = vi.fn();
 const listMarketplaceInstalled = vi.fn();
+const getConnectors = vi.fn();
+const getDeclarativeManagement = vi.fn();
+const getPluginManagement = vi.fn();
 const reportClientFrictionBatch = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/api", () => ({
   api: {
     searchMarketplace: (...a: unknown[]) => searchMarketplace(...a),
     listMarketplaceInstalled: (...a: unknown[]) => listMarketplaceInstalled(...a),
+    getConnectors: (...a: unknown[]) => getConnectors(...a),
+    getDeclarativeManagement: (...a: unknown[]) => getDeclarativeManagement(...a),
+    getPluginManagement: (...a: unknown[]) => getPluginManagement(...a),
   },
   apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
 }));
@@ -511,4 +517,156 @@ test("搜索时让出展厅标题空间，清空后恢复发现", async () => {
   await waitFor(() => expect(searchMarketplace).toHaveBeenLastCalledWith(auth, "PPT", "skill", 50));
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "" } });
   expect(screen.getByRole("region", { name: "探索市场" })).toBeInTheDocument();
+});
+
+// ── 插件类目:市场搜索结果 ∪ 内置插件 + 状态徽标(OCV5-379) ─────────────────────
+
+const WEIBO_CARD = card("weibo", {
+  kind: "connector",
+  artifactKind: "plugin",
+  name: "微博",
+  category: "daily-tools",
+  official: true,
+});
+
+function mockPluginDirectory() {
+  getConnectors.mockResolvedValue({
+    providers: [
+      { id: "webdav", label: "WebDAV 网盘", description: "坚果云 / Nextcloud", authKind: "basic", formFields: [] },
+    ],
+    connections: [],
+  });
+  getDeclarativeManagement.mockResolvedValue({
+    connectors: [
+      {
+        slug: "github",
+        label: "GitHub",
+        description: "只读",
+        installation: "default",
+        official: true,
+        available: true,
+        canBind: true,
+        listingState: "active",
+        installedVersion: "1",
+        installedVersionId: "4",
+        latestVersion: "1",
+        latestVersionId: "4",
+        updateAvailable: false,
+        connectionCount: 0,
+        contract: { versionId: 4, slug: "github", label: "GitHub", description: "只读", authMode: "static-token", requiredBindSources: [], actions: [] },
+      },
+    ],
+    connections: [],
+  });
+  getPluginManagement.mockResolvedValue({
+    catalog: [
+      {
+        versionId: "v2",
+        slug: "weibo",
+        pluginType: "managed-browser",
+        label: "微博",
+        description: "",
+        accountMode: "required",
+        actions: [],
+        installed: true,
+        installedVersion: "1.0.0",
+        latestVersionId: "v2",
+        latestVersion: "1.0.0",
+        installedCurrent: true,
+        updateAvailable: false,
+        available: true,
+      },
+    ],
+    accounts: [
+      {
+        id: "a1",
+        provider: "weibo",
+        pluginType: "managed-browser",
+        displayName: "我的微博",
+        accountHint: "",
+        status: "error",
+        actions: [],
+        versionId: "v2",
+        executable: false,
+        writeControl: null,
+      },
+    ],
+  });
+}
+
+test("插件类目:内置插件并入目录并带状态,点内置卡直接去管理中心,点市场卡照常开详情", async () => {
+  searchMarketplace.mockResolvedValue({ results: [WEIBO_CARD], method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  mockPluginDirectory();
+  const onOpenConnectors = vi.fn();
+
+  render(<BrowsePanel auth={auth} kind="connector" onOpenConnectors={onOpenConnectors} />);
+
+  const github = await screen.findByRole("button", { name: /^GitHub/ });
+  expect(github).toHaveAccessibleName(/官方 · 已预装/);
+  expect(screen.getByRole("button", { name: /^WebDAV 网盘/ })).toBeInTheDocument();
+  expect(screen.getByText("共 3 个插件")).toBeInTheDocument();
+  // 状态与管理中心同一判据:微博账号失效 → 需重新授权;内置未绑 → 未连接
+  const weibo = screen.getByRole("button", { name: /^微博/ });
+  expect(within(weibo).getByTestId("plugin-state")).toHaveTextContent("需重新授权");
+  expect(within(github).getByTestId("plugin-state")).toHaveTextContent("未连接");
+
+  fireEvent.click(github);
+  expect(onOpenConnectors).toHaveBeenCalledWith("github");
+  expect(screen.queryByTestId("detail-slug")).not.toBeInTheDocument();
+
+  fireEvent.click(weibo);
+  expect(screen.getByTestId("detail-slug")).toHaveTextContent("weibo");
+
+  // 内置插件不是市场条目:不进目录曝光统计
+  await waitFor(() => expect(reportClientFrictionBatch).toHaveBeenCalled());
+  const exposed = reportClientFrictionBatch.mock.calls.flatMap(([signals]) =>
+    (signals as { entitySlug: string }[]).map((x) => x.entitySlug),
+  );
+  expect(exposed).toEqual(["weibo"]);
+});
+
+test("插件类目搜索态:只并入命中关键词的内置插件", async () => {
+  searchMarketplace.mockResolvedValue({ results: [], method: "keyword" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  mockPluginDirectory();
+
+  render(<BrowsePanel auth={auth} kind="connector" onOpenConnectors={() => {}} />);
+  await screen.findByRole("button", { name: /^GitHub/ });
+  fireEvent.change(screen.getByPlaceholderText(/搜索插件/), { target: { value: "坚果云" } });
+  // 防抖 250ms 后进入搜索态:不命中的内置插件退出,命中的留下
+  await waitFor(() => expect(screen.queryByRole("button", { name: /^GitHub/ })).not.toBeInTheDocument());
+  expect(screen.getByRole("button", { name: /^WebDAV 网盘/ })).toBeInTheDocument();
+  expect(searchMarketplace).toHaveBeenLastCalledWith(auth, "坚果云", "connector", expect.any(Number));
+});
+
+test("插件目录读不到 / 没有管理中心出口:只显示市场结果,详情与安装流不受影响", async () => {
+  searchMarketplace.mockResolvedValue({ results: [WEIBO_CARD], method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  getConnectors.mockRejectedValue(new Error("x"));
+  getDeclarativeManagement.mockRejectedValue(new Error("x"));
+  getPluginManagement.mockRejectedValue(new Error("x"));
+
+  const view = render(<BrowsePanel auth={auth} kind="connector" onOpenConnectors={() => {}} />);
+  const weibo = await screen.findByRole("button", { name: /^微博/ });
+  await waitFor(() => expect(getPluginManagement).toHaveBeenCalled());
+  expect(screen.queryByTestId("plugin-state")).not.toBeInTheDocument();
+  fireEvent.click(weibo);
+  expect(screen.getByTestId("detail-slug")).toHaveTextContent("weibo");
+  view.unmount();
+
+  mockPluginDirectory();
+  render(<BrowsePanel auth={auth} kind="connector" />);
+  await screen.findByRole("button", { name: /^微博/ });
+  await waitFor(() => expect(getPluginManagement).toHaveBeenCalled());
+  expect(screen.queryByRole("button", { name: /^GitHub/ })).not.toBeInTheDocument();
+});
+
+test("非插件类目不读插件目录", async () => {
+  searchMarketplace.mockResolvedValue({ results: CATALOG, method: "all" });
+  listMarketplaceInstalled.mockResolvedValue([]);
+  render(<BrowsePanel auth={auth} kind="skill" onOpenConnectors={() => {}} />);
+  await screen.findByRole("heading", { name: "平台精选" });
+  expect(getConnectors).not.toHaveBeenCalled();
+  expect(getPluginManagement).not.toHaveBeenCalled();
 });

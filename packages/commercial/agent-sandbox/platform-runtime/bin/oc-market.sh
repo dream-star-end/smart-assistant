@@ -377,7 +377,7 @@ parser.add_argument(
     "--use-cases", required=True, help="1-4 user scenarios separated by semicolons"
 )
 parser.add_argument("--outcomes", default="", help="effect examples separated by semicolons")
-parser.add_argument("--tags", default="连接器", help="comma-separated tags")
+parser.add_argument("--tags", default="插件", help="comma-separated tags")
 parser.add_argument("--intro-file", help="optional Markdown storefront introduction")
 parser.add_argument("--visibility", choices=("public", "org"), default="public")
 args = parser.parse_args(argv)

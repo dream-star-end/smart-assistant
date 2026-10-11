@@ -42,7 +42,10 @@ import {
   marketplaceArtifactKind,
   updateAvailable,
 } from "../../lib/marketplace";
+import type { PluginEntry } from "../../lib/pluginDirectory";
+import { pluginMatchesQuery } from "../../lib/pluginDirectory";
 import type { AuthSession, MarketplaceCard, MarketplaceInstalled } from "../../lib/types";
+import { usePluginDirectory } from "../../lib/usePluginDirectory";
 import { cn } from "../../lib/utils";
 import {
   Alert,
@@ -115,6 +118,32 @@ function cardIcon(card: MarketplaceCard): LucideIcon {
   return (card.category ? CATEGORY_ICON[card.category] : undefined) ?? Sparkles;
 }
 
+/**
+ * 平台预装的内置插件(飞书 / GitHub / Notion / WebDAV / 邮箱)不是市场条目:市场目录有意不列它们
+ * (listMarketBrowseCatalog 过滤默认连接器),v1 的 WebDAV / 邮箱更没有 listing。插件类目把它们
+ * 合成卡片并进来,用户在「插件」里看到的才是完整的插件列表(OCV5-379)。点击直接去管理中心绑定账号。
+ */
+const BUILTIN_PLUGIN_CATEGORY: Record<string, string> = {
+  github: "coding-dev",
+  notion: "office-docs",
+  feishu: "office-docs",
+  webdav: "office-docs",
+};
+
+function builtinPluginCard(entry: PluginEntry): MarketplaceCard {
+  return {
+    slug: entry.slug,
+    kind: "connector",
+    artifactKind: "plugin",
+    name: entry.label,
+    description: entry.description,
+    tags: [],
+    preinstalled: true,
+    official: true,
+    category: BUILTIN_PLUGIN_CATEGORY[entry.slug] ?? "daily-tools",
+  };
+}
+
 /** 分区图标:每个区头都有,不再只有「平台精选」一个有图标、其余光秃。 */
 function sectionIcon(categoryId: string): LucideIcon {
   return CATEGORY_ICON[categoryId] ?? Layers;
@@ -132,12 +161,15 @@ function sectionIcon(categoryId: string): LucideIcon {
 function CardTile({
   card,
   installed,
+  plugins,
   onOpen,
   featured = false,
 }: {
   featured?: boolean;
   card: MarketplaceCard;
   installed: Map<string, MarketplaceInstalled>;
+  /** 插件目录(slug → 状态);只在「插件」类目传入。 */
+  plugins?: Map<string, PluginEntry>;
   onOpen: (slug: string) => void;
 }) {
   const inst = card.preset ? undefined : installed.get(card.slug);
@@ -174,7 +206,11 @@ function CardTile({
   const Icon = cardIcon(card);
   const tags = card.tags.slice(0, 2);
   const restTags = card.tags.length - tags.length;
-  const stateLabel = canUpdate ? "有新版本" : inst ? "已安装" : null;
+  // 插件卡:状态以插件目录为准(已连接 / 未连接 / 需重新授权),与管理中心同一判据;
+  // 有新版本仍优先提示更新。目录读不到时退回原来的「已安装」。
+  const plugin = plugins?.get(card.slug);
+  const pluginState = plugin && !canUpdate ? plugin : null;
+  const stateLabel = canUpdate ? "有新版本" : pluginState ? pluginState.stateLabel : inst ? "已安装" : null;
   // 整卡是一个 button:不给显式名的话,读屏会把描述+全部徽章+评分连读成几十字的按钮名。
   // 描述走 aria-describedby(而不是 aria-hidden):名字短、描述仍可听 —— 它是装不装的主要依据。
   const ariaLabel = [card.name, catLabel, identity, stateLabel].filter(Boolean).join("，");
@@ -196,6 +232,20 @@ function CardTile({
           <span className="marketplace-card-icon"><Icon size={24} strokeWidth={1.6} aria-hidden="true" /></span>
           <span className="marketplace-card-state">
             {canUpdate ? <><ArrowUpCircle size={13} aria-hidden="true" /> 可更新</>
+              : pluginState ? (
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1",
+                    pluginState.tone === "success" && "text-success",
+                    pluginState.tone === "warning" && "text-warning",
+                    pluginState.tone === "danger" && "text-danger",
+                  )}
+                  data-testid="plugin-state"
+                >
+                  {pluginState.state === "connected" ? <ShieldCheck size={13} aria-hidden="true" /> : <Plug size={13} aria-hidden="true" />}
+                  {pluginState.stateLabel}
+                </span>
+              )
               : inst ? <><ShieldCheck size={13} aria-hidden="true" /> 已安装</>
                 : <ArrowUpRight size={18} className="marketplace-card-arrow" aria-hidden="true" />}
           </span>
@@ -274,6 +324,7 @@ function Section({
   iconClassName,
   cards,
   installed,
+  plugins,
   onOpen,
 }: {
   title: string;
@@ -285,6 +336,7 @@ function Section({
   iconClassName?: string;
   cards: MarketplaceCard[];
   installed: Map<string, MarketplaceInstalled>;
+  plugins?: Map<string, PluginEntry>;
   onOpen: (slug: string) => void;
 }) {
   return (
@@ -307,7 +359,7 @@ function Section({
       </div>
       <ul className="marketplace-grid">
         {cards.map((c) => (
-          <CardTile key={c.slug} card={c} installed={installed} onOpen={onOpen} featured={title === "平台精选"} />
+          <CardTile key={c.slug} card={c} installed={installed} plugins={plugins} onOpen={onOpen} featured={title === "平台精选"} />
         ))}
       </ul>
     </section>
@@ -488,17 +540,47 @@ export function BrowsePanel({
 
   const onInstalled = useCallback(() => setReloadInstalled((n) => n + 1), []);
 
+  // 插件类目叠加插件目录:状态徽标 + 并入内置插件。只叠加、不替代市场搜索 —— 未安装的市场插件
+  // 仍只来自搜索结果;目录读不到时卡片照常渲染,只是没有状态(OCV5-379 方案审查 r1)。
+  const pluginsOn = kind === "connector";
+  const directory = usePluginDirectory(auth, pluginsOn, reloadInstalled);
+  const pluginBySlug = useMemo(
+    () => (pluginsOn && directory ? new Map(directory.map((e) => [e.slug, e])) : undefined),
+    [pluginsOn, directory],
+  );
+  const builtinCards = useMemo<MarketplaceCard[]>(() => {
+    // 没有「去管理中心」出口时不并入:内置插件没有市场详情可开。
+    if (!pluginsOn || !directory || !cards || !onOpenConnectors) return [];
+    const listed = new Set(cards.map((c) => c.slug));
+    return directory
+      .filter((e) => e.origin === "builtin" && !listed.has(e.slug) && pluginMatchesQuery(e, debouncedQ))
+      .map(builtinPluginCard);
+  }, [pluginsOn, directory, cards, onOpenConnectors, debouncedQ]);
+  const builtinSlugs = useMemo(() => new Set(builtinCards.map((c) => c.slug)), [builtinCards]);
+  /** 实际展示的卡片 = 市场搜索结果 + 内置插件。翻页判断(truncated)与曝光上报只看市场结果。 */
+  const shownCards = useMemo(
+    () => (cards && builtinCards.length > 0 ? [...cards, ...builtinCards] : cards),
+    [cards, builtinCards],
+  );
+  const openCard = useCallback(
+    (slug: string) => {
+      if (builtinSlugs.has(slug) && onOpenConnectors) onOpenConnectors(slug);
+      else setActive(slug);
+    },
+    [builtinSlugs, onOpenConnectors],
+  );
+
   const noun = kind === "agent" ? "智能体" : kind === "connector" ? "插件" : "技能";
   /** 首次加载(还没有任何数据)才铺骨架;刷新/翻页保留旧列表,只压暗。 */
   const firstLoad = loading && cards === null;
-  const empty = !loading && !!cards && cards.length === 0;
+  const empty = !loading && !!shownCards && shownCards.length === 0;
   /** 本页已装满 → 服务端可能还有更多(响应体没有 total,只能用「装满即可能有」判定)。 */
   const truncated = !!cards && cards.length >= limit;
 
   // 分区视图仅在浏览态(空查询)构建;搜索态走平铺相关度列表。
   const grouped = useMemo(
-    () => (!debouncedQ && cards ? groupCardsByCategory(cards) : null),
-    [debouncedQ, cards],
+    () => (!debouncedQ && shownCards ? groupCardsByCategory(shownCards) : null),
+    [debouncedQ, shownCards],
   );
 
   /**
@@ -519,23 +601,27 @@ export function BrowsePanel({
 
   // 当前平铺(chips 选中某类,或搜索态)的卡片集。
   const flatCards = useMemo(() => {
-    if (debouncedQ) return cards ?? [];
+    if (debouncedQ) return shownCards ?? [];
     if (!grouped || selectedCat === null) return [];
     if (selectedCat === UNCAT) return grouped.uncategorized;
     return grouped.categories.find((c) => c.id === selectedCat)?.cards ?? [];
-  }, [debouncedQ, cards, grouped, selectedCat]);
+  }, [debouncedQ, shownCards, grouped, selectedCat]);
 
   const flatMode = Boolean(debouncedQ) || selectedCat !== null;
   const exposedCards = useMemo(() => {
     if (!cards) return [];
-    if (flatMode) return flatCards;
-    if (!sections) return cards;
-    return [
-      ...sections.featured,
-      ...sections.categories.flatMap((section) => section.cards),
-      ...sections.uncategorized,
-    ];
-  }, [cards, flatCards, flatMode, sections]);
+    const shown = flatMode
+      ? flatCards
+      : !sections
+        ? cards
+        : [
+            ...sections.featured,
+            ...sections.categories.flatMap((section) => section.cards),
+            ...sections.uncategorized,
+          ];
+    // 内置插件不是市场条目,不进目录曝光统计。
+    return builtinSlugs.size > 0 ? shown.filter((c) => !builtinSlugs.has(c.slug)) : shown;
+  }, [cards, flatCards, flatMode, sections, builtinSlugs]);
 
   // Cohort 必须按同一 user + skill 关联；只记录本次市场面板实际渲染过的卡片，
   // 并在面板生命周期内按 slug 去重，避免静默刷新重复放大曝光。
@@ -739,7 +825,7 @@ export function BrowsePanel({
             }
           />
         )
-      ) : cards && cards.length > 0 ? (
+      ) : shownCards && shownCards.length > 0 ? (
         // 刷新/翻页时保留旧列表(只压暗),不再整片闪成骨架把滚动位置打乱。
         <div
           aria-busy={loading || undefined}
@@ -765,7 +851,7 @@ export function BrowsePanel({
             ) : (
               // 只拉了一页时说「已加载」而不是「共」:分区计数与这里都不能把一页当全量(K-03)。
               <p className="text-caption text-faint">
-                {truncated ? `已加载 ${cards.length} 个${noun}，还有更多` : `共 ${cards.length} 个${noun}`}
+                {truncated ? `已加载 ${shownCards.length} 个${noun}，还有更多` : `共 ${shownCards.length} 个${noun}`}
               </p>
             )}
             {selectedCat !== null && (
@@ -799,7 +885,8 @@ export function BrowsePanel({
                   iconClassName="text-accent"
                   cards={sections.featured}
                   installed={installed}
-                  onOpen={setActive}
+                  plugins={pluginBySlug}
+                  onOpen={openCard}
                 />
               )}
               {sections.categories.map((c) => (
@@ -812,7 +899,8 @@ export function BrowsePanel({
                   icon={sectionIcon(c.id)}
                   cards={c.cards}
                   installed={installed}
-                  onOpen={setActive}
+                  plugins={pluginBySlug}
+                  onOpen={openCard}
                 />
               ))}
               {sections.uncategorized.length > 0 && (
@@ -824,7 +912,8 @@ export function BrowsePanel({
                   icon={Layers}
                   cards={sections.uncategorized}
                   installed={installed}
-                  onOpen={setActive}
+                  plugins={pluginBySlug}
+                  onOpen={openCard}
                 />
               )}
             </div>
@@ -832,7 +921,7 @@ export function BrowsePanel({
             // 平铺视图:搜索相关度列表,或选中某个分类筛选片
             <ul className="marketplace-grid marketplace-flat-grid">
               {flatCards.map((c) => (
-                <CardTile key={c.slug} card={c} installed={installed} onOpen={setActive} />
+                <CardTile key={c.slug} card={c} installed={installed} plugins={pluginBySlug} onOpen={openCard} />
               ))}
             </ul>
           )}

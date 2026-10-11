@@ -11,7 +11,7 @@ describe('oc-plugin shared CLI surface', () => {
     assert.match(help.stdout, /Usage: oc-plugin/)
     assert.doesNotMatch(help.stdout, /Usage: oc-connect/)
     assert.match(help.stdout, /--confirm/)
-    assert.match(help.stdout, /确认卡批准的 Plugin 写操作/)
+    assert.match(help.stdout, /确认卡批准的插件写操作/)
 
     const list = await runOcPluginCli(['list'], {
       transport: async () => ({

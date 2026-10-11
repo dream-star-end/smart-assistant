@@ -166,9 +166,9 @@ test("Agent 详情展示 typed capabilities、就绪状态与 Plugin 授权入�
     />,
   );
 
-  expect(await screen.findByText(/Skill · paper-read · 必需 · 已就绪/)).toBeInTheDocument();
-  expect(screen.getByText(/Plugin · paper-search · 必需 · 待授权/)).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "管理 Plugin 账号" }));
+  expect(await screen.findByText(/技能 · paper-read · 必需 · 已就绪/)).toBeInTheDocument();
+  expect(screen.getByText(/插件 · paper-search · 必需 · 待授权/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "管理插件账号" }));
   expect(open).toHaveBeenCalledTimes(1);
   expect(screen.getByText(/不是逐智能体的插件权限隔离/)).toBeInTheDocument();
 });
@@ -413,9 +413,9 @@ test("可选 Plugin 待授权时 Agent 仍可用，但完成态保留明确授�
   );
 
   fireEvent.click(await screen.findByRole("button", { name: "安装" }));
-  expect(await screen.findByText("安装完成，仍有 Plugin 待授权")).toBeInTheDocument();
-  expect(screen.getByText(/智能体已经可用；另有 1 项可选 Plugin/)).toBeInTheDocument();
-  fireEvent.click(screen.getByRole("button", { name: "管理 Plugin 账号" }));
+  expect(await screen.findByText("安装完成，仍有插件待授权")).toBeInTheDocument();
+  expect(screen.getByText(/智能体已经可用；另有 1 项可选插件/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "管理插件账号" }));
   expect(open).toHaveBeenCalledTimes(1);
 });
 
@@ -773,7 +773,7 @@ test("精确预装 Plugin 不提供市场安装，只引导到管理中心", asy
     />,
   );
 
-  expect(await screen.findByText("官方 API 插件 · 已预装")).toBeInTheDocument();
+  expect(await screen.findByText("官方插件 · 已预装")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "安装" })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "去绑定账号" }));
   expect(openConnectors).toHaveBeenCalledTimes(1);

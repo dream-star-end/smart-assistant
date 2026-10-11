@@ -68,13 +68,13 @@ const CONNECTOR_SURFACE: CliSurface = {
   rpcSurface: 'connectors',
   listKey: 'connections',
   catalogKey: 'connectors',
-  emptyListText: '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。',
-  emptyCatalogText: '暂无可用的应用连接器。',
-  listTitle: '已绑定的应用连接:',
-  catalogTitle: '可绑定的应用连接器:',
+  emptyListText: '当前未绑定任何插件账号。请告知用户前往 管理中心 → 插件 绑定后重试。',
+  emptyCatalogText: '暂无可用的插件。',
+  listTitle: '已绑定的插件账号:',
+  catalogTitle: '可绑定的插件:',
   catalogBindHint:
-    '（绑定需用户在 设置 → 应用连接器 中填写凭据;凭据永不进入容器,你无法代为绑定,只能引导用户。）',
-  missingAccountHint: '请告知用户前往 设置 → 应用连接器 绑定后重试。',
+    '（绑定需用户在 管理中心 → 插件 中填写凭据;凭据永不进入容器,你无法代为绑定,只能引导用户。）',
+  missingAccountHint: '请告知用户前往 管理中心 → 插件 绑定后重试。',
 }
 
 const PLUGIN_SURFACE: CliSurface = {
@@ -107,21 +107,21 @@ function usage(surface: CliSurface): string {
     '',
     'Commands:',
     plugin
-      ? '  list                                    列出当前可调用的 Plugin 目标与操作'
-      : '  list                                    列出已绑定的应用连接与可用操作',
+      ? '  list                                    列出当前可调用的插件目标与操作'
+      : '  list                                    列出已绑定的插件账号与可用操作',
     plugin
-      ? '  catalog [query]                         列出已安装的可用 Plugin(可选关键词搜索)'
-      : '  catalog [query]                         列出可绑定的应用连接器(可选关键词搜索)',
+      ? '  catalog [query]                         列出已安装的可用插件(可选关键词搜索)'
+      : '  catalog [query]                         列出可绑定的插件(可选关键词搜索)',
     plugin
-      ? '  call <plugin> <action> [options]        调用 Plugin 操作(params 从 stdin 读 JSON)'
+      ? '  call <plugin> <action> [options]        调用插件操作(params 从 stdin 读 JSON)'
       : '  call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)',
     '',
     'Options (call):',
     plugin
-      ? '  --account <targetId>       指定目标(同一 Plugin 有多个账户时必填)'
+      ? '  --account <targetId>       指定目标(同一插件有多个账户时必填)'
       : '  --account <connectionId>   指定连接(同一 provider 有多个连接时必填)',
     plugin
-      ? '  --confirm <id>             执行已被用户在确认卡批准的 Plugin 写操作'
+      ? '  --confirm <id>             执行已被用户在确认卡批准的插件写操作'
       : '  --confirm <id>             执行已被用户确认的写操作(凭确认卡返回的 id)',
     '  --out <file>               结果含文件时,解码 base64 落盘到 <file>(只打印路径与大小)',
   ].join('\n')
@@ -270,17 +270,17 @@ function formatConnections(connections: any[], surface: CliSurface): string {
 
 /**
  * catalog 输出:可**绑定**的连接器目录(≠已绑 list)。供 AI 感知"有哪些应用可用"并**引导用户
- * 去绑定**——凭据永不进容器,agent 不能代绑,只能告知用户去 设置 → 应用连接器 填凭据。
+ * 去绑定**——凭据永不进容器,agent 不能代绑,只能告知用户去 管理中心 → 插件 填凭据。
  */
 function formatCatalog(connectors: any[], surface: CliSurface, query?: string): string {
   if (!connectors.length) {
     return query
-      ? `未找到匹配「${query}」的${surface.rpcSurface === 'plugins' ? '插件' : '应用连接器'}。可不带关键词再列全部。`
+      ? `未找到匹配「${query}」的插件。可不带关键词再列全部。`
       : surface.emptyCatalogText
   }
   const lines: string[] = [
     query
-      ? `匹配「${query}」的${surface.rpcSurface === 'plugins' ? '插件' : '应用连接器'}:`
+      ? `匹配「${query}」的插件:`
       : surface.catalogTitle,
     surface.catalogBindHint,
     '',
@@ -335,7 +335,7 @@ async function cmdCall(
     if (matches.length === 0) {
       const message =
         ctx.surface.rpcSurface === 'connectors'
-          ? `oc-connect: 未找到 provider=${provider} 的已绑定连接。请告知用户前往 设置 → 应用连接器 绑定后重试。\n`
+          ? `oc-connect: 未找到 provider=${provider} 的已绑定账号。请告知用户前往 管理中心 → 插件 绑定后重试。\n`
           : `oc-plugin: 未找到 provider=${provider} 的可用目标。${ctx.surface.missingAccountHint}\n`
       return {
         exitCode: 1,
@@ -352,7 +352,7 @@ async function cmdCall(
         .join('\n')
       const message =
         ctx.surface.rpcSurface === 'connectors'
-          ? `oc-connect: provider=${provider} 有多个已绑定连接，请用 --account <connectionId> 指定其一:\n${cand}\n`
+          ? `oc-connect: provider=${provider} 有多个已绑定账号，请用 --account <connectionId> 指定其一:\n${cand}\n`
           : `oc-plugin: provider=${provider} 有多个可用目标，请用 --account <connectionId> 指定其一:\n${cand}\n`
       return {
         exitCode: 2,

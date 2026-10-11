@@ -396,13 +396,13 @@ describe("其余 oc-* 卡片", () => {
     expect(container.querySelector("a")).toBeNull(); // 不安全 src → 无下载/预览链接
   });
 
-  test("oc-market search → 技能市场卡(数组输出)", () => {
+  test("oc-market search → AI 市场卡(数组输出)", () => {
     const out = JSON.stringify([
       { slug: "research-assistant", name: "科研助手", kind: "agent", description: "端到端科研" },
       { slug: "pptx", name: "PPTX", kind: "skill", description: "做幻灯" },
     ]);
     render(<div>{researchToolCard("oc-market search 科研", tool({ output: out }))}</div>);
-    expect(screen.getByText("技能市场")).toBeInTheDocument();
+    expect(screen.getByText("AI 市场")).toBeInTheDocument();
     expect(screen.getByText("科研助手")).toBeInTheDocument();
     expect(screen.getByText("智能体")).toBeInTheDocument();
   });

@@ -144,10 +144,10 @@ export const OC_TOOLS = {
   mmx: { icon: Sparkles, label: "媒体生成", tone: "accent" },
   // 应用连接器(webdav/imap/notion/github/feishu):body 专属卡含写操作确认卡
   // (connectorCards.tsx,human-in-the-loop 安全关键)。
-  "oc-connect": { icon: Plug, label: "应用连接", tone: "accent" },
+  "oc-connect": { icon: Plug, label: "插件", tone: "accent" },
   // 市场 Plugin(知识星球/微博等)沿用同一服务端确认账本与确认卡；CLI stdout 只提供
   // 不透明 confirmation id，卡片内容仍由后端权威详情铸造。
-  "oc-plugin": { icon: Plug, label: "市场插件", tone: "accent" },
+  "oc-plugin": { icon: Plug, label: "插件", tone: "accent" },
 } satisfies Record<string, ToolMeta>;
 
 /** oc-* CLI 名的联合类型(= OC_TOOLS 的键)。body 卡注册表以它为键,保证不会给未登记的
@@ -407,17 +407,17 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
   }
   if (cli === "oc-plugin") {
     const labels: Record<string, string> = {
-      list: "可用市场插件",
-      catalog: "搜索市场插件",
-      call: "调用市场插件",
+      list: "可用插件",
+      catalog: "搜索插件",
+      call: "调用插件",
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
   if (cli === "oc-connect") {
     const labels: Record<string, string> = {
-      list: "已连接应用",
-      catalog: "搜索应用连接",
-      call: "调用应用连接",
+      list: "已连接插件",
+      catalog: "可连接的插件",
+      call: "调用插件",
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }

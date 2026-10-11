@@ -205,6 +205,18 @@ test('导航栏底部「去市场添加」直达市场', () => {
   expect(onOpenMarketplace).toHaveBeenCalledTimes(1)
 })
 
+test('「去市场添加」按当前分区带上类目：插件页 → 插件，其余 → 技能（OCV5-379）', () => {
+  stubMd(true)
+  const onOpenMarketplace = vi.fn()
+  const view = renderShell({ onOpenMarketplace, tab: 'skills' })
+  fireEvent.click(screen.getByRole('button', { name: /去市场添加/ }))
+  expect(onOpenMarketplace).toHaveBeenLastCalledWith('skill')
+  view.unmount()
+  renderShell({ onOpenMarketplace, tab: 'connectors' })
+  fireEvent.click(screen.getByRole('button', { name: /去市场添加/ }))
+  expect(onOpenMarketplace).toHaveBeenLastCalledWith('connector')
+})
+
 test('tablist 与面板建立 aria 关联，键盘可聚焦内容区', () => {
   renderShell({ tab: 'skills' })
   const panel = screen.getByRole('tabpanel')

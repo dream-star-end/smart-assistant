@@ -96,7 +96,7 @@ describe("Sidebar 管理中心入口副标题", () => {
     renderSidebar({ onOpenManage: () => {} });
     openAccountMenu();
     const entry = screen.getByRole("menuitem", { name: /管理中心/ });
-    expect(entry).toHaveTextContent("记忆 · 技能");
+    expect(entry).toHaveTextContent("记忆 · 技能 · 定时 · 插件");
     expect(entry).not.toHaveTextContent(/待确认/);
   });
 });

@@ -1653,7 +1653,7 @@ describe("T-02/T-03:Cursor shell 信封的表头摘要与展开体", () => {
         }}
       />,
     );
-    const header = screen.getByRole("button", { name: /调用应用连接/ });
+    const header = screen.getByRole("button", { name: /调用插件/ });
     expect(header).toHaveAccessibleName(/待确认/);
     expect(header.textContent).not.toContain("oc_connect");
     expect(header.textContent).not.toContain("confirmation_required");
