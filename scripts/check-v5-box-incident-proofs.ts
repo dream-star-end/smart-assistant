@@ -2333,6 +2333,9 @@ def call(method, path, body=b''):
     while s.recv(65536):
         pass
     s.close()
+# Real Claude Code takes seconds to load its plugins; the host reads claude.pid by polling and refuses
+# a peer that calls before that read (BOX_BRIDGE_PEER_REFUSED), so a stand-in must not be faster.
+import time as _startup; _startup.sleep(0.5)
 call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
 tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
