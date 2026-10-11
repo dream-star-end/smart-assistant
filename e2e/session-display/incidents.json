@@ -6619,6 +6619,58 @@
           "assertion": "OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and billed once"
         }
       ]
+    },
+    {
+      "id": "INC-20261011-BOX-TOOL-409-STUCK-RECOVERY",
+      "occurredAt": "2026-10-11",
+      "severity": "P0",
+      "symptom": "商业版 uid 4（2026-10-11 10:15 CST，box-api-claude-opus-5-5）与 uid 1870（10-08 11:30）：上一条 assistant 并行 5 个 Read（图片），下一条 user 是 5 个 tool_result + 1 个 Claude Code 自己追加的 text（图片缩放说明，折叠白名单没认出）→ egress 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION，回合 engine_error，自动恢复；uid 4 的恢复轮里 Opus 5.5 以 stop_reason refusal 结束，decoder 不认识 → BOX_TOOL_STOP_REASON_INVALID → 运行 unknown，Box CLI 自己的“continuing once”重试继续生成无人接收，占住会话槽（BOX_CAPACITY_HELD）；容器在该会话上以 IDLE_HISTORY_PENDING 拒收每条新消息（DISPATCH_NOT_ACCEPTED），恢复任务停在 forwarded，界面一直「模型繁忙，正在重试中」。两周内同类 409 第 8 次（逐形状白名单）。修复：工具结果之后的任意 text/图片/尾随 system 提示一律当已回答的交换走新调用（交换入历史，其余作为下一条 user 消息），本回合仍在等这些结果的 handoff 先认领并经平台停止路径证明停止；refusal 映射为确定性拒绝码 BOX_CLI_MODEL_REFUSED，Box CLI 以 CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1 运行；对账器每轮把派发 not_accepted 的 forwarded 恢复任务置为 paused（dispatch_not_accepted）。",
+      "rootFixCommit": "3198303a",
+      "coverageCommits": [
+        "9335dee5",
+        "ab4a0ebf"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAnsweredExchange.test.ts",
+          "assertion": "any text, image or system hint after paired results runs fresh, never 409"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAnsweredExchange.test.ts",
+          "assertion": "a handoff of this turn still waiting is claimed and stopped, then the prompt runs fresh"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxAnsweredExchange.test.ts",
+          "assertion": "a handoff that cannot be taken over or proven stopped keeps the 409"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/http/proxy/boxOrphanHandoff.integ.test.ts",
+          "assertion": "waiting handoff lookup returns this turn's waiting run, or live when it cannot be taken over"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/anthropicProxy.integ.test.ts",
+          "assertion": "unknown current tool text is admitted and launched, never 409"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "a model safety stop is the named, final refusal code, not an invalid stop"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/turnRecoveryRefusedDispatch.integ.test.ts",
+          "assertion": "a forwarded recovery job whose dispatch ended not_accepted is paused, nothing else"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit/integration 层：分类器、fetch 认领停止、journal 查询、decoder refusal 与恢复任务收口都有真实 SQL 或真实代码路径的用例；个人版 canary 用不了仅管理员可见的 Box 模型，触发需要真实 Claude Code 注入文本或真实 refusal，不是可重复执行的 browser/live-e2e 产物。商业版以 deploy-gate proof 覆盖。",
+        "since": "2026-10-11"
+      }
     }
   ]
 }
