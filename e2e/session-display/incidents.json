@@ -6628,7 +6628,8 @@
       "rootFixCommit": "3198303a",
       "coverageCommits": [
         "9335dee5",
-        "ab4a0ebf"
+        "ab4a0ebf",
+        "f809e9ad"
       ],
       "regressions": [
         {
@@ -6665,6 +6666,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/turnRecoveryRefusedDispatch.integ.test.ts",
           "assertion": "a forwarded recovery job whose dispatch ended not_accepted is paused, nothing else"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
+          "assertion": "OCV5-377 a model safety stop in the finished spool is undeliverable"
         }
       ],
       "proofPending": {
