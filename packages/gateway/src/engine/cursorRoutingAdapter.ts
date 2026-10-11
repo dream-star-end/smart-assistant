@@ -134,7 +134,17 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   ) {
     super()
     this.selectCredential = selector
-    this.credentialSelection = this.selectionFor(opts, opts.executionTarget, opts.cursorCredentialSelection)
+    // An interactive Box session (box-claude-*, local) gets its Box from the master; everything else
+    // keeps a selection handed in, else selects from the pool.
+    this.credentialSelection = cursorBoxCcFromMaster(opts.model, opts.executionTarget?.kind === 'remote')
+      || opts.cursorCredentialSelection?.masterBox === true
+      ? this.selectionFor(opts, opts.executionTarget, opts.cursorCredentialSelection)
+      : opts.cursorCredentialSelection ?? selector({
+        agentId: opts.agentId,
+        sessionKey: opts.sessionKey,
+        agentBaseDir: opts.agentBaseDir,
+        model: opts.model,
+      })
     this.opts = { ...opts, cursorCredentialSelection: this.credentialSelection }
     this.variant = cursorVariantFor(opts.model, this.credentialSelection, opts.executionTarget)
     this.inner = this.createInner(this.variant)
