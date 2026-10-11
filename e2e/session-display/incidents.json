@@ -5774,7 +5774,10 @@
       "severity": "P2",
       "symptom": "OCV5-308候选真实Chromium回归复现（非声称生产用户报障）：工具卡默认头部只有40px，低于原44px键盘/指针命中合同；恢复44px。",
       "rootFixCommit": "5abf0dfd",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "a492e45d",
+        "7e6a2d06"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -5804,7 +5807,9 @@
       "severity": "P2",
       "symptom": "OCV5-308候选真实Chromium双视口与React回归复现（非声称生产用户报障）：completed历史目标进入处理过程后，MessageRenderer将所有goal返回null，展开只有空壳、正文与原始记录不可查看；仅恢复completed历史纯文本及精确原始记录，当前active/paused/blocked目标仍只在唯一dock展示，cleared不复活。",
       "rootFixCommit": "f00e0564",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "0ac746ff"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -5864,7 +5869,9 @@
       "severity": "P2",
       "symptom": "OCV5-308候选真实Chromium复现（非声称生产用户报障）：live状态同时带oc-swap-in与oc-live-status-shine，后置入场fade-in覆盖扫光动画，并覆盖forced-colors要求的animation:none。仅将入场selector排除shine，其他入场行为保留；六主题/媒体正控全部通过，独立旧CSS输入负控在两主题normal/forced四叶精准红，父级失败仅为成功reports汇总，reduced与原过程/历史目标证明继续通过。",
       "rootFixCommit": "98760e9e",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "3789a1a5"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -6376,7 +6383,8 @@
       "symptom": "商业（2026-10-06）：uid 4 的 Box Claude Opus 5.5 会话在一轮没能开始处理时，同一个失败同时显示两张卡片：『消息未开始处理，已确认未计费』（带重新尝试）和『任务执行失败，内部错误，你的消息已保留』（带重新尝试），两个重试按钮，红卡还让人以为消息丢失或已计费。根因：前端既渲染服务端核实的 dispatch 状态记录（_turnStatusRecord），又渲染同一轮的 assistant 错误行（_errorCode），两者互不抑制。修复：同一轮已有状态记录时，不带部分回答正文的 assistant 错误行不再渲染，只留说明未计费、可重试的状态卡；带部分回答正文、属于别的轮、或没有状态记录的错误行不受影响。",
       "rootFixCommit": "3323ce4b",
       "coverageCommits": [
-        "3fead6ab"
+        "3fead6ab",
+        "6117c45e"
       ],
       "regressions": [
         {
@@ -6402,7 +6410,9 @@
       "severity": "P2",
       "symptom": "个人版与商业版 Box Claude：安装的 CLI 版本不在白名单时，入场前被拒为 BOX_CLI_VERSION_UNSUPPORTED，界面停在「模型繁忙，正在重试」。同一道白名单还让未列出的版本不走原生续写。修复：去掉版本白名单。能读到的 x.y.z 一律放行并允许原生续写；读不到版本仍在入场前拒绝；另一构建写下的 transcript 仍是缓存未命中。个人版先合入 49a1cd7c1，商业版按同一行为同步。",
       "rootFixCommit": "9aa73389",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "49a1cd7c"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -6428,7 +6438,9 @@
       "symptom": "商业（2026-10-07）：uid 4 用 Box Claude Opus 5.5 最高档提问，引擎约 16 秒就绪，之后模型思考约 150 秒且思考正文为空，活动行一直显示『正在启动引擎 (136s)…』直到正文出来，用户以为启动卡死。根因：gateway 的 engine_starting/engine_resuming 阶段态只在首个可见块、权限卡、后继 turn_status、错误或终态时清除；CCB parser 丢弃 message_start 和思考块 content_block_start，空思考没有任何事件能清掉启动态。修复：parser 把主 agent 的 message_start 与思考块开合作为 model_progress 侧信道上报；sessionManager 在 message_start 结束启动态，思考块打开期间立即并每 10 秒发 turn_status working(detail=thinking)，思考块关闭发 null，权限/错误/终态/detach 时停止；web-react 把它显示为『深度思考中 (Ns)』，正文帧兜底清除，不进厨房粘滞动作。",
       "rootFixCommit": "1d38b018",
       "coverageCommits": [
-        "1c2f408d"
+        "1c2f408d",
+        "9527b9aa",
+        "728efd61"
       ],
       "regressions": [
         {
@@ -6471,7 +6483,10 @@
       "rootFixCommit": "f2315c66",
       "coverageCommits": [
         "40946716",
-        "fa6ae519"
+        "fa6ae519",
+        "f295fb3f",
+        "b3d01825",
+        "df4c2dfe"
       ],
       "regressions": [
         {
@@ -6502,7 +6517,9 @@
       "severity": "P1",
       "symptom": "商业 rel-ac3dbe616 用户 1870：续接被拒后 Box 运行停不掉，之后每条消息『消息未开始处理』（IDLE_HISTORY_PENDING），本应持续到 4 小时期限。原生续接把 keeper 启动在写 transcript 那次运行的目录，keeper 停止脚本只认自己运行目录，退出 125（BOX_EXEC_REMOTE_EXIT）；自 PR #605 起所有原生续接的运行都无法停止",
       "rootFixCommit": "91849ecf",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "5d96780d"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -6522,7 +6539,9 @@
       "severity": "P2",
       "symptom": "商业 rel-ac3dbe616 用户 1870：同一会话先用 k3-256k 调用工具（tool id 为 tool_…），再切到 box-api-claude-opus-5-5，每次请求在发起前被拒 400 BOX_REQUEST_UNSUPPORTED（BOX_BLOCK_UNSUPPORTED，界面 upstream_failed，第三次重试还显示成认证失败）；Box 历史编译只认 toolu_ 形式的 tool id",
       "rootFixCommit": "f9113f38",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "3d3a652b"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -6552,7 +6571,9 @@
       "severity": "P2",
       "symptom": "个人版 OCV5-355 托管真 Chromium 复现（非用户报障）：同一次点击切会话并预填输入框时，预填在 passive effect 里写入，React 19 下晚于绘制，目标会话的旧草稿先显示一帧；改为 layout effect，首个提交帧即为预填。微任务后读取：修前 3/3 红，修后 10/10 绿。（商业版 OCV5-355 挑自个人版；商业版同样缺此修复，开发机红绿复现一致。）",
       "rootFixCommit": "6981c360",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "53a7141d"
+      ],
       "regressions": [
         {
           "layer": "browser",
@@ -6568,7 +6589,9 @@
       "symptom": "个人版 OCV5-355 真 Chromium 复现（非用户报障，托管 double-failure-card 偶发红引出）：服务端回显用户行合并时丢掉客户端自有的自动重试谱系（root/attempt/max），每次 REST 同步后下一次自动重放都从 attempt 2、以上一条重试为 root 重新起算，共享 1..10 上限永不触发；派发前持续失败的轮被无限重发（fixture 10 秒 80 次）。修后 attempt 1..10 后停止，共 11 次发送。（商业版 OCV5-355 挑自个人版；商业版同样缺此修复，开发机红绿复现一致。）",
       "rootFixCommit": "af04fd7e",
       "coverageCommits": [
-        "6ac17b78"
+        "6ac17b78",
+        "c8288390",
+        "42e4a01f"
       ],
       "regressions": [
         {
@@ -6592,7 +6615,11 @@
       "coverageCommits": [
         "bd575023",
         "1f04e1b2",
-        "e48575d7"
+        "e48575d7",
+        "01831646",
+        "17093508",
+        "b7325db0",
+        "131211fb"
       ],
       "regressions": [
         {
@@ -6651,7 +6678,14 @@
         "76c7ec34",
         "c1f3bacf",
         "64431795",
-        "1cc989fc"
+        "1cc989fc",
+        "3198303a",
+        "9335dee5",
+        "ab4a0ebf",
+        "f809e9ad",
+        "9d86e0e9",
+        "1e927ae5",
+        "a4368f43"
       ],
       "regressions": [
         {
