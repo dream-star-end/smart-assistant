@@ -10,6 +10,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inHeadLineage } from "./lib/lineage.ts";
 
 export type LedgerIncident = {
   id: string;
@@ -264,7 +265,8 @@ export function checkIncidentLedgerSuperset(input: SupersetInput = {}): Superset
     }
     if (!input.skipGit) {
       for (const sha of [live.rootFixCommit, ...liveCoverage]) {
-        if (sha && !isAncestor(root, sha)) {
+        // 祖先,或 HEAD 里有逐行相同的 cherry-pick -x(见 scripts/lib/lineage.ts)。
+        if (sha && !inHeadLineage(root, sha)) {
           errors.push(`${id}: lineage ${sha} is not an ancestor of HEAD`);
         }
       }

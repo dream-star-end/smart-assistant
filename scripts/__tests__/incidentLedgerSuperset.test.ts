@@ -335,6 +335,7 @@ function makeSeverityFixture(): SeverityFixture {
     git("init", "-q"); git("add", "."); git("commit", "-qm", "chore: fixture baseline");
     const unanchored = git("rev-parse", "HEAD").slice(0, 8);
     write("scripts/check-v5-incident-regressions.ts", severityCheckerBytes.toString("utf8"));
+    write("scripts/lib/lineage.ts", readFileSync(path.join(root, "scripts/lib/lineage.ts"), "utf8"));
     write("package.json", JSON.stringify({ type: "module", fixture: "scripts/__tests__/p2Fixture.test.ts" }));
     write("scripts/__tests__/p2Fixture.test.ts", "// P2_UNIT_ASSERTION\n");
     write("scripts/p2-proof-fixture.ts", "// P2_PROOF_ASSERTION\n");
@@ -361,9 +362,9 @@ function makeSeverityFixture(): SeverityFixture {
     throw error;
   }
 }
-function runSeverityCli(f: SeverityFixture) {
+function runSeverityCli(f: SeverityFixture, args: string[] = []) {
   f.write("e2e/session-display/incidents.json", JSON.stringify(f.manifest));
-  const result = spawnSync(process.execPath, ["--import", severityLoader, path.join(f.dir, "scripts/check-v5-incident-regressions.ts")], {
+  const result = spawnSync(process.execPath, ["--import", severityLoader, path.join(f.dir, "scripts/check-v5-incident-regressions.ts"), ...args], {
     cwd: f.dir, encoding: "utf8", timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
     env: { PATH: process.env.PATH, HOME: f.dir, LANG: "C.UTF-8", TZ: "UTC", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
   });
@@ -435,6 +436,79 @@ describe("incident severity CLI admission", () => {
           actual: actual ?? before ?? { notRun: true }, failure,
           cleanup: { directoryRemoved: f ? !existsSync(f.dir) : true },
           boundary: "real checker CLI/Git/metadata; synthetic proof not executed; no historical marker" }));
+      }
+    });
+  }
+});
+
+// OCV5-376: --edition=selfhost replaces the proofPending count with an explicit, shrink-only list.
+describe("incident selfhost edition", () => {
+  const debt = (f: SeverityFixture, incidents: Record<string, string>) =>
+    f.write("e2e/session-display/selfhost-proof-debt.json", JSON.stringify({ schema: 1, incidents }));
+  const cases: Array<{ name: string; arrange: (f: SeverityFixture) => string[]; pass: boolean; reason: RegExp }> = [
+    {
+      name: "a listed unit-only incident passes",
+      arrange: (f) => {
+        f.manifest.incidents[0].regressions.pop();
+        debt(f, { "INC-20260909-P2-GATE-SCHEMA": "selfhost release does not run the proof" });
+        return ["--edition=selfhost"];
+      },
+      pass: true,
+      reason: /selfhost proof debt 1\//,
+    },
+    {
+      name: "an unlisted unit-only incident fails",
+      arrange: (f) => {
+        f.manifest.incidents[0].regressions.pop();
+        debt(f, {});
+        return ["--edition=selfhost"];
+      },
+      pass: false,
+      reason: /不在 selfhost-proof-debt\.json 里/,
+    },
+    {
+      name: "a listed incident that has proof must leave the list",
+      arrange: (f) => {
+        debt(f, { "INC-20260909-P2-GATE-SCHEMA": "stale" });
+        return ["--edition=selfhost"];
+      },
+      pass: false,
+      reason: /从清单删掉/,
+    },
+    {
+      name: "a list entry without a reason fails",
+      arrange: (f) => {
+        f.manifest.incidents[0].regressions.pop();
+        debt(f, { "INC-20260909-P2-GATE-SCHEMA": " " });
+        return ["--edition=selfhost"];
+      },
+      pass: false,
+      reason: /缺原因/,
+    },
+    {
+      name: "an unknown edition is refused",
+      arrange: () => ["--edition=personal"],
+      pass: false,
+      reason: /--edition 只能是 selfhost/,
+    },
+  ];
+  for (const c of cases) {
+    test(c.name, () => {
+      const f = makeSeverityFixture();
+      try {
+        const args = c.arrange(f);
+        const r = runSeverityCli(f, args);
+        assert.equal(r.error, null, JSON.stringify(r));
+        if (c.pass) {
+          assert.equal(r.exit, 0, JSON.stringify(r));
+          assert.match(r.stdout, c.reason);
+        } else {
+          assert.ok(typeof r.exit === "number" && r.exit !== 0, JSON.stringify(r));
+          assert.match(r.stderr, c.reason);
+          assert.doesNotMatch(r.stdout, /\[incident-regressions\] PASS:/);
+        }
+      } finally {
+        rmSync(f.dir, { recursive: true, force: true });
       }
     });
   }
