@@ -7095,6 +7095,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/admin/AdminShellBoundary.test.tsx",
           "assertion": "页面崩溃只影响当前 tab，切页后错误边界重置"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/admin-boundary-sticky.node-test.mjs",
+          "assertion": "INC-20261009-ADMIN-BOUNDARY-STICKY: one crashed admin page does not lock the other tabs"
         }
       ]
     },
