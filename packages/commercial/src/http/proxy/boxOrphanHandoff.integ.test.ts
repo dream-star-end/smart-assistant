@@ -85,3 +85,49 @@ test("orphan handoff lookup requires same tool ids, another turn and a terminal 
     assert.equal((await find(["toolu_S"])).kind, "claimed");
   } finally { client.release(); await pool.end(); }
 });
+
+// OCV5-377: the handoff of this very turn that still waits for exactly these
+// results is taken over (claimed, stopped) before an answered exchange runs fresh.
+test("waiting handoff lookup returns this turn's waiting run, or live when it cannot be taken over",
+  { skip: !url }, async () => {
+  const pool = new Pool({ connectionString: url, max: 1 });
+  const client = await pool.connect();
+  try {
+    await client.query(`CREATE TEMP TABLE request_finalize_journal (request_id text PRIMARY KEY,
+      user_id bigint NOT NULL, state text NOT NULL, ctx jsonb NOT NULL, updated_at timestamptz DEFAULT now())`);
+    const q = (sql: string, params: unknown[] = []) => client.query(sql, params);
+    const journal = new BoxDurableJournal({ connect: async () => ({ query: q, release: () => {} }), query: q } as never);
+    const turn = "aa".repeat(32);
+    const handoff = (ids: string[]) => ({ version: 1, roundNo: 1, messageId: "msg_1",
+      catalogHash: "c".repeat(64), detachedRunnerHash: "d".repeat(64), spoolOffset: 10,
+      assistantContentHash: "1".repeat(64), assistantEchoHash: "2".repeat(64),
+      assistantNoCallerHash: "3".repeat(64), verifiedPendingToolUseIds: [ids[0]],
+      usage: { inputTokens: 2, outputTokens: 7, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      toolUses: ids.map((id) => ({ id, boxName: "mcp__ocbridge__t0", clientName: "Read",
+        inputHash: "e".repeat(64) })) });
+    const row = (id: string, session: string, ids: string[], extra = {}) =>
+      q(`INSERT INTO request_finalize_journal VALUES ($1,3,'committed',$2::jsonb)`, [id, JSON.stringify({
+        boxSessionId: session, boxTurnKey: turn, boxState: "handoff", boxAccountId: "20",
+        boxRunNonce: "a".repeat(24), boxLeaseEpoch: "b".repeat(32), boxToolHandoff: handoff(ids), ...extra })]);
+    const find = (session: string, toolIds: string[], turnKey = turn) =>
+      journal.findWaitingToolHandoff({ uid: 3n, sessionId: session, turnKey, toolIds });
+    await row("box-wait", "s1", ["toolu_1", "toolu_2"]);
+    assert.deepEqual(await find("s1", ["toolu_2", "toolu_1"]), { kind: "waiting", identity: {
+      requestId: "box-wait", uid: 3n, accountId: 20n, runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) } });
+    assert.deepEqual(await find("s1", ["toolu_1"]), { kind: "none" }, "different id set");
+    assert.deepEqual(await find("s1", ["toolu_1", "toolu_2"], "ff".repeat(32)), { kind: "none" }, "another turn");
+    await row("box-cancel", "s2", ["toolu_3"], { boxCancelIntent: true });
+    assert.deepEqual(await find("s2", ["toolu_3"]), { kind: "live" }, "a Stop in flight is not ours");
+    await row("box-claimed", "s3", ["toolu_4"], { boxRecoveredBy: "box-other" });
+    assert.deepEqual(await find("s3", ["toolu_4"]), { kind: "live" }, "another recovery owns it");
+    await row("box-bad", "s4", ["toolu_5"], { boxRunNonce: "short" });
+    assert.deepEqual(await find("s4", ["toolu_5"]), { kind: "live" }, "malformed identity");
+    await row("box-dup-1", "s5", ["toolu_6"]); await row("box-dup-2", "s5", ["toolu_6"]);
+    assert.deepEqual(await find("s5", ["toolu_6"]), { kind: "live" }, "not unique");
+    // claimed by this recovery, then proven stopped: nothing waits any more
+    assert.equal(await journal.claimOrphanRecovery({ requestId: "box-wait", uid: 3n, by: "box-fresh" }), true);
+    assert.deepEqual(await find("s1", ["toolu_1", "toolu_2"]), { kind: "live" });
+    await q(`UPDATE request_finalize_journal SET ctx = ctx || '{"boxState":"failed_stopped"}'::jsonb WHERE request_id='box-wait'`);
+    assert.deepEqual(await find("s1", ["toolu_1", "toolu_2"]), { kind: "none" });
+  } finally { client.release(); await pool.end(); }
+});

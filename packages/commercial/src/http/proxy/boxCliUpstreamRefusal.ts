@@ -7,11 +7,15 @@
  * is one named code instead of an order or snapshot violation. */
 export const BOX_CLI_UPSTREAM_RATE_LIMITED = "BOX_CLI_UPSTREAM_RATE_LIMITED";
 export const BOX_CLI_UPSTREAM_REFUSED = "BOX_CLI_UPSTREAM_REFUSED";
+/** OCV5-377: the model's own safety stop (`stop_reason: "refusal"`). Final for
+ * this call: the CLI runs with CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1, so it does
+ * not start a hidden second answer nobody receives. Settled like a refusal. */
+export const BOX_CLI_MODEL_REFUSED = "BOX_CLI_MODEL_REFUSED";
 export type BoxCliUpstreamRefusalCode = typeof BOX_CLI_UPSTREAM_RATE_LIMITED
-  | typeof BOX_CLI_UPSTREAM_REFUSED;
+  | typeof BOX_CLI_UPSTREAM_REFUSED | typeof BOX_CLI_MODEL_REFUSED;
 
 const REFUSAL_CODES: ReadonlySet<string> = new Set([BOX_CLI_UPSTREAM_RATE_LIMITED,
-  BOX_CLI_UPSTREAM_REFUSED]);
+  BOX_CLI_UPSTREAM_REFUSED, BOX_CLI_MODEL_REFUSED]);
 
 export function isBoxCliUpstreamRefusalCode(code: unknown): code is BoxCliUpstreamRefusalCode {
   return typeof code === "string" && REFUSAL_CODES.has(code);

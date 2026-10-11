@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES, BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import { hashBoxAssistantContent } from "./boxCallFingerprint.js";
+import { BOX_CLI_MODEL_REFUSED } from "./boxCliUpstreamRefusal.js";
 import { _UsageObserver } from "./shared.js";
 
 const model = "claude-opus-5-5";
@@ -545,4 +546,27 @@ test("a CLI usage-limit refusal before any model message is a named code, not a 
   assert.throws(() => local.push(JSON.stringify(plain) + "\n"),
     (error: unknown) => error instanceof BoxCliToolHandoffError
       && error.code === "BOX_TOOL_SNAPSHOT_INVALID");
+});
+
+// OCV5-377 (commercial uid 4, 10-11): Opus 5.5 stopped an answer with
+// stop_reason "refusal". The decoder treated it as an invalid stop, the run
+// became "unknown", and the CLI's own hidden retry kept generating for nobody.
+test("a model safety stop is the named, final refusal code, not an invalid stop", () => {
+  for (const allowFinal of [true, false]) {
+    const decoder = new BoxCliToolHandoffDecoder(model, catalog,
+      { alreadyInitialized: true, allowFinal });
+    const refused = [
+      event({ type: "message_start", message: { id: "msg_refused", model,
+        role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+      event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial" } }),
+      event({ type: "content_block_stop", index: 0 }),
+    ];
+    for (const line of lines(refused)) decoder.push(line);
+    assert.throws(() => decoder.push(lines([event({ type: "message_delta",
+      delta: { stop_reason: "refusal", stop_details: { category: "reasoning_extraction" } },
+      usage: { input_tokens: 2, output_tokens: 9 } })])[0]!),
+    (error: unknown) => error instanceof BoxCliToolHandoffError
+      && error.message === BOX_CLI_MODEL_REFUSED, String(allowFinal));
+  }
 });

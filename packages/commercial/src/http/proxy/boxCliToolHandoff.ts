@@ -7,7 +7,7 @@
  */
 import { BoxCliCompaction, BoxCliCompactionError, isBoxCliCompactBoundary,
   isBoxCliOutputLimitResume, isBoxCliSyntheticUser } from "./boxCliCompaction.js";
-import { boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
+import { BOX_CLI_MODEL_REFUSED, boxCliUpstreamRefusal } from "./boxCliUpstreamRefusal.js";
 import { BOX_TOOL_MESSAGE_STREAM_MAX_BYTES } from "./boxToolCapacity.js";
 import type { BoxToolCatalog } from "./boxToolCatalog.js";
 import { hashBoxAssistantContent, hashBoxAssistantEchoContent,
@@ -723,6 +723,10 @@ export class BoxCliToolHandoffDecoder {
         throw new BoxCliToolHandoffError("BOX_TOOL_ORDER_INVALID");
       }
       const reason = obj(event.delta).stop_reason;
+      // OCV5-377: a safety stop ends this call for good (no CLI retry).
+      if (reason === "refusal" && this.stopReason === null) {
+        throw new BoxCliToolHandoffError(BOX_CLI_MODEL_REFUSED);
+      }
       if (this.stopReason !== null || (reason !== "tool_use"
         && !(this.options.allowFinal && (reason === "end_turn"
           || reason === "max_tokens" || reason === "stop_sequence")))) {
