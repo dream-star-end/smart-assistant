@@ -73,8 +73,10 @@ type Attach = {
 // 的漂移(用户挂 6-8 个上传成功却被后端拒)。
 const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
 
-// 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。
-const ComposerPrediction = lazy(() => import("./ComposerPrediction"));
+// 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。只是提示,加载失败(发版后的
+// 旧标签页取不到旧 chunk)就不显示,不走 ChunkErrorBoundary 的整页「刷新」接管。
+const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
+const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";

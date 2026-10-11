@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useRef } from "react";
 import { cn } from "../lib/utils";
 
 /**
@@ -25,7 +25,7 @@ export default function ComposerPrediction({
   onAccept: () => void;
   /** 浮层高度:整句预测比空输入框长时会折行,Composer 按它撑开输入框。 */
   onHeight: (px: number) => void;
-}) {
+}): ReactNode {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     onHeight(ref.current?.scrollHeight ?? 0);
