@@ -405,6 +405,33 @@ function mapRecoveryJobTerminalRows(
   return mapped
 }
 
+/** OCV5-377: a recovery dispatch the container received but refused (e.g. the
+ * session was held on IDLE_HISTORY_PENDING) ends not_accepted and writes no
+ * tape, so its forwarded job never settled — only a sealed tape settles one,
+ * and a user Stop cancels only queued/leased/sent — and the turn showed
+ * "retrying" forever. Pause it instead: no automatic re-dispatch loop; the
+ * session takes the user's next message. Returns the number of jobs paused. */
+export async function pauseRecoveryJobsForRefusedDispatches(
+  q: Queryable,
+  input: { limit?: number } = {},
+): Promise<number> {
+  const result = await q.query(
+    `UPDATE turn_recovery_jobs j
+        SET status='paused',pause_reason='dispatch_not_accepted',terminal_outcome='interrupted',
+            lease_owner=NULL,lease_until=NULL,updated_at=NOW()
+      WHERE j.job_id IN (
+        SELECT r.job_id FROM turn_recovery_jobs r
+          JOIN turn_dispatches d
+            ON d.dispatch_id::text=r.dispatch_id::text AND d.attempt_no=r.dispatch_attempt_no
+         WHERE r.status='forwarded' AND d.status='terminal' AND d.outcome='not_accepted'
+         ORDER BY r.updated_at
+         LIMIT $1)
+        AND j.status='forwarded'`,
+    [input.limit ?? 100],
+  )
+  return result.rowCount ?? 0
+}
+
 export async function settleRecoveryJobForTape(
   q: Queryable,
   input: { userId: bigint; sessionId: string; clientMessageId: string; outcome: 'completed' | 'interrupted' | 'crashed' },

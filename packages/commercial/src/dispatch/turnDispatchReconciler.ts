@@ -35,6 +35,7 @@ import {
   type TraceFirstVisibleRow,
 } from './visibleOrphan.js'
 import { registerProducerFence } from '../db/liveTurnFrames.js'
+import { pauseRecoveryJobsForRefusedDispatches } from './turnRecoveryStore.js'
 import {
   casAdmittedToRejecting,
   casRejectingToAccepted,
@@ -1608,6 +1609,8 @@ export interface TurnDispatchReconcilerHandle {
 }
 
 export interface StartTurnDispatchReconcilerOptions extends TurnDispatchReconcilerDeps {
+  /** Test seam; production pauses refused forwarded recovery jobs each tick. */
+  pauseRefusedRecoveryJobs?: (pool: Pool) => Promise<number>
   intervalMs?: number
   runOnStart?: boolean
   onError?: (err: unknown) => void
@@ -1644,6 +1647,11 @@ export function startTurnDispatchReconciler(
     if (running) return empty // DB 卡时跳过重叠 tick
     running = true
     try {
+      // OCV5-377: a forwarded recovery job whose dispatch ended not_accepted
+      // gets no tape and would read "retrying" forever; pause it (best-effort,
+      // the next tick retries).
+      await (opts.pauseRefusedRecoveryJobs ?? pauseRecoveryJobsForRefusedDispatches)(opts.pool)
+        .catch(onError)
       // jitter:错开双 master 抢先(leaderBundle 只 leader 跑,jitter 再防定时对齐踩踏)。
       return await runReconcileTick(opts)
     } catch (err) {

@@ -301,7 +301,8 @@ test("a billed handoff nobody answered closes without touching its settlement an
   const dead = await owner("dead", OLD);
   const waiting = { uid: 3n, sessionId: dead.session, turnKey: dead.turn,
     toolIds: ["toolu_exp_claim"] };
-  assert.equal(await db.journal.hasWaitingToolHandoff(waiting), true);
+  assert.deepEqual(await db.journal.findWaitingToolHandoff(waiting), { kind: "waiting",
+    identity: { requestId: "dead-owner", uid: 3n, accountId: 20n, runNonce: dead.nonce, leaseEpoch: EPOCH } });
   assert.deepEqual(await db.journal.markRunExpiredUnproven({ requestId: "dead-owner", uid: 3n,
     accountId: 20n, runNonce: dead.nonce, leaseEpoch: EPOCH, cause: "BOX_ACCOUNT_UNAVAILABLE" }),
   { action: "closed", shape: "billed_handoff", priorBoxState: "handoff", ancestors: 0 });
@@ -309,7 +310,7 @@ test("a billed handoff nobody answered closes without touching its settlement an
   assert.deepEqual([row.state, row.final_credits, row.failure_code, row.ctx.boxState],
     ["committed", "8", null, "expired_unproven"]);
   assert.equal((row.ctx.boxExpiredClose as { priorBoxState: string }).priorBoxState, "handoff");
-  assert.equal(await db.journal.hasWaitingToolHandoff(waiting), false);
+  assert.deepEqual(await db.journal.findWaitingToolHandoff(waiting), { kind: "none" });
   const closed = await db.snapshot();
   await assert.rejects(dead.claim(), BoxDurableJournalError);
   assert.equal(await db.snapshot(), closed, "a late tool result cannot resume the closed run");

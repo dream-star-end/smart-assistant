@@ -18,7 +18,7 @@ import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
 import { makeBoxStageBatch } from "./boxStageBatch.js";
 import { boxFastPathEnabled } from "./boxFastPath.js";
 import { boxCliNativeResumeVerified } from "./boxCliVersion.js";
-import { BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED } from "./boxCliUpstreamRefusal.js";
+import { BOX_CLI_MODEL_REFUSED, BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED } from "./boxCliUpstreamRefusal.js";
 import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
@@ -61,7 +61,9 @@ type Journal = Pick<BoxDurableJournal, "admit" |
 const BOX_LOCALLY_REJECTED_STREAM = new Set(["BOX_TOOL_ID_OR_NAME_INVALID",
   // The CLI answered an upstream refusal (usage window exhausted, API error)
   // with its own synthetic message: nothing was generated, nothing is billed.
-  BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED]);
+  BOX_CLI_UPSTREAM_RATE_LIMITED, BOX_CLI_UPSTREAM_REFUSED,
+  // OCV5-377: the model's safety stop is final for this call as well.
+  BOX_CLI_MODEL_REFUSED]);
 
 export async function runBoxToolFirstRound(input: {
   uid: bigint;
