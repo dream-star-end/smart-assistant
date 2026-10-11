@@ -1,5 +1,6 @@
-/** Sand relay installer against Cursor Box host layouts (INC-20261007-SAND-INSTALLER-HOST-F95DBFB).
- * Runs the real installer.py on the verbatim-gate f95dbfb fixture and serves the patched host. */
+/** Sand relay installer against Cursor Box host layouts (INC-20261007-SAND-INSTALLER-HOST-F95DBFB,
+ * INC-20261011-SAND-INSTALLER-HOST-F1727E3). Runs the real installer.py on verbatim-gate fixtures and
+ * serves the patched host. */
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
@@ -23,11 +24,11 @@ try: print(json.dumps(m.install(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[
 except Exception as e: print(type(e).__name__+':'+str(e));sys.exit(1)`, installer, host, modulePath, hash(readFileSync(modulePath))], { encoding: "utf8", timeout: 30_000 });
 }
 
-test("host f95dbfb layout: relay answers only the primary gateway token, never the WebAuthn proxy token", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "sand-installer-f95dbfb-")), host = join(dir, "host-main.cjs");
+async function relayAnswersOnlyTheGatewayToken(fixture: string): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "sand-installer-layout-")), host = join(dir, "host-main.cjs");
   let server: http.Server | undefined;
   try {
-    writeFileSync(host, readFileSync(join(relayDir, "fixtures/host-f95dbfb.cjs")));
+    writeFileSync(host, readFileSync(join(relayDir, fixture)));
     const first = apply(host); assert.equal(first.status, 0, first.stdout + first.stderr);
     const patched = readFileSync(host, "utf8");
     assert.ok(patched.indexOf("return handleSandStreamRelay(deps, req, res);") < patched.indexOf("webAuthnProxyRefusal({"), "route sits before the proxy branch");
@@ -59,6 +60,32 @@ test("host f95dbfb layout: relay answers only the primary gateway token, never t
   } finally {
     if (server) { server.closeAllConnections(); await new Promise<void>((r) => server!.close(() => r())); }
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("host f95dbfb layout: relay answers only the primary gateway token, never the WebAuthn proxy token", async () => {
+  await relayAnswersOnlyTheGatewayToken("fixtures/host-f95dbfb.cjs");
+});
+
+test("host f1727e3 layout (the f95dbfb gate re-bundled as refusal3): relay answers only the primary gateway token", async () => {
+  await relayAnswersOnlyTheGatewayToken("fixtures/host-f1727e3.cjs");
+});
+
+test("the auth anchor tolerates only the bundler's numbering: a changed or doubled gate is still refused", () => {
+  const base = readFileSync(join(relayDir, "fixtures/host-f1727e3.cjs"), "utf8");
+  const gate = base.slice(base.indexOf("    if (deps.authToken != null && !isAuthorized(req, deps.authToken)) {"),
+    base.indexOf("const refusal3 = webAuthnProxyRefusal({") + "const refusal3 = webAuthnProxyRefusal({".length);
+  const variants = {
+    changed: base.replace("!isAuthorized(req, deps.webAuthnProxyToken)", "!isAuthorizedProxy(req, deps.webAuthnProxyToken)"),
+    renamed: base.replace("const refusal3 = webAuthnProxyRefusal", "const refusalX = webAuthnProxyRefusal"),
+    doubled: base.replace(gate, `${gate}\n      });\n    }\n${gate}`),
+  };
+  for (const [name, source] of Object.entries(variants)) {
+    const r = spawnSync("python3", ["-c", `import importlib.util,sys
+s=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+try: m.patch_source(sys.stdin.read()); print('patched')
+except RuntimeError as e: print(e)`, installer], { input: source, encoding: "utf8", timeout: 10_000 });
+    assert.equal(r.stdout.trim(), "UNSUPPORTED_HOST_LAYOUT", name);
   }
 });
 

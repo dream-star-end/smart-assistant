@@ -35,6 +35,15 @@ AUTH_V3 = '''    if (deps.authToken != null && !isAuthorized(req, deps.authToken
         return respondError(res, 401, "unauthorized");
       }
       const refusal2 = webAuthnProxyRefusal({'''
+# Host f1727e3 (2026-10-11) is the same gate, re-bundled: the bundler renumbers the local
+# (`refusal2` -> `refusal3`). Only that generated suffix may differ; the anchor is the exact
+# text found, and it must still occur once.
+AUTH_V3_RE = re.compile(re.escape(AUTH_V3).replace("refusal2", r"refusal[0-9]{1,3}"))
+
+
+def auth_v3_anchor(source):
+    found = AUTH_V3_RE.findall(source)
+    return found[0] if len(found) == 1 else None
 SERVICE = '''      log: (message) => context2.host.log(message),
       credentials: context2.host.environment.auth
     });
@@ -94,8 +103,9 @@ def digest(data):
 
 def layout_anchors(source):
     if source.count(HANDLE_V2) == 1:
-        if source.count(AUTH_V3) == 1:
-            return HANDLE_V2, GROUP_V2, SERVICE_V2, AUTH_V3, ROUTE_V3
+        auth_v3 = auth_v3_anchor(source)
+        if auth_v3 is not None:
+            return HANDLE_V2, GROUP_V2, SERVICE_V2, auth_v3, ROUTE_V3
         return HANDLE_V2, GROUP_V2, SERVICE_V2, AUTH, ROUTE
     if source.count(HANDLE) == 1:
         return HANDLE, GROUP, SERVICE, AUTH, ROUTE
@@ -110,7 +120,7 @@ def patch_source(source):
         owned = HOOK in source or (old_hook in source and old_body in source)
         if not owned or source.count(handle) != 1 or REGISTER not in source or route not in source:
             fail("UNSUPPORTED_EXISTING_HOOK")
-        if auth is AUTH_V3 and (source.count(route) != 1 or source.index(route) > source.index(auth)):
+        if route is ROUTE_V3 and (source.count(route) != 1 or source.index(route) > source.index(auth)):
             fail("UNSUPPORTED_EXISTING_HOOK")
         # Add a GET-only capability route without changing the original auth gate.
         if source.count(OLD_ROUTE_KIND) == 1:
@@ -127,7 +137,7 @@ def patch_source(source):
     source = source.replace(handle, HOOK + handle, 1)
     source = source.replace(CLASSIFY, CLASSIFY + '\n' + ROUTE_KIND, 1)
     source = source.replace(group, group.replace(") {", " || isSandStreamRelay) {"), 1)
-    if auth is AUTH_V3:
+    if route is ROUTE_V3:
         source = source.replace(auth, route + auth, 1)
     else:
         source = source.replace(auth, auth.replace("    if (isPrepareUpgrade) {", route + "    if (isPrepareUpgrade) {"), 1)
