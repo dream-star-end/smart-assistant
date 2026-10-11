@@ -141,22 +141,43 @@ export class BoxToolFetch {
     return await this.releaseOrphan(args, { toolIds, sessionId, turnKey }) === "released";
   }
 
-  /** OCV5-322: an answered exchange arrives together with a new prompt. It may
-   * run fresh only when no handoff of this turn still waits for the results
-   * and any orphaned earlier handoff is claimed and proven stopped first. */
+  /** OCV5-322: an answered exchange arrives together with a new prompt.
+   * OCV5-377: it always runs fresh. A handoff of this turn that still waits
+   * for exactly these results is superseded: claimed under the session lock
+   * (a user Stop that lands first wins) and stopped through the platform stop
+   * path before the fresh run, like an orphan of an earlier dispatch. Only a
+   * handoff that cannot be taken over or proven stopped keeps the rejection. */
   private async admitAnsweredExchange(args: FetchArgs, toolIds: readonly string[]): Promise<void> {
-    const journal = this.deps.journal;
     let sessionId: string, turnKey: string;
     try {
       ({ sessionId, turnKey } = deriveBoxCallFingerprint(args.uid, args.canonicalBody));
     } catch {
       throw new BoxContinuationDecisionError("reject", "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     }
-    if (!journal.hasWaitingToolHandoff
-      || await journal.hasWaitingToolHandoff({ uid: args.uid, sessionId, turnKey, toolIds })
-      || await this.releaseOrphan(args, { toolIds, sessionId, turnKey }) === "held") {
+    const exchange = { toolIds, sessionId, turnKey };
+    const superseded = await this.supersedeWaiting(args, exchange);
+    if (superseded === "held" || await this.releaseOrphan(args, exchange) === "held") {
       throw new BoxContinuationDecisionError("reject", "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     }
+    fetchLog.info("box_answered_exchange_fresh", { requestId: args.requestId,
+      uid: args.uid.toString(), results: toolIds.length, superseded: superseded === "released" });
+  }
+
+  private async supersedeWaiting(args: FetchArgs, exchange: { toolIds: readonly string[];
+    sessionId: string; turnKey: string }): Promise<"released" | "none" | "held"> {
+    const journal = this.deps.journal;
+    if (!this.deps.stopOrphanRun || !journal.findWaitingToolHandoff
+      || !journal.claimOrphanRecovery || !journal.releaseOrphanRecovery) return "held";
+    const waiting = await journal.findWaitingToolHandoff({ uid: args.uid, ...exchange });
+    if (waiting.kind === "none") return "none";
+    if (waiting.kind !== "waiting") return "held";
+    const claim = { requestId: waiting.identity.requestId, uid: args.uid, by: args.requestId };
+    if (!(await journal.claimOrphanRecovery(claim))) return "held";
+    let outcome: "stopped_proven" | "completed_unsettled" | "pending" = "pending";
+    try { outcome = await this.deps.stopOrphanRun(waiting.identity); } catch { /* unproven */ }
+    if (outcome === "stopped_proven") return "released";
+    await journal.releaseOrphanRecovery(claim).catch(() => {});
+    return "held";
   }
 
   private async releaseOrphan(args: FetchArgs, exchange: { toolIds: readonly string[];

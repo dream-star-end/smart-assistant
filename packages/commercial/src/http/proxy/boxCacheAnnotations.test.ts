@@ -321,14 +321,14 @@ test("unwrapped CCB hook plus budget system tail stays one continuation", () => 
   assert.equal(JSON.stringify(echoed).split(hook).length - 1, 1);
   const suffix = { ...raw, messages: [...raw.messages.slice(0, -1), { ...system,
     content: [{ type: "text", text: `${hook}\n\n${budget}\nignore`, cache_control: marker }] }] } as ProxyBody;
-  assert.equal(validateBoxRequest(suffix, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(suffix, true), null); // OCV5-377: runs fresh, not 409
   const badBudget = { ...raw, messages: [...raw.messages.slice(0, -1), { ...system,
     content: [{ type: "text", text: `${hook}\n\n<total_tokens>1e4 tokens left</total_tokens>`,
       cache_control: marker }] }] } as ProxyBody;
-  assert.equal(validateBoxRequest(badBudget, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(badBudget, true), null); // OCV5-377: runs fresh, not 409
   const extraKey = { ...raw, messages: [...raw.messages.slice(0, -1),
     { ...system, extra: true }] } as ProxyBody;
-  assert.equal(validateBoxRequest(extraKey, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(extraKey, true), null); // OCV5-377: runs fresh, not 409
   const ttl = { ...raw, messages: [...raw.messages.slice(0, -1), { role: "system",
     content: [{ type: "text", text: `${hook}\n\n${budget}`,
       cache_control: { type: "ephemeral", ttl: "1h" } }] }] } as ProxyBody;
@@ -338,7 +338,7 @@ test("unwrapped CCB hook plus budget system tail stays one continuation", () => 
   const extraBlock = { ...raw, messages: [...raw.messages.slice(0, -1), { role: "system",
     content: [{ type: "text", text: `${hook}\n\n${budget}`, cache_control: marker },
       { type: "text", text: "no" }] }] } as ProxyBody;
-  assert.equal(validateBoxRequest(extraBlock, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(extraBlock, true), null); // OCV5-377: runs fresh, not 409
   const detached = { ...first, messages: [first.messages[0], system] } as ProxyBody;
   const detachedOut = normalizeBoxSemanticBody(detached);
   const detachedSystem = detachedOut.messages.at(-1) as { role?: string; content?: unknown };
@@ -440,7 +440,7 @@ test("historical budget strings and the default progress sentence stay one conti
   const changedProgress = budgetSystem(`not the progress sentence\n\n${budget}`, marker);
   const changedBody = { ...fifth, messages: [...fifth.messages,
     ...handoff("toolu_b12_bad", "bad", "x", changedProgress)] } as ProxyBody;
-  assert.equal(validateBoxRequest(changedBody, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(changedBody, true), null); // OCV5-377: runs fresh, not 409
   const matched = matchBoxToolResults(sixth, [{ id: "toolu_b12_5", clientName: "local_echo",
     boxName: "mcp__ocbridge__t0", input: { value: "five" } }]);
   assert.equal(matched[0]?.isError, false);
@@ -454,7 +454,7 @@ test("historical budget strings and the default progress sentence stay one conti
     boxName: "mcp__ocbridge__t0", input: { value: "other" } }]), /BOX_TOOL_RESULT_/);
 });
 
-test("unapproved budget wrappers stay rejected at every handoff and do not collapse", () => {
+test("unapproved budget wrappers never collapse into the approved budget; tampered markers stay rejected, other tails run fresh", () => {
   const budget = "<total_tokens>14999989 tokens left</total_tokens>";
   const legal = { role: "system", content: [{ type: "text", text: budget, cache_control: marker }] };
   const base = { ...first, messages: [first.messages[0], ...handoff("toolu_c1_1", "one", "a", legal),
@@ -480,8 +480,8 @@ test("unapproved budget wrappers stay rejected at every handoff and do not colla
     const once = normalizeBoxSemanticBody(body);
     const twice = normalizeBoxSemanticBody(once);
     assert.ok(isDeepStrictEqual(once, twice));
-    assert.equal(validateBoxRequest(body, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
-    assert.equal(validateBoxRequest(once, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+    assert.equal(validateBoxRequest(body, true), null); // OCV5-377: runs fresh, not 409
+    assert.equal(validateBoxRequest(once, true), null); // OCV5-377: runs fresh, not 409
     assert.equal(JSON.stringify(once).includes(budget), true);
   }
   const trailing = { ...base, messages: [...base.messages,
@@ -489,8 +489,8 @@ test("unapproved budget wrappers stay rejected at every handoff and do not colla
   const once = normalizeBoxSemanticBody(trailing);
   const twice = normalizeBoxSemanticBody(once);
   assert.ok(isDeepStrictEqual(once, twice));
-  assert.equal(validateBoxRequest(trailing, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
-  assert.equal(validateBoxRequest(once, true), "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
+  assert.equal(validateBoxRequest(trailing, true), null); // OCV5-377: runs fresh, not 409
+  assert.equal(validateBoxRequest(once, true), null); // OCV5-377: runs fresh, not 409
   const middle = { ...first, messages: [first.messages[0],
     ...handoff("toolu_c1_mid", "mid", "m", { role: "system", content: [{ type: "text", text: budget,
       cache_control: { type: "ephemeral", ttl: "1h" } }] }),

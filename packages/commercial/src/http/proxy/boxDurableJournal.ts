@@ -464,6 +464,39 @@ export class BoxDurableJournal implements BoxJournalPort {
     private readonly capacity: (uid: bigint, accountId: bigint) => number | BoxRunCapacity = () => 1) {}
 
   /** An older pointer cannot be reused after an intervening uncached turn. */
+  /** OCV5-322 / OCV5-377: the handoff of this very turn that still waits for
+   * exactly these tool results. "waiting" carries the run identity a stop
+   * needs; "live" when it cannot be taken over (a Stop or another recovery is
+   * already on it, more than one row, or a malformed identity). */
+  async findWaitingToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
+    toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" }
+    | { kind: "waiting"; identity: { requestId: string; uid: bigint; accountId: bigint;
+      runNonce: string; leaseEpoch: string } }> {
+    const want = [...input.toolIds].sort().join(",");
+    const rows = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id, ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
+          AND ctx->>'boxState'='handoff'
+          AND state IN ('inflight','finalizing','committed')`,
+      [input.uid.toString(), input.sessionId, input.turnKey]);
+    const matches = rows.rows.filter((row) => {
+      const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
+      return handoff === null || handoff.toolUses.map((use) => use.id).sort().join(",") === want;
+    });
+    if (matches.length === 0) return { kind: "none" };
+    if (matches.length !== 1) return { kind: "live" };
+    const row = matches[0]!, ctx = row.ctx;
+    if (parseBoxStoredToolHandoff(ctx.boxToolHandoff) === null
+      || ctx.boxCancelIntent !== undefined || ctx.boxRecoveredBy !== undefined
+      || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+      || typeof ctx.boxRunNonce !== "string" || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+      || typeof ctx.boxLeaseEpoch !== "string" || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)) {
+      return { kind: "live" };
+    }
+    return { kind: "waiting", identity: { requestId: row.request_id, uid: input.uid,
+      accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce, leaseEpoch: ctx.boxLeaseEpoch } };
+  }
+
   /**
    * OCV5-304: a recovered dispatch ("从断点继续"/"重新尝试") resends the same
    * tool results under a new turn key. A continuation belongs to its own
@@ -474,23 +507,6 @@ export class BoxDurableJournal implements BoxJournalPort {
    * stopped ("failed_stopped"). "claimed" when another recovery owns it,
    * "live" when it cannot be proven finished, "none" when no such record.
    */
-  /** OCV5-322: a handoff of this very turn still waits for exactly these
-   * tool results, so the request is a live continuation, never a fresh run. */
-  async hasWaitingToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
-    toolIds: readonly string[] }): Promise<boolean> {
-    const want = [...input.toolIds].sort().join(",");
-    const rows = await this.pool.query<{ ctx: Record<string, unknown> }>(
-      `SELECT ctx FROM request_finalize_journal
-        WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
-          AND ctx->>'boxState'='handoff'
-          AND state IN ('inflight','finalizing','committed')`,
-      [input.uid.toString(), input.sessionId, input.turnKey]);
-    return rows.rows.some((row) => {
-      const handoff = parseBoxStoredToolHandoff(row.ctx.boxToolHandoff);
-      return handoff === null || handoff.toolUses.map((use) => use.id).sort().join(",") === want;
-    });
-  }
-
   async findOrphanToolHandoff(input: { uid: bigint; sessionId: string; turnKey: string;
     toolIds: readonly string[] }): Promise<{ kind: "none" } | { kind: "live" } | { kind: "claimed" }
     | { kind: "orphan"; stopped: boolean; staleClaim?: string; identity: { requestId: string;
@@ -1978,6 +1994,7 @@ export class BoxDurableJournal implements BoxJournalPort {
         `SELECT request_id,ctx FROM request_finalize_journal
           WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'boxTurnKey'=$3
             AND ctx->>'boxState'='handoff' AND NOT (ctx ? 'boxCancelIntent')
+            AND NOT (ctx ? 'boxRecoveredBy')
             AND state IN ('inflight','finalizing','committed') FOR UPDATE`,
         [input.uid.toString(), fingerprint.sessionId, fingerprint.turnKey]);
       if (owners.rows.length !== 1) {

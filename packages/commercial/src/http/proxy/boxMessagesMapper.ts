@@ -112,6 +112,10 @@ function validateContent(content: unknown, role: "user" | "assistant"): void {
     if (role === "assistant" && block.type === "redacted_thinking"
       && Object.keys(block).sort().join(",") === "data,type"
       && typeof block.data === "string" && block.data.length > 0) continue;
+    // OCV5-377: Claude Code's own images after tool results (staged inside
+    // the last result for the Box CLI, see compileBoxCliSyntheticTurn).
+    if (role === "user" && block.type === "image" && strictBoxImageBlock(block) !== null
+      && blocks(content).some((item) => item.type === "tool_result")) continue;
     // No silent multimodal or unknown thinking downgrade.
     throw new BoxMessagesShapeError("BOX_BLOCK_UNSUPPORTED");
   }
@@ -237,19 +241,34 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     // still requires every tool_use to be answered exactly once.
     // OCV5-322: results followed only by text are that exchange plus a new
     // prompt (Claude Code merged them); the text becomes the stdin prompt.
+    // OCV5-377: images may follow too (e.g. Claude Code's own resized-image
+    // blocks). The Box CLI takes images only inside tool results, so they
+    // join the last result, beside the images that Read already returned.
     const all = Array.isArray(current.content) ? current.content : [];
     const cut = all.findIndex((block) => blocks([block])[0]?.type !== "tool_result");
     const tail = cut < 0 ? [] : all.slice(cut);
-    const textTail = tail.length > 0 && tail.every((block) => {
+    const isText = (block: unknown): boolean => {
       const [item] = blocks([block]);
       return item?.type === "text" && typeof item.text === "string" && item.text.trim().length > 0;
-    });
-    if (!args.resumeToolResults || cut === 0 || (tail.length > 0 && !textTail)) {
+    };
+    const isImage = (block: unknown): boolean => blocks([block])[0]?.type === "image";
+    const answeredTail = tail.length > 0 && tail.every((block) => isText(block) || isImage(block));
+    if (!args.resumeToolResults || cut === 0 || (tail.length > 0 && !answeredTail)) {
       throw new BoxMessagesShapeError("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     }
-    if (textTail) {
-      prompt = tail as Block[];
-      current = { ...current, content: all.slice(0, cut) };
+    if (answeredTail) {
+      const results = all.slice(0, cut) as Block[];
+      const images = tail.filter(isImage) as Block[];
+      if (images.length > 0) {
+        const last = results[results.length - 1]!;
+        const prior = typeof last.content === "string"
+          ? (last.content.length > 0 ? [{ type: "text", text: last.content }] : [])
+          : Array.isArray(last.content) ? last.content : [];
+        results[results.length - 1] = { ...last, content: [...prior, ...images] };
+      }
+      const texts = tail.filter(isText) as Block[];
+      if (texts.length > 0) prompt = texts;
+      current = { ...current, content: results };
     }
     resumed = true;
   }
