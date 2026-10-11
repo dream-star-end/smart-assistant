@@ -1,5 +1,5 @@
 import { isBoxApiModel } from '@openclaude/protocol'
-import { getDesiredIntelligentUi, intelligentUiNeedsRestart } from './intelligentUiDesired.js'
+import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
@@ -5529,9 +5529,10 @@ export class SessionManager {
         !sameToolsetsForCompare(runnerToolsets, desiredToolsets)
       // Intelligent UI(OCV5-361):CCB/Codex 的系统提示在 spawn 时写死;开关切换后第一轮
       // 并入同一次 shutdown → 本次 submit 以 resume 重启并重建提示。拉取失败不重启。
+      // 按内容指纹比(输入预测 OCV5-375 与组件协议同在这一段,单关其中一个也要重建)。
       const iuiApplied = (session.runner as { promptIntelligentUi?: unknown }).promptIntelligentUi
       const iuiChanged =
-        typeof iuiApplied === 'boolean' &&
+        isIntelligentUiApplied(iuiApplied) &&
         intelligentUiNeedsRestart(iuiApplied, await getDesiredIntelligentUi(session.sessionKey).catch(() => undefined))
       if (effortChanged) session.runner.setEffortLevel(desiredEffort)
       if (modelChanged) {

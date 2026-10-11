@@ -41,7 +41,7 @@ import { createLogger } from './logger.js'
 import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
-import { buildPromptContext, INTELLIGENT_UI_SLOT, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
+import { buildPromptContext, type IntelligentUiApplied, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -324,8 +324,8 @@ export interface CodexLaunchOverridesContext {
 }
 
 export interface CodexLaunchOverrides {
-  /** Intelligent UI(OCV5-361):instructions 是否含 INTELLIGENT_UI slot(开关切换后判断要否重启)。 */
-  intelligentUiApplied: boolean
+  /** Intelligent UI(OCV5-361):instructions 里 INTELLIGENT_UI 段的指纹,没有 = false(开关切换后判断要否重启)。 */
+  intelligentUiApplied: IntelligentUiApplied
   /** Absolute path of the instructions file. Caller writes
    *  `instructionsContent` to this path before spawn. */
   instructionsFile: string
@@ -541,7 +541,7 @@ export async function buildCodexLaunchOverrides(
   }
 
   return {
-    intelligentUiApplied: platformResult.applied.some((a) => a.name === INTELLIGENT_UI_SLOT),
+    intelligentUiApplied: platformResult.intelligentUi ?? false,
     instructionsFile,
     instructionsContent,
     tokenFile,

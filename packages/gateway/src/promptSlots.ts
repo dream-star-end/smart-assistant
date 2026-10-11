@@ -29,6 +29,7 @@
  *   改这两段文案 = 改 platform-runtime/prompts/*.md **与** 本文件 fallback 常量两处
  *   同步(有 __tests__/platformPrompts.test.ts 的「文件 === 常量」断言把同步固化成门)。
  */
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import {
   type SkillStore,
@@ -1430,6 +1431,17 @@ export const INTELLIGENT_UI_SLOT = 'INTELLIGENT_UI'
 const PLATFORM_SLOT_WHITELIST = new Set(['SKILLS_LITERATURE', 'MODEL_HINT', INTELLIGENT_UI_SLOT])
 
 /**
+ * 本次提示里的 INTELLIGENT_UI 段:master 原文的 sha256;没注入 = false。
+ * 这一段由几个开关拼成(组件协议、输入预测 OCV5-375),只比「有没有」会漏掉其中一个开关的切换,
+ * 所以 spawn 时写死提示的引擎(CCB / Codex)按内容比对(intelligentUiDesired.ts)。
+ */
+export type IntelligentUiApplied = string | false
+
+export function intelligentUiFingerprint(content: string | undefined): IntelligentUiApplied {
+  return content === undefined ? false : createHash('sha256').update(content, 'utf8').digest('hex')
+}
+
+/**
  * 只有 Web 对话会话(`agent:<aid>:webchat:...`)注入 Intelligent UI 协议:
  * 微信 / QQ / cron / 委派 / 子 agent / webhook / openai 兼容通道的输出不经 web 渲染器,
  * 注入后用户会在那些通道里收到原始 JSON。
@@ -1629,6 +1641,8 @@ export interface PromptContextResult {
   contentSha256: string
   /** 命中的 slot 列表(按拼装顺序) */
   applied: PromptSlotApplied[]
+  /** INTELLIGENT_UI 段的 master 原文指纹(intelligentUiFingerprint);没注入 = false。省略视同 false。 */
+  intelligentUi?: IntelligentUiApplied
   /** Frozen at build time. persist writer must not re-read project meta/ledger. */
   frozenProjectContext?: FrozenProjectContextDigests
 }
@@ -1734,13 +1748,17 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
 
   // 等 remote 决策。null = personal 路径,数组 = v3 路径(可空)。
   const remotePlatformSlots = await remotePlatformSlotsPromise
+  let intelligentUi: IntelligentUiApplied = false
 
   // Intelligent UI(OCV5-361)回答组件协议。只来自 master(总开关 + 用户偏好),只对 webchat
   // 会话注入,插在上面记下的 iuiInsertAt(AGENTS 之前)。静态文案,位置固定利于缓存;
   // MODEL_HINT 仍在其后,模型补丁可覆盖其中的行为。开关关闭时 master 不下发 → 本段不存在(零 token)。
   if (remotePlatformSlots !== null && isWebchatSessionKey(ctx.sessionKey)) {
     const iui = remotePlatformSlots.find((s) => s.name === INTELLIGENT_UI_SLOT)
-    if (iui) slots.splice(iuiInsertAt, 0, { name: INTELLIGENT_UI_SLOT, content: iui.content })
+    if (iui) {
+      slots.splice(iuiInsertAt, 0, { name: INTELLIGENT_UI_SLOT, content: iui.content })
+      intelligentUi = intelligentUiFingerprint(iui.content)
+    }
   }
 
   // 平台级技能(SKILLS_LITERATURE):SKILLS 之后、MEMORY 之前。
@@ -1848,6 +1866,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     content,
     contentSha256: await sha256Hex(content),
     applied,
+    intelligentUi,
     frozenProjectContext:
       frozenProjectContext && frozenProjectContext.bound
         ? frozenProjectDigests(frozenProjectContext)

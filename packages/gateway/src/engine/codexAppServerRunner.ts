@@ -19,6 +19,7 @@ export function _codexMemoryTurnEnv(
   }
 }
 import { EventEmitter } from 'node:events'
+import type { IntelligentUiApplied } from '../promptSlots.js'
 import {
   createReadStream,
   lstatSync,
@@ -1295,9 +1296,9 @@ export class CodexAppServerRunner extends EventEmitter {
   // ── SubprocessRunner interface parity (referenced by sessionManager.ts) ──
   public lastActivityAt: number = Date.now()
   public effortLevel: string | undefined = undefined
-  /** Intelligent UI(OCV5-361):当前 app-server 的 instructions 是否含 INTELLIGENT_UI slot。 */
-  private _promptIntelligentUi: boolean | undefined = undefined
-  get promptIntelligentUi(): boolean | undefined {
+  /** Intelligent UI(OCV5-361):当前 app-server 的 instructions 里 INTELLIGENT_UI 段的指纹(没有 = false)。 */
+  private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return this._promptIntelligentUi
   }
   private relayDeniedTracker: CodexRelayPathDeniedTracker

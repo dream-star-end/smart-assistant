@@ -35,7 +35,7 @@ import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
 import { relocateCcbJsonlToCwd } from './engine/ccbTranscriptRelocate.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
-import { buildPromptContext, INTELLIGENT_UI_SLOT } from './promptSlots.js'
+import { buildPromptContext, type IntelligentUiApplied } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -1464,9 +1464,9 @@ export class SubprocessRunner extends EventEmitter {
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
   private delegateContextFile: string | null = null
   private platformGoal: GoalStateSnapshot | null = null
-  /** Intelligent UI(OCV5-361):本次 spawn 的 extra-prompt 是否含 INTELLIGENT_UI slot。
+  /** Intelligent UI(OCV5-361):本次 spawn 的 extra-prompt 里 INTELLIGENT_UI 段的指纹(没有 = false)。
    *  undefined = 还没组装过 / 组装失败;sessionManager 用它判断开关切换后是否需要重启。 */
-  private _promptIntelligentUi: boolean | undefined = undefined
+  private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
@@ -1528,7 +1528,7 @@ export class SubprocessRunner extends EventEmitter {
     return this.opts.effortLevel
   }
 
-  get promptIntelligentUi(): boolean | undefined {
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return this._promptIntelligentUi
   }
 
@@ -2731,7 +2731,7 @@ export class SubprocessRunner extends EventEmitter {
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
-      this._promptIntelligentUi = promptResult.applied.some((a) => a.name === INTELLIGENT_UI_SLOT)
+      this._promptIntelligentUi = promptResult.intelligentUi ?? false
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
       if (mergedPrompt) {

@@ -1,6 +1,8 @@
 // OCV5-361: Intelligent UI toggle reaches spawn-time prompts (CCB/Codex) on the next turn.
-// A runner that recorded `promptIntelligentUi` is restarted under the turn lock when the
-// master-side setting no longer matches; unknown (fetch failure / non-recording engine) never restarts.
+// A runner that recorded `promptIntelligentUi` (the INTELLIGENT_UI text fingerprint, or false) is
+// restarted under the turn lock when the master-side slot no longer matches; unknown (fetch failure /
+// non-recording engine) never restarts. OCV5-375: input prediction shares the slot, so turning only it
+// off changes the content while the slot stays — that must restart too.
 // The master fetch itself is covered in intelligentUi.test.ts; here it is replaced by a stub.
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
@@ -26,7 +28,9 @@ after(async () => {
   await rm(home, { recursive: true, force: true })
 })
 
-let desired: boolean | undefined
+const ON = 'a'.repeat(64)
+const ON_NO_PREDICTION = 'b'.repeat(64)
+let desired: string | false | undefined
 let fetches = 0
 beforeEach(() => {
   __resetIntelligentUiDesiredCacheForTests()
@@ -38,7 +42,7 @@ beforeEach(() => {
 })
 
 let serial = 0
-async function run(t: TestContext, opts: { applied?: boolean; channel?: string }) {
+async function run(t: TestContext, opts: { applied?: string | false; channel?: string }) {
   const id = ++serial
   const dir = join(home, 'fx-' + id)
   await mkdir(dir, { recursive: true })
@@ -72,24 +76,29 @@ async function run(t: TestContext, opts: { applied?: boolean; channel?: string }
 
 test('on → off: runner restarted before the turn', { timeout: 15000 }, async (t) => {
   desired = false
-  assert.deepEqual((await run(t, { applied: true })).slice(0, 2), ['shutdown', 'submitTurn'])
+  assert.deepEqual((await run(t, { applied: ON })).slice(0, 2), ['shutdown', 'submitTurn'])
 })
 
 test('off → on: runner restarted before the turn', { timeout: 15000 }, async (t) => {
-  desired = true
+  desired = ON
   assert.deepEqual((await run(t, { applied: false })).slice(0, 2), ['shutdown', 'submitTurn'])
 })
 
+test('only input prediction turned off (slot stays, text changes): runner restarted', { timeout: 15000 }, async (t) => {
+  desired = ON_NO_PREDICTION
+  assert.deepEqual((await run(t, { applied: ON })).slice(0, 2), ['shutdown', 'submitTurn'])
+})
+
 test('unchanged: no restart', { timeout: 15000 }, async (t) => {
-  desired = true
-  const calls = await run(t, { applied: true })
+  desired = ON
+  const calls = await run(t, { applied: ON })
   assert.equal(calls.includes('shutdown'), false)
   assert.ok(calls.includes('submitTurn'))
 })
 
 test('master unreachable (undefined): never restarts — failure is not "off"', { timeout: 15000 }, async (t) => {
   desired = undefined
-  const calls = await run(t, { applied: true })
+  const calls = await run(t, { applied: ON })
   assert.equal(calls.includes('shutdown'), false)
   assert.ok(calls.includes('submitTurn'))
 })
@@ -102,7 +111,7 @@ test('engines that rebuild per turn (no record): no lookup, no restart', { timeo
 })
 
 test('non-webchat session: no lookup, no restart', { timeout: 15000 }, async (t) => {
-  desired = true
+  desired = ON
   const calls = await run(t, { applied: false, channel: 'wechat' })
   assert.equal(calls.includes('shutdown'), false)
   assert.equal(fetches, 0)
