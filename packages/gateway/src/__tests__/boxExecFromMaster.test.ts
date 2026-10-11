@@ -12,7 +12,7 @@ import { masterBoxCredentialSelection, type CursorCredentialSelection } from '..
 import { CursorRoutingAdapter } from '../engine/cursorRoutingAdapter.js'
 
 const MASTER = 'http://172.31.0.1:18892'
-const ENV = { OC_CURSOR_SAND_BOX_CC: '1', ANTHROPIC_BASE_URL: MASTER, OPENCLAUDE_V3_MASTER_BASE_URL: MASTER }
+const ENV = { OC_CURSOR_SAND_BOX_CC: '1', OC_BOX_INTERACTIVE_MASTER: '1', ANTHROPIC_BASE_URL: MASTER, OPENCLAUDE_V3_MASTER_BASE_URL: MASTER }
 const TARGET = { accountId: '25', execUrl: 'https://box.example.cursorvm.com/agent.v1.ControlService/Exec', execToken: 'T0K', networkToken: 'N3T' }
 
 test('only box-claude rows on a local container with the master route take the master Box', () => {
@@ -21,7 +21,10 @@ test('only box-claude rows on a local container with the master route take the m
   assert.equal(cursorBoxCcFromMaster('cursor-grok-4.7-high', false, ENV), false, 'Sand inference keeps the pool')
   assert.equal(cursorBoxCcFromMaster('box-claude-haiku-5-5', true, ENV), false, 'remote execution target')
   assert.equal(cursorBoxCcFromMaster('box-claude-haiku-5-5', false, { ...ENV, OC_CURSOR_SAND_BOX_CC: '0' }), false)
-  assert.equal(cursorBoxCcFromMaster('box-claude-haiku-5-5', false, { OC_CURSOR_SAND_BOX_CC: '1' }), false, 'no master route: pool path')
+  assert.equal(cursorBoxCcFromMaster('box-claude-haiku-5-5', false, { OC_CURSOR_SAND_BOX_CC: '1', OC_BOX_INTERACTIVE_MASTER: '1' }), false, 'no master route: pool path')
+  // OCV5-380: commercial forwards OC_CURSOR_SAND_BOX_CC without the master switch: box-claude-* never reaches the Box.
+  const { OC_BOX_INTERACTIVE_MASTER: _off, ...commercial } = ENV
+  assert.equal(cursorBoxCcFromMaster('box-claude-haiku-5-5', false, commercial), false, 'commercial: no master switch')
 })
 
 function withEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {

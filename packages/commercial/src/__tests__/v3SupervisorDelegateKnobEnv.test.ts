@@ -31,12 +31,13 @@ const KEYS = [
   'OC_DELEGATE_CURSOR_MCP_WAIT',
   'OC_CURSOR_SAND_OFFICIAL_CC',
   'OC_CURSOR_SAND_BOX_CC',
+  'OC_BOX_INTERACTIVE_MASTER',
   'OC_CCB_OFFICIAL_CC',
 ] as const
 
 describe('buildDelegateKnobContainerEnv', () => {
-  test('exported key list matches the seventeen knobs and feature flags', () => {
-    assert.equal(KEYS.length, 17)
+  test('exported key list matches the eighteen knobs and feature flags', () => {
+    assert.equal(KEYS.length, 18)
     assert.deepEqual([...DELEGATE_KNOB_CONTAINER_ENV_KEYS], [...KEYS])
   })
 
@@ -117,6 +118,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       OC_DELEGATE_CURSOR_MCP_WAIT: '1',
       OC_CURSOR_SAND_OFFICIAL_CC: '1',
       OC_CURSOR_SAND_BOX_CC: '1',
+      OC_BOX_INTERACTIVE_MASTER: '1',
       OC_CCB_OFFICIAL_CC: '1',
     })
     assert.deepEqual(out, [
@@ -130,6 +132,7 @@ describe('buildDelegateKnobContainerEnv', () => {
       'OC_DELEGATE_CURSOR_MCP_WAIT=1',
       'OC_CURSOR_SAND_OFFICIAL_CC=1',
       'OC_CURSOR_SAND_BOX_CC=1',
+      'OC_BOX_INTERACTIVE_MASTER=1',
       'OC_CCB_OFFICIAL_CC=1',
     ])
   })
@@ -143,4 +146,10 @@ describe('buildDelegateKnobContainerEnv', () => {
     })
     assert.deepEqual(out, [])
   })
+})
+
+test('OCV5-380 commercial env (no OC_BOX_INTERACTIVE_MASTER) forwards exactly what it did before', () => {
+  const out = buildDelegateKnobContainerEnv({ OC_CURSOR_SAND_BOX_CC: '1', OC_CCB_OFFICIAL_CC: '1' })
+  assert.deepEqual(out, ['OC_CURSOR_SAND_BOX_CC=1', 'OC_CCB_OFFICIAL_CC=1'])
+  assert.ok(!out.some((line) => line.startsWith('OC_BOX_INTERACTIVE_MASTER=')))
 })
