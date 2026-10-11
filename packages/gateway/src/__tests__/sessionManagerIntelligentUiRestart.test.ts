@@ -69,6 +69,9 @@ async function run(t: TestContext, opts: { applied?: string | false; channel?: s
     calls.push('submitTurn')
     throw new Error('stop-after-submit')
   })
+  // The stub throws inside submitTurn, before the turn can settle, so the turn's 30-minute idle timer is
+  // never cleared and kept this file's process alive (CI cancelled the gateway job, OCV5-380). Fake it.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   await sm.submit(session, 'hi', () => {}).catch(() => {})
   await session.lock
   return calls
