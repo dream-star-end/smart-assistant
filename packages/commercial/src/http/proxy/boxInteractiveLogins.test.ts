@@ -176,12 +176,12 @@ const container = { resolve: async () => ({ uid: 3n, containerId: 7n }) } as nev
 test("POST /internal/box/login: the uid comes from the container identity; the answer is a login name", async () => {
   const asked: Array<[bigint, bigint, unknown]> = [];
   const handler = makeBoxLoginHandler({ identity: container, logins: {
-    choose: async (uid, accountId, sticky) => { asked.push([uid, accountId, sticky]); return { kind: "login", profile: "account2", reason: "affinity" }; },
+    choose: async (uid, accountId, sticky) => { asked.push([uid, accountId, sticky]); return { kind: "login", profile: "account2", reason: "affinity", alternatives: 1 }; },
     observe: () => true } });
-  assert.deepEqual(await call(handler, "/internal/box/login", { account_id: "25" }), { status: 200, result: { profile: "account2" } });
+  assert.deepEqual(await call(handler, "/internal/box/login", { account_id: "25" }), { status: 200, result: { profile: "account2", alternatives: 1 } });
   assert.deepEqual(asked, [[3n, 25n, {}]]);
   assert.deepEqual(await call(handler, "/internal/box/login", { account_id: "25", session: "0123456789abcdef", prefer: "default" }),
-    { status: 200, result: { profile: "account2" } });
+    { status: 200, result: { profile: "account2", alternatives: 1 } });
   assert.deepEqual(asked[1], [3n, 25n, { session: "0123456789abcdef", prefer: "default" }]);
   for (const body of [{}, { account_id: 25 }, { account_id: "025" }, { account_id: "25", uid: "1" }, [],
     { account_id: "25", session: "XYZ" }, { account_id: "25", prefer: "../x" }, { account_id: "25", session: 1 }]) {
