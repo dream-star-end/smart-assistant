@@ -53,6 +53,49 @@ test('a box-claude session never asks the pool, at creation or at later turns; i
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
+test('a box-claude session moved to a remote target selects from the pool again, and back to local takes the master Box', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'box-master-remote-'))
+  const pool: CursorCredentialSelection = { slot: 2, keyName: 'api-key.2', sandEnabled: true, poolGeneration: 'legacy', accountId: '0',
+    keyFingerprint: '0000000000000000', credentialKind: 'api_key', machineId: null }
+  const remote = { kind: 'remote' as const, hostId: 'host-1', hostMeta: { sessionId: 'agent:main:test:box-remote', userId: 'user-1',
+    hostId: 'host-1', controlPath: '/run/ccb-ssh/host-1/ctl.sock', knownHostsPath: '/run/ccb-ssh/host-1/known_hosts', username: 'runner',
+    host: '127.0.0.2', port: 22, remoteWorkdir: '/workspace' } }
+  try {
+    await withEnv(ENV, async () => {
+      let asked = 0
+      let empty = true
+      const selector = (() => {
+        asked++
+        if (empty) throw new Error('CURSOR_CREDENTIAL_SELECTION_FAILED:oc-cursor: Cursor CLI is not enabled for this account')
+        return pool
+      }) as never
+      const router = new CursorRoutingAdapter({ sessionKey: 'agent:main:test:box-remote', agentId: 'main', agentBaseDir: dir,
+        config: {} as never, model: 'box-claude-haiku-5-5' }, selector)
+      assert.equal(router.currentCredentialForTest.masterBox, true)
+      // An empty pool refuses the remote move before the local session is torn down.
+      await assert.rejects(router.setExecutionTarget(remote), /Cursor CLI is not enabled/)
+      assert.equal(router.currentVariant, 'sand-box-cc')
+      assert.deepEqual(router.executionTarget, { kind: 'local' })
+      empty = false
+      await router.setExecutionTarget(remote)
+      assert.equal(router.currentVariant, 'sand-ccb')
+      assert.deepEqual(router.currentCredentialForTest, pool, 'the remote route runs on a real pool slot, as before')
+      assert.deepEqual(router.executionTarget, remote)
+      await router.setExecutionTarget({ kind: 'local' })
+      assert.equal(router.currentVariant, 'sand-box-cc')
+      assert.equal(router.currentCredentialForTest.masterBox, true)
+      assert.equal(asked, 2)
+      await router.shutdown()
+      // A master selection handed to a remote session is not used; a pool selection on a remote session is kept.
+      const onRemote = new CursorRoutingAdapter({ sessionKey: 'agent:main:test:box-remote2', agentId: 'main', agentBaseDir: dir,
+        config: {} as never, model: 'box-claude-haiku-5-5', executionTarget: remote,
+        cursorCredentialSelection: masterBoxCredentialSelection() }, selector)
+      assert.deepEqual(onRemote.currentCredentialForTest, pool)
+      await onRemote.shutdown()
+    })
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('the control file carries the master endpoint and account; an unavailable answer is retried once, a refusal never', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'box-master-control-'))
   try {

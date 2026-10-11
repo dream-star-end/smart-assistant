@@ -134,20 +134,30 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   ) {
     super()
     this.selectCredential = selector
-    // An interactive Box session gets its Box from the master; it selects no pool slot.
-    this.credentialSelection = opts.cursorCredentialSelection
-      ?? (cursorBoxCcFromMaster(opts.model, opts.executionTarget?.kind === 'remote')
-        ? masterBoxCredentialSelection()
-        : selector({
-          agentId: opts.agentId,
-          sessionKey: opts.sessionKey,
-          agentBaseDir: opts.agentBaseDir,
-          model: opts.model,
-        }))
+    this.credentialSelection = this.selectionFor(opts, opts.executionTarget, opts.cursorCredentialSelection)
     this.opts = { ...opts, cursorCredentialSelection: this.credentialSelection }
     this.variant = cursorVariantFor(opts.model, this.credentialSelection, opts.executionTarget)
     this.inner = this.createInner(this.variant)
     this.bindInner()
+  }
+
+  /** An interactive Box session (box-claude-*, local) gets its Box from the master and selects no pool
+   * slot; everything else selects from the pool. A selection handed in is kept while it is of the
+   * kind this model and target need. */
+  private selectionFor(
+    opts: EngineCreateOpts,
+    target: ExecutionTarget | undefined,
+    given?: CursorCredentialSelection,
+  ): CursorCredentialSelection {
+    const fromMaster = cursorBoxCcFromMaster(opts.model, target?.kind === 'remote')
+    if (given && (given.masterBox === true) === fromMaster) return given
+    if (fromMaster) return masterBoxCredentialSelection()
+    return this.selectCredential({
+      agentId: opts.agentId,
+      sessionKey: opts.sessionKey,
+      agentBaseDir: opts.agentBaseDir,
+      model: opts.model,
+    })
   }
 
   get currentVariant(): CursorVariant { return this.variant }
@@ -488,8 +498,12 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
   }
   get toolsets(): string[] | undefined { return this.opts.agentToolsets }
   async setExecutionTarget(target: ExecutionTarget): Promise<void> {
-    const desired = cursorVariantFor(this.opts.model, this.credentialSelection, target)
-    if (desired === this.variant) {
+    // Moving a box-claude-* session between local and remote changes where its Box comes from
+    // (master vs pool). Select first: a failed pool selection throws before anything is torn down.
+    const selection = this.selectionFor(this.opts, target, this.credentialSelection)
+    const selectionChanged = selection !== this.credentialSelection
+    const desired = cursorVariantFor(this.opts.model, selection, target)
+    if (desired === this.variant && !selectionChanged) {
       this.opts.executionTarget = target
       await this.inner.setExecutionTarget(target)
       return
@@ -504,6 +518,9 @@ export class CursorRoutingAdapter extends EventEmitter implements EngineAdapter 
     this.unbindInner()
     this.opts.executionTarget = target
     this.opts.resumeSessionId = undefined
+    this.credentialSelection = selection
+    this.opts.cursorCredentialSelection = selection
+    this.credentialNeedsRefresh = false
     this.variant = desired
     this.inner = this.createInner(desired)
     this.bindInner()
