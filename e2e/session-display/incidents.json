@@ -6641,7 +6641,8 @@
         "11aeb1da",
         "96b1b7ee",
         "76c7ec34",
-        "c1f3bacf"
+        "c1f3bacf",
+        "64431795"
       ],
       "regressions": [
         {
@@ -6698,6 +6699,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxIdleChain.test.ts",
           "assertion": "OCV5-377 a turn whose every component is a proven failure projects failed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/boxIdleOcv5377.test.ts",
+          "assertion": "a stuck op whose runner was killed stops the parked run and settles; the session is free"
         }
       ]
     }
