@@ -686,6 +686,8 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     stopRejectedRun?: (identity: unknown) => Promise<string> } } = {}) {
   const sequence: string[] = [];
   const emitted: string[] = [];
+  /** What each handoff recorded in the journal (the claim the next round is built from). */
+  const handoffs: unknown[] = [];
   const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0 };
   let nonce = "", epoch = "", controlHash = "", disposed = false;
   const epochs = new Map<string, string>();
@@ -793,6 +795,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     recordToolHandoff: async (arg: { candidate: { toolUses: ReadonlyArray<{ id: string }> };
       verifiedPendingToolUseIds: string[] }) => {
       sequence.push("handoff");
+      handoffs.push(arg.candidate);
       return { durableRevision: "rev-1", journaledToolUseIds: arg.candidate.toolUses.map((use) => use.id),
         verifiedPendingToolUseIds: arg.verifiedPendingToolUseIds };
     },
@@ -818,7 +821,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     retainCleanupTarget: () => {} };
   const round = () => api.firstRound({ ...call, emit: (sse: string) => { emitted.push(sse); },
     ...(real?.resumeToolResults ? { resumeToolResults: true } : {}) }, deps);
-  return { round, call, deps, target, sequence, count, staged, files, sse: () => emitted.join(""),
+  return { round, call, deps, target, sequence, count, staged, files, handoffs, sse: () => emitted.join(""),
     /** The CLI goes on and appends to its stdout spool. */
     write: (records: unknown[]) => { spool = Buffer.concat([spool, spoolOf(records)]); },
     get spoolLength() { return spool.length; },
@@ -833,7 +836,9 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
 function boxContinuation(api: Api, results: readonly EchoExpected[], records: unknown[], faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
-  proofRead?: (call: number) => void } = {}, catalogHash = api.catalogHash(CLI_TOOLS)) {
+  proofRead?: (call: number) => void } = {}, catalogHash = api.catalogHash(CLI_TOOLS),
+  /** Fields the previous round's handoff recorded on the claim (e.g. its hidden calls). */
+  recorded: Record<string, unknown> = {}) {
   const sequence: string[] = [];
   const emitted: string[] = [];
   const count = { spoolRead: 0, pendingRead: 0, proofRead: 0 };
@@ -842,7 +847,7 @@ function boxContinuation(api: Api, results: readonly EchoExpected[], records: un
     leaseEpoch: "b".repeat(32), spoolOffset: 1234, roundNo: 2, detachedRunnerHash: "b".repeat(64),
     catalogHash, durableRevision: "rev-1", results,
     toolUses: results.map((result) => ({ id: result.modelToolUseId, boxName: BOX_BASH, clientName: "Bash",
-      inputHash: "f".repeat(64) })) };
+      inputHash: "f".repeat(64) })), ...recorded };
   const bytes = spoolOf(records);
   const run = async (request: ExecRequest): Promise<ExecReply> => {
     const args = request.args;
@@ -1013,9 +1018,17 @@ async function proveCliRejectedCall(api: Api): Promise<string> {
     fail("REJECTED_CALL_FREE_TEXT");
   }
   if (failsWith([init, ...rejected, cliError("toolu_other")]) !== "BOX_TOOL_CLI_ERROR_INVALID") fail("REJECTED_CALL_OTHER_ID");
-  if (failsWith([init, start("msg_a"), ...call("msg_a", 0, "toolu_good", boxName),
+  // A message that also calls an exposed tool is no longer refused (OCV5-328, see
+  // proveMixedCallTurnCut): the exposed call is handed off and the unexposed one
+  // still never reaches the client.
+  const mixed = feed([init, start("msg_a"), ...call("msg_a", 0, "toolu_good", boxName),
     ...call("msg_a", 1, "toolu_bad_1", "Bash", [{ type: "tool_use", id: "toolu_good", name: boxName,
-      input: { value: "x" } }])]) !== "BOX_TOOL_ID_OR_NAME_INVALID") fail("REJECTED_CALL_MIXED_MESSAGE");
+      input: { value: "x" } }]), ...stop("tool_use", 7)]);
+  if (!isDeepStrictEqual(mixed.last?.candidate?.toolUses.map((use) => [use.id, use.clientName]), [["toolu_good", "Bash"]])
+    || mixed.sse.includes("toolu_bad_1")) fail("REJECTED_CALL_MIXED_MESSAGE");
+  const mixedHeld = mixed.decoder.commitHandoff({ durableRevision: "rev-1", journaledToolUseIds: ["toolu_good"],
+    verifiedPendingToolUseIds: ["toolu_good"] });
+  if (mixedHeld.includes("toolu_bad_1")) fail("REJECTED_CALL_MIXED_MESSAGE_VISIBLE");
   // the whole first round: launched once, the retry is handed off, nothing is left unknown
   const whole = boxHost(api, spoolOf([init, ...rejected, cliError("toolu_bad_1"), ...retry]));
   const handoff = await whole.round().catch((error: unknown) =>
@@ -1117,6 +1130,55 @@ async function proveCliRejectedCall(api: Api): Promise<string> {
 // at the network layer, and that single failed read ended the whole turn. The
 // poller must read the same offset again and deliver the line; errors that say
 // something about the account or the run itself are never retried.
+// INC-20261006-BOX-MIXED-CALL-TURN-CUT (OCV5-328, #27da48a8): one model message
+// called an exposed tool and, beside it, tools this Box run does not expose.
+// Claude Code runs the exposed call and answers the others itself with
+// "No such tool available". The decoder refused the whole message, so the turn
+// ended early. Now the exposed call is handed off, the others are recorded as
+// hidden, and the next round takes the CLI's own answers to them before the
+// model goes on. Both rounds run through the product's own entry points.
+async function proveMixedCallTurnCut(api: Api): Promise<string> {
+  const hidden = "mcp__openclaude-memory__delegate_task";
+  const noSuchTool = (id: string, name = hidden) =>
+    cliError(id, `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>`);
+  const message = [start("msg_a"), ...say("msg_a", 0, "Checking both."),
+    ...call("msg_a", 1, "toolu_good_1", BOX_BASH), ...call("msg_a", 2, "toolu_hidden_1", hidden),
+    ...call("msg_a", 3, "toolu_hidden_2", hidden), ...stop("tool_use", 9)];
+  const first = boxHost(api, spoolOf([cliInit, ...message]));
+  const handoff = await must("MIXED_CALL_ROUND_FAILED", first.round());
+  if (handoff.kind !== "tool_handoff" || first.count.launch !== 1) fail("MIXED_CALL_NO_HANDOFF");
+  if (first.sse().includes("toolu_hidden") || first.sse().includes(hidden)) fail("MIXED_CALL_HIDDEN_VISIBLE");
+  if ((first.sse().match(/event: content_block_start/g) ?? []).length !== 2 || !first.sse().includes('"name":"Bash"')
+    || !first.sse().includes("Checking both.")) fail("MIXED_CALL_WRONG_HANDOFF");
+  if (first.sequence.some((step) => step.startsWith("unknown") || step === "retain-unknown")) {
+    fail("MIXED_CALL_ROUND_LEFT_UNKNOWN");
+  }
+  const recorded = first.handoffs.at(-1) as { rejectedToolUses?: unknown } | undefined;
+  const rejected = [{ id: "toolu_hidden_1", name: hidden }, { id: "toolu_hidden_2", name: hidden }];
+  if (!isDeepStrictEqual(recorded?.rejectedToolUses, rejected)) fail("MIXED_CALL_HIDDEN_NOT_RECORDED");
+  // Round 2: the CLI's answers to the hidden calls arrive around the echo of the published result.
+  const results = [publishedText("toolu_good_1", "ok")];
+  const echo = echoOf("toolu_good_1", "ok");
+  const [one, two] = [noSuchTool("toolu_hidden_1"), noSuchTool("toolu_hidden_2")];
+  for (const records of [[echo, one, two], [one, two, echo], [one, echo, two]]) {
+    const next = boxContinuation(api, results, [...records, ...FINAL_ANSWER], {}, undefined,
+      { rejectedToolUses: rejected });
+    const ended = await must("MIXED_CALL_NEXT_FAILED", next.round());
+    if (!endedWithAnswer(ended, next) || next.sse().includes("No such tool")) fail("MIXED_CALL_NEXT_CUT");
+  }
+  // Fail closed: the model cannot go on before every hidden call has its answer,
+  // and answers no recorded hidden call is waiting for are still unbound echoes.
+  const missing = boxContinuation(api, results, [echo, one, ...FINAL_ANSWER], {}, undefined,
+    { rejectedToolUses: rejected });
+  if (await codeOf(() => missing.round()) !== "BOX_TOOL_CLI_ERROR_MISSING") fail("MIXED_CALL_MISSING_ANSWER_ACCEPTED");
+  const unbound = boxContinuation(api, results, [echo, one, two, ...FINAL_ANSWER]);
+  if (await codeOf(() => unbound.round()) !== "BOX_TOOL_ECHO_ID_INVALID") fail("MIXED_CALL_UNBOUND_ANSWER_ACCEPTED");
+  const altered = boxContinuation(api, results, [echo, noSuchTool("toolu_hidden_1", "Bash"), two, ...FINAL_ANSWER],
+    {}, undefined, { rejectedToolUses: rejected });
+  if (await codeOf(() => altered.round()) !== "BOX_TOOL_CLI_ERROR_INVALID") fail("MIXED_CALL_ALTERED_ANSWER_ACCEPTED");
+  return "[inc-20261006-mixed-call-turn-cut] PASS — a message that mixes an exposed call with hidden ones hands off the exposed call and the next round takes the CLI own answers to the hidden ones";
+}
+
 async function proveSpoolReadTransient(api: Api): Promise<string> {
   const line = Buffer.from('{"type":"assistant"}\n', "utf8");
   const chunk = (bytes: Buffer, offset: number) => ({ stdout: JSON.stringify({
@@ -1271,9 +1333,12 @@ async function proveRejectedStreamWedge(api: Api, db: Db): Promise<string> {
   const before = await money(db, who.uid);
   const turnKey = "3".repeat(64);
   await prechecked(api, db, { ...who, requestId: "box-wedge", turnKey });
-  // one message with a valid call and a bare, unexposed name: rejected, never merged
+  // one message with a valid call and a bare, unexposed name that the model then ends as a final answer:
+  // rejected, never merged. (Since OCV5-328 the same message ending in tool_use is a legitimate handoff of
+  // the exposed call, proveMixedCallTurnCut; tool calls that claim to end the turn are still refused.)
   const mixed = [cliInit, start("msg_a"), ...call("msg_a", 0, "toolu_ok", BOX_BASH),
-    ...call("msg_a", 1, "toolu_bad", "Bash", [{ type: "tool_use", id: "toolu_ok", name: BOX_BASH, input: { value: "x" } }])];
+    ...call("msg_a", 1, "toolu_bad", "Bash", [{ type: "tool_use", id: "toolu_ok", name: BOX_BASH, input: { value: "x" } }]),
+    ...stop("end_turn", 3)];
   let stops = 0;
   const host = boxHost(api, spoolOf(mixed), { real: { journal, ...who, requestId: "box-wedge", turnKey,
     // the CLI already exited by itself: its keeper proof says worker_complete
@@ -2201,7 +2266,15 @@ async function boxCliBox(tag: string, claudeScript: string) {
   cleanups.add(() => {
     for (const run of execs) run.kill("SIGKILL");
     for (const pid of readers()) { try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } }
-    for (const name of readdirSync("/tmp")) if (`/tmp/${name}`.startsWith(`${fifoBase}.`)) rmSync(`/tmp/${name}`, { force: true });
+    // an interactive host whose bridge gave up runs on in tmux -L oc-box: end the sessions started in this Box
+    const sessions = spawnSync("tmux", ["-L", "oc-box", "list-sessions", "-F", "#{session_name} #{session_path}"],
+      { encoding: "utf8" });
+    for (const row of (sessions.stdout ?? "").split("\n")) {
+      const [name, path] = row.split(" ");
+      if (name && path === dir) spawnSync("tmux", ["-L", "oc-box", "kill-session", "-t", `=${name}`]);
+    }
+    // the interactive host also leaves its run directory (`<fifo>.d`) beside the fifo
+    for (const name of readdirSync("/tmp")) if (`/tmp/${name}`.startsWith(`${fifoBase}.`)) rmSync(`/tmp/${name}`, { recursive: true, force: true });
   });
   const execFrame = (body: unknown): Buffer => {
     const payload = Buffer.from(JSON.stringify(body));
@@ -2220,13 +2293,16 @@ async function boxCliBox(tag: string, claudeScript: string) {
         res.end(execFrame({ exitEvent: { exitCode: 1 } }));
         return;
       }
-      const run = spawn(body.command, body.args, { cwd: dir, stdio: ["ignore", "pipe", "ignore"],
+      const run = spawn(body.command, body.args, { cwd: dir, stdio: ["ignore", "pipe", "pipe"],
         env: { ...body.environment, PATH: process.env.PATH ?? "/usr/bin:/bin" } });
       execs.add(run);
       res.flushHeaders();
       // a pipe chunk can end inside a multi-byte character
       const utf8 = new StringDecoder("utf8");
+      const utf8Err = new StringDecoder("utf8");
       run.stdout!.on("data", (chunk: Buffer) => res.write(execFrame({ stdoutEvent: { data: utf8.write(chunk) } })));
+      // the Box streams stderr too; the interactive host announces READY there
+      run.stderr!.on("data", (chunk: Buffer) => res.write(execFrame({ stderrEvent: { data: utf8Err.write(chunk) } })));
       run.on("close", (code) => { execs.delete(run); res.end(execFrame({ exitEvent: code ? { exitCode: code } : {} })); });
     });
   });
@@ -2237,6 +2313,55 @@ async function boxCliBox(tag: string, claudeScript: string) {
   return { readers, refuse, control: { execUrl: `http://127.0.0.1:${address.port}/agent.v1.ControlService/Exec`,
     execToken: "exec", networkToken: "network", remoteClaude: claude, fifo: `${fifoBase}.fifo`, cwd: dir } };
 }
+
+/** Since OCV5-378 the resident CLI lane runs only interactive Claude Code: the launch exec starts the host
+ * (packages/gateway/box-bridge-mod/host.py) as the fifo reader, which runs `claude` under tmux -L oc-box and
+ * hands each gateway line to it through the oc-bridge mod; there is no `-p` runner. This stand-in does what the
+ * mod does (READY, then one /out record per line it is handed) and answers each line with its own pid and the
+ * sha256 and size of the user text it was handed (the host re-encodes the line itself), so a proof can tell which
+ * Claude took a line and whether the user's text arrived whole. */
+const BOX_CLI_STAND_IN = `#!/usr/bin/python3
+import hashlib, json, os, socket, subprocess
+d = os.environ['OC_BRIDGE_DIR']
+sock = d + '/bridge.sock'
+token = open(d + '/token').read().strip()
+def call(method, path, body=b''):
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(sock)
+    s.sendall(b'%s %s HTTP/1.1\\r\\nx-oc-bridge-token: %s\\r\\nContent-Length: %d\\r\\n\\r\\n' % (method.encode(), path.encode(), token.encode(), len(body)) + body)
+    while s.recv(65536):
+        pass
+    s.close()
+call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
+tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
+for line in tap.stdout:
+    content = json.loads(line).get('message', {}).get('content')
+    text = content if isinstance(content, str) else ''.join(part.get('text', '') for part in content or [] if isinstance(part, dict))
+    data = text.encode()
+    call('POST', '/out', (json.dumps({'type': 'result', 'pid': os.getpid(), 'sha256': hashlib.sha256(data).hexdigest(), 'bytes': len(data)}) + '\\n').encode())
+`;
+
+/** The product's bridge (runBoxCcBridge) as a container runs it for box-claude-*: interactive, default login. */
+function boxCliBridge(api: Api, box: Awaited<ReturnType<typeof boxCliBox>>, tag: string) {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  let out = "", err = "";
+  stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
+  stderr.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
+  const loginState = mkdtempSync(join(tmpdir(), `${tag}-login-`));
+  cleanups.add(() => rmSync(loginState, { recursive: true, force: true }));
+  const bridge = api.boxCli.bridge({ control: box.control, args: ["--model", "box-claude-opus-5-5"], stdin, stdout,
+    stderr, runner: "interactive", env: {}, loginStateDir: loginState,
+    login: { choose: async () => ({ profile: "default", source: "master" }), report: async () => {} } });
+  const results = (): Array<{ pid: number; sha256: string; bytes: number }> => out.split("\n").filter(Boolean)
+    .flatMap((raw) => { try { const record = JSON.parse(raw) as { type?: string }; return record.type === "result" ? [record as never] : []; } catch { return []; } });
+  return { stdin, bridge, results, err: () => err };
+}
+/** The user text of one gateway stdin line, hashed the way BOX_CLI_STAND_IN reports it. */
+const textOf = (line: string): string => (JSON.parse(line) as { message: { content: string } }).message.content;
+const lineHash = (line: string) => createHash("sha256").update(textOf(line)).digest("hex");
 
 /** The stop script has killed the box Claude; on a loaded host its /proc entry can outlive the kill by a moment. */
 async function gone(readers: () => number[]): Promise<boolean> {
@@ -2273,24 +2398,25 @@ async function proveBoxCliFollowUpTurn(api: Api): Promise<string> {
     fail(`FOLLOWUP_TURN_RECYCLED_BOX_PROCESS_${written.length}_${stdinEnded}`);
   }
 
-  const box = await boxCliBox("ocv5-315",
-    "#!/bin/sh\nwhile IFS= read -r line; do printf '%s\\n' \"$line\"; done\n");
+  // The lane itself (interactive since OCV5-378): both turns reach the same Claude behind the same host.
+  const box = await boxCliBox("ocv5-315", BOX_CLI_STAND_IN);
   const readers = box.readers;
-  const stdin = new PassThrough();
-  const stdout = new PassThrough();
-  let answered = "";
-  stdout.on("data", (chunk: Buffer) => { answered += chunk.toString("utf8"); });
-  const bridge = api.boxCli.bridge({ control: box.control,
-    args: ["--model", "box-claude-opus-5-5"], stdin, stdout, stderr: new PassThrough() });
-  const answer = async (marker: string): Promise<void> => {
-    stdin.write(`${JSON.stringify({ type: "user", message: { role: "user", content: marker } })}\n`);
-    for (let i = 0; i < 200 && !answered.includes(marker); i++) await tick(25);
-    if (!answered.includes(marker)) fail(`FOLLOWUP_TURN_NOT_ANSWERED_${marker}`);
+  const { stdin, bridge, results, err } = boxCliBridge(api, box, "ocv5-315");
+  const answer = async (marker: string): Promise<{ pid: number; sha256: string }> => {
+    const line = `${JSON.stringify({ type: "user", message: { role: "user", content: marker } })}\n`;
+    const before = results().length;
+    stdin.write(line);
+    for (let i = 0; i < 1200 && results().length === before; i++) await tick(25);
+    const got = results()[before];
+    if (!got || got.sha256 !== lineHash(line)) fail(`FOLLOWUP_TURN_NOT_ANSWERED_${marker} ${err().trim().split("\n").slice(-3).join(" | ").slice(-400)}`);
+    return got;
   };
-  await answer("turn-one");
+  const first = await answer("turn-one");
   const serving = readers();
-  await answer("turn-two");
-  if (serving.length === 0 || !isDeepStrictEqual(readers(), serving)) fail("FOLLOWUP_TURN_CHANGED_BOX_CLAUDE");
+  const second = await answer("turn-two");
+  if (serving.length === 0 || !isDeepStrictEqual(readers(), serving) || first.pid !== second.pid) {
+    fail("FOLLOWUP_TURN_CHANGED_BOX_CLAUDE");
+  }
   // the gateway retires the process: shutdown, model switch, idle recycle
   stdin.end();
   const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
@@ -2313,38 +2439,33 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
     { env: { PATH: process.env.PATH ?? "/usr/bin:/bin", OC_BOX_CC_LINE: large } });
   if ((before.error as NodeJS.ErrnoException | undefined)?.code !== "E2BIG") fail("LARGE_LINE_SHAPE_STARTED_A_PROCESS");
 
-  const box = await boxCliBox("ocv5-317", "#!/bin/sh\nexec cat\n");
-  const stdin = new PassThrough();
-  const stdout = new PassThrough();
-  const received: Buffer[] = [];
-  stdout.on("data", (chunk: Buffer) => received.push(chunk));
-  const bridge = api.boxCli.bridge({ control: box.control, args: ["--model", "box-claude-opus-5-5"], stdin, stdout,
-    stderr: new PassThrough() });
-  const expected = Buffer.from(`${line("before")}${large}${line("after")}`);
-  stdin.write(line("before"));
-  stdin.write(large);
-  stdin.write(line("after"));
-  const size = () => received.reduce((sum, chunk) => sum + chunk.length, 0);
-  for (let i = 0; i < 800 && size() < expected.length; i++) await tick(25);
-  await tick(200);
-  if (!Buffer.concat(received).equals(expected)) fail(`LARGE_LINE_NOT_WHOLE_${size()}_OF_${expected.length}`);
+  // Interactive since OCV5-378: the host hands each line to Claude; Claude reports what it was handed.
+  const box = await boxCliBox("ocv5-317", BOX_CLI_STAND_IN);
+  const { stdin, bridge, results } = boxCliBridge(api, box, "ocv5-317");
+  const sent = [line("before"), large, line("after")];
+  for (const item of sent) stdin.write(item);
+  for (let i = 0; i < 2400 && results().length < sent.length; i++) await tick(25);
+  const got = results();
+  if (!isDeepStrictEqual(got.map((item) => [item.sha256, item.bytes]), sent.map((item) => [lineHash(item), Buffer.byteLength(textOf(item))]))
+    || new Set(got.map((item) => item.pid)).size !== 1) {
+    fail(`LARGE_LINE_NOT_WHOLE_${got.map((item) => item.bytes).join("+")}_OF_${sent.map((item) => Buffer.byteLength(textOf(item))).join("+")}`);
+  }
   stdin.end();
   const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
   if (code !== 0 || !await gone(box.readers)) fail(`LARGE_LINE_CLOSE_${code}`);
 
   // the Box does not complete a write: the bridge reports it and ends, instead of waiting for an answer
-  const failing = await boxCliBox("ocv5-317-refused", "#!/bin/sh\nexec cat\n");
+  const failing = await boxCliBox("ocv5-317-refused", BOX_CLI_STAND_IN);
   failing.refuse.writes = true;
-  const input = new PassThrough();
-  const errors = new PassThrough();
-  let reported = "";
-  errors.on("data", (chunk: Buffer) => { reported += chunk.toString("utf8"); });
-  const refused = api.boxCli.bridge({ control: failing.control, args: [], stdin: input, stdout: new PassThrough(),
-    stderr: errors });
-  input.write(line("never delivered"));
-  const outcome = await Promise.race([refused.then((exit) => `exit-${exit}`, () => "failed"),
-    tick(5_000).then(() => "still-waiting")]);
-  if (outcome !== "failed" || !reported.includes("BOX_CC_WRITE_FAILED")) fail(`LARGE_LINE_WRITE_FAILURE_${outcome}`);
+  const refused = boxCliBridge(api, failing, "ocv5-317-refused");
+  refused.stdin.write(line("never delivered"));
+  const outcome = await Promise.race([refused.bridge.then((exit) => `exit-${exit}`, () => "failed"),
+    tick(30_000).then(() => "still-waiting")]);
+  if (outcome !== "failed" || !refused.err().includes("BOX_CC_WRITE_FAILED") || refused.results().length !== 0) {
+    fail(`LARGE_LINE_WRITE_FAILURE_${outcome}`);
+  }
+  refused.stdin.end();
+  if (!await gone(failing.readers)) fail("LARGE_LINE_REFUSED_HOST_LEFT_RUNNING");
   return "[ocv5-317-box-cli-large-line] PASS — a 900 KB stdin line reaches the box Claude whole and a failed write ends the turn at once";
 }
 
@@ -3008,6 +3129,7 @@ async function main(): Promise<void> {
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
