@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { uiFencesToMarkdown } from "../components/iui/toMarkdown";
-import { completionFor, isNextBlockCode, nextPredictionOf, predictInput, suggestionItemsOf } from "./inputPrediction";
+import { completionFor } from "./inputCompletion";
+import { isNextBlockCode, nextPredictionOf, predictInput, suggestionItemsOf } from "./inputPrediction";
 
 const ui = (json: string) => `\`\`\`ui\n${json}\n\`\`\``;
 const NEXT = ui('{"type":"next","text":"把木星的卫星也加上"}');

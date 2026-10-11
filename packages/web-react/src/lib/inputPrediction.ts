@@ -8,19 +8,15 @@
  * 输入中补全:当前正文是某个候选的开头 → 显示候选剩下的部分。候选 = 上面几条 + 本会话里
  * 用户自己发过的话。全部来自当前会话时间线,不额外请求模型,不落盘、不上传。
  *
- * 这里在首屏包里(输入框),所以不引用 components/iui 的解析器和 schema(它们只在懒加载的
- * Markdown 块里),只认 next / suggestions 两种块。suggestions 的取值规则与 schema.ts 的
+ * 本模块由 App 按需加载(不进首屏包);输入框里的补全和类型在 ./inputCompletion。
+ * 不引用 components/iui 的解析器和 schema(它们只在懒加载的 Markdown 块里),
+ * 只认 next / suggestions 两种块。suggestions 的取值规则与 schema.ts 的
  * suggestions() 一致:`items`(或 `suggestions`)里的非空字符串 / 数字,含 followups / follow_up 别名。
  */
 
-export type InputPredictionSource = "agent" | "suggestion";
+import type { InputPrediction } from "./inputCompletion";
 
-export type InputPrediction = {
-  /** 输入框为空时显示的整句预测;没有时为 null。 */
-  next: { text: string; source: InputPredictionSource } | null;
-  /** 输入中补全的候选,优先级从高到低。 */
-  candidates: readonly string[];
-};
+export type { InputPrediction, InputPredictionSource } from "./inputCompletion";
 
 type TimelineRow = { role: string; text: string; status?: string };
 
@@ -28,9 +24,6 @@ type TimelineRow = { role: string; text: string; status?: string };
 const MAX_PREDICTION_CHARS = 80;
 /** 本会话里参与补全的历史条数。 */
 const MAX_HISTORY = 50;
-/** 补全最少要先输入几个字(CJK 一个字信息量大,拉丁字母要多几个)。 */
-const MIN_CJK_PREFIX = 2;
-const MIN_LATIN_PREFIX = 3;
 
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)/;
 const NEXT_TYPES = new Set(["next", "prediction"]);
@@ -150,20 +143,4 @@ export function predictInput(rows: readonly TimelineRow[]): InputPrediction {
   const candidates: string[] = [];
   for (const c of [...(agent ? [agent] : []), ...suggestions, ...history]) if (!candidates.includes(c)) candidates.push(c);
   return { next, candidates };
-}
-
-/**
- * 正文是某个候选的开头 → 返回候选剩下的部分(从正文末尾接着显示);否则 null。
- * 只补单行;拉丁字母不区分大小写,采用时保留用户已输入的大小写。
- */
-export function completionFor(value: string, candidates: readonly string[]): string | null {
-  if (!value || value.includes("\n")) return null;
-  const typed = value.trim();
-  const cjk = /[㐀-鿿豈-﫿]/.test(typed);
-  if (typed.length < (cjk ? MIN_CJK_PREFIX : MIN_LATIN_PREFIX)) return null;
-  const lower = value.toLowerCase();
-  for (const c of candidates) {
-    if (c.length > value.length && c.toLowerCase().startsWith(lower)) return c.slice(value.length);
-  }
-  return null;
 }

@@ -126,7 +126,6 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
-import { predictInput } from "./lib/inputPrediction";
 import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
 import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
@@ -221,6 +220,7 @@ import type { SaveToProjectRequest } from "./components/project/SaveToProjectDia
 // 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；React.lazy 解析后模块
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
+type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const SettingsCenter = lazy(() =>
   import("./components/SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -2837,10 +2837,25 @@ export function App() {
   }
   // 输入预测(OCV5-375):回答末尾模型写的 next 块 → 输入框浅色预测;打字时按本会话说过的话补全。
   // 设置里关掉时 master 也不再下发这段提示词。demo 不开。
+  // 解析器按需加载,不进首屏包(首屏只有输入框的补全和浮层);加载失败就没有预测。
   const inputPredictionOn = useInputPredictionEnabled();
+  const [predictInput, setPredictInput] = useState<PredictInput | null>(null);
+  useEffect(() => {
+    if (demo || !inputPredictionOn || predictInput) return;
+    let alive = true;
+    void import("./lib/inputPrediction").then(
+      (m) => {
+        if (alive) setPredictInput(() => m.predictInput);
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [demo, inputPredictionOn, predictInput]);
   const inputPrediction = useMemo(
-    () => (demo || !inputPredictionOn ? null : predictInput(wsMessages)),
-    [demo, inputPredictionOn, wsMessages],
+    () => (demo || !inputPredictionOn || !predictInput ? null : predictInput(wsMessages)),
+    [demo, inputPredictionOn, predictInput, wsMessages],
   );
   const timelineMessages = wsMessages.filter(
     (message) => message.role !== "user" || message.status !== "queued",

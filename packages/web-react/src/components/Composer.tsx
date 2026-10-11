@@ -16,14 +16,25 @@ import {
   Target,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type SetStateAction } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type SetStateAction,
+} from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
 import { clearDraft, draftExceedsStorage } from "../lib/composerDraft";
-import { completionFor, type InputPrediction } from "../lib/inputPrediction";
+import { completionFor, type InputPrediction } from "../lib/inputCompletion";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -61,6 +72,9 @@ type Attach = {
 // 附件件数上限:与后端 gateway 帧准入共用 protocol 单一权威常量,消除历史上前端 8 / 后端 5
 // 的漂移(用户挂 6-8 个上传成功却被后端拒)。
 const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
+
+// 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。
+const ComposerPrediction = lazy(() => import("./ComposerPrediction"));
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";
@@ -222,7 +236,7 @@ export function Composer({
   goalOpenRequest?: number;
   /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
   projectSlot?: ReactNode;
-  /** 输入预测(lib/inputPrediction):空输入框显示 next,输入中按 candidates 补全;Tab / → 采用。
+  /** 输入预测(lib/inputCompletion):空输入框显示 next,输入中按 candidates 补全;Tab / → 采用。
    *  省略或 null = 关闭(设置里关掉、demo)。 */
   prediction?: InputPrediction | null;
 }) {
@@ -287,7 +301,7 @@ export function Composer({
 
   // 输入预测(OCV5-375):浅色字叠在正文后面,不进 value,采用前不会被发送。
   // 输入法组字中、光标不在末尾、生成中(整句预测属于上一条回答)时不显示;Esc 收起本条整句预测。
-  const ghostRef = useRef<HTMLDivElement>(null);
+  const [ghostHeight, setGhostHeight] = useState(0);
   const predictionHintId = useId();
   const [composing, setComposing] = useState(false);
   const [caretAtEnd, setCaretAtEnd] = useState(true);
@@ -412,8 +426,8 @@ export function Composer({
     if (!el) return;
     el.style.height = "0px";
     // 整句预测比空输入框长时会折行:按浅色字的高度撑开,别压到下面的工具行上。
-    el.style.height = Math.min(Math.max(el.scrollHeight, ghostRef.current?.scrollHeight ?? 0), 240) + "px";
-  }, [value, ghostRest]);
+    el.style.height = Math.min(Math.max(el.scrollHeight, ghostRest ? ghostHeight : 0), 240) + "px";
+  }, [value, ghostRest, ghostHeight]);
 
   const uploading = attachments.some((a) => a.status === "uploading");
   const attachFailed = attachments.some((a) => a.status === "error");
@@ -744,37 +758,17 @@ export function Composer({
               )}
             />
             {ghostRest && (
-              // 与 textarea 同字号、同行高、同内边距地叠在它上面:已输入部分透明占位,预测接在后面。
-              <div
-                ref={ghostRef}
-                data-testid="composer-prediction"
-                className={cn(
-                  "pointer-events-none absolute inset-y-0 left-1 right-1 overflow-hidden whitespace-pre-wrap break-words py-1.5 leading-relaxed",
-                  fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
-                )}
-              >
-                <span aria-hidden="true" className="invisible">
-                  {value}
-                </span>
-                <span aria-hidden="true" className="text-faint">
-                  {ghostRest}
-                </span>
-                {/* 触屏没有 Tab 键:同一个位置给一个「填入」按钮。不进 Tab 序列,不抢输入框焦点。 */}
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label="采用输入预测"
-                  data-testid="composer-prediction-accept"
-                  onPointerDown={(e) => e.preventDefault()}
-                  onClick={acceptPrediction}
-                  className="pointer-events-auto ml-2 inline-flex h-5 -translate-y-px items-center rounded-md border border-border px-1.5 align-middle text-[11px] font-medium leading-none text-faint transition-colors hover:bg-hover hover:text-fg"
-                >
-                  {coarsePointer ? "填入" : "Tab"}
-                </button>
-                <span id={predictionHintId} className="sr-only">
-                  {`输入预测：${value}${ghostRest}。按 Tab 采用。`}
-                </span>
-              </div>
+              <Suspense fallback={null}>
+                <ComposerPrediction
+                  value={value}
+                  rest={ghostRest}
+                  large={fontSize === "large"}
+                  coarsePointer={coarsePointer}
+                  hintId={predictionHintId}
+                  onAccept={acceptPrediction}
+                  onHeight={setGhostHeight}
+                />
+              </Suspense>
             )}
           </div>
           <div className="mt-1 flex items-center gap-1.5" data-testid="composer-tool-row">
