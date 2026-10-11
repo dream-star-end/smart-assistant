@@ -69,9 +69,9 @@ import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
 import { createProductionBoxAccountResolver, productionBoxProfileHealth } from "../http/proxy/boxAccountResolver.js";
 import { listBoxProfiles } from "../http/proxy/boxClaudeProfileStore.js";
 import { BoxInteractiveLogins } from "../http/proxy/boxInteractiveLogins.js";
-import { BOX_EXEC_TARGET_PATH, BOX_LOGIN_PATH, BOX_LOGIN_SIGNALS_PATH, makeBoxLoginHandler } from "../http/proxy/boxLoginHandler.js";
+import { boxInteractiveMasterRoute, isBoxInteractiveMasterPath, makeBoxLoginHandler } from "../http/proxy/boxLoginHandler.js";
 import { BOX_API_RESOLVE_MODEL } from "../http/proxy/boxApiResolveModel.js";
-import { isCursorCredentialEntitled } from "../cursor/access.js";
+import { boxExecTargetEntitlement } from "../cursor/access.js";
 import { getAccount } from "../account-pool/store.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
@@ -467,7 +467,8 @@ export async function startEgress(): Promise<void> {
   // Which Box login an interactive session (box-claude-*) launches under, and what its turns
   // reported: the admin's selection plus the login health this process shares with the Box
   // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.
-  const boxLoginHandler = makeBoxLoginHandler({ identity: identityStrategy,
+  // OCV5-380: built only where OC_BOX_INTERACTIVE_MASTER=1 (selfhost); elsewhere all three paths 404.
+  const boxLoginHandler = boxInteractiveMasterRoute(process.env, () => makeBoxLoginHandler({ identity: identityStrategy,
     logins: new BoxInteractiveLogins({
       accountActive: async (id) => {
         const row = await getAccount(id);
@@ -479,7 +480,8 @@ export async function startEgress(): Promise<void> {
     // The Box exec endpoint for an interactive session, from the account's own credential and egress
     // (the model route's resolver), for a uid entitled to the owner's Cursor accounts. No Sand relay.
     execTargets: async (uid) => {
-      if (!isCursorCredentialEntitled(uid)) return { kind: "not_entitled" };
+      const entitlement = boxExecTargetEntitlement(uid);
+      if (entitlement !== "entitled") return { kind: entitlement };
       const abort = new AbortController();
       const timer = setTimeout(() => abort.abort(), 60_000);
       try {
@@ -494,7 +496,7 @@ export async function startEgress(): Promise<void> {
         log.warn("box_exec_target_unavailable", { code: (err as { code?: string }).code ?? "unknown" });
         return { kind: "unavailable" };
       } finally { clearTimeout(timer); }
-    } });
+    } });)
   const boxStopCleanupTimer = setInterval(() => {
     void boxStopCoordinator.retryFailedLocal().catch(() =>
       log.error("box_stop_local_cleanup_failed"));
@@ -635,7 +637,7 @@ export async function startEgress(): Promise<void> {
       });
       return;
     }
-    if (path === BOX_LOGIN_PATH || path === BOX_LOGIN_SIGNALS_PATH || path === BOX_EXEC_TARGET_PATH) {
+    if (isBoxInteractiveMasterPath(path)) {
       Promise.resolve(boxLoginHandler(req, res, {
         hostUuid: selfHostUuid, boundIp: peerIp,
       })).catch((err) => {
