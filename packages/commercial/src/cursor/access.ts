@@ -44,3 +44,16 @@ export function isCursorCredentialMember(
   if (policy === "all") return true;
   return policy.has(normalized);
 }
+
+/** Who may receive a Box exec endpoint from the master (POST /internal/box/exec-target). The same
+ * entitlement as the credential mount, except that a wildcard policy (`all` / `*`) is refused outright:
+ * the endpoint drives the shared Box itself, so it goes only to explicitly listed uids (OCV5-380). */
+export function boxExecTargetEntitlement(
+  uid: number | string | bigint,
+  env: NodeJS.ProcessEnv = process.env,
+): "entitled" | "not_entitled" | "wildcard_refused" {
+  const raw = env.OC_V5_CURSOR_CREDENTIAL_UIDS?.trim() ? env.OC_V5_CURSOR_CREDENTIAL_UIDS : env.OC_V5_CURSOR_OWNER_UID;
+  if (parseCursorCredentialUids(raw) === "all") return "wildcard_refused";
+  return isCursorCredentialMember(uid, raw) ? "entitled" : "not_entitled";
+}
+

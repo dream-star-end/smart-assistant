@@ -7,7 +7,13 @@
  *     the container's own Cursor credential pool for this route, which only ever published accounts whose
  *     Sand relay was installed (a relay the interactive route never uses).
  * The uid always comes from the container identity, never from the body. Not part of the public
- * Anthropic Messages API. */
+ * Anthropic Messages API.
+ *
+ * OCV5-380: the egress serves these three paths only when OC_BOX_INTERACTIVE_MASTER is exactly "1"
+ * (selfhost). Unset or any other value: every one of them is a plain 404 and nothing behind them is
+ * built (boxInteractiveMasterRoute). Commercial never sets it. Even when it is on, exec-target refuses
+ * a wildcard credential policy (OC_V5_CURSOR_CREDENTIAL_UIDS=all / *): the Box exec endpoint is
+ * handed only to explicitly listed uids. */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { IdentityError, type IdentityStrategy } from "../../auth/proxyIdentity.js";
 import type { BoxInteractiveLogins } from "./boxInteractiveLogins.js";
@@ -15,11 +21,15 @@ import type { BoxInteractiveLogins } from "./boxInteractiveLogins.js";
 export const BOX_LOGIN_PATH = "/internal/box/login";
 export const BOX_LOGIN_SIGNALS_PATH = "/internal/box/login-signals";
 export const BOX_EXEC_TARGET_PATH = "/internal/box/exec-target";
+export const BOX_INTERACTIVE_MASTER_ENV = "OC_BOX_INTERACTIVE_MASTER";
+const BOX_INTERACTIVE_MASTER_PATHS: ReadonlySet<string> =
+  new Set([BOX_LOGIN_PATH, BOX_LOGIN_SIGNALS_PATH, BOX_EXEC_TARGET_PATH]);
 const MAX_EXEC_TARGETS_IN_FLIGHT_PER_UID = 2;
 
 export type BoxExecTargetAnswer =
   | { kind: "target"; accountId: bigint; execUrl: string; execToken: string; networkToken: string }
   | { kind: "not_entitled" }
+  | { kind: "wildcard_refused" }
   | { kind: "unavailable" };
 const ACCOUNT = /^[1-9][0-9]{0,18}$/;
 const PROFILE = /^(default|[a-z0-9][a-z0-9-]{0,31})$/;
@@ -116,6 +126,7 @@ export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
         if (left > 0) inFlight.set(key, left); else inFlight.delete(key);
       }
       if (answer.kind === "not_entitled") { reply(res, 403, { error: "BOX_EXEC_NOT_ENTITLED" }); return; }
+      if (answer.kind === "wildcard_refused") { reply(res, 403, { error: "BOX_EXEC_WILDCARD_REFUSED" }); return; }
       if (answer.kind === "unavailable") { reply(res, 503, { error: "BOX_EXEC_TARGET_UNAVAILABLE" }); return; }
       reply(res, 200, { account_id: answer.accountId.toString(), exec_url: answer.execUrl,
         exec_token: answer.execToken, network_token: answer.networkToken });
@@ -154,4 +165,24 @@ export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
     if (!report) { reply(res, 400, { error: "INVALID_REQUEST" }); return; }
     reply(res, 200, { recorded: deps.logins.observe(identity.uid, accountId, body.profile, report) });
   };
+}
+
+/** The interactive-route endpoints are served only where OC_BOX_INTERACTIVE_MASTER is exactly "1". */
+export function boxInteractiveMasterEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[BOX_INTERACTIVE_MASTER_ENV] === "1";
+}
+
+export function isBoxInteractiveMasterPath(path: string): boolean {
+  return BOX_INTERACTIVE_MASTER_PATHS.has(path);
+}
+
+type BoxLoginRoute = ReturnType<typeof makeBoxLoginHandler>;
+
+/** The egress handler for the three interactive-route paths. Off: a 404 for every request and `build`
+ * never runs, so no login service, resolver hook or exec-target lookup exists in that process. */
+export function boxInteractiveMasterRoute(env: NodeJS.ProcessEnv, build: () => BoxLoginRoute): BoxLoginRoute {
+  if (!boxInteractiveMasterEnabled(env)) {
+    return async (_req, res) => { reply(res, 404, { error: "NOT_FOUND" }); };
+  }
+  return build();
 }
