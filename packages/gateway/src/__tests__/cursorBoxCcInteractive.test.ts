@@ -1,6 +1,8 @@
-/** Route B interactive runner (OC_BOX_INTERACTIVE): transport-only parity.
+/** Route B interactive runner: transport-only parity, and no `-p` anywhere.
  *
- * - the runner stays `-p` unless explicitly enabled per model;
+ * - every Box turn runs the interactive session; a session that cannot come
+ *   up fails the turn and nothing ever runs as `claude -p` (operator rule
+ *   2026-10-11); the bridge launches under the Box login the master chose;
  * - the interactive argv keeps exactly the adapter-owned flags of `-p`;
  * - stream-json the oc-bridge mod produced from a real interactive CLI
  *   (fixtures recorded on the Box, CLI 2.1.292, P0 2026-10-07) parses in the
@@ -37,8 +39,9 @@ import {
   loadBoxBridgeMod,
   remoteInteractiveClaudeArgs,
 } from '../engine/cursorBoxCcInteractive.js'
-import { interactiveCoolingDown, noteInteractiveFailure, runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
-import { resolveBoxCcRunner, stripBoxCcParentAuth } from '../engine/cursorBoxCc.js'
+import { BOX_TURN_UNAVAILABLE_TEXT, BoxLoginSignalTap, runBoxCcBridge, type BoxLoginPort } from '../engine/cursorBoxCcBridge.js'
+import { BoxLoginUnavailableError } from '../engine/boxLoginClient.js'
+import { stripBoxCcParentAuth } from '../engine/cursorBoxCc.js'
 import { boxClaudeRunner, CURSOR_ENGINE_MODELS } from '@openclaude/protocol'
 import { PassThrough } from 'node:stream'
 import { StreamJson, textOfUserContent } from '../../box-bridge-mod/oc-bridge/hooks/frames.js'
@@ -46,40 +49,60 @@ import { StreamJson, textOfUserContent } from '../../box-bridge-mod/oc-bridge/ho
 const HERE = dirname(fileURLToPath(import.meta.url))
 const FIXTURES = join(HERE, 'fixtures')
 
-test('runner: catalog row decides, OC_BOX_INTERACTIVE forces either side, the bridge reads the result', () => {
+test('runner: every box-claude row is interactive; the bridge env always says so and keeps the login endpoint', () => {
   const box = CURSOR_ENGINE_MODELS.filter((m: { id: string }) => m.id.startsWith('box-claude-'))
   assert.equal(box.length, 4)
-  for (const m of box) {
-    const row = boxClaudeRunner(m.id)
-    assert.ok(row === 'p' || row === 'interactive', m.id)
-    assert.equal(resolveBoxCcRunner(m.id, {}), row)
-    assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '0' }), 'p')
-    assert.equal(resolveBoxCcRunner(m.id, { OC_BOX_INTERACTIVE: '1' }), 'interactive')
-  }
-  // Personal default: every box-claude row prefers the interactive runner.
   assert.deepEqual(box.map((m: { id: string }) => boxClaudeRunner(m.id)), ['interactive', 'interactive', 'interactive', 'interactive'])
-  // Only box-claude rows carry a runner; anything else is -p.
-  assert.equal(boxClaudeRunner('cursor-opus-5-high'), undefined)
-  assert.equal(resolveBoxCcRunner('cursor-opus-5-high', {}), 'p')
-  assert.equal(resolveBoxCcRunner(undefined, {}), 'p')
-  const env = stripBoxCcParentAuth({ PATH: '/usr/bin', OC_BOX_INTERACTIVE: '1' }, '/tmp/c.json', 'box-claude-opus-5-5')
-  assert.equal(env.OC_BOX_CC_RUNNER, 'interactive')
-  assert.equal(stripBoxCcParentAuth({ PATH: '/usr/bin', OC_BOX_INTERACTIVE: '0' }, '/tmp/c.json', 'box-claude-opus-5-5').OC_BOX_CC_RUNNER, 'p')
+  const base = 'http://172.31.0.1:18892'
+  const env = stripBoxCcParentAuth({ PATH: '/usr/bin', OC_BOX_INTERACTIVE: '0', ANTHROPIC_BASE_URL: base,
+    OPENCLAUDE_V3_MASTER_BASE_URL: base, ANTHROPIC_AUTH_TOKEN: 'x' }, '/tmp/c.json')
+  assert.equal(env.OC_BOX_CC_RUNNER, 'interactive', 'no knob turns it into -p')
+  assert.equal(env.OC_BOX_LOGIN_URL, base)
+  assert.equal(env.ANTHROPIC_BASE_URL, undefined)
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined)
+  // Not the master's internal route: no login endpoint (the bridge then runs the default login).
+  assert.equal(stripBoxCcParentAuth({ ANTHROPIC_BASE_URL: 'https://api.example', OPENCLAUDE_V3_MASTER_BASE_URL: 'https://api.example' },
+    '/tmp/c.json').OC_BOX_LOGIN_URL, undefined)
+  assert.equal(stripBoxCcParentAuth({ OC_BOX_LOGIN_URL: 'http://172.31.0.1:1' }, '/tmp/c.json').OC_BOX_LOGIN_URL, undefined,
+    'an inherited value is never trusted')
   assert.equal(boxCcRunnerFromEnv({ OC_BOX_CC_RUNNER: 'interactive' }), 'interactive')
-  assert.equal(boxCcRunnerFromEnv({ OC_BOX_CC_RUNNER: 'p' }), 'p')
   assert.equal(boxCcRunnerFromEnv({}), 'p')
 })
 
-test('cooldown marker: set by a fallback, honoured for OC_BOX_INTERACTIVE_COOLDOWN_SEC', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'ocb-cool-'))
-  try {
-    assert.equal(interactiveCoolingDown(dir, {}), false)
-    noteInteractiveFailure(dir)
-    assert.equal(interactiveCoolingDown(dir, {}), true)
-    assert.equal(interactiveCoolingDown(dir, { OC_BOX_INTERACTIVE_COOLDOWN_SEC: '0' }), false)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
+test('launch: the default login launches exactly as before; another login reaches the host by name only', () => {
+  const control: BoxCcControl = { execUrl: 'https://x', execToken: 't', networkToken: 'n', remoteClaude: '/c',
+    fifo: '/tmp/oc-box-cc-0123456789abcdef.0a0b0c0d.fifo', cwd: '/workspace' }
+  const mod = loadBoxBridgeMod()
+  const plain = boxCcInteractiveLaunchExec(control, [], mod)
+  assert.deepEqual(boxCcInteractiveLaunchExec(control, [], mod, 'default'), plain)
+  assert.equal(plain.environment.OC_BOX_CLAUDE_PROFILE, undefined)
+  assert.equal(boxCcInteractiveLaunchExec(control, [], mod, 'account2').environment.OC_BOX_CLAUDE_PROFILE, 'account2')
+  for (const bad of ['Account2', '../x', '-x', 'a'.repeat(33), '']) {
+    assert.throws(() => boxCcInteractiveLaunchExec(control, [], mod, bad), /BOX_INTERACTIVE_PROFILE_INVALID/, bad)
   }
+})
+
+test('signal tap: plan-window and notice lines per turn, rotation on a rejected window or a logged-out login', () => {
+  const tap = new BoxLoginSignalTap()
+  const rate = (status: string, utilization = 0.5) => JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status, utilization } })
+  const result = JSON.stringify({ type: 'result', subtype: 'success' })
+  const text = JSON.stringify({ type: 'assistant', message: { model: 'claude-haiku-4-5', content: [{ type: 'text', text: 'rate_limit_event' }] } })
+  // A line split across chunks is read whole; ordinary lines are not collected.
+  const first = `${rate('allowed')}\n${text}\n${result}\n`
+  assert.deepEqual(tap.push(first.slice(0, 10)), [])
+  assert.deepEqual(tap.push(first.slice(10)), [{ rotate: null }])
+  assert.deepEqual(tap.take(), [rate('allowed')])
+  assert.deepEqual(tap.push(`${rate('rejected')}\n${result}\n`), [{ rotate: 'quota' }])
+  assert.deepEqual(tap.take(), [rate('rejected')])
+  const notLoggedIn = JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: 'Not logged in · Please run /login' }] } })
+  assert.deepEqual(tap.push(`${notLoggedIn}\n${result}\n`), [{ rotate: 'login' }])
+  assert.deepEqual(tap.push(`${result}\n`), [{ rotate: null }], 'a reason belongs to its own turn')
+  tap.take()
+  // Near the window: a hint to move before a refusal; a refusal in the same turn outranks it.
+  assert.deepEqual(tap.push(`${rate('allowed', 0.985)}\n${result}\n`), [{ rotate: 'near_limit' }])
+  assert.deepEqual(tap.push(`${rate('allowed', 0.99)}\n${rate('rejected', 1.0)}\n${result}\n`), [{ rotate: 'quota' }])
+  const hit = JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', content: [{ type: 'text', text: "You've hit your session limit · resets 11:20pm" }] } })
+  assert.deepEqual(tap.push(`${hit}\n${result}\n`), [{ rotate: 'quota' }], 'the CLI notice alone is enough')
 })
 
 test('interactive argv keeps -p\'s adapter-owned flags and drops the stream-json ones', () => {
@@ -232,6 +255,33 @@ test('recorded AskUserQuestion: surfaces as can_use_tool, as under -p --permissi
   assert.equal(req.request.toolName, 'AskUserQuestion')
   assert.equal(req.request.input.questions.length, 1)
   assert.equal(t.result.isError, false)
+})
+
+test('frames: a turn\'s plan windows become the -p rate_limit_event the login health reads', () => {
+  const sj = new StreamJson()
+  sj.sessionId = 's1'
+  const line = sj.rateLimits([
+    { kind: 'five_hour', percentUsed: 37, resetsAt: '2026-10-11T15:50:00.000Z' },
+    { kind: 'seven_day', percentUsed: 39, resetsAt: '2026-10-13T20:00:00.000Z' },
+  ])
+  const event = JSON.parse(line!)
+  assert.equal(event.type, 'rate_limit_event')
+  assert.equal(event.session_id, 's1')
+  assert.deepEqual({ ...event.rate_limit_info }, {
+    status: 'allowed', resetsAt: Date.parse('2026-10-13T20:00:00.000Z') / 1000, rateLimitType: 'seven_day', utilization: 0.39,
+    unifiedWindows: {
+      five_hour: { utilization: 0.37, resetsAt: Date.parse('2026-10-11T15:50:00.000Z') / 1000 },
+      seven_day: { utilization: 0.39, resetsAt: Date.parse('2026-10-13T20:00:00.000Z') / 1000 },
+    },
+  })
+  const full = JSON.parse(sj.rateLimits([{ kind: 'five_hour', percentUsed: 100, resetsAt: '2026-10-11T15:50:00.000Z' }])!)
+  assert.equal(full.rate_limit_info.status, 'rejected')
+  assert.equal(full.rate_limit_info.rateLimitType, 'five_hour')
+  // Nothing usable: no line rather than a made-up one.
+  for (const bad of [null, undefined, [], [{ kind: 'five_hour' }], [{ kind: 'x y', percentUsed: 1, resetsAt: '2026-10-11T00:00:00Z' }],
+    [{ kind: 'five_hour', percentUsed: -1, resetsAt: '2026-10-11T00:00:00Z' }], [{ kind: 'five_hour', percentUsed: 1, resetsAt: 'soon' }]]) {
+    assert.equal(sj.rateLimits(bad), null, JSON.stringify(bad))
+  }
 })
 
 test('frames: chunk mapping, abort result and user text', () => {
@@ -459,11 +509,11 @@ test('host: a mod that does not match its digest never launches', { timeout: 30_
   assert.notEqual(spawnSync('tmux', ['-L', 'oc-box', 'has-session', '-t', `=${h.session}`]).status, 0)
 })
 
-// ---- the bridge end to end: interactive, or -p when interactive cannot start
+// ---- the bridge end to end: interactive only; a session that cannot start fails the turn
 
 /** Runs each exec request on this machine and answers in the exec API's
  * Connect framing, the way the Box's exec daemon does. */
-function localExec(opts: { delayStderrMs?: number; failWritesToFirstLaunch?: boolean } = {}): (url: string, init: RequestInit) => Promise<Response> {
+function localExec(opts: { delayStderrMs?: number; failWritesToFirstLaunch?: boolean; env?: Record<string, string> } = {}): (url: string, init: RequestInit) => Promise<Response> {
   let firstFifo: string | undefined
   const frame = (body: unknown): Uint8Array => {
     const payload = Buffer.from(JSON.stringify(body))
@@ -480,7 +530,7 @@ function localExec(opts: { delayStderrMs?: number; failWritesToFirstLaunch?: boo
       // The write exec ran and could not deliver (the fifo was gone).
       return new Response(new Blob([Buffer.from(frame({ exitEvent: { exitCode: 1 } }))]).stream(), { status: 200 })
     }
-    const child = spawn(req.command, req.args, { cwd: req.cwd, env: req.environment, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(req.command, req.args, { cwd: req.cwd, env: { ...req.environment, ...opts.env }, stdio: ['ignore', 'pipe', 'pipe'] })
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         let open = true
@@ -511,6 +561,8 @@ const FAKE_BOTH = `#!/usr/bin/python3
 import json, os, socket, subprocess, sys
 mode = open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'mode')).read().strip()
 if '-p' in sys.argv:
+    # Never expected: the bridge has no -p runner. Leave a mark the tests check.
+    open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'p-ran'), 'a').write('x')
     for line in sys.stdin:
         print(json.dumps({'type': 'result', 'runner': 'p', 'echo': json.loads(line)}), flush=True)
     sys.exit(0)
@@ -546,14 +598,29 @@ if mode == 'ready-exit':
 for line in tap.stdout:
     if mode == 'die-on-line':
         sys.exit(3)
-    call('POST', '/out', (json.dumps({'type': 'result', 'runner': 'interactive', 'echo': json.loads(line)}) + '\\n').encode())
+    if mode == 'rejected':
+        call('POST', '/out', (json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {'status': 'rejected', 'resetsAt': 1791800000, 'utilization': 1.0}}) + '\\n').encode())
+    if mode == 'near-limit':
+        call('POST', '/out', (json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {'status': 'allowed', 'utilization': 0.99, 'unifiedWindows': {'five_hour': {'utilization': 0.99, 'resetsAt': 1791800000}}}}) + '\\n').encode())
+    if mode == 'notice':
+        call('POST', '/out', (json.dumps({'type': 'assistant', 'message': {'model': '<synthetic>', 'content': [{'type': 'text', 'text': "You've hit your session limit \u00b7 resets 11:20pm (Asia/Taipei)"}]}}) + '\\n').encode())
+        call('POST', '/out', (json.dumps({'type': 'assistant', 'message': {'model': 'claude-haiku-4-5', 'content': [{'type': 'text', 'text': 'an ordinary answer mentioning a rate limit stays as written'}]}}) + '\\n').encode())
+        call('POST', '/out', (json.dumps({'type': 'result', 'is_error': True, 'result': "You've hit your session limit \u00b7 resets 11:20pm"}) + '\\n').encode())
+        continue
+    call('POST', '/out', (json.dumps({'type': 'result', 'runner': 'interactive', 'config_dir': os.environ.get('CLAUDE_CONFIG_DIR'), 'echo': json.loads(line)}) + '\\n').encode())
 `
 
 async function bridgeRun(
-  mode: 'exit' | 'ready' | 'ready-exit' | 'die-on-line' | 'slow-ready',
+  mode: 'exit' | 'ready' | 'ready-exit' | 'die-on-line' | 'slow-ready' | 'rejected' | 'near-limit' | 'notice',
   opts: {
-    cooled?: boolean
     lines: number
+    login?: BoxLoginPort
+    /** Overrides every exec's env (e.g. HOME holding a fake Box login). */
+    execEnv?: Record<string, string>
+    accountId?: string
+    /** The chat's fifo base and the container's login memory, to run the same chat twice. */
+    fifoBase?: string
+    loginStateDir?: string
     mod?: ReturnType<typeof loadBoxBridgeMod>
     delayStderrMs?: number
     failWritesToFirstLaunch?: boolean
@@ -562,12 +629,15 @@ async function bridgeRun(
   },
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'ocb-bridge-'))
-  const state = join(dir, 'state')
   const fake = join(dir, 'claude')
   writeFileSync(fake, FAKE_BOTH)
   chmodSync(fake, 0o755)
   writeFileSync(join(dir, 'mode'), mode)
-  if (opts.cooled) noteInteractiveFailure(state)
+  const reports: Array<{ profile: string; lines: readonly string[]; unsafe?: boolean }> = []
+  const login: BoxLoginPort = opts.login ?? {
+    choose: async () => ({ profile: 'default', source: 'master' }),
+    report: async (input) => { reports.push(input) },
+  }
   const stdin = new PassThrough()
   const stdout = new PassThrough()
   const stderr = new PassThrough()
@@ -577,16 +647,19 @@ async function bridgeRun(
   stderr.on('data', (b: Buffer) => { err += b.toString('utf8') })
   const control: BoxCcControl = {
     execUrl: 'https://exec.example', execToken: 't', networkToken: 'n', remoteClaude: fake,
-    fifo: `/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, cwd: dir,
+    fifo: opts.fifoBase ?? `/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, cwd: dir,
+    ...(opts.accountId ? { accountId: opts.accountId } : {}),
   }
   const running = runBoxCcBridge({
     control,
     args: ['--model', 'box-claude-haiku-4-5', '--permission-mode', 'bypassPermissions'],
     stdin, stdout, stderr,
-    fetchImpl: localExec({ delayStderrMs: opts.delayStderrMs, failWritesToFirstLaunch: opts.failWritesToFirstLaunch }),
+    fetchImpl: localExec({ delayStderrMs: opts.delayStderrMs, failWritesToFirstLaunch: opts.failWritesToFirstLaunch,
+      ...(opts.execEnv ? { env: opts.execEnv } : {}) }),
     runner: 'interactive',
-    stateDir: state,
     env: opts.env ?? {},
+    login,
+    loginStateDir: opts.loginStateDir ?? join(dir, 'login-state'),
     ...(opts.mod ? { bridgeMod: opts.mod } : {}),
   })
   // The gateway writes the turn at once, before anything is ready.
@@ -606,12 +679,15 @@ async function bridgeRun(
     await until(() => (results().length >= opts.lines ? true : undefined), 40_000)
     stdin.end()
     code = await running
+    // The launch script removes the fifo files once its host has exited, which can land just
+    // after the bridge returns; the tests then assert nothing is left.
+    await until(() => (leftovers(control.fifo).length === 0 ? true : undefined), 15_000).catch(() => undefined)
   }
-  const cooled = interactiveCoolingDown(state, {})
   const executedPath = join(dir, 'executed')
   const executed = existsSync(executedPath) ? readFileSync(executedPath, 'utf8') : ''
+  const pRan = existsSync(join(dir, 'p-ran'))
   rmSync(dir, { recursive: true, force: true })
-  return { code, results: results(), err, cooled, fifoBase: control.fifo, executed }
+  return { code, results: results(), err, out, fifoBase: control.fifo, executed, pRan, reports }
 }
 
 function leftovers(fifoBase: string): string[] {
@@ -619,57 +695,79 @@ function leftovers(fifoBase: string): string[] {
   return readdirSync('/tmp').filter((n) => n.startsWith(prefix))
 }
 
-test('bridge: an interactive host that dies before ready hands the pending turns to -p, in order', { timeout: 90_000 }, async (t) => {
+/** The waiting turn ends with the plain failure a user sees; nothing ran, nothing names a quota. */
+function assertPlainFailure(results: any[]): void {
+  assert.deepEqual(results.map((m) => [m.is_error, m.result, m.usage?.output_tokens]), [[true, BOX_TURN_UNAVAILABLE_TEXT, 0]])
+}
+
+test('bridge: an interactive host that dies before ready is retried once, then the turn ends plainly; nothing on -p', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
-  const r = await bridgeRun('exit', { lines: 2 })
-  assert.equal(r.code, 0)
-  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2']])
-  assert.match(r.err, /BOX_INTERACTIVE_NOT_READY exited/)
-  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK not_ready/)
-  assert.equal(r.cooled, true, 'cooldown marker written')
+  const r = await bridgeRun('exit', { lines: 2, expectResults: false })
+  assert.equal(r.code, 0, 'a finished (failed) turn, not a crash')
+  assertPlainFailure(r.results)
+  assert.equal(r.pRan, false, 'no claude -p')
+  assert.equal(r.err.match(/BOX_INTERACTIVE_NOT_READY exited/g)?.length, 2, 'two launches')
+  assert.match(r.err, /BOX_INTERACTIVE_RETRY not_ready/)
+  assert.match(r.err, /BOX_INTERACTIVE_NOT_READY_NO_FALLBACK not_ready/)
   assert.deepEqual(leftovers(r.fifoBase), [])
 })
 
-test('bridge: a ready interactive host serves the turn, no fallback', { timeout: 90_000 }, async (t) => {
+test('bridge: a ready interactive host serves the turns under the default login', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
   const r = await bridgeRun('ready', { lines: 2 })
   assert.equal(r.code, 0)
-  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['interactive', 'turn 1'], ['interactive', 'turn 2']])
-  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
-  assert.equal(r.cooled, false)
+  assert.deepEqual(r.results.map((m) => [m.runner, m.config_dir, m.echo.message.content[0].text]),
+    [['interactive', null, 'turn 1'], ['interactive', null, 'turn 2']])
+  assert.match(r.err, /BOX_INTERACTIVE_LOGIN default master/)
+  assert.equal(r.pRan, false)
   assert.deepEqual(leftovers(r.fifoBase), [])
 })
 
-test('bridge: during cooldown, or with an unusable mod, the turn goes straight to -p', { timeout: 90_000 }, async (t) => {
+test('bridge: an unusable mod, a refused runner or no usable login fails the turn without running anything', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
-  const cooled = await bridgeRun('ready', { lines: 1, cooled: true })
-  assert.deepEqual(cooled.results.map((m) => m.runner), ['p'])
-  assert.match(cooled.err, /BOX_INTERACTIVE_FALLBACK cooldown/)
   const mod = { ...loadBoxBridgeMod(), hostPy: '#'.repeat(130 * 1024) }
-  const bad = await bridgeRun('ready', { lines: 1, mod })
-  assert.deepEqual(bad.results.map((m) => m.runner), ['p'])
-  assert.match(bad.err, /BOX_INTERACTIVE_FALLBACK BOX_INTERACTIVE_MOD_TOO_LARGE/)
-  assert.equal(bad.cooled, true)
+  const bad = await bridgeRun('ready', { lines: 1, mod, expectResults: false })
+  assert.equal(bad.code, 0)
+  assertPlainFailure(bad.results)
+  assert.equal(bad.pRan, false)
+  assert.match(bad.err, /BOX_INTERACTIVE_NOT_READY BOX_INTERACTIVE_MOD_TOO_LARGE/)
+  assert.doesNotMatch(bad.err, /BOX_INTERACTIVE_RETRY/, 'a launch that cannot be built is not retried')
+  const stderr = new PassThrough()
+  let err = ''
+  stderr.on('data', (b: Buffer) => { err += b.toString('utf8') })
+  const control: BoxCcControl = { execUrl: 'https://x', execToken: 't', networkToken: 'n', remoteClaude: '/c',
+    fifo: `/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`, cwd: '/tmp' }
+  const never = async (): Promise<Response> => { throw new Error('no exec expected') }
+  const stdout = new PassThrough()
+  let out = ''
+  stdout.on('data', (b: Buffer) => { out += b.toString('utf8') })
+  const base = { control, args: [], stdin: new PassThrough(), stdout, stderr, fetchImpl: never, env: {} }
+  assert.equal(await runBoxCcBridge({ ...base, runner: 'p' }), 1)
+  assert.match(err, /BOX_CC_RUNNER_REFUSED p/)
+  const unavailable: BoxLoginPort = { choose: async () => { throw new BoxLoginUnavailableError() }, report: async () => undefined }
+  assert.equal(await runBoxCcBridge({ ...base, stdin: new PassThrough(), login: unavailable }), 0)
+  assert.match(err, /BOX_LOGIN_UNAVAILABLE/)
+  assertPlainFailure(out.trim().split('\n').map((l) => JSON.parse(l)))
 })
 
-test('bridge: a host that took /ready and died before the bridge saw READY never runs a turn twice', { timeout: 90_000 }, async (t) => {
+test('bridge: a host that took /ready and died before the bridge saw READY never ran a turn, and nothing replays it', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
-  // READY reaches the bridge only after the host is gone: the lines were
-  // still held here, so -p runs each exactly once and interactive runs none.
-  const r = await bridgeRun('ready-exit', { lines: 2, delayStderrMs: 3_000 })
+  // READY reaches the bridge only after the host is gone: the lines were still
+  // held here, so nothing ran anywhere; the turn fails.
+  const r = await bridgeRun('ready-exit', { lines: 2, delayStderrMs: 3_000, expectResults: false })
   assert.equal(r.executed, '', 'no turn reached the interactive session')
-  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2']])
-  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK not_ready/)
+  assertPlainFailure(r.results)
+  assert.equal(r.pRan, false)
+  assert.match(r.err, /BOX_INTERACTIVE_NOT_READY_NO_FALLBACK not_ready/)
   assert.deepEqual(leftovers(r.fifoBase), [])
 })
 
-test('bridge: once a line went to a ready host, its failure is not replayed on -p', { timeout: 90_000 }, async (t) => {
+test('bridge: once a line went to a ready host, its failure is not replayed', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
   const r = await bridgeRun('die-on-line', { lines: 1, expectResults: false })
   assert.notEqual(r.code, 0)
   assert.deepEqual(r.results, [])
-  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
-  assert.equal(r.cooled, false)
+  assert.equal(r.pRan, false)
   assert.deepEqual(leftovers(r.fifoBase), [])
 })
 
@@ -684,23 +782,148 @@ test('host: a session whose tap is gone stops instead of piling up input', { tim
   assert.ok(!existsSync(h.fifo))
 })
 
-test('bridge: after READY a failed write ends the bridge as on -p, never a second run', { timeout: 90_000 }, async (t) => {
+test('bridge: after READY a failed write ends the bridge, never a second run', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
   const r = await bridgeRun('ready', { lines: 2, failWritesToFirstLaunch: true, expectResults: false })
   assert.equal(r.code, 'rejected: aborted')
   assert.deepEqual(r.results, [])
   assert.match(r.err, /BOX_CC_WRITE_FAILED BOX_CC_WRITE_EXIT_1/)
-  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_FALLBACK/)
+  assert.equal(r.pRan, false)
   assert.deepEqual(leftovers(r.fifoBase), [], 'host stopped on the way out')
 })
 
-test('bridge: held input over OC_BOX_INTERACTIVE_HOLD_MAX_BYTES switches to -p before the host is ready', { timeout: 90_000 }, async (t) => {
+test('bridge: held input over OC_BOX_INTERACTIVE_HOLD_MAX_BYTES abandons the host and fails the turn', { timeout: 90_000 }, async (t) => {
   if (!haveTools()) { t.skip('tmux/python3 missing'); return }
   const started = Date.now()
-  const r = await bridgeRun('slow-ready', { lines: 3, env: { OC_BOX_INTERACTIVE_HOLD_MAX_BYTES: '200' } })
+  const r = await bridgeRun('slow-ready', { lines: 3, env: { OC_BOX_INTERACTIVE_HOLD_MAX_BYTES: '200' }, expectResults: false })
   assert.ok(Date.now() - started < 20_000, 'did not wait for the ready timeout')
-  assert.deepEqual(r.results.map((m) => [m.runner, m.echo.message.content[0].text]), [['p', 'turn 1'], ['p', 'turn 2'], ['p', 'turn 3']])
-  assert.match(r.err, /BOX_INTERACTIVE_FALLBACK held_overflow/)
+  assertPlainFailure(r.results)
+  assert.doesNotMatch(r.err, /BOX_INTERACTIVE_RETRY/, 'the same input would overflow again')
+  assert.equal(r.pRan, false)
+  assert.match(r.err, /BOX_INTERACTIVE_ABANDON held_overflow/)
+  assert.match(r.err, /BOX_INTERACTIVE_NOT_READY_NO_FALLBACK held_overflow/)
+  assert.deepEqual(leftovers(r.fifoBase), [])
+})
+
+/** A Box home with one extra login: `ok` is safe (shared projects symlink, credential file),
+ * `own` keeps its own projects dir (a developer login), as discovery classifies them. */
+function fakeBoxHome(): string {
+  const home = mkdtempSync(join(tmpdir(), 'ocb-home-'))
+  spawnSync('mkdir', ['-p', join(home, '.claude', 'projects'), join(home, '.claude-own', 'projects'), join(home, '.claude-ok')])
+  spawnSync('ln', ['-s', join(home, '.claude', 'projects'), join(home, '.claude-ok', 'projects')])
+  for (const p of ['.claude-ok', '.claude-own']) writeFileSync(join(home, p, '.credentials.json'), '{}', { mode: 0o600 })
+  return home
+}
+
+test('bridge: the chosen login launches with its own CLAUDE_CONFIG_DIR; plan windows are reported per turn', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const home = fakeBoxHome()
+  try {
+    const reports: Array<{ accountId: string | undefined; profile: string; lines: readonly string[] }> = []
+    const asked: Array<string | undefined> = []
+    const r = await bridgeRun('ready', { lines: 1, accountId: '25', execEnv: { HOME: home },
+      login: { choose: async (id) => { asked.push(id); return { profile: 'ok', source: 'master' } },
+        report: async (input) => { reports.push(input) } } })
+    assert.deepEqual(asked, ['25'], 'the account comes from the control file')
+    assert.equal(r.code, 0)
+    assert.deepEqual(r.results.map((m) => [m.runner, m.config_dir]), [['interactive', join(home, '.claude-ok')]])
+    assert.match(r.err, /BOX_INTERACTIVE_LOGIN ok master/)
+    assert.equal(r.pRan, false)
+    assert.deepEqual(reports, [], 'no window line in this turn, nothing to report')
+  } finally { rmSync(home, { recursive: true, force: true }) }
+})
+
+test('bridge: a login the Box refuses is reported unsafe and the same turn is served on the next login', { timeout: 120_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const home = fakeBoxHome()
+  try {
+    for (const profile of ['own', 'missing']) {
+      const reports: Array<{ profile: string; lines: readonly string[]; unsafe?: boolean }> = []
+      const offered = [profile, 'ok']
+      const r = await bridgeRun('ready', { lines: 1, accountId: '25', execEnv: { HOME: home },
+        login: { choose: async () => ({ profile: offered.shift()!, source: 'master' }), report: async (input) => { reports.push(input) } } })
+      assert.equal(r.code, 0, profile)
+      assert.deepEqual(r.results.map((m) => [m.runner, m.config_dir, m.echo.message.content[0].text]),
+        [['interactive', join(home, '.claude-ok'), 'turn 1']], 'the user sees the answer, not a failure')
+      assert.equal(r.pRan, false)
+      assert.match(r.err, /BOX_INTERACTIVE_NOT_READY profile_unsafe/)
+      assert.match(r.err, /BOX_INTERACTIVE_RETRY profile_unsafe/)
+      assert.deepEqual(reports.map((x) => [x.profile, x.unsafe]), [[profile, true]], 'reported before the retry asked again')
+    }
+    // Every login refused: the turn ends plainly.
+    const r = await bridgeRun('ready', { lines: 1, accountId: '25', execEnv: { HOME: home }, expectResults: false,
+      login: { choose: async () => ({ profile: 'own', source: 'master' }), report: async () => undefined } })
+    assert.equal(r.code, 0)
+    assertPlainFailure(r.results)
+  } finally { rmSync(home, { recursive: true, force: true }) }
+})
+
+test('bridge: near its window limit a session retires after its turn only when another login is usable', { timeout: 120_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  for (const alternatives of [1, 0]) {
+    const r = await bridgeRun('near-limit', { lines: 1, accountId: '25',
+      login: { choose: async () => ({ profile: 'default', source: 'master', alternatives }), report: async () => undefined } })
+    assert.equal(r.code, 0)
+    assert.deepEqual(r.results.map((m) => m.runner), ['interactive'], 'the turn itself is answered')
+    if (alternatives > 0) assert.match(r.err, /BOX_LOGIN_ROTATE default near_limit/)
+    else assert.doesNotMatch(r.err, /BOX_LOGIN_ROTATE/, 'no point relaunching onto the same login every turn')
+  }
+})
+
+test('bridge: a quota or login notice the CLI writes for the user is reworded plainly', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const r = await bridgeRun('notice', { lines: 1, accountId: '25' })
+  const shown = r.out.split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  const texts = shown.filter((m) => m.type === 'assistant').flatMap((m) => m.message.content.map((b: any) => b.text))
+  assert.deepEqual(texts, [BOX_TURN_UNAVAILABLE_TEXT, 'an ordinary answer mentioning a rate limit stays as written'])
+  assert.equal(shown.find((m) => m.type === 'result').result, BOX_TURN_UNAVAILABLE_TEXT)
+  assert.doesNotMatch(r.out, /hit your session limit|resets 11:20pm|Please run \/login/)
+})
+
+test('bridge: a chat relaunches on the login it last ran on (its prompt cache), and forgets it after a rotation', { timeout: 120_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const state = mkdtempSync(join(tmpdir(), 'ocb-login-state-'))
+  const home = fakeBoxHome()
+  const fifoBase = `/tmp/oc-box-cc-${randomBytes(8).toString('hex')}.fifo`
+  const session = fifoBase.slice('/tmp/oc-box-cc-'.length, -'.fifo'.length)
+  const asked: Array<{ session?: string; prefer?: string } | undefined> = []
+  const events: string[] = []
+  const login = (profile: string): BoxLoginPort => ({
+    choose: async (_id, sticky) => { asked.push(sticky); return { profile, source: 'master' } },
+    report: async (input) => { await new Promise((r) => setTimeout(r, 300)); events.push(`report:${input.profile}`) },
+  })
+  try {
+    await bridgeRun('ready', { lines: 1, accountId: '25', fifoBase, loginStateDir: state, login: login('default') })
+    await bridgeRun('ready', { lines: 1, accountId: '25', fifoBase, loginStateDir: state, login: login('default') })
+    assert.deepEqual(asked, [{ session }, { session, prefer: 'default' }], 'the second launch asks for the same login')
+    const rotated = await bridgeRun('rejected', { lines: 1, accountId: '25', fifoBase, loginStateDir: state, login: login('default') })
+    events.push('exit')
+    assert.deepEqual(events, ['report:default', 'exit'], 'the master heard of the bench before the session ended')
+    assert.match(rotated.err, /BOX_LOGIN_ROTATE default quota/)
+    asked.length = 0
+    // The master moves the chat to another login; --resume carries its history there.
+    const moved = await bridgeRun('ready', { lines: 1, accountId: '25', fifoBase, loginStateDir: state, login: login('ok'),
+      execEnv: { HOME: home } })
+    assert.deepEqual(asked, [{ session }], 'an exhausted login is not suggested again')
+    assert.deepEqual(moved.results.map((m) => m.config_dir), [join(home, '.claude-ok')])
+    assert.equal(readFileSync(join(state, `login-${session}`), 'utf8'), 'ok')
+  } finally {
+    rmSync(state, { recursive: true, force: true })
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('bridge: a rejected plan window is reported and retires the session after its result', { timeout: 90_000 }, async (t) => {
+  if (!haveTools()) { t.skip('tmux/python3 missing'); return }
+  const reports: Array<{ profile: string; lines: readonly string[] }> = []
+  const r = await bridgeRun('rejected', { lines: 1, accountId: '25',
+    login: { choose: async () => ({ profile: 'default', source: 'master' }), report: async (input) => { reports.push(input) } } })
+  assert.equal(r.code, 0, 'a clean exit: the next message relaunches and asks for a login again')
+  assert.deepEqual(r.results.map((m) => m.runner), ['interactive'])
+  assert.match(r.err, /BOX_LOGIN_ROTATE default quota/)
+  assert.equal(reports.length, 1)
+  assert.match(reports[0]!.lines[0]!, /"status":\s*"rejected"/)
+  assert.equal(r.pRan, false)
   assert.deepEqual(leftovers(r.fifoBase), [])
 })
 

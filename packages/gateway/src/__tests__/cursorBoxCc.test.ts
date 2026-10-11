@@ -245,6 +245,8 @@ test('control file is private and the bridge copies one stdin line to stdout', a
         assert.equal(body.environment.ANTHROPIC_BASE_URL, undefined)
         longRes = res
         res.writeHead(200, { 'content-type': 'application/connect+json' })
+        // Box Claude runs interactive only: the host reports ready before any line is sent.
+        res.write(frame({ stderrEvent: { data: 'BOX_INTERACTIVE_READY plugins=oc-bridge\n' } }))
         if (queued.length > 0) {
           res.write(frame({ stdoutEvent: { data: '{"type":"assistant"}\n' } }))
           res.end(frame({ exitEvent: { exitCode: 0 } }))
@@ -347,7 +349,7 @@ async function bridgeAgainstFakeBox(remoteEndsOnStop: boolean): Promise<{
       } else {
         launchFifo = String(body.args[3])
         launch.res = res
-        res.flushHeaders()
+        res.write(frame({ stderrEvent: { data: 'BOX_INTERACTIVE_READY plugins=oc-bridge\n' } }))
       }
     })
   })
@@ -758,9 +760,15 @@ function largeLineBridge(writeExit: number, loseFirstResponse = false): {
           && body.environment.OC_BOX_CC_SEQ === '2') endLaunch?.()
         return new Response(Uint8Array.from(exit(writeExit)))
       }
-      // The launch stream stays open until Claude exits or the bridge gives up.
+      // The launch stream stays open until Claude exits or the bridge gives up; the interactive
+      // host first reports ready (Box Claude has no -p launch).
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
+          const ready = Buffer.from(JSON.stringify({ stderrEvent: { data: 'BOX_INTERACTIVE_READY plugins=oc-bridge\n' } }))
+          const readyFrame = Buffer.alloc(5 + ready.length)
+          readyFrame.writeUInt32BE(ready.length, 1)
+          ready.copy(readyFrame, 5)
+          controller.enqueue(Uint8Array.from(readyFrame))
           endLaunch = () => { controller.enqueue(Uint8Array.from(exit(0))); controller.close() }
           init.signal?.addEventListener('abort', () => controller.error(new Error('aborted')))
         },
@@ -801,7 +809,7 @@ test('a write whose response was lost is sent again as the same numbered line', 
   assert.deepEqual(bridge.writes[1], bridge.writes[0], 'the repeat is the identical request')
   assert.equal(bridge.writes[0]?.OC_BOX_CC_SEQ, '1')
   assert.equal(bridge.writes[2]?.OC_BOX_CC_SEQ, '2')
-  assert.equal(bridge.stderr(), '')
+  assert.doesNotMatch(bridge.stderr(), /BOX_CC_WRITE_FAILED/, 'the repeat succeeded; nothing was reported as lost')
 })
 
 test('a write the box did not complete stops the bridge at once', async () => {

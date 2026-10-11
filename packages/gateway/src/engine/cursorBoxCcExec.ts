@@ -144,6 +144,8 @@ export interface BoxCcControl {
   remoteClaude: string
   fifo: string
   cwd: string
+  /** Cursor account (decimal id) whose Box logins the master chooses from. Absent: default login. */
+  accountId?: string
 }
 
 const BOX_CC_PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'

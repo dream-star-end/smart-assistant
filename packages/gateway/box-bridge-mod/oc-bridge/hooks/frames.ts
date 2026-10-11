@@ -285,6 +285,39 @@ export class StreamJson {
     })
   }
 
+  /** The login's plan windows after a turn, as `-p` reports them (`rate_limit_event`), so the
+   * route's login health reads interactive and `-p` turns alike. `windows` is
+   * `$.session.usage().rateLimits`: [{ kind, percentUsed, resetsAt (ISO) }]. A window at
+   * 100% or more is a rejection; the binding window gives the reset. Null when nothing usable. */
+  rateLimits(windows: unknown): string | null {
+    if (!Array.isArray(windows)) return null
+    const unified: Record<string, { utilization: number; resetsAt: number }> = {}
+    let top: { kind: string; utilization: number; resetsAt: number } | null = null
+    for (const w of windows) {
+      const kind = (w as { kind?: unknown })?.kind
+      const pct = (w as { percentUsed?: unknown })?.percentUsed
+      const at = Date.parse(String((w as { resetsAt?: unknown })?.resetsAt ?? ''))
+      if (typeof kind !== 'string' || !/^[a-z0-9_]{1,40}$/.test(kind)) continue
+      if (typeof pct !== 'number' || !Number.isFinite(pct) || pct < 0 || !Number.isFinite(at)) continue
+      const window = { utilization: pct / 100, resetsAt: Math.floor(at / 1000) }
+      unified[kind] = window
+      if (!top || window.utilization > top.utilization) top = { kind, ...window }
+    }
+    if (!top) return null
+    return this.line({
+      type: 'rate_limit_event',
+      rate_limit_info: {
+        status: top.utilization >= 1 ? 'rejected' : 'allowed',
+        resetsAt: top.resetsAt,
+        rateLimitType: top.kind,
+        utilization: top.utilization,
+        unifiedWindows: unified,
+      },
+      session_id: this.sessionId,
+      uuid: this.uuid(),
+    })
+  }
+
   canUseTool(requestId: string, tool: string, input: unknown, toolUseId: string | undefined): string {
     return this.line({
       type: 'control_request',

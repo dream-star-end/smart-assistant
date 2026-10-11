@@ -11,9 +11,11 @@ argv: host.py <run_dir> <tmux_session> <claude> [claude args...]
 env : OC_BOX_MOD_FILES  JSON {relpath: base64} of the mod, written into run_dir
       OC_BOX_MOD_SHA256 sha256 of the canonical file listing (see mod_digest)
       OC_BOX_READY_MS   ready timeout (default 20000)
-      OC_BOX_CLAUDE_CONFIG_DIR  test-only passthrough; never set by the gateway
+      OC_BOX_CLAUDE_PROFILE  Claude Code login to run under: unset or `default` = $HOME/.claude
+                             (no CLAUDE_CONFIG_DIR, as before); `<name>` = $HOME/.claude-<name>,
+                             only after profile_safe() (else NOT_READY profile_unsafe, never -p)
 """
-import base64, collections, hashlib, hmac, json, os, secrets, shutil, signal, socket, socketserver, struct, subprocess, sys, threading, time
+import base64, collections, hashlib, hmac, json, os, re, secrets, shutil, signal, socket, socketserver, stat, struct, subprocess, sys, threading, time
 
 TAP_SOURCE = r'''
 import socket, sys
@@ -56,9 +58,40 @@ def err(line):
         pass
 
 
+PROFILE_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
+
+
+def profile_config_dir(name, home):
+    """CLAUDE_CONFIG_DIR for a login name, or None for the default login.
+    Mirrors boxClaudeProfile.ts: `default` keeps the launch byte-for-byte as before.
+    `home` is the launch exec's HOME (/home/box on the Box)."""
+    if name in (None, '', 'default'):
+        return None
+    if not isinstance(name, str) or not PROFILE_NAME.fullmatch(name):
+        raise ValueError('profile name')
+    return home + '/.claude-' + name
+
+
+def profile_safe(config_dir, home):
+    """Same checks as the master's Box GUARD (boxProfileDiscovery.ts), on the Box at launch time:
+    the dir is ours and real, it is logged in (credential file present; never read), and its
+    projects is the literal symlink to the shared dir, so history, resume and cleanup see one tree."""
+    try:
+        st = os.lstat(config_dir)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        if os.readlink(os.path.join(config_dir, 'projects')) != home + '/.claude/projects':
+            return False
+        cred = os.lstat(os.path.join(config_dir, '.credentials.json'))
+        return stat.S_ISREG(cred.st_mode) and cred.st_uid == os.getuid()
+    except (OSError, ValueError):
+        return False
+
+
 class Host:
-    def __init__(self, run_dir, session, claude, args):
+    def __init__(self, run_dir, session, claude, args, config_dir=None):
         self.run_dir = run_dir
+        self.config_dir = config_dir  # None: the default login, launched exactly as before
         self.session = session
         self.claude = claude
         self.args = args
@@ -338,9 +371,8 @@ class Host:
             mode = self.args[i + 1] if i + 1 < len(self.args) else mode
         env = ['HOME=/home/box', 'PATH=' + PATH, 'LANG=C.UTF-8', 'TERM=xterm-256color',
                'DISABLE_AUTOUPDATER=1', 'OC_BRIDGE_DIR=' + self.run_dir, 'OC_BRIDGE_PERMISSION_MODE=' + mode]
-        cfg = os.environ.get('OC_BOX_CLAUDE_CONFIG_DIR')
-        if cfg:
-            env.append('CLAUDE_CONFIG_DIR=' + cfg)
+        if self.config_dir:
+            env.append('CLAUDE_CONFIG_DIR=' + self.config_dir)
         exit_file = os.path.join(self.run_dir, 'exit')
         pid_file = os.path.join(self.run_dir, 'claude.pid')
         script = 'echo $$ > "$OC_BRIDGE_DIR/claude.pid"; exec "$@"'
@@ -387,6 +419,15 @@ class Host:
 def main():
     run_dir, session, claude = sys.argv[1], sys.argv[2], sys.argv[3]
     args = sys.argv[4:]
+    home = os.environ.get('HOME', '/home/box')
+    try:
+        config_dir = profile_config_dir(os.environ.get('OC_BOX_CLAUDE_PROFILE'), home)
+    except ValueError:
+        err('BOX_INTERACTIVE_NOT_READY profile_invalid')
+        return 1
+    if config_dir is not None and not profile_safe(config_dir, home):
+        err('BOX_INTERACTIVE_NOT_READY profile_unsafe')
+        return 1
     files = {k: base64.b64decode(v) for k, v in json.loads(os.environ['OC_BOX_MOD_FILES']).items()}
     if mod_digest(files) != os.environ.get('OC_BOX_MOD_SHA256'):
         err('BOX_INTERACTIVE_MOD_DIGEST_MISMATCH')
@@ -412,7 +453,7 @@ def main():
         f.write(TAP_SOURCE)
     os.chmod(os.path.join(run_dir, 'tap.py'), 0o400)
 
-    host = Host(run_dir, session, claude, args + ['--plugin-dir', mod_root])
+    host = Host(run_dir, session, claude, args + ['--plugin-dir', mod_root], config_dir)
     stopping = threading.Event()
 
     def on_signal(signum, _frame):

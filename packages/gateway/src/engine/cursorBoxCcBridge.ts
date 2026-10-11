@@ -1,23 +1,33 @@
 /** Local stdio bridge. The gateway speaks stream-json to this process.
  * This process runs official `claude` inside the selected account's Grok Bot
- * box and copies stdout back. It does not call the model itself. */
+ * box and copies stdout back. It does not call the model itself.
+ *
+ * Box Claude runs only as the interactive session (tmux + oc-bridge mod), never
+ * as `claude -p` (operator rule 2026-10-11): a session that cannot come up
+ * fails the turn. Before launching, the bridge asks the master which Box login
+ * to run under; after each turn it reports what the output said about that
+ * login, and a login that turned out exhausted or logged out ends the session
+ * after its result, so the next message relaunches (--resume) on another. */
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  boxCcLaunchExec,
   boxCcSpawnFifo,
   boxCcStopExec,
   boxCcWriteExecs,
   encodeExecRequest,
   execExitCode,
   parseExecFrames,
-  remoteClaudeArgs,
   type BoxCcControl,
   type BoxCcExecRequest,
 } from './cursorBoxCcExec.js'
+import {
+  BoxLoginUnavailableError,
+  reportBoxLoginSignals,
+  requestBoxLogin,
+} from './boxLoginClient.js'
 import {
   boxCcInteractiveAbandonExec,
   boxCcInteractiveLaunchExec,
@@ -42,6 +52,10 @@ function readControl(path: string): BoxCcControl {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
   if (!parsed.execUrl.startsWith('https://') || !parsed.fifo.startsWith('/tmp/oc-box-cc-')) {
+    throw new Error('BOX_CC_CONTROL_INVALID')
+  }
+  if (parsed.accountId !== undefined
+    && (typeof parsed.accountId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(parsed.accountId))) {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
   return parsed as BoxCcControl
@@ -71,6 +85,20 @@ async function postExec(
   return response
 }
 
+/** What a user sees when a Box Claude turn cannot be served. Never names a quota, a window or an
+ * account (the platform's rule for end users); the ops detail stays on stderr. */
+export const BOX_TURN_UNAVAILABLE_TEXT = 'Claude 暂时繁忙，这条消息没有完成，请稍后再发一次。'
+/** Interactive launches a turn may take before it is reported as failed: the first, and one
+ * transparent retry when nothing ran (a host that did not come up, a login the Box refused). */
+const LAUNCH_ATTEMPTS = 2
+/** A login this close to its window ends the chat's session after the turn (when the master said
+ * another login is usable), so the next message moves before a turn is refused. */
+const NEAR_LIMIT = 0.98
+
+type SessionOutcome =
+  | { kind: 'not_ready'; why: string; unsafe: boolean; retryable: boolean; held: string[] }
+  | { kind: 'ended'; code: number }
+
 export async function runBoxCcBridge(opts: {
   control: BoxCcControl
   args: readonly string[]
@@ -79,77 +107,220 @@ export async function runBoxCcBridge(opts: {
   stderr: NodeJS.WritableStream
   fetchImpl?: FetchFn
   signal?: AbortSignal
-  /** `interactive` launches the mod-driven TTY session instead of `-p`;
-   * every other step (writes, stop, stdout) is the same. */
+  /** Must be `interactive` (the default); anything else is refused. */
   runner?: BoxCcRunner
   bridgeMod?: BoxBridgeMod
-  /** Where the interactive cooldown marker lives (tests). */
-  stateDir?: string
   env?: NodeJS.ProcessEnv
+  /** Box login choice and reports (tests); default: the master's egress. */
+  login?: BoxLoginPort
+  /** Where this container remembers each chat's last login (tests). */
+  loginStateDir?: string
 }): Promise<number> {
   const fetchImpl = opts.fetchImpl ?? fetch
   const env = opts.env ?? process.env
-  const stateDir = opts.stateDir ?? join(tmpdir(), 'oc-box-cc')
+  const login: BoxLoginPort = opts.login ?? {
+    choose: (accountId, sticky) => requestBoxLogin({ accountId, ...sticky }, { env }),
+    report: (input) => reportBoxLoginSignals(input, { env }),
+  }
+  if ((opts.runner ?? 'interactive') !== 'interactive') {
+    opts.stderr.write(`BOX_CC_RUNNER_REFUSED ${String(opts.runner)}\n`)
+    return 1
+  }
+  const accountId = opts.control.accountId
+  // A chat keeps its login across bridge restarts when it can: --resume then lands on the login
+  // that holds its prompt cache. The master has the last word (benched or deselected logins move).
+  const memory = new BoxLoginMemory(opts.loginStateDir ?? join(tmpdir(), 'oc-box-cc'), opts.control.fifo)
   const abort = new AbortController()
   const onAbort = (): void => abort.abort()
   opts.signal?.addEventListener('abort', onAbort)
-  const freshControl = (): BoxCcControl => ({
-    ...opts.control,
-    fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')),
-  })
-  let control = freshControl()
-
-  // The interactive runner is preferred, never required: when it cannot be
-  // built, or recently failed in this container, the turn runs on `-p`.
-  let interactive = opts.runner === 'interactive'
-  let launch: BoxCcExecRequest | null = null
-  if (interactive && interactiveCoolingDown(stateDir, env)) {
-    opts.stderr.write('BOX_INTERACTIVE_FALLBACK cooldown\n')
-    interactive = false
-  }
-  if (interactive) {
-    try {
-      launch = boxCcInteractiveLaunchExec(control, remoteInteractiveClaudeArgs(opts.args), opts.bridgeMod ?? loadBoxBridgeMod())
-    } catch (err) {
-      opts.stderr.write(`BOX_INTERACTIVE_FALLBACK ${err instanceof Error ? err.message : 'BOX_INTERACTIVE_LAUNCH_FAILED'}\n`)
-      noteInteractiveFailure(stateDir)
-      interactive = false
-    }
-  }
-  if (!launch) launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
-
-  // Two phases, so no turn can run twice or vanish:
-  // - until this bridge has seen the host report READY, it sends the host
-  //   nothing and holds every line here; if the host ends first (a dialog,
-  //   the ready timeout, a crash, held input over the cap), the held lines
-  //   go to `-p` in order and nothing ran interactively;
-  // - once READY is seen, the held lines go out first and the bridge behaves
-  //   exactly as on `-p`: a failed write or a dead host ends it, and the
-  //   next turn resumes.
-  let held: string[] | null = interactive ? [] : null
-  let heldBytes = 0
   const holdMax = positiveInt(env.OC_BOX_INTERACTIVE_HOLD_MAX_BYTES) ?? 64 * 1024 * 1024
-  let readySeen = false
-  let abandoned: string | null = null
-  let hostStreamEnded = false
-  let sawStdout = false
-  let gate: Promise<void> = Promise.resolve()
+  const out = new StdoutLines(opts.stdout)
 
-  let exitCode = 1
-  let sawExit = false
+  // stdin -> the current session; lines that arrive between sessions wait in `carry`.
+  let current: BoxSession | null = null
+  let carry: string[] = []
+  let stdinEnded = false
+  const pending = bufferLines(opts.stdin, async (line) => {
+    if (abort.signal.aborted) return
+    if (current) await current.deliver(line)
+    else carry.push(line)
+  }).then(async () => {
+    stdinEnded = true
+    await current?.stop()
+  })
+
+  let code = 1
+  try {
+    for (let attempt = 1; ; attempt++) {
+      let profile: string
+      let alternatives = 0
+      try {
+        const prefer = memory.read()
+        const chosen = await login.choose(accountId,
+          { ...(memory.session ? { session: memory.session } : {}), ...(prefer ? { prefer } : {}) })
+        profile = chosen.profile
+        alternatives = chosen.alternatives ?? 0
+        memory.write(profile)
+        opts.stderr.write(`BOX_INTERACTIVE_LOGIN ${profile} ${chosen.source}${prefer && prefer !== profile ? ` moved_from=${prefer}` : ''}\n`)
+      } catch (err) {
+        opts.stderr.write(`${err instanceof BoxLoginUnavailableError ? err.message : 'BOX_LOGIN_UNAVAILABLE'}\n`)
+        // Not even the default login is usable; the waiting turn ends plainly.
+        out.unavailable(sessionIdOf(opts.args))
+        code = 0
+        break
+      }
+      const session = new BoxSession({
+        control: { ...opts.control, fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')) },
+        args: opts.args, profile, alternatives, accountId, bridgeMod: opts.bridgeMod, held: carry, holdMax,
+        fetchImpl, abort, stderr: opts.stderr, out, login, memory,
+        // A line that reaches a session after it gave up (nothing ran) belongs to the next attempt.
+        late: (line) => { carry.push(line) },
+      })
+      if (stdinEnded) { code = 0; break }   // the gateway retired this process meanwhile
+      carry = []
+      current = session
+      const outcome = await session.run()
+      current = null
+      if (outcome.kind === 'ended') { code = outcome.code; break }
+      // Nothing ran on this attempt: its lines are still ours.
+      carry = [...outcome.held, ...carry]
+      if (outcome.unsafe) {
+        // The master benches the login before the retry asks again; this chat stops preferring it.
+        await login.report({ accountId, profile, lines: [], unsafe: true }).catch(() => false)
+        memory.forget()
+      }
+      if (outcome.retryable && attempt < LAUNCH_ATTEMPTS && !stdinEnded && !abort.signal.aborted) {
+        opts.stderr.write(`BOX_INTERACTIVE_RETRY ${outcome.why}\n`)
+        continue
+      }
+      // There is no `-p` to hand the turn to. The user gets a plain failure for the waiting turn;
+      // the bridge is spawned for a turn, so its line is at most a moment away.
+      opts.stderr.write(`BOX_INTERACTIVE_NOT_READY_NO_FALLBACK ${outcome.why}\n`)
+      const waiting = (): boolean => carry.some((line) => TOP_TYPE.exec(line)?.[1] === 'user')
+      for (let i = 0; i < 20 && !waiting() && !stdinEnded && !abort.signal.aborted; i++) {
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      if (waiting()) {
+        out.unavailable(sessionIdOf(opts.args))
+        code = 0
+      } else code = 1
+      break
+    }
+  } finally {
+    abort.abort()
+    opts.signal?.removeEventListener('abort', onAbort)
+    if ('destroy' in opts.stdin && typeof opts.stdin.destroy === 'function') {
+      opts.stdin.destroy()
+    }
+    await pending.catch(() => undefined)
+    out.flush()
+  }
+  return code
+}
+
+function sessionIdOf(args: readonly string[]): string {
+  const at = args.indexOf('--resume')
+  return at >= 0 && typeof args[at + 1] === 'string' ? args[at + 1]! : ''
+}
+
+/** Whole stream-json lines to the gateway. A line the CLI synthesized about a quota or a login
+ * (shown to the user as assistant text, or as a failed result's text) is reworded neutrally. */
+class StdoutLines {
+  private buf = ''
+  constructor(private readonly stdout: NodeJS.WritableStream) {}
+  write(data: string): void {
+    this.buf += data
+    const cut = this.buf.lastIndexOf('\n')
+    if (cut < 0) return
+    const whole = this.buf.slice(0, cut + 1)
+    this.buf = this.buf.slice(cut + 1)
+    this.stdout.write(whole.split('\n').map(neutralLine).join('\n'))
+  }
+  flush(): void {
+    if (this.buf) this.stdout.write(neutralLine(this.buf))
+    this.buf = ''
+  }
+  /** A failed result for the waiting turn, in the CLI's own result shape (the parser finalizes it). */
+  unavailable(sessionId: string): void {
+    this.flush()
+    this.stdout.write(`${JSON.stringify({
+      type: 'result', subtype: 'error_during_execution', is_error: true, duration_ms: 0, duration_api_ms: 0,
+      num_turns: 0, result: BOX_TURN_UNAVAILABLE_TEXT, stop_reason: null, session_id: sessionId, total_cost_usd: 0,
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      permission_denials: [], errors: ['BOX_INTERACTIVE_UNAVAILABLE'],
+    })}\n`)
+  }
+}
+
+const QUOTA_OR_LOGIN = /hit your .*limit|usage limit|rate limit|limit reached|Not logged in|Please run \/login|resets? (at )?\d/i
+
+function neutralLine(line: string): string {
+  const type = TOP_TYPE.exec(line)?.[1]
+  if (type !== 'assistant' && type !== 'result') return line
+  if (!QUOTA_OR_LOGIN.test(line)) return line
+  let record: Record<string, any>
+  try { record = JSON.parse(line) as Record<string, any> } catch { return line }
+  if (type === 'assistant' && record.message?.model === '<synthetic>' && Array.isArray(record.message.content)) {
+    record.message.content = record.message.content.map((block: Record<string, unknown>) =>
+      typeof block?.text === 'string' && QUOTA_OR_LOGIN.test(block.text) ? { ...block, text: BOX_TURN_UNAVAILABLE_TEXT } : block)
+    return JSON.stringify(record)
+  }
+  if (type === 'result' && record.is_error === true && typeof record.result === 'string' && QUOTA_OR_LOGIN.test(record.result)) {
+    record.result = BOX_TURN_UNAVAILABLE_TEXT
+    return JSON.stringify(record)
+  }
+  return line
+}
+
+/** One interactive Box session: launch under one login, hold the gateway's lines until the host is
+ * READY (so a session that never came up ran nothing and can be retried or failed cleanly), then
+ * write each line, read stdout, and stop on request. */
+class BoxSession {
+  private held: string[] | null
+  private heldBytes = 0
+  private readySeen = false
+  private abandoned: string | null = null
+  private hostStreamEnded = false
+  private sawStdout = false
+  private hostErr = ''
+  private gate: Promise<void> = Promise.resolve()
+  private lineSeq = 0
+  private exitCode = 1
+  private sawExit = false
+  private stopRequested = false
+  private readonly signals = new BoxLoginSignalTap()
+  private readonly abort = new AbortController()
+  /** Set once the session gave up before READY: later lines go back to the bridge. */
+  private gaveUp = false
+
+  constructor(private readonly o: {
+    control: BoxCcControl; args: readonly string[]; profile: string; alternatives: number
+    accountId: string | undefined; bridgeMod?: BoxBridgeMod; held: string[]; holdMax: number
+    fetchImpl: FetchFn; abort: AbortController; stderr: NodeJS.WritableStream; out: StdoutLines
+    login: BoxLoginPort; memory: BoxLoginMemory; late: (line: string) => void
+  }) {
+    this.held = [...o.held]
+    for (const line of this.held) this.heldBytes += Buffer.byteLength(line)
+    const parent = (): void => this.abort.abort()
+    if (o.abort.signal.aborted) parent()
+    else o.abort.signal.addEventListener('abort', parent, { once: true })
+  }
+
+  private get control(): BoxCcControl { return this.o.control }
+
   // The write runs as its own exec in the box. A request whose response the
   // transport lost is sent once more: the box script never writes a numbered
   // line twice. An exec that ran and did not exit 0 did not deliver the line,
   // so the bridge stops instead of waiting for an answer.
-  const writeExec = async (body: BoxCcExecRequest): Promise<void> => {
+  private async writeExec(body: BoxCcExecRequest): Promise<void> {
     let last: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
-      if (abort.signal.aborted) return
+      if (this.abort.signal.aborted) return
       const writer = new AbortController()
       const timer = setTimeout(() => writer.abort(), 20_000)
       let code: number | null
       try {
-        const response = await postExec(control, body, fetchImpl, writer.signal)
+        const response = await postExec(this.control, body, this.o.fetchImpl, writer.signal)
         code = execExitCode(Buffer.from(await response.arrayBuffer()))
       } catch (err) {
         last = err
@@ -162,88 +333,89 @@ export async function runBoxCcBridge(opts: {
     }
     throw last instanceof Error ? last : new Error('BOX_CC_WRITE_FAILED')
   }
-  let lineSeq = 0
-  const writeLine = async (line: string): Promise<void> => {
+
+  private async writeLine(line: string): Promise<void> {
     try {
-      for (const body of boxCcWriteExecs(control, line, ++lineSeq)) await writeExec(body)
+      for (const body of boxCcWriteExecs(this.control, line, ++this.lineSeq)) await this.writeExec(body)
     } catch (err) {
-      if (abort.signal.aborted) return
+      if (this.abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
-      opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
-      // An interactive host would otherwise keep its tmux session until this
-      // chat's next launch reaps it; end it now (best effort, as stopRemote).
-      if (interactive) {
-        const stopper = new AbortController()
-        setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS).unref?.()
-        void postExec(control, boxCcStopExec(control), fetchImpl, stopper.signal)
-          .then((response) => response.arrayBuffer())
-          .catch(() => undefined)
-      }
-      abort.abort()
+      this.o.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
+      // The interactive host would otherwise keep its tmux session until this
+      // chat's next launch reaps it; end it now (best effort, as stop()).
+      const stopper = new AbortController()
+      setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS).unref?.()
+      void postExec(this.control, boxCcStopExec(this.control), this.o.fetchImpl, stopper.signal)
+        .then((response) => response.arrayBuffer())
+        .catch(() => undefined)
+      this.abort.abort()
     }
   }
-  /** Ends a host that is not ready yet without ending the bridge. The launch
-   * may not have started it, so the abandon exec repeats until its stream
-   * has ended; the fallback below then runs. */
-  const abandonInteractive = (why: string): void => {
-    if (abandoned || readySeen) return
-    abandoned = why
-    opts.stderr.write(`BOX_INTERACTIVE_ABANDON ${why}\n`)
-    const hostControl = control
+
+  /** Ends a host that is not ready yet. The launch may not have started it, so
+   * the abandon exec repeats until its stream has ended. */
+  private abandon(why: string): void {
+    if (this.abandoned || this.readySeen) return
+    this.abandoned = why
+    this.o.stderr.write(`BOX_INTERACTIVE_ABANDON ${why}\n`)
     void (async () => {
-      for (let attempt = 0; attempt < 30 && !hostStreamEnded && !abort.signal.aborted; attempt++) {
+      for (let attempt = 0; attempt < 30 && !this.hostStreamEnded && !this.abort.signal.aborted; attempt++) {
         const stopper = new AbortController()
         const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
         try {
-          const response = await postExec(hostControl, boxCcInteractiveAbandonExec(hostControl), fetchImpl, stopper.signal)
+          const response = await postExec(this.control, boxCcInteractiveAbandonExec(this.control), this.o.fetchImpl, stopper.signal)
           await response.arrayBuffer()
         } catch {
           // Tried again below while the host's stream is open.
         } finally {
           clearTimeout(timer)
         }
-        if (!hostStreamEnded) await new Promise((r) => setTimeout(r, 1_000))
+        if (!this.hostStreamEnded) await new Promise((r) => setTimeout(r, 1_000))
       }
     })()
   }
-  const deliverLine = async (line: string): Promise<void> => {
-    await gate
-    if (abort.signal.aborted) return
-    if (held) {
-      held.push(line)
-      heldBytes += Buffer.byteLength(line)
-      if (heldBytes > holdMax) abandonInteractive('held_overflow')
+
+  async deliver(line: string): Promise<void> {
+    await this.gate
+    if (this.gaveUp) { this.o.late(line); return }
+    if (this.abort.signal.aborted) return
+    if (this.held) {
+      this.held.push(line)
+      this.heldBytes += Buffer.byteLength(line)
+      if (this.heldBytes > this.o.holdMax) this.abandon('held_overflow')
       return
     }
-    await writeLine(line)
+    await this.writeLine(line)
   }
+
   /** Sends `lines` first; later lines wait behind them. */
-  const flushFirst = (lines: string[]): Promise<void> => {
+  private flushFirst(lines: string[]): Promise<void> {
     let release!: () => void
-    gate = new Promise((resolveGate) => { release = resolveGate })
+    this.gate = new Promise((resolveGate) => { release = resolveGate })
     return (async () => {
       try {
         for (const line of lines) {
-          if (abort.signal.aborted) break
-          await writeLine(line)
+          if (this.abort.signal.aborted) break
+          await this.writeLine(line)
         }
       } finally {
         release()
       }
     })()
   }
+
   // Closed stdin is the gateway retiring this process (shutdown, model switch,
   // idle recycle). Claude in the box cannot see that EOF, so end it there and
   // report a clean exit; otherwise the runner has to SIGKILL this bridge and
-  // the box Claude lives on, still attached to the session.
-  let stopRequested = false
-  const stopRemote = async (): Promise<void> => {
-    if (abort.signal.aborted) return
-    stopRequested = true
+  // the box Claude lives on, still attached to the session. The same clean end
+  // retires a session whose login should not take the chat's next message.
+  async stop(): Promise<void> {
+    if (this.abort.signal.aborted || this.stopRequested) return
+    this.stopRequested = true
     const stopper = new AbortController()
     const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
     try {
-      const response = await postExec(control, boxCcStopExec(control), fetchImpl, stopper.signal)
+      const response = await postExec(this.control, boxCcStopExec(this.control), this.o.fetchImpl, stopper.signal)
       await response.arrayBuffer()
     } catch {
       // The next launch for this session ends whatever is left.
@@ -251,106 +423,203 @@ export async function runBoxCcBridge(opts: {
       clearTimeout(timer)
     }
     // The launch stream normally ends by itself once Claude is gone.
-    const cut = setTimeout(() => abort.abort(), STOP_STREAM_GRACE_MS)
+    const cut = setTimeout(() => this.abort.abort(), STOP_STREAM_GRACE_MS)
     cut.unref?.()
   }
-  const streamLaunch = async (request: BoxCcExecRequest): Promise<void> => {
-    const response = await postExec(control, request, fetchImpl, abort.signal)
-    const reader = response.body!.getReader()
-    let pendingBytes = Buffer.alloc(0)
-    let errTail = ''
-    for (;;) {
-      const chunk = await reader.read()
-      if (chunk.done) break
-      pendingBytes = Buffer.concat([pendingBytes, Buffer.from(chunk.value)])
-      const parsed = parseExecFrames(pendingBytes)
-      pendingBytes = Buffer.from(parsed.rest)
-      for (const event of parsed.events) {
-        if (event.kind === 'stdout' && event.data) {
-          sawStdout = true
-          opts.stdout.write(event.data)
-        } else if (event.kind === 'stderr' && event.data) {
-          opts.stderr.write(event.data)
-          if (held && !abandoned) {
-            errTail = (errTail + event.data).slice(-4096)
-            if (errTail.includes('BOX_INTERACTIVE_READY')) {
-              readySeen = true
-              const lines = held
-              held = null
-              heldBytes = 0
-              void flushFirst(lines)
+
+  private async onTurnEnd(rotate: string | null): Promise<void> {
+    const lines = this.signals.take()
+    const retire = rotate === 'quota' || rotate === 'login' || (rotate === 'near_limit' && this.o.alternatives > 0)
+    if (!retire || this.stopRequested) {
+      if (lines.length > 0) void this.o.login.report({ accountId: this.o.accountId, profile: this.o.profile, lines }).catch(() => false)
+      return
+    }
+    // The master must know before this chat's next launch asks, or it could hand out the same
+    // login again; and this container stops preferring it. The next message relaunches (--resume).
+    await this.o.login.report({ accountId: this.o.accountId, profile: this.o.profile, lines }).catch(() => false)
+    this.o.memory.forget()
+    this.o.stderr.write(`BOX_LOGIN_ROTATE ${this.o.profile} ${rotate}\n`)
+    void this.stop()
+  }
+
+  /** Nothing ran: hand back every line this session holds, and every later one. */
+  private giveUp(o: { why: string; unsafe: boolean; retryable: boolean }): SessionOutcome {
+    this.gaveUp = true
+    const held = this.held ?? []
+    this.held = []
+    return { kind: 'not_ready', ...o, held }
+  }
+
+  async run(): Promise<SessionOutcome> {
+    let launch: BoxCcExecRequest
+    try {
+      launch = boxCcInteractiveLaunchExec(this.control, remoteInteractiveClaudeArgs(this.o.args),
+        this.o.bridgeMod ?? loadBoxBridgeMod(), this.o.profile)
+    } catch (err) {
+      const why = err instanceof Error ? err.message : 'BOX_INTERACTIVE_LAUNCH_FAILED'
+      this.o.stderr.write(`BOX_INTERACTIVE_NOT_READY ${why}\n`)
+      return this.giveUp({ why, unsafe: false, retryable: false })
+    }
+    try {
+      const response = await postExec(this.control, launch, this.o.fetchImpl, this.abort.signal)
+      const reader = response.body!.getReader()
+      let pendingBytes = Buffer.alloc(0)
+      for (;;) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        pendingBytes = Buffer.concat([pendingBytes, Buffer.from(chunk.value)])
+        const parsed = parseExecFrames(pendingBytes)
+        pendingBytes = Buffer.from(parsed.rest)
+        for (const event of parsed.events) {
+          if (event.kind === 'stdout' && event.data) {
+            this.sawStdout = true
+            this.o.out.write(event.data)
+            for (const end of this.signals.push(event.data)) await this.onTurnEnd(end.rotate)
+          } else if (event.kind === 'stderr' && event.data) {
+            this.o.stderr.write(event.data)
+            if (this.held && !this.abandoned) {
+              this.hostErr = (this.hostErr + event.data).slice(-4096)
+              if (this.hostErr.includes('BOX_INTERACTIVE_READY')) {
+                this.readySeen = true
+                const lines = this.held
+                this.held = null
+                this.heldBytes = 0
+                void this.flushFirst(lines)
+              }
             }
+          } else if (event.kind === 'exit') {
+            this.sawExit = true
+            this.exitCode = event.code ?? 0
           }
-        } else if (event.kind === 'exit') {
-          sawExit = true
-          exitCode = event.code ?? 0
         }
       }
+      this.hostStreamEnded = true
+    } catch (error) {
+      this.hostStreamEnded = true
+      if (!this.stopRequested && !this.o.abort.signal.aborted) {
+        if (this.readySeen || this.sawStdout) throw error
+        // The launch itself failed before anything ran (an exec error): like a host that never came up.
+        const why = error instanceof Error ? error.message : 'launch_failed'
+        return this.giveUp({ why, unsafe: false, retryable: true })
+      }
+    } finally {
+      this.abort.abort()
     }
+    if (!this.readySeen && !this.sawStdout && !this.stopRequested && !this.o.abort.signal.aborted) {
+      // The host never got a line, so nothing ran.
+      const unsafe = /BOX_INTERACTIVE_NOT_READY profile_unsafe/.test(this.hostErr)
+      return this.giveUp({ why: this.abandoned ?? (unsafe ? 'profile_unsafe' : 'not_ready'), unsafe,
+        retryable: this.abandoned !== 'held_overflow' })
+    }
+    const rest = this.signals.take()
+    if (rest.length > 0) void this.o.login.report({ accountId: this.o.accountId, profile: this.o.profile, lines: rest }).catch(() => false)
+    if (this.stopRequested) return { kind: 'ended', code: 0 }
+    return { kind: 'ended', code: this.sawExit ? this.exitCode : 1 }
   }
-  const pending = bufferLines(opts.stdin, async (line) => {
-    if (abort.signal.aborted) return
-    await deliverLine(line)
-  }).then(stopRemote)
-  try {
-    await streamLaunch(launch)
-    hostStreamEnded = true
-    if (interactive && !readySeen && !sawStdout && !stopRequested && !abort.signal.aborted) {
-      // The host never got a line: -p takes them all, on a fresh fifo, in order.
-      opts.stderr.write(`BOX_INTERACTIVE_FALLBACK ${abandoned ?? 'not_ready'}\n`)
-      noteInteractiveFailure(stateDir)
-      const lines = held ?? []
-      held = null
-      interactive = false
-      sawExit = false
-      exitCode = 1
-      control = freshControl()
-      lineSeq = 0
-      const streaming = streamLaunch(boxCcLaunchExec(control, remoteClaudeArgs(opts.args)))
-      await flushFirst(lines)
-      await streaming
-    }
-  } catch (error) {
-    if (!stopRequested) throw error
-  } finally {
-    abort.abort()
-    opts.signal?.removeEventListener('abort', onAbort)
-    if ('destroy' in opts.stdin && typeof opts.stdin.destroy === 'function') {
-      opts.stdin.destroy()
-    }
-    await pending.catch(() => undefined)
-  }
-  if (stopRequested) return 0
-  return sawExit ? exitCode : 1
 }
 
-const INTERACTIVE_DOWN_MARKER = 'interactive-down'
+/** This container's record of the login each chat last launched under, keyed by the session hash
+ * in the chat's fifo name (stable across bridge restarts). Lost with the container: the master
+ * also remembers it, and otherwise per-user affinity usually lands on the same login. */
+class BoxLoginMemory {
+  readonly session: string | null
+  private readonly path: string | null
+  constructor(dir: string, fifo: string) {
+    this.session = /^\/tmp\/oc-box-cc-([a-f0-9]{16})\.fifo$/.exec(fifo)?.[1] ?? null
+    this.path = this.session ? join(dir, `login-${this.session}`) : null
+    if (this.path) {
+      try { mkdirSync(dir, { recursive: true, mode: 0o700 }) } catch { /* reading fails below; only a cost */ }
+    }
+  }
+  read(): string | null {
+    if (!this.path) return null
+    try {
+      const value = readFileSync(this.path, 'utf8').trim()
+      return /^(default|[a-z0-9][a-z0-9-]{0,31})$/.test(value) ? value : null
+    } catch { return null }
+  }
+  write(profile: string): void {
+    if (!this.path) return
+    try { writeFileSync(this.path, profile, { mode: 0o600 }) } catch { /* only a cost */ }
+  }
+  forget(): void {
+    if (!this.path) return
+    try { rmSync(this.path, { force: true }) } catch { /* only a cost */ }
+  }
+}
+
+export interface BoxLoginPort {
+  choose(accountId: string | undefined, sticky?: { session?: string; prefer?: string }):
+    Promise<{ profile: string; source: 'master' | 'fallback'; alternatives?: number }>
+  report(input: { accountId: string | undefined; profile: string; lines: readonly string[]; unsafe?: boolean }):
+    Promise<unknown>
+}
+
+const MAX_TURN_SIGNALS = 16
+const MAX_SIGNAL_LINE = 65_536
+/** The stream-json line's own `type` (always its first key), read without parsing the line. */
+const TOP_TYPE = /^\{"type":\s*"([a-z_]+)"/
+
+/** Reads the session's stdout for what it says about the login: the plan-window line
+ * (`rate_limit_event`) and the CLI's synthetic notices. A turn's lines are handed over at its
+ * `result`, with whether the login must be rotated out: a rejected window (exhausted) or a
+ * "Not logged in" notice. Everything else passes through untouched by this reader. */
+export class BoxLoginSignalTap {
+  private buf = ''
+  private turn: string[] = []
+  private rotate: string | null = null
+
+  push(chunk: string): Array<{ rotate: string | null }> {
+    this.buf += chunk
+    const ends: Array<{ rotate: string | null }> = []
+    for (let nl = this.buf.indexOf('\n'); nl >= 0; nl = this.buf.indexOf('\n')) {
+      const line = this.buf.slice(0, nl)
+      this.buf = this.buf.slice(nl + 1)
+      const type = TOP_TYPE.exec(line)?.[1]
+      if (type === 'rate_limit_event' || (type === 'assistant' && line.includes('"<synthetic>"'))) {
+        if (line.length <= MAX_SIGNAL_LINE && this.turn.length < MAX_TURN_SIGNALS) this.turn.push(line)
+        const reason = rotateReason(line)
+        // A refusal or a logged-out login outranks "near the limit" within the same turn.
+        if (reason && (this.rotate === null || this.rotate === 'near_limit')) this.rotate = reason
+      } else if (type === 'result') {
+        ends.push({ rotate: this.rotate })
+        this.rotate = null
+      }
+    }
+    // A line longer than any signal is not one; do not hold it.
+    if (this.buf.length > MAX_SIGNAL_LINE * 4) this.buf = ''
+    return ends
+  }
+
+  take(): string[] {
+    const lines = this.turn
+    this.turn = []
+    return lines
+  }
+}
+
+function rotateReason(line: string): string | null {
+  let record: unknown
+  try { record = JSON.parse(line) } catch { return null }
+  const top = record as { type?: unknown; rate_limit_info?: Record<string, unknown>; message?: { model?: unknown; content?: unknown } }
+  if (top?.type === 'rate_limit_event') {
+    const info = (top.rate_limit_info ?? {}) as { status?: unknown; utilization?: unknown; unifiedWindows?: unknown }
+    if (info.status === 'rejected') return 'quota'
+    const used = [info.utilization, ...Object.values((info.unifiedWindows ?? {}) as Record<string, { utilization?: unknown }>)
+      .map((w) => w?.utilization)].filter((u): u is number => typeof u === 'number' && Number.isFinite(u))
+    return used.some((u) => u >= NEAR_LIMIT) ? 'near_limit' : null
+  }
+  if (top?.type === 'assistant' && top.message?.model === '<synthetic>' && Array.isArray(top.message.content)) {
+    for (const block of top.message.content as Array<{ text?: unknown }>) {
+      if (typeof block?.text === 'string' && /^Not logged in\b/.test(block.text)) return 'login'
+      if (typeof block?.text === 'string' && /hit your .*limit|usage limit/i.test(block.text)) return 'quota'
+    }
+  }
+  return null
+}
 
 function positiveInt(raw: string | undefined): number | undefined {
   return raw && /^[0-9]+$/.test(raw) && Number(raw) > 0 ? Number(raw) : undefined
-}
-
-/** After a fallback, this container skips the interactive launch for
- * OC_BOX_INTERACTIVE_COOLDOWN_SEC (default 600) so each new process does not
- * pay the ready timeout again. */
-export function interactiveCoolingDown(stateDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env.OC_BOX_INTERACTIVE_COOLDOWN_SEC
-  const seconds = raw && /^[0-9]+$/.test(raw) ? Number(raw) : 600
-  try {
-    const at = Number(readFileSync(join(stateDir, INTERACTIVE_DOWN_MARKER), 'utf8').trim())
-    return Number.isFinite(at) && Date.now() - at < seconds * 1000
-  } catch {
-    return false
-  }
-}
-
-export function noteInteractiveFailure(stateDir: string): void {
-  try {
-    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-    writeFileSync(join(stateDir, INTERACTIVE_DOWN_MARKER), String(Date.now()), { mode: 0o600 })
-  } catch {
-    // Only a cost: the next process tries interactive again.
-  }
 }
 
 function bufferLines(

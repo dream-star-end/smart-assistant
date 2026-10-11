@@ -19,9 +19,9 @@ import {
 
 export type BoxCcRunner = 'p' | 'interactive'
 
-/** The runner the gateway resolved for this bridge (`OC_BOX_CC_RUNNER`, set
- * by stripBoxCcParentAuth from the catalog and the ops override). Anything
- * but `interactive` is `-p`. */
+/** The runner named in the bridge's env (`OC_BOX_CC_RUNNER`, always `interactive` from
+ * stripBoxCcParentAuth). The bridge refuses anything else: a Box login never serves a
+ * product turn through `claude -p` (operator rule 2026-10-11). */
 export function boxCcRunnerFromEnv(env: NodeJS.ProcessEnv): BoxCcRunner {
   return env.OC_BOX_CC_RUNNER === 'interactive' ? 'interactive' : 'p'
 }
@@ -153,11 +153,18 @@ const BOX_CC_PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/s
 /** The kernel refuses any single argv/env string over 128 KiB. */
 const MAX_EXEC_STRING = 120 * 1024
 
+const BOX_LOGIN_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/
+
+/** `profile`: the Box login the master chose. `default` (or none) leaves the launch exactly as
+ * before; another name reaches the host as OC_BOX_CLAUDE_PROFILE, which checks that login on the
+ * Box and runs claude with CLAUDE_CONFIG_DIR=$HOME/.claude-<name>. */
 export function boxCcInteractiveLaunchExec(
   control: BoxCcControl,
   remoteArgs: readonly string[],
   mod: BoxBridgeMod,
+  profile = 'default',
 ): BoxCcExecRequest {
+  if (profile !== 'default' && !BOX_LOGIN_NAME.test(profile)) throw new Error('BOX_INTERACTIVE_PROFILE_INVALID')
   const environment: Record<string, string> = {
     HOME: BOX_CC_HOME,
     PATH: BOX_CC_PATH,
@@ -165,6 +172,7 @@ export function boxCcInteractiveLaunchExec(
     OC_BOX_HOST_PY: mod.hostPy,
     OC_BOX_MOD_FILES: JSON.stringify(mod.files),
     OC_BOX_MOD_SHA256: mod.sha256,
+    ...(profile !== 'default' ? { OC_BOX_CLAUDE_PROFILE: profile } : {}),
   }
   for (const value of Object.values(environment)) {
     if (Buffer.byteLength(value) > MAX_EXEC_STRING) throw new Error('BOX_INTERACTIVE_MOD_TOO_LARGE')

@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { boxClaudeRunner } from '@openclaude/protocol'
+import { boxLoginUrlFromEnv } from './boxLoginClient.js'
 import type { CursorCredentialSelection } from './cursorCredentialSelection.js'
 import { readCursorApiKey } from './cursorSandRelay.js'
 import {
@@ -75,30 +75,23 @@ const STRIPPED_PARENT_AUTH = [
   '_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL',
 ] as const
 
-/** Which Box process a box-claude-* turn gets. The catalog row's `runner`
- * decides; `OC_BOX_INTERACTIVE` (a master knob passed to the container) lets
- * ops force either side: `0` always `-p`, `1` interactive for every row.
- * Interactive always keeps the bridge's automatic `-p` fallback. */
-export function resolveBoxCcRunner(
-  catalogModel: string | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): 'p' | 'interactive' {
-  if (env.OC_BOX_INTERACTIVE === '0') return 'p'
-  if (env.OC_BOX_INTERACTIVE === '1') return 'interactive'
-  return boxClaudeRunner(catalogModel) ?? 'p'
-}
-
 /** The local bridge must not inherit the container's Anthropic route.
- * The box process uses the login the user configures inside the box. */
+ * The box process uses the login the user configures inside the box.
+ * Every Box Claude turn runs the interactive session (operator rule 2026-10-11:
+ * Box Claude logins never serve product turns through `claude -p`). The bridge
+ * keeps only the master's Box login endpoint, derived here before the route is
+ * stripped, so it can ask which login to launch under and report its windows. */
 export function stripBoxCcParentAuth(
   env: Record<string, string>,
   controlPath: string,
-  catalogModel?: string,
 ): Record<string, string> {
+  const loginUrl = boxLoginUrlFromEnv(env)
   const next = { ...env }
-  for (const key of STRIPPED_PARENT_AUTH) delete next[key]
+  // An inherited login endpoint is never trusted: only the one derived above.
+  for (const key of [...STRIPPED_PARENT_AUTH, 'OC_BOX_LOGIN_URL']) delete next[key]
   next.OC_BOX_CC_CONTROL = controlPath
-  next.OC_BOX_CC_RUNNER = resolveBoxCcRunner(catalogModel, env)
+  next.OC_BOX_CC_RUNNER = 'interactive'
+  if (loginUrl) next.OC_BOX_LOGIN_URL = loginUrl
   return next
 }
 
@@ -141,6 +134,8 @@ export async function writeBoxCcControlFile(input: {
     remoteClaude: BOX_CC_REMOTE_CLAUDE,
     fifo: boxCcFifoPath(input.sessionKey),
     cwd: BOX_CC_CWD,
+    // Which Cursor account's Box logins the bridge asks the master to choose from.
+    accountId: input.selection.accountId,
   }
   const dir = input.dir ?? join(tmpdir(), 'oc-box-cc')
   mkdirSync(dir, { recursive: true, mode: 0o700 })
