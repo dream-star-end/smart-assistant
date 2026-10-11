@@ -7151,6 +7151,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/admin/pages/selfheal/__tests__/selfheal.test.tsx",
           "assertion": "加载更多不超过后端上限 200(OCV5-365)"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/selfheal-load-more.node-test.mjs",
+          "assertion": "INC-20261009-SELFHEAL-LOAD-MORE-400: load more stops at the backend cap and the list stays up"
         }
       ]
     },
