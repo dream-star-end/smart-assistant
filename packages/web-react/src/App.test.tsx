@@ -9,6 +9,10 @@ import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
 import { setAuthHint } from './lib/authHint'
 import { prefetchMarkdownImpl } from './components/Markdown'
 import { loadBeforeAll } from './test/moduleLoad'
+import { preloadToolBody } from './components/tool/lazyToolBody'
+
+// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody)
 
 // App 首屏后会在空闲期预取这些懒块(prefetchLazyCentersOnIdle);在用例窗口之外先取好,
 // 冷加载就不计进某一个用例的 15s / findBy 5s(src/test/moduleLoad.ts)。

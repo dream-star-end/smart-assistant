@@ -8,6 +8,10 @@ import { MessageRenderer } from "../MessageRenderer";
 import type { CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
 import { loadBeforeAll } from "../../test/moduleLoad";
+import { preloadToolBody } from "../tool/lazyToolBody";
+
+// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody);
 
 afterEach(() => {
   cleanup();
