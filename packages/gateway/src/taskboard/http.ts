@@ -706,10 +706,12 @@ async function dispatch(
   }
 
   // Read-only view of the project's folder (项目主页 → 文件 → 项目文件夹).
-  const projectWorkspace = path.match(/^\/api\/board\/projects\/([^/]+)\/workspace(\/file)?$/)
+  // Two literal routes (not one optional group) so serverRouteWiring.test.ts can match each against server.ts.
+  const projectWorkspaceFile = path.match(/^\/api\/board\/projects\/([^/]+)\/workspace\/file$/)
+  const projectWorkspace = projectWorkspaceFile ?? path.match(/^\/api\/board\/projects\/([^/]+)\/workspace$/)
   if (projectWorkspace) {
     if (method !== 'GET') return sendError(res, 405, 'method not allowed')
-    return handleProjectWorkspace(res, url, db, decodeURIComponent(projectWorkspace[1]), Boolean(projectWorkspace[2]))
+    return handleProjectWorkspace(res, url, db, decodeURIComponent(projectWorkspace[1]), projectWorkspaceFile !== null)
   }
 
   const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)
