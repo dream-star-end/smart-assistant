@@ -74,6 +74,18 @@ describe("BoxClaudeProfilesModal", () => {
     expect(await screen.findByText(/额度用尽,.*前不参与/)).toBeTruthy();
   });
 
+  test("each bench says why and what to do; the page says logins serve interactive sessions only", async () => {
+    const until = new Date(Date.now() + 3_600_000).toISOString();
+    adminGet.mockResolvedValue(view([{ ...base, cooldown_until: until, cooldown_reason: "login_required" },
+      { ...second, cooldown_until: until, cooldown_reason: "profile_unsafe" }]));
+    open();
+    expect(await screen.findByText(/登录失效,请在 Box 里重新 \/login,.*前不参与/)).toBeTruthy();
+    expect(screen.getByText(/Box 检查未通过\(登录或目录有变\),请重新扫描,.*前不参与/)).toBeTruthy();
+    expect(screen.queryByText(/额度用尽,.*前不参与/)).toBeNull();
+    expect(screen.getByText(/一律交互模式,不走 claude -p/)).toBeTruthy();
+    expect(screen.getByText(/在 \/workspace 里信任一次/)).toBeTruthy();
+  });
+
   test("the same Claude account logged in twice is flagged", async () => {
     adminGet.mockResolvedValue(view([base, { ...second, duplicate_of: "default" }]));
     open();

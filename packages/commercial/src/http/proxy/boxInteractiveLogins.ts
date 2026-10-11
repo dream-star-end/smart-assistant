@@ -10,13 +10,17 @@ import { boxProfileKey } from "./boxClaudeProfile.js";
 import type { BoxProfileRow } from "./boxClaudeProfileStore.js";
 import type { BoxProfileHealth } from "./boxProfileHealth.js";
 import { boxLoginCandidates } from "./boxLoginCandidates.js";
-import { pickBoxProfile, type BoxProfilePolicy } from "./boxProfileScheduler.js";
+import { BOX_PROFILE_POLICY, pickBoxProfile, type BoxProfilePolicy } from "./boxProfileScheduler.js";
 import { BoxProfileSignalTap } from "./boxProfileSignals.js";
 import { rootLogger } from "../../logging/logger.js";
 
 const log = rootLogger.child({ subsys: "box-interactive-logins" });
 const ASSIGNMENT_TTL_MS = 24 * 3_600_000;
 const MAX_ASSIGNMENTS = 10_000;
+/** A chat already on a login stays there (its prompt cache lives with that Claude account, and its
+ * --resume is free there) until the login is benched, deselected, or this close to its window
+ * limit. New chats spill earlier (BOX_PROFILE_POLICY.utilizationCeiling). */
+export const BOX_SESSION_STAY_CEILING = 0.98;
 
 export interface BoxInteractiveLoginDeps {
   /** True when the id is an active Cursor account (the only kind that owns a Box). */
@@ -29,7 +33,9 @@ export interface BoxInteractiveLoginDeps {
 }
 
 export type BoxInteractiveChoice =
-  | { kind: "login"; profile: string; reason: string }
+  | { kind: "login"; profile: string; reason: string; moved?: string;
+      /** Other logins a new launch could move to now (not benched, below the new-chat spill line). */
+      alternatives: number }
   | { kind: "unavailable" }
   | { kind: "unknown_account" };
 
@@ -37,6 +43,8 @@ export class BoxInteractiveLogins {
   private readonly cache = new Map<string, { atMs: number; rows: BoxProfileRow[] }>();
   /** `${uid}:${accountId}:${profile}` -> expiry: only a login handed to this user is reported on. */
   private readonly assigned = new Map<string, number>();
+  /** `${uid}:${accountId}:${session}` -> the login that chat last launched under (and expiry). */
+  private readonly sessions = new Map<string, { profile: string; expires: number }>();
 
   constructor(private readonly deps: BoxInteractiveLoginDeps) {}
 
@@ -60,21 +68,44 @@ export class BoxInteractiveLogins {
     }
   }
 
-  async choose(uid: bigint, accountId: bigint): Promise<BoxInteractiveChoice> {
+  /** `sticky.session`: the chat's stable id; `sticky.prefer`: the login the container says it last ran
+   * on. Either keeps the chat where it was, under the stay rule; neither ever selects a login that
+   * the safety filter, a bench or the admin's selection rules out. */
+  async choose(uid: bigint, accountId: bigint,
+    sticky: { session?: string; prefer?: string } = {}): Promise<BoxInteractiveChoice> {
     if (!(await this.deps.accountActive(accountId))) return { kind: "unknown_account" };
     const own = await this.rows(accountId);
     const candidates = boxLoginCandidates({ accountId, weight: 1, own, health: this.deps.health });
     const load = candidates.reduce((sum, item) => sum + item.loginLoad, 0);
     for (const candidate of candidates) candidate.boxLoad = load;
-    const pick = pickBoxProfile({ candidates, affinityKey: uid.toString(),
-      ...(this.deps.policy ? { policy: this.deps.policy } : {}) });
-    if (!pick) return { kind: "unavailable" };
-    const profile = pick.candidate.profile;
+    const sessionKey = sticky.session ? `${uid}:${accountId}:${sticky.session}` : null;
+    const remembered = sessionKey ? this.sessions.get(sessionKey) : undefined;
+    const previous = sticky.prefer
+      ?? (remembered && remembered.expires > this.now() ? remembered.profile : undefined);
+    const stay = previous === undefined ? undefined : candidates.find((c) => c.profile === previous
+      && !c.cooldownActive && (c.utilization === null || c.utilization < BOX_SESSION_STAY_CEILING));
+    let profile: string;
+    let reason: string;
+    if (stay) {
+      profile = stay.profile;
+      reason = "session";
+    } else {
+      const pick = pickBoxProfile({ candidates, affinityKey: uid.toString(),
+        ...(this.deps.policy ? { policy: this.deps.policy } : {}) });
+      if (!pick) return { kind: "unavailable" };
+      profile = pick.candidate.profile;
+      reason = pick.reason;
+    }
     this.deps.health.recordLaunch(boxProfileKey(accountId, profile));
     this.remember(`${uid}:${accountId}:${profile}`);
+    if (sessionKey) this.rememberSession(sessionKey, profile);
+    const moved = previous !== undefined && previous !== profile ? previous : undefined;
+    const ceiling = (this.deps.policy ?? BOX_PROFILE_POLICY).utilizationCeiling;
+    const alternatives = candidates.filter((c) => c.profile !== profile && !c.cooldownActive
+      && (c.utilization === null || c.utilization < ceiling)).length;
     log.info("box_interactive_login_picked", { accountId: accountId.toString(), profile,
-      reason: pick.reason, candidates: candidates.length });
-    return { kind: "login", profile, reason: pick.reason };
+      reason, candidates: candidates.length, ...(moved ? { movedFrom: moved } : {}) });
+    return { kind: "login", profile, reason, alternatives, ...(moved ? { moved } : {}) };
   }
 
   /** Applies a turn's report to the login's health. False when this user was never handed that
@@ -90,6 +121,16 @@ export class BoxInteractiveLogins {
     for (const line of report.lines) tap.push(`${line}\n`);
     tap.end();
     return true;
+  }
+
+  private rememberSession(key: string, profile: string): void {
+    const at = this.now();
+    this.sessions.delete(key);
+    this.sessions.set(key, { profile, expires: at + ASSIGNMENT_TTL_MS });
+    for (const [old, entry] of this.sessions) {
+      if (this.sessions.size <= MAX_ASSIGNMENTS) break;
+      if (entry.expires <= at || this.sessions.size > MAX_ASSIGNMENTS) this.sessions.delete(old);
+    }
   }
 
   private remember(id: string): void {

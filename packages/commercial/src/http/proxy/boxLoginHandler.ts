@@ -1,5 +1,5 @@
 /** Internal, container-authenticated Box login endpoints for the interactive session route:
- *   POST /internal/box/login          {account_id}                      -> {profile}
+ *   POST /internal/box/login          {account_id, session?, prefer?}    -> {profile, alternatives}
  *   POST /internal/box/login-signals  {account_id, profile, lines, unsafe?} -> {recorded}
  * The uid always comes from the container identity, never from the body. Not part of the public
  * Anthropic Messages API. */
@@ -11,6 +11,7 @@ export const BOX_LOGIN_PATH = "/internal/box/login";
 export const BOX_LOGIN_SIGNALS_PATH = "/internal/box/login-signals";
 const ACCOUNT = /^[1-9][0-9]{0,18}$/;
 const PROFILE = /^(default|[a-z0-9][a-z0-9-]{0,31})$/;
+const SESSION = /^[a-f0-9]{16}$/;
 const MAX_LINES = 16;
 const MAX_LINE_BYTES = 65_536;
 const MAX_BODY_BYTES = 300 * 1024;
@@ -90,9 +91,17 @@ export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
     }
     const accountId = BigInt(body.account_id);
     if (path === BOX_LOGIN_PATH) {
-      if (Object.keys(body).length !== 1) { reply(res, 400, { error: "INVALID_REQUEST" }); return; }
+      if (Object.keys(body).some((key) => !["account_id", "session", "prefer"].includes(key))
+        || (body.session !== undefined && (typeof body.session !== "string" || !SESSION.test(body.session)))
+        || (body.prefer !== undefined && (typeof body.prefer !== "string" || !PROFILE.test(body.prefer)))) {
+        reply(res, 400, { error: "INVALID_REQUEST" }); return;
+      }
       let choice: Awaited<ReturnType<BoxInteractiveLogins["choose"]>>;
-      try { choice = await deps.logins.choose(identity.uid, accountId); }
+      try {
+        choice = await deps.logins.choose(identity.uid, accountId, {
+          ...(body.session !== undefined ? { session: body.session as string } : {}),
+          ...(body.prefer !== undefined ? { prefer: body.prefer as string } : {}) });
+      }
       catch {
         // The selection could not be read (and no read from the last 60s is cached). The
         // container then launches its default login, as every Box session did before logins.
@@ -100,7 +109,7 @@ export function makeBoxLoginHandler(deps: { identity: IdentityStrategy;
       }
       if (choice.kind === "unknown_account") { reply(res, 404, { error: "NOT_FOUND" }); return; }
       if (choice.kind === "unavailable") { reply(res, 503, { error: "BOX_LOGIN_UNAVAILABLE" }); return; }
-      reply(res, 200, { profile: choice.profile });
+      reply(res, 200, { profile: choice.profile, alternatives: choice.alternatives });
       return;
     }
     if (typeof body.profile !== "string" || !PROFILE.test(body.profile)) {

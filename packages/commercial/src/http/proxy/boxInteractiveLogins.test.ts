@@ -23,9 +23,25 @@ function logins(rows: BoxProfileRow[] | (() => Promise<BoxProfileRow[]>), opts: 
   return { service, health };
 }
 
+/** A choice without its `alternatives` count (asserted on its own below). */
+function brief(choice: unknown): unknown {
+  const { alternatives: _count, ...rest } = choice as { alternatives?: number };
+  return rest;
+}
+
+test("the answer says how many other logins a launch could move to now", async () => {
+  const { service, health } = logins([row("default"), row("account2"), row("off", { enabled: false })]);
+  const first = await service.choose(3n, ACCOUNT) as { profile: string; alternatives: number };
+  assert.equal(first.alternatives, 1, "the other enabled login; a disabled one never counts");
+  const other = first.profile === "default" ? "account2" : "default";
+  health.observe(`25:${other}`, { kind: "rate_limit", status: "allowed", utilization: 0.95, resetsAtMs: null });
+  assert.equal((await service.choose(3n, ACCOUNT, { prefer: first.profile }) as { alternatives: number }).alternatives, 0,
+    "a login past the new-chat spill line is no place to move a chat to");
+});
+
 test("an account with no saved logins runs its default login", async () => {
   const { service } = logins([]);
-  assert.deepEqual(await service.choose(3n, ACCOUNT), { kind: "login", profile: "default", reason: "affinity" });
+  assert.deepEqual(brief(await service.choose(3n, ACCOUNT)), { kind: "login", profile: "default", reason: "affinity" });
 });
 
 test("only enabled, logged-in, shared logins are chosen; one user keeps one login", async () => {
@@ -56,14 +72,51 @@ test("a login benched by its own reported window spills to the other; nothing us
   assert.equal((await service.choose(uid, ACCOUNT) as { profile: string }).profile, "account2", "the benched login is skipped");
   // account2 refused on the Box as well: only the quota-benched default is still worth a try.
   assert.equal(service.observe(uid, ACCOUNT, "account2", { lines: [], unsafe: true }), true);
-  assert.deepEqual(await service.choose(uid, ACCOUNT), { kind: "login", profile: "default", reason: "quota_benched" });
+  assert.deepEqual(brief(await service.choose(uid, ACCOUNT)), { kind: "login", profile: "default", reason: "quota_benched" });
   // A logged-out default leaves nothing.
   const notLoggedIn = JSON.stringify({ type: "assistant", message: { model: "<synthetic>",
     content: [{ type: "text", text: "Not logged in · Please run /login" }] } });
   assert.equal(service.observe(uid, ACCOUNT, "default", { lines: [notLoggedIn], unsafe: false }), true);
-  assert.deepEqual(await service.choose(uid, ACCOUNT), { kind: "unavailable" });
+  assert.deepEqual(brief(await service.choose(uid, ACCOUNT)), { kind: "unavailable" });
   at += 2 * 3_600_000;
   assert.equal((await service.choose(uid, ACCOUNT)).kind, "login", "benches expire");
+});
+
+test("a chat stays on its login across restarts (prompt cache, free --resume) until it must move", async () => {
+  let at = 1_791_700_000_000;
+  const rows = [row("default"), row("account2")];
+  const { service, health } = logins(async () => rows, { now: () => (at += 1) });
+  const session = "0123456789abcdef";
+  const allowed = (u: number) => JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", utilization: u } });
+  // Find a user whose affinity is default, then pin one of their chats to account2 (it ran there before).
+  let uid = 1n;
+  while ((await service.choose(uid, ACCOUNT) as { profile: string }).profile !== "default") uid++;
+  assert.deepEqual(brief(await service.choose(uid, ACCOUNT, { session, prefer: "account2" })),
+    { kind: "login", profile: "account2", reason: "session" }, "the container's record wins over affinity");
+  // Past the new-chat spill line (0.92) the chat still stays; new chats of this user stay on default anyway.
+  service.observe(uid, ACCOUNT, "account2", { lines: [allowed(0.95)], unsafe: false });
+  assert.equal(health.utilization("25:account2"), 0.95);
+  assert.deepEqual(brief(await service.choose(uid, ACCOUNT, { session })), { kind: "login", profile: "account2", reason: "session" },
+    "the master remembers the chat when the container lost its record");
+  // At the stay ceiling it moves (once), and says where from.
+  service.observe(uid, ACCOUNT, "account2", { lines: [allowed(0.985)], unsafe: false });
+  assert.deepEqual(brief(await service.choose(uid, ACCOUNT, { session, prefer: "account2" })),
+    { kind: "login", profile: "default", reason: "affinity", moved: "account2" });
+  assert.deepEqual(brief(await service.choose(uid, ACCOUNT, { session, prefer: "default" })),
+    { kind: "login", profile: "default", reason: "session" }, "then it stays on the new login");
+  // A benched login is left.
+  const rejected = JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "rejected", resetsAt: Math.floor(at / 1000) + 3600 } });
+  service.observe(uid, ACCOUNT, "default", { lines: [rejected], unsafe: false });
+  assert.equal((await service.choose(uid, ACCOUNT, { session, prefer: "default" }) as { moved?: string }).moved, "default");
+});
+
+test("a remembered or suggested login never overrides the safety filter or the admin's selection", async () => {
+  const rows = [row("default"), row("account2", { enabled: false }), row("own", { projectsMode: "own" })];
+  const { service } = logins(rows);
+  for (const prefer of ["account2", "own", "ghost"]) {
+    assert.deepEqual(brief(await service.choose(3n, ACCOUNT, { session: "0123456789abcdef", prefer })),
+      { kind: "login", profile: "default", reason: "affinity", moved: prefer }, prefer);
+  }
 });
 
 test("a report counts only for a login this user was handed", async () => {
@@ -79,12 +132,12 @@ test("a report counts only for a login this user was handed", async () => {
 });
 
 test("unknown account, and a store failure without a recent read", async () => {
-  assert.deepEqual(await logins([row("default")], { active: false }).service.choose(3n, ACCOUNT), { kind: "unknown_account" });
+  assert.deepEqual(brief(await logins([row("default")], { active: false }).service.choose(3n, ACCOUNT)), { kind: "unknown_account" });
   let fail = false;
   let at = 1_791_700_000_000;
   const { service } = logins(async () => { if (fail) throw new Error("db down"); return [row("default"), row("account2", { enabled: false })]; },
     { now: () => at });
-  assert.deepEqual(await service.choose(3n, ACCOUNT), { kind: "login", profile: "default", reason: "affinity" });
+  assert.deepEqual(brief(await service.choose(3n, ACCOUNT)), { kind: "login", profile: "default", reason: "affinity" });
   fail = true;
   at += 30_000;
   assert.equal((await service.choose(3n, ACCOUNT)).kind, "login", "a read from the last 60s is reused");
@@ -121,13 +174,17 @@ async function call(handler: ReturnType<typeof makeBoxLoginHandler>, path: strin
 const container = { resolve: async () => ({ uid: 3n, containerId: 7n }) } as never;
 
 test("POST /internal/box/login: the uid comes from the container identity; the answer is a login name", async () => {
-  const asked: Array<[bigint, bigint]> = [];
+  const asked: Array<[bigint, bigint, unknown]> = [];
   const handler = makeBoxLoginHandler({ identity: container, logins: {
-    choose: async (uid, accountId) => { asked.push([uid, accountId]); return { kind: "login", profile: "account2", reason: "affinity" }; },
+    choose: async (uid, accountId, sticky) => { asked.push([uid, accountId, sticky]); return { kind: "login", profile: "account2", reason: "affinity" }; },
     observe: () => true } });
   assert.deepEqual(await call(handler, "/internal/box/login", { account_id: "25" }), { status: 200, result: { profile: "account2" } });
-  assert.deepEqual(asked, [[3n, 25n]]);
-  for (const body of [{}, { account_id: 25 }, { account_id: "025" }, { account_id: "25", uid: "1" }, []]) {
+  assert.deepEqual(asked, [[3n, 25n, {}]]);
+  assert.deepEqual(await call(handler, "/internal/box/login", { account_id: "25", session: "0123456789abcdef", prefer: "default" }),
+    { status: 200, result: { profile: "account2" } });
+  assert.deepEqual(asked[1], [3n, 25n, { session: "0123456789abcdef", prefer: "default" }]);
+  for (const body of [{}, { account_id: 25 }, { account_id: "025" }, { account_id: "25", uid: "1" }, [],
+    { account_id: "25", session: "XYZ" }, { account_id: "25", prefer: "../x" }, { account_id: "25", session: 1 }]) {
     assert.equal((await call(handler, "/internal/box/login", body)).status, 400, JSON.stringify(body));
   }
   assert.equal((await call(handler, "/internal/box/login", null, "GET")).status, 404);

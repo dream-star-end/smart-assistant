@@ -36,13 +36,19 @@ test('the login endpoint comes only from the master route the container already 
 
 test('requestBoxLogin asks the egress with the container token and returns the chosen login', async () => {
   const { calls, fetchImpl } = recorder(200, { profile: 'account2' })
-  assert.deepEqual(await requestBoxLogin({ accountId: '25' }, { env: ENV, fetchImpl }), { profile: 'account2', source: 'master' })
+  assert.deepEqual(await requestBoxLogin({ accountId: '25' }, { env: ENV, fetchImpl }), { profile: 'account2', source: 'master', alternatives: 0 })
+  assert.equal((await requestBoxLogin({ accountId: '25' }, { env: ENV, fetchImpl: recorder(200, { profile: 'default', alternatives: 1 }).fetchImpl }))
+    .alternatives, 1)
   assert.equal(calls.length, 1)
   assert.equal(calls[0]!.url, `${ORIGIN}${BOX_LOGIN_PATH}`)
   assert.equal(calls[0]!.init.method, 'POST')
   assert.equal(calls[0]!.init.redirect, 'error')
   assert.equal((calls[0]!.init.headers as Record<string, string>).authorization, 'Bearer oc-v3.c1.secret')
   assert.deepEqual(JSON.parse(String(calls[0]!.init.body)), { account_id: '25' })
+  await requestBoxLogin({ accountId: '25', session: '0123456789abcdef', prefer: 'account2' }, { env: ENV, fetchImpl })
+  assert.deepEqual(JSON.parse(String(calls[1]!.init.body)), { account_id: '25', session: '0123456789abcdef', prefer: 'account2' })
+  await requestBoxLogin({ accountId: '25', session: 'not-a-hash', prefer: '../x' }, { env: ENV, fetchImpl })
+  assert.deepEqual(JSON.parse(String(calls[2]!.init.body)), { account_id: '25' }, 'malformed hints are dropped, not sent')
 })
 
 test('requestBoxLogin falls back to the default login when it cannot ask, and fails only on "nothing usable"', async () => {
@@ -55,7 +61,7 @@ test('requestBoxLogin falls back to the default login when it cannot ask, and fa
     fetchImpl: never }), fallback, 'no valid token')
   const tokenFile = await requestBoxLogin({ accountId: '25' }, { env: { OC_BOX_LOGIN_URL: ORIGIN,
     OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: '/run/token' }, readFile: () => 'oc-v3.f.secret\n', fetchImpl: recorder(200, { profile: 'default' }).fetchImpl })
-  assert.deepEqual(tokenFile, { profile: 'default', source: 'master' })
+  assert.deepEqual(tokenFile, { profile: 'default', source: 'master', alternatives: 0 })
   for (const [status, body] of [[404, { error: 'NOT_FOUND' }], [500, {}], [200, { profile: '../x' }], [200, {}],
     [503, { error: 'BOX_LOGIN_STORE_UNAVAILABLE' }]] as const) {
     assert.deepEqual(await requestBoxLogin({ accountId: '25' }, { env: ENV, fetchImpl: recorder(status, body).fetchImpl }), fallback,

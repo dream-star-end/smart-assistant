@@ -18,6 +18,8 @@ export const BOX_LOGIN_SIGNALS_PATH = '/internal/box/login-signals'
 export const BOX_DEFAULT_LOGIN = 'default'
 const PROFILE = /^(default|[a-z0-9][a-z0-9-]{0,31})$/
 const ACCOUNT = /^[1-9][0-9]{0,18}$/
+/** A chat session's stable id across bridge restarts (the hash in its fifo name). */
+const SESSION = /^[a-f0-9]{16}$/
 /** Lines a turn may report: the plan-window line and the CLI's synthetic notices. */
 const MAX_SIGNAL_LINES = 16
 const MAX_SIGNAL_LINE_BYTES = 65_536
@@ -64,12 +66,15 @@ function endpoint(env: NodeJS.ProcessEnv, readFile: (path: string) => string, pa
   return origin && token ? { url: `${origin}${path}`, token } : null
 }
 
-/** The login to launch under. `default` when the account has no saved logins, or when the master
- * cannot be asked (no internal route, an older master without the endpoint, a network failure):
- * the default login is the one every Box session used before logins existed. Only an explicit
- * "nothing usable" from the master fails the turn (BoxLoginUnavailableError). */
-export async function requestBoxLogin(input: { accountId: string | undefined }, deps: Deps = {}):
-  Promise<{ profile: string; source: 'master' | 'fallback' }> {
+/** The login to launch under. `session` and `prefer` (the login this chat last ran on) let the
+ * master keep a chat on its login across restarts, so --resume lands where its prompt cache is.
+ * `default` when the account has no saved logins, or when the master cannot be asked (no internal
+ * route, an older master without the endpoint, a network failure): the default login is the one
+ * every Box session used before logins existed. Only an explicit "nothing usable" from the master
+ * fails the turn (BoxLoginUnavailableError). */
+export async function requestBoxLogin(input: { accountId: string | undefined; session?: string; prefer?: string },
+  deps: Deps = {}):
+  Promise<{ profile: string; source: 'master' | 'fallback'; alternatives?: number }> {
   const fallback = { profile: BOX_DEFAULT_LOGIN, source: 'fallback' as const }
   if (!input.accountId || !ACCOUNT.test(input.accountId)) return fallback
   const env = deps.env ?? process.env
@@ -81,8 +86,10 @@ export async function requestBoxLogin(input: { accountId: string | undefined }, 
       method: 'POST',
       redirect: 'error',
       headers: { authorization: `Bearer ${target.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ account_id: input.accountId }),
-      signal: AbortSignal.timeout(deps.timeoutMs ?? 10_000),
+      body: JSON.stringify({ account_id: input.accountId,
+        ...(input.session && SESSION.test(input.session) ? { session: input.session } : {}),
+        ...(input.prefer && PROFILE.test(input.prefer) ? { prefer: input.prefer } : {}) }),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 3_000),
     })
   } catch { return fallback }
   let body: unknown
@@ -90,7 +97,9 @@ export async function requestBoxLogin(input: { accountId: string | undefined }, 
   const record = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {}
   if (response.status === 503 && record.error === 'BOX_LOGIN_UNAVAILABLE') throw new BoxLoginUnavailableError()
   if (!response.ok || typeof record.profile !== 'string' || !PROFILE.test(record.profile)) return fallback
-  return { profile: record.profile, source: 'master' }
+  const alternatives = typeof record.alternatives === 'number' && Number.isSafeInteger(record.alternatives)
+    && record.alternatives >= 0 ? record.alternatives : 0
+  return { profile: record.profile, source: 'master', alternatives }
 }
 
 /** Best effort: what this turn's output said about the login (plan windows, a CLI notice), or that
@@ -113,7 +122,7 @@ export async function reportBoxLoginSignals(
       headers: { authorization: `Bearer ${target.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ account_id: input.accountId, profile: input.profile, lines,
         ...(input.unsafe ? { unsafe: true } : {}) }),
-      signal: AbortSignal.timeout(deps.timeoutMs ?? 5_000),
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 3_000),
     })
     await response.arrayBuffer().catch(() => undefined)
     return response.ok

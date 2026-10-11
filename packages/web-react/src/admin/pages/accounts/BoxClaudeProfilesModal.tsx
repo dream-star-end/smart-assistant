@@ -38,9 +38,15 @@ function reasonText(p: BoxClaudeProfile): string {
   return NOT_SELECTABLE_REASON[p.projects_mode] ?? "不可用";
 }
 
+const COOLDOWN_REASON: Record<string, string> = {
+  quota_exhausted: "额度用尽",
+  login_required: "登录失效,请在 Box 里重新 /login",
+  profile_unsafe: "Box 检查未通过(登录或目录有变),请重新扫描",
+};
+
 function Health({ p, ceiling }: { p: BoxClaudeProfile; ceiling: number }) {
   if (p.cooldown_until) {
-    const why = p.cooldown_reason === "login_required" ? "登录失效" : "额度用尽";
+    const why = COOLDOWN_REASON[p.cooldown_reason ?? ""] ?? "暂停使用";
     return <Badge tone="danger">{`${why},${fmtDateTime(p.cooldown_until)} 前不参与`}</Badge>;
   }
   if (p.utilization === null) return <span className="text-muted">暂无数据</span>;
@@ -49,7 +55,7 @@ function Health({ p, ceiling }: { p: BoxClaudeProfile; ceiling: number }) {
     <div className="flex min-w-32 items-center gap-2">
       <Progress value={pct} size="sm" tone={p.utilization >= ceiling ? "warning" : "neutral"} className="w-20" />
       <span className="tabular-nums">{pct}%</span>
-      {p.utilization >= ceiling && <Badge tone="warning">接近上限</Badge>}
+      {p.utilization >= ceiling && <Badge tone="warning" title="新对话会改用其它已勾选的登录">接近上限</Badge>}
     </div>
   );
 }
@@ -221,7 +227,7 @@ export function BoxClaudeProfilesModal({
         </div>
       ),
     },
-    { key: "health", title: "5 小时额度", render: (p) => <Health p={p} ceiling={ceiling} /> },
+    { key: "health", title: "额度使用(5 小时 / 7 天取较高)", render: (p) => <Health p={p} ceiling={ceiling} /> },
   ];
 
   return (
@@ -234,7 +240,10 @@ export function BoxClaudeProfilesModal({
     >
       <div className="flex flex-col gap-3">
         <p className="text-caption text-muted">
-          勾选的登录会一起参与调度:同一用户尽量固定用同一个(利于缓存和会话续接),只有该登录额度用尽、登录失效或过忙时才换到其它已勾选的登录,恢复后自动换回。默认登录用于无用户标识的请求,并在负载均衡时略有优先。
+          勾选的登录用于 Box Claude 的交互会话(box-claude-* 模型,一律交互模式,不走 claude -p);box-api-claude-* 只用默认登录。
+          同一用户的新对话尽量落在同一个登录;进行中的对话会一直留在原登录(复用提示缓存和 --resume),
+          直到该登录额度用尽、登录失效或 Box 检查未通过才换到其它已勾选的登录,换号后接着原对话继续。
+          新对话在登录用到 {Math.round(ceiling * 100)}% 时就改用其它登录。
         </p>
         {error && <Alert tone="danger">{error}</Alert>}
         {data?.available === false && (
@@ -257,6 +266,10 @@ export function BoxClaudeProfilesModal({
           <ol className="mt-1 list-decimal pl-5">
             <li>在这个 Box 的终端里:mkdir -p ~/.claude-名称(名称只含小写字母、数字和连字符)</li>
             <li>CLAUDE_CONFIG_DIR=~/.claude-名称 claude,按提示 /login 登录要加入的账号。</li>
+            <li>
+              在 /workspace 里信任一次:cd /workspace &amp;&amp; CLAUDE_CONFIG_DIR=~/.claude-名称 claude,出现“trust this folder”时选
+              “Yes, I trust this folder”,然后退出。不做这一步,交互会话会在启动时停在这个确认框上而失败。
+            </li>
             <li>回到这里点“扫描”,勾选新出现的登录并保存。不要把含有自己会话记录的目录(如开发用的账号目录)勾进来。</li>
           </ol>
         </details>

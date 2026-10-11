@@ -10,6 +10,8 @@ Every Box Claude turn (`box-claude-*`, all four rows `runner: 'interactive'`) ru
 - the mod cannot be loaded or sent (`BOX_INTERACTIVE_NOT_READY BOX_INTERACTIVE_MOD_*`);
 - held input before READY exceeded `OC_BOX_INTERACTIVE_HOLD_MAX_BYTES` (default 64 MiB) (`BOX_INTERACTIVE_ABANDON held_overflow`).
 
+Before giving up, the bridge retries once, transparently, when nothing ran: a host that did not come up (`BOX_INTERACTIVE_RETRY not_ready`) is launched again; a login the Box refused (`BOX_INTERACTIVE_RETRY profile_unsafe`) is reported first, so the master benches it and the retry gets another login. A launch that cannot be built (mod too large) or held input over the cap is not retried. When the turn does fail, the user gets one plain failure line (`Claude 暂时繁忙，这条消息没有完成，请稍后再发一次。`, a `result` with `is_error`), never a quota, window or account detail, and the bridge exits 0 (a finished turn, not a crash; the runner's crash backoff is not touched). The same wording replaces any quota or login notice the CLI writes into a chat.
+
 After READY, a failed write or a dead host ends the bridge; the next turn resumes. The former `OC_BOX_INTERACTIVE=0` switch-back and the container cooldown marker are gone (OCV5-378). Rolling back to `-p` would take a code change and the operator's decision.
 
 ## Which Box login a session uses
