@@ -16,8 +16,8 @@ import {
 
 const v1: ConnectorsResponse = {
   providers: [
-    { id: 'webdav', label: 'WebDAV 网盘', description: '浏览目录', authKind: 'basic', formFields: [] },
-    { id: 'github', label: 'GitHub (v1)', description: 'v1', authKind: 'oauth2', formFields: [] },
+    { id: 'webdav', label: 'WebDAV 网盘', description: '浏览目录', authKind: 'basic_form', formFields: [] },
+    { id: 'github', label: 'GitHub (v1)', description: 'v1', authKind: 'oauth2_byoa', formFields: [] },
   ],
   connections: [],
 }
