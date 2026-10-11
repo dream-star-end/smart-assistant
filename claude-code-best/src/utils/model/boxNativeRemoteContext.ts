@@ -9,15 +9,18 @@ export const BOX_NATIVE_CONTEXT_MODELS: readonly string[] = [
   'box-api-claude-haiku-4-5',
   'box-api-claude-haiku-5-5',
 ]
-/** OCV5-368: official output cap of the Box API models whose CCB default must
- * be that cap, not the generic 32k. The Box CLI's own catalog runs these
- * models at default = upper = 128000; at 32000 a final answer at high effort
- * spent the whole cap on thinking (commercial #8bbb12ed). Mirror of
- * maxOutputTokens in packages/protocol/src/boxApiModels.ts; boxApiModels.test.ts
- * there compares the two. */
+/** OCV5-368: official output cap of every Box API model; CCB uses it as both
+ * default and upper limit instead of the generic 32k/64k. At 32000 a final
+ * answer at high effort spent the whole cap on thinking (commercial #8bbb12ed).
+ * The Box CLI accepts each value: its catalog upper limit is 128000 for the
+ * 5.5 models and 64000 for Haiku 4.5. Mirror of maxOutputTokens in
+ * packages/protocol/src/boxApiModels.ts; boxApiModels.test.ts there compares
+ * the two. */
 export const BOX_API_OUTPUT_TOKENS: Readonly<Record<string, number>> = {
   'box-api-claude-opus-5-5': 128_000,
   'box-api-claude-sonnet-5-5': 128_000,
+  'box-api-claude-haiku-4-5': 64_000,
+  'box-api-claude-haiku-5-5': 128_000,
 }
 /** One listed model, kept for tests. */
 export const BOX_NATIVE_CONTEXT_MODEL = BOX_NATIVE_CONTEXT_MODELS[0]!
