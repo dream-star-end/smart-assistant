@@ -145,8 +145,21 @@ export function Media({
 
 // ── 复制 ──────────────────────────────────────────────────────────────
 
-export function CopyButton({ getText, label = "复制" }: { getText: () => string; label?: string }) {
+/** 「已复制」状态亮 1.5 秒;卸载时清掉计时器,不在卸载后(或测试环境拆掉后)再 setState。 */
+export function useCopiedFlag(): [boolean, () => void] {
   const [done, setDone] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const flash = () => {
+    setDone(true);
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setDone(false), 1500);
+  };
+  return [done, flash];
+}
+
+export function CopyButton({ getText, label = "复制" }: { getText: () => string; label?: string }) {
+  const [done, flash] = useCopiedFlag();
   return (
     <button
       type="button"
@@ -156,8 +169,7 @@ export function CopyButton({ getText, label = "复制" }: { getText: () => strin
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(getText());
-          setDone(true);
-          setTimeout(() => setDone(false), 1500);
+          flash();
         } catch {
           /* 剪贴板不可用(非安全上下文):静默 */
         }

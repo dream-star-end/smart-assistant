@@ -7,7 +7,7 @@ import { cn } from "../../lib/utils";
 import { countWords, diffText } from "./diff";
 import { uiIcon } from "./icons";
 import type { DraftSpec, OutlineNode, OutlineSpec, SourcesSpec } from "./schema";
-import { Frame, Inline, Segmented } from "./shell";
+import { Frame, Inline, Segmented, useCopiedFlag } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; nested?: boolean };
@@ -281,7 +281,7 @@ export function OutlineBlock({ spec, notes, streaming, nested }: BlockProps<Outl
 const KIND_LABEL = { email: "邮件", message: "消息", post: "帖子", doc: "文档" } as const;
 
 function CopyTextButton({ getText, label, disabled, primary }: { getText: () => string; label: string; disabled?: boolean; primary?: boolean }) {
-  const [done, setDone] = useState(false);
+  const [done, flash] = useCopiedFlag();
   return (
     <button
       type="button"
@@ -292,8 +292,7 @@ function CopyTextButton({ getText, label, disabled, primary }: { getText: () => 
       onClick={async () => {
         try {
           await navigator.clipboard.writeText(getText());
-          setDone(true);
-          setTimeout(() => setDone(false), 1500);
+          flash();
         } catch {
           /* 剪贴板不可用(非安全上下文):静默 */
         }
