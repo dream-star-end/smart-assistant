@@ -89,6 +89,10 @@ function forbidTaskboardEntryImport(): Plugin {
  * MessageFeedbackDialog / ProjectSettingsDialog(+ProjectAssetsPanel)改 React.lazy,订阅意图 /
  * 项目色板两处小常量下沉到 lib 以断开红卡 / 侧栏对弹窗的静态边 → 实测 445.5KB(余 14.5KB)。
  * 详见 docs/audit/shell.md §9。
+ * 2026-10-11 OCV5-376:余量只剩 1.2KB。名为 styles 的 82KB chunk 其实是 api.ts + protocol + TypeBox +
+ * tailwind-merge 的 JS;ProcessDisclosure / lineDiff / agentNames 也只是 rolldown 借来的块名,装的是
+ * 聊天卡片、工具摘要和 chat/model·render,首屏渲染离不开,不移出。改为让 protocol 可摇树(见下方
+ * rolldownOptions.treeshake)→ 460.6KB,余 10.5KB,阈值不动。每次构建打印一行当前体量与余量。
  * 纯函数与单测在 src/lib/firstScreenBudget。
  */
 const FIRST_SCREEN_GZIP_BUDGET = 471040;
@@ -117,6 +121,11 @@ function firstScreenBudget(): Plugin {
       if (report.overBudget) {
         throw new Error(`first-screen-budget:\n${describeFirstScreenBudget(report)}`);
       }
+      // 每次构建都把余量摆出来,而不是等超了才看到(OCV5-376)。
+      console.log(
+        `first-screen-budget: ${report.totalGzipBytes} / ${FIRST_SCREEN_GZIP_BUDGET} bytes gzip, ` +
+          `margin ${FIRST_SCREEN_GZIP_BUDGET - report.totalGzipBytes}`,
+      );
     },
   };
 }
@@ -162,6 +171,12 @@ export default defineConfig(() => {
       //  is-plain-obj / extend）」一并圈进同一块、从而经该 util 在 entry 建立静态边、把整块
       //  markdown 拽回首屏的风险（已实测复现）。故让动态 import 自然成块，最稳。
       rolldownOptions: {
+        // 首屏只用 protocol 的类型、常量和少数纯函数,但 frames/events/research 等模块顶层用
+        // TypeBox 建了上百个 schema(Type.Object/Union/...)。打包器不知道这些调用无副作用,
+        // 用不到也整段保留,TypeBox 跟着进首屏(OCV5-376 P4)。声明 Type.* 为纯调用,配合
+        // packages/protocol 的 "sideEffects": false(模块顶层只有常量/正则/schema,无注册类副作用),
+        // 用不到的 schema 和模块就能摇掉:首屏 gzip 469.9KB → 460.6KB(预算 460.0KiB 不动)。
+        treeshake: { manualPureFunctions: ["Type"] },
         input: {
           main: fileURLToPath(new URL("./index.html", import.meta.url)),
           admin: fileURLToPath(new URL("./admin.html", import.meta.url)),
