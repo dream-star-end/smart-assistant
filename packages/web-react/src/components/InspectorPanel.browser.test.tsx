@@ -6,7 +6,12 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
+import { loadBeforeAll } from "../test/moduleLoad";
 import { InspectorPanelContent, PANE_TAB_STORAGE_KEY } from "./InspectorPanel";
+import { preloadToolBody } from "./tool/lazyToolBody";
+
+// 「详情」进步骤页会渲染工具卡展开体(懒加载);先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody);
 
 afterEach(cleanup);
 beforeEach(() => {
