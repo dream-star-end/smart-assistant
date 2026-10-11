@@ -1,3 +1,4 @@
+-- order-dependency: 0300_box_claude_haiku_5_5
 -- 0302 — 项目工作空间(个人版 P2):项目可归档、可置顶、带创建模板,删除可在 30 天内恢复。
 --
 -- archived_at / pinned_at:epoch ms(对齐 0230)。归档只是不在侧栏主列表显示,
