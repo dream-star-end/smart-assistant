@@ -13,8 +13,8 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
 Usage: oc-connect <command> [options]
 
 Commands:
-  list                                    列出已绑定的应用连接与可用操作
-  catalog [query]                         列出可绑定的应用连接器(可选关键词搜索)
+  list                                    列出已绑定的插件账号与可用操作
+  catalog [query]                         列出可绑定的插件(可选关键词搜索)
   call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)
 
 Options (call):

@@ -236,7 +236,7 @@ export const PRODUCT_CAPABILITIES = {
   connectors: {
     id: "connectors",
     title: "管理插件的外部应用账号",
-    shortTitle: "插件账号",
+    shortTitle: "插件",
     category: "extend",
     icon: "plug",
     aliases: ["插件", "连接器", "Notion", "飞书", "GitHub", "OAuth", "外部应用", "API"],

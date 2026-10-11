@@ -4585,9 +4585,9 @@ export function App() {
             autoAuthorizePluginSlug={manageAutoAuthorizePluginSlug}
             onAutoAuthorizeConsumed={() => setManageAutoAuthorizePluginSlug(null)}
             onTabChange={(next) => setManageTab(normalizeManageTab(next))}
-            onOpenMarketplace={() => {
+            onOpenMarketplace={(kind) => {
               setManageOpen(false);
-              openMarketplace("browse", "connector");
+              openMarketplace("browse", kind);
             }}
             // 「怎么用」：openTutorial 自己会先收起管理中心，避免两层弹层叠加。
             onOpenHelp={(featureId) => openTutorial(featureId)}

@@ -865,7 +865,7 @@ function MarketCard({ tool }: { tool: ToolLike }) {
   }
   if (items.length === 0) return null;
   return (
-    <CardShell icon={<Package className="size-4" />} title="技能市场" subtitle={`${items.length} 项`}>
+    <CardShell icon={<Package className="size-4" />} title="AI 市场" subtitle={`${items.length} 项`}>
       <MarketItems items={items} />
     </CardShell>
   );

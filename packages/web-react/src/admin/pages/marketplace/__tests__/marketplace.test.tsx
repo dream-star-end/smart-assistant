@@ -89,7 +89,7 @@ describe("MarketplacePage", () => {
   test("默认「审核」tab:PageHeader + 复用 ReviewPanel（空待审 + 下架框）", async () => {
     renderPage(<MarketplacePage />);
 
-    expect(screen.getByText("技能市场")).toBeInTheDocument();
+    expect(screen.getByText("AI 市场")).toBeInTheDocument();
     expect(await screen.findByText("暂无待审版本")).toBeInTheDocument();
     // ReviewPanel 内的 AI 审批记录折叠区 + 下架 kill-switch
     expect(screen.getByText("AI 审批记录")).toBeInTheDocument();

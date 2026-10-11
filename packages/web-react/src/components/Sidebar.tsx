@@ -1208,7 +1208,7 @@ export function Sidebar({
                 >
                   <LayoutGrid size={16} className="shrink-0 text-muted" />
                   <span className="flex-1">管理中心</span>
-                  <span className="text-caption text-faint">记忆 · 技能</span>
+                  <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
                 </DropdownMenuItem>
               )}
               {onOpenMarketplace && (

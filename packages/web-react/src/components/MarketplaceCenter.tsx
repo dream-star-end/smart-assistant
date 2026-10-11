@@ -21,7 +21,7 @@ export type MarketplaceKind = 'skill' | 'agent' | 'connector'
 
 function artifactLabel(item: Pick<MarketplaceMyPublish, 'kind' | 'artifactKind'>): string {
   const kind = marketplaceArtifactKind(item)
-  return kind === 'plugin' ? 'API 连接插件' : kind === 'agent' ? '智能体' : '技能'
+  return kind === 'plugin' ? '插件' : kind === 'agent' ? '智能体' : '技能'
 }
 
 /** Tabs 的 id 前缀:tab ↔ 面板的 aria 关联(aria-controls / aria-labelledby)由它派生。 */

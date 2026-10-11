@@ -73,7 +73,11 @@ export function ManageCenter({
   onAutoAuthorizeConsumed?: () => void
   onTabChange: (t: ManageTab) => void
   onClose: () => void
-  onOpenMarketplace?: () => void
+  /**
+   * 去 AI 市场添加。带上类目：技能页 → 技能，插件页 → 插件（OCV5-379：改造前一律落到插件类目，
+   * 技能页的「市场」按钮把用户送错了地方）。
+   */
+  onOpenMarketplace?: (kind: 'skill' | 'connector') => void
   /** 「怎么用」：打开对应功能的教程。省略则不渲染帮助入口。 */
   onOpenHelp?: (featureId: ProductFeatureId) => void
   /** 未登录态 CTA：关闭本壳并把用户送到登录页。省略则空态只剩说明。 */
@@ -134,7 +138,7 @@ export function ManageCenter({
                   onOpenMarketplace && (
                     <button
                       type="button"
-                      onClick={onOpenMarketplace}
+                      onClick={() => onOpenMarketplace(tab === 'connectors' ? 'connector' : 'skill')}
                       className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-body text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
                     >
                       <Store size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />
@@ -228,7 +232,10 @@ export function ManageCenter({
                       )}
                       {tab === 'skills' && (
                         <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.skills.id}>
-                          <SkillsPanel auth={auth} onOpenMarketplace={onOpenMarketplace} />
+                          <SkillsPanel
+                            auth={auth}
+                            onOpenMarketplace={onOpenMarketplace && (() => onOpenMarketplace('skill'))}
+                          />
                         </div>
                       )}
                       {tab === 'cron' && (
@@ -240,7 +247,7 @@ export function ManageCenter({
                         <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
                           <ConnectorsTab
                             auth={auth}
-                            onOpenMarketplace={onOpenMarketplace}
+                            onOpenMarketplace={onOpenMarketplace && (() => onOpenMarketplace('connector'))}
                             autoAuthorizePluginSlug={autoAuthorizePluginSlug}
                             onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
                           />

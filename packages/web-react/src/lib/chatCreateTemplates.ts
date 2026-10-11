@@ -26,7 +26,7 @@ export const CHAT_CREATE_TEMPLATES: Record<ChatCreateKind, string> = {
 
 我的定位:【用一句话描述这个智能体,例如:懂合同审阅和合规问答的法律顾问】`,
 
-  connector: `我想创建一个 API 连接插件并发布到市场,请你全程引导我,让我尽量只做选择题:
+  connector: `我想创建一个插件并发布到市场,请你全程引导我,让我尽量只做选择题:
 
 1. 先根据我的目标,最多分两轮确认:连接的服务/API 文档、认证方式(静态令牌/token exchange/OAuth2 BYOA)、固定 API 域名、需要的读取/写入动作、identity 身份探针、分类与适用场景。必须按当前引擎提问:CCB 用 AskUserQuestion;Codex 用 request_user_input,让我在专用问答 UI 中点选;Cursor 在正文输出 \`\`\`options 围栏选项卡(一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交),贴完立刻结束本回合。CCB/Codex 不要用 Markdown 富块或普通正文模拟选择卡。每轮≤3题。
 2. 信息足够后,运行 oc-market plugin examples 读取容器内置、经过编译器验证的三种完整单文件模板和合法分类；选择最接近的一种,把全部发布信息写入 /tmp/openclaude-plugin.json。不要猜私有 schema,也不要读取容器中不存在的平台源码。不得向我索要或把真实密码、token、client secret、授权码写进文件；社区 OAuth2 必须 BYOA,凭据只能在安装后通过账号授权注入。

@@ -1163,7 +1163,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       '卸载',
     )
     const dialog = await screen.findByRole('dialog')
-    expect(within(dialog).getByText(/卸载 Plugin「知识星球」/)).toBeInTheDocument()
+    expect(within(dialog).getByText(/卸载插件「知识星球」/)).toBeInTheDocument()
     fireEvent.click(within(dialog).getByRole('button', { name: '卸载' }))
 
     await waitFor(() =>
@@ -1701,7 +1701,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     expect(await within(dialog).findByText(/无需再次扫码/)).toBeInTheDocument()
     expect(screen.queryByText(/Agent 现在可以直接读取相关内容/)).not.toBeInTheDocument()
     expect(
-      await within(dialog).findByText(/系统完成 Plugin 升级后会自动启用/),
+      await within(dialog).findByText(/系统完成插件升级后会自动启用/),
     ).toBeInTheDocument()
     expect(dialog).toBeInTheDocument()
   })
@@ -2049,7 +2049,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
 
     expect(
       await within(dialog).findByText(
-        '写入能力尚未开启，请先在 Plugin 账号中阅读免责声明并开启',
+        '写入能力尚未开启，请先在插件账号中阅读免责声明并开启',
       ),
     ).toBeInTheDocument()
     expect(writeSwitch).not.toBeChecked()
@@ -2092,7 +2092,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       expect(mockedSetPluginWriteAccess).toHaveBeenCalledWith(auth, '906', { enabled: false }),
     )
     expect(
-      await screen.findByText('写入能力尚未开启，请先在 Plugin 账号中阅读免责声明并开启'),
+      await screen.findByText('写入能力尚未开启，请先在插件账号中阅读免责声明并开启'),
     ).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: '发布账号写入能力' })).toBeChecked()
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
@@ -2681,3 +2681,43 @@ describe('ConnectorsTab 第 4 轮行语法（OCV5-360）', () => {
     expect(within(row).queryByRole('button', { name: /重新扫码/ })).not.toBeInTheDocument()
   })
 })
+
+describe("ConnectorsTab 定位 API 插件（OCV5-379：AI 市场 / 已安装页跳转）", () => {
+  test("市场来的声明式插件没有账号 → 直接打开它的绑定弹层，不再误报「尚未安装到当前版本」", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclManagement.mockResolvedValue({ connectors: [managementEntry()], connections: [] });
+    const consumed = vi.fn();
+    render(<ConnectorsTab auth={auth} autoAuthorizePluginSlug="linear" onAutoAuthorizeConsumed={consumed} />);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/Linear/)).toBeInTheDocument();
+    expect(consumed).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/尚未安装到当前版本/)).not.toBeInTheDocument();
+  });
+
+  test("已有账号 → 卡片内提示已连接几个账号，不弹绑定", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]));
+    mockedDeclManagement.mockResolvedValue({ connectors: [], connections: [] });
+    render(<ConnectorsTab auth={auth} autoAuthorizePluginSlug="imap" onAutoAuthorizeConsumed={() => {}} />);
+
+    const notice = await screen.findByText("邮箱已连接 1 个账号；需要再绑一个时点「绑定」。");
+    expect(providerCard("邮箱")).toContainElement(notice);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  test("内置 v1 插件没有账号 → 打开表单弹层；GitHub v1 不自动整页跳 OAuth，只给提示", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    mockedDeclManagement.mockResolvedValue({ connectors: [], connections: [] });
+    const view = render(
+      <ConnectorsTab auth={auth} autoAuthorizePluginSlug="imap" onAutoAuthorizeConsumed={() => {}} />,
+    );
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByLabelText(/邮箱地址/)).toBeInTheDocument();
+    view.unmount();
+
+    render(<ConnectorsTab auth={auth} autoAuthorizePluginSlug="github" onAutoAuthorizeConsumed={() => {}} />);
+    const notice = await screen.findByText("点「绑定」即可连接GitHub账号。");
+    expect(providerCard("GitHub")).toContainElement(notice);
+    expect(mockedGithubStart).not.toHaveBeenCalled();
+  });
+});

@@ -360,7 +360,7 @@ export function AgentPicker({
                     <span className="flex items-center gap-1.5">
                       <span className="text-[14.5px] font-semibold text-fg">{a.name}</span>
                       {a.preset && <Badge tone="accent">预设</Badge>}
-                      <Badge tone="warning">{needsAuth ? 'Plugin 待授权' : '能力待修复'}</Badge>
+                      <Badge tone="warning">{needsAuth ? '插件待授权' : '能力待修复'}</Badge>
                     </span>
                     <span className="mt-0.5 line-clamp-2 text-[12.5px] leading-snug text-muted">
                       {a.description}

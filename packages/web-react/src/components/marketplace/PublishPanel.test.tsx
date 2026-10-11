@@ -201,12 +201,12 @@ test("API 插件展示 AI 创建入口，同时保持 connector kind 的旧调�
 
   // 发布类型切换已改用 Tabs 原语(role=tab + roving tabindex + 44px 触控靶),不再是裸 button。
   fireEvent.click(screen.getByRole("tab", { name: "发布插件" }));
-  const create = screen.getByRole("button", { name: /在对话中创建 API 连接插件/ });
+  const create = screen.getByRole("button", { name: /在对话中创建插件/ });
   expect(create).toBeInTheDocument();
   fireEvent.click(create);
   expect(onCreateInChat).toHaveBeenCalledWith("connector");
-  expect(screen.getByText("API 连接插件 · AI 自动审核")).toBeInTheDocument();
-  expect(screen.getByText(/当前支持无需运行自定义代码的声明式 API 连接插件/)).toBeInTheDocument();
+  expect(screen.getByText("插件 · AI 自动审核")).toBeInTheDocument();
+  expect(screen.getByText(/当前支持无需运行自定义代码的声明式插件/)).toBeInTheDocument();
 });
 
 test("智能体可从已安装 Skill / Plugin 选择必需或可选组合能力", async () => {
@@ -237,15 +237,15 @@ test("智能体可从已安装 Skill / Plugin 选择必需或可选组合能力"
   render(<PublishPanel auth={auth} />);
   await screen.findByPlaceholderText("例：学术翻译");
   fireEvent.click(screen.getByRole("tab", { name: "发布智能体" }));
-  const plugin = await screen.findByRole("button", { name: /Plugin · 论文 Plugin/ });
+  const plugin = await screen.findByRole("button", { name: /插件 · 论文 Plugin/ });
   fireEvent.click(plugin);
-  expect(plugin).toHaveTextContent("必需 · Plugin");
+  expect(plugin).toHaveTextContent("必需 · 插件");
   fireEvent.click(plugin);
-  expect(plugin).toHaveTextContent("可选 · Plugin");
+  expect(plugin).toHaveTextContent("可选 · 插件");
   fireEvent.click(plugin);
   expect(plugin).not.toHaveTextContent("可选 ·");
-  expect(screen.getByRole("button", { name: /Skill · 写作 Skill/ })).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: /Plugin · Notion/ })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /技能 · 写作 Skill/ })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /插件 · Notion/ })).toBeInTheDocument();
 });
 
 // ── 覆盖草稿前的二次确认 ──────────────────────────────────────────────────────

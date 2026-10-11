@@ -150,7 +150,7 @@ describe("connectorToolCard 分派", () => {
   });
 
   test("meta 单一权威:OC_TOOLS 已登记 oc-connect 且 detectOcCli 识别命令位置调用", () => {
-    expect(OC_TOOLS["oc-connect"].label).toBe("应用连接");
+    expect(OC_TOOLS["oc-connect"].label).toBe("插件");
     expect(detectOcCli("oc-connect list")).toBe("oc-connect");
     expect(detectOcCli("echo done && oc-connect call imap send_email --account k1")).toBe(
       "oc-connect",
@@ -159,7 +159,7 @@ describe("connectorToolCard 分派", () => {
   });
 
   test("oc-plugin 微博写操作渲染权威确认卡；普通读取回落 Plugin 通用卡", async () => {
-    expect(OC_TOOLS["oc-plugin"].label).toBe("市场插件");
+    expect(OC_TOOLS["oc-plugin"].label).toBe("插件");
     const command =
       "oc-plugin call weibo create_post --account 3 --params '{\"text\":\"发布测试\"}'";
     expect(detectOcCli(command)).toBe("oc-plugin");
