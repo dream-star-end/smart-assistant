@@ -1,23 +1,32 @@
 /** Local stdio bridge. The gateway speaks stream-json to this process.
  * This process runs official `claude` inside the selected account's Grok Bot
- * box and copies stdout back. It does not call the model itself. */
+ * box and copies stdout back. It does not call the model itself.
+ *
+ * Box Claude runs only as the interactive session (tmux + oc-bridge mod), never
+ * as `claude -p` (operator rule 2026-10-11): a session that cannot come up
+ * fails the turn. Before launching, the bridge asks the master which Box login
+ * to run under; after each turn it reports what the output said about that
+ * login, and a login that turned out exhausted or logged out ends the session
+ * after its result, so the next message relaunches (--resume) on another. */
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  boxCcLaunchExec,
   boxCcSpawnFifo,
   boxCcStopExec,
   boxCcWriteExecs,
   encodeExecRequest,
   execExitCode,
   parseExecFrames,
-  remoteClaudeArgs,
   type BoxCcControl,
   type BoxCcExecRequest,
 } from './cursorBoxCcExec.js'
+import {
+  BoxLoginUnavailableError,
+  reportBoxLoginSignals,
+  requestBoxLogin,
+} from './boxLoginClient.js'
 import {
   boxCcInteractiveAbandonExec,
   boxCcInteractiveLaunchExec,
@@ -42,6 +51,10 @@ function readControl(path: string): BoxCcControl {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
   if (!parsed.execUrl.startsWith('https://') || !parsed.fifo.startsWith('/tmp/oc-box-cc-')) {
+    throw new Error('BOX_CC_CONTROL_INVALID')
+  }
+  if (parsed.accountId !== undefined
+    && (typeof parsed.accountId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(parsed.accountId))) {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
   return parsed as BoxCcControl
@@ -79,17 +92,32 @@ export async function runBoxCcBridge(opts: {
   stderr: NodeJS.WritableStream
   fetchImpl?: FetchFn
   signal?: AbortSignal
-  /** `interactive` launches the mod-driven TTY session instead of `-p`;
-   * every other step (writes, stop, stdout) is the same. */
+  /** Must be `interactive` (the default); anything else is refused. */
   runner?: BoxCcRunner
   bridgeMod?: BoxBridgeMod
-  /** Where the interactive cooldown marker lives (tests). */
-  stateDir?: string
   env?: NodeJS.ProcessEnv
+  /** Box login choice and reports (tests); default: the master's egress. */
+  login?: BoxLoginPort
 }): Promise<number> {
   const fetchImpl = opts.fetchImpl ?? fetch
   const env = opts.env ?? process.env
-  const stateDir = opts.stateDir ?? join(tmpdir(), 'oc-box-cc')
+  const login: BoxLoginPort = opts.login ?? {
+    choose: (accountId) => requestBoxLogin({ accountId }, { env }),
+    report: (input) => reportBoxLoginSignals(input, { env }),
+  }
+  if ((opts.runner ?? 'interactive') !== 'interactive') {
+    opts.stderr.write(`BOX_CC_RUNNER_REFUSED ${String(opts.runner)}\n`)
+    return 1
+  }
+  let profile: string
+  try {
+    const chosen = await login.choose(opts.control.accountId)
+    profile = chosen.profile
+    opts.stderr.write(`BOX_INTERACTIVE_LOGIN ${profile} ${chosen.source}\n`)
+  } catch (err) {
+    opts.stderr.write(`${err instanceof BoxLoginUnavailableError ? err.message : 'BOX_LOGIN_UNAVAILABLE'}\n`)
+    return 1
+  }
   const abort = new AbortController()
   const onAbort = (): void => abort.abort()
   opts.signal?.addEventListener('abort', onAbort)
@@ -97,43 +125,38 @@ export async function runBoxCcBridge(opts: {
     ...opts.control,
     fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')),
   })
-  let control = freshControl()
-
-  // The interactive runner is preferred, never required: when it cannot be
-  // built, or recently failed in this container, the turn runs on `-p`.
-  let interactive = opts.runner === 'interactive'
-  let launch: BoxCcExecRequest | null = null
-  if (interactive && interactiveCoolingDown(stateDir, env)) {
-    opts.stderr.write('BOX_INTERACTIVE_FALLBACK cooldown\n')
-    interactive = false
+  const control = freshControl()
+  let launch: BoxCcExecRequest
+  try {
+    launch = boxCcInteractiveLaunchExec(control, remoteInteractiveClaudeArgs(opts.args),
+      opts.bridgeMod ?? loadBoxBridgeMod(), profile)
+  } catch (err) {
+    opts.stderr.write(`BOX_INTERACTIVE_NOT_READY ${err instanceof Error ? err.message : 'BOX_INTERACTIVE_LAUNCH_FAILED'}\n`)
+    return 1
   }
-  if (interactive) {
-    try {
-      launch = boxCcInteractiveLaunchExec(control, remoteInteractiveClaudeArgs(opts.args), opts.bridgeMod ?? loadBoxBridgeMod())
-    } catch (err) {
-      opts.stderr.write(`BOX_INTERACTIVE_FALLBACK ${err instanceof Error ? err.message : 'BOX_INTERACTIVE_LAUNCH_FAILED'}\n`)
-      noteInteractiveFailure(stateDir)
-      interactive = false
-    }
-  }
-  if (!launch) launch = boxCcLaunchExec(control, remoteClaudeArgs(opts.args))
 
   // Two phases, so no turn can run twice or vanish:
   // - until this bridge has seen the host report READY, it sends the host
   //   nothing and holds every line here; if the host ends first (a dialog,
-  //   the ready timeout, a crash, held input over the cap), the held lines
-  //   go to `-p` in order and nothing ran interactively;
-  // - once READY is seen, the held lines go out first and the bridge behaves
-  //   exactly as on `-p`: a failed write or a dead host ends it, and the
-  //   next turn resumes.
-  let held: string[] | null = interactive ? [] : null
+  //   the ready timeout, a crash, held input over the cap, a refused login),
+  //   the bridge fails without running anything;
+  // - once READY is seen, the held lines go out first; a failed write or a
+  //   dead host ends the bridge, and the next turn resumes.
+  let held: string[] | null = []
   let heldBytes = 0
   const holdMax = positiveInt(env.OC_BOX_INTERACTIVE_HOLD_MAX_BYTES) ?? 64 * 1024 * 1024
   let readySeen = false
   let abandoned: string | null = null
   let hostStreamEnded = false
   let sawStdout = false
+  let hostErr = ''
   let gate: Promise<void> = Promise.resolve()
+  // What the output says about the login: collected per turn, reported at its result.
+  const signals = new BoxLoginSignalTap()
+  const flushSignals = (): void => {
+    const lines = signals.take()
+    if (lines.length > 0) void login.report({ accountId: opts.control.accountId, profile, lines }).catch(() => false)
+  }
 
   let exitCode = 1
   let sawExit = false
@@ -170,21 +193,19 @@ export async function runBoxCcBridge(opts: {
       if (abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
       opts.stderr.write(`BOX_CC_WRITE_FAILED ${message}\n`)
-      // An interactive host would otherwise keep its tmux session until this
+      // The interactive host would otherwise keep its tmux session until this
       // chat's next launch reaps it; end it now (best effort, as stopRemote).
-      if (interactive) {
-        const stopper = new AbortController()
-        setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS).unref?.()
-        void postExec(control, boxCcStopExec(control), fetchImpl, stopper.signal)
-          .then((response) => response.arrayBuffer())
-          .catch(() => undefined)
-      }
+      const stopper = new AbortController()
+      setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS).unref?.()
+      void postExec(control, boxCcStopExec(control), fetchImpl, stopper.signal)
+        .then((response) => response.arrayBuffer())
+        .catch(() => undefined)
       abort.abort()
     }
   }
-  /** Ends a host that is not ready yet without ending the bridge. The launch
-   * may not have started it, so the abandon exec repeats until its stream
-   * has ended; the fallback below then runs. */
+  /** Ends a host that is not ready yet. The launch may not have started it,
+   * so the abandon exec repeats until its stream has ended; the bridge then
+   * fails the turn below. */
   const abandonInteractive = (why: string): void => {
     if (abandoned || readySeen) return
     abandoned = why
@@ -235,7 +256,8 @@ export async function runBoxCcBridge(opts: {
   // Closed stdin is the gateway retiring this process (shutdown, model switch,
   // idle recycle). Claude in the box cannot see that EOF, so end it there and
   // report a clean exit; otherwise the runner has to SIGKILL this bridge and
-  // the box Claude lives on, still attached to the session.
+  // the box Claude lives on, still attached to the session. The same clean end
+  // retires a session whose login turned out unusable, after its result.
   let stopRequested = false
   const stopRemote = async (): Promise<void> => {
     if (abort.signal.aborted) return
@@ -258,7 +280,6 @@ export async function runBoxCcBridge(opts: {
     const response = await postExec(control, request, fetchImpl, abort.signal)
     const reader = response.body!.getReader()
     let pendingBytes = Buffer.alloc(0)
-    let errTail = ''
     for (;;) {
       const chunk = await reader.read()
       if (chunk.done) break
@@ -269,11 +290,18 @@ export async function runBoxCcBridge(opts: {
         if (event.kind === 'stdout' && event.data) {
           sawStdout = true
           opts.stdout.write(event.data)
+          for (const end of signals.push(event.data)) {
+            flushSignals()
+            if (end.rotate && !stopRequested) {
+              opts.stderr.write(`BOX_LOGIN_ROTATE ${profile} ${end.rotate}\n`)
+              void stopRemote()
+            }
+          }
         } else if (event.kind === 'stderr' && event.data) {
           opts.stderr.write(event.data)
           if (held && !abandoned) {
-            errTail = (errTail + event.data).slice(-4096)
-            if (errTail.includes('BOX_INTERACTIVE_READY')) {
+            hostErr = (hostErr + event.data).slice(-4096)
+            if (hostErr.includes('BOX_INTERACTIVE_READY')) {
               readySeen = true
               const lines = held
               held = null
@@ -292,23 +320,18 @@ export async function runBoxCcBridge(opts: {
     if (abort.signal.aborted) return
     await deliverLine(line)
   }).then(stopRemote)
+  let failedBeforeReady = false
   try {
     await streamLaunch(launch)
     hostStreamEnded = true
-    if (interactive && !readySeen && !sawStdout && !stopRequested && !abort.signal.aborted) {
-      // The host never got a line: -p takes them all, on a fresh fifo, in order.
-      opts.stderr.write(`BOX_INTERACTIVE_FALLBACK ${abandoned ?? 'not_ready'}\n`)
-      noteInteractiveFailure(stateDir)
-      const lines = held ?? []
-      held = null
-      interactive = false
-      sawExit = false
-      exitCode = 1
-      control = freshControl()
-      lineSeq = 0
-      const streaming = streamLaunch(boxCcLaunchExec(control, remoteClaudeArgs(opts.args)))
-      await flushFirst(lines)
-      await streaming
+    if (!readySeen && !sawStdout && !stopRequested && !abort.signal.aborted) {
+      // The host never got a line, so nothing ran: the turn fails here. There is
+      // no `-p` to hand it to. A login the Box refused is benched by the master.
+      failedBeforeReady = true
+      opts.stderr.write(`BOX_INTERACTIVE_NOT_READY_NO_FALLBACK ${abandoned ?? 'not_ready'}\n`)
+      if (/BOX_INTERACTIVE_NOT_READY profile_unsafe/.test(hostErr)) {
+        await login.report({ accountId: opts.control.accountId, profile, lines: [], unsafe: true }).catch(() => false)
+      }
     }
   } catch (error) {
     if (!stopRequested) throw error
@@ -319,38 +342,75 @@ export async function runBoxCcBridge(opts: {
       opts.stdin.destroy()
     }
     await pending.catch(() => undefined)
+    flushSignals()
   }
+  if (failedBeforeReady) return 1
   if (stopRequested) return 0
   return sawExit ? exitCode : 1
 }
 
-const INTERACTIVE_DOWN_MARKER = 'interactive-down'
+export interface BoxLoginPort {
+  choose(accountId: string | undefined): Promise<{ profile: string; source: 'master' | 'fallback' }>
+  report(input: { accountId: string | undefined; profile: string; lines: readonly string[]; unsafe?: boolean }):
+    Promise<unknown>
+}
+
+const MAX_TURN_SIGNALS = 16
+const MAX_SIGNAL_LINE = 65_536
+/** The stream-json line's own `type` (always its first key), read without parsing the line. */
+const TOP_TYPE = /^\{"type":\s*"([a-z_]+)"/
+
+/** Reads the session's stdout for what it says about the login: the plan-window line
+ * (`rate_limit_event`) and the CLI's synthetic notices. A turn's lines are handed over at its
+ * `result`, with whether the login must be rotated out: a rejected window (exhausted) or a
+ * "Not logged in" notice. Everything else passes through untouched by this reader. */
+export class BoxLoginSignalTap {
+  private buf = ''
+  private turn: string[] = []
+  private rotate: string | null = null
+
+  push(chunk: string): Array<{ rotate: string | null }> {
+    this.buf += chunk
+    const ends: Array<{ rotate: string | null }> = []
+    for (let nl = this.buf.indexOf('\n'); nl >= 0; nl = this.buf.indexOf('\n')) {
+      const line = this.buf.slice(0, nl)
+      this.buf = this.buf.slice(nl + 1)
+      const type = TOP_TYPE.exec(line)?.[1]
+      if (type === 'rate_limit_event' || (type === 'assistant' && line.includes('"<synthetic>"'))) {
+        if (line.length <= MAX_SIGNAL_LINE && this.turn.length < MAX_TURN_SIGNALS) this.turn.push(line)
+        this.rotate ??= rotateReason(line)
+      } else if (type === 'result') {
+        ends.push({ rotate: this.rotate })
+        this.rotate = null
+      }
+    }
+    // A line longer than any signal is not one; do not hold it.
+    if (this.buf.length > MAX_SIGNAL_LINE * 4) this.buf = ''
+    return ends
+  }
+
+  take(): string[] {
+    const lines = this.turn
+    this.turn = []
+    return lines
+  }
+}
+
+function rotateReason(line: string): string | null {
+  let record: unknown
+  try { record = JSON.parse(line) } catch { return null }
+  const top = record as { type?: unknown; rate_limit_info?: { status?: unknown }; message?: { model?: unknown; content?: unknown } }
+  if (top?.type === 'rate_limit_event') return top.rate_limit_info?.status === 'rejected' ? 'quota' : null
+  if (top?.type === 'assistant' && top.message?.model === '<synthetic>' && Array.isArray(top.message.content)) {
+    for (const block of top.message.content as Array<{ text?: unknown }>) {
+      if (typeof block?.text === 'string' && /^Not logged in\b/.test(block.text)) return 'login'
+    }
+  }
+  return null
+}
 
 function positiveInt(raw: string | undefined): number | undefined {
   return raw && /^[0-9]+$/.test(raw) && Number(raw) > 0 ? Number(raw) : undefined
-}
-
-/** After a fallback, this container skips the interactive launch for
- * OC_BOX_INTERACTIVE_COOLDOWN_SEC (default 600) so each new process does not
- * pay the ready timeout again. */
-export function interactiveCoolingDown(stateDir: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env.OC_BOX_INTERACTIVE_COOLDOWN_SEC
-  const seconds = raw && /^[0-9]+$/.test(raw) ? Number(raw) : 600
-  try {
-    const at = Number(readFileSync(join(stateDir, INTERACTIVE_DOWN_MARKER), 'utf8').trim())
-    return Number.isFinite(at) && Date.now() - at < seconds * 1000
-  } catch {
-    return false
-  }
-}
-
-export function noteInteractiveFailure(stateDir: string): void {
-  try {
-    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
-    writeFileSync(join(stateDir, INTERACTIVE_DOWN_MARKER), String(Date.now()), { mode: 0o600 })
-  } catch {
-    // Only a cost: the next process tries interactive again.
-  }
 }
 
 function bufferLines(

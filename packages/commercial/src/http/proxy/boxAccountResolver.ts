@@ -17,6 +17,7 @@ import { listBoxProfiles, writeBoxProfileHealth, type BoxProfileRow } from "./bo
 import { BoxProfileHealth } from "./boxProfileHealth.js";
 import { BOX_PROFILE_GUARD_REFUSED, makeBoxProfileGuard } from "./boxProfileDiscovery.js";
 import { scopeBoxExecToProfile } from "./boxProfileExec.js";
+import { boxLoginCandidates } from "./boxLoginCandidates.js";
 import { pickBoxProfile, type BoxProfileCandidate, type BoxProfilePolicy } from "./boxProfileScheduler.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
@@ -194,30 +195,8 @@ export class BoxAccountResolver {
     if (stored.length === 0) return "legacy";
     const candidates: BoxProfileCandidate[] = [];
     for (const { row, weight } of selectable) {
-      const own = stored.filter((item) => item.accountId === row.id);
-      // This account has no saved logins: it predates profiles and runs its default login.
-      const logins = own.length === 0
-        ? [{ profile: BOX_DEFAULT_PROFILE, isDefault: true }]
-        // Defence in depth behind the admin API: a row edited by hand can never route traffic to a
-        // login that is logged out or whose projects dir is not the shared one (a developer dir).
-        : own.filter((item) => item.enabled && item.loginState === "logged_in"
-          && (item.projectsMode === "root" || item.projectsMode === "shared"))
-          .map((item) => ({ profile: item.profile, isDefault: item.isDefault }));
-      for (const login of logins) {
-        const key = boxProfileKey(row.id, login.profile);
-        if (skip.has(key)) continue;
-        const durable = own.find((item) => item.profile === login.profile);
-        if (durable?.healthUpdatedAt) {
-          profiles.health.load(key, { utilization: durable.utilization,
-            cooldownUntilMs: durable.cooldownUntil?.getTime() ?? null,
-            lastReason: durable.lastReason, updatedAtMs: durable.healthUpdatedAt.getTime() });
-        }
-        candidates.push({ accountId: row.id, profile: login.profile, isDefault: login.isDefault,
-          weight, utilization: profiles.health.utilization(key),
-          cooldownActive: profiles.health.cooldownActive(key),
-          cooldownQuotaOnly: profiles.health.get(key)?.lastReason === "quota_exhausted",
-          loginLoad: profiles.health.recentLaunches(key), boxLoad: 0 });
-      }
+      candidates.push(...boxLoginCandidates({ accountId: row.id, weight,
+        own: stored.filter((item) => item.accountId === row.id), health: profiles.health, skip }));
     }
     for (const candidate of candidates) {
       candidate.boxLoad = candidates.filter((other) => other.accountId === candidate.accountId)
@@ -463,6 +442,16 @@ export function productionBoxProfileHealth(): BoxProfileHealth {
   });
 }
 
+/** The Box model route (`claude -p` per request) runs only the default login of each account,
+ * whatever else an admin enabled: the other logins serve interactive sessions only (operator
+ * rule 2026-10-11, Box logins never serve `claude -p` product turns; BoxInteractiveLogins).
+ * The default row keeps its stored login state and health, so a logged-out default still stops
+ * the route. */
+export function boxModelRouteLogins(rows: readonly BoxProfileRow[]): BoxProfileRow[] {
+  return rows.filter((row) => row.profile === BOX_DEFAULT_PROFILE)
+    .map((row) => ({ ...row, enabled: true, isDefault: true }));
+}
+
 export function createProductionBoxAccountResolver(): BoxAccountResolver {
   return new BoxAccountResolver({
     list: () => listAccounts({ provider: "cursor", status: "active", limit: 500 }),
@@ -473,7 +462,7 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
       egressProxy: token.egress_proxy, egressTarget: token.egress_target,
       egressProxyId: token.egress_proxy_id, egressHostUuid: token.egress_host_uuid }),
     uidProxy: boxUnboundProxy(),
-    profiles: { list: (ids) => listBoxProfiles(ids),
+    profiles: { list: async (ids) => boxModelRouteLogins(await listBoxProfiles(ids)),
       health: productionBoxProfileHealth() },
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,

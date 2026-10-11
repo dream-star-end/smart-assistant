@@ -66,7 +66,11 @@ import { createBoxReplayReader, createBoxReplayRecoveryWriter,
 import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
 import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
 import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
-import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
+import { createProductionBoxAccountResolver, productionBoxProfileHealth } from "../http/proxy/boxAccountResolver.js";
+import { listBoxProfiles } from "../http/proxy/boxClaudeProfileStore.js";
+import { BoxInteractiveLogins } from "../http/proxy/boxInteractiveLogins.js";
+import { BOX_LOGIN_PATH, BOX_LOGIN_SIGNALS_PATH, makeBoxLoginHandler } from "../http/proxy/boxLoginHandler.js";
+import { getAccount } from "../account-pool/store.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
@@ -456,6 +460,18 @@ export async function startEgress(): Promise<void> {
     coordinator: boxStopCoordinator });
   const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
     journal: boxStopJournal, readCapsule: boxReplayReader });
+  // Which Box login an interactive session (box-claude-*) launches under, and what its turns
+  // reported: the admin's selection plus the login health this process shares with the Box
+  // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.
+  const boxLoginHandler = makeBoxLoginHandler({ identity: identityStrategy,
+    logins: new BoxInteractiveLogins({
+      accountActive: async (id) => {
+        const row = await getAccount(id);
+        return row?.provider === "cursor" && row.status === "active";
+      },
+      list: (ids) => listBoxProfiles(ids),
+      health: productionBoxProfileHealth(),
+    }) });
   const boxStopCleanupTimer = setInterval(() => {
     void boxStopCoordinator.retryFailedLocal().catch(() =>
       log.error("box_stop_local_cleanup_failed"));
@@ -592,6 +608,19 @@ export async function startEgress(): Promise<void> {
           res.statusCode = 503;
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ status: "pending", reason: "unavailable" }));
+        } else try { res.destroy(); } catch { /* */ }
+      });
+      return;
+    }
+    if (path === BOX_LOGIN_PATH || path === BOX_LOGIN_SIGNALS_PATH) {
+      Promise.resolve(boxLoginHandler(req, res, {
+        hostUuid: selfHostUuid, boundIp: peerIp,
+      })).catch((err) => {
+        log.error("box_login_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 503;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: "BOX_LOGIN_STORE_UNAVAILABLE" }));
         } else try { res.destroy(); } catch { /* */ }
       });
       return;

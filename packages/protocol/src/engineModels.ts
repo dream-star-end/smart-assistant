@@ -1044,9 +1044,8 @@ export const CURSOR_ENGINE_MODELS = [
   },
   // Official Claude Code inside the account Grok Bot box. These ids are not
   // Cursor Sand slugs; upstreamModel is the id the box CLI accepts.
-  // runner: personal default is the interactive terminal + oc-bridge mod;
-  // the bridge falls back to `claude -p` by itself when that cannot start,
-  // and the OC_BOX_INTERACTIVE master knob (0/1) forces either side.
+  // runner: the interactive terminal + oc-bridge mod. Box logins never serve
+  // these rows through `claude -p` (operator rule 2026-10-11, OCV5-378).
   // One family each: the picker collapses a family to a single effort row,
   // and these names are different models, not effort levels.
   {
@@ -1101,9 +1100,9 @@ export function isCursorEngineModel(modelId: string | null | undefined): boolean
     (CURSOR_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
 }
 
-/** How the Box runs a box-claude-* row: `p` (headless `claude -p`) or
- * `interactive` (interactive Claude Code + the oc-bridge mod, with an
- * automatic `-p` fallback). Undefined for every other model. */
+/** How the Box runs a box-claude-* row. Every row is `interactive` (interactive
+ * Claude Code + the oc-bridge mod); the box bridge refuses `p`. Undefined for
+ * every other model. */
 export type BoxClaudeRunner = 'p' | 'interactive'
 
 export function boxClaudeRunner(modelId: string | null | undefined): BoxClaudeRunner | undefined {

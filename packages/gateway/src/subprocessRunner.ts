@@ -1984,7 +1984,6 @@ export class SubprocessRunner extends EventEmitter {
         spawnOpts.env = stripBoxCcParentAuth(
           spawnOpts.env as Record<string, string>,
           this.boxCcControlPath,
-          this.opts.model,
         )
       }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)

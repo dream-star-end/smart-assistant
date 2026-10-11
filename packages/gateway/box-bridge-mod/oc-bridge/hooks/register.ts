@@ -250,7 +250,10 @@ export const register: Register = (on) => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (active && !e.agentId) {
-      send([sj.result(e as any, lastStopReason)])
+      // The login's plan windows ride ahead of the result, as on `-p`; a failed read only drops the line.
+      let rate: string | null = null
+      try { rate = sj.rateLimits((await $.session.usage())?.rateLimits) } catch { rate = null }
+      send(rate ? [rate, sj.result(e as any, lastStopReason)] : [sj.result(e as any, lastStopReason)])
       running = undefined
     }
     return done
