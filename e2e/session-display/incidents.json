@@ -6584,13 +6584,14 @@
       "coverageCommits": [
         "bd575023",
         "1f04e1b2",
-        "e48575d7"
+        "e48575d7",
+        "5320bcb1"
       ],
       "regressions": [
         {
           "layer": "unit",
           "path": "packages/protocol/src/__tests__/boxApiModels.test.ts",
-          "assertion": "the CCB output-cap mirror equals maxOutputTokens for every model it lists"
+          "assertion": "the CCB output-cap mirror lists every model with its maxOutputTokens"
         },
         {
           "layer": "unit",
