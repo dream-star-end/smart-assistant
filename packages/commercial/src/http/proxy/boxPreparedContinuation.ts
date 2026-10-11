@@ -216,26 +216,23 @@ export function boxRequestTailShape(body: ProxyBody, count = 3): string {
   }).join(" | ").slice(0, 400);
 }
 
-/** Text Claude Code itself injects beside tool results (image captions,
- * hook / budget reminders, Skill bodies). Alone it is never a user prompt;
- * an unfolded one must keep the live-continuation rejection (OCV5-302/303). */
-const CCB_INJECTED_TEXT = /^(?:<system-reminder>|<total_tokens>|\[Image[: ]|\[Request interrupted|Base directory for this skill:)/;
-
-/** OCV5-322: tool results followed only by non-empty text blocks, at least
- * one of which is not text Claude Code injected itself. */
+/** OCV5-322 / OCV5-377: tool results followed only by content the Box CLI
+ * cannot take through a tool result: non-empty text blocks and images, in any
+ * mix, whoever wrote them (a prompt typed during the tool run, a Claude Code
+ * reminder, caption or Skill body no fold recognized). `tail` may be empty. */
 export function answeredExchangeSplit(content: readonly unknown[]):
-  { results: Record<string, unknown>[]; texts: Record<string, unknown>[] } | null {
+  { results: Record<string, unknown>[]; tail: Record<string, unknown>[] } | null {
   let cut = 0;
   while (cut < content.length && record(content[cut])
     && (content[cut] as Record<string, unknown>).type === "tool_result") cut += 1;
   const results = content.slice(0, cut) as Record<string, unknown>[];
-  const texts = content.slice(cut);
-  if (results.length < 1 || texts.length < 1 || !texts.every((block) => record(block)
-    && block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)
-    || texts.every((block) => CCB_INJECTED_TEXT.test(((block as { text: string }).text).trimStart()))) {
+  const tail = content.slice(cut);
+  if (results.length < 1 || !tail.every((block) => record(block)
+    && ((block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)
+      || block.type === "image"))) {
     return null;
   }
-  return { results, texts: texts as Record<string, unknown>[] };
+  return { results, tail: tail as Record<string, unknown>[] };
 }
 
 export function classifyBoxContinuation(body: ProxyBody): Pick<PreparedContinuation,
@@ -275,13 +272,18 @@ export function classifyBoxContinuation(body: ProxyBody): Pick<PreparedContinuat
   // OCV5-322: the answered exchange of a turn that failed before the model
   // read it, followed by a new user prompt. Claude Code drops its own API
   // error rows, so a later prompt (e.g. a recovery "继续") is merged into the
-  // tool-result message. No live CLI can take text, so it runs fresh with the
-  // exchange staged as history (BoxToolFetch first proves no handoff waits).
-  // Trailing system hints (e.g. the CCB budget) become fresh system prompt.
-  const split = Array.isArray(content) && messages.slice(currentIndex + 1)
-    .every((message) => record(message) && message.role === "system")
+  // tool-result message. OCV5-377: the same holds for anything else after the
+  // results that no fold recognized — a message typed while the tools ran,
+  // a new kind of Claude Code reminder, an image, a trailing system hint. No
+  // live CLI can take it, so it runs fresh with the exchange staged as history
+  // (BoxToolFetch first stops a handoff that still waits for these results).
+  // Trailing system hints become fresh system prompt.
+  const after = messages.slice(currentIndex + 1);
+  const split = Array.isArray(content)
+    && after.every((message) => record(message) && message.role === "system")
     ? answeredExchangeSplit(content) : null;
-  if (split && pairs(split.results.map((block) => block.tool_use_id))) {
+  if (split && (split.tail.length > 0 || after.length > 0)
+    && pairs(split.results.map((block) => block.tool_use_id))) {
     return { ...fresh, answeredToolIds: split.results.map((block) => block.tool_use_id as string) };
   }
   // A legal budget/hook tail is already folded away. Anything still sitting

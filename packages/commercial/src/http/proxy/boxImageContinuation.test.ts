@@ -113,7 +113,8 @@ test("unique non-terminal image keeps the original caption once, then hook and b
 
 test("unknown, conflicting, and malformed captions stay unfolded", () => {
   const unknown = siblingTurn("[Image: original 10x10, displayed at 10x10. Multiply coordinates by 1.00 to map to original image.]");
-  assert.notEqual(validateBoxRequest(unknown, true), null);
+  // OCV5-377: an unfolded caption no longer rejects the request; it runs fresh.
+  assert.equal(validateBoxRequest(unknown, true), null);
   assert.equal(JSON.stringify(normalizeBoxSemanticBody(unknown)).split("displayed at").length - 1, 1);
   const conflict = siblingTurn();
   const user = conflict.messages[2] as { content: Array<Record<string, unknown>> };

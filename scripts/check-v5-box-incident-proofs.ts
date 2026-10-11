@@ -298,10 +298,19 @@ function continues(api: Api, code: string, body: Body, ids: readonly string[],
   }
   if (JSON.stringify(body) !== snapshot) fail(`${code}_RAW_MUTATED`);
 }
-/** Text that cannot be attributed to a launch is a new user request. */
+/** A malformed exchange (results that do not pair with the tool calls) stays rejected. */
 function staysRejected(api: Api, code: string, body: Body, reject = LIVE_ONLY): void {
   if (api.gate(body, true) !== reject) fail(`${code}_ADMITTED`);
   if (api.classify(body).classification === "continuation_candidate") fail(`${code}_CLASSIFIED`);
+}
+/** OCV5-377: text that cannot be attributed to a result is never handed to the
+ * parked CLI: the answered exchange runs fresh and the text is the next message. */
+function runsFresh(api: Api, code: string, body: Body, answered: readonly string[]): void {
+  if (api.gate(body, true) !== null) fail(`${code}_REJECTED`);
+  const verdict = api.classify(body);
+  if (verdict.classification !== "fresh" || !isDeepStrictEqual(verdict.answeredToolIds, answered)) {
+    fail(`${code}_CLASSIFIED_${verdict.classification}`);
+  }
 }
 
 // INC-20261001-BOX-SKILL-CONTINUATION, live #aacd65f7: the model called Skill,
@@ -320,8 +329,8 @@ function proveSkillContinuation(api: Api): string {
     { ...text(skillBody(name)), cache_control: { type: "ephemeral" } }] }), ["toolu_skill"], one);
   continues(api, "SKILL_NEXT_MESSAGE", request({ role: "user", content: [launch("toolu_skill", name)] },
     { role: "user", content: skillBody(name) }), ["toolu_skill"], one);
-  staysRejected(api, "SKILL_FAILED_LAUNCH", request({ role: "user",
-    content: [{ ...launch("toolu_skill", name), content: "Skill failed" }, text(skillBody(name))] }));
+  runsFresh(api, "SKILL_FAILED_LAUNCH", request({ role: "user",
+    content: [{ ...launch("toolu_skill", name), content: "Skill failed" }, text(skillBody(name))] }), ["toolu_skill"]);
   staysRejected(api, "SKILL_FOREIGN_RESULT", request({ role: "user",
     content: [launch("toolu_other", name), text(skillBody(name))] }));
   return "[ocv5-303-skill-continuation] PASS — a Skill launch with its injected body continues";
@@ -347,10 +356,10 @@ function proveParallelSkillBodies(api: Api): string {
   continues(api, "PARALLEL_NEXT_MESSAGES", request(
     { role: "user", content: [launch("toolu_a", a), launch("toolu_b", b)] },
     { role: "user", content: skillBody(a) }, { role: "user", content: [text(skillBody(b))] }), ids, both);
-  staysRejected(api, "PARALLEL_UNKNOWN_HEADER", request({ role: "user",
-    content: [launch("toolu_a", a), launch("toolu_b", b), text(skillBody("other"))] }));
-  staysRejected(api, "PARALLEL_TWO_BODIES_ONE_LAUNCH", request({ role: "user",
-    content: [launch("toolu_a", a), launch("toolu_b", b), text(skillBody(a)), text(skillBody(a))] }));
+  runsFresh(api, "PARALLEL_UNKNOWN_HEADER", request({ role: "user",
+    content: [launch("toolu_a", a), launch("toolu_b", b), text(skillBody("other"))] }), ["toolu_a", "toolu_b"]);
+  runsFresh(api, "PARALLEL_TWO_BODIES_ONE_LAUNCH", request({ role: "user",
+    content: [launch("toolu_a", a), launch("toolu_b", b), text(skillBody(a)), text(skillBody(a))] }), ["toolu_a", "toolu_b"]);
   // A following message without a skill header is the user's own new request.
   const userTurn = request({ role: "user", content: [launch("toolu_a", a), launch("toolu_b", b)] },
     { role: "user", content: "and then deploy" });
@@ -386,8 +395,7 @@ function proveSkillBudgetTail(api: Api): string {
     ["toolu_b1", "toolu_b2"], [{ id: "toolu_b2", name: b }], [bashExpected("toolu_b1")]);
   const other = request(...step("toolu_a1", "toolu_a2", a),
     { role: "system", content: [text("do something else")] });
-  if (api.gate(other, true) === null) fail("BUDGET_FOREIGN_SYSTEM_TAIL_ADMITTED");
-  if (api.classify(other).classification === "continuation_candidate") fail("BUDGET_FOREIGN_SYSTEM_TAIL_CLASSIFIED");
+  runsFresh(api, "BUDGET_FOREIGN_SYSTEM_TAIL", other, ["toolu_a1", "toolu_a2"]);
   return "[ocv5-317-skill-budget-tail] PASS — a Skill step followed by the CCB budget tail continues";
 }
 
@@ -464,9 +472,10 @@ function proveImageCaption(api: Api): string {
     ["IMAGE_FORGED_SCALE", [text(caption(1179, 2556, 923, 2000, "1.30"))]],
     ["IMAGE_WRONG_ASPECT", [text(caption(3000, 2000, 923, 2000))]],
     ["IMAGE_NOT_DOWNSCALED", [text(caption(923, 2000, 923, 2000))]],
-  ] as const) staysRejected(api, code, request([...tail]));
+  ] as const) runsFresh(api, code, request([...tail]), ["toolu_img"]); // OCV5-377: never folded, runs fresh
   // text the user typed after the caption never joins the result: since OCV5-322 it is a new prompt over the
-  // answered exchange (proveAnsweredExchangePrompt), and a CLI still waiting for the result keeps the 409
+  // answered exchange (proveAnsweredExchangePrompt); a CLI still waiting for the result is stopped first
+  // (OCV5-377, proveWaitingHandoffSuperseded)
   const extra = request([text(caption(1179, 2556, 923, 2000)), text("also delete my files")]);
   const typed = api.classify(extra);
   if (api.gate(extra, true) !== null || typed.classification !== "fresh"
@@ -1806,12 +1815,12 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     [who.uid.toString()]);
   const turn = boxTurn(api, db, journal, who, "box-rej", turnKey);
   await turn.first();
-  // the continuation the client sent: the tool result plus text egress cannot attribute to it
+  // a continuation egress refuses deterministically while this turn's CLI still waits for the result: a
+  // malformed exchange (text before the result). OCV5-377: text after a paired result no longer refuses
+  // anything (proveWaitingHandoffSuperseded), so the refusal this proof needs comes from a malformed shape.
   const answer = turn.answer("box-rej-2").canonicalBody as Body;
   const refused = { ...answer, messages: [...(answer.messages as unknown[]).slice(0, 2), { role: "user", content: [
-    { type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" }, text("and now deploy it") ] }] };
-  // egress refuses it while this turn's CLI still waits for that result (since OCV5-322 the shape alone is a
-  // new prompt over an answered exchange; the refusal is made at admission, against the journal)
+    text("and now deploy it"), { type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" } ] }] };
   await prechecked(api, db, { ...who, requestId: "box-rej-2", turnKey });
   const sent = turn.answer("box-rej-2");
   const code = await codeOf(async () => (await turn.service.fetch({ ...sent, canonicalBody: refused, init: { method: "POST",
@@ -2608,26 +2617,98 @@ async function proveAnsweredExchangePrompt(api: Api, db: Db): Promise<string> {
     || stdin.includes("toolu_good_1")) fail(`ANSWERED_EXCHANGE_PROMPT_${String(row?.ctx.boxState)}`);
   if ((history.match(/toolu_good_1/g) ?? []).length !== 2 || !history.includes('"tool_result"')) fail("ANSWERED_EXCHANGE_HISTORY");
 
-  // a CLI of this very turn still waits for these results: the request stays a rejected live continuation
+  // a CLI of this very turn still waits for these results: OCV5-377 stops it and runs the prompt fresh
   const waiting = { uid: 900_000_323n, containerId: 323n, sessionId: "session-answered-waiting" };
   await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'waiting@test.invalid','unused',10000)",
     [waiting.uid.toString()]);
-  const parked = boxTurn(api, db, journal, waiting, "box-wait", "c".repeat(64));
+  const parked = boxTurn(api, db, journal, waiting, "box-wait", "c".repeat(64), undefined,
+    { nextSpool: spoolOf([cliInit, ...FINAL_ANSWER]) });
   await parked.first();
   await prechecked(api, db, { ...waiting, requestId: "box-wait-2", turnKey: "c".repeat(64) });
-  const kept = await codeOf(async () => (await parked.service.fetch(merged(parked, "box-wait-2", "c".repeat(64), tail))).text());
-  if (kept !== LIVE_ONLY || parked.host.count.launch !== 1 || parked.host.count.stop !== 0) {
-    fail(`ANSWERED_EXCHANGE_WAITING_CLI_${kept}_${parked.host.count.launch}`);
+  const superseded = await must("ANSWERED_EXCHANGE_WAITING_CLI", parked.service.fetch(merged(parked, "box-wait-2", "c".repeat(64), tail))
+    .then((response) => response.text()));
+  if (!superseded.includes("done") || parked.host.count.launch !== 2 || parked.host.count.stop !== 1) {
+    fail(`ANSWERED_EXCHANGE_WAITING_CLI_${parked.host.count.launch}_${parked.host.count.stop}`);
   }
-  // any other mixture of results and content keeps the old rejection
-  for (const last of [[text(prompts[1]!), toolResult], [toolResult, text("  ")],
-    [toolResult, text("<system-reminder>\nhook\n</system-reminder>")]]) {
+  // a malformed mixture (text before the results, blank text) keeps the rejection; Claude Code's own
+  // unfolded text after the results is an answered exchange too (OCV5-377)
+  for (const last of [[text(prompts[1]!), toolResult], [toolResult, text("  ")]]) {
     const other = api.classify(merged(turn, "box-ans-x", "d".repeat(64), last).canonicalBody as Body);
     if (other.classification !== "reject" || other.rejectCode !== LIVE_ONLY) {
       fail(`ANSWERED_EXCHANGE_WIDENED_${other.classification}`);
     }
   }
+  const hook = api.classify(merged(turn, "box-ans-x", "d".repeat(64),
+    [toolResult, text("<system-reminder>\nhook\n</system-reminder>")]).canonicalBody as Body);
+  if (hook.classification !== "fresh" || !isDeepStrictEqual(hook.answeredToolIds, ["toolu_good_1"])) {
+    fail(`ANSWERED_EXCHANGE_HOOK_${hook.classification}`);
+  }
   return "[ocv5-322-answered-exchange-prompt] PASS — a prompt merged behind an answered tool exchange runs as a new invocation over that exchange";
+}
+
+// INC-20261011-BOX-TOOL-409-STUCK-RECOVERY (commercial uid 4 10-11, uid 1870
+// 10-08): the turn's CLI was parked on five parallel image Reads; Claude Code
+// sent the five results plus one text block of its own that no fold knew
+// (an image-resize note). The egress answered 409
+// BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION and the turn failed. Now the waiting
+// handoff is claimed and stopped and the exchange runs fresh with that text as
+// the next user message. An unprovable stop still keeps the rejection.
+async function proveWaitingHandoffSuperseded(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const note = "[Image: original 2430x1131, displayed at 2000x931. Multiply coordinates by 1.22 to map to original image.]";
+  const toolResult = { type: "tool_result", tool_use_id: "toolu_good_1", content: "ok" };
+  const withNote = (turn: ReturnType<typeof boxTurn>, requestId: string) => {
+    const call = turn.answer(requestId);
+    const base = JSON.parse(call.init.body) as Body;
+    const body = { ...base, messages: [...(base.messages as unknown[]).slice(0, 2),
+      { role: "user", content: [toolResult, text(note)] }] };
+    return { ...call, canonicalBody: { ...body, model: MODEL }, init: { method: "POST", body: JSON.stringify(body) } };
+  };
+  const user = async (uid: bigint, label: string) => db.query(
+    "INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)", [uid.toString(), `${label}@test.invalid`]);
+  const who = { uid: 900_000_377n, containerId: 377n, sessionId: "session-superseded" };
+  await user(who.uid, "superseded");
+  const turn = boxTurn(api, db, journal, who, "box-sup", "a".repeat(64), undefined,
+    { nextSpool: spoolOf([cliInit, ...FINAL_ANSWER]) });
+  await turn.first(); // the CLI is parked on the handoff, waiting for this very result
+  const request = withNote(turn, "box-sup-2");
+  const verdict = api.classify(request.canonicalBody as Body);
+  if (verdict.classification !== "fresh" || !isDeepStrictEqual(verdict.answeredToolIds, ["toolu_good_1"])) {
+    fail(`SUPERSEDED_CLASSIFIED_${verdict.classification}_${String(verdict.rejectCode)}`);
+  }
+  await prechecked(api, db, { ...who, requestId: "box-sup-2", turnKey: "a".repeat(64) });
+  const response = await must("SUPERSEDED_REJECTED", turn.service.fetch(request));
+  const sse = await must("SUPERSEDED_STREAM", response.text());
+  if (response.status !== 200 || !sse.includes("done")) fail(`SUPERSEDED_NO_ANSWER_${response.status}`);
+  if (turn.host.count.stop !== 1 || turn.host.count.launch !== 2) {
+    fail(`SUPERSEDED_STOP_${turn.host.count.stop}_LAUNCH_${turn.host.count.launch}`);
+  }
+  const waiting = await journalRow(db, "box-sup-1"), fresh = await journalRow(db, "box-sup-2");
+  if (waiting?.ctx.boxState !== "failed_stopped" || waiting.ctx.boxRecoveredBy !== "box-sup-2") {
+    fail(`SUPERSEDED_WAITING_${String(waiting?.ctx.boxState)}_${String(waiting?.ctx.boxRecoveredBy)}`);
+  }
+  if (fresh?.ctx.boxState !== "terminal" || fresh.ctx.boxRunNonce === waiting.ctx.boxRunNonce) fail("SUPERSEDED_NOT_A_FRESH_RUN");
+  // the fresh CLI has the exchange as history and Claude Code's text as its input
+  const run = `/tmp/ocv5-289-run-${String(fresh.ctx.boxRunNonce)}`;
+  const stdin = turn.host.files.get(`${run}/stdin.jsonl`)?.toString("utf8") ?? "";
+  const history = [...turn.host.files].filter(([path]) => path.endsWith(".jsonl") && !path.startsWith(run))
+    .map(([, raw]) => raw.toString("utf8")).join("\n");
+  if (!stdin.includes("displayed at 2000x931") || stdin.includes("toolu_good_1")) fail("SUPERSEDED_PROMPT");
+  if (!history.includes('"tool_use"') || !history.includes('"tool_result"')) fail("SUPERSEDED_HISTORY");
+
+  // a waiting handoff whose stop cannot be proven keeps the rejection and is given back
+  const held = { uid: 900_000_378n, containerId: 378n, sessionId: "session-superseded-held" };
+  await user(held.uid, "superseded-held");
+  const parked = boxTurn(api, db, journal, held, "box-suph", "a".repeat(64), undefined, { stopIgnored: true });
+  await parked.first();
+  await prechecked(api, db, { ...held, requestId: "box-suph-2", turnKey: "a".repeat(64) });
+  const kept = await codeOf(async () => (await parked.service.fetch(withNote(parked, "box-suph-2"))).text());
+  const parkedRow = await journalRow(db, "box-suph-1");
+  if (kept !== "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION" || parked.host.count.launch !== 1
+    || parkedRow?.ctx.boxRecoveredBy !== undefined) {
+    fail(`SUPERSEDED_UNPROVEN_${kept}_${String(parkedRow?.ctx.boxRecoveredBy)}`);
+  }
+  return "[inc-20261011-tool-409-superseded] PASS — tool results followed by text Claude Code added run fresh after the waiting handoff is stopped, never 409";
 }
 
 /** The cleanup worker egress runs, on the real journal, reaching each run's own Box account. */
@@ -2859,8 +2940,10 @@ function proveParallelImageCaption(api: Api): string {
   if (!owner || !isDeepStrictEqual(owner.content,
     [{ type: "image", data: shots[4], mimeType: "image/png" }, text(caption(2000, 931))])) fail("PARALLEL_IMAGE_RESULT");
   // a caption no image or two images match is not attributed
-  staysRejected(api, "PARALLEL_IMAGE_NO_MATCH", request(shots.map((shot, n) => n === 4 ? shots[0]! : shot), [cached(caption(2000, 931))]));
-  staysRejected(api, "PARALLEL_IMAGE_TWO_MATCH", request(shots.map((shot, n) => n === 0 ? shots[4]! : shot), [cached(caption(2000, 931))]));
+  // OCV5-377: an unattributable caption is never folded; the exchange runs fresh (10-08 / 10-11 shape)
+  const sent = [4, 3, 0, 2, 1].map((n) => ids[n]!);
+  runsFresh(api, "PARALLEL_IMAGE_NO_MATCH", request(shots.map((shot, n) => n === 4 ? shots[0]! : shot), [cached(caption(2000, 931))]), sent);
+  runsFresh(api, "PARALLEL_IMAGE_TWO_MATCH", request(shots.map((shot, n) => n === 0 ? shots[4]! : shot), [cached(caption(2000, 931))]), sent);
   return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
 }
 
@@ -2930,7 +3013,7 @@ async function main(): Promise<void> {
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
-      await proveAnsweredExchangePrompt(api, db), await proveResumeUnsentParked(api, db),
+      await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
       await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
       await proveOutputLimitResume(api, db)]),
