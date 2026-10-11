@@ -8,8 +8,8 @@
 import { readFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 
-export function readGatewayToken(): string {
-  const file = process.env.OPENCLAUDE_GATEWAY_TOKEN_FILE
+export function readGatewayToken(env: NodeJS.ProcessEnv = process.env): string {
+  const file = env.OPENCLAUDE_GATEWAY_TOKEN_FILE
   if (file) {
     try {
       return readFileSync(file, 'utf8').trim()
@@ -19,7 +19,7 @@ export function readGatewayToken(): string {
       )
     }
   }
-  return process.env.OPENCLAUDE_GATEWAY_TOKEN || ''
+  return env.OPENCLAUDE_GATEWAY_TOKEN || ''
 }
 
 export function gatewayBaseUrl(): string {

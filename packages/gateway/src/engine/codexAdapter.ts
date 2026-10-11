@@ -37,6 +37,7 @@ import type {
   TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
+import type { IntelligentUiApplied } from '../promptSlots.js'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import { createLogger } from '../logger.js'
@@ -684,6 +685,11 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   get effortLevel(): string | undefined {
     return this.kernel.effortLevel
+  }
+
+  /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
+    return (this.kernel as { promptIntelligentUi?: IntelligentUiApplied }).promptIntelligentUi
   }
 
   setTraceId(traceId: string | undefined): void {

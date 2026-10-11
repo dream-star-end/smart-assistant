@@ -179,6 +179,8 @@ own_instance_present() {
 
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
+  if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
   if declare -F lease_train_on_exit >/dev/null 2>&1; then lease_train_on_exit "$exit_rc" || true; fi
   if [[ -n "${PLATFORM_ARCHIVE_TMP:-}" && -d "$PLATFORM_ARCHIVE_TMP" ]]; then
@@ -878,6 +880,12 @@ OC_REDACT_TOOL_EVENT_PREVIEWS=1
 # Bound project context (PROJECT.md / skill overlay / run snapshots). Commercial
 # production does not set this; gateway keeps the old path when unset.
 OC_PROJECT_CONTEXT=1
+# Project smart assist (OCV5-354), one flag each; the master forwards them into
+# user containers. OC_P5_UNFILED_SUGGEST stays unset: its precision on the
+# operator's real unfiled chats was below the bar (evidence in OCV5-354).
+OC_P5_PROJECT_SEARCH=1
+OC_P5_CHIPS=1
+OC_P5_RECIPE_SCHEDULE=1
 # Claude Code external HTTPS transport:keep internal http://172.31.0.1:18892
 # on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
 OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
@@ -978,6 +986,9 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_LOCAL_USAGE_RETENTION_DAYS 365
   ensure_env_kv "$V5_ENV" OC_REDACT_TOOL_EVENT_PREVIEWS 1
   ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
+  ensure_env_kv "$V5_ENV" OC_P5_PROJECT_SEARCH 1
+  ensure_env_kv "$V5_ENV" OC_P5_CHIPS 1
+  ensure_env_kv "$V5_ENV" OC_P5_RECIPE_SCHEDULE 1
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
   ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
   ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
@@ -1509,6 +1520,72 @@ build_runtime_release() {
   log "  ✓ runtime release=$BUILT_RUNTIME_RELEASE"
 }
 
+# ── runtime release 与 master release 并行构建(2026-10-08 devflow-opt)──
+# 两者都只读 pinned SHA 的 git archive,写各自独立的 staging(runtime: $OC_HOTCFG_RELEASES_ROOT,
+# master: $MASTER_RELEASES_ROOT),互不依赖;实测串行时 runtime 段约 3.5 分钟。
+# 后台段的输出落独立日志,收尾时整段回放,保持 train 日志可读;结果经结果文件回传父 shell。
+# 父 shell 无论成功失败退出,EXIT 清理都会先等后台段结束(不留在飞写 runtime-releases 的进程)。
+# 父进程被直接杀掉(不走 EXIT)时:后台段继承了发布锁 fd 8,锁会一直持有到它结束,不会有第二趟发布并发写。
+RUNTIME_BG_PID=""
+RUNTIME_BG_LOG=""
+RUNTIME_BG_RESULT=""
+
+start_runtime_release_bg() { # <sha>
+  local sha="$1"
+  if [[ "$DRY" == 1 || "${OC_V5_SERIAL_RUNTIME_BUILD:-0}" == 1 ]]; then
+    return 0   # dry-run / 显式串行:由 collect_runtime_release_bg 就地构建
+  fi
+  RUNTIME_BG_LOG="$(mktemp "${TMPDIR:-/tmp}/ocv5-runtime-release-bg.XXXXXX.log")" || die "mktemp runtime bg log 失败"
+  RUNTIME_BG_RESULT="$(mktemp "${TMPDIR:-/tmp}/ocv5-runtime-release-bg.XXXXXX.env")" || die "mktemp runtime bg result 失败"
+  log "  runtime release 后台并行构建 → $RUNTIME_BG_LOG"
+  (
+    trap - EXIT
+    build_runtime_release "$sha"
+    printf 'BUILT_RUNTIME_RELEASE=%q\nRUNTIME_IMAGE_ID=%q\n' "$BUILT_RUNTIME_RELEASE" "$RUNTIME_IMAGE_ID" >"$RUNTIME_BG_RESULT"
+  ) >"$RUNTIME_BG_LOG" 2>&1 &
+  RUNTIME_BG_PID=$!
+}
+
+collect_runtime_release_bg() { # <sha>
+  local sha="$1" rc=0 line
+  if [[ -z "${RUNTIME_BG_PID:-}" ]]; then
+    build_runtime_release "$sha"
+    return 0
+  fi
+  wait "$RUNTIME_BG_PID" || rc=$?
+  RUNTIME_BG_PID=""
+  log "── runtime release(后台段日志回放)──"
+  cat "$RUNTIME_BG_LOG" 2>/dev/null || true
+  if [[ "$rc" != 0 ]]; then
+    rm -f "$RUNTIME_BG_LOG" "$RUNTIME_BG_RESULT"   # 日志已回放进本次输出
+    die "runtime release 后台构建失败 rc=$rc(live 未改;日志见上)"
+  fi
+  BUILT_RUNTIME_RELEASE=""
+  RUNTIME_IMAGE_ID=""
+  while IFS= read -r line; do
+    case "$line" in
+      BUILT_RUNTIME_RELEASE=*|RUNTIME_IMAGE_ID=*) eval "$line" ;;
+      *) die "runtime bg 结果文件含非法行: $line" ;;
+    esac
+  done <"$RUNTIME_BG_RESULT"
+  [[ "$BUILT_RUNTIME_RELEASE" == "$OC_HOTCFG_RELEASES_ROOT"/rel-* && -d "$BUILT_RUNTIME_RELEASE" ]] \
+    || die "runtime bg 结果非法: BUILT_RUNTIME_RELEASE=$BUILT_RUNTIME_RELEASE"
+  [[ "$RUNTIME_IMAGE_ID" == sha256:* ]] || die "runtime bg 结果非法: RUNTIME_IMAGE_ID=$RUNTIME_IMAGE_ID"
+  rm -f "$RUNTIME_BG_LOG" "$RUNTIME_BG_RESULT"
+  RUNTIME_BG_LOG=""
+  RUNTIME_BG_RESULT=""
+}
+
+# EXIT 清理用:父 shell 提前失败时,等后台段自然结束(它自己的失败路径会清 staging),再回放日志。
+reap_runtime_release_bg() {
+  [[ -n "${RUNTIME_BG_PID:-}" ]] || return 0
+  echo "  等待后台 runtime release 构建收尾(pid=$RUNTIME_BG_PID)…" >&2
+  wait "$RUNTIME_BG_PID" 2>/dev/null || true
+  RUNTIME_BG_PID=""
+  [[ -n "${RUNTIME_BG_LOG:-}" ]] && cat "$RUNTIME_BG_LOG" >&2 2>/dev/null || true
+  rm -f "${RUNTIME_BG_LOG:-}" "${RUNTIME_BG_RESULT:-}"
+}
+
 hotcfg_smoke_cmd() {
   # 该字符串稍后由 oc_hotcfg_activate_saga eval;单引号是故意的,让 $hz/$i 在 eval 时展开。
   # shellcheck disable=SC2016
@@ -2035,13 +2112,14 @@ $dirty
   lease_train_begin "$sha"
   assert_fix_trailers "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
+  start_runtime_release_bg "$sha"
   build_master_release "$sha"
   [[ -n "$BUILT_MASTER_RELEASE" ]] || die "build_master_release 未设置 BUILT_MASTER_RELEASE"
   if [[ "$DRY" != 1 ]]; then
     [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "缺 .complete: $BUILT_MASTER_RELEASE"
     log "  ✓ master release=$BUILT_MASTER_RELEASE donor 优先 live,不吃工作树/.poisoned"
   fi
-  build_runtime_release "$sha"
+  collect_runtime_release_bg "$sha"
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
@@ -2708,11 +2786,12 @@ cmd_cutover() {
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
   # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
-  # master release:引用感知 v5-release-gc.sh,keep 6;live/.prev-release/unit cwd/
+  # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
+  # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/
   # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
   # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
   bash "$SCRIPT_DIR/v5-release-gc.sh" \
-    "$MASTER_RELEASES_ROOT" 6 \
+    "$MASTER_RELEASES_ROOT" 3 \
     "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
     "$MASTER_RELEASES_ROOT/.prev-release" \
     "$V5_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)" \

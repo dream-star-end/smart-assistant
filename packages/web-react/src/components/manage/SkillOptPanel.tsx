@@ -451,7 +451,10 @@ export function SkillEvalSection({
         </Alert>
       )}
 
-      {/* 用例编辑:标题与操作分两行(窄屏),操作可换行 —— 4 个按钮曾横向撑破整个管理中心。 */}
+      {/* 用例编辑:标题与操作分两行(窄屏),操作可换行 —— 4 个按钮曾横向撑破整个管理中心。
+          还没有用例时整条不出现(OCV5-362):改前是「0/5 + 加用例 + 灰掉的保存用例 + 灰掉的运行评测」
+          压在空态上方,两颗点不了的按钮比空态本身还显眼。空态自己给「AI 生成 / 手动添加」两个出口。 */}
+      {cases.length > 0 && (
       <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
         <div className="flex items-center gap-1.5">
           <span className="text-meta font-medium text-muted">评测用例</span>
@@ -505,6 +508,7 @@ export function SkillEvalSection({
           </Button>
         </div>
       </div>
+      )}
 
       {/* 生成中进度(禁用运行评测与再次生成期间的可见反馈)。 */}
       {generating && (
@@ -515,26 +519,36 @@ export function SkillEvalSection({
         </Card>
       )}
       {cases.length === 0 ? (
-        <Card tone="sunken" padding="none" className="border-dashed">
-          <EmptyState
-            icon={FlaskConical}
-            title="还没有评测用例"
-            hint="用例 = 一个真实任务 + 几条可判定的验收断言；它是「这个技能到底有没有用」的唯一事实标准。"
-            action={
-              writable ? (
-                <div className="flex flex-col items-center gap-2">
-                  <Button variant="primary" size="sm" loading={generating} disabled={!!running} onClick={startGenerate}>
-                    {generating ? null : <Sparkles size={13} />}
-                    AI 生成用例
-                  </Button>
-                  <p className="max-w-[19rem] text-meta text-muted">
-                    从技能内容和你的真实使用记录起草，生成后可编辑；也可点上方「加用例」手动写。
-                  </p>
-                </div>
-              ) : undefined
-            }
-          />
-        </Card>
+        <EmptyState
+          icon={FlaskConical}
+          title="还没有评测用例"
+          hint={
+            writable
+              ? "用例 = 一个真实任务 + 几条可判定的验收断言，用来回答「这个技能到底有没有用」。可以让 AI 从技能内容和你的使用记录起草，生成后再改。"
+              : "用例 = 一个真实任务 + 几条可判定的验收断言，用来回答「这个技能到底有没有用」。"
+          }
+          action={
+            writable ? (
+              <>
+                <Button variant="primary" size="sm" loading={generating} disabled={!!running} onClick={startGenerate}>
+                  {generating ? null : <Sparkles size={13} />}
+                  AI 生成用例
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={generating}
+                  onClick={() => {
+                    setCases([{ id: "case-1", prompt: "", assertions: "" }]);
+                    setDirty(true);
+                  }}
+                >
+                  <Plus size={13} /> 手动添加
+                </Button>
+              </>
+            ) : undefined
+          }
+        />
       ) : (
         <ul className="flex flex-col gap-2">
           {cases.map((c, i) => (

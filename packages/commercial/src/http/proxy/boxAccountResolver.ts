@@ -17,6 +17,7 @@ import { listBoxProfiles, writeBoxProfileHealth, type BoxProfileRow } from "./bo
 import { BoxProfileHealth } from "./boxProfileHealth.js";
 import { BOX_PROFILE_GUARD_REFUSED, makeBoxProfileGuard } from "./boxProfileDiscovery.js";
 import { scopeBoxExecToProfile } from "./boxProfileExec.js";
+import { boxLoginCandidates } from "./boxLoginCandidates.js";
 import { pickBoxProfile, type BoxProfileCandidate, type BoxProfilePolicy } from "./boxProfileScheduler.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
@@ -194,30 +195,8 @@ export class BoxAccountResolver {
     if (stored.length === 0) return "legacy";
     const candidates: BoxProfileCandidate[] = [];
     for (const { row, weight } of selectable) {
-      const own = stored.filter((item) => item.accountId === row.id);
-      // This account has no saved logins: it predates profiles and runs its default login.
-      const logins = own.length === 0
-        ? [{ profile: BOX_DEFAULT_PROFILE, isDefault: true }]
-        // Defence in depth behind the admin API: a row edited by hand can never route traffic to a
-        // login that is logged out or whose projects dir is not the shared one (a developer dir).
-        : own.filter((item) => item.enabled && item.loginState === "logged_in"
-          && (item.projectsMode === "root" || item.projectsMode === "shared"))
-          .map((item) => ({ profile: item.profile, isDefault: item.isDefault }));
-      for (const login of logins) {
-        const key = boxProfileKey(row.id, login.profile);
-        if (skip.has(key)) continue;
-        const durable = own.find((item) => item.profile === login.profile);
-        if (durable?.healthUpdatedAt) {
-          profiles.health.load(key, { utilization: durable.utilization,
-            cooldownUntilMs: durable.cooldownUntil?.getTime() ?? null,
-            lastReason: durable.lastReason, updatedAtMs: durable.healthUpdatedAt.getTime() });
-        }
-        candidates.push({ accountId: row.id, profile: login.profile, isDefault: login.isDefault,
-          weight, utilization: profiles.health.utilization(key),
-          cooldownActive: profiles.health.cooldownActive(key),
-          cooldownQuotaOnly: profiles.health.get(key)?.lastReason === "quota_exhausted",
-          loginLoad: profiles.health.recentLaunches(key), boxLoad: 0 });
-      }
+      candidates.push(...boxLoginCandidates({ accountId: row.id, weight,
+        own: stored.filter((item) => item.accountId === row.id), health: profiles.health, skip }));
     }
     for (const candidate of candidates) {
       candidate.boxLoad = candidates.filter((other) => other.accountId === candidate.accountId)
@@ -270,7 +249,11 @@ export class BoxAccountResolver {
     requiredAccountId?: bigint;
     /** Admin discovery/maintenance on a Box: no login scheduling, so a Box whose
      * every login is benched can still be inspected. Never set on model traffic. */
-    adminProbe?: boolean }): Promise<BoxResolvedTarget> {
+    adminProbe?: boolean;
+    /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
+     * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
+     * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
+    interactiveExecTarget?: boolean }): Promise<BoxResolvedTarget> {
     const refused = new Set<string>();
     for (let attempt = 0; ; attempt++) {
       try { return await this.resolveOnce(args, refused); }
@@ -293,7 +276,11 @@ export class BoxAccountResolver {
     requiredAccountId?: bigint;
     /** Admin discovery/maintenance on a Box: no login scheduling, so a Box whose
      * every login is benched can still be inspected. Never set on model traffic. */
-    adminProbe?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
+    adminProbe?: boolean;
+    /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
+     * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
+     * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
+    interactiveExecTarget?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
     const rows = (await this.deps.list()).filter((row) => eligible(row, now())
@@ -302,7 +289,7 @@ export class BoxAccountResolver {
     let profile = BOX_DEFAULT_PROFILE;
     // Cleanup, stop and observer paths pin an account and do not launch (they never wake a Box): a benched
     // or refused login must not stop them from reaching the Box to clean up.
-    const inspectOnly = args.adminProbe === true
+    const inspectOnly = args.adminProbe === true || args.interactiveExecTarget === true
       || (args.requiredAccountId !== undefined && args.allowWakeIfHibernated !== true);
     const choice = this.deps.profiles && !inspectOnly
       ? await this.chooseLogin(rows, args, now(), refused) : "legacy";
@@ -415,7 +402,9 @@ export class BoxAccountResolver {
           health: this.deps.profiles.health }) : transport;
       const owned = owner;
       handedOff = true;
-      return { accountId, exec, profile, ...(owned ? { dispose: () => owned.close() } : {}) };
+      return { accountId, exec, profile, ...(owned ? { dispose: () => owned.close() } : {}),
+        ...(args.interactiveExecTarget === true ? { execTarget: { execUrl: descriptor.execUrl,
+          execToken: descriptor.execToken, networkToken: descriptor.networkToken } } : {}) };
     } catch (error) {
       if (error instanceof BoxAccountResolverError) throw error;
       if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
@@ -463,6 +452,16 @@ export function productionBoxProfileHealth(): BoxProfileHealth {
   });
 }
 
+/** The Box model route (`claude -p` per request) runs only the default login of each account,
+ * whatever else an admin enabled: the other logins serve interactive sessions only (operator
+ * rule 2026-10-11, Box logins never serve `claude -p` product turns; BoxInteractiveLogins).
+ * The default row keeps its stored login state and health, so a logged-out default still stops
+ * the route. */
+export function boxModelRouteLogins(rows: readonly BoxProfileRow[]): BoxProfileRow[] {
+  return rows.filter((row) => row.profile === BOX_DEFAULT_PROFILE)
+    .map((row) => ({ ...row, enabled: true, isDefault: true }));
+}
+
 export function createProductionBoxAccountResolver(): BoxAccountResolver {
   return new BoxAccountResolver({
     list: () => listAccounts({ provider: "cursor", status: "active", limit: 500 }),
@@ -473,7 +472,7 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
       egressProxy: token.egress_proxy, egressTarget: token.egress_target,
       egressProxyId: token.egress_proxy_id, egressHostUuid: token.egress_host_uuid }),
     uidProxy: boxUnboundProxy(),
-    profiles: { list: (ids) => listBoxProfiles(ids),
+    profiles: { list: async (ids) => boxModelRouteLogins(await listBoxProfiles(ids)),
       health: productionBoxProfileHealth() },
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,

@@ -18,15 +18,23 @@
 //   OC_UI_SHOT_DELAY  每张图截前的稳定等待毫秒(默认 400)
 //   OC_UI_SHOT_TIMEOUT 单张截图的超时毫秒(默认 90000,见下方"渲染器偶发卡顿")
 //   OC_E2E_BROWSER    指定 Chrome/Chromium 可执行文件(见 scripts/lib/resolve-browser.mjs)
+//   OC_UI_IMAGE_HOSTS 放行这些主机的图片请求(逗号分隔,如 images.unsplash.com);缺省全部离线兜 204
 // 退出码:0 全部成功 / 1 有场景失败或零场景(fail-loud,不静默出空目录)。
 import { createRequire } from 'node:module'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import tailwindcss from '@tailwindcss/vite'
 import { build as viteBuild } from 'vite'
 import { resolveBrowserExecutable } from '../../../../scripts/lib/resolve-browser.mjs'
+
+const IMAGE_HOSTS = new Set(
+  (process.env.OC_UI_IMAGE_HOSTS ?? '')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean),
+)
 
 const require_ = createRequire(import.meta.url)
 const esbuild = require_('esbuild')
@@ -117,6 +125,8 @@ const plugins = [
 
 // ── 构建 ────────────────────────────────────────────────────────────────────
 const workDir = mkdtempSync(join(tmpdir(), 'oc-ui-preview-'))
+// Build output only (shots go elsewhere); remove it on every exit path (OCV5-357).
+process.on('exit', () => { rmSync(workDir, { recursive: true, force: true }) })
 const bundlePath = join(workDir, 'harness.js')
 await esbuild.build({
   entryPoints: [join(HERE, 'harness.tsx')],
@@ -237,6 +247,11 @@ async function preparePage(page) {
     }
     if (url.startsWith(HARNESS_URL)) {
       return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html })
+    }
+    if (IMAGE_HOSTS.size > 0 && route.request().resourceType() === 'image') {
+      try {
+        if (IMAGE_HOSTS.has(new URL(url).hostname)) return route.continue()
+      } catch {}
     }
     let asset
     try {

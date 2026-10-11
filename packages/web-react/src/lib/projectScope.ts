@@ -166,7 +166,7 @@ export function projectScopeSelectOptions(opts: {
   const works = opts.workProjects.filter((p) => !p.archivedAt);
   const options: { value: string; label: string; disabled?: boolean }[] = [
     { value: "all", label: "全部项目" },
-    { value: "none", label: "未归类" },
+    { value: "none", label: "未分类" },
   ];
   for (const w of works) {
     options.push({
@@ -180,7 +180,7 @@ export function projectScopeSelectOptions(opts: {
   );
   const unbound = opts.chatProjects.filter((c) => !boundChatIds.has(c.id));
   for (const c of unbound) {
-    options.push({ value: c.id, label: `会话组 · ${c.name}` });
+    options.push({ value: c.id, label: `项目 · ${c.name}` });
   }
   return options;
 }

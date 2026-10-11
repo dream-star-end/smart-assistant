@@ -9,12 +9,18 @@ const mocks = vi.hoisted(() => ({
   listMarketplaceInstalled: vi.fn(),
   listMyAgents: vi.fn(),
   uninstallMarketplace: vi.fn(),
+  getConnectors: vi.fn(),
+  getDeclarativeManagement: vi.fn(),
+  getPluginManagement: vi.fn(),
 }))
 vi.mock('../../lib/api', () => ({
   api: {
     listMarketplaceInstalled: (...args: unknown[]) => mocks.listMarketplaceInstalled(...args),
     listMyAgents: (...args: unknown[]) => mocks.listMyAgents(...args),
     uninstallMarketplace: (...args: unknown[]) => mocks.uninstallMarketplace(...args),
+    getConnectors: (...args: unknown[]) => mocks.getConnectors(...args),
+    getDeclarativeManagement: (...args: unknown[]) => mocks.getDeclarativeManagement(...args),
+    getPluginManagement: (...args: unknown[]) => mocks.getPluginManagement(...args),
   },
   apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
 }))
@@ -38,6 +44,9 @@ beforeEach(() => {
   mocks.listMarketplaceInstalled.mockReset().mockResolvedValue([installed])
   mocks.listMyAgents.mockReset().mockResolvedValue([])
   mocks.uninstallMarketplace.mockReset().mockResolvedValue({ ok: true })
+  mocks.getConnectors.mockReset().mockRejectedValue(new Error('offline'))
+  mocks.getDeclarativeManagement.mockReset().mockRejectedValue(new Error('offline'))
+  mocks.getPluginManagement.mockReset().mockRejectedValue(new Error('offline'))
 })
 afterEach(cleanup)
 
@@ -109,7 +118,7 @@ test('列表按 kind 分组;行内不再重复挂与分组同名的种类徽章,
 
   expect(await screen.findByText('智能体（1）')).toBeInTheDocument()
   expect(screen.getByText('技能（1）')).toBeInTheDocument()
-  expect(screen.getByText('API 连接插件（1）')).toBeInTheDocument()
+  expect(screen.getByText('插件（1）')).toBeInTheDocument()
   // 分组标题已经说明了种类,行内那枚「技能」「智能体」「API 插件」徽章是重复信息
   expect(screen.queryByText('技能')).not.toBeInTheDocument()
   expect(screen.queryByText('智能体')).not.toBeInTheDocument()
@@ -166,7 +175,7 @@ const READINESS_CASES: Array<[string, MarketplaceCapabilityReadiness, string, st
     '2/2 项组合能力就绪',
   ],
   [
-    '必需就绪 + 1 项可选 Plugin 待授权',
+    '必需就绪 + 1 项可选插件待授权',
     {
       installed: true,
       ready: true,
@@ -183,7 +192,7 @@ const READINESS_CASES: Array<[string, MarketplaceCapabilityReadiness, string, st
       ],
       needsAuthorization: ['b'],
     },
-    '必需能力已就绪 · 1 项可选 Plugin 待授权',
+    '必需能力已就绪 · 1 项可选插件待授权',
     '1/2 项组合能力就绪',
   ],
   [
@@ -224,7 +233,86 @@ test.each(READINESS_CASES)('智能体就绪状态只留一枚徽章 + 一句注�
   expect(screen.getByText(badge)).toBeInTheDocument()
   expect(screen.getByText(caption)).toBeInTheDocument()
   // 旧版三句打架的另外两句不再同时出现
-  for (const stale of ['可选 Plugin 待授权', 'Plugin 待授权', '能力未就绪']) {
+  for (const stale of ['可选插件待授权', '插件待授权', '能力未就绪']) {
     expect(screen.queryByText(stale)).not.toBeInTheDocument()
   }
+})
+
+test('插件行显示与管理中心同一判据的状态；已连接给「管理账号」，未连接给「去绑定」（OCV5-379）', async () => {
+  mocks.listMarketplaceInstalled.mockResolvedValue([
+    { ...installed, slug: 'weibo', kind: 'connector', name: '微博', agentIds: undefined },
+    { ...installed, slug: 'zhihu', kind: 'connector', name: '知乎', agentIds: undefined },
+  ] as MarketplaceInstalled[])
+  const plugin = (slug: string, label: string) => ({
+    versionId: 'v2',
+    slug,
+    pluginType: 'managed-browser',
+    label,
+    description: '',
+    accountMode: 'required',
+    actions: [],
+    installed: true,
+    installedVersion: '1.0.0',
+    latestVersionId: 'v2',
+    latestVersion: '1.0.0',
+    installedCurrent: true,
+    updateAvailable: false,
+    available: true,
+  })
+  mocks.getPluginManagement.mockResolvedValue({
+    catalog: [plugin('weibo', '微博'), plugin('zhihu', '知乎')],
+    accounts: [
+      {
+        id: 'a1',
+        provider: 'weibo',
+        pluginType: 'managed-browser',
+        displayName: '我的微博',
+        accountHint: '',
+        status: 'active',
+        actions: [],
+        versionId: 'v2',
+        executable: true,
+        writeControl: null,
+      },
+    ],
+  })
+  const onOpenConnectors = vi.fn()
+  render(
+    <TooltipProvider>
+      <InstalledPanel auth={auth} onGoBrowse={() => {}} onOpenConnectors={onOpenConnectors} />
+    </TooltipProvider>,
+  )
+  const weibo = (await screen.findByText('微博')).closest('li') as HTMLElement
+  await waitFor(() => expect(within(weibo).getByTestId('plugin-state')).toHaveTextContent('已连接'))
+  const zhihu = screen.getByText('知乎').closest('li') as HTMLElement
+  expect(within(zhihu).getByTestId('plugin-state')).toHaveTextContent('待授权')
+  fireEvent.click(within(weibo).getByRole('button', { name: '管理账号' }))
+  expect(onOpenConnectors).toHaveBeenLastCalledWith('weibo')
+  fireEvent.click(within(zhihu).getByRole('button', { name: '去绑定' }))
+  expect(onOpenConnectors).toHaveBeenLastCalledWith('zhihu')
+})
+
+test('插件目录读不到时插件行照常渲染、不显示状态（只叠加，不阻断）', async () => {
+  mocks.listMarketplaceInstalled.mockResolvedValue([
+    { ...installed, slug: 'weibo', kind: 'connector', name: '微博', agentIds: undefined },
+  ] as MarketplaceInstalled[])
+  render(
+    <TooltipProvider>
+      <InstalledPanel auth={auth} onGoBrowse={() => {}} onOpenConnectors={() => {}} />
+    </TooltipProvider>,
+  )
+  expect(await screen.findByText('微博')).toBeInTheDocument()
+  await waitFor(() => expect(mocks.getPluginManagement).toHaveBeenCalled())
+  expect(screen.queryByTestId('plugin-state')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '去绑定' })).toBeInTheDocument()
+})
+
+test('空态说清三类都没装', async () => {
+  mocks.listMarketplaceInstalled.mockResolvedValue([])
+  render(
+    <TooltipProvider>
+      <InstalledPanel auth={auth} onGoBrowse={() => {}} />
+    </TooltipProvider>,
+  )
+  expect(await screen.findByText('还没有安装任何技能、智能体或插件')).toBeInTheDocument()
 })

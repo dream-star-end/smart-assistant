@@ -620,8 +620,8 @@ export async function handleMarketplaceInstall(
             : '智能体与能力已安装；完成必需插件的账号授权后即可使用。'
           : v.kind === 'connector'
             ? v.ready
-              ? 'API 连接插件已安装并可使用。'
-              : 'API 连接插件已安装；绑定应用账号后即可使用。'
+              ? '插件已安装并可使用。'
+              : '插件已安装；到「管理中心 → 插件」绑定账号后即可使用。'
             : '已安装,将在你的下一次会话中对 AI 可用。',
     })
   } catch (e) {
@@ -1121,7 +1121,7 @@ export async function handleAdminMarketplaceReviewBatch(
     throw new HttpError(
       400,
       'CONNECTOR_BATCH_APPROVE_FORBIDDEN',
-      '连接器需逐个填写实际安全决策并确认功能验收',
+      '插件需逐个填写实际安全决策并确认功能验收',
     )
   const results = [] as Awaited<ReturnType<typeof reviewVersions>>
   for (const id of versionIds) {

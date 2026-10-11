@@ -83,10 +83,10 @@ function fileInput(): HTMLInputElement {
 describe("ProjectAssetsPanel", () => {
   test("空状态", async () => {
     renderPanel({ list: [] });
-    await waitFor(() => expect(screen.getByText("还没有资产")).toBeTruthy());
-    expect(screen.getByText(/设为项目知识的资料/)).toBeTruthy();
-    // PA-01：用户语境用「项目知识」，不再露出实现术语「注入」。
-    expect(screen.getByText("项目知识 0/20")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("还没有文件")).toBeTruthy());
+    expect(screen.getByText(/设为常用的文件/)).toBeTruthy();
+    // PA-01：用户语境用「常用文件」，不再露出实现术语「注入」。
+    expect(screen.getByText("常用文件 0/20")).toBeTruthy();
     expect(screen.queryByText(/注入/)).toBeNull();
   });
 
@@ -97,7 +97,7 @@ describe("ProjectAssetsPanel", () => {
     await act(async () => {
       list.resolve([]);
     });
-    await waitFor(() => expect(screen.getByText("还没有资产")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("还没有文件")).toBeTruthy());
   });
 
   test("错误态可重试", async () => {
@@ -114,7 +114,7 @@ describe("ProjectAssetsPanel", () => {
     );
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "重试" }));
-    await waitFor(() => expect(screen.getByText("还没有资产")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("还没有文件")).toBeTruthy());
     expect(list).toHaveBeenCalledTimes(2);
   });
 
@@ -138,8 +138,8 @@ describe("ProjectAssetsPanel", () => {
     await waitFor(() => expect(screen.getByText("brief.md")).toBeTruthy());
     const names = [...document.querySelectorAll("[data-asset-id] .truncate")].map((el) => el.textContent);
     expect(names[0]).toBe("brief.md");
-    expect(screen.getByText("项目知识")).toBeTruthy();
-    expect(screen.getByText("项目知识 1/20")).toBeTruthy();
+    expect(screen.getByText("常用")).toBeTruthy();
+    expect(screen.getByText("常用文件 1/20")).toBeTruthy();
     expect(screen.getAllByText("上传").length).toBeGreaterThan(0);
     expect(screen.getByText("产出")).toBeTruthy();
     expect(screen.getByText("2 KB")).toBeTruthy();
@@ -155,11 +155,11 @@ describe("ProjectAssetsPanel", () => {
     });
     vi.spyOn(api, "createProjectAsset").mockResolvedValue(created);
     renderPanel({ list: [] });
-    await waitFor(() => expect(screen.getByText("还没有资产")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("还没有文件")).toBeTruthy());
     const file = new File(["hello"], "notes.pdf", { type: "application/pdf" });
     fireEvent.change(fileInput(), { target: { files: [file] } });
     await waitFor(() => expect(screen.getByText("notes.pdf")).toBeTruthy());
-    expect(screen.queryByText("还没有资产")).toBeNull();
+    expect(screen.queryByText("还没有文件")).toBeNull();
   });
 
   test("上传失败提示且不污染列表", async () => {
@@ -181,14 +181,14 @@ describe("ProjectAssetsPanel", () => {
       list: [asset({ id: "a", name: "doc.txt", pinned: false })],
     });
     await waitFor(() => expect(screen.getByText("doc.txt")).toBeTruthy());
-    const sw = screen.getByRole("switch", { name: "设为项目知识" });
+    const sw = screen.getByRole("switch", { name: "设为常用" });
     expect(sw).toHaveAttribute("data-state", "unchecked");
     fireEvent.click(sw);
-    await waitFor(() => expect(screen.getByRole("switch", { name: "取消项目知识" })).toHaveAttribute("data-state", "checked"));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "取消常用" })).toHaveAttribute("data-state", "checked"));
     await act(async () => {
       patch.reject(new Error("后端拒绝"));
     });
-    await waitFor(() => expect(screen.getByRole("switch", { name: "设为项目知识" })).toHaveAttribute("data-state", "unchecked"));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "设为常用" })).toHaveAttribute("data-state", "unchecked"));
   });
 
   test("删除二次确认：取消保留，确认后移除", async () => {

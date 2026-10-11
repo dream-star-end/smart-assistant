@@ -5,7 +5,7 @@ import { formatBytes } from '../../lib/chat/download'
 import { isWorkScope } from '../../lib/projectScope'
 import { taskboardApi } from '../../lib/taskboard'
 import type { AuthSession } from '../../lib/types'
-import { Alert, Button, ListSkeleton, PanelHeader } from '../ui'
+import { Alert, Button, ListSkeleton } from '../ui'
 
 /**
  * 注入槽的用户可读名。后端槽名是实现词（instructions / memories / skills），
@@ -73,10 +73,11 @@ export function AgentProjectPreview({ auth, agentId }: { auth: AuthSession; agen
 
   return (
     <div data-testid="agent-project-preview" className="border-t border-border">
-      <PanelHeader
-        title="智能体会带着这些项目信息开始对话"
-        hint="只展示注入了哪些内容和大小，不展示原文。"
-      />
+      {/* 小节标题,不是页面标题:PanelHeader 在手机管理中心里只留给读屏,这里必须一直可见。 */}
+      <div className="px-4 pb-2 pt-5">
+        <h4 className="text-[14px] font-semibold leading-5 text-fg">智能体会带着这些项目信息开始对话</h4>
+        <p className="mt-0.5 text-meta text-muted">只展示注入了哪些内容和大小，不展示原文。</p>
+      </div>
       {loading ? (
         <div className="px-4 pb-3">
           <ListSkeleton rows={3} />

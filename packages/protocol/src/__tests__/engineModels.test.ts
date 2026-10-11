@@ -24,6 +24,7 @@ import {
   DEFAULT_CURSOR_CONTEXT_TIER,
   DEFAULT_CODEX_ENGINE_MODEL,
   PLATFORM_REASONING_EFFORTS,
+  boxClaudeRunner,
   cursorFamilyDefaultEffort,
   cursorFamilyDefaultFast,
   cursorFamilyEfforts,
@@ -336,6 +337,7 @@ describe('Cursor engine model authority', () => {
     assert.equal(findCursorEngineModel('box-claude-haiku-5-5', null, false)?.upstreamModel, 'claude-haiku-5-5')
     assert.equal(publicCursorModelId('box-claude-haiku-5-5'), 'box-claude-haiku-5-5')
     assert.equal(cursorModelIdFromPublic('box-claude-haiku-5-5'), 'box-claude-haiku-5-5')
+    assert.equal(boxClaudeRunner('box-claude-haiku-5-5'), 'interactive')
     assert.equal(publicCursorModelId('box-claude-opus-5-5'), 'box-claude-opus-5-5')
     assert.equal(cursorModelIdFromPublic('box-claude-opus-5-5'), 'box-claude-opus-5-5')
 

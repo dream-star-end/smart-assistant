@@ -68,7 +68,6 @@ export const apiAccessScenes: Scene[] = [
         theme="light"
         onClose={() => {}}
         onSetTheme={() => {}}
-        onOpenMemory={() => {}}
         initialSection="api-access"
       />
     ),

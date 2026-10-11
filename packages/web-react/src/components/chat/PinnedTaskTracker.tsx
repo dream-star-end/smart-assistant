@@ -114,8 +114,11 @@ function normalizeTodoItems(todos: unknown): TodoItem[] {
  * 子 agent 的 TodoWrite 是 agent-group 子块,不进主 HUD。反向扫描,命中最近的结构化
  * 任务源即返回；text-only plan 没有 steps,继续保留 inline PlanCard 兜底。
  */
-export function extractLatestTodos(messages: ChatMessage[]): TodoItem[] {
-  const turnStart = currentTurnStartIndex(messages);
+export function extractLatestTodos(
+  messages: readonly ChatMessage[],
+  /** 扫描起点。缺省 = 当前活跃段(HUD 语义);详情面板「计划」页传 0 看整个会话最近的一份。 */
+  turnStart: number = currentTurnStartIndex(messages),
+): TodoItem[] {
   for (let i = messages.length - 1; i >= turnStart; i--) {
     const m = messages[i];
     if (!m) continue;

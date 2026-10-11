@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronsUpDown,
+  Command,
   Film,
   Globe,
   KeyRound,
@@ -68,7 +69,6 @@ import {
 } from "./sidebar/runningOrder";
 import {
   Avatar,
-  Badge,
   Button,
   DropdownMenu,
   DropdownMenuContent,
@@ -124,13 +124,18 @@ export type SidebarProps = {
   activeId?: string;
   user: User | null;
   credits?: string | null;
-  optimizerPending?: number;
   onSelect: (id: string) => void;
   onNew: () => void;
   onRename: (s: Session) => void;
   onDelete: (s: Session) => void;
   onTogglePin?: (s: Session) => void;
   onMoveToProject?: (s: Session, projectId: string | null) => void;
+  /** 会话菜单「新建项目并移入…」:打开新建项目对话框,创建后该会话移进新项目。 */
+  onCreateProjectFromSession?: (s: Session) => void;
+  onToggleProjectPin?: (p: ChatProject) => void;
+  onArchiveProject?: (p: ChatProject) => void;
+  /** 「已归档 / 最近删除的项目」入口(项目标题行)。 */
+  onOpenProjectArchive?: () => void;
   projects?: ChatProject[];
   collapsedProjectIds?: Set<string>;
   onToggleProjectCollapsed?: (id: string) => void;
@@ -172,6 +177,10 @@ export type SidebarProps = {
   unreadIds?: Set<string>;
   onMarkRead?: (id: string) => void;
   onOpenProjectSettings?: (p: ChatProject) => void;
+  /** 打开项目主页（点项目名）。不传则项目行整行只负责展开/折叠（旧行为）。 */
+  onOpenProject?: (projectId: string) => void;
+  /** 主区正在显示主页的项目（行高亮）；不在项目主页时为 null。 */
+  activeProjectId?: string | null;
   /** 打开某项目的资产面板；default 组传 null。 */
   onOpenProjectAssets?: (projectId: string | null) => void;
   /** 返回 Promise 时，reject 会回滚侧栏本地的乐观排序（S-03）。 */
@@ -199,6 +208,8 @@ export type SidebarProps = {
   ) => Promise<SessionSearchHit[]>;
   searchProjectId?: string | null;
   virtualizeThreshold?: number;
+  /** Ctrl/⌘K palette (projects, chats, files, actions). Omit to hide the hint button. */
+  onOpenPalette?: () => void;
 };
 
 export function Sidebar({
@@ -206,13 +217,16 @@ export function Sidebar({
   activeId,
   user,
   credits,
-  optimizerPending = 0,
   onSelect,
   onNew,
   onRename,
   onDelete,
   onTogglePin,
   onMoveToProject,
+  onCreateProjectFromSession,
+  onToggleProjectPin,
+  onArchiveProject,
+  onOpenProjectArchive,
   projects,
   collapsedProjectIds,
   onToggleProjectCollapsed,
@@ -244,6 +258,8 @@ export function Sidebar({
   unreadIds,
   onMarkRead,
   onOpenProjectSettings,
+  onOpenProject,
+  activeProjectId = null,
   onOpenProjectAssets,
   onReorderProjects,
   width,
@@ -261,6 +277,7 @@ export function Sidebar({
   onSearchMessages,
   searchProjectId,
   virtualizeThreshold = VIRTUALIZE_THRESHOLD,
+  onOpenPalette,
 }: SidebarProps) {
   const [q, setQ] = useState("");
   const [now, setNow] = useState(() => Date.now());
@@ -291,8 +308,18 @@ export function Sidebar({
   }, [archivedExpanded]);
   const searching = q.trim().length > 0;
   const projectScope = useProjectScope();
+  // 全局项目范围(在看板/管理中心选的)也会收窄侧栏搜索:必须看得见,也能一键放开。
+  // 放开只对本侧栏搜索生效,范围本身一变就恢复跟随。
+  const [ignoreScopeForSearch, setIgnoreScopeForSearch] = useState(false);
+  const scopeToken = projectScope.scope.token;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 范围 token 变化即恢复跟随
+  useEffect(() => setIgnoreScopeForSearch(false), [scopeToken]);
+  const scopeFilterForSearch =
+    searchProjectId === undefined && !ignoreScopeForSearch
+      ? projectScope.scope.chatProjectIdForFilter
+      : undefined;
   const activeSearchProjectId =
-    searchProjectId !== undefined ? searchProjectId : projectScope.scope.chatProjectIdForFilter;
+    searchProjectId !== undefined ? searchProjectId : scopeFilterForSearch;
   const showProjects = Array.isArray(projects) && Boolean(onCreateProject);
   // 只有出现在项目列表里的 projectId 才算「有归属」。projectId 指向未知项目的会话
   // （项目列表请求失败 / 项目在他端被删）一律落回「未分类」，绝不从侧栏消失（S-12）。
@@ -317,7 +344,9 @@ export function Sidebar({
   }, []);
 
   const orderedProjects = useMemo(() => {
-    const list = projects ?? [];
+    // 归档的项目不在主列表;置顶的排在最前(各自保持原有顺序)。
+    const live = (projects ?? []).filter((p) => !p.archivedAt);
+    const list = [...live.filter((p) => p.pinnedAt), ...live.filter((p) => !p.pinnedAt)];
     if (!orderOverride) return list;
     const map = new Map(list.map((p) => [p.id, p]));
     const out: ChatProject[] = [];
@@ -341,8 +370,13 @@ export function Sidebar({
       ? sessions.filter((s) => !s.archived || archivedExpanded)
       : activeSessions;
     if (!needle) return pool;
-    return pool.filter((s) => (s.title || "新对话").toLowerCase().includes(needle));
-  }, [activeSessions, sessions, q, searching, archivedExpanded]);
+    // 标题命中与消息命中同一个项目范围,不再一边过滤一边不过滤。
+    return pool.filter(
+      (s) =>
+        (s.title || "新对话").toLowerCase().includes(needle) &&
+        (activeSearchProjectId === undefined || (s.projectId ?? null) === activeSearchProjectId),
+    );
+  }, [activeSessions, sessions, q, searching, archivedExpanded, activeSearchProjectId]);
 
   const pinned = useMemo(
     () =>
@@ -615,6 +649,19 @@ export function Sidebar({
               <Plus size={14} />
             </IconButton>
           )}
+          {withAction && onOpenProjectArchive && (
+            <IconButton
+              aria-label="已归档和最近删除的项目"
+              title="已归档和最近删除的项目"
+              variant="muted"
+              size="xs"
+              shape="square"
+              className="rounded-xs"
+              onClick={onOpenProjectArchive}
+            >
+              <Archive size={14} />
+            </IconButton>
+          )}
         </h2>
       );
     }
@@ -716,6 +763,7 @@ export function Sidebar({
           onDelete={onDelete}
           onTogglePin={onTogglePin}
           onMoveToProject={onMoveToProject}
+          onCreateProjectFromSession={onCreateProjectFromSession}
           onArchive={onArchive}
           onMarkRead={onMarkRead}
           unread={unreadIds?.has(s.id)}
@@ -728,6 +776,11 @@ export function Sidebar({
           }}
           allowDrag={!coarse}
           highlightQuery={searching ? q : undefined}
+          projectHint={
+            searching && s.projectId
+              ? (projects ?? []).find((p) => p.id === s.projectId)?.name
+              : undefined
+          }
         />
       );
     }
@@ -747,7 +800,9 @@ export function Sidebar({
           canMoveUp={!isDefault && idx > 0}
           canMoveDown={!isDefault && idx >= 0 && idx < orderedProjects.length - 1}
           immutable={isDefault}
+          active={!isDefault && activeProjectId === p.id}
           onToggle={onToggleProjectCollapsed}
+          onOpen={isDefault ? undefined : onOpenProject}
           onRename={isDefault ? undefined : onRenameProject}
           onDelete={isDefault ? undefined : onDeleteProject}
           onOpenSettings={isDefault ? undefined : onOpenProjectSettings}
@@ -757,6 +812,8 @@ export function Sidebar({
           onNewSession={!isDefault && onNewInProject ? () => onNewInProject(p.id) : undefined}
           onMoveUp={() => moveProject(p.id, -1)}
           onMoveDown={() => moveProject(p.id, 1)}
+          onTogglePin={isDefault ? undefined : onToggleProjectPin}
+          onArchive={isDefault ? undefined : onArchiveProject}
           onDragOverSession={() => setDragOverProjectId(p.id)}
           onDragLeave={() => setDragOverProjectId((cur) => (cur === p.id ? null : cur))}
           onDropSessionId={(id) => {
@@ -989,6 +1046,23 @@ export function Sidebar({
               <X size={13} />
             </IconButton>
           )}
+          {onOpenPalette && !q && (
+            <button
+              type="button"
+              data-product-control
+              data-sidebar-palette
+              aria-label="搜索与跳转（项目、会话、文件）"
+              title={`搜索与跳转 (${paletteKeyLabel()})`}
+              onClick={(e) => {
+                e.preventDefault();
+                onOpenPalette();
+              }}
+              className="flex h-6 shrink-0 items-center justify-center rounded-xs px-1.5 text-faint outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:size-11 [@media(hover:none)]:px-0"
+            >
+              <kbd className="font-sans text-caption [@media(hover:none)]:hidden">{paletteKeyLabel()}</kbd>
+              <Command size={15} aria-hidden className="hidden [@media(hover:none)]:block" />
+            </button>
+          )}
           {onBatch && !multiSelect && (
             <IconButton
               data-product-control
@@ -1005,6 +1079,31 @@ export function Sidebar({
             </IconButton>
           )}
         </label>
+        {searching && scopeFilterForSearch !== undefined && (
+          <div
+            data-testid="sidebar-search-scope"
+            className="mt-1 flex min-w-0 items-center gap-1 rounded-sm bg-accent-soft py-0.5 pl-2.5 pr-1 text-caption text-accent"
+          >
+            <span className="min-w-0 flex-1 truncate">
+              仅在「
+              {scopeFilterForSearch === null
+                ? "未分类"
+                : ((projects ?? []).find((p) => p.id === scopeFilterForSearch)?.name ?? "当前项目")}
+              」中搜索
+            </span>
+            <IconButton
+              data-product-control
+              aria-label="搜索全部项目"
+              title="搜索全部项目"
+              variant="muted"
+              size="xs"
+              shape="round"
+              onClick={() => setIgnoreScopeForSearch(true)}
+            >
+              <X size={12} />
+            </IconButton>
+          </div>
+        )}
 
         {onOpenBoard && (
           <button
@@ -1109,13 +1208,7 @@ export function Sidebar({
                 >
                   <LayoutGrid size={16} className="shrink-0 text-muted" />
                   <span className="flex-1">管理中心</span>
-                  {optimizerPending > 0 ? (
-                    <Badge tone="accent" size="sm">
-                      {optimizerPending > 99 ? "99+" : optimizerPending} 项待确认
-                    </Badge>
-                  ) : (
-                    <span className="text-caption text-faint">记忆 · 技能</span>
-                  )}
+                  <span className="text-caption text-faint">记忆 · 技能 · 定时 · 插件</span>
                 </DropdownMenuItem>
               )}
               {onOpenMarketplace && (
@@ -1222,4 +1315,11 @@ export function Sidebar({
       </div>
     </aside>
   );
+}
+
+/** 「Ctrl K」/「⌘K」 hint for the palette button (Mac-family shows ⌘). */
+function paletteKeyLabel(): string {
+  const platform =
+    typeof navigator === "undefined" ? "" : `${navigator.platform ?? ""} ${navigator.userAgent ?? ""}`;
+  return /Mac|iPhone|iPad|iPod/i.test(platform) ? "⌘K" : "Ctrl K";
 }

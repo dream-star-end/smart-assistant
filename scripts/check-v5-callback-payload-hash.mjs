@@ -139,8 +139,11 @@ async function supervise() {
       cwd: root, detached: true, stdio: 'inherit',
       // Do not inherit production DB/PG*, Redis, model keys, proxies, runtime
       // flags or NODE_OPTIONS/NODE_PATH. The CCB fixture can query global billing.
+      // TMPDIR is kept: the release gives each build its own, so tsx's
+      // compile cache goes away with the build (OCV5-357).
       env: { PATH: process.env.PATH, HOME: home, OPENCLAUDE_HOME: home,
-        NODE_ENV: 'test', OC_TEST_MUTEX_TIMEOUT: '90' },
+        NODE_ENV: 'test', OC_TEST_MUTEX_TIMEOUT: '90',
+        ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) },
     });
     const code = await new Promise((resolve, reject) => {
       child.once('error', reject);

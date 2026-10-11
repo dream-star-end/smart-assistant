@@ -2393,8 +2393,8 @@ const SCENARIOS: ScenarioDefinition[] = [
     featureId: "connectors",
     async run(ctx) {
       await openManage(ctx);
-      await selectDialogTab(ctx, "连接器");
-      await assertVisible(ctx, ':text("产品知识库")', "已绑定连接器已加载");
+      await selectDialogTab(ctx, "插件");
+      await assertVisible(ctx, ':text("产品知识库")', "已绑定插件已加载");
       await stage(ctx, "查看已绑定的 Notion 产品知识库");
       await tracedClick(
         ctx,

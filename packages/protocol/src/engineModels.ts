@@ -1066,6 +1066,8 @@ export const CURSOR_ENGINE_MODELS = [
   },
   // Official Claude Code inside the account Grok Bot box. These ids are not
   // Cursor Sand slugs; upstreamModel is the id the box CLI accepts.
+  // runner: the interactive terminal + oc-bridge mod. Box logins never serve
+  // these rows through `claude -p` (operator rule 2026-10-11, OCV5-378).
   // One family each: the picker collapses a family to a single effort row,
   // and these names are different models, not effort levels.
   {
@@ -1076,6 +1078,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Opus 5.5',
     effort: null,
     fast: false,
+    runner: 'interactive',
   },
   {
     id: 'box-claude-sonnet-5',
@@ -1085,6 +1088,7 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Sonnet 5',
     effort: null,
     fast: false,
+    runner: 'interactive',
   },
   {
     id: 'box-claude-haiku-4-5',
@@ -1094,6 +1098,17 @@ export const CURSOR_ENGINE_MODELS = [
     familyLabel: 'Claude Haiku 4.5',
     effort: null,
     fast: false,
+    runner: 'interactive',
+  },
+  {
+    id: 'box-claude-haiku-5-5',
+    displayName: 'Claude Haiku 5.5',
+    upstreamModel: 'claude-haiku-5-5',
+    family: 'box-claude-haiku-5-5',
+    familyLabel: 'Claude Haiku 5.5',
+    effort: null,
+    fast: false,
+    runner: 'interactive',
   },
   {
     id: 'box-claude-haiku-5-5',
@@ -1114,6 +1129,16 @@ export const DEFAULT_CURSOR_ENGINE_MODEL: CursorEngineModelId = CURSOR_ENGINE_MO
 export function isCursorEngineModel(modelId: string | null | undefined): boolean {
   return typeof modelId === 'string' &&
     (CURSOR_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+}
+
+/** How the Box runs a box-claude-* row. Every row is `interactive` (interactive
+ * Claude Code + the oc-bridge mod); the box bridge refuses `p`. Undefined for
+ * every other model. */
+export type BoxClaudeRunner = 'p' | 'interactive'
+
+export function boxClaudeRunner(modelId: string | null | undefined): BoxClaudeRunner | undefined {
+  const model = cursorModelById(modelId)
+  return model && 'runner' in model ? model.runner : undefined
 }
 
 export function cursorModelById(modelId: string | null | undefined): CursorEngineModel | undefined {

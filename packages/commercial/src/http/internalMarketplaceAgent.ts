@@ -510,7 +510,7 @@ export function makeMarketplaceAgentHandler(deps: MarketplaceAgentDeps): Marketp
             {
               error: {
                 code: 'CONFIRMATION_STALE',
-                message: 'Plugin 草稿已变化；请重新准备并取得用户确认',
+                message: '插件草稿已变化；请重新准备并取得用户确认',
               },
             },
             requestId,
@@ -686,7 +686,7 @@ async function handlePublish(
       {
         error: {
           code: 'CONFIRMATION_REQUIRED',
-          message: 'Plugin 发布必须使用 prepare-plugin / publish-plugin 两阶段确认流程',
+          message: '插件发布必须使用 prepare-plugin / publish-plugin 两阶段确认流程',
         },
       },
       requestId,

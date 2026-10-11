@@ -1245,7 +1245,11 @@ function InspectorDesktop() {
             </div>
           </div>
         </main>
-        <InspectorPanel target={{ kind: 'tool', message: INSPECT_TARGET }} onClose={() => {}} />
+        <InspectorPanel
+          messages={[]}
+          request={{ tab: 'steps', message: INSPECT_TARGET, nonce: 1 }}
+          onClose={() => {}}
+        />
       </div>
     </ArtifactInspectContext.Provider>
   )
@@ -1260,9 +1264,10 @@ function InspectorMobile() {
           <Cards rows={INSPECT_ROWS} />
         </div>
       </div>
-      <Sheet open onOpenChange={() => {}} side="bottom" srTitle="产物详情" className="h-[85dvh]">
+      <Sheet open onOpenChange={() => {}} side="bottom" srTitle="详情面板" className="h-[85dvh]">
         <InspectorPanelContent
-          target={{ kind: 'tool', message: INSPECT_TARGET }}
+          messages={[]}
+          request={{ tab: 'steps', message: INSPECT_TARGET, nonce: 1 }}
           onClose={() => {}}
         />
       </Sheet>

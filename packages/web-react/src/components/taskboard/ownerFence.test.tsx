@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createMemoryAuthSession } from '../../lib/authSession'
 import {
   type PipelineStage,
@@ -12,15 +12,14 @@ import { ToastProvider, TooltipProvider } from '../ui'
 import { TicketDrawer } from './TicketDrawer'
 import { TicketListView } from './TicketListView'
 import { useTaskboard } from './useTaskboard'
+import { loadBeforeAll } from '../../test/moduleLoad'
 
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
 })
 
-beforeAll(async () => {
-  await import('../MarkdownImpl')
-})
+loadBeforeAll(() => import('../MarkdownImpl'))
 
 const auth = createMemoryAuthSession(() => {}, 'tok-owner')
 

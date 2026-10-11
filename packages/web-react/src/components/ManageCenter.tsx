@@ -1,37 +1,51 @@
-import { LogIn } from "lucide-react";
-import { MANAGE_TABS, type ManageTab } from "../lib/manageTabs";
-import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
-import type { AuthSession } from "../lib/types";
-import { CronPanel } from "./manage/CronPanel";
-import { LibraryPanel } from "./manage/LibraryPanel";
-import { MemoryPanel } from "./manage/MemoryPanel";
-import { OptimizationPanel } from "./manage/OptimizationPanel";
-import { SkillsPanel } from "./manage/SkillsPanel";
-import { ConnectorsTab } from "./settings/ConnectorsTab";
-import { Badge, Button, EmptyState, Modal, ProjectScopeSelect, Tabs } from "./ui";
+import { ArrowUpRight, CircleHelp, LogIn, Store } from 'lucide-react'
+import { useState } from 'react'
+import { useMdViewport } from '../hooks/useMdViewport'
+import { MANAGE_TABS, type ManageTab, SCOPED_MANAGE_TABS } from '../lib/manageTabs'
+import { PRODUCT_CAPABILITIES, type ProductFeatureId } from '../lib/productCapabilities'
+import type { AuthSession } from '../lib/types'
+import { CronPanel } from './manage/CronPanel'
+import { MemoryPanel } from './manage/MemoryPanel'
+import { SkillsPanel } from './manage/SkillsPanel'
+import { ConnectorsTab } from './settings/ConnectorsTab'
+import {
+  Button,
+  EmptyState,
+  HeaderSlotProvider,
+  Modal,
+  ProjectScopeSelect,
+  QuietSurface,
+  SectionNav,
+  Tabs,
+} from './ui'
 
-export type { ManageTab };
+export type { ManageTab }
 
 /**
- * 管理中心：记忆 / 技能 / 定时 / 插件 / 文献 / 优化。均经 commercial router 容器代理
- * 读写用户容器内 gateway。与设置中心（账户/计费/偏好）分离 —— 这里是「智能体数据」管理。
+ * 管理中心：记忆 / 技能 / 定时 / 插件。均经 commercial router 容器代理读写用户容器内
+ * gateway。与设置中心（账户/计费/偏好）分离 —— 这里是「智能体数据」管理。
  * 各 Tab 懒渲染，demo/未登录不渲染网络分区。
+ * 「文献」「优化」两个分区已在 OCV5-360 下线（个人版现网 0 文档 / 0 条建议，证据见工单）；
+ * 后端接口与数据原样保留，回退本提交即可恢复入口。
  *
- * ── 外壳 ─────────────────────────────────────────────────────────────
- * 壳体收敛到 ui/Modal 的 size / fixedHeight / toolbar 三轴（改造前是手抄 ~250 字符的
- * Radix 类名，与市场壳 768×736 差一截 —— 两个中心互相跳转时窗口会跳一下）。
- * `size="xl" + fixedHeight` = 与市场壳同一尺寸；定高（非 max-h）保证切 Tab 时高度不跳。
- * 底色显式保持 bg-surface：四个中心壳同层级，且内部卡片就是 bg-surface，
- * 换 bg-elevated 会让深色主题下的卡片反而比壳更暗（层级倒挂）。
+ * ── 外壳（OCV5-362 第 5 轮）────────────────────────────────────────
+ * 与设置中心是同一个壳：Modal 自带标题行（左「管理中心」，右「怎么用」+ 关闭）；
+ * 桌面左侧是与设置共用的 SectionNav，窄屏是与设置同款的宫格药丸 Tabs（一条带底线的色带）。
+ * 第 3/4 轮另起了一套语言（居中 iOS 标题、方角分段、染色侧栏、把圆角 token 压到 10/8px），
+ * 运营 19:56：「样式感觉和v5个人版的整体样式很割裂」—— 那套外壳已删除，圆角 / 阴影 / 页签
+ * 全部回到 app 自己的 token。保留的只是行级的克制（一行一个点按目标、两行截断、一条元信息、
+ * 圆点 + 文字的状态），见 ui/Quiet.tsx。
+ *
+ * 上下文行（两个断点同一条）：左作用范围，右是分区自己的操作（PanelHeader 的 action 经
+ * HeaderSlot portal 过来）。分区标题只留给读屏 —— 导航已写明你在哪，设置中心同样没有页面大标题。
+ * 内容滚动后上下文行下沿出现发丝线（第 4 轮修的「搜索框被切一半」）。
  *
  * ── 分区契约（新增/改面板的人请遵守）─────────────────────────────────
- * 1. 面板的**第一个子节点必须是 PanelHeader**，且面板自身不得再包一层水平 padding
- *    ——PanelHeader 自带 px-4，外面再套 px-5 会让标题左缘在切 Tab 时横向平移 20px。
- * 2. 加载态用 ListSkeleton 且**保留 PanelHeader 在骨架之上**，不要整面板早返：
- *    定高壳里的整面板早返 = 700px 空白 + 中间一个圈，观感等同整页重载。
- * 3. 错误渲染在**发起它的那个容器内**（弹窗内失败→弹窗内报）；成功且离开当前上下文
- *    （弹窗关闭 / 行消失）走 toast，留在原地则用内联 Alert。
- * 4. 空态必须有 icon + 说明 + 可点 CTA（EmptyState 的 action 槽）。
+ * 1. 面板的**第一个子节点必须是 PanelHeader**，且面板自身不得再包一层水平 padding。
+ *    分区唯一的主操作放 PanelHeader 的 action（会被搬进上下文行，要短、要小）。
+ * 2. 加载态用 ListSkeleton 且**保留 PanelHeader 在骨架之上**，不要整面板早返。
+ * 3. 错误渲染在**发起它的那个容器内**；成功且离开当前上下文走 toast，留在原地用内联 Alert。
+ * 4. 空态 = 标题 + 一句说明 + 可点 CTA（EmptyState 的 action 槽）。
  */
 export function ManageCenter({
   open,
@@ -40,165 +54,213 @@ export function ManageCenter({
   agentId,
   agents,
   autoAuthorizePluginSlug,
-  optimizerPendingCount = 0,
   onAutoAuthorizeConsumed,
   onTabChange,
   onClose,
   onOpenMarketplace,
+  onOpenHelp,
   onRequireLogin,
 }: {
-  open: boolean;
-  tab: ManageTab;
-  auth: AuthSession | null;
+  open: boolean
+  tab: ManageTab
+  auth: AuthSession | null
   /** 记忆按 agent 维度；默认选中当前对话 agent。 */
-  agentId: string;
+  agentId: string
   /** 可切换的智能体（全能助手 + 已安装市场智能体），记忆面板内切换。 */
-  agents: { id: string; name: string }[];
+  agents: { id: string; name: string }[]
   /** 市场安装后一次性自动打开对应 Plugin 的授权弹层。 */
-  autoAuthorizePluginSlug?: string | null;
-  /** Auto‑Dream 待确认建议数（与侧栏入口信号同源，见 hooks/useOptimizerPending）。 */
-  optimizerPendingCount?: number;
-  onAutoAuthorizeConsumed?: () => void;
-  onTabChange: (t: ManageTab) => void;
-  onClose: () => void;
-  onOpenMarketplace?: () => void;
+  autoAuthorizePluginSlug?: string | null
+  onAutoAuthorizeConsumed?: () => void
+  onTabChange: (t: ManageTab) => void
+  onClose: () => void
+  /**
+   * 去 AI 市场添加。带上类目：技能页 → 技能，插件页 → 插件（OCV5-379：改造前一律落到插件类目，
+   * 技能页的「市场」按钮把用户送错了地方）。
+   */
+  onOpenMarketplace?: (kind: 'skill' | 'connector') => void
+  /** 「怎么用」：打开对应功能的教程。省略则不渲染帮助入口。 */
+  onOpenHelp?: (featureId: ProductFeatureId) => void
   /** 未登录态 CTA：关闭本壳并把用户送到登录页。省略则空态只剩说明。 */
-  onRequireLogin?: () => void;
+  onRequireLogin?: () => void
 }) {
-  const items = MANAGE_TABS.map((t) => ({
-    value: t.id,
-    featureId: t.featureId,
-    // 「优化」是收件箱型分区：有待办才值得看。徽标是它唯一的曝光位（改造前 Tab 上
-    // 没有任何数量信号，用户点进去才知道有事要办）；0 时不渲染，避免恒亮的噪声。
-    label:
-      t.id === "optimization" && optimizerPendingCount > 0 ? (
-        <span className="inline-flex min-w-0 items-center gap-1">
-          <span className="truncate">{t.label}</span>
-          <Badge tone="accent" size="sm">
-            {optimizerPendingCount > 99 ? "99+" : optimizerPendingCount}
-            <span className="sr-only"> 项待确认</span>
-          </Badge>
-        </span>
-      ) : (
-        t.label
-      ),
-  }));
+  const desktop = useMdViewport()
+  const current = MANAGE_TABS.find((t) => t.id === tab) ?? MANAGE_TABS[0]
+  // 上下文行右侧的插槽节点：PanelHeader 的 action 经 portal 渲染到这里。
+  const [slot, setSlot] = useState<HTMLDivElement | null>(null)
+  // 内容是否已滚离顶部：决定上下文行下沿的发丝线（切分区时面板重挂、回到顶部）。
+  const [scrolled, setScrolled] = useState(false)
+  const scoped = SCOPED_MANAGE_TABS.has(current.id)
+
+  // 两种导航同一个 id 体系（manage-tab-<id> / manage-panel-<id>），任一时刻只挂一种。
+  const navItems = MANAGE_TABS.map((t) => ({ id: t.id, label: t.label, featureId: t.featureId }))
 
   return (
     <Modal
       open={open}
       onOpenChange={(next) => {
-        if (!next) onClose();
+        if (!next) onClose()
       }}
-      title="管理中心"
-      description="记忆、技能、定时任务与插件都在这里"
+      title={<span className="text-title font-semibold text-fg">管理中心</span>}
+      headerActions={
+        onOpenHelp ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => onOpenHelp(current.featureId)}
+            className="gap-1.5 text-muted hover:text-fg"
+          >
+            <CircleHelp size={15} strokeWidth={1.75} aria-hidden="true" />
+            怎么用
+          </Button>
+        ) : undefined
+      }
       size="xl"
       fixedHeight
-      // mobile 显式取 center（= 默认）：只有 center 形态会挂 .oc-center-dialog，
-      // 那是 iOS 键盘弹起时把弹层顶回可视视口的 visualViewport / safe-area 契约，
-      // 四个中心壳都依赖它；fullscreen/sheet 挂上反而会被它反向覆盖定位。
+      // 窄屏仍是居中弹窗（运营「弹窗不变」）：只有 center 形态会挂 .oc-center-dialog，
+      // 那是 iOS 键盘弹起时把弹层顶回可视视口的 visualViewport / safe-area 契约。
       mobile="center"
-      className="bg-surface"
-      // 移动端主导航：与市场壳同款的单行横滚（no-scrollbar + 边缘渐隐 + 选中项自动居中）。
-      // 3×2 宫格把首屏内容压掉两行高度、热区又被摊薄，移动端审计后弃用。
-      toolbar={
-        <div className="flex flex-col gap-2">
-          {tab === "memory" || tab === "skills" || tab === "cron" ? (
-            <ProjectScopeSelect className="w-full sm:w-56" />
-          ) : null}
-          <Tabs
-            aria-label="管理分区"
-            idBase="manage"
-            value={tab}
-            onValueChange={(v) => onTabChange(v as ManageTab)}
-            items={items}
-          />
-          {/* 390px 下六个 Tab 单行横滚，第 6 个「优化」—— 唯一带待办徽标的分区 —— 整个在视口外，
-              徽标信号等于没有。窄屏补一行可点的待办提示（md 起 Tab 条放得下，隐藏）；
-              不恢复 3×2 宫格（占两行首屏、热区摊薄，移动端审计后弃用）。 */}
-          {optimizerPendingCount > 0 && tab !== "optimization" && (
-            <button
-              type="button"
-              onClick={() => onTabChange("optimization")}
-              className="flex w-full items-center justify-between gap-2 rounded-md bg-accent-soft px-3 py-2 text-left text-meta text-accent outline-none focus-visible:ring-2 focus-visible:ring-ring md:hidden [@media(hover:none)]:min-h-11"
-            >
-              <span>
-                有 {optimizerPendingCount > 99 ? "99+" : optimizerPendingCount} 项优化建议待确认
-              </span>
-              <span aria-hidden="true">→</span>
-            </button>
-          )}
-        </div>
-      }
-      // 面板自带内距（PanelHeader px-4 + 正文 px-5），壳体不再叠一层。
-      bodyClassName="p-0"
+      // 桌面比设置宽：记忆 / 技能列表需要行宽。高度与设置同档。
+      className="bg-surface md:max-w-[min(1000px,calc(100vw-2rem))]"
+      bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden p-0"
     >
-      {/* tabpanel 与 tablist 的 aria 关联：读屏才能把"当前面板"和"当前标签"对上，
-          tabIndex=0 也让键盘用户能聚焦到内容区用方向键滚动。 */}
-      <div
-        role="tabpanel"
-        id={`manage-panel-${tab}`}
-        aria-labelledby={`manage-tab-${tab}`}
-        tabIndex={0}
-        className="flex min-h-full flex-col outline-none"
-      >
-        {!auth ? (
-          <div className="flex flex-1 items-center justify-center">
-            <EmptyState
-              icon={LogIn}
-              title="登录后即可管理"
-              hint="记忆、技能、定时任务与插件都需要登录后才能读写。"
-              action={
-                onRequireLogin ? (
-                  <Button variant="primary" onClick={onRequireLogin}>
-                    去登录
-                  </Button>
-                ) : undefined
-              }
-            />
-          </div>
-        ) : (
-          <>
-            {tab === "memory" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
-                {/* 工作项目作用域下的「项目资产」「智能体项目上下文预览」由 MemoryPanel 在
-                    「项目记忆」页签内渲染（改造前追加在整个面板之后、不随页签切换）。 */}
-                <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
-              </div>
-            )}
-            {tab === "skills" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.skills.id}>
-                <SkillsPanel auth={auth} />
-              </div>
-            )}
-            {tab === "cron" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.schedules.id}>
-                <CronPanel auth={auth} />
-              </div>
-            )}
-            {tab === "connectors" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
-                <ConnectorsTab
-                  auth={auth}
-                  onOpenMarketplace={onOpenMarketplace}
-                  autoAuthorizePluginSlug={autoAuthorizePluginSlug}
-                  onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
+      <QuietSurface>
+        <HeaderSlotProvider value={slot}>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col md:flex-row">
+            {desktop ? (
+              <SectionNav
+                aria-label="管理分区"
+                idBase="manage-tab"
+                panelIdBase="manage-panel"
+                value={current.id}
+                onChange={onTabChange}
+                groups={[{ label: '管理', items: navItems }]}
+                footer={
+                  onOpenMarketplace && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenMarketplace(tab === 'connectors' ? 'connector' : 'skill')}
+                      className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-body text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <Store size={15} strokeWidth={1.75} aria-hidden="true" className="shrink-0" />
+                      <span className="flex-1 truncate">去市场添加</span>
+                      <ArrowUpRight size={14} strokeWidth={1.75} aria-hidden="true" className="shrink-0 text-faint" />
+                    </button>
+                  )
+                }
+              />
+            ) : (
+              <div className="shrink-0 border-b border-border px-4 py-3">
+                <Tabs
+                  aria-label="管理分区"
+                  idBase="manage"
+                  layout="grid"
+                  value={current.id}
+                  onValueChange={(v) => onTabChange(v as ManageTab)}
+                  items={navItems.map((it) => ({ value: it.id, label: it.label, featureId: it.featureId }))}
+                  className="grid-cols-4 [&_[role=tab]]:px-2"
                 />
               </div>
             )}
-            {tab === "library" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.research.id}>
-                <LibraryPanel auth={auth} />
+
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+              {/* 上下文行：左作用范围，右分区操作插槽（四个分区都至少有其一）。 */}
+              <div
+                data-scrolled={scrolled || undefined}
+                className="oc-manage-toolbar flex min-h-12 shrink-0 items-center gap-2 px-4 py-1 md:min-h-14 md:px-6"
+              >
+                {scoped && (
+                  <div className="oc-manage-scope flex min-w-0 items-center gap-1 max-md:max-w-[62%] md:max-w-72">
+                    {/* 可见标签是真 <label>：点「作用范围」也能拉起选择器（触控靶 = 标签 + 值）。 */}
+                    <label
+                      htmlFor="manage-scope-select"
+                      className="shrink-0 cursor-pointer text-body text-muted"
+                    >
+                      作用范围
+                    </label>
+                    <ProjectScopeSelect id="manage-scope-select" className="w-auto min-w-0 max-w-full" />
+                  </div>
+                )}
+                <div
+                  ref={setSlot}
+                  data-manage-slot=""
+                  className="ml-auto flex min-w-0 items-center justify-end gap-1"
+                />
               </div>
-            )}
-            {tab === "optimization" && (
-              <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
-                <OptimizationPanel auth={auth} agentId={agentId} agents={agents} />
+
+              {/* tabpanel 与 tablist 的 aria 关联：读屏才能把"当前面板"和"当前标签"对上，
+                  tabIndex=0 也让键盘用户能聚焦到内容区用方向键滚动。 */}
+              <div
+                role="tabpanel"
+                id={`manage-panel-${tab}`}
+                aria-labelledby={`manage-tab-${tab}`}
+                aria-describedby="manage-panel-blurb"
+                tabIndex={0}
+                onScroll={(e) => setScrolled(e.currentTarget.scrollTop > 2)}
+                className="oc-manage-panel flex min-h-0 flex-1 flex-col overflow-y-auto outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              >
+                <span id="manage-panel-blurb" className="sr-only">
+                  {current.blurb}
+                </span>
+                {/* 内容列：最宽 800px；key 让切分区时淡入一次。 */}
+                <div
+                  key={auth ? tab : 'login'}
+                  className="oc-manage-page flex w-full max-w-[800px] flex-1 flex-col pb-6 pt-1 md:px-2 md:pb-10"
+                >
+                  {!auth ? (
+                    <div className="pt-2">
+                      <EmptyState
+                        icon={LogIn}
+                        title="登录后即可管理"
+                        hint="记忆、技能、定时任务与插件都需要登录后才能读写。"
+                        action={
+                          onRequireLogin ? (
+                            <Button variant="primary" onClick={onRequireLogin}>
+                              去登录
+                            </Button>
+                          ) : undefined
+                        }
+                      />
+                    </div>
+                  ) : (
+                    <>
+                      {tab === 'memory' && (
+                        <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.memory.id}>
+                          {/* 工作项目作用域下的「项目资产」「智能体项目上下文预览」由 MemoryPanel 在
+                            「项目记忆」页签内渲染。 */}
+                          <MemoryPanel auth={auth} agentId={agentId} agents={agents} />
+                        </div>
+                      )}
+                      {tab === 'skills' && (
+                        <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.skills.id}>
+                          <SkillsPanel
+                            auth={auth}
+                            onOpenMarketplace={onOpenMarketplace && (() => onOpenMarketplace('skill'))}
+                          />
+                        </div>
+                      )}
+                      {tab === 'cron' && (
+                        <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.schedules.id}>
+                          <CronPanel auth={auth} />
+                        </div>
+                      )}
+                      {tab === 'connectors' && (
+                        <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.connectors.id}>
+                          <ConnectorsTab
+                            auth={auth}
+                            onOpenMarketplace={onOpenMarketplace && (() => onOpenMarketplace('connector'))}
+                            autoAuthorizePluginSlug={autoAuthorizePluginSlug}
+                            onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
+                          />
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
-            )}
-          </>
-        )}
-      </div>
+            </div>
+          </div>
+        </HeaderSlotProvider>
+      </QuietSurface>
     </Modal>
-  );
+  )
 }

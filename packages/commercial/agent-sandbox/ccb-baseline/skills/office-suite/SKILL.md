@@ -56,7 +56,7 @@ ev.add("summary", "项目评审会"); ev.add("dtstart", datetime(2026,7,3,14,0))
 cal.add_component(ev)
 open("/home/agent/.openclaude/邀请.ics","wb").write(cal.to_ical())
 ```
-> 真正收发邮件需用户授权自己的邮箱(连接器方向),当前仅生成草稿/附件/.ics,不代登录任何账号。
+> 真正收发邮件需用户授权自己的邮箱(插件方向),当前仅生成草稿/附件/.ics,不代登录任何账号。
 
 ### 7. 长文档 / PDF 总结与提炼
 `oc-web parse <文件>` 或 `pdfplumber` 读入 → 结构化总结 → 需要时出脑图(mermaid)/要点表(oc-xlsx)/汇报(oc-slides)。总结要标来源(页码/章节),区分事实与推断。

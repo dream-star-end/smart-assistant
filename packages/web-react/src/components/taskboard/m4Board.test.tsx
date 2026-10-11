@@ -2,6 +2,11 @@ import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ReactElement } from 'react'
 import { afterEach, describe, expect, test, vi } from 'vitest'
+import { prefetchMarkdownImpl } from '../Markdown'
+import { loadBeforeAll } from '../../test/moduleLoad'
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl)
 
 const scopeState = vi.hoisted(() => ({
   kind: 'work' as 'work' | 'all' | 'ungrouped' | 'chat',
@@ -37,9 +42,9 @@ vi.mock('../../hooks/useProjectScope', () => ({
     chatProjects: [{ id: 'chat-unbound', name: 'test', boardProjectId: null }],
     selectOptions: [
       { value: 'all', label: '全部项目' },
-      { value: 'none', label: '未归类' },
+      { value: 'none', label: '未分类' },
       { value: 'p1', label: 'OCV5 自用' },
-      { value: 'chat-unbound', label: '会话组 · test' },
+      { value: 'chat-unbound', label: '项目 · test' },
     ],
     loading: false,
     refreshWorkProjects: async () => {},

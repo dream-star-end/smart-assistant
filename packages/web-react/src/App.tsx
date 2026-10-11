@@ -24,9 +24,11 @@ import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { saveBlob } from "./lib/chat/download";
+import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
+import { ComposerProjectPill } from "./components/ComposerProjectPill";
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import type { ImageAnnotationSource } from "./components/ImageAnnotationEditor";
 import {
@@ -40,7 +42,7 @@ import { QueuedSendList } from "./components/chat/QueuedSendList";
 import { PinnedDelegateTracker } from "./components/chat/PinnedDelegateTracker";
 import { PinnedGoalBar } from "./components/chat/PinnedGoalBar";
 import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/TurnActivity";
-import { EmptyState } from "./components/EmptyState";
+import { EmptyState, greetingName } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
 import { sessionHistorySurface } from "./lib/chat/historyLoadState";
@@ -50,11 +52,12 @@ import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecov
 import { CHAT_CREATE_TEMPLATES } from "./lib/chatCreateTemplates";
 import { sessionTitleFromText } from "./lib/sessionTitle";
 import { isDialogLayerOpen, resolveGlobalHotkey } from "./lib/hotkeys";
+import { pushPaletteRecent } from "./lib/paletteRecents";
 import { type BannerKind, collapsedBannersLabel, resolveBanners } from "./lib/bannerStack";
 import { readNetworkInformation, shouldPrefetchCenters } from "./lib/prefetchPolicy";
 // 分区注册表在 lib（不是 ManageCenter）：ManageCenter 是 lazy chunk，从组件里取值会把
 // 六个面板一起拖进主包。默认落地页 = 注册表首位，两处不再各写各的。
-import { DEFAULT_MANAGE_TAB, type ManageTab } from "./lib/manageTabs";
+import { DEFAULT_MANAGE_TAB, type ManageTab, normalizeManageTab } from "./lib/manageTabs";
 import type { SettingsSection } from "./components/SettingsCenter";
 import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
@@ -69,13 +72,9 @@ import {
 } from "./components/chat/archivePaging";
 import { createStickToBottomController } from "./components/chat/stickToBottom";
 import { attachWheelFence } from "./components/chat/wheelFence";
-import { currentTurnSettled, turnFinalAssistantFlags } from "./components/chat/turnSegment";
+import { currentTurnSettled } from "./components/chat/turnSegment";
 import type { CardCallbacks, FeedbackContext } from "./components/chat/cards";
-import {
-  type RatingEntry,
-  type ResponseRatingCtx,
-  ResponseRatingProvider,
-} from "./components/chat/ResponseRating";
+import { ResponseRatingProvider } from "./components/chat/ResponseRating";
 import { MediaSignProvider } from "./components/chat/media";
 import {
   ArtifactInspectActiveContext,
@@ -85,7 +84,19 @@ import {
   type ArtifactInspectTarget,
   type ChatInteraction,
 } from "./components/tool/context";
-import { InspectorPanel, InspectorPanelContent } from "./components/InspectorPanel";
+import { isBrowserStepMessage } from "./components/tool/browserDetect";
+import {
+  DETAIL_PANE_WIDTH,
+  type DeferredPayloadLoader,
+  InspectorPanel,
+  InspectorPanelContent,
+  type PaneRequest,
+  type PaneTab,
+  paneRequestForSession,
+  readDetailPaneOpen,
+  writeDetailPaneOpen,
+} from "./components/InspectorPanel";
+import type { ToolLike } from "./components/tool/format";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { useAgentGate } from "./hooks/useAgentGate";
@@ -96,6 +107,7 @@ import {
   parseBoardTicket,
   parseBoardTicketType,
   parsePanelParam,
+  parseProjectPath,
   parseSessionPath,
   parseTutorialCase,
   parseTutorialCommunity,
@@ -104,6 +116,7 @@ import {
   parseTutorialTopic,
   parseTutorialWork,
   preferredBoardView,
+  type ProjectRoute,
   type TutorialTab,
   type TutorialWorkId,
   useAppRoute,
@@ -114,12 +127,14 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
-import { useMdViewport } from "./hooks/useMdViewport";
+import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
+import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
+import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRatings";
+import { useSessionEngineOptions } from "./hooks/useSessionEngineOptions";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
-import { useOptimizerPending } from "./hooks/useOptimizerPending";
 import { useRepoBinding } from "./hooks/useRepoBinding";
 import { useTheme } from "./hooks/useTheme";
 import { useToast } from "./components/ui";
@@ -141,8 +156,6 @@ import {
   findRewriteTarget,
   findStopTarget,
   type ImplicitTarget,
-  isExpensiveTurn,
-  ratingNudgeBucket,
 } from "./lib/implicitFeedback";
 import { CONTINUE_PROMPT } from "./lib/chat/render";
 import { deriveLiveTerminalFromMessages } from "./lib/sessionStatus";
@@ -167,16 +180,8 @@ import {
   sendCollabFields,
 } from "./lib/collaborationConfig";
 
-import {
-  clearSessionEffort,
-  readSessionEffort,
-  writeSessionEffort,
-} from "./lib/sessionEffort";
-import {
-  clearContextTierForSession,
-  readContextTierForSession,
-  writeContextTier,
-} from "./lib/sessionContextTier";
+import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
+import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -186,6 +191,7 @@ import {
 import { resolveTutorialAction } from "./lib/tutorialActions";
 import type { TutorialCase, TutorialCaseId } from "./lib/tutorialCaseCatalog";
 import { api, apiErrorMessage, ApiError } from "./lib/api";
+import { uploadFilesToProject } from "./lib/projectFileUpload";
 import { reportClientFriction } from "./lib/clientFriction";
 import {
   effectiveEffortModelId,
@@ -205,12 +211,17 @@ import {
   modelSwitchCompactionReason,
 } from "./lib/modelSwitch";
 import { TASKBOARD_ENABLED } from "./lib/taskboardFeature";
+import { useServerFeatures } from "./hooks/useServerFeatures";
+import { dismissSuggestion, readDismissedSuggestions, suggestProjectForChat } from "./lib/unfiledSuggest";
+import { projectChipsBoardId } from "./lib/projectChips";
+import type { SaveToProjectRequest } from "./components/project/SaveToProjectDialog";
 
 // 首屏瘦身:营销首页 + 设置/管理/市场/组织/教程中心按需异步加载,移出 entry chunk。
 // 命名导出 → default 适配。渲染点各自套 LazyBoundary（= chunk 加载失败兜底 + Suspense：
 // 对话框仅在 open 时挂载 → 首屏零下载,首次打开拉块时短暂显 loading；React.lazy 解析后模块
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
+type PredictInput = typeof import("./lib/inputPrediction").predictInput;
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const SettingsCenter = lazy(() =>
   import("./components/SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -233,6 +244,7 @@ const MediaTaskCenter = lazy(() =>
 const ChatGptProxyDialog = lazy(() =>
   import("./components/ChatGptProxyDialog").then((m) => ({ default: m.ChatGptProxyDialog })),
 );
+const ShareDialog = lazy(() => import("./components/ShareDialog").then((m) => ({ default: m.ShareDialog })));
 const TaskboardView = lazy(() =>
   import("./components/taskboard/TaskboardView").then((m) => ({ default: m.TaskboardView })),
 );
@@ -250,8 +262,26 @@ const InboxDialog = lazy(() => import("./components/InboxDialog").then((m) => ({
 const MessageFeedbackDialog = lazy(() =>
   import("./components/chat/MessageFeedbackDialog").then((m) => ({ default: m.MessageFeedbackDialog })),
 );
+const ProjectArchiveDialog = lazy(() =>
+  import("./components/ProjectArchiveDialog").then((m) => ({ default: m.ProjectArchiveDialog })),
+);
+const CreateProjectDialog = lazy(() =>
+  import("./components/CreateProjectDialog").then((m) => ({ default: m.CreateProjectDialog })),
+);
 const ProjectSettingsDialog = lazy(() =>
   import("./components/ProjectSettingsDialog").then((m) => ({ default: m.ProjectSettingsDialog })),
+);
+// Ctrl/⌘K palette: lazy, mounted on first open (first-screen budget).
+const CommandPalette = lazy(() =>
+  import("./components/CommandPalette").then((m) => ({ default: m.CommandPalette })),
+);
+// 项目主页(/p/<id>)是并列工作区,点开项目才需要;带着 ProjectAssetsPanel,不能进入口闭包。
+const ProjectHome = lazy(() =>
+  import("./components/project/ProjectHome").then((m) => ({ default: m.ProjectHome })),
+);
+// P5b「记住这条 / 存为项目技能」弹窗：点了才下载（带 lib/taskboard）。
+const SaveToProjectDialog = lazy(() =>
+  import("./components/project/SaveToProjectDialog").then((m) => ({ default: m.SaveToProjectDialog })),
 );
 
 // UX 体验对冲（红线:优化不得降低体验）:懒加载省首屏,但慢网下首开中心会多一个
@@ -328,8 +358,6 @@ function replyQuoteText(message: ChatMessage): string {
   return media.length > 0 ? "[附件]" : "";
 }
 
-/** 隐式负反馈的成因标签（随 implicit down 一并上报，仅供后端归因，用户不可见）。 */
-type ImplicitReason = "中途打断" | "改写重发";
 
 // 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
 //  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
@@ -369,9 +397,22 @@ export function App() {
     routingEnabled ? parseSessionPath(location.pathname) : null,
   );
   // 任务面板是并列工作区（整段替换 <main>），不是管理中心 Tab。boot 自 /board。
-  const [boardOpen, setBoardOpen] = useState(
+  const [boardOpen, setBoardOpenState] = useState(
     () => TASKBOARD_ENABLED && routingEnabled && location.pathname === "/board",
   );
+  // 项目主页(/p/<id>[/<tab>])：第三个并列工作区。null = 不在项目主页。
+  const [projectHome, setProjectHome] = useState<ProjectRoute | null>(null);
+  // 启动深链 /p/<id> 的未决目标：等项目列表到达再打开(useAppRoute),不存在则回 /。
+  const [pendingRouteProject, setPendingRouteProject] = useState<ProjectRoute | null>(() =>
+    routingEnabled ? parseProjectPath(location.pathname) : null,
+  );
+  // 所有「去对话 / 去任务面板」的入口都经这里：切工作区即离开项目主页。
+  // 用户主动导航也作废未决的 /p/<id> 深链恢复(否则列表迟到后会把人拽回项目主页)。
+  const setBoardOpen = useCallback((open: boolean) => {
+    setBoardOpenState(open);
+    setProjectHome(null);
+    setPendingRouteProject(null);
+  }, []);
   const [boardView, setBoardView] = useState<BoardViewParam>(() =>
     routingEnabled ? parseBoardView(params, preferredBoardView()) : preferredBoardView(),
   );
@@ -429,10 +470,33 @@ export function App() {
   const updateBannerVisible = useSyncExternalStore(appUpdate.subscribe, appUpdate.getBannerVisible);
   const [imageAnnotationSource, setImageAnnotationSource] = useState<ImageAnnotationSource | null>(null);
   const [containerPreviewUrl, setContainerPreviewUrl] = useState<string | null>(null);
-  // 产物详情列(Codex 式第三列):选中产物是纯 UI 态(切会话/关面板即清),不进 ChatSocket。
-  // 桌面 md+ 内联第三列;窄屏用右侧 Sheet 抽屉,不硬挤三列。
-  const [inspectTarget, setInspectTarget] = useState<ArtifactInspectTarget | null>(null);
+  // 详情面板(右侧第三栏,OCV5-370):宽屏(≥1100px)内联第三列,开合与宽度记在本机;
+  // 更窄的视口用贴底 Sheet,不硬挤三列。面板里看哪一步是纯 UI 态,不进 ChatSocket。
   const isMdViewport = useMdViewport();
+  const isWideViewport = useWideViewport();
+  const [paneOpen, setPaneOpenState] = useState(readDetailPaneOpen);
+  const [paneSheetOpen, setPaneSheetOpen] = useState(false);
+  const [paneRequest, setPaneRequest] = useState<PaneRequest | null>(null);
+  const [paneActive, setPaneActive] = useState<ToolLike | null>(null);
+  const paneWidth = useResizableWidth(DETAIL_PANE_WIDTH);
+  const setPaneOpen = useCallback((open: boolean) => {
+    setPaneOpenState(open);
+    writeDetailPaneOpen(open);
+  }, []);
+  const paneToggleRef = useRef<(() => void) | null>(null);
+  // 请求记下发起时的会话(openPane 引用稳定,不随会话变):切会话后旧请求不再交给新面板。
+  const activeIdRef = useRef<string | null>(null);
+  const isWideRef = useRef(isWideViewport);
+  isWideRef.current = isWideViewport;
+  /** 从面板外打开 / 定位面板:宽屏展开内联列,窄屏弹出贴底面板。 */
+  const openPane = useCallback(
+    (tab?: PaneTab, message?: ToolLike | null) => {
+      setPaneRequest({ tab, message, nonce: Date.now(), sessionId: activeIdRef.current });
+      if (isWideRef.current) setPaneOpen(true);
+      else setPaneSheetOpen(true);
+    },
+    [setPaneOpen],
+  );
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
   const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
@@ -443,6 +507,9 @@ export function App() {
   const [inboxOpen, setInboxOpen] = useState(false);
   const inboxMounted = useMountedOnce(inboxOpen);
   const [findOpen, setFindOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const paletteMounted = useMountedOnce(paletteOpen);
   const [mediaTasksOpen, setMediaTasksOpen] = useState(false);
   // 「视频任务」入口门控:null=未知(保持可见),false=账号未开放(隐藏死入口)。
   const [mediaTasksAvailable, setMediaTasksAvailable] = useState<boolean | null>(null);
@@ -694,6 +761,7 @@ export function App() {
       setMessages([]);
       setChatError(null);
       setPendingRouteSession(null);
+      setPendingRouteProject(null);
     },
     onDeleteSession: (id) => {
       localStore.current.delete(id);
@@ -712,31 +780,64 @@ export function App() {
   // 「项目下新建会话」草稿意图：项目行入口记下目标项目，空白草稿真正建会话（首次发送）时
   // 消费——本地立即归属该项目 + 服务端 PATCH 落库。无参新建 / 选中已有会话都会覆盖清除，
   // 意图只活在「一次草稿」生命周期内，不会泄漏到之后的新会话。
+  // 草稿归属既要被 send 同步读取(ref),也要在输入框里显示、可改(state):两者经 setDraftProject 同写。
   const draftProjectRef = useRef<string | null>(null);
+  const [draftProjectId, setDraftProjectIdState] = useState<string | null>(null);
+  const setDraftProject = useCallback((projectId: string | null) => {
+    draftProjectRef.current = projectId;
+    setDraftProjectIdState(projectId);
+  }, []);
   const handleNew = useCallback(() => {
-    draftProjectRef.current = null;
+    setDraftProject(null);
     newSession();
-  }, [newSession]);
+  }, [newSession, setDraftProject]);
   const newSessionInProject = useCallback(
     (projectId: string) => {
-      draftProjectRef.current = projectId;
+      setDraftProject(projectId);
       newSession();
     },
-    [newSession],
+    [newSession, setDraftProject],
   );
 
   const [projectSettings, setProjectSettings] = useState<ChatProject | null>(null);
   const [ungroupedAssetsOpen, setUngroupedAssetsOpen] = useState(false);
+  // 「打开项目」的唯一入口(侧栏项目名、顶栏项目、输入框项目标识)：打开项目主页。
+  // 项目设置仍可从主页的 ⋯ / 设置 与侧栏行的 ⋯ 进入。
+  const projectsRef = useRef<ChatProject[]>([]);
+  const openProject = useCallback((projectId: string) => {
+    if (!projectsRef.current.some((x) => x.id === projectId)) return;
+    setPendingRouteProject(null);
+    setBoardOpenState(false);
+    setProjectHome({ projectId, tab: "overview" });
+  }, []);
   const projectSettingsOpen = projectSettings !== null || ungroupedAssetsOpen;
   const projectSettingsMounted = useMountedOnce(projectSettingsOpen);
+  // 新建项目对话框:null=关;{}=普通新建;{sessionId,title}=从该会话创建并移入。
+  const [createProjectFrom, setCreateProjectFrom] = useState<{ sessionId?: string; title?: string } | null>(null);
+  const createProjectMounted = useMountedOnce(createProjectFrom !== null);
+  const [projectArchiveOpen, setProjectArchiveOpen] = useState(false);
+  const projectArchiveMounted = useMountedOnce(projectArchiveOpen);
+  // P5b：「记住这条 / 存为项目技能」弹窗请求（null = 关）。
+  const [saveToProject, setSaveToProject] = useState<SaveToProjectRequest | null>(null);
+  const saveToProjectMounted = useMountedOnce(saveToProject !== null);
+  // 换号 / 登出：发起时的身份已不在，弹窗直接收起（保存流程自己也会按身份停下）。
+  useEffect(() => {
+    void user?.id;
+    setSaveToProject(null);
+  }, [user?.id]);
 
   const {
     projects,
+    projectsLoaded,
     collapsedIds: collapsedProjectIds,
     toggleCollapsed: toggleProjectCollapsed,
-    createProjectPrompt,
+    createProject,
     renameProjectPrompt,
     deleteProjectConfirm,
+    restoreProject,
+    listDeletedProjects,
+    setProjectArchived,
+    setProjectPinned,
     updateProject,
     reorderProjects,
   } = useChatProjects({
@@ -758,11 +859,76 @@ export function App() {
       const ids = new Set(sessionIds);
       setSessions((c) => c.map((s) => (ids.has(s.id) ? { ...s, projectId } : s)));
     },
-    onCreated: (p) => {
-      setUngroupedAssetsOpen(false);
-      setProjectSettings(p);
-    },
   });
+
+  projectsRef.current = projects;
+  const homeProject = projectHome ? projects.find((p) => p.id === projectHome.projectId) : undefined;
+
+  // 服务端功能开关（GET /api/features；读不到 = 全关，demo 不读）。
+  const serverFeatures = useServerFeatures(demo ? null : auth, demo);
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    setDismissedSuggestions(user?.id ? readDismissedSuggestions(user.id) : new Set());
+  }, [user?.id]);
+  // 当前会话所属项目的看板：P5b 两个入口只在会话属于有看板的项目时出现。
+  const activeProjectId = activeId ? sessions.find((s) => s.id === activeId)?.projectId : undefined;
+  const activeChatProject = activeProjectId ? projects.find((p) => p.id === activeProjectId) : undefined;
+  const chipsBoardProjectId = projectChipsBoardId({
+    demo,
+    taskboardEnabled: TASKBOARD_ENABLED,
+    chipsFlag: serverFeatures.chips,
+    project: activeChatProject,
+  });
+  const chipsProjectName = activeChatProject?.name ?? "";
+
+  // 确保项目的看板已在容器里建好（任何看板路由首次访问都会建出预留的看板）。
+  // 项目主页的入口和 P5b / P5c 的保存共用这一条路径。
+  const prepareProjectBoard = useCallback(
+    async (boardProjectId: string): Promise<boolean> => {
+      try {
+        const { taskboardApi } = await import("./lib/taskboard");
+        await taskboardApi.getProject(authRef.current, boardProjectId);
+        return true;
+      } catch (e) {
+        toast(apiErrorMessage(e, "项目看板暂时打不开，请稍后再试"), "error");
+        return false;
+      }
+    },
+    [toast],
+  );
+  // 主页上的项目被删除(本页 ⋯ 删除或别处删除)：列表落定后不再存在 → 回对话。
+  useEffect(() => {
+    if (projectHome && projectsLoaded && !homeProject) setProjectHome(null);
+  }, [projectHome, projectsLoaded, homeProject]);
+
+  // Ctrl/⌘K recents: whatever the user actually lands on (project home or a chat).
+  const paletteUserId = user?.id ?? (demo ? "demo" : null);
+  const homeProjectId = homeProject?.id ?? null;
+  const chatViewActiveId = !boardOpen && !projectHome ? activeId : undefined;
+  useEffect(() => {
+    if (homeProjectId) pushPaletteRecent(paletteUserId, { kind: "project", id: homeProjectId });
+  }, [paletteUserId, homeProjectId]);
+  useEffect(() => {
+    if (chatViewActiveId) pushPaletteRecent(paletteUserId, { kind: "session", id: chatViewActiveId });
+  }, [paletteUserId, chatViewActiveId]);
+  // Stable search callbacks for the palette (its debounce effect depends on them).
+  const searchSessionMessagesRef = useRef(searchSessionMessages);
+  searchSessionMessagesRef.current = searchSessionMessages;
+  const paletteSearchMessages = useMemo(
+    () =>
+      demo || !auth
+        ? undefined
+        : (q: string, signal: AbortSignal) => searchSessionMessagesRef.current(q, signal, undefined, true),
+    [demo, auth],
+  );
+  const paletteSearchAssets = useMemo(
+    () =>
+      demo || !auth
+        ? undefined
+        : (q: string, signal: AbortSignal, limit: number) =>
+            api.searchProjectAssets(authRef.current, q, { signal, limit }),
+    [demo, auth],
+  );
 
   const unreadSessions = useUnreadSessions({
     sessions,
@@ -770,15 +936,23 @@ export function App() {
     userId: user?.id ?? null,
     auth: demo ? null : auth,
     // sidebar-B UUS-01：系统通知点开后落到对应会话（hook 内已 window.focus()）。
-    onNotificationOpen: selectSession,
+    // 在项目主页时点系统通知：落到对应会话即离开主页(任务面板保持原行为)。
+    onNotificationOpen: (id: string) => {
+      setProjectHome(null);
+      setPendingRouteProject(null);
+      selectSession(id);
+    },
   });
   const sidebarWidth = useSidebarWidth();
 
-  // 切会话/进出任务看板时清掉产物详情列:消息对象引用属于旧会话上下文,跨会话保留只会
-  // 展示与当前消息流无关的陈旧内容。
+  // 切会话/进出任务看板时清掉面板里的定位:消息对象引用属于旧会话上下文,跨会话保留只会
+  // 展示与当前消息流无关的陈旧内容。宽屏面板的开合是用户偏好,保留;窄屏抽屉收起。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId / boardOpen / projectHome 是「换了上下文」的触发信号
   useEffect(() => {
-    setInspectTarget(null);
-  }, [activeId, boardOpen]);
+    setPaneRequest(null);
+    setPaneActive(null);
+    setPaneSheetOpen(false);
+  }, [activeId, boardOpen, projectHome]);
 
   // ── per-session 模型选择(会话间互不影响,持久化恢复)────────────────────────
   //
@@ -1074,38 +1248,8 @@ export function App() {
       });
   }, [activeId, applyCollabDoc, auth, demo]);
 
-  // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
-  // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
-  // 与 teamMode 同款 per-session 键;首条消息创建会话后同样落地当前 intent。
-  const [sessionEffort, setSessionEffortState] = useState<PreferenceEffort | null | undefined>(() =>
-    readSessionEffort(activeId),
-  );
-  const setSessionEffort = useCallback(
-    (value: PreferenceEffort | null) => {
-      setSessionEffortState(value);
-      writeSessionEffort(activeId, value);
-    },
-    [activeId],
-  );
-  useEffect(() => {
-    setSessionEffortState(readSessionEffort(activeId));
-  }, [activeId]);
-
-  // Cursor Opus/Fable 上下文档位(300k 默认 / 1M;语义见 lib/sessionContextTier)。
-  // per-session 键优先,缺失继承全局最近选择,再缺失回产品默认 300k。
-  const [contextTier, setContextTierState] = useState<CursorContextTier>(() =>
-    readContextTierForSession(activeId),
-  );
-  const setContextTier = useCallback(
-    (tier: CursorContextTier) => {
-      setContextTierState(tier);
-      writeContextTier(activeId, tier);
-    },
-    [activeId],
-  );
-  useEffect(() => {
-    setContextTierState(readContextTierForSession(activeId));
-  }, [activeId]);
+  // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
+  const { sessionEffort, setSessionEffort, contextTier, setContextTier } = useSessionEngineOptions(activeId);
 
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
@@ -1327,7 +1471,7 @@ export function App() {
           if (
             draftProjectRef.current === draftPid &&
             (!target || selectedSessionIdRef.current === sessionId)
-          ) draftProjectRef.current = null;
+          ) setDraftProject(null);
           const applyProject = (retries: number) => {
             api.patchSessionMeta(authRef.current, sessionId!, { projectId: draftPid }).catch((e: unknown) => {
               if (retries > 0) window.setTimeout(() => applyProject(retries - 1), 1500);
@@ -1338,7 +1482,8 @@ export function App() {
         }
       }
     },
-    // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
+    // teamMode 不再入依赖:自 08326136f 起 send 只从 collabUi/collabMode 取模式(sendCollabFields),
+    // 不读 teamMode 本身(OCV5-376)。applyCollabDoc/toast/setDraftProject 都是稳定引用,补齐不改重建时机。
     // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
@@ -1352,15 +1497,71 @@ export function App() {
       preferenceEffort,
       sessionEffort,
       contextTier,
-      teamMode,
       collabMode,
       collabUi,
       collabAsDefault,
       sessions,
       setSessions,
       setActiveId,
+      applyCollabDoc,
+      toast,
+      setDraftProject,
     ],
   );
+
+  // 项目主页「在 X 里开始…」/ 快捷开始：先进入该项目的空白草稿，再在草稿就位后发送首条消息。
+  // 不能与 newSessionInProject 同一拍调用 send：send 同步读 draftProjectRef，但 activeId、模型、
+  // 思考档位、上下文档位、团队模式都取自闭包；它们由「activeId 变化」触发的 effect 重置为新会话
+  // 的默认值，同一轮 effect 里拿到的 send 仍是旧会话的配置(会把旧会话的模型定格进新会话)。
+  // 所以分两拍：①草稿就位(对话工作区 + 无选中 + 草稿归属该项目)时只「上膛」——此时各重置 effect
+  // 的 setState 与上膛同批提交；②下一次渲染后的 effect 用新的 send 发送，与手动新建会话后再发一致。
+  // nonce 保证只发一次；任一拍发现草稿不在(用户已走开 / 未登录 newSession 直接返回)即丢弃，
+  // 不把消息发进别的会话。
+  const [pendingProjectStart, setPendingProjectStart] = useState<
+    { projectId: string; text: string; nonce: number; armed: boolean } | null
+  >(null);
+  const consumedProjectStartRef = useRef(0);
+  const startInProject = useCallback(
+    (projectId: string, text: string) => {
+      const t = text.trim();
+      if (!t) return;
+      setBoardOpen(false);
+      newSessionInProject(projectId);
+      setPendingProjectStart({ projectId, text: t, nonce: Date.now() + Math.random(), armed: false });
+    },
+    [setBoardOpen, newSessionInProject],
+  );
+  useEffect(() => {
+    const p = pendingProjectStart;
+    if (!p || consumedProjectStartRef.current === p.nonce) return;
+    // demo 的 newSession 会立即建一条本地会话并选中，所以 demo 不要求 activeId 为空。
+    const draftReady =
+      (demo || activeId === undefined) &&
+      !boardOpen &&
+      !projectHome &&
+      draftProjectId === p.projectId;
+    if (!draftReady) {
+      consumedProjectStartRef.current = p.nonce;
+      setPendingProjectStart(null);
+      return;
+    }
+    if (!p.armed) {
+      if (demo && activeId) {
+        // demo 的 send 不建会话也不落项目：把刚建的本地会话直接归入项目，侧栏与主页才看得到。
+        const title = p.text.slice(0, 40);
+        setSessions((c) =>
+          c.map((x) =>
+            x.id === activeId ? { ...x, projectId: p.projectId, title, messageCount: 1 } : x,
+          ),
+        );
+      }
+      setPendingProjectStart({ ...p, armed: true });
+      return;
+    }
+    consumedProjectStartRef.current = p.nonce;
+    setPendingProjectStart(null);
+    void send(p.text);
+  }, [pendingProjectStart, activeId, boardOpen, projectHome, draftProjectId, send, demo, setSessions]);
 
   // 上传单文件 → MediaRef（kind 以服务端 mimeType 为准，退回 file.type）。供 Composer 附件。
   const uploadMedia = useCallback(async (file: File): Promise<MediaRef> => {
@@ -1612,8 +1813,9 @@ export function App() {
   );
 
   // 打开管理中心到指定分区（侧栏入口 + 工具卡「打开记忆/技能/定时」按钮统一走此）。
+  // 归一化：已下线分区（文献 / 优化）或未知值从旧入口进来时回落默认分区，不开空白页。
   const openManage = useCallback((tab: ManageTab) => {
-    setManageTab(tab);
+    setManageTab(normalizeManageTab(tab));
     setManageOpen(true);
   }, []);
 
@@ -1763,6 +1965,7 @@ export function App() {
       openMarketplace,
       openRepo,
       openOrg,
+      setBoardOpen,
     ],
   );
 
@@ -1803,16 +2006,21 @@ export function App() {
       return;
     }
     let text = "";
+    let fromLanding = false;
     try {
-      const parsed = JSON.parse(raw) as { starterPrompt?: unknown };
+      const parsed = JSON.parse(raw) as { starterPrompt?: unknown; source?: unknown };
       if (typeof parsed.starterPrompt === "string") text = parsed.starterPrompt;
+      fromLanding = parsed.source === "landing";
     } catch {
       return;
     }
     if (!text) return;
     handleNew();
     setComposerPrefill({ text, nonce: Date.now() });
-    toast("已带入案例指令，不会自动发送", "info");
+    toast(
+      fromLanding ? "已带入你在首页写下的任务，不会自动发送" : "已带入案例指令，不会自动发送",
+      "info",
+    );
   }, [inWorkspace, handleNew, toast]);
 
   // 站内信未读轮询（铃铛红点）。demo / 未登录不发请求。
@@ -1932,7 +2140,14 @@ export function App() {
     setModelsLoading(true);
     Promise.all([
       api.getPublicModels(auth),
-      api.getPreferences(auth).then(extractPrefs).catch(() => ({} as PrefsView)),
+      api
+        .getPreferences(auth)
+        .then((snap) => {
+          // Intelligent UI 开关(OCV5-361)与模型偏好同批水合。
+          applyIntelligentUiSnapshot(snap);
+          return extractPrefs(snap);
+        })
+        .catch(() => ({} as PrefsView)),
     ])
       .then(([catalog, prefs]) => {
         if (cancelled) return;
@@ -1983,10 +2198,6 @@ export function App() {
   // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
   // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
   const gate = useAgentGate(auth, inWorkspace && !demo);
-
-  // Auto‑Dream 待确认建议数：同一份计数同时驱动侧栏入口信号与管理中心「优化」Tab 徽标。
-  // 挂 gate.ready 是硬要求 —— 该 GET 经容器代理，容器没起时恒 503。
-  const optimizer = useOptimizerPending(auth, agent.id, inWorkspace && !demo && gate.ready);
 
   // P4 真实 WS 对话引擎。gate.ready（容器 running）是连接硬前置；refreshMe 供
   // cost_charged / 余额不足时刷新顶栏余额。demo 不连真实 WS。
@@ -2054,9 +2265,30 @@ export function App() {
 
   // 非 demo：展示的消息来自 WS service 快照（就地 mutation + version 触发重渲）。
   const wsMessages = !demo && activeId ? chat.getMessages(activeId) : EMPTY_WS_MESSAGES;
+  // 分享对话框只针对打开时的会话;切会话(返回键/深链)就关掉,不拿旧快照配新标题。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是触发条件
+  useEffect(() => {
+    setShareOpen(false);
+  }, [activeId]);
   const wsSending = !demo && chat.isSending(activeId);
   // 统一“本轮进行中”信号：demo 用本地 busy，非 demo 用 WS in-flight。
   const sending = demo ? busy : wsSending;
+  activeIdRef.current = activeId ?? null;
+  // 详情面板可用 = 对话视图(非任务看板 / 项目主页)里有会话内容;demo 只在点了某张工具卡时出现。
+  const paneAvailable =
+    !boardOpen && !projectHome && (demo ? !!paneRequest?.message : !!activeId && wsMessages.length > 0);
+  const paneRequestHere = paneRequestForSession(paneRequest, activeId);
+  const paneInline = paneAvailable && isWideViewport && paneOpen;
+  const paneShown = paneInline || (paneAvailable && !isWideViewport && paneSheetOpen);
+  const togglePane = () => {
+    if (paneShown) {
+      if (isWideViewport) setPaneOpen(false);
+      else setPaneSheetOpen(false);
+      return;
+    }
+    openPane();
+  };
+  paneToggleRef.current = paneAvailable && !demo ? togglePane : null;
   const inflightDelegates = useInflightDelegates({
     sessionId: !demo && activeId ? activeId : null,
     messages: wsMessages,
@@ -2095,17 +2327,11 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       const action = resolveGlobalHotkey(e);
       if (action === "search") {
+        if (!inWorkspace) return;
         e.preventDefault();
-        // 按视口分流(shell 审计 S-01):移动抽屉的 Sheet 带 md:hidden,桌面断点下抽屉与遮罩都是
-        // display:none,但 Radix 模态照常把 <body> 设成 pointer-events:none、其余内容 aria-hidden
-        // —— 桌面按 ⌘K 会把整页点死且看不见任何弹层。桌面只展开内联侧栏,窄屏才开抽屉。
-        setCollapsed(false);
-        if (!isMdViewport) setMobileNavOpen(true);
-        window.setTimeout(() => {
-          const nodes = [...document.querySelectorAll<HTMLInputElement>("[data-sidebar-search]")];
-          const visible = nodes.find((el) => el.getClientRects().length > 0) ?? nodes[0];
-          visible?.focus();
-        }, 0);
+        // Toggle. Another dialog layer (settings, drawer, …) keeps Esc/focus; don't stack on it.
+        const otherLayer = isDialogLayerOpen();
+        setPaletteOpen((o) => (o ? false : !otherLayer));
         return;
       }
       if (action === "new") {
@@ -2118,10 +2344,15 @@ export function App() {
         e.preventDefault();
         setFindOpen(true);
       }
+      if (action === "pane") {
+        if (!inWorkspace || !paneToggleRef.current) return;
+        e.preventDefault();
+        paneToggleRef.current();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew, inWorkspace, demo, wsMessages.length, isMdViewport]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length, setBoardOpen]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2134,8 +2365,10 @@ export function App() {
   // Fetch on session selection; live updates arrive through sys.goal_snapshot.
   // Draft sessions with no client_sessions row used to 404; the route now
   // returns 200 {goal:null}, and a missing goal is a no-op here.
+  // 只随登录身份变化重拉(user 对象 refreshMe 会换引用,不应触发)。
+  const goalUserId = user?.id;
   useEffect(() => {
-    if (demo || !activeId || !user) return;
+    if (demo || !activeId || !goalUserId) return;
     let cancelled = false;
     void api.getSessionGoal(authRef.current, activeId).then((goal) => {
       if (!cancelled) sockRef.current?.setGoalState(activeId, goal);
@@ -2144,7 +2377,7 @@ export function App() {
       // next selection or goal action retries; do not poison chat readiness.
     });
     return () => { cancelled = true; };
-  }, [demo, activeId, user?.id]);
+  }, [demo, activeId, goalUserId]);
 
   const goalStarterRef = useRef(createGoalStarter());
   const setSessionGoal = useCallback(async (input: {
@@ -2205,6 +2438,7 @@ export function App() {
     effortCandidate != null && effortSupported.includes(effortCandidate)
       ? effortCandidate
       : null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: chat.version 是就地 mutation 会话的刷新触发器(见末行注释)。
   const turnActivity = useMemo<TurnActivityInfo | null>(() => {
     if (demo || !activeSess || !activeSess._sendingInFlight) return null;
     return {
@@ -2300,85 +2534,6 @@ export function App() {
     },
     [activeId],
   );
-  // 逐条响应评价（👍/👎 + 可选标签/评论）。单一权威 = 本 Map（含乐观态），经 Context 下发给
-  // 每条 AssistantCard 底部的 ResponseRatingCard。切会话/加载后由 GET 回读已评态填充（见下方
-  // effect）；提交时乐观同步更新 + 静默 POST（维护期 503 / 限流 / 网络失败一律吞，不打断）。
-  const [sessionRatings, setSessionRatings] = useState<Map<string, RatingEntry>>(() => new Map());
-  const [sessionNudges, setSessionNudges] = useState<Map<string, 'exposed' | 'rated' | 'dismissed'>>(() => new Map());
-  // 隐式负反馈上报去重：本会话运行内已隐式上报过的 messageId（切会话时清），防同一条重复 POST。
-  const implicitReportedRef = useRef<Set<string>>(new Set());
-  // 方案 a：高成本 turn 完成后对评分行做一次性脉冲高亮（4s）。nudgeId 经 ratingCtx 下发；
-  // 定时器走 ref 自管（不绑 effect cleanup，避免 sending/activeId 变更中途误清 → 高亮永驻）。
-  const [ratingNudgeId, setRatingNudgeId] = useState<string | null>(null);
-  const nudgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // sending 沿检测：true→false（turn 完成）才评估是否高亮。
-  const prevSendingRef = useRef(sending);
-  const onRateResponse = useCallback(
-    (input: {
-      messageId: string;
-      rating: "up" | "down";
-      traceId?: string | null;
-      tags?: string[];
-      comment?: string;
-    }) => {
-      if (demo || !activeId || !user) return;
-      // 乐观更新:bare thumb(无 tags)时,同 thumb 沿用旧标签、切 thumb 清空;带 tags 直接覆盖。
-      setSessionRatings((prev) => {
-        const next = new Map(prev);
-        const prevEntry = next.get(input.messageId);
-        const tags = input.tags ?? (prevEntry?.rating === input.rating ? prevEntry.tags : []);
-        next.set(input.messageId, { rating: input.rating, tags });
-        return next;
-      });
-      setSessionNudges((prev) => {
-        const next = new Map(prev);
-        if (next.has(input.messageId)) next.set(input.messageId, "rated");
-        return next;
-      });
-      void api
-        .submitResponseRating(authRef.current, {
-          messageId: input.messageId,
-          rating: input.rating,
-          sessionId: activeId,
-          traceId: input.traceId ?? undefined,
-          model: modelId,
-          tags: input.tags,
-          comment: input.comment,
-        })
-        .catch(() => {
-          /* 静默:503 维护 / 429 限流 / 网络失败——保留乐观态,刷新后由 GET 对账。*/
-        });
-    },
-    [demo, activeId, user, modelId],
-  );
-  // 隐式负反馈静默上报（方案 b）：仅记 implicit down，**绝不碰 sessionRatings**（不渲染成
-  // 用户已选态）。两道跳过闸：① 用户已显式评过该条 → 尊重其表态不覆盖；② 本会话运行已隐式
-  // 上报过该 id → 幂等。tags=['implicit', reason] 供后端归因；503/限流/网络失败一律静默吞。
-  const sendImplicitRating = useCallback(
-    (target: ImplicitTarget, { reason }: { reason: ImplicitReason }) => {
-      if (demo || !user || !activeId) return;
-      const { messageId, traceId } = target;
-      if (sessionRatings.has(messageId)) return;
-      if (implicitReportedRef.current.has(messageId)) return;
-      implicitReportedRef.current.add(messageId);
-      void api
-        .submitResponseRating(authRef.current, {
-          messageId,
-          rating: "down",
-          sessionId: activeId,
-          traceId: traceId ?? undefined,
-          model: modelId,
-          tags: ["implicit", reason],
-        })
-        .catch(() => {
-          /* 静默：不弹错、不打断对话；隐式信号丢失可接受。*/
-        });
-    },
-    [demo, user, activeId, modelId, sessionRatings],
-  );
-  // 回填稳定间接（render 期赋值幂等，与 sockRef / repoStatusHandlerRef 同模式）——
-  // send/stopTurn 只经 ref 调用，故它们的引用不被本回调的重建牵动。
-  sendImplicitRatingRef.current = sendImplicitRating;
 
   // 逐条反馈：打开显式反馈弹窗。上下文发送白名单由 MessageFeedbackDialog 收口，
   // 不再把诊断串静默写入剪贴板。
@@ -2426,7 +2581,7 @@ export function App() {
                 }
               : {}),
           },
-    [demo, openManage],
+    [demo, openManage, setBoardOpen],
   );
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
@@ -2438,8 +2593,12 @@ export function App() {
 
   // 产物详情列 open 回调:引用稳定,不随面板开合变化,避免打穿 MessageList 的 sig-memo。
   const artifactInspect = useMemo(
-    () => ({ open: (t: ArtifactInspectTarget) => setInspectTarget(t) }),
-    [],
+    () => ({
+      // 浏览器操作(OCV5-374)进「浏览器」页看截图和整轮操作记录;其余工具进步骤详情。
+      open: (t: ArtifactInspectTarget) => openPane(isBrowserStepMessage(t.message) ? "browser" : "steps", t.message),
+      openPane: (tab: PaneTab, message?: ToolLike | null) => openPane(tab, message),
+    }),
+    [openPane],
   );
 
   // 发送失败重试：复用原消息 payload（含附件引用）走 WS service 既有发送收口原地重发；
@@ -2618,6 +2777,24 @@ export function App() {
         : (messageId, expected) =>
             peekUserMessagePayload(activeId, messageId, expected),
       resolveRetryTarget: demo ? undefined : resolveRetryTarget,
+      onSaveToProject:
+        chipsBoardProjectId && activeId
+          ? (message, kind) => {
+              const text = (message.text ?? "").trim();
+              if (!text) return;
+              const a = authRef.current;
+              setSaveToProject({
+                kind,
+                text,
+                sessionId: activeId,
+                boardProjectId: chipsBoardProjectId,
+                projectName: chipsProjectName,
+                auth: a,
+                epoch: a.snapshot().epoch,
+                nonce: Date.now(),
+              });
+            }
+          : undefined,
     }),
     [
       regenerate,
@@ -2635,7 +2812,14 @@ export function App() {
       fetchUserMessagePayload,
       peekUserMessagePayload,
       resolveRetryTarget,
+      chipsBoardProjectId,
+      chipsProjectName,
     ],
+  );
+  // 详情面板里点开大记录(>1 MiB 定位桩)时,与聊天区共用同一套正文取数与页面缓存。
+  const paneDeferredLoader = useMemo<DeferredPayloadLoader>(
+    () => ({ peek: cardCallbacks.onPeekTapeRecordPayload, fetch: cardCallbacks.onFetchTapeRecordPayload }),
+    [cardCallbacks],
   );
 
   const composerReplyTo =
@@ -2660,6 +2844,28 @@ export function App() {
       }
     }
   }
+  // 输入预测(OCV5-375):回答末尾模型写的 next 块 → 输入框浅色预测;打字时按本会话说过的话补全。
+  // 设置里关掉时 master 也不再下发这段提示词。demo 不开。
+  // 解析器按需加载,不进首屏包(首屏只有输入框的补全和浮层);加载失败就没有预测。
+  const inputPredictionOn = useInputPredictionEnabled();
+  const [predictInput, setPredictInput] = useState<PredictInput | null>(null);
+  useEffect(() => {
+    if (demo || !inputPredictionOn || predictInput) return;
+    let alive = true;
+    void import("./lib/inputPrediction").then(
+      (m) => {
+        if (alive) setPredictInput(() => m.predictInput);
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [demo, inputPredictionOn, predictInput]);
+  const inputPrediction = useMemo(
+    () => (demo || !inputPredictionOn || !predictInput ? null : predictInput(wsMessages)),
+    [demo, inputPredictionOn, predictInput, wsMessages],
+  );
   const timelineMessages = wsMessages.filter(
     (message) => message.role !== "user" || message.status !== "queued",
   );
@@ -2711,123 +2917,19 @@ export function App() {
     };
   }, [mediaGateEnabled]);
 
-  // 已评回读：切会话/登录后拉一次 GET，填充已评态（重开会话时高亮 👍/👎、避免重复采集）。
-  // 依赖用**派生布尔**（非 user 对象，refreshMe 换引用不误触发清空）+ activeId。切会话先清
-  // 旧 Map（防串态），再异步注水；cancelled 守卫防慢响应覆盖新会话。demo/未登录不拉。
-  const ratingsEnabled = !demo && !!user;
-  useEffect(() => {
-    setSessionRatings(new Map());
-    setSessionNudges(new Map());
-    // 切会话：清隐式上报去重集 + 收起任何未散的评分脉冲高亮（旧 nudgeId 属上个会话）。
-    implicitReportedRef.current = new Set();
-    setRatingNudgeId(null);
-    if (nudgeTimerRef.current) {
-      clearTimeout(nudgeTimerRef.current);
-      nudgeTimerRef.current = null;
-    }
-    if (!ratingsEnabled || !activeId) return;
-    let cancelled = false;
-    api
-      .getSessionRatings(authRef.current, activeId)
-      .then((snapshot) => {
-        if (cancelled) return;
-        const next = new Map<string, RatingEntry>();
-        for (const [mid, v] of Object.entries(snapshot.ratings)) {
-          if (v && (v.rating === "up" || v.rating === "down")) {
-            next.set(mid, { rating: v.rating, tags: Array.isArray(v.tags) ? v.tags : [] });
-          }
-        }
-        setSessionRatings(next);
-        setSessionNudges(new Map(Object.entries(snapshot.nudges)));
-      })
-      .catch(() => {
-        /* 静默:503 维护 / 网络失败——无已评高亮,不影响新评。*/
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [ratingsEnabled, activeId]);
-
-  // 评价 Context 载荷:demo/未登录 → null（ResponseRatingCard 自渲 null，天然隐藏）。
-  // nudgeId 随载荷下发：nudge 卡作为 Context 消费者穿透 MessageRenderer sig-memo 重渲（同 ratings
-  // 机制，不改渲染签名）→ 命中的评分行加/去脉冲类，其余卡 nudgeId!==自身 id 不受影响。
-  const ratingCtx: ResponseRatingCtx | null = useMemo(
-    () =>
-      ratingsEnabled
-        ? {
-            ratings: sessionRatings,
-            submit: onRateResponse,
-            nudgeId: ratingNudgeId,
-            sessionId: activeId,
-            getToken: () => authRef.current?.snapshot().token,
-          }
-        : null,
-    [ratingsEnabled, sessionRatings, onRateResponse, ratingNudgeId, activeId],
-  );
-
-  // 方案 a：sending true→false（本轮完成）沿检测 → 若为高成本 turn 且轮末条 assistant 未被评过，
-  // 点亮该条评分行做一次性脉冲高亮引导（4s 自动熄灭）。用户主动 Stop 的轮不高亮（stoppedTurnRef）。
-  // 走 sockRef.current（稳定句柄，同 chat）现场取消息，deps 不含每帧翻新的 chat 引用。
-  useEffect(() => {
-    const wasSending = prevSendingRef.current;
-    prevSendingRef.current = sending;
-    if (!wasSending || sending) return; // 仅 true→false 沿动作
-    if (stoppedTurnRef.current) {
-      stoppedTurnRef.current = false; // 消费"本轮被主动打断"标记 → 不高亮
-      return;
-    }
-    if (demo || !activeId) return;
-    const msgs = sockRef.current?.getMessages(activeId) ?? [];
-    const expensive = isExpensiveTurn(msgs);
-    // 轮末条 assistant 正文 = 评价行唯一落点（turnFinalAssistantFlags 最后一个 true）。
-    const flags = turnFinalAssistantFlags(msgs);
-    let idx = -1;
-    for (let i = flags.length - 1; i >= 0; i--) {
-      if (flags[i]) { idx = i; break; }
-    }
-    if (idx < 0) return;
-    const message = msgs[idx];
-    const id = message?.id;
-    if (!id || sessionRatings.has(id) || sessionNudges.has(id)) return;
-    const sampleBucket = ratingNudgeBucket(id);
-    if (!expensive && sampleBucket !== 0) return;
-    const traceId = message?.usage?.traceId ?? undefined;
-    const clientBuild = document.querySelector<HTMLMetaElement>('meta[name="oc-build"]')?.content || undefined;
-    void api.submitResponseRatingNudge(authRef.current, {
-      messageId: id,
-      sessionId: activeId,
-      traceId,
-      clientBuild,
-      sampleBucket,
-      nudgeAction: "expose",
-    }).then((result) => {
-      if (!result.newlyExposed || result.state !== "exposed") return;
-      setSessionNudges((prev) => new Map(prev).set(id, "exposed"));
-      if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
-      setRatingNudgeId(id);
-      nudgeTimerRef.current = setTimeout(() => {
-        setRatingNudgeId(null);
-        nudgeTimerRef.current = null;
-        setSessionNudges((prev) => new Map(prev).set(id, "dismissed"));
-        void api.submitResponseRatingNudge(authRef.current, {
-          messageId: id,
-          sessionId: activeId,
-          traceId,
-          clientBuild,
-          sampleBucket,
-          nudgeAction: "dismiss",
-        }).catch(() => {});
-      }, 4000);
-    }).catch(() => {});
-  }, [sending, demo, activeId, sessionRatings, sessionNudges]);
-
-  // 卸载兜底：清未散的脉冲定时器，防泄漏。
-  useEffect(
-    () => () => {
-      if (nudgeTimerRef.current) clearTimeout(nudgeTimerRef.current);
-    },
-    [],
-  );
+  // 逐条响应评价 / 隐式负反馈 / 完成脉冲高亮(hooks/useResponseRatings)。放在原先这几个 effect
+  // 所在的位置,与其它 effect 的执行顺序不变;send/stopTurn 经 ref 调用隐式上报,引用保持稳定。
+  const { ratingCtx, sendImplicitRating } = useResponseRatings({
+    demo,
+    signedIn: !!user,
+    activeId,
+    modelId,
+    sending,
+    authRef,
+    sockRef,
+    stoppedTurnRef,
+  });
+  sendImplicitRatingRef.current = sendImplicitRating;
 
   // autoscroll: controller 是 scrollTop 的唯一写入方。正确性来自 check-before-write,
   // 输入 mark 只立刻挂起写入以降低抖动,没有 400ms 手势寿命。
@@ -2907,8 +3009,9 @@ export function App() {
       // 用户已经离开点击位置：响应仍须等 DOM 提交后释放 FIFO，但不再把视口拉回旧坐标。
       anchor.cancelled = true;
     }
-  }, [settleArchiveAnchor, stick]);
+  }, [stick]);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是切会话触发器,函数体不读它。
   useLayoutEffect(() => {
     stick.reset();
     scrollToChatBottom();
@@ -2924,6 +3027,7 @@ export function App() {
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
   // layout 阶段贴底,避免普通 DOM 时间线先画出旧顶部再跳到底部。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: messages/streamText/chat.version/wsSending 是内容变更触发器;stickToBottomRef.current 是稳定对象上的 getter,执行时现读。
   useLayoutEffect(() => {
     if (!stickToBottomRef.current) return;
     scrollToChatBottom();
@@ -2986,6 +3090,7 @@ export function App() {
   }, [demo, activeId, chat, settleArchiveAnchor, stick]);
   // 对应归档响应完成且前插行渲染后(paint 前)才校正 scrollTop。请求在途时的 tape/live
   // 增长没有 ready token，不能冒领这个锚点。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: archiveLoading/chat.version 是前插渲染完成的触发器,函数体经 ref 读锚点。
   useLayoutEffect(() => {
     const anchor = archiveScrollAnchorRef.current;
     if (!anchor?.ready) return;
@@ -3014,12 +3119,13 @@ export function App() {
       undefined,
       stick.correctTo,
     ).finally(() => settleArchiveAnchor(anchor.token));
-  }, [archiveLoading, chat.version, settleArchiveAnchor, stick]);
+  }, [activeId, archiveLoading, chat.version, settleArchiveAnchor, stick]);
 
   // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
   // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
   // 让 fixed root 的 top:0 看起来被顶到屏幕上方。这里把实测 height + offsetTop
   // 写入 CSS var；若用户本就在底部或本轮正在生成，下一帧重新贴底。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stickToBottomRef.current 是稳定对象上的 getter,事件发生时现读,不是依赖。
   useEffect(() => {
     if (!inWorkspace) return;
     let raf: number | null = null;
@@ -3103,6 +3209,7 @@ export function App() {
           : orgOpen
             ? "org"
             : null;
+  const routeProjectIds = useMemo(() => projects.map((p) => p.id), [projects]);
   useAppRoute({
     enabled: routingEnabled,
     inWorkspace,
@@ -3147,11 +3254,23 @@ export function App() {
         setTutorialStep(null);
       }
     },
-    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : "chat",
+    workspace: TASKBOARD_ENABLED && boardOpen ? "board" : projectHome ? "project" : "chat",
     boardView,
     boardTicket: boardTicketId,
     boardTicketType,
-    onPopWorkspace: (ws) => setBoardOpen(TASKBOARD_ENABLED && ws === "board"),
+    projectRoute: projectHome,
+    pendingProject: pendingRouteProject,
+    clearPendingProject: () => setPendingRouteProject(null),
+    projectIds: routeProjectIds,
+    projectListSettled: projectsLoaded,
+    onOpenProject: (route) => {
+      setBoardOpenState(false);
+      setProjectHome(route);
+    },
+    onPopWorkspace: (ws) => {
+      setBoardOpenState(TASKBOARD_ENABLED && ws === "board");
+      if (ws !== "project") setProjectHome(null);
+    },
     onPopBoardParams: (nextView, ticket, ticketType) => {
       setBoardView(nextView);
       setBoardTicketId(ticket);
@@ -3174,7 +3293,18 @@ export function App() {
       <>
         <LazyBoundary fallback={<SplashFallback />}>
           <Landing
-            onStart={() => {
+            onStart={(prompt) => {
+              // 首页输入框 / 场景卡带来的任务:沿用案例的 pending 键,进入工作区后预填、不自动发送。
+              if (prompt) {
+                try {
+                  sessionStorage.setItem(
+                    "oc_v5_pending_case",
+                    JSON.stringify({ source: "landing", starterPrompt: prompt }),
+                  );
+                } catch {
+                  /* quota / private mode */
+                }
+              }
               // 「免费开始」直达注册表，少一次「立即注册」点击。
               setAuthMode("register");
               setView("app");
@@ -3380,7 +3510,10 @@ export function App() {
   // rename/delete 的数据收口（三持有方）在 useSessionList。
   const sidebarProps = {
     sessions,
-    activeId,
+    // 项目主页时侧栏高亮项目行，而不是背后仍选中的会话。
+    activeId: homeProject ? undefined : activeId,
+    activeProjectId: homeProject ? homeProject.id : null,
+    onOpenProject: openProject,
     user,
     credits: user?.credits ?? null,
     onOpenAccount: demo ? undefined : () => openSettings(),
@@ -3394,16 +3527,18 @@ export function App() {
     projects,
     collapsedProjectIds,
     onToggleProjectCollapsed: toggleProjectCollapsed,
-    onCreateProject: createProjectPrompt,
+    onCreateProject: () => setCreateProjectFrom({}),
+    onCreateProjectFromSession: (sess: Session) => setCreateProjectFrom({ sessionId: sess.id, title: sess.title }),
     onRenameProject: renameProjectPrompt,
     onDeleteProject: deleteProjectConfirm,
+    onToggleProjectPin: demo ? undefined : (p: ChatProject) => void setProjectPinned(p, !p.pinnedAt),
+    onArchiveProject: demo ? undefined : (p: ChatProject) => void setProjectArchived(p, true),
+    onOpenProjectArchive: demo ? undefined : () => setProjectArchiveOpen(true),
     isSending: (id: string) => !demo && chat.isSending(id),
     liveTerminal,
     socketVersion: chat.version,
     onLogout: demo ? undefined : logout,
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
-    // 账号菜单「管理中心」右侧的待办信号（Auto‑Dream 有待确认建议时替换静态副标题）。
-    optimizerPending: demo ? 0 : optimizer.pendingCount,
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
     onOpenMediaTasks:
@@ -3450,6 +3585,7 @@ export function App() {
     onLoadArchived: loadArchivedSessions,
     loadingArchived,
     onSearchMessages: searchSessionMessages,
+    onOpenPalette: () => setPaletteOpen(true),
   };
   const closeMobileThen = (fn?: () => void) =>
     fn
@@ -3468,7 +3604,7 @@ export function App() {
     <ArtifactInspectContext.Provider value={artifactInspect}>
     {/* tools T-18:详情面板当前查看的那条 tool 消息 → 源卡片选中态。与 open 回调分开成独立 context,
         面板开合只重渲消费它的 ToolCard,不打穿 MessageList 的 sig-memo(tool/context.ts 注释)。 */}
-    <ArtifactInspectActiveContext.Provider value={inspectTarget?.message ?? null}>
+    <ArtifactInspectActiveContext.Provider value={paneShown ? paneActive : null}>
     <ImageEditActionsContext.Provider value={imageEditActions}>
     {/* safe-px:横屏侧刘海安全区(竖屏为 0) */}
     <ProjectScopeProvider
@@ -3483,7 +3619,7 @@ export function App() {
           <Sidebar
             {...sidebarProps}
             onSelect={(id) => {
-              draftProjectRef.current = null;
+              setDraftProject(null);
               setBoardOpen(false);
               selectSession(id);
             }}
@@ -3521,7 +3657,7 @@ export function App() {
         <Sidebar
           {...sidebarProps}
           onSelect={(id) => {
-            draftProjectRef.current = null;
+            setDraftProject(null);
             setBoardOpen(false);
             selectSession(id);
             setMobileNavOpen(false);
@@ -3546,6 +3682,10 @@ export function App() {
             newSessionInProject(projectId);
             setMobileNavOpen(false);
           }}
+          onOpenProject={(projectId) => {
+            openProject(projectId);
+            setMobileNavOpen(false);
+          }}
           onCollapse={() => setMobileNavOpen(false)}
           // sidebar-B S-06：抽屉里同一按钮语义是「关闭导航」，读屏名与桌面「折叠侧栏」区分。
           collapseLabel="关闭导航"
@@ -3563,6 +3703,7 @@ export function App() {
           onOpenMarketplace={closeMobileThen(sidebarProps.onOpenMarketplace)}
           onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
+          onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}
           onOpenChatGptProxy={closeMobileThen(sidebarProps.onOpenChatGptProxy)}
           onOpenApiAccess={closeMobileThen(sidebarProps.onOpenApiAccess)}
@@ -3602,6 +3743,51 @@ export function App() {
               }}
             />
           </LazyBoundary>
+        ) : homeProject && projectHome ? (
+          <LazyBoundary fallback={<SplashFallback />}>
+            <ProjectHome
+              project={homeProject}
+              tab={projectHome.tab}
+              onTabChange={(tab) => setProjectHome({ projectId: homeProject.id, tab })}
+              sessions={sessions}
+              demo={demo}
+              auth={auth}
+              authSession={authRef.current}
+              onStart={(text) => startInProject(homeProject.id, text)}
+              onNewSession={() => {
+                setBoardOpen(false);
+                newSessionInProject(homeProject.id);
+              }}
+              onOpenSession={(id) => {
+                if (!sessions.some((s) => s.id === id)) return;
+                setDraftProject(null);
+                setBoardOpen(false);
+                selectSession(id);
+              }}
+              onOpenSettings={() => {
+                setUngroupedAssetsOpen(false);
+                setProjectSettings(homeProject);
+              }}
+              onRename={() => void renameProjectPrompt(homeProject)}
+              onDelete={() => void deleteProjectConfirm(homeProject)}
+              onOpenMobileNav={() => setMobileNavOpen(true)}
+              onLoadArchived={() => void loadArchivedSessions()}
+              onPrepareBoard={
+                demo || !TASKBOARD_ENABLED || !homeProject.boardProjectId
+                  ? undefined
+                  : () => prepareProjectBoard(homeProject.boardProjectId as string)
+              }
+              recipeSchedule={serverFeatures.recipeSchedule}
+              onShowSurface={(surface) => {
+                setProjectHome(null);
+                if (surface === "board") setBoardOpen(true);
+                else openManage(surface);
+              }}
+              loadingArchived={loadingArchived}
+              sidebarCollapsed={collapsed}
+              onExpandSidebar={() => setCollapsed(false)}
+            />
+          </LazyBoundary>
         ) : (
         <>
         {/* 会话标题 h1(读屏定位当前会话;视觉已由顶栏表达,故 sr-only。探针:工作区 h1=0)。 */}
@@ -3613,9 +3799,29 @@ export function App() {
             const pid = sessions.find((s) => s.id === activeId)?.projectId;
             if (!pid) return null;
             const chat = projects.find((p) => p.id === pid);
-            return chat ? { chatName: chat.name, workName: chat.boardProjectId ? chat.name : null } : null;
+            return chat ? { chatName: chat.name } : null;
           })()}
-          onOpenProjectScope={() => openManage(DEFAULT_MANAGE_TAB)}
+          projectSuggestion={(() => {
+            if (!serverFeatures.unfiledSuggest || !user?.id || !activeId) return null;
+            const active = sessions.find((s) => s.id === activeId);
+            if (!active || active.projectId || active.archived || dismissedSuggestions.has(active.id)) return null;
+            const hit = suggestProjectForChat(active, sessions, projects);
+            const target = hit ? projects.find((p) => p.id === hit.projectId) : undefined;
+            if (!target) return null;
+            const uid = user.id;
+            return {
+              name: target.name,
+              onAccept: () => moveSessionToProject(active, target.id),
+              onDismiss: () => {
+                dismissSuggestion(uid, active.id);
+                setDismissedSuggestions((cur) => new Set(cur).add(active.id));
+              },
+            };
+          })()}
+          onOpenProjectScope={() => {
+            const pid = sessions.find((s) => s.id === activeId)?.projectId;
+            if (pid) openProject(pid);
+          }}
           models={models}
           lockedModels={lockedModels}
           selectedModelId={modelId}
@@ -3648,18 +3854,9 @@ export function App() {
           onOpenMobileNav={() => setMobileNavOpen(true)}
           onOpenInbox={demo ? undefined : () => setInboxOpen(true)}
           onOpenFind={demo ? undefined : () => setFindOpen(true)}
-          onExport={
-            demo
-              ? undefined
-              : () => {
-                  saveBlob(
-                    new Blob([exportSessionMarkdown(wsMessages)], {
-                      type: "text/markdown;charset=utf-8",
-                    }),
-                    sessionExportFilename(activeSess?.title),
-                  );
-                }
-          }
+          onShare={demo ? undefined : () => setShareOpen(true)}
+          onTogglePane={paneAvailable && !demo ? togglePane : undefined}
+          paneOpen={paneShown}
           unreadCount={inbox.unreadCount}
           sessionUnreadCount={unreadSessions.unreadIds.size}
         />
@@ -3735,6 +3932,7 @@ export function App() {
           ) : showEmpty || historySurface === "empty" ? (
             <EmptyState
               agent={agent}
+              userName={demo ? undefined : greetingName(user)}
               onPrefill={(text) => setComposerPrefill({ text, nonce: Date.now() })}
               onChangeAgent={() => setPickerOpen(true)}
               onOpenGoal={demo ? undefined : () => setGoalOpenNonce(Date.now())}
@@ -3968,6 +4166,7 @@ export function App() {
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
             lastUserText={lastUserText}
+            prediction={inputPrediction}
             draftKey={accountDraftKey(activeId ?? NEW_COMPOSER_DRAFT_KEY, user?.id)}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}
@@ -3979,29 +4178,66 @@ export function App() {
             sendKey={composerPrefs.sendKey}
             fontSize={composerPrefs.fontSize}
             goalOpenRequest={goalOpenNonce}
+            projectSlot={
+              // 仍是未发首条的草稿时可改归属:包括被 GitHub/目标提前物化成空会话行的草稿。
+              activeId && !sessions.some((x) => x.id === activeId && x.messageCount === 0 && !x.projectId) ? undefined : (
+                <ComposerProjectPill
+                  projects={projects}
+                  projectId={draftProjectId}
+                  editable
+                  onPick={setDraftProject}
+                  onOpen={openProject}
+                />
+              )
+            }
           />
         </div>
         </>
         )}
       </main>
 
-      {/* 产物详情列(Codex 式第三列)。桌面:与 Sidebar|main 并列的内联 aside;
-          窄屏:右侧 Sheet 抽屉(共用 InspectorPanelContent)。任务看板占据 main 时不渲染。 */}
-      {!boardOpen && inspectTarget && isMdViewport && (
-        <InspectorPanel target={inspectTarget} onClose={() => setInspectTarget(null)} />
+      {/* 详情面板(右侧第三栏)。宽屏:与 Sidebar|main 并列的内联 aside;
+          更窄:贴底 Sheet(共用 InspectorPanelContent)。任务看板 / 项目主页占据 main 时不渲染。 */}
+      {paneInline && (
+        <InspectorPanel
+          key={activeId ?? "demo"}
+          messages={wsMessages}
+          version={chat.version}
+          running={wsSending}
+          request={paneRequestHere}
+          deferredLoader={paneDeferredLoader}
+          focusNonce={paneRequestHere?.nonce}
+          onClose={() => setPaneOpen(false)}
+          onActiveChange={setPaneActive}
+          width={paneWidth.width}
+          resizing={paneWidth.resizing}
+          widthMin={DETAIL_PANE_WIDTH.min}
+          widthMax={DETAIL_PANE_WIDTH.max}
+          onResizeStart={paneWidth.onResizeStart}
+          onResizeKeyDown={paneWidth.onResizeKeyDown}
+        />
       )}
       <Sheet
-        open={!boardOpen && !!inspectTarget && !isMdViewport}
+        open={paneAvailable && paneSheetOpen && !isWideViewport}
         onOpenChange={(o) => {
-          if (!o) setInspectTarget(null);
+          if (!o) setPaneSheetOpen(false);
         }}
         side="bottom"
-        srTitle="产物详情"
-        className="md:hidden"
-        overlayClassName="md:hidden"
+        srTitle="详情面板"
       >
-        {inspectTarget && (
-          <InspectorPanelContent target={inspectTarget} onClose={() => setInspectTarget(null)} />
+        {paneSheetOpen && (
+          <div className="flex h-[80dvh] min-h-0 flex-col">
+            <InspectorPanelContent
+              key={activeId ?? "demo"}
+              messages={wsMessages}
+              version={chat.version}
+              running={wsSending}
+              request={paneRequestHere}
+              deferredLoader={paneDeferredLoader}
+              onClose={() => setPaneSheetOpen(false)}
+              onActiveChange={setPaneActive}
+            />
+          </div>
         )}
       </Sheet>
 
@@ -4085,7 +4321,6 @@ export function App() {
             onRefreshMe={refreshMe}
             onPreferencesChange={applyConversationPreferences}
             feedbackContext={settingsFeedbackContext}
-            onOpenMemory={() => openManage("optimization")}
             onOpenManage={() => openManage("connectors")}
             onOpenRepo={demo ? undefined : openRepo}
             onOpenProjectSettings={() => {
@@ -4117,6 +4352,127 @@ export function App() {
         </LazyBoundary>
       )}
 
+      {projectArchiveMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ProjectArchiveDialog
+            open={projectArchiveOpen}
+            onOpenChange={setProjectArchiveOpen}
+            archived={projects.filter((p) => p.archivedAt)}
+            loadDeleted={listDeletedProjects}
+            onUnarchive={(p) => setProjectArchived(p, false)}
+            onRestore={restoreProject}
+          />
+        </LazyBoundary>
+      )}
+      {paletteMounted && (
+        <LazyBoundary fallback={null}>
+          <CommandPalette
+            open={paletteOpen}
+            onOpenChange={setPaletteOpen}
+            userId={paletteUserId}
+            projects={projects}
+            sessions={sessions}
+            currentProjectId={
+              homeProject?.id ??
+              (boardOpen
+                ? null
+                : ((chatViewActiveId ? sessions.find((x) => x.id === chatViewActiveId)?.projectId : null) ??
+                  draftProjectId))
+            }
+            onProjectHome={!!homeProject}
+            activeSession={chatViewActiveId ? (sessions.find((x) => x.id === chatViewActiveId) ?? null) : null}
+            searchMessages={paletteSearchMessages}
+            searchAssets={paletteSearchAssets}
+            onOpenProject={(projectId, tab) => {
+              if (!projects.some((x) => x.id === projectId)) return;
+              setPendingRouteProject(null);
+              setBoardOpenState(false);
+              setProjectHome({ projectId, tab: tab ?? "overview" });
+            }}
+            onOpenSession={(id) => {
+              setDraftProject(null);
+              setBoardOpen(false);
+              selectSession(id);
+            }}
+            onOpenUngroupedAssets={() => {
+              setProjectSettings(null);
+              setUngroupedAssetsOpen(true);
+            }}
+            onNewSession={() => {
+              setBoardOpen(false);
+              handleNew();
+            }}
+            onNewSessionInProject={(projectId) => {
+              setBoardOpen(false);
+              newSessionInProject(projectId);
+            }}
+            onCreateProject={(name) => setCreateProjectFrom(name ? { title: name } : {})}
+            onMoveSession={(sess, projectId) => void moveSessionToProject(sess, projectId)}
+            onOpenBoard={demo || !TASKBOARD_ENABLED ? undefined : () => setBoardOpen(true)}
+          />
+        </LazyBoundary>
+      )}
+      {saveToProjectMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <SaveToProjectDialog
+            request={saveToProject}
+            onClose={() => setSaveToProject(null)}
+            currentAuth={() => authRef.current}
+            prepareBoard={prepareProjectBoard}
+            onShowSurface={(surface) => {
+              setProjectHome(null);
+              setBoardOpen(false);
+              openManage(surface);
+            }}
+          />
+        </LazyBoundary>
+      )}
+      {createProjectMounted && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <CreateProjectDialog
+            open={createProjectFrom !== null}
+            onOpenChange={(o) => {
+              if (!o) setCreateProjectFrom(null);
+            }}
+            fromSessionTitle={createProjectFrom?.sessionId ? (createProjectFrom.title ?? "") : null}
+            initialName={createProjectFrom && !createProjectFrom.sessionId ? (createProjectFrom.title ?? null) : null}
+            onSubmit={async (input) => {
+              const from = createProjectFrom;
+              // 上传与之后的落位都绑定发起创建时的身份:中途换号/登出则停,不把文件传进另一个账号。
+              const createAuth = authRef.current;
+              const createEpoch = createAuth.snapshot().epoch;
+              const identityChanged = () =>
+                authRef.current !== createAuth || createAuth.snapshot().epoch !== createEpoch;
+              const created = await createProject({
+                name: input.name,
+                instructions: input.instructions,
+                ...(input.color ? { color: input.color } : {}),
+              });
+              if (!created) return false;
+              if (identityChanged()) return true;
+              if (input.files.length > 0 && !demo && auth) {
+                const result = await uploadFilesToProject({
+                  auth: createAuth,
+                  projectId: created.id,
+                  files: input.files,
+                  identityChanged,
+                });
+                if (result.aborted) return true;
+                if (result.failed > 0) {
+                  toast(`有 ${result.failed} 个文件没有上传成功，可以在项目设置的「文件」里重新上传`, "error");
+                }
+              }
+              const moving = from?.sessionId ? sessions.find((x) => x.id === from.sessionId) : undefined;
+              if (moving) moveSessionToProject(moving, created.id);
+              else {
+                setBoardOpen(false);
+                newSessionInProject(created.id);
+              }
+              return true;
+            }}
+          />
+        </LazyBoundary>
+      )}
       {projectSettingsMounted && (
         <LazyBoundary fallback={<DialogFallback />}>
           <ProjectSettingsDialog
@@ -4173,6 +4529,29 @@ export function App() {
         </LazyBoundary>
       )}
 
+      {/* OCV5-369:右上角「分享会话」。原 Markdown 导出收进对话框的次要入口。 */}
+      {!demo && shareOpen && (
+        <LazyBoundary fallback={<DialogFallback />}>
+          <ShareDialog
+            open={shareOpen}
+            onOpenChange={setShareOpen}
+            messages={wsMessages}
+            sending={sending}
+            title={activeSess?.title}
+            agentName={agent.name || "助手"}
+            onExportMarkdown={async () => {
+              const md = await exportSessionMarkdown(wsMessages);
+              saveBlob(
+                new Blob([md], {
+                  type: "text/markdown;charset=utf-8",
+                }),
+                sessionExportFilename(activeSess?.title),
+              );
+            }}
+          />
+        </LazyBoundary>
+      )}
+
       {!demo && auth && chatGptProxyEnabled && chatGptProxyOpen && (
         <LazyBoundary fallback={<DialogFallback />}>
           <ChatGptProxyDialog open={chatGptProxyOpen} auth={auth} onOpenChange={setChatGptProxyOpen} />
@@ -4204,13 +4583,14 @@ export function App() {
             agentId={agent.id}
             agents={myAgents}
             autoAuthorizePluginSlug={manageAutoAuthorizePluginSlug}
-            optimizerPendingCount={optimizer.pendingCount}
             onAutoAuthorizeConsumed={() => setManageAutoAuthorizePluginSlug(null)}
-            onTabChange={setManageTab}
-            onOpenMarketplace={() => {
+            onTabChange={(next) => setManageTab(normalizeManageTab(next))}
+            onOpenMarketplace={(kind) => {
               setManageOpen(false);
-              openMarketplace("browse", "connector");
+              openMarketplace("browse", kind);
             }}
+            // 「怎么用」：openTutorial 自己会先收起管理中心，避免两层弹层叠加。
+            onOpenHelp={(featureId) => openTutorial(featureId)}
             onRequireLogin={() => {
               // 未登录深链兜底（正常路径进不来：未登录时工作区根本不渲染）。
               setManageOpen(false);
@@ -4226,8 +4606,6 @@ export function App() {
               setManageAutoAuthorizePluginSlug(null);
               // Plugin 绑定/解绑会改变 Agent readiness；关闭管理中心时立即刷新目录。
               void refreshMyAgents().catch(() => {});
-              // 面板里应用/忽略过建议 → 回拉待办真值，侧栏信号不留 stale。
-              void optimizer.refresh().catch(() => {});
             }}
           />
         </LazyBoundary>

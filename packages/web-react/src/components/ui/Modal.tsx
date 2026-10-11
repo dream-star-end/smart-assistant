@@ -107,6 +107,8 @@ export interface ModalProps extends VariantProps<typeof modalContentVariants> {
   /** 内容区附加类;大尺寸对话查看器可用来接管 padding/滚动容器。 */
   bodyClassName?: string;
   hideClose?: boolean;
+  /** 标题行右侧、关闭按钮之前的附加操作(如管理中心「怎么用」)。仅在有 title 时渲染。 */
+  headerActions?: ReactNode;
   /** Optional layered-Escape handler. Omit to keep Radix's default close behavior. */
   onEscapeKeyDown?: RD.DialogContentProps["onEscapeKeyDown"];
   /** Let immersive dialogs place initial focus on their primary interaction surface. */
@@ -137,6 +139,7 @@ export function Modal({
   className,
   bodyClassName,
   hideClose,
+  headerActions,
   onEscapeKeyDown,
   onOpenAutoFocus,
   onCloseAutoFocus,
@@ -177,12 +180,17 @@ export function Modal({
                   <RD.Description className="mt-1 text-sm text-muted">{description}</RD.Description>
                 )}
               </div>
-              {!hideClose && (
-                <RD.Close asChild>
-                  <IconButton aria-label="关闭" size="sm">
-                    <X size={16} />
-                  </IconButton>
-                </RD.Close>
+              {(headerActions || !hideClose) && (
+                <div className="flex shrink-0 items-center gap-1">
+                  {headerActions}
+                  {!hideClose && (
+                    <RD.Close asChild>
+                      <IconButton aria-label="关闭" size="sm">
+                        <X size={16} />
+                      </IconButton>
+                    </RD.Close>
+                  )}
+                </div>
               )}
             </div>
           ) : (

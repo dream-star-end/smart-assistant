@@ -12,22 +12,24 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// OCV5-376: the route branches live in routes/projectAssets.ts; server.ts dispatches to it.
+const routeSrc = readFileSync(join(here, '../routes/projectAssets.ts'), 'utf8')
 const allowlistSrc = readFileSync(join(here, '../bridgeApiAllowlist.ts'), 'utf8')
 
 describe('project-assets 网关接线', () => {
   it('集合路由用 url.pathname === 字面量,条目路由用 match 字面量', () => {
     assert.ok(
-      serverSrc.includes("url.pathname === '/api/project-assets'"),
-      "server.ts 必须有 url.pathname === '/api/project-assets'",
+      routeSrc.includes("url.pathname === '/api/project-assets'"),
+      "routes/projectAssets.ts 必须有 url.pathname === '/api/project-assets'",
     )
     assert.ok(
-      serverSrc.includes('url.pathname.match(/^\\/api\\/project-assets\\/([a-zA-Z0-9_-]{8,64})$/)'),
+      routeSrc.includes('url.pathname.match(/^\\/api\\/project-assets\\/([a-zA-Z0-9_-]{8,64})$/)'),
       'PATCH/DELETE 必须是 url.pathname.match(/^\\/api\\/project-assets\\/:id$/)',
     )
-    assert.match(serverSrc, /listProjectAssets\(/)
-    assert.match(serverSrc, /createProjectAsset\(/)
-    assert.match(serverSrc, /updateProjectAsset\(/)
-    assert.match(serverSrc, /deleteProjectAsset\(/)
+    assert.match(routeSrc, /listProjectAssets\(/)
+    assert.match(routeSrc, /createProjectAsset\(/)
+    assert.match(routeSrc, /updateProjectAsset\(/)
+    assert.match(routeSrc, /deleteProjectAsset\(/)
   })
 
   it('KNOWN_ROUTES 含 /api/project-assets,normalizePath 收动态段', () => {
@@ -47,15 +49,43 @@ describe('project-assets 网关接线', () => {
     assert.doesNotMatch(allowlistSrc, /chat-projects/)
   })
 
+  it('产出物版本路由:versions(GET) 与 restore(POST) 用 match 字面量,normalizePath 收口', () => {
+    assert.ok(
+      routeSrc.includes('url.pathname.match(/^\\/api\\/project-assets\\/([a-zA-Z0-9_-]{8,64})\\/versions$/)'),
+      'versions 必须是 url.pathname.match 字面量',
+    )
+    assert.ok(
+      routeSrc.includes('url.pathname.match(/^\\/api\\/project-assets\\/([a-zA-Z0-9_-]{8,64})\\/restore$/)'),
+      'restore 必须是 url.pathname.match 字面量',
+    )
+    assert.match(routeSrc, /listProjectAssetVersions\(/)
+    assert.ok(serverSrc.includes("'/api/project-assets/:id/versions'"))
+    assert.ok(serverSrc.includes("'/api/project-assets/:id/restore'"))
+  })
+
+  it('server.ts 在原位置(chat-projects 之后、sessions/unclaimed 之前)把请求交给 handleProjectAssetsHttp', () => {
+    const dispatch = serverSrc.indexOf('if (handleProjectAssetsHttp(this.httpIo, req, res, url)) return')
+    const unclaimed = serverSrc.indexOf("url.pathname === '/api/sessions/unclaimed'")
+    assert.ok(dispatch >= 0 && unclaimed > dispatch)
+  })
+
   it('GET/POST/PATCH/DELETE 四个方法都接线', () => {
-    const start = serverSrc.indexOf("url.pathname === '/api/project-assets'")
+    const start = routeSrc.indexOf("url.pathname === '/api/project-assets'")
     assert.ok(start >= 0)
-    const end = serverSrc.indexOf("url.pathname === '/api/sessions/unclaimed'", start)
-    const block = serverSrc.slice(start, end)
+    const block = routeSrc.slice(start)
     assert.match(block, /req\.method === 'GET'/)
     assert.match(block, /req\.method === 'POST'/)
     assert.match(block, /req\.method === 'PATCH'/)
     assert.match(block, /req\.method === 'DELETE'/)
     assert.match(block, /tryExtractProjectAssetExcerpt/)
+  })
+
+  it('GET ?q= switches to cross-project search with a validated source and capped limit', () => {
+    const start = routeSrc.indexOf("url.pathname === '/api/project-assets'")
+    const block = routeSrc.slice(start, routeSrc.indexOf("req.method === 'POST'", start))
+    assert.match(block, /searchParams\.get\('q'\)/)
+    assert.match(block, /searchProjectAssets\(userId, /)
+    assert.match(block, /'invalid source'/)
+    assert.match(block, /PROJECT_ASSET_SEARCH_LIMIT_MAX/)
   })
 })

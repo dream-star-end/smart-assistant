@@ -1,7 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ComponentProps } from 'react'
-import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { workspaceWantPath } from '../../hooks/useAppRoute'
 import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import { ApiError, api } from '../../lib/api'
@@ -41,6 +41,7 @@ import { TicketCard, ticketPriorityTone, ticketTypeIconClass } from './TicketCar
 import { TicketDrawer } from './TicketDrawer'
 import { TicketListView } from './TicketListView'
 import { useTaskboard } from './useTaskboard'
+import { loadBeforeAll } from '../../test/moduleLoad'
 
 afterEach(() => {
   cleanup()
@@ -51,11 +52,9 @@ afterEach(() => {
   history.replaceState({}, '', '/')
 })
 
-beforeAll(async () => {
-  // MarkdownImpl 是 React.lazy 的重 chunk。首次 transform/import 会耗尽 RTL 统一的 5s
-  // 查询窗口，findBy* 只等到纯文本占位。先显式等模块就绪，再让查询只等 React 提交 DOM。
-  await import('../MarkdownImpl')
-})
+// MarkdownImpl 是 React.lazy 的重 chunk。首次 transform/import 会耗尽 RTL 统一的 5s
+// 查询窗口，findBy* 只等到纯文本占位。先显式等模块就绪，再让查询只等 React 提交 DOM。
+loadBeforeAll(() => import('../MarkdownImpl'))
 
 const auth = createMemoryAuthSession(() => {}, 'tok-board')
 
@@ -1451,7 +1450,7 @@ describe('TaskboardView 窄屏配置入口', () => {
     await waitFor(() => expect(screen.getByLabelText('项目范围')).toHaveValue('p1'))
     await openConfigMenu()
     expect(await screen.findByTestId('project-edit-open')).toHaveTextContent('管理项目')
-    expect(screen.getByTestId('project-create-open')).toHaveTextContent('新建项目')
+    expect(screen.getByTestId('project-create-open')).toHaveTextContent('新建工作项目')
     expect(screen.getByTestId('stage-settings-open')).toHaveTextContent('流水线配置')
     expect(screen.getByTestId('template-library-open')).toHaveTextContent('流水线模板')
     expect(screen.getByTestId('board-settings-open')).toHaveTextContent('护栏设置')

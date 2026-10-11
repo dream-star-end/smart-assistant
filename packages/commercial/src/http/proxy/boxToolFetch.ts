@@ -99,7 +99,8 @@ export class BoxToolFetch {
    * Stop it through the same explicit-stop path as a user Stop (durable intent,
    * original keeper, keeper proof, failed_stopped chain). The wait is bounded;
    * a stop that takes longer keeps running and is still observed. An unproven
-   * stop leaves the leaf unknown (phase continuation_echo_rejected) for the
+   * stop leaves the leaf unknown (phase continuation_echo_rejected, or
+   * continuation_stream_rejected for a decoder rejection, OCV5-328) for the
    * cleanup worker. */
   private async stopEchoRejected(args: FetchArgs, claim: BoxToolResumeClaim): Promise<void> {
     const stop = this.deps.stopRejectedRun;

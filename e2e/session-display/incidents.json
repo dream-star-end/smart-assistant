@@ -711,7 +711,8 @@
       "rootFixCommit": "83681d59",
       "coverageCommits": [
         "8f04bb2d",
-        "dda24a1e"
+        "dda24a1e",
+        "55dc8cfe"
       ],
       "regressions": [
         {
@@ -5953,7 +5954,9 @@
       "severity": "P1",
       "symptom": "#b6df9aee 中断后没有自动恢复，只能手点『从断点继续』：master 判 checkpoint_unsafe。回合 Read（有 read_only 证明）、Bash、Skill 均已完成并有结果，随后下一次模型调用 ENGINE_ERROR；自动断点续接要求每个工具都有网关副作用证明，Bash 永远没有，于是所有用过 Bash 的 Box Claude 回合遇模型错误都停在手动卡。修复：模型面错误（upstream_failed/error/timeout、network_error、rate_limited、model_capacity、engine_error）且所有工具/委派/权限都已收口、每个 tool_use 都有完成记录时，允许自动断点续接（续接不重跑工具，提示词要求先查可观察状态）；此类自动续接最多 3 次；未完成/未知工具、runner 丢失、服务重启仍走原规则。",
       "rootFixCommit": "f3c91504",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "78368a61"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -5974,6 +5977,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "OCV5-317 finalize schedules a checkpoint after settled Bash/Skill and a model-plane error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/settledToolsCheckpoint.test.ts",
+          "assertion": "keeps explicitly unknown structured results on the manual path"
         }
       ]
     },
@@ -6707,6 +6715,431 @@
           "assertion": "a stuck op whose runner was killed stops the parked run and settles; the session is free"
         }
       ]
+    },
+    {
+      "id": "INC-20261006-BOX-MIXED-CALL-TURN-CUT",
+      "occurredAt": "2026-10-06",
+      "severity": "P1",
+      "symptom": "个人版 #27da48a8（box-api-claude-opus-5-5，已执行 77 步，08:17–08:44 CST）：第 64 轮模型在同一条消息里调用了 ExecuteExtraTool，又直接点名调用了两次本次运行未暴露的 mcp__openclaude-memory__delegate_task。decoder 只合并“整条消息都是未暴露调用”的情况，混在一起时在文本块已转发之后抛 BOX_TOOL_ID_OR_NAME_INVALID；代理不带错误地结束了响应，CCB 把“若干完整 content block 之后干净 EOF”当成回合结束，回合显示已完成、最后一句是“I'll test the other models in that route the same way.”。该运行此后占着会话的 Box 名额 21 分钟才被清理。修复：decoder 把同一条消息里的未暴露调用隐藏、只交接已暴露调用，并在 journal 里记下被隐藏调用的 id 和名字，下一轮（在线、terminal recovery、unknown observer）在模型消息之前只接受 Claude Code 对这些调用的 No such tool available 回答；代理在 message_delta/message_stop 之前断流时补一帧 SSE error；decoder 拒绝的续轮按 continuation_stream_rejected 立即停止。",
+      "rootFixCommit": "cdcd1cfb",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "回归在 unit / integration 层，其中一条用 Box 上 Claude Code 2.1.288 对同形态消息的真实输出（一次已暴露调用加两次未暴露调用）走完两轮解码。个人版 canary 用不了仅管理员可见的 box-api-claude-opus-5-5，个人版也没有 Box 事故的 deploy-gate 脚本；对真实 CCB 构建做的“干净截断 / 带 error 帧”对照是一次性核对，不是可重复执行的 browser/live-e2e/deploy-gate 产物。",
+        "since": "2026-10-06"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.mixed.test.ts",
+          "assertion": "an exposed call followed by unexposed calls hands off the exposed one only"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.mixed.test.ts",
+          "assertion": "the next round takes the CLI's answers to the hidden calls before its model message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.mixed.test.ts",
+          "assertion": "a real Claude Code capture of a mixed message runs through both rounds"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-328 a round continues past the CLI's own answers to hidden calls"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolContinuation.test.ts",
+          "assertion": "OCV5-328 a missing, foreign or altered answer to a hidden call fails closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFetch.test.ts",
+          "assertion": "OCV5-328 a stream the decoder rejects stops the run like a rejected echo"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyCore.unit.test.ts",
+          "assertion": "中途断流 → 收尾前补一帧 SSE error,客户端不会把半截消息当成完成"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261006-BOX-BIGCTX-QUOTA",
+      "occurredAt": "2026-10-06",
+      "severity": "P1",
+      "symptom": "商业（2026-10-06，同类缺陷在个人版 Box 路线同样存在）：Box 的 Claude 账号五小时额度耗尽后，CLI 不再流出模型消息，只写一条合成 assistant 记录（model <synthetic>，rate_limit）和 429 result；解码器把它当成 BOX_TOOL_SNAPSHOT_INVALID，首轮记 unknown，客户端重试撞 BOX_CAPACITY_HELD 只看到匿名 500；已结算的未计费失败行还被重放查重当成“仍在处理”，等满 240 秒；非流式回退得到 409 BOX_REPLAY_NOT_FOUND。长上下文成本侧：Box CLI 为 2.1.288 但原生续接未验证，且候选查找拿 OpenClaude 会话 id 去查按 CLI 会话 id 记账的 journal，从未命中，三轮 35 万 token 对话把账号窗口从 3% 推到 42%。修复（商业 PR 599/600/602/603/605/606/607，个人版按净补丁同步）：合成 assistant 记录由两个解码器按 BOX_CLI_UPSTREAM_RATE_LIMITED / BOX_CLI_UPSTREAM_REFUSED 拒绝并归入首轮本地拒绝流，立即停止并未计费收尾；客户端收到 503 BOX_UPSTREAM_RATE_LIMITED（带 Retry-After），非流式回退按进程内 10 分钟拒绝记忆回同一个 503；已结算的未计费失败行不再算原始调用；2.1.288 标为原生续接已验证，指针带 CLI 版本；候选改用请求里的 CLI 会话 id，claim 被并发回合抢走时退回冷启动。商业线上验证：3 轮 35 万 token 上下文 cache_read 约 36.7 万、单轮 265→23 积分，用量、journal、ledger 三处对账一致。",
+      "rootFixCommit": "3d0e67f5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "INC-20261006 a CLI usage-limit refusal is stopped and settled unbilled, not left to hold the session"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "a native claim lost to a concurrent turn degrades to a cold start, not an error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRefusalMemory.test.ts",
+          "assertion": "a refused Box call is remembered for its own logical turn only, for ten minutes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRefusalMemory.test.ts",
+          "assertion": "the client sees a 503 with Retry-After for a usage-limit refusal and for any other refusal"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliSse.test.ts",
+          "assertion": "a CLI usage-limit refusal is one named code, not an order violation"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "a CLI usage-limit refusal before any model message is a named code, not a snapshot violation"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层，其中一条用 Box 上抓到的真实“额度耗尽”记录（__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl）走完首轮解码和未计费收尾。商业版在真实 Postgres 上有部署门禁证明（scripts/check-v5-box-incident-proofs.ts，红绿对照），个人版没有 Box 事故的 deploy-gate 脚本，canary 也用不了 box-claude-*，所以个人版暂无 browser/live-e2e/deploy-gate 层产物。",
+        "since": "2026-10-07"
+      }
+    },
+    {
+      "id": "INC-20261006-MODEL-CONFIG-CARD-BILLING-COPY",
+      "occurredAt": "2026-10-06",
+      "severity": "P2",
+      "symptom": "个人版（2026-10-06 05:22–05:28Z，uid 3，box-api-claude-opus-5-5）：一轮 Box 回合跑了 22 次上游调用、计 275 积分（usage_records / request_finalize_journal / credit_ledger 三处一致），随后助手在同一轮里跑运维脚本禁用 6 个目录模型，model_catalog 触发器把 security epoch 166→167，egress 每请求 fence 把第 23 次调用拒为 409 MODEL_CONFIG_CHANGED_RETRY_TURN（设计内的 fail-closed）。卡片却写「本轮已停止（不计费）」，与 275 积分的账单矛盾；还让用户「点它下方的「重试」」，而该码 retryable:false，卡片只会出「重新尝试」兜底按钮。修复：文案改为「停止前已完成的调用照常计费，被拒的这一次不计费」并按实际按钮名指引；fence 不动。",
+      "rootFixCommit": "b7e91d34",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
+          "assertion": "the card must not claim the whole turn was unbilled"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/model-config-card.node-test.mjs",
+          "assertion": "the card does not name a button that is not there"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "MODEL_CONFIG_CHANGED_RETRY_TURN 文案不声称整轮不计费,按钮名与卡片实际一致"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261007-SAND-INSTALLER-HOST-F95DBFB",
+      "occurredAt": "2026-10-04",
+      "severity": "P1",
+      "symptom": "selfhost（2026-10-04 起）：Cursor 账号池每次同步都写 0 个账号，个人版所有 cursor-* 回合在选账号时失败（oc-cursor：Cursor CLI is not enabled for this account）。唯一 Sand 账号 25 的生命周期停在 INSTALL_UNCONFIRMED：Cursor 把 Box 主程序升到 f95dbfb，主程序搬到 /opt/sand/sand-host/，安装器和安装 prompt 仍写死 /home/box/sand-host/；网关鉴权多了 WebAuthn 代理令牌分支，旧 AUTH 锚点匹配 0 次（UNSUPPORTED_HOST_LAYOUT）。2026-10-07 外机 cc3 重启 Sand host 后同样失败，确认不是一次性状态。修复：安装器布局 V3，按预期主程序 PID 的 cwd 在已知目录中选主程序（新路径优先，保留旧路径），安装 prompt 也优先在该目录暂存；Sand relay 路由插在 WebAuthn 代理分支之前并自带主网关令牌校验，代理令牌永远到不了 relay，未配置令牌时失败关闭；重跑时路由不在代理分支之前就拒绝；relay.cjs 自身的令牌校验保留为第二道闸。",
+      "rootFixCommit": "7f99c559",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host f95dbfb layout: relay answers only the primary gateway token, never the WebAuthn proxy token"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host f95dbfb layout: the installer's own route gate holds even when the relay module has no token check"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "re-run refuses an f95dbfb host whose relay route sits after the proxy gate"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host path follows the expected PID's cwd among known Sand host directories"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层（真实 installer.py 对 f95dbfb 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌，含无自身鉴权的 relay 替身）；线上证据要账号 25 真实 Box：发布后 Sand host 换 PID、生命周期 ready、能力探针命中、账号池写入 ≥1，属一次性运维核对，接不进 browser/live-e2e/deploy-gate runner。",
+        "since": "2026-10-08"
+      }
+    },
+    {
+      "id": "INC-20261008-MARKET-SKILL-IMPORT-OVERFLOW",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "市场发布页将技能长说明当按钮标题并平铺数百项，导致横向溢出、基本信息表单被挤走。",
+      "rootFixCommit": "3dfd9ea7",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/marketplace/PublishPanel.test.tsx",
+          "assertion": "从大列表搜索导入后，名称、说明、正文和附属文件完整回填"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ui-preview/marketplace-design.mjs",
+          "assertion": "bounded list height"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261008-PROJECT-MD-SEED-OVERWRITE",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "绑定看板的项目里，手改过的 PROJECT.md（哈希与记录不符）会被当成没有指令，随后被项目的 PG 旧指令整份覆盖；用户清空的指令下一轮又被 PG 旧文本填回。",
+      "rootFixCommit": "9fd5d327",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "缺陷在存储层（项目卷上的 PROJECT.md 与 meta.json），回归在 unit 层，对旧实现红、新实现绿（五条）。个人版没有能覆盖容器卷文件的 browser/live-e2e/deploy-gate runner；发布后在 uid3 卷上只读核对 meta.json 的 instructionsState 与 PROJECT.md 未变，属一次性核对。",
+        "since": "2026-10-08"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/projectContext.test.ts",
+          "assertion": "a hand-edited PROJECT.md with a stale hash is preserved, not replaced by the seed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/projectContext.test.ts",
+          "assertion": "a deliberate clear is never refilled by a stale PG mirror"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/storage/src/__tests__/projectContext.test.ts",
+          "assertion": "a seed racing a human write cannot overwrite it (checked under the lock)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "容器向主控读会话所属项目失败（超时/5xx/网络/坏响应）时，本轮静默按无项目执行：没有项目指令和常用文件，工作目录回落默认，用户与日志都看不出。",
+      "rootFixCommit": "057655c7",
+      "coverageCommits": [
+        "569538bb"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
+          "assertion": "a session in a project is held when the master stays unreachable"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
+          "assertion": "resolveChatRunWorkspace passes the hold to the caller instead of a default cwd"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectContextRuntime.test.ts",
+          "assertion": "a spawn-time read that fails builds from the turn-start read, not without the project"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/project-context-held.node-test.mjs",
+          "assertion": "INC-20261008-PROJECT-CONTEXT-SILENT-DROP: a held turn explains itself and one retry runs it"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261008-PROJECT-OUTPUTS-INVISIBLE",
+      "occurredAt": "2026-10-08",
+      "severity": "P1",
+      "symptom": "智能体生成的文件（会话产出）由容器网关登记进容器本地 SQLite，且无项目归属；界面读主控 PG，项目资产面板里看不到。uid3 自 2026-08-20 起积压 223 条。",
+      "rootFixCommit": "dbfa54cd",
+      "coverageCommits": [
+        "d371a45b"
+      ],
+      "proofPending": {
+        "reason": "缺陷在容器↔主控的登记链路，回归在 unit 层：容器侧收集器对假主控（重试/待登记队列/冻结项目）六条、主控路由对假身份与假存储（租户只取容器身份、冻结项目、已删项目落未分类、外人会话不登记）六条；把收集器强制回本地登记时六条全红。个人版没有覆盖真实容器→主控链路的 browser/live-e2e/deploy-gate runner；发布后用 uid3 真实一轮产出文件、在 PG project_assets 只读核对新行与项目归属，属一次性核对。",
+        "since": "2026-10-08"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts",
+          "assertion": "registers on the master with the project frozen at turn start"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts",
+          "assertion": "a master outage spools the registration and the next collection sends it once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalProjectAssets.test.ts",
+          "assertion": "registers into the tenant from the container identity, never from the body"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalProjectAssets.test.ts",
+          "assertion": "the project frozen at turn start wins over the session's current project"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/turnChatProjectFreeze.test.ts",
+          "assertion": "a queued next message in another project does not change the running turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts",
+          "assertion": "a registration queued while a flush is sending is not lost"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-UPLOAD-RETRY-ACCOUNT-SWITCH",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "上传遇到 503（容器冷启）退避重试期间若退出并登录另一账号，重试会用新账号的凭据把前一账号选中的文件上传进新账号的空间。代码审查发现，未见线上发生。",
+      "rootFixCommit": "10f10992",
+      "coverageCommits": [],
+      "proofPending": {
+        "reason": "回归在 unit 层（真实 api.uploadFile + 内存 AuthSession，503 退避中切换身份后不再发出第二次请求；去掉修复即红）。换号时机需要在退避窗口内人工登出登录，个人版没有能编排这一时序的 browser/live-e2e/deploy-gate runner。",
+        "since": "2026-10-09"
+      },
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/api.test.ts",
+          "assertion": "uploadFile never retries under another identity after a 503 backoff"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-CC-SWITCH-LIGHT-SLOT-ORDER",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "个人版 OCV5-355 托管真 Chromium 复现（非用户报障）：CC Switch 导入的轻量位 ANTHROPIC_DEFAULT_HAIKU_MODEL 在目录里 sonnet 排在 gemini flash 之前时被填成 sonnet（更贵）。0bf1a90d7 把 haiku/flash/sonnet 三档合成一个正则，按目录顺序取首个命中；改为按档优先级逐档匹配。",
+      "rootFixCommit": "e9f933aa",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/settings/ApiAccessTab.test.tsx",
+          "assertion": "轻量位按档取：sonnet 排在 gemini flash 前也先取 flash"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/cc-switch-ascii-name.node-test.mjs",
+          "assertion": "existing key: real paste exports exact Clarvy ASCII name and intact import contract"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-PROJECT-NAME-ACTION-OVERLAP",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "个人版运营 2026-10-09 21:52 报障（附截图）：侧栏项目名过长（「V5个人版和商业版项目开发」，268px 默认宽度）时，悬停出现的「+」「⋯」叠在项目名和折叠箭头上。操作钮绝对定位叠在行上，悬停只淡出比两枚按钮窄的计数；改为桌面悬停/聚焦/菜单打开时操作钮进入 flex 流、与计数互换，名字截断。真 Chromium 量测：修前 chevron 右缘 228.3 > 首个操作钮左缘 206，修后各状态无重叠。",
+      "rootFixCommit": "8d99a504",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/project-row-long-name.node-test.mjs",
+          "assertion": "OCV5-364: long project names never run under the sidebar row actions"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-ADMIN-BOUNDARY-STICKY",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "管理后台任一页面渲染崩溃后，错误边界不随切页重置，所有 tab 都停在「此页面加载出错」直到整页刷新。",
+      "rootFixCommit": "596687a5",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/admin/AdminShellBoundary.test.tsx",
+          "assertion": "页面崩溃只影响当前 tab，切页后错误边界重置"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-ALERT-INBOX-FALLBACK",
+      "occurredAt": "2026-10-09",
+      "severity": "P1",
+      "symptom": "个人版未配置告警通道时，运维告警兜底站内信写给非管理员 uid=1 且不去重，每天约 300 条无人阅读，运营看不到任何告警。",
+      "rootFixCommit": "dae6883b",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts",
+          "assertion": "同 dedupe_key 重复兜底 → 只写 1 条,第二次 inbox_fallback=false"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts",
+          "assertion": "uid=1 不是 admin(个人版)→ 发给最小的非系统种子 active admin"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-INBOX-DELIVERY-KEY-500",
+      "occurredAt": "2026-10-08",
+      "severity": "P2",
+      "symptom": "容器重建后看板日报按新统计重发同一 deliveryKey，主控回 500，网关每分钟重试到午夜，每天约 1.4k 条 error 日志。",
+      "rootFixCommit": "1560945a",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalInboxPost.test.ts",
+          "assertion": "delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261009-SELFHEAL-LOAD-MORE-400",
+      "occurredAt": "2026-10-09",
+      "severity": "P2",
+      "symptom": "自愈修复页「加载更多」把 limit 加到 300，后端上限 200 回 400，列表报错。",
+      "rootFixCommit": "1f55ee33",
+      "coverageCommits": [],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/admin/pages/selfheal/__tests__/selfheal.test.tsx",
+          "assertion": "加载更多不超过后端上限 200(OCV5-365)"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261011-SAND-INSTALLER-HOST-F1727E3",
+      "occurredAt": "2026-10-10",
+      "severity": "P1",
+      "symptom": "selfhost（2026-10-10 23:58Z 起）：Cursor 把 Box 主程序升到 f1727e3（/opt/sand/sand-host 于 10-11 07:57 CST 整目录替换、主程序 PID 换新），生命周期给新主程序重装 Sand relay，安装 prompt 被接受但 15 分钟无能力，账号 25 停在 INSTALL_UNCONFIRMED；同一主程序进程不再重试，账号池同步只写空池（gen-e3b0c442…），个人版所有 cursor-* 与 box-claude-* 回合在选凭据时失败（oc-cursor：Cursor CLI is not enabled for this account），用户看到“消息未开始处理，已确认未计费”。根因：f1727e3 的网关鉴权段与 f95dbfb 逐字相同，只有打包器生成的局部变量从 refusal2 变成 refusal3，安装器 AUTH_V3 锚点写死了 refusal2，匹配 0 次（UNSUPPORTED_HOST_LAYOUT）；10-07 那次修复也写明“仅发布不触发新尝试，要等主程序换 PID”。修复：AUTH_V3 只放宽 refusal 后的数字编号，取实际匹配原文作锚点且须唯一，鉴权逻辑任何别的变化仍拒绝；relay.cjs 加安装包修订行使模块哈希变化，生命周期按既有规则对同一主程序进程再给一次尝试（且只一次）。",
+      "rootFixCommit": "82632943",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host f1727e3 layout (the f95dbfb gate re-bundled as refusal3): relay answers only the primary gateway token"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "the auth anchor tolerates only the bundler's numbering: a changed or doubled gate is still refused"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层(真实 installer.py 对 f1727e3 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌;锚点反例;生命周期同一主程序遇新模块再试一次);线上证据要账号 25 的真实 Box:发布后生命周期 ready、能力探针命中新模块、账号池写入 ≥1、个人版 box-claude 回合跑通,属一次性运维核对,个人版发布不跑 deploy-gate/live-e2e,canary 也没有 Cursor slot。",
+        "since": "2026-10-11"
+      }
     }
   ]
 }

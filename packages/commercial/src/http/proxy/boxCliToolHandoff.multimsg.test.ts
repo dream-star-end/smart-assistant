@@ -140,13 +140,7 @@ test("anything outside the exact rejected-call shape still fails closed", () => 
   fails([...base, cancelled], "BOX_TOOL_CLI_ERROR_INVALID");
   // a user record with nothing rejected, and a synthetic one
   fails([init, start("msg_a"), cliError("toolu_bad_1")], "BOX_TOOL_RECORD_INVALID");
-  // valid and unknown calls mixed in one message keep the old rejection
-  fails([init, start("msg_a"), ...call("msg_a", 0, "toolu_good", boxName),
-    ...call("msg_a", 1, "toolu_bad_1", "Bash", [{ type: "tool_use", id: "toolu_good",
-      name: boxName, input: { value: "x" } }])], "BOX_TOOL_ID_OR_NAME_INVALID");
-  fails([init, start("msg_a"), ...call("msg_a", 0, "toolu_bad_1", "Bash"),
-    ...call("msg_a", 1, "toolu_good", boxName, [{ type: "tool_use", id: "toolu_bad_1",
-      name: "Bash", input: { value: "x" } }])], "BOX_TOOL_ID_OR_NAME_INVALID");
+  // valid and unknown calls mixed in one message: boxCliToolHandoff.mixed.test.ts (OCV5-328)
   // a rejected call id is unique, and a later exposed call cannot reuse it
   fails([init, start("msg_a"), ...call("msg_a", 0, "toolu_dup", "Read"),
     ...call("msg_a", 1, "toolu_dup", "Grep", [{ type: "tool_use", id: "toolu_dup",

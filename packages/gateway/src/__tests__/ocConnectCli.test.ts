@@ -152,7 +152,7 @@ describe('oc-connect list', () => {
     assert.equal(r.exitCode, 0)
     assert.equal(
       r.stdout,
-      '当前未绑定任何应用连接。请告知用户前往 设置 → 应用连接器 绑定后重试。\n',
+      '当前未绑定任何插件账号。请告知用户前往 管理中心 → 插件 绑定后重试。\n',
     )
   })
 })
@@ -188,7 +188,7 @@ describe('oc-connect catalog', () => {
     assert.equal(r.exitCode, 0)
     assert.deepEqual(calls, [{ op: 'catalog', body: {} }])
     // 引导语明确:凭据永不进容器、agent 不能代绑、引导用户去设置。
-    assert.match(r.stdout, /设置 → 应用连接器/)
+    assert.match(r.stdout, /管理中心 → 插件/)
     assert.match(r.stdout, /凭据永不进入容器/)
     assert.match(r.stdout, /notion · Notion/)
     // static-token → 提示填"访问令牌";token-exchange → 提示填应用 ID/密钥。
@@ -203,7 +203,7 @@ describe('oc-connect catalog', () => {
     const r = await runOcConnectCli(['catalog', '飞书'], deps)
     assert.equal(r.exitCode, 0)
     assert.deepEqual(calls, [{ op: 'catalog', body: { query: '飞书' } }])
-    assert.match(r.stdout, /匹配「飞书」的应用连接器/)
+    assert.match(r.stdout, /匹配「飞书」的插件/)
     assert.match(r.stdout, /feishu · 飞书/)
   })
 
@@ -211,12 +211,12 @@ describe('oc-connect catalog', () => {
     const empty = mkDeps({ responses: { catalog: { connectors: [] } } })
     const r1 = await runOcConnectCli(['catalog'], empty.deps)
     assert.equal(r1.exitCode, 0)
-    assert.equal(r1.stdout, '暂无可用的应用连接器。\n')
+    assert.equal(r1.stdout, '暂无可用的插件。\n')
 
     const noHit = mkDeps({ responses: { catalog: { connectors: [] } } })
     const r2 = await runOcConnectCli(['catalog', 'zzz'], noHit.deps)
     assert.equal(r2.exitCode, 0)
-    assert.match(r2.stdout, /未找到匹配「zzz」的应用连接器/)
+    assert.match(r2.stdout, /未找到匹配「zzz」的插件/)
   })
 
   test('catalog 至多一个 query 位置参数', async () => {
@@ -250,15 +250,15 @@ describe('oc-connect call — account resolution', () => {
     assert.match(r.stderr, /--account 11/)
     assert.match(r.stderr, /--account 12/)
     assert.match(r.stderr, /坚果云/)
-    assert.match(r.stderr, /有多个已绑定连接/)
+    assert.match(r.stderr, /有多个已绑定账号/)
   })
 
   test('no connection for provider → guidance, exit 1', async () => {
     const { deps } = mkDeps({ responses: { list: { connections: [CONN_A] } } })
     const r = await runOcConnectCli(['call', 'notion', 'search'], deps)
     assert.equal(r.exitCode, 1)
-    assert.match(r.stderr, /未找到 provider=notion 的已绑定连接/)
-    assert.match(r.stderr, /设置 → 应用连接器/)
+    assert.match(r.stderr, /未找到 provider=notion 的已绑定账号/)
+    assert.match(r.stderr, /管理中心 → 插件/)
   })
 
   test('--account skips the list round-trip', async () => {

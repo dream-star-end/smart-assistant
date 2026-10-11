@@ -50,9 +50,10 @@ function Harness({
 }
 
 describe("ResponseRatingCard", () => {
-  test("默认收起态：一行小字 + 两个 thumb 按钮，无标签区", () => {
+  // OCV5-359:不再有「这条回复怎么样?」引导语,只剩两个带 aria-label 的 thumb。
+  test("默认收起态：只有两个 thumb 按钮，无引导文案、无标签区", () => {
     render(<Harness />);
-    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+    expect(screen.queryByText("这条回复怎么样?")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "点赞" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "点踩" })).toBeInTheDocument();
     // 未评 → 标签未展开
@@ -60,12 +61,13 @@ describe("ResponseRatingCard", () => {
     expect(screen.queryByRole("button", { name: "保存补充" })).not.toBeInTheDocument();
   });
 
-  test("点 👍：立即静默提交(只带 rating)，保持单行并显示谢谢反馈", () => {
+  test("点 👍：立即静默提交(只带 rating)，不展开，读屏播报谢谢反馈", () => {
     const onSubmit = vi.fn();
     render(<Harness onSubmit={onSubmit} />);
     fireEvent.click(screen.getByRole("button", { name: "点赞" }));
     expect(onSubmit).toHaveBeenCalledWith({ messageId: "m1", rating: "up", traceId: "t1" });
-    expect(screen.getByText("谢谢反馈")).toBeInTheDocument();
+    // 「谢谢反馈」只进 sr-only 的 polite live region,视觉上不常驻一行小字。
+    expect(screen.getByText("谢谢反馈")).toHaveClass("sr-only");
     expect(screen.queryByRole("button", { name: "不准确" })).not.toBeInTheDocument();
     // 选中态：点赞 thumb aria-pressed
     expect(screen.getByRole("button", { name: "点赞" })).toHaveAttribute("aria-pressed", "true");
@@ -88,6 +90,16 @@ describe("ResponseRatingCard", () => {
     ]) {
       expect(screen.getByRole("button", { name: t })).toBeInTheDocument();
     }
+  });
+
+  test("补充区挂在动作条下方另起一行(order-last basis-full),根节点不占盒子", () => {
+    const { container } = render(<Harness />);
+    expect(container.firstElementChild).toHaveClass("contents");
+    fireEvent.click(screen.getByRole("button", { name: "点踩" }));
+    const panel = container.querySelector("[data-rating-panel]");
+    expect(panel).not.toBeNull();
+    expect(panel).toHaveClass("order-last", "basis-full");
+    expect(panel).toContainElement(screen.getByText("已记录，可选补充原因"));
   });
 
   test("选标签 + 点保存补充 → 同一 POST 覆盖(带 tags)，随后收起", () => {
@@ -121,8 +133,8 @@ describe("ResponseRatingCard", () => {
   test("nudgeId 命中未评消息 → 外层带 oc-rating-nudge 脉冲类（方案 a 引导）", () => {
     const { container } = render(<Harness nudgeId="m1" />);
     expect(container.querySelector(".oc-rating-nudge")).not.toBeNull();
-    // 高亮只是视觉引导，不得渲染成已选态：thumb 仍未按下、文案仍是未评。
-    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+    // 高亮只是视觉引导，不得渲染成已选态：thumb 仍未按下、也不播报谢谢反馈。
+    expect(screen.queryByText("谢谢反馈")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "点赞" })).toHaveAttribute("aria-pressed", "false");
   });
 

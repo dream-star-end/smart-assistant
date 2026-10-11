@@ -32,7 +32,6 @@ import {
   formatValue,
   isInternalSubtaskInput,
   isOpaqueArgToolName,
-  isSafeHttpUrl,
   isToolInFlight,
   parseCodexTypeName,
   safeSubtaskDescription,
@@ -42,6 +41,8 @@ import {
 } from "./format";
 import { parseMcpName } from "./meta";
 import { researchToolCard, safeArtifactSrc, WebSearchResultsCard } from "./researchCards";
+import { BrowserStepCard } from "./BrowserStepCard";
+import { browserStepOf } from "./browserSteps";
 import { renderReleaseJobCard } from "./releaseCards";
 
 const TaskApprovalCard = lazy(() =>
@@ -873,61 +874,25 @@ function WebSearchBody({ input, tool }: BodyProps) {
 // ── MCP ─────────────────────────────────────────────────────────────────────
 
 function BrowserBody({ op, input, tool }: BodyProps & { op: string }) {
-  let head: ReactNode = null;
-  if (op === "browser_navigate" && asStr(input?.url)) {
-    const url = asStr(input?.url);
-    head = isSafeHttpUrl(url) ? (
-      <a
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="block break-all rounded-lg bg-info-soft px-3 py-2.5 text-meta font-medium text-info outline-none transition-colors hover:bg-info-soft/80 focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        {url}
-      </a>
-    ) : (
-      <div className="block break-all rounded-lg bg-hover px-3 py-2.5 text-xs text-muted">
-        {url}
-      </div>
-    );
-  } else if (op === "browser_evaluate" || op === "browser_run_code") {
-    const code = asStr(input?.code) || asStr(input?.function);
-    if (code) head = <ExpandablePre text={code} max={1500} language="javascript" />;
-  } else if (input) {
-    const target = asStr(input.element) || asStr(input.ref);
-    const text = asStr(input.text);
-    const key = asStr(input.key);
-    const option = asStr(input.values) || asStr(input.value);
-    const useful = [
-      target ? { label: "目标", value: target } : null,
-      text ? { label: op === "browser_wait_for" ? "等待内容" : "文本", value: text } : null,
-      key ? { label: "按键", value: key } : null,
-      option ? { label: "选项", value: option } : null,
-    ].filter((row): row is { label: string; value: string } => !!row);
-    head = useful.length > 0 ? (
-      <dl className="grid gap-2 sm:grid-cols-2">
-        {useful.map((row) => (
-          <div key={row.label} className="min-w-0 rounded-lg bg-hover/70 px-3 py-2">
-            <dt className="text-caption font-medium text-faint">{row.label}</dt>
-            <dd className="mt-0.5 break-words text-meta text-fg">{row.value}</dd>
+  // OCV5-374:导航 / 点击 / 截图等已登记动作走与 oc-browser 同一张浏览器卡;其余(标签页列表、等待…)照旧。
+  const step = browserStepOf(tool);
+  if (step && step.actions.length > 0) {
+    const code = op === "browser_evaluate" || op === "browser_run_code" ? asStr(input?.code) || asStr(input?.function) : "";
+    return (
+      <>
+        <BrowserStepCard step={step} tool={tool} />
+        {code && (
+          <div className="mt-2">
+            <ExpandablePre text={code} max={1500} language="javascript" />
           </div>
-        ))}
-      </dl>
-    ) : <KvList obj={input} skip={["_meta"]} />;
+        )}
+      </>
+    );
   }
-  const screenshotPath = op === "browser_take_screenshot"
-    ? asStr(input?.filename) || asStr(input?.path) || /(?:\/[^\s"']+\.(?:png|jpe?g|webp))/i.exec(asStr(tool.output))?.[1] || ""
-    : "";
-  const safeScreenshot = screenshotPath ? safeArtifactSrc(screenshotPath) : null;
   return (
     <>
-      {head}
-      {safeScreenshot && (
-        <div className="mt-2.5 overflow-hidden rounded-lg bg-code p-2">
-          <SignedImg src={safeScreenshot} alt="页面截图" className="max-h-64 rounded-md object-contain" />
-        </div>
-      )}
-      {!safeScreenshot && <OutputBlock output={tool.output} />}
+      {input && <KvList obj={input} skip={["_meta"]} />}
+      <OutputBlock output={tool.output} />
     </>
   );
 }

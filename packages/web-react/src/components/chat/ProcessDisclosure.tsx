@@ -10,6 +10,7 @@ import {
   ListTodo,
   type LucideIcon,
   MessageCircleQuestion,
+  PanelRight,
   Pencil,
   Search,
   ShieldCheck,
@@ -18,14 +19,19 @@ import {
   TriangleAlert,
   Wrench,
 } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
 import { ProgressiveMarkdown, RecoveredStepContext } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
 import { ProcessStepContext } from "./processStep";
+import { StepTimingContext } from "./stepDuration";
+import { combineStepTimings, computeStepTimings, formatStepDuration, stepTimingsSignature } from "../../lib/chat/stepTiming";
 import { safeArtifactSrc } from "../tool/artifactSrc";
+import { useArtifactInspect } from "../tool/context";
+import { cn } from "../../lib/utils";
+import { toolChangedFileCount } from "./workPane";
 import { timelineMessageKey } from "./findInSession";
 
 /**
@@ -268,23 +274,6 @@ function minimaxOutputKeys(command: string, output: string): string[] {
   return keys;
 }
 
-function isScreenshotTool(name: string, command: string): boolean {
-  if (/browser_take_screenshot/i.test(name)) return true;
-  if (detectOcCli(command) !== "oc-browser") return false;
-  for (const match of command.matchAll(/oc-browser\s+([a-z-]+)/gi)) {
-    if ((match[1] ?? "").toLowerCase() === "screenshot") return true;
-  }
-  return false;
-}
-
-function screenshotOutputKeys(name: string, command: string, output: string): string[] {
-  if (!isScreenshotTool(name, command)) return [];
-  const match = /\/[^\s"'<>]+\.(?:png|jpe?g|webp)/i.exec(output);
-  if (!match) return [];
-  const key = renderedLocatorKey(match[0]);
-  return key ? [key] : [];
-}
-
 function artifactRecord(output: string, outputJson: unknown): Record<string, unknown> | null {
   const fromJson = asRecord(outputJson);
   if (typeof fromJson?.output === "string" || typeof fromJson?.qmd === "string") return fromJson;
@@ -325,8 +314,11 @@ function outputEvidence(message: ChatMessage, displayOutput: string, outputJson:
  * Media the existing tool card renders from a successful output/outputJson.
  * Request paths are ignored. Office CLI cards guess a download from the
  * command, and Read/imageView only inspect a file — neither is a deliverable.
- * Image generation, minimax/mmx, screenshots, and oc-report/slides/poster
- * stay up only when that card has a returned file it can actually show.
+ * Image generation, minimax/mmx, and oc-report/slides/poster stay up only
+ * when that card has a returned file it can actually show. Browser steps
+ * (oc-browser / MCP browser_*) never do (OCV5-374): a screenshot is the agent
+ * checking its own work even when it lands in generated/ — the step folds, the
+ * shot shows on its card inside 处理过程 and in the detail pane (产出 / 浏览器).
  * An html/htmlpreview fence in tool output is not media: no tool body mounts
  * HtmlPreview. Bash shows that fence as terminal text. Assistant fences still
  * use artifactEvidenceKeys.
@@ -352,7 +344,6 @@ function renderedToolMediaKeys(message: ChatMessage): string[] {
   return dedupe([
     ...imageGenerationKeys(name, input, evidence),
     ...minimaxOutputKeys(command, evidence),
-    ...screenshotOutputKeys(name, command, evidence),
     ...artifactOutputKeys(command, output, outputJson),
   ]);
 }
@@ -1099,6 +1090,8 @@ export function ProcessDisclosure<T>({
   olderSteps,
   startedAt,
   lastFrameAt,
+  turnStartedAt,
+  turnEndedAt,
 }: {
   sections: ProcessSection<T>[];
   active: boolean;
@@ -1121,8 +1114,19 @@ export function ProcessDisclosure<T>({
    * 摘要行旁显示已运行时长。缺省(历史轮、单测)则两者都不出现。
    */
   lastFrameAt?: number | null;
+  /** OCV5-367: 本轮起点(进行中 = 本轮活动起点;历史 = 本轮用户消息时刻),首步耗时从这里算。 */
+  turnStartedAt?: number | null;
+  /** OCV5-367: 过程之后第一行(本轮回答)的到达时刻,末步没有自身终点时以它收尾。 */
+  turnEndedAt?: number | null;
 }) {
   const messages = sections.flatMap((section) => section.messages);
+  // OCV5-367: 每一步的耗时(自上一步结束到本步结束)。按值签名缓存,数值不变时 Map 引用不变,
+  // 步骤行(在 memo 边界之下读 context)不会被每一帧无谓重渲。
+  const computedTimings = computeStepTimings(messages, { turnStartedAt, turnEndedAt, active });
+  const timingsSig = stepTimingsSignature(computedTimings);
+  const timingsRef = useRef<{ sig: string; map: typeof computedTimings } | null>(null);
+  if (timingsRef.current?.sig !== timingsSig) timingsRef.current = { sig: timingsSig, map: computedTimings };
+  const stepTimings = timingsRef.current.map;
   const summary = operationSummary(messages);
   // Cleared/completed goals are diagnostics, not a new step. They must not
   // take the current-stage identity from the work still in progress.
@@ -1135,6 +1139,12 @@ export function ProcessDisclosure<T>({
   }
   const steps = stepItemCount(sections, messagesOf);
   const tally = kindTally(sections, messagesOf);
+  // 详情面板入口(OCV5-370):本轮改过文件 → 常显「改动 N 个文件」,点开面板的改动页;
+  // 只有其它步骤 → 一个安静的面板图标(桌面悬停 / 触屏常显),点开步骤页。
+  const openPane = useArtifactInspect().openPane;
+  const processRows = openPane ? sections.flatMap((section) => section.items.flatMap((item) => messagesOf(item))) : [];
+  const changedFiles = openPane ? toolChangedFileCount(processRows) : 0;
+  const hasToolRows = processRows.some((message) => message.role === "tool");
   const elapsed = useElapsed(startedAt, active);
   // 长步骤 / 步骤间隙的活性信号。当前段是叙述(中途说明)时原本不挂任何动效——流式文字本身就是信号;
   // 但文字写完后模型可能还要想很久、或下一条命令还没到,整屏就没有任何「还在干活」的迹象,
@@ -1210,14 +1220,16 @@ export function ProcessDisclosure<T>({
   };
 
   return (
+    <StepTimingContext.Provider value={stepTimings}>
     <section
       data-testid="process-disclosure"
       data-process-active={active ? "true" : "false"}
       className="min-w-0"
     >
+      <div className="group/shellrow -mx-1.5 flex w-[calc(100%+0.75rem)] min-w-0 items-center gap-1">
       <button
         type="button"
-        className={shellToggleClass}
+        className={cn(shellToggleClass, "mx-0 w-auto min-w-0 flex-1")}
         aria-expanded={open}
         data-testid="process-toggle"
         onClick={() => setOpen(!open)}
@@ -1267,6 +1279,32 @@ export function ProcessDisclosure<T>({
           className={`shrink-0 text-faint transition-transform duration-300 ease-[var(--ease-spring)] group-hover/shell:text-muted ${open ? "rotate-180" : ""}`}
         />
       </button>
+      {openPane && changedFiles > 0 ? (
+        <button
+          type="button"
+          data-testid="process-pane-changes"
+          className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-full border border-border px-2.5 text-meta text-muted outline-none transition-colors hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+          title="在详情面板查看这一轮的产出"
+          onClick={() => openPane("outputs", processRows[0])}
+        >
+          <Pencil size={12} aria-hidden className="text-faint" />
+          {/* 手机上省掉「改动」二字,给左边的步骤统计留位置;读屏仍念全句。 */}
+          <span className="sr-only sm:not-sr-only">改动 </span>
+          {changedFiles} 个文件
+        </button>
+      ) : openPane && hasToolRows ? (
+        <button
+          type="button"
+          data-testid="process-pane-steps"
+          aria-label="在详情面板查看步骤"
+          title="在详情面板查看步骤"
+          className="flex size-8 shrink-0 items-center justify-center rounded-md text-faint opacity-0 outline-none transition-opacity hover:bg-hover hover:text-fg focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring group-hover/shellrow:opacity-100 [@media(hover:none)]:size-11 [@media(hover:none)]:opacity-100"
+          onClick={() => openPane("steps")}
+        >
+          <PanelRight size={15} />
+        </button>
+      ) : null}
+      </div>
       {!open
         ? sections.flatMap((section) => section.items.map((item) => clippedDeferred(item)))
         : null}
@@ -1327,6 +1365,7 @@ export function ProcessDisclosure<T>({
               // background-clip:text 时都不生效,这一档静态差异是那时唯一能指出「哪一行在干活」的线索;
               // 动效正常时流光静止色本就是 --faint,观感与其余过程行一致。
               const working = active && index === currentIndex;
+              const groupTiming = working ? undefined : combineStepTimings(stepTimings, section.messages.map((message) => message.id));
               return (
                 <div key={section.key} className="space-y-0.5" data-testid="process-step-group">
                   <RailRow node={<StepNode Icon={group.Icon} tone={group.tone} />} enter={false}>
@@ -1353,6 +1392,15 @@ export function ProcessDisclosure<T>({
                           className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
                         >
                           {`已运行 ${runningFor}`}
+                        </span>
+                      ) : groupTiming?.ms !== undefined ? (
+                        // OCV5-367: 折叠的步骤组给出这一组合计用时(组内每一步都有可信时间才给)。
+                        <span
+                          data-testid="process-group-duration"
+                          className="shrink-0 whitespace-nowrap text-meta tabular-nums text-faint"
+                          title={`这一组步骤共用时 ${formatStepDuration(groupTiming.ms)}`}
+                        >
+                          {formatStepDuration(groupTiming.ms)}
                         </span>
                       ) : null}
                       <span className="sr-only">{operationSummary(section.messages)}</span>
@@ -1390,5 +1438,6 @@ export function ProcessDisclosure<T>({
           </div>
         ) : null}
     </section>
+    </StepTimingContext.Provider>
   );
 }

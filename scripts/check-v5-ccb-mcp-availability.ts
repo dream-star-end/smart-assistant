@@ -72,12 +72,28 @@ assert.equal(
   false,
 );
 
+// Platform tools that are advertised only behind their own flag (the MCP
+// server hides them the same way). Each must be absent without the flag and
+// present with it; every other platform tool is always advertised.
+const FLAG_GATED_PLATFORM_TOOLS = { project_search: "projectSearchEnabled" } as const;
+
 const withLaunch = projectCcbMcpAvailability({
   configuredTools: [],
   mcpLaunch: LAUNCH,
 });
 for (const name of PLATFORM_MCP_TOOL_NAMES) {
+  if (name in FLAG_GATED_PLATFORM_TOOLS) continue;
   assert.ok(withLaunch.includes(name), `launch advertised set missing ${name}`);
+}
+for (const [name, flag] of Object.entries(FLAG_GATED_PLATFORM_TOOLS)) {
+  assert.ok((PLATFORM_MCP_TOOL_NAMES as readonly string[]).includes(name), `${name} must stay a platform tool`);
+  assert.equal(withLaunch.includes(name), false, `${name} must be hidden without its flag (${flag})`);
+  const flagged = projectCcbMcpAvailability({ configuredTools: [], mcpLaunch: LAUNCH, [flag]: true });
+  assert.ok(flagged.includes(name), `launch advertised set missing ${name} with ${flag}`);
+  for (const other of PLATFORM_MCP_TOOL_NAMES) {
+    if (other in FLAG_GATED_PLATFORM_TOOLS) continue;
+    assert.ok(flagged.includes(other), `${flag} must not hide ${other}`);
+  }
 }
 
 const evalNames = projectCcbMcpAvailability({

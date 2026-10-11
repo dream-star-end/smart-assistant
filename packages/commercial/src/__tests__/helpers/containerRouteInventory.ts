@@ -20,12 +20,15 @@
  * 正则构造,遇到没见过的构造**立刻抛错**(而不是猜),并且每条合成出来的样例都要用原正则
  * 自校验一遍 —— 我们绝不会拿一条"容器根本不接受的路径"去做断言。
  */
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverPath = join(here, '..', '..', '..', '..', 'gateway', 'src', 'server.ts')
+const gatewaySrc = join(here, '..', '..', '..', '..', 'gateway', 'src')
+const serverPath = join(gatewaySrc, 'server.ts')
+/** OCV5-376 P2: route domains split out of server.ts dispatch from gateway/src/routes/*.ts. */
+const routesDir = join(gatewaySrc, 'routes')
 const routerPath = join(here, '..', '..', 'http', 'router.ts')
 
 export interface ContainerRoute {
@@ -35,7 +38,9 @@ export interface ContainerRoute {
   readonly declared: string
   /** 一条确定满足该路由的具体路径(regex 形态经自校验)。 */
   readonly sample: string
-  /** server.ts 行号(1-based),报错时人能直接跳过去。 */
+  /** 声明所在文件(相对 gateway/src),配合 line 报错定位。 */
+  readonly file: string
+  /** 该文件内行号(1-based),报错时人能直接跳过去。 */
   readonly line: number
 }
 
@@ -192,25 +197,18 @@ function synthesizeFromRegexSource(src: string): string {
 export const __synthesizeFromRegexSource = synthesizeFromRegexSource
 
 /**
- * 扫 server.ts 的三种分发形态,返回容器侧 `/api/*` 路由清单。
+ * 扫 server.ts 与 routes/*.ts(从 server.ts 按领域搬出的路由模块)的三种分发形态,
+ * 返回容器侧 `/api/*` 路由清单。
  *
  * fail-loud:抓到的条数低于历史下界 → 抛错(正则被格式改动打瞎时必须红,而不是让
  * "家族闭包成立"在一个空清单上轻松通过)。
  */
 export async function readContainerApiRoutes(): Promise<ContainerRoute[]> {
-  const source = await readFile(serverPath, 'utf8')
-  const lineStarts: number[] = [0]
-  for (let k = 0; k < source.length; k++) if (source[k] === '\n') lineStarts.push(k + 1)
-  const lineOf = (index: number): number => {
-    let lo = 0
-    let hi = lineStarts.length - 1
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1
-      if (lineStarts[mid]! <= index) lo = mid
-      else hi = mid - 1
-    }
-    return lo + 1
-  }
+  const routeFiles = (await readdir(routesDir).catch(() => [] as string[]))
+    .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'))
+    .sort()
+    .map((name) => ({ file: `routes/${name}`, path: join(routesDir, name) }))
+  const files = [{ file: 'server.ts', path: serverPath }, ...routeFiles]
 
   const routes: ContainerRoute[] = []
   const seen = new Set<string>()
@@ -221,26 +219,43 @@ export async function readContainerApiRoutes(): Promise<ContainerRoute[]> {
     routes.push(r)
   }
 
-  // ① url.pathname === '/api/x'
-  for (const m of source.matchAll(/url\.pathname === '(\/api\/[^']*)'/g)) {
-    push({ kind: 'exact', declared: m[1]!, sample: m[1]!, line: lineOf(m.index!) })
-  }
-  // ② url.pathname.startsWith('/api/x/') —— 裸 '/api/' 是鉴权兜底判定,不是路由。
-  for (const m of source.matchAll(/url\.pathname\.startsWith\('(\/api\/[^']*)'\)/g)) {
-    const prefix = m[1]!
-    if (prefix === '/api/') continue
-    push({ kind: 'prefix', declared: prefix, sample: `${prefix}sample`, line: lineOf(m.index!) })
-  }
-  // ③ url.pathname.match(/^\/api\/…$/) —— 正则可能换行落在下一行。
-  const matchRe = /url\.pathname\.match\(\s*\/(\^\\\/api\\\/[^\n]*?)\/[a-z]*\s*[,)]/g
-  for (const m of source.matchAll(matchRe)) {
-    const src = m[1]!
-    push({
-      kind: 'regex',
-      declared: src,
-      sample: synthesizeFromRegexSource(src),
-      line: lineOf(m.index!),
-    })
+  for (const { file, path } of files) {
+    const source = await readFile(path, 'utf8')
+    const lineStarts: number[] = [0]
+    for (let k = 0; k < source.length; k++) if (source[k] === '\n') lineStarts.push(k + 1)
+    const lineOf = (index: number): number => {
+      let lo = 0
+      let hi = lineStarts.length - 1
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1
+        if (lineStarts[mid]! <= index) lo = mid
+        else hi = mid - 1
+      }
+      return lo + 1
+    }
+
+    // ① url.pathname === '/api/x'
+    for (const m of source.matchAll(/url\.pathname === '(\/api\/[^']*)'/g)) {
+      push({ kind: 'exact', declared: m[1]!, sample: m[1]!, file, line: lineOf(m.index!) })
+    }
+    // ② url.pathname.startsWith('/api/x/') —— 裸 '/api/' 是鉴权兜底判定,不是路由。
+    for (const m of source.matchAll(/url\.pathname\.startsWith\('(\/api\/[^']*)'\)/g)) {
+      const prefix = m[1]!
+      if (prefix === '/api/') continue
+      push({ kind: 'prefix', declared: prefix, sample: `${prefix}sample`, file, line: lineOf(m.index!) })
+    }
+    // ③ url.pathname.match(/^\/api\/…$/) —— 正则可能换行落在下一行。
+    const matchRe = /url\.pathname\.match\(\s*\/(\^\\\/api\\\/[^\n]*?)\/[a-z]*\s*[,)]/g
+    for (const m of source.matchAll(matchRe)) {
+      const src = m[1]!
+      push({
+        kind: 'regex',
+        declared: src,
+        sample: synthesizeFromRegexSource(src),
+        file,
+        line: lineOf(m.index!),
+      })
+    }
   }
 
   // 下界哨兵:2026-07-26 实测 exact 30 / prefix 1 / regex 30 条。任一形态归零 = 正则瞎了。

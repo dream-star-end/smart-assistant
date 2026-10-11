@@ -108,7 +108,7 @@ async function main(): Promise<void> {
     assertion(entry.rows.length === 1 && row
       && ["staged", "active", "disabled"].includes(row.state)
       && row.engine === "ccb" && row.provider_id === "box_cli"
-      && row.upstream_model_id === SOURCE && row.context_window === 200_000
+      && row.upstream_model_id === SOURCE && row.context_window === 1_000_000
       && isDeepStrictEqual(row.capability_profile, { supports_vision: false,
         reasoning: { supported: [], codex_model_default: null },
         ccb: { capability_zero: true, supports_thinking: false } })

@@ -54,7 +54,13 @@ export interface CardProps
 
 export function Card({ className, padding, tone, interactive, ...props }: CardProps) {
   return (
-    <div className={cn(cardVariants({ padding, tone, interactive }), className)} {...props} />
+    <div
+      className={cn(
+        cardVariants({ padding, tone, interactive }),
+        className,
+      )}
+      {...props}
+    />
   );
 }
 

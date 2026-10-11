@@ -184,11 +184,9 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         assert.notEqual(committed._historyRevision, reloadRevision);
         await page.reload();
         await until("reload hydrates old server error", () => detailResponses > before);
-        const originalUser = page.getByTestId("user-row").getByTestId("message-text")
-          .filter({ hasText: /^RECOVERY_ORIGINAL_REQUEST$/ });
-        await originalUser.waitFor();
-        assert.equal(await originalUser.count(), 1, "reload renders exactly one original user request");
-        assert.equal(await originalUser.textContent(), "RECOVERY_ORIGINAL_REQUEST");
+        // The user's bubble, not the sr-only page <h1> (a6c4442b3) that carries the same text once the
+        // session title is the first message; an unscoped exact match is ambiguous after reload (OCV5-355).
+        await page.getByTestId("user-row").getByTestId("message-text").filter({ hasText: /^RECOVERY_ORIGINAL_REQUEST$/ }).waitFor();
         await until("reload processed old REST", async () => (await stored(page))?._historyRevision===preview.store.revision);
         if (red) await until("RED observes second child after reload", () => scenario.children.length>=2);
         assert.equal(scenario.children.length, 1, "reload must not submit second recovery child");
@@ -207,7 +205,8 @@ test("INC-20260725-RECOVERY-RETRY-LOOP: real App REST and IndexedDB reload fence
         if (await toggle.getAttribute("aria-expanded")!=="true") await toggle.click();
         const detailToggle = shell.getByTestId("process-detail-toggle");
         if (await detailToggle.count() && await detailToggle.getAttribute("aria-expanded")!=="true") await detailToggle.click();
-        const thinkingToggle = shell.getByTestId("thinking-step").getByRole("button", { name: "思考", exact: true });
+        // The step button's name carries its duration since OCV5-367 (「思考 <0.1 秒」).
+        const thinkingToggle = shell.getByTestId("thinking-step").getByRole("button", { name: /^思考(\s|$)/ });
         assert.equal(await thinkingToggle.count(), 1, "one source thinking step");
         console.log("RECOVERY_THINKING_CONTROL", JSON.stringify({ width, name: await thinkingToggle.innerText(), expanded: await thinkingToggle.getAttribute("aria-expanded") }));
         if (await thinkingToggle.getAttribute("aria-expanded") !== "true") await thinkingToggle.click();

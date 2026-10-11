@@ -84,6 +84,14 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     proxyFromCommercial: true,
   },
   {
+    // Server-side feature flags for the web UI: three booleans read from the
+    // container env (protocol/serverFeatures). The rest of /api/config stays host-only.
+    label: '/api/features',
+    re: /^\/api\/features$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
     label: '/api/collaboration-config',
     re: /^\/api\/collaboration-config$/,
     methods: M('GET', 'PUT'),
@@ -327,6 +335,24 @@ export const BRIDGE_API_ALLOWLIST: readonly BridgeApiAllowRule[] = [
     label: '/api/board/projects/:id/context',
     re: /^\/api\/board\/projects\/[^/]+\/context$/,
     methods: M('GET', 'PUT'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/ensure',
+    re: /^\/api\/board\/projects\/[^/]+\/ensure$/,
+    methods: M('POST'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/workspace',
+    re: /^\/api\/board\/projects\/[^/]+\/workspace$/,
+    methods: M('GET'),
+    proxyFromCommercial: true,
+  },
+  {
+    label: '/api/board/projects/:id/workspace/file',
+    re: /^\/api\/board\/projects\/[^/]+\/workspace\/file$/,
+    methods: M('GET'),
     proxyFromCommercial: true,
   },
   {

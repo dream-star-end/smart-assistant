@@ -1,5 +1,6 @@
 import { isBoxApiModel } from '@openclaude/protocol'
 import type { GrokExecutionDescriptor } from '@openclaude/protocol'
+import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { rename, writeFile } from 'node:fs/promises'
@@ -181,6 +182,7 @@ import { emptyCompletedTurnAssistantText, shouldFailClosedEmptyModelTurn } from 
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
+import { adoptRunContext } from './runContextPersist.js'
 import {
   deriveLosslessTurnKey,
   getV3MasterSinkOrNull,
@@ -866,12 +868,14 @@ function scheduleSessionOutputAssetCollection(opts: {
   assistantText: string
   sessionKey: string
   traceId?: string
+  chatProjectId?: string | null
 }): void {
   if (!opts.userId || !opts.assistantText) return
   void collectSessionOutputAssets({
     userId: opts.userId,
     sessionId: opts.sessionId,
     assistantText: opts.assistantText,
+    ...(opts.chatProjectId !== undefined ? { chatProjectId: opts.chatProjectId } : {}),
   }).catch((err) => {
     log.warn(
       'collectSessionOutputAssets failed',
@@ -933,6 +937,13 @@ export interface AgentSession {
   projectId?: string | null
   /** projectId + contextVersion + assetsRevision + manifest hashes. */
   contextFingerprint?: string
+  /**
+   * Chat project the running turn resolved at its start (server.ts); its
+   * output assets are registered there. Set by submit() under the turn lock,
+   * so a queued next message cannot replace it mid-turn. undefined = not
+   * resolved (flag off): the master infers.
+   */
+  turnChatProjectId?: string | null
   runContext?: import('./runContextPersist.js').RunContextDescriptor
   frozenProjectContext?: import('@openclaude/storage').FrozenProjectContext | null
   /**
@@ -3058,6 +3069,8 @@ export class SessionManager {
       requestId: string
       traceId?: string
       model?: string
+      /** Chat project this external turn resolved at its start (not via submit, so passed here). */
+      chatProjectId?: string | null
     },
     reservation?: PromptQueueExternalTurnReservation,
   ): Promise<{ turnIndex: number; messageId: string }> {
@@ -3124,6 +3137,7 @@ export class SessionManager {
       this._trackPersistence(persistence)
       scheduleSessionOutputAssetCollection({
         userId: session.userId,
+        ...(Object.prototype.hasOwnProperty.call(args, 'chatProjectId') ? { chatProjectId: args.chatProjectId } : {}),
         sessionId: session.peerId,
         assistantText: args.assistantText,
         sessionKey: session.sessionKey,
@@ -4329,7 +4343,7 @@ export class SessionManager {
           existing.parentSessionKey = opts.parentSessionKey
         if (opts.projectId !== undefined) existing.projectId = opts.projectId
         if (nextFingerprint) existing.contextFingerprint = nextFingerprint
-        if (opts.runContext) existing.runContext = opts.runContext
+        if (opts.runContext) existing.runContext = adoptRunContext(existing.runContext, opts.runContext)
         existing._identityCreationOpts = identityCreationOpts
         return existing
       }
@@ -5206,6 +5220,8 @@ export class SessionManager {
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
+      /** Chat project this turn resolved at its start; see AgentSession.turnChatProjectId. */
+      turnChatProjectId?: string | null
       toolsets?: string[]
       collabAgentPolicy?: CollabAgentPolicy
       /** 模型权威批次 §4:本 turn 的上游请求凭据(master 签名 authority + turn lease)。
@@ -5540,6 +5556,13 @@ export class SessionManager {
         callerSpecifiedToolsets &&
         typeof maybeSetToolsets === 'function' &&
         !sameToolsetsForCompare(runnerToolsets, desiredToolsets)
+      // Intelligent UI(OCV5-361):CCB/Codex 的系统提示在 spawn 时写死;开关切换后第一轮
+      // 并入同一次 shutdown → 本次 submit 以 resume 重启并重建提示。拉取失败不重启。
+      // 按内容指纹比(输入预测 OCV5-375 与组件协议同在这一段,单关其中一个也要重建)。
+      const iuiApplied = (session.runner as { promptIntelligentUi?: unknown }).promptIntelligentUi
+      const iuiChanged =
+        isIntelligentUiApplied(iuiApplied) &&
+        intelligentUiNeedsRestart(iuiApplied, await getDesiredIntelligentUi(session.sessionKey).catch(() => undefined))
       if (effortChanged) session.runner.setEffortLevel(desiredEffort)
       if (modelChanged) {
         session.runner.setModel(desiredModel)
@@ -5553,7 +5576,7 @@ export class SessionManager {
       if (toolsetsChanged) {
         maybeSetToolsets.call(session.runner, desiredToolsets)
       }
-      if (effortChanged || modelChanged || toolsetsChanged) {
+      if (effortChanged || modelChanged || toolsetsChanged || iuiChanged) {
         try {
           await session.runner.shutdown()
           // Delta tracker reset happens automatically on the next 'spawn' event
@@ -5569,6 +5592,7 @@ export class SessionManager {
               effortChanged,
               modelChanged,
               toolsetsChanged,
+              iuiChanged,
               ...(traceId ? { traceId } : {}),
             },
             err,
@@ -5580,6 +5604,11 @@ export class SessionManager {
         session._platformGoal = goal
         await session.runner.setGoalState(goal)
       }
+      // Under the turn lock: this turn's outputs go to the project it resolved
+      // at start, even if a queued next message resolved another one.
+      session.turnChatProjectId = Object.prototype.hasOwnProperty.call(opts ?? {}, 'turnChatProjectId')
+        ? opts?.turnChatProjectId
+        : undefined
       session.lastUsedAt = Date.now()
       // Clear tool use mappings from previous turn to prevent unbounded growth
       session.toolUseIdToName.clear()
@@ -7277,6 +7306,7 @@ export class SessionManager {
               session.turns = Math.max(session.turns, turnIndex)
               scheduleSessionOutputAssetCollection({
                 userId: session.userId,
+                chatProjectId: session.turnChatProjectId,
                 sessionId: session.peerId,
                 assistantText: partialAssistant.text,
                 sessionKey: session.sessionKey,
@@ -8124,6 +8154,7 @@ export class SessionManager {
             const turnIndex = session.turns
             scheduleSessionOutputAssetCollection({
               userId: session.userId,
+              chatProjectId: session.turnChatProjectId,
               sessionId: peerId,
               assistantText,
               sessionKey: session.sessionKey,

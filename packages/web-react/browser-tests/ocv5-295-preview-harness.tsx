@@ -2,9 +2,9 @@
 //
 // 与 mobile-harness.tsx 同构:safe-px 外层 → main → ChatHeader → 聊天滚动区 → Composer,
 // 同一份 production CSS。这里只换数据:三种典型态,由 URL 参数选择:
-//   ?scene=complete   完成态(工作过程 + 正文 + 复制常显 + 更多操作 + 时间/积分/请求号/赞踩)
+//   ?scene=complete   完成态(工作过程 + 正文 + 复制 · 赞踩 · 更多菜单;时间/积分/请求号在菜单里,OCV5-359)
 //   ?scene=streaming  流式中(sending=true,末条 assistant 为 live,整排操作不出现)
-//   ?scene=partial    停止 / 上游失败但已有部分正文(精简三动作 + 积分/请求号仍在)
+//   ?scene=partial    停止 / 上游失败但已有部分正文(复制 + 精简菜单;积分/请求号在菜单里)
 //   &theme=dark       暗色(useTheme 的唯一落点 <html class="dark">)
 //   &model=long       超长模型名(顶栏截断回归)
 // 只读合成示例:不发任何模型请求;网络只剩 fetch 兜底 204。评分 submit 只写内存。

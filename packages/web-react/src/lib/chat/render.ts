@@ -594,6 +594,7 @@ const ERROR_LABELS: Record<string, string> = {
   session_persist_unavailable: "消息暂未安全送达",
   session_deleted: "会话已删除",
   durable_dispatch_unavailable: "派发未能接入执行通道",
+  project_context_unavailable: "项目信息暂未加载",
   stopped: "已停止本轮生成",
   user_cancelled: "已取消本轮",
   runner_crashed: "执行环境异常中断",

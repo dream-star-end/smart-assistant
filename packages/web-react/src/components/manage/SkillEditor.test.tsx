@@ -260,7 +260,8 @@ describe("技能工作台保存竞态(请求在途继续编辑)", () => {
     await settleSave();
     expect(screen.getByDisplayValue("服务端 v5")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("服务端 v4")).not.toBeInTheDocument();
-    expect(screen.getByText(/正文（v5；/)).toBeInTheDocument();
+    // 版本号在工作台头部的 slug 行里(OCV5-362:不再塞进「正文」字段标签)。
+    expect(screen.getByText("v5")).toBeInTheDocument();
   });
 
   test("保存期间没再动过的路径照常清干净(不因为加了快照校验就永远脏)", async () => {
@@ -329,7 +330,7 @@ describe("技能工作台只读态与触屏可达性", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  test("标题用列表同款展示名,历史页签计数在打开时就带上", async () => {
+  test("标题:正文没有 H1 时用列表同款展示名,历史页签计数在打开时就带上", async () => {
     vi.spyOn(api, "getSkillHistory").mockResolvedValue({
       history: [{ version: "2", timestamp: new Date().toISOString() }],
       writable: true,
@@ -342,8 +343,38 @@ describe("技能工作台只读态与触屏可达性", () => {
         <SkillEditor auth={auth} skillName="写作助手" displayTitle="帮你把草稿改成成稿" open onClose={() => {}} onChanged={() => {}} />
       </TooltipProvider>,
     );
-    expect(await screen.findByText("技能工作台 · 帮你把草稿改成成稿")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "帮你把草稿改成成稿" })).toBeInTheDocument();
+    expect(screen.queryByText(/技能工作台 ·/)).not.toBeInTheDocument();
     expect(await screen.findByRole("tab", { name: "历史（1）" })).toBeInTheDocument();
+  });
+
+  test("标题优先用正文的一级标题(人话名字),slug 与版本号在下面一行;触发描述不进头部", async () => {
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: true });
+    vi.spyOn(api, "getSkill").mockResolvedValue({
+      ...DETAIL,
+      version: "1.0.16",
+      body: "# 顾问模式：参考核验与设计检查\n\n## 何时使用\n",
+    });
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    render(
+      <TooltipProvider>
+        <SkillEditor
+          auth={auth}
+          skillName="advisor-mode-reference-design"
+          displayTitle="设计或核验 Claude Code 风格的顾问模式时使用。先核验官方机制，再检查与团队、审计的边界"
+          open
+          onClose={() => {}}
+          onChanged={() => {}}
+        />
+      </TooltipProvider>,
+    );
+    const heading = await screen.findByRole("heading", { name: "顾问模式：参考核验与设计检查" });
+    expect(heading.querySelector(".line-clamp-1")).not.toBeNull();
+    expect(screen.getByText("advisor-mode-reference-design")).toBeInTheDocument();
+    expect(screen.getByText("v1.0.16")).toBeInTheDocument();
+    expect(screen.queryByText(/正文 \/ 文件 \/ 评测/)).not.toBeInTheDocument();
+    // 「技能标识 …」不再作为正文区里的一行(曾在窄屏压到正文标签上)。
+    expect(screen.queryByText(/^技能标识/)).not.toBeInTheDocument();
   });
 
   test("辅助文件删除按钮常驻 DOM(不再靠 hover 才出现 → 触屏可达)", async () => {
@@ -352,5 +383,124 @@ describe("技能工作台只读态与触屏可达性", () => {
     const del = await screen.findByRole("button", { name: "删除 a.md" });
     expect(del).toBeInTheDocument();
     expect(del.className).not.toContain("hidden");
+  });
+});
+
+describe("技能工作台 删除入口(OCV5-360:删除从列表行挪进工作台底部)", () => {
+  function mountWithDelete(detail: SkillDetail, onDelete: () => Promise<boolean>) {
+    const onClose = vi.fn();
+    vi.spyOn(api, "getSkill").mockResolvedValue(detail);
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({ history: [], writable: detail.writable === true });
+    render(
+      <SkillEditor
+        auth={auth}
+        skillName={detail.name}
+        displayTitle="帮你写作"
+        open
+        onClose={onClose}
+        onChanged={vi.fn()}
+        onDelete={onDelete}
+      />,
+    );
+    return { onClose };
+  }
+
+  test("可写技能:正文页签底部有「删除技能」,删除成功后工作台关闭;slug 在这里出现", async () => {
+    const onDelete = vi.fn().mockResolvedValue(true);
+    const { onClose } = mountWithDelete(DETAIL, onDelete);
+    const del = await screen.findByRole("button", { name: "删除技能" });
+    expect(del.closest("[data-danger-zone]")).not.toBeNull();
+    expect(screen.getByText("写作助手", { selector: "span" })).toBeInTheDocument();
+    fireEvent.click(del);
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  test("正文页签两栏:正文编辑器 + 信息栏(多行描述 / 来源 / 删除),删除不再压在正文框上(OCV5-362)", async () => {
+    mountWithDelete(DETAIL, vi.fn().mockResolvedValue(true));
+    const body = await screen.findByRole("textbox", { name: "正文" });
+    const aside = screen.getByRole("complementary", { name: "技能信息" });
+    // 描述是多行文本框(改前单行 Input,长触发句被截成一行)。
+    const desc = screen.getByLabelText("描述");
+    expect(desc.tagName).toBe("TEXTAREA");
+    expect(aside).toContainElement(desc);
+    expect(aside).toContainElement(screen.getByRole("button", { name: "删除技能" }));
+    expect(aside).not.toContainElement(body);
+    expect(aside.querySelector("[data-skill-facts]")).toHaveTextContent("自建");
+    // 切走后正文面板只剩 hidden —— 不能同时带 md:grid(桌面上会盖过 hidden,叠在别的页签上面)。
+    fireEvent.click(screen.getByRole("tab", { name: "评测" }));
+    const bodyPanel = document.getElementById(body.closest("[role=tabpanel]")?.id ?? "");
+    expect(bodyPanel).toHaveClass("hidden");
+    expect(bodyPanel?.className).not.toMatch(/md:grid/);
+  });
+
+  test("历史页签:版本是一个分组列表,且不会在定高面板里被压缩裁掉(Codex r1)", async () => {
+    vi.spyOn(api, "getSkill").mockResolvedValue(DETAIL);
+    vi.spyOn(api, "listMyAgents").mockResolvedValue([]);
+    vi.spyOn(api, "getSkillHistory").mockResolvedValue({
+      history: Array.from({ length: 20 }, (_, i) => ({ version: `1.0.${i}`, timestamp: new Date().toISOString() })),
+      writable: true,
+    });
+    render(
+      <TooltipProvider>
+        <SkillEditor auth={auth} skillName="写作助手" open onClose={() => {}} onChanged={() => {}} />
+      </TooltipProvider>,
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: "历史（20）" }));
+    const list = document.querySelector("[data-skill-history]") as HTMLElement;
+    expect(list.querySelectorAll("li")).toHaveLength(20);
+    expect(list).toHaveClass("shrink-0");
+    expect(screen.getAllByRole("button", { name: "恢复此版本" })).toHaveLength(20);
+  });
+
+  test("没有辅助文件:文件页签是一个空态 + 就地新建,不再左右两个空栏(OCV5-362)", async () => {
+    mountWithDelete({ ...DETAIL, files: ["SKILL.md"] }, vi.fn());
+    fireEvent.click(await screen.findByRole("tab", { name: "文件" }));
+    expect(await screen.findByText("还没有辅助文件")).toBeInTheDocument();
+    expect(screen.getAllByText("还没有辅助文件")).toHaveLength(1);
+    expect(document.querySelector("[data-new-file-form]")).toContainElement(screen.getByLabelText("新建文件"));
+    expect(screen.queryByRole("button", { name: /展开文件列表|收起文件列表/ })).not.toBeInTheDocument();
+  });
+
+  test("保存与删除互斥(Codex r1):保存在途时删除不可点;删除在途时保存不可点", async () => {
+    // 保存晚于删除落地会让后端重建技能目录 —— 技能「复活」。
+    let releaseSave: (v?: unknown) => void = () => {};
+    vi.spyOn(api, "updateSkill").mockImplementation(
+      () => new Promise((ok) => { releaseSave = ok; }) as never,
+    );
+    let releaseDelete: (v: boolean) => void = () => {};
+    const onDelete = vi.fn(() => new Promise<boolean>((ok) => { releaseDelete = ok; }));
+    mountWithDelete(DETAIL, onDelete);
+    const editor = await screen.findByDisplayValue("原始正文");
+    fireEvent.change(editor, { target: { value: "改过" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存（1）" }));
+    const del = screen.getByRole("button", { name: "删除技能" });
+    await waitFor(() => expect(del).toBeDisabled());
+    fireEvent.click(del);
+    expect(onDelete).not.toHaveBeenCalled();
+    releaseSave({});
+    await waitFor(() => expect(del).toBeEnabled());
+
+    fireEvent.change(editor, { target: { value: "再改" } });
+    fireEvent.click(del);
+    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: /保存/ })).toBeDisabled();
+    releaseDelete(false);
+    await waitFor(() => expect(screen.getByRole("button", { name: /保存/ })).toBeEnabled());
+  });
+
+  test("删除被取消 / 失败(onDelete 返回 false):工作台保持打开", async () => {
+    const onDelete = vi.fn().mockResolvedValue(false);
+    const { onClose } = mountWithDelete(DETAIL, onDelete);
+    fireEvent.click(await screen.findByRole("button", { name: "删除技能" }));
+    await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  test("只读技能:即使传了 onDelete 也不渲染删除入口", async () => {
+    mountWithDelete({ ...DETAIL, writable: false, layer: "hub" }, vi.fn().mockResolvedValue(true));
+    await screen.findByText(/内容由作者维护/);
+    expect(screen.queryByRole("button", { name: "删除技能" })).not.toBeInTheDocument();
   });
 });

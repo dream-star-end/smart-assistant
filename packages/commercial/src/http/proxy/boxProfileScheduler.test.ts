@@ -35,7 +35,8 @@ test("users spread over every enabled login, the default taking the larger share
 test("a benched login moves only its own users, and they come back when it recovers", () => {
   const before = new Map(users.map((u) => [u, label(pickBoxProfile({ candidates: three(), affinityKey: u })!.candidate)]));
   const benched = three({ "1:b": { cooldownActive: true } });
-  let moved = 0, stayed = 0;
+  let moved = 0;
+  let stayed = 0;
   for (const u of users) {
     const pick = pickBoxProfile({ candidates: benched, affinityKey: u })!;
     assert.notEqual(label(pick.candidate), "1:b");

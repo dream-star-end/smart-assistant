@@ -1,4 +1,8 @@
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
+import {
+  identityCompatEnvironment,
+  isProjectSearchEnabled,
+  type IdentityCompatRuntimeContext,
+} from '@openclaude/storage'
 /**
  * codexLaunchOverrides — assemble per-spawn `-c` overrides for codex CLI.
  *
@@ -37,7 +41,7 @@ import { createLogger } from './logger.js'
 import { issueDelegateContextToken } from './delegateContext.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
-import { buildPromptContext, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
+import { buildPromptContext, type IntelligentUiApplied, PLATFORM_MCP_TOOL_NAMES } from './promptSlots.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import { resolveMcpMemoryEntry, resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -154,6 +158,16 @@ not use markdown image syntax (\`![]()\`). Inline rich-content code blocks
 For UI previews, interactive demos, HTML Canvas, animations, small games, or
 design mockups, prefer a fenced \`htmlpreview\` block directly in the reply
 unless the user explicitly asks for a saved/downloadable file.
+htmlpreview renders seamlessly inside the reply (no frame, auto height, follows
+light/dark): keep the page background transparent and use \`var(--oc-fg)\`,
+\`--oc-muted\`, \`--oc-surface\`, \`--oc-line\`, \`--oc-accent\`; ready-made classes
+\`.oc-pills\` (toggle buttons, active one \`aria-pressed="true"\`), \`.oc-stage\`,
+\`.oc-caption\`, \`.oc-links\`. Load libraries (e.g. three.js) only from
+cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com with a pinned version; no
+other network requests or form posts. To show or download a file from the
+generated directory use \`<img data-oc-src="/abs/path">\`,
+\`await ocFile("/abs/path")\` (returns a blob URL, e.g. for GLTFLoader) or
+\`<a data-oc-download="/abs/path">\`.
 
 ---
 `
@@ -310,6 +324,8 @@ export interface CodexLaunchOverridesContext {
 }
 
 export interface CodexLaunchOverrides {
+  /** Intelligent UI(OCV5-361):instructions 里 INTELLIGENT_UI 段的指纹,没有 = false(开关切换后判断要否重启)。 */
+  intelligentUiApplied: IntelligentUiApplied
   /** Absolute path of the instructions file. Caller writes
    *  `instructionsContent` to this path before spawn. */
   instructionsFile: string
@@ -382,7 +398,10 @@ export async function buildCodexLaunchOverrides(
   const mcpLaunch = omitPlatformMcp
     ? null
     : resolveMcpMemoryLaunch(ctx.claudeCodePath, { fallback: 'npx-tsx' })
-  const availableMcpTools = mcpLaunch ? [...PLATFORM_MCP_TOOL_NAMES] : []
+  const projectSearchOn = isProjectSearchEnabled(process.env)
+  const availableMcpTools = mcpLaunch
+    ? [...PLATFORM_MCP_TOOL_NAMES].filter((name) => projectSearchOn || name !== 'project_search')
+    : []
   const platformResult = await buildPromptContext({
     agentId: ctx.agentId,
     ...(ctx.sessionKey ? { sessionKey: ctx.sessionKey } : {}),
@@ -496,6 +515,7 @@ export async function buildCodexLaunchOverrides(
       OC_AGENT_ID: ctx.agentId,
       ...identityCompatEnvironment(ctx.identityCompat),
       ...(ctx.projectId ? { OPENCLAUDE_PROJECT_ID: ctx.projectId } : {}),
+      ...(isProjectSearchEnabled(process.env) ? { OC_PROJECT_CONTEXT: '1', OC_P5_PROJECT_SEARCH: '1' } : {}),
       OPENCLAUDE_HOME: ctx.openclaudeHome ?? process.env.OPENCLAUDE_HOME ?? '',
       ...(ctx.sessionKey ? { OPENCLAUDE_SESSION_KEY: ctx.sessionKey } : {}),
       OPENCLAUDE_GATEWAY_PORT: String(ctx.gatewayPort),
@@ -521,6 +541,7 @@ export async function buildCodexLaunchOverrides(
   }
 
   return {
+    intelligentUiApplied: platformResult.intelligentUi ?? false,
     instructionsFile,
     instructionsContent,
     tokenFile,

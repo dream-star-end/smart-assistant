@@ -165,7 +165,8 @@ describe("CC Switch ASCII provider name from real ApiKeysSection (Chromium, fixt
       });
       await page.goto(origin);
       await page.addScriptTag({ content: bundled.text });
-      if (source === "new") await page.getByText("还没有 API Key。在上方「创建新密钥」里起个名（如 MacBook）即可创建第一把。", { exact: true }).waitFor();
+      // d3201a8a8 / 0bf1a90d7 turned the empty state into one guiding sentence; anchor on its start.
+      if (source === "new") await page.getByText(/^还没有 API Key。/).waitFor();
       else await page.getByTestId("api-keys-list").waitFor();
       // A nondefault model proves the real fetch response, filtering and public-id conversion settled.
       await page.waitForFunction(() =>

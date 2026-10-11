@@ -13,6 +13,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import {
   commitProjectSkillOverlay,
   loadProjectContext,
+  parseBoardProjectId,
   parseProjectWorkspace,
   paths,
   readProjectRunContextFile,
@@ -121,6 +122,11 @@ import {
   buildPatrolSessionKey,
 } from './domain.js'
 import { parseEntryCondition } from './entryCondition.js'
+import {
+  listProjectWorkspaceDir,
+  openProjectWorkspaceFile,
+  resolveProjectWorkspaceRoot,
+} from './projectWorkspaceFiles.js'
 import { getSharedPatrolSlots, stageLoopCountOnProgress } from './guardrails.js'
 import {
   type AllowedMove,
@@ -666,11 +672,44 @@ async function dispatch(
     return sendError(res, 405, 'method not allowed')
   }
 
+  // Any project-scoped call on a reserved-but-not-yet-created board (settings,
+  // context, memory, board view) creates it first, the same way a turn does.
+  // Only a board the master knows as a chat project's is created.
+  const projectScoped = path.match(/^\/api\/board\/projects\/([^/]+)(?:\/|$)/)
+  if (projectScoped) {
+    const scopedId = parseBoardProjectId(decodeURIComponent(projectScoped[1]))
+    if ('present' in scopedId && scopedId.present && scopedId.value && !getProject(db, scopedId.value)) {
+      const { resolveTurnProjectContext } = await import('../projectContextRuntime.js')
+      await resolveTurnProjectContext({ boardProjectId: scopedId.value }).catch(() => null)
+    }
+  }
+
   const projectBoard = path.match(/^\/api\/board\/projects\/([^/]+)\/board$/)
   if (projectBoard) {
     if (method === 'GET')
       return handleProjectBoard(res, url, db, decodeURIComponent(projectBoard[1]))
     return sendError(res, 405, 'method not allowed')
+  }
+
+  // A chat project reserved this work-project id on the master; create the board
+  // here on first use. Name and template come from the master, never the client.
+  const projectEnsure = path.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/)
+  if (projectEnsure) {
+    if (method !== 'POST') return sendError(res, 405, 'method not allowed')
+    const id = parseBoardProjectId(decodeURIComponent(projectEnsure[1]))
+    if (!('present' in id) || !id.present || !id.value) return sendError(res, 400, 'invalid project id')
+    const { resolveTurnProjectContext } = await import('../projectContextRuntime.js')
+    await resolveTurnProjectContext({ boardProjectId: id.value })
+    const project = getProject(db, id.value)
+    if (!project) throw new TaskboardNotFound('project', id.value)
+    return sendJson(res, 200, { project })
+  }
+
+  // Read-only view of the project's folder (项目主页 → 文件 → 项目文件夹).
+  const projectWorkspace = path.match(/^\/api\/board\/projects\/([^/]+)\/workspace(\/file)?$/)
+  if (projectWorkspace) {
+    if (method !== 'GET') return sendError(res, 405, 'method not allowed')
+    return handleProjectWorkspace(res, url, db, decodeURIComponent(projectWorkspace[1]), Boolean(projectWorkspace[2]))
   }
 
   const projectContextPreview = path.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/)
@@ -911,6 +950,53 @@ async function handleCreateProject(
     }
     throw err
   }
+}
+
+const WORKSPACE_ERROR_STATUS: Record<string, number> = {
+  no_workspace: 404,
+  invalid_path: 400,
+  not_found: 404,
+  not_directory: 400,
+  not_file: 400,
+  too_large: 413,
+}
+
+async function handleProjectWorkspace(
+  res: ServerResponse,
+  url: URL,
+  db: TaskboardDb,
+  idOrKey: string,
+  file: boolean,
+): Promise<void> {
+  const project = resolveProject(db, idOrKey)
+  if (!project) throw new TaskboardNotFound('project', idOrKey)
+  const root = resolveProjectWorkspaceRoot(project)
+  if (!root.ok) return sendError(res, 404, root.error)
+  const rel = url.searchParams.get('path') ?? ''
+  if (!file) {
+    const listed = await listProjectWorkspaceDir(root.root, rel)
+    if (!listed.ok) return sendError(res, WORKSPACE_ERROR_STATUS[listed.error] ?? 400, listed.error)
+    return sendJson(res, 200, { kind: root.kind, shared: root.kind === 'default', ...listed })
+  }
+  const opened = await openProjectWorkspaceFile(root.root, rel)
+  if (!opened.ok) return sendError(res, WORKSPACE_ERROR_STATUS[opened.error] ?? 400, opened.error)
+  // Always a download, never rendered in the app origin.
+  res.writeHead(200, {
+    'content-type': 'application/octet-stream',
+    'content-length': String(opened.size),
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(opened.name)}`,
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'no-store',
+  })
+  if (opened.size === 0) {
+    await opened.handle.close().catch(() => {})
+    res.end()
+    return
+  }
+  // Stream from the descriptor that was checked, not from the path again.
+  const stream = opened.handle.createReadStream({ end: opened.size - 1 })
+  stream.on('error', () => res.destroy())
+  stream.pipe(res)
 }
 
 function handleGetProject(res: ServerResponse, db: TaskboardDb, idOrKey: string): void {

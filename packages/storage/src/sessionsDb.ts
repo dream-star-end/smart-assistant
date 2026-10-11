@@ -445,6 +445,19 @@ export async function getSessionsDb(): Promise<Database.Database> {
     if (!projCols.some(c => c.name === 'is_research_default')) {
       db.exec('ALTER TABLE chat_projects ADD COLUMN is_research_default INTEGER NOT NULL DEFAULT 0')
     }
+    // PG 0310_chat_project_workspace:归档/置顶/模板。
+    if (!projCols.some(c => c.name === 'archived_at')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN archived_at INTEGER DEFAULT NULL')
+    }
+    if (!projCols.some(c => c.name === 'pinned_at')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN pinned_at INTEGER DEFAULT NULL')
+    }
+    if (!projCols.some(c => c.name === 'template')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN template TEXT DEFAULT NULL')
+    }
+    if (!projCols.some(c => c.name === 'deleted_manifest')) {
+      db.exec('ALTER TABLE chat_projects ADD COLUMN deleted_manifest TEXT DEFAULT NULL')
+    }
   } catch { /* table missing in extremely old fixtures; CREATE above already ran */ }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_projects_user_board
@@ -2103,9 +2116,22 @@ export type ChatProject = {
   updatedAt: number
   sessionCount: number
   boardProjectId: string | null
+  archivedAt: number | null
+  pinnedAt: number | null
+  template: ChatProjectTemplate | null
 }
 
-export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color'
+/** Decides the default workspace of a new project; null for projects created before templates. */
+export const CHAT_PROJECT_TEMPLATES = ['blank', 'repo', 'research', 'writing'] as const
+export type ChatProjectTemplate = (typeof CHAT_PROJECT_TEMPLATES)[number]
+export function parseChatProjectTemplate(value: unknown): ChatProjectTemplate | null | 'invalid' {
+  if (value === undefined || value === null || value === '') return null
+  return typeof value === 'string' && (CHAT_PROJECT_TEMPLATES as readonly string[]).includes(value)
+    ? (value as ChatProjectTemplate)
+    : 'invalid'
+}
+
+export type ChatProjectCreateError = 'limit_exceeded' | 'invalid_name' | 'invalid_instructions' | 'invalid_color' | 'invalid_template'
 export type ChatProjectUpdateError =
   | 'not_found'
   | 'invalid_name'
@@ -2114,7 +2140,58 @@ export type ChatProjectUpdateError =
   | 'invalid_sort_order'
   | 'invalid_board_project_id'
   | 'board_project_bound'
+  | 'invalid_flag'
 export type ChatProjectDeleteError = 'not_found'
+export type ChatProjectRestoreError = 'not_found' | 'expired' | 'limit_exceeded' | 'board_project_bound'
+
+/** A deleted project can be restored this long after deletion. */
+export const CHAT_PROJECT_RESTORE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * What a delete unlinked, kept on the project row so a restore can put it
+ * back. pausedCronJobIds are the jobs the client paused (fenced) before the
+ * delete; a restore hands them back to be re-enabled.
+ */
+export type ChatProjectDeletedManifest = {
+  sessionIds: string[]
+  assetIds: string[]
+  pausedCronJobIds: string[]
+  at: number
+}
+
+export type ChatProjectRestoreResult =
+  | {
+      ok: true
+      project: ChatProject
+      pausedCronJobIds: string[]
+      relinkedSessions: number
+      relinkedSessionIds: string[]
+      relinkedAssets: number
+    }
+  | { ok: false; error: ChatProjectRestoreError }
+
+export type DeletedChatProject = { id: string; name: string; deletedAt: number; sessionCount: number }
+
+export function parseChatProjectCronJobIds(value: unknown): string[] | null {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value) || value.length > 200) return null
+  const out: string[] = []
+  for (const v of value) {
+    if (typeof v !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(v)) return null
+    if (!out.includes(v)) out.push(v)
+  }
+  return out
+}
+
+export function parseDeletedManifest(raw: unknown): ChatProjectDeletedManifest {
+  try {
+    const m = (typeof raw === 'string' ? JSON.parse(raw) : raw) as Partial<ChatProjectDeletedManifest> | null
+    const ids = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === 'string') : [])
+    return { sessionIds: ids(m?.sessionIds), assetIds: ids(m?.assetIds), pausedCronJobIds: ids(m?.pausedCronJobIds), at: Number(m?.at) || 0 }
+  } catch {
+    return { sessionIds: [], assetIds: [], pausedCronJobIds: [], at: 0 }
+  }
+}
 
 export type ChatProjectCreateResult =
   | { ok: true; project: ChatProject }
@@ -2158,6 +2235,11 @@ export type ProjectAsset = {
   pinned: boolean
   createdAt: number
   updatedAt: number
+  /**
+   * 产出物版本数:只出现在 list 结果里,且只在同一源路径(container_path)有 >1 个
+   * 未删版本时给出。list 对每个源路径只回最新版本那一行。
+   */
+  versionCount?: number
 }
 
 export type ProjectAssetCreateError =
@@ -2171,6 +2253,7 @@ export type ProjectAssetCreateError =
   | 'invalid_mime'
   | 'invalid_size'
   | 'invalid_session'
+  | 'invalid_captured_at'
   | 'project_not_found'
 export type ProjectAssetUpdateError =
   | 'not_found'
@@ -2194,6 +2277,16 @@ export type ListProjectAssetsOpts = {
   limit?: number
 }
 
+/** Cross-project search (Cmd+K): name/excerpt substring over the caller's non-deleted assets. */
+export type SearchProjectAssetsOpts = {
+  q: string
+  source?: ProjectAssetSource
+  limit?: number
+}
+export const PROJECT_ASSET_SEARCH_LIMIT_DEFAULT = 20
+export const PROJECT_ASSET_SEARCH_LIMIT_MAX = 50
+export const PROJECT_ASSET_SEARCH_QUERY_MAX = 200
+
 export type ProjectAssetCreateInput = {
   projectId?: unknown
   source?: unknown
@@ -2206,6 +2299,11 @@ export type ProjectAssetCreateInput = {
   digest?: unknown
   excerpt?: unknown
   pinned?: unknown
+  /**
+   * 产出物:容器读到这份字节时源文件的 mtime(ms)。只用来认出重放的旧登记,
+   * 不落库。缺省(旧容器 / 恢复 / 回填工具)= 只和最新版本比。
+   */
+  capturedAt?: unknown
 }
 
 export type ProjectAssetUpdateInput = {
@@ -2227,6 +2325,7 @@ export type ParsedProjectAssetCreate = {
   digest: string | null
   excerpt: string | null
   pinned: boolean
+  capturedAt: number | null
 }
 
 export type ClientSessionMetaPatch = {
@@ -2646,6 +2745,8 @@ export function parseProjectAssetCreateInput(
   if ('invalid' in size) return { ok: false, error: 'invalid_size' }
   const sessionId = parseProjectAssetSessionId(input.sessionId)
   if ('invalid' in sessionId) return { ok: false, error: 'invalid_session' }
+  const capturedAt = parseProjectAssetCapturedAt(input.capturedAt)
+  if ('invalid' in capturedAt) return { ok: false, error: 'invalid_captured_at' }
   let digestValue = digest.present ? digest.value : null
   if (!digestValue && urlValue) digestValue = digestFromProjectAssetUrl(urlValue)
   return {
@@ -2663,8 +2764,17 @@ export function parseProjectAssetCreateInput(
       digest: digestValue,
       excerpt: parseProjectAssetExcerpt(input.excerpt),
       pinned: input.pinned === true,
+      capturedAt: capturedAt.present ? capturedAt.value : null,
     },
   }
+}
+
+export function parseProjectAssetCapturedAt(
+  value: unknown,
+): { present: false } | { present: true; value: number } | { invalid: true } {
+  if (value === undefined || value === null) return { present: false }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return { invalid: true }
+  return { present: true, value }
 }
 
 export function mapClientSessionLastOutcome(raw: unknown): ClientSessionLastOutcome | null {
@@ -6021,6 +6131,9 @@ type ChatProjectDbRow = {
   updated_at: number
   session_count: number
   board_project_id: string | null
+  archived_at: number | null
+  pinned_at: number | null
+  template: string | null
 }
 
 function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
@@ -6034,12 +6147,18 @@ function _mapChatProjectRow(r: ChatProjectDbRow): ChatProject {
     updatedAt: r.updated_at,
     sessionCount: r.session_count,
     boardProjectId: r.board_project_id ?? null,
+    archivedAt: r.archived_at ?? null,
+    pinnedAt: r.pinned_at ?? null,
+    template: (() => {
+      const t = parseChatProjectTemplate(r.template)
+      return t === 'invalid' ? null : t
+    })(),
   }
 }
 
 const CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         p.board_project_id, COALESCE(c.cnt, 0) AS session_count
+         p.board_project_id, p.archived_at, p.pinned_at, p.template, COALESCE(c.cnt, 0) AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -6072,7 +6191,15 @@ async function _sqliteListChatProjects(userId: string): Promise<ChatProject[]> {
 
 async function _sqliteCreateChatProject(
   userId: string,
-  input: { name?: unknown; instructions?: unknown; color?: unknown; isResearchDefault?: unknown },
+  input: {
+    name?: unknown
+    instructions?: unknown
+    color?: unknown
+    isResearchDefault?: unknown
+    template?: unknown
+    /** Reserve the work-project id now (project layer on): the container creates that board on first use. */
+    reserveBoard?: boolean
+  },
 ): Promise<ChatProjectCreateResult> {
   const name = parseChatProjectName(input.name)
   if (!name) return { ok: false, error: 'invalid_name' }
@@ -6080,7 +6207,10 @@ async function _sqliteCreateChatProject(
   if ('invalid' in instructions) return { ok: false, error: 'invalid_instructions' }
   const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX)
   if ('invalid' in color) return { ok: false, error: 'invalid_color' }
+  const template = parseChatProjectTemplate(input.template)
+  if (template === 'invalid') return { ok: false, error: 'invalid_template' }
   const isDefault = input.isResearchDefault === true
+  const boardProjectId = input.reserveBoard === true && !isDefault ? randomUUID() : null
 
   const db = await getSessionsDb()
   const now = Date.now()
@@ -6093,10 +6223,11 @@ async function _sqliteCreateChatProject(
     try {
       db.prepare(`
         INSERT INTO chat_projects
-          (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at, is_research_default)
+          (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at,
+           is_research_default, template, board_project_id)
         VALUES (?, ?, ?, ?, ?, COALESCE((
           SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL
-        ), 0), ?, ?, NULL, ?)
+        ), 0), ?, ?, NULL, ?, ?, ?)
       `).run(
         id,
         userId,
@@ -6107,6 +6238,8 @@ async function _sqliteCreateChatProject(
         now,
         now,
         isDefault ? 1 : 0,
+        template,
+        boardProjectId,
       )
     } catch (err) {
       if (isDefault && isUniqueConstraintError(err, 'idx_chat_projects_user_research_default')) {
@@ -6130,10 +6263,29 @@ async function _sqliteCreateChatProject(
 async function _sqliteUpdateChatProject(
   userId: string,
   id: string,
-  input: { name?: unknown; instructions?: unknown; color?: unknown; sortOrder?: unknown; boardProjectId?: unknown },
+  input: {
+    name?: unknown
+    instructions?: unknown
+    color?: unknown
+    sortOrder?: unknown
+    boardProjectId?: unknown
+    archived?: unknown
+    pinned?: unknown
+  },
 ): Promise<ChatProjectUpdateResult> {
   const sets: string[] = ['updated_at = MAX(updated_at + 1, ?)']
   const params: unknown[] = [Date.now()]
+  let bindGuard: string | null = null
+  if (input.archived !== undefined) {
+    if (typeof input.archived !== 'boolean') return { ok: false, error: 'invalid_flag' }
+    sets.push(input.archived ? 'archived_at = COALESCE(archived_at, ?)' : 'archived_at = NULL')
+    if (input.archived) params.push(Date.now())
+  }
+  if (input.pinned !== undefined) {
+    if (typeof input.pinned !== 'boolean') return { ok: false, error: 'invalid_flag' }
+    sets.push(input.pinned ? 'pinned_at = COALESCE(pinned_at, ?)' : 'pinned_at = NULL')
+    if (input.pinned) params.push(Date.now())
+  }
   if (input.name !== undefined) {
     const name = parseChatProjectName(input.name)
     if (!name) return { ok: false, error: 'invalid_name' }
@@ -6171,8 +6323,13 @@ async function _sqliteUpdateChatProject(
     const bound = parseBoardProjectId(input.boardProjectId)
     if ('invalid' in bound) return { ok: false, error: 'invalid_board_project_id' }
     if (bound.present) {
+      // A project keeps its work project for life: memory, skills, cron and
+      // billing history hang off that id. Only an unbound project may bind;
+      // enforced in the UPDATE itself so concurrent binds cannot both win.
+      if (bound.value === null) return { ok: false, error: 'board_project_bound' }
       sets.push('board_project_id = ?')
       params.push(bound.value)
+      bindGuard = bound.value
     }
   }
   if (sets.length === 1) {
@@ -6185,15 +6342,22 @@ async function _sqliteUpdateChatProject(
     try {
       res = db.prepare(
         `UPDATE chat_projects SET ${sets.join(', ')}
-          WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
-      ).run(...params, id, userId)
+          WHERE id = ? AND user_id = ? AND deleted_at IS NULL${
+            bindGuard ? ' AND (board_project_id IS NULL OR board_project_id = ?)' : ''
+          }`,
+      ).run(...params, id, userId, ...(bindGuard ? [bindGuard] : []))
     } catch (err) {
       if (isUniqueConstraintError(err, 'idx_chat_projects_user_board')) {
         return { ok: false, error: 'board_project_bound' }
       }
       throw err
     }
-    if (res.changes === 0) return { ok: false, error: 'not_found' }
+    if (res.changes === 0) {
+      const exists = bindGuard
+        ? db.prepare('SELECT 1 FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL').get(id, userId)
+        : null
+      return { ok: false, error: exists ? 'board_project_bound' : 'not_found' }
+    }
     const project = _sqliteReadChatProject(db, userId, id)
     if (!project) return { ok: false, error: 'not_found' }
     return { ok: true, project }
@@ -6206,22 +6370,114 @@ async function _sqliteGetChatProjectForUser(userId: string, id: string): Promise
   return _sqliteReadChatProject(db, userId, id)
 }
 
-async function _sqliteDeleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+async function _sqliteDeleteChatProject(
+  userId: string,
+  id: string,
+  opts: { pausedCronJobIds?: string[] } = {},
+): Promise<ChatProjectDeleteResult> {
   const db = await getSessionsDb()
   const now = Date.now()
   const txn = db.transaction((): ChatProjectDeleteResult => {
-    const res = db.prepare(
-      `UPDATE chat_projects
-          SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
+    const live = db.prepare(
+      'SELECT 1 FROM chat_projects WHERE id = ? AND user_id = ? AND deleted_at IS NULL',
+    ).get(id, userId)
+    if (!live) return { ok: false, error: 'not_found' }
+    // Mark deleted first: from here no new session/asset can be filed into it.
+    db.prepare(
+      `UPDATE chat_projects SET deleted_at = ?, updated_at = MAX(updated_at + 1, ?)
         WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
     ).run(now, now, id, userId)
-    if (res.changes === 0) return { ok: false, error: 'not_found' }
-    db.prepare(
-      `UPDATE client_sessions
-          SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
-        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL`,
-    ).run(now, userId, id)
+    // The manifest is exactly the set these UPDATEs unlinked.
+    const sessionIds = (db.prepare(
+      `UPDATE client_sessions SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL RETURNING id`,
+    ).all(now, userId, id) as Array<{ id: string }>).map((r) => r.id)
+    const assetIds = (db.prepare(
+      `UPDATE project_assets SET project_id = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL RETURNING id`,
+    ).all(now, userId, id) as Array<{ id: string }>).map((r) => r.id)
+    const manifest: ChatProjectDeletedManifest = {
+      sessionIds,
+      assetIds,
+      pausedCronJobIds: opts.pausedCronJobIds ?? [],
+      at: now,
+    }
+    db.prepare('UPDATE chat_projects SET deleted_manifest = ? WHERE id = ? AND user_id = ?').run(
+      JSON.stringify(manifest),
+      id,
+      userId,
+    )
     return { ok: true }
+  })
+  return txn()
+}
+
+async function _sqliteListDeletedChatProjects(userId: string): Promise<DeletedChatProject[]> {
+  const db = await getSessionsDb()
+  const since = Date.now() - CHAT_PROJECT_RESTORE_WINDOW_MS
+  const rows = db.prepare(
+    `SELECT id, name, deleted_at, deleted_manifest FROM chat_projects
+      WHERE user_id = ? AND deleted_at IS NOT NULL AND deleted_at >= ? AND is_research_default = 0
+      ORDER BY deleted_at DESC`,
+  ).all(userId, since) as Array<{ id: string; name: string; deleted_at: number; deleted_manifest: string | null }>
+  return rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    deletedAt: r.deleted_at,
+    sessionCount: parseDeletedManifest(r.deleted_manifest).sessionIds.length,
+  }))
+}
+
+async function _sqliteRestoreChatProject(userId: string, id: string): Promise<ChatProjectRestoreResult> {
+  const db = await getSessionsDb()
+  const now = Date.now()
+  const txn = db.transaction((): ChatProjectRestoreResult => {
+    const row = db.prepare(
+      `SELECT deleted_at, deleted_manifest, board_project_id FROM chat_projects
+        WHERE id = ? AND user_id = ? AND deleted_at IS NOT NULL`,
+    ).get(id, userId) as { deleted_at: number; deleted_manifest: string | null; board_project_id: string | null } | undefined
+    if (!row) return { ok: false, error: 'not_found' }
+    if (now - row.deleted_at > CHAT_PROJECT_RESTORE_WINDOW_MS) return { ok: false, error: 'expired' }
+    const count = db.prepare(
+      'SELECT COUNT(*) AS n FROM chat_projects WHERE user_id = ? AND deleted_at IS NULL',
+    ).get(userId) as { n: number }
+    if (count.n >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: 'limit_exceeded' }
+    if (row.board_project_id) {
+      const taken = db.prepare(
+        'SELECT 1 FROM chat_projects WHERE user_id = ? AND board_project_id = ? AND deleted_at IS NULL',
+      ).get(userId, row.board_project_id)
+      if (taken) return { ok: false, error: 'board_project_bound' }
+    }
+    const manifest = parseDeletedManifest(row.deleted_manifest)
+    db.prepare(
+      `UPDATE chat_projects SET deleted_at = NULL, deleted_manifest = NULL, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ?`,
+    ).run(now, id, userId)
+    // Only items still ungrouped come back; anything the user moved since stays where it is.
+    const relinkedSessionIds: string[] = []
+    const relinkSession = db.prepare(
+      `UPDATE client_sessions SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND project_id IS NULL AND deleted_at IS NULL`,
+    )
+    for (const sid of manifest.sessionIds) {
+      if (relinkSession.run(id, now, sid, userId).changes > 0) relinkedSessionIds.push(sid)
+    }
+    let relinkedAssets = 0
+    const relinkAsset = db.prepare(
+      `UPDATE project_assets SET project_id = ?, updated_at = MAX(updated_at + 1, ?)
+        WHERE id = ? AND user_id = ? AND project_id IS NULL AND deleted_at IS NULL`,
+    )
+    for (const aid of manifest.assetIds) relinkedAssets += relinkAsset.run(id, now, aid, userId).changes
+    const project = _sqliteReadChatProject(db, userId, id)
+    if (!project) throw new Error('restored chat project vanished')
+    return {
+      ok: true,
+      project,
+      pausedCronJobIds: manifest.pausedCronJobIds,
+      relinkedSessions: relinkedSessionIds.length,
+      relinkedSessionIds,
+      relinkedAssets,
+    }
   })
   return txn()
 }
@@ -6296,13 +6552,19 @@ export type ChatProjectRuntimeBind = {
   boardProjectId: string | null
   name: string
   instructions: string | null
+  template?: ChatProjectTemplate | null
+}
+
+function _bindTemplate(raw: string | null | undefined): ChatProjectTemplate | null {
+  const t = parseChatProjectTemplate(raw)
+  return t === 'invalid' ? null : t
 }
 
 async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<ChatProjectRuntimeBind | null> {
   const db = await getSessionsDb()
   const row = db.prepare(`
     SELECT cs.user_id AS user_id, p.id AS chat_project_id, p.board_project_id AS board_project_id,
-           p.name AS name, p.instructions AS instructions
+           p.name AS name, p.instructions AS instructions, p.template AS template
       FROM client_sessions cs
       JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
      WHERE cs.id = ? AND cs.deleted_at IS NULL AND p.deleted_at IS NULL
@@ -6313,6 +6575,7 @@ async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<
         board_project_id: string | null
         name: string
         instructions: string | null
+        template: string | null
       }
     | undefined
   if (!row) return null
@@ -6322,6 +6585,7 @@ async function _sqliteGetChatProjectBindBySessionId(sessionId: string): Promise<
     boardProjectId: row.board_project_id ?? null,
     name: row.name,
     instructions: row.instructions,
+    template: _bindTemplate(row.template),
   }
 }
 
@@ -6333,7 +6597,7 @@ async function _sqliteGetChatProjectBindByBoardProjectId(
   if (!('present' in parsed) || !parsed.present || !parsed.value) return null
   const db = await getSessionsDb()
   const row = db.prepare(`
-    SELECT user_id, id, board_project_id, name, instructions
+    SELECT user_id, id, board_project_id, name, instructions, template
       FROM chat_projects
      WHERE user_id = ? AND board_project_id = ? AND deleted_at IS NULL
   `).get(userId, parsed.value) as
@@ -6343,6 +6607,7 @@ async function _sqliteGetChatProjectBindByBoardProjectId(
         board_project_id: string | null
         name: string
         instructions: string | null
+        template: string | null
       }
     | undefined
   if (!row) return null
@@ -6352,6 +6617,7 @@ async function _sqliteGetChatProjectBindByBoardProjectId(
     boardProjectId: row.board_project_id ?? null,
     name: row.name,
     instructions: row.instructions,
+    template: _bindTemplate(row.template),
   }
 }
 
@@ -6365,6 +6631,7 @@ async function _sqliteListPinnedProjectAssetsForChatProject(
   const rows = db.prepare(
     `${PROJECT_ASSET_SELECT}
       WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+        AND ${SQLITE_ASSET_IS_LATEST_VERSION}
       ORDER BY created_at DESC
       LIMIT ?`,
   ).all(userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]
@@ -6394,6 +6661,28 @@ const PROJECT_ASSET_SELECT = `
          size_bytes, digest, excerpt, pinned, created_at, updated_at
     FROM project_assets
 `
+
+/**
+ * 「是该源路径的最新版本」(上传与无源路径的行恒为真)。注入常用资产时只认最新版本,
+ * 旧数据里残留的旧版本 pinned 不会被注入。顺序与 list 的 created_at DESC, id DESC 一致。
+ */
+const SQLITE_ASSET_IS_LATEST_VERSION = `NOT EXISTS (
+  SELECT 1 FROM project_assets newer
+   WHERE project_assets.source = 'output' AND project_assets.container_path IS NOT NULL
+     AND newer.user_id = project_assets.user_id AND newer.deleted_at IS NULL
+     AND newer.source = 'output' AND newer.project_id IS project_assets.project_id
+     AND newer.container_path = project_assets.container_path
+     AND (newer.created_at > project_assets.created_at
+          OR (newer.created_at = project_assets.created_at AND newer.id > project_assets.id)))`
+
+/** list 折叠版本用的分组键;SQLite / PG 同一表达式。 */
+export const PROJECT_ASSET_VERSION_GROUP_SQL =
+  "CASE WHEN source = 'output' AND container_path IS NOT NULL THEN 'p:' || container_path ELSE 'i:' || id END"
+
+/** versionCount 只在有多个版本时出现,单版本的行形状与以前一致。 */
+export function withVersionCount(asset: ProjectAsset, count: number): ProjectAsset {
+  return Number.isFinite(count) && count > 1 ? { ...asset, versionCount: count } : asset
+}
 
 function _mapProjectAssetRow(r: ProjectAssetDbRow): ProjectAsset {
   return {
@@ -6447,6 +6736,33 @@ function _sqliteCountProjectAssets(
   return row.n
 }
 
+/** 同一项目里某个产出源路径的最新未删版本(无则 null)。 */
+function _sqliteLatestOutputVersion(
+  db: Database.Database,
+  userId: string,
+  projectId: string | null,
+  containerPath: string,
+): ProjectAsset | null {
+  const row = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ? AND container_path = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`,
+  ).get(userId, projectId, containerPath) as ProjectAssetDbRow | undefined
+  return row ? _mapProjectAssetRow(row) : null
+}
+
+/**
+ * 去重规则(PG 侧 pgFindDuplicateAsset 同构):
+ *   - 带字节副本的产出(output + containerPath + digest):先与该源路径的**最新**版本比。
+ *     digest 相同 = 同一版本(返回它);不同 = 新版本(返回 null,由调用方插入)。
+ *     A→B→A 会得到第三个版本,「恢复旧版本」也是同一条路:用旧 digest 再登记一次。
+ *     例外是重放:登记带 capturedAt(源文件 mtime),且它不晚于最新版本的 created_at,
+ *     而这个 digest 已是某个旧版本 —— 那是早先那次登记的重发(响应丢了、队列补发),
+ *     返回那个旧版本,不出新版本。真的又写回 A 时 mtime 晚于最新版本,照常出新版本。
+ *   - 其它(上传、旧容器只报路径的产出):同 (user, project, source, digest),
+ *     digest 空则同 container_path,与以前一致。
+ */
 function _sqliteFindDuplicateAsset(
   db: Database.Database,
   userId: string,
@@ -6454,7 +6770,24 @@ function _sqliteFindDuplicateAsset(
   source: ProjectAssetSource,
   digest: string | null,
   containerPath: string | null,
+  capturedAt: number | null,
 ): ProjectAsset | null {
+  if (source === 'output' && containerPath && digest) {
+    const latest = _sqliteLatestOutputVersion(db, userId, projectId, containerPath)
+    if (!latest) return null
+    if (latest.digest === digest) return latest
+    if (capturedAt !== null && capturedAt <= latest.createdAt) {
+      const row = db.prepare(
+        `${PROJECT_ASSET_SELECT}
+          WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ?
+            AND container_path = ? AND digest = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1`,
+      ).get(userId, projectId, containerPath, digest) as ProjectAssetDbRow | undefined
+      if (row) return _mapProjectAssetRow(row)
+    }
+    return null
+  }
   if (digest) {
     const row = db.prepare(
       `${PROJECT_ASSET_SELECT}
@@ -6500,12 +6833,73 @@ async function _sqliteListProjectAssets(
     ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
     : PROJECT_ASSET_LIST_LIMIT_DEFAULT
   const db = await getSessionsDb()
+  // 产出物按源路径折叠成一条(最新版本)并带版本数;上传与无源路径的行各自成组。
   const rows = db.prepare(
-    `${PROJECT_ASSET_SELECT}
-      WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?
+    `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+            size_bytes, digest, excerpt, pinned, created_at, updated_at, version_count
+       FROM (
+         SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                   ORDER BY created_at DESC, id DESC) AS version_rank,
+                COUNT(*) OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}) AS version_count
+           FROM project_assets
+          WHERE user_id = ? AND deleted_at IS NULL AND project_id IS ?
+       ) AS versioned
+      WHERE version_rank = 1
       ORDER BY created_at DESC
       LIMIT ?`,
-  ).all(userId, opts.projectId, limit) as ProjectAssetDbRow[]
+  ).all(userId, opts.projectId, limit) as Array<ProjectAssetDbRow & { version_count: number }>
+  return rows.map((r) => withVersionCount(_mapProjectAssetRow(r), Number(r.version_count)))
+}
+
+async function _sqliteListProjectAssetVersions(
+  userId: string,
+  assetId: string,
+): Promise<ProjectAsset[] | null> {
+  const db = await getSessionsDb()
+  const asset = _sqliteReadProjectAsset(db, userId, assetId)
+  if (!asset) return null
+  if (asset.source !== 'output' || !asset.containerPath) return [asset]
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ? AND container_path = ?
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).all(userId, asset.projectId, asset.containerPath, PROJECT_ASSET_PER_PROJECT_LIMIT) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
+async function _sqliteSearchProjectAssets(
+  userId: string,
+  opts: SearchProjectAssetsOpts,
+): Promise<ProjectAsset[]> {
+  const q = typeof opts.q === 'string' ? opts.q.trim().slice(0, PROJECT_ASSET_SEARCH_QUERY_MAX) : ''
+  if (!q) return []
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(PROJECT_ASSET_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+    : PROJECT_ASSET_SEARCH_LIMIT_DEFAULT
+  const like = `%${escapeLikePattern(q)}%`
+  const sourceSql = opts.source === 'upload' || opts.source === 'output' ? ' AND source = ?' : ''
+  const params: unknown[] = [userId, userId, like, like]
+  if (sourceSql) params.push(opts.source)
+  params.push(limit)
+  const db = await getSessionsDb()
+  // SQLite LIKE is ASCII case-insensitive by default; CJK has no case.
+  // Outputs fold to their latest version (per project and source path), as in listProjectAssets.
+  const rows = db.prepare(
+    `${PROJECT_ASSET_SELECT}
+      WHERE user_id = ? AND deleted_at IS NULL
+        AND id IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id, ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                          ORDER BY created_at DESC, id DESC) AS version_rank
+              FROM project_assets WHERE user_id = ? AND deleted_at IS NULL
+          ) WHERE version_rank = 1
+        )
+        AND (name LIKE ? ESCAPE '\\' OR COALESCE(excerpt, '') LIKE ? ESCAPE '\\')${sourceSql}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).all(...params) as ProjectAssetDbRow[]
   return rows.map(_mapProjectAssetRow)
 }
 
@@ -6529,10 +6923,33 @@ async function _sqliteCreateProjectAsset(
       parsed.value.source,
       parsed.value.digest,
       parsed.value.containerPath,
+      parsed.value.capturedAt,
     )
     if (dup) return { ok: true, asset: dup, created: false }
     if (_sqliteCountProjectAssets(db, userId, projectId) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
       return { ok: false, error: 'limit_exceeded' }
+    }
+    // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+    // 带 capturedAt 的产出版本以「文件写成的时间」为 created_at(不晚于现在):重放判断
+    // 拿 capturedAt 和它比,比的是同一种时间;补发队列晚到的登记不会把之后的真实重写挤成「重放」。
+    // 「常用」只挂在最新版本上:新版本(登记或恢复)继承上一版的 pinned,旧版本一律取消。
+    const versionBase =
+      parsed.value.source === 'output' && parsed.value.capturedAt !== null
+        ? Math.min(parsed.value.capturedAt, now)
+        : now
+    let createdAt = versionBase
+    let pinned = parsed.value.pinned
+    if (parsed.value.source === 'output' && parsed.value.containerPath) {
+      const latest = _sqliteLatestOutputVersion(db, userId, projectId, parsed.value.containerPath)
+      if (latest) {
+        createdAt = Math.max(versionBase, latest.createdAt + 1)
+        pinned = pinned || latest.pinned
+        db.prepare(
+          `UPDATE project_assets SET pinned = 0, updated_at = MAX(updated_at + 1, ?)
+            WHERE user_id = ? AND deleted_at IS NULL AND source = 'output' AND project_id IS ?
+              AND container_path = ? AND pinned = 1`,
+        ).run(now, userId, projectId, parsed.value.containerPath)
+      }
     }
     // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
     db.prepare(`
@@ -6553,9 +6970,9 @@ async function _sqliteCreateProjectAsset(
       parsed.value.sizeBytes,
       parsed.value.digest,
       parsed.value.excerpt,
-      parsed.value.pinned ? 1 : 0,
-      now,
-      now,
+      pinned ? 1 : 0,
+      createdAt,
+      Math.max(now, createdAt),
     )
     const asset = _sqliteReadProjectAsset(db, userId, id)
     if (!asset) throw new Error('project asset insert vanished')
@@ -6642,9 +7059,68 @@ async function _sqliteListPinnedProjectAssetsForSession(sessionId: string): Prom
   const rows = db.prepare(
     `${PROJECT_ASSET_SELECT}
       WHERE user_id = ? AND deleted_at IS NULL AND pinned = 1 AND project_id IS ?
+        AND ${SQLITE_ASSET_IS_LATEST_VERSION}
       ORDER BY created_at DESC
       LIMIT ?`,
   ).all(sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX) as ProjectAssetDbRow[]
+  return rows.map(_mapProjectAssetRow)
+}
+
+/**
+ * project_search (agent tool): one chat project's non-deleted assets, matched by
+ * name or excerpt substring. Outputs fold to their latest version first, so an
+ * older version's text never surfaces. The caller resolves the chat project
+ * from a verified identity; this only adds the user_id scope on top.
+ */
+export type SearchChatProjectAssetsOpts = {
+  q: string
+  source?: ProjectAssetSource
+  limit?: number
+}
+export const PROJECT_ASSET_PROJECT_SEARCH_LIMIT_DEFAULT = 8
+export const PROJECT_ASSET_PROJECT_SEARCH_LIMIT_MAX = 20
+export const PROJECT_ASSET_PROJECT_SEARCH_QUERY_MAX = 200
+
+/** Shared by both backends: null = nothing to search (empty query). */
+export function normalizeChatProjectAssetSearch(
+  opts: SearchChatProjectAssetsOpts,
+): { like: string; limit: number; source: ProjectAssetSource | null } | null {
+  const q = typeof opts.q === 'string' ? opts.q.trim().slice(0, PROJECT_ASSET_PROJECT_SEARCH_QUERY_MAX) : ''
+  if (!q) return null
+  const limit = typeof opts.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+    ? Math.min(PROJECT_ASSET_PROJECT_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+    : PROJECT_ASSET_PROJECT_SEARCH_LIMIT_DEFAULT
+  const source = opts.source === 'upload' || opts.source === 'output' ? opts.source : null
+  return { like: `%${escapeLikePattern(q)}%`, limit, source }
+}
+
+async function _sqliteSearchChatProjectAssets(
+  userId: string,
+  chatProjectId: string,
+  opts: SearchChatProjectAssetsOpts,
+): Promise<ProjectAsset[]> {
+  const norm = normalizeChatProjectAssetSearch(opts)
+  if (!norm || !chatProjectId) return []
+  const params: unknown[] = [userId, chatProjectId, norm.like, norm.like]
+  if (norm.source) params.push(norm.source)
+  params.push(norm.limit)
+  const db = await getSessionsDb()
+  // SQLite LIKE is ASCII case-insensitive by default; CJK has no case.
+  const rows = db.prepare(
+    `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+            size_bytes, digest, excerpt, pinned, created_at, updated_at
+       FROM (
+         SELECT *,
+                ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                   ORDER BY created_at DESC, id DESC) AS version_rank
+           FROM project_assets
+          WHERE user_id = ? AND deleted_at IS NULL AND project_id = ?
+       ) AS versioned
+      WHERE version_rank = 1
+        AND (name LIKE ? ESCAPE '\\' OR COALESCE(excerpt, '') LIKE ? ESCAPE '\\')${norm.source ? ' AND source = ?' : ''}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`,
+  ).all(...params) as ProjectAssetDbRow[]
   return rows.map(_mapProjectAssetRow)
 }
 
@@ -7252,11 +7728,16 @@ const sqliteBackend = {
   createChatProject: _sqliteCreateChatProject,
   updateChatProject: _sqliteUpdateChatProject,
   deleteChatProject: _sqliteDeleteChatProject,
+  listDeletedChatProjects: _sqliteListDeletedChatProjects,
+  restoreChatProject: _sqliteRestoreChatProject,
   listProjectAssets: _sqliteListProjectAssets,
+  searchProjectAssets: _sqliteSearchProjectAssets,
+  listProjectAssetVersions: _sqliteListProjectAssetVersions,
   createProjectAsset: _sqliteCreateProjectAsset,
   updateProjectAsset: _sqliteUpdateProjectAsset,
   deleteProjectAsset: _sqliteDeleteProjectAsset,
   listPinnedProjectAssetsForSession: _sqliteListPinnedProjectAssetsForSession,
+  searchChatProjectAssets: _sqliteSearchChatProjectAssets,
   bumpClientSessionHistoryRevision: _sqliteBumpClientSessionHistoryRevision,
   listUnclaimedSessions: _sqliteListUnclaimedSessions,
   allMasterWsessRows: _sqliteAllMasterWsessRows,
@@ -7444,8 +7925,19 @@ export const updateChatProject: ClientSessionsBackend['updateChatProject'] =
 export const deleteChatProject: ClientSessionsBackend['deleteChatProject'] =
   (...args) => getActiveBackend().deleteChatProject(...args)
 
+export const listDeletedChatProjects: ClientSessionsBackend['listDeletedChatProjects'] =
+  (...args) => getActiveBackend().listDeletedChatProjects(...args)
+
+export const restoreChatProject: ClientSessionsBackend['restoreChatProject'] =
+  (...args) => getActiveBackend().restoreChatProject(...args)
+
 export const listProjectAssets: ClientSessionsBackend['listProjectAssets'] =
   (...args) => getActiveBackend().listProjectAssets(...args)
+
+export const searchProjectAssets: ClientSessionsBackend['searchProjectAssets'] =
+  (...args) => getActiveBackend().searchProjectAssets(...args)
+export const listProjectAssetVersions: ClientSessionsBackend['listProjectAssetVersions'] =
+  (...args) => getActiveBackend().listProjectAssetVersions(...args)
 
 export const createProjectAsset: ClientSessionsBackend['createProjectAsset'] =
   (...args) => getActiveBackend().createProjectAsset(...args)
@@ -7458,6 +7950,9 @@ export const deleteProjectAsset: ClientSessionsBackend['deleteProjectAsset'] =
 
 export const listPinnedProjectAssetsForSession: ClientSessionsBackend['listPinnedProjectAssetsForSession'] =
   (...args) => getActiveBackend().listPinnedProjectAssetsForSession(...args)
+
+export const searchChatProjectAssets: ClientSessionsBackend['searchChatProjectAssets'] =
+  (...args) => getActiveBackend().searchChatProjectAssets(...args)
 
 export const bumpClientSessionHistoryRevision: ClientSessionsBackend['bumpClientSessionHistoryRevision'] =
   (...args) => getActiveBackend().bumpClientSessionHistoryRevision(...args)

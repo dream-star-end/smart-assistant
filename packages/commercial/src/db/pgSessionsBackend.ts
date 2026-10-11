@@ -119,6 +119,10 @@ import {
   type ChatProjectCreateResult,
   type ChatProjectDeleteResult,
   type ChatProjectRuntimeBind,
+  type ChatProjectTemplate,
+  type ChatProjectDeletedManifest,
+  type ChatProjectRestoreResult,
+  type DeletedChatProject,
   type ChatProjectUpdateResult,
   type PinnedAssetsPage,
   type ProjectAsset,
@@ -128,6 +132,8 @@ import {
   type ProjectAssetUpdateInput,
   type ProjectAssetUpdateResult,
   type ListProjectAssetsOpts,
+  type SearchProjectAssetsOpts,
+  type SearchChatProjectAssetsOpts,
   type ParsedProjectAssetCreate,
   type ClientSession,
   type ClientSessionLifecycle,
@@ -153,8 +159,12 @@ import {
   CHAT_PROJECT_PER_USER_LIMIT,
   PROJECT_ASSET_LIST_LIMIT_DEFAULT,
   PROJECT_ASSET_LIST_LIMIT_MAX,
+  PROJECT_ASSET_SEARCH_LIMIT_DEFAULT,
+  PROJECT_ASSET_SEARCH_LIMIT_MAX,
+  PROJECT_ASSET_SEARCH_QUERY_MAX,
   PROJECT_ASSET_PER_PROJECT_LIMIT,
   PROJECT_ASSET_PINNED_INJECT_MAX,
+  PROJECT_ASSET_VERSION_GROUP_SQL,
   compareMessagesByOrder,
   deriveArchivedOrderSeqsForRead,
   deriveOrderSeqsForRead,
@@ -171,14 +181,19 @@ import {
   _warnSeqAnomaly,
   buildSearchSnippet,
   escapeLikePattern,
+  normalizeChatProjectAssetSearch,
   parseBoardProjectId,
   assetsRevision,
   parseChatProjectName,
   parseChatProjectOptionalText,
   parseChatProjectSortOrder,
+  parseChatProjectTemplate,
+  parseDeletedManifest,
+  CHAT_PROJECT_RESTORE_WINDOW_MS,
   parseProjectAssetCreateInput,
   parseProjectAssetName,
   parseProjectAssetProjectId,
+  withVersionCount,
   parseSessionBatchInput,
   type PatchClientSessionMetaResult,
   rankSessionSearchHits,
@@ -668,7 +683,8 @@ async function pgUnreadBySessionIds(
 
 const PG_CHAT_PROJECT_SELECT = `
   SELECT p.id, p.name, p.instructions, p.color, p.sort_order, p.created_at, p.updated_at,
-         p.board_project_id, COALESCE(c.cnt, 0)::text AS session_count
+         p.board_project_id, p.archived_at, p.pinned_at, p.template,
+         COALESCE(c.cnt, 0)::text AS session_count
     FROM chat_projects p
     LEFT JOIN (
       SELECT project_id, COUNT(*) AS cnt
@@ -688,7 +704,15 @@ type PgChatProjectRow = {
   updated_at: string;
   session_count: string;
   board_project_id: string | null;
+  archived_at: string | null;
+  pinned_at: string | null;
+  template: string | null;
 };
+
+function pgTemplate(raw: string | null | undefined): ChatProjectTemplate | null {
+  const t = parseChatProjectTemplate(raw);
+  return t === "invalid" ? null : t;
+}
 
 function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
   return {
@@ -701,6 +725,9 @@ function mapPgChatProjectRow(r: PgChatProjectRow): ChatProject {
     updatedAt: bigIntNum(r.updated_at, "updated_at"),
     sessionCount: Number(r.session_count) || 0,
     boardProjectId: r.board_project_id ?? null,
+    archivedAt: r.archived_at == null ? null : bigIntNum(r.archived_at, "archived_at"),
+    pinnedAt: r.pinned_at == null ? null : bigIntNum(r.pinned_at, "pinned_at"),
+    template: pgTemplate(r.template),
   };
 }
 
@@ -724,6 +751,19 @@ const PG_PROJECT_ASSET_SELECT = `
          created_at::text AS created_at, updated_at::text AS updated_at
     FROM project_assets
 `;
+
+/**
+ * 「是该源路径的最新版本」(上传与无源路径的行恒为真),与 SQLite 侧
+ * SQLITE_ASSET_IS_LATEST_VERSION 同构:注入常用资产时只认最新版本。
+ */
+const PG_ASSET_IS_LATEST_VERSION = `NOT EXISTS (
+  SELECT 1 FROM project_assets newer
+   WHERE project_assets.source = 'output' AND project_assets.container_path IS NOT NULL
+     AND newer.user_id = project_assets.user_id AND newer.deleted_at IS NULL
+     AND newer.source = 'output' AND newer.project_id IS NOT DISTINCT FROM project_assets.project_id
+     AND newer.container_path = project_assets.container_path
+     AND (newer.created_at > project_assets.created_at
+          OR (newer.created_at = project_assets.created_at AND newer.id > project_assets.id)))`;
 
 type PgProjectAssetRow = {
   id: string;
@@ -804,6 +844,34 @@ async function pgCountProjectAssets(
   return Number(row?.n ?? 0);
 }
 
+/** 同一项目里某个产出源路径的最新未删版本(无则 null)。 */
+async function pgLatestOutputVersion(
+  queryable: Pick<Pool | PoolClient, "query">,
+  userId: string,
+  projectId: string | null,
+  containerPath: string,
+): Promise<ProjectAsset | null> {
+  const row = (
+    await queryable.query<PgProjectAssetRow>(
+      `${PG_PROJECT_ASSET_SELECT}
+        WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+          AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1`,
+      [userId, projectId, containerPath],
+    )
+  ).rows[0];
+  return row ? mapPgProjectAssetRow(row) : null;
+}
+
+/**
+ * 去重规则与 SQLite 侧 _sqliteFindDuplicateAsset 同构:
+ *   - 带字节副本的产出(output + containerPath + digest):先与该源路径的最新版本比,
+ *     digest 相同 = 同一版本,不同 = 新版本(返回 null)。
+ *     例外是重放:带 capturedAt(源文件 mtime)且不晚于最新版本的 created_at,而这个
+ *     digest 已是某个旧版本 → 返回那个旧版本,不出新版本。
+ *   - 其它(上传、旧容器只报路径的产出):同 digest,digest 空则同 container_path。
+ */
 async function pgFindDuplicateAsset(
   queryable: Pick<Pool | PoolClient, "query">,
   userId: string,
@@ -811,7 +879,27 @@ async function pgFindDuplicateAsset(
   source: ParsedProjectAssetCreate["source"],
   digest: string | null,
   containerPath: string | null,
+  capturedAt: number | null,
 ): Promise<ProjectAsset | null> {
+  if (source === "output" && containerPath && digest) {
+    const latest = await pgLatestOutputVersion(queryable, userId, projectId, containerPath);
+    if (!latest) return null;
+    if (latest.digest === digest) return latest;
+    if (capturedAt !== null && capturedAt <= latest.createdAt) {
+      const row = (
+        await queryable.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+              AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3 AND digest = $4
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1`,
+          [userId, projectId, containerPath, digest],
+        )
+      ).rows[0];
+      if (row) return mapPgProjectAssetRow(row);
+    }
+    return null;
+  }
   if (digest) {
     const row = (
       await queryable.query<PgProjectAssetRow>(
@@ -12217,8 +12305,9 @@ export function createPgSessionsBackend(
           board_project_id: string | null;
           name: string;
           instructions: string | null;
+          template: string | null;
         }>(
-          `SELECT cs.user_id, p.id AS chat_project_id, p.board_project_id, p.name, p.instructions
+          `SELECT cs.user_id, p.id AS chat_project_id, p.board_project_id, p.name, p.instructions, p.template
              FROM client_sessions cs
              JOIN chat_projects p ON p.id = cs.project_id AND p.user_id = cs.user_id
             WHERE cs.id = $1 AND cs.deleted_at IS NULL AND p.deleted_at IS NULL`,
@@ -12232,6 +12321,7 @@ export function createPgSessionsBackend(
         boardProjectId: row.board_project_id ?? null,
         name: row.name,
         instructions: row.instructions,
+        template: pgTemplate(row.template),
       };
     },
 
@@ -12248,8 +12338,9 @@ export function createPgSessionsBackend(
           board_project_id: string | null;
           name: string;
           instructions: string | null;
+          template: string | null;
         }>(
-          `SELECT user_id, id, board_project_id, name, instructions
+          `SELECT user_id, id, board_project_id, name, instructions, template
              FROM chat_projects
             WHERE user_id = $1 AND board_project_id = $2 AND deleted_at IS NULL`,
           [userId, parsed.value],
@@ -12262,6 +12353,7 @@ export function createPgSessionsBackend(
         boardProjectId: row.board_project_id ?? null,
         name: row.name,
         instructions: row.instructions,
+        template: pgTemplate(row.template),
       };
     },
 
@@ -12274,6 +12366,7 @@ export function createPgSessionsBackend(
           `${PG_PROJECT_ASSET_SELECT}
             WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
               AND project_id IS NOT DISTINCT FROM $2
+              AND ${PG_ASSET_IS_LATEST_VERSION}
             ORDER BY created_at DESC
             LIMIT $3`,
           [userId, chatProjectId, PROJECT_ASSET_PINNED_INJECT_MAX],
@@ -12642,7 +12735,14 @@ export function createPgSessionsBackend(
 
     async createChatProject(
       userId: string,
-      input: { name?: unknown; instructions?: unknown; color?: unknown; isResearchDefault?: unknown },
+      input: {
+        name?: unknown;
+        instructions?: unknown;
+        color?: unknown;
+        isResearchDefault?: unknown;
+        template?: unknown;
+        reserveBoard?: boolean;
+      },
     ): Promise<ChatProjectCreateResult> {
       const name = parseChatProjectName(input.name);
       if (!name) return { ok: false, error: "invalid_name" };
@@ -12650,7 +12750,11 @@ export function createPgSessionsBackend(
       if ("invalid" in instructions) return { ok: false, error: "invalid_instructions" };
       const color = parseChatProjectOptionalText(input.color, CHAT_PROJECT_COLOR_MAX);
       if ("invalid" in color) return { ok: false, error: "invalid_color" };
+      const template = parseChatProjectTemplate(input.template);
+      if (template === "invalid") return { ok: false, error: "invalid_template" };
       const isDefault = input.isResearchDefault === true;
+      // Project layer on: reserve the work-project id now; the container creates that board on first use.
+      const boardProjectId = input.reserveBoard === true && !isDefault ? randomUUID() : null;
       const id = randomUUID();
       return withTx(pool, async (client) => {
         const countRow = (
@@ -12665,10 +12769,11 @@ export function createPgSessionsBackend(
         try {
           await client.query(
             `INSERT INTO chat_projects
-               (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at, is_research_default)
+               (id, user_id, name, instructions, color, sort_order, created_at, updated_at, deleted_at,
+                is_research_default, template, board_project_id)
              VALUES ($1, $2, $3, $4, $5, COALESCE((
                SELECT MAX(sort_order) + 1 FROM chat_projects WHERE user_id = $2 AND deleted_at IS NULL
-             ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL, $6)`,
+             ), 0), ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL, $6, $7, $8)`,
             [
               id,
               userId,
@@ -12676,6 +12781,8 @@ export function createPgSessionsBackend(
               instructions.present ? instructions.value : null,
               color.present ? color.value : null,
               isDefault,
+              template,
+              boardProjectId,
             ],
           );
         } catch (err) {
@@ -12710,11 +12817,22 @@ export function createPgSessionsBackend(
         color?: unknown;
         sortOrder?: unknown;
         boardProjectId?: unknown;
+        archived?: unknown;
+        pinned?: unknown;
       },
     ): Promise<ChatProjectUpdateResult> {
       const sets: string[] = [`updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})`];
       const params: unknown[] = [];
       let n = 1;
+      let bindGuard: string | null = null;
+      if (input.archived !== undefined) {
+        if (typeof input.archived !== "boolean") return { ok: false, error: "invalid_flag" };
+        sets.push(input.archived ? `archived_at = COALESCE(archived_at, ${CLOCK_MS_SQL})` : "archived_at = NULL");
+      }
+      if (input.pinned !== undefined) {
+        if (typeof input.pinned !== "boolean") return { ok: false, error: "invalid_flag" };
+        sets.push(input.pinned ? `pinned_at = COALESCE(pinned_at, ${CLOCK_MS_SQL})` : "pinned_at = NULL");
+      }
       if (input.name !== undefined) {
         const name = parseChatProjectName(input.name);
         if (!name) return { ok: false, error: "invalid_name" };
@@ -12755,8 +12873,12 @@ export function createPgSessionsBackend(
         const bound = parseBoardProjectId(input.boardProjectId);
         if ("invalid" in bound) return { ok: false, error: "invalid_board_project_id" };
         if (bound.present) {
+          // A project keeps its work project for life (memory, skills, cron, billing hang off it);
+          // enforced in the UPDATE itself so concurrent binds cannot both win.
+          if (bound.value === null) return { ok: false, error: "board_project_bound" };
           sets.push(`board_project_id = $${n++}`);
           params.push(bound.value);
+          bindGuard = bound.value;
         }
       }
       if (sets.length === 1) {
@@ -12765,13 +12887,29 @@ export function createPgSessionsBackend(
       }
       return withTx(pool, async (client) => {
         params.push(id, userId);
+        const idParam = n++;
+        const userParam = n++;
+        let guardSql = "";
+        if (bindGuard) {
+          params.push(bindGuard);
+          guardSql = ` AND (board_project_id IS NULL OR board_project_id = $${n})`;
+        }
         try {
           const res = await client.query(
             `UPDATE chat_projects SET ${sets.join(", ")}
-              WHERE id = $${n++} AND user_id = $${n} AND deleted_at IS NULL`,
+              WHERE id = $${idParam} AND user_id = $${userParam} AND deleted_at IS NULL${guardSql}`,
             params,
           );
-          if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+          if ((res.rowCount ?? 0) === 0) {
+            if (bindGuard) {
+              const exists = await client.query(
+                "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL",
+                [id, userId],
+              );
+              if ((exists.rowCount ?? 0) > 0) return { ok: false, error: "board_project_bound" };
+            }
+            return { ok: false, error: "not_found" };
+          }
         } catch (err) {
           const code = (err as { code?: string }).code;
           if (code === "23505") return { ok: false, error: "board_project_bound" };
@@ -12783,24 +12921,141 @@ export function createPgSessionsBackend(
       });
     },
 
-    async deleteChatProject(userId: string, id: string): Promise<ChatProjectDeleteResult> {
+    async deleteChatProject(
+      userId: string,
+      id: string,
+      opts: { pausedCronJobIds?: string[] } = {},
+    ): Promise<ChatProjectDeleteResult> {
       return withTx(pool, async (client) => {
-        const res = await client.query(
+        const live = await client.query(
+          "SELECT 1 FROM chat_projects WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL FOR UPDATE",
+          [id, userId],
+        );
+        if ((live.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        // Mark deleted first: asset/session filing checks the project is live, so
+        // nothing new can attach after this; the manifest is exactly what the
+        // UPDATEs below unlink (RETURNING), not a separate earlier read.
+        await client.query(
           `UPDATE chat_projects
               SET deleted_at = ${CLOCK_MS_SQL},
                   updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
             WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
           [id, userId],
         );
-        if ((res.rowCount ?? 0) === 0) return { ok: false, error: "not_found" };
+        const sessionIds = (
+          await client.query<{ id: string }>(
+            `UPDATE client_sessions
+                SET project_id = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL
+              RETURNING id`,
+            [userId, id],
+          )
+        ).rows.map((r) => r.id);
+        const assetIds = (
+          await client.query<{ id: string }>(
+            `UPDATE project_assets
+                SET project_id = NULL,
+                    updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+              WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL
+              RETURNING id`,
+            [userId, id],
+          )
+        ).rows.map((r) => r.id);
+        const manifest: ChatProjectDeletedManifest = {
+          sessionIds,
+          assetIds,
+          pausedCronJobIds: opts.pausedCronJobIds ?? [],
+          at: Date.now(),
+        };
         await client.query(
-          `UPDATE client_sessions
-              SET project_id = NULL,
-                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
-            WHERE user_id = $1 AND project_id = $2 AND deleted_at IS NULL`,
-          [userId, id],
+          "UPDATE chat_projects SET deleted_manifest = $3 WHERE id = $1 AND user_id = $2",
+          [id, userId, JSON.stringify(manifest)],
         );
         return { ok: true };
+      });
+    },
+
+    async listDeletedChatProjects(userId: string): Promise<DeletedChatProject[]> {
+      const rows = (
+        await pool.query<{ id: string; name: string; deleted_at: string; deleted_manifest: string | null }>(
+          `SELECT id, name, deleted_at, deleted_manifest FROM chat_projects
+            WHERE user_id = $1 AND deleted_at IS NOT NULL AND deleted_at >= $2
+              AND is_research_default IS NOT TRUE
+            ORDER BY deleted_at DESC`,
+          [userId, Date.now() - CHAT_PROJECT_RESTORE_WINDOW_MS],
+        )
+      ).rows;
+      return rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        deletedAt: bigIntNum(r.deleted_at, "deleted_at"),
+        sessionCount: parseDeletedManifest(r.deleted_manifest).sessionIds.length,
+      }));
+    },
+
+    async restoreChatProject(userId: string, id: string): Promise<ChatProjectRestoreResult> {
+      return withTx(pool, async (client) => {
+        const row = (
+          await client.query<{ deleted_at: string; deleted_manifest: string | null; board_project_id: string | null }>(
+            `SELECT deleted_at, deleted_manifest, board_project_id FROM chat_projects
+              WHERE id = $1 AND user_id = $2 AND deleted_at IS NOT NULL FOR UPDATE`,
+            [id, userId],
+          )
+        ).rows[0];
+        if (!row) return { ok: false, error: "not_found" };
+        if (Date.now() - bigIntNum(row.deleted_at, "deleted_at") > CHAT_PROJECT_RESTORE_WINDOW_MS) {
+          return { ok: false, error: "expired" };
+        }
+        const count = (
+          await client.query<{ n: string }>(
+            "SELECT COUNT(*)::text AS n FROM chat_projects WHERE user_id = $1 AND deleted_at IS NULL",
+            [userId],
+          )
+        ).rows[0];
+        if (Number(count?.n ?? 0) >= CHAT_PROJECT_PER_USER_LIMIT) return { ok: false, error: "limit_exceeded" };
+        if (row.board_project_id) {
+          const taken = await client.query(
+            "SELECT 1 FROM chat_projects WHERE user_id = $1 AND board_project_id = $2 AND deleted_at IS NULL",
+            [userId, row.board_project_id],
+          );
+          if ((taken.rowCount ?? 0) > 0) return { ok: false, error: "board_project_bound" };
+        }
+        const manifest = parseDeletedManifest(row.deleted_manifest);
+        await client.query(
+          `UPDATE chat_projects SET deleted_at = NULL, deleted_manifest = NULL,
+                  updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+            WHERE id = $1 AND user_id = $2`,
+          [id, userId],
+        );
+        // Only items still ungrouped come back; anything the user moved since stays where it is.
+        const relinkedSessionIds = manifest.sessionIds.length
+          ? (
+              await client.query<{ id: string }>(
+                `UPDATE client_sessions SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                  WHERE user_id = $2 AND id = ANY($3::text[]) AND project_id IS NULL AND deleted_at IS NULL
+                  RETURNING id`,
+                [id, userId, manifest.sessionIds],
+              )
+            ).rows.map((r) => r.id)
+          : [];
+        const ra = manifest.assetIds.length
+          ? await client.query(
+              `UPDATE project_assets SET project_id = $1, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE user_id = $2 AND id = ANY($3::text[]) AND project_id IS NULL AND deleted_at IS NULL`,
+              [id, userId, manifest.assetIds],
+            )
+          : { rowCount: 0 };
+        const project = await readPgChatProject(client, userId, id);
+        if (!project) throw new Error("restored chat project vanished");
+        return {
+          ok: true,
+          project,
+          pausedCronJobIds: manifest.pausedCronJobIds,
+          relinkedSessions: relinkedSessionIds.length,
+          relinkedSessionIds,
+          relinkedAssets: ra.rowCount ?? 0,
+        };
       });
     },
 
@@ -12808,13 +13063,73 @@ export function createPgSessionsBackend(
       const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
         ? Math.min(PROJECT_ASSET_LIST_LIMIT_MAX, Math.floor(opts.limit))
         : PROJECT_ASSET_LIST_LIMIT_DEFAULT;
+      // 产出物按源路径折叠成一条(最新版本)并带版本数;与 SQLite 同一分组键。
       const rows = (
-        await pool.query<PgProjectAssetRow>(
-          `${PG_PROJECT_ASSET_SELECT}
-            WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2
+        await pool.query<PgProjectAssetRow & { version_count: string }>(
+          `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+                  size_bytes::text AS size_bytes, digest, excerpt, pinned,
+                  created_at::text AS created_at, updated_at::text AS updated_at,
+                  version_count::text AS version_count
+             FROM (
+               SELECT *,
+                      ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                         ORDER BY created_at DESC, id DESC) AS version_rank,
+                      COUNT(*) OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}) AS version_count
+                 FROM project_assets
+                WHERE user_id = $1 AND deleted_at IS NULL AND project_id IS NOT DISTINCT FROM $2
+             ) AS versioned
+            WHERE version_rank = 1
             ORDER BY created_at DESC
             LIMIT $3`,
           [userId, opts.projectId, limit],
+        )
+      ).rows;
+      return rows.map((r) => withVersionCount(mapPgProjectAssetRow(r), Number(r.version_count)));
+    },
+
+    async listProjectAssetVersions(userId: string, assetId: string): Promise<ProjectAsset[] | null> {
+      const asset = await readPgProjectAsset(pool, userId, assetId);
+      if (!asset) return null;
+      if (asset.source !== "output" || !asset.containerPath) return [asset];
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+              AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4`,
+          [userId, asset.projectId, asset.containerPath, PROJECT_ASSET_PER_PROJECT_LIMIT],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
+    },
+
+    async searchProjectAssets(userId: string, opts: SearchProjectAssetsOpts): Promise<ProjectAsset[]> {
+      const q = typeof opts.q === "string" ? opts.q.trim().slice(0, PROJECT_ASSET_SEARCH_QUERY_MAX) : "";
+      if (!q) return [];
+      const limit = typeof opts.limit === "number" && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.min(PROJECT_ASSET_SEARCH_LIMIT_MAX, Math.floor(opts.limit))
+        : PROJECT_ASSET_SEARCH_LIMIT_DEFAULT;
+      const like = `%${escapeLikePattern(q)}%`;
+      const hasSource = opts.source === "upload" || opts.source === "output";
+      const params: unknown[] = [userId, like, limit];
+      if (hasSource) params.push(opts.source);
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          // Outputs fold to their latest version (per project and source path), as in listProjectAssets.
+          `${PG_PROJECT_ASSET_SELECT}
+            WHERE user_id = $1 AND deleted_at IS NULL
+              AND id IN (
+                SELECT id FROM (
+                  SELECT id, ROW_NUMBER() OVER (PARTITION BY project_id, ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                                ORDER BY created_at DESC, id DESC) AS version_rank
+                    FROM project_assets WHERE user_id = $1 AND deleted_at IS NULL
+                ) AS versioned WHERE version_rank = 1
+              )
+              AND (name ILIKE $2 ESCAPE '\\' OR COALESCE(excerpt, '') ILIKE $2 ESCAPE '\\')${hasSource ? " AND source = $4" : ""}
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3`,
+          params,
         )
       ).rows;
       return rows.map(mapPgProjectAssetRow);
@@ -12831,17 +13146,9 @@ export function createPgSessionsBackend(
         const resolved = await pgResolveAssetProjectId(client, userId, parsed.value);
         if (!resolved.ok) return resolved;
         const { projectId } = resolved;
-        const dup = await pgFindDuplicateAsset(
-          client,
-          userId,
-          projectId,
-          parsed.value.source,
-          parsed.value.digest,
-          parsed.value.containerPath,
-        );
-        if (dup) return { ok: true, asset: dup, created: false };
-        // 同一 (user_id, project_id) 桶的 count+INSERT 必须串行:默认 READ COMMITTED
-        // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破。
+        // 同一 (user_id, project_id) 桶的 去重+count+INSERT 必须串行:默认 READ COMMITTED
+        // 下无行锁,并发事务都会读到 count<500 再各自写入 → 上限被突破;同一产出的两个
+        // 新版本并发登记也会各自看不到对方。锁放在去重之前,与 SQLite 的单事务一致。
         // pg_advisory_xact_lock 随 COMMIT/ROLLBACK 自动释放;不用会话级
         // pg_advisory_lock(连接归还池后锁会泄漏)。
         // NULL project_id(未分组)用 coalesce($2,'') 编码:真实 chat_projects.id 是 UUID
@@ -12850,8 +13157,35 @@ export function createPgSessionsBackend(
           "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '')))",
           [`oc_proj_asset:${userId}`, projectId],
         );
+        const dup = await pgFindDuplicateAsset(
+          client,
+          userId,
+          projectId,
+          parsed.value.source,
+          parsed.value.digest,
+          parsed.value.containerPath,
+          parsed.value.capturedAt,
+        );
+        if (dup) return { ok: true, asset: dup, created: false };
         if ((await pgCountProjectAssets(client, userId, projectId)) >= PROJECT_ASSET_PER_PROJECT_LIMIT) {
           return { ok: false, error: "limit_exceeded" };
+        }
+        // 同一源路径的版本按 created_at 排序,新版本严格晚于上一版(同毫秒也不并列)。
+        // 「常用」只挂在最新版本上:新版本(登记或恢复)继承上一版的 pinned,旧版本一律取消。
+        let createdAtFloor = 0;
+        let pinned = parsed.value.pinned;
+        if (parsed.value.source === "output" && parsed.value.containerPath) {
+          const latest = await pgLatestOutputVersion(client, userId, projectId, parsed.value.containerPath);
+          if (latest) {
+            createdAtFloor = latest.createdAt + 1;
+            pinned = pinned || latest.pinned;
+            await client.query(
+              `UPDATE project_assets SET pinned = FALSE, updated_at = GREATEST(updated_at + 1, ${CLOCK_MS_SQL})
+                WHERE user_id = $1 AND deleted_at IS NULL AND source = 'output'
+                  AND project_id IS NOT DISTINCT FROM $2 AND container_path = $3 AND pinned IS TRUE`,
+              [userId, projectId, parsed.value.containerPath],
+            );
+          }
         }
         // 只插索引行,绝不写/删磁盘文件(内容寻址,可能被其它消息/资产共用)。
         await client.query(
@@ -12860,7 +13194,7 @@ export function createPgSessionsBackend(
              mime, size_bytes, digest, excerpt, pinned, created_at, updated_at, deleted_at
            ) VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-             ${CLOCK_MS_SQL}, ${CLOCK_MS_SQL}, NULL
+             GREATEST(LEAST(${CLOCK_MS_SQL}, $15::bigint), $14::bigint), GREATEST(${CLOCK_MS_SQL}, $14::bigint), NULL
            )`,
           [
             id,
@@ -12875,7 +13209,12 @@ export function createPgSessionsBackend(
             parsed.value.sizeBytes,
             parsed.value.digest,
             parsed.value.excerpt,
-            parsed.value.pinned,
+            pinned,
+            createdAtFloor,
+            // Output versions are dated by when the file was written (never later
+            // than now), the same clock the replay rule compares capturedAt with.
+            // LEAST ignores NULL, so without capturedAt this is the clock as before.
+            parsed.value.source === "output" ? parsed.value.capturedAt : null,
           ],
         );
         const asset = await readPgProjectAsset(client, userId, id);
@@ -12972,9 +13311,42 @@ export function createPgSessionsBackend(
           `${PG_PROJECT_ASSET_SELECT}
             WHERE user_id = $1 AND deleted_at IS NULL AND pinned IS TRUE
               AND project_id IS NOT DISTINCT FROM $2
+              AND ${PG_ASSET_IS_LATEST_VERSION}
             ORDER BY created_at DESC
             LIMIT $3`,
           [sess.user_id, sess.project_id ?? null, PROJECT_ASSET_PINNED_INJECT_MAX],
+        )
+      ).rows;
+      return rows.map(mapPgProjectAssetRow);
+    },
+
+    async searchChatProjectAssets(
+      userId: string,
+      chatProjectId: string,
+      opts: SearchChatProjectAssetsOpts,
+    ): Promise<ProjectAsset[]> {
+      const norm = normalizeChatProjectAssetSearch(opts);
+      if (!norm || !chatProjectId) return [];
+      const params: unknown[] = [userId, chatProjectId, norm.like, norm.limit];
+      if (norm.source) params.push(norm.source);
+      // Same fold as listProjectAssets: only the latest version of an output is searched.
+      const rows = (
+        await pool.query<PgProjectAssetRow>(
+          `SELECT id, project_id, source, session_id, name, url, container_path, mime,
+                  size_bytes::text AS size_bytes, digest, excerpt, pinned,
+                  created_at::text AS created_at, updated_at::text AS updated_at
+             FROM (
+               SELECT *,
+                      ROW_NUMBER() OVER (PARTITION BY ${PROJECT_ASSET_VERSION_GROUP_SQL}
+                                         ORDER BY created_at DESC, id DESC) AS version_rank
+                 FROM project_assets
+                WHERE user_id = $1 AND deleted_at IS NULL AND project_id = $2
+             ) AS versioned
+            WHERE version_rank = 1
+              AND (name ILIKE $3 ESCAPE '\\' OR COALESCE(excerpt, '') ILIKE $3 ESCAPE '\\')${norm.source ? " AND source = $5" : ""}
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4`,
+          params,
         )
       ).rows;
       return rows.map(mapPgProjectAssetRow);

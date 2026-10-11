@@ -91,15 +91,13 @@ const EMPTY_KEYS: ApiKeySummary[] = [];
 export function pickDefaultModel(
   available: string[] | null,
   preferred: string,
-  fallbackPattern?: RegExp | readonly RegExp[],
+  fallback?: RegExp | readonly RegExp[],
 ): string {
   if (!available || available.length === 0 || available.includes(preferred)) return preferred;
-  if (fallbackPattern) {
-    const patterns = fallbackPattern instanceof RegExp ? [fallbackPattern] : fallbackPattern;
-    for (const pattern of patterns) {
-      const hit = available.find((id) => pattern.test(id));
-      if (hit) return hit;
-    }
+  // 数组按优先级逐档匹配：先找满足第一档的，再看第二档……不按目录顺序混在一起挑。
+  for (const pattern of fallback === undefined ? [] : Array.isArray(fallback) ? fallback : [fallback]) {
+    const hit = available.find((id) => pattern.test(id));
+    if (hit) return hit;
   }
   return available[0]!;
 }
@@ -280,6 +278,7 @@ export function ApiKeysSection({
   const opusModel = pickDefaultModel(externalModels, DEFAULT_OPUS_MODEL, /^(opus|fable)-/);
   const sonnetModel = pickDefaultModel(externalModels, DEFAULT_SONNET_MODEL, /^sonnet-/);
   // 轻量位：haiku 优先；没有就退到 gemini flash，再退到 sonnet。
+  // 三档分开传：合成一个正则时按目录顺序取第一个命中，sonnet 排在 flash 前就会占掉轻量位(OCV5-355)。
   const haikuModel = pickDefaultModel(externalModels, DEFAULT_HAIKU_MODEL, [/^haiku-/, /^gemini-|-flash(-|$)/, /^sonnet-/]);
   const candidateKey = keySource === "new" ? (justCreated?.plaintext ?? "") : existingKey.trim();
   const knownKey = keys?.find(

@@ -40,3 +40,19 @@ export function useMdViewport(): boolean {
 export function useNarrowViewport(): boolean {
   return useSyncExternalStore(subscribeNarrow, getNarrowSnapshot, () => false);
 }
+
+/** 详情面板内联成第三列的门槛:再窄就挤掉对话列(1024 宽时对话列只剩 ~370px),改用贴底面板。 */
+const WIDE_QUERY = "(min-width: 1100px)";
+
+function subscribeWide(onChange: () => void): () => void {
+  return subscribeQuery(WIDE_QUERY, onChange);
+}
+
+function getWideSnapshot(): boolean {
+  return snapshotQuery(WIDE_QUERY);
+}
+
+/** ≥1100px。jsdom / SSR 默认 false(按窄屏贴底面板测)。 */
+export function useWideViewport(): boolean {
+  return useSyncExternalStore(subscribeWide, getWideSnapshot, () => false);
+}

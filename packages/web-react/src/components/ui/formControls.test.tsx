@@ -96,6 +96,15 @@ test("Textarea 同构", () => {
   expect(el.className).toContain("py-2.5");
 });
 
+test("Textarea:不带单行控件的粗指针最小高度,调用方的 min-h 在手机上照样生效", () => {
+  render(<Textarea placeholder="t" className="min-h-[18rem]" />);
+  const cls = screen.getByPlaceholderText("t").className.split(/\s+/);
+  // `[@media(hover:none)]:min-h-11` 层叠在 `min-h-[18rem]` 之后,手机上会把文本框压成一行(OCV5-362)。
+  // 任何 `[@media(hover:none)]:min-h-*` 都会盖过调用方的 min-h(媒体查询规则排在后面)。
+  expect(cls.some((c) => c.startsWith("[@media(hover:none)]:min-h"))).toBe(false);
+  expect(cls).toContain("min-h-[18rem]");
+});
+
 test("Switch 触控靶伪元素", () => {
   render(<Switch aria-label="sw" />);
   const cls = screen.getByRole("switch").className;

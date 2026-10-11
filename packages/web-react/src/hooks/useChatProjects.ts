@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useToast } from "../components/ui";
-import { api } from "../lib/api";
-import type { AuthSession, ChatProject } from "../lib/types";
+import { api, apiErrorMessage } from "../lib/api";
+import {
+  fenceAndDeleteProject,
+  type LifecycleDeps,
+  restoreDeletedProject,
+  setProjectArchivedFenced,
+} from "../lib/projectLifecycle";
+import type { AuthSession, ChatProject, DeletedChatProject } from "../lib/types";
 
 export function projectCollapsedStorageKey(userId: string): string {
   return `oc_v5_sidebar_project_collapsed:${userId}`;
@@ -50,9 +56,9 @@ export type UseChatProjectsOptions = {
   onUngroupProjectSessions?: (projectId: string) => string[];
   /** 删除项目失败：把 sessionIds 重新挂回该项目。 */
   onRestoreProjectSessions?: (projectId: string, sessionIds: string[]) => void;
-  /** 真实创建成功、乐观行被服务端记录替换后调用（demo 不调）。 */
-  onCreated?: (project: ChatProject) => void;
 };
+
+export type CreateProjectInput = { name: string; instructions?: string; color?: string };
 
 /** 项目列表拉取失败后的自动重试间隔（仅在失败态且标签可见时计时）。 */
 export const PROJECTS_RETRY_MS = 30_000;
@@ -60,14 +66,27 @@ export const PROJECTS_RETRY_MS = 30_000;
 export type UseChatProjects = {
   projects: ChatProject[];
   collapsedIds: Set<string>;
+  /**
+   * 列表至少成功拉取过一次（demo 恒为 true）。判定「项目确实不存在」（深链 `/p/<id>`）的依据：
+   * 首次拉取未到或失败重试中都不能下结论。
+   */
+  projectsLoaded: boolean;
   /** 最近一次列表拉取失败（正在按 PROJECTS_RETRY_MS 自动重试；也可手动 reloadProjects）。 */
   projectsLoadFailed: boolean;
   /** 手动重拉项目列表（失败态的重试入口；成功后清失败态）。 */
   reloadProjects: () => Promise<void>;
   toggleCollapsed: (projectId: string) => void;
-  createProjectPrompt: () => Promise<void>;
+  /**
+   * 一步创建(名称 + 可选指令/颜色)。返回服务端记录;demo 返回本地乐观记录;失败 toast 并返回 null。
+   */
+  createProject: (input: CreateProjectInput) => Promise<ChatProject | null>;
   renameProjectPrompt: (p: ChatProject) => Promise<void>;
   deleteProjectConfirm: (p: ChatProject) => Promise<void>;
+  /** Undo a delete (30 days): project, its chats/files, board and paused cron come back. */
+  restoreProject: (projectId: string) => Promise<boolean>;
+  listDeletedProjects: () => Promise<DeletedChatProject[]>;
+  setProjectArchived: (p: ChatProject, archived: boolean) => Promise<void>;
+  setProjectPinned: (p: ChatProject, pinned: boolean) => Promise<void>;
   updateProject: (
     id: string,
     patch: { name?: string; color?: string | null; instructions?: string | null },
@@ -87,6 +106,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
 
   const [projects, setProjects] = useState<ChatProject[]>([]);
   const [projectsLoadFailed, setProjectsLoadFailed] = useState(false);
+  const [projectsLoaded, setProjectsLoaded] = useState(demo);
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() =>
     userId ? readCollapsed(userId) : new Set(),
   );
@@ -116,6 +136,7 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
         );
         listFailedRef.current = false;
         setProjectsLoadFailed(false);
+        setProjectsLoaded(true);
       } catch (e) {
         if (gen !== listGenRef.current) return;
         console.warn("listChatProjects failed", e);
@@ -136,7 +157,11 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     listGenRef.current += 1;
     listInflightRef.current = false;
     listFailedRef.current = false;
-    if (demo) return;
+    if (demo) {
+      setProjectsLoaded(true);
+      return;
+    }
+    setProjectsLoaded(false);
     if (!auth || !userId) {
       setProjects([]);
       setProjectsLoadFailed(false);
@@ -176,32 +201,42 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     [userId],
   );
 
-  const createProjectPrompt = useCallback(async () => {
-    const name = (
-      await cbRef.current.promptText({ title: "新建项目", placeholder: "项目名称" })
-    )?.trim();
-    if (!name) return;
-    const tempId = `local-proj-${Date.now()}`;
-    const optimistic: ChatProject = {
-      id: tempId,
-      name,
-      sortOrder: projects.length,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sessionCount: 0,
-    };
-    setProjects((c) => [...c, optimistic]);
-    if (demo || !cbRef.current.auth) return;
-    try {
-      const created = await api.createChatProject(cbRef.current.authSession, { name });
-      setProjects((c) => c.map((p) => (p.id === tempId ? created : p)));
-      cbRef.current.onCreated?.(created);
-    } catch (e) {
-      setProjects((c) => c.filter((p) => p.id !== tempId));
-      console.warn("createChatProject failed", e);
-      toast("新建项目失败", "error");
-    }
-  }, [demo, projects.length, toast]);
+  const createProject = useCallback(
+    async (input: CreateProjectInput): Promise<ChatProject | null> => {
+      const name = input.name.trim();
+      if (!name) return null;
+      const instructions = input.instructions?.trim() || undefined;
+      const color = input.color || undefined;
+      const tempId = `local-proj-${Date.now()}`;
+      const optimistic: ChatProject = {
+        id: tempId,
+        name,
+        ...(instructions ? { instructions } : {}),
+        ...(color ? { color } : {}),
+        sortOrder: projects.length,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        sessionCount: 0,
+      };
+      setProjects((c) => [...c, optimistic]);
+      if (demo || !cbRef.current.auth) return optimistic;
+      try {
+        const created = await api.createChatProject(cbRef.current.authSession, {
+          name,
+          ...(instructions ? { instructions } : {}),
+          ...(color ? { color } : {}),
+        });
+        setProjects((c) => c.map((p) => (p.id === tempId ? created : p)));
+        return created;
+      } catch (e) {
+        setProjects((c) => c.filter((p) => p.id !== tempId));
+        console.warn("createChatProject failed", e);
+        toast(apiErrorMessage(e, "新建项目失败"), "error");
+        return null;
+      }
+    },
+    [demo, projects.length, toast],
+  );
 
   const renameProjectPrompt = useCallback(
     async (p: ChatProject) => {
@@ -224,11 +259,67 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
     [demo, toast],
   );
 
+  const restoredRef = useRef<{ project: ChatProject; relinkedSessionIds: string[] } | null>(null);
+  const lifecycleDeps = useCallback((): LifecycleDeps => {
+    const a = cbRef.current.authSession;
+    return {
+      listCron: (board) => api.listCron(a, { boardProjectId: board }),
+      setCronEnabled: (id, enabled) => api.updateCron(a, id, { enabled }).then(() => undefined),
+      // lib/taskboard stays out of the entry bundle (first-screen budget).
+      setBoardArchived: async (board, archived) => {
+        const { taskboardApi } = await import("../lib/taskboard");
+        await taskboardApi.patchProject(a, board, { archivedAt: archived ? Date.now() : null });
+      },
+      isBoardArchived: async (board) => {
+        const { taskboardApi } = await import("../lib/taskboard");
+        return Boolean((await taskboardApi.getProject(a, board)).archivedAt);
+      },
+      setProjectArchived: (id, archived) => api.patchChatProject(a, id, { archived }).then(() => undefined),
+      deleteProject: (id, paused) => api.deleteChatProject(a, id, paused),
+      restoreProject: async (id) => {
+        const r = await api.restoreChatProject(a, id);
+        restoredRef.current = r;
+        return {
+          boardProjectId: r.project.boardProjectId ?? null,
+          pausedCronJobIds: r.pausedCronJobIds,
+          archived: Boolean(r.project.archivedAt),
+        };
+      },
+    };
+  }, []);
+
+  const restoreProject = useCallback(
+    async (projectId: string): Promise<boolean> => {
+      if (demo || !cbRef.current.auth) return false;
+      restoredRef.current = null;
+      try {
+        const { cronNotResumed } = await restoreDeletedProject(lifecycleDeps(), projectId);
+        const restored = restoredRef.current as { project: ChatProject; relinkedSessionIds: string[] } | null;
+        if (restored) {
+          setProjects((c) => [...c.filter((x) => x.id !== restored.project.id), restored.project]);
+          cbRef.current.onRestoreProjectSessions?.(projectId, restored.relinkedSessionIds);
+        }
+        toast(
+          cronNotResumed.length > 0
+            ? `项目已恢复；有 ${cronNotResumed.length} 个定时任务没能重新启用，请在定时任务里手动打开`
+            : "项目已恢复",
+          cronNotResumed.length > 0 ? "error" : "success",
+        );
+        return true;
+      } catch (e) {
+        console.warn("restoreChatProject failed", e);
+        toast(apiErrorMessage(e, "恢复项目失败"), "error");
+        return false;
+      }
+    },
+    [demo, lifecycleDeps, toast],
+  );
+
   const deleteProjectConfirm = useCallback(
     async (p: ChatProject) => {
       const ok = await cbRef.current.confirmDialog({
         title: "删除该项目?",
-        body: `「${p.name}」将被删除。会话不会被删除，只会移出项目。`,
+        body: `「${p.name}」将被删除。会话不会被删除，会移到未分类；项目里的定时任务会先暂停。30 天内可以恢复。`,
         confirmText: "删除",
         danger: true,
       });
@@ -238,15 +329,61 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
       const movedIds = cbRef.current.onUngroupProjectSessions?.(p.id) ?? [];
       if (demo) return;
       try {
-        await api.deleteChatProject(cbRef.current.authSession, p.id);
+        await fenceAndDeleteProject(lifecycleDeps(), p);
+        toast(`已删除「${p.name}」`, "info", {
+          actionLabel: "撤销",
+          onAction: () => void restoreProject(p.id),
+        });
       } catch (e) {
         setProjects(snapshot);
         cbRef.current.onRestoreProjectSessions?.(p.id, movedIds);
         console.warn("deleteChatProject failed", e);
-        toast("删除项目失败，已恢复", "error");
+        toast(apiErrorMessage(e, "删除项目失败，已恢复"), "error");
       }
     },
-    [demo, projects, toast],
+    [demo, projects, toast, lifecycleDeps, restoreProject],
+  );
+
+  const listDeletedProjects = useCallback(async (): Promise<DeletedChatProject[]> => {
+    if (demo || !cbRef.current.auth) return [];
+    try {
+      return await api.listDeletedChatProjects(cbRef.current.authSession);
+    } catch {
+      return [];
+    }
+  }, [demo]);
+
+  const setProjectArchived = useCallback(
+    async (p: ChatProject, archived: boolean) => {
+      const prev = p.archivedAt ?? null;
+      setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, archivedAt: archived ? Date.now() : null } : x)));
+      if (demo || !cbRef.current.auth) return;
+      try {
+        await setProjectArchivedFenced(lifecycleDeps(), p, archived);
+      } catch (e) {
+        setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, archivedAt: prev } : x)));
+        console.warn("archive project failed", e);
+        toast(archived ? "归档项目失败，已恢复" : "取消归档失败，已恢复", "error");
+      }
+    },
+    [demo, lifecycleDeps, toast],
+  );
+
+  const setProjectPinned = useCallback(
+    async (p: ChatProject, pinned: boolean) => {
+      const prev = p.pinnedAt ?? null;
+      setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, pinnedAt: pinned ? Date.now() : null } : x)));
+      if (demo || !cbRef.current.auth) return;
+      try {
+        const updated = await api.patchChatProject(cbRef.current.authSession, p.id, { pinned });
+        setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, ...updated } : x)));
+      } catch (e) {
+        setProjects((c) => c.map((x) => (x.id === p.id ? { ...x, pinnedAt: prev } : x)));
+        console.warn("pin project failed", e);
+        toast(pinned ? "置顶失败，已恢复" : "取消置顶失败，已恢复", "error");
+      }
+    },
+    [demo, toast],
   );
 
   const updateProject = useCallback(
@@ -331,12 +468,17 @@ export function useChatProjects(opts: UseChatProjectsOptions): UseChatProjects {
   return {
     projects,
     collapsedIds,
+    projectsLoaded,
     projectsLoadFailed,
     reloadProjects,
     toggleCollapsed,
-    createProjectPrompt,
+    createProject,
     renameProjectPrompt,
     deleteProjectConfirm,
+    restoreProject,
+    listDeletedProjects,
+    setProjectArchived,
+    setProjectPinned,
     updateProject,
     reorderProjects,
   };

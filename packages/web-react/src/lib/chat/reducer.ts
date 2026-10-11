@@ -2228,6 +2228,8 @@ export function applyOutboundMessage(
           if (existing.role === "agent-group") continue;
           if (frameTurnOwnerId && !existing._turnOwnerId) existing._turnOwnerId = frameTurnOwnerId;
           existing._completed = true;
+          // OCV5-367: 结果到达时刻 = 这一步的终点(过程时间轴的步骤耗时)。
+          existing.completedAt = Date.now();
           existing.output = rb.output ?? rb.preview ?? "";
           if (rb.outputJson !== undefined) existing.outputJson = rb.outputJson;
           existing.error = !!rb.isError;

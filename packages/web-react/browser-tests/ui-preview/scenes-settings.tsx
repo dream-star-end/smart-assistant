@@ -25,7 +25,7 @@ import { PreferencesTab } from '../../src/components/settings/PreferencesTab'
 import { SubscriptionDialog } from '../../src/components/settings/SubscriptionDialog'
 import { UsageTab } from '../../src/components/settings/UsageTab'
 import { createMemoryAuthSession } from '../../src/lib/authSession'
-import { extractAutoDreamFeature, extractPrefs } from '../../src/lib/modelPreferences'
+import { extractPrefs } from '../../src/lib/modelPreferences'
 import { savePendingPayment } from '../../src/lib/pendingPayment'
 import type {
   MySubscription,
@@ -844,7 +844,6 @@ function settings(section: SettingsSection, user: User, extra?: { subscribeOpenS
       theme="light"
       onClose={noop}
       onSetTheme={noop}
-      onOpenMemory={noop}
       onRefreshMe={noop}
       onOpenProjectSettings={noop}
       feedbackContext={{ sessionId: 's-alpha-0001-9f3c', requestId: 'req-7f3a' }}
@@ -1011,7 +1010,7 @@ export const settingsScenes: Scene[] = [
   },
   {
     id: 'settings-full-preferences',
-    label: '整页 · 偏好(Auto-Dream 旧版提示 · QQ 已绑定 · 通知)',
+    label: '整页 · 偏好(QQ 已绑定 · 通知)',
     group: '工作区',
     viewports: ['desktop', 'mobile'],
     api: {
@@ -1023,12 +1022,9 @@ export const settingsScenes: Scene[] = [
         <PreferencesTab
           auth={auth}
           prefs={extractPrefs(prefsFull)}
-          autoDream={extractAutoDreamFeature(prefsFull)}
           theme="light"
           onSetTheme={noop}
           onPatch={async () => {}}
-          onUpgrade={noop}
-          onOpenMemory={noop}
         />
       </FullPage>
     ),
@@ -1122,7 +1118,7 @@ export const settingsScenes: Scene[] = [
   },
   {
     id: 'settings-preferences',
-    label: '设置 · 偏好(Max 可用 Auto-Dream · QQ 已绑定)',
+    label: '设置 · 偏好(付费用户 · QQ 已绑定)',
     group: '工作区',
     viewports: ['desktop', 'mobile'],
     api: {
@@ -1134,7 +1130,7 @@ export const settingsScenes: Scene[] = [
   },
   {
     id: 'settings-preferences-locked',
-    label: '设置 · 偏好(免费用户 Auto-Dream 锁定 · QQ 未配置)',
+    label: '设置 · 偏好(免费用户 · QQ 未配置)',
     group: '工作区',
     viewports: ['desktop', 'mobile'],
     api: {

@@ -691,7 +691,7 @@ export function TaskboardView({
         ) : null}
         <DropdownMenuItem data-testid="project-create-open" onSelect={() => setProjectMode('create')}>
           <FolderPlus size={14} />
-          新建项目
+          新建工作项目
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
@@ -783,7 +783,7 @@ export function TaskboardView({
           action={
             <Button type="button" data-testid="board-empty-create-project" onClick={() => setProjectMode('create')}>
               <FolderPlus size={14} />
-              新建项目
+              新建工作项目
             </Button>
           }
         />

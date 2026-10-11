@@ -4,6 +4,11 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
 import type { InboxMessage } from "../types";
+import { prefetchMarkdownImpl } from "../../../../components/Markdown";
+import { loadBeforeAll } from "../../../../test/moduleLoad";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 const adminGet = vi.fn();
 const adminSend = vi.fn();
@@ -114,8 +119,12 @@ describe("InboxPage", () => {
       target: { value: "正文内容" },
     });
     fireEvent.click(screen.getByRole("button", { name: "预览受众" }));
-    expect((await screen.findAllByText("100")).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    // 等受众预览本身落地、「发送」可点再点。「100」也是统计卡「发送收件」的值（/messages/stats
+    // 与历史同时到达），只等「100」会在预览返回前去点仍禁用的「发送」，弹窗永远不出（OCV5-373）。
+    const sendButton = screen.getByRole("button", { name: /发送/ });
+    await waitFor(() => expect(sendButton).toBeEnabled());
+    expect(screen.getByText("预计收件人").nextElementSibling).toHaveTextContent("100");
+    fireEvent.click(sendButton);
 
     // 确认弹窗
     const dialog = await screen.findByRole("dialog");

@@ -200,7 +200,7 @@ describe("AgentPicker capability readiness", () => {
     expect(agent).not.toBeDisabled();
     expect(agent).toHaveAttribute("aria-disabled", "true");
     expect(agent).toHaveAccessibleDescription(/1 项插件待授权/);
-    expect(screen.getByText("Plugin 待授权")).toBeInTheDocument();
+    expect(screen.getByText("插件待授权")).toBeInTheDocument();
     fireEvent.click(agent);
     expect(onPick).not.toHaveBeenCalled();
     // 未传 onOpenPluginAuth:只保留说明,不渲染去授权按钮。

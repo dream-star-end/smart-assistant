@@ -26,7 +26,7 @@ import type {
   SkillSummary,
 } from "../../lib/types";
 import { cn } from "../../lib/utils";
-import { skillDisplayTitle } from "../manage/skillDisplay";
+import { SkillImportPicker } from "./SkillImportPicker";
 import {
   Alert,
   Badge,
@@ -391,7 +391,7 @@ function DoneScreen({
       <p className="text-title font-medium text-fg">已提交，等待平台审核</p>
       <p className="max-w-sm text-body text-muted">
         {plugin
-          ? "API 连接插件会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度会在市场内实时更新。"
+          ? "插件会先由 AI 核对完整技术声明与安全决策；真实凭据在用户绑定时由身份探针验证，不确定、内容过大或高风险项会转人工复核。审核进度会在市场内实时更新。"
           : "AI 审核通常几分钟内完成；通过后将上架并对其他用户可见，需要人工复核的会稍慢。"}
       </p>
       <div className="flex flex-wrap items-center justify-center gap-2">
@@ -480,7 +480,7 @@ function emptyAgentDraft(): AgentDraft {
 function emptyConnectorDraft(): ConnectorDraft {
   return {
     version: "1.0.0",
-    tags: "API 插件",
+    tags: "插件",
     specJson: "",
     decisionJson: "",
     meta: emptyHumanMeta(),
@@ -754,7 +754,8 @@ export function PublishPanel({
   }, [refill]);
 
   return (
-    <div className="flex flex-col gap-4 px-4 py-4">
+    <div className="marketplace-publish marketplace-workbench flex flex-col gap-4 px-4 py-4">
+      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">MADE TO SHARE</span><h2>把你的得心应手，分享出去。</h2><p>将经验变成技能，让更多人从你的创造中受益。</p></header>
       {confirmEl}
       <div ref={publishesRef}>
         <MyPublishes
@@ -790,7 +791,7 @@ export function PublishPanel({
           <span className="min-w-0 flex-1">
             <span className="block text-section font-semibold text-fg">
               在对话中创建
-              {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : " API 连接插件"}（推荐）
+              {kind === "skill" ? "技能" : kind === "agent" ? "智能体" : "插件"}（推荐）
             </span>
             <span className="mt-0.5 block text-meta leading-snug text-muted">
               回答几个选择题，AI 帮你完成起草、创建
@@ -945,8 +946,8 @@ function SkillPublishForm({
     // 导入会覆盖 IMPORT_OVERWRITES 里的每一个字段(不含商品信息)—— 其中任何一个已被
     // 用户写过就必须先确认,一次误点不能吃掉草稿。字段清单直接来自下面的 draft.set,
     // 两处改一处必改:漏一个就是"用户写的内容被静默替换"。
-    // 确认框与提示里的名字跟芯片一致(展示名),用户刚点的是什么就写什么(K-10)。
-    const shownName = skillDisplayTitle(sk).title;
+    // 确认框与选择项始终使用同一个技能名称，不将用途说明冒充标题。
+    const shownName = sk.name;
     if (draft.isDirty(IMPORT_OVERWRITES)) {
       const go = await confirmDialog({
         title: `用「${shownName}」覆盖当前内容？`,
@@ -1158,28 +1159,11 @@ function SkillPublishForm({
                   </Button>
                 </p>
               ) : (
-                <div className="flex flex-wrap gap-1.5">
-                  {/* 芯片用管理中心同一套展示名(描述首行),不再把 slug 当名字混排(K-10);
-                      slug 进 aria-label / title 供核对,与 manage 技能列表口径一致。 */}
-                  {mySkills.map((sk) => {
-                    const shown = skillDisplayTitle(sk);
-                    return (
-                      <Button
-                        key={sk.name}
-                        variant="secondary"
-                        size="sm"
-                        shape="pill"
-                        loading={importing === sk.name}
-                        disabled={importing !== null}
-                        onClick={() => void importSkill(sk)}
-                        aria-label={shown.caption ? `${shown.title}（${sk.name}）` : sk.name}
-                        title={shown.caption}
-                      >
-                        {shown.title}
-                      </Button>
-                    );
-                  })}
-                </div>
+                <SkillImportPicker
+                  skills={mySkills}
+                  importing={importing}
+                  onSelect={(skill) => void importSkill(skill)}
+                />
               )}
               {importNote && (
                 <p
@@ -1643,7 +1627,7 @@ function AgentPublishForm({
   return (
     <div className="flex flex-col gap-4">
       <Alert tone="info" density="compact">
-        智能体 = 模型 + 工具集 + 人设 + 可组合的 Skill / Plugin。安装时必需能力与智能体
+        智能体 = 模型 + 工具集 + 人设 + 可组合的技能 / 插件。安装时必需能力与智能体
         原子落地；插件账号仍由每位用户在管理中心授权。
       </Alert>
 
@@ -1795,7 +1779,7 @@ function AgentPublishForm({
           <div id={AGENT_ID.capabilities} className="flex flex-col gap-1.5">
             <span className="text-meta font-medium text-muted">组合能力</span>
             <p className="text-caption leading-snug text-faint">
-              选填。从你已安装的市场 Skill / Plugin 中选择：点击一次设为「必需」，再点设为「可选」，
+              选填。从你已安装的市场技能 / 插件中选择：点击一次设为「必需」，再点设为「可选」，
               第三次移除。必需能力不可用时整包回滚；可选能力不可用时会明确跳过。
             </p>
             {capState === "loading" ? (
@@ -1818,8 +1802,7 @@ function AgentPublishForm({
               </Alert>
             ) : installedCapabilities.length === 0 ? (
               <p className="text-caption text-faint">
-                你还没有可组合的市场能力 —— 先在「发现」安装 Skill 或
-                Plugin；也可以发布不带依赖的智能体。
+                你还没有可组合的市场能力 —— 先在「发现」安装技能或插件；也可以发布不带依赖的智能体。
               </p>
             ) : (
               <div className="flex flex-wrap gap-1.5">
@@ -1848,7 +1831,7 @@ function AgentPublishForm({
                       )}
                     >
                       {selected ? (selected.optional ? "可选 · " : "必需 · ") : ""}
-                      {capability.kind === "plugin" ? "Plugin" : "Skill"} · {capability.name}
+                      {capability.kind === "plugin" ? "插件" : "技能"} · {capability.name}
                       <span className="ml-1 font-mono text-micro text-faint">{capability.slug}</span>
                     </button>
                   );
@@ -2033,7 +2016,7 @@ function ConnectorPublishForm({
     } catch (e) {
       setErr({
         field: null,
-        message: apiErrorMessage(e, "发布 API 连接插件失败，请检查技术声明与安全决策。"),
+        message: apiErrorMessage(e, "发布插件失败，请检查技术声明与安全决策。"),
       });
     } finally {
       setSubmitting(false);
@@ -2064,8 +2047,8 @@ function ConnectorPublishForm({
 
   return (
     <div className="flex flex-col gap-4">
-      <Alert tone="info" density="compact" title="API 连接插件 · AI 自动审核">
-        当前支持无需运行自定义代码的声明式 API 连接插件。发布者填写的安全决策只是审核建议；AI 会核对完整 ConnectorSpec、固定网络来源、凭据位置与每个动作的读写效果，
+      <Alert tone="info" density="compact" title="插件 · AI 自动审核">
+        当前支持无需运行自定义代码的声明式插件。发布者填写的安全决策只是审核建议；AI 会核对完整 ConnectorSpec、固定网络来源、凭据位置与每个动作的读写效果，
         通过后编译并签名上架，用户绑定时再由身份探针验证真实凭据；不确定或高风险项转人工复核。OAuth2 社区插件必须自带 OAuth 应用（BYOA）。
       </Alert>
 
@@ -2084,7 +2067,7 @@ function ConnectorPublishForm({
               id={CONNECTOR_ID.tags}
               value={d.tags}
               onChange={(e) => draft.set({ tags: e.target.value })}
-              placeholder="API 插件, 文档"
+              placeholder="插件, 文档"
             />
           </Field>
         </div>
@@ -2092,7 +2075,7 @@ function ConnectorPublishForm({
 
       <Panel
         title="技术声明"
-        hint="不确定格式？用上方「在对话中创建 API 连接插件」让 AI 起草，比手写更快也更不容易被拒。"
+        hint="不确定格式？用上方「在对话中创建插件」让 AI 起草，比手写更快也更不容易被拒。"
       >
         <div className="flex flex-col gap-4">
           <Field
@@ -2108,7 +2091,7 @@ function ConnectorPublishForm({
               onBlur={() => setTouched((t) => ({ ...t, spec: true }))}
               rows={15}
               className="min-h-52 resize-y font-mono"
-              placeholder={'{"id":"my-plugin","label":"我的 API 插件",…}'}
+              placeholder={'{"id":"my-plugin","label":"我的插件",…}'}
             />
           </Field>
           <div className="-mt-2 flex flex-wrap items-center gap-2">
@@ -2357,7 +2340,7 @@ function MyPublishes({
                   <span className="text-body font-medium text-fg">{r.name}</span>
                   <span className="shrink-0 text-caption text-faint">v{r.version}</span>
                   {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
-                  {marketplaceArtifactKind(r) === "plugin" && <Badge tone="info">API 插件</Badge>}
+                  {marketplaceArtifactKind(r) === "plugin" && <Badge tone="info">插件</Badge>}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
                   {r.status === "approved" && !r.isCurrent && !revoked && !unlisted && (
                     <Badge tone="neutral">已被新版本取代</Badge>

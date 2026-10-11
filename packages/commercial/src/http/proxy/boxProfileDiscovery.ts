@@ -155,7 +155,7 @@ export function parseBoxProfileDiscovery(stdout: string): BoxDiscoveredProfile[]
     const row = item as Record<string, unknown>;
     const profile = typeof row.dir === "string" ? boxProfileNameFromDirName(row.dir) : null;
     const mode = row.projects;
-    const email = row.email, fp = row.fp, org = row.org;
+    const { email, fp, org } = row;
     if (!profile || seen.has(profile) || typeof row.login !== "boolean"
       || (mode !== "root" && mode !== "shared" && mode !== "absent" && mode !== "own")
       || (email !== null && !isMaskedEmail(email))

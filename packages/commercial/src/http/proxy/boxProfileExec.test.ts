@@ -111,7 +111,8 @@ test("an ordinary spool read and junk that only looks like one are ignored", asy
 });
 
 const cwdOf = (nonce: string) => `/tmp/ocv5-289-run-${nonce}`;
-const NONCE_A = "a".repeat(24), NONCE_B = "b".repeat(24);
+const NONCE_A = "a".repeat(24);
+const NONCE_B = "b".repeat(24);
 const readReq = (nonce: string) => ({ command: "/p", args: ["--read", cwdOf(nonce), "0", "65536"], cwd: "/tmp", environment: {} });
 const spoolBytes = (bytes: Buffer, start: number) => JSON.stringify({ offset: start + bytes.length, data: bytes.toString("base64") });
 
