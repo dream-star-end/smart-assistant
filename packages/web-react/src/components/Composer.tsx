@@ -321,8 +321,14 @@ export function Composer({
         : completionFor(value, prediction.candidates);
   // 只有浮层真的显示出来的那句才发(浮层是懒加载的,加载失败时什么都不显示,也就不能发)。
   const sendablePrediction = value === "" && ghostRest && ghostShown?.rest === ghostRest ? ghostRest : null;
+  // 值没变就不调 setState(连「返回原值」的更新也不排):浮层的报告可能落在 commit 阶段,
+  // 白排的同步更新会被 React 记成嵌套更新(#185)。
+  const ghostShownRef = useRef(ghostShown);
   const onPredictionShown = useCallback((rest: string, px: number) => {
-    setGhostShown((prev) => (prev && prev.rest === rest && prev.px === px ? prev : { rest, px }));
+    const prev = ghostShownRef.current;
+    if (prev && prev.rest === rest && prev.px === px) return;
+    ghostShownRef.current = { rest, px };
+    setGhostShown(ghostShownRef.current);
   }, []);
   const acceptPrediction = () => {
     if (!ghostRest) return;

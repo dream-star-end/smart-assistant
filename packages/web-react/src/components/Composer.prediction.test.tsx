@@ -148,6 +148,33 @@ describe("Composer 输入预测", () => {
     expect(screen.getByTestId("composer-prediction")).toBeInTheDocument();
   });
 
+  // 线上白屏(React #185,round 2):浮层每次渲染都在 layout effect 里调 onShown → Composer setState。
+  // 回答结束、预测显示着时页面空闲也会被计时器约 0.7 秒重渲一次,这些白排的同步更新被 React 记成嵌套更新,
+  // 约 35–50 秒累计到 50 次就整页白屏。jsdom 里 React 的这种累计复现不出来,所以直接卡住机制:
+  // 输入没变时重渲不能再报;Composer 收到相同的报告也不能 setState。
+  test("浮层只在内容变化时报告,父层重渲不再触发报告(#185)", async () => {
+    const { default: ComposerPrediction } = await import("./ComposerPrediction");
+    const onShown = vi.fn();
+    const el = (rest: string, value = "") => (
+      <ComposerPrediction value={value} rest={rest} large={false} hintId="h" onShown={onShown} />
+    );
+    const { rerender } = render(el("把木星的卫星也加上"));
+    expect(onShown).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 60; i++) rerender(el("把木星的卫星也加上"));
+    expect(onShown).toHaveBeenCalledTimes(1);
+    rerender(el("另一句"));
+    expect(onShown).toHaveBeenCalledTimes(2);
+    expect(onShown).toHaveBeenLastCalledWith("另一句", expect.any(Number));
+  });
+
+  test("生成中(busy)不显示上一轮的整句预测,发送按钮是「停止」", async () => {
+    render(<Composer onSend={() => {}} onStop={() => {}} prediction={prediction} busy />);
+    await flushFrames();
+    expect(screen.queryByTestId("composer-prediction")).toBeNull();
+    expect(screen.queryByRole("button", { name: "发送" })).toBeNull();
+    expect(screen.getByRole("button", { name: "停止" })).toBeInTheDocument();
+  });
+
   test("Shift+Tab 等带修饰键的 Tab 不采用", () => {
     render(<Composer onSend={() => {}} prediction={prediction} />);
     const ta = screen.getByLabelText("消息输入框") as HTMLTextAreaElement;
