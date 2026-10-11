@@ -99,6 +99,38 @@ describe("浏览器页", () => {
     expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 5");
   });
 
+  test("大记录定位桩:用点击带来的完整消息,或页面缓存里的正文", async () => {
+    const full = session();
+    const stub: ChatMessage = {
+      id: "b1",
+      role: "tool",
+      text: "",
+      ts: TS,
+      _payloadDeferred: true,
+      _turnTapeId: "tape-1",
+      _recordOrdinal: 3,
+    } as ChatMessage;
+    const messages = full.map((m) => (m.id === "b1" ? stub : m));
+    const { unmount } = render(
+      <InspectorPanelContent messages={messages} request={{ tab: "browser", message: full[2], nonce: 1 }} onClose={() => {}} />,
+    );
+    await browserReady();
+    expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveTextContent("3");
+    expect(screen.getAllByTestId("browser-log-row")[0]).toHaveAttribute("aria-current", "true");
+    unmount();
+    const peek = () => [full[2] as ChatMessage];
+    render(
+      <InspectorPanelContent
+        messages={messages}
+        deferredLoader={{ peek }}
+        request={{ tab: "browser", message: stub, nonce: 1 }}
+        onClose={() => {}}
+      />,
+    );
+    await browserReady();
+    expect(screen.getByRole("tab", { name: /浏览器/ })).toHaveTextContent("3");
+  });
+
   test("不在顶层轮里的浏览器步(子任务等)退回步骤详情", () => {
     const child = bash("child", "oc-browser open https://a.example", page("https://a.example/", "A"));
     render(<InspectorPanelContent messages={session()} request={{ tab: "browser", message: child, nonce: 1 }} onClose={() => {}} />);

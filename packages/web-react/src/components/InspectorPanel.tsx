@@ -189,6 +189,20 @@ function pickRecord(records: ChatMessage[] | null, locator: ChatMessage): ChatMe
   return records.find((r) => r.id === locator.id) ?? records.find((r) => r.role === "tool") ?? null;
 }
 
+function peekRecord(m: ChatMessage, loader?: DeferredPayloadLoader): ChatMessage | null {
+  const tapeId = m._turnTapeId;
+  const ordinal = m._recordOrdinal;
+  if (!m.id || !loader?.peek || typeof tapeId !== "string" || typeof ordinal !== "number") return null;
+  const expected = { recordId: m.id, role: m.role, ...(m._payloadSha256 ? { contentSha256: m._payloadSha256 } : {}) };
+  return pickRecord(loader.peek(tapeId, ordinal, expected), m);
+}
+
+/** 请求带来的完整消息(聊天卡已取到正文),按 id 记;定位桩不记。 */
+function fullRecordOf(message: ToolLike | null | undefined): Record<string, ChatMessage> {
+  const m = message as ChatMessage | null | undefined;
+  return m?.id && m._payloadDeferred !== true ? { [m.id]: m } : {};
+}
+
 /** 定位桩 → 完整工具消息(先 peek 页面缓存,没有再取);不是定位桩原样返回。 */
 function useHydratedTool(message: ToolLike, loader?: DeferredPayloadLoader): Hydrated {
   const m = message as ChatMessage;
@@ -679,7 +693,23 @@ export function InspectorPanelContent({
   const [browserFocus, setBrowserFocus] = useState<string | null>(() =>
     request?.tab === "browser" ? (idOf(request.message) ?? null) : null,
   );
-  const viewedTurn = workTurns[outputsIndex];
+  // 大记录定位桩没有命令和输出,认不出是浏览器步:换成请求带来的完整消息,或页面缓存里已取到的正文。
+  const [fullRecords, setFullRecords] = useState<Record<string, ChatMessage>>(() => fullRecordOf(request?.message));
+  const browserTurns = useMemo(
+    () =>
+      workTurns.map((t) =>
+        t.steps.some((m) => m._payloadDeferred === true)
+          ? {
+              ...t,
+              steps: t.steps.map((m) =>
+                m._payloadDeferred === true ? ((m.id ? fullRecords[m.id] : undefined) ?? peekRecord(m, deferredLoader) ?? m) : m,
+              ),
+            }
+          : t,
+      ),
+    [workTurns, fullRecords, deferredLoader],
+  );
+  const viewedTurn = browserTurns[outputsIndex];
   // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
   const browserCount = useMemo(
     () => (viewedTurn ? viewedTurn.steps.filter((m) => isBrowserStepMessage(m)).length : 0),
@@ -713,7 +743,11 @@ export function InspectorPanelContent({
     if (!next) return;
     setTabState(next);
     if (next === "outputs" || next === "browser") setTurnKey(turnKeyFor(request.message));
-    if (next === "browser") setBrowserFocus(idOf(request.message) ?? null);
+    if (next === "browser") {
+      setBrowserFocus(idOf(request.message) ?? null);
+      const full = fullRecordOf(request.message);
+      if (Object.keys(full).length > 0) setFullRecords((prev) => ({ ...prev, ...full }));
+    }
     if (next === "steps") {
       setSelected(request.message ?? null);
       // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
@@ -812,7 +846,7 @@ export function InspectorPanelContent({
         ) : view === "browser" ? (
           <Suspense fallback={<OutputsFallback />}>
             <BrowserView
-              turns={workTurns}
+              turns={browserTurns}
               index={outputsIndex}
               running={running && outputsIndex === lastTurn}
               focusId={browserFocus}

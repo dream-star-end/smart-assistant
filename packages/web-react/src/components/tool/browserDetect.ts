@@ -8,8 +8,11 @@ import type { ToolLike } from "./format";
 import { asStr, normalizeToolForDisplay } from "./format";
 import { detectOcCli, parseMcpName } from "./meta";
 
-/** 命令位置调用了 oc-browser(动词由 browserSteps 的动作表解析;没登记的动词也算浏览器操作)。 */
-const OC_BROWSER_CALL = /(?:^|[\n;&|(]\s*)(?:\S*\/)?oc-browser\s+([a-z-]+)/i;
+/**
+ * 命令位置调用了 oc-browser(动词由 browserSteps 的动作表解析;没登记的动词也算浏览器操作)。
+ * 前缀与 meta.detectOcCli 同口径:行首空白、env 赋值、路径、`cd &&` / 管道 / 换行。
+ */
+const OC_BROWSER_CALL = /(?:^\s*|[\n;&|(]\s*)(?:\w+=\S*\s+)*(?:\S*\/)?oc-browser\s+([a-z-]+)/i;
 /** 同一模式的全局版,给 matchAll 逐个取动词。 */
 export const OC_BROWSER_CALL_RE = new RegExp(OC_BROWSER_CALL.source, "gi");
 

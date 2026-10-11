@@ -179,6 +179,12 @@ test("isBrowserStepMessage(首屏判定)与完整解析同口径", () => {
   ];
   expect(cases.map((m) => isBrowserStepMessage(m))).toEqual([true, true, false, true, false, true, false]);
   expect(cases.map((m) => browserStepOf(m) !== null)).toEqual([true, true, false, true, false, true, false]);
+  // 前缀与 detectOcCli 同口径:env 赋值、行首空白。
+  const prefixed = bash("FOO=1 oc-browser screenshot", "- [Screenshot](/home/agent/.openclaude/generated/x.png)");
+  expect(isBrowserStepMessage(prefixed)).toBe(true);
+  expect(browserStepOf(prefixed)?.shots).toEqual(["/home/agent/.openclaude/generated/x.png"]);
+  expect(browserStepOf(prefixed)?.actions.map((a) => a.verb)).toEqual(["screenshot"]);
+  expect(browserStepOf(bash("  oc-browser click e3", "ok"))?.actions[0]?.detail).toBe("e3");
   // 工具卡分派处已拿到命令、行里没有输入时用调用方给的命令。
   expect(isBrowserStepMessage({ output: "x" }, "oc-browser click e1")).toBe(true);
 });
