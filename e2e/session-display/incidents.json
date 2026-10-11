@@ -6720,7 +6720,11 @@
           "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
           "assertion": "a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层(真实 installer.py 对 f1727e3 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌;锚点反例;生命周期同一主程序遇新模块再试一次);线上证据要账号 25 的真实 Box:发布后生命周期 ready、能力探针命中新模块、账号池写入 ≥1、个人版 box-claude 回合跑通,属一次性运维核对,个人版发布不跑 deploy-gate/live-e2e,canary 也没有 Cursor slot。",
+        "since": "2026-10-11"
+      }
     }
   ]
 }
