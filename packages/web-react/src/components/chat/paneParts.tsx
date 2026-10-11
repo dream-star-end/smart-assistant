@@ -3,7 +3,7 @@
  * 文件的一次改动。产出页(OutputsView)与步骤页都用,放在这里免得两边互相 import。
  */
 import { Check, Copy } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type DisplayTool, type ToolLike, asStr, normalizeToolForDisplay } from "../tool/format";
 import { ToolBodyFullContext, ToolHeaderLabelContext } from "../tool/context";
 import { ToolBody } from "../tool/lazyToolBody";
@@ -23,6 +23,18 @@ export function CopyIconButton({
 }) {
   const toast = useToast();
   const [done, setDone] = useState(false);
+  // 「已复制」复位定时器只留一个,卸载时清掉:漏清的定时器会在面板(测试里是整个 jsdom)拆除后回写 state。
+  const doneTimer = useRef<number | null>(null);
+  const clearDoneTimer = () => {
+    if (doneTimer.current !== null) window.clearTimeout(doneTimer.current);
+    doneTimer.current = null;
+  };
+  useEffect(
+    () => () => {
+      if (doneTimer.current !== null) window.clearTimeout(doneTimer.current);
+    },
+    [],
+  );
   return (
     <IconButton
       aria-label={label}
@@ -34,7 +46,11 @@ export function CopyIconButton({
           await navigator.clipboard.writeText(getText());
           setDone(true);
           toast(doneText, "success");
-          setTimeout(() => setDone(false), 1500);
+          clearDoneTimer();
+          doneTimer.current = window.setTimeout(() => {
+            doneTimer.current = null;
+            setDone(false);
+          }, 1500);
         } catch {
           // 剪贴板不可用(非安全上下文 / 权限拒绝):不能再静默,给用户一个出口(T-19)。
           toast("复制失败，请手动选中文本复制", "error");
