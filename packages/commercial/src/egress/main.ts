@@ -494,7 +494,7 @@ export async function startEgress(): Promise<void> {
         log.warn("box_exec_target_unavailable", { code: (err as { code?: string }).code ?? "unknown" });
         return { kind: "unavailable" };
       } finally { clearTimeout(timer); }
-    } });)
+    } }));
   const boxStopCleanupTimer = setInterval(() => {
     void boxStopCoordinator.retryFailedLocal().catch(() =>
       log.error("box_stop_local_cleanup_failed"));
