@@ -376,7 +376,7 @@ describe('seedPlatformGeneralAgents (integ) — 办公助手 + 编程助手', ()
       await listCurrentAgentDefaults(GENERAL_SLUGS),
       {
         'coding-assistant': { version: '1.0.4', model: 'glm-5.3-zai' },
-        'general-assistant': { version: '1.0.0', model: 'auto' },
+        'general-assistant': { version: '1.0.1', model: 'auto' },
         'office-assistant': { version: '1.0.3', model: 'grok-build' },
       },
       '当前 approved 版本应体现不同助手的默认模型(办公 Grok 4.7,编程 GLM-5.3 Z.AI Coding Plan,通用 auto=不锁模型)',
