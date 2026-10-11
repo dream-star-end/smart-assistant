@@ -1,0 +1,16 @@
+# Paths V5 selfhost (feat/v5-selfhost) may keep different from commercial (feat/v5-aurora-rewrite).
+# Everything else must be identical on both tips after the unified sync (OCV5-376 / P5).
+# Checked by scripts/check-v5-two-tree-divergence.ts. `*` = within one path segment, `**` = across.
+# A pattern that matches no tracked file fails the check, so delete entries that are gone.
+#
+# Add a path here only when it is selfhost-specific by design (personal deploy, personal-only
+# entry point), never to silence a difference that should be ported.
+
+# Personal deploy: the selfhost release script, its libraries, units and their tests.
+deploy/v5-selfhost/**
+scripts/*selfhost*
+scripts/__tests__/*selfhost*
+scripts/__tests__/*Selfhost*
+
+# Selfhost-only CI (the commercial tree runs v5-ci.yml).
+.github/workflows/v5-selfhost-*.yml

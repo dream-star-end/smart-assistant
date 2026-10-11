@@ -1,0 +1,58 @@
+name: V5 selfhost gates
+
+# 个人版(feat/v5-selfhost)的仓库级门(OCV5-376)。此前这些检查只有商业 v5-ci.yml 跑
+# (只触发 feat/v5-aurora-rewrite),在个人版树上从没跑过:事故账本里一条 assertion 锚点
+# 早已改名也没人发现,整包 lint 永远红。这里跑的是个人版能真实通过、失败即有意义的版本。
+#   · biome:只看本次改动的文件,只拦新增错误(scripts/check-biome-changed.sh);
+#   · 事故账本:check-v5-incident-regressions.ts --edition=selfhost + ledger superset;
+#   · 两树差异:只报告不拦(两棵树统一同步之后改成 --enforce)。
+
+on:
+  pull_request:
+    branches: [feat/v5-selfhost]
+  push:
+    branches: [feat/v5-selfhost]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-selfhost-gates-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: selfhost-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 账本血缘、trailer 闭环与两树差异都要完整历史和 feat/v5-aurora-rewrite。
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Biome (changed files, no new errors)
+        run: npm run lint
+
+      - name: Incident ledger (selfhost edition)
+        run: npx tsx scripts/check-v5-incident-regressions.ts --edition=selfhost
+
+      - name: Incident ledger superset
+        run: npx tsx scripts/check-incident-ledger-superset.ts
+
+      - name: Gate script tests
+        run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts
+
+      - name: Two-tree divergence (report only until the unified sync)
+        run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
