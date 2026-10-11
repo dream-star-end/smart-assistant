@@ -97,10 +97,14 @@ async function settleStrandedIdleOp(session: AgentSession, op: IdleOp, recoveryD
  * egress to stop that run, as a browser Stop does (container-scoped, this
  * session and idle turn key only); its proof then reads failed and the op
  * settles as idle_turn_failed. Nothing is sent to a model. */
+const IDLE_TURN_STOP_WAIT_MS = 30_000
 async function stopParkedIdleTurn(op: IdleOp): Promise<void> {
   if (idleOpSettled(op) || op.summaryText || typeof op.runnerKilledAt !== 'number') return
-  const outcome = await notifyBoxUserStop({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey })
-    .catch(() => 'pending' as const)
+  // Bounded: this runs under session.lock on the submit path. A stop that is
+  // still running on egress past the budget completes there; the op then
+  // settles on a later pass (Codex r1).
+  const outcome = await notifyBoxUserStop({ sessionId: op.sourceSessionId, turnKey: op.idleTurnKey },
+    { timeoutMs: IDLE_TURN_STOP_WAIT_MS }).catch(() => 'pending' as const)
   if (outcome !== 'skipped') {
     log.info('box idle turn stop requested', { sessionKey: op.sessionKey, revision: op.revision, outcome })
   }

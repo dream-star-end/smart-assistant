@@ -9,7 +9,7 @@ const TURN = /^[a-f0-9]{64}$/
 
 export async function notifyBoxUserStop(input: { sessionId: string; turnKey: string },
   deps: { env?: NodeJS.ProcessEnv; fetchImpl?: Fetcher;
-    readFile?: (path: string) => string } = {}): Promise<'stopped' | 'pending' | 'skipped'> {
+    readFile?: (path: string) => string; timeoutMs?: number } = {}): Promise<'stopped' | 'pending' | 'skipped'> {
   if (!SESSION.test(input.sessionId) || !TURN.test(input.turnKey)) return 'skipped'
   const env = deps.env ?? process.env
   const base = env.ANTHROPIC_BASE_URL?.trim()
@@ -36,7 +36,7 @@ export async function notifyBoxUserStop(input: { sessionId: string; turnKey: str
     redirect: 'error',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({ session_id: input.sessionId, oc_turn_key: input.turnKey }),
-    signal: AbortSignal.timeout(70_000),
+    signal: AbortSignal.timeout(deps.timeoutMs ?? 70_000),
   })
   if (!response.ok) return 'pending'
   let body: unknown
