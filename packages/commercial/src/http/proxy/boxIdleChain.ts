@@ -80,6 +80,14 @@ const RESUMABLE_STATES = new Set(["inflight", "finalizing", "committed"]);
  * markToolChainStoppedFailure / CLEANUP_PROOF_FENCE (failed branch) and the
  * prestart stop fences. Returns null for every other shape.
  */
+/** The run a component's leaf belongs to (its terminal proof's nonce, else the
+ * row's), or null when the row names none (a never-launched prestart stop). */
+function leafRun(leaf: IdleChainRow): string | null {
+  const proof = leaf.ctx.boxTerminalProof as { runNonce?: unknown } | undefined;
+  const nonce = typeof proof?.runNonce === "string" ? proof.runNonce : leaf.ctx.boxRunNonce;
+  return typeof nonce === "string" ? nonce : null;
+}
+
 function projectFailedChain(leafId: string, byId: Map<string, IdleChainRow>): IdleChainRow[] | null {
   const chain: IdleChainRow[] = [];
   const seen = new Set<string>();
@@ -352,28 +360,39 @@ export function projectBoxIdleChain(input: {
   if (leaves.length === 0) return { status: "pending", reason: "leaf" };
   const chains: IdleChainRow[][] = [];
   const covered = new Set<string>();
+  // OCV5-377 (commercial uid 4, 10-11): one turn may hold several components,
+  // e.g. a tool chain stopped on an upstream refusal plus the client's retry,
+  // itself refused. Each leaf is a success chain or, after that projection
+  // failed, a proven failed chain (closed, unbilled final); anything else keeps
+  // the turn pending. Components must be disjoint, cover every row and come
+  // from distinct runs. Before, only a single-leaf turn could project failed,
+  // so such a turn stayed pending forever and the container refused every next
+  // message of the session (IDLE_HISTORY_PENDING).
+  const failedIds: string[] = [];
+  const runs = new Set<string>();
   for (const leafRow of leaves) {
     const built = projectOneChain(leafRow.requestId, byId);
-    if (!built.ok) {
-      // Tried only after the success projection failed, for a single chain
-      // that covers every scoped row with no other open chain.
-      const failed = leaves.length === 1 ? projectFailedChain(leafRow.requestId, byId) : null;
-      const open = (input.otherOpenRequestIds ?? []).filter((id) => !byId.has(id));
-      if (failed && failed.length === scoped.length && open.length === 0) {
-        return { status: "failed", sessionId: input.sessionId, turnKey: input.turnKey,
-          requestIds: failed.map((row) => row.requestId).sort() };
-      }
-      return { status: "pending", reason: built.reason };
+    const component = built.ok ? built.chain : projectFailedChain(leafRow.requestId, byId);
+    if (!component) return { status: "pending", reason: built.ok ? "unsettled" : built.reason };
+    const run = leafRun(component[0]!);
+    if (run !== null) {
+      if (runs.has(run)) return { status: "pending", reason: "fork" };
+      runs.add(run);
     }
-    for (const row of built.chain) {
+    for (const row of component) {
       if (covered.has(row.requestId)) return { status: "pending", reason: "fork" };
       covered.add(row.requestId);
     }
-    chains.push(built.chain);
+    if (built.ok) chains.push(built.chain);
+    else failedIds.push(...component.map((row) => row.requestId));
   }
   if (covered.size !== scoped.length) return { status: "pending", reason: "gap" };
   const open = (input.otherOpenRequestIds ?? []).filter((id) => !byId.has(id));
   if (open.length > 0) return { status: "pending", reason: "other_chain" };
+  if (chains.length === 0) {
+    return { status: "failed", sessionId: input.sessionId, turnKey: input.turnKey,
+      requestIds: failedIds.sort() };
+  }
   if (chains.length === 1) {
     const chain = chains[0]!;
     const leaf = chain[0]!;
@@ -412,7 +431,8 @@ export function projectBoxIdleChain(input: {
     sessionId: input.sessionId,
     turnKey: input.turnKey,
     revision: sha({ sessionId: input.sessionId, turnKey: input.turnKey, members }),
-    requestIds: [...covered].sort(),
+    // The ready members only; a proven failed component carries no capsule.
+    requestIds: chains.flat().map((row) => row.requestId).sort(),
   };
 }
 
