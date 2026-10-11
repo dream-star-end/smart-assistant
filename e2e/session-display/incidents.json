@@ -5790,7 +5790,7 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
-          "assertion": "a new launch is refused before anything is admitted unless the installed CLI is supported"
+          "assertion": "a new launch is refused before anything is admitted only when the CLI version cannot be read"
         },
         {
           "layer": "integration",
@@ -6407,12 +6407,19 @@
       "severity": "P2",
       "symptom": "OCV5-308候选真实Chromium回归复现（非声称生产用户报障）：工具卡默认头部只有40px，低于原44px键盘/指针命中合同；恢复44px。（个人版 OCV5-343 挑自商业 5abf0dfd：个人版缺此修复，前端单测/浏览器回归长期红。）",
       "rootFixCommit": "a492e45d",
-      "coverageCommits": [],
+      "coverageCommits": [
+        "7e6a2d06"
+      ],
       "regressions": [
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ToolCard.test.tsx",
+          "assertion": "工具卡表头默认至少 44px 高(min-h-11),不是 40px"
         }
       ]
     },

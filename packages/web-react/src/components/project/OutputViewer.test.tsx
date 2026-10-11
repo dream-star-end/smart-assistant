@@ -7,6 +7,10 @@ import { prefetchMarkdownImpl } from "../Markdown";
 import { MediaSignProvider } from "../chat/media";
 import { ToastProvider, TooltipProvider } from "../ui";
 import { OutputRow, OutputViewer, __resetOutputSnippetCache } from "./OutputViewer";
+import { loadBeforeAll } from "../../test/moduleLoad";
+
+// 点开图片后断言查看器内容:懒加载的 ImageViewer 先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(() => import("../ImageViewer"));
 
 const sign = async (paths: string[]) =>
   Object.fromEntries(paths.map((p) => [p, `/api/media-signed?t=${encodeURIComponent(p)}`]));

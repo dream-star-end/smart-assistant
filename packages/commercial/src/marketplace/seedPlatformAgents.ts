@@ -233,7 +233,10 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       description:
         '不锁模型、不锁思考档的全能预设:编程、写作、分析、检索、办公文件、日常问答都接;用哪个模型、开多深的思考完全由你在会话里随时指定。',
       tags: ['通用', '全能', '任意模型', '思考档位'],
-      version: '1.0.0',
+      // 1.0.1(OCV5-376):库里已批准的 1.0.0 manifest 是 model=glm-5.3-zai(早于 auto 定稿的
+      // 一次 seed),之后代码改成 AGENT_MODEL_AUTO 却没 bump,approvePlatformVersion 每次启动都因
+      // artifact hash 不一致拒批,listing 一直指着锁 GLM-5.3 的旧版。bump 后新版本按 auto 发布并批准。
+      version: '1.0.1',
       // AGENT_MODEL_AUTO = 「不锁模型」:用户在模型选择器任选(帧模型优先),不选则落
       // 平台默认链 —— 与 main 同形;master 计费权威侧 auto 归一为平台默认,无旁路面。
       model: AGENT_MODEL_AUTO,
@@ -448,6 +451,12 @@ export async function seedPlatformResearchAgents(
 /** 平台预设 agent 的 slug 权威(与上面的 seed 定义同源)。预设 = 开箱即用:
  *  my-agents 与容器 sync 无条件下发 current approved 版本,无需安装、不可卸载。
  *  科研预设仍受 research_config 门控(关闭时科研能力 503,预设它只会坏)。 */
+/** 全部平台 seed 定义(只读),供 artifact hash 钉住测试使用。 */
+export const PLATFORM_SEED_AGENT_DEFS: readonly Readonly<PlatformAgentDef>[] = [
+  ...PLATFORM_GENERAL_AGENTS,
+  ...PLATFORM_RESEARCH_AGENTS,
+]
+
 export const PLATFORM_GENERAL_AGENT_SLUGS: readonly string[] = PLATFORM_GENERAL_AGENTS.map(
   (a) => a.slug,
 )

@@ -12,6 +12,11 @@ import {
   PANE_TAB_STORAGE_KEY,
   paneRequestForSession,
 } from "./InspectorPanel";
+import { preloadToolBody } from "./tool/lazyToolBody";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+// These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
+loadBeforeAll(preloadToolBody);
 
 afterEach(cleanup);
 beforeEach(() => {

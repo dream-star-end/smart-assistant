@@ -4,6 +4,11 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { AuthSession, MarketplaceCard } from "../../lib/types";
 import { createMemoryAuthSession } from "../../lib/authSession";
 import { ToastProvider } from "../ui";
+import { prefetchMarkdownImpl } from "../Markdown";
+import { loadBeforeAll } from "../../test/moduleLoad";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 // api 网络层全 mock —— 只验证 BrowsePanel 的分区/筛选片行为,不打真实网络。
 const searchMarketplace = vi.fn();

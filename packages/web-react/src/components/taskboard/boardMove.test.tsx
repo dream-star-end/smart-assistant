@@ -21,6 +21,11 @@ import {
   formatMoveSuccess,
   formatNoIntentMessage,
 } from './ticketMove'
+import { prefetchMarkdownImpl } from '../Markdown'
+import { loadBeforeAll } from '../../test/moduleLoad'
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl)
 
 afterEach(() => {
   cleanup()

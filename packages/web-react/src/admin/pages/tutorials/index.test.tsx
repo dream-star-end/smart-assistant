@@ -4,6 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { adminApi } from '../../../lib/api/admin'
 import type { CommunityTutorialPending } from '../../../lib/types'
 import TutorialReviewPage from './index'
+import { prefetchMarkdownImpl } from '../../../components/Markdown'
+import { loadBeforeAll } from '../../../test/moduleLoad'
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl)
 
 const pending: CommunityTutorialPending = {
   id: '9',

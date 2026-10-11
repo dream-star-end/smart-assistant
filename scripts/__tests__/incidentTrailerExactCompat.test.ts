@@ -29,6 +29,8 @@ function execute(options: {
   trailer?: string | null;
   incidents?: Row[];
   waivers?: Map<string, Waiver>;
+  /** Commits `git rev-list TIP ^START` reports as frozen imported history (default: the tip only). */
+  frozen?: string[];
 } = {}) {
   const sha = options.sha ?? TARGET;
   const trailer = options.trailer === undefined ? OLD : options.trailer;
@@ -54,6 +56,8 @@ function execute(options: {
       if (args[0] === "cat-file" && args[1] === "-e" && args.length === 3
         && [START + "^{commit}", TIP + "^{commit}"].includes(args[2]!)) return "";
       if (key === `log -1 --format=%ct ${START}`) return "100";
+      // OCV5-376: the frozen-history set is one rev-list, not a merge-base per commit × tip.
+      if (key === `rev-list ${TIP} ^${START}`) return (options.frozen ?? [TIP]).join("\n");
       if (key === `log --no-merges --format=%H%x1f%s%x1f%b%x1f%ct%x1e ${START}..HEAD`) {
         return `${sha}\x1ffix(v5): exact fixture\x1f${trailer === null ? "no trailer" : `Incident: ${trailer}`}\x1f101\x1e`;
       }
@@ -63,7 +67,6 @@ function execute(options: {
       assert.equal(cmd, "git"); assert.equal(opts.cwd, "/isolated-checker-fixture");
       const key = args.join(" "); calls.push(key);
       if (key === `merge-base --is-ancestor ${START} HEAD` || key === `merge-base --is-ancestor ${TIP} HEAD`) return "";
-      if (key === `merge-base --is-ancestor ${sha} ${TIP}`) throw new Error("not a frozen ancestor");
       return bad(`exec ${key}`);
     },
   };
@@ -72,8 +75,10 @@ function execute(options: {
     return { checked, audit: audit.join("") };
   } finally {
     assert.deepEqual(unexpected, [], "fixture cannot silently accept unknown git calls");
-    assert.ok(calls.includes(`files:${sha}`), "commit must reach user-visible surface check");
-    assert.ok(calls.includes(`merge-base --is-ancestor ${sha} ${TIP}`), "target must not be skipped as imported history");
+    assert.ok(calls.includes(`rev-list ${TIP} ^${START}`), "frozen imported history must be queried");
+    if (!(options.frozen ?? []).includes(sha)) {
+      assert.ok(calls.includes(`files:${sha}`), "target must not be skipped as imported history");
+    }
   }
 }
 
@@ -125,4 +130,8 @@ test("a future ordinary legal incident still follows original closure", () => {
 });
 test("a future ordinary malformed incident remains rejected", () => {
   assert.throws(() => execute({ sha: "b".repeat(40), trailer: "OCV5-999" }), /Incident trailer 格式非法:OCV5-999/);
+});
+test("a commit inside a frozen tip's history is skipped, not judged", () => {
+  const r = execute({ trailer: "OCV5-999", frozen: [TIP, TARGET] });
+  assert.equal(r.checked, 0);
 });

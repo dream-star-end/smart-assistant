@@ -12,24 +12,33 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// OCV5-376: the route branches live in routes/chatProjects.ts; server.ts dispatches to it.
+const routeSrc = readFileSync(join(here, '../routes/chatProjects.ts'), 'utf8')
 const allowlistSrc = readFileSync(join(here, '../bridgeApiAllowlist.ts'), 'utf8')
 
 describe('chat-projects 网关接线', () => {
   it('集合路由用 url.pathname === 字面量,条目路由用 match 字面量', () => {
     assert.ok(
-      serverSrc.includes("url.pathname === '/api/chat-projects'"),
-      "server.ts 必须有 url.pathname === '/api/chat-projects'",
+      routeSrc.includes("url.pathname === '/api/chat-projects'"),
+      "routes/chatProjects.ts 必须有 url.pathname === '/api/chat-projects'",
     )
     assert.ok(
-      serverSrc.includes('url.pathname.match(/^\\/api\\/chat-projects\\/([a-zA-Z0-9_-]{8,64})$/)'),
+      routeSrc.includes('url.pathname.match(/^\\/api\\/chat-projects\\/([a-zA-Z0-9_-]{8,64})$/)'),
       'PATCH/DELETE 必须是 url.pathname.match(/^\\/api\\/chat-projects\\/:id$/)',
     )
-    assert.match(serverSrc, /listChatProjects\(/)
-    assert.match(serverSrc, /createChatProject\(/)
-    assert.match(serverSrc, /updateChatProject\(/)
-    assert.match(serverSrc, /deleteChatProject\(/)
-    assert.match(serverSrc, /boardProjectId/)
-    assert.match(serverSrc, /board_project_bound/)
+    assert.match(routeSrc, /listChatProjects\(/)
+    assert.match(routeSrc, /createChatProject\(/)
+    assert.match(routeSrc, /updateChatProject\(/)
+    assert.match(routeSrc, /deleteChatProject\(/)
+    assert.match(routeSrc, /boardProjectId/)
+    assert.match(routeSrc, /board_project_bound/)
+  })
+
+  it('server.ts 在原位置(read-all 之后、project-assets 之前)把请求交给 handleChatProjectsHttp', () => {
+    const readAll = serverSrc.indexOf("url.pathname === '/api/sessions/read-all'")
+    const dispatch = serverSrc.indexOf('if (handleChatProjectsHttp(this.httpIo, req, res, url)) return')
+    const assets = serverSrc.indexOf('if (handleProjectAssetsHttp(this.httpIo, req, res, url)) return')
+    assert.ok(readAll >= 0 && dispatch > readAll && assets > dispatch)
   })
 
   it('KNOWN_ROUTES 含 /api/chat-projects,normalizePath 收动态段', () => {

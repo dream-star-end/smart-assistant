@@ -3,6 +3,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
+import { prefetchMarkdownImpl } from "../../../../components/Markdown";
+import { loadBeforeAll } from "../../../../test/moduleLoad";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 // ReviewPanel / FeaturedPanel（被复用组件）依赖用户端 api 网络层 —— 全 mock，只验证
 // admin 页把 adminSession 作为 AuthSession 传入后能干净挂载出两 tab(审核 + 精选管理)。

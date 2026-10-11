@@ -3,6 +3,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, test } from "vitest";
 import { MediaSignProvider } from "./chat/media";
 import { ToolCard } from "./ToolCard";
+import { preloadToolBody } from "./tool/lazyToolBody";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+// These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
+loadBeforeAll(preloadToolBody);
 
 afterEach(cleanup);
 
@@ -1721,6 +1726,19 @@ describe("T-08:卡内文字型操作在触屏下有 44px 命中面积", () => {
     // 摘要键中文化:output_mode 不再直显 files_with_matches
     expect(document.body.textContent).toContain("匹配的文件");
     expect(document.body.textContent).not.toContain("files_with_matches");
+  });
+});
+
+describe("INC-20261002-TOOL-HIT-TARGET 工具卡表头的命中面积", () => {
+  // 292f59093 曾把表头降到 min-h-10(40px),真浏览器 T13 的 44px 指针/键盘命中契约随之失效;
+  // a492e45d 改回 min-h-11。这里在 jsdom 层先锁住 class,不必等真浏览器门。
+  test("工具卡表头默认至少 44px 高(min-h-11),不是 40px", () => {
+    render(
+      <ToolCard message={{ toolName: "Bash", inputJson: { command: "pwd" }, _completed: true, output: "/home" }} />,
+    );
+    const header = screen.getByRole("button", { name: "终端 pwd 完成" });
+    expect(header.className).toMatch(/(^|\s)min-h-11(\s|$)/);
+    expect(header.className).not.toMatch(/(^|\s)min-h-10(\s|$)/);
   });
 });
 

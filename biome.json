@@ -1,6 +1,6 @@
 {
   "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
-  "files": { "ignore": ["**/dist/**", "**/node_modules/**", "packages/web/public/vendor/**"] },
+  "files": { "ignore": ["**/dist/**", "**/dist-types/**", "**/node_modules/**", "packages/web/public/vendor/**"] },
   "formatter": { "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },
   "linter": {
     "enabled": true,
@@ -19,5 +19,8 @@
       }
     }
   },
-  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } }
+  "javascript": { "formatter": { "quoteStyle": "single", "semicolons": "asNeeded" } },
+  "overrides": [
+    { "include": ["**/tsconfig*.json"], "json": { "parser": { "allowComments": true } } }
+  ]
 }

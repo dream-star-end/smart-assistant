@@ -107,7 +107,7 @@ describe('容器路由 × bridge allowlist 闭包契约(#201)', () => {
         (r) =>
           !claimedByAllowlist(r.sample) && !NOT_PROXIED_ON_PURPOSE.some((e) => e.re.test(r.sample)),
       )
-      .map((r) => `${r.declared} (server.ts:${r.line}, 样例 ${r.sample})`)
+      .map((r) => `${r.declared} (${r.file}:${r.line}, 样例 ${r.sample})`)
 
     assert.deepEqual(
       unowned,

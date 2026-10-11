@@ -4,6 +4,15 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { MessageBoundary } from "./MessageBoundary";
 import { MessageList } from "./MessageRenderer";
+import { prefetchMarkdownImpl } from "./Markdown";
+import { loadBeforeAll } from "../test/moduleLoad";
+import { preloadToolBody } from "./tool/lazyToolBody";
+
+// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody);
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 // 把 UserCard 换成"遇到 id==='bad' 必抛"的版本:构造一条渲染必抛的消息(签名计算安全、
 // 渲染期抛),验证 per-message boundary 只降级该条、相邻消息不受影响。其余卡保持原实现。

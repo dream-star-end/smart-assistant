@@ -14,6 +14,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
+import { inHeadLineage } from "./lib/lineage.ts";
 
 const ROOT = resolve(import.meta.dirname, "..");
 const MANIFEST = join(ROOT, "e2e/session-display/incidents.json");
@@ -37,6 +38,51 @@ const ASSERTION_DEBT_BASELINE = 37;
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
 const PROOF_PENDING_BASELINE = 11;
+
+// ── 个人版(--edition=selfhost)────────────────────────────────────────────────
+// 个人版的发布(deploy-v5-selfhost.sh)不跑商业的 deploy-gate / live-e2e proof,所以同一条事故在
+// 个人版账本里常常只有 unit/integration 证据,上面 11 条的计数门在个人版上结构性过不去,
+// 这道门因此在个人版上从来不跑,账本跟着烂(OCV5-376 跑出一条早已改名的 assertion 锚点)。
+// 个人版的规则:
+//   · 存量:2026-10-11 盘点出的 63 条无 proof 事故逐条列在 SELFHOST_PROOF_DEBT(带原因)。按 id
+//     只许删不许加(与基线引用上的清单比),已有 proof 或已不在账本的必须删掉。
+//   · 新事故:与商业版同一条规则 —— 有 proof 层证据,或写 proofPending{reason,since} 并计入
+//     SELFHOST_PROOF_PENDING_BASELINE。基线只在评审里显式调高(商业版 11→17 也是这样走的)。
+//     个人版跑不了 Box 活体 proof(canary 没有 Box 模型),所以这条路必须存在,否则门又会永远红。
+// 其余校验(锚点、路径形态、runner、血缘、trailer 闭环)两版完全相同。商业版不传 --edition,行为不变。
+const EDITION_ARG = process.argv.find((arg) => arg.startsWith("--edition="));
+const EDITION = EDITION_ARG ? EDITION_ARG.slice("--edition=".length) : "commercial";
+const SELFHOST_PROOF_DEBT = join(ROOT, "e2e/session-display/selfhost-proof-debt.json");
+/** 个人版存量无 proof 事故清单的条数上界(2026-10-11 OCV5-376 盘点所得);只许降不许升。 */
+const SELFHOST_PROOF_DEBT_CEILING = 63;
+/**
+ * 个人版新登记、带 proofPending 的无 proof 事故条数上界(同商业版 PROOF_PENDING_BASELINE 的用法)。
+ * 1 = INC-20261011-BOX-TOOL-409-STUCK-RECOVERY(OCV5-377:个人版 canary 用不了 Box 模型,
+ *     商业版由 deploy-gate proof 覆盖)。补上 proof 后同步调低。
+ */
+const SELFHOST_PROOF_PENDING_BASELINE = 1;
+const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
+/** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
+function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {
+  const refs = [process.env.INCIDENT_LEDGER_BASE_REF, "origin/feat/v5-selfhost", "HEAD~1"]
+    .filter((ref): ref is string => Boolean(ref));
+  for (const ref of refs) {
+    try {
+      git("rev-parse", "--verify", "--quiet", `${ref}^{commit}`);
+    } catch {
+      continue;
+    }
+    let raw: string;
+    try {
+      raw = git("show", `${ref}:${SELFHOST_PROOF_DEBT_REL}`);
+    } catch {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as { incidents?: Record<string, string> };
+    return { ref, ids: new Set(Object.keys(parsed.incidents ?? {})) };
+  }
+  return null;
+}
 
 // ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
 // 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
@@ -241,6 +287,18 @@ const pendingRunners: string[] = [];
 let assertionDebt = 0;
 let proofPending = 0;
 
+if (EDITION !== "commercial" && EDITION !== "selfhost") fail(`--edition 只能是 selfhost(缺省 = 商业版),收到 ${EDITION}`);
+const selfhostProofDebt = new Map<string, string>();
+const selfhostDebtSeen = new Set<string>();
+if (EDITION === "selfhost") {
+  const raw = JSON.parse(readFileSync(SELFHOST_PROOF_DEBT, "utf8")) as { schema: number; incidents: Record<string, string> };
+  if (raw.schema !== 1) fail(`selfhost-proof-debt.json schema must be 1, got ${raw.schema}`);
+  for (const [id, reason] of Object.entries(raw.incidents ?? {})) {
+    if (typeof reason !== "string" || !reason.trim()) fail(`selfhost-proof-debt.json: ${id} 缺原因`);
+    selfhostProofDebt.set(id, reason);
+  }
+}
+
 for (const incident of manifest.incidents) {
   if (!/^INC-[0-9]{8}-[A-Z0-9-]{3,40}$/.test(incident.id)) fail(`invalid id ${incident.id}`);
   if (ids.has(incident.id)) fail(`duplicate id ${incident.id}`);
@@ -254,9 +312,12 @@ for (const incident of manifest.incidents) {
     if (!/^[0-9a-f]{8}$/.test(sha)) fail(`${incident.id}: lineage commit ${sha} must be 8 hex`);
     try {
       git("cat-file", "-e", `${sha}^{commit}`);
-      execFileSync("git", ["merge-base", "--is-ancestor", sha, "HEAD"], { cwd: ROOT });
     } catch {
       fail(`${incident.id}: lineage commit ${sha} is not an ancestor of HEAD`);
+    }
+    // 祖先,或 HEAD 里有它的逐行相同的 cherry-pick -x(两棵树互相移植修复,见 scripts/lib/lineage.ts)。
+    if (!inHeadLineage(ROOT, sha)) {
+      fail(`${incident.id}: lineage commit ${sha} is not an ancestor of HEAD(也没有 patch-id 相同、注明 cherry picked from 它的提交)`);
     }
   }
   const lineageFiles = new Set(lineageCommits.flatMap((sha) => commitFiles(sha)));
@@ -310,7 +371,10 @@ for (const incident of manifest.incidents) {
   }
 
   const hasProof = incident.regressions.some((item) => PROOF_LAYERS.has(item.layer));
-  if (!hasProof) {
+  if (!hasProof && EDITION === "selfhost" && selfhostProofDebt.has(incident.id)) {
+    // 个人版存量清单里的事故:原因写在清单里,不计入 proofPending。
+    selfhostDebtSeen.add(incident.id);
+  } else if (!hasProof) {
     if (!incident.proofPending?.reason?.trim() || !/^2026-[0-9]{2}-[0-9]{2}$/.test(incident.proofPending.since ?? "")) {
       fail(`${incident.id}: 没有 browser/live-e2e/deploy-gate 证据时必须写 proofPending{reason,since}`);
     }
@@ -324,7 +388,31 @@ if (assertionDebt > ASSERTION_DEBT_BASELINE) {
   fail(`无 assertion 锚点的 unit/integration 证据 ${assertionDebt} 条 > 基线 ${ASSERTION_DEBT_BASELINE};`
     + "新增证据必须带 assertion(基线只许降不许升)");
 }
-if (proofPending > PROOF_PENDING_BASELINE) {
+if (EDITION === "selfhost") {
+  for (const id of selfhostProofDebt.keys()) {
+    if (!selfhostDebtSeen.has(id)) {
+      fail(`selfhost-proof-debt.json: ${id} 已有 proof 层证据或已不在账本里,从清单删掉(清单只许缩短)`);
+    }
+  }
+  // 只许删不许加按 id 比,不只比条数:否则"补掉一条旧债 + 塞进一条新的无 proof 事故"能保持 63 条过门。
+  // 基线取与 ledger superset 相同的引用(CI push 用推送前的 SHA,PR 用目标分支)。
+  const previous = previousSelfhostDebtIds();
+  if (previous === null) {
+    process.stdout.write("[incident-regressions] selfhost proof debt: 基线引用里还没有清单(首次引入),只做上界检查\n");
+  } else {
+    for (const id of selfhostProofDebt.keys()) {
+      if (!previous.ids.has(id)) {
+        fail(`selfhost-proof-debt.json: ${id} 不在 ${previous.ref} 的清单里;清单只许删不许加(新事故走 proofPending,见 SELFHOST_PROOF_PENDING_BASELINE)`);
+      }
+    }
+  }
+  if (selfhostProofDebt.size > SELFHOST_PROOF_DEBT_CEILING) {
+    fail(`selfhost-proof-debt.json 有 ${selfhostProofDebt.size} 条 > 上界 ${SELFHOST_PROOF_DEBT_CEILING};清单只许减`);
+  }
+  if (proofPending > SELFHOST_PROOF_PENDING_BASELINE) {
+    fail(`个人版 proofPending 事故 ${proofPending} 条 > 基线 ${SELFHOST_PROOF_PENDING_BASELINE};新事故必须带真 proof 证据,或在评审里显式调高 SELFHOST_PROOF_PENDING_BASELINE 并写明为什么个人版跑不了它的 proof`);
+  }
+} else if (proofPending > PROOF_PENDING_BASELINE) {
   fail(`proofPending 事故 ${proofPending} 条 > 基线 ${PROOF_PENDING_BASELINE};新事故必须带真 proof 证据`);
 }
 
@@ -493,15 +581,17 @@ function checkTrailerClosure(): number {
       fail(`冻结的 trailer import tip ${tip.slice(0, 12)} 不可达 HEAD，拒绝静默失效`);
     }
   }
-  const isFrozenImportedCommit = (sha: string): boolean =>
-    IMPORTED_TRAILER_HISTORY_TIPS.some((tip) => {
-      try {
-        execFileSync("git", ["merge-base", "--is-ancestor", sha, tip], { cwd: ROOT });
-        return true;
-      } catch {
-        return false;
-      }
-    });
+  // 冻结 tip 的祖先集合只算一次(一次 rev-list),而不是每个提交 × 每个 tip 各起一个 git 进程:
+  // 个人版 start..HEAD 有上千个提交、tip 二十多个,逐个 merge-base 要跑十几分钟(OCV5-376)。
+  // 语义不变:sha 是某个冻结 tip 的祖先(含 tip 自身)即豁免;start..HEAD 里的提交都不是
+  // start 的祖先,所以排除 ^start 不会漏判。
+  const frozenImported = new Set(
+    git("rev-list", ...IMPORTED_TRAILER_HISTORY_TIPS, `^${start}`)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
+  const isFrozenImportedCommit = (sha: string): boolean => frozenImported.has(sha);
   // 拓扑范围不够:CI 检出的是 PR 的 **merge ref**(base + head 的合并态),于是 base 侧
   // 在本 PR 排队期间新合入的 commit 与 head 侧的锚点 commit 是并行两支 —— 它们不是锚点
   // 的祖先,`start..HEAD` 会把它们一并捞进来,门于是拦住别人的提交(2026-07-26 实测拦到
@@ -572,12 +662,15 @@ function checkTrailerClosure(): number {
 }
 
 const trailerChecked = checkTrailerClosure();
+const proofDebtSummary = EDITION === "selfhost"
+  ? `selfhost proof debt ${selfhostProofDebt.size}/${SELFHOST_PROOF_DEBT_CEILING}, proofPending ${proofPending}/${SELFHOST_PROOF_PENDING_BASELINE}`
+  : `proofPending ${proofPending}/${PROOF_PENDING_BASELINE}`;
 
 for (const note of pendingRunners) {
   process.stdout.write(`[incident-regressions] pending-runner: ${note}\n`);
 }
 process.stdout.write(
   `[incident-regressions] PASS: ${manifest.incidents.length} P0/P1/P2 incidents, ${linked.size} regression artifacts, `
-  + `assertion debt ${assertionDebt}/${ASSERTION_DEBT_BASELINE}, proofPending ${proofPending}/${PROOF_PENDING_BASELINE}, `
+  + `assertion debt ${assertionDebt}/${ASSERTION_DEBT_BASELINE}, ${proofDebtSummary}, `
   + `trailer-closure checked ${trailerChecked} fix(v5) commits, fixed live matrix locked\n`,
 );
