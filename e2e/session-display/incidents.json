@@ -6636,7 +6636,8 @@
       "coverageCommits": [
         "9335dee5",
         "ab4a0ebf",
-        "f809e9ad"
+        "f809e9ad",
+        "9d86e0e9"
       ],
       "regressions": [
         {
@@ -6678,6 +6679,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolTerminalRecovery.test.ts",
           "assertion": "OCV5-377 a model safety stop in the finished spool is undeliverable"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxIdleChain.test.ts",
+          "assertion": "OCV5-377 a turn whose every component is a proven failure projects failed"
         }
       ],
       "proofPending": {
