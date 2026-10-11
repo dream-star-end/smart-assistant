@@ -45,6 +45,11 @@ describe("Composer 输入预测", () => {
     expect(onSend).toHaveBeenCalledTimes(1);
     expect(onSend).toHaveBeenCalledWith("把木星的卫星也加上", undefined, undefined);
     expect((screen.getByLabelText("消息输入框") as HTMLTextAreaElement).value).toBe("");
+    // 发出后这句立即作废:父层还没换掉 prediction 时连点也不会再发一次(Codex r1 P1)
+    expect(screen.queryByTestId("composer-prediction")).toBeNull();
+    expect(send).toBeDisabled();
+    fireEvent.click(send);
+    expect(onSend).toHaveBeenCalledTimes(1);
   });
 
   test("空输入框按 Enter 不发预测(防误发,要先 Tab 填入)", async () => {

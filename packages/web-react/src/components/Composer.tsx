@@ -480,6 +480,8 @@ export function Composer({
     if (!typed && !sendPrediction) return;
     const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
     onSend(text, doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
+    // 发出去的预测本地立刻作废:value 本来就是空的,不作废的话在父层换掉 prediction 之前再点一次会重复发送。
+    if (!typed && sendablePrediction) setDismissedPrediction(sendablePrediction);
     setValue("");
     if (draftKey) clearDraft(draftKey);
     for (const a of attachments) revoke(a.previewUrl);
