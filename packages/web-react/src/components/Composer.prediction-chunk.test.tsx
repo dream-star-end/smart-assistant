@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, expect, test, vi } from "vitest";
 import { Composer } from "./Composer";
 
@@ -10,10 +10,11 @@ vi.mock("./ComposerPrediction", () => {
 
 afterEach(cleanup);
 
-test("输入预测浮层加载失败 → 不显示预测,输入框照常可用", async () => {
+test("输入预测浮层加载失败 → 不显示预测,输入框照常可用;看不见的预测不能被发送", async () => {
+  const onSend = vi.fn();
   render(
     <Composer
-      onSend={() => {}}
+      onSend={onSend}
       prediction={{ next: { text: "把木星的卫星也加上", source: "agent" }, candidates: [] }}
     />,
   );
@@ -23,4 +24,8 @@ test("输入预测浮层加载失败 → 不显示预测,输入框照常可用",
   expect(screen.queryByTestId("composer-prediction")).toBeNull();
   expect(screen.queryByRole("alertdialog")).toBeNull();
   expect(screen.getByLabelText("消息输入框")).toBeEnabled();
+  const send = screen.getByRole("button", { name: "发送" });
+  expect(send).toBeDisabled();
+  fireEvent.click(send);
+  expect(onSend).not.toHaveBeenCalled();
 });

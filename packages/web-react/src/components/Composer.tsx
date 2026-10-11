@@ -238,7 +238,7 @@ export function Composer({
   goalOpenRequest?: number;
   /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
   projectSlot?: ReactNode;
-  /** 输入预测(lib/inputCompletion):空输入框显示 next,输入中按 candidates 补全;Tab / → 采用。
+  /** 输入预测(lib/inputCompletion):空输入框显示 next(直接点发送就发出),输入中按 candidates 补全;Tab / → 填入。
    *  省略或 null = 关闭(设置里关掉、demo)。 */
   prediction?: InputPrediction | null;
 }) {
@@ -301,9 +301,11 @@ export function Composer({
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
 
-  // 输入预测(OCV5-375):浅色字叠在正文后面,不进 value,采用前不会被发送。
+  // 输入预测(OCV5-375):浅色字叠在正文后面,不进 value。
   // 输入法组字中、光标不在末尾、生成中(整句预测属于上一条回答)时不显示;Esc 收起本条整句预测。
-  const [ghostHeight, setGhostHeight] = useState(0);
+  // 整句预测(空输入框)直接点发送就发出去;带附件或引用时不显示,免得发送按钮的含义说不清。
+  // 打字后的补全只是提示,发送只发已输入的部分。
+  const [ghostShown, setGhostShown] = useState<{ rest: string; px: number } | null>(null);
   const predictionHintId = useId();
   const [composing, setComposing] = useState(false);
   const [caretAtEnd, setCaretAtEnd] = useState(true);
@@ -313,10 +315,15 @@ export function Composer({
     !prediction || disabled || composing || (value !== "" && !caretAtEnd)
       ? null
       : value === ""
-        ? !busy && nextPrediction && nextPrediction !== dismissedPrediction
+        ? !busy && attachments.length === 0 && !replyTo && nextPrediction && nextPrediction !== dismissedPrediction
           ? nextPrediction
           : null
         : completionFor(value, prediction.candidates);
+  // 只有浮层真的显示出来的那句才发(浮层是懒加载的,加载失败时什么都不显示,也就不能发)。
+  const sendablePrediction = value === "" && ghostRest && ghostShown?.rest === ghostRest ? ghostRest : null;
+  const onPredictionShown = useCallback((rest: string, px: number) => {
+    setGhostShown((prev) => (prev && prev.rest === rest && prev.px === px ? prev : { rest, px }));
+  }, []);
   const acceptPrediction = () => {
     if (!ghostRest) return;
     const next = value + ghostRest;
@@ -428,8 +435,8 @@ export function Composer({
     if (!el) return;
     el.style.height = "0px";
     // 整句预测比空输入框长时会折行:按浅色字的高度撑开,别压到下面的工具行上。
-    el.style.height = Math.min(Math.max(el.scrollHeight, ghostRest ? ghostHeight : 0), 240) + "px";
-  }, [value, ghostRest, ghostHeight]);
+    el.style.height = Math.min(Math.max(el.scrollHeight, ghostRest && ghostShown?.rest === ghostRest ? ghostShown.px : 0), 240) + "px";
+  }, [value, ghostRest, ghostShown]);
 
   const uploading = attachments.some((a) => a.status === "uploading");
   const attachFailed = attachments.some((a) => a.status === "error");
@@ -437,7 +444,8 @@ export function Composer({
     .filter((a) => a.status === "done" && a.media)
     .map((a) => a.media as MediaRef);
   // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
-  const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading && !attachFailed;
+  const canSend =
+    (value.trim().length > 0 || doneMedia.length > 0 || !!sendablePrediction) && !uploading && !attachFailed;
   // 草稿超过 sessionStorage 上限后只留内存、刷新即丢,此前没有任何预警(C-21)。
   const draftVolatile = !!draftKey && draftExceedsStorage(value);
 
@@ -461,12 +469,17 @@ export function Composer({
     [revoke],
   );
 
-  const submit = () => {
+  // sendPrediction:只有发送按钮传 true。键盘 Enter 在空输入框里不发预测(防误发,先 Tab 填入再 Enter)。
+  const submit = (sendPrediction = false) => {
     // 生成中(busy)不再拒发:发送经 WS service 的"排队"路径(status=queued),本轮结束自动
     // 发出(对标 ChatGPT/Claude),用户不再干等。并轨安全由 service 侧保证——排队项只在
     // 本会话 _sendingInFlight 清除后才真正下发,绝不 mid-turn 并发送(见 socket.dispatchPayload)。
     if (disabled || !canSend) return;
-    onSend(value.trim(), doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
+    // 空输入框(没有附件、没有引用)时 canSend 只可能来自正在显示的整句预测:按钮发出这句。
+    const typed = value.trim().length > 0 || doneMedia.length > 0;
+    if (!typed && !sendPrediction) return;
+    const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
+    onSend(text, doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
     setValue("");
     if (draftKey) clearDraft(draftKey);
     for (const a of attachments) revoke(a.previewUrl);
@@ -765,10 +778,8 @@ export function Composer({
                   value={value}
                   rest={ghostRest}
                   large={fontSize === "large"}
-                  coarsePointer={coarsePointer}
                   hintId={predictionHintId}
-                  onAccept={acceptPrediction}
-                  onHeight={setGhostHeight}
+                  onShown={onPredictionShown}
                 />
               </Suspense>
             )}
@@ -978,6 +989,7 @@ export function Composer({
                 type="button"
                 data-product-control
                 aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+                aria-describedby={!busy && sendablePrediction ? predictionHintId : undefined}
                 title={
                   attachFailed
                     ? "有附件上传失败，请重试或移除后再发送"
@@ -985,14 +997,16 @@ export function Composer({
                       ? "附件上传中"
                       : busy && !stopping
                         ? "停止生成"
-                        : undefined
+                        : sendablePrediction
+                          ? "发送这句预测"
+                          : undefined
                 }
                 onClick={() => {
                   if (busy) {
                     if (!stopping) onStop?.();
                     return;
                   }
-                  submit();
+                  submit(true);
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(

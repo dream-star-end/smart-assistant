@@ -274,7 +274,7 @@ export function PreferencesTab({
           <div className="min-w-0">
             <div className="text-section text-fg">输入预测</div>
             <p className="mt-0.5 text-meta leading-relaxed text-muted">
-              每条回答的末尾，助手会预测你接下来可能要说的话，用浅色字显示在输入框里，按 Tab 或 → 采用，触屏点「填入」。每条回答约多写几十个字，按正常回答计费。打字时也会按本会话说过的话补全。
+              每条回答的末尾，助手会预测你接下来可能要说的话，用浅色字显示在输入框里：不打字直接点发送就发出这句，想改就按 Tab 或 → 填入后再改。每条回答约多写几十个字，按正常回答计费。打字时也会按本会话说过的话补全。
             </p>
             {!iui.predictAvailable && (
               <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
