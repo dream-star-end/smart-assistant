@@ -1,0 +1,107 @@
+/**
+ * OCV5-374 详情面板「浏览器」页:只在这一轮用过浏览器时出现;从浏览器卡点进来停在那一步;
+ * 窗口显示地址 / 标题 / 截图,操作记录可切换、可进步骤详情;不在顶层轮里的浏览器步退回步骤页。
+ */
+import "@testing-library/jest-dom/vitest";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import type { ChatMessage } from "../lib/chat/model";
+import { InspectorPanelContent, PANE_TAB_STORAGE_KEY } from "./InspectorPanel";
+
+afterEach(cleanup);
+beforeEach(() => {
+  try {
+    localStorage.clear();
+  } catch {
+    /* ignore */
+  }
+});
+
+const TS = 1_700_000_000_000;
+const user = (id: string, text: string, ts = TS): ChatMessage => ({ id, role: "user", text, ts, status: "replied" });
+const assistant = (id: string, text: string, ts = TS): ChatMessage => ({ id, role: "assistant", text, ts });
+const bash = (id: string, command: string, output: string, extra: Partial<ChatMessage> = {}): ChatMessage => ({
+  id,
+  role: "tool",
+  text: "Bash",
+  ts: TS,
+  toolName: "Bash",
+  inputJson: { command },
+  _completed: true,
+  output,
+  ...extra,
+});
+
+const page = (url: string, title: string, shot?: string) =>
+  [`- Page URL: ${url}`, `- Page Title: ${title}`, ...(shot ? [`- [Screenshot of viewport](${shot})`] : [])].join("\n");
+
+function session(): ChatMessage[] {
+  return [
+    user("u1", "做个演示页并截图检查"),
+    bash("srv", "python3 -m http.server 8765", "ok"),
+    bash("b1", "oc-browser goto 'http://127.0.0.1:8765/demo.html' && oc-browser screenshot", page("http://127.0.0.1:8765/demo.html", "Demo", ".playwright-cli/one.png")),
+    bash("b2", "oc-browser click e32 && oc-browser screenshot", page("http://127.0.0.1:8765/demo.html#saturn", "Demo · Saturn", ".playwright-cli/two.png")),
+    bash("b3", "oc-browser open 'file:///tmp/x.html'", "### Error\nError: Access to \"file:\" protocol is blocked.\nexit 1", { error: true }),
+    assistant("a1", "好了", TS + 60_000),
+    user("u2", "再写个说明", TS + 70_000),
+    bash("w", "echo hi > README.md", "ok"),
+    assistant("a2", "写好了", TS + 80_000),
+  ];
+}
+
+const browserReady = () => screen.findByTestId("browser-view");
+
+describe("浏览器页", () => {
+  test("最新一轮没用浏览器:没有「浏览器」分区;记着上次停在浏览器也退回产出", async () => {
+    localStorage.setItem(PANE_TAB_STORAGE_KEY, "browser");
+    render(<InspectorPanelContent messages={session()} onClose={() => {}} />);
+    await screen.findByTestId(/^outputs-(view|empty)$/);
+    expect(screen.queryByRole("tab", { name: /浏览器/ })).toBeNull();
+  });
+
+  test("从浏览器卡点进来:分区计数、停在那一步、地址 / 标题 / 截图", async () => {
+    const messages = session();
+    render(<InspectorPanelContent messages={messages} request={{ tab: "browser", message: messages[2], nonce: 1 }} onClose={() => {}} />);
+    await browserReady();
+    const tab = screen.getByRole("tab", { name: /浏览器/ });
+    expect(tab).toHaveAttribute("aria-selected", "true");
+    expect(tab).toHaveTextContent("3");
+    const windowEl = screen.getByTestId("browser-window");
+    expect(within(windowEl).getByTestId("browser-address")).toHaveAttribute("href", "http://127.0.0.1:8765/demo.html");
+    expect(within(windowEl).getByTestId("browser-window-title")).toHaveTextContent("Demo");
+    expect(within(windowEl).getByTestId("browser-window-shot")).toBeInTheDocument();
+    const rows = screen.getAllByTestId("browser-log-row");
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toHaveAttribute("aria-current", "true");
+    expect(rows[2]).toHaveTextContent("打开网页");
+  });
+
+  test("默认停在最后一张截图;点操作记录换窗口内容;失败的一步说明没有截图", async () => {
+    const messages = session();
+    render(<InspectorPanelContent messages={messages} request={{ tab: "browser", message: messages[1], nonce: 1 }} onClose={() => {}} />);
+    await browserReady();
+    // messages[1] 不是浏览器步:落到这一轮的默认(最后一张截图 = 第 2 步)。
+    let rows = screen.getAllByTestId("browser-log-row");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    expect(screen.getByTestId("browser-window-title")).toHaveTextContent("Demo · Saturn");
+    fireEvent.click(within(rows[2] as HTMLElement).getAllByRole("button")[0] as HTMLElement);
+    rows = screen.getAllByTestId("browser-log-row");
+    expect(rows[2]).toHaveAttribute("aria-current", "true");
+    expect(screen.getByTestId("browser-window-noshot")).toHaveTextContent("没有成功");
+  });
+
+  test("操作记录里的「详情」进步骤页那一步", async () => {
+    const messages = session();
+    render(<InspectorPanelContent messages={messages} request={{ tab: "browser", message: messages[2], nonce: 1 }} onClose={() => {}} />);
+    await browserReady();
+    fireEvent.click(screen.getByRole("button", { name: "第 2 步的详情" }));
+    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("pane-step-counter")).toHaveTextContent("3 / 5");
+  });
+
+  test("不在顶层轮里的浏览器步(子任务等)退回步骤详情", () => {
+    const child = bash("child", "oc-browser open https://a.example", page("https://a.example/", "A"));
+    render(<InspectorPanelContent messages={session()} request={{ tab: "browser", message: child, nonce: 1 }} onClose={() => {}} />);
+    expect(screen.getByRole("tab", { name: /步骤/ })).toHaveAttribute("aria-selected", "true");
+  });
+});

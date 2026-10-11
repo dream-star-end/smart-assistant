@@ -274,23 +274,6 @@ function minimaxOutputKeys(command: string, output: string): string[] {
   return keys;
 }
 
-function isScreenshotTool(name: string, command: string): boolean {
-  if (/browser_take_screenshot/i.test(name)) return true;
-  if (detectOcCli(command) !== "oc-browser") return false;
-  for (const match of command.matchAll(/oc-browser\s+([a-z-]+)/gi)) {
-    if ((match[1] ?? "").toLowerCase() === "screenshot") return true;
-  }
-  return false;
-}
-
-function screenshotOutputKeys(name: string, command: string, output: string): string[] {
-  if (!isScreenshotTool(name, command)) return [];
-  const match = /\/[^\s"'<>]+\.(?:png|jpe?g|webp)/i.exec(output);
-  if (!match) return [];
-  const key = renderedLocatorKey(match[0]);
-  return key ? [key] : [];
-}
-
 function artifactRecord(output: string, outputJson: unknown): Record<string, unknown> | null {
   const fromJson = asRecord(outputJson);
   if (typeof fromJson?.output === "string" || typeof fromJson?.qmd === "string") return fromJson;
@@ -331,8 +314,11 @@ function outputEvidence(message: ChatMessage, displayOutput: string, outputJson:
  * Media the existing tool card renders from a successful output/outputJson.
  * Request paths are ignored. Office CLI cards guess a download from the
  * command, and Read/imageView only inspect a file — neither is a deliverable.
- * Image generation, minimax/mmx, screenshots, and oc-report/slides/poster
- * stay up only when that card has a returned file it can actually show.
+ * Image generation, minimax/mmx, and oc-report/slides/poster stay up only
+ * when that card has a returned file it can actually show. Browser steps
+ * (oc-browser / MCP browser_*) never do (OCV5-374): a screenshot is the agent
+ * checking its own work even when it lands in generated/ — the step folds, the
+ * shot shows on its card inside 处理过程 and in the detail pane (产出 / 浏览器).
  * An html/htmlpreview fence in tool output is not media: no tool body mounts
  * HtmlPreview. Bash shows that fence as terminal text. Assistant fences still
  * use artifactEvidenceKeys.
@@ -358,7 +344,6 @@ function renderedToolMediaKeys(message: ChatMessage): string[] {
   return dedupe([
     ...imageGenerationKeys(name, input, evidence),
     ...minimaxOutputKeys(command, evidence),
-    ...screenshotOutputKeys(name, command, evidence),
     ...artifactOutputKeys(command, output, outputJson),
   ]);
 }

@@ -726,7 +726,7 @@ describe("4 个新专属卡", () => {
     expect(screen.getByText(/任务号 abc123/)).toBeInTheDocument();
   });
 
-  test("oc-browser open → 打开网页语义正文(URL 链接,无原始 stdout)", () => {
+  test("oc-browser open → 浏览器卡:地址栏链接,无原始 stdout", () => {
     const { container } = render(
       <div>
         {researchToolCard(
@@ -736,10 +736,12 @@ describe("4 个新专属卡", () => {
       </div>,
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
-    const urlChip = container.querySelector('a[href="https://example.com"]');
-    expect(urlChip).not.toBeNull();
-    // a11y-B tools#1:Chip 链接桌面 20px 高,hover:none 下要撑到 44px 命中(ui-preview 无该卡场景,类名即契约)。
-    expect(urlChip?.className).toContain("[@media(hover:none)]:min-h-11");
+    const address = container.querySelector('a[href="https://example.com"]');
+    expect(address).not.toBeNull();
+    expect(address).toHaveAttribute("target", "_blank");
+    expect(address?.textContent).toContain("example.com");
+    // a11y-B tools#1:地址栏链接桌面紧凑,hover:none 下要撑到 44px 命中(类名即契约)。
+    expect(address?.className).toContain("[@media(hover:none)]:min-h-11");
     // open 不展示原始 a11y dump。
     expect(container.textContent).not.toContain("huge a11y tree");
   });
@@ -760,7 +762,7 @@ describe("4 个新专属卡", () => {
   });
 });
 
-describe("BrowserCliCard 复合命令 + 失败原因", () => {
+describe("浏览器卡(OCV5-374) 复合命令 + 失败原因", () => {
   // 官方 Playwright CLI 成功输出形状(open 后的 markdown)。
   const PLAYWRIGHT_OK = [
     "### Ran Playwright code",
@@ -780,7 +782,7 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
     "Run oc-browser open to start the browser session.",
   ].join("\n");
 
-  test("open && snapshot 复合命令 → 动作序列标题 + 快照折叠", () => {
+  test("open && snapshot 复合命令 → 动作序列 + 快照折叠", () => {
     const { container } = render(
       <div>
         {researchToolCard(
@@ -789,8 +791,10 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
         )}
       </div>,
     );
-    expect(screen.getByText("打开网页 · 页面快照")).toBeInTheDocument();
-    expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+    const trail = screen.getByTestId("browser-actions");
+    expect([...trail.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["打开网页", "读取页面"]);
+    // 地址栏用输出里的最终 Page URL(带尾斜杠),不是命令里写的地址。
+    expect(container.querySelector('a[href="https://example.com/"]')).not.toBeNull();
     // 任一 verb 为 snapshot → 快照折叠区可见。
     expect(screen.getByText("查看页面快照")).toBeInTheDocument();
   });

@@ -1064,7 +1064,7 @@ describe("MessageList Manus 过程披露", () => {
     expect(within(otherImage as HTMLElement).getByText(/other\.v2\.png/)).toBeInTheDocument();
   });
 
-  test("只有输出里的真实图像留在结果层，命令里的截图路径不算", async () => {
+  test("只有输出里的真实图像留在结果层，命令里的截图路径不算；浏览器截图一律是过程(OCV5-374)", async () => {
     renderList([
       row("u", "user", "出图", { status: "replied" }),
       row("noise", "tool", "终端", {
@@ -1109,18 +1109,56 @@ describe("MessageList Manus 过程披露", () => {
     expect(screen.queryByText(/input-only\.png/)).not.toBeInTheDocument();
     expect(document.querySelector("[data-chat-virtual-key=named]")).toBeNull();
     expect(document.querySelector("[data-chat-virtual-key=empty-image]")).toBeNull();
-    const shot = document.querySelector("[data-chat-virtual-key=shot]");
+    // 浏览器截图即使存进 generated/ 也是助手自己核对用的过程:这一步折进处理过程(图在卡片和详情面板里)。
+    expect(document.querySelector("[data-chat-virtual-key=shot]")).toBeNull();
     const media = document.querySelector("[data-chat-virtual-key=mmx]");
-    expect(shot?.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(media?.closest("[data-testid=process-disclosure]")).toBeNull();
-    fireEvent.click(within(shot as HTMLElement).getByRole("button"));
     fireEvent.click(within(media as HTMLElement).getByRole("button"));
-    const shotImage = within(shot as HTMLElement).queryByText("页面截图")
-      ?? within(shot as HTMLElement).queryByAltText("页面截图");
-    expect(shotImage).not.toBeNull();
-    expect(shotImage?.closest("[data-testid=process-disclosure]")).toBeNull();
     expect(within(media as HTMLElement).getByText("shelf-unique.png")).toBeInTheDocument();
     expect(screen.getByText("shelf-unique.png").closest("[data-testid=process-disclosure]")).toBeNull();
+  });
+
+  test("OCV5-374:浏览器操作(默认截图 / 存进 generated 的截图)都是过程,不漏到处理过程外面", () => {
+    renderList([
+      row("u", "user", "做个演示页", { status: "replied" }),
+      row("serve", "tool", "终端", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: { command: "python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp" },
+        _completed: true,
+        output: "ok",
+      }),
+      row("browse", "tool", "浏览器", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: {
+          command: "oc-browser goto 'http://127.0.0.1:8765/demo.html' && oc-browser resize 1100 900 && oc-browser screenshot",
+        },
+        _completed: true,
+        output: [
+          "### Page",
+          "- Page URL: http://127.0.0.1:8765/demo.html",
+          "- Page Title: Demo",
+          "### Result",
+          "- [Screenshot of viewport](.playwright-cli/page-2026-10-11T00-50-55-101Z.png)",
+        ].join("\n"),
+      }),
+      row("public", "tool", "浏览器", {
+        _clientMessageId: "u",
+        toolName: "Bash",
+        inputJson: {
+          command: "oc-browser goto https://example.com 2>&1 && oc-browser screenshot --filename=/home/agent/.openclaude/generated/demo-3-example.png 2>&1",
+        },
+        _completed: true,
+        output: "- Page URL: https://example.com/\n- [Screenshot of viewport](/home/agent/.openclaude/generated/demo-3-example.png)",
+      }),
+      row("answer", "assistant", "演示页做好了,截图 `demo-3-example.png`", { _clientMessageId: "u" }),
+    ]);
+    expect(screen.getByText(/演示页做好了/)).toBeInTheDocument();
+    // 浏览器这两步只在处理过程里:顶层没有它们的独立卡。
+    expect(document.querySelector("[data-chat-virtual-key=browse]")).toBeNull();
+    expect(document.querySelector("[data-chat-virtual-key=public]")).toBeNull();
+    expect(screen.getByTestId("process-disclosure")).toBeInTheDocument();
   });
 
   test("回答元信息用 caption 和本地日期，积分仍在，token 不打印", () => {

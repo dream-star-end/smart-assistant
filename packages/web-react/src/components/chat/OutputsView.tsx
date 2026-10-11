@@ -76,8 +76,8 @@ function ExtTile({ path, kind, className }: { path: string; kind: OutputKind; cl
   );
 }
 
-/** 本轮标题 + 翻轮 + 一行摘要。 */
-function TurnBar({
+/** 本轮标题 + 翻轮 + 一行摘要(浏览器视图也用)。 */
+export function TurnBar({
   turn,
   index,
   total,

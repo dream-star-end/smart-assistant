@@ -9,6 +9,7 @@
  *    回放不出来(中间有 shell 改写、Edit 对不上、只有 update diff)→ null,界面改读容器里的当前文件。
  */
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
+import { browserStepOf, isDeliverableShot } from "../tool/browserSteps";
 import type { ChatMessage } from "../../lib/chat/model";
 import { asArr, asStr, normalizeToolForDisplay } from "../tool/format";
 import { parseWebSearchSources } from "../tool/webSearchHits";
@@ -164,6 +165,16 @@ export function collectTurnOutputs(turn: WorkTurn): TurnOutputs {
     if (m.role === "tool") {
       const { name, input } = normalizeToolForDisplay(m);
       if (failed(m)) continue;
+      // 浏览器截图存进交付目录 = 给用户的图(OCV5-374):这一步折在处理过程里,图在这里露出来。
+      const browser = browserStepOf(m);
+      if (browser) {
+        for (const p of [...browser.shots, ...browser.requestedShots]) {
+          if (!isDeliverableShot(p) || seenMedia.has(p)) continue;
+          seenMedia.add(p);
+          media.push({ src: p, kind: "image", name: baseName(p) });
+        }
+        continue;
+      }
       if (name === "WebSearch") {
         for (const hit of parseWebSearchSources(toolOutputText(m))) addSource(hit.url, hit.title);
       } else if (name === "WebFetch") {

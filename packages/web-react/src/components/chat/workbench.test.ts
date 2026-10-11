@@ -216,3 +216,22 @@ describe("fileTouchFingerprint", () => {
     expect(fileTouchFingerprint([write, locator], "/tmp/a.md")).toContain("big:");
   });
 });
+
+describe("浏览器截图(OCV5-374)", () => {
+  test("存进交付目录的截图进「图片与媒体」;默认 .playwright-cli 截图和失败的一步不进", () => {
+    const [turn] = collectWorkTurns([
+      user("u1", "截个图"),
+      tool("b1", "Bash", { command: "oc-browser goto https://example.com && oc-browser screenshot --filename=/home/agent/.openclaude/generated/ex.png" }, {
+        output: "- Page URL: https://example.com/\n- [Screenshot of viewport](/home/agent/.openclaude/generated/ex.png)",
+      }),
+      tool("b2", "Bash", { command: "oc-browser screenshot" }, { output: "- [Screenshot of viewport](.playwright-cli/page-1.png)" }),
+      tool("b3", "Bash", { command: "oc-browser screenshot --filename=/home/agent/.openclaude/generated/bad.png" }, {
+        output: "### Error\nError: Browser 'browser' is not open.",
+        error: true,
+      }),
+      assistant("a1", "好了"),
+    ]);
+    const out = collectTurnOutputs(turn);
+    expect(out.media).toEqual([{ src: "/home/agent/.openclaude/generated/ex.png", kind: "image", name: "ex.png" }]);
+  });
+});

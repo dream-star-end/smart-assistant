@@ -334,7 +334,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("任务B")).toBeInTheDocument();
   });
 
-  test("MCP browser_navigate：标签 + URL 链接", () => {
+  test("MCP browser_navigate：标签 + 浏览器卡地址栏链接", () => {
     render(
       <ToolCard
         message={{
@@ -346,8 +346,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    const link = screen.getByRole("link", { name: "https://example.com" });
+    const link = screen.getByTestId("browser-address");
     expect(link).toHaveAttribute("href", "https://example.com");
+    expect(link).toHaveTextContent("example.com");
   });
 
   test("未知 MCP server → generic kv-list 兜底", () => {
@@ -437,7 +438,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(header).toHaveClass("px-3", "py-2");
     fireEvent.click(header);
     expect(screen.getAllByText("点击页面").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText(/元素 e12/).length).toBeGreaterThanOrEqual(1);
+    // 浏览器卡的动作序列:动作 + 目标元素。
+    expect(screen.getByTestId("browser-actions")).toHaveTextContent("点击e12");
     expect(screen.queryByText(/oc-browser click/)).not.toBeInTheDocument();
   });
 

@@ -8,11 +8,14 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../lib/chat/model";
 import { InspectorPanelContent } from "./InspectorPanel";
 import { wrapWithCspOnly } from "./embedCsp";
+import { prefetchMarkdownImpl } from "./Markdown";
 import { preloadToolBody } from "./tool/lazyToolBody";
 import { loadBeforeAll } from "../test/moduleLoad";
 
 // 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
 loadBeforeAll(preloadToolBody);
+// 文档正文走懒加载的 Markdown 渲染器,同理先加载好。
+loadBeforeAll(prefetchMarkdownImpl);
 
 // 读容器文件的那条回落:测试里没有签名通道,直接替换受限读取(其余导出照旧)。
 const fetchSignedCapped = vi.hoisted(() => vi.fn());

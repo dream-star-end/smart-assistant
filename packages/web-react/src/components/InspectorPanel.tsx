@@ -49,6 +49,7 @@ import { cn } from "../lib/utils";
 import { extractLatestTodos, type TodoItem } from "./chat/PinnedTaskTracker";
 import { CopyIconButton, FullToolBody } from "./chat/paneParts";
 import { collectWorkTurns, turnIndexOf } from "./chat/workTurns";
+import { collectBrowserSteps } from "./tool/browserSteps";
 import { collectPaneSteps, type PaneTurn } from "./chat/workPane";
 import {
   type DisplayTool,
@@ -67,6 +68,7 @@ import { Badge, EmptyState, IconButton, Skeleton, Spinner, Tabs, useToast } from
 
 // 产出页(含主产物渲染)只在面板打开且停在产出时才需要:懒加载,不进首屏(first-screen-budget)。
 const OutputsView = lazy(() => import("./chat/OutputsView").then((m) => ({ default: m.OutputsView })));
+const BrowserView = lazy(() => import("./chat/BrowserView").then((m) => ({ default: m.BrowserView })));
 
 function codexChangesText(input: Record<string, unknown> | null): string {
   return asArr(input?.changes)
@@ -128,7 +130,7 @@ function isEditableTarget(node: EventTarget | null): boolean {
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || node.isContentEditable;
 }
 
-export type PaneTab = "outputs" | "steps" | "plan";
+export type PaneTab = "outputs" | "steps" | "plan" | "browser";
 
 /**
  * 从面板外打开 / 定位面板的请求(工具卡入口、过程摘要上的「改动 N 个文件」、顶栏开关)。
@@ -138,7 +140,7 @@ export type PaneTab = "outputs" | "steps" | "plan";
 export type PaneRequest = {
   /** "changes" 是 r1 的改动页:改动并进了产出页,旧入口 / 旧记忆按产出处理。 */
   tab?: PaneTab | "changes";
-  /** steps:要打开的那一步;outputs:这一轮里的任意一行(定位到它所在的那一轮)。 */
+  /** steps / browser:要打开的那一步;outputs:这一轮里的任意一行(定位到它所在的那一轮)。 */
   message?: ToolLike | null;
   nonce: number;
   /** 发起请求时的会话;App 只把属于当前会话的请求交给面板(切会话后旧请求作废)。 */
@@ -287,7 +289,7 @@ function requestTab(tab: PaneTab | "changes"): PaneTab {
 function readStoredTab(): PaneTab {
   try {
     const v = localStorage.getItem(PANE_TAB_STORAGE_KEY);
-    if (v === "steps" || v === "plan" || v === "outputs") return v;
+    if (v === "steps" || v === "plan" || v === "outputs" || v === "browser") return v;
   } catch {
     /* private mode */
   }
@@ -636,8 +638,18 @@ export function InspectorPanelContent({
   onActiveChange?: (message: ToolLike | null) => void;
   titleId?: string;
 }) {
-  const [tab, setTabState] = useState<PaneTab>(() => (request?.tab ? requestTab(request.tab) : readStoredTab()));
-  const [selected, setSelected] = useState<ToolLike | null>(() => (request?.tab === "steps" ? (request.message ?? null) : null));
+  // 浏览器卡点进来:那一步不在顶层轮里(团队子任务等)就退回步骤详情,不落到一个没有它的「浏览器」页。
+  const resolveTab = (req: PaneRequest): PaneTab | null => {
+    if (!req.tab) return null;
+    if (req.tab === "browser" && req.message && turnIndexOf(collectWorkTurns(messages), req.message as { id?: string }) < 0) {
+      return "steps";
+    }
+    return requestTab(req.tab);
+  };
+  const [tab, setTabState] = useState<PaneTab>(() => (request ? resolveTab(request) : null) ?? readStoredTab());
+  const [selected, setSelected] = useState<ToolLike | null>(() =>
+    request && resolveTab(request) === "steps" ? (request.message ?? null) : null,
+  );
   const fallbackTitleId = useId();
   const headingId = titleId ?? fallbackTitleId;
   const idBase = useId();
@@ -657,17 +669,26 @@ export function InspectorPanelContent({
     const i = turnIndexOf(workTurns, message as { id?: string } | null | undefined);
     return i < 0 || i === lastTurn ? null : (workTurns[i]?.key ?? null);
   };
+  const turnScoped = (t: PaneRequest["tab"]) => t !== undefined && (requestTab(t) === "outputs" || t === "browser");
   const [turnKey, setTurnKey] = useState<string | null>(() =>
-    request && request.tab !== undefined && requestTab(request.tab) === "outputs" ? turnKeyFor(request.message) : null,
+    request && turnScoped(request.tab) ? turnKeyFor(request.message) : null,
   );
   const keyedTurn = turnKey === null ? -1 : workTurns.findIndex((t) => t.key === turnKey);
   const outputsIndex = keyedTurn >= 0 ? keyedTurn : lastTurn;
+  // 「浏览器」页看的那一步(从浏览器卡点进来时);null = 默认(最新一张截图)。
+  const [browserFocus, setBrowserFocus] = useState<string | null>(() =>
+    request?.tab === "browser" ? (idOf(request.message) ?? null) : null,
+  );
+  const viewedTurn = workTurns[outputsIndex];
+  // biome-ignore lint/correctness/useExhaustiveDependencies: version 是就地 mutate 消息的变更信号
+  const browserCount = useMemo(() => (viewedTurn ? collectBrowserSteps(viewedTurn.steps).length : 0), [viewedTurn, version]);
 
-  const view: PaneTab = tab === "plan" && todos.length === 0 ? "outputs" : tab;
+  const view: PaneTab =
+    (tab === "plan" && todos.length === 0) || (tab === "browser" && browserCount === 0) ? "outputs" : tab;
   const latest = steps.at(-1)?.message ?? null;
   // 首次挂载带着请求(面板 / 底部抽屉刚打开)时和后续请求一样:运行中点开最新那张卡就跟随。
   const [follow, setFollow] = useState(
-    () => request?.tab === "steps" && !!request.message && running && sameMessage(request.message, latest),
+    () => !!request && resolveTab(request) === "steps" && !!request.message && running && sameMessage(request.message, latest),
   );
   // 选中按消息 id 记:历史重载 / 同步会用同 id 的新对象替换旧行,按引用记会停在旧正文上。
   // 不在顶层步骤里的消息(团队子任务 / demo)按原对象显示。
@@ -685,10 +706,11 @@ export function InspectorPanelContent({
   useEffect(() => {
     if (!request || request.nonce === handledNonce.current) return;
     handledNonce.current = request.nonce;
-    if (!request.tab) return;
-    const next = requestTab(request.tab);
+    const next = resolveTab(request);
+    if (!next) return;
     setTabState(next);
-    if (next === "outputs") setTurnKey(turnKeyFor(request.message));
+    if (next === "outputs" || next === "browser") setTurnKey(turnKeyFor(request.message));
+    if (next === "browser") setBrowserFocus(idOf(request.message) ?? null);
     if (next === "steps") {
       setSelected(request.message ?? null);
       // 运行中从最新那张卡点开 = 想看它往下走:直接跟随。
@@ -734,6 +756,7 @@ export function InspectorPanelContent({
   const count = (n: number) => (n > 0 ? <span className="ml-1 tabular-nums text-faint">{n}</span> : null);
   const tabItems = [
     { value: "outputs", label: <span>产出</span> },
+    ...(browserCount > 0 ? [{ value: "browser", label: <span>浏览器{count(browserCount)}</span> }] : []),
     { value: "steps", label: <span>步骤{count(steps.length)}</span> },
     ...(todos.length > 0 ? [{ value: "plan", label: <span>计划</span> }] : []),
   ];
@@ -783,6 +806,26 @@ export function InspectorPanelContent({
           ) : (
             <StepList turns={turns} total={steps.length} active={selected} onPick={pick} />
           )
+        ) : view === "browser" ? (
+          <Suspense fallback={<OutputsFallback />}>
+            <BrowserView
+              turns={workTurns}
+              index={outputsIndex}
+              running={running && outputsIndex === lastTurn}
+              focusId={browserFocus}
+              onSelectTurn={(i) => {
+                const t = workTurns[i];
+                if (t) setTurnKey(i === lastTurn ? null : t.key);
+                setBrowserFocus(null);
+              }}
+              onOpenSteps={() => {
+                setTab("steps");
+                setSelected(null);
+                setFollow(false);
+              }}
+              onOpenStep={openStep}
+            />
+          </Suspense>
         ) : view === "outputs" ? (
           <Suspense fallback={<OutputsFallback />}>
           <OutputsView
