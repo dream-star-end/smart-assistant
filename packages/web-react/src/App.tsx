@@ -131,6 +131,7 @@ import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
 import { type UseChatSocket, useChatSocket } from "./hooks/useChatSocket";
 import { type ImplicitReason, useResponseRatings } from "./hooks/useResponseRatings";
+import { useSessionEngineOptions } from "./hooks/useSessionEngineOptions";
 import { useInbox } from "./hooks/useInbox";
 import { useInflightDelegates } from "./hooks/useInflightDelegates";
 import { useRepoBinding } from "./hooks/useRepoBinding";
@@ -178,16 +179,8 @@ import {
   sendCollabFields,
 } from "./lib/collaborationConfig";
 
-import {
-  clearSessionEffort,
-  readSessionEffort,
-  writeSessionEffort,
-} from "./lib/sessionEffort";
-import {
-  clearContextTierForSession,
-  readContextTierForSession,
-  writeContextTier,
-} from "./lib/sessionContextTier";
+import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
+import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -1253,38 +1246,8 @@ export function App() {
       });
   }, [activeId, applyCollabDoc, auth, demo]);
 
-  // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
-  // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
-  // 与 teamMode 同款 per-session 键;首条消息创建会话后同样落地当前 intent。
-  const [sessionEffort, setSessionEffortState] = useState<PreferenceEffort | null | undefined>(() =>
-    readSessionEffort(activeId),
-  );
-  const setSessionEffort = useCallback(
-    (value: PreferenceEffort | null) => {
-      setSessionEffortState(value);
-      writeSessionEffort(activeId, value);
-    },
-    [activeId],
-  );
-  useEffect(() => {
-    setSessionEffortState(readSessionEffort(activeId));
-  }, [activeId]);
-
-  // Cursor Opus/Fable 上下文档位(300k 默认 / 1M;语义见 lib/sessionContextTier)。
-  // per-session 键优先,缺失继承全局最近选择,再缺失回产品默认 300k。
-  const [contextTier, setContextTierState] = useState<CursorContextTier>(() =>
-    readContextTierForSession(activeId),
-  );
-  const setContextTier = useCallback(
-    (tier: CursorContextTier) => {
-      setContextTierState(tier);
-      writeContextTier(activeId, tier);
-    },
-    [activeId],
-  );
-  useEffect(() => {
-    setContextTierState(readContextTierForSession(activeId));
-  }, [activeId]);
+  // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
+  const { sessionEffort, setSessionEffort, contextTier, setContextTier } = useSessionEngineOptions(activeId);
 
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
