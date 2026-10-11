@@ -104,11 +104,8 @@ function main(): void {
   const dsn = assertTestDsn(process.env.TEST_DATABASE_URL)
   const lines: string[] = []
   for (const proof of MASTER_INCIDENT_PROOFS) {
-    const env = { ...process.env }
-    delete env.DATABASE_URL
-    delete env.NODE_OPTIONS
-    if (proof.db) env.TEST_DATABASE_URL = dsn
-    else delete env.TEST_DATABASE_URL
+    const { DATABASE_URL: _db, NODE_OPTIONS: _opts, TEST_DATABASE_URL: _test, ...base } = process.env
+    const env: NodeJS.ProcessEnv = proof.db ? { ...base, TEST_DATABASE_URL: dsn } : base
     const run = spawnSync('npx', ['--no-install', 'tsx', '--test', '--test-reporter=tap',
       '--test-concurrency=1', proof.file], { cwd: process.cwd(), env, encoding: 'utf8', timeout: 240_000,
       maxBuffer: 64 * 1024 * 1024 })
