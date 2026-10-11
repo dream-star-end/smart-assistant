@@ -1729,6 +1729,19 @@ describe("T-08:卡内文字型操作在触屏下有 44px 命中面积", () => {
   });
 });
 
+describe("INC-20261002-TOOL-HIT-TARGET 工具卡表头的命中面积", () => {
+  // 292f59093 曾把表头降到 min-h-10(40px),真浏览器 T13 的 44px 指针/键盘命中契约随之失效;
+  // a492e45d 改回 min-h-11。这里在 jsdom 层先锁住 class,不必等真浏览器门。
+  test("工具卡表头默认至少 44px 高(min-h-11),不是 40px", () => {
+    render(
+      <ToolCard message={{ toolName: "Bash", inputJson: { command: "pwd" }, _completed: true, output: "/home" }} />,
+    );
+    const header = screen.getByRole("button", { name: "终端 pwd 完成" });
+    expect(header.className).toMatch(/(^|\s)min-h-11(\s|$)/);
+    expect(header.className).not.toMatch(/(^|\s)min-h-10(\s|$)/);
+  });
+});
+
 describe("T-22/T-07:表头可及名、状态播报与迟到错误", () => {
   test("表头按钮 aria-labelledby 拼出标签 + 摘要 + 状态;状态区 aria-live=polite", () => {
     const { container } = render(
