@@ -35,13 +35,13 @@ test("old pr-1 keeps 180000/3600 and its own max-minutes", () => {
   assert.equal(budget.fileTimeoutMs, DEFAULT_FILE_TIMEOUT_MS);
   assert.equal(budget.mutexTimeoutSeconds, DEFAULT_MUTEX_TIMEOUT_SECONDS);
   assert.equal(budget.maxMinutes, 30);
-  assert.equal(budget.minTests, 270);
+  assert.equal(budget.minTests, 271);
   assert.equal(budget.declaredNewFields, false);
 });
 
 test("pr-4..7 budgets cover serial files plus cleanup and leave install room", () => {
   const expect: Record<string, { file: number; mutex: number; job: number; files: number; min: number }> = {
-    "pr-4.txt": { file: 180_000, mutex: 1260, job: 30, files: 6, min: 11 },
+    "pr-4.txt": { file: 180_000, mutex: 1260, job: 30, files: 6, min: 12 },
     "pr-5.txt": { file: 3_000_000, mutex: 3300, job: 70, files: 1, min: 5 },
     "pr-6.txt": { file: 1_200_000, mutex: 1500, job: 40, files: 1, min: 1 },
     "pr-7.txt": { file: 3_600_000, mutex: 3900, job: 90, files: 1, min: 1 },
