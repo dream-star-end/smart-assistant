@@ -1482,7 +1482,8 @@ export function App() {
         }
       }
     },
-    // teamMode 必须在依赖里:否则 memoized send 闭包捕获初始 false,用户开开关后仍发 false(Codex 审)。
+    // teamMode 不再入依赖:自 08326136f 起 send 只从 collabUi/collabMode 取模式(sendCollabFields),
+    // 不读 teamMode 本身(OCV5-376)。applyCollabDoc/toast/setDraftProject 都是稳定引用,补齐不改重建时机。
     // setSessions/setActiveId 是 useSessionList 透传的 useState dispatcher(恒稳定),入 deps
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
@@ -1496,13 +1497,15 @@ export function App() {
       preferenceEffort,
       sessionEffort,
       contextTier,
-      teamMode,
       collabMode,
       collabUi,
       collabAsDefault,
       sessions,
       setSessions,
       setActiveId,
+      applyCollabDoc,
+      toast,
+      setDraftProject,
     ],
   );
 
@@ -1962,6 +1965,7 @@ export function App() {
       openMarketplace,
       openRepo,
       openOrg,
+      setBoardOpen,
     ],
   );
 
@@ -2348,7 +2352,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleNew, inWorkspace, demo, wsMessages.length]);
+  }, [handleNew, inWorkspace, demo, wsMessages.length, setBoardOpen]);
 
   // 当前选中会话（对账/本轮活动指示的数据源）。告知 WS service 供 S1 对账无条件优先拉它。
   const activeSess = !demo && activeId ? chat.getSession(activeId) : undefined;
@@ -2361,8 +2365,10 @@ export function App() {
   // Fetch on session selection; live updates arrive through sys.goal_snapshot.
   // Draft sessions with no client_sessions row used to 404; the route now
   // returns 200 {goal:null}, and a missing goal is a no-op here.
+  // 只随登录身份变化重拉(user 对象 refreshMe 会换引用,不应触发)。
+  const goalUserId = user?.id;
   useEffect(() => {
-    if (demo || !activeId || !user) return;
+    if (demo || !activeId || !goalUserId) return;
     let cancelled = false;
     void api.getSessionGoal(authRef.current, activeId).then((goal) => {
       if (!cancelled) sockRef.current?.setGoalState(activeId, goal);
@@ -2371,7 +2377,7 @@ export function App() {
       // next selection or goal action retries; do not poison chat readiness.
     });
     return () => { cancelled = true; };
-  }, [demo, activeId, user?.id]);
+  }, [demo, activeId, goalUserId]);
 
   const goalStarterRef = useRef(createGoalStarter());
   const setSessionGoal = useCallback(async (input: {
@@ -2432,6 +2438,7 @@ export function App() {
     effortCandidate != null && effortSupported.includes(effortCandidate)
       ? effortCandidate
       : null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: chat.version 是就地 mutation 会话的刷新触发器(见末行注释)。
   const turnActivity = useMemo<TurnActivityInfo | null>(() => {
     if (demo || !activeSess || !activeSess._sendingInFlight) return null;
     return {
@@ -2574,7 +2581,7 @@ export function App() {
                 }
               : {}),
           },
-    [demo, openManage],
+    [demo, openManage, setBoardOpen],
   );
 
   // 对话交互(```options 选择卡片等):点选即替用户发送。demo 不给发送能力(纯展示),
@@ -3002,8 +3009,9 @@ export function App() {
       // 用户已经离开点击位置：响应仍须等 DOM 提交后释放 FIFO，但不再把视口拉回旧坐标。
       anchor.cancelled = true;
     }
-  }, [settleArchiveAnchor, stick]);
+  }, [stick]);
   // 切会话:重置粘滞并瞬时跳底(历史回看从底部开始);同时清归档按钮子态与视口锚点。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: activeId 是切会话触发器,函数体不读它。
   useLayoutEffect(() => {
     stick.reset();
     scrollToChatBottom();
@@ -3019,6 +3027,7 @@ export function App() {
   // 内容变更跟随:demo 走 messages/streamText,真实路径走 version/wsSending。
   // 流式期间高频触发,用瞬时赋值而非 smooth(60fps 下排队的平滑动画反而卡顿)。
   // layout 阶段贴底,避免普通 DOM 时间线先画出旧顶部再跳到底部。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: messages/streamText/chat.version/wsSending 是内容变更触发器;stickToBottomRef.current 是稳定对象上的 getter,执行时现读。
   useLayoutEffect(() => {
     if (!stickToBottomRef.current) return;
     scrollToChatBottom();
@@ -3081,6 +3090,7 @@ export function App() {
   }, [demo, activeId, chat, settleArchiveAnchor, stick]);
   // 对应归档响应完成且前插行渲染后(paint 前)才校正 scrollTop。请求在途时的 tape/live
   // 增长没有 ready token，不能冒领这个锚点。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: archiveLoading/chat.version 是前插渲染完成的触发器,函数体经 ref 读锚点。
   useLayoutEffect(() => {
     const anchor = archiveScrollAnchorRef.current;
     if (!anchor?.ready) return;
@@ -3109,12 +3119,13 @@ export function App() {
       undefined,
       stick.correctTo,
     ).finally(() => settleArchiveAnchor(anchor.token));
-  }, [archiveLoading, chat.version, settleArchiveAnchor, stick]);
+  }, [activeId, archiveLoading, chat.version, settleArchiveAnchor, stick]);
 
   // iOS Safari 的地址栏/底栏/截图/输入键盘会触发 visualViewport 高度与 offset 抖动。
   // CSS dvh 仍可能短暂大于真实可视区；键盘弹起时 Safari 还会 pan visual viewport,
   // 让 fixed root 的 top:0 看起来被顶到屏幕上方。这里把实测 height + offsetTop
   // 写入 CSS var；若用户本就在底部或本轮正在生成，下一帧重新贴底。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: stickToBottomRef.current 是稳定对象上的 getter,事件发生时现读,不是依赖。
   useEffect(() => {
     if (!inWorkspace) return;
     let raf: number | null = null;
