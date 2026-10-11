@@ -7,7 +7,7 @@
  * 静默替换为富文本。组件契约与历史一致（{ children: string; signMedia?: boolean }），
  * 所有调用方（Message / chat/cards / chat/AgentGroupCard）无需改动。
  */
-import { Component, lazy, memo, Suspense, type ReactNode } from "react";
+import { Component, lazy, memo, Suspense, type ReactNode, useState } from "react";
 import { wrapWithCspOnly } from "./embedCsp";
 
 export type MarkdownProps = {
@@ -40,14 +40,21 @@ export type MarkdownProps = {
 };
 
 let markdownImplLoader: Promise<typeof import("./MarkdownImpl")> | null = null;
+// chunk 到达后的模块本体。React.lazy 首次渲染必然挂起一次（它只经 .then 得知结果，哪怕
+// promise 早已兑现），于是 chunk 已在手时每个 lazy 首帧仍先出纯文本占位、再整块换成富文本
+// （OCV5-373）。有了它，之后挂载的 Markdown 直接渲染实现，不再走这一次占位。
+let markdownImplModule: typeof import("./MarkdownImpl") | null = null;
 
 /** Kick the lazy chunk as soon as a session mounts, before the first Suspense. */
 export function prefetchMarkdownImpl(): Promise<typeof import("./MarkdownImpl")> {
-  markdownImplLoader ??= import("./MarkdownImpl");
+  markdownImplLoader ??= import("./MarkdownImpl").then((mod) => {
+    markdownImplModule = mod;
+    return mod;
+  });
   return markdownImplLoader;
 }
 
-const MarkdownImpl = lazy(() => prefetchMarkdownImpl());
+const LazyMarkdownImpl = lazy(() => prefetchMarkdownImpl());
 
 type HtmlFenceFallback = {
   before: string;
@@ -146,6 +153,9 @@ export const Markdown = memo(function Markdown({
   blockImages,
   autoDetectCode,
 }: MarkdownProps) {
+  // 组件类型按实例在挂载时定一次：chunk 到达前挂载的实例（如正在流式的消息）保持 lazy，
+  // 不会在 chunk 到达后因类型变化再被整块重挂（HTML 预览 iframe 会因此重载）。
+  const [MarkdownImpl] = useState(() => markdownImplModule?.default ?? LazyMarkdownImpl);
   const fallback = <MarkdownFallback live={live} readOnly={readOnly}>{children}</MarkdownFallback>;
   return (
     <MarkdownBoundary fallback={fallback}>
