@@ -67,8 +67,11 @@ count_errors() {
   local f out n
   for f in "$@"; do
     if [[ ! -f "$dir/$f" ]]; then printf '0\t%s\n' "$f"; continue; fi
-    out="$(cd "$dir" && "$BIOME" lint --reporter=json --max-diagnostics=0 "$f" 2>/dev/null || true)"
-    n="$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);console.log(j.summary?.errors??0)}catch{console.log("?")}})')"
+    # biome skips files over files.maxSize (1 MiB default) and reports 0 errors for them: gateway
+    # server.ts sits right at that edge, so a version over it counted as clean. Lint every version
+    # with the same raised limit, and treat a skipped file as unreadable instead of clean.
+    out="$(cd "$dir" && "$BIOME" lint --reporter=json --max-diagnostics=0 --files-max-size=8388608 "$f" 2>/dev/null || true)"
+    n="$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);console.log(j.summary?.skipped?"?":(j.summary?.errors??0))}catch{console.log("?")}})')"
     printf '%s\t%s\n' "$n" "$f"
   done
 }
