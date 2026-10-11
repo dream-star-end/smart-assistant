@@ -2,6 +2,13 @@
 
 状态：商业版迁移 0299；个人版迁移 0303（同一张表、同一 DDL，`IF NOT EXISTS`，OCV5-378 移植）。表不存在或账号没有行时只用默认登录，行为不变。
 
+**运营规定（2026-10-11 21:35 CST）：Box 里的 Claude Code 登录（cc1=`default`、cc2=`account2`）只以交互模式服务产品流量，
+不得走非交互 `claude -p`。** 因此（OCV5-378 第二部分）：
+- 管理页勾选的登录只作用于**交互路线**（`box-claude-*`，见下文“交互路线”）。
+- **模型路线**（`box-api-claude-*`，每个请求一次 `claude -p`）在代码里固定只用每个账号的 `default`
+  （`boxModelRouteLogins`），勾选什么都不会让其它登录走 `-p`。个人版该路线的下线见 OCV5-378 交接。
+- 交互路线没有 `-p` 回退：交互会话起不来就让这一轮失败（`BOX_INTERACTIVE_NOT_READY_NO_FALLBACK`）。
+
 ## 背景
 
 一个 Cursor 账号 = 一个 Box；Box 里原先只有一个 Claude Code 登录（`/home/box/.claude`）。它的 5 小时额度用尽时，
@@ -55,17 +62,37 @@
 
 ## 额度/故障怎么学到（不额外花钱）
 
-每个 `claude -p` 的 stream-json 都带 `rate_limit_event`（真实形状见 `boxProfileSignals.test.ts` 的夹具，取自
+模型路线：每个 `claude -p` 的 stream-json 都带 `rate_limit_event`（真实形状见 `boxProfileSignals.test.ts` 的夹具，取自
 2026-10-06 的真机输出）。`boxProfileExec.ts` 在 `target.exec` 上旁听 stdout（按行重组，行可以被切在任意字节处；运行失败退出 1 时同样会读到）：
 `allowed*` → 更新利用率；`rejected` → 冷却到该窗口的 `resetsAt`（缺失则 15 分钟，上限 7 天）；合成助手消息
 `Not logged in` → 登录失效冷却 30 分钟。状态先写进程内存，再尽力镜像到表（重启和管理页可见）。
+
+## 交互路线（`box-claude-*`）怎么用这些登录
+
+- 选号：用户容器里的 box 桥接在**每次拉起交互会话前**问 egress `POST /internal/box/login {account_id}`（容器令牌认证，
+  uid 取自令牌）。egress 用同一套候选过滤（`boxLoginCandidates.ts`）、同一个调度函数和同一份进程内健康度
+  （`BoxInteractiveLogins`）回答登录名。问不到（旧 master、网络）就用 `default`；egress 明确回答“无可用登录”（503
+  `BOX_LOGIN_UNAVAILABLE`）则这一轮失败。
+- 启动：非 `default` 时启动环境带 `OC_BOX_CLAUDE_PROFILE=<名称>`；Box 上的 `host.py` 先做与 GUARD 等价的本地检查
+  （目录属于 box 且不是软链、`projects` 是字面指向 `$HOME/.claude/projects` 的软链、凭据文件存在——只 stat），
+  通过才以 `CLAUDE_CONFIG_DIR=$HOME/.claude-<名称>` 在 `tmux -L oc-box` 里启动交互 claude；不通过报
+  `NOT_READY profile_unsafe`，桥接上报 `unsafe`，该登录冷却 1 小时。`default` 的启动请求与以前逐字节相同。
+- 额度信号：oc-bridge mod 每轮结束读 `$.session.usage().rateLimits`（CLI 2.1.296 起有，2026-10-11 本机实测 cc1/cc2
+  各自返回自己的 5 小时 / 7 天窗口），输出一行与 `-p` 同形状的 `rate_limit_event`；桥接把这一行和 `<synthetic>`
+  提示在该轮 `result` 时报给 `POST /internal/box/login-signals`，egress 用同一个解析器（`BoxProfileSignalTap`）更新健康度。
+  只接受“这个用户被分配过的登录”的报告。
+- 换号：一个交互会话固定在启动它的登录上。该轮读到 `rejected` 窗口或 `Not logged in` 时，桥接在 result 之后结束这个
+  Box 会话（正常退出），下一条消息重新问登录、用 `--resume` 在另一个登录上接着跑（会话文件共享，所以续得上）。
+- 前置：每个要勾选的登录都要在 Box 上预先信任 `/workspace`（交互模式启动前的信任对话框不能靠按键处理）。
+  cc1 于 2026-10-07 由运营设置；cc2 于 2026-10-11 用 CLI 自己的信任对话框设置（OCV5-378，未手改账号文件）。
 
 ## 已知限制（诚实写在这里）
 
 - 同一个**请求**不会在失败后换登录重试：账本对相同指纹的第二次 admit 返回 `BOX_CALL_AMBIGUOUS`，自动重放有重复
   计费风险。因此第一次撞上额度的那一次请求仍会失败，之后的请求立刻换走（亲和 + 利用率 0.92 的提前避让会让这种情况很少见）。
 - 负载是“近 90 秒启动数”的估计（后台运行没有可见的结束信号），不是精确并发；硬并发上限仍是账本里的每账号/每用户上限。
-- 路线 B（`box-claude-*`，整个代理跑在 Box 里）仍只用默认登录。商业版路线 B 已停用。
+- 模型路线（`box-api-claude-*`）只用 `default`（运营规定，见上）。商业版交互路线 B 已停用，商业 cc2 待运营决定。
+- 交互会话中途撞额度：该轮失败（不扣费的上游拒绝），下一条消息换号续聊；不会在同一轮里换号重放。
 - 调度状态的“启动数”是每个 egress 进程各自一份；利用率/冷却通过表共享。
 
 ## 运维
