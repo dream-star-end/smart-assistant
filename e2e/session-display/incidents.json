@@ -6697,6 +6697,34 @@
         "reason": "回归在 unit/integration 层：分类器、fetch 认领停止、journal 查询、decoder refusal 与恢复任务收口都有真实 SQL 或真实代码路径的用例；个人版 canary 用不了仅管理员可见的 Box 模型，触发需要真实 Claude Code 注入文本或真实 refusal，不是可重复执行的 browser/live-e2e 产物。商业版以 deploy-gate proof 覆盖。",
         "since": "2026-10-11"
       }
+    },
+    {
+      "id": "INC-20261011-SAND-INSTALLER-HOST-F1727E3",
+      "occurredAt": "2026-10-10",
+      "severity": "P1",
+      "symptom": "selfhost（2026-10-10 23:58Z 起）：Cursor 把 Box 主程序升到 f1727e3（/opt/sand/sand-host 于 10-11 07:57 CST 整目录替换、主程序 PID 换新），生命周期给新主程序重装 Sand relay，安装 prompt 被接受但 15 分钟无能力，账号 25 停在 INSTALL_UNCONFIRMED；同一主程序进程不再重试，账号池同步只写空池（gen-e3b0c442…），个人版所有 cursor-* 与 box-claude-* 回合在选凭据时失败（oc-cursor：Cursor CLI is not enabled for this account），用户看到“消息未开始处理，已确认未计费”。根因：f1727e3 的网关鉴权段与 f95dbfb 逐字相同，只有打包器生成的局部变量从 refusal2 变成 refusal3，安装器 AUTH_V3 锚点写死了 refusal2，匹配 0 次（UNSUPPORTED_HOST_LAYOUT）；10-07 那次修复也写明“仅发布不触发新尝试，要等主程序换 PID”。修复：AUTH_V3 只放宽 refusal 后的数字编号，取实际匹配原文作锚点且须唯一，鉴权逻辑任何别的变化仍拒绝；relay.cjs 加安装包修订行使模块哈希变化，生命周期按既有规则对同一主程序进程再给一次尝试（且只一次）。",
+      "rootFixCommit": "82632943",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "host f1727e3 layout (the f95dbfb gate re-bundled as refusal3): relay answers only the primary gateway token"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
+          "assertion": "the auth anchor tolerates only the bundler's numbering: a changed or doubled gate is still refused"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
+          "assertion": "a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)"
+        }
+      ],
+      "proofPending": {
+        "reason": "回归在 unit 层(真实 installer.py 对 f1727e3 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌;锚点反例;生命周期同一主程序遇新模块再试一次);线上证据要账号 25 的真实 Box:发布后生命周期 ready、能力探针命中新模块、账号池写入 ≥1、个人版 box-claude 回合跑通,属一次性运维核对,个人版发布不跑 deploy-gate/live-e2e,canary 也没有 Cursor slot。",
+        "since": "2026-10-11"
+      }
     }
   ]
 }

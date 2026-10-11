@@ -58,9 +58,14 @@ const SELFHOST_PROOF_DEBT_CEILING = 63;
 /**
  * 个人版新登记、带 proofPending 的无 proof 事故条数上界(同商业版 PROOF_PENDING_BASELINE 的用法)。
  * 1 = INC-20261011-BOX-TOOL-409-STUCK-RECOVERY(OCV5-377:个人版 canary 用不了 Box 模型,
- *     商业版由 deploy-gate proof 覆盖)。补上 proof 后同步调低。
+ *     商业版由 deploy-gate proof 覆盖)。
+ * 2 = + INC-20261011-SAND-INSTALLER-HOST-F1727E3(OCV5-378,评审中显式调高):Sand 生命周期只在
+ *     个人版启用,商业 deploy-v5.sh 不跑它;个人版发布只跑 canary 用户合同,而 canary 没有 Cursor
+ *     slot,跑不到 Sand/Box 凭据选择,所以这条没有可接进 runner 的 proof 层。证据是一次性运维
+ *     核对(账号 25 生命周期 ready、账号池写入 ≥1、真实 box-claude 回合),记在事故 proofPending 里。
+ *     补上 proof 后同步调低。
  */
-const SELFHOST_PROOF_PENDING_BASELINE = 1;
+const SELFHOST_PROOF_PENDING_BASELINE = 2;
 const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
 /** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
 function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {

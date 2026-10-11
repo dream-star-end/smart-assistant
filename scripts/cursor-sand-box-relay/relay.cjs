@@ -1,4 +1,7 @@
 "use strict";
+// Install bundle revision 2026-10-11 (OCV5-378, host f1727e3). The lifecycle retries an unconfirmed install
+// on the same Box host only when this module's bytes change (cursorSandLifecycle), so a change to the
+// installer's host anchors that must reach an already-stuck host bumps this line.
 const { Readable } = require("node:stream");
 const { pipeline } = require("node:stream/promises");
 const { readFileSync } = require("node:fs");

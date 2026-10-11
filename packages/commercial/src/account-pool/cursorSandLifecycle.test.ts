@@ -296,6 +296,70 @@ test("an accepted install that leaves no capability is not sent again to the sam
   }
 });
 
+test("a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)", { timeout: 15_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sand-unconfirmed-module-"));
+  const token = `x.${Buffer.from(JSON.stringify({ type: "session", sub: "unconfirmed-module-principal", exp: 2_000_000_000 })).toString("base64url")}.y`;
+  const oldModule = "d".repeat(64);
+  const newModule = "e".repeat(64);
+  const machine = "a".repeat(32);
+  let now = Date.now();
+  let sends = 0;
+  let installed: string | null = null;
+  const pid = 321;
+  const agents: any[] = [];
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []; req.on("data", (x) => chunks.push(x));
+    req.on("end", () => {
+      const path = req.url!;
+      const body = Buffer.concat(chunks).toString();
+      const reply = (value: unknown, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); };
+      if (path.endsWith("GetSandBoxRunState")) return reply({ state: "SAND_BOX_RUN_STATE_RUNNING" });
+      if (path.endsWith("EnsureSandBox")) return reply({ gatewayUrl: `${base}/box`, gatewayToken: "GATE", networkToken: "NET" });
+      if (path.endsWith("/health")) return reply({ ok: true, pid, isBusy: false });
+      if (path.endsWith("InferenceService/Stream")) return installed ? reply({ protocol: "oc-sand-relay-v2", moduleSha256: installed, nonce: req.headers["x-oc-sand-box-probe-nonce"], active: 0, maxConcurrent: 4 }) : reply({}, 404);
+      if (path.endsWith("/listAgents")) return reply(agents);
+      if (path.endsWith("/createAgent")) {
+        agents.push({ id: "owned-maintenance-bot", description: JSON.parse(body).description, isRunning: false });
+        return reply({ agent: { id: "owned-maintenance-bot" }, transcript: [] });
+      }
+      if (path.endsWith("/sendPrompt")) { sends++; return reply({ accepted: true }); }
+      return reply({}, 404);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const row: any = { id: 1n, provider: "cursor", status: "active", cursor_sand_enabled: true, runtime_channel: "v5" };
+  const coordinatorFor = (moduleHash: string) => new CursorSandLifecycleCoordinator({
+    authDir: dir, moduleHash, listAccounts: async () => [row], getAccount: async () => row,
+    getTokenSnapshot: async () => ({ id: 1n, token: Buffer.from(token), refresh: null, credential_kind: "session" as const, machine_id: machine, expires_at: null }),
+    clientFor: async () => ({ client: new CursorSandProvisionClient({ fetchImpl: fetch, apiBase: base, allowTestLoopback: true }) }),
+    installerPrompt: () => "synthetic deterministic installer", onChange: () => {}, now: () => now,
+  });
+  const op = () => Object.values(readSandLifecycleState(dir).operations)[0];
+  let coordinator = coordinatorFor(oldModule);
+  try {
+    await coordinator.tick();
+    for (let i = 0; i < 3; i++) { now += 15 * 60_000 + 1; await coordinator.tick(); }
+    assert.deepEqual({ sends, phase: op().phase, errorCode: op().errorCode }, { sends: 1, phase: "error", errorCode: "INSTALL_UNCONFIRMED" });
+    // A release with a new relay module (e.g. an installer that now matches the host): same host process,
+    // one new attempt, carrying the new module, and again only one.
+    await coordinator.stop();
+    coordinator = coordinatorFor(newModule);
+    now += 60_001; await coordinator.tick();
+    assert.deepEqual({ sends, phase: op().phase, moduleHash: op().moduleHash, hostPid: op().hostPid }, { sends: 2, phase: "submitted", moduleHash: newModule, hostPid: pid });
+    for (let i = 0; i < 3; i++) { now += 15 * 60_000 + 1; await coordinator.tick(); }
+    assert.equal(sends, 2, "no loop on the same host and module");
+    // The new module installed and loaded: the capability probe makes the account ready.
+    installed = newModule; now += 60_001; await coordinator.tick();
+    assert.equal(readSandLifecycleState(dir).accounts["1"].phase, "ready");
+  } finally {
+    await coordinator.stop();
+    server.closeAllConnections();
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("API-key exchange transient failures retain exact ready expiry; expiry and explicit rejection still withdraw", async () => {
   const dir = mkdtempSync(join(tmpdir(), "sand-exchange-recheck-"));
   const key = "crsr_" + "a".repeat(64), machine = "b".repeat(32), subject = sandHash("api-principal"), moduleHash = "c".repeat(64);
