@@ -69,6 +69,7 @@ test("first text request stages only files and carries no prompt/system on Claud
   assert.ok(!plan.run.args.join(" ").includes("private current user marker"));
   assert.ok(!plan.run.args.join(" ").includes("OpenClaude memory marker"));
   assert.equal(plan.run.environment.CLAUDE_CODE_MAX_RETRIES, "0");
+  assert.equal(plan.run.environment.CLAUDE_CODE_DISABLE_REFUSAL_RETRY, "1");
   assert.equal(plan.run.environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "128");
   assert.equal(plan.run.cwd, plan.cwd);
   assert.equal(plan.run.args[0], "-I");
