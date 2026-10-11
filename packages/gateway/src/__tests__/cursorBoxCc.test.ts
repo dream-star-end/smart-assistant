@@ -67,8 +67,12 @@ function token(sub = 'account-a'): string {
 }
 
 test('box Claude is an account-pool session transport, not a second account system', () => {
-  const env = { OC_CURSOR_SAND_BOX_CC: '1', OC_CURSOR_SAND_OFFICIAL_CC: '1' }
+  const env = { OC_CURSOR_SAND_BOX_CC: '1', OC_BOX_INTERACTIVE_MASTER: '1', OC_CURSOR_SAND_OFFICIAL_CC: '1' }
   assert.equal(cursorBoxCcEnabled(env), true)
+  // OCV5-380: commercial forwards OC_CURSOR_SAND_BOX_CC=1 but not the master switch.
+  assert.equal(cursorBoxCcEnabled({ OC_CURSOR_SAND_BOX_CC: '1', OC_CURSOR_SAND_OFFICIAL_CC: '1' }), false)
+  assert.equal(cursorVariantFor('box-claude-opus-5-5', selection, undefined,
+    { OC_CURSOR_SAND_BOX_CC: '1', OC_CURSOR_SAND_OFFICIAL_CC: '1' }) === 'sand-box-cc', false)
   assert.equal(cursorBoxCcSelectionEligible(selection), true)
   assert.equal(cursorBoxCcSelectionEligible(apiKeySelection), false)
   assert.equal(cursorVariantFor('box-claude-opus-5-5', selection, { kind: 'local' }, env), 'sand-box-cc')
