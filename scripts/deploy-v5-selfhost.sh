@@ -2786,11 +2786,12 @@ cmd_cutover() {
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
   # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
-  # master release:引用感知 v5-release-gc.sh,keep 6;live/.prev-release/unit cwd/
+  # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
+  # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/
   # 容器 baseline bind 全在保护集,校验失败 rc=75 整轮安全跳过零删除。
   # runtime tuple:oc_hotcfg_gc,history 最近 N 条 committed + env tuple + 容器 label 保护。
   bash "$SCRIPT_DIR/v5-release-gc.sh" \
-    "$MASTER_RELEASES_ROOT" 6 \
+    "$MASTER_RELEASES_ROOT" 3 \
     "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" "$MASTER_LIVE_LINK" \
     "$MASTER_RELEASES_ROOT/.prev-release" \
     "$V5_UNIT" "$(egress_slot_unit A service)" "$(egress_slot_unit B service)" \
