@@ -920,6 +920,9 @@ export interface SubprocessRunnerOpts {
     /** 0257 — `session` slots carry a Cursor account session token (Sand-only). */
     credentialKind: 'api_key' | 'session'
     machineId: string | null
+    /** OCV5-378: an interactive Box session (box-claude-*) whose Box comes from the master; minted by the
+     * gateway (masterBoxCredentialSelection), names no key or account, carries no credential. */
+    masterBox?: true
   }
   /** Agent-loop implementation. Omitted follows `resolveCcbHarness` (CCB
    * unless `OC_CCB_OFFICIAL_CC=1`). Official-cc is either Cursor Sand

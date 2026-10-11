@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { boxLoginUrlFromEnv } from './boxLoginClient.js'
+import { BoxExecTargetError, boxLoginUrlFromEnv, requestBoxExecTarget, type BoxExecTargetFromMaster } from './boxLoginClient.js'
 import type { CursorCredentialSelection } from './cursorCredentialSelection.js'
 import { readCursorApiKey } from './cursorSandRelay.js'
 import {
@@ -17,6 +17,7 @@ import {
 import {
   BOX_CC_CWD,
   BOX_CC_REMOTE_CLAUDE,
+  isBoxClaudeCatalogModel,
   type BoxCcControl,
 } from './cursorBoxCcExec.js'
 
@@ -49,9 +50,19 @@ export function cursorBoxCcEnabled(env: NodeJS.ProcessEnv = process.env): boolea
 /** Session slots are the logged-in Cursor accounts that own a Grok Bot box.
  * API-key slots stay on the existing in-container Sand loop. */
 export function cursorBoxCcSelectionEligible(selection: CursorCredentialSelection): boolean {
+  if (selection.masterBox === true) return true
   return selection.sandEnabled
     && selection.credentialKind === 'session'
     && selection.machineId !== null
+}
+
+/** An interactive Box session (box-claude-*) on this container gets its Box from the master
+ * (masterBoxCredentialSelection) instead of a pool slot: Box exec needs only the account's own
+ * credential and egress, which the master holds; the container pool additionally requires the Sand
+ * relay to be installed. Needs the container's master route; otherwise the pool path stays. */
+export function cursorBoxCcFromMaster(model: string | undefined, remote: boolean,
+  env: NodeJS.ProcessEnv = process.env): boolean {
+  return !remote && cursorBoxCcEnabled(env) && isBoxClaudeCatalogModel(model) && boxLoginUrlFromEnv(env) !== null
 }
 
 export function boxCcFifoPath(sessionKey: string): string {
@@ -104,9 +115,34 @@ export async function writeBoxCcControlFile(input: {
   fetchImpl?: FetchFn
   readPolicy?: () => CursorSandBoxPolicy | null
   readToken?: () => Buffer
+  /** The master's Box exec endpoint (tests); default: boxLoginClient.requestBoxExecTarget. */
+  requestExecTarget?: () => Promise<BoxExecTargetFromMaster>
+  retryDelayMs?: number
 }): Promise<string> {
   if (!cursorBoxCcSelectionEligible(input.selection)) {
     throw new Error('BOX_CC_SESSION_REQUIRED')
+  }
+  if (input.selection.masterBox === true) {
+    const ask = input.requestExecTarget ?? (() => requestBoxExecTarget())
+    let target: BoxExecTargetFromMaster
+    try {
+      target = await ask()
+    } catch (err) {
+      // A Cursor control hiccup on the master's side is worth one more try before the turn fails;
+      // an entitlement refusal is final.
+      if (!(err instanceof BoxExecTargetError) || err.code !== 'BOX_EXEC_TARGET_UNAVAILABLE') throw err
+      await new Promise((r) => setTimeout(r, input.retryDelayMs ?? 1_000))
+      target = await ask()
+    }
+    return writeControl({
+      execUrl: target.execUrl,
+      execToken: target.execToken,
+      networkToken: target.networkToken,
+      remoteClaude: BOX_CC_REMOTE_CLAUDE,
+      fifo: boxCcFifoPath(input.sessionKey),
+      cwd: BOX_CC_CWD,
+      accountId: target.accountId,
+    }, input.sessionKey, input.dir)
   }
   const generation = input.selection.poolGeneration.startsWith('gen-')
     ? input.selection.poolGeneration
@@ -137,9 +173,13 @@ export async function writeBoxCcControlFile(input: {
     // Which Cursor account's Box logins the bridge asks the master to choose from.
     accountId: input.selection.accountId,
   }
-  const dir = input.dir ?? join(tmpdir(), 'oc-box-cc')
+  return writeControl(control, input.sessionKey, input.dir)
+}
+
+function writeControl(control: BoxCcControl, sessionKey: string, dirOverride: string | undefined): string {
+  const dir = dirOverride ?? join(tmpdir(), 'oc-box-cc')
   mkdirSync(dir, { recursive: true, mode: 0o700 })
-  const path = join(dir, `control-${createHash('sha256').update(input.sessionKey).digest('hex').slice(0, 12)}.json`)
+  const path = join(dir, `control-${createHash('sha256').update(sessionKey).digest('hex').slice(0, 12)}.json`)
   writeFileSync(path, JSON.stringify(control), { mode: 0o600 })
   chmodSync(path, 0o600)
   return path

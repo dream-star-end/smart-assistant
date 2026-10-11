@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { isCursorCredentialMember, parseCursorCredentialUids } from '../cursor/access.js'
+import { isCursorCredentialEntitled, isCursorCredentialMember, parseCursorCredentialUids } from '../cursor/access.js'
 
 describe('Cursor credential membership', () => {
   test('accepts the explicit shared members only', () => {
@@ -27,5 +27,17 @@ describe('Cursor credential membership', () => {
       const parsed = parseCursorCredentialUids(raw)
       assert.equal(parsed === 'all' ? 'all' : parsed.size, 0, raw)
     }
+  })
+})
+
+describe('Cursor credential entitlement (the container pool mount rule)', () => {
+  test('the credential uid list when set, else the owner uid; nothing configured is nobody', () => {
+    assert.equal(isCursorCredentialEntitled(3, { OC_V5_CURSOR_CREDENTIAL_UIDS: '3,4', OC_V5_CURSOR_OWNER_UID: '9' }), true)
+    assert.equal(isCursorCredentialEntitled(9, { OC_V5_CURSOR_CREDENTIAL_UIDS: '3,4', OC_V5_CURSOR_OWNER_UID: '9' }), false)
+    assert.equal(isCursorCredentialEntitled(9, { OC_V5_CURSOR_CREDENTIAL_UIDS: '  ', OC_V5_CURSOR_OWNER_UID: '9' }), true)
+    assert.equal(isCursorCredentialEntitled(3n, { OC_V5_CURSOR_OWNER_UID: '3' }), true)
+    assert.equal(isCursorCredentialEntitled(765, { OC_V5_CURSOR_OWNER_UID: '3' }), false)
+    assert.equal(isCursorCredentialEntitled(3, {}), false)
+    assert.equal(isCursorCredentialEntitled(3, { OC_V5_CURSOR_CREDENTIAL_UIDS: '3,evil' }), false, 'malformed fails closed')
   })
 })
