@@ -370,3 +370,20 @@ test("INC-20261006 a finished spool the decoder rejects is undeliverable", async
   assert.deepEqual(outcome, { status: "pending", reason: "BOX_TOOL_SNAPSHOT_INVALID",
     undeliverable: true });
 });
+
+// OCV5-377 (Codex r1): a continuation refused by the model whose CLI then ended
+// on its own (worker_complete) must not stay unknown and hold the session.
+test("OCV5-377 a model safety stop in the finished spool is undeliverable", async () => {
+  const refused = finalRecords.slice(0, 6).concat([
+    event({ type: "message_delta", delta: { stop_reason: "refusal" },
+      usage: { input_tokens: 3, output_tokens: 4 } }),
+    event({ type: "message_stop" }),
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 9, output_tokens: 8 } }]);
+  const deps = { writeMessage: async () => { throw new Error("must not write"); },
+    journal: { complete: async () => { throw new Error("must not complete"); },
+      completeToolChain: async () => { throw new Error("must not complete"); },
+      readRecoveryWinner: async () => null } as never };
+  assert.deepEqual(await observeBoxToolTerminalOnly({ evidence, catalog,
+    target: spool(refused) as never }, deps),
+  { status: "pending", reason: "BOX_CLI_MODEL_REFUSED", undeliverable: true });
+});

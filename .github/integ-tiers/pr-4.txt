@@ -11,7 +11,7 @@
 #
 # 4 个文件串行，每个父超时 180000ms。mutex 900s 覆盖 4*180s+120s 清理。
 # job 20min 再留安装余量。这些是拟上界，不是 2 核实测。
-# min-tests: 11
+# min-tests: 12
 # max-minutes: 30
 # file-timeout-ms: 180000
 # mutex-timeout-seconds: 1260
