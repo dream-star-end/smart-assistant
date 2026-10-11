@@ -57,8 +57,7 @@ test('every platform seed agent keeps the artifact hash pinned for its slug@vers
     assert.equal(
       hash,
       pinned,
-      `${key}: the manifest changed but the version did not. Bump the version in seedPlatformAgents.ts; ` +
-        'the seed refuses to approve a different artifact under an existing version',
+      `${key}: the manifest changed but the version did not. Bump the version in seedPlatformAgents.ts; the seed refuses to approve a different artifact under an existing version`,
     )
   }
   assert.deepEqual(Object.keys(PINNED).sort(), Object.keys(current).sort(), 'PINNED lists exactly the current seed versions')
