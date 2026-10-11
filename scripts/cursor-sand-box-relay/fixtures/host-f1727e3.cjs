@@ -15,7 +15,7 @@ const GATEWAY_COOKIE_ORIGIN_APPROVAL_REQUESTS_PATH = "/cookie-requests";
 const GATEWAY_COOKIE_ORIGIN_APPROVAL_RESPONSES_PATH = "/cookie-responses";
 function createNodeHttpClient(options2) { return () => { throw Error("unexpected upstream"); }; }
 function createCursorChecksum(machine) { return "checksum"; }
-function isAuthorized(req, token) { return req.headers.authorization === "Bearer " + token; }
+function isAuthorized(req, token) { return req.headers.authorization === `Bearer ${token}`; }
 function rejectUntrustedBrowserRequest() { return false; }
 // f95dbfb WebAuthn proxy branch. Worst case: this stub lets every path
 // through (the real one only allows one POST method), so the relay is kept

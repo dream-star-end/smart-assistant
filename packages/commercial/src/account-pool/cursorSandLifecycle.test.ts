@@ -298,18 +298,23 @@ test("an accepted install that leaves no capability is not sent again to the sam
 
 test("a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)", { timeout: 15_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "sand-unconfirmed-module-"));
-  const token = "x." + Buffer.from(JSON.stringify({ type: "session", sub: "unconfirmed-module-principal", exp: 2_000_000_000 })).toString("base64url") + ".y";
-  const oldModule = "d".repeat(64), newModule = "e".repeat(64), machine = "a".repeat(32);
-  let now = Date.now(), sends = 0, installed: string | null = null;
+  const token = `x.${Buffer.from(JSON.stringify({ type: "session", sub: "unconfirmed-module-principal", exp: 2_000_000_000 })).toString("base64url")}.y`;
+  const oldModule = "d".repeat(64);
+  const newModule = "e".repeat(64);
+  const machine = "a".repeat(32);
+  let now = Date.now();
+  let sends = 0;
+  let installed: string | null = null;
   const pid = 321;
   const agents: any[] = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []; req.on("data", (x) => chunks.push(x));
     req.on("end", () => {
-      const path = req.url!, body = Buffer.concat(chunks).toString();
+      const path = req.url!;
+      const body = Buffer.concat(chunks).toString();
       const reply = (value: unknown, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); };
       if (path.endsWith("GetSandBoxRunState")) return reply({ state: "SAND_BOX_RUN_STATE_RUNNING" });
-      if (path.endsWith("EnsureSandBox")) return reply({ gatewayUrl: base + "/box", gatewayToken: "GATE", networkToken: "NET" });
+      if (path.endsWith("EnsureSandBox")) return reply({ gatewayUrl: `${base}/box`, gatewayToken: "GATE", networkToken: "NET" });
       if (path.endsWith("/health")) return reply({ ok: true, pid, isBusy: false });
       if (path.endsWith("InferenceService/Stream")) return installed ? reply({ protocol: "oc-sand-relay-v2", moduleSha256: installed, nonce: req.headers["x-oc-sand-box-probe-nonce"], active: 0, maxConcurrent: 4 }) : reply({}, 404);
       if (path.endsWith("/listAgents")) return reply(agents);
@@ -322,7 +327,7 @@ test("a stuck unconfirmed install on the same host process gets one new attempt 
     });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const base = "http://127.0.0.1:" + (server.address() as { port: number }).port;
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   const row: any = { id: 1n, provider: "cursor", status: "active", cursor_sand_enabled: true, runtime_channel: "v5" };
   const coordinatorFor = (moduleHash: string) => new CursorSandLifecycleCoordinator({
     authDir: dir, moduleHash, listAccounts: async () => [row], getAccount: async () => row,
