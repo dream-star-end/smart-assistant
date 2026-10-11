@@ -23,7 +23,8 @@ import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { tmpdir } from "node:os";
 import { EventEmitter } from "node:events";
-import { createServer } from "node:http";
+import { createServer, type Server } from "node:http";
+import { createRequire } from "node:module";
 import { deflateSync } from "node:zlib";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -2689,6 +2690,120 @@ async function proveSandInstallNotResent(api: Api): Promise<string> {
   return "[ocv5-314-sand-install-resend] PASS — an installer the Box accepted is not sent again to the same Box host process";
 }
 
+/** The real relay installer (scripts/cursor-sand-box-relay/installer.py) applied to a copy of a Box host
+ * whose gateway auth gate is verbatim from the live host, then that patched host served: who reaches the
+ * relay route, and whether re-running is a no-op. */
+const SAND_RELAY_DIR = join(CANDIDATE, "scripts/cursor-sand-box-relay");
+function sandInstall(host: string): { status: number | null; out: string } {
+  const module = join(SAND_RELAY_DIR, "relay.cjs");
+  const r = spawnSync("python3", ["-c", `import importlib.util,json,pathlib,sys
+s=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+try: print(json.dumps(m.install(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3]).read_bytes(),sys.argv[4],'oc-sand-'+'a'*32)))
+except Exception as e: print(type(e).__name__+':'+str(e));sys.exit(1)`, join(SAND_RELAY_DIR, "installer.py"), host, module,
+  createHash("sha256").update(readFileSync(module)).digest("hex")], { encoding: "utf8", timeout: 30_000 });
+  return { status: r.status, out: `${r.stdout}${r.stderr}` };
+}
+async function sandPatchedHost(fixture: string, tag: string, relay?: string) {
+  const dir = mkdtempSync(join(tmpdir(), `${tag}-`));
+  cleanups.add(() => rmSync(dir, { recursive: true, force: true }));
+  const host = join(dir, "host-main.cjs");
+  writeFileSync(host, readFileSync(join(SAND_RELAY_DIR, fixture)));
+  const first = sandInstall(host);
+  if (first.status !== 0) fail(`SAND_LAYOUT_INSTALL_FAILED_${tag}_${first.out.trim().slice(0, 80)}`);
+  const patched = readFileSync(host, "utf8");
+  const again = sandInstall(host);
+  if (again.status !== 0 || (JSON.parse(again.out) as { changed?: boolean }).changed !== false) fail(`SAND_LAYOUT_RERUN_${tag}`);
+  if (relay !== undefined) writeFileSync(join(dir, "ocv5-197-relay.cjs"), relay);
+  const app = createRequire(import.meta.url)(host) as { initialize: (input: unknown) => void;
+    handleRequest: (deps: unknown, req: unknown, res: unknown) => void };
+  app.initialize({ host: { log() {}, environment: { auth: {} } }, onStop() {} });
+  const state: { deps: Record<string, unknown> } = { deps: { authToken: "TEST_GATE", webAuthnProxyToken: "PROXY_GATE",
+    isWebAuthnProxyCredentialLive: () => true } };
+  const server: Server = createServer((req, res) => app.handleRequest(state.deps, req, res));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  cleanups.add(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  const relayUrl = `${base}/sand-stream-relay/aiserver.v1.InferenceService/Stream`;
+  const probe = { "content-type": "application/connect+proto", "x-oc-sand-box-probe": "1",
+    "x-oc-sand-box-probe-nonce": "b".repeat(32) };
+  /** Every way in that is not the primary gateway token is refused (401), with or without a configured token. */
+  const refusesOthers = async (): Promise<boolean> => {
+    for (const auth of [undefined, "Bearer PROXY_GATE", "Bearer wrong"]) {
+      for (const method of ["GET", "POST"]) {
+        const r = await fetch(relayUrl, { method, ...(method === "POST" ? { body: "" } : {}),
+          headers: auth ? { ...probe, authorization: auth } : probe });
+        await r.text();
+        if (r.status !== 401) return false;
+      }
+    }
+    return true;
+  };
+  return { patched, base, relayUrl, probe, state, refusesOthers };
+}
+
+// INC-20261007-SAND-INSTALLER-HOST-F95DBFB: Cursor's f95dbfb Box host moved to /opt/sand/sand-host and
+// gained a WebAuthn proxy branch in its gateway token gate. The installer still used /home/box/sand-host
+// and an AUTH anchor the new gate no longer had (UNSUPPORTED_HOST_LAYOUT), so no account published a
+// relay and the Sand pool stayed empty. The installer now finds the host by the expected PID's cwd and
+// inserts its route before the proxy branch with its own primary-token check.
+async function proveSandInstallerHostF95dbfb(api: Api): Promise<string> {
+  void api;
+  const host = await sandPatchedHost("fixtures/host-f95dbfb.cjs", "inc-20261007-sand-f95dbfb");
+  if (host.patched.indexOf("return handleSandStreamRelay(deps, req, res);") > host.patched.indexOf("webAuthnProxyRefusal({")) {
+    fail("SAND_F95DBFB_ROUTE_AFTER_PROXY_GATE");
+  }
+  if (!await host.refusesOthers()) fail("SAND_F95DBFB_RELAY_OPEN");
+  const ok = await fetch(host.relayUrl, { headers: { ...host.probe, authorization: "Bearer TEST_GATE" } });
+  const moduleSha = createHash("sha256").update(readFileSync(join(SAND_RELAY_DIR, "relay.cjs"))).digest("hex");
+  if (ok.status !== 200 || (await ok.json() as { moduleSha256?: string }).moduleSha256 !== moduleSha) fail("SAND_F95DBFB_RELAY_UNREACHABLE");
+  host.state.deps = {};
+  const open = await fetch(host.relayUrl, { headers: host.probe });
+  await open.text();
+  if (open.status !== 401) fail("SAND_F95DBFB_NO_TOKEN_OPEN");
+  // the installer's own route gate holds even when the relay module itself checks nothing
+  const ungated = await sandPatchedHost("fixtures/host-f95dbfb.cjs", "inc-20261007-sand-f95dbfb-ungated",
+    'exports.createRelay = () => (deps, req, res) => { res.writeHead(200); res.end("UNGATED_RELAY"); };\n');
+  if (!await ungated.refusesOthers()) fail("SAND_F95DBFB_ROUTE_GATE_MISSING");
+  // the host directory is the one the expected host PID runs in, among the known Sand host dirs
+  const where = spawnSync("python3", ["-c", `import importlib.util,os,pathlib,sys,json
+s=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+print(json.dumps({'dirs':[str(d) for d in m.HOST_DIRS]}))`, join(SAND_RELAY_DIR, "installer.py")], { encoding: "utf8", timeout: 10_000 });
+  if (!isDeepStrictEqual((JSON.parse(where.stdout || "{}") as { dirs?: unknown }).dirs, ["/opt/sand/sand-host", "/home/box/sand-host"])) {
+    fail("SAND_F95DBFB_HOST_DIRS");
+  }
+  return "[inc-20261007-sand-installer-host-f95dbfb] PASS — the installer patches the f95dbfb host with its relay route before the proxy gate and only the gateway token reaches it";
+}
+
+// INC-20261011-SAND-INSTALLER-HOST-F1727E3: the f1727e3 Box host re-bundled the f95dbfb gate with one
+// renumbered local (refusal2 → refusal3); the installer found no anchor, account 25 stayed
+// INSTALL_UNCONFIRMED and every personal cursor-* / box-claude-* turn failed at credential selection.
+// The anchor now tolerates only that numeric suffix; any other change to the gate is still refused.
+async function proveSandInstallerHostF1727e3(api: Api): Promise<string> {
+  void api;
+  const host = await sandPatchedHost("fixtures/host-f1727e3.cjs", "inc-20261011-sand-f1727e3");
+  if (host.patched.indexOf("return handleSandStreamRelay(deps, req, res);") > host.patched.indexOf("webAuthnProxyRefusal({")) {
+    fail("SAND_F1727E3_ROUTE_AFTER_PROXY_GATE");
+  }
+  if (!await host.refusesOthers()) fail("SAND_F1727E3_RELAY_OPEN");
+  const ok = await fetch(host.relayUrl, { headers: { ...host.probe, authorization: "Bearer TEST_GATE" } });
+  await ok.text();
+  if (ok.status !== 200) fail("SAND_F1727E3_RELAY_UNREACHABLE");
+  const base = readFileSync(join(SAND_RELAY_DIR, "fixtures/host-f1727e3.cjs"), "utf8");
+  const gate = base.slice(base.indexOf("    if (deps.authToken != null && !isAuthorized(req, deps.authToken)) {"),
+    base.indexOf("const refusal3 = webAuthnProxyRefusal({") + "const refusal3 = webAuthnProxyRefusal({".length);
+  for (const [name, source] of Object.entries({
+    changed: base.replace("!isAuthorized(req, deps.webAuthnProxyToken)", "!isAuthorizedProxy(req, deps.webAuthnProxyToken)"),
+    renamed: base.replace("const refusal3 = webAuthnProxyRefusal", "const refusalX = webAuthnProxyRefusal"),
+    doubled: base.replace(gate, `${gate}\n      });\n    }\n${gate}`) })) {
+    const r = spawnSync("python3", ["-c", `import importlib.util,sys
+s=importlib.util.spec_from_file_location('installer',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+try: m.patch_source(sys.stdin.read()); print('patched')
+except RuntimeError as e: print(e)`, join(SAND_RELAY_DIR, "installer.py")], { input: source, encoding: "utf8", timeout: 10_000 });
+    if (r.stdout.trim() !== "UNSUPPORTED_HOST_LAYOUT") fail(`SAND_F1727E3_ACCEPTED_${name}`);
+  }
+  return "[inc-20261011-sand-installer-host-f1727e3] PASS — the installer patches the f1727e3 host, still refuses any other change to its auth gate, and only the gateway token reaches the relay";
+}
+
 /** INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT, live #7da201bd/#2a81a2fe: a Box turn's tool results had been
  * sent when the turn failed. Claude Code drops its own API Error rows, so every later message of the session,
  * the automatic 「从断点继续」 included, was merged into that tool-result message (tool_result + text + text…).
@@ -3132,6 +3247,7 @@ async function main(): Promise<void> {
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
+    await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),

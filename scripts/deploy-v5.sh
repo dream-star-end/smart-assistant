@@ -3985,6 +3985,15 @@ build_release() {
     ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
     return 1
   fi
+  # OCV5-380: master-side incidents that came with the selfhost merge (alert inbox fallback, inbox
+  # delivery key, project output assets, PROJECT.md seed). Each named regression case must pass on
+  # this pinned tree; the alert cases run on the same hermetic test PostgreSQL.
+  if ! (cd "$REPO_ROOT" && TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+        npx --no-install tsx scripts/check-v5-master-incident-proofs.ts); then
+    echo "✗ pinned master incident proofs failed" >&2
+    ssh "$KL_HOST" "rm -rf '$staging'" 2>/dev/null
+    return 1
+  fi
   # Phase A writer / Phase B reader must choose the same physical billing
   # anchor across format-2/3 and rolling batching-flag skew. Run from the exact
   # pinned staging tree, not the shared checkout.

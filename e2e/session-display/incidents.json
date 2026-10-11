@@ -6837,12 +6837,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
           "assertion": "a CLI usage-limit refusal before any model message is a named code, not a snapshot violation"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261006-upstream-refusal] PASS — a CLI usage-limit refusal settles unbilled at once, its retries are not seen as still resolving, and the next message runs"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层，其中一条用 Box 上抓到的真实“额度耗尽”记录（__fixtures__/box-cli-upstream-refusal/real-session-limit.jsonl）走完首轮解码和未计费收尾。商业版在真实 Postgres 上有部署门禁证明（scripts/check-v5-box-incident-proofs.ts，红绿对照），个人版没有 Box 事故的 deploy-gate 脚本，canary 也用不了 box-claude-*，所以个人版暂无 browser/live-e2e/deploy-gate 层产物。",
-        "since": "2026-10-07"
-      }
+      ]
     },
     {
       "id": "INC-20261006-MODEL-CONFIG-CARD-BILLING-COPY",
@@ -6895,12 +6896,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorSandInstallerLayout.test.ts",
           "assertion": "host path follows the expected PID's cwd among known Sand host directories"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261007-sand-installer-host-f95dbfb] PASS — the installer patches the f95dbfb host with its relay route before the proxy gate and only the gateway token reaches it"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层（真实 installer.py 对 f95dbfb 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌，含无自身鉴权的 relay 替身）；线上证据要账号 25 真实 Box：发布后 Sand host 换 PID、生命周期 ready、能力探针命中、账号池写入 ≥1，属一次性运维核对，接不进 browser/live-e2e/deploy-gate runner。",
-        "since": "2026-10-08"
-      }
+      ]
     },
     {
       "id": "INC-20261008-MARKET-SKILL-IMPORT-OVERFLOW",
@@ -6929,10 +6931,6 @@
       "symptom": "绑定看板的项目里，手改过的 PROJECT.md（哈希与记录不符）会被当成没有指令，随后被项目的 PG 旧指令整份覆盖；用户清空的指令下一轮又被 PG 旧文本填回。",
       "rootFixCommit": "9fd5d327",
       "coverageCommits": [],
-      "proofPending": {
-        "reason": "缺陷在存储层（项目卷上的 PROJECT.md 与 meta.json），回归在 unit 层，对旧实现红、新实现绿（五条）。个人版没有能覆盖容器卷文件的 browser/live-e2e/deploy-gate runner；发布后在 uid3 卷上只读核对 meta.json 的 instructionsState 与 PROJECT.md 未变，属一次性核对。",
-        "since": "2026-10-08"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -6948,6 +6946,11 @@
           "layer": "unit",
           "path": "packages/storage/src/__tests__/projectContext.test.ts",
           "assertion": "a seed racing a human write cannot overwrite it (checked under the lock)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "a hand-edited PROJECT.md with a stale hash is preserved, not replaced by the seed"
         }
       ]
     },
@@ -6992,10 +6995,6 @@
       "coverageCommits": [
         "d371a45b"
       ],
-      "proofPending": {
-        "reason": "缺陷在容器↔主控的登记链路，回归在 unit 层：容器侧收集器对假主控（重试/待登记队列/冻结项目）六条、主控路由对假身份与假存储（租户只取容器身份、冻结项目、已删项目落未分类、外人会话不登记）六条；把收集器强制回本地登记时六条全红。个人版没有覆盖真实容器→主控链路的 browser/live-e2e/deploy-gate runner；发布后用 uid3 真实一轮产出文件、在 PG project_assets 只读核对新行与项目归属，属一次性核对。",
-        "since": "2026-10-08"
-      },
       "regressions": [
         {
           "layer": "unit",
@@ -7026,6 +7025,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/projectAssetOutputsMaster.test.ts",
           "assertion": "a registration queued while a flush is sending is not lost"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "registers into the tenant from the container identity, never from the body"
         }
       ]
     },
@@ -7121,6 +7125,11 @@
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/alertOutboxInboxFallback.integ.test.ts",
           "assertion": "uid=1 不是 admin(个人版)→ 发给最小的非系统种子 active admin"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
+          "assertion": "同 dedupe_key 重复兜底 → 只写 1 条,第二次 inbox_fallback=false"
         }
       ]
     },
@@ -7135,6 +7144,11 @@
         {
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalInboxPost.test.ts",
+          "assertion": "delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-master-incident-proofs.ts",
           "assertion": "delivery key already delivered with other content → 200 duplicate, not 500 (OCV5-365)"
         }
       ]
@@ -7180,12 +7194,13 @@
           "layer": "unit",
           "path": "packages/commercial/src/account-pool/cursorSandLifecycle.test.ts",
           "assertion": "a stuck unconfirmed install on the same host process gets one new attempt when the relay module changes (OCV5-378, host f1727e3)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[inc-20261011-sand-installer-host-f1727e3] PASS — the installer patches the f1727e3 host, still refuses any other change to its auth gate, and only the gateway token reaches the relay"
         }
-      ],
-      "proofPending": {
-        "reason": "回归在 unit 层(真实 installer.py 对 f1727e3 鉴权原文 fixture 打补丁并起 HTTP 服务验证令牌;锚点反例;生命周期同一主程序遇新模块再试一次);线上证据要账号 25 的真实 Box:发布后生命周期 ready、能力探针命中新模块、账号池写入 ≥1、个人版 box-claude 回合跑通,属一次性运维核对,个人版发布不跑 deploy-gate/live-e2e,canary 也没有 Cursor slot。",
-        "since": "2026-10-11"
-      }
+      ]
     }
   ]
 }
