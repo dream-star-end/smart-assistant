@@ -697,7 +697,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
       "卸载",
     );
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/卸载 API 插件「Linear」/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/卸载插件「Linear」/)).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "卸载" }));
 
     await waitFor(() => expect(mockedUninstallMarketplace).toHaveBeenCalledWith(auth, "linear"));
@@ -958,7 +958,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: "前往授权" }));
 
     expect(
-      await within(dialog).findByText("该连接器暂不可用，请稍后重试或联系管理员"),
+      await within(dialog).findByText("该插件暂不可用，请稍后重试或联系管理员"),
     ).toBeInTheDocument();
     expect(within(dialog).queryByText("CONNECTOR_UNAVAILABLE")).not.toBeInTheDocument();
     expect(within(dialog).queryByText("raw internal")).not.toBeInTheDocument();

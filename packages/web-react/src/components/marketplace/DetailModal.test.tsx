@@ -773,7 +773,7 @@ test("精确预装 Plugin 不提供市场安装，只引导到管理中心", asy
     />,
   );
 
-  expect(await screen.findByText("官方 API 插件 · 已预装")).toBeInTheDocument();
+  expect(await screen.findByText("官方插件 · 已预装")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "安装" })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "去绑定账号" }));
   expect(openConnectors).toHaveBeenCalledTimes(1);

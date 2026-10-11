@@ -415,7 +415,7 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   VERIFY_FAILED: "连接校验失败，请检查填写信息后重试",
   RELINK_REQUIRED: "授权已失效，请重新绑定",
   ACCOUNT_ALREADY_LINKED: "该账号已绑定，请勿重复绑定",
-  CONNECTOR_NOT_INSTALLED: "请先从 AI 市场安装或更新该连接器",
+  CONNECTOR_NOT_INSTALLED: "请先从 AI 市场安装或更新该插件",
   DUPLICATE_CONNECTION: "该账号已绑定，请勿重复绑定",
   TOO_MANY_CONNECTIONS: "绑定数量已达上限，请先解绑部分账号",
   QUOTA_EXCEEDED: "绑定数量已达上限，请先解绑部分账号",
@@ -425,7 +425,7 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   INVALID_URL: "地址格式不正确，请检查后重试",
   UNSUPPORTED_SCHEME: "仅支持 https 安全连接",
   // OAuth（BYOA）
-  CONNECTOR_UNAVAILABLE: "该连接器暂不可用，请稍后重试或联系管理员",
+  CONNECTOR_UNAVAILABLE: "该插件暂不可用，请稍后重试或联系管理员",
   OAUTH_START_FAILED: "发起授权失败，请稍后重试",
   TOKEN_EXCHANGE_FAILED: "授权失败，请重新发起授权",
   INVALID_CLIENT: "应用凭据无效，请检查 Client ID / Secret",

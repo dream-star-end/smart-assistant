@@ -327,7 +327,7 @@ export function ConnectorsTab({
         toast(`「${c.label}」已更新到 v${c.latestVersion ?? ""}`.trim(), "success");
         reload();
       } catch (e) {
-        setCardNotice({ slug: c.slug, tone: "danger", text: errText(e, "更新 API 插件失败") });
+        setCardNotice({ slug: c.slug, tone: "danger", text: errText(e, "更新插件失败") });
       }
     },
     [auth, reload, toast],
@@ -337,7 +337,7 @@ export function ConnectorsTab({
     async (c: DeclarativeManagementConnector) => {
       if (c.installation !== "marketplace" || c.connectionCount > 0) return;
       const ok = await confirm({
-        title: `卸载 API 插件「${c.label}」?`,
+        title: `卸载插件「${c.label}」?`,
         body: "卸载后不能再绑定或执行；以后仍可从 AI 市场重新安装。",
         confirmText: "卸载",
         danger: true,
@@ -349,7 +349,7 @@ export function ConnectorsTab({
         toast(`已卸载「${c.label}」`, "success");
         reload();
       } catch (e) {
-        setCardNotice({ slug: c.slug, tone: "danger", text: errText(e, "卸载 API 插件失败") });
+        setCardNotice({ slug: c.slug, tone: "danger", text: errText(e, "卸载插件失败") });
       }
     },
     [auth, confirm, reload, toast],

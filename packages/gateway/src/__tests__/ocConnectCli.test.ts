@@ -250,14 +250,14 @@ describe('oc-connect call — account resolution', () => {
     assert.match(r.stderr, /--account 11/)
     assert.match(r.stderr, /--account 12/)
     assert.match(r.stderr, /坚果云/)
-    assert.match(r.stderr, /有多个已绑定连接/)
+    assert.match(r.stderr, /有多个已绑定账号/)
   })
 
   test('no connection for provider → guidance, exit 1', async () => {
     const { deps } = mkDeps({ responses: { list: { connections: [CONN_A] } } })
     const r = await runOcConnectCli(['call', 'notion', 'search'], deps)
     assert.equal(r.exitCode, 1)
-    assert.match(r.stderr, /未找到 provider=notion 的已绑定连接/)
+    assert.match(r.stderr, /未找到 provider=notion 的已绑定账号/)
     assert.match(r.stderr, /管理中心 → 插件/)
   })
 

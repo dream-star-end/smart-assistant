@@ -461,14 +461,14 @@ export async function reviewOne(
       const codes = warnRiskCodes(candidate.riskFlags).join(', ')
       return {
         action: 'escalate',
-        aiNote: `连接器存在风险信号(${codes}),未调用 AI 模型并转人工复核`,
+        aiNote: `插件存在风险信号(${codes}),未调用 AI 模型并转人工复核`,
       }
     }
     const prepared = prepareConnectorReviewPrompt(candidate)
     if (!prepared.ok)
       return {
         action: 'escalate',
-        aiNote: `连接器无法完整安全送审(${prepared.reason}),已转人工复核`,
+        aiNote: `插件无法完整安全送审(${prepared.reason}),已转人工复核`,
       }
     prompt = prepared.prompt
   } else {

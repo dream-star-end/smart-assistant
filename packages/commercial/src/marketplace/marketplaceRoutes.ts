@@ -1121,7 +1121,7 @@ export async function handleAdminMarketplaceReviewBatch(
     throw new HttpError(
       400,
       'CONNECTOR_BATCH_APPROVE_FORBIDDEN',
-      '连接器需逐个填写实际安全决策并确认功能验收',
+      '插件需逐个填写实际安全决策并确认功能验收',
     )
   const results = [] as Awaited<ReturnType<typeof reviewVersions>>
   for (const id of versionIds) {

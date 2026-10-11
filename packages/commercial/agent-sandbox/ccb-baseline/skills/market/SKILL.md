@@ -19,7 +19,7 @@ oc-market search "PPT 美化" --kind skill
 oc-market search "写作" --kind agent
 oc-market search "飞书" --kind plugin
 
-# 看详情(技能看 SKILL.md;智能体看模型、工具集、Skill/Plugin 依赖与就绪状态)
+# 看详情(技能看 SKILL.md;智能体看模型、工具集、技能/插件依赖与就绪状态)
 oc-market detail <slug>
 
 # 我的已安装
@@ -107,7 +107,7 @@ oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
 - **发布是提交审核,不会立刻上架**:`publish-*` 返回 `status: pending`,要等平台管理员审核通过后才对其他用户可见。如实告诉用户"已提交,等待审核"。
 - 发布会过**静态安全扫描**:正文/人设里有密钥、内网地址、提示词注入等会被拒(返回 SCAN_BLOCKED + 原因),按提示让用户修正后重发。
 - slug 全局唯一且**归首次发布者所有**;同一 slug 不能换类型(技能↔智能体)。
-- 加 `--kind`/看返回的 `artifactKind` 区分 Skill、Agent 与 Plugin。
+- 加 `--kind`/看返回的 `artifactKind` 区分技能、智能体与插件。
 - 失败时命令会打印 `状态码 + 错误码 + 原因`,照着告诉用户即可。
 
 ## 工具调用纪律(重要)

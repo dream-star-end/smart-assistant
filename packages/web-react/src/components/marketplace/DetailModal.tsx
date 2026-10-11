@@ -839,7 +839,7 @@ export function DetailModal({
             </Alert>
           )}
           {isPreinstalledConnector && (
-            <Alert tone="info" title="官方预装 API 插件">
+            <Alert tone="info" title="官方预装插件">
               无需安装；可直接到管理中心绑定你的应用账号。
             </Alert>
           )}
@@ -876,7 +876,7 @@ export function DetailModal({
               {isPreinstalledConnector ? (
                 <Badge tone="success">
                   <ShieldCheck size={12} aria-hidden="true" />
-                  官方 API 插件 · 已预装
+                  官方插件 · 已预装
                 </Badge>
               ) : detail.official ? (
                 <Badge tone="success">
@@ -1003,7 +1003,7 @@ export function DetailModal({
             </Section>
           ) : detail.kind === 'connector' ? (
             <Section>
-              <SectionTitle className="mb-1.5">API 插件 · 平台已签安全范围</SectionTitle>
+              <SectionTitle className="mb-1.5">插件 · 平台已签安全范围</SectionTitle>
               <div
                 className={cn(
                   cardVariants({ padding: 'sm', tone: 'sunken' }),

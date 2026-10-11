@@ -480,7 +480,7 @@ function emptyAgentDraft(): AgentDraft {
 function emptyConnectorDraft(): ConnectorDraft {
   return {
     version: "1.0.0",
-    tags: "API 插件",
+    tags: "插件",
     specJson: "",
     decisionJson: "",
     meta: emptyHumanMeta(),
@@ -2067,7 +2067,7 @@ function ConnectorPublishForm({
               id={CONNECTOR_ID.tags}
               value={d.tags}
               onChange={(e) => draft.set({ tags: e.target.value })}
-              placeholder="API 插件, 文档"
+              placeholder="插件, 文档"
             />
           </Field>
         </div>
@@ -2091,7 +2091,7 @@ function ConnectorPublishForm({
               onBlur={() => setTouched((t) => ({ ...t, spec: true }))}
               rows={15}
               className="min-h-52 resize-y font-mono"
-              placeholder={'{"id":"my-plugin","label":"我的 API 插件",…}'}
+              placeholder={'{"id":"my-plugin","label":"我的插件",…}'}
             />
           </Field>
           <div className="-mt-2 flex flex-wrap items-center gap-2">
@@ -2340,7 +2340,7 @@ function MyPublishes({
                   <span className="text-body font-medium text-fg">{r.name}</span>
                   <span className="shrink-0 text-caption text-faint">v{r.version}</span>
                   {r.kind === "agent" && <Badge tone="accent">智能体</Badge>}
-                  {marketplaceArtifactKind(r) === "plugin" && <Badge tone="info">API 插件</Badge>}
+                  {marketplaceArtifactKind(r) === "plugin" && <Badge tone="info">插件</Badge>}
                   <Badge tone={meta.tone}>{meta.label}</Badge>
                   {r.status === "approved" && !r.isCurrent && !revoked && !unlisted && (
                     <Badge tone="neutral">已被新版本取代</Badge>

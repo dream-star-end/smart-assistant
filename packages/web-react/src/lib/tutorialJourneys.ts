@@ -98,7 +98,7 @@ export const TUTORIAL_SCENARIO_PATHS = [
   },
   {
     id: "automation-connectors",
-    title: "自动化与连接器",
+    title: "自动化与插件",
     description: "接上外部账号，让重复工作按点执行。",
     topicIds: ["connectors", "schedules-reminders", "skills-training", "marketplace-discovery"],
   },

@@ -335,7 +335,7 @@ async function cmdCall(
     if (matches.length === 0) {
       const message =
         ctx.surface.rpcSurface === 'connectors'
-          ? `oc-connect: 未找到 provider=${provider} 的已绑定连接。请告知用户前往 管理中心 → 插件 绑定后重试。\n`
+          ? `oc-connect: 未找到 provider=${provider} 的已绑定账号。请告知用户前往 管理中心 → 插件 绑定后重试。\n`
           : `oc-plugin: 未找到 provider=${provider} 的可用目标。${ctx.surface.missingAccountHint}\n`
       return {
         exitCode: 1,
@@ -352,7 +352,7 @@ async function cmdCall(
         .join('\n')
       const message =
         ctx.surface.rpcSurface === 'connectors'
-          ? `oc-connect: provider=${provider} 有多个已绑定连接，请用 --account <connectionId> 指定其一:\n${cand}\n`
+          ? `oc-connect: provider=${provider} 有多个已绑定账号，请用 --account <connectionId> 指定其一:\n${cand}\n`
           : `oc-plugin: provider=${provider} 有多个可用目标，请用 --account <connectionId> 指定其一:\n${cand}\n`
       return {
         exitCode: 2,

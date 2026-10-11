@@ -822,7 +822,7 @@ export const TUTORIAL_TOPICS = {
       "读取 Notion 或飞书文档",
       "在 GitHub 上协作开发",
       "检索知识星球的主题、评论、动态、标签、专栏与打卡内容",
-      "调用已审核的业务 API 插件",
+      "调用已审核的业务插件",
     ],
     steps: [
       {
@@ -922,7 +922,7 @@ export const TUTORIAL_TOPICS = {
       "版本号和变更说明要能让已安装用户判断是否更新。",
     ],
     cautions: [
-      "不得发布密钥、个人数据、侵权内容或能绕过权限的脚本；API 插件只能声明允许的固定域名和动作。",
+      "不得发布密钥、个人数据、侵权内容或能绕过权限的脚本；插件只能声明允许的固定域名和动作。",
     ],
     media: "marketplace-publishing",
     related: ["skills-training", "connectors", "marketplace-discovery"],

@@ -4,22 +4,22 @@ description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应�
 tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet, weibo, zhihu, social]
 ---
 
-# app-connectors 应用连接器与 Plugin(CLI)
+# app-connectors 插件(CLI)
 
 访问用户在管理中心绑定的第三方账号。对用户一律把这些统称为「插件」，绑定 / 授权入口是「管理中心 → 插件」
-（不要说「应用连接器」「设置 → 应用连接」，界面上没有这些名字）。平台在服务端托管全部凭据与浏览器登录状态：
-- API 连接器用 `oc-connect`；
-- 市场 Plugin（含知识星球）用 `oc-plugin`。
+（不要换成别的叫法，界面上只有「插件」）。平台在服务端托管全部凭据与浏览器登录状态：
+- API 插件（邮箱、WebDAV、Notion、GitHub、飞书）用 `oc-connect`；
+- 浏览器插件（知识星球、微博、知乎）用 `oc-plugin`。
 
-**不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/Plugin
+**不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
 只有一个可用账号时直接调用。仅在多个账号必须消歧、未安装或未授权时才请用户介入。
-API 连接器写操作必须逐次确认；受管浏览器 Plugin 以 `oc-plugin list` 显示的写入模式为准：
+API 插件写操作必须逐次确认；受管浏览器插件以 `oc-plugin list` 显示的写入模式为准：
 `逐次确认`会展示确认卡，`账号免逐次确认`会直接执行。**不要再口头问一次“要我执行吗”**。
 
 ## 用法
 
 ```bash
-# 发现「可绑定」的应用连接器(可带关键词搜索),用于回答"我能连哪些应用"、帮用户找应用。
+# 发现「可绑定」的插件(可带关键词搜索),用于回答"我能连哪些应用"、帮用户找应用。
 # 注意:绑定要用户自己在 管理中心 → 插件 里填凭据(凭据永不进容器),你不能代绑,只能引导。
 oc-connect catalog
 oc-connect catalog notion        # 关键词搜索
@@ -37,18 +37,18 @@ echo '{"text":"发票","limit":10}' | oc-connect call imap search_messages --acc
 echo '{"path":"/报告.pdf"}' | oc-connect call webdav get_file --out /tmp/报告.pdf
 ```
 
-## Plugin 自动发现与调用
+##插件自动发现与调用
 
 ```bash
-# 先发现当前真正可调用的 Plugin、账号、actions 与写入模式。不要凭印象猜 action。
+# 先发现当前真正可调用的插件、账号、actions 与写入模式。不要凭印象猜 action。
 oc-plugin list
 
-# 同一 Plugin 只有一个账号时不要传 --account，CLI 会自动选中。
+# 同一插件只有一个账号时不要传 --account，CLI 会自动选中。
 echo '{}' | oc-plugin call knowledge-planet list_groups
 echo '{"groupId":"123456789","count":10,"scope":"all"}' \
   | oc-plugin call knowledge-planet list_topics
 
-# 只有 list 显示同一 Plugin 有多个目标时，才指定账号 id。
+# 只有 list 显示同一插件有多个目标时，才指定账号 id。
 echo '{"groupId":"123456789","keyword":"AI","count":10}' \
   | oc-plugin call knowledge-planet search_topics --account 42
 ```
@@ -141,7 +141,7 @@ echo '{"topicId":"987654321","liked":true}' \
 
 ```bash
 echo '{}' | oc-connect call imap send_email --confirm <确认码>
-# Plugin 写操作同理，params 仍以确认账本为准，可传空对象：
+#插件写操作同理，params 仍以确认账本为准，可传空对象：
 echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 ```
 
