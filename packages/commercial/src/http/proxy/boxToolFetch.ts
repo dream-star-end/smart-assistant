@@ -22,6 +22,7 @@ import { classifyBoxContinuation } from "./boxPreparedContinuation.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BoxToolResultEchoError } from "./boxToolResultEcho.js";
+import { BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolResumeClaim } from "./boxDurableJournal.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -584,7 +585,11 @@ export class BoxToolFetch {
                 this.own(held.claim.runNonce, held.target,
                   args.uid, held.claim.leaseEpoch),
               onUnknown: this.deps.onUnknown }).catch(async (error: unknown) => {
-              if (error instanceof BoxToolResultEchoError) {
+              // OCV5-328 / OCV5-377: a stream the decoder rejects (e.g. a model
+              // safety stop) is as undeliverable as a rejected echo; stop the
+              // run instead of holding the slot.
+              if (error instanceof BoxToolResultEchoError
+                || error instanceof BoxCliToolHandoffError) {
                 await this.stopEchoRejected(args, claim);
               }
               throw error;

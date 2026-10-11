@@ -2,7 +2,7 @@
  * Delivers either the next durable tool handoff or a remotely-proven final
  * message. The caller retains the Box target until terminal cleanup. */
 import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
-import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
+import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { BoxDurableJournal } from "./boxDurableJournal.js";
@@ -253,8 +253,11 @@ export async function runBoxToolContinuation(input: {
   } catch (error) {
     // OCV5-313: a rejected result echo is named so the stop paths can end
     // this run at once; nothing it writes afterwards can be delivered.
-    await unknown(error instanceof BoxToolResultEchoError
-      ? "continuation_echo_rejected" : "continuation_unknown");
+    // OCV5-328 / OCV5-377: the same holds when the decoder rejects the stream
+    // itself (e.g. a model safety stop): the run is stopped at once.
+    await unknown(error instanceof BoxToolResultEchoError ? "continuation_echo_rejected"
+      : error instanceof BoxCliToolHandoffError ? "continuation_stream_rejected"
+        : "continuation_unknown");
     throw error;
   } finally {
     clearTimeout(timer);
