@@ -35,7 +35,8 @@ describe("0303 box_claude_profiles", () => {
 
   test("constraints: names, one default per account, a default must be enabled, cascade on delete", async (t) => {
     if (db.skipIfUnavailable(t)) return;
-    const a = await account("c1"), b = await account("c2");
+    const a = await account("c1");
+    const b = await account("c2");
     const ins = (id: bigint, profile: string, enabled: boolean, isDefault: boolean) => query(
       "INSERT INTO box_claude_profiles(account_id, profile, enabled, is_default) VALUES ($1,$2,$3,$4)", [id.toString(), profile, enabled, isDefault]);
     await ins(a, "default", true, true);

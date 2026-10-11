@@ -13,9 +13,7 @@ export interface BoxProfileHealthState {
   windowResetsAtMs?: number | null;
 }
 
-export interface BoxProfileHealthSink {
-  (key: string, state: BoxProfileHealthState): void;
-}
+export type BoxProfileHealthSink = (key: string, state: BoxProfileHealthState) => void;
 
 const LAUNCH_WINDOW_MS = 90_000;
 /** A rejection that reports no reset time still benches the login this long. */
