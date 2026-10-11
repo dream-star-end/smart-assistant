@@ -536,7 +536,11 @@ function checks(api: Api): void {
   if ((historical.messages as Array<{ role?: string }>).some((message) => message.role === "system")) {
     fail("HISTORICAL_BUDGET_KEPT");
   }
-  if (api.gate(unknownText, true) !== "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION") fail("UNKNOWN_TEXT");
+  // OCV5-377: an unrecognized system tail after paired results is never folded
+  // into a result or dropped; the exchange runs fresh with it as system prompt.
+  if (api.gate(unknownText, true) !== null || api.classify(unknownText).classification !== "fresh") {
+    fail("UNKNOWN_TEXT");
+  }
   const unknownOnce = api.normalize(unknownText);
   if (!isDeepStrictEqual(unknownOnce, api.normalize(unknownOnce as unknown as Record<string, unknown>))) {
     fail("UNKNOWN_TEXT_IDEMPOTENT");
@@ -571,7 +575,7 @@ function provePrepared(api: Api): void {
   const currentBody = fx.chain[1] ?? {};
   if (api.gate(currentBody, true) !== null) fail("WRONG_ROUTE");
   if (api.classify(currentBody).classification !== "continuation_candidate") fail("WRONG_ROUTE");
-  if (api.gate(fx.unknownText, true) !== "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION") fail("WRONG_ROUTE");
+  if (api.classify(fx.unknownText).classification !== "fresh") fail("WRONG_ROUTE");
   const signed = api.projectAuthority("bridge_signed", "ab".repeat(16));
   const other = api.projectAuthority("bridge_signed", "cd".repeat(16));
   const legacy = api.projectAuthority("local_catalog", null);
@@ -768,7 +772,11 @@ function proveImageCaption(api: Api): void {
   const sibling = ((oneByte.messages[2] as { content: Array<{ text?: string }> }).content)
     .find((part) => part.text === caption)!;
   sibling.text = nudged;
-  if (api.gate(oneByte, true) === null) fail("IMAGE_ONE_BYTE_GATE");
+  // OCV5-377: a caption one byte off is still never folded into the result as
+  // proven; the exchange runs fresh with it as the next message instead of 409.
+  if (api.gate(oneByte, true) !== null || api.classify(oneByte).classification !== "fresh") {
+    fail("IMAGE_ONE_BYTE_GATE");
+  }
 }
 
 function procField(pid: number, index: number): string {
