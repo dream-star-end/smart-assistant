@@ -1110,15 +1110,6 @@ export const CURSOR_ENGINE_MODELS = [
     fast: false,
     runner: 'interactive',
   },
-  {
-    id: 'box-claude-haiku-5-5',
-    displayName: 'Claude Haiku 5.5',
-    upstreamModel: 'claude-haiku-5-5',
-    family: 'box-claude-haiku-5-5',
-    familyLabel: 'Claude Haiku 5.5',
-    effort: null,
-    fast: false,
-  },
 ] as const
 
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
