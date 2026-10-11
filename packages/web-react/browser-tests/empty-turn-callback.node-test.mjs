@@ -92,7 +92,11 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
           await page.getByText("EMPTY_NONEMPTY_REAL_ANSWER",{exact:true}).waitFor();
           const answerRow=page.getByTestId("assistant-row").filter({hasText:"EMPTY_NONEMPTY_REAL_ANSWER"});
           await answerRow.hover();
-          await answerRow.getByRole("button",{name:"引用",exact:true}).waitFor();
+          // OCV5-359: 「引用」 lives in the answer's 「更多操作」 menu (a Portal), as in run.mjs T18.
+          await answerRow.getByRole("button",{name:"更多操作",exact:true}).click();
+          await page.getByRole("menu").getByRole("menuitem",{name:"引用"}).waitFor();
+          await page.keyboard.press("Escape");
+          await page.getByRole("menu").waitFor({state:"hidden",timeout:3000});
           assert.equal(leaf.status,"completed");
           assert.equal(leaf.text,"EMPTY_NONEMPTY_REAL_ANSWER");
           assert.equal(leaf.errorCode??null,null);

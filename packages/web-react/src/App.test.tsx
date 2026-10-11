@@ -686,8 +686,11 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
     await screen.findAllByRole('menuitem')
-    // 573b7c88b (2026-09-22) retired the GPT-5.6 families on selfhost; nothing is collapsed by
-    // default any more, so the fixture's Terra row is directly in the menu.
+    // Commercial still serves the GPT-5.6 families: Terra/Luna live in the collapsed "更多 GPT 模型"
+    // group (selfhost retired them in 573b7c88b, so its copy of this case has no group to open).
+    const collapsed = document.querySelector('[data-collapsed-group]')
+    expect(collapsed).toBeTruthy()
+    if (collapsed) fireEvent.click(collapsed)
     const modelTarget = (await screen.findAllByRole('menuitem'))
       .find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     expect(modelTarget).toBeTruthy()
@@ -2024,6 +2027,11 @@ describe('Aurora v5 — 项目主页(P1 review)', () => {
     // 当前会话换到 Terra(B)；全局默认仍是首个模型 Sol(A)。
     const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    await screen.findAllByRole('menuitem')
+    // Commercial keeps Terra in the collapsed "更多 GPT 模型" group (selfhost retired the family).
+    const collapsedGroup = document.querySelector('[data-collapsed-group]')
+    expect(collapsedGroup).toBeTruthy()
+    if (collapsedGroup) fireEvent.click(collapsedGroup)
     const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
     await act(async () => {
       fireEvent.click(terra!)

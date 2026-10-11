@@ -2,7 +2,7 @@ import React, { useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { ModelSelector } from '../src/components/ModelSelector'
 function ContractPicker() {
-  const [model, setModel] = useState('gpt-6.1-sol')
+  const [model, setModel] = useState('gpt-5.6-sol')
   return (
     <>
       <ModelSelector

@@ -96,6 +96,10 @@ const WHITELIST = new Set<string>([
   "scripts/v5-sessions-backfill-pg.ts",
   "scripts/v5-sessions-spill-archive.ts",
   "scripts/sessions-fix-oversized.ts",
+  // OCV5-380: selfhost one-off backfill of output assets the old container collector left in its local
+  // SQLite (scripts/*selfhost* is selfhost deploy scope, never run on commercial). Its only six-table SQL is
+  // a read-only lookup of client_sessions to classify each row by tenant before one insert transaction.
+  "scripts/v5-selfhost-backfill-output-assets.ts",
 ])
 
 // This operator pins every journal/finalizer query to one client and proves all
