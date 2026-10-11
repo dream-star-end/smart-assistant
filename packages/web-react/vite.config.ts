@@ -224,10 +224,11 @@ export default defineConfig(() => {
       // CPU)与 setup,串行时这些成本一个接一个叠加。实测 8 个 worker 全量 621s,失败只来自
       // 两类可修的依赖:靠全局预取的工具卡体用例(改为各自 loadBeforeAll)和 beforeAll 冷加载
       // MarkdownImpl 超过默认 10s 钩子时限(见 src/test/moduleLoad.ts)。
-      // 上限取一半核数:这台开发机常有多个会话同时跑全量,CI 4 vCPU 上是 2 个 worker。
+      // 上限取四分之一核数(v5-dev 16 核 → 4,CI 4 vCPU → 1):这台开发机常有多个会话、Codex
+      // 审查同时跑全量,8 个 worker 时负载冲到 30,jsdom 渲染与懒块冷加载被饿到超过 findBy 5s。
       // 并行下的截止线饥饿由 asyncUtilTimeout 校准根治,时序竞态一律修在交互语义上
       // (等 enabled 再点/先等 boot 选中落定),不靠串行掩盖。
-      maxWorkers: "50%",
+      maxWorkers: "25%",
       testTimeout: 15_000,
     },
   };
