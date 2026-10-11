@@ -119,8 +119,12 @@ describe("InboxPage", () => {
       target: { value: "正文内容" },
     });
     fireEvent.click(screen.getByRole("button", { name: "预览受众" }));
-    expect((await screen.findAllByText("100")).length).toBeGreaterThan(0);
-    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    // 等受众预览本身落地、「发送」可点再点。「100」也是统计卡「发送收件」的值（/messages/stats
+    // 与历史同时到达），只等「100」会在预览返回前去点仍禁用的「发送」，弹窗永远不出（OCV5-373）。
+    const sendButton = screen.getByRole("button", { name: /发送/ });
+    await waitFor(() => expect(sendButton).toBeEnabled());
+    expect(screen.getByText("预计收件人").nextElementSibling).toHaveTextContent("100");
+    fireEvent.click(sendButton);
 
     // 确认弹窗
     const dialog = await screen.findByRole("dialog");
