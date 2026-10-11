@@ -20,11 +20,12 @@ function args(over: Partial<UseResponseRatingsArgs> = {}): UseResponseRatingsArg
 
 describe("useResponseRatings", () => {
   test("loads the session's ratings and clears them when the session changes", async () => {
-    const get = vi.spyOn(api, "getSessionRatings").mockImplementation(async (_auth, sessionId) =>
-      sessionId === "s1"
-        ? { ratings: { m9: { rating: "up", tags: ["准确"] } }, nudges: {} }
-        : { ratings: {}, nudges: {} },
-    );
+    type Snapshot = Awaited<ReturnType<typeof api.getSessionRatings>>;
+    const loaded: Snapshot = { ratings: { m9: { rating: "up", tags: ["准确"] } }, nudges: {} };
+    const empty: Snapshot = { ratings: {}, nudges: {} };
+    const get = vi
+      .spyOn(api, "getSessionRatings")
+      .mockImplementation(async (_auth, sessionId) => (sessionId === "s1" ? loaded : empty));
     const { result, rerender } = renderHook((p: UseResponseRatingsArgs) => useResponseRatings(p), {
       initialProps: args(),
     });
