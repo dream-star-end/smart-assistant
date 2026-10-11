@@ -1489,7 +1489,9 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       .startsWith("INSERT INTO USAGE_RECORDS")).length, 0);
   });
 
-  test("unknown current tool text is rejected before precheck", async () => {
+  // OCV5-377: text beside the current tool results no longer rejects the
+  // request; it is admitted (precheck) and runs fresh over the exchange.
+  test("unknown current tool text is admitted and launched, never 409", async () => {
     const oldApi = process.env.OC_BOX_MODEL_API;
     const oldBridge = process.env.OC_BOX_TOOL_BRIDGE;
     try {
@@ -1498,7 +1500,7 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
       const { h, headers } = boxRouteHarness();
       let launches = 0;
       h.deps.boxModel = { toolBridgeReady: true, async fetch() { launches += 1;
-        throw new Error("SHOULD_NOT_LAUNCH"); } };
+        throw new Error("FRESH_LAUNCH_REACHED"); } };
       h.deps.boxReplay = { lookup: async () => ({ kind: "missing" }) } as never;
       const response = await h.run({ ...minBody(BOX_API_MODEL), tools: [{ name: "Read",
         description: "read", input_schema: { type: "object", properties: {} } }],
@@ -1511,10 +1513,10 @@ describe("OCV5-289 Box internal model route — existing proxy E2E", () => {
           ] },
         ], metadata: { user_id: JSON.stringify({ session_id: "web-box-unknown",
           oc_turn_key: "ef".repeat(32) }) } }, headers);
-      assert.equal(response.statusCode, 409, response.bodyText());
-      assert.match(response.bodyText(), /BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION/);
-      assert.equal(launches, 0);
-      assert.equal(h.preCheckSpy.reserveCalls.length, 0);
+      assert.notEqual(response.statusCode, 409, response.bodyText());
+      assert.doesNotMatch(response.bodyText(), /BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION/);
+      assert.equal(launches, 1);
+      assert.equal(h.preCheckSpy.reserveCalls.length, 1);
     } finally {
       if (oldApi === undefined) delete process.env.OC_BOX_MODEL_API;
       else process.env.OC_BOX_MODEL_API = oldApi;
