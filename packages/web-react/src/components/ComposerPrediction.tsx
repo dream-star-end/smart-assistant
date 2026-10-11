@@ -30,6 +30,7 @@ export default function ComposerPrediction({
   // 只在内容变化时同步量一次;宽度、字体等变化交给 ResizeObserver(异步回调)。不能每次渲染都报:
   // 回答结束后页面空闲时也会被计时器反复重渲,每次都在 commit 里给 Composer 排同步更新,
   // React 把它们算作嵌套更新,累计 50 次就抛 #185 整页白屏(round 2 线上事故)。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: value / large 是重新量高的触发器(改变浮层里的字和字号);ResizeObserver 只看盒子尺寸,看不到内容溢出。
   useLayoutEffect(() => {
     onShown(rest, ref.current?.scrollHeight ?? 0);
   }, [rest, value, large, onShown]);
