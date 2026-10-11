@@ -204,9 +204,15 @@ export default defineConfig(() => {
       setupFiles: ["./src/test/setup.ts"],
       // 用例级超时与 setup.ts 的 asyncUtilTimeout(5s)拉开梯度:waitFor 先于用例超时
       // 报出精确断言错误,而不是笼统的 "Test timed out"。
-      // 显式权衡:**不**关 fileParallelism —— 实测本机串行 7m12s vs 并行 ~1m(CI 4vCPU
-      // 并行 ~72s),6 倍税不可接受;并行下的截止线饥饿由 asyncUtilTimeout 校准根治,
-      // 时序竞态一律修在交互语义上(等 enabled 再点/先等 boot 选中落定),不靠串行掩盖。
+      // 并行跑文件,不串行(OCV5-376)。2026-08-21 起命令行带 --maxWorkers=1,本机串行全量
+      // 约 60 分钟(CI 约 9 分钟):每个文件都要重付 jsdom 冷加载(本机 require('jsdom') 约 3.3s
+      // CPU)与 setup,串行时这些成本一个接一个叠加。实测 8 个 worker 全量 621s,失败只来自
+      // 两类可修的依赖:靠全局预取的工具卡体用例(改为各自 loadBeforeAll)和 beforeAll 冷加载
+      // MarkdownImpl 超过默认 10s 钩子时限(见 src/test/moduleLoad.ts)。
+      // 上限取一半核数:这台开发机常有多个会话同时跑全量,CI 4 vCPU 上是 2 个 worker。
+      // 并行下的截止线饥饿由 asyncUtilTimeout 校准根治,时序竞态一律修在交互语义上
+      // (等 enabled 再点/先等 boot 选中落定),不靠串行掩盖。
+      maxWorkers: "50%",
       testTimeout: 15_000,
     },
   };

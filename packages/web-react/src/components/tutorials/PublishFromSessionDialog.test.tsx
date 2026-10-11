@@ -6,6 +6,11 @@ import type { ChatMessage } from '../../lib/chat/model'
 import type { AuthSession, ProjectAsset } from '../../lib/types'
 import { MAX_TUTORIAL_ARTIFACT_BYTES } from '../../lib/tutorialStudio'
 import { PublishFromSessionDialog } from './PublishFromSessionDialog'
+import { prefetchMarkdownImpl } from '../Markdown'
+import { loadBeforeAll } from '../../test/moduleLoad'
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl)
 
 vi.mock('../MessageRenderer', () => ({
   MessageList: ({

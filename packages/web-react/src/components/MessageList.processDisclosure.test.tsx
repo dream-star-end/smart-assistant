@@ -7,6 +7,15 @@ import { MessageListSkeleton, PartialHistorySkeleton } from "./chat/HistorySkele
 import { operationSummary } from "./chat/ProcessDisclosure";
 import { MessageList } from "./MessageRenderer";
 import { ArtifactInspectContext } from "./tool/context";
+import { preloadToolBody } from "./tool/lazyToolBody";
+import { loadBeforeAll } from "../test/moduleLoad";
+import { prefetchMarkdownImpl } from "./Markdown";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
+
+// These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
+loadBeforeAll(preloadToolBody);
 
 afterEach(() => {
   cleanup();

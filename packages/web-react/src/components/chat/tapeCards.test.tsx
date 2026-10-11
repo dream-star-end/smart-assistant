@@ -1,20 +1,19 @@
 /** Direct timeline cards: process cursor, deferred exact record, runtime event. */
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
 import { MessageRenderer } from "../MessageRenderer";
 import type { CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
+import { loadBeforeAll } from "../../test/moduleLoad";
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
-beforeAll(async () => {
-  await import("../MarkdownImpl");
-});
+loadBeforeAll(() => import("../MarkdownImpl"));
 
 function renderMsg(message: ChatMessage, cb: CardCallbacks = {}) {
   return render(

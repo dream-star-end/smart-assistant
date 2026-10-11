@@ -4,6 +4,11 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
 import type { InboxMessage } from "../types";
+import { prefetchMarkdownImpl } from "../../../../components/Markdown";
+import { loadBeforeAll } from "../../../../test/moduleLoad";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 const adminGet = vi.fn();
 const adminSend = vi.fn();

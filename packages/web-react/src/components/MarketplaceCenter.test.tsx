@@ -5,6 +5,11 @@ import type { AuthSession, MarketplaceMyPublish } from "../lib/types";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { expectAriaControlsResolvable } from "../test/ariaControls";
 import { ToastProvider } from "./ui";
+import { prefetchMarkdownImpl } from "./Markdown";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 const monitor = vi.hoisted(() => ({
   emit: null as null | ((transition: { previousStatus: "pending"; publish: MarketplaceMyPublish }) => void),

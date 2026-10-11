@@ -1,18 +1,17 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { childSignature } from "../../lib/chat/render";
 import { extractLatestTodos } from "./PinnedTaskTracker";
 import { SessionTimelineBoundary } from "../SessionTimelineBoundary";
 import { MessageList } from "../MessageRenderer";
 import fixture from "./__fixtures__/ocv5-70-timeline-repro.json";
+import { loadBeforeAll } from "../../test/moduleLoad";
 
 afterEach(cleanup);
 
-beforeAll(async () => {
-  await import("../MarkdownImpl");
-});
+loadBeforeAll(() => import("../MarkdownImpl"));
 
 const messages = fixture as ChatMessage[];
 

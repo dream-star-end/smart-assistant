@@ -4,6 +4,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { api } from '../lib/api'
 import { BRAND } from '../lib/brand'
 import { LANDING_PROMPT_MAX, Landing } from './Landing'
+import { prefetchMarkdownImpl } from './Markdown'
+import { loadBeforeAll } from '../test/moduleLoad'
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl)
 
 const base = { theme: 'light' as const, onCycleTheme: () => {}, onCreateOrg: () => {} }
 
