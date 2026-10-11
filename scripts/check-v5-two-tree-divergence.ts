@@ -114,7 +114,7 @@ function main(argv: string[]): number {
   if (listFile) {
     writeFileSync(
       listFile,
-      divergences.map((item) => `${item.status}\t${item.allowed ? "selfhost-only" : "shared"}\t${item.path}`).join("\n") + "\n",
+      `${divergences.map((item) => `${item.status}\t${item.allowed ? "selfhost-only" : "shared"}\t${item.path}`).join("\n")}\n`,
     );
   }
   console.log(`two-tree divergence vs ${against}`);
