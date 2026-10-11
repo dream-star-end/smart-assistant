@@ -362,11 +362,11 @@ function makeSeverityFixture(): SeverityFixture {
     throw error;
   }
 }
-function runSeverityCli(f: SeverityFixture, args: string[] = []) {
+function runSeverityCli(f: SeverityFixture, args: string[] = [], extraEnv: Record<string, string> = {}) {
   f.write("e2e/session-display/incidents.json", JSON.stringify(f.manifest));
   const result = spawnSync(process.execPath, ["--import", severityLoader, path.join(f.dir, "scripts/check-v5-incident-regressions.ts"), ...args], {
     cwd: f.dir, encoding: "utf8", timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
-    env: { PATH: process.env.PATH, HOME: f.dir, LANG: "C.UTF-8", TZ: "UTC", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+    env: { PATH: process.env.PATH, HOME: f.dir, LANG: "C.UTF-8", TZ: "UTC", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...extraEnv },
   });
   return { exit: result.status, signal: result.signal, error: result.error?.message ?? null,
     stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
@@ -445,6 +445,44 @@ describe("incident severity CLI admission", () => {
 describe("incident selfhost edition", () => {
   const debt = (f: SeverityFixture, incidents: Record<string, string>) =>
     f.write("e2e/session-display/selfhost-proof-debt.json", JSON.stringify({ schema: 1, incidents }));
+  const fixtureGit = (f: SeverityFixture, ...args: string[]) =>
+    execFileSync("git", ["-c", "user.name=Incident Fixture", "-c", "user.email=fixture@example.invalid", ...args], {
+      cwd: f.dir, encoding: "utf8", env: { PATH: process.env.PATH, HOME: f.dir, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+    }).trim();
+  // The base branch's list (committed) vs the working list: ids may only leave it.
+  const withBaseList = (f: SeverityFixture, base: Record<string, string>) => {
+    debt(f, base);
+    fixtureGit(f, "add", ".");
+    fixtureGit(f, "commit", "-qm", "base list");
+    return fixtureGit(f, "rev-parse", "HEAD");
+  };
+  test("a list id the base branch does not have fails even when the count stays the same", () => {
+    const f = makeSeverityFixture();
+    try {
+      f.manifest.incidents[0].regressions.pop();
+      const second = { ...f.manifest.incidents[0], id: "INC-20260909-P2-GATE-SECOND" };
+      f.manifest.incidents.push(second);
+      const base = withBaseList(f, { "INC-20260909-P2-GATE-SCHEMA": "old debt", "INC-20260909-P2-GATE-OTHER": "retired" });
+      debt(f, { "INC-20260909-P2-GATE-SCHEMA": "old debt", "INC-20260909-P2-GATE-SECOND": "swapped in" });
+      const r = runSeverityCli(f, ["--edition=selfhost"], { INCIDENT_LEDGER_BASE_REF: base });
+      assert.ok(typeof r.exit === "number" && r.exit !== 0, JSON.stringify(r));
+      assert.match(r.stderr, /INC-20260909-P2-GATE-SECOND 不在 .* 的清单里/);
+    } finally {
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+  test("removing an id the base branch had passes", () => {
+    const f = makeSeverityFixture();
+    try {
+      f.manifest.incidents[0].regressions.pop();
+      const base = withBaseList(f, { "INC-20260909-P2-GATE-SCHEMA": "old debt", "INC-20260909-P2-GATE-OTHER": "fixed since" });
+      debt(f, { "INC-20260909-P2-GATE-SCHEMA": "old debt" });
+      const r = runSeverityCli(f, ["--edition=selfhost"], { INCIDENT_LEDGER_BASE_REF: base });
+      assert.equal(r.exit, 0, JSON.stringify(r));
+    } finally {
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
   const cases: Array<{ name: string; arrange: (f: SeverityFixture) => string[]; pass: boolean; reason: RegExp }> = [
     {
       name: "a listed unit-only incident passes",

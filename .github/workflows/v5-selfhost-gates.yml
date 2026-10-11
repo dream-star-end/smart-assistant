@@ -42,13 +42,37 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # 比较基线:PR 用目标分支;push 用推送前的 SHA(否则 origin/feat/v5-selfhost 就是 HEAD 本身,
+      # 改动文件为 0、账本与自己比,门形同虚设)。新建分支的 push(before 全 0)退回目标分支。
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "comparison base: $ref"
+
       - name: Biome (changed files, no new errors)
-        run: npm run lint
+        run: bash scripts/check-biome-changed.sh --base "${{ steps.base.outputs.ref }}"
 
       - name: Incident ledger (selfhost edition)
+        env:
+          INCIDENT_LEDGER_BASE_REF: ${{ steps.base.outputs.ref }}
         run: npx tsx scripts/check-v5-incident-regressions.ts --edition=selfhost
 
       - name: Incident ledger superset
+        env:
+          INCIDENT_LEDGER_BASE_REF: ${{ steps.base.outputs.ref }}
         run: npx tsx scripts/check-incident-ledger-superset.ts
 
       - name: Gate script tests

@@ -52,6 +52,28 @@ const EDITION = EDITION_ARG ? EDITION_ARG.slice("--edition=".length) : "commerci
 const SELFHOST_PROOF_DEBT = join(ROOT, "e2e/session-display/selfhost-proof-debt.json");
 /** 个人版无 proof 层证据的事故条数上界(2026-10-11 OCV5-376 盘点所得);只许降不许升。 */
 const SELFHOST_PROOF_DEBT_CEILING = 63;
+const SELFHOST_PROOF_DEBT_REL = "e2e/session-display/selfhost-proof-debt.json";
+/** 基线引用上的欠账清单 id;引用都取不到或该引用上还没有清单 → null。 */
+function previousSelfhostDebtIds(): { ref: string; ids: Set<string> } | null {
+  const refs = [process.env.INCIDENT_LEDGER_BASE_REF, "origin/feat/v5-selfhost", "HEAD~1"]
+    .filter((ref): ref is string => Boolean(ref));
+  for (const ref of refs) {
+    try {
+      git("rev-parse", "--verify", "--quiet", `${ref}^{commit}`);
+    } catch {
+      continue;
+    }
+    let raw: string;
+    try {
+      raw = git("show", `${ref}:${SELFHOST_PROOF_DEBT_REL}`);
+    } catch {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as { incidents?: Record<string, string> };
+    return { ref, ids: new Set(Object.keys(parsed.incidents ?? {})) };
+  }
+  return null;
+}
 
 // ── Incident trailer 闭环门的生效锚点(运行时自算,不写死 SHA)─────────────
 // 起点 = marker 文件被 git 添加的那个 commit。为什么不写死 SHA —— 连踩两次:
@@ -363,6 +385,18 @@ if (EDITION === "selfhost") {
   for (const id of selfhostProofDebt.keys()) {
     if (!selfhostDebtSeen.has(id)) {
       fail(`selfhost-proof-debt.json: ${id} 已有 proof 层证据或已不在账本里,从清单删掉(清单只许缩短)`);
+    }
+  }
+  // 只许删不许加按 id 比,不只比条数:否则"补掉一条旧债 + 塞进一条新的无 proof 事故"能保持 63 条过门。
+  // 基线取与 ledger superset 相同的引用(CI push 用推送前的 SHA,PR 用目标分支)。
+  const previous = previousSelfhostDebtIds();
+  if (previous === null) {
+    process.stdout.write("[incident-regressions] selfhost proof debt: 基线引用里还没有清单(首次引入),只做上界检查\n");
+  } else {
+    for (const id of selfhostProofDebt.keys()) {
+      if (!previous.ids.has(id)) {
+        fail(`selfhost-proof-debt.json: ${id} 不在 ${previous.ref} 的清单里;清单只许删不许加,新事故必须直接带 proof 层证据`);
+      }
     }
   }
   if (selfhostProofDebt.size > SELFHOST_PROOF_DEBT_CEILING) {
