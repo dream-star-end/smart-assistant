@@ -354,11 +354,11 @@ test("OCV5-313 a rejected result echo is undeliverable; infrastructure failures 
 // OCV5-377 (Codex r1): a continuation refused by the model whose CLI then ended
 // on its own (worker_complete) must not stay unknown and hold the session.
 test("OCV5-377 a model safety stop in the finished spool is undeliverable", async () => {
-  const refused = finalRecords.slice(0, 6).concat([
+  const refused: unknown[] = [...finalRecords.slice(0, 6),
     event({ type: "message_delta", delta: { stop_reason: "refusal" },
       usage: { input_tokens: 3, output_tokens: 4 } }),
     event({ type: "message_stop" }),
-    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 9, output_tokens: 8 } }]);
+    { type: "result", subtype: "success", is_error: false, usage: { input_tokens: 9, output_tokens: 8 } }];
   const deps = { writeMessage: async () => { throw new Error("must not write"); },
     journal: { complete: async () => { throw new Error("must not complete"); },
       completeToolChain: async () => { throw new Error("must not complete"); },
