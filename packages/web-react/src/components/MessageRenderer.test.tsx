@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { createSession, type ChatMessage } from "../lib/chat/model";
 import type { OutboundMessageWire } from "../lib/chat/frames";
 import { applyOutboundMessage } from "../lib/chat/reducer";
@@ -31,12 +31,10 @@ afterEach(() => {
   resetPermissionAutoOpenMemory();
 });
 
-beforeAll(async () => {
-  // MarkdownImpl 是 React.lazy 的重 chunk。全量并行时首次 transform/import 偶尔会耗尽
-  // RTL 统一的 5s 查询窗口；测试先显式等模块就绪，再让 findBy* 只等待 React 提交 DOM。
-  // 冷态 Suspense fallback 由 Markdown.test.tsx 的永久 suspend 替身独立覆盖。
-  await import("./MarkdownImpl");
-});
+// MarkdownImpl 是 React.lazy 的重 chunk。全量并行时首次 transform/import 偶尔会耗尽
+// RTL 统一的 5s 查询窗口；测试先显式等模块就绪，再让 findBy* 只等待 React 提交 DOM。
+// 冷态 Suspense fallback 由 Markdown.test.tsx 的永久 suspend 替身独立覆盖。
+loadBeforeAll(() => import("./MarkdownImpl"));
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id: "m1", role, text: "", ts: 1000, ...extra };
