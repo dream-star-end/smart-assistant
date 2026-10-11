@@ -100,6 +100,11 @@ import {
   handleAdminResetAccountCooldown,
 } from './admin/accounts.js'
 import {
+  handleAdminBoxClaudeProfilesDiscover,
+  handleAdminBoxClaudeProfilesList,
+  handleAdminBoxClaudeProfilesSelect,
+} from './admin/boxClaudeProfiles.js'
+import {
   handleAdminListAudit,
   handleAdminListHostAudit,
   handleAdminListSecurityEvents,
@@ -1195,6 +1200,11 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'POST', path: '/api/admin/accounts/cursor-session/start', handler: handleAdminCursorSessionStart },
     { method: 'GET', pathPrefix: '/api/admin/accounts/cursor-session/', handler: handleAdminCursorSessionStatus },
     { method: 'DELETE', pathPrefix: '/api/admin/accounts/cursor-session/', handler: handleAdminCursorSessionCancel },
+    // Claude Code logins (CLAUDE_CONFIG_DIR profiles) on a Box account. Exact paths: the
+    // accounts/ prefix routes below would swallow a sub-resource.
+    { method: 'GET', path: '/api/admin/box-claude-profiles', handler: handleAdminBoxClaudeProfilesList },
+    { method: 'POST', path: '/api/admin/box-claude-profiles/discover', handler: handleAdminBoxClaudeProfilesDiscover },
+    { method: 'PUT', path: '/api/admin/box-claude-profiles', handler: handleAdminBoxClaudeProfilesSelect },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。

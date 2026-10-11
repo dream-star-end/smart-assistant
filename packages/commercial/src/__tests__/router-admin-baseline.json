@@ -456,6 +456,24 @@
     "handler": "handleAdminCursorSessionCancel"
   },
   {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/box-claude-profiles",
+    "handler": "handleAdminBoxClaudeProfilesList"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/box-claude-profiles/discover",
+    "handler": "handleAdminBoxClaudeProfilesDiscover"
+  },
+  {
+    "method": "PUT",
+    "pathKind": "path",
+    "pathValue": "/api/admin/box-claude-profiles",
+    "handler": "handleAdminBoxClaudeProfilesSelect"
+  },
+  {
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/accounts/",

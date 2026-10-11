@@ -32,6 +32,8 @@ export interface BoxResolvedTarget {
   /** OCV5-313: Claude Code build installed on this Box, when it was read and
    * is supported (boxCliVersion). Absent means unknown. */
   cliVersion?: string;
+  /** Claude Code login (boxClaudeProfile) this target launches under; absent = default. */
+  profile?: string;
 }
 const MIN_RUN_BUDGET_MS = 160_000; // 120s Exec + 10s proof + 20s cleanup + margin
 export class BoxTextFetchError extends Error {
