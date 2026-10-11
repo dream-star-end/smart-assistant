@@ -7,6 +7,11 @@
  *
  * 总开关:env `OC_INTELLIGENT_UI`,缺省/`1`/`on`/`true` = 启用;`0`/`off`/`false` = 禁用。
  * 用户偏好:`user_preferences.prefs.intelligent_ui`,缺省视为开。
+ *
+ * 输入预测(OCV5-375)也走这个 slot:每条回答末尾由模型写一个 `{"type":"next"}` 块,预测用户
+ * 接下来要输入的话,前端不显示它,只把它作为输入框里的浅色预测。它和组件协议各有开关
+ * (env `OC_INPUT_PREDICTION` + `user_preferences.prefs.input_prediction`,缺省都开),
+ * 两段按需拼进同一个 slot:容器侧 gateway 只认白名单里的 slot 名,复用它不需要改容器。
  */
 
 export const INTELLIGENT_UI_SLOT_NAME = "INTELLIGENT_UI";
@@ -28,6 +33,25 @@ export function intelligentUiFeatureView(
 ): { available: boolean; enabled: boolean } {
   const available = isIntelligentUiServerEnabled(env);
   return { available, enabled: available && intelligentUiPrefEnabled(prefs) };
+}
+
+/** 输入预测总开关:env `OC_INPUT_PREDICTION`,取值规则同 OC_INTELLIGENT_UI。 */
+export function isInputPredictionServerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.OC_INPUT_PREDICTION ?? "").trim().toLowerCase();
+  return !["0", "off", "false", "no", "disabled"].includes(raw);
+}
+
+export function inputPredictionPrefEnabled(prefs: { input_prediction?: boolean } | null | undefined): boolean {
+  return prefs?.input_prediction !== false;
+}
+
+/** `/api/me/preferences` 响应里的 features.input_prediction。 */
+export function inputPredictionFeatureView(
+  prefs: { input_prediction?: boolean } | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): { available: boolean; enabled: boolean } {
+  const available = isInputPredictionServerEnabled(env);
+  return { available, enabled: available && inputPredictionPrefEnabled(prefs) };
 }
 
 const F = "```";
@@ -86,6 +110,26 @@ export const INTELLIGENT_UI_PROMPT = [
 ].join("\n");
 
 /**
+ * 输入预测协议。每条回答多写一个短块(约 20–40 个输出 token),不额外请求模型。
+ * 前端取最后一个 next 块的 text 作为输入框预测,块本身在聊天、复制、导出里都不出现
+ * (`web-react/src/lib/inputPrediction.ts`)。
+ */
+export const INPUT_PREDICTION_PROMPT = [
+  "# 输入预测",
+  "",
+  `每条回答的最后,单独写一个 ${F}ui 块,预测用户接下来最可能输入的一句话:`,
+  `${F}ui`,
+  '{"type":"next","text":"用户接下来最可能输入的话"}',
+  F,
+  "这个块不会显示在回答里,只会以浅色字出现在用户的输入框中,用户按 Tab 就能采用后发送。",
+  "- 预测用户自己会打的字,不是你的建议:从用户说过的话和刚完成的事推断下一步,不替用户想新点子。",
+  "- 用用户的语言和口吻,写成能直接发出的一句话,30 字以内;不要写评价或客套(谢谢、很好、没问题了)。",
+  "- 你在等用户确认或选择时,写用户最可能的答复,如「好的,继续」「用第二个方案」。",
+  "- 回答里有 suggestions 时,next 可以与它的第一条相同。",
+  "- 实在猜不出就不写这个块。写了就必须是整条回答的最后一个块,后面不再有文字;JSON 规则同 ui 组件。",
+].join("\n");
+
+/**
  * platform-prompt-slots 用:给定 uid 算出该用户是否该拿到 INTELLIGENT_UI slot。
  * 读偏好失败 → 不下发(fail-soft:组件协议是增强,不是安全控制)。
  */
@@ -93,10 +137,12 @@ export async function resolveIntelligentUiSlot(
   userId: number | bigint | string,
   deps: {
     env?: NodeJS.ProcessEnv;
-    readPrefs?: (uid: string) => Promise<{ prefs: { intelligent_ui?: boolean } }>;
+    readPrefs?: (uid: string) => Promise<{ prefs: { intelligent_ui?: boolean; input_prediction?: boolean } }>;
   } = {},
 ): Promise<{ name: string; content: string } | null> {
-  if (!isIntelligentUiServerEnabled(deps.env)) return null;
+  const iuiOn = isIntelligentUiServerEnabled(deps.env);
+  const predictOn = isInputPredictionServerEnabled(deps.env);
+  if (!iuiOn && !predictOn) return null;
   const readPrefs =
     deps.readPrefs ??
     (async (uid: string) => {
@@ -104,6 +150,10 @@ export async function resolveIntelligentUiSlot(
       return getPreferences(uid);
     });
   const snap = await readPrefs(String(userId));
-  if (!intelligentUiPrefEnabled(snap.prefs)) return null;
-  return { name: INTELLIGENT_UI_SLOT_NAME, content: INTELLIGENT_UI_PROMPT };
+  const parts = [
+    ...(iuiOn && intelligentUiPrefEnabled(snap.prefs) ? [INTELLIGENT_UI_PROMPT] : []),
+    ...(predictOn && inputPredictionPrefEnabled(snap.prefs) ? [INPUT_PREDICTION_PROMPT] : []),
+  ];
+  if (parts.length === 0) return null;
+  return { name: INTELLIGENT_UI_SLOT_NAME, content: parts.join("\n\n") };
 }

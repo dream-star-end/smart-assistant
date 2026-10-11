@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { useLocalComposerPrefs } from '../../hooks/useLocalComposerPrefs'
 import type { Theme } from '../../hooks/useTheme'
 import { api, apiErrorMessage } from '../../lib/api'
-import { setIntelligentUiPref, useIntelligentUiState } from '../../lib/intelligentUi'
+import { setInputPredictionPref, setIntelligentUiPref, useIntelligentUiState } from '../../lib/intelligentUi'
 import { longContextCostConfirmationRequired } from '../../lib/cursorModelPicker'
 import {
   type PreferenceEffort,
@@ -119,6 +119,19 @@ export function PreferencesTab({
       await onPatch({ intelligent_ui: checked })
     } catch (e) {
       setIntelligentUiPref(prev)
+      setErr(apiErrorMessage(e, '保存失败'))
+    }
+  }
+
+  /** 输入预测开关(OCV5-375):同上,先本地生效,写失败回滚。 */
+  async function changeInputPrediction(checked: boolean) {
+    const prev = iui.predict
+    setInputPredictionPref(checked)
+    setErr(null)
+    try {
+      await onPatch({ input_prediction: checked })
+    } catch (e) {
+      setInputPredictionPref(prev)
       setErr(apiErrorMessage(e, '保存失败'))
     }
   }
@@ -254,6 +267,25 @@ export function PreferencesTab({
             disabled={!iui.available}
             onCheckedChange={(checked) => {
               void changeIntelligentUi(checked)
+            }}
+          />
+        </div>
+        <div className="flex items-start justify-between gap-4 py-1.5">
+          <div className="min-w-0">
+            <div className="text-section text-fg">输入预测</div>
+            <p className="mt-0.5 text-meta leading-relaxed text-muted">
+              每条回答的末尾，助手会预测你接下来可能要说的话，用浅色字显示在输入框里，按 Tab 或 → 采用，触屏点「填入」。每条回答约多写几十个字，按正常回答计费。打字时也会按本会话说过的话补全。
+            </p>
+            {!iui.predictAvailable && (
+              <p className="mt-1 text-meta text-warning">服务端已暂停此功能。</p>
+            )}
+          </div>
+          <Switch
+            aria-label="输入预测"
+            checked={iui.predictAvailable && iui.predict}
+            disabled={!iui.predictAvailable}
+            onCheckedChange={(checked) => {
+              void changeInputPrediction(checked)
             }}
           />
         </div>

@@ -1609,7 +1609,7 @@ export async function handleGetMyPreferences(
   const user = await requireAuth(req, deps.jwtSecret);
   const { getPreferences } = await import("../user/preferences.js");
   const { getAutoDreamFeature } = await import("../user/autoDream.js");
-  const { intelligentUiFeatureView } = await import("../intelligentUi/index.js");
+  const { inputPredictionFeatureView, intelligentUiFeatureView } = await import("../intelligentUi/index.js");
   const snap = await getPreferences(user.id);
   const autoDream = await getAutoDreamFeature(
     user.id,
@@ -1618,7 +1618,11 @@ export async function handleGetMyPreferences(
   );
   sendJson(res, 200, {
     ...snap,
-    features: { auto_dream: autoDream, intelligent_ui: intelligentUiFeatureView(snap.prefs) },
+    features: {
+      auto_dream: autoDream,
+      intelligent_ui: intelligentUiFeatureView(snap.prefs),
+      input_prediction: inputPredictionFeatureView(snap.prefs),
+    },
   });
 }
 
@@ -1658,10 +1662,14 @@ export async function handlePatchMyPreferences(
       snap.prefs.auto_dream_enabled === true,
       snap.prefs.auto_optimizer_enabled === true,
     );
-    const { intelligentUiFeatureView } = await import("../intelligentUi/index.js");
+    const { inputPredictionFeatureView, intelligentUiFeatureView } = await import("../intelligentUi/index.js");
     sendJson(res, 200, {
       ...snap,
-      features: { auto_dream: autoDream, intelligent_ui: intelligentUiFeatureView(snap.prefs) },
+      features: {
+        auto_dream: autoDream,
+        intelligent_ui: intelligentUiFeatureView(snap.prefs),
+        input_prediction: inputPredictionFeatureView(snap.prefs),
+      },
     });
   } catch (err) {
     if (err instanceof PreferencesError) {

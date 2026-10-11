@@ -24,7 +24,7 @@ import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { saveBlob } from "./lib/chat/download";
-import { applyIntelligentUiSnapshot } from "./lib/intelligentUi";
+import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
@@ -126,6 +126,7 @@ import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
 import { useLocalComposerPrefs } from "./hooks/useLocalComposerPrefs";
+import { predictInput } from "./lib/inputPrediction";
 import { useMdViewport, useWideViewport } from "./hooks/useMdViewport";
 import { useResizableWidth } from "./hooks/useResizableWidth";
 import { readCollapsed, writeCollapsed } from "./lib/sidebarCollapsed";
@@ -2834,6 +2835,13 @@ export function App() {
       }
     }
   }
+  // 输入预测(OCV5-375):回答末尾模型写的 next 块 → 输入框浅色预测;打字时按本会话说过的话补全。
+  // 设置里关掉时 master 也不再下发这段提示词。demo 不开。
+  const inputPredictionOn = useInputPredictionEnabled();
+  const inputPrediction = useMemo(
+    () => (demo || !inputPredictionOn ? null : predictInput(wsMessages)),
+    [demo, inputPredictionOn, wsMessages],
+  );
   const timelineMessages = wsMessages.filter(
     (message) => message.role !== "user" || message.status !== "queued",
   );
@@ -4130,6 +4138,7 @@ export function App() {
             getVoiceToken={demo ? undefined : () => authRef.current.snapshot().token}
             prefill={composerPrefill}
             lastUserText={lastUserText}
+            prediction={inputPrediction}
             draftKey={accountDraftKey(activeId ?? NEW_COMPOSER_DRAFT_KEY, user?.id)}
             replyTo={composerReplyTo}
             onCancelReply={() => setMessageReplyTarget(null)}

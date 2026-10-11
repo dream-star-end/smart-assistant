@@ -7,6 +7,7 @@
  *   3. 组件渲染异常 → 组件级错误边界,显示该组件的 Markdown 版本。
  */
 import { Component, type ReactNode, useMemo } from "react";
+import { isNextBlockCode } from "../../lib/inputPrediction";
 import { CalculatorBlock } from "./CalculatorBlock";
 import { ChartBlock } from "./ChartBlock";
 import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
@@ -167,6 +168,8 @@ export type IuiBlockProps = {
 
 export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
   const outcome = useMemo(() => {
+    // 输入预测块(OCV5-375)只给输入框用,回答里不显示,流式中也不出骨架。
+    if (isNextBlockCode(code, !!live)) return { kind: "hidden" as const };
     const parsed = parseUiBlock(code, !!live);
     if (!parsed.ok) {
       if (live && parsed.reason !== "too_large") {
@@ -187,6 +190,8 @@ export function IuiBlock({ code, live, readOnly }: IuiBlockProps) {
   }, [code, live]);
 
   switch (outcome.kind) {
+    case "hidden":
+      return null;
     case "skeleton":
       return <Skeleton kind={outcome.type} />;
     case "raw":

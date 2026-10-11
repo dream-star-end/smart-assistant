@@ -23,6 +23,7 @@ import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
 import { clearDraft, draftExceedsStorage } from "../lib/composerDraft";
+import { completionFor, type InputPrediction } from "../lib/inputPrediction";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -174,6 +175,7 @@ export function Composer({
   draftKey,
   goalOpenRequest,
   projectSlot,
+  prediction,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -220,6 +222,9 @@ export function Composer({
   goalOpenRequest?: number;
   /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
   projectSlot?: ReactNode;
+  /** 输入预测(lib/inputPrediction):空输入框显示 next,输入中按 candidates 补全;Tab / → 采用。
+   *  省略或 null = 关闭(设置里关掉、demo)。 */
+  prediction?: InputPrediction | null;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -279,6 +284,34 @@ export function Composer({
   const fileInputId = useId();
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
+
+  // 输入预测(OCV5-375):浅色字叠在正文后面,不进 value,采用前不会被发送。
+  // 输入法组字中、光标不在末尾、生成中(整句预测属于上一条回答)时不显示;Esc 收起本条整句预测。
+  const ghostRef = useRef<HTMLDivElement>(null);
+  const predictionHintId = useId();
+  const [composing, setComposing] = useState(false);
+  const [caretAtEnd, setCaretAtEnd] = useState(true);
+  const [dismissedPrediction, setDismissedPrediction] = useState<string | null>(null);
+  const nextPrediction = prediction?.next?.text ?? null;
+  const ghostRest =
+    !prediction || disabled || composing || (value !== "" && !caretAtEnd)
+      ? null
+      : value === ""
+        ? !busy && nextPrediction && nextPrediction !== dismissedPrediction
+          ? nextPrediction
+          : null
+        : completionFor(value, prediction.candidates);
+  const acceptPrediction = () => {
+    if (!ghostRest) return;
+    const next = value + ghostRest;
+    setValue(next);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+    });
+  };
 
   // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟。正文草稿按 draftKey 写入
   // sessionStorage,但附件/引用仍只在内存,reload 会丢。
@@ -378,8 +411,9 @@ export function Composer({
     const el = ref.current;
     if (!el) return;
     el.style.height = "0px";
-    el.style.height = Math.min(el.scrollHeight, 240) + "px";
-  }, [value]);
+    // 整句预测比空输入框长时会折行:按浅色字的高度撑开,别压到下面的工具行上。
+    el.style.height = Math.min(Math.max(el.scrollHeight, ghostRef.current?.scrollHeight ?? 0), 240) + "px";
+  }, [value, ghostRest]);
 
   const uploading = attachments.some((a) => a.status === "uploading");
   const attachFailed = attachments.some((a) => a.status === "error");
@@ -626,7 +660,7 @@ export function Composer({
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
-          <div className="flex px-1" data-testid="composer-input-row">
+          <div className="relative flex px-1" data-testid="composer-input-row">
             <textarea
               data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
               ref={ref}
@@ -634,7 +668,17 @@ export function Composer({
               value={value}
               disabled={disabled}
               aria-label="消息输入框"
-              onChange={(e) => setValue(e.target.value)}
+              aria-describedby={ghostRest ? predictionHintId : undefined}
+              onChange={(e) => {
+                setValue(e.target.value);
+                setCaretAtEnd(e.target.selectionEnd === e.target.value.length);
+              }}
+              onSelect={(e) => {
+                const el = e.currentTarget;
+                setCaretAtEnd(el.selectionStart === el.selectionEnd && el.selectionEnd === el.value.length);
+              }}
+              onCompositionStart={() => setComposing(true)}
+              onCompositionEnd={() => setComposing(false)}
               onPaste={(e) => {
                 if (!onUpload) return;
                 const images = clipboardImages(e.clipboardData);
@@ -643,6 +687,20 @@ export function Composer({
                 void onFiles(images);
               }}
               onKeyDown={(e) => {
+                // 采用预测:Tab,或光标在末尾时按 →。没有预测时 Tab 照常移动焦点。
+                if (
+                  ghostRest &&
+                  (e.key === "Tab" || e.key === "ArrowRight") &&
+                  !e.nativeEvent.isComposing &&
+                  !e.shiftKey &&
+                  !e.altKey &&
+                  !e.ctrlKey &&
+                  !e.metaKey
+                ) {
+                  e.preventDefault();
+                  acceptPrediction();
+                  return;
+                }
                 if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
                   e.preventDefault();
                   setValue(lastUserText);
@@ -661,6 +719,12 @@ export function Composer({
                   onCancelReply();
                   return;
                 }
+                // Esc 收起整句预测(不在生成中才会显示,不和全局「停止生成」抢键)。
+                if (e.key === "Escape" && value === "" && ghostRest && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  setDismissedPrediction(ghostRest);
+                  return;
+                }
                 if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                   // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                   if (coarsePointer) return;
@@ -673,12 +737,45 @@ export function Composer({
                 }
               }}
               enterKeyHint={coarsePointer ? "enter" : "send"}
-              placeholder={placeholder}
+              placeholder={value === "" && ghostRest ? "" : placeholder}
               className={cn(
                 "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1.5 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
                 fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
               )}
             />
+            {ghostRest && (
+              // 与 textarea 同字号、同行高、同内边距地叠在它上面:已输入部分透明占位,预测接在后面。
+              <div
+                ref={ghostRef}
+                data-testid="composer-prediction"
+                className={cn(
+                  "pointer-events-none absolute inset-y-0 left-1 right-1 overflow-hidden whitespace-pre-wrap break-words py-1.5 leading-relaxed",
+                  fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
+                )}
+              >
+                <span aria-hidden="true" className="invisible">
+                  {value}
+                </span>
+                <span aria-hidden="true" className="text-faint">
+                  {ghostRest}
+                </span>
+                {/* 触屏没有 Tab 键:同一个位置给一个「填入」按钮。不进 Tab 序列,不抢输入框焦点。 */}
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  aria-label="采用输入预测"
+                  data-testid="composer-prediction-accept"
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={acceptPrediction}
+                  className="pointer-events-auto ml-2 inline-flex h-5 -translate-y-px items-center rounded-md border border-border px-1.5 align-middle text-[11px] font-medium leading-none text-faint transition-colors hover:bg-hover hover:text-fg"
+                >
+                  {coarsePointer ? "填入" : "Tab"}
+                </button>
+                <span id={predictionHintId} className="sr-only">
+                  {`输入预测：${value}${ghostRest}。按 Tab 采用。`}
+                </span>
+              </div>
+            )}
           </div>
           <div className="mt-1 flex items-center gap-1.5" data-testid="composer-tool-row">
             {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条

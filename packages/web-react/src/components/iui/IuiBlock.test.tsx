@@ -347,3 +347,26 @@ describe("switch on/off through the Markdown renderer", () => {
     expect(md).not.toContain("```ui");
   });
 });
+
+// OCV5-375:回答末尾的输入预测块只给输入框用,回答里看不到(写完、写到一半、组件关闭时都一样)。
+describe("next(输入预测)", () => {
+  const md = `改好了。\n\n\`\`\`ui\n${j({ type: "next", text: "把木星的卫星也加上" })}\n\`\`\``;
+
+  it("完整块与流式半截块都不渲染任何东西", () => {
+    const { container, rerender } = render(<IuiBlock code={j({ type: "next", text: "好的" })} />);
+    expect(container).toBeEmptyDOMElement();
+    rerender(<IuiBlock code={'{"type":"ne'} live />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("消息里只剩正文;组件开关关闭时也不出现", () => {
+    const { container, unmount } = render(<MarkdownImpl>{md}</MarkdownImpl>);
+    expect(container).toHaveTextContent("改好了。");
+    expect(container).not.toHaveTextContent("把木星的卫星也加上");
+    unmount();
+    setIntelligentUiPref(false);
+    const off = render(<MarkdownImpl>{md}</MarkdownImpl>);
+    expect(off.container).not.toHaveTextContent("把木星的卫星也加上");
+    expect(off.container).not.toHaveTextContent("next");
+  });
+});

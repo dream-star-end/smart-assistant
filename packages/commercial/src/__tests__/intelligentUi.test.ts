@@ -10,10 +10,14 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  INPUT_PREDICTION_PROMPT,
   INTELLIGENT_UI_PROMPT,
   INTELLIGENT_UI_SLOT_NAME,
+  inputPredictionFeatureView,
+  inputPredictionPrefEnabled,
   intelligentUiFeatureView,
   intelligentUiPrefEnabled,
+  isInputPredictionServerEnabled,
   isIntelligentUiServerEnabled,
   resolveIntelligentUiSlot,
 } from "../intelligentUi/index.js";
@@ -45,20 +49,45 @@ describe("用户偏好", () => {
   });
 });
 
-describe("resolveIntelligentUiSlot", () => {
-  const prefs = (p: { intelligent_ui?: boolean }) => async () => ({ prefs: p });
+describe("输入预测开关(OCV5-375)", () => {
+  test("总开关 OC_INPUT_PREDICTION:缺省开,0 / off 关", () => {
+    assert.equal(isInputPredictionServerEnabled({}), true);
+    assert.equal(isInputPredictionServerEnabled({ OC_INPUT_PREDICTION: " OFF " }), false);
+  });
+  test("偏好缺省开;features 视图跟总开关", () => {
+    assert.equal(inputPredictionPrefEnabled(undefined), true);
+    assert.equal(inputPredictionPrefEnabled({ input_prediction: false }), false);
+    assert.deepEqual(inputPredictionFeatureView({}, {}), { available: true, enabled: true });
+    assert.deepEqual(inputPredictionFeatureView({}, { OC_INPUT_PREDICTION: "0" }), { available: false, enabled: false });
+  });
+});
 
-  test("总开关开 + 偏好未设 → 下发协议", async () => {
+describe("resolveIntelligentUiSlot", () => {
+  const prefs = (p: { intelligent_ui?: boolean; input_prediction?: boolean }) => async () => ({ prefs: p });
+  const both = `${INTELLIGENT_UI_PROMPT}\n\n${INPUT_PREDICTION_PROMPT}`;
+
+  test("总开关开 + 偏好未设 → 组件协议 + 输入预测", async () => {
     const slot = await resolveIntelligentUiSlot(3, { env: {}, readPrefs: prefs({}) });
-    assert.deepEqual(slot, { name: INTELLIGENT_UI_SLOT_NAME, content: INTELLIGENT_UI_PROMPT });
+    assert.deepEqual(slot, { name: INTELLIGENT_UI_SLOT_NAME, content: both });
   });
-  test("偏好关 → null", async () => {
-    assert.equal(await resolveIntelligentUiSlot(3, { env: {}, readPrefs: prefs({ intelligent_ui: false }) }), null);
+  test("各自的偏好或总开关只去掉自己那段", async () => {
+    const onlyPredict = { name: INTELLIGENT_UI_SLOT_NAME, content: INPUT_PREDICTION_PROMPT };
+    const onlyIui = { name: INTELLIGENT_UI_SLOT_NAME, content: INTELLIGENT_UI_PROMPT };
+    assert.deepEqual(await resolveIntelligentUiSlot(3, { env: {}, readPrefs: prefs({ intelligent_ui: false }) }), onlyPredict);
+    assert.deepEqual(await resolveIntelligentUiSlot(3, { env: { OC_INTELLIGENT_UI: "0" }, readPrefs: prefs({}) }), onlyPredict);
+    assert.deepEqual(await resolveIntelligentUiSlot(3, { env: {}, readPrefs: prefs({ input_prediction: false }) }), onlyIui);
+    assert.deepEqual(await resolveIntelligentUiSlot(3, { env: { OC_INPUT_PREDICTION: "off" }, readPrefs: prefs({}) }), onlyIui);
   });
-  test("总开关关 → null,且不读偏好", async () => {
+  test("两个偏好都关 → null", async () => {
+    assert.equal(
+      await resolveIntelligentUiSlot(3, { env: {}, readPrefs: prefs({ intelligent_ui: false, input_prediction: false }) }),
+      null,
+    );
+  });
+  test("两个总开关都关 → null,且不读偏好", async () => {
     let read = false;
     const slot = await resolveIntelligentUiSlot(3, {
-      env: { OC_INTELLIGENT_UI: "off" },
+      env: { OC_INTELLIGENT_UI: "off", OC_INPUT_PREDICTION: "off" },
       readPrefs: async () => {
         read = true;
         return { prefs: {} };
@@ -131,5 +160,14 @@ describe("协议文案", () => {
 
   test("体积受控(系统提示每轮都带;第二轮组件补齐后上限 9KB)", () => {
     assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8") < 9_000, String(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8")));
+  });
+
+  test("输入预测:示例块是合法 JSON、类型 next、要求放在最后;体积小(每轮都带)", () => {
+    const m = /```ui\n(\{[^\n]*\})\n```/.exec(INPUT_PREDICTION_PROMPT);
+    assert.ok(m);
+    assert.equal((JSON.parse(m[1]!) as { type: string }).type, "next");
+    assert.match(INPUT_PREDICTION_PROMPT, /最后一个块/);
+    assert.match(INPUT_PREDICTION_PROMPT, /不是你的建议/);
+    assert.ok(Buffer.byteLength(INPUT_PREDICTION_PROMPT, "utf8") < 1_500, String(Buffer.byteLength(INPUT_PREDICTION_PROMPT, "utf8")));
   });
 });

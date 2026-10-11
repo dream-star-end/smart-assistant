@@ -4,6 +4,7 @@
  * 四个用处:开关关闭时的渲染、消息复制、会话导出、组件渲染失败时的兜底。
  * 输出是普通 GFM(表格、列表、引用),任何 Markdown 阅读器都能读。
  */
+import { isNextBlockCode } from "../../lib/inputPrediction";
 import { computeOutputs } from "./formula";
 import { parseUiBlock } from "./parse";
 import type { CalcFormat, CalculatorSpec, Cell, IuiSpec, OutlineNode, TableSpec } from "./schema";
@@ -351,6 +352,8 @@ function rawFence(code: string): string {
 /** 单个 ui 块源码 → Markdown;`partial` = 未闭合的流式块。 */
 export function uiCodeToMarkdown(code: string, partial = false): string {
   // 复制 / 导出 / 关闭开关都走这里:任何意外都退回原文,绝不让整条消息渲染失败。
+  // 输入预测块(OCV5-375)不是回答内容,一律去掉。
+  if (isNextBlockCode(code, partial)) return "";
   try {
     const parsed = parseUiBlock(code, partial);
     if (!parsed.ok) return partial ? "" : rawFence(code);
