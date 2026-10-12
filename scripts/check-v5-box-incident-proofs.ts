@@ -1372,7 +1372,13 @@ async function proveRejectedStreamWedge(api: Api, db: Db): Promise<string> {
   // the CLI is launched with the client's own names, so a native "Bash" resolves
   const allowed = next.launchArgs[next.launchArgs.indexOf("--allowedTools") + 1];
   if (allowed !== BOX_BASH) fail(`WEDGE_ALIAS_${allowed}`);
-  if (!/new BoxToolFetch\(\{[^}]*?toolAliasMode: "natural"/s.test(api.egressSource)) fail("WEDGE_PRODUCTION_ALIAS_MODE");
+  // The production construction, from `new BoxToolFetch({` to its closing `}) : undefined;` (the
+  // options now hold nested objects, e.g. the interactive host, so a no-brace scan stops early).
+  const toolFetchAt = api.egressSource.indexOf("new BoxToolFetch({");
+  const toolFetchEnd = toolFetchAt < 0 ? -1 : api.egressSource.indexOf("}) : undefined;", toolFetchAt);
+  if (toolFetchEnd < 0 || !api.egressSource.slice(toolFetchAt, toolFetchEnd).includes('toolAliasMode: "natural"')) {
+    fail("WEDGE_PRODUCTION_ALIAS_MODE");
+  }
   // a chain admitted before that release, on the opaque t0 binding, still continues
   const opaqueUse = [start("msg_o"), ...call("msg_o", 0, "toolu_opaque", "mcp__ocbridge__t0"), ...stop("tool_use", 4)];
   const opaque = boxContinuation(api, [publishedText("toolu_prior", "ok")],
