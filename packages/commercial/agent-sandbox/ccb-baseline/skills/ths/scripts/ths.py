@@ -1482,7 +1482,7 @@ def cmd_watchlist(args):
 # `--ui`：把与 JSON 输出同源的数据转成 OpenClaude 智能 UI 的 ```ui 块（quote / kline / intraday /
 # stocklist 以及通用的 table / kv / sources / steps / callout）。只做格式转换，不增删任何数值；
 # 分时按 2 分钟取样（成交量为两分钟合计，最后一分钟总保留），在块的 note 里写明。
-# 上游 1.3.0 新命令：indicators → stats + 折线图，events → timeline，doctor / commands → table。
+# 上游 1.3.0 新命令：indicators → stats + 四张折线图（数值一个不少），events → timeline，doctor / commands → table。
 
 UI_SOURCE = "同花顺公开 Web 接口（ths 插件）"
 
@@ -1612,9 +1612,11 @@ def _indicator_blocks(data):
     period = PERIOD_LABELS.get(data.get("period"), data.get("period") or "")
     adjust = "，前复权" if data.get("adjust") == "forward" else ""
     head = f"{data.get('name', '')}（{data.get('code', '')}）"
-    items = [{"label": label, "value": latest[k]} for k, label in
-             (("close", "收盘"), ("ma5", "MA5"), ("ma20", "MA20"), ("ma60", "MA60"), ("rsi14", "RSI14"))
-             if latest.get(k) is not None]
+    # latest 的每个数值都要出现（Codex r1）：单值直接放，成组的用「/」连起来，缺值写「—」。
+    items = [{"label": "收盘", "value": latest.get("close")},
+             {"label": "MA5 / 10 / 20 / 60", "value": _join(latest.get("ma5"), latest.get("ma10"), latest.get("ma20"), latest.get("ma60"))},
+             {"label": "RSI14", "value": latest.get("rsi14")}]
+    items = [i for i in items if i["value"] is not None]
     items.append({"label": "MACD（DIF / DEA / 柱）", "value": _join(latest.get("dif"), latest.get("dea"), latest.get("macd_hist"))})
     items.append({"label": "KDJ（K / D / J）", "value": _join(latest.get("kdj_k"), latest.get("kdj_d"), latest.get("kdj_j"))})
     items.append({"label": "BOLL（上 / 中 / 下）", "value": _join(latest.get("boll_upper"), latest.get("boll_mid"), latest.get("boll_lower"))})
@@ -1634,8 +1636,10 @@ def _indicator_blocks(data):
         return {"type": "chart", "kind": "line", "title": f"{head}{title}", "labels": labels,
                 "series": [{"name": name, "values": [r.get(k) for r in series]} for k, name in keys],
                 "source": src, "note": note}
-    blocks.append(chart("价格、均线与布林带", (("close", "收盘"), ("ma5", "MA5"), ("ma20", "MA20"),
-                                       ("boll_upper", "BOLL 上轨"), ("boll_lower", "BOLL 下轨"))))
+    # series 的每个字段都画进某一张图（每张 ≤6 条线）。
+    blocks.append(chart("收盘与均线", (("close", "收盘"), ("ma5", "MA5"), ("ma10", "MA10"), ("ma20", "MA20"), ("ma60", "MA60"))))
+    blocks.append(chart("布林带", (("close", "收盘"), ("boll_upper", "BOLL 上轨"), ("boll_mid", "BOLL 中轨"),
+                                ("boll_lower", "BOLL 下轨"))))
     blocks.append(chart("MACD", (("dif", "DIF"), ("dea", "DEA"), ("macd_hist", "MACD 柱"))))
     blocks.append(chart("RSI 与 KDJ", (("rsi14", "RSI14"), ("kdj_k", "K"), ("kdj_d", "D"), ("kdj_j", "J"))))
     return blocks

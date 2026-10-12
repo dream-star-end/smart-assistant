@@ -82,18 +82,30 @@ describe("ths --ui → 前端 schema（真实夹具）", () => {
     for (const s of specs) expect(s.notes).toEqual([]);
   });
 
-  test("技术指标（v1.3.0）：指标卡取 latest 原值，三张折线图逐点等于 series", () => {
+  test("技术指标（v1.3.0）：指标卡取 latest 原值，四张折线图逐点等于 series", () => {
     const raw = JSON.parse(fixture("indicators"));
-    const [stats, price, macd, osc] = thsUi("indicators", "indicators").map((b) => valid(b).spec) as Record<string, any>[];
+    const [stats, price, boll, macd, osc] = thsUi("indicators", "indicators").map((b) => valid(b).spec) as Record<string, any>[];
     expect(stats.title).toContain("前复权");
-    const byLabel = Object.fromEntries(stats.items.map((i: { label: string; value: unknown }) => [i.label, i.value]));
-    expect(byLabel["收盘"]).toBe(raw.latest.close);
-    expect(byLabel.RSI14).toBe(raw.latest.rsi14);
-    expect(byLabel["MACD（DIF / DEA / 柱）"]).toBe(`${raw.latest.dif} / ${raw.latest.dea} / ${raw.latest.macd_hist}`);
+    const byLabel = new Map(stats.items.map((i: { label: string; value: unknown }) => [i.label, i.value]));
+    expect(byLabel.get("收盘")).toBe(raw.latest.close);
+    expect(byLabel.get("MA5 / 10 / 20 / 60")).toBe(`${raw.latest.ma5} / ${raw.latest.ma10} / ${raw.latest.ma20} / ${raw.latest.ma60}`);
+    expect(byLabel.get("RSI14")).toBe(raw.latest.rsi14);
+    expect(byLabel.get("MACD（DIF / DEA / 柱）")).toBe(`${raw.latest.dif} / ${raw.latest.dea} / ${raw.latest.macd_hist}`);
     expect(price.labels).toEqual(raw.series.map((r: { date: string }) => r.date));
     expect(price.series[0].values).toEqual(raw.series.map((r: { close: number }) => r.close));
+    expect(boll.series.map((x: { name: string }) => x.name)).toEqual(["收盘", "BOLL 上轨", "BOLL 中轨", "BOLL 下轨"]);
     expect(macd.series.map((x: { name: string }) => x.name)).toEqual(["DIF", "DEA", "MACD 柱"]);
     expect(osc.series[0].values).toEqual(raw.series.map((r: { rsi14: number | null }) => r.rsi14));
+  });
+
+  test("技术指标：CLI 输出的每个数值字段都进了某个块（不丢字段）", () => {
+    const raw = JSON.parse(fixture("indicators"));
+    const blocks = thsUi("indicators", "indicators").map((b) => valid(b).spec) as Record<string, any>[];
+    const statsText = JSON.stringify(blocks[0].items);
+    for (const [k, v] of Object.entries(raw.latest)) if (k !== "date" && v !== null) expect(statsText).toContain(String(v));
+    const plotted = blocks.slice(1).flatMap((c) => c.series.map((s: { values: unknown[] }) => JSON.stringify(s.values)));
+    for (const k of Object.keys(raw.series[0]).filter((x) => x !== "date"))
+      expect(plotted).toContain(JSON.stringify(raw.series.map((r: Record<string, unknown>) => r[k])));
   });
 
   test("公司大事（v1.3.0）：时间线条数、日期、类别、正文与 CLI 一致", () => {

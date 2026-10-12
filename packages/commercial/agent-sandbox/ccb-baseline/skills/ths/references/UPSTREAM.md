@@ -12,7 +12,7 @@
    之后优先读用户目录。原版写在脚本旁边，而插件目录在容器里是只读挂载。
 
 3. `--ui` 与上游的全局选项一起在任意位置提取；加了 `--ui` 时 `--compact` / `--fields` 不起作用（ui 块总是完整数据）。
-4. 1.3.0 新命令的 ui 映射：`indicators` → stats + 三张折线图（超过 60 根时只画最近 60 根并注明）；`events` → timeline；
+4. 1.3.0 新命令的 ui 映射：`indicators` → stats + 四张折线图（均线、布林带、MACD、RSI 与 KDJ；输出的每个数值都在；超过 60 根时只画最近 60 根并注明）；`events` → timeline；
    `doctor` → callout + table；`commands` → table；`kline` 的 `adjust=forward` 写进 K 线块的 note「前复权」。
 
 未随包：上游的 `README.md`、`CHANGELOG.md`、`tests/test_indicators.py`、`tools/latency_check.py`、`ths` shell 包装。
