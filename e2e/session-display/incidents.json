@@ -7201,6 +7201,25 @@
           "assertion": "[inc-20261011-sand-installer-host-f1727e3] PASS — the installer patches the f1727e3 host, still refuses any other change to its auth gate, and only the gateway token reaches the relay"
         }
       ]
+    },
+    {
+      "id": "INC-20261012-BOX-SYSTEM-HEADER-DROP",
+      "occurredAt": "2026-10-12",
+      "severity": "P1",
+      "symptom": "box-api-claude-*（路线 A，两版）回合从不输出智能 UI 和输入预测块，也没有 OpenClaude 的其它系统指令。根因：CCB 的系统提示第 0 块是 `x-anthropic-billing-header: …`，Box 映射把所有系统块拼成一个 --system-prompt-file，文件以该头开头；Claude Code CLI 2.1.293/2.1.296 把以该头开头的系统块当作计费归属头整块丢弃，模型只收到 CLI 自带的环境段。2026-10-12 商业生产 Haiku 探针确认（系统提示只有 Environment 等标题）。起始时间未能确定（Box 上现存 CLI 版本都在 10-10 安装）。修复：systemText 去掉计费头块（字符串形式去掉首行头），其余块原样保留。",
+      "rootFixCommit": "9f0d8f58",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "drops the CCB billing header block so the CLI keeps the system prompt"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept"
+        }
+      ]
     }
   ]
 }
