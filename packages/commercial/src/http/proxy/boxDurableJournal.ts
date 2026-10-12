@@ -31,7 +31,7 @@ import { authorityFromJournalCtx, consumePrepared, isContinuationConflict,
   type AuthorityProjection, type PreparedContinuation,
   type PreparedConsumption } from "./boxPreparedContinuation.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
-import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
+import { parseBoxNativePointer, type BoxNativePointer, BOX_PROMPT_LAYOUT_STATIC_FIRST } from "./boxNativePointer.js";
 import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
@@ -112,7 +112,9 @@ export interface BoxJournalAdmission {
   /** First native invocation mints an opaque Claude UUID in its own run cwd. */
   nativeStart?: { sessionId: string; cliCwd: string;
     /** The build that writes the transcript; absent where native resume is unverified. */
-    cliVersion?: BoxNativePointer["cliVersion"] };
+    cliVersion?: BoxNativePointer["cliVersion"];
+    /** OCV5-383: the prompt layout this run stages the transcript with. */
+    promptLayout?: BoxNativePointer["promptLayout"] };
 }
 export interface BoxNativeCandidate {
   readonly ownerRequestId: string;
@@ -136,6 +138,8 @@ export interface BoxToolResumeClaim {
   readonly nativeCliCwd?: string;
   /** The build that wrote the native transcript; absent for chains admitted before it was recorded. */
   readonly nativeCliVersion?: BoxNativePointer["cliVersion"];
+  /** OCV5-383: layout the transcript was staged with; absent = legacy (or unrecorded). */
+  readonly nativePromptLayout?: BoxNativePointer["promptLayout"];
 }
 export type BoxResumeDecision =
   | { readonly kind: "new_claim"; readonly claim: BoxToolResumeClaim }
@@ -298,6 +302,14 @@ const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
         AND ctx ? 'boxToolHandoff'))))`;
 // New successful Box rounds retain the completed Message before stdout is
 // truncated. Old rows and proven stopped failures keep their cleanup route.
+/** OCV5-384: a finished run that recorded a native start attaches its native pointer right
+ * after the terminal proof lands (after a remote transcript inspection). Cleanup claimed in
+ * between made attachNativePointer refuse, so the next turn found no candidate and re-staged the
+ * whole conversation at cache-write price. Such a run waits for its pointer, or for this grace. */
+const CLEANUP_NATIVE_POINTER_GRACE = `(ctx->>'boxState'<>'terminal'
+  OR NOT (ctx ? 'boxNativeSessionId')
+  OR ctx ? 'boxNativePointer'
+  OR updated_at <= NOW() - INTERVAL '20 seconds')`;
 const CLEANUP_REPLAY_FENCE = `(ctx->>'boxState'<>'terminal'
   OR ctx->>'boxReplayRequired' IS DISTINCT FROM 'true'
   OR ctx ? 'boxReplayMessage')`;
@@ -390,7 +402,9 @@ function goodId(input: BoxJournalAdmission): void {
       || !UUID_V4.test(input.nativeStart.sessionId)
       || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`
       || (input.nativeStart.cliVersion !== undefined
-        && !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(input.nativeStart.cliVersion))))
+        && !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(input.nativeStart.cliVersion))
+      || (input.nativeStart.promptLayout !== undefined
+        && input.nativeStart.promptLayout !== BOX_PROMPT_LAYOUT_STATIC_FIRST)))
     || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -642,6 +656,46 @@ export class BoxDurableJournal implements BoxJournalPort {
     if (!proof || typeof proof !== "object" || Array.isArray(proof)
       || (proof as { reason?: unknown }).reason !== "worker_complete") return null;
     return { ownerRequestId: row.request_id, pointer };
+  }
+
+  /** OCV5-384: native transcripts Box runs of this session and model wrote (any outcome: a
+   * failed run's transcript still holds the first exchange), oldest first then newest. The
+   * oldest is the session's origin, where the CLI put its context records after the first user
+   * message; a transcript re-staged before this fix has them elsewhere. Used only to copy those
+   * records into a re-staged conversation; never a resume authority. */
+  async findNativeTranscriptSources(input: { uid: bigint; sessionId: string;
+    currentRequestId: string; canonicalModel: string }): Promise<{ cliCwd: string;
+    nativeSessionId: string; cliVersion: string }[]> {
+    if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
+      || !/^(?:box-api-|box-)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return [];
+    const found = await this.pool.query<{ cwd: unknown; sid: unknown; version: unknown }>(
+      `(SELECT ctx->>'boxNativeCliCwd' AS cwd, ctx->>'boxNativeSessionId' AS sid,
+               ctx->>'boxNativeCliVersion' AS version, 0 AS rank
+          FROM request_finalize_journal
+         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'model'=$3
+           AND ctx->>'boxInvocationRecovery'='v1' AND request_id<>$4
+           AND ctx ? 'boxNativeCliCwd' AND ctx ? 'boxNativeSessionId' AND ctx ? 'boxNativeCliVersion'
+         ORDER BY created_at ASC, request_id ASC LIMIT 1)
+       UNION ALL
+       (SELECT ctx->>'boxNativeCliCwd', ctx->>'boxNativeSessionId', ctx->>'boxNativeCliVersion', 1
+          FROM request_finalize_journal
+         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'model'=$3
+           AND ctx->>'boxInvocationRecovery'='v1' AND request_id<>$4
+           AND ctx ? 'boxNativeCliCwd' AND ctx ? 'boxNativeSessionId' AND ctx ? 'boxNativeCliVersion'
+         ORDER BY created_at DESC, request_id DESC LIMIT 1)
+       ORDER BY rank`,
+      [input.uid.toString(), input.sessionId, input.canonicalModel, input.currentRequestId]);
+    const out: { cliCwd: string; nativeSessionId: string; cliVersion: string }[] = [];
+    for (const row of found.rows) {
+      if (typeof row.cwd !== "string" || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(row.cwd)
+        || typeof row.sid !== "string"
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.sid)
+        || typeof row.version !== "string" || !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(row.version)
+        || out.some((item) => item.nativeSessionId === row.sid)) continue;
+      out.push({ cliCwd: row.cwd, nativeSessionId: row.sid, cliVersion: row.version });
+    }
+    return out;
   }
 
   /** At most one latest expired pointer per native project. A successful
@@ -1248,10 +1302,13 @@ export class BoxDurableJournal implements BoxJournalPort {
         ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
           boxNativeSessionId: native.pointer.nativeSessionId,
           boxNativeCliCwd: native.pointer.cliCwd,
-          boxNativeCliVersion: native.pointer.cliVersion } : {}),
+          boxNativeCliVersion: native.pointer.cliVersion,
+          ...(native.pointer.promptLayout ? { boxNativePromptLayout: native.pointer.promptLayout } : {}) } : {}),
         ...(input.nativeStart ? { boxNativeSessionId: input.nativeStart.sessionId,
           boxNativeCliCwd: input.nativeStart.cliCwd,
-          ...(input.nativeStart.cliVersion ? { boxNativeCliVersion: input.nativeStart.cliVersion } : {}) } : {}) };
+          ...(input.nativeStart.cliVersion ? { boxNativeCliVersion: input.nativeStart.cliVersion } : {}),
+          ...(input.nativeStart.promptLayout
+            ? { boxNativePromptLayout: input.nativeStart.promptLayout } : {}) } : {}) };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
@@ -2037,6 +2094,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       const nativeCliVersion = typeof ctx.boxNativeCliVersion === "string"
         && /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(ctx.boxNativeCliVersion)
         ? ctx.boxNativeCliVersion : undefined;
+      const nativePromptLayout = ctx.boxNativePromptLayout === BOX_PROMPT_LAYOUT_STATIC_FIRST
+        ? BOX_PROMPT_LAYOUT_STATIC_FIRST : undefined;
       if (ctx.model !== input.canonicalModel
         || ctx.boxInvocationMode !== "detached_tool"
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -2180,7 +2239,8 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(nativeSessionId === undefined ? {} : {
                boxNativeSessionId: nativeSessionId,
                boxNativeCliCwd: nativeCliCwd,
-               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}) }) })]);
+               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}),
+               ...(nativePromptLayout ? { boxNativePromptLayout: nativePromptLayout } : {}) }) })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
@@ -2200,7 +2260,8 @@ export class BoxDurableJournal implements BoxJournalPort {
          ...(nativeSessionId === undefined ? {} : {
            nativeSessionId: nativeSessionId as string,
            nativeCliCwd: nativeCliCwd as string,
-           ...(nativeCliVersion ? { nativeCliVersion } : {}) }) };
+           ...(nativeCliVersion ? { nativeCliVersion } : {}),
+           ...(nativePromptLayout ? { nativePromptLayout } : {}) }) };
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
@@ -3230,6 +3291,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ${CLEANUP_MODE_FENCE}
            AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
            AND ${CLEANUP_REPLAY_FENCE}
+           AND ${CLEANUP_NATIVE_POINTER_GRACE}
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
            AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
@@ -3318,6 +3380,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ${CLEANUP_MODE_FENCE}
            AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
            AND ${CLEANUP_REPLAY_FENCE}
+           AND ${CLEANUP_NATIVE_POINTER_GRACE}
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
            AND ctx->'boxTerminalProof'=$6::jsonb

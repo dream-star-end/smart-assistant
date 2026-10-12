@@ -314,26 +314,27 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(!prompt.includes('Agent 工具 spawn 子 agent'))
     assert.ok(!prompt.includes('子 agent 会继承你的全部工具和上下文'))
   })
-  it('效率契约对所有 agent 生效且覆盖改动档位/等待/读代码三条硬规则', () => {
+  it('效率契约对所有 agent 生效:只在两份 CLAUDE 基线里一份,不再在常驻 prompt 里重复(OCV5-382)', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
-    assert.ok(prompt.includes('## 效率契约'))
-    assert.ok(prompt.includes('**T0** 配置/catalog'))
-    assert.ok(prompt.includes('**T1** 单包代码'))
-    assert.ok(prompt.includes('**T2** 跨包/协议/迁移'))
-    assert.ok(prompt.includes('禁止 `sleep >= 60`'))
-    assert.ok(prompt.includes('gh pr checks --watch'))
-    assert.ok(prompt.includes('while true'))
-    assert.ok(prompt.includes('Read`/`Grep`/`Glob'))
-    assert.ok(prompt.includes('host cat/rg'))
-    assert.ok(prompt.includes('80 次工具调用或 30 分钟'))
-    assert.ok(prompt.includes('验一下'))
-    const baseline = readFileSync(
-      'packages/commercial/agent-sandbox/ccb-baseline/CLAUDE.md',
-      'utf8',
-    )
-    assert.ok(baseline.includes('## 效率契约'), 'CLAUDE.md 基线必须含效率契约(子 agent User memory)')
-    assert.ok(baseline.includes('对所有 agent(含委派子 agent)生效'))
-    assert.ok(baseline.includes('只验不修'))
+    assert.ok(!prompt.includes('## 效率契约'), '常驻 prompt 与基线重复,主 agent 会读两遍')
+    for (const file of ['CLAUDE.md', 'CLAUDE.admin.md']) {
+      const baseline = readFileSync(join('packages/commercial/agent-sandbox/ccb-baseline', file), 'utf8')
+      assert.equal(baseline.split('## 效率契约').length, 2, `${file} 必须恰好含一段效率契约`)
+      for (const fragment of [
+        '对所有 agent(含委派子 agent)生效',
+        '**T0** 配置/catalog',
+        '**T1** 单包代码',
+        '**T2** 跨包/协议/迁移',
+        '禁止 `sleep >= 60`',
+        'while true',
+        'Read/Grep/Glob',
+        'host cat/rg',
+        '80 次工具或 30 分钟',
+        '只验不修',
+      ]) {
+        assert.ok(baseline.includes(fragment), `${file} 缺效率契约条款: ${fragment}`)
+      }
+    }
   })
   it('需要用户决策时:说人话/讲影响/给推荐三条契约覆盖常驻 prompt 与四份 CCB/Codex 基线', () => {
     const baselineDir = 'packages/commercial/agent-sandbox/ccb-baseline'

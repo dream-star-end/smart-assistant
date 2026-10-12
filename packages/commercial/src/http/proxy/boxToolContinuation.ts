@@ -237,7 +237,10 @@ export async function runBoxToolContinuation(input: {
                 : deriveBoxContextHash(input.canonicalBody),
               assistantContentHash: final.assistantContentHash,
               catalogHash: claim.catalogHash,
-              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000,
+              // OCV5-383: the layout the first round staged the transcript with,
+              // not this request's (an egress upgrade can land mid-chain).
+              ...(claim.nativePromptLayout ? { promptLayout: claim.nativePromptLayout } : {}) });
             if (candidate && await deps.journal.attachNativePointer({
               requestId: input.requestId, uid: input.uid,
               accountId: claim.accountId, proof, pointer: candidate })) {

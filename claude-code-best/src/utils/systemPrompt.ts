@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { appendSystemPromptFor } from './openclaudePromptLayout.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
@@ -105,19 +106,19 @@ export function buildEffectiveSystemPrompt({
     (feature('PROACTIVE') || feature('KAIROS')) &&
     isProactiveActive_SAFE_TO_CALL_ANYWHERE()
   ) {
+    const append = appendSystemPromptFor(defaultSystemPrompt, appendSystemPrompt)
     return asSystemPrompt([
       ...defaultSystemPrompt,
       `\n# Custom Agent Instructions\n${agentSystemPrompt}`,
-      ...(appendSystemPrompt ? [appendSystemPrompt] : []),
+      ...(append ? [append] : []),
     ])
   }
 
-  return asSystemPrompt([
-    ...(agentSystemPrompt
-      ? [agentSystemPrompt]
-      : customSystemPrompt
-        ? [customSystemPrompt]
-        : defaultSystemPrompt),
-    ...(appendSystemPrompt ? [appendSystemPrompt] : []),
-  ])
+  const base = agentSystemPrompt
+    ? [agentSystemPrompt]
+    : customSystemPrompt
+      ? [customSystemPrompt]
+      : defaultSystemPrompt
+  const append = appendSystemPromptFor(base, appendSystemPrompt)
+  return asSystemPrompt([...base, ...(append ? [append] : [])])
 }

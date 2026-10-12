@@ -158,6 +158,13 @@ export function makeBoxStageFiles(input: {
   /** Existing owner-0700 run directory; never create it a second time. */
   initialize?: boolean;
   /**
+   * OCV5-384: create the project directory (owner 0700) even without a snapshot file, for a
+   * fresh native session. Claude Code would create it 0755 itself, and the native transcript
+   * inspection (boxNativeFile) refuses a non-0700 project, so the turn never got a native
+   * pointer. Cleanup never receives it: a discard must not remove the transcript's directory.
+   */
+  ensureProject?: boolean;
+  /**
    * Ceiling for the project snapshot jsonl only. Omitted = 8 MiB.
    * stdin, system, catalog and tool-result paths ignore this and stay at 8 MiB.
    */
@@ -197,8 +204,10 @@ export function makeBoxStageFiles(input: {
   const fixed = (script: string, args: string[]): BoxCcExecRequest => ({
     command: PYTHON, args: ["-I", "-c", script, ...args], cwd: "/tmp", environment: ENV,
   });
+  const initProject = input.project !== "" ? input.project
+    : input.ensureProject ? `/home/box/.claude/projects/${input.cwd.replaceAll("/", "-")}` : "";
   const requests: BoxCcExecRequest[] = input.initialize === false
-    ? [] : [fixed(INIT, [input.cwd, input.project])];
+    ? [] : [fixed(INIT, [input.cwd, initProject])];
   for (const file of input.files) {
     const chunks: string[] = [];
     for (let offset = 0; offset < file.raw.length; offset += RAW_CHUNK_BYTES) {

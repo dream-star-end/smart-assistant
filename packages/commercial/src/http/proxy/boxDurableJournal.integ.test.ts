@@ -878,6 +878,13 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
       "SELECT ctx FROM request_finalize_journal WHERE request_id=$1", [`box-e-${suffix}`]);
     assert.equal(afterFinalError.rows[0]?.ctx.boxState, "terminal",
       "late error cannot undo a proven billed final Message");
+    // OCV5-384: a just-finished run with a native start and no native pointer yet waits for
+    // its pointer (or the grace) before cleanup may claim it.
+    assert.equal((await journal.listRemoteCleanupCandidates(20))
+      .some((item) => item.requestId === `box-e-${suffix}`), false,
+    "fresh run without its native pointer is not cleaned yet");
+    await client.query(`UPDATE request_finalize_journal SET updated_at=NOW()-INTERVAL '1 minute'
+      WHERE request_id=$1`, [`box-e-${suffix}`]);
     const cleanCandidate = (await journal.listRemoteCleanupCandidates(20))
       .find((item) => item.requestId === `box-e-${suffix}`);
     assert.ok(cleanCandidate, "completed replay-required run with pointer may clean");

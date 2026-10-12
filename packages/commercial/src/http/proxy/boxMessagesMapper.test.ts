@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { compileBoxCliSyntheticTurn, BoxMessagesShapeError } from "./boxMessagesMapper.js";
+import { boxPromptLayoutOf, compileBoxCliSyntheticTurn, BoxMessagesShapeError } from "./boxMessagesMapper.js";
 import type { ProxyBody } from "./shared.js";
 
 const args = { cwd: "/tmp/ocv5-289-run-aaaaaaaaaaaaaaaaaaaaaaaa", cliVersion: "2.1.280" };
@@ -26,6 +26,87 @@ describe("Box Messages → Claude CLI synthetic session boundary", () => {
     assert.deepEqual(JSON.parse(output.stdinJsonl).message.content,
       [{ type: "text", text: "current" }]);
     assert.equal(output.systemPrompt, "top system\n\nOpenClaude memory and skills");
+  });
+
+  it("drops the CCB billing header block so the CLI keeps the system prompt", () => {
+    const header = "x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=sdk-cli;";
+    const output = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: [{ type: "text", text: "current" }] },
+    ], [
+      { type: "text", text: header },
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: "INTELLIGENT_UI marker" },
+    ]), args);
+    assert.equal(output.systemPrompt,
+      "You are Claude Code, Anthropic's official CLI for Claude.\n\nINTELLIGENT_UI marker");
+    assert.ok(!output.systemPrompt.includes("x-anthropic-billing-header"));
+    const fromString = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "current" },
+    ], `${header}\nINTELLIGENT_UI marker`), args);
+    assert.equal(fromString.systemPrompt, "INTELLIGENT_UI marker");
+    const onlyHeader = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "current" },
+    ], [{ type: "text", text: header }]), args);
+    assert.equal(onlyHeader.systemPrompt, "");
+  });
+
+  it("keeps only the shared part of the system prompt and stages the session part in the first user message", () => {
+    const marked = "STATIC RULES\n\n---\n\n<!-- oc:session-context -->\n\n---\n\nuid=3 ENV";
+    const first = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ], [{ type: "text", text: marked }]), args);
+    assert.equal(first.systemPrompt, "STATIC RULES");
+    assert.deepEqual(JSON.parse(first.stdinJsonl).message.content, [
+      { type: "text", text: "<system-reminder>\nuid=3 ENV\n</system-reminder>" },
+      { type: "text", text: "hi" },
+    ]);
+    const later = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      { role: "user", content: [{ type: "text", text: "next" }] },
+    ], [{ type: "text", text: marked }]), args);
+    assert.equal(later.systemPrompt, "STATIC RULES");
+    const staged = later.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(staged[0].message.content, [
+      { type: "text", text: "<system-reminder>\nuid=3 ENV\n</system-reminder>" },
+      { type: "text", text: "hi" },
+    ]);
+    assert.deepEqual(JSON.parse(later.stdinJsonl).message.content, [{ type: "text", text: "next" }]);
+    const plain = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: [{ type: "text", text: "hi" }] },
+    ], [{ type: "text", text: "NO MARKER" }]), args);
+    assert.equal(plain.systemPrompt, "NO MARKER");
+    assert.deepEqual(JSON.parse(plain.stdinJsonl).message.content, [{ type: "text", text: "hi" }]);
+  });
+
+  it("reports the static-first prompt layout only when the marker is present", () => {
+    const marked = "STATIC\n\n---\n\n<!-- oc:session-context -->\n\n---\n\nuid=3";
+    assert.equal(boxPromptLayoutOf(body([{ role: "user", content: "hi" }], [{ type: "text", text: marked }])),
+      "static-first-v1");
+    assert.equal(boxPromptLayoutOf(body([{ role: "user", content: "hi" }], "plain system")), null);
+    assert.equal(boxPromptLayoutOf(body([{ role: "user", content: "hi" }])), null);
+  });
+
+  it("stages the session's native context records right after the first user message", () => {
+    const records = [
+      { type: "attachment", attachment: { type: "environment", snapshot: { workingDirectory: "/x" } },
+        rendered: "# Environment", session_id: "old", sessionId: "old", uuid: "old-1", parentUuid: "p" },
+      { type: "attachment", attachment: { type: "date", date: "2026-10-12" }, uuid: "old-2" },
+    ];
+    const out = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "q1" },
+      { role: "assistant", content: [{ type: "text", text: "a1" }] },
+      { role: "user", content: "q2" },
+    ]), { ...args, stagedAttachments: records });
+    const staged = out.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(staged.map((r) => r.type === "attachment" ? r.attachment.type : r.type),
+      ["user", "environment", "date", "assistant"]);
+    for (let i = 1; i < staged.length; i++) assert.equal(staged[i].parentUuid, staged[i - 1].uuid);
+    assert.equal(staged[1].sessionId, out.sessionId);
+    assert.equal(staged[1].session_id, out.sessionId);
+    assert.equal(staged[1].cwd, args.cwd);
+    assert.equal(staged[1].rendered, "# Environment");
+    assert.notEqual(staged[1].uuid, "old-1");
   });
 
   it("serializes completed tool history in order without changing roles or IDs", () => {
