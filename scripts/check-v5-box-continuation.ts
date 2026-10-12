@@ -1073,17 +1073,19 @@ async function proveLoginImageNote(api: Api): Promise<void> {
   const published = [{ type: "image", data: png, mimeType: "image/png" }];
   const hash = createHash("sha256").update(JSON.stringify({ content: published, isError: false })).digest("hex");
   const echo = (dir: string) => ({ type: "user", message: { role: "user", content: [{
-    type: "tool_result", tool_use_id: SEALED_ID, content: [image, { type: "text", text:
-      `[Image: source: /home/box/${dir}/projects/-tmp-ocv5-289-run-${"c".repeat(24)}/`
-      + `b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/mcp-ocbridge-blob-1.png]` }] }] } });
+    type: "tool_result", tool_use_id: SEALED_ID, content: [image, { type: "text",
+      text: `[Image: source: /home/box/${dir}/projects/-tmp-ocv5-289-run-${"c".repeat(24)}/b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/mcp-ocbridge-blob-1.png]` }] }] } });
   for (const dir of [".claude", ".claude-account2"]) {
     try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(dir)); }
     catch { fail(dir === ".claude" ? "IMAGE_NOTE_DEFAULT_LOGIN" : "IMAGE_NOTE_OTHER_LOGIN"); }
   }
   let refused = false;
-  try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(".claudeX")); }
-  catch (error) { refused = (error as { code?: string }).code === "BOX_TOOL_ECHO_CONTENT_MISMATCH"; }
-  if (!refused) fail("IMAGE_NOTE_FOREIGN_DIR");
+  for (const foreign of [".claudeX", ".claude-default"]) {
+    refused = false;
+    try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(foreign)); }
+    catch (error) { refused = (error as { code?: string }).code === "BOX_TOOL_ECHO_CONTENT_MISMATCH"; }
+    if (!refused) fail("IMAGE_NOTE_FOREIGN_DIR");
+  }
 }
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
