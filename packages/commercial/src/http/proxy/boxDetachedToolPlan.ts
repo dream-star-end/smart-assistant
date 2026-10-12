@@ -5,7 +5,7 @@ import type { BoxMcpAliasMode } from "./boxToolCatalog.js";
 import { createHash } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
-import { makeBoxAssetStage, makeBoxAssetsStage } from "./boxTextPlan.js";
+import { makeBoxAssetStage, makeBoxAssetsStage, type BoxInteractiveHostAsset } from "./boxTextPlan.js";
 import { makeBoxToolPlan, type BoxToolPlan } from "./boxToolPlan.js";
 import { makeBoxDetachedRunAccess, makeBoxPinnedRunnerRequest } from "./boxDetachedRunAccess.js";
 
@@ -31,6 +31,8 @@ export function makeBoxDetachedToolPlan(input: {
   /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
   resumeToolResults?: boolean;
   toolAliasMode?: BoxMcpAliasMode;
+  /** OCV5-378: run through the interactive host (see makeBoxTextPlan). */
+  interactiveHost?: BoxInteractiveHostAsset;
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;
   const base = makeBoxToolPlan(toolInput);
@@ -43,6 +45,7 @@ export function makeBoxDetachedToolPlan(input: {
     { asset: input.keeperAsset, path: base.stageKeeper.args[3]! },
     { asset: input.virtualMcpAsset, path: base.stageVirtualMcp.args[3]! },
     { asset: detachedRunnerAsset, path: runnerPath },
+    ...(base.interactiveHost ? [{ asset: base.interactiveHost.asset, path: base.interactiveHost.path }] : []),
   ]);
   // The pinned runner owns the interpreter invocation. Do not pass Python's
   // -I switch as its first business argument (which must be the keeper path).

@@ -8,12 +8,16 @@
  *
  * Inert unless OC_BRIDGE_DIR is set (the host sets it for product sessions). */
 import type { Register } from 'claude-code'
-import { StreamJson, textOfUserContent, type StepChunk } from './frames.ts'
+import { StreamJson, textOfUserContent, type PrintStep, type StepChunk } from './frames.ts'
 
 // Tools a person must answer. Route B shows them in web through can_use_tool
 // even under bypassPermissions; here the bridge answers them the same way.
 const PERSON_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
 const BATCH_BYTES = 256 * 1024
+// Print mode (OCV5-378): attachments the CLI adds about the machine it runs on and the login it
+// runs under. The Box only serves the model request; the environment the model works in is the
+// user container's, described by the container's own system prompt.
+const BOX_CONTEXT = new Set(['environment', 'session_context'])
 
 export const register: Register = (on) => {
   const sj = new StreamJson()
@@ -28,6 +32,22 @@ export const register: Register = (on) => {
   let decisionSeq = 0
   /** Interrupts the tap saw; the session.start loop that owns `$` runs them. */
   const aborts: string[] = []
+  /** Print mode (OC_BRIDGE_MODE=print, set by the host for the Box model route): the session speaks
+   * `claude -p`'s exact stream-json, a step at a time (see StreamJson.printStep). */
+  let print = false
+  let printInit: { tools: string[]; mcp_servers: { name: string; status: string }[] } = { tools: [], mcp_servers: [] }
+  let initSent = false
+  /** The main-loop step being collected, until its usage is known. */
+  let printing: { step: PrintStep; flushed: boolean } | null = null
+  /** Lines that arrive while a step is held; they follow it, as on `-p`. */
+  const held: string[] = []
+  const flushPrint = (stop: { stopReason: string | null; usage: any }): void => {
+    if (!printing || printing.flushed) return
+    printing.flushed = true
+    lastStopReason = stop.stopReason ?? null
+    send(sj.printStep(printing.step, stop))
+    if (held.length > 0) send(held.splice(0))
+  }
 
   const send = (lines: string[]): void => {
     if (!active || lines.length === 0) return
@@ -88,6 +108,16 @@ export const register: Register = (on) => {
     sj.cwd = e.cwd
     sj.version = (await $.env.get('OC_BRIDGE_CLI_VERSION')) ?? ''
     sj.permissionMode = (await $.env.get('OC_BRIDGE_PERMISSION_MODE')) ?? 'default'
+    print = (await $.env.get('OC_BRIDGE_MODE')) === 'print'
+    if (print) {
+      try {
+        const declared = JSON.parse((await $.env.get('OC_BRIDGE_INIT')) ?? '{}')
+        printInit = { tools: Array.isArray(declared.tools) ? declared.tools.map(String) : [],
+          mcp_servers: Array.isArray(declared.mcp_servers) ? declared.mcp_servers : [] }
+      } catch {
+        printInit = { tools: [], mcp_servers: [] }
+      }
+    }
     if (!sj.plugins.includes('oc-bridge')) sj.plugins.unshift('oc-bridge')
 
     // Sender: one loop, so order is the hooks' order and no hook waits on I/O.
@@ -170,12 +200,36 @@ export const register: Register = (on) => {
       running = e.turnId
       lastStopReason = null
       sj.turnStart()
-      send([sj.init()])
+      // `-p` prints one init per process; Route B's bridge reads one per turn.
+      if (!print) send([sj.init()])
+      else if (!initSent) send([sj.printInit(printInit.tools, printInit.mcp_servers)])
+      initSent = true
     }
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
+    if (print && !e.agentId) {
+      const step: PrintStep = { turnId: e.turnId, index: e.index, model: e.model, chunks: [], rows: [] }
+      printing = { step, flushed: false }
+      const stream = next(e) as AsyncGenerator<StepChunk, any>
+      let result: any
+      for (;;) {
+        const item = await stream.next()
+        if (item.done) {
+          result = item.value
+          break
+        }
+        const c = item.value as StepChunk
+        // The stop chunk carries the step's usage and comes before a pending tool returns.
+        if (c.kind === 'stop') flushPrint({ stopReason: (c as any).stopReason ?? null, usage: (c as any).usage ?? null })
+        else if (!printing.flushed) step.chunks.push(c)
+        yield item.value as any
+      }
+      flushPrint({ stopReason: result?.stopReason ?? null, usage: result?.usage ?? null })
+      printing = null
+      return result
+    }
     send(sj.stepStart(e))
     const stream = next(e) as AsyncGenerator<StepChunk, any>
     let res: any
@@ -194,8 +248,18 @@ export const register: Register = (on) => {
   })
 
   on('session.append', async ($, e, next) => {
+    const m = e.message as any
+    if (print && m?.type === 'attachment' && BOX_CONTEXT.has(m.name)) {
+      return next({ ...e, message: { ...m, content: [] } } as any)
+    }
     const stored = await next(e)
-    send(sj.row({ door: e.door, uuid: e.uuid, agentId: e.agentId, message: stored?.message ?? e.message } as any))
+    const row = { door: e.door, uuid: e.uuid, agentId: e.agentId, message: stored?.message ?? e.message } as any
+    if (print && printing && !printing.flushed && !e.agentId) {
+      if (e.door === 'response' && row.message?.type === 'assistant') printing.step.rows.push(row)
+      else held.push(...sj.row(row))
+      return stored
+    }
+    send(sj.row(row))
     return stored
   })
 
@@ -203,6 +267,7 @@ export const register: Register = (on) => {
     if (!active) return next(e)
     if (!e.agentId && e.tool === 'Agent' && e.tool_use_id) sj.noteAgentCall(e.tool_use_id)
     if (!PERSON_TOOLS.has(e.tool)) return next(e)
+    if (print) return { deny: `${e.tool} is not available here.` }
     // The tool's own arguments sit beside the reserved keys on `e`.
     const { tool: _tool, tool_use_id: _id, consent: _consent, agentId: _agent, ...input } = e as any
     const requestId = permRequest(e.tool, input, e.tool_use_id)
@@ -231,6 +296,8 @@ export const register: Register = (on) => {
   on('tool.check', async ($, e, next) => {
     const verdict = await next(e)
     if (!active || verdict.decision !== 'ask' || !e.tool_use_id || PERSON_TOOLS.has(e.tool)) return verdict
+    // Nobody answers a prompt on the Box model route; the launch allows exactly the tools it serves.
+    if (print) return { decision: 'deny', reason: 'oc-bridge: not allowed for this session' }
     const requestId = permRequest(e.tool, e.input, e.tool_use_id)
     let decision: any = null
     for (;;) {
