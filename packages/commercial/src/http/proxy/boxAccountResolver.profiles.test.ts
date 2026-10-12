@@ -370,3 +370,24 @@ test("selfhost cc2-first (OCV5-387): chats start on the default login account2 a
   assert.equal(await f.resolver.chatMustMove(7n, "c-switch"), true, "at 95% the switch (and its compaction) is due");
   assert.equal((await f.launch(7n, chat)).profile, "default", "and it moves to cc1, the backup");
 });
+
+test("a no-launch target (tool results for a live run) schedules no login and refuses a launch (OCV5-390)", async () => {
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "account2", { isDefault: true })]);
+  // every login benched: a scheduled resolve has nothing to offer, the live run must still be reachable
+  for (const p of ["default", "account2"]) {
+    f.health.observe(`20:${p}`, { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: Date.now() + 86_400_000 });
+  }
+  f.health.recordLaunch("20:default");
+  const before = f.health.recentLaunches("20:default");
+  const target = await f.resolver.resolve({ ...f.args(5n), requiredAccountId: 20n, allowWakeIfHibernated: true,
+    noLaunch: true });
+  assert.equal(target.accountId, 20n);
+  assert.equal(target.profile, "default", "no login was scheduled (the transport default, used for nothing but reads)");
+  assert.equal(f.health.recentLaunches("20:default"), before);
+  await assert.rejects(target.exec.run({ command: "/home/box/.local/bin/claude", args: [], cwd: "/tmp",
+    environment: { CLAUDE_CODE_MAX_RETRIES: "0" } }, { timeoutMs: 2000 }), /BOX_TARGET_NO_LAUNCH/);
+  const read = await target.exec.run({ command: "/home/box/.local/bin/claude", args: [], cwd: "/tmp", environment: {} },
+    { timeoutMs: 2000 });
+  assert.equal(typeof read.stdout, "string");
+  await target.dispose?.();
+});
