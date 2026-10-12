@@ -2863,7 +2863,7 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
 
   test("保存失败时开关回滚并提示（不乐观谎报）", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
-    vi.mocked(api.patchPreferences).mockRejectedValue(new ApiError(500, "INTERNAL", "boom"));
+    vi.mocked(api.patchPreferences).mockRejectedValue(new ApiError({ status: 500, code: "INTERNAL", message: "boom" }));
     render(
       <ToastProvider>
         <ConnectorsTab auth={auth} />
@@ -2871,7 +2871,7 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
     );
     fireEvent.click(await screen.findByRole("switch", { name: "启用「邮箱」" }));
     await waitFor(() => expect(screen.getByRole("switch", { name: "启用「邮箱」" })).toBeChecked());
-    expect(await screen.findByText(/停用失败|操作失败/)).toBeInTheDocument();
+    expect(await screen.findByText("服务暂时不可用，请稍后重试")).toBeInTheDocument();
   });
 
   test("偏好里已停用的插件：行显示「已停用」，详情页给出说明且设置仍可用", async () => {

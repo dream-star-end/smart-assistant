@@ -41,7 +41,7 @@ export function usePluginDirectory(
       if (!alive) return
       const disabled = new Set(disabledPluginsOf(prefs))
       setEntries(
-        failures >= 4
+        failures >= 5
           ? null
           : buildPluginDirectory({ v1, declarative, runtime, local: local?.plugins ?? null, disabled }),
       )

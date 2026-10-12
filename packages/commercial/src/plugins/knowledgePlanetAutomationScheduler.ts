@@ -242,6 +242,16 @@ async function knowledgePlanetDisabled(userId: number): Promise<boolean> {
   return (await disabledPluginSet(userId)).has(KNOWLEDGE_PLANET_PLUGIN_SLUG)
 }
 
+/**
+ * 运行时门面在调用前也会按启用开关拒绝（loadManagedTarget → PLUGIN_DISABLED）。调度入口的预检读到
+ * 「未停用」之后用户才关、或预检读失败 fail-open 时，就会走到这里：这类 run 一律跳过、不计失败（Codex r2）。
+ */
+function pluginDisabledCode(code: unknown): boolean {
+  return code === 'PLUGIN_DISABLED'
+}
+
+export const pluginDisabledCodeForTest = pluginDisabledCode
+
 async function manualWriteStillEnabled(
   client: PoolClient,
   connectionId: string,
@@ -985,6 +995,10 @@ async function generateRun(
     }
   } catch (error) {
     const code = (error as { code?: unknown })?.code
+    if (pluginDisabledCode(code)) {
+      await skipRun(opts.pool, run, 'PLUGIN_DISABLED')
+      return 'skipped'
+    }
     if (code === 'RELINK_REQUIRED')
       await pauseAccount(opts.pool, run.connectionId, run.userId, 'RELINK_REQUIRED')
     await failRun(
@@ -1304,11 +1318,20 @@ async function dispatchRun(
         await skipReadyRun(pool, run, 'SOURCE_CHANGED')
         return 'skipped'
       }
+      // 未发出即被启用开关拦下：跳过、不计失败。
+      if (pluginDisabledCode(execution.errorCode) && (await skipReadyRun(pool, run, 'PLUGIN_DISABLED')))
+        return 'skipped'
       await failReadyRun(pool, run, execution.errorCode)
       return 'failed'
     }
     return settleDispatchFailure(pool, run, execution.errorCode)
   } catch (error) {
+    // 发出前的读取（get_topic）被启用开关拦下：run 仍是 ready，跳过、不计失败。
+    if (
+      pluginDisabledCode((error as { code?: unknown })?.code) &&
+      (await skipReadyRun(pool, run, 'PLUGIN_DISABLED'))
+    )
+      return 'skipped'
     return settleDispatchFailure(pool, run, 'DISPATCH_FAILED')
   } finally {
     if (plaintext) zeroBuffer(plaintext)

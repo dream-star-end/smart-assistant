@@ -12,6 +12,7 @@ import {
   composeKnowledgePlanetAutomationReplyForTest,
   knowledgePlanetAutomationSourceDigestForTest,
   parseKnowledgePlanetAutomationDecisionForTest,
+  pluginDisabledCodeForTest,
 } from './knowledgePlanetAutomationScheduler.js'
 
 describe('Knowledge Planet unattended automation policy', () => {
@@ -136,5 +137,11 @@ describe('Knowledge Planet unattended automation policy', () => {
       knowledgePlanetAutomationSourceDigestForTest(original),
       knowledgePlanetAutomationSourceDigestForTest({ ...original, text: '已编辑' }),
     )
+  })
+
+  test('treats only the runtime PLUGIN_DISABLED code as a skip, never as a failure (OCV5-383)', () => {
+    assert.equal(pluginDisabledCodeForTest('PLUGIN_DISABLED'), true)
+    for (const code of ['GENERATION_FAILED', 'RELINK_REQUIRED', 'DISPATCH_FAILED', undefined, null, 409])
+      assert.equal(pluginDisabledCodeForTest(code), false)
   })
 })
