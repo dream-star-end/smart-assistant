@@ -25,6 +25,10 @@ import { rootLogger } from "../../logging/logger.js";
 const log = rootLogger.child({ subsys: "box-account-resolver" });
 const MIN_REMAINING_MS = 60_000;
 
+/** Logins a model launch may run under: `default` for `claude -p` models (the default login of each
+ * account only, boxModelRouteLogins), `all` for interactive-runner models (every enabled login). */
+export type BoxLoginScope = "default" | "all";
+
 export class BoxAccountResolverError extends Error {
   /** Safe cause tag (error name and provision code only, never a message). */
   constructor(readonly code: string, readonly causeTag?: string) {
@@ -57,7 +61,8 @@ export interface BoxAccountResolverDeps {
   /** Claude Code logins per Box account. Absent: every account runs its default
    * login exactly as before (selfhost, unit fixtures). */
   profiles?: {
-    list: (accountIds: readonly bigint[]) => Promise<BoxProfileRow[]>;
+    /** `scope` says which logins a launch may use (BoxLoginScope). */
+    list: (accountIds: readonly bigint[], scope: BoxLoginScope) => Promise<BoxProfileRow[]>;
     health: BoxProfileHealth;
     policy?: BoxProfilePolicy;
     cacheMs?: number;
@@ -159,14 +164,14 @@ export class BoxAccountResolver {
     return this.orphanedAgents.size;
   }
 
-  private profileCache: { atMs: number; ids: string; rows: BoxProfileRow[] } | null = null;
+  private readonly profileCache = new Map<BoxLoginScope, { atMs: number; ids: string; rows: BoxProfileRow[] }>();
   private readonly guardOkUntil = new Map<string, number>();
 
   /** Account x login choice: affinity first (one user keeps one login), then
    * quota/health/load fallback. See boxProfileScheduler. "legacy" = no saved logins
    * anywhere in the candidate set (or no table): the original random pick, unchanged. */
   private async chooseLogin(rows: AccountRow[], args: { uid: bigint; requestId: string;
-    upstreamModel: string }, nowMs: number, skip: ReadonlySet<string>):
+    upstreamModel: string; loginScope?: BoxLoginScope }, nowMs: number, skip: ReadonlySet<string>):
     Promise<{ accountId: bigint; profile: string } | "legacy" | null> {
     const profiles = this.deps.profiles!;
     const selectable = cursorSelectableAccounts({ accounts: rows, model: args.upstreamModel,
@@ -175,20 +180,22 @@ export class BoxAccountResolver {
     const ids = selectable.map((item) => item.row.id);
     const idsKey = ids.map(String).sort().join(",");
     const cacheMs = profiles.cacheMs ?? 5_000;
+    const scope: BoxLoginScope = args.loginScope ?? "default";
+    const cached = this.profileCache.get(scope);
     let stored: BoxProfileRow[];
-    if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < cacheMs) {
-      stored = this.profileCache.rows;
+    if (cached && cached.ids === idsKey && nowMs - cached.atMs < cacheMs) {
+      stored = cached.rows;
     } else {
       try {
-        stored = await profiles.list(ids);
-        this.profileCache = { atMs: nowMs, ids: idsKey, rows: stored };
+        stored = await profiles.list(ids, scope);
+        this.profileCache.set(scope, { atMs: nowMs, ids: idsKey, rows: stored });
       } catch {
         // Fail closed: a read error must not turn an account whose logins were all switched off
         // into an implicit default. Only the identical account set, last READ successfully within
         // 60s, is reused; a failed attempt never refreshes that timestamp.
         log.error("BOX_PROFILE_LIST_FAILED");
-        if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < 60_000) {
-          stored = this.profileCache.rows;
+        if (cached && cached.ids === idsKey && nowMs - cached.atMs < 60_000) {
+          stored = cached.rows;
         } else throw new BoxAccountResolverError("BOX_PROFILE_STORE_UNAVAILABLE");
       }
     }
@@ -253,7 +260,9 @@ export class BoxAccountResolver {
     /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
-    interactiveExecTarget?: boolean }): Promise<BoxResolvedTarget> {
+    interactiveExecTarget?: boolean;
+    /** Logins this launch may use; `default` when absent (BoxLoginScope). */
+    loginScope?: BoxLoginScope }): Promise<BoxResolvedTarget> {
     const refused = new Set<string>();
     for (let attempt = 0; ; attempt++) {
       try { return await this.resolveOnce(args, refused); }
@@ -280,7 +289,8 @@ export class BoxAccountResolver {
     /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
-    interactiveExecTarget?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
+    interactiveExecTarget?: boolean;
+    loginScope?: BoxLoginScope }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
     const rows = (await this.deps.list()).filter((row) => eligible(row, now())
@@ -452,9 +462,10 @@ export function productionBoxProfileHealth(): BoxProfileHealth {
   });
 }
 
-/** The Box model route (`claude -p` per request) runs only the default login of each account,
+/** A `claude -p` launch of the Box model route runs only the default login of each account,
  * whatever else an admin enabled: the other logins serve interactive sessions only (operator
- * rule 2026-10-11, Box logins never serve `claude -p` product turns; BoxInteractiveLogins).
+ * rule 2026-10-11, Box logins never serve `claude -p` product turns). Interactive-runner models
+ * (BoxApiRunner "interactive", scope `all`) use every enabled login.
  * The default row keeps its stored login state and health, so a logged-out default still stops
  * the route. */
 export function boxModelRouteLogins(rows: readonly BoxProfileRow[]): BoxProfileRow[] {
@@ -472,7 +483,8 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
       egressProxy: token.egress_proxy, egressTarget: token.egress_target,
       egressProxyId: token.egress_proxy_id, egressHostUuid: token.egress_host_uuid }),
     uidProxy: boxUnboundProxy(),
-    profiles: { list: async (ids) => boxModelRouteLogins(await listBoxProfiles(ids)),
+    profiles: { list: async (ids, scope) => scope === "all" ? listBoxProfiles(ids)
+      : boxModelRouteLogins(await listBoxProfiles(ids)),
       health: productionBoxProfileHealth() },
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,

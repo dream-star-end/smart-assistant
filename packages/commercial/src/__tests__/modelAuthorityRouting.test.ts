@@ -62,9 +62,11 @@ function body(model: string) {
 
 describe("selectUpstreamRoute — provider_id 驱动(catalog hint)", () => {
   test("Box CLI only routes from signed catalog hint, never legacy OAuth fallback", async () => {
-    assert.throws(() => selectUpstreamRoute("box-api-claude-opus-5-5"),
-      (error: unknown) => error instanceof UnroutableProviderError
-        && error.providerId === "box_cli_authority_required");
+    for (const model of ["box-api-claude-opus-5-5", "box-claude-haiku-5-5"]) {
+      assert.throws(() => selectUpstreamRoute(model),
+        (error: unknown) => error instanceof UnroutableProviderError
+          && error.providerId === "box_cli_authority_required", model);
+    }
     const route = selectUpstreamRoute("box-api-claude-opus-5-5", {
       providerId: "box_cli", upstreamModelId: "claude-opus-5-5",
     });

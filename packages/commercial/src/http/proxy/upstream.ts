@@ -163,7 +163,9 @@ export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): Ups
   }
   // Without an enforced catalog, a known Box API model must not fall through
   // to the Anthropic OAuth pool merely because it is not a static-key model.
-  if (model.startsWith("box-api-")) throw new UnroutableProviderError("box_cli_authority_required");
+  if (model.startsWith("box-api-") || model.startsWith("box-claude-")) {
+    throw new UnroutableProviderError("box_cli_authority_required");
+  }
   const provider = findRouteProviderForModel(model);
   if (!provider) return { kind: "oauth" };
   const upstreamModel = provider.upstreamModelForRequest?.(model);

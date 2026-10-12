@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { Dispatcher, ProxyAgent } from "undici";
 import type { AccountRow, AccountToken, CursorTokenSnapshot } from "../../account-pool/store.js";
-import { BoxAccountResolver, BoxAccountResolverError } from "./boxAccountResolver.js";
+import { BoxAccountResolver, BoxAccountResolverError, boxModelRouteLogins, type BoxLoginScope } from "./boxAccountResolver.js";
 import type { BoxProfileRow } from "./boxClaudeProfileStore.js";
 import { BoxProfileHealth } from "./boxProfileHealth.js";
 
@@ -25,7 +25,8 @@ const stored = (accountId: bigint, profile: string, over: Partial<BoxProfileRow>
   orgType: null, lastSeenAt: null, utilization: null, cooldownUntil: null, lastReason: null,
   healthUpdatedAt: null, ...over });
 
-function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0) {
+function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0,
+  scoped?: (rows: BoxProfileRow[], scope: BoxLoginScope) => BoxProfileRow[]) {
   const clock = { t: now };
   const health = new BoxProfileHealth(() => clock.t);
   const launches: Array<{ account: string; config: string | null }> = [];
@@ -51,7 +52,11 @@ function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0) {
       expires_at: new Date(now + 172_800_000) }) as CursorTokenSnapshot,
     egress: async () => ({ kind: "unbound" }), uidProxy: () => null,
     makeProxyAgent: () => ({ destroy: async () => {} }) as unknown as ProxyAgent & Dispatcher,
-    profiles: { list: async (ids) => { if (storeFails) throw new Error("db down"); return current.filter((r) => ids.includes(r.accountId)); }, health, cacheMs: 0 },
+    profiles: { list: async (ids, scope) => {
+      if (storeFails) throw new Error("db down");
+      const own = current.filter((r) => ids.includes(r.accountId));
+      return scoped ? scoped(own, scope) : own;
+    }, health, cacheMs: 0 },
     fetch: async (url, init) => {
       if (url.endsWith("/GetSandBoxRunState")) return Response.json({ state: "SAND_BOX_RUN_STATE_RUNNING" });
       if (url.endsWith("/EnsureSandBox")) return Response.json({ execDaemonUrl: `https://box${accountOf(init)}.example.cursorvm.com`,
@@ -269,4 +274,21 @@ test("the interactive route gets the Box exec endpoint itself, through the same 
   const model = await g.resolver.resolve(g.args(3n));
   assert.equal(model.execTarget, undefined);
   await model.dispose?.();
+});
+
+test("claude -p launches stay on the default login; interactive-runner launches (scope all) use every enabled login", async () => {
+  const scopes: BoxLoginScope[] = [];
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")], 0, (own, scope) => {
+    scopes.push(scope);
+    return scope === "all" ? own : boxModelRouteLogins(own);
+  });
+  const print = new Set<string>();
+  const interactive = new Set<string>();
+  for (const uid of uids) {
+    print.add((await f.launch(uid)).profile!);
+    interactive.add((await f.launch(uid, { loginScope: "all" })).profile!);
+  }
+  assert.deepEqual([...print], ["default"]);
+  assert.deepEqual([...interactive].sort(), ["b", "default"]);
+  assert.deepEqual([...new Set(scopes)].sort(), ["all", "default"]);
 });

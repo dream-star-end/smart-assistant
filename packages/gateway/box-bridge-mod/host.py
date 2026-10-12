@@ -8,6 +8,11 @@ stdout                         : stream-json lines the mod produced
 stderr                         : operational lines (BOX_INTERACTIVE_*), no user text
 
 argv: host.py <run_dir> <tmux_session> <claude> [claude args...]
+      or, print mode (OC_BOX_HOST_MODE=print, OCV5-378): host.py <claude> [claude args...]
+      The Box model route's supervisor runs this in place of `claude -p`: its argv without the
+      --print-only flags (any that remain are dropped; OC_BOX_NO_SESSION_PERSISTENCE=1 stands for
+      --no-session-persistence), the same stdin and stdout. The mod speaks -p's exact stream-json,
+      and the host exits once every submitted message has its result. The login is CLAUDE_CONFIG_DIR.
 env : OC_BOX_MOD_FILES  JSON {relpath: base64} of the mod, written into run_dir
       OC_BOX_MOD_SHA256 sha256 of the canonical file listing (see mod_digest)
       OC_BOX_READY_MS   ready timeout (default 20000)
@@ -40,6 +45,29 @@ DECISION_MAX = 256
 # Text of the native dialogs that draw before any hook runs (P0).
 DIALOGS = ('trust this folder', 'Bypass Permissions mode')
 PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+# Print mode: flags that exist only with --print (dropped), and the run's own CLI settings that
+# pass through to the interactive process (the route's plan sets them).
+PRINT_FLAGS = {'-p', '--print', '--include-partial-messages', '--verbose', '--no-session-persistence'}
+PRINT_VALUE_FLAGS = {'--input-format', '--output-format'}
+PASS_ENV = re.compile(r'(CLAUDE_CODE_[A-Z_]+|DISABLE_AUTO_COMPACT|MAX_MCP_OUTPUT_TOKENS)')
+RESULT_LINE = re.compile(rb'\{\s*"type"\s*:\s*"result"')
+# Ends the session if the host itself is killed (a supervisor kills the host's process group,
+# and the tmux server is outside it).
+WATCHDOG = r'''
+import os, subprocess, sys, time
+pid, session = int(sys.argv[1]), sys.argv[2]
+def tmux(*a):
+    return subprocess.run(['tmux', '-L', 'oc-box'] + list(a), stdin=subprocess.DEVNULL, capture_output=True).returncode
+while True:
+    time.sleep(1)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        tmux('kill-session', '-t', '=' + session)
+        break
+    if tmux('has-session', '-t', '=' + session) != 0:
+        break
+'''
 
 
 def mod_digest(files):
@@ -88,9 +116,52 @@ def profile_safe(config_dir, home):
         return False
 
 
+def print_args(argv):
+    """`claude -p` argv -> (interactive argv, no_persistence, init {tools, mcp_servers}, session id).
+    Raises ValueError for an argv the route never produces."""
+    out, no_persist, tools, servers, session_id = [], False, [], [], None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in PRINT_FLAGS:
+            no_persist = no_persist or a == '--no-session-persistence'
+            i += 1
+            continue
+        if a in PRINT_VALUE_FLAGS:
+            if i + 1 >= len(argv) or argv[i + 1] != 'stream-json':
+                raise ValueError(a)
+            i += 2
+            continue
+        if a in ('--mcp-config', '--allowedTools', '--session-id', '--resume') and i + 1 < len(argv):
+            v = argv[i + 1]
+            if a == '--mcp-config':
+                servers = sorted((json.loads(v).get('mcpServers') or {}).keys())
+            elif a == '--allowedTools':
+                tools = [t for t in re.split(r'[,\s]+', v) if t]
+            else:
+                session_id = v
+        out.append(a)
+        i += 1
+    if not servers:
+        tools = []
+    init = {'tools': tools, 'mcp_servers': [{'name': n, 'status': 'connected', 'source': 'dynamic'} for n in servers]}
+    return out, no_persist, init, session_id
+
+
+def only_text(msg):
+    content = (msg.get('message') or {}).get('content')
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and all(isinstance(b, dict) and b.get('type') == 'text' for b in content)
+
+
 class Host:
-    def __init__(self, run_dir, session, claude, args, config_dir=None):
+    def __init__(self, run_dir, session, claude, args, config_dir=None, extra_env=None, print_mode=False):
         self.run_dir = run_dir
+        self.extra_env = extra_env or []
+        self.print_mode = print_mode
+        self.users = 0             # print mode: user messages handed to the session
+        self.results = 0           # print mode: result lines written out
         self.config_dir = config_dir  # None: the default login, launched exactly as before
         self.session = session
         self.claude = claude
@@ -116,6 +187,15 @@ class Host:
         with self.out_lock:
             sys.stdout.buffer.write(data if data.endswith(b'\n') else data + b'\n')
             sys.stdout.buffer.flush()
+        if self.print_mode:
+            n = 0
+            for line in data.split(b'\n'):
+                if RESULT_LINE.match(line):
+                    n += 1
+            if n:
+                with self.cv:
+                    self.results += n
+                    self.cv.notify_all()
 
     # ---- inbound --------------------------------------------------------
     def read_stdin(self):
@@ -156,7 +236,17 @@ class Host:
                     self.cv.notify_all()
             return
         if msg.get('type') == 'user':
-            line = self.stage_attachments(msg)
+            if self.print_mode:
+                # The route's prompt is text; anything else would be lost on the way to the model.
+                if not only_text(msg):
+                    with self.cv:
+                        self.fatal = self.fatal or 'input_unsupported'
+                        self.cv.notify_all()
+                    return
+                with self.cv:
+                    self.users += 1
+            else:
+                line = self.stage_attachments(msg)
         with self.cv:
             if self.fatal:
                 return
@@ -373,6 +463,7 @@ class Host:
                'DISABLE_AUTOUPDATER=1', 'OC_BRIDGE_DIR=' + self.run_dir, 'OC_BRIDGE_PERMISSION_MODE=' + mode]
         if self.config_dir:
             env.append('CLAUDE_CONFIG_DIR=' + self.config_dir)
+        env += self.extra_env
         exit_file = os.path.join(self.run_dir, 'exit')
         pid_file = os.path.join(self.run_dir, 'claude.pid')
         script = 'echo $$ > "$OC_BRIDGE_DIR/claude.pid"; exec "$@"'
@@ -416,22 +507,12 @@ class Host:
         return r.stdout[-4000:] if r.returncode == 0 else ''
 
 
-def main():
-    run_dir, session, claude = sys.argv[1], sys.argv[2], sys.argv[3]
-    args = sys.argv[4:]
-    home = os.environ.get('HOME', '/home/box')
-    try:
-        config_dir = profile_config_dir(os.environ.get('OC_BOX_CLAUDE_PROFILE'), home)
-    except ValueError:
-        err('BOX_INTERACTIVE_NOT_READY profile_invalid')
-        return 1
-    if config_dir is not None and not profile_safe(config_dir, home):
-        err('BOX_INTERACTIVE_NOT_READY profile_unsafe')
-        return 1
+def stage_mod(run_dir):
+    """Writes the mod and the tap into the run dir; the mod root, or None (error printed)."""
     files = {k: base64.b64decode(v) for k, v in json.loads(os.environ['OC_BOX_MOD_FILES']).items()}
     if mod_digest(files) != os.environ.get('OC_BOX_MOD_SHA256'):
         err('BOX_INTERACTIVE_MOD_DIGEST_MISMATCH')
-        return 1
+        return None
     os.makedirs(run_dir, mode=0o700, exist_ok=True)
     os.chmod(run_dir, 0o700)
     # For the bridge's abandon exec, which ends this host and nothing else
@@ -443,7 +524,7 @@ def main():
     for rel, data in files.items():
         if rel.startswith('/') or '..' in rel.split('/'):
             err('BOX_INTERACTIVE_MOD_PATH_INVALID')
-            return 1
+            return None
         path = os.path.join(mod_root, rel)
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         with open(path, 'wb') as f:
@@ -452,8 +533,76 @@ def main():
     with open(os.path.join(run_dir, 'tap.py'), 'w') as f:
         f.write(TAP_SOURCE)
     os.chmod(os.path.join(run_dir, 'tap.py'), 0o400)
+    return mod_root
 
+
+def main():
+    if os.environ.get('OC_BOX_HOST_MODE') == 'print':
+        return main_print()
+    run_dir, session, claude = sys.argv[1], sys.argv[2], sys.argv[3]
+    args = sys.argv[4:]
+    home = os.environ.get('HOME', '/home/box')
+    try:
+        config_dir = profile_config_dir(os.environ.get('OC_BOX_CLAUDE_PROFILE'), home)
+    except ValueError:
+        err('BOX_INTERACTIVE_NOT_READY profile_invalid')
+        return 1
+    if config_dir is not None and not profile_safe(config_dir, home):
+        err('BOX_INTERACTIVE_NOT_READY profile_unsafe')
+        return 1
+    mod_root = stage_mod(run_dir)
+    if mod_root is None:
+        return 1
     host = Host(run_dir, session, claude, args + ['--plugin-dir', mod_root], config_dir)
+    return serve_host(host)
+
+
+def main_print():
+    """The Box model route's runner for interactive models: `claude -p` in, `claude -p` out."""
+    claude = sys.argv[1] if len(sys.argv) >= 3 else ''
+    if not os.path.isabs(claude):
+        err('BOX_INTERACTIVE_ARGS_INVALID')
+        return 126
+    home = os.environ.get('HOME', '/home/box')
+    # The route picks the login as for `-p` (CLAUDE_CONFIG_DIR); a non-default one is re-checked here.
+    config_dir = os.environ.get('CLAUDE_CONFIG_DIR') or None
+    if config_dir is not None:
+        name = config_dir[len(home + '/.claude-'):] if config_dir.startswith(home + '/.claude-') else ''
+        try:
+            ok = profile_config_dir(name, home) == config_dir and profile_safe(config_dir, home)
+        except ValueError:
+            ok = False
+        if not ok:
+            err('BOX_INTERACTIVE_NOT_READY profile_unsafe')
+            return 1
+    try:
+        args, no_persist, init, session_id = print_args(sys.argv[2:])
+    except (ValueError, AttributeError):
+        err('BOX_INTERACTIVE_ARGS_INVALID')
+        return 126
+    no_persist = no_persist or os.environ.get('OC_BOX_NO_SESSION_PERSISTENCE') == '1'
+    nonce = secrets.token_hex(8)
+    run_dir = '/tmp/ocb-' + nonce
+    mod_root = stage_mod(run_dir)
+    if mod_root is None:
+        return 1
+    extra = ['%s=%s' % (k, v) for k, v in sorted(os.environ.items()) if PASS_ENV.fullmatch(k)]
+    extra += ['OC_BRIDGE_MODE=print', 'OC_BRIDGE_INIT=' + json.dumps(init)]
+    host = Host(run_dir, 'ocp-' + nonce, claude, args + ['--plugin-dir', mod_root], config_dir,
+                extra_env=extra, print_mode=True)
+    try:
+        return serve_host(host)
+    finally:
+        # `--no-session-persistence` cannot reach an interactive session: its transcript goes here.
+        if no_persist and session_id and re.fullmatch(r'[0-9a-f-]{36}', session_id):
+            project = re.sub(r'[^A-Za-z0-9]', '-', os.getcwd())
+            try:
+                os.unlink(os.path.join(config_dir or home + '/.claude', 'projects', project, session_id + '.jsonl'))
+            except OSError:
+                pass
+
+
+def serve_host(host):
     stopping = threading.Event()
 
     def on_signal(signum, _frame):
@@ -471,13 +620,17 @@ def main():
         srv.shutdown()
         # The CLI transcript lives under ~/.claude/projects (as with -p);
         # the run dir holds only the mod copy, socket and attachments.
-        shutil.rmtree(run_dir, ignore_errors=True)
+        shutil.rmtree(host.run_dir, ignore_errors=True)
 
 
 def run(host, srv, stopping):
     run_dir = host.run_dir
     if not host.launch():
         return 1
+    if host.print_mode:
+        subprocess.Popen([sys.executable, '-I', '-c', WATCHDOG, str(os.getpid()), host.session],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
     threading.Thread(target=host.read_stdin, daemon=True).start()
 
     ready_ms = int(os.environ.get('OC_BOX_READY_MS', '20000'))
@@ -514,6 +667,15 @@ def run(host, srv, stopping):
             err('BOX_INTERACTIVE_INPUT_LOST %s' % host.fatal)
             code = 1
             break
+        if host.print_mode and host.stdin_closed:
+            # As `-p`: done once every submitted message has its result.
+            if host.users == 0:
+                err('BOX_INTERACTIVE_NO_INPUT')
+                code = 1
+                break
+            if host.results >= host.users:
+                code = 0
+                break
         if not host.alive():
             try:
                 with open(os.path.join(run_dir, 'exit')) as f:

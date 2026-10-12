@@ -48,6 +48,17 @@ export type TurnCompleteLike = {
 
 type Step = { msgId: string; model: string; open: Map<number, string> }
 
+/** One main-loop step in print mode (OCV5-378): everything `-p` prints for it, collected until
+ * its usage is known. */
+export type PrintStep = {
+  turnId: string
+  index: number
+  model: string
+  chunks: StepChunk[]
+  /** The step's response rows (session.append door `response`), in append order. */
+  rows: RowLike[]
+}
+
 const ZERO: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
 function usageOf(u: Usage | null | undefined): Usage {
@@ -224,6 +235,93 @@ export class StreamJson {
     }, null))
     out.push(this.event({ type: 'message_stop' }, null))
     return out
+  }
+
+  /** Print mode (OCV5-378, the Box model route's `claude -p` contract): a whole main-loop step in
+   * `-p`'s order. `message_start` carries the real input and cache usage, each block is followed by
+   * its signature (thinking) and its `assistant` line before it stops, and `message_delta` carries
+   * the final usage. Called once the usage is known (the stop chunk, or the step's end). */
+  printStep(step: PrintStep, stop: StepResultLike): string[] {
+    const msgId = `msg_ocb_${step.turnId.replace(/[^A-Za-z0-9]/g, '').slice(0, 24)}_${step.index}`
+    this.steps.set('', { msgId, model: step.model, open: new Map() })
+    this.mainSteps += 1
+    const used = usageOf(stop.usage)
+    for (const k of Object.keys(used) as (keyof Usage)[]) {
+      if (k !== 'model') (this.turnUsage[k] as number) += used[k] as number
+    }
+    const start = { input_tokens: used.input_tokens, cache_creation_input_tokens: used.cache_creation_input_tokens,
+      cache_read_input_tokens: used.cache_read_input_tokens, output_tokens: 0 }
+    const out: string[] = [this.event({
+      type: 'message_start',
+      message: { id: msgId, type: 'message', role: 'assistant', model: step.model,
+        content: [], stop_reason: null, stop_sequence: null, usage: start },
+    }, null)]
+    // Blocks by index, each with its deltas in arrival order.
+    const blocks = new Map<number, { block: Record<string, unknown>; deltas: Record<string, unknown>[] }>()
+    for (const c of step.chunks) {
+      const index = (c as { index?: unknown }).index
+      if (typeof index !== 'number') continue
+      if (c.kind === 'text' || c.kind === 'thinking' || c.kind === 'tool') {
+        if (!blocks.has(index)) {
+          blocks.set(index, { block: c.kind === 'text' ? { type: 'text', text: '' }
+            : c.kind === 'thinking' ? { type: 'thinking', thinking: '', signature: '' }
+            : { type: 'tool_use', id: (c as { id: string }).id, name: (c as { name: string }).name, input: {} }, deltas: [] })
+        }
+        const t = (c as { text?: unknown }).text
+        if (c.kind === 'text' && typeof t === 'string') blocks.get(index)!.deltas.push({ type: 'text_delta', text: t })
+        if (c.kind === 'thinking' && typeof t === 'string') blocks.get(index)!.deltas.push({ type: 'thinking_delta', thinking: t })
+      } else if (c.kind === 'input' && blocks.has(index)) {
+        blocks.get(index)!.deltas.push({ type: 'input_json_delta', partial_json: (c as { json: string }).json })
+      }
+    }
+    const rows = step.rows.filter((r) => r.message.type === 'assistant' && r.door === 'response' && !r.agentId)
+    const taken = new Set<number>()
+    const rowFor = (block: Record<string, unknown>): number => rows.findIndex((r, i) => {
+      if (taken.has(i) || !Array.isArray(r.message.content)) return false
+      const first = (r.message.content as Record<string, unknown>[])[0]
+      return !!first && first.type === block.type && (block.type !== 'tool_use' || first.id === block.id)
+    })
+    const assistantLine = (r: RowLike): string => this.line({
+      type: 'assistant',
+      message: { id: msgId, type: 'message', role: 'assistant', model: step.model,
+        content: r.message.content, stop_reason: null, stop_sequence: null, usage: start },
+      parent_tool_use_id: null, session_id: this.sessionId, uuid: r.uuid,
+    })
+    for (const index of [...blocks.keys()].sort((a, b) => a - b)) {
+      const { block, deltas } = blocks.get(index)!
+      const at = rowFor(block)
+      if (at >= 0) taken.add(at)
+      const first = at >= 0 ? (rows[at]!.message.content as Record<string, unknown>[])[0]! : null
+      // A tool_use opens as the CLI stored it (e.g. `caller`), with the input still to stream.
+      const opened = block.type === 'tool_use' && first ? { ...first, input: {} } : block
+      out.push(this.event({ type: 'content_block_start', index, content_block: opened }, null))
+      for (const delta of deltas) out.push(this.event({ type: 'content_block_delta', index, delta }, null))
+      if (first) {
+        if (block.type === 'thinking' && typeof first.signature === 'string' && first.signature) {
+          out.push(this.event({ type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: first.signature } }, null))
+        }
+        out.push(assistantLine(rows[at]!))
+      }
+      out.push(this.event({ type: 'content_block_stop', index }, null))
+    }
+    rows.forEach((r, i) => { if (!taken.has(i)) out.push(assistantLine(r)) })
+    out.push(this.event({
+      type: 'message_delta',
+      delta: { stop_reason: stop.stopReason ?? null, stop_sequence: null },
+      usage: { input_tokens: used.input_tokens, cache_creation_input_tokens: used.cache_creation_input_tokens,
+        cache_read_input_tokens: used.cache_read_input_tokens, output_tokens: used.output_tokens },
+    }, null))
+    out.push(this.event({ type: 'message_stop' }, null))
+    return out
+  }
+
+  /** Print mode's init line: what `-p` reports for the session's tools and MCP servers
+   * (the host derives both from the launch argv). */
+  printInit(tools: string[], mcpServers: { name: string; status: string }[]): string {
+    const line = JSON.parse(this.init()) as Record<string, unknown>
+    line.tools = tools
+    line.mcp_servers = mcpServers
+    return JSON.stringify(line)
   }
 
   /** Durable rows become the `assistant` / `user` / `system` lines. */
