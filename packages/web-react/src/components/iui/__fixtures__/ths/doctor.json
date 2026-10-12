@@ -1,0 +1,61 @@
+{
+  "ok": true,
+  "checks": [
+    {
+      "name": "gateway_quote",
+      "ok": true,
+      "critical": true,
+      "ms": 1172,
+      "detail": "贵州茅台 price=1288.0 update_time=2026-10-12 15:30"
+    },
+    {
+      "name": "gateway_kline",
+      "ok": true,
+      "critical": true,
+      "ms": 659,
+      "detail": "bars=5 last=20261012"
+    },
+    {
+      "name": "quote_kline_consistency",
+      "ok": true,
+      "critical": true,
+      "ms": 2209,
+      "detail": "quote_vs_kline_close_diff=0.000%"
+    },
+    {
+      "name": "wencai_nlp",
+      "ok": true,
+      "critical": true,
+      "ms": 613,
+      "detail": "hits=1 parsed=['股票简称是贵州茅台 (1)']"
+    },
+    {
+      "name": "news_rss",
+      "ok": true,
+      "critical": true,
+      "ms": 471,
+      "detail": "rss ok"
+    },
+    {
+      "name": "f10_finance",
+      "ok": true,
+      "critical": true,
+      "ms": 13193,
+      "detail": "latest_period=2026-06-30"
+    },
+    {
+      "name": "sector_registry",
+      "ok": true,
+      "critical": true,
+      "ms": 1,
+      "detail": "sectors=526"
+    },
+    {
+      "name": "login",
+      "ok": true,
+      "critical": false,
+      "ms": 0,
+      "detail": "not logged in (optional, login only needed for cloud watchlist)"
+    }
+  ]
+}

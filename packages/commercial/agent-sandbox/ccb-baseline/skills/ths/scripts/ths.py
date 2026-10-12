@@ -41,13 +41,32 @@ TIMEOUT = 20
 
 # ---------------------------------------------------------------- http utils
 
+def _urlopen_retry(req):
+    """网关偶发 502/503 与瞬时网络错误时重试（3 次，退避 0.7s/1.4s）；
+    agent 调用不应被单次瞬时故障打断。"""
+    import time as _time
+    last = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code not in (502, 503, 504):
+                raise
+        except urllib.error.URLError as e:
+            last = e
+        if attempt < 2:
+            _time.sleep(0.7 * (attempt + 1))
+    raise last
+
+
 def http_get(url, referer=None, encoding=None):
     headers = {"User-Agent": UA}
     if referer:
         headers["Referer"] = referer
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        raw = resp.read()
+    raw = _urlopen_retry(req)
     if encoding:
         return raw.decode(encoding, errors="ignore")
     return raw.decode("utf-8", errors="ignore")
@@ -69,27 +88,73 @@ def http_raw(url, data=None, ctype=None):
         headers["Content-Type"] = ctype
     req = urllib.request.Request(url, headers=headers, data=data,
                                  method="POST" if data is not None else "GET")
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        return resp.read()
+    if data is not None:
+        # POST 不自动重试（避免重复提交，如发短信/推送自选）
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.read()
+    return _urlopen_retry(req)
 
 
-def fail(msg):
-    print(json.dumps({"error": msg}, ensure_ascii=False), file=sys.stderr)
+def fail(msg, code="ERROR"):
+    """统一错误出口：stderr 输出 {"error": msg, "code": code} 并以退出码 1 结束，
+    code 供 agent 分支处理（INVALID_CODE/NOT_FOUND/UPSTREAM/NETWORK/AUTH 等）。"""
+    print(json.dumps({"error": msg, "code": code}, ensure_ascii=False),
+          file=sys.stderr)
     sys.exit(1)
+
+
+# ---------------------------------------------------------------- tiny cache
+
+CACHE_PATH = os.path.join(os.path.expanduser("~"), ".ths_cache.json")
+
+
+def _cache_get(key, ttl):
+    """短期文件缓存：降低 agent 一轮分析内的重复请求（行情 20s、K 线 30min、
+    财报 6h）。THS_NO_CACHE=1 可禁用。缓存损坏时静默回退为未命中。"""
+    if os.environ.get("THS_NO_CACHE"):
+        return None
+    try:
+        import time
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            ent = json.load(f).get(key)
+        if ent and time.time() - ent["ts"] < ttl:
+            return ent["data"]
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(key, data):
+    if os.environ.get("THS_NO_CACHE"):
+        return
+    try:
+        import time
+        store = {}
+        if os.path.exists(CACHE_PATH):
+            with open(CACHE_PATH, encoding="utf-8") as f:
+                store = json.load(f)
+        now = time.time()
+        store = {k: v for k, v in store.items() if now - v["ts"] < 86400}
+        store[key] = {"ts": now, "data": data}
+        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- code utils
 
-MARKET_ID = {"17": "SH", "33": "SZ"}
+MARKET_ID = {"17": "SH", "33": "SZ", "151": "BJ"}
 
 
-def normalize_code(raw):
-    """600519 / sh600519 / 600519.SH / 600519.17 -> (code, market_id|None)"""
+def _normalize_code(raw):
+    """normalize_code 的内部实现：无法识别时抛 ValueError（不打印、不退出），
+    供需要静默试探的调用方使用（如指数代码 1A0001 的 old_id 回退）。"""
     s = str(raw).strip().upper()
     market = None
     m = re.match(r"^(SH|SZ|BJ)?(\d{6})(?:\.(SH|SZ|BJ|17|33))?$", s)
     if not m:
-        fail(f"无法识别的股票代码: {raw}")
+        raise ValueError(f"无法识别的股票代码: {raw}")
     pre, code, suf = m.group(1), m.group(2), m.group(3)
     tag = suf or pre
     if tag in ("SH", "17"):
@@ -99,11 +164,21 @@ def normalize_code(raw):
     elif tag == "BJ":
         market = "151"  # 北交所，v6 网关同样走 hs_ 前缀时可回退
     if market is None:  # 按代码段推断
-        if code.startswith(("6", "9")):
+        if code.startswith("920"):
+            market = "151"  # 北交所（920xxx；网关同样走 hs_ 前缀，实测 920185 贝特瑞可查）
+        elif code.startswith(("6", "9")):
             market = "17"
         elif code.startswith(("0", "2", "3")):
             market = "33"
     return code, market
+
+
+def normalize_code(raw):
+    """600519 / sh600519 / 600519.SH / 600519.17 -> (code, market_id|None)"""
+    try:
+        return _normalize_code(raw)
+    except ValueError as e:
+        fail(str(e), code="INVALID_CODE")
 
 
 def v6_symbol(code):
@@ -136,6 +211,9 @@ REALHEAD_FIELDS = {
 
 def fetch_quote(code):
     symbol = v6_symbol(code)
+    hit = _cache_get(f"quote:{code}", ttl=20)
+    if hit is not None:
+        return hit["out"], hit["items"]
     data = http_jsonp(
         f"https://d.10jqka.com.cn/v6/realhead/{symbol}/last.js",
         referer=f"https://stockpage.10jqka.com.cn/{code}/",
@@ -172,13 +250,32 @@ def fetch_quote(code):
         if bv and av:
             book["imbalance_pct"] = round((bv - av) / (bv + av) * 100, 2)
         out["order_book"] = book
+    _cache_set(f"quote:{code}", {"out": out, "items": items})
     return out, items
 
 
 def cmd_quote(args):
     results = []
     for raw in args.codes:
-        code, _ = normalize_code(raw)
+        try:
+            code, _ = _normalize_code(raw)
+        except ValueError:
+            # 指数代码（如上证指数 1A0001）不是 6 位数字股票代码，
+            # 网关 hs_ 符号可直接查，绕过股票代码规范化
+            if re.fullmatch(r"[0-9A-Z]{6}", str(raw).strip().upper()):
+                code = str(raw).strip().upper()
+            else:
+                fail(f"无法识别的股票代码: {raw}")
+        if code.startswith(("881", "885")) and \
+                code in load_sectors()["sectors"]:
+            # 板块代码直查：走板块指数行情（bk_ 网关）
+            info = load_sectors()["sectors"][code]
+            q = fetch_block_quote(code)
+            q.pop("raw_items", None)
+            q.update({"name": info["name"], "type": info["type"],
+                      "target_type": "sector"})
+            results.append(q)
+            continue
         q, items = fetch_quote(code)
         if args.raw:
             q["raw_items"] = items
@@ -194,10 +291,16 @@ PERIODS = {"day": "01", "week": "11", "month": "21",
            "60m": "41", "30m": "51", "15m": "61", "5m": "71", "1m": "81"}
 
 
-def fetch_kline(code, period, count):
+def fetch_kline(code, period, count, symbol=None):
+    symbol = symbol or v6_symbol(code)
+    ttl = 1800 if period in ("day", "week", "month") else 120
+    ckey = f"kline:{symbol}:{period}:{count}"
+    hit = _cache_get(ckey, ttl=ttl)
+    if hit is not None:
+        return hit
     p = PERIODS[period]
     data = http_jsonp(
-        f"https://d.10jqka.com.cn/v6/line/{v6_symbol(code)}/{p}/last{count}.js",
+        f"https://d.10jqka.com.cn/v6/line/{symbol}/{p}/last{count}.js",
         referer=f"https://stockpage.10jqka.com.cn/{code}/",
     )
     rows = []
@@ -213,22 +316,55 @@ def fetch_kline(code, period, count):
             "volume": float(f[5]), "amount": float(f[6]),
             "turnover_pct": float(f[7]) if len(f) > 7 and f[7] else None,
         })
-    return {"code": code, "name": data.get("name", ""),
-            "period": period, "rows": rows[-count:]}
+    # 复权口径：已用比亚迪(002594)验证——2025-07-29 送转除权日(10送8转12)
+    # 前后收盘价连续无 1/3 跳空，网关个股日线为前复权（板块指数无复权概念）。
+    out = {"code": code, "name": data.get("name", ""), "symbol": symbol,
+           "period": period,
+           "adjust": "forward" if symbol.startswith("hs_") else None,
+           "rows": rows[-count:]}
+    _cache_set(ckey, out)
+    return out
+
+
+def _resolve_kline_target(raw):
+    """K线/指标的目标解析：股票代码、指数代码、板块代码（881xxx/885xxx）、
+    板块名、bk_881101 写法 → (展示代码, v6 符号, 名称提示, 是否板块)。"""
+    s = str(raw).strip()
+    if s.lower().startswith("bk_"):
+        c = s[3:]
+        info = load_sectors()["sectors"].get(c, {})
+        return c, f"bk_{c}", info.get("name", ""), True
+    try:
+        code, _ = _normalize_code(s)
+    except ValueError:
+        code = None
+    if code:
+        if code.startswith(("881", "885")):
+            info = load_sectors()["sectors"].get(code)
+            if info:
+                return code, f"bk_{code}", info["name"], True
+        return code, v6_symbol(code), "", False
+    if re.fullmatch(r"[0-9A-Z]{6}", s.upper()):
+        return s.upper(), v6_symbol(s.upper()), "", False
+    code, name, _t = resolve_sector(s, load_sectors())
+    return code, f"bk_{code}", name, True
 
 
 def cmd_kline(args):
-    code, _ = normalize_code(args.code)
-    emit(fetch_kline(code, args.period, args.count), args)
+    code, symbol, hint, _is_sector = _resolve_kline_target(args.code)
+    k = fetch_kline(code, args.period, args.count, symbol=symbol)
+    if not k["name"] and hint:
+        k["name"] = hint
+    emit(k, args)
 
 
 def cmd_intraday(args):
-    code, _ = normalize_code(args.code)
+    code, symbol, hint, is_sector = _resolve_kline_target(args.code)
     data = http_jsonp(
-        f"https://d.10jqka.com.cn/v6/time/{v6_symbol(code)}/last.js",
+        f"https://d.10jqka.com.cn/v6/time/{symbol}/last.js",
         referer=f"https://stockpage.10jqka.com.cn/{code}/",
     )
-    node = data.get(v6_symbol(code), {})
+    node = data.get(symbol, {})
 
     def fnum(s):
         try:
@@ -246,7 +382,8 @@ def cmd_intraday(args):
             points.append({"time": f[0], "price": fnum(f[1]),
                            "amount": fnum(f[2]), "avg": fnum(f[3]),
                            "volume": fnum(f[4])})
-    emit({"code": code, "name": node.get("name", ""),
+    emit({"code": code, "name": node.get("name", "") or hint,
+          "target_type": "sector" if is_sector else "stock",
           "prev_close": float(node["pre"]) if node.get("pre") else None,
           "date": node.get("date", ""), "points": points}, args)
 
@@ -282,13 +419,17 @@ def cmd_search(args):
 
 def cmd_screen(args):
     chunks, codes = nlp_query(args.condition)
-    results = []
-    for code, mid in codes[: args.limit]:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(cm):
+        code, _mid = cm
         try:
             q, _ = fetch_quote(code)
-            results.append(q)
+            return q
         except Exception as e:  # 单只失败不拖垮整批
-            results.append({"code": code, "error": str(e)})
+            return {"code": code, "error": str(e)}
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        results = list(ex.map(one, codes[:args.limit]))
     emit({"condition": args.condition, "parsed": chunks,
           "total": len(codes), "results": results}, args,
          cols=["code", "name", "price", "change_pct", "amount"])
@@ -391,7 +532,7 @@ def cmd_f10(args):
                                    "total_shares", "turnover_pct")},
                "finance_diagnosis": diagnosis}
     if getattr(args, "deep", False):
-        payload["deep"] = cmd_f10_deep(code)
+        payload["deep"] = cmd_f10_deep(code, all_rows=getattr(args, "all", False))
     emit(payload, args)
 
 
@@ -409,9 +550,13 @@ def _num(v):
 def fetch_statement(code, kind, periods_n=4):
     """财报三表：basic.10jqka.com.cn/api/stock/finance/{code}_{kind}.json
     外层 JSON 的 flashData 是内嵌 JSON 字符串：title=科目行，report=按期矩阵。"""
+    hit = _cache_get(f"stmt:{code}:{kind}:{periods_n}", ttl=21600)
+    if hit is not None:
+        return hit
     text = http_get(f"https://basic.10jqka.com.cn/api/stock/finance/{code}_{kind}.json")
     inner = json.loads(json.loads(text)["flashData"])
     titles, report = inner["title"], inner["report"]
+    yoy_mat = inner.get("report_yoy") or []
     periods = [p for p in report[0] if p][:periods_n]
     rows = []
     for i in range(1, len(titles)):
@@ -420,11 +565,16 @@ def fetch_statement(code, kind, periods_n=4):
             continue
         name = str(t[0])
         vals = report[i]
+        yoy = yoy_mat[i] if i < len(yoy_mat) else []
         rows.append({"item": name.lstrip("*"), "core": name.startswith("*"),
                      "unit": t[1] if len(t) > 1 else "",
                      "values": {periods[j]: _num(vals[j])
-                                for j in range(len(periods)) if j < len(vals)}})
-    return {"periods": periods, "rows": rows}
+                                for j in range(len(periods)) if j < len(vals)},
+                     "yoy_pct": {periods[j]: _num(yoy[j])
+                                 for j in range(len(periods)) if j < len(yoy)}})
+    out = {"periods": periods, "rows": rows}
+    _cache_set(f"stmt:{code}:{kind}:{periods_n}", out)
+    return out
 
 
 def _td_texts(tr_html):
@@ -438,6 +588,9 @@ def _td_texts(tr_html):
 
 def fetch_holders(code):
     """十大股东：basic F10 holder.html 服务端渲染表格（取最新一期）。"""
+    hit = _cache_get(f"holders:{code}", ttl=21600)
+    if hit is not None:
+        return hit
     raw = http_get(f"https://basic.10jqka.com.cn/{code}/holder.html", encoding="gbk")
     out = {}
     for key, anchor in (("top10_float", "前十大流通股东累计持有"),
@@ -462,17 +615,21 @@ def fetch_holders(code):
                 break
         out[key] = {"period": max(dates) if dates else None,
                     "summary": summary, "holders": holders}
+    _cache_set(f"holders:{code}", out)
     return out
 
 
-def cmd_f10_deep(code):
+def cmd_f10_deep(code, all_rows=False):
     fin = {}
     for kind in ("benefit", "debt", "cash"):
         try:
             st = fetch_statement(code, kind)
-            fin[kind] = {"periods": st["periods"],
-                         "core_rows": [r for r in st["rows"] if r["core"]],
-                         "total_rows": len(st["rows"])}
+            entry = {"periods": st["periods"],
+                     "core_rows": [r for r in st["rows"] if r["core"]],
+                     "total_rows": len(st["rows"])}
+            if all_rows:
+                entry["rows"] = st["rows"]
+            fin[kind] = entry
         except Exception as e:
             fin[kind] = {"error": str(e)}
     return {"financials": fin, "holders": fetch_holders(code)}
@@ -601,8 +758,10 @@ def resolve_sector(query, cache):
         c, v = fuzzy[0]
         return c, v["name"], v["type"]
     if len(fuzzy) > 1:
-        fail(f"板块名不唯一，请用代码: {[(c, v['name']) for c, v in fuzzy[:10]]}")
-    fail(f"板块注册表里找不到: {q}（可先 ths sector list --refresh 刷新）")
+        fail(f"板块名不唯一，请用代码: {[(c, v['name']) for c, v in fuzzy[:10]]}",
+             code="AMBIGUOUS")
+    fail(f"板块注册表里找不到: {q}（可先 ths sector list --refresh 刷新）",
+         code="NOT_FOUND")
 
 
 def fetch_block_quote(code):
@@ -644,6 +803,238 @@ def cmd_sector(args):
         emit({"sector": {"code": code, "name": name, "type": typ},
               "total_from_nlp": len(codes), "results": results[:args.limit]},
              args, cols=["code", "name", "price", "change_pct", "amount"])
+
+
+# ---------------------------------------------------------------- events
+
+def cmd_events(args):
+    """公司大事·近期重要事件：basic F10 event.html 的「近期重要事件」区
+    （股东大会/业绩披露/股票回购/分红方案/限售解禁等，页面服务端渲染）。"""
+    code, _ = normalize_code(args.code)
+    text = _page_text(f"https://basic.10jqka.com.cn/{code}/event.html")
+    # 页面导航里也有「近期重要事件」字样，真正的区块标题后紧跟日期
+    m_sec = re.search(r"近期重要事件\s*(?=\d{4}-\d{2}-\d{2})", text)
+    idx = m_sec.start() if m_sec else text.find("近期重要事件")
+    seg = text[idx:idx + 9000] if idx >= 0 else text[:9000]
+    pat = re.compile(
+        r"(\d{4}-\d{2}-\d{2})\s*([^：:\s]{2,10})：\s*"
+        r"(.+?)(?=\s*\d{4}-\d{2}-\d{2}\s*[^：:]{2,10}：|详细内容|$)")
+    import html as _html
+    events = []
+    for m in pat.finditer(seg):
+        body = _html.unescape(re.sub(r"\s+", " ", m.group(3))).strip()
+        body = re.split(r"(详细内容|展开|收起)", body)[0].strip(" ▼▲·")
+        body = re.sub(r"^(更多>>|详情>>|更多|详情)\s*", "", body)
+        if body:
+            events.append({"date": m.group(1), "category": m.group(2),
+                           "text": body[:220]})
+        if len(events) >= args.limit:
+            break
+    emit({"code": code, "events": events,
+          "source": "basic.10jqka.com.cn F10 公司大事·近期重要事件"}, args,
+         cols=["date", "category", "text"])
+
+
+# ---------------------------------------------------------------- indicators / doctor / manifest
+
+def _r3(x):
+    return round(x, 3) if isinstance(x, float) else x
+
+
+def _ema_series(vals, n):
+    k = 2 / (n + 1)
+    out, cur = [], None
+    for v in vals:
+        cur = v if cur is None else v * k + cur * (1 - k)
+        out.append(cur)
+    return out
+
+
+def compute_indicators(rows):
+    """在 K 线 rows 上计算 MA/MACD/RSI/KDJ/BOLL，返回与 rows 等长的列表。"""
+    closes = [r["close"] for r in rows]
+    highs = [r["high"] for r in rows]
+    lows = [r["low"] for r in rows]
+    ema12, ema26 = _ema_series(closes, 12), _ema_series(closes, 26)
+    dif = [a - b for a, b in zip(ema12, ema26)]
+    dea = _ema_series(dif, 9)
+    # RSI(14) Wilder 平滑
+    rsi = [None] * len(closes)
+    if len(closes) > 14:
+        gains = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
+        losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
+        ag = sum(gains[:14]) / 14
+        al = sum(losses[:14]) / 14
+        rsi[14] = 100 - 100 / (1 + (ag / al if al else float("inf")))
+        for i in range(15, len(closes)):
+            ag = (ag * 13 + gains[i - 1]) / 14
+            al = (al * 13 + losses[i - 1]) / 14
+            rsi[i] = 100 - 100 / (1 + (ag / al if al else float("inf")))
+    out = []
+    kk = dd = 50.0
+    for i, r in enumerate(rows):
+        e = {"date": r["date"], "close": r["close"]}
+        for n in (5, 10, 20, 60):
+            e[f"ma{n}"] = _r3(sum(closes[i - n + 1:i + 1]) / n) if i >= n - 1 else None
+        e["dif"] = _r3(dif[i])
+        e["dea"] = _r3(dea[i])
+        e["macd_hist"] = _r3(2 * (dif[i] - dea[i]))
+        e["rsi14"] = _r3(rsi[i]) if rsi[i] is not None else None
+        if i >= 8:
+            llv = min(lows[i - 8:i + 1])
+            hhv = max(highs[i - 8:i + 1])
+            rsv = (closes[i] - llv) / (hhv - llv) * 100 if hhv > llv else 50.0
+            kk = 2 / 3 * kk + 1 / 3 * rsv
+            dd = 2 / 3 * dd + 1 / 3 * kk
+            e["kdj_k"], e["kdj_d"], e["kdj_j"] = _r3(kk), _r3(dd), _r3(3 * kk - 2 * dd)
+        else:
+            e["kdj_k"] = e["kdj_d"] = e["kdj_j"] = None
+        if i >= 19:
+            import statistics
+            win = closes[i - 19:i + 1]
+            mid = sum(win) / 20
+            sd = statistics.pstdev(win)
+            e["boll_mid"], e["boll_upper"], e["boll_lower"] = \
+                _r3(mid), _r3(mid + 2 * sd), _r3(mid - 2 * sd)
+        else:
+            e["boll_mid"] = e["boll_upper"] = e["boll_lower"] = None
+        out.append(e)
+    return out
+
+
+def cmd_indicators(args):
+    code, symbol, hint, is_sector = _resolve_kline_target(args.code)
+    k = fetch_kline(code, args.period, 300, symbol=symbol)
+    rows = k["rows"]
+    if len(rows) < 30:
+        fail(f"K 线数据不足（{len(rows)} 根），无法计算指标")
+    series = compute_indicators(rows)
+    tail = series[-args.count:]
+    emit({"code": code, "name": k["name"] or hint,
+          "target_type": "sector" if is_sector else "stock",
+          "period": args.period,
+          "adjust": k.get("adjust"), "bars_used": len(rows),
+          "as_of": rows[-1]["date"], "latest": tail[-1], "series": tail},
+         args)
+
+
+def cmd_doctor(args):
+    """通道健康检查：供 agent 自检（接口均为非官方，失效要能第一时间发现）。"""
+    import time as _time
+    checks = []
+
+    def run(name, fn, critical=True):
+        t0 = _time.time()
+        try:
+            detail = fn()
+            checks.append({"name": name, "ok": True, "critical": critical,
+                           "ms": int((_time.time() - t0) * 1000),
+                           "detail": detail})
+        except BaseException as e:  # nlp 失败走 fail() 的 SystemExit
+            checks.append({"name": name, "ok": False, "critical": critical,
+                           "ms": int((_time.time() - t0) * 1000),
+                           "detail": str(e)[:200]})
+
+    def c_quote():
+        q, _ = fetch_quote("600519")
+        assert q.get("price"), "no price"
+        return f"{q.get('name')} price={q['price']} update_time={q.get('update_time')}"
+
+    def c_kline():
+        k = fetch_kline("600519", "day", 5)
+        assert len(k["rows"]) >= 5, "bars<5"
+        return f"bars={len(k['rows'])} last={k['rows'][-1]['date']}"
+
+    def c_consistency():
+        q, _ = fetch_quote("600519")
+        k = fetch_kline("600519", "day", 2)
+        diff = abs(k["rows"][-1]["close"] - q["price"]) / q["price"] * 100
+        assert diff < 2, f"quote/kline close diff {diff:.2f}%"
+        return f"quote_vs_kline_close_diff={diff:.3f}%"
+
+    def c_nlp():
+        chunks, codes = nlp_query("贵州茅台")
+        assert codes, "no hits"
+        return f"hits={len(codes)} parsed={chunks[:1]}"
+
+    def c_news():
+        raw = http_get(NEWS_SOURCES["cjzx"][1], encoding="gbk")
+        assert "<item>" in raw, "no rss items"
+        return "rss ok"
+
+    def c_f10():
+        st = fetch_statement("600519", "benefit")
+        assert st["periods"], "no periods"
+        return f"latest_period={st['periods'][0]}"
+
+    def c_sector():
+        n = len(load_sectors()["sectors"])
+        assert n > 400, f"sectors={n}"
+        return f"sectors={n}"
+
+    def c_login():
+        auth = _load_json_file(AUTH_PATH)
+        if not auth:
+            return "not logged in (optional, login only needed for cloud watchlist)"
+        exp = auth.get("expireTime")
+        left = ""
+        if isinstance(exp, (int, float)) and exp > 0:
+            days = (exp - _time.time()) / 86400
+            left = f", {days:.1f} days left"
+        return f"account={auth.get('account')}{left}"
+
+    run("gateway_quote", c_quote)
+    run("gateway_kline", c_kline)
+    run("quote_kline_consistency", c_consistency)
+    run("wencai_nlp", c_nlp)
+    run("news_rss", c_news)
+    run("f10_finance", c_f10)
+    run("sector_registry", c_sector)
+    run("login", c_login, critical=False)
+    ok = all(c["ok"] for c in checks if c["critical"])
+    emit({"ok": ok, "checks": checks}, args)
+    if not ok:
+        sys.exit(1)
+
+
+COMMANDS_MANIFEST = [
+    {"name": "quote", "usage": "ths quote <code...> [--raw]",
+     "desc": "实时行情快照：现价/涨跌幅/量额/换手/涨跌停/市值 + order_book 买一卖一与委比（仅一档）"},
+    {"name": "kline", "usage": "ths kline <code> [--period day|week|month|60m|30m|15m|5m] [--count N]",
+     "desc": "K线（前复权，输出含 adjust=forward）"},
+    {"name": "intraday", "usage": "ths intraday <code>", "desc": "当日 1 分钟分时"},
+    {"name": "indicators", "usage": "ths indicators <code> [--period day] [--count N]",
+     "desc": "技术指标：MA5/10/20/60、MACD、RSI14、KDJ、BOLL（本地计算，基于前复权K线）"},
+    {"name": "search", "usage": "ths search <关键词>", "desc": "按名称/代码找股"},
+    {"name": "screen", "usage": "ths screen \"<自然语言条件>\" [--limit N]",
+     "desc": "问财 NLP 自然语言选股"},
+    {"name": "news", "usage": "ths news [--source cjzx|hk|hgt|whfx|global] [--limit N]",
+     "desc": "财经资讯 RSS"},
+    {"name": "f10", "usage": "ths f10 <code> [--deep] [--all]",
+     "desc": "F10 摘要；--deep 附财报三表核心指标（近4期，含同比 yoy_pct）+十大股东；--all 附全量科目"},
+    {"name": "rank", "usage": "ths rank [--by change|fall|amount|turnover|volume|fund|fundout] [--limit N]",
+     "desc": "全市场排行（近似榜单）；fund/fundout 为主力资金名单版，无金额数值"},
+    {"name": "lhb", "usage": "ths lhb [--limit N]",
+     "desc": "龙虎榜名单（最近交易日；无上榜原因/营业部明细）"},
+    {"name": "sector", "usage": "ths sector list|quote|stocks [板块名|代码] [--type industry|concept] [--limit N] [--refresh]",
+     "desc": "板块列表（95行业+431概念）/板块指数行情/成分股"},
+    {"name": "watchlist", "usage": "ths watchlist list|add|remove|sync|push [code]",
+     "desc": "本地自选（list 带行情）；sync 云→本地合并、push 本地→云（需登录）"},
+    {"name": "login", "usage": "ths login send-code --phone N [--captcha-x X] | verify --code C | status | logout",
+     "desc": "同花顺短信登录（滑块验证码需看图定位；凭据存 ~/.ths_auth.json，约30天）"},
+    {"name": "events", "usage": "ths events <code> [--limit N]",
+     "desc": "公司大事·近期重要事件（股东大会/业绩披露/回购/分红/解禁等，来自 F10 event 页）"},
+    {"name": "doctor", "usage": "ths doctor",
+     "desc": "通道健康检查（行情/K线/问财/资讯/F10/板块/登录），有关键项失败时退出码 1"},
+    {"name": "commands", "usage": "ths commands", "desc": "本能力清单（机器可读）"},
+]
+
+
+def cmd_commands(args):
+    emit({"commands": COMMANDS_MANIFEST,
+          "conventions": "默认 JSON 输出；--table 切表格；错误为 stderr 的 "
+                         "{\"error\": ...} 且退出码 1；非交易时段返回最近收盘，"
+                         "先看 status/update_time"}, args)
 
 
 # ---------------------------------------------------------------- login / cloud
@@ -1003,16 +1394,23 @@ def watchlist_push(args):
         fail("本地自选为空，无可推送")
     cloud = _load_json_file(CLOUD_PATH) or {"items": []}
     known = {it["code"]: it.get("old_id") for it in cloud.get("items", [])}
+
+    def _mid(code):
+        # 指数代码（如上证指数 1A0001）不是标准股票代码，normalize 会失败；
+        # 这类代码以云端快照里的 old_id 为准，不走市场回退
+        try:
+            return _normalize_code(code)[1]
+        except ValueError:
+            return None
     market_old = {}
     for code, oid in known.items():
         if oid:
-            _c, mid = normalize_code(code)
+            mid = _mid(code)
             if mid and mid not in market_old:
                 market_old[mid] = oid
     olds, missing = [], []
     for code in local:
-        _c, mid = normalize_code(code)
-        oid = known.get(code) or market_old.get(mid or "")
+        oid = known.get(code) or market_old.get(_mid(code) or "")
         if oid:
             olds.append(oid)
         else:
@@ -1065,14 +1463,17 @@ def cmd_watchlist(args):
         lst = [c for c in lst if c != code]
         wl_save(lst)
         emit({"watchlist": lst}, args)
-    else:  # list（带实时行情）
-        results = []
-        for code in lst:
+    else:  # list（带实时行情，并发拉取、保持原顺序，单只失败不拖垮整批）
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(code):
             try:
                 q, _ = fetch_quote(code)
-                results.append(q)
+                return q
             except Exception as e:
-                results.append({"code": code, "error": str(e)})
+                return {"code": code, "error": str(e)}
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            results = list(ex.map(one, lst))
         emit({"watchlist": results}, args,
              cols=["code", "name", "price", "change_pct", "amount"])
 
@@ -1081,6 +1482,7 @@ def cmd_watchlist(args):
 # `--ui`：把与 JSON 输出同源的数据转成 OpenClaude 智能 UI 的 ```ui 块（quote / kline / intraday /
 # stocklist 以及通用的 table / kv / sources / steps / callout）。只做格式转换，不增删任何数值；
 # 分时按 2 分钟取样（成交量为两分钟合计，最后一分钟总保留），在块的 note 里写明。
+# 上游 1.3.0 新命令：indicators → stats + 折线图，events → timeline，doctor / commands → table。
 
 UI_SOURCE = "同花顺公开 Web 接口（ths 插件）"
 
@@ -1196,6 +1598,62 @@ def _login_blocks(data, args):
     return [{"type": "callout", "tone": "info", "body": json.dumps(data, ensure_ascii=False)[:500]}]
 
 
+PERIOD_LABELS = {"day": "日线", "week": "周线", "month": "月线", "60m": "60 分钟", "30m": "30 分钟",
+                 "15m": "15 分钟", "5m": "5 分钟"}
+CHART_POINTS = 60  # 智能 UI 折线图最多 60 个点
+
+
+def _join(*vals):
+    return " / ".join("—" if v is None else str(v) for v in vals)
+
+
+def _indicator_blocks(data):
+    latest = data.get("latest") or {}
+    period = PERIOD_LABELS.get(data.get("period"), data.get("period") or "")
+    adjust = "，前复权" if data.get("adjust") == "forward" else ""
+    head = f"{data.get('name', '')}（{data.get('code', '')}）"
+    items = [{"label": label, "value": latest[k]} for k, label in
+             (("close", "收盘"), ("ma5", "MA5"), ("ma20", "MA20"), ("ma60", "MA60"), ("rsi14", "RSI14"))
+             if latest.get(k) is not None]
+    items.append({"label": "MACD（DIF / DEA / 柱）", "value": _join(latest.get("dif"), latest.get("dea"), latest.get("macd_hist"))})
+    items.append({"label": "KDJ（K / D / J）", "value": _join(latest.get("kdj_k"), latest.get("kdj_d"), latest.get("kdj_j"))})
+    items.append({"label": "BOLL（上 / 中 / 下）", "value": _join(latest.get("boll_upper"), latest.get("boll_mid"), latest.get("boll_lower"))})
+    src = _src(data.get("as_of"))
+    blocks = [{"type": "stats", "title": f"{head}技术指标 · {data.get('as_of', '')}（{period}{adjust}）",
+               "items": items, "source": src}]
+    series = data.get("series") or []
+    if len(series) < 2:
+        return blocks
+    note = None
+    if len(series) > CHART_POINTS:
+        note = f"图里画最近 {CHART_POINTS} 根，共 {len(series)} 根"
+        series = series[-CHART_POINTS:]
+    labels = [str(r.get("date", "")) for r in series]
+
+    def chart(title, keys):
+        return {"type": "chart", "kind": "line", "title": f"{head}{title}", "labels": labels,
+                "series": [{"name": name, "values": [r.get(k) for r in series]} for k, name in keys],
+                "source": src, "note": note}
+    blocks.append(chart("价格、均线与布林带", (("close", "收盘"), ("ma5", "MA5"), ("ma20", "MA20"),
+                                       ("boll_upper", "BOLL 上轨"), ("boll_lower", "BOLL 下轨"))))
+    blocks.append(chart("MACD", (("dif", "DIF"), ("dea", "DEA"), ("macd_hist", "MACD 柱"))))
+    blocks.append(chart("RSI 与 KDJ", (("rsi14", "RSI14"), ("kdj_k", "K"), ("kdj_d", "D"), ("kdj_j", "J"))))
+    return blocks
+
+
+def _doctor_blocks(data):
+    checks = data.get("checks") or []
+    rows = [[c.get("name"), "正常" if c.get("ok") else ("失败" if c.get("critical") else "未通过（非必需）"),
+             c.get("ms"), c.get("detail") or ""] for c in checks]
+    bad = [c.get("name") for c in checks if not c.get("ok") and c.get("critical")]
+    tone, title = ("success", "同花顺各通道正常") if data.get("ok") else ("warning", f"{len(bad)} 项关键检查失败")
+    body = "行情、K 线、选股、资讯、财报、板块都能正常取数。" if data.get("ok") else \
+        f"失败的通道：{'、'.join(bad)}。这些接口不是官方开放接口，可能临时不可用或已改版。"
+    return [{"type": "callout", "tone": tone, "title": title, "body": body},
+            {"type": "table", "title": "通道检查", "columns": ["检查项", "结果", {"label": "耗时(ms)", "align": "right"}, "说明"],
+             "rows": rows, "source": _src()}]
+
+
 def ui_blocks(data, args):
     cmd = args.cmd
     if cmd == "quote":
@@ -1205,7 +1663,19 @@ def ui_blocks(data, args):
     if cmd == "kline":
         rows = [[r["date"], r["open"], r["high"], r["low"], r["close"], r.get("volume")] for r in data.get("rows", [])]
         return [{"type": "kline", "code": data.get("code"), "name": data.get("name"), "period": data.get("period"),
-                 "rows": rows, "source": _src()}]
+                 "rows": rows, "source": _src(),
+                 "note": "前复权" if data.get("adjust") == "forward" else None}]
+    if cmd == "indicators":
+        return _indicator_blocks(data)
+    if cmd == "events":
+        return [{"type": "timeline", "title": f"{data.get('code', '')} 近期重要事件",
+                 "items": [{"time": e.get("date", ""), "title": e.get("category", ""), "detail": e.get("text")}
+                           for e in data.get("events", []) if e.get("category")]}]
+    if cmd == "doctor":
+        return _doctor_blocks(data)
+    if cmd == "commands":
+        return [{"type": "table", "title": "同花顺插件能做什么", "columns": ["命令", "用法", "说明"],
+                 "rows": [[c.get("name"), c.get("usage"), c.get("desc")] for c in data.get("commands", [])]}]
     if cmd == "intraday":
         return [{"type": "intraday", "code": data.get("code"), "name": data.get("name"), "date": data.get("date"),
                  "prev_close": data.get("prev_close"), "points": _intraday_points(data.get("points", [])),
@@ -1266,6 +1736,28 @@ def ui_fences(data, args):
 
 # ---------------------------------------------------------------- output
 
+_LIST_KEYS = ("results", "watchlist", "items", "series", "sectors", "checks",
+              "events")
+
+
+def _pick_fields(obj, fields):
+    """--fields 字段裁剪：顶层 dict 只保留所选键；结果列表容器
+    （results/watchlist/...）保留并逐行裁剪，元信息键随之丢弃。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in _LIST_KEYS and isinstance(v, list):
+                out[k] = [{kk: vv for kk, vv in row.items() if kk in fields}
+                          if isinstance(row, dict) else row for row in v]
+            elif k in fields:
+                out[k] = v
+        return out
+    if isinstance(obj, list):
+        return [{k: v for k, v in row.items() if k in fields}
+                if isinstance(row, dict) else row for row in obj]
+    return obj
+
+
 def emit(data, args, cols=None):
     if getattr(args, "ui", False):
         print(ui_fences(data, args))
@@ -1273,7 +1765,7 @@ def emit(data, args, cols=None):
     if getattr(args, "table", False):
         rows = data
         if isinstance(data, dict):
-            for k in ("results", "items", "watchlist"):
+            for k in ("results", "items", "watchlist", "events"):
                 if k in data:
                     meta = {kk: vv for kk, vv in data.items() if kk != k}
                     if meta:
@@ -1289,13 +1781,20 @@ def emit(data, args, cols=None):
         for r in rows:
             print("\t".join("" if r.get(c) is None else str(r.get(c)) for c in cols))
     else:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
+        fields = getattr(args, "fields", None)
+        if fields:
+            data = _pick_fields(data, set(fields))
+        if getattr(args, "compact", False):
+            print(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 # ---------------------------------------------------------------- main
 
 def main():
     p = argparse.ArgumentParser(prog="ths", description="同花顺 CLI（agent 友好，默认 JSON 输出）")
+    p.add_argument("--version", action="version", version="ths 1.3.0")
     p.add_argument("--table", action="store_true", help="表格输出代替 JSON")
     p.add_argument("--ui", action="store_true",
                    help="输出可直接贴进回答的 ```ui 组件块（OpenClaude 智能 UI；数据与 JSON 输出同源）")
@@ -1333,7 +1832,21 @@ def main():
     sp = sub.add_parser("f10", help="F10 公司资料 + 财务指标摘要（--deep 附财报三表核心指标 + 十大股东）")
     sp.add_argument("code")
     sp.add_argument("--deep", action="store_true")
+    sp.add_argument("--all", action="store_true", help="配合 --deep 输出三表全量科目")
     sp.set_defaults(func=cmd_f10)
+
+    sp = sub.add_parser("indicators", help="技术指标（MA/MACD/RSI/KDJ/BOLL，基于前复权 K 线本地计算）")
+    sp.add_argument("code")
+    sp.add_argument("--period", default="day",
+                    choices=["day", "week", "month", "60m", "30m", "15m", "5m"])
+    sp.add_argument("--count", type=int, default=5, help="输出最近 N 根的指标序列")
+    sp.set_defaults(func=cmd_indicators)
+
+    sp = sub.add_parser("doctor", help="通道健康检查（agent 自检用）")
+    sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser("commands", help="能力清单（机器可读 JSON）")
+    sp.set_defaults(func=cmd_commands)
 
     sp = sub.add_parser("rank", help="全市场排行（问财 NLP + 行情重排：涨幅/跌幅/成交额/换手/成交量/资金流净流入/净流出）")
     sp.add_argument("--by", default="change",
@@ -1345,6 +1858,11 @@ def main():
     sp = sub.add_parser("lhb", help="龙虎榜名单（最近交易日，问财；无营业部明细）")
     sp.add_argument("--limit", type=int, default=100)
     sp.set_defaults(func=cmd_lhb)
+
+    sp = sub.add_parser("events", help="公司大事·近期重要事件（股东大会/业绩披露/回购/分红/解禁）")
+    sp.add_argument("code")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(func=cmd_events)
 
     sp = sub.add_parser("sector", help="板块：list 列表 / quote 板块指数行情 / stocks 成分股")
     sp.add_argument("action", choices=["list", "quote", "stocks"])
@@ -1373,12 +1891,31 @@ def main():
     sp.set_defaults(func=cmd_login)
 
     argv = sys.argv[1:]
-    table_flag = "--table" in argv  # --table 允许出现在任意位置
-    ui_flag = "--ui" in argv        # --ui 同样允许出现在任意位置（OpenClaude V5 智能 UI）
-    argv = [a for a in argv if a not in ("--table", "--ui")]
-    args = p.parse_args(argv)
+    # --table / --compact / --fields / --ui 允许出现在任意位置，先行提取
+    table_flag = "--table" in argv
+    compact_flag = "--compact" in argv
+    ui_flag = "--ui" in argv  # OpenClaude V5 智能 UI
+    fields = None
+    cleaned = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--table", "--compact", "--ui"):
+            i += 1
+        elif a == "--fields" and i + 1 < len(argv):
+            fields = [x.strip() for x in argv[i + 1].split(",") if x.strip()]
+            i += 2
+        elif a.startswith("--fields="):
+            fields = [x.strip() for x in a[9:].split(",") if x.strip()]
+            i += 1
+        else:
+            cleaned.append(a)
+            i += 1
+    args = p.parse_args(cleaned)
     args.table = table_flag
+    args.compact = compact_flag
     args.ui = ui_flag
+    args.fields = fields
     if args.cmd == "watchlist" and args.action in ("add", "remove") and not args.code:
         fail("watchlist add/remove 需要股票代码")
     try:
@@ -1386,7 +1923,15 @@ def main():
     except BrokenPipeError:
         pass
     except Exception as e:
-        fail(str(e))
+        code = "INTERNAL"
+        if isinstance(e, urllib.error.HTTPError):
+            code = {404: "NOT_FOUND", 429: "RATE_LIMIT"}.get(
+                e.code, "UPSTREAM" if e.code >= 500 else "HTTP")
+        elif isinstance(e, urllib.error.URLError):
+            code = "NETWORK"
+        elif isinstance(e, RuntimeError):
+            code = "UPSTREAM"
+        fail(str(e), code=code)
 
 
 if __name__ == "__main__":

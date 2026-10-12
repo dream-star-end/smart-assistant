@@ -2,7 +2,8 @@
  * 行情类智能 UI 组件（OCV5-383）：schema / 渲染 / Markdown，以及同花顺插件 `ths --ui` 的真实产出。
  *
  * __fixtures__/ths/*.json 是 2026-10-12 13:06 CST 在 v5-dev 上用上游 ths CLI 真实拉到的 JSON 输出
- * （600519 等）。「ths --ui 产出能被前端 schema 接受」这条用 python3 直接调用插件里的 ui_fences()
+ * （600519 等）；indicators / events / doctor / commands / kline-adj / quote-index / kline-sector / f10-deep 是
+ * 同日 17:1x 用上游 v1.3.0（ca5b125）拉的。「ths --ui 产出能被前端 schema 接受」这条用 python3 直接调用插件里的 ui_fences()
  * 转换同一份夹具，不走网络 —— Python 端与前端端的字段约定改了任何一边，这里都会红。
  */
 import "@testing-library/jest-dom/vitest";
@@ -62,6 +63,15 @@ describe("ths --ui → 前端 schema（真实夹具）", () => {
     ["news", "news", {}, "sources"],
     ["f10", "f10", {}, "kv"],
     ["login", "login", { login_action: "status" }, "callout"],
+    // 上游 v1.3.0（ca5b125）
+    ["indicators", "indicators", {}, "stats"],
+    ["events", "events", {}, "timeline"],
+    ["doctor", "doctor", {}, "callout"],
+    ["commands", "commands", {}, "table"],
+    ["kline-adj", "kline", {}, "kline"],
+    ["quote-index", "quote", {}, "quote"],
+    ["kline-sector", "kline", {}, "kline"],
+    ["f10-deep", "f10", {}, "kv"],
   ];
   test.each(cases)("%s（ths %s）产出的块全部通过校验，首块类型 %s", (name, cmd, extra, firstType) => {
     const blocks = thsUi(name, cmd, extra);
@@ -70,6 +80,41 @@ describe("ths --ui → 前端 schema（真实夹具）", () => {
     expect(specs[0].spec.type).toBe(firstType);
     // 不能有「修过」的痕迹：插件产出应当一次过，不靠前端截断。
     for (const s of specs) expect(s.notes).toEqual([]);
+  });
+
+  test("技术指标（v1.3.0）：指标卡取 latest 原值，三张折线图逐点等于 series", () => {
+    const raw = JSON.parse(fixture("indicators"));
+    const [stats, price, macd, osc] = thsUi("indicators", "indicators").map((b) => valid(b).spec) as Record<string, any>[];
+    expect(stats.title).toContain("前复权");
+    const byLabel = Object.fromEntries(stats.items.map((i: { label: string; value: unknown }) => [i.label, i.value]));
+    expect(byLabel["收盘"]).toBe(raw.latest.close);
+    expect(byLabel.RSI14).toBe(raw.latest.rsi14);
+    expect(byLabel["MACD（DIF / DEA / 柱）"]).toBe(`${raw.latest.dif} / ${raw.latest.dea} / ${raw.latest.macd_hist}`);
+    expect(price.labels).toEqual(raw.series.map((r: { date: string }) => r.date));
+    expect(price.series[0].values).toEqual(raw.series.map((r: { close: number }) => r.close));
+    expect(macd.series.map((x: { name: string }) => x.name)).toEqual(["DIF", "DEA", "MACD 柱"]);
+    expect(osc.series[0].values).toEqual(raw.series.map((r: { rsi14: number | null }) => r.rsi14));
+  });
+
+  test("公司大事（v1.3.0）：时间线条数、日期、类别、正文与 CLI 一致", () => {
+    const raw = JSON.parse(fixture("events"));
+    const [tl] = thsUi("events", "events").map((b) => valid(b).spec) as Record<string, any>[];
+    expect(tl.items).toEqual(raw.events.map((e: { date: string; category: string; text: string }) => ({ time: e.date, title: e.category, detail: e.text })));
+  });
+
+  test("通道自检（v1.3.0）：每项检查一行，结论与 ok 一致", () => {
+    const raw = JSON.parse(fixture("doctor"));
+    const [callout, table] = thsUi("doctor", "doctor").map((b) => valid(b).spec) as Record<string, any>[];
+    expect(callout.tone).toBe(raw.ok ? "success" : "warning");
+    expect(table.rows.map((r: unknown[]) => r[0])).toEqual(raw.checks.map((c: { name: string }) => c.name));
+  });
+
+  test("前复权 K 线（v1.3.0）：块里注明前复权，行数与收盘价逐行一致", () => {
+    const raw = JSON.parse(fixture("kline-adj"));
+    expect(raw.adjust).toBe("forward");
+    const [k] = thsUi("kline-adj", "kline").map((b) => valid(b).spec) as Record<string, any>[];
+    expect(k.note).toBe("前复权");
+    expect(k.rows.map((r: { close: number }) => r.close)).toEqual(raw.rows.map((r: { close: number }) => r.close));
   });
 
   test("数值原样：行情卡的现价 / 涨跌幅 / 盘口与 CLI JSON 一致", () => {

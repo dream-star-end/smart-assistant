@@ -1,9 +1,9 @@
 {
   "schema": "openclaude-plugin/1",
   "name": "ths",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "displayName": "同花顺行情",
-  "description": "查询 A 股行情、K 线、分时、选股、板块、排行、龙虎榜、资讯和 F10，可短信登录同步云自选。数据来自同花顺公开 Web 接口，只读，无交易功能。",
+  "description": "查询 A 股和指数行情、K 线、分时、技术指标、选股、板块、排行、龙虎榜、资讯、公司大事和 F10，可短信登录同步云自选。数据来自同花顺公开 Web 接口，只读，无交易功能。",
   "author": { "name": "ths-plugin contributors", "url": "https://github.com/dream-star-end/ths-plugin" },
   "license": "MIT",
   "homepage": "https://github.com/dream-star-end/ths-plugin",
@@ -11,7 +11,7 @@
   "tags": ["股票", "行情", "A股", "同花顺"],
   "useCases": [
     "查一只或几只股票的实时行情和盘口",
-    "看日 K、周 K 或分钟 K 线和当天分时走势",
+    "看 K 线、分时和 MACD、KDJ 等技术指标",
     "按条件选股，看涨幅榜、成交额榜和板块成分股",
     "同步同花顺云自选，一次看完自选股行情"
   ],
