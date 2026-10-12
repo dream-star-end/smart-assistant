@@ -8,6 +8,9 @@
  */
 
 import { needsSignedSrc } from "../../lib/chat/media";
+import { MARKET_ALIASES, MARKET_VALIDATORS, type MarketSpec } from "./marketSchema";
+
+export type { IntradaySpec, KlineSpec, MarketSpec, QuoteSpec, StockListSpec } from "./marketSchema";
 
 export type Cell = string | number | null;
 
@@ -236,7 +239,8 @@ export type IuiSpec =
   | ProgressSpec
   | KvSpec
   | FormSpec
-  | RouteSpec;
+  | RouteSpec
+  | MarketSpec;
 
 export type IuiType = IuiSpec["type"];
 
@@ -265,6 +269,10 @@ export const IUI_TYPES: readonly IuiType[] = [
   "sources",
   "outline",
   "draft",
+  "quote",
+  "kline",
+  "intraday",
+  "stocklist",
 ];
 
 export type ValidateResult =
@@ -1172,6 +1180,7 @@ const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => Iu
   sources,
   outline,
   draft,
+  ...MARKET_VALIDATORS,
 };
 
 /** 常见别名(模型偶尔写成其它名字)。 */
@@ -1215,6 +1224,7 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   mind_map: "outline",
   email: "draft",
   copy: "draft",
+  ...MARKET_ALIASES,
 };
 
 export function resolveType(raw: unknown): IuiType | null {

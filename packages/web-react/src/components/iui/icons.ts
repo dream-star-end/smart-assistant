@@ -121,6 +121,10 @@ export const KIND_ICON_SOURCES = {
   sources: "book-marked",
   outline: "network",
   draft: "pen-line",
+  quote: "gauge",
+  kline: "chart-column",
+  intraday: "chart-column",
+  stocklist: "table-2",
 } as const satisfies Record<string, LucideName>;
 
 /** 组件内部控件用、别处没有引过的图标(同样走生成的形状数据,不进首屏)。 */
