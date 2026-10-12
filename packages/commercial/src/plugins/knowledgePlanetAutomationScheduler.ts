@@ -237,6 +237,11 @@ async function lockControl(
   return result.rows[0] ?? null
 }
 
+/** 用户是否在 管理中心 → 插件 停用了知识星球（OCV5-383）。读失败按启用处理（disabledPluginSet 内 fail-open）。 */
+async function knowledgePlanetDisabled(userId: number): Promise<boolean> {
+  return (await disabledPluginSet(userId)).has(KNOWLEDGE_PLANET_PLUGIN_SLUG)
+}
+
 async function manualWriteStillEnabled(
   client: PoolClient,
   connectionId: string,
@@ -321,7 +326,7 @@ async function claimNextRule(pool: Pool): Promise<RuleClaim | null> {
     }
     // 用户在 管理中心 → 插件 停用了知识星球（OCV5-383）：本轮不跑，5 分钟后再看。
     // 不暂停、不改规则 —— 重新启用后自动恢复；运行时门面（loadManagedTarget）另有一道兜底。
-    if ((await disabledPluginSet(row.user_id)).has(KNOWLEDGE_PLANET_PLUGIN_SLUG)) {
+    if (await knowledgePlanetDisabled(row.user_id)) {
       await client.query(
         `UPDATE plugin_automation_rules
             SET next_run_at = GREATEST(next_run_at, now() + interval '5 minutes'), updated_at = now()
@@ -653,6 +658,17 @@ async function claimNextRun(pool: Pool): Promise<RunClaim | null> {
     )
     const ruleRow = rule.rows[0]
     const runRow = run.rows[0]
+    // 插件在 管理中心 → 插件 被停用（OCV5-383 Codex r1 P1）：已排队的 run 直接跳过，记 PLUGIN_DISABLED，
+    // 不进生成、不计失败，规则不暂停；重新启用后由新的扫描继续。
+    if (runRow?.status === 'reserved' && (await knowledgePlanetDisabled(picked.user_id))) {
+      await client.query(
+        `UPDATE plugin_automation_runs
+            SET status = 'skipped', reason_code = 'PLUGIN_DISABLED', finished_at = now()
+          WHERE id = $1::uuid AND status = 'reserved'`,
+        [picked.id],
+      )
+      return null
+    }
     const allowed =
       control !== null &&
       automationControlValid(control) &&
@@ -883,6 +899,10 @@ async function generateRun(
   },
   run: RunClaim,
 ): Promise<'ready' | 'skipped' | 'failed'> {
+  if (await knowledgePlanetDisabled(run.userId)) {
+    await skipRun(opts.pool, run, 'PLUGIN_DISABLED')
+    return 'skipped'
+  }
   if (!opts.apiKey) {
     await failRun(opts.pool, run, 'MODEL_UNAVAILABLE')
     return 'failed'
@@ -1200,6 +1220,11 @@ async function dispatchRun(
   env: NodeJS.ProcessEnv,
   run: ReadyRun,
 ): Promise<'sent' | 'skipped' | 'failed' | 'unknown' | 'deferred'> {
+  // 已生成、待发出的回复：插件停用后不发，记 PLUGIN_DISABLED 跳过（不计失败）。
+  if (await knowledgePlanetDisabled(run.userId)) {
+    await skipReadyRun(pool, run, 'PLUGIN_DISABLED')
+    return 'skipped'
+  }
   let key: Buffer | null = null
   let plaintext: Buffer | null = null
   try {
