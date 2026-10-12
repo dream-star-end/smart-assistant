@@ -302,6 +302,14 @@ const CLEANUP_PROOF_FENCE = `((ctx->>'boxState'='terminal'
         AND ctx ? 'boxToolHandoff'))))`;
 // New successful Box rounds retain the completed Message before stdout is
 // truncated. Old rows and proven stopped failures keep their cleanup route.
+/** OCV5-384: a finished run that recorded a native start attaches its native pointer right
+ * after the terminal proof lands (after a remote transcript inspection). Cleanup claimed in
+ * between made attachNativePointer refuse, so the next turn found no candidate and re-staged the
+ * whole conversation at cache-write price. Such a run waits for its pointer, or for this grace. */
+const CLEANUP_NATIVE_POINTER_GRACE = `(ctx->>'boxState'<>'terminal'
+  OR NOT (ctx ? 'boxNativeSessionId')
+  OR ctx ? 'boxNativePointer'
+  OR updated_at <= NOW() - INTERVAL '20 seconds')`;
 const CLEANUP_REPLAY_FENCE = `(ctx->>'boxState'<>'terminal'
   OR ctx->>'boxReplayRequired' IS DISTINCT FROM 'true'
   OR ctx ? 'boxReplayMessage')`;
@@ -3243,6 +3251,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ${CLEANUP_MODE_FENCE}
            AND ${CLEANUP_STATE_FENCE} AND ctx ? 'boxTerminalProof'
            AND ${CLEANUP_REPLAY_FENCE}
+           AND ${CLEANUP_NATIVE_POINTER_GRACE}
           AND COALESCE(ctx->>'boxRemoteCleanup','pending')<>'done'
           AND NOT (ctx ? 'boxRemoteCleanupQuarantine')
            AND (ctx->>'boxRemoteCleanupClaimed' IS DISTINCT FROM 'true'
@@ -3331,6 +3340,7 @@ export class BoxDurableJournal implements BoxJournalPort {
           AND ${CLEANUP_MODE_FENCE}
            AND ${CLEANUP_PROOF_FENCE} AND ctx ? 'boxTerminalProof'
            AND ${CLEANUP_REPLAY_FENCE}
+           AND ${CLEANUP_NATIVE_POINTER_GRACE}
           AND ctx->'boxTerminalProof'->>'runNonce'=$4
           AND ctx->'boxTerminalProof'->>'leaseEpoch'=$5
            AND ctx->'boxTerminalProof'=$6::jsonb
