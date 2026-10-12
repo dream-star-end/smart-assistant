@@ -26,8 +26,20 @@ function blocks(content: unknown): Block[] {
     && typeof (item as { type?: unknown }).type === "string");
 }
 
+/** OCV5-381: CCB sends `x-anthropic-billing-header: …` as system block 0.
+ * The Box CLI reads `--system-prompt-file` as one block, sees that prefix and
+ * discards the whole file as an attribution header, so every OpenClaude
+ * instruction after it was lost. Drop the header; keep everything else. */
+const BILLING_HEADER_PREFIX = "x-anthropic-billing-header";
+
+function withoutBillingHeader(text: string): string {
+  if (!text.startsWith(BILLING_HEADER_PREFIX)) return text;
+  const newline = text.indexOf("\n");
+  return newline < 0 ? "" : text.slice(newline + 1).replace(/^\n+/, "");
+}
+
 function systemText(content: unknown): string {
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return withoutBillingHeader(content);
   if (!Array.isArray(content)) throw new BoxMessagesShapeError("BOX_SYSTEM_UNSUPPORTED");
   return content.map((part) => {
     if (part === null || typeof part !== "object" || Array.isArray(part)
@@ -35,8 +47,8 @@ function systemText(content: unknown): string {
       || typeof (part as { text?: unknown }).text !== "string") {
       throw new BoxMessagesShapeError("BOX_SYSTEM_UNSUPPORTED");
     }
-    return (part as { text: string }).text;
-  }).join("\n\n");
+    return withoutBillingHeader((part as { text: string }).text);
+  }).filter(Boolean).join("\n\n");
 }
 
 /** OCV5-337: completed history written by another model (e.g. k3 `tool_…`,

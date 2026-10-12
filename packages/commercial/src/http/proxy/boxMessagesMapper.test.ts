@@ -28,6 +28,28 @@ describe("Box Messages → Claude CLI synthetic session boundary", () => {
     assert.equal(output.systemPrompt, "top system\n\nOpenClaude memory and skills");
   });
 
+  it("drops the CCB billing header block so the CLI keeps the system prompt", () => {
+    const header = "x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=sdk-cli;";
+    const output = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: [{ type: "text", text: "current" }] },
+    ], [
+      { type: "text", text: header },
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: "INTELLIGENT_UI marker" },
+    ]), args);
+    assert.equal(output.systemPrompt,
+      "You are Claude Code, Anthropic's official CLI for Claude.\n\nINTELLIGENT_UI marker");
+    assert.ok(!output.systemPrompt.includes("x-anthropic-billing-header"));
+    const fromString = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "current" },
+    ], `${header}\nINTELLIGENT_UI marker`), args);
+    assert.equal(fromString.systemPrompt, "INTELLIGENT_UI marker");
+    const onlyHeader = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "current" },
+    ], [{ type: "text", text: header }]), args);
+    assert.equal(onlyHeader.systemPrompt, "");
+  });
+
   it("serializes completed tool history in order without changing roles or IDs", () => {
     const messages = [
       { role: "user", content: "prior question" },

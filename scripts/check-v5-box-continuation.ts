@@ -43,6 +43,9 @@ const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as co
 /** Direct runtime module for the OCV5-296 compact carrier. No oracle or graph edit. */
 const COMPACTION_SOURCE = ["boxCliSse.ts"] as const;
 const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo";
+/** OCV5-381: module that writes the Box `--system-prompt-file` text. */
+const SYSTEM_SOURCE = ["boxMessagesMapper.ts"] as const;
+const SYSTEM_HEADER_BINDING = "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
 const SEALED_IMAGE_SHA = "a9491d8d9cb458b11d4ac6c5fc4b5c2d4d370a1d9b6f7960cc5dffae678538a0";
@@ -170,7 +173,7 @@ function resolveLocal(fromFile: string, spec: string): string | null {
   return null;
 }
 function digest(): Digest {
-  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT, ...COMPACTION_SOURCE]
+  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT, ...COMPACTION_SOURCE, ...SYSTEM_SOURCE]
     .map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
   const files = new Set<string>([SELF, FIXTURE, LOADER, IMAGE_FILE, ORACLE_FILE]);
@@ -974,6 +977,25 @@ async function proveCompactionConsumer(): Promise<void> {
     if (!(error instanceof sse.BoxCliSseError) || error.code !== "BOX_CLI_COMPACT_PHASE") throw error;
   }
 }
+/** The Box CLI drops a system prompt whose first block starts with
+ * `x-anthropic-billing-header`; CCB always sends that block first. */
+async function proveSystemHeader(): Promise<void> {
+  const mapper = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[0])).href) as {
+    compileBoxCliSyntheticTurn: (body: Record<string, unknown>, args: { cwd: string; cliVersion: string }) =>
+      { systemPrompt: string };
+  };
+  const header = "x-anthropic-billing-header: cc_version=2.1.296.gate; cc_entrypoint=sdk-cli;";
+  const marker = "OCV5-381 platform slot marker";
+  const out = mapper.compileBoxCliSyntheticTurn({ model: "claude-opus-5-5", max_tokens: 64,
+    system: [{ type: "text", text: header },
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: marker }],
+    messages: [{ role: "user", content: "probe" }] }, { cwd: publishDir, cliVersion: "2.1.280" });
+  if (out.systemPrompt.startsWith("x-anthropic-billing-header")
+    || out.systemPrompt.includes(header) || !out.systemPrompt.endsWith(marker)) {
+    fail("SYSTEM_HEADER_DROP");
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -994,6 +1016,8 @@ async function workerMain(expectSha: string): Promise<void> {
   const before = digest();
   await proveCompactionConsumer();
   if (!COMPACTION_BINDING.startsWith("[ocv5-296-compaction] PASS")) fail("COMPACTION_BINDING");
+  await proveSystemHeader();
+  if (!SYSTEM_HEADER_BINDING.startsWith("[ocv5-381-system-header] PASS")) fail("SYSTEM_HEADER_BINDING");
   const api = await load();
   const after = digest();
   if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
