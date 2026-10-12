@@ -272,6 +272,8 @@ export function makeBoxTextPlan(input: {
     ...(interactiveHost ? [{ asset: interactiveHost.asset, path: interactiveHost.path }] : []),
   ]);
   const staged = makeBoxStageFiles({ cwd, project,
+    // OCV5-384: a fresh native session's transcript directory must be ours (0700).
+    ensureProject: !hasHistory && !input.nativeResume && nativePersistence,
     snapshotMaxBytes: snapshotCeiling,
     files: [
       ...(hasHistory ? [{ path: snapshotPath, raw: snapshot, hash: snapshotHash! }] : []),

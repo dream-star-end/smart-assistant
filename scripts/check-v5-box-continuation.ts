@@ -44,7 +44,8 @@ const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as co
 const COMPACTION_SOURCE = ["boxCliSse.ts"] as const;
 const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo";
 /** OCV5-381: module that writes the Box `--system-prompt-file` text. */
-const SYSTEM_SOURCE = ["boxMessagesMapper.ts"] as const;
+const SYSTEM_SOURCE = ["boxMessagesMapper.ts", "boxTextPlan.ts"] as const;
+const FRESH_PROJECT_BINDING = "[ocv5-384-fresh-native-project] PASS — a fresh native session stages its owner-0700 project directory and cleanup never receives it";
 const RESTAGE_BINDING = "[ocv5-384-restage-context] PASS — a re-staged conversation keeps the native context records after the first user message";
 const SYSTEM_HEADER_BINDING = "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
@@ -1017,6 +1018,23 @@ async function proveRestageContext(): Promise<void> {
     fail("RESTAGE_CONTEXT_POSITION");
   }
 }
+/** OCV5-384: interactive Claude Code creates a new project directory 0755, which the native
+ * transcript inspection refuses, so a fresh session never got a native pointer. */
+async function proveFreshNativeProject(): Promise<void> {
+  const plans = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[1])).href) as {
+    makeBoxTextPlan: (input: Record<string, unknown>) => { stageInputs: { args: string[] }[];
+      cleanup: { args: string[] }; discardNativeCleanup?: { args: string[] } };
+  };
+  const nonce = "c".repeat(24);
+  const plan = plans.makeBoxTextPlan({ body: { model: "box-api-claude-opus-5-5", max_tokens: 64, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "first" }] }] },
+    upstreamModel: "claude-opus-5-5", supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
+    maxOutputTokensLimit: 64, runNonce: nonce, leaseEpoch: "d".repeat(32), nativePersistence: true });
+  if (plan.stageInputs[0]?.args[4] !== `/home/box/.claude/projects/-tmp-ocv5-289-run-${nonce}`
+    || plan.cleanup.args[4] !== "" || plan.discardNativeCleanup?.args[4] !== "") {
+    fail("FRESH_NATIVE_PROJECT");
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -1039,6 +1057,8 @@ async function workerMain(expectSha: string): Promise<void> {
   if (!COMPACTION_BINDING.startsWith("[ocv5-296-compaction] PASS")) fail("COMPACTION_BINDING");
   await proveSystemHeader();
   await proveRestageContext();
+  await proveFreshNativeProject();
+  if (!FRESH_PROJECT_BINDING.startsWith("[ocv5-384-fresh-native-project] PASS")) fail("FRESH_PROJECT_BINDING");
   if (!RESTAGE_BINDING.startsWith("[ocv5-384-restage-context] PASS")) fail("RESTAGE_BINDING");
   if (!SYSTEM_HEADER_BINDING.startsWith("[ocv5-381-system-header] PASS")) fail("SYSTEM_HEADER_BINDING");
   const api = await load();

@@ -38,9 +38,11 @@ st=os.fstat(fd)
 if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_nlink!=1:raise SystemExit(126)
 out=[];seen_user=False;budget=64*1024*1024
 with os.fdopen(fd,'rb') as f:
- for raw in f:
+ while True:
+  raw=f.readline(min(budget,16*1024*1024)+1)
+  if not raw:break
   budget-=len(raw)
-  if budget<0:out=[];break
+  if budget<0 or (len(raw)>16*1024*1024 and not raw.endswith(b'\n')):out=[];break
   try:rec=json.loads(raw)
   except ValueError:continue
   if not isinstance(rec,dict):continue

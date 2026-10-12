@@ -378,8 +378,14 @@ export async function runBoxToolFirstRound(input: {
         let records: Record<string, unknown>[] | null = null;
         for (const source of sources) {
           if (source.cliVersion !== target.cliVersion) continue;
-          const read = await run(makeBoxTranscriptAttachmentsRead(source), 10_000);
-          records = parseBoxTranscriptAttachments(read.stdout);
+          try {
+            const read = await run(makeBoxTranscriptAttachmentsRead(source), 10_000);
+            records = parseBoxTranscriptAttachments(read.stdout);
+          } catch (error) {
+            if (signal.aborted || error instanceof BoxToolFirstRoundError
+              && error.code === "BOX_TOOL_ABORTED") throw error;
+            records = null; // this transcript is gone or unreadable: try the next one
+          }
           if (records && records.length > 0) break;
         }
         if (records && records.length > 0) {
