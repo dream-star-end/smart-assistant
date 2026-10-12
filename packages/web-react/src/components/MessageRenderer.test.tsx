@@ -4210,6 +4210,16 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
       .filter((b) => b.closest("[data-testid=assistant-footer]") !== null)).toHaveLength(0);
   });
 
+  test("a 从断点继续 control row whose client message id differs from its row id still joins the turn (Codex r2)", () => {
+    renderTurn([user,
+      mk("assistant", { id: "a-look", text: "我先看截图", _clientMessageId: user.id, ts: 2000 }),
+      mk("user", { id: "row-r", text: "CONTROL_ROW", _clientMessageId: "u-r", _recoveryOfClientMessageId: user.id,
+        _recoveryMode: "checkpoint", _automaticRecovery: false, ts: 2001 }),
+      mk("assistant", { id: "a-final", text: "最终答案", _clientMessageId: "u-r", ts: 2002 })]);
+    expect(screen.queryAllByRole("button", { name: "复制" })
+      .filter((b) => b.closest("[data-testid=assistant-footer]") !== null)).toHaveLength(1);
+  });
+
   test("a turn whose retries end on an error: no copy / more row on any text before it", () => {
     renderTurn([user, ...attempt1, child(true), ...attempt2("error")]);
     expect(screen.queryAllByRole("button", { name: "复制" })
