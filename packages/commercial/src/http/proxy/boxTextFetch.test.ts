@@ -753,7 +753,7 @@ for (const fast of ["0", "1"]) test(`box-claude-* launch the staged interactive 
     await assert.rejects(bare.service.fetch(interactive), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
     assert.deepEqual(bare.stages, []);
   } finally {
-    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_FAST_NATIVE");
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
