@@ -123,6 +123,7 @@ import type {
   DeclarativeManagementResponse,
   DeclarativeOauthStartResult,
   KnowledgePlanetSetupView,
+  LocalPlugin,
   PluginManagementResponse,
   KnowledgePlanetAutomationControl,
   KnowledgePlanetAutomationGroup,
@@ -4232,6 +4233,17 @@ export const api = {
     ).then(() => undefined),
 
   // ── 通用 Plugin 运行时（账号授权与隔离执行）────────────────────────────
+
+  /** 本机插件（随平台基线下发、在你的容器里运行，如同花顺行情）+ 启用状态（OCV5-383）。 */
+  getLocalPlugins: (a: AuthSession): Promise<{ plugins: LocalPlugin[] }> =>
+    jsonOrThrow<{ plugins: LocalPlugin[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/plugins/local", {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 
   getPluginManagement: (a: AuthSession): Promise<PluginManagementResponse> =>
     jsonOrThrow<PluginManagementResponse>(
