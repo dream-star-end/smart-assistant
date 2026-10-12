@@ -124,7 +124,7 @@ import { validateBoxRequest } from "./boxRequestGate.js";
 import { waitForBoxReplay } from "./boxReplayWait.js";
 import { boxRequestTailShape, prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
-import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -520,12 +520,12 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
-      // `box-api-` 前缀不是放行。它只让可能走受信 Box 的请求先活过 legacy
+      // `box-api-` / `box-claude-` 前缀不是放行。它只让可能走受信 Box 的请求先活过 legacy
       // 8/16,好把签名和 catalog 路由判完。判完仍不是 Box / 无能力 / 未就绪
       // 的,下面会按 legacy 拒绝。其它模型在进 gate 前就受原预算。
       const deferLegacyUntilVerifiedBox = deps.modelCatalog != null
         && deps.modelAuthorityEnforce === true
-        && body.model.startsWith("box-api-");
+        && isBoxRouteModelName(body.model);
       const rejectOverBudget = (budget: typeof PROXY_BYTE_BUDGET_LEGACY): boolean => {
         try {
           enforceVerifiedProxyBudget(body, rawBodyBytes, budget);
@@ -545,7 +545,7 @@ export function makeAnthropicProxyHandler(
       // A non-streaming request is never a fresh paid model dispatch. Only
       // Box can use it to retrieve the exact prior round; reject it before
       // Cursor external (which branches off ahead of the regular provider).
-      if (body.stream === false && !body.model.startsWith("box-api-")) {
+      if (body.stream === false && !isBoxRouteModelName(body.model)) {
         incrAnthropicProxyReject("bad_body");
         sendJsonError(res, 400, "BAD_BODY", "invalid request body", requestId);
         return;
