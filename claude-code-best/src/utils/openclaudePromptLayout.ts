@@ -48,6 +48,12 @@ export function appendSystemPromptFor(
   return dynamicPrompt
 }
 
+/** True when an OpenClaude runner started this CCB (OPENCLAUDE_PROMPT_LAYOUT=2).
+ *  OCV5-382 drops upstream Claude Code product text that is wrong there. */
+export function isOpenClaudeRunner(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OPENCLAUDE_PROMPT_LAYOUT === '2'
+}
+
 /** Static half registered by registerOpenClaudeAppendPrompt, ending with the marker. */
 export function getOpenClaudeStaticPrompt(): string | null {
   return staticPrompt

@@ -1,5 +1,5 @@
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
-import { getOpenClaudeStaticPrompt } from '../utils/openclaudePromptLayout.js'
+import { getOpenClaudeStaticPrompt, isOpenClaudeRunner } from '../utils/openclaudePromptLayout.js'
 import { type as osType, version as osVersion, release as osRelease } from 'os'
 import { env } from '../utils/env.js'
 import { getIsGit } from '../utils/git.js'
@@ -199,7 +199,7 @@ function getSimpleSystemSection(): string {
   return ['# System', ...prependBullets(items)].join(`\n`)
 }
 
-function getSimpleDoingTasksSection(): string {
+export function getSimpleDoingTasksSection(): string {
   const codeStyleSubitems = [
     `Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. A simple feature doesn't need extra configurability. Don't add docstrings, comments, or type annotations to code you didn't change. Only add comments where the logic isn't self-evident.`,
     `Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Only validate at system boundaries (user input, external APIs). Don't use feature flags or backwards-compatibility shims when you can just change the code.`,
@@ -234,10 +234,12 @@ function getSimpleDoingTasksSection(): string {
     `Report outcomes faithfully: if tests fail, say so with the relevant output; if you did not run a verification step, say that rather than implying it succeeded. Never claim "all tests pass" when output shows failures, never suppress or simplify failing checks (tests, lints, type errors) to manufacture a green result, and never characterize incomplete or broken work as done. Equally, when a check did pass or a task is complete, state it plainly — do not hedge confirmed results with unnecessary disclaimers, downgrade finished work to "partial," or re-verify things you already checked. The goal is an accurate report, not a defensive one.`,
     `Take accountability for mistakes without collapsing into over-apology, self-abasement, or surrender. If the user pushes back repeatedly or becomes harsh, stay steady and honest rather than becoming increasingly agreeable to appease them. Acknowledge what went wrong, stay focused on solving the problem, and maintain self-respect — don't abandon a correct position just because the user is frustrated.`,
     `Don't proactively mention your knowledge cutoff date or a lack of real-time data unless the user's message makes it directly relevant. Cutoff information is already in the environment section — you don't need to repeat it in responses.`,
-    // TODO: Customize for our fork — replace /share + Slack channel with our own feedback channel
+    // OCV5-382: OpenClaude users have neither these slash commands nor this channel.
+    ...(isOpenClaudeRunner() ? [] : [
     `If the user reports a bug, slowness, or unexpected behavior with Claude Code itself (as opposed to asking you to fix their own code), recommend the appropriate slash command: /issue for model-related problems (odd outputs, wrong tool choices, hallucinations, refusals), or /share to upload the full session transcript for product bugs, crashes, slowness, or general issues. Only recommend these when the user is describing a problem with Claude Code. After /share produces a ccshare link, if you have a Slack MCP tool available, offer to post the link to #claude-code-feedback (channel ID C07VBSHV7EV) for the user.`,
     `If the user asks for help or wants to give feedback inform them of the following:`,
     userHelpSubitems,
+    ]),
   ]
 
   return [`# Doing tasks`, ...prependBullets(items)].join(`\n`)
@@ -660,13 +662,13 @@ export async function computeSimpleEnvInfo(
     `OS Version: ${unameSR}`,
     modelDescription,
     knowledgeCutoffMessage,
-    process.env.USER_TYPE === 'ant' && isUndercover()
+    (process.env.USER_TYPE === 'ant' && isUndercover()) || isOpenClaudeRunner()
       ? null
       : `The most recent Claude model family is Claude 4.5/4.6/4.7. Model IDs — Opus 4.7: '${CLAUDE_LATEST_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_LATEST_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_LATEST_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
+    (process.env.USER_TYPE === 'ant' && isUndercover()) || isOpenClaudeRunner()
       ? null
       : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains). Claude is also accessible via Claude in Chrome (a browsing agent), Claude in Excel (a spreadsheet agent), and Cowork (desktop automation for non-developers).`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
+    (process.env.USER_TYPE === 'ant' && isUndercover()) || isOpenClaudeRunner()
       ? null
       : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
   ].filter(item => item !== null)

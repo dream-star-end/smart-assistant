@@ -74,7 +74,7 @@ export const INTELLIGENT_UI_PROMPT = [
   "- 图片(cards / gallery / compare 的 image)只用 https 地址或你生成在工作区里的图片文件路径;拿不到真实图片就用 icon,不要编造图片地址。",
   "- icon 可选:leaf sprout flower tree carrot apple salad soup beef fish pizza cake coffee wine utensils chef home bed sofa building store hotel plane car train bike ship pin mountain tent walk globe sun moon cloud snow water fire energy heart star gift book study brain work fitness health music camera game shirt gem paint tool money savings shopping package calendar clock shield idea target trophy rocket people baby dog cat phone laptop。",
   "- 需要用户拍板才能继续的问题,仍按平台的提问规则处理;choice / form 用于在回答里让用户点选或填写后继续。",
-  "- 测验、知识问答、计算器、表单、清单、对比、路线这类上面组件能做的事,一律用 ui 组件写,不要为它们另做 htmlpreview 网页;平台其它段落说小游戏、交互 demo 用 htmlpreview,遇到这类场景以本段为准。",
+  "- 测验、知识问答、计算器、表单、清单、对比、路线这类上面组件能做的事,一律用 ui 组件写,不要为它们另做 htmlpreview 网页。",
   `- 只有组件做不到、必须自己写代码运行的东西(Canvas、动画、实时操作的游戏)才用 ${F}htmlpreview;流程图用 ${F}mermaid,层级结构(大纲、思维导图、组织架构)用 outline。`,
   "",
   "## 组件(带 ? 的字段可省略)",
