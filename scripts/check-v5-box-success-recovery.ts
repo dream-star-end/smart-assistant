@@ -46,6 +46,7 @@ const BEHAVIOR = [
   "unknown worker_complete closed through reconcileBatch to a readable capsule and this-round usage",
   "intermediate handoff stayed pending without capsule or CAS",
   "staged history and system use current catalog aliases; rejected first round is proven failed with zero charge, idle failed, and next admission succeeds",
+  "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -934,9 +935,43 @@ async function runBusiness(root: string, ledger: string, db: DbConfig): Promise<
     assert.equal(held?.box, "unknown");
     assert.equal(held?.replay ?? null, null);
     assert.deepEqual(writes, ["gate-ok"]);
+    // OCV5-384: cleanup claimed before the first round attached the native pointer, so every
+    // next turn re-staged the conversation (live selfhost 2026-10-12: each turn 2 rewrote ~36k).
+    const nativeNonce = "e".repeat(24);
+    const nativeEpoch = "f".repeat(32);
+    const nativeProof = { runNonce: nativeNonce, leaseEpoch: nativeEpoch, keeperPid: 101, cliPid: 102,
+      reason: "worker_complete", revision: 1 };
+    const nativeSession = "12345678-1234-4123-8123-123456789abc";
+    const nativeCwd = `/tmp/ocv5-289-run-${nativeNonce}`;
+    await client.query(`INSERT INTO request_finalize_journal
+      (request_id,user_id,state,ctx,precheck_credits) VALUES ('gate-native',900000232,'committed',$1::jsonb,0)`,
+    [JSON.stringify({ model: "box-api-claude-opus-5-5", boxInvocationRecovery: "v1",
+      boxInvocationMode: "detached_tool", boxAccountId: "20", boxRunNonce: nativeNonce,
+      boxLeaseEpoch: nativeEpoch, boxSessionId: "gate-native", boxTurnKey: "a".repeat(64),
+      boxCatalogHash: catalog.bindingSha256, boxDetachedRunnerHash: RUNNER_HASH, boxState: "terminal",
+      boxLaunchPermit: true, boxTerminalProof: nativeProof,
+      boxUsage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      boxNativeSessionId: nativeSession, boxNativeCliCwd: nativeCwd })]);
+    const journal = new journalMod.BoxDurableJournal(same) as {
+      listRemoteCleanupCandidates: (limit: number) => Promise<Array<{ requestId: string }>>;
+      claimRemoteCleanup: (input: unknown) => Promise<boolean>;
+      attachNativePointer: (input: unknown) => Promise<boolean>;
+    };
+    const listed = async () => (await journal.listRemoteCleanupCandidates(20)).map((c) => c.requestId);
+    assert.equal((await listed()).includes("gate-native"), false, "fresh run without pointer is not cleaned yet");
+    assert.equal(await journal.claimRemoteCleanup({ requestId: "gate-native", uid: 900_000_232n, accountId: 20n,
+      runNonce: nativeNonce, leaseEpoch: nativeEpoch, proof: nativeProof }), false, "claim waits for the pointer");
+    const pointer = { version: 1, accountId: "20", upstreamModel: MODEL, cliVersion: "2.1.296",
+      nativeSessionId: nativeSession, cliCwd: nativeCwd, transcriptSha256: "1".repeat(64),
+      contextHashBeforeFinal: "2".repeat(64), assistantContentHash: "3".repeat(64),
+      catalogHash: catalog.bindingSha256, expiresAtMs: Date.now() + 60 * 60 * 1000 };
+    assert.equal(await journal.attachNativePointer({ requestId: "gate-native", uid: 900_000_232n,
+      accountId: 20n, proof: nativeProof, pointer }), true, "the pointer attaches");
+    assert.equal((await listed()).includes("gate-native"), true, "with its pointer the run is cleaned as usual");
     emit(BEHAVIOR[0]!);
     emit(BEHAVIOR[1]!);
     await runToolNameBusiness(root, client!, capsuleParent);
+    emit(BEHAVIOR[3]!);
   } finally {
     try { client?.release(); } catch { /* already released */ }
     if (pool) await pool.end();
