@@ -14,7 +14,15 @@ export interface BoxNativePointer {
   readonly assistantContentHash: string;
   readonly catalogHash: string | null;
   readonly expiresAtMs: number;
+  /** OCV5-383: set when the transcript was staged with the per-session prompt
+   * part in its first user message (static-first layout). Absent = legacy. */
+  readonly promptLayout?: typeof BOX_PROMPT_LAYOUT_STATIC_FIRST;
 }
+
+export const BOX_PROMPT_LAYOUT_STATIC_FIRST = "static-first-v1" as const;
+const POINTER_KEYS = ["accountId", "assistantContentHash", "catalogHash", "cliCwd",
+  "cliVersion", "contextHashBeforeFinal", "expiresAtMs", "nativeSessionId",
+  "transcriptSha256", "upstreamModel", "version"];
 
 const HEX64 = /^[a-f0-9]{64}$/;
 const CLI_VERSION = /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/;
@@ -26,9 +34,10 @@ export function parseBoxNativePointer(value: unknown, nowMs = Date.now(),
   if (!Number.isFinite(nowMs)) return null;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const item = value as Record<string, unknown>;
-  if (Object.keys(item).sort().join(",") !== ["accountId", "assistantContentHash",
-    "catalogHash", "cliCwd", "cliVersion", "contextHashBeforeFinal", "expiresAtMs",
-    "nativeSessionId", "transcriptSha256", "upstreamModel", "version"].join(",")) return null;
+  const keys = Object.keys(item).sort().join(",");
+  if (keys !== POINTER_KEYS.join(",")
+    && keys !== [...POINTER_KEYS, "promptLayout"].sort().join(",")) return null;
+  if ("promptLayout" in item && item.promptLayout !== BOX_PROMPT_LAYOUT_STATIC_FIRST) return null;
   if (item.version !== 1 || typeof item.cliVersion !== "string" || !CLI_VERSION.test(item.cliVersion)
     || typeof item.accountId !== "string" || !/^[1-9][0-9]{0,18}$/.test(item.accountId)
     || typeof item.upstreamModel !== "string"

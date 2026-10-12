@@ -38,3 +38,11 @@ test("malformed, expired and path-swapped native pointers are cache misses", () 
     "cleanup must still recognize an expired transcript pointer");
   assert.equal(parseBoxNativePointer({ ...valid, upstreamModel: "claude-." }, now), null);
 });
+
+test("OCV5-383: the static-first prompt layout is the only optional key", () => {
+  assert.deepEqual(parseBoxNativePointer({ ...valid, promptLayout: "static-first-v1" }, now),
+    { ...valid, promptLayout: "static-first-v1" });
+  assert.equal(parseBoxNativePointer({ ...valid, promptLayout: "other" }, now), null);
+  assert.equal(parseBoxNativePointer({ ...valid, promptLayout: null }, now), null);
+  assert.equal(parseBoxNativePointer({ ...valid, extra: 1 }, now), null);
+});

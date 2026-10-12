@@ -24,7 +24,8 @@ import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { randomBytes } from "node:crypto";
-import { explainBoxNativeHistory } from "./boxNativeHistory.js";
+import { explainBoxNativeHistory, withPromptLayout } from "./boxNativeHistory.js";
+import { boxPromptLayoutOf } from "./boxMessagesMapper.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -325,6 +326,9 @@ export async function runBoxToolFirstRound(input: {
         // a transcript written by another CLI build is not resumed (cache miss)
         : candidate.pointer.cliVersion !== target.cliVersion ? "build"
         : !pointerCatalog ? "catalog"
+        // OCV5-383: a transcript staged with the other prompt layout would lose
+        // (or duplicate) the per-session context on resume.
+        : (candidate.pointer.promptLayout ?? null) !== boxPromptLayoutOf(input.canonicalBody) ? "layout"
         : explainBoxNativeHistory(input.canonicalBody, candidate.pointer);
       deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
         reason: miss, cliVersion: String(target.cliVersion) });
@@ -371,7 +375,7 @@ export async function runBoxToolFirstRound(input: {
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
-          cliCwd: plan.cliCwd,
+          cliCwd: plan.cliCwd, ...withPromptLayout(input.canonicalBody),
           ...(boxCliNativeResumeVerified(launchCliVersion)
             ? { cliVersion: launchCliVersion } : {}) } } : {}) });
     const pendingAdmission = waitingForBoxCapacity(async () => {
@@ -553,7 +557,8 @@ export async function runBoxToolFirstRound(input: {
               contextHashBeforeFinal: contextHash,
               assistantContentHash: final.assistantContentHash,
               catalogHash: plan.catalog.bindingSha256,
-              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000,
+              ...withPromptLayout(input.canonicalBody) });
             if (candidate && await deps.journal.attachNativePointer({
               requestId: input.requestId, uid: input.uid,
               accountId: target.accountId, proof, pointer: candidate })) {

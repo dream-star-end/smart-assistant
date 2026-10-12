@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { appendSystemPromptFor } from './utils/openclaudePromptLayout.js'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 import { randomUUID } from 'crypto'
 import last from 'lodash-es/last.js'
@@ -328,10 +329,13 @@ export class QueryEngine {
         ? await loadMemoryPrompt()
         : null
 
+    const basePrompt =
+      customPrompt !== undefined ? [customPrompt] : defaultSystemPrompt
+    const append = appendSystemPromptFor(basePrompt, appendSystemPrompt)
     const systemPrompt = asSystemPrompt([
-      ...(customPrompt !== undefined ? [customPrompt] : defaultSystemPrompt),
+      ...basePrompt,
       ...(memoryMechanicsPrompt ? [memoryMechanicsPrompt] : []),
-      ...(appendSystemPrompt ? [appendSystemPrompt] : []),
+      ...(append ? [append] : []),
     ])
 
     // Register function hook for structured output enforcement

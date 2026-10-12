@@ -9,6 +9,7 @@
  * import from here (QueryEngine.ts, cli/print.ts).
  */
 
+import { appendSystemPromptFor } from './openclaudePromptLayout.js'
 import type { Command } from '../commands.js'
 import { getSystemPrompt } from '../constants/prompts.js'
 import { getSystemContext, getUserContext } from '../context.js'
@@ -124,12 +125,10 @@ export async function buildSideQuestionFallbackParams({
       customSystemPrompt,
     })
 
-  const systemPrompt = asSystemPrompt([
-    ...(customSystemPrompt !== undefined
-      ? [customSystemPrompt]
-      : defaultSystemPrompt),
-    ...(appendSystemPrompt ? [appendSystemPrompt] : []),
-  ])
+  const base =
+    customSystemPrompt !== undefined ? [customSystemPrompt] : defaultSystemPrompt
+  const append = appendSystemPromptFor(base, appendSystemPrompt)
+  const systemPrompt = asSystemPrompt([...base, ...(append ? [append] : [])])
 
   // Strip in-progress assistant message (stop_reason === null) — same guard
   // as btw.tsx. The SDK can fire side_question mid-turn.
