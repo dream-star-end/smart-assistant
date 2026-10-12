@@ -62,6 +62,14 @@ export interface BoxInteractiveHostAsset {
 
 /** Plan input for a canonical model's Box runner. A model that runs interactively never falls
  * back to `claude -p`: without the host its request is refused. */
+/** The interactive runner (box-claude-*: interactive Claude Code on the Box) is a separate approval
+ * per installation: the egress loads its host only with OC_BOX_INTERACTIVE_RUNNER=1. Without it every
+ * interactive model is refused (BOX_INTERACTIVE_HOST_UNAVAILABLE) whatever the catalog says, and no
+ * `claude -p` model is affected. */
+export function boxInteractiveRunnerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OC_BOX_INTERACTIVE_RUNNER === "1";
+}
+
 export function boxRunnerPlanInput(canonicalModel: string, host: BoxInteractiveHostAsset | undefined):
   { interactiveHost?: BoxInteractiveHostAsset } {
   if (boxApiRunnerFor(canonicalModel) !== "interactive") return {};
