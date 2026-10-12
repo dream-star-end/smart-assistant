@@ -38,6 +38,9 @@ export interface BoxProfilePolicy {
   boxSpillLoad: number;
   /** Rank bonus for the default login (still hash-spread over users). */
   defaultBonus: number;
+  /** The default login is every user's first choice; the others only take what spills from it
+   * (quota, health, load). Off: the default login is only weighted (defaultBonus). */
+  defaultFirst?: boolean;
 }
 
 export const BOX_PROFILE_POLICY: BoxProfilePolicy = {
@@ -60,7 +63,8 @@ export function rankBoxProfiles(candidates: readonly BoxProfileCandidate[], affi
     const weight = Math.max(c.weight, 0.0001) * (c.isDefault ? policy.defaultBonus : 1);
     const u = unitHash([affinityKey, c.accountId.toString(), c.profile]);
     return { c, score: weight / -Math.log(u) };
-  }).sort((a, b) => b.score - a.score
+  }).sort((a, b) => (policy.defaultFirst ? Number(b.c.isDefault) - Number(a.c.isDefault) : 0)
+    || b.score - a.score
     || (a.c.accountId < b.c.accountId ? -1 : a.c.accountId > b.c.accountId ? 1 : 0)
     || a.c.profile.localeCompare(b.c.profile)).map((x) => x.c);
 }

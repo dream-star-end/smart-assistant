@@ -18,7 +18,8 @@ import { BoxProfileHealth } from "./boxProfileHealth.js";
 import { BOX_PROFILE_GUARD_REFUSED, makeBoxProfileGuard } from "./boxProfileDiscovery.js";
 import { scopeBoxExecToProfile } from "./boxProfileExec.js";
 import { boxLoginCandidates } from "./boxLoginCandidates.js";
-import { pickBoxProfile, type BoxProfileCandidate, type BoxProfilePolicy } from "./boxProfileScheduler.js";
+import { BOX_PROFILE_POLICY, pickBoxProfile, type BoxProfileCandidate,
+  type BoxProfilePolicy } from "./boxProfileScheduler.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -538,7 +539,11 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
     uidProxy: boxUnboundProxy(),
     profiles: { list: async (ids, scope) => scope === "all" ? listBoxProfiles(ids)
       : boxModelRouteLogins(await listBoxProfiles(ids)),
-      health: productionBoxProfileHealth() },
+      health: productionBoxProfileHealth(),
+      // An installation that keeps one login for itself and the others as backup (selfhost:
+      // cc2 first, cc1 shared with the commercial edition) turns this on.
+      ...(process.env.OC_BOX_LOGIN_DEFAULT_FIRST === "1"
+        ? { policy: { ...BOX_PROFILE_POLICY, defaultFirst: true } } : {}) },
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,
       { ...init, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>,

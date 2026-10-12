@@ -5,6 +5,7 @@ import type { AccountRow, AccountToken, CursorTokenSnapshot } from "../../accoun
 import { BoxAccountResolver, BoxAccountResolverError, boxModelRouteLogins, type BoxLoginScope } from "./boxAccountResolver.js";
 import type { BoxProfileRow } from "./boxClaudeProfileStore.js";
 import { BoxProfileHealth } from "./boxProfileHealth.js";
+import { BOX_PROFILE_POLICY, type BoxProfilePolicy } from "./boxProfileScheduler.js";
 
 const now = Date.now();
 const session = (subject: string) => `x.${Buffer.from(JSON.stringify({ sub: subject, type: "session",
@@ -26,7 +27,7 @@ const stored = (accountId: bigint, profile: string, over: Partial<BoxProfileRow>
   healthUpdatedAt: null, ...over });
 
 function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0,
-  scoped?: (rows: BoxProfileRow[], scope: BoxLoginScope) => BoxProfileRow[]) {
+  scoped?: (rows: BoxProfileRow[], scope: BoxLoginScope) => BoxProfileRow[], policy?: BoxProfilePolicy) {
   const clock = { t: now };
   const health = new BoxProfileHealth(() => clock.t);
   const launches: Array<{ account: string; config: string | null }> = [];
@@ -56,7 +57,7 @@ function fixture(accounts: bigint[], rows: BoxProfileRow[], random = 0,
       if (storeFails) throw new Error("db down");
       const own = current.filter((r) => ids.includes(r.accountId));
       return scoped ? scoped(own, scope) : own;
-    }, health, cacheMs: 0 },
+    }, health, cacheMs: 0, ...(policy ? { policy } : {}) },
     fetch: async (url, init) => {
       if (url.endsWith("/GetSandBoxRunState")) return Response.json({ state: "SAND_BOX_RUN_STATE_RUNNING" });
       if (url.endsWith("/EnsureSandBox")) return Response.json({ execDaemonUrl: `https://box${accountOf(init)}.example.cursorvm.com`,
@@ -352,4 +353,20 @@ test("a switch is due when the login's durable row (the other egress slot's read
   const placed = (await g.launch(uid, chat)).profile!;
   g.setRows([stored(20n, placed, { enabled: false }), stored(20n, placed === "default" ? "b" : "default")]);
   assert.equal(await g.resolver.chatMustMove(uid, "chat-rows"), true, "a deselected login cannot keep the chat");
+});
+
+test("selfhost cc2-first (OCV5-387): chats start on the default login account2 and switch to cc1 at 95%", async () => {
+  const rows = [stored(20n, "default", { isDefault: false }), stored(20n, "account2", { isDefault: true })];
+  const f = fixture([20n], rows, 0, undefined, { ...BOX_PROFILE_POLICY, defaultFirst: true });
+  for (const uid of uids.slice(0, 20)) {
+    assert.equal((await f.launch(uid, { loginScope: "all", stickyKey: `c-${uid}` })).profile, "account2");
+  }
+  const chat = { loginScope: "all" as const, stickyKey: "c-switch" };
+  assert.equal((await f.launch(7n, chat)).profile, "account2");
+  atUtil(f, "account2", 0.94);
+  assert.equal(await f.resolver.chatMustMove(7n, "c-switch"), false);
+  assert.equal((await f.launch(7n, chat)).profile, "account2", "below 95% the chat stays on cc2");
+  atUtil(f, "account2", 0.95);
+  assert.equal(await f.resolver.chatMustMove(7n, "c-switch"), true, "at 95% the switch (and its compaction) is due");
+  assert.equal((await f.launch(7n, chat)).profile, "default", "and it moves to cc1, the backup");
 });
