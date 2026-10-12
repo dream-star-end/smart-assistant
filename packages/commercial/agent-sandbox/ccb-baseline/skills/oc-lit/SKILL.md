@@ -87,3 +87,84 @@ oc-lit job-status <requestId>
 - 不打印/回显容器身份 token(`OPENCLAUDE_V3_CONTAINER_TOKEN`):不要 `echo`、`printenv`、`set -x`、`/proc/*/environ`。
 - 不尝试发现或猜测平台各源 API key —— 它们只在 master,容器里没有也不需要。
 - 失败(401/429/503)不要打印 token debug:401≠token 缺失;429 配额/频次过高,等几秒或减少检索;503 管理员临时关停,改用已有知识。
+
+## DeepXiv arXiv 全文 RAG(平台接口)
+
+<!-- deepxiv:start (rendered from literatureSkill.ts) -->
+# 平台技能: 文献检索 (arXiv via DeepXiv)
+
+你可以通过 **POST `/v3/literature/search`** 直接查 arXiv 全文 RAG 索引,
+用于回答用户的科研/技术问题前先核查最新文献。DeepXiv 上游凭证由平台托管,
+你**不需要**也**不应该**关心 API key — 但容器→master 这一跳需要带容器
+身份 bearer(下面会说明)。
+
+## ⚠️ Token 安全 — 严格遵守
+
+`OPENCLAUDE_V3_CONTAINER_TOKEN` 在每个容器启动时**一定**被平台注入,
+你不需要也不应该验证它是否存在,直接拼进 curl 即可。
+
+**严禁** 任何形式让该 env 的值出现在 stdout / stderr / 对话 UI:
+
+- 不要 `echo $OPENCLAUDE_V3_CONTAINER_TOKEN`、`printenv` / `env` / `set` / `printf $...`
+- 不要 `echo $... | head -c N`、`${VAR:0:N}` 字串切片 ——
+  即便截断也是泄漏(prefix + 容器编号 + 部分 secret 足以被复用攻击),**截断也不行**
+- 不要 `curl -v` / `curl --trace` / `curl --trace-ascii` 调试请求头
+- 不要 `set -x` / `bash -x` 让 shell 把展开后的命令回显
+- 不要读 `/proc/*/environ` 或 `/proc/self/environ`
+- 调用 **失败时也不要打印 token 来 debug**:401 不是 "token 缺失" 问题(env
+  一定有),通常是网络或服务端问题,只看 HTTP 状态码和 response body 即可
+
+curl 自己**不会**把 `-H` 头打印到 stdout(除非加 `-v`),所以直接 shell 展开即可,
+安全。
+
+## 调用
+
+```sh
+curl -sS -X POST "${ANTHROPIC_BASE_URL%/}/v3/literature/search" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${OPENCLAUDE_V3_CONTAINER_TOKEN}" \
+  -d '{"query": "<英文检索关键词>", "size": 10}' \
+  -w '\nHTTP_STATUS:%{http_code}\n'
+```
+
+如需查看 HTTP 状态码,**只允许** 加 `-w '\nHTTP_STATUS:%{http_code}\n'`
+(已在上面模板里);**严禁** 用 `-v` / `--trace` / `--trace-ascii` / `-i` /
+`--include` —— 这些会把请求头(含 Authorization)一并打印,等价于 token 泄漏。
+
+Base URL 必须用 `$ANTHROPIC_BASE_URL`(容器启动时由平台注入,指向容器→master
+的平台内部网关,与 anthropic `/v1/messages` 共用同一 listener)。**不要发明或
+猜测任何公网 API host**(容器 egress 拦不通,只能走 `$ANTHROPIC_BASE_URL`)。
+
+- 字段:`query` (string, 必填,建议英文 3~8 个术语);
+  `size` (int, 1~100, 可选, 默认 10)。
+- 鉴权:仅 `Authorization: Bearer ${OPENCLAUDE_V3_CONTAINER_TOKEN}`。
+  **不要** 加 `X-OC-Nonce` / `X-OC-Bridge-Nonce` 或任何其它 auth header —
+  那些属于完全不同的内部通道,本接口一律 401。
+
+返回 JSON `{ results: [{ title, abstract, authors, year, arxiv_id, ... }] }`,
+条目内容来自 arXiv 元数据 + DeepXiv RAG 摘要;`results` 可能为空数组。
+
+## 使用守则
+
+- **英文检索更有效**:中文 query 也能搜,但召回率明显低于英文关键词。
+  用户问中文问题时,先翻译核心术语再调用。
+- **不要把整段用户问题塞进 query**:DeepXiv 是关键词 + 语义混合检索,
+  3~8 个英文术语效果最佳。
+- **失败处理**:
+  - `401` —— **不要** 打印或检查 token 来 debug(env 一定有),直接告诉用户
+    「文献检索鉴权异常」,转用你已有的知识回答。
+  - `429 quota_exceeded` —— 平台当天检索配额用尽,**不要重试**,直接告诉
+    用户「今天检索配额已用尽」,转用你已有的知识回答。
+  - `429 rate_limited` —— 短时频次过高,等几秒再试;同会话内一般不要连续
+    超过 3 次检索。
+  - `503 disabled` —— 管理员临时关停此能力,改用其它知识源。
+  - `502/504 upstream_*` —— DeepXiv 上游问题,**最多重试 1 次**,失败就放弃。
+- **结果引用**:把 arxiv_id 一并展示给用户(格式 `arXiv:1234.5678`),
+  方便用户回查原文。不要瞎编 DOI / arxiv 编号。
+
+## 何时不该调用
+
+- 用户问的是闲聊、代码题、产品使用 —— 文献检索没意义。
+- 用户已经给了具体论文链接 / arxiv ID —— 直接读不需要搜。
+- 你已经能基于自身知识自信回答,且用户没要求「查最新文献」。
+<!-- deepxiv:end -->

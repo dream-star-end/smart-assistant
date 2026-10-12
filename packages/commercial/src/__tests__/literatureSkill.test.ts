@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 /**
  * literatureSkill — renderLiteratureSkillContent 行为契约。
  *
@@ -23,7 +25,7 @@
  */
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { renderLiteratureSkillContent } from "../literatureSkill.js";
+import { renderLiteratureSkillContent, LITERATURE_SKILL_POINTER, DEEPXIV_SECTION_START, DEEPXIV_SECTION_END, DEEPXIV_SKILL_RENDER_CONFIG } from "../literatureSkill.js";
 
 describe("renderLiteratureSkillContent", () => {
   test("contains heading + POST path + JSON body shape", () => {
@@ -186,5 +188,30 @@ describe("renderLiteratureSkillContent", () => {
       default_size: 10,
     });
     assert.equal(a, b);
+  });
+});
+
+describe("OCV5-382: SKILLS_LITERATURE is a pointer; the full text lives in oc-lit", () => {
+  test("pointer sends models to oc-lit first and never carries the endpoint recipe", () => {
+    assert.match(LITERATURE_SKILL_POINTER, /^# 平台技能: 文献检索/);
+    assert.match(LITERATURE_SKILL_POINTER, /skill_view\("oc-lit"\)/);
+    assert.match(LITERATURE_SKILL_POINTER, /DeepXiv/);
+    assert.equal(LITERATURE_SKILL_POINTER.includes("OPENCLAUDE_V3_CONTAINER_TOKEN"), false);
+    assert.equal(LITERATURE_SKILL_POINTER.includes("curl"), false);
+    assert.ok(LITERATURE_SKILL_POINTER.length < 400);
+  });
+
+  test("oc-lit SKILL.md carries the rendered DeepXiv text verbatim", () => {
+    const skill = readFileSync(
+      fileURLToPath(new URL("../../agent-sandbox/ccb-baseline/skills/oc-lit/SKILL.md", import.meta.url)),
+      "utf8",
+    );
+    const start = skill.indexOf(DEEPXIV_SECTION_START);
+    const end = skill.indexOf(DEEPXIV_SECTION_END);
+    assert.ok(start > 0 && end > start, "DeepXiv section markers missing");
+    assert.equal(
+      skill.slice(start + DEEPXIV_SECTION_START.length + 1, end - 1),
+      renderLiteratureSkillContent(DEEPXIV_SKILL_RENDER_CONFIG),
+    );
   });
 });
