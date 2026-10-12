@@ -143,6 +143,12 @@ const STATIC_PROVIDER_IDS: ReadonlySet<string> = new Set<StaticProviderId>([
  * hint 里的 providerId 不认识 → 抛 UnroutableProviderError(handler → 503):静默回落
  * OAuth 会把"配错 provider 的新模型"发到 Anthropic 账号池上烧真钱。
  */
+/** A name the Box model route may serve: `box-api-*` (claude -p) or `box-claude-*` (interactive runner,
+ * OCV5-378). Only a prefix test for the pre-catalog fences; routing itself reads the signed catalog. */
+export function isBoxRouteModelName(model: string): boolean {
+  return model.startsWith("box-api-") || model.startsWith("box-claude-");
+}
+
 export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): UpstreamRoute {
   if (hint) {
     const pid = hint.providerId;
@@ -163,9 +169,7 @@ export function selectUpstreamRoute(model: string, hint?: CatalogRouteHint): Ups
   }
   // Without an enforced catalog, a known Box API model must not fall through
   // to the Anthropic OAuth pool merely because it is not a static-key model.
-  if (model.startsWith("box-api-") || model.startsWith("box-claude-")) {
-    throw new UnroutableProviderError("box_cli_authority_required");
-  }
+  if (isBoxRouteModelName(model)) throw new UnroutableProviderError("box_cli_authority_required");
   const provider = findRouteProviderForModel(model);
   if (!provider) return { kind: "oauth" };
   const upstreamModel = provider.upstreamModelForRequest?.(model);

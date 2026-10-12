@@ -391,7 +391,7 @@ function goodId(input: BoxJournalAdmission): void {
       || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`
       || (input.nativeStart.cliVersion !== undefined
         && !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(input.nativeStart.cliVersion))))
-    || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
+    || !/^(?:box-(?:api-)?)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
 }
@@ -619,7 +619,7 @@ export class BoxDurableJournal implements BoxJournalPort {
     canonicalModel: string }): Promise<BoxNativeCandidate | null> {
     if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
       || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
-      || !/^(?:box-api-)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return null;
+      || !/^(?:box-(?:api-)?)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return null;
     const found = await this.pool.query<{ request_id: string;
       ctx: Record<string, unknown> }>(
       `SELECT request_id,ctx FROM request_finalize_journal
