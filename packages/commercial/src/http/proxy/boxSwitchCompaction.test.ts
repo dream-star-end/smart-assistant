@@ -7,6 +7,7 @@ import {
   BOX_SWITCH_COMPACT_MODEL,
   BOX_SWITCH_TRANSCRIPT_MAX_CHARS,
   BoxSwitchStore,
+  boxSwitchCompactionEnabled,
   applyBoxSwitchRecord,
   boxSwitchBoundary,
   boxSwitchPrefixDigest,
@@ -233,4 +234,11 @@ test("the compaction row is relabelled to the chat's final session id, and only 
   assert.match(seen[0]!.sql, /UPDATE usage_records SET session_id = \$3\s+WHERE user_id = \$1 AND request_id = \$2/);
   assert.deepEqual(seen[0]!.params, ["3", "req-1-switch-compact", "g385chat"]);
   assert.doesNotMatch(seen[0]!.sql, /cost|credit|ledger|journal/i, "statistics only");
+});
+
+test("the switch compaction is off unless the installation sets OC_BOX_SWITCH_COMPACTION=1", () => {
+  assert.equal(boxSwitchCompactionEnabled({}), false);
+  assert.equal(boxSwitchCompactionEnabled({ OC_BOX_SWITCH_COMPACTION: "0" }), false);
+  assert.equal(boxSwitchCompactionEnabled({ OC_BOX_SWITCH_COMPACTION: "true" }), false);
+  assert.equal(boxSwitchCompactionEnabled({ OC_BOX_SWITCH_COMPACTION: "1" }), true);
 });

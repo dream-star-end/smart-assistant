@@ -22,7 +22,7 @@
  * OC_EGRESS_SECRET,任一缺失拒启(比"静默半配跑起来"好排查)。
  */
 
-import { BoxSwitchStore } from "../http/proxy/boxSwitchCompaction.js";
+import { BoxSwitchStore, boxSwitchCompactionEnabled } from "../http/proxy/boxSwitchCompaction.js";
 import { boxApiModelById } from "@openclaude/protocol";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -394,8 +394,8 @@ export async function startEgress(): Promise<void> {
     }) : undefined;
   const boxModel = boxTextModel ? {
     toolBridgeReady: boxToolModel !== undefined,
-    // A running chat that must leave its login is compacted by Haiku before it moves.
-    ...(boxResolver ? { switchCompaction: { store: new BoxSwitchStore(),
+    // A running chat that must leave its login is compacted by Haiku before it moves (opt-in).
+    ...(boxResolver && boxSwitchCompactionEnabled() ? { switchCompaction: { store: new BoxSwitchStore(),
       chatMustMove: (uid: bigint, stickyKey: string) => boxResolver.chatMustMove(uid, stickyKey),
       fetch: (args: Parameters<BoxTextFetch["fetch"]>[0]) => boxTextModel.fetch(args) } } : {}),
     fetch: (args: Parameters<BoxTextFetch["fetch"]>[0] & {

@@ -36,6 +36,13 @@ import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
 import { BOX_TOOL_MAX_WALL_MS } from "./boxToolCapacity.js";
 import { estimateMaxCostBothSides, pipeStreamWithUsageCapture, type ProxyBody } from "./shared.js";
 
+/** The compaction is a billed model call the user did not type, so an installation turns it on
+ * explicitly (OC_BOX_SWITCH_COMPACTION=1 on the egress). Unset: a chat that has to move continues
+ * with its full context, exactly as before this feature. */
+export function boxSwitchCompactionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OC_BOX_SWITCH_COMPACTION === "1";
+}
+
 export const BOX_SWITCH_COMPACT_MODEL = "box-claude-haiku-5-5";
 /** Below this the whole conversation costs less to rewrite on the new login than to compact. */
 export const BOX_SWITCH_COMPACT_MIN_TOKENS = 30_000;
