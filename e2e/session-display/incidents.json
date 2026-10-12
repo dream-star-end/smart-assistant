@@ -7208,6 +7208,9 @@
       "severity": "P1",
       "symptom": "box-api-claude-*（路线 A，两版）回合从不输出智能 UI 和输入预测块，也没有 OpenClaude 的其它系统指令。根因：CCB 的系统提示第 0 块是 `x-anthropic-billing-header: …`，Box 映射把所有系统块拼成一个 --system-prompt-file，文件以该头开头；Claude Code CLI 2.1.293/2.1.296 把以该头开头的系统块当作计费归属头整块丢弃，模型只收到 CLI 自带的环境段。2026-10-12 商业生产 Haiku 探针确认（系统提示只有 Environment 等标题）。起始时间未能确定（Box 上现存 CLI 版本都在 10-10 安装）。修复：systemText 去掉计费头块（字符串形式去掉首行头），其余块原样保留。",
       "rootFixCommit": "9f0d8f58",
+      "coverageCommits": [
+        "9ed2cfe1"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -7227,6 +7230,9 @@
       "severity": "P1",
       "symptom": "Box 路线（box-claude-* 交互 runner 与 box-api-claude-*）会话第 2 轮起不走原生 resume（box_native_decision miss no_candidate），每轮重建合成 transcript，静态前缀之后的整段历史按缓存写价重写。2026-10-12 个人版线上（uid 3，cc2，Haiku）每个会话第 1 轮都没有 native pointer，第 2 轮重写约 36k token。根因：first round 在 terminal 证明落库后、做完远端 transcript 检查才 attachNativePointer；后台清理 worker 在这段时间里 claim 了清理，attach 因 boxRemoteCleanupClaimed=true 被拒且静默。修复：已记录 native start、还没有 pointer 的刚完成运行，要等 pointer 写入或最后更新后 20 秒，才成为清理候选、才可 claim。 更正（同日复测）：修复上线后会话第 1 轮仍无 pointer，实际原因是交互模式 CLI 新建 project 目录为 0755、native 检查只接受 0700（见 INC-20261012-BOX-FRESH-NATIVE-PROJECT-MODE）；本条修复的竞态窗口真实存在但这次未被观测到，不是第 1 轮缺 pointer 的原因。",
       "rootFixCommit": "b6e83550",
+      "coverageCommits": [
+        "4b0c0f83"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
@@ -7241,6 +7247,9 @@
       "severity": "P1",
       "symptom": "Box 路线不能原生 resume 而重建合成 transcript 时（上一轮失败、无 pointer、历史校验不符等），合成 transcript 里没有 CLI 原本放在首条 user 消息之后的上下文记录（environment/model/token 预算/date，交互模式为 session_context/date/credential_org），CLI 改在最新消息后重新渲染，请求从首条消息之后就与缓存前缀分叉，后面整段历史按缓存写价重写（商业 10-11 一个长会话约 2.7k 积分）。修复：重建时从同会话、同 CLI 版本的较早 native transcript（先最早、再最新）读出这些记录，放在首条 user 消息之后；离线抓包证实请求与原生续接逐字相同到当前 user 消息，只在尾部多一条 Environment update。",
       "rootFixCommit": "0206cdf9",
+      "coverageCommits": [
+        "40117e42"
+      ],
       "regressions": [
         {
           "layer": "unit",
@@ -7265,6 +7274,9 @@
       "severity": "P1",
       "symptom": "交互模式 Box 会话（box-claude-*）每个会话第 1 轮都没有 native pointer，第 2 轮因此重建合成 transcript，静态前缀之后的整段历史按缓存写价重写。根因：交互模式 Claude Code 新建会话的 project 目录权限为 0755（-p 模式为 0700），native transcript 检查只接受 owner 0700 的目录，attach 前的检查失败被静默吞掉。2026-10-12 个人版线上复测（uid 3，cc2，Haiku）：第 1 轮目录 755、重建轮（由 INIT 创建）700。修复：INIT 对新的 native 会话预先创建 0700 project 目录，清理脚本不接收它；离线证实两种模式都保留预建的 0700 目录并以 0600 写 transcript。",
       "rootFixCommit": "6170d555",
+      "coverageCommits": [
+        "8e722e14"
+      ],
       "regressions": [
         {
           "layer": "unit",
