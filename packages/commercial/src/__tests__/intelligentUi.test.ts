@@ -114,9 +114,16 @@ describe("协议文案", () => {
     const here = dirname(fileURLToPath(import.meta.url));
     const schema = readFileSync(resolve(here, "../../../web-react/src/components/iui/schema.ts"), "utf8");
     const block = /export const IUI_TYPES[^=]*=\s*\[([\s\S]*?)\]/.exec(schema)?.[1] ?? "";
-    const types = [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!);
+    const all = [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!);
+    // OCV5-383: the market blocks (quote / kline / intraday / stocklist) only ever come verbatim from
+    // the 同花顺 CLI's `--ui` output, never from the model, so the model prompt must not offer them.
+    const market = readFileSync(resolve(here, "../../../web-react/src/components/iui/marketSchema.ts"), "utf8");
+    const cliOnly = new Set([...market.matchAll(/type: "([a-z_]+)"/g)].map((m) => m[1]!));
+    assert.ok(cliOnly.size >= 4, `parsed market types: ${[...cliOnly].join(",")}`);
+    const types = all.filter((t) => !cliOnly.has(t));
     assert.ok(types.length >= 10, `parsed types: ${types.join(",")}`);
     for (const t of types) assert.match(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
+    for (const t of cliOnly) assert.doesNotMatch(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
     const advertised = [...INTELLIGENT_UI_PROMPT.matchAll(/"type":"([a-z_]+)"/g)].map((m) => m[1]!);
     for (const t of advertised) assert.ok(types.includes(t), `prompt advertises unknown type ${t}`);
   });
