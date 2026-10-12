@@ -99,7 +99,7 @@ export async function runBoxToolFirstRound(input: {
   maxOutputTokensForModel: (model: string) => number | null;
   resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
     upstreamModel: string; signal: AbortSignal;
-    loginScope?: "default" | "all" }) => Promise<BoxResolvedTarget>;
+    loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
   onUnknown: (args: { uid: bigint; accountId: bigint; requestId: string;
     phase: string }) => Promise<void>;
   /** Retain the local target until remote proof or explicit operator recovery. */
@@ -284,7 +284,7 @@ export async function runBoxToolFirstRound(input: {
     if (signal.aborted) throw new BoxToolFirstRoundError("BOX_TOOL_ABORTED");
     const pendingTarget = deps.resolveTarget({ uid: input.uid, sessionId: input.sessionId,
       requestId: input.requestId, upstreamModel: input.upstreamModel, signal,
-      loginScope: boxRunnerLoginScope(input.canonicalModel) });
+      loginScope: boxRunnerLoginScope(input.canonicalModel), stickyKey: fingerprint.sessionId });
     let resolutionAbandoned = false;
     let completedTarget: BoxResolvedTarget | null = null;
     void pendingTarget.then((late) => {

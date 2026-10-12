@@ -28,6 +28,13 @@ const MIN_REMAINING_MS = 60_000;
 /** Logins a model launch may run under: `default` for `claude -p` models (the default login of each
  * account only, boxModelRouteLogins), `all` for interactive-runner models (every enabled login). */
 export type BoxLoginScope = "default" | "all";
+/** How long a chat's login is remembered, and how many chats (oldest forgotten first). */
+/** A running chat leaves its login at this utilization (operator, 2026-10-12): late enough that a
+ * chat rarely moves, early enough that the switch turn (and the compaction before it, see
+ * boxSwitchCompaction) still has room on the old window. New chats spill earlier (policy). */
+export const BOX_CHAT_SWITCH_AT = 0.95;
+const CHAT_LOGIN_TTL_MS = 24 * 3_600_000;
+const CHAT_LOGIN_MAX = 10_000;
 
 export class BoxAccountResolverError extends Error {
   /** Safe cause tag (error name and provision code only, never a message). */
@@ -170,8 +177,39 @@ export class BoxAccountResolver {
   /** Account x login choice: affinity first (one user keeps one login), then
    * quota/health/load fallback. See boxProfileScheduler. "legacy" = no saved logins
    * anywhere in the candidate set (or no table): the original random pick, unchanged. */
+  /** `${uid}:${chat}` -> the account and login that chat last ran on (see chooseLogin). */
+  private readonly chatLogins = new Map<string, { accountId: bigint; profile: string; expires: number }>();
+
+  private rememberChatLogin(key: string, accountId: bigint, profile: string, nowMs: number): void {
+    this.chatLogins.delete(key);
+    this.chatLogins.set(key, { accountId, profile, expires: nowMs + CHAT_LOGIN_TTL_MS });
+    for (const old of this.chatLogins.keys()) {
+      if (this.chatLogins.size <= CHAT_LOGIN_MAX) break;
+      this.chatLogins.delete(old);
+    }
+  }
+
+  /** Read-only: true when the chat's last login can no longer take it, so its next launch moves
+   * to another login (chooseLogin applies the same rule to the same rows). False for a chat this
+   * process has not placed yet: nothing would move. Reads the login's durable row first, as
+   * chooseLogin does, so a reading from the other egress slot counts here too. */
+  async chatMustMove(uid: bigint, stickyKey: string): Promise<boolean> {
+    const profiles = this.deps.profiles;
+    const last = this.chatLogins.get(`${uid}:${stickyKey}`);
+    if (!profiles || !last || last.expires <= (this.deps.now ?? Date.now)()) return false;
+    const rows = await profiles.list([last.accountId], "all");
+    const candidate = boxLoginCandidates({ accountId: last.accountId, weight: 1,
+      own: rows.filter((item) => item.accountId === last.accountId), health: profiles.health })
+      .find((c) => c.profile === last.profile);
+    // Switched off, logged out or deselected: it cannot take the chat either.
+    if (!candidate) return true;
+    return candidate.cooldownActive
+      || (candidate.utilization !== null && candidate.utilization >= BOX_CHAT_SWITCH_AT);
+  }
+
   private async chooseLogin(rows: AccountRow[], args: { uid: bigint; requestId: string;
-    upstreamModel: string; loginScope?: BoxLoginScope }, nowMs: number, skip: ReadonlySet<string>):
+    upstreamModel: string; loginScope?: BoxLoginScope; stickyKey?: string }, nowMs: number,
+    skip: ReadonlySet<string>):
     Promise<{ accountId: bigint; profile: string } | "legacy" | null> {
     const profiles = this.deps.profiles!;
     const selectable = cursorSelectableAccounts({ accounts: rows, model: args.upstreamModel,
@@ -209,11 +247,24 @@ export class BoxAccountResolver {
       candidate.boxLoad = candidates.filter((other) => other.accountId === candidate.accountId)
         .reduce((sum, other) => sum + other.loginLoad, 0);
     }
-    const pick = pickBoxProfile({ candidates, affinityKey: args.uid.toString(),
-      ...(profiles.policy ? { policy: profiles.policy } : {}) });
+    // A running chat stays on the login it last ran on: that Claude account holds its prompt cache
+    // (caches are per account), so a move makes the next turn write the whole conversation again.
+    // It moves only when that login is benched or at BOX_CHAT_SWITCH_AT,
+    // not for load or the new-chat spill line; new chats keep spreading as before.
+    const chatKey = args.stickyKey ? `${args.uid}:${args.stickyKey}` : null;
+    const last = chatKey ? this.chatLogins.get(chatKey) : undefined;
+    const stay = last && last.expires > nowMs ? candidates.find((c) => c.accountId === last.accountId
+      && c.profile === last.profile && !c.cooldownActive
+      && (c.utilization === null || c.utilization < BOX_CHAT_SWITCH_AT)) : undefined;
+    const pick = stay ? { candidate: stay, reason: "session" }
+      : pickBoxProfile({ candidates, affinityKey: args.uid.toString(),
+        ...(profiles.policy ? { policy: profiles.policy } : {}) });
     if (!pick) return null;
+    const moved = last && last.expires > nowMs && !stay ? last.profile : undefined;
+    if (chatKey) this.rememberChatLogin(chatKey, pick.candidate.accountId, pick.candidate.profile, nowMs);
     log.info("box_login_picked", { accountId: pick.candidate.accountId.toString(),
-      profile: pick.candidate.profile, reason: pick.reason, candidates: candidates.length });
+      profile: pick.candidate.profile, reason: pick.reason, candidates: candidates.length,
+      ...(moved ? { movedFrom: moved } : {}) });
     return { accountId: pick.candidate.accountId, profile: pick.candidate.profile };
   }
 
@@ -262,7 +313,9 @@ export class BoxAccountResolver {
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
     interactiveExecTarget?: boolean;
     /** Logins this launch may use; `default` when absent (BoxLoginScope). */
-    loginScope?: BoxLoginScope }): Promise<BoxResolvedTarget> {
+    loginScope?: BoxLoginScope;
+    /** The chat this launch belongs to (its CLI session id): it stays on the login it last ran on. */
+    stickyKey?: string }): Promise<BoxResolvedTarget> {
     const refused = new Set<string>();
     for (let attempt = 0; ; attempt++) {
       try { return await this.resolveOnce(args, refused); }
@@ -290,7 +343,7 @@ export class BoxAccountResolver {
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
     interactiveExecTarget?: boolean;
-    loginScope?: BoxLoginScope }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
+    loginScope?: BoxLoginScope; stickyKey?: string }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
     const rows = (await this.deps.list()).filter((row) => eligible(row, now())

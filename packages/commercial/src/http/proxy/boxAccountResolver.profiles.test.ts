@@ -292,3 +292,64 @@ test("claude -p launches stay on the default login; interactive-runner launches 
   assert.deepEqual([...interactive].sort(), ["b", "default"]);
   assert.deepEqual([...new Set(scopes)].sort(), ["all", "default"]);
 });
+
+// OCV5-378: a Claude account's prompt cache is its own (verified on the Box: the same 45.8k-token prompt
+// was a full write on the other login), so moving a running chat makes its next turn rewrite the whole
+// conversation. A chat therefore stays on its login until that login is benched or near its window limit.
+const atUtil = (f: ReturnType<typeof fixture>, profile: string, utilization: number) =>
+  f.health.observe(`20:${profile}`, { kind: "rate_limit", status: "allowed", utilization, resetsAtMs: null });
+
+test("a running chat stays on its login past the new-chat spill line, moves when the login's quota reaches 95%, and does not bounce back", async () => {
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+  const uid = 7n;
+  const chat = { loginScope: "all" as const, stickyKey: "chat-1" };
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-1"), false, "a chat not placed yet has nothing to move");
+  const first = (await f.launch(uid, chat)).profile!;
+  const other = first === "default" ? "b" : "default";
+  atUtil(f, first, 0.94);
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-1"), false);
+  assert.equal((await f.launch(uid, chat)).profile, first, "0.94: the running chat stays (its cache is there)");
+  assert.equal((await f.launch(uid, { loginScope: "all", stickyKey: "chat-2" })).profile, other,
+    "0.94: a new chat of the same user spreads as before");
+  assert.equal((await f.launch(uid, { loginScope: "all" })).profile, other, "a request without a chat key spreads too");
+  atUtil(f, first, 0.95);
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-1"), true, "95% of the login's quota: the switch is due");
+  assert.equal((await f.launch(uid, chat)).profile, other, "at 95% the chat moves");
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-1"), false, "on its new login nothing is due");
+  atUtil(f, first, 0.1);
+  assert.equal((await f.launch(uid, chat)).profile, other, "once moved it stays on its new login (no bounce back)");
+});
+
+test("load spill does not move a running chat; a benched login does", async () => {
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+  const uid = 8n;
+  const chat = { loginScope: "all" as const, stickyKey: "chat-load" };
+  const first = (await f.launch(uid, chat)).profile!;
+  const other = first === "default" ? "b" : "default";
+  for (let i = 0; i < 30; i++) f.health.recordLaunch(`20:${first}`);
+  const stays = await f.resolver.resolve({ ...f.args(uid), ...chat });
+  assert.equal(stays.profile, first, "a busy login keeps its running chat");
+  await stays.dispose?.();
+  const fresh = await f.resolver.resolve({ ...f.args(uid), loginScope: "all", stickyKey: "chat-new" });
+  assert.equal(fresh.profile, other, "a new chat spills off the busy login");
+  await fresh.dispose?.();
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-load"), false, "load alone never makes a switch due");
+  f.health.observe(`20:${first}`, { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: Date.now() + 86_400_000 });
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-load"), true);
+  assert.equal((await f.launch(uid, chat)).profile, other, "a benched login always moves the chat");
+});
+
+test("a switch is due when the login's durable row (the other egress slot's reading) reaches 95%, or it is deselected", async () => {
+  const f = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+  const uid = 9n;
+  const chat = { loginScope: "all" as const, stickyKey: "chat-rows" };
+  const first = (await f.launch(uid, chat)).profile!;
+  const other = first === "default" ? "b" : "default";
+  f.advance(1_000);
+  f.setRows([stored(20n, first, { utilization: 0.96, healthUpdatedAt: new Date(now + 10_000_000) }), stored(20n, other)]);
+  assert.equal(await f.resolver.chatMustMove(uid, "chat-rows"), true);
+  const g = fixture([20n], [stored(20n, "default"), stored(20n, "b")]);
+  const placed = (await g.launch(uid, chat)).profile!;
+  g.setRows([stored(20n, placed, { enabled: false }), stored(20n, placed === "default" ? "b" : "default")]);
+  assert.equal(await g.resolver.chatMustMove(uid, "chat-rows"), true, "a deselected login cannot keep the chat");
+});

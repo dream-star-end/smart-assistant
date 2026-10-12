@@ -65,7 +65,7 @@ export class BoxTextFetch {
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
       upstreamModel: string; signal: AbortSignal;
-      loginScope?: "default" | "all" }) => Promise<BoxResolvedTarget>;
+      loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
     onUnknown: (args: { uid: bigint; sessionId: string; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
     now?: () => number;
@@ -272,7 +272,7 @@ export class BoxTextFetch {
         const pendingTarget = this.deps.resolveTarget({ uid: args.uid,
           sessionId: args.sessionId, requestId: args.requestId,
           upstreamModel: args.upstreamModel, signal: abort.signal,
-          loginScope: boxRunnerLoginScope(args.canonicalModel) });
+          loginScope: boxRunnerLoginScope(args.canonicalModel), stickyKey: fingerprint.sessionId });
         // A resolver may ignore cancellation and finish after the HTTP budget.
         // Observe and release that target rather than leaking a ProxyAgent.
         void pendingTarget.then((target) => {

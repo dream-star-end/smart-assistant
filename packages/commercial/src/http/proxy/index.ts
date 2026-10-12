@@ -125,6 +125,7 @@ import { waitForBoxReplay } from "./boxReplayWait.js";
 import { boxRequestTailShape, prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
+import { prepareBoxSwitch } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -911,6 +912,33 @@ export function makeAnthropicProxyHandler(
           ? await passClassRate(boxRateCfg, boxFallbackLimiter, "box")
           : await passClassRate(generalRateCfg, generalFallbackLimiter, "general");
         if (!passed) return;
+      }
+      // A chat whose login is at its switch line continues on the next login from a Haiku
+      // compaction (its own billed request), not from a full cache rewrite. Applied before the
+      // replay lookup so a retry and every later request of the chat see the same body.
+      if (route.kind === "box" && gate && deps.boxModel?.switchCompaction) {
+        const switchAbort = new AbortController();
+        const onSwitchClose = (): void => { if (!res.writableEnded) switchAbort.abort(); };
+        res.once("close", onSwitchClose);
+        let switched: Awaited<ReturnType<typeof prepareBoxSwitch>>;
+        try {
+          switched = await runWithVerifiedProxyByteBudget(byteBudget, () => prepareBoxSwitch({
+            ...deps.boxModel!.switchCompaction!, pgPool: deps.pgPool,
+            preCheckRedis: deps.preCheckRedis, scheduler: deps.scheduler,
+            endpoint: BOX_INTERNAL_ENDPOINT, log: userLog,
+          }, { uid, containerId: containerIdBig, requestId, body, snapshot: gate.snapshot,
+            deniedModelIds: gate.deniedModelIds,
+            sessionId: extractUsageAttribution(body.metadata).sessionId,
+            authority: { executionRevision: gate.executionRevision,
+              projectionRevision: gate.projectionRevision, securityEpoch: gate.securityEpoch,
+              kind: gate.authorityKind },
+            signal: switchAbort.signal }));
+        } finally { res.off("close", onSwitchClose); }
+        if (switched.kind === "compacted") {
+          userLog.info("proxy_box_switch_compacted", { billingRequestId: switched.billingRequestId,
+            credits: switched.credits, tokensBefore: switched.tokensBefore, tokensAfter: switched.tokensAfter });
+        }
+        if (switchAbort.signal.aborted) return;
       }
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A

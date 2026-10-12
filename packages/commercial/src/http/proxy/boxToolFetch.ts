@@ -78,7 +78,7 @@ export class BoxToolFetch {
       requestId: string; upstreamModel: string; signal: AbortSignal;
       allowWakeIfHibernated?: boolean;
       requiredAccountId?: bigint;
-      loginScope?: "default" | "all" }) => Promise<BoxResolvedTarget>;
+      loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
     onUnknown: (args: { uid: bigint; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
     runFirst?: First;
