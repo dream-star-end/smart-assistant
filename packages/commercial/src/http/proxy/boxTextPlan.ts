@@ -309,6 +309,11 @@ export function makeBoxTextPlan(input: {
       // nudge; that hidden answer reaches no client and holds the run. The
       // client's own Claude Code decides what to do with the refusal.
       CLAUDE_CODE_DISABLE_REFUSAL_RETRY: "1",
+      // OCV5-386: an interactive Claude Code moves an MCP tool call to the background after
+      // 120 s and answers the model with its own "still running ... moved to the background"
+      // text. Box tools are the container's tools behind one bridge call: the run must wait
+      // for their real result (the container enforces each tool's own timeout). 0 = never.
+      CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: "0",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(input.body.max_tokens),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       // Explicit 0 or 1. Omitting the key would inherit an outer "1".

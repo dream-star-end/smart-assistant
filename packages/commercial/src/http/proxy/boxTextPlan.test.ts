@@ -78,6 +78,8 @@ test("an interactive-runner plan runs the staged oc-box host on the same argv wi
   assert.deepEqual({ mode: interactive.run.environment.OC_BOX_HOST_MODE, files: interactive.run.environment.OC_BOX_MOD_FILES,
     sha: interactive.run.environment.OC_BOX_MOD_SHA256 }, { mode: "print", files: host.modFiles, sha: host.modSha256 });
   assert.equal(print.run.environment.OC_BOX_HOST_MODE, undefined);
+  // OCV5-386: an interactive CLI would background a >120 s tool call and answer with its own text.
+  for (const plan of [print, interactive]) assert.equal(plan.run.environment.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS, "0");
   assert.deepEqual(interactive.interactiveHost?.path, hostPath);
   assert.equal(print.interactiveHost, undefined);
   assert.equal(interactive.assetManifest.split(",").length, 3);
