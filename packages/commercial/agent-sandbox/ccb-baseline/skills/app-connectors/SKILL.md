@@ -159,7 +159,7 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 | github | search_issues / get_issue | (v1 只读) |
 | feishu | get_doc / list_calendar_events | create_calendar_event / send_message |
 
-用户没绑定对应 API 应用时，引导到 管理中心→插件账号；知识星球或微博未安装时先引导到 AI 市场安装，
+用户没绑定对应 API 应用时，引导到 管理中心 → 插件；知识星球或微博未安装时先引导到 AI 市场安装，
 安装后分别使用微信或微博客户端扫码授权。二维码在对话框内看不到时，引导用户打开界面提供的独立
 网页链接；不要把临时二维码图片当永久链接。不要空转重试，也不要索要 cookie/token。
 

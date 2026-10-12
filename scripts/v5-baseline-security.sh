@@ -52,6 +52,7 @@ EXPECTED_SKILLS=(
   connector-authoring
   manage-taskboard
   ssh
+  ths
 )
 
 # MIN_SECURITY_POLICY: applied to every release, independent of that release's
@@ -113,8 +114,20 @@ assert_skill_inner() { # <baseline-dir> <skill>
         [[ -d "$root/skills/$skill/$entry" ]] \
           || die "skill $skill/$entry must be a directory"
         ;;
+      plugin.json)
+        # OCV5-383 plugin manifest: a regular file <= 64KB that parses as JSON. Parsed with the
+        # host's python3 json module (never code shipped inside the release); the field-level
+        # schema is enforced by @openclaude/protocol parsePluginManifest in tests and on the master.
+        [[ -f "$root/skills/$skill/plugin.json" && ! -L "$root/skills/$skill/plugin.json" ]] \
+          || die "skill $skill/plugin.json must be a regular file"
+        (( $(stat -c %s "$root/skills/$skill/plugin.json") <= 65536 )) \
+          || die "skill $skill/plugin.json is larger than 64KB"
+        python3 -I -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' \
+          "$root/skills/$skill/plugin.json" 2>/dev/null \
+          || die "skill $skill/plugin.json is not valid JSON"
+        ;;
       *)
-        die "skill $skill has undeclared entry $entry; allowed: SKILL.md, evals/, references/, scripts/"
+        die "skill $skill has undeclared entry $entry; allowed: SKILL.md, plugin.json, evals/, references/, scripts/"
         ;;
     esac
   done < <(find -P "$root/skills/$skill" -mindepth 1 -maxdepth 1 -printf '%f\n')
@@ -161,7 +174,7 @@ assert_structure() { # <baseline-dir>
   assert_exact_lines "skill manifest" "$skills_expected" "$skills_actual"
 
   # 与 runtime resolveCcbBaselineMounts() / ccbBaselineSkills.test.ts 同一白名单:
-  # 必有 SKILL.md;可选 evals/、references/、scripts/;evals/ 内恰好一个 evals.json。
+  # 必有 SKILL.md;可选 plugin.json(插件清单,OCV5-383)、evals/、references/、scripts/;evals/ 内恰好一个 evals.json。
   for skill in "${EXPECTED_SKILLS[@]}"; do
     if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" ]]; then
       case "$skill" in

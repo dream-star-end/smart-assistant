@@ -715,6 +715,8 @@ export const V3_CCB_BASELINE_SKILL_NAMES = [
   "connector-authoring",
   "manage-taskboard",
   "ssh",
+  // OCV5-383：同花顺行情插件（plugin.json + SKILL.md + scripts/ths.py + references/）。
+  "ths",
 ] as const;
 
 /**
@@ -852,11 +854,12 @@ export function resolveCcbBaselineMounts(
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const skillDir = pathJoin(skillsDirPath, name);
       assertBaselineLeaf(skillDir, "dir", abs);
-      // 白名单:SKILL.md 必有;evals/ / references/ / scripts/ 可选。
+      // 白名单:SKILL.md 必有;evals/ / references/ / scripts/ 可选;plugin.json(插件清单,OCV5-383)可选,
+      // 只能是 root 拥有、不可写的普通文件,且 ≤ 64KB(内容由 master 用 parsePluginManifest 校验,不在这里解析)。
       // evals/ 必须恰好 evals.json;references/ 与 scripts/ 为文件树,逐叶子
       // assertBaselineLeaf(owner=root / 非 group-other 可写 / 非 symlink / 不逃逸)。
       const skillEntries = readdirSync(skillDir).sort();
-      const allowed = new Set(["SKILL.md", "evals", "references", "scripts"]);
+      const allowed = new Set(["SKILL.md", "evals", "references", "scripts", "plugin.json"]);
       if (!skillEntries.includes("SKILL.md")) {
         throw new Error(
           `skill dir ${name} missing SKILL.md, got: ${JSON.stringify(skillEntries)}`,
@@ -865,7 +868,7 @@ export function resolveCcbBaselineMounts(
       for (const entry of skillEntries) {
         if (!allowed.has(entry)) {
           throw new Error(
-            `skill dir ${name} has undeclared entry ${entry}; allowed: SKILL.md, evals/, references/, scripts/`,
+            `skill dir ${name} has undeclared entry ${entry}; allowed: SKILL.md, plugin.json, evals/, references/, scripts/`,
           );
         }
       }
@@ -881,6 +884,13 @@ export function resolveCcbBaselineMounts(
           );
         }
         assertBaselineLeaf(pathJoin(evalsDir, "evals.json"), "file", abs);
+      }
+      if (skillEntries.includes("plugin.json")) {
+        const manifestPath = pathJoin(skillDir, "plugin.json");
+        assertBaselineLeaf(manifestPath, "file", abs);
+        if (lstatSync(manifestPath).size > 64 * 1024) {
+          throw new Error(`skill dir ${name}/plugin.json is larger than 64KB`);
+        }
       }
       if (skillEntries.includes("references")) {
         assertBaselineTree(pathJoin(skillDir, "references"), abs);

@@ -1,0 +1,63 @@
+{
+  "schema": "openclaude-plugin/1",
+  "name": "ths",
+  "version": "1.0.0",
+  "displayName": "同花顺行情",
+  "description": "查询 A 股行情、K 线、分时、选股、板块、排行、龙虎榜、资讯和 F10，可短信登录同步云自选。数据来自同花顺公开 Web 接口，只读，无交易功能。",
+  "author": { "name": "ths-plugin contributors", "url": "https://github.com/dream-star-end/ths-plugin" },
+  "license": "MIT",
+  "homepage": "https://github.com/dream-star-end/ths-plugin",
+  "category": "finance-business",
+  "tags": ["股票", "行情", "A股", "同花顺"],
+  "useCases": [
+    "查一只或几只股票的实时行情和盘口",
+    "看日 K、周 K 或分钟 K 线和当天分时走势",
+    "按条件选股，看涨幅榜、成交额榜和板块成分股",
+    "同步同花顺云自选，一次看完自选股行情"
+  ],
+  "components": {
+    "skills": [{ "path": "SKILL.md" }],
+    "bin": [
+      {
+        "name": "ths",
+        "entry": "scripts/ths.py",
+        "interpreter": "python3",
+        "description": "同花顺行情命令行；默认输出 JSON，加 --ui 输出智能 UI 组件块"
+      }
+    ],
+    "data": [{ "path": "references/sectors.json", "description": "526 个行业与概念板块注册表" }]
+  },
+  "auth": {
+    "mode": "none",
+    "login": {
+      "optional": true,
+      "kind": "sms-code",
+      "description": "行情、K 线、选股都不需要登录；同步云自选需要用手机号短信登录同花顺。登录信息只保存在你自己的容器里（约 30 天有效）。",
+      "start": "帮我登录同花顺，同步云自选"
+    }
+  },
+  "permissions": {
+    "network": [
+      "https://d.10jqka.com.cn",
+      "https://stockpage.10jqka.com.cn",
+      "https://basic.10jqka.com.cn",
+      "https://xfer.10jqka.com.cn",
+      "https://news.10jqka.com.cn",
+      "https://stock.10jqka.com.cn",
+      "https://index.10jqka.com.cn",
+      "http://upass.10jqka.com.cn",
+      "http://auth.10jqka.com.cn",
+      "http://captcha.10jqka.com.cn",
+      "http://selfstock.10jqka.com.cn"
+    ],
+    "writes": [
+      { "id": "watchlist.push", "description": "把本地自选推送到同花顺云自选（需登录，执行前向用户确认）" }
+    ],
+    "userInteraction": ["sms-code"]
+  },
+  "disclaimer": {
+    "version": 1,
+    "text": "数据来自同花顺未公开的 Web 接口，仅供个人学习研究，可能随时变更或失效；行情为快照轮询，非逐笔推送。不提供交易功能，不构成投资建议。"
+  },
+  "compat": { "python": ">=3.8" }
+}
