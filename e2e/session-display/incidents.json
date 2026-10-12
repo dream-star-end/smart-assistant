@@ -6744,6 +6744,20 @@
           "assertion": "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept"
         }
       ]
+    },
+    {
+      "id": "INC-20261012-BOX-NATIVE-POINTER-CLEANUP-RACE",
+      "occurredAt": "2026-10-12",
+      "severity": "P1",
+      "symptom": "Box 路线（box-claude-* 交互 runner 与 box-api-claude-*）会话第 2 轮起不走原生 resume（box_native_decision miss no_candidate），每轮重建合成 transcript，静态前缀之后的整段历史按缓存写价重写。2026-10-12 个人版线上（uid 3，cc2，Haiku）每个会话第 1 轮都没有 native pointer，第 2 轮重写约 36k token。根因：first round 在 terminal 证明落库后、做完远端 transcript 检查才 attachNativePointer；后台清理 worker 在这段时间里 claim 了清理，attach 因 boxRemoteCleanupClaimed=true 被拒且静默。修复：已记录 native start、还没有 pointer 的刚完成运行，要等 pointer 写入或最后更新后 20 秒，才成为清理候选、才可 claim。",
+      "rootFixCommit": "4b0c0f83",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached"
+        }
+      ]
     }
   ]
 }
