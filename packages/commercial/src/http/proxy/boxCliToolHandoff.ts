@@ -147,6 +147,9 @@ export class BoxCliToolHandoffDecoder {
   private outputTokens = 0;
   private cacheRead = 0;
   private cacheWrite = 0;
+  /** OCV5-378: this segment's message_start had all-zero usage (the interactive Box runner streams
+   * it before the usage is known; a `claude -p` start never does); its message_delta carries it. */
+  private usageAtStop = false;
   private nextIndex = 0;
   private lastOriginalIndex = -1;
   private active: ActiveBlock | null = null;
@@ -544,6 +547,8 @@ export class BoxCliToolHandoffDecoder {
         write: count(usage.cache_creation_input_tokens ?? 0) };
       this.messageIds.add(message.id);
       this.segmentMessageId = message.id;
+      this.usageAtStop = segmentUsage.input === 0 && segmentUsage.output === 0
+        && segmentUsage.read === 0 && segmentUsage.write === 0;
       if (this.awaitingNextMessage) {
         // The client already holds this turn's message_start; the retry
         // continues the same visible message (OCV5-301).
@@ -734,6 +739,13 @@ export class BoxCliToolHandoffDecoder {
       }
       const usage = obj(event.usage);
       this.deltaUsage = { ...this.deltaUsage, ...usage };
+      if (this.usageAtStop) {
+        if (usage.input_tokens === undefined) throw new BoxCliToolHandoffError("BOX_TOOL_USAGE_MISMATCH");
+        this.inputTokens = count(usage.input_tokens);
+        this.cacheRead = count(usage.cache_read_input_tokens ?? 0);
+        this.cacheWrite = count(usage.cache_creation_input_tokens ?? 0);
+        this.usageAtStop = false;
+      }
       if ((usage.input_tokens !== undefined && count(usage.input_tokens) !== this.inputTokens)
         || (usage.cache_read_input_tokens !== undefined
           && count(usage.cache_read_input_tokens) !== this.cacheRead)
