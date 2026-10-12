@@ -140,7 +140,7 @@ function builtinPluginCard(entry: PluginEntry): MarketplaceCard {
     tags: [],
     preinstalled: true,
     official: true,
-    category: BUILTIN_PLUGIN_CATEGORY[entry.slug] ?? "daily-tools",
+    category: entry.category ?? BUILTIN_PLUGIN_CATEGORY[entry.slug] ?? "daily-tools",
   };
 }
 

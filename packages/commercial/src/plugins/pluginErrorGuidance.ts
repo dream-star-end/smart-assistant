@@ -512,6 +512,12 @@ const ROWS: Record<string, Row> = {
     message: '请求参数无效',
     nextAction: '请修正参数后重试，不要原样重放',
   },
+  PLUGIN_DISABLED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '插件已停用',
+    nextAction: '请告诉用户在 管理中心 → 插件 里打开这个插件后再试，不要绕过',
+  },
   WRITE_DISABLED: {
     retrySafe: 'no',
     requiresReauth: false,

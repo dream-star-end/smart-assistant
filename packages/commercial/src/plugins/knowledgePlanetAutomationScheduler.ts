@@ -18,6 +18,7 @@ import { loadKmsKey, zeroBuffer } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { tx } from '../db/queries.js'
 import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from '../http/proxy/shared.js'
+import { disabledPluginSet } from './enablement.js'
 import { KNOWLEDGE_PLANET_AUTOMATION_DISCLAIMER_VERSION } from './knowledgePlanetAutomation.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import type { PluginRuntimeFacade } from './runtime.js'
@@ -236,6 +237,21 @@ async function lockControl(
   return result.rows[0] ?? null
 }
 
+/** 用户是否在 管理中心 → 插件 停用了知识星球（OCV5-383）。读失败按启用处理（disabledPluginSet 内 fail-open）。 */
+async function knowledgePlanetDisabled(userId: number): Promise<boolean> {
+  return (await disabledPluginSet(userId)).has(KNOWLEDGE_PLANET_PLUGIN_SLUG)
+}
+
+/**
+ * 运行时门面在调用前也会按启用开关拒绝（loadManagedTarget → PLUGIN_DISABLED）。调度入口的预检读到
+ * 「未停用」之后用户才关、或预检读失败 fail-open 时，就会走到这里：这类 run 一律跳过、不计失败（Codex r2）。
+ */
+function pluginDisabledCode(code: unknown): boolean {
+  return code === 'PLUGIN_DISABLED'
+}
+
+export const pluginDisabledCodeForTest = pluginDisabledCode
+
 async function manualWriteStillEnabled(
   client: PoolClient,
   connectionId: string,
@@ -316,6 +332,17 @@ async function claimNextRule(pool: Pool): Promise<RuleClaim | null> {
     const writeBlockReason = await manualWriteBlockReason(client, row.connection_id, row.user_id)
     if (writeBlockReason) {
       await pauseAccountLocked(client, row.connection_id, row.user_id, writeBlockReason)
+      return null
+    }
+    // 用户在 管理中心 → 插件 停用了知识星球（OCV5-383）：本轮不跑，5 分钟后再看。
+    // 不暂停、不改规则 —— 重新启用后自动恢复；运行时门面（loadManagedTarget）另有一道兜底。
+    if (await knowledgePlanetDisabled(row.user_id)) {
+      await client.query(
+        `UPDATE plugin_automation_rules
+            SET next_run_at = GREATEST(next_run_at, now() + interval '5 minutes'), updated_at = now()
+          WHERE id = $1::uuid AND deleted_at IS NULL`,
+        [row.id],
+      )
       return null
     }
     const token = randomUUID()
@@ -641,6 +668,17 @@ async function claimNextRun(pool: Pool): Promise<RunClaim | null> {
     )
     const ruleRow = rule.rows[0]
     const runRow = run.rows[0]
+    // 插件在 管理中心 → 插件 被停用（OCV5-383 Codex r1 P1）：已排队的 run 直接跳过，记 PLUGIN_DISABLED，
+    // 不进生成、不计失败，规则不暂停；重新启用后由新的扫描继续。
+    if (runRow?.status === 'reserved' && (await knowledgePlanetDisabled(picked.user_id))) {
+      await client.query(
+        `UPDATE plugin_automation_runs
+            SET status = 'skipped', reason_code = 'PLUGIN_DISABLED', finished_at = now()
+          WHERE id = $1::uuid AND status = 'reserved'`,
+        [picked.id],
+      )
+      return null
+    }
     const allowed =
       control !== null &&
       automationControlValid(control) &&
@@ -871,6 +909,10 @@ async function generateRun(
   },
   run: RunClaim,
 ): Promise<'ready' | 'skipped' | 'failed'> {
+  if (await knowledgePlanetDisabled(run.userId)) {
+    await skipRun(opts.pool, run, 'PLUGIN_DISABLED')
+    return 'skipped'
+  }
   if (!opts.apiKey) {
     await failRun(opts.pool, run, 'MODEL_UNAVAILABLE')
     return 'failed'
@@ -953,6 +995,10 @@ async function generateRun(
     }
   } catch (error) {
     const code = (error as { code?: unknown })?.code
+    if (pluginDisabledCode(code)) {
+      await skipRun(opts.pool, run, 'PLUGIN_DISABLED')
+      return 'skipped'
+    }
     if (code === 'RELINK_REQUIRED')
       await pauseAccount(opts.pool, run.connectionId, run.userId, 'RELINK_REQUIRED')
     await failRun(
@@ -1188,6 +1234,11 @@ async function dispatchRun(
   env: NodeJS.ProcessEnv,
   run: ReadyRun,
 ): Promise<'sent' | 'skipped' | 'failed' | 'unknown' | 'deferred'> {
+  // 已生成、待发出的回复：插件停用后不发，记 PLUGIN_DISABLED 跳过（不计失败）。
+  if (await knowledgePlanetDisabled(run.userId)) {
+    await skipReadyRun(pool, run, 'PLUGIN_DISABLED')
+    return 'skipped'
+  }
   let key: Buffer | null = null
   let plaintext: Buffer | null = null
   try {
@@ -1267,11 +1318,20 @@ async function dispatchRun(
         await skipReadyRun(pool, run, 'SOURCE_CHANGED')
         return 'skipped'
       }
+      // 未发出即被启用开关拦下：跳过、不计失败。
+      if (pluginDisabledCode(execution.errorCode) && (await skipReadyRun(pool, run, 'PLUGIN_DISABLED')))
+        return 'skipped'
       await failReadyRun(pool, run, execution.errorCode)
       return 'failed'
     }
     return settleDispatchFailure(pool, run, execution.errorCode)
   } catch (error) {
+    // 发出前的读取（get_topic）被启用开关拦下：run 仍是 ready，跳过、不计失败。
+    if (
+      pluginDisabledCode((error as { code?: unknown })?.code) &&
+      (await skipReadyRun(pool, run, 'PLUGIN_DISABLED'))
+    )
+      return 'skipped'
     return settleDispatchFailure(pool, run, 'DISPATCH_FAILED')
   } finally {
     if (plaintext) zeroBuffer(plaintext)

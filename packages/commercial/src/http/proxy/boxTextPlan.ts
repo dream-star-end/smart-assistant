@@ -6,6 +6,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
+import { boxApiRunnerFor } from "@openclaude/protocol";
 import { currentVerifiedProxyByteBudget, type ProxyBody } from "./shared.js";
 import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { validateBoxTextRequest } from "./boxRequestGate.js";
@@ -37,6 +38,10 @@ export interface BoxTextPlan {
   readonly discardNativeCleanup?: BoxCcExecRequest;
   /** Must run and match before native resume admission; also ensures old cwd. */
   readonly nativePreflight?: BoxCcExecRequest;
+  /** OCV5-378: the staged interactive host, when this run's model uses that runner. */
+  readonly interactiveHost?: { readonly asset: Buffer; readonly path: string; readonly hash: string };
+  /** Its own stage request, for callers that stage helpers one by one (fast path off). */
+  readonly stageInteractiveHost?: BoxCcExecRequest;
   readonly supervisorHash: string;
   readonly keeperHash: string;
   readonly snapshotHash: string | null;
@@ -44,18 +49,46 @@ export interface BoxTextPlan {
   readonly systemHash: string;
 }
 
+/** OCV5-378: how a model with BoxApiRunner "interactive" runs on the Box. The oc-box host
+ * (packages/gateway/box-bridge-mod/host.py, print mode) takes the same claude argv and stdio
+ * contract as `claude -p` and serves it with an interactive Claude Code in tmux, driven by the
+ * oc-bridge mod. The host is staged like the other helpers; the mod rides in the environment. */
+export interface BoxInteractiveHostAsset {
+  readonly host: Buffer;
+  /** JSON {relpath: base64} of the oc-bridge mod (host.py OC_BOX_MOD_FILES). */
+  readonly modFiles: string;
+  readonly modSha256: string;
+}
+
+/** Plan input for a canonical model's Box runner. A model that runs interactively never falls
+ * back to `claude -p`: without the host its request is refused. */
+export function boxRunnerPlanInput(canonicalModel: string, host: BoxInteractiveHostAsset | undefined):
+  { interactiveHost?: BoxInteractiveHostAsset } {
+  if (boxApiRunnerFor(canonicalModel) !== "interactive") return {};
+  if (!host) throw new BoxTextPlanError("BOX_INTERACTIVE_HOST_UNAVAILABLE");
+  return { interactiveHost: host };
+}
+
+/** Logins a canonical model's launch may use: every enabled login for an interactive runner,
+ * the default login of each account for `claude -p` (BoxLoginScope). */
+export function boxRunnerLoginScope(canonicalModel: string): "default" | "all" {
+  return boxApiRunnerFor(canonicalModel) === "interactive" ? "all" : "default";
+}
+
 const MODEL = "/home/box/.local/bin/claude";
+const BOX_PRINT_ONLY_FLAGS = new Set(["-p", "--include-partial-messages", "--verbose", "--no-session-persistence"]);
+const BOX_PRINT_VALUE_FLAGS = new Set(["--input-format", "--output-format"]);
 const PYTHON = "/usr/bin/python3";
 const BASE_ENV = { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" };
 function sha(raw: Buffer): string { return createHash("sha256").update(raw).digest("hex"); }
 
 const STAGE_SUPERVISOR = String.raw`import base64,hashlib,os,re,stat,sys
 items=sys.argv[1:]
-if len(items)<4 or len(items)>16 or len(items)%4:raise SystemExit(1)
+if len(items)<4 or len(items)>20 or len(items)%4:raise SystemExit(1)
 manifest=[]
 for index in range(0,len(items),4):
  p,encoded,want,tmpid=items[index:index+4]
- if not re.fullmatch(r'/tmp/ocv5-289-v2-(?:supervisor|keeper|box-virtual-mcp|detached-runner)-[a-f0-9]{16}\.py',p) or not re.fullmatch(r'[a-f0-9]{24}',tmpid):raise SystemExit(1)
+ if not re.fullmatch(r'/tmp/ocv5-289-v2-(?:supervisor|keeper|box-virtual-mcp|detached-runner|interactive-host)-[a-f0-9]{16}\.py',p) or not re.fullmatch(r'[a-f0-9]{24}',tmpid):raise SystemExit(1)
  raw=base64.b64decode(encoded,validate=True)
  if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=want or want[:16] not in p:raise SystemExit(1)
  parent=os.open('/tmp',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
@@ -100,7 +133,7 @@ export function makeBoxAssetStage(asset: Buffer, path: string): {
     throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
   }
   const hash = sha(asset);
-  const match = /^\/tmp\/ocv5-289-v2-(?:supervisor|keeper|box-virtual-mcp|detached-runner)-([a-f0-9]{16})\.py$/.exec(path);
+  const match = /^\/tmp\/ocv5-289-v2-(?:supervisor|keeper|box-virtual-mcp|detached-runner|interactive-host)-([a-f0-9]{16})\.py$/.exec(path);
   if (!match || match[1] !== hash.slice(0, 16)) {
     throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
   }
@@ -115,7 +148,7 @@ export function makeBoxAssetStage(asset: Buffer, path: string): {
 export function makeBoxAssetsStage(assets: readonly { asset: Buffer; path: string }[]): {
   manifest: string; request: BoxCcExecRequest;
 } {
-  if (assets.length < 1 || assets.length > 4) {
+  if (assets.length < 1 || assets.length > 5) {
     throw new BoxTextPlanError("BOX_ASSET_STAGE_INVALID");
   }
   const stages = assets.map(({ asset, path }) => makeBoxAssetStage(asset, path));
@@ -150,6 +183,8 @@ export function makeBoxTextPlan(input: {
   toolAliases?: ReadonlyMap<string, string>;
   /** Appended to the staged system prompt (tool plan: the alias table). */
   systemSuffix?: string;
+  /** OCV5-378: run through the interactive host (models with BoxApiRunner "interactive"). */
+  interactiveHost?: BoxInteractiveHostAsset;
   /** OCV5-384: see compileBoxCliSyntheticTurn. Ignored on native resume (nothing is staged). */
   stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxTextPlan {
@@ -169,6 +204,12 @@ export function makeBoxTextPlan(input: {
   }
   if (input.body.max_tokens > input.maxOutputTokensLimit) {
     throw new BoxTextPlanError("BOX_MAX_TOKENS_UNSUPPORTED");
+  }
+  const host = input.interactiveHost;
+  if (host && (host.host.length === 0 || host.host.length > 32768
+    || !/^[a-f0-9]{64}$/.test(host.modSha256)
+    || host.modFiles.length === 0 || host.modFiles.length > 256 * 1024)) {
+    throw new BoxTextPlanError("BOX_TEXT_PLAN_INVALID");
   }
   const supervisorDeadlineSeconds = input.supervisorDeadlineSeconds ?? 110;
   if (!Number.isSafeInteger(supervisorDeadlineSeconds)
@@ -206,6 +247,9 @@ export function makeBoxTextPlan(input: {
   const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${supervisorHash.slice(0, 16)}.py`;
   const keeperHash = sha(input.keeperAsset);
   const keeperPath = `/tmp/ocv5-289-v2-keeper-${keeperHash.slice(0, 16)}.py`;
+  const hostHash = host ? sha(host.host) : "";
+  const interactiveHost = host ? { asset: host.host, hash: hostHash,
+    path: `/tmp/ocv5-289-v2-interactive-host-${hostHash.slice(0, 16)}.py` } : undefined;
   const hasHistory = !input.nativeResume && mapped.snapshotJsonl.length > 0;
   const project = hasHistory ? `/home/box/.claude/projects/${cwd.replaceAll("/", "-")}` : "";
   const snapshotPath = hasHistory ? `${project}/${mapped.sessionId}.jsonl` : "";
@@ -226,6 +270,7 @@ export function makeBoxTextPlan(input: {
   const assetBatch = makeBoxAssetsStage([
     { asset: input.supervisorAsset, path: supervisorPath },
     { asset: input.keeperAsset, path: keeperPath },
+    ...(interactiveHost ? [{ asset: interactiveHost.asset, path: interactiveHost.path }] : []),
   ]);
   const staged = makeBoxStageFiles({ cwd, project,
     // OCV5-384: a fresh native session's transcript directory must be ours (0700).
@@ -237,12 +282,7 @@ export function makeBoxTextPlan(input: {
       { path: systemPath, raw: system, hash: systemHash },
       ...(input.extraStageFiles ?? []),
     ] });
-  const run: BoxCcExecRequest = {
-    command: PYTHON,
-    args: ["-I", keeperPath, supervisorPath, "--proof-dir", proofDir,
-      "--lease-epoch", leaseEpoch, "--deadline", String(supervisorDeadlineSeconds), "--kill-after", "2",
-      "--max-output", "1048576", "--stdin-file", stdinPath,
-      "--stdin-sha256", stdinHash, "--", MODEL, "-p", "--model", input.upstreamModel,
+  const cliArgs = [MODEL, "-p", "--model", input.upstreamModel,
       "--input-format", "stream-json", "--output-format", "stream-json",
       "--include-partial-messages", "--verbose", "--tools", "",
       "--disallowedTools", "mcp__*", "--strict-mcp-config",
@@ -250,7 +290,19 @@ export function makeBoxTextPlan(input: {
       "--disable-slash-commands", ...(nativePersistence ? [] : ["--no-session-persistence"]),
       ...(effort ? ["--effort", effort] : []),
       "--system-prompt-file", systemPath,
-      hasHistory || input.nativeResume ? "--resume" : "--session-id", mapped.sessionId],
+      hasHistory || input.nativeResume ? "--resume" : "--session-id", mapped.sessionId];
+  // The interactive host gets the interactive argv: no `-p` (or any --print-only flag) appears on
+  // the Box for these models; a non-persistent run says so in the environment instead.
+  const interactiveCli = cliArgs.filter((arg, i) => !BOX_PRINT_ONLY_FLAGS.has(arg)
+    && !(BOX_PRINT_VALUE_FLAGS.has(cliArgs[i - 1] ?? "") && arg === "stream-json")
+    && !BOX_PRINT_VALUE_FLAGS.has(arg));
+  const run: BoxCcExecRequest = {
+    command: PYTHON,
+    args: ["-I", keeperPath, supervisorPath, "--proof-dir", proofDir,
+      "--lease-epoch", leaseEpoch, "--deadline", String(supervisorDeadlineSeconds), "--kill-after", "2",
+      "--max-output", "1048576", "--stdin-file", stdinPath,
+      "--stdin-sha256", stdinHash, "--",
+      ...(interactiveHost ? [PYTHON, "-I", interactiveHost.path, ...interactiveCli] : cliArgs)],
     cwd: cliCwd,
     environment: { HOME: "/home/box", PATH: "/home/box/.local/bin:/usr/local/bin:/usr/bin:/bin",
       LANG: "C.UTF-8", CLAUDE_CODE_MAX_RETRIES: "0",
@@ -258,6 +310,11 @@ export function makeBoxTextPlan(input: {
       // nudge; that hidden answer reaches no client and holds the run. The
       // client's own Claude Code decides what to do with the refusal.
       CLAUDE_CODE_DISABLE_REFUSAL_RETRY: "1",
+      // OCV5-386: an interactive Claude Code moves an MCP tool call to the background after
+      // 120 s and answers the model with its own "still running ... moved to the background"
+      // text. Box tools are the container's tools behind one bridge call: the run must wait
+      // for their real result (the container enforces each tool's own timeout). 0 = never.
+      CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS: "0",
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(input.body.max_tokens),
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
       // Explicit 0 or 1. Omitting the key would inherit an outer "1".
@@ -266,7 +323,11 @@ export function makeBoxTextPlan(input: {
       // Non-persistent plans keep the previous omission.
       ...(nativePersistence ? {
         DISABLE_AUTO_COMPACT: currentVerifiedProxyByteBudget().id === "box-native-v1" ? "0" : "1",
-      } : {}) },
+      } : {}),
+      // The host's print mode reads the same argv; the mod files are checked against the digest.
+      ...(host ? { OC_BOX_HOST_MODE: "print", OC_BOX_MOD_FILES: host.modFiles,
+        OC_BOX_MOD_SHA256: host.modSha256,
+        ...(nativePersistence ? {} : { OC_BOX_NO_SESSION_PERSISTENCE: "1" }) } : {}) },
   };
   const cleanup = nativePersistence && !input.nativeResume
     ? staged.cleanupPreservingNative : staged.cleanup;
@@ -275,7 +336,9 @@ export function makeBoxTextPlan(input: {
   const nativePreflight = input.nativeResume ? makeBoxNativeFileInspect({
     cliCwd: input.nativeResume.cliCwd, nativeSessionId: input.nativeResume.sessionId,
     expectedSha256: input.nativeResume.expectedSha256, ensureCwd: true }) : undefined;
-  return { cwd, cliCwd, nativePersistence, proofDir, runNonce, leaseEpoch,
+  return { ...(interactiveHost ? { interactiveHost,
+    stageInteractiveHost: makeBoxAssetStage(interactiveHost.asset, interactiveHost.path).request } : {}),
+    cwd, cliCwd, nativePersistence, proofDir, runNonce, leaseEpoch,
     sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
     stageSupervisor, stageKeeper, stageAssets: assetBatch.request,
     assetManifest: assetBatch.manifest, stageInputs: staged.requests, run, cleanup,

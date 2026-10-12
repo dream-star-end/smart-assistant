@@ -18,12 +18,24 @@ import { BoxProfileHealth } from "./boxProfileHealth.js";
 import { BOX_PROFILE_GUARD_REFUSED, makeBoxProfileGuard } from "./boxProfileDiscovery.js";
 import { scopeBoxExecToProfile } from "./boxProfileExec.js";
 import { boxLoginCandidates } from "./boxLoginCandidates.js";
-import { pickBoxProfile, type BoxProfileCandidate, type BoxProfilePolicy } from "./boxProfileScheduler.js";
+import { BOX_PROFILE_POLICY, pickBoxProfile, type BoxProfileCandidate,
+  type BoxProfilePolicy } from "./boxProfileScheduler.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
 
 const log = rootLogger.child({ subsys: "box-account-resolver" });
 const MIN_REMAINING_MS = 60_000;
+
+/** Logins a model launch may run under: `default` for `claude -p` models (the default login of each
+ * account only, boxModelRouteLogins), `all` for interactive-runner models (every enabled login). */
+export type BoxLoginScope = "default" | "all";
+/** How long a chat's login is remembered, and how many chats (oldest forgotten first). */
+/** A running chat leaves its login at this utilization (operator, 2026-10-12): late enough that a
+ * chat rarely moves, early enough that the switch turn (and the compaction before it, see
+ * boxSwitchCompaction) still has room on the old window. New chats spill earlier (policy). */
+export const BOX_CHAT_SWITCH_AT = 0.95;
+const CHAT_LOGIN_TTL_MS = 24 * 3_600_000;
+const CHAT_LOGIN_MAX = 10_000;
 
 export class BoxAccountResolverError extends Error {
   /** Safe cause tag (error name and provision code only, never a message). */
@@ -57,7 +69,8 @@ export interface BoxAccountResolverDeps {
   /** Claude Code logins per Box account. Absent: every account runs its default
    * login exactly as before (selfhost, unit fixtures). */
   profiles?: {
-    list: (accountIds: readonly bigint[]) => Promise<BoxProfileRow[]>;
+    /** `scope` says which logins a launch may use (BoxLoginScope). */
+    list: (accountIds: readonly bigint[], scope: BoxLoginScope) => Promise<BoxProfileRow[]>;
     health: BoxProfileHealth;
     policy?: BoxProfilePolicy;
     cacheMs?: number;
@@ -159,14 +172,45 @@ export class BoxAccountResolver {
     return this.orphanedAgents.size;
   }
 
-  private profileCache: { atMs: number; ids: string; rows: BoxProfileRow[] } | null = null;
+  private readonly profileCache = new Map<BoxLoginScope, { atMs: number; ids: string; rows: BoxProfileRow[] }>();
   private readonly guardOkUntil = new Map<string, number>();
 
   /** Account x login choice: affinity first (one user keeps one login), then
    * quota/health/load fallback. See boxProfileScheduler. "legacy" = no saved logins
    * anywhere in the candidate set (or no table): the original random pick, unchanged. */
+  /** `${uid}:${chat}` -> the account and login that chat last ran on (see chooseLogin). */
+  private readonly chatLogins = new Map<string, { accountId: bigint; profile: string; expires: number }>();
+
+  private rememberChatLogin(key: string, accountId: bigint, profile: string, nowMs: number): void {
+    this.chatLogins.delete(key);
+    this.chatLogins.set(key, { accountId, profile, expires: nowMs + CHAT_LOGIN_TTL_MS });
+    for (const old of this.chatLogins.keys()) {
+      if (this.chatLogins.size <= CHAT_LOGIN_MAX) break;
+      this.chatLogins.delete(old);
+    }
+  }
+
+  /** Read-only: true when the chat's last login can no longer take it, so its next launch moves
+   * to another login (chooseLogin applies the same rule to the same rows). False for a chat this
+   * process has not placed yet: nothing would move. Reads the login's durable row first, as
+   * chooseLogin does, so a reading from the other egress slot counts here too. */
+  async chatMustMove(uid: bigint, stickyKey: string): Promise<boolean> {
+    const profiles = this.deps.profiles;
+    const last = this.chatLogins.get(`${uid}:${stickyKey}`);
+    if (!profiles || !last || last.expires <= (this.deps.now ?? Date.now)()) return false;
+    const rows = await profiles.list([last.accountId], "all");
+    const candidate = boxLoginCandidates({ accountId: last.accountId, weight: 1,
+      own: rows.filter((item) => item.accountId === last.accountId), health: profiles.health })
+      .find((c) => c.profile === last.profile);
+    // Switched off, logged out or deselected: it cannot take the chat either.
+    if (!candidate) return true;
+    return candidate.cooldownActive
+      || (candidate.utilization !== null && candidate.utilization >= BOX_CHAT_SWITCH_AT);
+  }
+
   private async chooseLogin(rows: AccountRow[], args: { uid: bigint; requestId: string;
-    upstreamModel: string }, nowMs: number, skip: ReadonlySet<string>):
+    upstreamModel: string; loginScope?: BoxLoginScope; stickyKey?: string }, nowMs: number,
+    skip: ReadonlySet<string>):
     Promise<{ accountId: bigint; profile: string } | "legacy" | null> {
     const profiles = this.deps.profiles!;
     const selectable = cursorSelectableAccounts({ accounts: rows, model: args.upstreamModel,
@@ -175,20 +219,22 @@ export class BoxAccountResolver {
     const ids = selectable.map((item) => item.row.id);
     const idsKey = ids.map(String).sort().join(",");
     const cacheMs = profiles.cacheMs ?? 5_000;
+    const scope: BoxLoginScope = args.loginScope ?? "default";
+    const cached = this.profileCache.get(scope);
     let stored: BoxProfileRow[];
-    if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < cacheMs) {
-      stored = this.profileCache.rows;
+    if (cached && cached.ids === idsKey && nowMs - cached.atMs < cacheMs) {
+      stored = cached.rows;
     } else {
       try {
-        stored = await profiles.list(ids);
-        this.profileCache = { atMs: nowMs, ids: idsKey, rows: stored };
+        stored = await profiles.list(ids, scope);
+        this.profileCache.set(scope, { atMs: nowMs, ids: idsKey, rows: stored });
       } catch {
         // Fail closed: a read error must not turn an account whose logins were all switched off
         // into an implicit default. Only the identical account set, last READ successfully within
         // 60s, is reused; a failed attempt never refreshes that timestamp.
         log.error("BOX_PROFILE_LIST_FAILED");
-        if (this.profileCache && this.profileCache.ids === idsKey && nowMs - this.profileCache.atMs < 60_000) {
-          stored = this.profileCache.rows;
+        if (cached && cached.ids === idsKey && nowMs - cached.atMs < 60_000) {
+          stored = cached.rows;
         } else throw new BoxAccountResolverError("BOX_PROFILE_STORE_UNAVAILABLE");
       }
     }
@@ -202,11 +248,24 @@ export class BoxAccountResolver {
       candidate.boxLoad = candidates.filter((other) => other.accountId === candidate.accountId)
         .reduce((sum, other) => sum + other.loginLoad, 0);
     }
-    const pick = pickBoxProfile({ candidates, affinityKey: args.uid.toString(),
-      ...(profiles.policy ? { policy: profiles.policy } : {}) });
+    // A running chat stays on the login it last ran on: that Claude account holds its prompt cache
+    // (caches are per account), so a move makes the next turn write the whole conversation again.
+    // It moves only when that login is benched or at BOX_CHAT_SWITCH_AT,
+    // not for load or the new-chat spill line; new chats keep spreading as before.
+    const chatKey = args.stickyKey ? `${args.uid}:${args.stickyKey}` : null;
+    const last = chatKey ? this.chatLogins.get(chatKey) : undefined;
+    const stay = last && last.expires > nowMs ? candidates.find((c) => c.accountId === last.accountId
+      && c.profile === last.profile && !c.cooldownActive
+      && (c.utilization === null || c.utilization < BOX_CHAT_SWITCH_AT)) : undefined;
+    const pick = stay ? { candidate: stay, reason: "session" }
+      : pickBoxProfile({ candidates, affinityKey: args.uid.toString(),
+        ...(profiles.policy ? { policy: profiles.policy } : {}) });
     if (!pick) return null;
+    const moved = last && last.expires > nowMs && !stay ? last.profile : undefined;
+    if (chatKey) this.rememberChatLogin(chatKey, pick.candidate.accountId, pick.candidate.profile, nowMs);
     log.info("box_login_picked", { accountId: pick.candidate.accountId.toString(),
-      profile: pick.candidate.profile, reason: pick.reason, candidates: candidates.length });
+      profile: pick.candidate.profile, reason: pick.reason, candidates: candidates.length,
+      ...(moved ? { movedFrom: moved } : {}) });
     return { accountId: pick.candidate.accountId, profile: pick.candidate.profile };
   }
 
@@ -253,7 +312,11 @@ export class BoxAccountResolver {
     /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
-    interactiveExecTarget?: boolean }): Promise<BoxResolvedTarget> {
+    interactiveExecTarget?: boolean;
+    /** Logins this launch may use; `default` when absent (BoxLoginScope). */
+    loginScope?: BoxLoginScope;
+    /** The chat this launch belongs to (its CLI session id): it stays on the login it last ran on. */
+    stickyKey?: string }): Promise<BoxResolvedTarget> {
     const refused = new Set<string>();
     for (let attempt = 0; ; attempt++) {
       try { return await this.resolveOnce(args, refused); }
@@ -280,7 +343,8 @@ export class BoxAccountResolver {
     /** The interactive Box route (box-claude-*): resolve the account and its Box exec endpoint through
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
-    interactiveExecTarget?: boolean }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
+    interactiveExecTarget?: boolean;
+    loginScope?: BoxLoginScope; stickyKey?: string }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
     const rows = (await this.deps.list()).filter((row) => eligible(row, now())
@@ -452,9 +516,10 @@ export function productionBoxProfileHealth(): BoxProfileHealth {
   });
 }
 
-/** The Box model route (`claude -p` per request) runs only the default login of each account,
+/** A `claude -p` launch of the Box model route runs only the default login of each account,
  * whatever else an admin enabled: the other logins serve interactive sessions only (operator
- * rule 2026-10-11, Box logins never serve `claude -p` product turns; BoxInteractiveLogins).
+ * rule 2026-10-11, Box logins never serve `claude -p` product turns). Interactive-runner models
+ * (BoxApiRunner "interactive", scope `all`) use every enabled login.
  * The default row keeps its stored login state and health, so a logged-out default still stops
  * the route. */
 export function boxModelRouteLogins(rows: readonly BoxProfileRow[]): BoxProfileRow[] {
@@ -472,8 +537,13 @@ export function createProductionBoxAccountResolver(): BoxAccountResolver {
       egressProxy: token.egress_proxy, egressTarget: token.egress_target,
       egressProxyId: token.egress_proxy_id, egressHostUuid: token.egress_host_uuid }),
     uidProxy: boxUnboundProxy(),
-    profiles: { list: async (ids) => boxModelRouteLogins(await listBoxProfiles(ids)),
-      health: productionBoxProfileHealth() },
+    profiles: { list: async (ids, scope) => scope === "all" ? listBoxProfiles(ids)
+      : boxModelRouteLogins(await listBoxProfiles(ids)),
+      health: productionBoxProfileHealth(),
+      // An installation that keeps one login for itself and the others as backup (selfhost:
+      // cc2 first, cc1 shared with the commercial edition) turns this on.
+      ...(process.env.OC_BOX_LOGIN_DEFAULT_FIRST === "1"
+        ? { policy: { ...BOX_PROFILE_POLICY, defaultFirst: true } } : {}) },
     makeProxyAgent: (uri) => new ProxyAgent(uri),
     fetch: (url, init, dispatcher) => undiciFetch(url,
       { ...init, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>,

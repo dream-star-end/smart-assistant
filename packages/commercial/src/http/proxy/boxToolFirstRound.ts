@@ -27,6 +27,7 @@ import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
 import { randomBytes } from "node:crypto";
 import { explainBoxNativeHistory, withPromptLayout } from "./boxNativeHistory.js";
 import { boxPromptLayoutOf } from "./boxMessagesMapper.js";
+import { boxRunnerLoginScope, boxRunnerPlanInput, type BoxInteractiveHostAsset } from "./boxTextPlan.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -92,6 +93,8 @@ export async function runBoxToolFirstRound(input: {
   keeperAsset: Buffer;
   virtualMcpAsset: Buffer;
   detachedRunnerAsset: Buffer;
+  /** OCV5-378: required for models with BoxApiRunner "interactive". */
+  interactiveHost?: BoxInteractiveHostAsset;
   /** OCV5-301 bounded wait for a held session/account slot (default 45s). */
   capacityWaitMs?: number;
   /** OCV5-300: production passes "natural" so the CLI sees client names. */
@@ -100,7 +103,8 @@ export async function runBoxToolFirstRound(input: {
   writeMessage?: BoxReplayMessageWriter;
   maxOutputTokensForModel: (model: string) => number | null;
   resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
-    upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
+    upstreamModel: string; signal: AbortSignal;
+    loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
   onUnknown: (args: { uid: bigint; accountId: bigint; requestId: string;
     phase: string }) => Promise<void>;
   /** Retain the local target until remote proof or explicit operator recovery. */
@@ -158,7 +162,8 @@ export async function runBoxToolFirstRound(input: {
     throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
   }
   const nativeEnabled = boxFastPathEnabled();
-  let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+  const runner = boxRunnerPlanInput(input.canonicalModel, deps.interactiveHost);
+  let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
     detachedRunnerAsset: deps.detachedRunnerAsset,
@@ -283,7 +288,8 @@ export async function runBoxToolFirstRound(input: {
   try {
     if (signal.aborted) throw new BoxToolFirstRoundError("BOX_TOOL_ABORTED");
     const pendingTarget = deps.resolveTarget({ uid: input.uid, sessionId: input.sessionId,
-      requestId: input.requestId, upstreamModel: input.upstreamModel, signal });
+      requestId: input.requestId, upstreamModel: input.upstreamModel, signal,
+      loginScope: boxRunnerLoginScope(input.canonicalModel), stickyKey: fingerprint.sessionId });
     let resolutionAbandoned = false;
     let completedTarget: BoxResolvedTarget | null = null;
     void pendingTarget.then((late) => {
@@ -334,7 +340,7 @@ export async function runBoxToolFirstRound(input: {
       deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
         reason: miss, cliVersion: String(target.cliVersion) });
       if (candidate && pointerCatalog && miss === "ok") {
-        const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+        const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
           keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
           detachedRunnerAsset: deps.detachedRunnerAsset,
@@ -388,7 +394,7 @@ export async function runBoxToolFirstRound(input: {
           if (records && records.length > 0) break;
         }
         if (records && records.length > 0) {
-          plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+          plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
             maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
             keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
             detachedRunnerAsset: deps.detachedRunnerAsset,
@@ -456,6 +462,8 @@ export async function runBoxToolFirstRound(input: {
           ["keeper", plan.stageKeeper, plan.keeperHash],
           ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
           ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
+          ...(plan.stageInteractiveHost && plan.interactiveHost
+            ? [["interactive_host", plan.stageInteractiveHost, plan.interactiveHost.hash] as const] : []),
         ] as const) {
           stageLabel = label;
           const staged = await run(request);

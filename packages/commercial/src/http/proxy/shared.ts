@@ -1681,6 +1681,9 @@ export interface AnthropicProxyDeps {
       canonicalModel: string; canonicalBody: ProxyBody; upstreamModel: string;
       url: string; init: RequestInit;
       prepared?: import("./boxPreparedContinuation.js").PreparedContinuation }): Promise<Response>;
+    /** A running chat that must leave its login is compacted by Haiku first (boxSwitchCompaction). */
+    switchCompaction?: Omit<import("./boxSwitchCompaction.js").BoxSwitchDeps,
+      "pgPool" | "preCheckRedis" | "scheduler" | "endpoint" | "log">;
   };
   /** Read-only same-round capsule replay, independent of the Box launch flag. */
   boxReplay?: {

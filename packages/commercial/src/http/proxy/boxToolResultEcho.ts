@@ -25,6 +25,9 @@ type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string;
  * image. Only those notes may be extra; every published block must still be
  * echoed byte for byte and in order. */
 const EMPTY_MARKER = /^\(mcp__ocbridge__[A-Za-z0-9_-]{1,48} completed with no output\)$/;
+/** OCV5-386: Claude Code's own text when it moved an MCP tool call to the background. The Box
+ * runs with that disabled; if it ever appears the round still stops, under its own code. */
+const CLI_BACKGROUNDED = /^MCP tool "[^"\n]{1,120}" (?:is still running after \d+s|was moved to the background)/;
 const CLI_PREVIEW_BYTES = 2000;
 /** Claude Code persists an MCP result only when the summed text length
  * (toolResultStorage.contentSize) exceeds min(MCP 100k, default 50k). */
@@ -192,6 +195,10 @@ export class BoxToolResultEcho {
       const expected = this.expected.get(id)!;
       if (isError !== expected.isError || (hash !== expected.contentHash && (!expected.content
         || !possibleCliRewrite(normalized as EchoBlock[], expected.content as EchoBlock[])))) {
+        const first = normalized[0] as EchoBlock | undefined;
+        if (first?.type === "text" && CLI_BACKGROUNDED.test(first.text)) {
+          throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CLI_BACKGROUNDED");
+        }
         throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
       }
       // OCV5-302: a possible CLI rewrite of known published content is

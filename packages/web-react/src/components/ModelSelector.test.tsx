@@ -802,3 +802,52 @@ describe('ModelSelector 窄屏贴底 sheet', () => {
     }
   })
 })
+
+describe('ModelSelector Box Claude 走平台思考档位(OCV5-378)', () => {
+  const BOX: PublicModel[] = [
+    { id: 'box-claude-haiku-5-5', display_name: 'Claude Haiku 5.5', engine: 'ccb',
+      supported_efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('catalog 路由到 Box 模型路线(engine ccb)时显示「思考档位」,选档上抛', async () => {
+    const onSelectEffort = vi.fn()
+    render(
+      <ModelSelector
+        models={BOX}
+        selectedId="box-claude-haiku-5-5"
+        onSelect={() => {}}
+        effortSupported={['low', 'medium', 'high', 'xhigh', 'max']}
+        effortActive="high"
+        onSelectEffort={onSelectEffort}
+      />,
+    )
+    const trigger = screen.getByRole('button', { name: '选择对话模型' })
+    expect(trigger).toHaveTextContent('Claude Haiku 5.5')
+    expect(screen.getByTestId('model-trigger-tier')).toHaveTextContent(
+      EFFORT_OPTIONS.find((o) => o.value === 'high')!.label,
+    )
+    openMenu(trigger)
+    await screen.findAllByRole('menuitem')
+    for (const effort of ['follow', 'low', 'medium', 'high', 'xhigh', 'max']) {
+      expect(document.querySelector(`[data-effort="${effort}"]`)).not.toBeNull()
+    }
+    fireEvent.click(document.querySelector('[data-effort="low"]')!)
+    expect(onSelectEffort).toHaveBeenCalledWith('low')
+  })
+
+  it('同一 id 仍由 catalog 路由到 Cursor 引擎时,保持 Cursor 家族行为(不出平台档位)', async () => {
+    render(
+      <ModelSelector
+        models={[{ ...BOX[0]!, engine: 'cursor', supported_efforts: [] }, BOX[1]!]}
+        selectedId="box-claude-haiku-5-5"
+        onSelect={() => {}}
+        effortSupported={[]}
+        onSelectEffort={() => {}}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-effort]')).toBeNull()
+  })
+})

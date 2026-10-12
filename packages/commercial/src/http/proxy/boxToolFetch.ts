@@ -2,6 +2,7 @@
  * OpenClaude remains the agent/tool/memory/Skill owner; Box runs only Claude
  * Code's model process. This is off-route until real Box acceptance, remote
  * cleanup/reconciliation and production wiring pass T2 audit. */
+import type { BoxInteractiveHostAsset } from "./boxTextPlan.js";
 import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxMcpAliasMode } from "./boxToolCatalog.js";
 import type { BoxDurableJournal, BoxRemoteCleanupCandidate,
@@ -67,6 +68,8 @@ export class BoxToolFetch {
     keeperAsset: Buffer;
     virtualMcpAsset: Buffer;
     detachedRunnerAsset: Buffer;
+    /** OCV5-378: required for models with BoxApiRunner "interactive". */
+    interactiveHost?: BoxInteractiveHostAsset;
     toolAliasMode?: BoxMcpAliasMode;
     journal: BoxDurableJournal;
     writeMessage?: BoxReplayMessageWriter;
@@ -74,7 +77,8 @@ export class BoxToolFetch {
     resolveTarget: (args: { uid: bigint; sessionId: string | null;
       requestId: string; upstreamModel: string; signal: AbortSignal;
       allowWakeIfHibernated?: boolean;
-      requiredAccountId?: bigint }) => Promise<BoxResolvedTarget>;
+      requiredAccountId?: bigint;
+      loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
     onUnknown: (args: { uid: bigint; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
     runFirst?: First;
@@ -610,6 +614,7 @@ export class BoxToolFetch {
               keeperAsset: this.deps.keeperAsset,
               virtualMcpAsset: this.deps.virtualMcpAsset,
               detachedRunnerAsset: this.deps.detachedRunnerAsset,
+              ...(this.deps.interactiveHost ? { interactiveHost: this.deps.interactiveHost } : {}),
               toolAliasMode: this.deps.toolAliasMode,
               journal: this.deps.journal,
               writeMessage: this.deps.writeMessage,

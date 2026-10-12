@@ -47,6 +47,7 @@ const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus
 const SYSTEM_SOURCE = ["boxMessagesMapper.ts", "boxTextPlan.ts"] as const;
 const FRESH_PROJECT_BINDING = "[ocv5-384-fresh-native-project] PASS — a fresh native session stages its owner-0700 project directory and cleanup never receives it";
 const RESTAGE_BINDING = "[ocv5-384-restage-context] PASS — a re-staged conversation keeps the native context records after the first user message";
+const MCP_AUTO_BACKGROUND_BINDING = "[ocv5-386-mcp-auto-background] PASS — every Box run sets CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 and the interactive host passes it to the CLI";
 const SYSTEM_HEADER_BINDING = "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
@@ -1035,6 +1036,24 @@ async function proveFreshNativeProject(): Promise<void> {
     fail("FRESH_NATIVE_PROJECT");
   }
 }
+/** OCV5-386: an interactive Claude Code moves an MCP tool call to the background after 120 s and
+ * answers with its own text, which the echo check rejects (the round stops). Every Box run must
+ * disable that, and the interactive host must hand the setting to the CLI. */
+async function proveNoMcpAutoBackground(): Promise<void> {
+  const plans = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[1])).href) as {
+    makeBoxTextPlan: (input: Record<string, unknown>) => { run: { environment: Record<string, string> } };
+  };
+  const plan = plans.makeBoxTextPlan({ body: { model: "box-api-claude-opus-5-5", max_tokens: 64, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "first" }] }] },
+    upstreamModel: "claude-opus-5-5", supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
+    maxOutputTokensLimit: 64, runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32) });
+  if (plan.run.environment.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS !== "0") fail("MCP_AUTO_BACKGROUND_ENV");
+  const host = readFileSync(join(CANDIDATE, "packages/gateway/box-bridge-mod/host.py"), "utf8");
+  const pass = /^PASS_ENV = re\.compile\(r'(.+)'\)$/m.exec(host)?.[1];
+  if (!pass || !new RegExp(`^(?:${pass})$`).test("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")) {
+    fail("MCP_AUTO_BACKGROUND_HOST_PASS");
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -1058,6 +1077,8 @@ async function workerMain(expectSha: string): Promise<void> {
   await proveSystemHeader();
   await proveRestageContext();
   await proveFreshNativeProject();
+  await proveNoMcpAutoBackground();
+  if (!MCP_AUTO_BACKGROUND_BINDING.startsWith("[ocv5-386-mcp-auto-background] PASS")) fail("MCP_AUTO_BACKGROUND_BINDING");
   if (!FRESH_PROJECT_BINDING.startsWith("[ocv5-384-fresh-native-project] PASS")) fail("FRESH_PROJECT_BINDING");
   if (!RESTAGE_BINDING.startsWith("[ocv5-384-restage-context] PASS")) fail("RESTAGE_BINDING");
   if (!SYSTEM_HEADER_BINDING.startsWith("[ocv5-381-system-header] PASS")) fail("SYSTEM_HEADER_BINDING");

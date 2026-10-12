@@ -7,7 +7,8 @@ import { BoxExecTransportError } from "./boxExecTransport.js";
 import { BoxInvocationRegistry, type BoxInvocationLease } from "./boxInvocationRegistry.js";
 import { createBoxCliSseDecoder } from "./boxCliSse.js";
 import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
-import { makeBoxTextPlan } from "./boxTextPlan.js";
+import { boxRunnerLoginScope, boxRunnerPlanInput, makeBoxTextPlan,
+  type BoxInteractiveHostAsset } from "./boxTextPlan.js";
 import { makeBoxDetachedTextPlan } from "./boxDetachedTextPlan.js";
 import { observeBoxDetachedText } from "./boxDetachedTextObserve.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
@@ -56,12 +57,15 @@ export class BoxTextFetch {
     keeperAsset: Buffer;
     /** When injected, the text lane reuses the proven detached Box spool. */
     detachedRunnerAsset?: Buffer;
+    /** OCV5-378: required for models with BoxApiRunner "interactive". */
+    interactiveHost?: BoxInteractiveHostAsset;
     registry: BoxInvocationRegistry;
     journal: BoxJournalPort;
     writeMessage?: BoxReplayMessageWriter;
     maxOutputTokensForModel: (model: string) => number | null;
     resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
-      upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
+      upstreamModel: string; signal: AbortSignal;
+      loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
     onUnknown: (args: { uid: bigint; sessionId: string; accountId: bigint;
       requestId: string; phase: string }) => Promise<void>;
     now?: () => number;
@@ -152,7 +156,8 @@ export class BoxTextFetch {
     catch { throw new BoxTextFetchError("BOX_CALL_IDENTITY_MISSING"); }
     const planInput = { body, upstreamModel: args.upstreamModel,
       maxOutputTokensLimit: cap, supervisorAsset: this.deps.supervisorAsset,
-      keeperAsset: this.deps.keeperAsset };
+      keeperAsset: this.deps.keeperAsset,
+      ...boxRunnerPlanInput(args.canonicalModel, this.deps.interactiveHost) };
     const detached = this.deps.detachedRunnerAsset
       ? makeBoxDetachedTextPlan({ ...planInput,
         detachedRunnerAsset: this.deps.detachedRunnerAsset }) : null;
@@ -266,7 +271,8 @@ export class BoxTextFetch {
       try {
         const pendingTarget = this.deps.resolveTarget({ uid: args.uid,
           sessionId: args.sessionId, requestId: args.requestId,
-          upstreamModel: args.upstreamModel, signal: abort.signal });
+          upstreamModel: args.upstreamModel, signal: abort.signal,
+          loginScope: boxRunnerLoginScope(args.canonicalModel), stickyKey: fingerprint.sessionId });
         // A resolver may ignore cancellation and finish after the HTTP budget.
         // Observe and release that target rather than leaking a ProxyAgent.
         void pendingTarget.then((target) => {
@@ -352,6 +358,12 @@ export class BoxTextFetch {
           const keeper = await exec(plan.stageKeeper, 20_000);
           if (keeper.stdout.trim() !== plan.keeperHash) {
             throw new BoxTextFetchError("BOX_KEEPER_STAGE_INVALID");
+          }
+          if (plan.stageInteractiveHost && plan.interactiveHost) {
+            const host = await exec(plan.stageInteractiveHost, 20_000);
+            if (host.stdout.trim() !== plan.interactiveHost.hash) {
+              throw new BoxTextFetchError("BOX_INTERACTIVE_HOST_STAGE_INVALID");
+            }
           }
           if (detached) {
             const runner = await exec(detached.stageDetachedRunner, 20_000);

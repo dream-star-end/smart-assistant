@@ -7277,6 +7277,20 @@
           "assertion": "[ocv5-384-fresh-native-project] PASS — a fresh native session stages its owner-0700 project directory and cleanup never receives it"
         }
       ]
+    },
+    {
+      "id": "INC-20261012-BOX-MCP-AUTO-BACKGROUND",
+      "occurredAt": "2026-10-12",
+      "severity": "P1",
+      "symptom": "box-claude-*（交互 runner）会话里，容器工具执行超过 120 秒（如对超长 JSON 行的 grep、长构建、sleep 130）时回合中断：continuation_echo_rejected / BOX_TOOL_ECHO_CONTENT_MISMATCH，CCB 重试得 409 BOX_REPLAY_NOT_FOUND，UI「任务执行暂时中断，请直接重试本条消息」。根因：#665 起 Box 上跑交互式 Claude Code（不再 -p），2.1.296 对交互会话的 MCP 工具调用默认 120 秒自动转后台，并用自己的「MCP tool \"ocbridge/Bash\" is still running after 120s. It was moved to the background as task …」替换工具结果，egress 回显校验不认这种改写。修复：所有 Box 运行设 CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0（host.py 透传 CLAUDE_CODE_*），若仍出现则报 BOX_TOOL_ECHO_CLI_BACKGROUNDED。",
+      "rootFixCommit": "66a71da6",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "every Box run sets CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 and the interactive host passes it to the CLI"
+        }
+      ]
     }
   ]
 }

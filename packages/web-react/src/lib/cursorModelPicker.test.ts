@@ -8,6 +8,7 @@ import {
   pickCursorPublicModel,
   resolveContextPickerSelection,
   resolveCursorPickerSelection,
+  cursorPickerDef,
 } from './cursorModelPicker'
 import type { LockedPublicModel, PublicModel } from './types'
 
@@ -379,4 +380,14 @@ describe('lockedModelUnlockNotice (OCV5-86)', () => {
     expect(n.paragraphs[0]).toContain('LITE 及以上任一档')
     expect(n.paragraphs[0]).toContain('任意订阅套餐')
   })
+})
+
+it('OCV5-378: a catalog row routed to the Box model route (engine ccb) is a plain row, not a Cursor family', () => {
+  const rows = modelPickerRows([
+    { id: 'box-claude-haiku-5-5', display_name: 'Claude Haiku 5.5', engine: 'ccb' },
+    { id: 'box-claude-opus-5-5', display_name: 'Claude Opus 5.5', engine: 'cursor' },
+  ] as PublicModel[])
+  expect(rows.map((r) => r.kind)).toEqual(['plain', 'cursor-family'])
+  expect(cursorPickerDef({ id: 'box-claude-haiku-5-5', engine: 'ccb' })).toBeUndefined()
+  expect(cursorPickerDef({ id: 'box-claude-haiku-5-5' })?.id).toBe('box-claude-haiku-5-5')
 })

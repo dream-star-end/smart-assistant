@@ -7,6 +7,7 @@
  *
  * 扩展:新工具只需在 RESEARCH_CARD_REGISTRY 里加一条 {match, render}。
  */
+import { ThsToolCard, thsUiBlocks } from "./thsCard";
 import {
   AlertTriangle,
   Archive,
@@ -1527,6 +1528,8 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   "oc-connect": (_c, t) => connectorToolCard(t, { embedded: true }),
   // 市场 Plugin 使用与应用连接器相同的确认账本输出契约。
   "oc-plugin": (_c, t) => connectorToolCard(t, { embedded: true }),
+  // 同花顺插件：--ui 输出直接渲染成行情组件；JSON 输出 → null → 通用卡。
+  ths: (_c, t) => (thsUiBlocks(outputText(t)).length > 0 ? <ThsToolCard tool={t} /> : null),
 };
 
 /**

@@ -1,3 +1,4 @@
+import type { PluginManifest } from "@openclaude/protocol";
 import { HardDrive, Mail, MessagesSquare, NotebookText, Plug } from "lucide-react";
 import { type ComponentType, type ReactElement, createElement } from "react";
 
@@ -597,4 +598,18 @@ export function isConfirmTerminal(status: string): boolean {
 export function isConfirmExpired(expiresAt: string, nowMs: number = Date.now()): boolean {
   const t = Date.parse(expiresAt);
   return Number.isFinite(t) && t <= nowMs;
+}
+
+// ── 本机插件与启用开关（OCV5-383） ───────────────────────────────────────────
+
+/** 本机插件：随平台基线下发、在你的容器里运行（plugin.json openclaude-plugin/1）。 */
+export type LocalPlugin = PluginManifest & { enabled: boolean };
+
+/** 偏好快照（`/api/me/preferences` 的 {prefs} 或平铺）里的已停用插件 slug。 */
+export function disabledPluginsOf(snap: unknown): string[] {
+  if (!snap || typeof snap !== "object") return [];
+  const obj = snap as Record<string, unknown>;
+  const prefs = (obj.prefs && typeof obj.prefs === "object" ? obj.prefs : obj) as Record<string, unknown>;
+  const list = prefs.disabled_plugins;
+  return Array.isArray(list) ? list.filter((s): s is string => typeof s === "string") : [];
 }

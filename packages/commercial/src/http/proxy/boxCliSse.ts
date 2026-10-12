@@ -65,6 +65,11 @@ export function createBoxCliSseDecoder(expectedModel: string,
   let inputTokens: number | null = null, outputTokens: number | null = null;
   let cacheRead = 0, cacheCreation = 0, nextVisibleIndex = 0, lastOriginalIndex = -1;
   let deltaPhase = false, assistantSeen = false, lastAssistantText = "";
+  /** OCV5-378: the interactive Box runner streams its message_start before the step's usage is
+   * known, with all-zero usage (a `claude -p` start never is: every prompt has input or cached
+   * tokens). The first message_delta then carries that usage and fixes it for the rest of the
+   * checks. */
+  let usageAtStop = false;
   let currentMessageId: string | null = null;
   const assistantTexts: string[] = [];
   let stopReason: string | null = null;
@@ -119,6 +124,7 @@ export function createBoxCliSseDecoder(expectedModel: string,
         outputTokens = count(startUsage.output_tokens);
         cacheRead = count(startUsage.cache_read_input_tokens ?? 0);
         cacheCreation = count(startUsage.cache_creation_input_tokens ?? 0);
+        usageAtStop = inputTokens === 0 && outputTokens === 0 && cacheRead === 0 && cacheCreation === 0;
         started = true;
       } else if (eventType === "content_block_start") {
         const index = event.index;
@@ -190,6 +196,13 @@ export function createBoxCliSseDecoder(expectedModel: string,
         }
         const observed = usage(event.usage);
         deltaUsage = { ...deltaUsage, ...observed };
+        if (usageAtStop) {
+          if (observed.input_tokens === undefined) throw new BoxCliSseError("BOX_CLI_USAGE_MISMATCH");
+          inputTokens = count(observed.input_tokens);
+          cacheRead = count(observed.cache_read_input_tokens ?? 0);
+          cacheCreation = count(observed.cache_creation_input_tokens ?? 0);
+          usageAtStop = false;
+        }
         if ((observed.input_tokens !== undefined && count(observed.input_tokens) !== inputTokens)
           || (observed.cache_read_input_tokens !== undefined
             && count(observed.cache_read_input_tokens) !== cacheRead)

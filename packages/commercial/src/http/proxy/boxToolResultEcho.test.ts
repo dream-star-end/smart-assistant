@@ -31,3 +31,14 @@ test("missing, duplicate, forged and changed tool echoes fail closed", () => {
   assert.throws(() => verifier.accept(echo("toolu_A", "first")),
     /BOX_TOOL_ECHO_ID_INVALID/);
 });
+
+test("Claude Code's own background notice for a long tool call fails under its own code (OCV5-386)", () => {
+  for (const notice of [
+    'MCP tool "ocbridge/Bash" is still running after 120s. It was moved to the background as task kt4s1546v and keeps running.',
+    'MCP tool "ocbridge/Bash" was moved to the background as task kt4s1546v so that a message that arrived while it was running can reach you',
+  ]) {
+    assert.throws(() => new BoxToolResultEcho(expected).accept(echo("toolu_A", notice)), /BOX_TOOL_ECHO_CLI_BACKGROUNDED/);
+  }
+  assert.throws(() => new BoxToolResultEcho(expected).accept(echo("toolu_A", "MCP tool output")),
+    /BOX_TOOL_ECHO_CONTENT_MISMATCH/, "other mismatches keep their code");
+});

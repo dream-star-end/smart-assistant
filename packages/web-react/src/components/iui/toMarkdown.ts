@@ -6,6 +6,7 @@
  */
 import { isNextBlockCode } from "../../lib/inputPrediction";
 import { computeOutputs } from "./formula";
+import { marketToMarkdown } from "./marketMarkdown";
 import { parseUiBlock } from "./parse";
 import type { CalcFormat, CalculatorSpec, Cell, IuiSpec, OutlineNode, TableSpec } from "./schema";
 import { validateSpec } from "./schema";
@@ -317,6 +318,11 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
         .join("\n")
         .trim();
     }
+    case "quote":
+    case "kline":
+    case "intraday":
+    case "stocklist":
+      return marketToMarkdown(spec);
   }
 }
 

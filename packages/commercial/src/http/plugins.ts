@@ -5,6 +5,7 @@ import { PluginAccountError } from '../plugins/accounts.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import { KnowledgePlanetAutomationError } from '../plugins/knowledgePlanetAutomation.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
+import { localPluginsForUser } from '../plugins/localPlugins.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
@@ -211,6 +212,12 @@ export async function dispatchPluginsRoute(
 
   if (method === 'GET' && (path === '/api/plugins' || path === '/api/plugins/management')) {
     sendJson(res, 200, await runtime(deps).management(userId))
+    return
+  }
+
+  // 本机插件（随平台基线下发、在你的容器里运行，如同花顺行情）+ 当前用户的启用状态（OCV5-383）。
+  if (method === 'GET' && path === '/api/plugins/local') {
+    sendJson(res, 200, { plugins: await localPluginsForUser(userId) })
     return
   }
 

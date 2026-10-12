@@ -5,7 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
 import type { ProxyBody } from "./shared.js";
 import { makeBoxTextPlan, makeBoxAssetStage, makeBoxAssetsStage, BoxTextPlanError,
-  type BoxTextPlan } from "./boxTextPlan.js";
+  type BoxInteractiveHostAsset, type BoxTextPlan } from "./boxTextPlan.js";
 import { compileBoxToolCatalog, mapBoxCliEffort,
   type BoxToolCatalog, type BoxMcpAliasMode } from "./boxToolCatalog.js";
 import { BOX_TOOL_MAX_WALL_MS, BOX_TOOL_SPOOL_MAX_BYTES } from "./boxToolCapacity.js";
@@ -57,6 +57,8 @@ export function makeBoxToolPlan(input: {
   /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
   resumeToolResults?: boolean;
   toolAliasMode?: BoxMcpAliasMode;
+  /** OCV5-378: run through the interactive host (see makeBoxTextPlan). */
+  interactiveHost?: BoxInteractiveHostAsset;
   /** OCV5-384: see makeBoxTextPlan. */
   stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxToolPlan {
@@ -86,6 +88,7 @@ export function makeBoxToolPlan(input: {
        nativePersistence: input.nativePersistence, nativeResume: input.nativeResume,
        toolAliases: catalog.boxNameByClientName,
        systemSuffix: boxToolAliasNotice(catalog),
+       ...(input.interactiveHost ? { interactiveHost: input.interactiveHost } : {}),
        ...(input.stagedAttachments ? { stagedAttachments: input.stagedAttachments } : {}) });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
@@ -94,6 +97,7 @@ export function makeBoxToolPlan(input: {
     { asset: input.supervisorAsset, path: base.stageSupervisor.args[3]! },
     { asset: input.keeperAsset, path: base.stageKeeper.args[3]! },
     { asset: input.virtualMcpAsset, path: virtualMcpPath },
+    ...(base.interactiveHost ? [{ asset: base.interactiveHost.asset, path: base.interactiveHost.path }] : []),
   ]);
   const mcpConfig = JSON.stringify({ mcpServers: { ocbridge: { type: "stdio",
     command: "/usr/bin/python3", args: ["-I", virtualMcpPath, base.cwd,

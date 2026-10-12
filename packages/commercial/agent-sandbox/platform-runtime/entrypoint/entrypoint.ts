@@ -515,6 +515,8 @@ const PLATFORM_LINKED_CLIS = [
   "oc-task",
   "oc-memory",
   "oc-browser",
+  // 基线本机插件的命令（OCV5-383）：plugin.json components.bin[].name，经 plugin-exec 启动。
+  "ths",
 ] as const;
 for (const cliName of PLATFORM_LINKED_CLIS) {
   const source = join(PLATFORM_BIN_DIR, cliName);

@@ -37,6 +37,7 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  TrendingUp,
   Users,
   Video,
   Wrench,
@@ -148,6 +149,8 @@ export const OC_TOOLS = {
   // 市场 Plugin(知识星球/微博等)沿用同一服务端确认账本与确认卡；CLI stdout 只提供
   // 不透明 confirmation id，卡片内容仍由后端权威详情铸造。
   "oc-plugin": { icon: Plug, label: "插件", tone: "accent" },
+  // 同花顺行情插件（OCV5-383，本机插件，命令名不带 oc- 前缀，同 mmx）：`ths quote 600519 --ui` 等。
+  ths: { icon: TrendingUp, label: "同花顺行情", tone: "info" },
 } satisfies Record<string, ToolMeta>;
 
 /** oc-* CLI 名的联合类型(= OC_TOOLS 的键)。body 卡注册表以它为键,保证不会给未登记的
@@ -421,6 +424,27 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
+  if (cli === "ths") {
+    const labels: Record<string, string> = {
+      quote: "查行情",
+      kline: "看 K 线",
+      intraday: "看分时",
+      indicators: "看技术指标",
+      events: "看公司大事",
+      doctor: "检查通道",
+      commands: "看能力清单",
+      search: "找股票",
+      screen: "选股",
+      rank: "看排行",
+      lhb: "看龙虎榜",
+      sector: "看板块",
+      news: "看资讯",
+      f10: "看公司资料",
+      watchlist: "自选股",
+      login: "登录同花顺",
+    };
+    return labels[op] ? { ...base, label: `同花顺 · ${labels[op]}` } : base;
+  }
   if (cli === "oc-web") return { ...base, label: "提取网页内容" };
   if (cli === "oc-memory") {
     const labels: Record<string, ToolMeta> = {
@@ -464,7 +488,7 @@ function ocCommandSummary(cli: OcCli, command: string): string {
     if (op === "catalog") return humanSummaryToken(invocation?.[1]);
     return "";
   }
-  if (cli === "oc-market") {
+  if (cli === "oc-market" || cli === "ths") {
     return humanSummaryToken(invocation?.[1]);
   }
   if (cli === "oc-memory") {

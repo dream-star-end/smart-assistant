@@ -9,7 +9,7 @@ SELF_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # help-fast-path: stdout usage + exit 0; do not start tsx/node/network.
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
   cat <<'EOF'
-usage: oc-market <search|detail|installed|install|uninstall|publish-skill|publish-agent|plugin|publish-connector> ...
+usage: oc-market <search|detail|installed|install|uninstall|publish-skill|publish-agent|plugin> ...
 EOF
   exit 0
 fi
@@ -17,7 +17,8 @@ fi
 
 # Plugin authoring lives here rather than packages/gateway so the command can ship
 # through the true-hot platform bundle without a runtime image rebuild. The old
-# publish-connector surface retains read-only help/examples but cannot publish.
+# publish-connector surface retains read-only help/examples but cannot publish; it is
+# no longer listed in the usage line (OCV5-383) and only prints a redirect to `plugin`.
 if [ "${1:-}" = "plugin" ] || [ "${1:-}" = "publish-connector" ]; then
   MARKET_COMMAND="$1"
   shift
