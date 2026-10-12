@@ -347,10 +347,11 @@ def call(method, path, body=b'', tok=None):
     s.close()
     head, _, payload = data.partition(b'\\r\\n\\r\\n')
     return int(head.split()[1]), payload
-call('POST', '/out', (json.dumps({'type': 'system', 'subtype': 'fake_init', 'argv': sys.argv, 'env': sorted(os.environ)}) + '\\n').encode())
 # Real Claude Code takes seconds to load its plugins; the host reads claude.pid by polling and refuses
 # a peer that calls before that read (BOX_BRIDGE_PEER_REFUSED), so a stand-in must not be faster.
+# The pause comes before the first call, /out included.
 import time as _startup; _startup.sleep(0.5)
+call('POST', '/out', (json.dumps({'type': 'system', 'subtype': 'fake_init', 'argv': sys.argv, 'env': sorted(os.environ)}) + '\\n').encode())
 call('POST', '/ready', b'{"plugins":["oc-bridge"]}')
 tap = subprocess.Popen(['python3', d + '/tap.py', sock], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 tap.stdin.write(token.encode() + b'\\n'); tap.stdin.close()
