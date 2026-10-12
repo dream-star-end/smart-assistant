@@ -1118,6 +1118,11 @@ export function AssistantCard({
             <Square size={14} className="shrink-0" />
             <span>已停止生成</span>
           </output>
+        ) : recoveredStep && sem.automaticRecovery === true ? (
+          // OCV5-390: an error the platform retries by itself and that the turn got past is not the
+          // user's business: nothing stays in the process view. Only an error the turn ended on (or
+          // one that is not retried automatically) is shown.
+          null
         ) : recoveredStep && !suppressErrorAlert && presentedError ? (
           // OCV5-307:本轮已越过的错误(例:上游满载的 turn 终态错误被记在较早的正文段上,随后同一轮又
           // 继续并给出回复)。它是历史事实而非待办 —— 只留一行低调说明 + 可展开的请求信息,不再用整张
