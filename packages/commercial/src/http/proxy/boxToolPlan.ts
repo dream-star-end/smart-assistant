@@ -57,6 +57,8 @@ export function makeBoxToolPlan(input: {
   /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
   resumeToolResults?: boolean;
   toolAliasMode?: BoxMcpAliasMode;
+  /** OCV5-384: see makeBoxTextPlan. */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
   if (choice !== undefined && (choice === null || typeof choice !== "object"
@@ -83,7 +85,8 @@ export function makeBoxToolPlan(input: {
        supervisorDeadlineSeconds: BOX_TOOL_MAX_WALL_MS / 1000,
        nativePersistence: input.nativePersistence, nativeResume: input.nativeResume,
        toolAliases: catalog.boxNameByClientName,
-       systemSuffix: boxToolAliasNotice(catalog) });
+       systemSuffix: boxToolAliasNotice(catalog),
+       ...(input.stagedAttachments ? { stagedAttachments: input.stagedAttachments } : {}) });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;

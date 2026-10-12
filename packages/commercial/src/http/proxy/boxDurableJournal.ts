@@ -658,6 +658,46 @@ export class BoxDurableJournal implements BoxJournalPort {
     return { ownerRequestId: row.request_id, pointer };
   }
 
+  /** OCV5-384: native transcripts Box runs of this session and model wrote (any outcome: a
+   * failed run's transcript still holds the first exchange), oldest first then newest. The
+   * oldest is the session's origin, where the CLI put its context records after the first user
+   * message; a transcript re-staged before this fix has them elsewhere. Used only to copy those
+   * records into a re-staged conversation; never a resume authority. */
+  async findNativeTranscriptSources(input: { uid: bigint; sessionId: string;
+    currentRequestId: string; canonicalModel: string }): Promise<{ cliCwd: string;
+    nativeSessionId: string; cliVersion: string }[]> {
+    if (input.uid <= 0n || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(input.currentRequestId)
+      || !/^(?:box-api-|box-)?claude-[a-z0-9-]{3,64}$/.test(input.canonicalModel)) return [];
+    const found = await this.pool.query<{ cwd: unknown; sid: unknown; version: unknown }>(
+      `(SELECT ctx->>'boxNativeCliCwd' AS cwd, ctx->>'boxNativeSessionId' AS sid,
+               ctx->>'boxNativeCliVersion' AS version, 0 AS rank
+          FROM request_finalize_journal
+         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'model'=$3
+           AND ctx->>'boxInvocationRecovery'='v1' AND request_id<>$4
+           AND ctx ? 'boxNativeCliCwd' AND ctx ? 'boxNativeSessionId' AND ctx ? 'boxNativeCliVersion'
+         ORDER BY created_at ASC, request_id ASC LIMIT 1)
+       UNION ALL
+       (SELECT ctx->>'boxNativeCliCwd', ctx->>'boxNativeSessionId', ctx->>'boxNativeCliVersion', 1
+          FROM request_finalize_journal
+         WHERE user_id=$1 AND ctx->>'boxSessionId'=$2 AND ctx->>'model'=$3
+           AND ctx->>'boxInvocationRecovery'='v1' AND request_id<>$4
+           AND ctx ? 'boxNativeCliCwd' AND ctx ? 'boxNativeSessionId' AND ctx ? 'boxNativeCliVersion'
+         ORDER BY created_at DESC, request_id DESC LIMIT 1)
+       ORDER BY rank`,
+      [input.uid.toString(), input.sessionId, input.canonicalModel, input.currentRequestId]);
+    const out: { cliCwd: string; nativeSessionId: string; cliVersion: string }[] = [];
+    for (const row of found.rows) {
+      if (typeof row.cwd !== "string" || !/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(row.cwd)
+        || typeof row.sid !== "string"
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(row.sid)
+        || typeof row.version !== "string" || !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(row.version)
+        || out.some((item) => item.nativeSessionId === row.sid)) continue;
+      out.push({ cliCwd: row.cwd, nativeSessionId: row.sid, cliVersion: row.version });
+    }
+    return out;
+  }
+
   /** At most one latest expired pointer per native project. A successful
    * cleanup claim is still required before any remote file operation. */
   async listNativeGcCandidates(limit = 10): Promise<BoxNativeGcCandidate[]> {

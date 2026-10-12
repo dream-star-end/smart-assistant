@@ -79,7 +79,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
   spoolBody?: Buffer;
   compactUsingLaunchSession?: boolean;
   /** Claude Code build the resolver read on this Box; null = not read. */
-  cliVersion?: string | null } = {}) {
+  cliVersion?: string | null;
+  /** OCV5-384: earlier native transcripts of the session and their context records. */
+  transcriptSources?: { cliCwd: string; nativeSessionId: string; cliVersion: string }[];
+  transcriptRecords?: unknown[] } = {}) {
   let launchedSession = "";
   const sequence: string[] = [];
   const unknownPhases: string[] = [];
@@ -151,6 +154,11 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
           reason: "worker_complete", revision: 1 }) + "\n",
         stderrBytes: 0, exitCode: 0 as const };
       }
+      if (args[2]?.includes("if kind=='attachment':")) {
+        sequence.push("transcript-read");
+        return { stdout: `${JSON.stringify({ records: options.transcriptRecords ?? [] })}\n`,
+          stderrBytes: 0, exitCode: 0 as const };
+      }
       if (args[2]?.includes("print(json.dumps({'sha256':actual")) {
         sequence.push("native-inspect");
         return { stdout: JSON.stringify({ sha256: "f".repeat(64), size: 100 }) + "\n",
@@ -185,6 +193,10 @@ function fixture(options: { rejectAdmission?: boolean; ambiguousLaunch?: boolean
       return { stdout: "ok\n", stderrBytes: 0, exitCode: 0 as const };
     } } };
   const journal = {
+    findNativeTranscriptSources: async () => {
+      sequence.push("transcript-lookup");
+      return options.transcriptSources ?? [];
+    },
     findNativeCandidate: async (args: { sessionId: string }) => {
       sequence.push("native-lookup"); nativeLookups.push(args.sessionId);
       return options.nativeCandidate ?? null;
@@ -1053,6 +1065,45 @@ test("a native claim lost to a concurrent turn degrades to a cold start, not an 
     assert.equal(f.launches, 1);
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
+test("OCV5-384: a re-staged conversation carries the session's native context records", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const history = { ...canonicalBody, messages: [
+      { role: "user", content: "prior question" },
+      { role: "assistant", content: [{ type: "text", text: "prior answer" }] },
+      { role: "user", content: "next question" }] } as ProxyBody;
+    const source = { cliCwd: `/tmp/ocv5-289-run-${"7".repeat(24)}`,
+      nativeSessionId: "12345678-1234-4123-8123-123456789abc", cliVersion: "2.1.280" };
+    const records = [{ type: "attachment", attachment: { type: "date", date: "2026-10-12" },
+      rendered: "Today's date is 2026-10-12." }];
+    const run = async (options: Parameters<typeof fixture>[0]) => {
+      const f = fixture({ directFinal: true, ...options });
+      const decisions: { reason: string }[] = [];
+      const result = await runBoxToolFirstRound({ ...f.input, canonicalBody: history,
+        init: { ...f.input.init, body: JSON.stringify({ ...history, model: "claude-opus-5-5" }) } },
+      { ...f.deps, onNativeDecision: (info) => { decisions.push(info); } });
+      return { f, result, decisions };
+    };
+    const plain = await run({});
+    const carried = await run({ transcriptSources: [source], transcriptRecords: records });
+    assert.equal(carried.result.kind, "final");
+    assert.ok(carried.f.sequence.indexOf("transcript-read") < carried.f.sequence.indexOf("admit"));
+    assert.ok(carried.decisions.some((d) => d.reason === "restage_attachments"));
+    assert.ok(plain.result.kind === "final" && carried.result.kind === "final"
+      && plain.result.plan.snapshotHash !== null && carried.result.plan.snapshotHash !== null
+      && plain.result.plan.snapshotHash !== carried.result.plan.snapshotHash,
+    "the staged transcript differs from a plain re-stage");
+    const otherBuild = await run({ transcriptSources: [{ ...source, cliVersion: "2.1.999" }],
+      transcriptRecords: records });
+    assert.equal(otherBuild.f.sequence.includes("transcript-read"), false,
+      "a transcript written by another CLI build is not read");
+  } finally {
+    if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_FAST_NATIVE");
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });

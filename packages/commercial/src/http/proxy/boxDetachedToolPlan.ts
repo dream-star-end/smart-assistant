@@ -31,6 +31,8 @@ export function makeBoxDetachedToolPlan(input: {
   /** OCV5-304: resume a tool exchange whose live owner is gone (see mapper). */
   resumeToolResults?: boolean;
   toolAliasMode?: BoxMcpAliasMode;
+  /** OCV5-384: see makeBoxTextPlan. */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;
   const base = makeBoxToolPlan(toolInput);
